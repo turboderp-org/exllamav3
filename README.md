@@ -10,7 +10,7 @@ This is an **early preview release** of ExLlamaV3. Please note: ↙
 - There are no release builds yet.
 - Integration into [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) is planned when all the core functionality is in place.
 
-### Why?
+## Why?
 
 As the name implies, the original intention for ExLlama was to run inference on quantized Llama models. ExLlamaV2 was able to support a number of other architectures by treating every new model as (more or less) a Llama variant with optional features. However, as new models are increasingly moving away from the basic transformer template, this approach is no longer sustainable.  
 
@@ -18,7 +18,7 @@ Additionally, ExLlamaV2 is largely designed to run in a single process and CUDA 
 
  Aside from lifting a few of the most successful features from V2 (such as the generator), ExLlamaV3 is largely rewritten from scratch to provide a cleaner, more modular framework for supporting newer architectures. It also introduces a new SOTA quantization format based on [**QTIP**](https://github.com/Cornell-RelaxML/qtip) (see below).
 
-### What's missing?
+## What's missing?
 
 There's much that still needs to be added and/or ported over from ExLlamaV2. I've decided to release ExLlamaV3 in its current state to invite testing, feedback and contributions, but please be aware that it's not yet a viable replacement for ExLlamaV2. Currently on the to-do list:
 
@@ -34,9 +34,9 @@ There's much that still needs to be added and/or ported over from ExLlamaV2. I'v
 
 As for what is implemented, expect that some things may be a little broken at first. Please be patient and/or contribute. 👉👈 
 
-### How to?
+## How to?
 
-#### Installation
+### Installation
 
 Detailed installation instructions are coming soon, along with prebuilt wheels. For the time being, you can install the library with:
 
@@ -51,7 +51,7 @@ EXLLAMA_NOCOMPILE=1 pip install .
 
 Note that the included scripts can run in JIT mode from the repo directory without installing the library.
 
-#### Conversion
+### Conversion
 
 To convert a model to EXL3 format, use:
 
@@ -68,7 +68,7 @@ convert.py -h
 
 The working directory is temporary storage for state checkpoints and for storing quantized tensors until the converted model can be compiled. It should have enough free space to store an entire copy of the output model. Note that while EXL2 conversion by default resumes an interrupted job when pointed to an existing folder, EXL3 needs you to explicitly resume with the `-r`/`--resume` argument.    
 
-#### Examples
+### Examples
 
 A number of example scripts are provided to showcase the features of the backend and generator. Some of them have hardcoded model paths and should be edited before you run them, but there is a simple CLI chatbot that you can start with:
 
@@ -79,13 +79,13 @@ python examples/chat.py -m <input_dir> -mode <prompt_mode>
 python examples/chat.py -m /mnt/models/llama3.1-8b-instruct-exl3 -mode llama3
 ```
 
-### EXL3 quantization
+## EXL3 quantization
 
-<figure class="image" align="center">
+<div align="center">
     <a href="doc/exl3.md" target="_blank">
-        <img src="doc/llama31_8b_instruct_bpw.png" width="800">
+        <img src="doc/llama31_8b_instruct_bpw.png" width="640">
     </a>
-</figure>
+</div>
 
 Despite their amazing achievements, most SOTA quantization techniques remain cumbersome or even prohibitively expensive to use. For instance, **AQLM** quantization of a 70B model takes around **720 GPU-hours** on an A100 server, costing $850 US at the time of writing. ExLlamaV3 aims to address this with **EXL3** format, which is a streamlined variant of [**QTIP**](https://github.com/Cornell-RelaxML/qtip) from Cornell RelaxML. The conversion process is designed to be simple and efficient and requires only an input model (in HF format) and a target bitrate. By computing Hessians on the fly and thanks to a fused Viterbi kernel, the quantizer can convert a model in a single step, taking a couple of minutes for a smaller models, up to a few hours for larger ones (70B+) (on a single RTX 4090 or equivalent GPU.)
 
@@ -100,7 +100,7 @@ Fun fact: Llama-3.1-70B-EXL3 is coherent at 1.6 bpw. With the output layer quant
 A selection of EXL3-quantized models is available on [🤗 Hugging Face](https://huggingface.co/turboderp).
 
 
-### Acknowledgements
+## Acknowledgements
 
 This project owes its existence to a wonderful community of FOSS developers and some very generous supporters (🐈❤️!) The following projects in particular deserve a special mention:
 

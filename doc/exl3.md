@@ -16,61 +16,63 @@ The [eval/compare_q.py](../eval/compare_q.py) script makes an apples-to-apples c
 <b>Llama 3.1 8B Instruct</b>
 </p>
 
-<figure class="image" align="center">
+<div align="center">
   <a href="llama31_8b_instruct_bpw.png" target="_blank">
     <img src="llama31_8b_instruct_bpw.png" width="400">
   </a>
   <a href="llama31_8b_instruct_vram.png" target="_blank">
     <img src="llama31_8b_instruct_vram.png" width="400">
   </a>
-</figure>
+</div>
 
 <p align="center">
 <b>Llama 3.1 70B Instruct</b>
 </p>
 
-<figure class="image" align="center">
+<div align="center">
   <a href="llama31_70b_instruct_bpw.png" target="_blank">
     <img src="llama31_70b_instruct_bpw.png" width="400">
   </a>
   <a href="llama31_70b_instruct_vram.png" target="_blank">
     <img src="llama31_70b_instruct_vram.png" width="400">
   </a>
-</figure>
+</div>
 
 <p align="center">
 <b>Llama 3.2 1B Instruct</b>
 </p>
 
-<figure class="image" align="center">
+<div align="center">
   <a href="llama32_1b_instruct_bpw.png" target="_blank">
     <img src="llama32_1b_instruct_bpw.png" width="400">
   </a>
   <a href="llama32_1b_instruct_vram.png" target="_blank">
     <img src="llama32_1b_instruct_vram.png" width="400">
   </a>
-</figure>
+</div>
 
 <p align="center">
 <b>Mistral 7B Instruct v0.3</b>
 </p>
 
-<figure class="image" align="center">
+<div align="center">
   <a href="mistral_7b_instruct_v0.3_bpw.png" target="_blank">
     <img src="mistral_7b_instruct_v0.3_bpw.png" width="400">
   </a>
   <a href="mistral_7b_instruct_v0.3_vram.png" target="_blank">
     <img src="mistral_7b_instruct_v0.3_vram.png" width="400">
   </a>
-</figure>
+</div>
 
 ### HumanEval
 
 For the models tested here, HumanEval scores align closely with results advertised by the publishers or collected from other sources. Some deviation is to be expected due to differences in prompting and sampling, as well as random variation. See the [eval/humaneval.py](../eval/humaneval.py) script for specifics. The occasional bump around 3 bpw is repeatable and statistically significant, likely worth investigating. 
 
-<figure class="image" align="center">
-  <img src="humaneval.png" width="800">
-</figure>
+<div align="center">
+  <a href="humaneval.png" target="_blank">
+    <img src="humaneval.png" width="800">
+  </a>
+</div>
 
 ### Further work
 
