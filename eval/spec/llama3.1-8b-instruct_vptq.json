@@ -1,0 +1,26 @@
+[
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/vptq/v8-k65536-256-woft",
+        "load_fn": "transformers",
+        "fwd_fn": "transformers",
+        "label": "VPTQ v8-k65536-256-woft"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/vptq/v8-k65536-4096-woft",
+        "load_fn": "transformers",
+        "fwd_fn": "transformers",
+        "label": "VPTQ v8-k65536-4096-woft"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/vptq/v8-k65536-65536-woft",
+        "load_fn": "transformers",
+        "fwd_fn": "transformers",
+        "label": "VPTQ v8-k65536-65536-woft"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/vptq/v12-k65536-4096-woft",
+        "load_fn": "transformers",
+        "fwd_fn": "transformers",
+        "label": "VPTQ v12-k65536-4096-woft"
+    }
+]

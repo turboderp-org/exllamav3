@@ -1,0 +1,8 @@
+[
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.2-1b-instruct/bnb/bnb-4bit/",
+        "load_fn": "transformers",
+        "fwd_fn": "transformers",
+        "label": "BNB 4-bit"
+    }
+]

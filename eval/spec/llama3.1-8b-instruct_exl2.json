@@ -1,0 +1,44 @@
+[
+    {
+        "load_fn": "exllamav2",
+        "fwd_fn": "exllamav2",
+        "label": "EXL2 3.0bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/exl2/3.0bpw/"
+    },
+    {
+        "load_fn": "exllamav2",
+        "fwd_fn": "exllamav2",
+        "label": "EXL2 3.5bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/exl2/3.5bpw/"
+    },
+    {
+        "load_fn": "exllamav2",
+        "fwd_fn": "exllamav2",
+        "label": "EXL2 4.0bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/exl2/4.0bpw/"
+    },
+    {
+        "load_fn": "exllamav2",
+        "fwd_fn": "exllamav2",
+        "label": "EXL2 4.5bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/exl2/4.5bpw/"
+    },
+    {
+        "load_fn": "exllamav2",
+        "fwd_fn": "exllamav2",
+        "label": "EXL2 5.0bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/exl2/5.0bpw/"
+    },
+    {
+        "load_fn": "exllamav2",
+        "fwd_fn": "exllamav2",
+        "label": "EXL2 6.0bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/exl2/6.0bpw/"
+    },
+    {
+        "load_fn": "exllamav2",
+        "fwd_fn": "exllamav2",
+        "label": "EXL2 8.0bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/exl2/8.0bpw/"
+    }
+]

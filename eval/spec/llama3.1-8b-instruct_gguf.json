@@ -1,0 +1,74 @@
+[
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/gguf/Meta-Llama-3.1-8B-Instruct.i1-IQ1_M.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ1_M imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/gguf/Meta-Llama-3.1-8B-Instruct.i1-IQ2_M.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ2_M imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/gguf/Meta-Llama-3.1-8B-Instruct.i1-IQ2_S.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ2_S imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/gguf/Meta-Llama-3.1-8B-Instruct.i1-IQ2_XS.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ2_XS imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/gguf/Meta-Llama-3.1-8B-Instruct.i1-IQ2_XXS.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ2_XXS imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/gguf/Meta-Llama-3.1-8B-Instruct.i1-IQ3_M.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ3_M imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/gguf/Meta-Llama-3.1-8B-Instruct.i1-IQ3_S.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ3_S imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/gguf/Meta-Llama-3.1-8B-Instruct.i1-IQ3_XS.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ3_XS imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/gguf/Meta-Llama-3.1-8B-Instruct.i1-IQ4_XS.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ4_XS imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/gguf/Meta-Llama-3.1-8B-Instruct.i1-Q4_K_M.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF Q4_K_M imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/gguf/Meta-Llama-3.1-8B-Instruct.i1-Q5_K_M.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF Q5_K_M imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/gguf/Meta-Llama-3.1-8B-Instruct.i1-Q6_K.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF Q6_K imat"
+    }
+]

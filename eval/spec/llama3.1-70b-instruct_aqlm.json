@@ -1,0 +1,8 @@
+[
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-70b-instruct/aqlm/2bit-1x16-pv-g1/",
+        "load_fn": "transformers",
+        "fwd_fn": "transformers",
+        "label": "AQLM 2bit 1x16-g1"
+    }
+]

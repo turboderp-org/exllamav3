@@ -1,0 +1,62 @@
+[
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 2.0bpw H3",
+        "model_dir": "/mnt/str/eval_models/llama3.2-1b-instruct/exl3/2.0bpw_H3/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 2.0bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.2-1b-instruct/exl3/2.0bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 2.25bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.2-1b-instruct/exl3/2.25bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 2.5bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.2-1b-instruct/exl3/2.5bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 3.0bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.2-1b-instruct/exl3/3.0bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 3.5bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.2-1b-instruct/exl3/3.5bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 4.0bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.2-1b-instruct/exl3/4.0bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 5.0bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.2-1b-instruct/exl3/5.0bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 6.0bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.2-1b-instruct/exl3/6.0bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 8.0bpw H6",
+        "model_dir": "/mnt/str/eval_models/llama3.2-1b-instruct/exl3/8.0bpw/"
+    }
+]

@@ -1,0 +1,14 @@
+[
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-70b-instruct/vptq/v8-k65536-0-woft",
+        "load_fn": "transformers_auto",
+        "fwd_fn": "transformers",
+        "label": "VPTQ v8-k65536-0-woft"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-70b-instruct/vptq/v16-k65536-32768-woft",
+        "load_fn": "transformers_auto",
+        "fwd_fn": "transformers",
+        "label": "VPTQ v16-k65536-32768-woft"
+    }
+]

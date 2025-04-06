@@ -1,0 +1,50 @@
+[
+    {
+        "model_dir": "/mnt/str/eval_models/mistral-7b-instruct-v0.3/gguf/Mistral-7B-Instruct-v0.3.i1-IQ2_XS.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ2_XS imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/mistral-7b-instruct-v0.3/gguf/Mistral-7B-Instruct-v0.3.i1-IQ2_S.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ2_S imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/mistral-7b-instruct-v0.3/gguf/Mistral-7B-Instruct-v0.3.i1-IQ3_XS.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ3_XS imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/mistral-7b-instruct-v0.3/gguf/Mistral-7B-Instruct-v0.3.i1-IQ4_XS.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ4_XS imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/mistral-7b-instruct-v0.3/gguf/Mistral-7B-Instruct-v0.3.i1-Q2_K.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF Q2_K imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/mistral-7b-instruct-v0.3/gguf/Mistral-7B-Instruct-v0.3.i1-Q3_K_M.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF Q3_K_M imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/mistral-7b-instruct-v0.3/gguf/Mistral-7B-Instruct-v0.3.i1-Q6_K.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF Q6_K imat"
+    },
+    {
+        "model_dir": "/mnt/str/eval_models/mistral-7b-instruct-v0.3/gguf/Mistral-7B-Instruct-v0.3.i1-IQ3_XXS.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF IQ3_XXS imat"
+    }
+]

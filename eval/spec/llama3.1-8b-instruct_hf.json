@@ -1,0 +1,8 @@
+[
+    {
+        "model_dir": "/mnt/str/eval_models/llama3.1-8b-instruct/hf",
+        "load_fn": "transformers",
+        "fwd_fn": "transformers",
+        "label": "HF FP16"
+    }
+]
