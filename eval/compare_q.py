@@ -111,12 +111,15 @@ def test_ppl(data_spec: dict, spec: dict):
             log_probs = F.log_softmax(logits, dim = -1)
             del logits
             target_ids = input_ids[:, 1:].to(log_probs.device)
+            del input_ids
             target_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
             del log_probs
             logprob_sum += target_log_probs.sum().item()
             logprob_count += target_ids.numel()
             del target_log_probs
             del target_ids
+            torch.cuda.empty_cache()
+        pb.update(rows)
         mean_log_prob = logprob_sum / logprob_count
         perplexity = math.exp(-mean_log_prob)
 
