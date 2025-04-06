@@ -97,7 +97,7 @@ There are some benchmark results [here](doc/exl3.md), and a full writeup on the 
 
 Fun fact: Llama-3.1-70B-EXL3 is coherent at 1.6 bpw. With the output layer quantized to 3 bpw and a 4096-token cache, inference is possible in under 16 GB of VRAM. 
 
-A selection of EXL3-quantized models is available on [🤗 Hugging Face](https://huggingface.co/turboderp).
+A selection of EXL3-quantized models is available on [🤗 Hugging Face](https://huggingface.co/collections/turboderp/exl3-models-67f2dfe530f05cb9f596d21a).
 
 
 ## Acknowledgements
