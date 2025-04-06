@@ -16,7 +16,6 @@
 #include "quant/reconstruct.cuh"
 #include "quant/hadamard.cuh"
 #include "quant/exl3_gemm.cuh"
-#include "quant/exl3_gemv.cuh"
 
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
