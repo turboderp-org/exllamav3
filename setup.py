@@ -35,7 +35,7 @@ extra_compile_args = {
 library_dir = "exllamav3"
 sources_dir = os.path.join(library_dir, extension_name)
 sources = [
-    os.path.abspath(os.path.join(root, file))
+    os.path.relpath(os.path.join(root, file), start=os.path.dirname(__file__))
     for root, _, files in os.walk(sources_dir)
     for file in files
     if file.endswith(('.c', '.cpp', '.cu'))
