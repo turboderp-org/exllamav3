@@ -86,21 +86,17 @@ setup(
     license="MIT",
     author="turboderp",
     install_requires=[
-        "pandas",
-        "ninja",
-        "fastparquet",
-        "torch>=2.2.0",
-        "safetensors>=0.3.2",
-        "sentencepiece>=0.1.97",
-        "pygments",
-        "websockets",
-        "regex",
-        "numpy",
+        "torch>=2.6.0",
+        "flash_attn>=2.7.4.post1",
+        "tokenizers>=0.21.1",
+        "numpy>=2.1.0",
         "rich",
-        "pillow>=9.1.0"
+        "typing_extensions",
+        "ninja",
+        "safetensors>=0.3.2"
     ],
     include_package_data=True,
-    package_data={
+    package_data = {
         "": ["py.typed"],
     },
     verbose=verbose,

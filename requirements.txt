@@ -3,5 +3,6 @@ flash_attn>=2.7.4.post1
 tokenizers>=0.21.1
 numpy>=2.1.0
 rich
-tabulate
 typing_extensions
+safetensors>=0.3.2
+ninja
