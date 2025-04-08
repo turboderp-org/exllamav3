@@ -220,6 +220,6 @@ class Linear(Module):
     def quant_format_id(self):
         # alt_key is only used when loading unquantized model
         if self.is_exl3_storage(self.key):
-            return "EXL3"
+            return "exl3"
         else:
             return None
