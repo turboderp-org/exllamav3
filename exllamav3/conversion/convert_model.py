@@ -293,9 +293,7 @@ def main(args, job_state):
         tensors = {}
         for m in module:
             tensors.update(m.get_tensors())
-        qtensors_dir = os.path.join(args["work_dir"], "qtensors")
-        out_file = os.path.join(qtensors_dir, f"{module.key}.safetensors")
-        save_tensor(tensors, out_file, args)
+        save_tensor(tensors, f"qtensors/{module.key}.safetensors", args)
 
         # Output final bpw for layer
         num_bytes = dsize(tensors)
