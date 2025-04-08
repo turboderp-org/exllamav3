@@ -30,7 +30,7 @@ def create_quantization_config_json(
         module_dict["stored_tensors"] = stored_tensors
 
         qformat = module.quant_format_id()
-        if qformat == "EXL3":
+        if qformat == "exl3":
             shape = stored_tensors[f"{module.key}.trellis"]["shape"]
             module_dict["quant_format"] = "exl3"
             module_dict["bits_per_weight"] = shape[-1] // 16
