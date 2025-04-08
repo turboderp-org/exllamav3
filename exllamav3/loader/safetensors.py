@@ -136,6 +136,29 @@ class SafetensorsCollection:
         return bytesize
 
 
+    def list_tensors(
+        self,
+        prefix: str,
+    ) -> dict:
+        keys = [
+            key for key in self.tensor_file_map.keys()
+            if key == prefix or key.startswith(prefix + ".")
+        ]
+        results = {}
+        for key in keys:
+            filename = self.tensor_file_map[key]
+            header = self.file_headers[filename]
+            h = header[key]
+            dtype, np_dtype, esize = convert_dtype(h["dtype"])
+            beg, end = h["data_offsets"]
+            results[key] = {
+                "shape": h["shape"],
+                "n_bytes": end - beg,
+                "dtype": str(dtype),
+            }
+        return results
+
+
     def get_tensors(
         self,
         prefix: str,

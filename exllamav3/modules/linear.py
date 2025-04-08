@@ -71,11 +71,15 @@ class Linear(Module):
         return False
 
 
-    def load_exl3(self, key: str) -> bool:
-        if not self.config.stc.has_tensor_group(
+    def is_exl3_storage(self, key: str):
+        return self.config.stc.has_tensor_group(
             key,
             [["sv", "svh"], ["su", "suh"], "trellis"]
-        ): return False
+        )
+
+    def load_exl3(self, key: str) -> bool:
+        if not self.is_exl3_storage(key):
+            return False
         self.used_alt_key = key == self.alt_key
         scale = self.config.stc.get_tensor(key + ".scale", self.device, optional = True)
         su = self.config.stc.get_tensor(key + ".su", self.device, optional = True)
@@ -211,3 +215,11 @@ class Linear(Module):
             surplus_bits,
             self
         )
+
+
+    def quant_format_id(self):
+        # alt_key is only used when loading unquantized model
+        if self.is_exl3_storage(self.key):
+            return "EXL3"
+        else:
+            return None

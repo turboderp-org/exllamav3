@@ -85,3 +85,6 @@ class Module(ABC):
     def register_submodule(self, module: Module | None):
         if module is not None:
             self.modules.append(module)
+
+    def quant_format_id(self):
+        return None

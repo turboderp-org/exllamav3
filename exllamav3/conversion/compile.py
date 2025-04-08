@@ -5,6 +5,7 @@ from ..loader.safetensors import SafetensorsCollection
 from ..version import __version__
 from safetensors.torch import save_file
 from ..util.memory import free_mem
+from .quant_config import update_config, create_quantization_config_json
 
 def tsize(t):
     return t.nelement() * t.element_size()
@@ -128,9 +129,14 @@ def compile_model(args, model, config, tokenizer):
             "cols": args["cal_cols"],
         }
     }
+    update_config(config_dict)
     config_dict["quantization_config"] = qcfg
     with open(os.path.join(out_dir, "config.json"), "w") as f:
         f.write(json.dumps(config_dict, indent = 4))
+
+    # Add extra metadata to quant_config
+    print(f" -- Creating quantization_config.json")
+    create_quantization_config_json(out_dir)
 
     print(f" -- Finished compiling model to {out_dir}")
 
