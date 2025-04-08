@@ -535,22 +535,22 @@ def quantize_exl3(
         weight_q, encoded_q = ldlq(weight_r, L, quant_args, pb)
         free_mem()
 
-        if pb: pb.update(tiles_k)
+        pb.update(tiles_k)
 
         # Metrics
         E = weight_r - weight_q  # may run on CPU
         W = weight_r
         Hd = H.to(device)
+        weight_r = None
         E = E.to(device)
-        W = W.to(device)
-        # TODO: Could maybe use torch.trace to avoid large intermediate terms since H is symmetric?
-        # TODO: W @ W.T is especially bad for large lm_head tensors
-        proxy_err = torch.sum(Hd * (E @ E.T)).item() / max(torch.sum(Hd * (W @ W.T)).item(), 1e-8)
-
+        num = torch.einsum("ik,ij,jk->", E, Hd, E).item()
         E = None
+        W = W.to(device)
+        den = torch.einsum("ik,ij,jk->", W, Hd, W).item()
         W = None
         Hd = None
-        weight_r = None
+        proxy_err_2 = num / max(den, 1e-8)
+
         free_mem()
 
         if return_weight_q or verbose:
