@@ -227,7 +227,7 @@ class Model:
             Devices not included in use_per_device, or included with a value of 0, will not be used, e.g.:
 
             # use up to 23 GB on cuda:0 and cuda:2, do not load on cuda:1 and cuda:3 (if present)
-            model.load(reserve_per_device = [23, 0, 23])
+            model.load(use_per_device = [23, 0, 23])
 
         :param tensor_p:
             Load in tensor-parallel mode (not implemented yet)  TODO
