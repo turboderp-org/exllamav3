@@ -1,6 +1,5 @@
 from abc import abstractmethod
 import torch
-from typing import override
 from ...tokenizer import Tokenizer
 
 class Sampler:

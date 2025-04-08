@@ -1,6 +1,6 @@
 from .sampler import Sampler
 import torch
-from typing import override
+from typing_extensions import override
 from ...tokenizer import Tokenizer
 from ...ext import exllamav3_ext as ext
 from ...util import next_power_of_2
