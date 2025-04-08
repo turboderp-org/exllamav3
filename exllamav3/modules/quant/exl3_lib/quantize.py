@@ -284,39 +284,7 @@ def pack_signs(signs: torch.Tensor, quant_args: dict) -> torch.Tensor:
     return packed
 
 
-def g_scale_outliers_binsearch(weight_r: torch.Tensor, verbose: bool):
-    # Search for global scale with range that produces given outlier ratio
-    codebook_max = 3.9
-    max_outliers_ratio = 0.00025
-    min_scale, max_scale = 0.25, 1.0
-    finetune_steps = 20
-
-    def outliers_ratio(w):
-        return ((w.abs() > codebook_max).sum() / w.numel()).item()
-
-    initial_ratio = outliers_ratio(weight_r)
-
-    g_scale = (max_scale + min_scale) / 2
-    step = g_scale / 2
-    for _ in range(finetune_steps):
-        r = outliers_ratio(weight_r * g_scale)
-        if r < max_outliers_ratio:
-            g_scale += step
-        else:
-            g_scale -= step
-        step /= 2
-
-    if verbose:
-        print(f"     - outliers initial: {initial_ratio:.6f}")
-        print(f"     - outliers target: {r:.6f}")
-
-    return g_scale
-
-scale_steps = 11
-scale_substeps = 15
-scale_totalsteps = scale_steps + scale_substeps
-
-def g_scale_mse_gridsearch(
+def g_scale_gss(
     weight_r: torch.Tensor,
     verbose: bool,
     quant_args: dict,
@@ -326,8 +294,6 @@ def g_scale_mse_gridsearch(
     # Select a sample of tiles along a wrapped diagonal (sampling from every row and column of tiles, hopefully
     # representative) and search for the global scale within given range that minimizes the direct quantization
     # error
-    min_scale, max_scale = 0.25, 1.075
-
     tiles = []
     tiles_k = weight_r.shape[0] // 16
     tiles_n = weight_r.shape[1] // 16
@@ -341,38 +307,41 @@ def g_scale_mse_gridsearch(
             tiles.append(tile)
     tiles = torch.stack(tiles)
 
-    best_scale: float | None = None
-    best_mse = None
-    worst_mse = None
-    initial_mse = None
     def test_scale(scale: float):
-        nonlocal best_scale, best_mse, worst_mse, initial_mse
         quant_w, quant_i = quantize_tiles(tiles * scale, quant_args)
         mse = ((quant_w / scale - tiles) ** 2).mean()
-        if scale == 1.0:
-            initial_mse = mse
-        if worst_mse is None or mse > worst_mse:
-            worst_mse = mse
-        if best_mse is None or mse < best_mse:
-            best_scale = scale
-            best_mse = mse
+        return mse
 
-    for i in range(scale_steps + 1):
-        test_scale((min_scale * (scale_steps - i) + max_scale * i) / scale_steps)
-        if pb: pb.update(i + 1)
-    grid = (max_scale - min_scale) / scale_steps
-    min_scale = best_scale - grid * scale_substeps / (scale_substeps + 2)
-    max_scale = best_scale + grid * scale_substeps / (scale_substeps + 2)
-    for i in range(scale_substeps + 1):
-        test_scale((min_scale * (scale_substeps - i) + max_scale * i) / scale_substeps)
-        if pb: pb.update(scale_steps + i + 1)
+    # Assume quantization error is a unimodal function of scale, golden section search to find minimum
+    phi = (1 + math.sqrt(5)) / 2
+    resphi = 2 - phi
 
+    a, b = 0.1, 1.9
+    tol = 0.01
+
+    x1 = a + resphi * (b - a)
+    x2 = b - resphi * (b - a)
+    f1 = test_scale(x1)
+    f2 = test_scale(x2)
+    while abs(b - a) > tol:
+        if verbose:
+            print(f"     - gss: a = {a:.6f}, b = {b:.6f}")
+        if f1 < f2:
+            b = x2
+            x2 = x1
+            f2 = f1
+            x1 = a + resphi * (b - a)
+            f1 = test_scale(x1)
+        else:
+            a = x1
+            x1 = x2
+            f1 = f2
+            x2 = b - resphi * (b - a)
+            f2 = test_scale(x2)
+
+    best_scale = (a + b) / 2
     if verbose:
-        print(f"     - global scale search:")
-        print(f"       - initial_mse: {initial_mse:.6f}")
-        print(f"       - worst_mse: {worst_mse:.6f}")
-        print(f"       - best_mse: {best_mse:.6f}")
-
+        print(f"     - gss: min = {best_scale:.6f}, mse: {(f1 + f2) / 2:.6f}")
     return best_scale
 
 
@@ -460,7 +429,7 @@ def quantize_exl3(
     """
 
     progress_text = None if not progress_str else progress_str.replace("<step>", "Scaling")
-    with ProgressBar(progress_text, scale_totalsteps) as pb:
+    with ProgressBar(progress_text, 100) as pb:
 
         assert weight.dtype == torch.float
         tiles_k = weight.shape[0] // 16
@@ -492,7 +461,6 @@ def quantize_exl3(
         # Regularize output channels, then input channels with sign flips and scales. Output channel scales (sv)
         # are normalized to keep the global scale of the matrix incorporated in the input channel scales (su).
         # This reduces the risk of overflows during the GEMM and output hadamard transform in the linear layer.
-        # Input scales are computed after
         out_channel_scales = block_rms(weight_r, dim = 0, keepdim = True)
         out_channel_scales /= (out_channel_scales.abs() + 1e-10).mean()
         sv = (torch.randn(n, device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
@@ -507,12 +475,10 @@ def quantize_exl3(
         weight_r /= su
         weight_r = preapply_had_l(weight_r, had_k)
 
-        # At this point the overall distribution of weight_r should be ideally matched to the codebook, but we may
+        # At this point the overall distribution of weight_r should be roughly matched to the codebook, but we may
         # still have too many outliers. For some tensors it is advantageous to dial in the global scale to keep
         # this number below a small threshold.
-        # TODO: Find faster way to do this
-        g_scale = g_scale_mse_gridsearch(weight_r, verbose, quant_args, pb = pb)
-        # g_scale = g_scale_outliers_binsearch(weight_r, verbose)
+        g_scale = g_scale_gss(weight_r, verbose, quant_args, pb = pb)
 
     progress_text = None if not progress_str else progress_str.replace("<step>", "Quantizing")
     with ProgressBar(progress_text, tiles_k) as pb:
