@@ -515,7 +515,7 @@ def quantize_exl3(
         den = torch.einsum("ik,ij,jk->", W, Hd, W).item()
         W = None
         Hd = None
-        proxy_err_2 = num / max(den, 1e-8)
+        proxy_err = num / max(den, 1e-8)
 
         free_mem()
 
