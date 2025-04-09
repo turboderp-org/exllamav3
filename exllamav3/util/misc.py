@@ -43,3 +43,19 @@ def cuda_sync_active():
 
 def next_power_of_2(x):
     return 1 if x == 0 else 2**(x - 1).bit_length()
+
+
+def human_time(seconds: float) -> str:
+    seconds = round(seconds)
+    minutes = (seconds + 30) // 60
+    hours = (minutes + 30) // 60
+    minutes -= hours * 60
+    if hours:
+        hs = "s" if hours > 1 else ""
+        ms = "s" if minutes > 1 else ""
+        return f"{hours} hour{hs}, {minutes} minute{ms}"
+    elif minutes:
+        ms = "s" if minutes > 1 else ""
+        return f"{minutes} minute{ms}"
+    else:
+        return f"< 1 minute"

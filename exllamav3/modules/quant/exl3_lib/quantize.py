@@ -480,8 +480,9 @@ def quantize_exl3(
         # this number below a small threshold.
         g_scale = g_scale_gss(weight_r, verbose, quant_args, pb = pb)
 
-    progress_text = None if not progress_str else progress_str.replace("<step>", "Quantizing")
-    with ProgressBar(progress_text, tiles_k) as pb:
+        progress_text = None if not progress_str else progress_str.replace("<step>", "Quantizing")
+        pb.update(0)
+        pb.new_task(progress_text, tiles_k)
 
         weight_r *= g_scale
         su /= g_scale

@@ -7,7 +7,7 @@ from ..modules import Linear
 from ..modules.quant import LinearFP16
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem
-from ..util import Timer
+from ..util import Timer, human_time
 from .calibration_data import get_default_calibration
 from .compile import compile_model, dsize
 from safetensors.torch import save_file
@@ -208,6 +208,8 @@ def main(args, job_state):
     # Iterate over modules
     for idx, module in enumerate(model.modules):
 
+        start_module_time = time.time()
+
         # If resuming, skip along to checkpoint index
         if idx < job_state["next_module_idx"]:
             continue
@@ -283,7 +285,7 @@ def main(args, job_state):
                 )
             print(
                 f" -- Quantized: {linear.key:{config.stc.max_key_len()}}"
-                f"  bpw: {quant_args['K']:.2f}"
+                f"  bpw: {quant_args['K']:5.2f}"
                 f"  proxy_err: {proxy_err:8.6f}"
                 f"  [{t.interval:4.2f} s]"
             )
@@ -299,10 +301,6 @@ def main(args, job_state):
         num_bytes = dsize(tensors)
         num_bits = num_bytes * 8
         final_bpw = num_bits / module.weights_numel()
-        print(
-            f" -- Quantized: {module.key:{config.stc.max_key_len()}}"
-            f"  bpw: {final_bpw:.2f}"
-        )
 
         del tensors
         free_mem()
@@ -323,8 +321,19 @@ def main(args, job_state):
                     error += get_state_error(state[i], ref_states[i])
                     ref_states[i] = None
         error /= num_ref_states
-        print(f" -- Finished module: {module.key}, rfn: {error:.6f}")
+
+        # Feedback after module
+        module_time = time.time() - start_module_time
+        print(
+            f" -- Quantized: {module.key:47}"
+            f"  bpw: {final_bpw:5.2f}"
+            f"        rfn: {error:.6f}"
+            f"  [{module_time:.2f} s]"
+        )
         sys.stdout.flush()
+        if idx >= 1:
+            est_remaining = module_time * (len(model.modules) - idx - 1)
+            print(f" -- Estimated remaining time: {human_time(est_remaining)}")
 
         # Unload current module
         module.unload()

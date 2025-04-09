@@ -34,3 +34,11 @@ class ProgressBar:
         if self.text:
             self.progress.update(self.task_id, completed = value)
             sys.stdout.flush()
+
+    def new_task(self, text: str, count: int):
+        self.text = text
+        self.count = count
+        if self.text:
+            self.progress.update(self.task_id, description = self.text, total = count, progress = 0)
+
+
