@@ -498,9 +498,9 @@ def quantize_exl3(
             weight_r = weight_r.cpu()
 
         # Quantize
-        free_mem()
+        # free_mem()
         weight_q, encoded_q = ldlq(weight_r, L, quant_args, pb)
-        free_mem()
+        # free_mem()
 
         pb.update(tiles_k)
 
@@ -518,7 +518,7 @@ def quantize_exl3(
         Hd = None
         proxy_err = num / max(den, 1e-8)
 
-        free_mem()
+        # free_mem()
 
         if return_weight_q or verbose:
             weight_q = weight_q.to(device)

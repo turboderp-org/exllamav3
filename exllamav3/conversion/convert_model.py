@@ -303,7 +303,7 @@ def main(args, job_state):
         final_bpw = num_bits / module.weights_numel()
 
         del tensors
-        free_mem()
+        # free_mem()
 
         # Advance state
         error = 0
@@ -337,7 +337,7 @@ def main(args, job_state):
 
         # Unload current module
         module.unload()
-        free_mem()
+        # free_mem()
 
         # Checkpoint
         job_state["next_module_idx"] = idx + 1
