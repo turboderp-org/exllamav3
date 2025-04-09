@@ -51,9 +51,22 @@ def free_mem():
 
 
 
-def list_gpu_tensors(min_size: int = 1):
+def list_gpu_tensors(min_size: int = 1, cuda_only: bool = True):
+    """
+    Search the current process for referenced CUDA tensors and list them.
+
+    :param min_size:
+        Ignore tensors smaller than this size, in megabytes
+
+    :param cuda_only:
+        Only list CUDA tensors
+    """
+
     import threading
     import warnings
+    from tabulate import tabulate
+
+    # Suppress FutureWarning from Torch every time we try to access certain objects
     warnings.simplefilter(action = 'ignore', category = FutureWarning)
 
     @dataclass
@@ -67,17 +80,28 @@ def list_gpu_tensors(min_size: int = 1):
     results = {}
     visited = set()
 
+    # Helper function to filter and collect items
     def collect(path, item):
         nonlocal results
-        if not isinstance(item, torch.Tensor) or not item.is_cuda:
+
+        # Only collect CUDA tensors
+        if not isinstance(item, torch.Tensor) or (cuda_only and not item.is_cuda):
             return
+
+        # Tensor size in MB, filter anything smaller than the minimum size
         size = item.nelement() * item.element_size() // (1024**2)
         if size < min_size:
             return
+
+        # Skip tensors in paths containing specific debug substrings
         if ".stderr.dbg." in path:
             return
+
+        # Adjust the path display for objects defined in __main__
         if ".__main__." in path:
             path = path[path.find(".__main__.") + 10:]
+
+        # If tensor is already recorded, just record the additional path
         obj_id = id(item)
         if obj_id in results and path not in results[obj_id].paths:
             results[obj_id].paths.append(path)
@@ -90,27 +114,39 @@ def list_gpu_tensors(min_size: int = 1):
                 size = size
             )
 
+    # Queue of items to scan recursively
     queue = deque()
 
+    # Collect items that are global variables, and add to the queue
     for name, obj in globals().items():
         collect(name, obj)
         queue.append((name, obj))
 
+    # Traverse each thread's frame stack, collecting items and queueing items
     for thread_id, frame in sys._current_frames().items():
         prefix = ""
+
+        # Skip the current frame for the current thread to avoid recursion issues
         if thread_id == threading.get_ident():
             frame = frame.f_back
+
+        # Collect/queue each local variable in the frame, extend the relative path prefix
+        # and walk the stack
         while frame:
             for name, obj in frame.f_locals.items():
+                # We actually start three levels deep but want variables in the "current" frame
+                # (i.e. the frame of the function calling list_gpu_tensors) to have a prefix of "."
                 new_path = f"{prefix[2:]}.{name}"
                 collect(new_path, obj)
                 queue.append((name, obj))
             frame = frame.f_back
             prefix += "."
 
+    # Process the queue by examining attributes, dictionary entries, and sequence items
     while queue:
         path, obj = queue.popleft()
 
+        # Iterate over entries in object with __dict__ attribute
         if hasattr(obj, '__dict__'):
             for attr, value in obj.__dict__.items():
                 new_path = f"{path}.{attr}"
@@ -119,6 +155,7 @@ def list_gpu_tensors(min_size: int = 1):
                     visited.add(id(value))
                     queue.append((new_path, value))
 
+        # If object is a dictionary, iterate through all its items
         if isinstance(obj, dict):
             for key, value in obj.items():
                 new_path = f"{path}['{key}']"
@@ -127,6 +164,7 @@ def list_gpu_tensors(min_size: int = 1):
                     visited.add(id(value))
                     queue.append((new_path, value))
 
+        # Same for list, tuple, set
         if isinstance(obj, (list, tuple, set)):
             for idx, item in enumerate(obj):
                 new_path = f"{path}[{idx}]"
@@ -135,10 +173,12 @@ def list_gpu_tensors(min_size: int = 1):
                     visited.add(id(item))
                     queue.append((new_path, item))
 
-    from tabulate import tabulate
-    devices: dict[str, list] = {}
+    # Sort tensors by descending size
     items = list(results.values())
     items.sort(key = lambda x: -x.size)
+
+    # Build output table, grouped by device
+    devices: dict[str, list] = {}
     for v in items:
         if v.device not in devices:
             devices[v.device] = []
@@ -157,6 +197,7 @@ def list_gpu_tensors(min_size: int = 1):
                 None
             ])
 
+    # Print tables to console
     for k in sorted(devices.keys()):
         print()
         print(f"--------------")

@@ -5,6 +5,9 @@
 #include "../util.h"
 #include "../util.cuh"
 #include "codebook.cuh"
+#include <cmath>
+
+#define NUM_THREADS 1024
 
 template <int K>
 __global__ // __launch_bounds__(1024)
@@ -43,12 +46,12 @@ void quantize_tiles_kernel
             temp_costs = temp_costs_inc;
             temp_costs_inc = t;
 
-            for (int out_edge_idx = threadIdx.x; out_edge_idx < edges; out_edge_idx += 1024)
+            for (int out_edge_idx = threadIdx.x; out_edge_idx < edges; out_edge_idx += NUM_THREADS)
             {
                 float w = input_tile[ri];
 
-                float min_err;
-                int min_in_edge;
+                float min_err = INFINITY;
+                int min_in_edge = 0;
 
                 #pragma unroll
                 for (int k = 0; k < max_q; ++k)
@@ -64,7 +67,7 @@ void quantize_tiles_kernel
                     else if (pre_state >= 0 && in_edge_idx != pre_state)
                         err = 1e30f;
 
-                    if (k == 0 || err < min_err)
+                    if (err < min_err)
                     {
                         min_err = err;
                         min_in_edge = in_edge_idx;
@@ -86,7 +89,7 @@ void quantize_tiles_kernel
 
         float local_min = 1e30f;
         int local_idx = -1;
-        for (int e = threadIdx.x; e < edges; e += 1024)
+        for (int e = threadIdx.x; e < edges; e += NUM_THREADS)
         {
             float v = temp_costs_inc[e];
             if (v < local_min)
@@ -215,7 +218,7 @@ void quantize_tiles
     TORCH_CHECK_DTYPE(output_indices, kShort);
 
     int edges = 65536 >> K;
-    int threads = MIN(1024, edges);
+    int threads = MIN(NUM_THREADS, edges);
 
     int num_tiles = input_tiles.size(0);
 
