@@ -5,6 +5,7 @@ from ....ext import exllamav3_ext as ext
 from ....util.progress import ProgressBar
 from ....util.memory import free_mem
 from ....util.hadamard import get_hadamard_dt
+from ....util import cuda_sync_active
 from functools import lru_cache
 
 # Constant
@@ -36,17 +37,23 @@ def tensor_core_perm_i(device):
     return torch.argsort(tensor_core_perm(device))
 
 
+@lru_cache
+def get_temp_buffers(device, K: int):
+    max_batch_size = 128
+    temp_costs = torch.zeros((max_batch_size, 2, 65536 >> K), dtype = torch.float, device = device)
+    temp_edges = torch.zeros((max_batch_size, 256, 65536 >> K), dtype = torch.short, device = device)
+    return temp_costs, temp_edges
+
+
 def quantize_tiles(tiles, quant_args: dict):
     tiles = tiles.contiguous()
     assert tiles.shape[1] == 256
     assert tiles.dtype == torch.float
 
-    max_batch_size = 128
     K = quant_args["K"]
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
-    temp_costs = torch.zeros((max_batch_size, 2, 65536 >> K), dtype = torch.float, device = tiles.device)
-    temp_edges = torch.zeros((max_batch_size, 256, 65536 >> K), dtype = torch.short, device = tiles.device)
+    temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
     ext.quantize_tiles(
         tiles,
         quantized_tiles,
@@ -55,6 +62,129 @@ def quantize_tiles(tiles, quant_args: dict):
         temp_edges,
         K
     )
+    return quantized_tiles, quantized_idx
+
+
+@lru_cache
+def get_quant_stream(device):
+    return torch.cuda.Stream(device = device)
+
+
+pinned_tiles: torch.Tensor | None = None
+pinned_q_tiles: torch.Tensor | None = None
+pinned_q_idx: torch.Tensor | None = None
+def get_pinned(num_tiles: int):
+    global pinned_tiles, pinned_q_tiles, pinned_q_idx
+    if pinned_tiles is None or pinned_tiles.shape[0] < num_tiles:
+        pinned_tiles = torch.empty((num_tiles, 256), device = "cpu", dtype = torch.float, pin_memory = True)
+        pinned_q_tiles = torch.empty((num_tiles, 256), device = "cpu", dtype = torch.float, pin_memory = True)
+        pinned_q_idx = torch.empty((num_tiles, 256), device = "cpu", dtype = torch.int16, pin_memory = True)
+    return pinned_tiles[:num_tiles, :], pinned_q_tiles[:num_tiles, :], pinned_q_idx[:num_tiles, :]
+
+
+def quantize_tiles_multigpu(tiles, quant_args: dict):
+    devices = quant_args["devices"]
+    if len(devices) == 1:
+        return quantize_tiles(tiles, quant_args)
+
+    # Get pinned buffers
+    pin_tiles, pin_q_tiles, pin_q_idx = get_pinned(tiles.shape[0])
+
+    # Copy input tiles to pinned memory. Input is always on the first device in the split
+    copy_input_event = torch.cuda.Event(blocking = False)
+    main_stream = get_quant_stream(devices[0])
+    with torch.cuda.stream(main_stream):
+        tiles = tiles.contiguous()
+        pin_tiles.copy_(tiles, non_blocking = True)
+        copy_input_event.record(main_stream)
+
+    split_sizes = [tiles.shape[0] // len(devices)] * len(devices)
+    split_sizes[-1] += tiles.shape[0] - sum(split_sizes)
+
+    # Create split slices for input tiles, output tiles and output indices
+    pin_split_tiles = torch.split(pin_tiles, split_sizes)
+    pin_split_q_tiles = torch.split(pin_q_tiles, split_sizes)
+    pin_split_q_idx = torch.split(pin_q_idx, split_sizes)
+
+    slice_done_events = []
+    for i, device in enumerate(devices):
+
+        stream = get_quant_stream(device)
+        with torch.cuda.stream(stream):
+
+            # Wait for input in host memory
+            if i > 0:
+                stream.wait_event(copy_input_event)
+
+            # Asynchronously copy the slice from the pinned buffer to device memory
+            dev_tiles = pin_split_tiles[i].to(device, non_blocking = True)
+
+            # Preallocate output tensors on the device.
+            dev_q_tiles = torch.empty_like(dev_tiles, device = device)
+            dev_q_idx = torch.empty_like(dev_tiles, dtype = torch.short, device = device)
+
+            # Work buffers
+            K = quant_args["K"]
+            temp_costs, temp_edges = get_temp_buffers(device, K)
+
+            ext.quantize_tiles(
+                dev_tiles,
+                dev_q_tiles,
+                dev_q_idx,
+                temp_costs,
+                temp_edges,
+                K
+            )
+
+            # Async copy back to pinned memory
+            pin_split_q_tiles[i].copy_(dev_q_tiles, non_blocking = True)
+            pin_split_q_idx[i].copy_(dev_q_idx, non_blocking = True)
+
+            # Finished slice
+            evt = torch.cuda.Event(blocking = False)
+            slice_done_events.append(evt)
+            evt.record(stream)
+
+    # Copy pinned buffers to original device
+    with torch.cuda.stream(main_stream):
+        for evt in slice_done_events:
+            main_stream.wait_event(evt)
+        q_tiles = torch.empty_like(tiles, device = devices[0])
+        q_idx = torch.empty_like(tiles, dtype = torch.short, device = devices[0])
+        q_tiles.copy_(pin_q_tiles, non_blocking = True)
+        q_idx.copy_(pin_q_idx, non_blocking = True)
+
+    return q_tiles, q_idx
+
+
+def quantize_tiles_multigpu_sync(tiles, quant_args: dict):
+    devices = quant_args["devices"]
+    if len(devices) == 1:
+        return quantize_tiles(tiles, quant_args)
+
+    tiles = tiles.contiguous()
+
+    split_sizes = [tiles.shape[0] // len(devices)] * len(devices)
+    split_sizes[-1] += tiles.shape[0] - sum(split_sizes)
+    split_tiles = torch.split(tiles, split_sizes)
+    tiles_per_device = [chunk.to(device) for chunk, device in zip(split_tiles, devices)]
+    torch.cuda.synchronize()
+
+    q_tiles_per_device = []
+    q_idx_per_device = []
+    for dev_tiles, device in zip(tiles_per_device, devices):
+        with torch.cuda.stream(get_quant_stream(device)):
+            dev_q_tiles, dev_q_idx = quantize_tiles(dev_tiles, quant_args)
+            q_tiles_per_device.append(dev_q_tiles)
+            q_idx_per_device.append(dev_q_idx)
+
+    for device in devices:
+        torch.cuda.synchronize(device)
+
+    q_tiles_per_device = [x.to(devices[0]) for x in q_tiles_per_device]
+    q_idx_per_device = [x.to(devices[0]) for x in q_idx_per_device]
+    quantized_tiles = torch.cat(q_tiles_per_device, dim = 0)
+    quantized_idx = torch.cat(q_idx_per_device, dim = 0)
     return quantized_tiles, quantized_idx
 
 
@@ -139,82 +269,93 @@ def ldlq(
          - indices (unpacked), shape (k // 16, n // 16, 256), uint16_t
     """
 
-    device = L.device
-    buffer_device = weight.device
-    size_k, size_n = weight.shape  # Row-major
-    assert size_k % 16 == 0
-    assert size_n % 128 == 0
-    tiles_k = size_k // 16
-    tiles_n = size_n // 16
+    devices = quant_args["devices"]
+    for device in devices:
+        torch.cuda.synchronize(device)
+    main_stream = get_quant_stream(devices[0])
+    with torch.cuda.stream(main_stream):
 
-    buf_size_k = max(quant_args.get("buf_size_k", 128), 16)
-    assert buf_size_k % 16 == 0
-    assert size_n % buf_size_k == 0
+        devices = quant_args["devices"]
+        device = L.device
+        assert device == torch.device(devices[0])
 
-    p_row = 0
+        buffer_device = weight.device
+        size_k, size_n = weight.shape  # Row-major
+        assert size_k % 16 == 0
+        assert size_n % 128 == 0
+        tiles_k = size_k // 16
+        tiles_n = size_n // 16
 
-    # Work buffers
-    prod_cache = torch.zeros((size_k, size_n), dtype = torch.float, device = device)
-    weight_q = torch.zeros((size_k, size_n), dtype = torch.float, device = buffer_device)
-    encoded = torch.zeros((tiles_k, tiles_n, 256), dtype = torch.short, device = buffer_device)
+        buf_size_k = max(quant_args.get("buf_size_k", 128), 16)
+        assert buf_size_k % 16 == 0
+        assert size_n % buf_size_k == 0
 
-    for j in range(size_k, 0, -buf_size_k):
-        i = j - buf_size_k
+        p_row = 0
 
-        # Current span is rows i:j
-        b_weight = weight[i:j].to(device)
-        b_weight_q = weight_q[i:j] if device == buffer_device else \
-            torch.zeros_like(weight_q[i:j], device = device)
-        b_encoded = encoded[i // 16 : j // 16] if device == buffer_device else \
-            torch.zeros_like(encoded[i // 16 : j // 16], device = device)
-        b_prod_cache = prod_cache[i:j]
-        b_L = L[i:j]
+        # Work buffers
+        prod_cache = torch.zeros((size_k, size_n), dtype = torch.float, device = device)
+        weight_q = torch.zeros((size_k, size_n), dtype = torch.float, device = buffer_device)
+        encoded = torch.zeros((tiles_k, tiles_n, 256), dtype = torch.short, device = buffer_device)
 
-        # Iterate over rows of blocks in current span
-        for bj in range(buf_size_k, 0, -16):
-            bi = bj - 16
+        for j in range(size_k, 0, -buf_size_k):
+            i = j - buf_size_k
 
-            # Error so far for the current span
-            bb_err = b_weight[bj:] - b_weight_q[bj:]
+            # Current span is rows i:j
+            b_weight = weight[i:j].to(device)
+            b_weight_q = weight_q[i:j] if device == buffer_device else \
+                torch.zeros_like(weight_q[i:j], device = device)
+            b_encoded = encoded[i // 16 : j // 16] if device == buffer_device else \
+                torch.zeros_like(encoded[i // 16 : j // 16], device = device)
+            b_prod_cache = prod_cache[i:j]
+            b_L = L[i:j]
 
-            # Corresponding slice of LDL decomposition of H
-            bb_L = b_L[bj:, i + bi:i + bj]
+            # Iterate over rows of blocks in current span
+            for bj in range(buf_size_k, 0, -16):
+                bi = bj - 16
 
-            # Input tiles for quantization
-            compensation_term = b_prod_cache[bi:bj]
-            compensation_term.addmm_(bb_L.T, bb_err,  alpha = 1.0, beta = 1.0)
-            rows = b_weight[bi:bj] + compensation_term
+                # Error so far for the current span
+                bb_err = b_weight[bj:] - b_weight_q[bj:]
 
-            tiles = rows.reshape(16, tiles_n, 16).permute(1, 0, 2).reshape(tiles_n, 256)
+                # Corresponding slice of LDL decomposition of H
+                bb_L = b_L[bj:, i + bi:i + bj]
 
-            # Pre-permute to tensor core layout
-            tiles = tiles[:, tensor_core_perm(device)]
+                # Input tiles for quantization
+                compensation_term = b_prod_cache[bi:bj]
+                compensation_term.addmm_(bb_L.T, bb_err,  alpha = 1.0, beta = 1.0)
+                rows = b_weight[bi:bj] + compensation_term
 
-            # Quantize
-            # TODO: Profile and test if this could be split across multiple GPUs
-            quant_w, quant_i = quantize_tiles(tiles, quant_args)
+                tiles = rows.reshape(16, tiles_n, 16).permute(1, 0, 2).reshape(tiles_n, 256)
 
-            # Undo permutation on reconstructed tiles, but keep indices in tensor core layout
-            quant_w = quant_w[:, tensor_core_perm_i(device)]
+                # Pre-permute to tensor core layout
+                tiles = tiles[:, tensor_core_perm(device)]
 
-            # Store result
-            quant_w = quant_w.reshape(tiles_n, 16, 16).permute(1, 0, 2).reshape(16, size_n)
-            b_weight_q[bi:bj] = quant_w
-            b_encoded[bi // 16 : bj // 16] = quant_i.unsqueeze(0)
+                # Quantize
+                quant_w, quant_i = quantize_tiles_multigpu(tiles, quant_args)
 
-            # Update progress
-            if pb:
-                p_row += 1
-                pb.update(p_row)
+                # Undo permutation on reconstructed tiles, but keep indices in tensor core layout
+                quant_w = quant_w[:, tensor_core_perm_i(device)]
 
-        # Collect output
-        if device != buffer_device:
-            weight_q[i:j] = b_weight_q.to(buffer_device)
-            encoded[i // 16 : j // 16] = b_encoded.to(buffer_device)
+                # Store result
+                quant_w = quant_w.reshape(tiles_n, 16, 16).permute(1, 0, 2).reshape(16, size_n)
+                b_weight_q[bi:bj] = quant_w
+                b_encoded[bi // 16 : bj // 16] = quant_i.unsqueeze(0)
 
-        # Cache error term for the rest of the matrix
-        b_err = b_weight - b_weight_q
-        prod_cache.addmm_(b_L.T, b_err, alpha = 1.0, beta = 1.0)
+                # Update progress
+                if pb:
+                    p_row += 1
+                    pb.update(p_row)
+
+            # Collect output
+            if device != buffer_device:
+                weight_q[i:j] = b_weight_q.to(buffer_device)
+                encoded[i // 16 : j // 16] = b_encoded.to(buffer_device)
+
+            # Cache error term for the rest of the matrix
+            b_err = b_weight - b_weight_q
+            prod_cache.addmm_(b_L.T, b_err, alpha = 1.0, beta = 1.0)
+
+        for device in devices:
+            torch.cuda.synchronize(device)
 
     return weight_q, encoded
 
@@ -307,45 +448,56 @@ def g_scale_gss(
             tiles.append(tile)
     tiles = torch.stack(tiles)
 
-    def test_scale(scale: float):
-        quant_w, quant_i = quantize_tiles(tiles * scale, quant_args)
-        mse = ((quant_w / scale - tiles) ** 2).mean()
-        return mse
+    devices = quant_args["devices"]
+    for device in devices:
+        torch.cuda.synchronize(device)
 
-    # Assume quantization error is a unimodal function of scale, golden section search to find minimum
-    phi = (1 + math.sqrt(5)) / 2
-    resphi = 2 - phi
+    main_stream = get_quant_stream(devices[0])
+    # TODO: Figure out why Torch always initializes cuda:0 when exiting this CM, even when it's not used
+    with torch.cuda.stream(main_stream):
 
-    a, b = 0.1, 1.9
-    tol = 0.01
+        def test_scale(scale: float):
+            quant_w, quant_i = quantize_tiles_multigpu(tiles * scale, quant_args)
+            mse = ((quant_w / scale - tiles) ** 2).mean()
+            return mse
 
-    x1 = a + resphi * (b - a)
-    x2 = b - resphi * (b - a)
-    f1 = test_scale(x1)
-    f2 = test_scale(x2)
-    while abs(b - a) > tol:
+        # Assume quantization error is a unimodal function of scale, golden section search to find minimum
+        phi = (1 + math.sqrt(5)) / 2
+        resphi = 2 - phi
+
+        a, b = 0.1, 1.9
+        tol = 0.01
+        delta1 = abs(b - a)
+
+        x1 = a + resphi * (b - a)
+        x2 = b - resphi * (b - a)
+        f1 = test_scale(x1)
+        f2 = test_scale(x2)
+        while abs(b - a) > tol:
+            if verbose:
+                print(f"     - gss: a = {a:.6f}, b = {b:.6f}")
+            if f1 < f2:
+                b = x2
+                x2 = x1
+                f2 = f1
+                x1 = a + resphi * (b - a)
+                f1 = test_scale(x1)
+            else:
+                a = x1
+                x1 = x2
+                f1 = f2
+                x2 = b - resphi * (b - a)
+                f2 = test_scale(x2)
+            delta2 = abs(b - a)
+            pb.update(100 - 100 * int(delta2 / delta1))
+
+        best_scale = (a + b) / 2
         if verbose:
-            print(f"     - gss: a = {a:.6f}, b = {b:.6f}")
-        if f1 < f2:
-            b = x2
-            x2 = x1
-            f2 = f1
-            x1 = a + resphi * (b - a)
-            f1 = test_scale(x1)
-        else:
-            a = x1
-            x1 = x2
-            f1 = f2
-            x2 = b - resphi * (b - a)
-            f2 = test_scale(x2)
-
-    best_scale = (a + b) / 2
-    if verbose:
-        print(f"     - gss: min = {best_scale:.6f}, mse: {(f1 + f2) / 2:.6f}")
-    return best_scale
+            print(f"     - gss: min = {best_scale:.6f}, mse: {(f1 + f2) / 2:.6f}")
+        return best_scale
 
 
-def block_rms(x: torch.Tensor, dim: int, keepdim: bool = False, blocksize: int = 16):
+def block_rms(x: torch.Tensor, dim: int, keepdim: bool = False, blocksize: int = 32):
     # Compute blockwise x.square().mean(dim, keepdim).sqrt()
     n = x.size(dim)
     sq = None
@@ -359,7 +511,7 @@ def block_rms(x: torch.Tensor, dim: int, keepdim: bool = False, blocksize: int =
     return mean_sq.sqrt()
 
 
-def block_rms_n(x: torch.Tensor, dim: int = 0, blocksize: int = 16):
+def block_rms_n(x: torch.Tensor, dim: int = 0, blocksize: int = 32):
     # Compute blockwise x.square().mean().sqrt()
     n = 0
     sq = None
@@ -374,7 +526,7 @@ def block_rms_n(x: torch.Tensor, dim: int = 0, blocksize: int = 16):
     return mean_sq.sqrt()
 
 
-def block_nmse(x: torch.Tensor, y: torch.Tensor, dim: int = 0, blocksize: int = 16):
+def block_nmse(x: torch.Tensor, y: torch.Tensor, dim: int = 0, blocksize: int = 32):
     # Compute blockwise (x - y).square().mean().item() / y.square().mean().item()
     sq = None
     diff_sq = None
