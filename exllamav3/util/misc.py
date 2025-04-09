@@ -47,13 +47,17 @@ def next_power_of_2(x):
 
 def human_time(seconds: float) -> str:
     seconds = round(seconds)
-    minutes = (seconds + 30) // 60
-    hours = (minutes + 30) // 60
+    minutes = seconds // 60
+    hours = minutes // 60
     minutes -= hours * 60
     if hours:
-        hs = "s" if hours > 1 else ""
-        ms = "s" if minutes > 1 else ""
-        return f"{hours} hour{hs}, {minutes} minute{ms}"
+        if minutes:
+            hs = "s" if hours > 1 else ""
+            ms = "s" if minutes > 1 else ""
+            return f"{hours} hour{hs}, {minutes} minute{ms}"
+        else:
+            hs = "s" if hours > 1 else ""
+            return f"{hours} hour{hs}"
     elif minutes:
         ms = "s" if minutes > 1 else ""
         return f"{minutes} minute{ms}"
