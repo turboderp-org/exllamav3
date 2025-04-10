@@ -224,18 +224,20 @@ class Tokenizer:
     # Encode string with special tokens
 
     def encode_special(self, text: str) -> list[int]:
-        if self.special_delimiters is None:
-            self.special_delimiters = re.compile("(" + "|".join(map(re.escape, self.extended_piece_to_id.keys())) + ")")
+        # if self.special_delimiters is None:
+        #     self.special_delimiters = re.compile("(" + "|".join(map(re.escape, self.extended_piece_to_id.keys())) + ")")
+        #
+        # split = self.special_delimiters.split(text)
+        # encoded = []
+        #
+        # i = 0
+        # while i < len(split):
+        #     if split[i] != "": encoded += self.tokenizer.encode(split[i], add_special_tokens = False).ids
+        #     if i + 1 < len(split): encoded += [self.extended_piece_to_id[split[i + 1]]]
+        #     i += 2
 
-        split = self.special_delimiters.split(text)
-        encoded = []
-
-        i = 0
-        while i < len(split):
-            if split[i] != "": encoded += self.tokenizer.encode(split[i], add_special_tokens = False).ids
-            if i + 1 < len(split): encoded += [self.extended_piece_to_id[split[i + 1]]]
-            i += 2
-
+        # TODO: Test if the above is actually no longer needed (was written for SentencePiece lib)
+        encoded = self.tokenizer.encode(text, add_special_tokens = False).ids
         return encoded
 
     def encode_special_or_unspecial(
