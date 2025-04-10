@@ -13,12 +13,24 @@ def disk_lru_cache_name(filename):
     return str(path)
 
 def disk_lru_cache_clear(filename, *args, **kwargs):
+    """
+    Clear disk cache. Takes name of function and input arguments to forget.
+    """
     with shelve.open(disk_lru_cache_name(filename)) as db:
         key = str((json.dumps(args, sort_keys = True), json.dumps(kwargs, sort_keys = True)))
         if key in db:
             del db[key]
 
 def disk_lru_cache(filename):
+    """
+    Disk cache function decorator, mostly for quick-and-dirty caching of eval results. Creates a
+    __disk_lru_cache__  subdirectory in the module's directory to store cached outputs. The cache dictionary
+    is identified by the name of the calling function, so multiple functions in the same directory with the
+    same name would result in a conflict.
+
+    Requires all arguments to have a full string representation, and the function output must be
+    serializable by the shelve library.
+    """
     def decorator(func):
         @wraps(func)
         def disk_cached(*args, **kwargs):
