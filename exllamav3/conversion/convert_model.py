@@ -31,6 +31,7 @@ parser.add_argument("-cpi", "--checkpoint_interval", type = int, default = 60, h
 parser.add_argument("-lcpi", "--last_checkpoint_index", type = int, default = None, help = "Last module index to checkpoint (for debug purposes)")
 parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mode")
 parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
+parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 
 num_ref_states = 5
 
@@ -131,6 +132,7 @@ def prepare(args) -> (dict, bool, str, str):
         ("checkpoint_interval", True, None),
         ("last_checkpoint_index", True, -1),
         ("devices", True, None),
+        ("device_ratios", True, None),
     ]:
         override(arg_, can_override, default)
 
@@ -198,8 +200,15 @@ def main(args, job_state):
     torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
     torch.set_grad_enabled(False)
+
     devices = [int(d) for d in args["devices"].split(",")]
     device = torch.device(devices[0])
+    if args.get("device_ratios"):
+        device_ratios = [int(d) for d in args["device_ratios"].split(",")]
+        assert len(devices) == len(device_ratios), "--devices and --device_ratios must be same length"
+    else:
+        device_ratios = None
+
     last_checkpoint_time = time.time()
 
     # Get model
@@ -279,6 +288,7 @@ def main(args, job_state):
                 "seed": idx,
                 "K": strategy[linear.key],
                 "devices": devices,
+                "device_ratios": device_ratios,
             }
             with Timer() as t:
                 proxy_err = linear.convert_exl3(

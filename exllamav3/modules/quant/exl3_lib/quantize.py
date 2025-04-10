@@ -98,10 +98,17 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
         pin_tiles.copy_(tiles, non_blocking = True)
         copy_input_event.record(main_stream)
 
-    split_sizes = [tiles.shape[0] // len(devices)] * len(devices)
-    split_sizes[-1] += tiles.shape[0] - sum(split_sizes)
-
     # Create split slices for input tiles, output tiles and output indices
+    ratios = quant_args.get("device_ratios")
+    if ratios:
+        s = sum(ratios)
+        split_sizes = [tiles.shape[0] * r / s for r in ratios]
+        split_sizes = [round(s / 16) * 16 for s in split_sizes]
+        split_sizes[-1] += tiles.shape[0] - sum(split_sizes)
+    else:
+        split_sizes = [tiles.shape[0] // len(devices)] * len(devices)
+        split_sizes[-1] += tiles.shape[0] - sum(split_sizes)
+
     pin_split_tiles = torch.split(pin_tiles, split_sizes)
     pin_split_q_tiles = torch.split(pin_q_tiles, split_sizes)
     pin_split_q_idx = torch.split(pin_q_idx, split_sizes)
@@ -116,29 +123,31 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
             if i > 0:
                 stream.wait_event(copy_input_event)
 
-            # Asynchronously copy the slice from the pinned buffer to device memory
-            dev_tiles = pin_split_tiles[i].to(device, non_blocking = True)
+            if split_sizes[i] > 0:
 
-            # Preallocate output tensors on the device.
-            dev_q_tiles = torch.empty_like(dev_tiles, device = device)
-            dev_q_idx = torch.empty_like(dev_tiles, dtype = torch.short, device = device)
+                # Asynchronously copy the slice from the pinned buffer to device memory
+                dev_tiles = pin_split_tiles[i].to(device, non_blocking = True)
 
-            # Work buffers
-            K = quant_args["K"]
-            temp_costs, temp_edges = get_temp_buffers(device, K)
+                # Preallocate output tensors on the device.
+                dev_q_tiles = torch.empty_like(dev_tiles, device = device)
+                dev_q_idx = torch.empty_like(dev_tiles, dtype = torch.short, device = device)
 
-            ext.quantize_tiles(
-                dev_tiles,
-                dev_q_tiles,
-                dev_q_idx,
-                temp_costs,
-                temp_edges,
-                K
-            )
+                # Work buffers
+                K = quant_args["K"]
+                temp_costs, temp_edges = get_temp_buffers(device, K)
 
-            # Async copy back to pinned memory
-            pin_split_q_tiles[i].copy_(dev_q_tiles, non_blocking = True)
-            pin_split_q_idx[i].copy_(dev_q_idx, non_blocking = True)
+                ext.quantize_tiles(
+                    dev_tiles,
+                    dev_q_tiles,
+                    dev_q_idx,
+                    temp_costs,
+                    temp_edges,
+                    K
+                )
+
+                # Async copy back to pinned memory
+                pin_split_q_tiles[i].copy_(dev_q_tiles, non_blocking = True)
+                pin_split_q_idx[i].copy_(dev_q_idx, non_blocking = True)
 
             # Finished slice
             evt = torch.cuda.Event(blocking = False)
