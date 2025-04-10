@@ -10,7 +10,7 @@
 #define NUM_THREADS 1024
 
 template <int K>
-__global__ // __launch_bounds__(1024)
+__global__ __launch_bounds__(1024)
 void quantize_tiles_kernel
 (
     const float* __restrict__ input_tiles_ptr,
