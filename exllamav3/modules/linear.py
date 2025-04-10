@@ -27,13 +27,15 @@ class Linear(Module):
         fkey : str | None = None,
         frange: tuple[int, int] | None = None,
         caps: dict = None,
-        softcap: float = 0.0
+        softcap: float = 0.0,
+        pad_to: int = 128
     ):
         super().__init__(config, key, qmap)
 
         self.alt_key = alt_key
         self.in_features = in_features
-        self.out_features = out_features
+        self.out_features_unpadded = out_features
+        self.out_features = (out_features + pad_to - 1) // pad_to * pad_to
         self.inner = None
         self.qbits_key = qbits_key
         self.fkey = fkey
@@ -45,6 +47,19 @@ class Linear(Module):
             self.caps.update(caps)
 
 
+    def pad_out(self, w: torch.Tensor | None) -> torch.Tensor | None:
+        if w is None or self.out_features == self.out_features_unpadded:
+            return w
+        if w.dim() == 2:
+            padded = torch.zeros((self.out_features, self.in_features), dtype = w.dtype, device = w.device)
+            padded[:w.shape[0], :] = w
+        else:
+            assert w.dim() == 1
+            padded = torch.zeros((self.out_features,), dtype = w.dtype, device = w.device)
+            padded[:w.shape[0]] = w
+        return padded.contiguous()
+
+
     def load_fp16(self, key: str) -> bool:
         if self.config.stc.has_tensor_group(
             key,
@@ -52,7 +67,9 @@ class Linear(Module):
         ):
             self.used_alt_key = key == self.alt_key
             weight = self.config.stc.get_tensor(key + ".weight", self.device)
+            weight = self.pad_out(weight)
             bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
+            bias = self.pad_out(bias)
             self.inner = LinearFP16(self.in_features, self.out_features, weight, bias)
             self.quant_type = "fp16"
             return True
@@ -61,8 +78,10 @@ class Linear(Module):
             ["weight"]
         ):
             weight = self.config.stc.get_tensor(self.fkey + ".weight", self.device)
-            bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
             weight = weight[self.frange[0] : self.frange[1]].contiguous()
+            weight = self.pad_out(weight)
+            bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
+            bias = self.pad_out(bias)
             if bias is not None:
                 bias = bias[self.frange[0] : self.frange[1]].contiguous()
             self.inner = LinearFP16(self.in_features, self.out_features, weight, bias)
