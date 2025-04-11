@@ -109,6 +109,12 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
         split_sizes = [tiles.shape[0] // len(devices)] * len(devices)
         split_sizes[-1] += tiles.shape[0] - sum(split_sizes)
 
+    # Account for negative splits (edge case if too many GPUs and/or tensor too small)
+    for i in range(len(split_sizes) - 2, -1, -1):
+        if split_sizes[i + 1] < 0:
+            split_sizes[i] += split_sizes[i + 1]
+            split_sizes[i + 1] = 0
+
     pin_split_tiles = torch.split(pin_tiles, split_sizes)
     pin_split_q_tiles = torch.split(pin_q_tiles, split_sizes)
     pin_split_q_idx = torch.split(pin_q_idx, split_sizes)
