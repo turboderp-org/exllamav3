@@ -51,18 +51,22 @@ class TransformerBlock(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        y = self.attn_norm.forward(x, params, out_dtype = torch.half)
-        y = self.attn.forward(y, params)
-        if params.get("prefill"): return x
-        if self.attn_post_norm:
-            y = self.attn_post_norm.forward(y, params)
-        x += y
+        if self.attn:
+            if self.attn_norm:
+                y = self.attn_norm.forward(x, params, out_dtype = torch.half)
+            y = self.attn.forward(y, params)
+            if params.get("prefill"): return x
+            if self.attn_post_norm:
+                y = self.attn_post_norm.forward(y, params)
+            x += y
 
-        y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
-        y = self.mlp.forward(y, params)
-        if self.mlp_post_norm:
-            y = self.mlp_post_norm.forward(y, params)
-        x += y
+        if self.mlp:
+            if self.mlp_norm:
+                y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
+            y = self.mlp.forward(y, params)
+            if self.mlp_post_norm:
+                y = self.mlp_post_norm.forward(y, params)
+            x += y
 
         return to2(x, out_dtype, self.out_dtype)
 
@@ -71,11 +75,11 @@ class TransformerBlock(Module):
         return allocate_transformer(
             quant_args[self.qbits_key],
             surplus_bits,
-            self.attn.q_proj,
-            self.attn.k_proj,
-            self.attn.v_proj,
-            self.attn.o_proj,
+            self.attn.q_proj if self.attn else None,
+            self.attn.k_proj if self.attn else None,
+            self.attn.v_proj if self.attn else None,
+            self.attn.o_proj if self.attn else None,
             self.mlp.gate if isinstance(self.mlp, GatedMLP) else None,
-            self.mlp.up,
-            self.mlp.down,
+            self.mlp.up if self.mlp else None,
+            self.mlp.down if self.mlp else None,
         )

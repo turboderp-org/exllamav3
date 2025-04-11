@@ -9,43 +9,25 @@ if TYPE_CHECKING:
 def allocate_transformer(
     bpw: float,
     surplus_bits: int,
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
-    g: Linear,
-    u: Linear,
-    d: Linear,
+    q: Linear | None,
+    k: Linear | None,
+    v: Linear | None,
+    o: Linear | None,
+    g: Linear | None,
+    u: Linear | None,
+    d: Linear | None,
 ) -> (dict, int):
 
     # Submodules
-    keys = [
-        q.key,
-        k.key,
-        v.key,
-        o.key,
-        g.key,
-        u.key,
-        d.key,
-    ]
-    numels = [
-        q.weights_numel(),
-        k.weights_numel(),
-        v.weights_numel(),
-        o.weights_numel(),
-        g.weights_numel(),
-        u.weights_numel(),
-        d.weights_numel(),
-    ]
-    numel = sum(numels)
+    keys = []
+    numels = []
+    perms_qkvo = []
+    perms_gud = []
 
-    # Bits per weight from budget
-    budget = int(bpw * numel) + surplus_bits + 1
-    bpw = budget / numel
-
-    # Permutations to consider
-    @lru_cache
-    def get_perms(base):
+    if q is not None:
+        assert k and v and o
+        keys += [m.key for m in (q, k, v, o)]
+        numels += [m.weights_numel() for m in (q, k, v, o)]
         perms_qkvo = [
             [0, 0, 0, 0],
             [0, 0, 1, 0],
@@ -54,18 +36,46 @@ def allocate_transformer(
             [0, 1, 2, 1],
             [1, 2, 2, 1],
         ]
+
+    if g is not None and u is not None:
+        assert d
+        keys += [m.key for m in (g, u, d)]
+        numels += [m.weights_numel() for m in (g, u, d)]
         perms_gud = [
             [0, 0, 0],
             [0, 0, 1],
             [0, 1, 1],
             [1, 1, 1],
         ]
-        p = [qkvo + gud for qkvo in perms_qkvo for gud in perms_gud]
-        p = [[min(8, p1 + base_bpw) for p1 in p2] for p2 in p]
-        return p
 
+    elif g is None and u is not None:
+        assert d
+        keys += [m.key for m in (u, d)]
+        numels += [m.weights_numel() for m in (u, d)]
+        perms_gud = [
+            [0, 0],
+            [0, 1],
+            [1, 1],
+        ]
+
+    # Bits per weight from budget
+    numel = sum(numels)
+    budget = int(bpw * numel) + surplus_bits + 1
+    bpw = budget / numel
+
+    # Permutations to consider
     base_bpw = max(int(math.floor(bpw)), 1)
-    perms = get_perms(base_bpw)
+    if perms_qkvo and perms_gud:
+        perms = [qkvo + gud for qkvo in perms_qkvo for gud in perms_gud]
+        perms = [[min(8, p1 + base_bpw) for p1 in p2] for p2 in perms]
+    elif perms_qkvo:
+        perms = perms_qkvo
+        perms = [[min(8, p1 + base_bpw) for p1 in p2] for p2 in perms]
+    elif perms_gud:
+        perms = perms_gud
+        perms = [[min(8, p1 + base_bpw) for p1 in p2] for p2 in perms]
+    else:
+        assert False, "Logic error"
 
     # Find largest option within budget
     options = [(sum(a * b for a, b in zip(p, numels)), p) for p in perms]
