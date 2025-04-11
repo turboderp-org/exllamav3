@@ -1,5 +1,5 @@
 
-# <img src="doc/cat.png" width="40"> ExlLlamaV3
+# <img src="doc/cat.png" width="40"> ExLlamaV3
 
 This is an **early preview release** of ExLlamaV3. Please note: ↙
 
