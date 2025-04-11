@@ -6,20 +6,27 @@ from torch import nn
 from ..constants import PAGE_SIZE
 from ..models import Model, Config
 from .cache import CacheLayer
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..modules import Attention
 
 class CacheLayer_fp16(CacheLayer):
 
     def __init__(
         self,
         config: Config,
+        attention: Attention,
         max_num_tokens: int,
     ):
-        super().__init__(config, max_num_tokens)
+        super().__init__(config, attention, max_num_tokens)
 
         assert max_num_tokens % PAGE_SIZE == 0, \
             f"max_num_tokens must be a multiple of {PAGE_SIZE}."
 
-        self.shape = (max_num_tokens // PAGE_SIZE, PAGE_SIZE, config.num_kv_heads, config.head_dim)
+        self.shape = (
+            (max_num_tokens // PAGE_SIZE, PAGE_SIZE, attention.num_kv_heads, attention.head_dim)
+            if attention else None
+        )
         self.k = None
         self.v = None
         self.device = None
@@ -28,8 +35,8 @@ class CacheLayer_fp16(CacheLayer):
     @override
     def alloc(self, device: torch.device):
         self.device = device
-        self.k = torch.zeros(self.shape, dtype = torch.half, device = device)
-        self.v = torch.zeros(self.shape, dtype = torch.half, device = device)
+        self.k = torch.zeros(self.shape, dtype = torch.half, device = device) if self.shape else None
+        self.v = torch.zeros(self.shape, dtype = torch.half, device = device) if self.shape else None
 
 
     @override
@@ -46,6 +53,7 @@ class CacheLayer_fp16(CacheLayer):
 
     @override
     def copy_page(self, source: CacheLayer_fp16, from_page: int, to_page: int, num_tokens: int):
+        assert self.shape == source.shape
         kd = self.k[to_page, :num_tokens, :, :]
         vd = self.v[to_page, :num_tokens, :, :]
         ks = source.k[from_page, :num_tokens, :, :]

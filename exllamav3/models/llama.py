@@ -63,6 +63,8 @@ class LlamaModel(Model):
             )
         ]
 
+        self.first_block_idx = len(self.modules)
+
         self.modules += [
             TransformerBlock(
                 config = config,

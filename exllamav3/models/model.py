@@ -1,4 +1,7 @@
 from __future__ import annotations
+
+from functools import lru_cache
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -21,6 +24,7 @@ class Model:
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
         self.logit_layer_idx = None
+        self.first_block_idx = None
 
 
     def __iter__(self):
@@ -32,6 +36,11 @@ class Model:
         for module in self:
             if module.key == key:
                 return module
+
+
+    @lru_cache
+    def get_cache_layers(self):
+        return [m for m in self if m.caps.get("kv_cache")]
 
 
     @staticmethod

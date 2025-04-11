@@ -5,15 +5,20 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from ..models import Model, Config
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..modules import Attention
 
 class CacheLayer(ABC):
 
     def __init__(
         self,
         config: Config,
+        attention: Attention,
         max_num_tokens: int,
     ):
         self.config = config
+        self.attention = attention
         self.max_num_tokens = max_num_tokens
 
     @abstractmethod
@@ -64,12 +69,10 @@ class Cache:
         from .fp16 import CacheLayer_fp16
         self.layer_type = layer_type or CacheLayer_fp16
 
-        self.num_layers = self.config.num_hidden_layers
+        self.num_layers = len(self.model.get_cache_layers())
         self.layers = [
-            self.layer_type(
-                self.config,
-                self.max_num_tokens,
-            ) for _ in range(self.num_layers)
+            self.layer_type(self.config, attn, self.max_num_tokens)
+            for attn in self.model.get_cache_layers()
         ]
         self.attach_to_model()
 
@@ -82,9 +85,10 @@ class Cache:
         """
         if model is None:
             model = self.model
-        assert model.config.num_hidden_layers == self.num_layers, \
-            f"Cannot attach cache with {self.num_layers} layers to model with {model.config.num_hidden_layers} layers."
-        for layer, module in zip(self.layers, (m for m in model if m.caps.get("kv_cache"))):
+        model_num_layers = len(model.get_cache_layers())
+        assert model_num_layers == self.num_layers, \
+            f"Cannot attach cache with {self.num_layers} layers to model with {model_num_layers} layers."
+        for layer, module in zip(self.layers, model.get_cache_layers()):
             assert layer not in module.cache_layers, \
                 "Cannot attach cache twice to the same model."
             module.cache_layers.append(layer)
@@ -96,9 +100,10 @@ class Cache:
         """
         if model is None:
             model = self.model
-        assert model.config.num_hidden_layers == self.num_layers, \
-            f"Cannot detach cache with {self.num_layers} layers from model with {model.config.num_hidden_layers} layers."
-        for layer, module in zip(self.layers, (m for m in model if m.caps.get("kv_cache"))):
+        model_num_layers = len(model.get_cache_layers())
+        assert model_num_layers == self.num_layers, \
+            f"Cannot detach cache with {self.num_layers} layers from model with {model_num_layers()} layers."
+        for layer, module in zip(self.layers, model.get_cache_layers()):
             module.cache_layers.remove(layer)
 
 
