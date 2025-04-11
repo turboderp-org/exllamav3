@@ -24,7 +24,7 @@ class Config(ABC):
         Read a HF model config and prepare it for instantiation and loading
 
         :param directory:
-            Directory containg the model config.json, weights, etc.
+            Directory containing the model config.json, weights, etc.
 
         :param expect_arch:
             Expected achitecture string
