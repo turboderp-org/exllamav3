@@ -29,9 +29,10 @@ class LinearEXL3:
         if sv is not None: assert sv.dtype == torch.int16, "sv is wrong datatype"
         if suh is not None: assert suh.dtype == torch.half, "suh is wrong datatype"
         if svh is not None: assert svh.dtype == torch.half, "svh is wrong datatype"
-        if bias is not None: assert bias.dtype == torch.half, "bias is wrong datatype"
         assert trellis.dtype == torch.int16, "trellis is wrong datatype"
         assert len(trellis.shape) == 3, "trellis must have dim = 3"
+
+        if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
 
         # self.scale = scale.item()
         self.su = su

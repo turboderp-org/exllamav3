@@ -19,6 +19,7 @@ class LinearFP16:
         bias: torch.Tensor | None,
     ):
         if weight.dtype == torch.float: weight = weight.to(torch.half)
+        if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
         self.weight = weight.T.contiguous()
         self.in_features = in_features
         self.out_features = out_features
