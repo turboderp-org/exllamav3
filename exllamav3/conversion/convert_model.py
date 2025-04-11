@@ -27,7 +27,7 @@ parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bi
 parser.add_argument("-resume", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 100")
 parser.add_argument("-cc", "--cal_cols", type = int, help = "Calibration data size, columns, default: 2048")
-parser.add_argument("-cpi", "--checkpoint_interval", type = int, default = 60, help = "Minimum checkpoint interval, in seconds")
+parser.add_argument("-cpi", "--checkpoint_interval", type = int, default = 120, help = "Minimum checkpoint interval, in seconds")
 parser.add_argument("-lcpi", "--last_checkpoint_index", type = int, default = None, help = "Last module index to checkpoint (for debug purposes)")
 parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mode")
 parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
@@ -210,6 +210,8 @@ def main(args, job_state):
         device_ratios = None
 
     last_checkpoint_time = time.time()
+    start_time = time.time()
+    timed_blocks = 0
 
     # Get model
     config, model, tokenizer = get_base_model(args)
@@ -221,6 +223,9 @@ def main(args, job_state):
     for idx, module in enumerate(model.modules):
 
         start_module_time = time.time()
+        if idx == model.first_block_idx:
+            start_time = time.time()
+            timed_blocks = 0
 
         # If resuming, skip along to checkpoint index
         if idx < job_state["next_module_idx"]:
@@ -345,8 +350,10 @@ def main(args, job_state):
             f"  [{module_time:.2f} s]"
         )
         sys.stdout.flush()
-        if idx >= 1:
-            est_remaining = module_time * (len(model.modules) - idx - 1)
+        if idx >= model.first_block_idx:
+            overall_time = time.time() - start_time
+            timed_blocks += 1
+            est_remaining = (overall_time / timed_blocks) * (len(model.modules) - idx)
             print(f" -- Estimated remaining time: {human_time(est_remaining)}")
 
         # Unload current module
