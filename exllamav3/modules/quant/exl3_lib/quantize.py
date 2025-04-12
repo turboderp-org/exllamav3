@@ -205,22 +205,50 @@ def quantize_tiles_multigpu_sync(tiles, quant_args: dict):
 
 def preapply_had_l(x: torch.Tensor, had_dim):
     k, n = x.shape
-    xdt = x.dtype
+    x_dtype = x.dtype
     x = x.to(torch.float)
     had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
     x = (had @ x.view(-1, had_dim, n)).view(k, n)
-    x = x.to(xdt)
+    x = x.to(x_dtype)
     return x
 
 
 def preapply_had_r(x: torch.Tensor, had_dim):
     k, n = x.shape
-    xdt = x.dtype
+    x_dtype = x.dtype
     x = x.to(torch.float)
     had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
     x = (x.view(k, -1, had_dim) @ had).view(k, n)
-    x = x.to(xdt)
+    x = x.to(x_dtype)
     return x
+
+
+def blockwise_preapply_had_l_(x: torch.Tensor, had_dim):
+    k, n = x.shape
+    assert k % had_dim == 0
+    assert x.dtype == torch.float
+    had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
+    num_blocks = k // had_dim
+    for i in range(num_blocks):
+        start = i * had_dim
+        end = start + had_dim
+        block = x[start:end, :]  # shape (had_dim, n)
+        block_transformed = had @ block.view(had_dim, n)
+        x[start:end, :] = block_transformed
+
+
+def blockwise_preapply_had_r_(x: torch.Tensor, had_dim):
+    k, n = x.shape
+    assert n % had_dim == 0
+    assert x.dtype == torch.float
+    had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
+    num_blocks = n // had_dim
+    for i in range(num_blocks):
+        start = i * had_dim
+        end = start + had_dim
+        block = x[:, start:end]  # shape (k, had_dim)
+        block_transformed = block @ had
+        x[:, start:end] = block_transformed
 
 
 def block_ldl(H: torch.Tensor, b: int):
@@ -400,9 +428,9 @@ def finalize_capture_H(H_data: dict, quant_args: dict):
 
     # Input had
     H *= su.T
-    H = preapply_had_r(H, had_k)  # Todo: in-place had kernels, to save some memory here
+    blockwise_preapply_had_r_(H, had_k)
     H *= su
-    H = preapply_had_l(H, had_k)
+    blockwise_preapply_had_l_(H, had_k)
 
     # Get block LDL decomposition of H, zero diagonal
     L, _ = block_ldl(H, 16)
