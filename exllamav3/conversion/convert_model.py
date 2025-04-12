@@ -319,7 +319,7 @@ def main(args, job_state):
         # Output final bpw for layer
         num_bytes = dsize(tensors)
         num_bits = num_bytes * 8
-        final_bpw = num_bits / module.weights_numel()
+        final_bpw = num_bits / module.weights_numel() if module.weights_numel() else None
 
         del tensors
         # free_mem()
@@ -344,9 +344,9 @@ def main(args, job_state):
         # Feedback after module
         module_time = time.time() - start_module_time
         print(
-            f" -- Quantized: {module.key:47}"
-            f"  bpw: {final_bpw:5.2f}"
-            f"        rfn: {error:.6f}"
+            f" -- Quantized: {module.key:47}" +
+            (f"   bpw: {final_bpw:5.2f}" if final_bpw else f"   no_weights") +
+            f"        rfn: {error:.6f}" +
             f"  [{module_time:.2f} s]"
         )
         sys.stdout.flush()
