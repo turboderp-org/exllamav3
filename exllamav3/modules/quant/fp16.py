@@ -59,14 +59,16 @@ class LinearFP16:
 
     # Swap tensors to CPU (to free some space while quantizing)
     def swap_cpu(self):
-        assert self.swap_device is None
+        if self.swap_device is not None:
+            return
         self.swap_device = self.weight.device
         self.weight = self.weight.cpu()
         if self.bias is not None:
             self.bias = self.bias.cpu()
 
     def unswap_cpu(self):
-        assert self.swap_device is not None
+        if self.swap_device is None:
+            return
         self.weight = self.weight.to(self.swap_device)
         if self.bias is not None:
             self.bias = self.bias.to(self.swap_device)

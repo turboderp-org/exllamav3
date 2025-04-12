@@ -288,7 +288,6 @@ def main(args, job_state):
 
         # Quantize module
         for linear in linears:
-            linear.inner.unswap_cpu()
             quant_args = {
                 "seed": idx,
                 "K": strategy[linear.key],

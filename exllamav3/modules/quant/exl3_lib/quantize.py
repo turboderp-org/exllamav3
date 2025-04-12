@@ -563,7 +563,8 @@ def quantize_exl3(
     quant_args: dict,
     return_weight_q: bool,
     progress_str: str | None = None,
-    verbose: bool = False
+    verbose: bool = False,
+    swap_to_device: torch.device | None = None
 ):
     """
     :param weight:
@@ -588,6 +589,9 @@ def quantize_exl3(
     :param verbose:
         Dump extra stats
 
+    :param swap_to_device:
+        If input tensor is on CPU, move to this device before quantization
+
     :return:
         tuple:
           - quantized weight
@@ -604,7 +608,7 @@ def quantize_exl3(
         if "seed" in quant_args:
             torch.manual_seed(quant_args["seed"])
 
-        device = weight.device
+        device = weight.device if swap_to_device is None else swap_to_device
         k, n = weight.shape
 
         # Get H, LDL decomp. and input sign flips
@@ -616,6 +620,8 @@ def quantize_exl3(
 
         codebook_scale = 1.24371088
 
+        if swap_to_device is not None:
+            weight = weight.to(swap_to_device)
         if verbose:
             weight_copy = weight.cpu()
         weight_r = weight
@@ -665,7 +671,6 @@ def quantize_exl3(
             weight_r = weight_r.cpu()
 
         # Quantize
-        # free_mem()
         weight_q, encoded_q = ldlq(weight_r, L, quant_args, pb)
         # free_mem()
 

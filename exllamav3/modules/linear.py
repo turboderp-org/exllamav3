@@ -157,6 +157,7 @@ class Linear(Module):
             "Inner layer is already quant type"
 
         # Destroy original layer here to save VRAM, we only need weights
+        swap_to_device = self.inner.swap_device  # in case weights are swapped to CPU
         orig_weight = self.inner.get_weight_tensor().float()
         orig_bias = self.inner.get_bias_tensor()
         self.inner = None
@@ -167,7 +168,8 @@ class Linear(Module):
             quant_args,
             return_weight_q,
             progress_str,
-            verbose
+            verbose,
+            swap_to_device
         )
 
         self.inner = LinearEXL3(
