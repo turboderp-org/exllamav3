@@ -83,3 +83,10 @@ class TransformerBlock(Module):
             self.mlp.up if self.mlp else None,
             self.mlp.down if self.mlp else None,
         )
+
+
+    def get_name(self):
+        name = super().get_name()
+        if not self.attn and not self.mlp:
+            name += " (no-op)"
+        return name

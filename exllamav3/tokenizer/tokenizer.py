@@ -118,8 +118,10 @@ class Tokenizer:
 
         # Get control token strings
         self.unk_token = self.tokenizer.model.unk_token
-        self.bos_token = None if self.bos_token_id is None else (self.extended_id_to_piece.get(self.bos_token_id) or self.tokenizer.id_to_token(self.bos_token_id))
-        self.eos_token = None if self.eos_token_id is None else (self.extended_id_to_piece.get(self.eos_token_id) or self.tokenizer.id_to_token(self.eos_token_id))
+        self.bos_token = None if self.bos_token_id is None else \
+            (self.extended_id_to_piece.get(self.bos_token_id) or self.tokenizer.id_to_token(self.bos_token_id))
+        self.eos_token = None if self.eos_token_id is None else \
+            (self.extended_id_to_piece.get(self.eos_token_id) or self.tokenizer.id_to_token(self.eos_token_id))
 
         # Use "<pad>" or BOS token as fallback for padding token
         if self.pad_token_id is None:

@@ -345,7 +345,7 @@ class Model:
                         pref = f"[{count}x] "
                         count = 1
                     dedup_lines.append(lines[i].replace("[]", pref))
-            r = " " * (pre_indent + b_indent) + " - []" + module.__class__.__name__ + "\n"
+            r = " " * (pre_indent + b_indent) + " - []" + module.get_name() + "\n"
             r += "".join(dedup_lines)
             return r
         return get_branch(self, 0).replace("[]", "").rstrip()
@@ -368,3 +368,7 @@ class Model:
                 sum_numel += module.weights_numel()
         vram_bits = head_numel * head_bpw + sum_bits
         return sum_bits / sum_numel, head_bpw, vram_bits
+
+
+    def get_name(self):
+        return self.__class__.__name__

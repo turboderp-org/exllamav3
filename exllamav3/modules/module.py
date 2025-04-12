@@ -88,3 +88,6 @@ class Module(ABC):
 
     def quant_format_id(self):
         return None
+
+    def get_name(self):
+        return self.__class__.__name__
