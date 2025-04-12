@@ -653,7 +653,7 @@ def quantize_exl3(
         if verbose:
             weight_copy = weight.cpu()
         weight_r = weight
-        weight = None
+        del weight
 
         if verbose:
             rms = block_rms_n(weight_r, dim = 0)
@@ -700,7 +700,7 @@ def quantize_exl3(
 
         # Quantize
         weight_q, encoded_q = ldlq(weight_r, L, quant_args, pb)
-        # free_mem()
+        del L
 
         pb.update(tiles_k)
 
@@ -708,14 +708,14 @@ def quantize_exl3(
         E = weight_r - weight_q  # may run on CPU
         W = weight_r
         Hd = H.to(device)
-        weight_r = None
+        del weight_r
         E = E.to(device)
         num = torch.einsum("ik,ij,jk->", E, Hd, E).item()
-        E = None
+        del E
         W = W.to(device)
         den = torch.einsum("ik,ij,jk->", W, Hd, W).item()
-        W = None
-        Hd = None
+        del W
+        del Hd
         proxy_err = num / max(den, 1e-8)
 
         # free_mem()
