@@ -258,13 +258,39 @@ def block_ldl(H: torch.Tensor, b: int):
     m = n // b
 
     # Cholesky factorization: H = L @ L.T
-    L = torch.linalg.cholesky(H)
+    # Try on GPU first
+    try:
+        retry_cpu = False
+        L = torch.linalg.cholesky(H)
+        # H is not needed after this, move to CPU. Then overwrite H's GPU storage with L, since we can't otherwise
+        # free up that VRAM as the tensor is referenced by the parent frame
+        H_cpu = H.cpu()
+        H.copy_(L)  # VRAM copy, tiny overhead
+        L = H
+        H = H_cpu
+
+    # Fall back on CPU factorization
+    except Exception as e:
+        if e.__class__.__name__ == "OutOfMemoryError" or "CUDA out of memory" in str(e) or "HIP out of memory" in str(e):
+            retry_cpu = True
+        else:
+            raise e
+    if retry_cpu:
+        print(f" !! Out of memory on {str(H.device)}, trying CPU fallback")
+        free_mem()
+        H_cpu = H.cpu()
+        L_cpu = torch.linalg.cholesky(H_cpu)
+        # This is ugly, but overwrite H in VRAM to avoid allocating a new tensor, then replace reference with CPU copy
+        H.copy_(L_cpu)
+        del L_cpu
+        L = H
+        H = H_cpu
 
     # Get blocks along diagonal of L: DL.shape = (m, b, b)
     DL = torch.diagonal(L.reshape(m, b, m, b), dim1 = 0, dim2 = 2).permute(2, 0, 1)
 
-    # Compute D as D[i] = DL[i] @ DL[i].T for each diagonal block i
-    D = DL @ DL.transpose(1, 2)
+    # Compute D as D[i] = DL[i] @ DL[i].T for each diagonal block i (don't actually end up needing this)
+    # D = DL @ DL.transpose(1, 2)
 
     # Invert each diagonal block
     DL = torch.linalg.inv(DL)
@@ -281,7 +307,7 @@ def block_ldl(H: torch.Tensor, b: int):
     dr = torch.arange(m)
     L_block[dr, dr] = torch.stack([torch.eye(b, device = L.device, dtype = H.dtype)] * m)
 
-    return L, D.to(DL.device)
+    return L, H  # , D.to(DL.device)
 
 
 def ldlq(
@@ -433,7 +459,7 @@ def finalize_capture_H(H_data: dict, quant_args: dict):
     blockwise_preapply_had_l_(H, had_k)
 
     # Get block LDL decomposition of H, zero diagonal
-    L, _ = block_ldl(H, 16)
+    L, H = block_ldl(H, 16)
     dr = torch.arange(k)
     L[dr, dr] = 0
     H_data["L"] = L
