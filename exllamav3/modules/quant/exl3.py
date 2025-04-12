@@ -69,7 +69,7 @@ class LinearEXL3:
         input_dtype = x.dtype
         x = x.view(-1, self.in_features)
 
-        torch_mode = params.get("reconstruct", x.shape[0] >= 32)
+        torch_mode = params.get("reconstruct", x.shape[0] > 32)
 
         xh = torch.empty_like(x)
         ext.had_r_128(x, xh, self.suh, None, 1.0)
