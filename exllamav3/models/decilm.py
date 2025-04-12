@@ -96,7 +96,7 @@ class DeciLMModel(Model):
                     hidden_size = config.hidden_size,
                     head_dim = config.head_dim,
                     num_q_heads = config.num_q_heads,
-                    num_kv_heads = cfg_attn["n_heads_in_group"],
+                    num_kv_heads = config.num_q_heads // cfg_attn["n_heads_in_group"],
                     rope_settings = config.rope_settings,
                     sm_scale = None,
                     key_q = "q_proj",
