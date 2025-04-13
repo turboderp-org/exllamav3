@@ -57,6 +57,7 @@ class SafetensorsCollection:
         self.tensor_files = []
         self.add_tensor_files(directory)
 
+        self.new_tensors = None
 
     def add_tensor_files(
         self,
@@ -87,6 +88,8 @@ class SafetensorsCollection:
         self,
         key: str,
     ):
+        if self.new_tensors and key in self.new_tensors:
+            return True
         return key in self.tensor_file_map
 
 
@@ -95,11 +98,16 @@ class SafetensorsCollection:
         key: str,
         subkeys: list,
     ):
-        return all(
-            (
-                f"{key}.{subkey}" in self.tensor_file_map if isinstance(subkey, str) else
-                any(f"{key}.{sk}" in self.tensor_file_map for sk in subkey)
-            ) for subkey in subkeys
+        sources = [self.tensor_file_map]
+        if self.new_tensors:
+            sources += [self.new_tensors]
+        return any(
+            all(
+                (
+                    f"{key}.{subkey}" in source if isinstance(subkey, str) else
+                    any(f"{key}.{sk}" in source for sk in subkey)
+                ) for subkey in subkeys
+            ) for source in sources
         )
 
 
@@ -107,6 +115,7 @@ class SafetensorsCollection:
         self,
         prefix: str,
     ):
+        assert self.new_tensors is None  # TODO
         keys = [
             key for key in self.tensor_file_map.keys()
             if key == prefix or key.startswith(prefix + ".")
@@ -120,6 +129,7 @@ class SafetensorsCollection:
         key: str,
         optional: bool = False
     ):
+        assert self.new_tensors is None  # TODO
         if not key in self.tensor_file_map:
             if not optional:
                 raise ValueError(f"Required tensor {key} not found in any *.safetensors file in {self.directory}")
@@ -140,6 +150,7 @@ class SafetensorsCollection:
         self,
         prefix: str,
     ) -> dict:
+        assert self.new_tensors is None  # TODO
         keys = [
             key for key in self.tensor_file_map.keys()
             if key == prefix or key.startswith(prefix + ".")
@@ -165,6 +176,7 @@ class SafetensorsCollection:
         device: torch.device | None = None,
         allow_bf16: bool = False,
     ) -> dict:
+        assert self.new_tensors is None  # TODO
         keys = [
             key for key in self.tensor_file_map.keys()
             if key == prefix or key.startswith(prefix + ".")
@@ -181,14 +193,17 @@ class SafetensorsCollection:
         allow_bf16: bool = False
     ) -> torch.Tensor | None:
 
+        if device is None:
+            device = torch.device("cpu")
+
+        if self.new_tensors and key in self.new_tensors:
+            return self.new_tensors[key].to(device)
+
         if not key in self.tensor_file_map:
             if not optional:
                 raise ValueError(f"Required tensor {key} not found in any *.safetensors file in {self.directory}")
             else:
                 return None
-
-        if device is None:
-            device = torch.device("cpu")
 
         filename = self.tensor_file_map[key]
         header = self.file_headers[filename]
@@ -241,6 +256,7 @@ class SafetensorsCollection:
 
 
     def close(self):
+        assert self.new_tensors is None
         for filename, h in self.handles.items():
             if h:
                 ext.stloader_close_file(h)
@@ -256,6 +272,10 @@ class SafetensorsCollection:
     def max_key_len(self):
         l = max(len(k) for k in self.tensor_file_map.keys())
         return l
+
+
+    def set_new_tensors(self, new_tensors):
+        self.new_tensors = new_tensors
 
 
 class VariantSafetensorsCollection:
