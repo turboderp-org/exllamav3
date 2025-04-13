@@ -13,13 +13,14 @@ def allocate_transformer(
     k: Linear | None,
     v: Linear | None,
     o: Linear | None,
-    g: Linear | None,
-    u: Linear | None,
-    d: Linear | None,
+    g: Linear | list[Linear] | None,
+    u: Linear | list[Linear] | None,
+    d: Linear | list[Linear] | None,
 ) -> (dict, int):
 
     # Submodules
     keys = []
+    out_keys = {}
     numels = []
     perms_qkvo = []
     perms_gud = []
@@ -28,6 +29,8 @@ def allocate_transformer(
         assert k and v and o
         keys += [m.key for m in (q, k, v, o)]
         numels += [m.weights_numel() for m in (q, k, v, o)]
+        for m in (q, k, v, o):
+            out_keys[m.key] = m.key
         perms_qkvo = [
             [0, 0, 0, 0],
             [0, 0, 1, 0],
@@ -39,8 +42,18 @@ def allocate_transformer(
 
     if g is not None and u is not None:
         assert d
-        keys += [m.key for m in (g, u, d)]
-        numels += [m.weights_numel() for m in (g, u, d)]
+        if isinstance(g, list):
+            for m in (g, u, d):
+                key_ = m[0].key.replace(".slice.0", ".slice.*")
+                keys += [key_]
+                numels += [sum(mm.weights_numel() for mm in m)]
+                for mm in m:
+                    out_keys[mm.key] = key_
+        else:
+            keys += [m.key for m in (g, u, d)]
+            numels += [m.weights_numel() for m in (g, u, d)]
+            for m in (g, u, d):
+                out_keys[m.key] = m.key
         perms_gud = [
             [0, 0, 0],
             [0, 0, 1],
@@ -50,8 +63,18 @@ def allocate_transformer(
 
     elif g is None and u is not None:
         assert d
-        keys += [m.key for m in (u, d)]
-        numels += [m.weights_numel() for m in (u, d)]
+        if isinstance(u, list):
+            for m in (u, d):
+                key_ = m[0].key.replace(".slice.0", ".slice.*")
+                keys += [m]
+                numels += [sum(mm.weights_numel() for mm in m)]
+                for mm in m:
+                    out_keys[mm.key] = key_
+        else:
+            keys += [m.key for m in (u, d)]
+            numels += [m.weights_numel() for m in (u, d)]
+            for m in (u, d):
+                out_keys[m.key] = m.key
         perms_gud = [
             [0, 0],
             [0, 1],
@@ -86,6 +109,7 @@ def allocate_transformer(
 
     # Output
     strategy = {k: v for k, v in zip(keys, selected)}
+    strategy = {k: strategy[v] for k, v in out_keys.items()}
     surplus = budget - used_budget
     return strategy, surplus
 

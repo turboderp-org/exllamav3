@@ -42,6 +42,8 @@ class TransformerBlock(Module):
         self.register_submodule(self.mlp)
         self.register_submodule(self.mlp_post_norm)
 
+        self.num_slices = mlp.num_slices if mlp else 1
+
 
     @override
     def forward(
@@ -72,6 +74,8 @@ class TransformerBlock(Module):
 
 
     def allocate_q(self, quant_args: dict, surplus_bits: int):
+        if not self.attn and not self.mlp:
+            return {}, surplus_bits
         return allocate_transformer(
             quant_args[self.qbits_key],
             surplus_bits,
@@ -79,9 +83,9 @@ class TransformerBlock(Module):
             self.attn.k_proj if self.attn else None,
             self.attn.v_proj if self.attn else None,
             self.attn.o_proj if self.attn else None,
-            self.mlp.gate if isinstance(self.mlp, GatedMLP) else None,
-            self.mlp.up if self.mlp else None,
-            self.mlp.down if self.mlp else None,
+            self.mlp.gates if isinstance(self.mlp, GatedMLP) else None,
+            self.mlp.ups if self.mlp else None,
+            self.mlp.downs if self.mlp else None,
         )
 
 

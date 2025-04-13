@@ -35,6 +35,7 @@ class Module(ABC):
         self.modules = []
         self.caps = {}
         self.qmap = qmap
+        self.num_slices = 1
 
     def __iter__(self):
         yield self

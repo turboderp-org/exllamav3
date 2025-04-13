@@ -7,6 +7,7 @@ from ..models import Config
 from ..util.tensor import to2
 from . import Module, Linear
 from ..ext import exllamav3_ext as ext
+from ..constants import MAX_MLP_INTERMEDIATE
 
 class MLP(Module):
 
@@ -62,31 +63,122 @@ class GatedMLP(Module):
         key_fused_gate_up: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
-        activation_fn: str = "silu"
+        activation_fn: str = "silu",
+        intermediate_split_size: int | None = MAX_MLP_INTERMEDIATE,
     ):
         super().__init__(config, key, None)
 
         self.out_dtype = out_dtype
         self.activation_fn = activation_fn
+        self.intermediate_size = intermediate_size
 
         if key_fused_gate_up:
+            assert not intermediate_split_size or intermediate_size <= intermediate_split_size, \
+                "Cannot combine fused gate/up layers with MLP slicing"
             fkey = f"{key}.{key_fused_gate_up}"
             frange_gate = (0, intermediate_size)
             frange_up = (intermediate_size, 2 * intermediate_size)
         else:
             fkey, frange_gate, frange_up = None, None, None
 
-        self.gate = Linear(config, f"{key}.{key_gate}", hidden_size, intermediate_size, qmap = qmap + ".up", fkey = fkey, frange = frange_gate)
-        self.up = Linear(config, f"{key}.{key_up}", hidden_size, intermediate_size, qmap = qmap + ".up", fkey = fkey, frange = frange_up)
-        self.down = Linear(config, f"{key}.{key_down}", intermediate_size, hidden_size, qmap = qmap + ".down")
+        if intermediate_split_size and intermediate_size > intermediate_split_size:
+            num_slices = (intermediate_size + intermediate_split_size - 1) // intermediate_split_size
+            interm_slice = intermediate_size // num_slices // 128 * 128
+            interm_split = [interm_slice for _ in range(num_slices)]
+            interm_split[-1] += intermediate_size - sum(interm_split)
+            self.num_slices = num_slices
+        else:
+            interm_split = [intermediate_size]
+            self.num_slices = 1
 
-        self.register_submodule(self.up)
-        self.register_submodule(self.gate)
-        self.register_submodule(self.down)
+        self.gates = []
+        self.ups = []
+        self.downs = []
+
+        a = 0
+        for idx, sp in enumerate(interm_split):
+            b = a + sp
+
+            if self.num_slices > 1:
+                s_key_g = f"{key}.{key_gate}.slice.{idx}"
+                s_key_u = f"{key}.{key_up}.slice.{idx}"
+                s_key_d = f"{key}.{key_down}.slice.{idx}"
+                a_key_g = f"{key}.{key_gate}"
+                a_key_u = f"{key}.{key_up}"
+                a_key_d = f"{key}.{key_down}"
+            else:
+                s_key_g = f"{key}.{key_gate}"
+                s_key_u = f"{key}.{key_up}"
+                s_key_d = f"{key}.{key_down}"
+                a_key_g = None
+                a_key_u = None
+                a_key_d = None
+
+            gate = Linear(
+                config = config,
+                key = s_key_g,
+                in_features = hidden_size,
+                out_features = b - a,
+                full_in_features = hidden_size,
+                full_out_features = intermediate_size,
+                first_in_feature = 0,
+                first_out_feature = a,
+                qmap = qmap + ".up",
+                fkey = fkey,
+                frange = frange_gate,
+                alt_key = a_key_g,
+            )
+            up = Linear(
+                config = config,
+                key = s_key_u,
+                in_features = hidden_size,
+                out_features = b - a,
+                full_in_features = hidden_size,
+                full_out_features = intermediate_size,
+                first_in_feature = 0,
+                first_out_feature = a,
+                qmap = qmap + ".up",
+                fkey = fkey,
+                frange = frange_up,
+                alt_key = a_key_u,
+            )
+            down = Linear(
+                config = config,
+                key = s_key_d,
+                in_features = b - a,
+                out_features = hidden_size,
+                full_in_features = intermediate_size,
+                full_out_features = hidden_size,
+                first_in_feature = a,
+                first_out_feature = 0,
+                qmap = qmap + ".down",
+                alt_key = a_key_d,
+            )
+
+            self.ups.append(up)
+            self.gates.append(gate)
+            self.downs.append(down)
+
+            self.register_submodule(up)
+            self.register_submodule(gate)
+            self.register_submodule(down)
+
+            a = b
 
         match activation_fn:
             case "silu": self.activation_fn_call = ext.silu_mul
             case "gelu": self.activation_fn_call = ext.gelu_mul
+
+
+    @override
+    def load(self, device: torch.Device, load_slice: int | None = None, **kwargs):
+        if load_slice is None:
+            super().load(device, **kwargs)
+        else:
+            self.gates[load_slice].load(device, **kwargs)
+            self.ups[load_slice].load(device, **kwargs)
+            self.downs[load_slice].load(device, **kwargs)
+
 
     @override
     def forward(
@@ -96,9 +188,17 @@ class GatedMLP(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        g = self.gate.forward(x, params)
-        x = self.up.forward(x, params)
-        self.activation_fn_call(g, x, x)
-        x = self.down.forward(x, params)
+        qs = params.get("q_mlp_slice")
+        r = [qs] if qs is not None else range(0, self.num_slices)
+        d = None
 
-        return to2(x, out_dtype, self.out_dtype)
+        for s in r:
+            g = self.gates[s].forward(x, params)
+            u = self.ups[s].forward(x, params)
+            self.activation_fn_call(g, u, u)
+            d_ = self.downs[s].forward(u, params)
+            if d is None: d = d_
+            else: d += d_
+            del d_
+
+        return to2(d, out_dtype, self.out_dtype)
