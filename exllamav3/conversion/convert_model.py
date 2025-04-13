@@ -369,7 +369,7 @@ def main(args, job_state):
         print(
             f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
             (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"   no_weights") +
-            (f"        rfn: {error:.6f}" if module.num_slices == 1 else "          rfn: N/A     ") +
+            (f"        rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
             f"  [{module_time:.2f} s]"
         )
         sys.stdout.flush()
