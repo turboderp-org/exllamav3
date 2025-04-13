@@ -44,6 +44,7 @@ class LinearEXL3:
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
+        self.swap_device = None
 
 
     def get_tensors(self, key: str):
@@ -131,3 +132,28 @@ class LinearEXL3:
 
     def get_bias_tensor(self) -> torch.Tensor | None:
         return self.bias
+
+
+    # Swap tensors to CPU (to free some space while quantizing)
+    def swap_cpu(self):
+        if self.swap_device is not None:
+            return
+        self.swap_device = self.trellis.device
+        if self.su is not None: self.su = self.su.cpu()
+        if self.sv is not None: self.sv = self.sv.cpu()
+        if self.suh is not None: self.suh = self.suh.cpu()
+        if self.svh is not None: self.svh = self.svh.cpu()
+        if self.trellis is not None: self.trellis = self.trellis.cpu()
+        if self.bias is not None: self.bias = self.bias.cpu()
+
+
+    def unswap_cpu(self):
+        if self.swap_device is None:
+            return
+        if self.su is not None: self.su = self.su.to(self.swap_device)
+        if self.sv is not None: self.sv = self.sv.to(self.swap_device)
+        if self.suh is not None: self.suh = self.suh.to(self.swap_device)
+        if self.svh is not None: self.svh = self.svh.to(self.swap_device)
+        if self.trellis is not None: self.trellis = self.trellis.to(self.swap_device)
+        if self.bias is not None: self.bias = self.bias.to(self.swap_device)
+        self.swap_device = None
