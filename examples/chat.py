@@ -4,112 +4,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 from exllamav3 import Generator, Job, model_init
 from chat_templates import *
-from rich.prompt import Prompt
-from rich.live import Live
-from rich.markdown import Markdown
-from prompt_toolkit import prompt as ptk_prompt
-from prompt_toolkit.formatted_text import ANSI
 import torch
-import re
+from chat_console import *
 
-# ANSI color codes
-col_default = "\u001b[0m"
-col_user = "\u001b[33;1m"  # Yellow
-col_bot = "\u001b[34;1m"  # Blue
-col_think1 = "\u001b[35;1m"  # Bright magenta
-col_think2 = "\u001b[35m"  # Magenta
-col_error = "\u001b[31;1m"  # Bright red
-col_sysprompt = "\u001b[37;1m"  # Grey
 thinktag = ("<think>", "</think>")
-
-def read_input_console(args, user_name):
-    print("\n" + col_user + user_name + ": " + col_default, end = '', flush = True)
-    if args.mli:
-        user_prompt = sys.stdin.read().rstrip()
-    else:
-        user_prompt = input().strip()
-    return user_prompt
-
-def read_input_rich(args, user_name):
-    user_prompt = Prompt.ask("\n" + col_user + user_name + col_default)
-    return user_prompt
-
-def read_input_ptk(args, user_name):
-    print()
-    user_prompt = ptk_prompt(ANSI(col_user + user_name + col_default + ": "), multiline = args.multiline)
-    return user_prompt
-
-class Streamer_basic:
-    def __init__(self, args, bot_name):
-        self.all_text = ""
-        self.args = args
-        self.bot_name = bot_name
-
-    def __enter__(self):
-        print()
-        print(col_bot + self.bot_name + ": " + col_default, end = "")
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if not self.all_text.endswith("\n"):
-            print()
-
-    def stream(self, text: str):
-        if self.all_text or not text.startswith(" "):
-            print_text = text
-        else:
-            print_text = text[1:]
-        self.all_text += text
-        print(print_text, end = "", flush = True)
-
-class Streamer_rich:
-    def __init__(self, args, bot_name):
-        self.all_text = ""
-        self.think_text = ""
-        self.bot_name = bot_name
-        self.all_print_text = col_bot + self.bot_name + col_default + ": "
-        self.args = args
-        self.live = None
-        self.is_live = False
-
-    def begin(self):
-        self.live = Live(refresh_per_second = self.args.refresh_per_second, vertical_overflow = "visible")
-        self.live.__enter__()
-        self.live.update(Markdown(self.all_print_text))
-        self.is_live = True
-
-    def __enter__(self):
-        if self.args.think:
-            print()
-            print(col_think1 + "Thinking" + col_default + ": " + col_think2, end = "")
-        else:
-            print()
-            self.begin()
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if self.is_live:
-            self.live.__exit__(exc_type, exc_value, traceback)
-
-    def stream(self, text: str):
-        if self.args.think and not self.is_live:
-            if self.think_text or not text.startswith(" "):
-                print_text = text
-            else:
-                print_text = text[1:]
-            self.think_text += print_text
-            print(print_text, end = "", flush = True)
-            if thinktag[1] in self.think_text:
-                self.begin()
-        else:
-            if self.all_text or not text.startswith(" "):
-                print_text = text
-            else:
-                print_text = text[1:]
-            self.all_text += text
-            self.all_print_text += print_text
-            formatted_text = self.all_print_text
-            self.live.update(Markdown(formatted_text))
 
 @torch.inference_mode()
 def main(args):
@@ -186,7 +84,7 @@ def main(args):
             while generator.num_remaining_jobs():
                 for r in generator.iterate():
                     chunk = r.get("text", "")
-                    s.stream(chunk)
+                    s.stream(chunk, thinktag[1])
                     if r["eos"] and r["eos_reason"] == "max_new_tokens":
                         ctx_exceeded = True
 
