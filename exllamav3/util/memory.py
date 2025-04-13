@@ -96,7 +96,10 @@ def list_gpu_tensors(min_size: int = 1, cuda_only: bool = True):
         # Skip tensors in paths containing specific debug substrings
         if any(x in path for x in [
             ".stderr.dbg.",
-            "dbg.value_resolve_thread_list"
+            "dbg.value_resolve_thread_list",
+            "global_vars[",
+            "local_vars[",
+            "updated_globals[",
         ]):
             return
 
