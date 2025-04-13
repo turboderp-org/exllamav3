@@ -17,14 +17,36 @@ class LinearFP16:
         out_features: int,
         weight: torch.Tensor,
         bias: torch.Tensor | None,
+        full_in_features: int | None = None,
+        full_out_features: int | None = None,
+        first_in_feature: int | None = None,
+        first_out_feature: int | None = None,
     ):
         if weight.dtype == torch.float: weight = weight.to(torch.half)
         if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
-        self.weight = weight.T.contiguous()
+        self.weight = weight.T
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
         self.swap_device = None
+        self.full_in_features = full_in_features
+        self.full_out_features = full_out_features
+        self.first_in_feature = first_in_feature
+        self.first_out_feature = first_out_feature
+
+        if self.weight.shape[0] == full_in_features and self.weight.shape[0] != in_features:
+            self.weight = self.weight[first_in_feature : first_in_feature + in_features, :]
+        if self.weight.shape[1] == full_out_features and self.weight.shape[1] != out_features:
+            self.weight = self.weight[:, first_out_feature : first_out_feature + out_features]
+            if bias is not None:
+                self.bias = self.bias[..., first_out_feature : first_out_feature + out_features]
+
+        if in_features != full_in_features or out_features != full_out_features:
+            w = torch.empty(self.weight.shape, dtype = self.weight.dtype, device = self.weight.device)
+            w.copy_(self.weight)
+            self.weight = w
+        else:
+            self.weight = self.weight.contiguous()
 
     def get_tensors(self, key: str):
         t = {}

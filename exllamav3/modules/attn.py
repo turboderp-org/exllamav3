@@ -187,7 +187,7 @@ class Attention(Module):
 
 
     @override
-    def load(self, device: torch.Device):
+    def load(self, device: torch.Device, **kwargs):
         self.device_context = get_device_context(self.config, device)
         super().load(device)
 

@@ -41,10 +41,10 @@ class Module(ABC):
         for module in self.modules:
             yield from module
 
-    def load(self, device: torch.Device):
+    def load(self, device: torch.Device, **kwargs):
         self.device = device
         for module in self.modules:
-            module.load(device)
+            module.load(device, **kwargs)
 
     def unload(self):
         self.device = None

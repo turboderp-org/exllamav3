@@ -28,7 +28,11 @@ class Linear(Module):
         frange: tuple[int, int] | None = None,
         caps: dict = None,
         softcap: float = 0.0,
-        pad_to: int = 128
+        pad_to: int = 128,
+        full_in_features: int | None = None,
+        full_out_features: int | None = None,
+        first_in_feature: int | None = None,
+        first_out_feature: int | None = None,
     ):
         super().__init__(config, key, qmap)
 
@@ -36,12 +40,17 @@ class Linear(Module):
         self.in_features = in_features
         self.out_features_unpadded = out_features
         self.out_features = (out_features + pad_to - 1) // pad_to * pad_to
+        self.full_in_features = full_in_features
+        self.full_out_features = full_out_features
+        self.first_in_feature = first_in_feature
+        self.first_out_feature = first_out_feature
         self.inner = None
         self.qbits_key = qbits_key
         self.fkey = fkey
         self.frange = frange
         self.quant_type = None
         self.softcap = softcap
+        self.is_sliced = in_features != full_in_features or out_features != full_out_features
 
         if caps is not None:
             self.caps.update(caps)
@@ -66,11 +75,23 @@ class Linear(Module):
             ["weight"]
         ):
             self.used_alt_key = key == self.alt_key
-            weight = self.config.stc.get_tensor(key + ".weight", self.device)
+            weight = self.config.stc.get_tensor(key + ".weight", "cpu" if self.is_sliced else self.device)
             weight = self.pad_out(weight)
             bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
             bias = self.pad_out(bias)
-            self.inner = LinearFP16(self.in_features, self.out_features, weight, bias)
+            self.inner = LinearFP16(
+                self.in_features,
+                self.out_features,
+                weight,
+                bias,
+                self.full_in_features,
+                self.full_out_features,
+                self.first_in_feature,
+                self.first_out_feature,
+            )
+            if self.is_sliced:
+                self.inner.swap_device = self.device
+                self.inner.unswap_cpu()
             self.quant_type = "fp16"
             return True
         elif self.fkey and self.config.stc.has_tensor_group(
@@ -124,7 +145,7 @@ class Linear(Module):
 
 
     @override
-    def load(self, device: torch.device):
+    def load(self, device: torch.device, **kwargs):
         self.device = device
         keys = [self.key]
         if self.alt_key:
@@ -142,7 +163,10 @@ class Linear(Module):
 
     @override
     def get_tensors(self):
-        return self.inner.get_tensors(self.key)
+        if self.device:
+            return self.inner.get_tensors(self.key)
+        else:
+            return {}
 
 
     def convert_exl3(

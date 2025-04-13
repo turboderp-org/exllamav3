@@ -35,7 +35,7 @@ class Embedding(Module):
         })
 
     @override
-    def load(self, device: torch.device):
+    def load(self, device: torch.device, **kwargs):
         self.device = device
         weight = self.config.stc.get_tensor(self.key + ".weight", self.device)
         if weight.dtype == torch.float: weight = weight.to(torch.half)
