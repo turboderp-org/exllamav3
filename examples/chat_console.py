@@ -96,8 +96,11 @@ class MarkdownConsoleStream:
         with self.console.capture() as cap:
             self.console.print(Markdown(markdown_text))
         rendered = cap.get()
-        # rendered = rendered.rstrip("\n")
-        return rendered.split("\n")
+        split = []
+        for s in [r.rstrip() for r in rendered.rstrip("\n").split("\n")]:
+            if s or len(split) == 0 or split[-1]:
+                split.append(s)
+        return split
 
     @staticmethod
     def _common_prefix_length(a, b) -> int:
