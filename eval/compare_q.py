@@ -107,7 +107,8 @@ def test_ppl(data_spec: dict, spec: dict):
             pb.update(row)
             input_ids = eval_ids[row:row + 1, :]
             logits = fwd_fn(model_instance, input_ids)
-            logits = logits[:, :-1, :].float() + 1e-10
+            logits = logits[:, :-1, :].float()
+            logits += 1e-10
             log_probs = F.log_softmax(logits, dim = -1)
             del logits
             target_ids = input_ids[:, 1:].to(log_probs.device)
