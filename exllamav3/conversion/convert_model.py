@@ -33,6 +33,13 @@ parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mo
 parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 
+group = parser.add_mutually_exclusive_group()
+group.add_argument("--out_scales", dest = "out_scales_", action = "store_true", help = "Always enable out channel scales  (for debug purposes)")
+group.add_argument("--no_out_scales", dest = "out_scales_", action = "store_false", help = "Never enable out channel scales  (for debug purposes)")
+parser.set_defaults(out_scales_ = None)
+
+parser.add_argument("--override_anyway", action = "store_true", help = "Allow resuming even when overriding settings that will break the existing job.")
+
 num_ref_states = 5
 
 def save_dict(filename, dict_, args):
@@ -134,10 +141,11 @@ def prepare(args) -> (dict, bool, str, str):
         ("devices", True, None),
         ("device_ratios", True, None),
     ]:
-        override(arg_, can_override, default)
+        override(arg_, can_override if not args.override_anyway else True, default)
 
     # Momentary args
     in_args["verbose"] = args.verbose
+    in_args["apply_out_scales"] = args.out_scales_
 
     if args.resume:
         job_state = load_dict("ckpt/job.json", in_args)
@@ -152,10 +160,11 @@ def prepare(args) -> (dict, bool, str, str):
         save_dict("ckpt/job.json", job_state, in_args)
 
     print(f"    Input directory: {in_args['in_dir']}")
-    print(f"    Working directory: {in_args['work_dir']}")
     print(f"    Output directory: {in_args['out_dir']}")
+    print(f"    Working directory: {in_args['work_dir']}")
     print(f"    Calibration size: {in_args['cal_rows']} rows, {in_args['cal_cols']} columns")
     print(f"    Target bitrate: {in_args['bits']} (decoder), {in_args['head_bits']} (head)")
+    print(f"    Output scales: " + {True: "always", False: "never", None: "auto"}[in_args["apply_out_scales"]])
 
     return in_args, job_state, True, None
 
@@ -305,6 +314,7 @@ def main(args, job_state):
                     "K": strategy[linear.key],
                     "devices": devices,
                     "device_ratios": device_ratios,
+                    "apply_out_scales": args["apply_out_scales"],
                 }
                 with Timer() as t:
                     proxy_err = linear.convert_exl3(
@@ -315,10 +325,13 @@ def main(args, job_state):
                     )
                     assert isinstance(linear.inner, LinearEXL3)
                     linear.inner.swap_cpu()
+                flags = "o" if quant_args["apply_out_scales"] else "."
                 print(
                     f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
                     f"  bpw: {quant_args['K']:5.2f}"
                     f"  proxy_err: {proxy_err:8.6f}"
+                    f"  {flags}"
+                    f"  g_sc: {quant_args['g_scale']:.6f}"
                     f"  [{t.interval:4.2f} s]"
                 )
                 sys.stdout.flush()

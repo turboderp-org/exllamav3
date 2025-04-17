@@ -17,6 +17,10 @@ does.
   
 - **-hb / --head_bits *int***: Number of bits per weight for the lm_head (output) layer of the model. Must be an integer from 1 to 8, default is 6.
 
+#### Advanced (generally disregard these options)
+
+- **--out_scales | --no_out_scales**: Force enable or disable output channel scales. By default, whether to apply this setting is autodetected during quantization, so don't set either of these flags unless there's a good reason to. Mostly they're for debug purposes. 
+
 #### Checkpoints
 
 - **-cpi / --checkpoint_interval *int***: Interval (in seconds) between checkpoints.
@@ -38,6 +42,8 @@ does.
 - **-cc / --cal_cols *int***: Number of columns of calibration data.
 
 - **-v / --verbose**: Extra debug output while quantizing.
+
+- **--override_anyway**: Allow resuming even when overriding settings that will break the existing job. 
 
 ### Examples
 

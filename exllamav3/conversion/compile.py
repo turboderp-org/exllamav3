@@ -123,11 +123,12 @@ def compile_model(args, model, config, tokenizer):
         "quant_method": "exl3",
         "version": __version__,
         "bits": args["bits"],
-        # "head_bits": args["head_bits"],
+        "head_bits": args["head_bits"],
         "calibration": {
             "rows": args["cal_rows"],
             "cols": args["cal_cols"],
-        }
+        },
+        "out_scales": {True: "always", False: "never", None: "auto"}[args["apply_out_scales"]],
     }
     update_config(config_dict)
     config_dict["quantization_config"] = qcfg

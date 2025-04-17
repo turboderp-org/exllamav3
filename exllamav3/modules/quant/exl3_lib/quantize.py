@@ -10,6 +10,7 @@ from functools import lru_cache
 
 # Constant
 had_k, had_n = 128, 128
+codebook_scale = 1.24371088
 
 @lru_cache
 def tensor_core_perm(device):
@@ -251,7 +252,7 @@ def blockwise_preapply_had_r_(x: torch.Tensor, had_dim):
         x[:, start:end] = block_transformed
 
 
-def block_ldl(H: torch.Tensor, b: int):
+def block_ldl(H: torch.Tensor, b: int, verbose: bool):
 
     n, _ = H.shape
     assert (n % b == 0)
@@ -429,7 +430,7 @@ def ldlq(
     return weight_q, encoded
 
 
-def finalize_capture_H(H_data: dict, quant_args: dict):
+def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
     # Unswap H
     if "H_swap_device" in H_data:
         H_data["H"] = H_data["H"].to(H_data["H_swap_device"])
@@ -437,7 +438,7 @@ def finalize_capture_H(H_data: dict, quant_args: dict):
 
     H = H_data["H"]
     if H_data["finalized"]:
-        return H, H_data["L"], H_data["su"]
+        return H, H_data["L"], H_data["su"], H_data["diag"]
 
     # Mean of samples summed up during forward pass
     H /= H_data["count"]
@@ -446,6 +447,14 @@ def finalize_capture_H(H_data: dict, quant_args: dict):
     diag_mean = torch.diag(H).mean()
     idx = torch.arange(H.shape[0])
     H[idx, idx] += quant_args.get("sigma_reg", 0.025) * diag_mean
+
+    # Some tests
+    diag = H[idx, idx].clone()
+
+    if verbose:
+        print(f"     - H min/max: {H.min().item():.6f}   {H.max().item():.6f}")
+        print(f"     - H mean/std: {H.mean().item():.6f}   {H.std().item():.6f}")
+        print(f"     - H diag min/max: {diag.min():.6f}   {diag.max():.6f} ")
 
     # Random sign flips for input channel, fixed for the first linear layer to quantize with this H
     k = H.shape[0]
@@ -459,7 +468,7 @@ def finalize_capture_H(H_data: dict, quant_args: dict):
     blockwise_preapply_had_l_(H, had_k)
 
     # Get block LDL decomposition of H, zero diagonal
-    L, H = block_ldl(H, 16)
+    L, H = block_ldl(H, 16, verbose)
     dr = torch.arange(k)
     L[dr, dr] = 0
     H_data["L"] = L
@@ -469,7 +478,8 @@ def finalize_capture_H(H_data: dict, quant_args: dict):
     H_data["H"] = H.cpu()
 
     H_data["finalized"] = True
-    return H, L, su
+    H_data["diag"] = diag
+    return H, L, su, diag
 
 
 def pack_trellis(encoded: torch.Tensor, quant_args: dict) -> torch.Tensor:
@@ -564,12 +574,12 @@ def g_scale_gss(
         best_scale = (a + b) / 2
         if verbose:
             print(f"     - gss: min = {best_scale:.6f}, mse: {(f1 + f2) / 2:.6f}")
-        return best_scale
 
     devices = quant_args["devices"]
     for device in devices:
         torch.cuda.synchronize(device)
 
+    return best_scale, (f1 + f2) / 2
 
 
 def block_rms(x: torch.Tensor, dim: int, keepdim: bool = False, blocksize: int = 32):
@@ -617,6 +627,81 @@ def block_nmse(x: torch.Tensor, y: torch.Tensor, dim: int = 0, blocksize: int = 
     return diff_sq.item() / (sq.item() + 1e-20)
 
 
+def regularize(
+    weight: torch.Tensor,
+    su: torch.Tensor,
+    sv: torch.Tensor,
+    quant_args: dict,
+    verbose: bool,
+    H_diag: torch.Tensor,
+    pb: ProgressBar
+):
+    force_out_scales = quant_args["apply_out_scales"]
+
+    # dist_ref = torch.empty((512,), dtype = torch.float, device = weight.device)
+    # dist_r = torch.empty_like(dist_ref)
+    def jsd(h1, h2):
+        m = (h1 + h2) / 2
+        eps = 1e-12
+        js = F.kl_div((h1 + eps).log(), m, reduction = "sum") + \
+             F.kl_div((h2 + eps).log(), m, reduction = "sum")
+        return js / 2
+
+    # From experiments, it seems the deciding factor in when scaling output channels is beneficial is when
+    # the input to the linear layer is very irregular. After some testing, set the cutoff at 15% of the RMS sum
+    # on 2% of the channels
+    # TODO: More science
+    diag = H_diag.sqrt()
+    diag, _ = torch.sort(diag, descending = True)
+    cutoff = diag.shape[0] // 50
+    skew_factor = diag[:cutoff].sum() / diag.sum()
+    if verbose:
+        print(f"     - input state skew: {skew_factor.item():.6f}")
+
+    if force_out_scales is None:
+        apply_out_scales = skew_factor.item() < 0.15
+    else:
+        apply_out_scales = force_out_scales
+
+    # Apply output scales
+    if apply_out_scales:
+        out_channel_scales = block_rms(weight, dim = 0, keepdim = True)
+        out_channel_scales /= out_channel_scales.mean()
+        sv = (sv * out_channel_scales + 1e-10).float()
+        if verbose:
+            out_channel_std = out_channel_scales.std().item()
+            out_channel_mean = out_channel_scales.mean().item()
+            print(f"     - out ch scales std/mean: {out_channel_std:.6f}   {out_channel_mean:.6f}")
+
+    # Output sign flips (and scales)
+    weight /= sv
+
+    # Output hadamard transform
+    blockwise_preapply_had_r_(weight, had_n)
+
+    # Input sign flips and scales
+    in_channel_scales = block_rms(weight, dim = 1, keepdim = True)
+    su = (su * in_channel_scales / (-codebook_scale) + 1e-10).float()  # mustn't be inplace
+    weight /= su
+    blockwise_preapply_had_l_(weight, had_k)
+
+    # Determine best scale for matrix by test quantizing a sample of tiles along a wrapped diagonal
+    g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
+    weight *= g_scale
+    su /= g_scale
+
+    # ext.test_distribution(weight_os, dist_r, dist_ref, -3.8, 3.8)
+    # js_os = jsd(dist_r, dist_ref)
+
+    if verbose:
+        print(f"     - su/sv std: {su.std().item():.6f}   {sv.std().item():.6f}")
+        print(f"     - global scale: {g_scale:.6f}")
+        print(f"     - sample mse: {mse_scale.item():.6f}")
+        print(f"     - apply_out_scales: {str(apply_out_scales)}")
+
+    return apply_out_scales, weight, g_scale, su, sv
+
+
 def quantize_exl3(
     weight: torch.Tensor,
     H_data: dict,
@@ -632,7 +717,7 @@ def quantize_exl3(
 
     :param H_data:
         Dictionary of hessian tensor and related data, as collected by Linear wrapper class. May be reused between
-        linear layers (e.g. Q, K and V projections with the same input)
+        linear layers with the same input (e.g. Q, K and V projections)
 
     :param quant_args:
         dict:
@@ -659,8 +744,8 @@ def quantize_exl3(
           - quantized and packed tensors
     """
 
-    progress_text = None if not progress_str else progress_str.replace("<step>", "Scaling")
-    with ProgressBar(progress_text, 100) as pb:
+    progress_text = None if not progress_str else progress_str.replace("<step>", "Preparing")
+    with (ProgressBar(progress_text, 100) as pb):
 
         assert weight.dtype == torch.float
         tiles_k = weight.shape[0] // 16
@@ -671,14 +756,13 @@ def quantize_exl3(
         device = weight.device if swap_to_device is None else swap_to_device
         k, n = weight.shape
 
-        # Get H, LDL decomp. and input sign flips
-        H, L, su = finalize_capture_H(H_data, quant_args)
+        # Get H, LDL decomp. and input/output sign flips
+        H, L, su, H_diag = finalize_capture_H(H_data, quant_args, verbose)
+        sv = (torch.randn(n, device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
 
         # Move stored L to CPU (if not already), move working L to device
         H_data["L"] = H_data["L"].cpu()
         L = L.to(device)
-
-        codebook_scale = 1.24371088
 
         if swap_to_device is not None:
             weight = weight.to(swap_to_device)
@@ -689,41 +773,26 @@ def quantize_exl3(
 
         if verbose:
             rms = block_rms_n(weight_r, dim = 0)
-            print(f"     - input rms: {rms:.6f}")
+            print(f"     - input tensor rms: {rms:.6f}")
 
-        # Regularize output channels, then input channels with sign flips and scales. Output channel scales (sv)
-        # are normalized to keep the global scale of the matrix incorporated in the input channel scales (su).
-        # This reduces the risk of overflows during the GEMM and output hadamard transform in the linear layer.
-        out_channel_scales = block_rms(weight_r, dim = 0, keepdim = True)
-        out_channel_scales /= (out_channel_scales.abs() + 1e-10).mean()
-        sv = (torch.randn(n, device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
-        sv = (sv * out_channel_scales + 1e-10).float()
+        # Regularization
+        apply_out_scales, weight_r, g_scale, su, sv = regularize(
+            weight_r,
+            su,
+            sv,
+            quant_args,
+            verbose,
+            H_diag,
+            pb
+        )
 
-        weight_r /= sv
-        weight_r = preapply_had_r(weight_r, had_n)
-
-        in_channel_scales = block_rms(weight_r, dim = 1, keepdim = True)
-        su = (su * in_channel_scales / (-codebook_scale) + 1e-10).float()
-
-        weight_r /= su
-        weight_r = preapply_had_l(weight_r, had_k)
-
-        # At this point the overall distribution of weight_r should be roughly matched to the codebook, but we may
-        # still have too many outliers. For some tensors it is advantageous to dial in the global scale to keep
-        # this number below a small threshold.
-        g_scale = g_scale_gss(weight_r, verbose, quant_args, pb = pb)
+        if verbose:
+            rms = weight_r.square().mean().sqrt()
+            print(f"     - regularized rms:  {rms:.6f}")
 
         progress_text = None if not progress_str else progress_str.replace("<step>", "Quantizing")
         pb.update(0)
         pb.new_task(progress_text, tiles_k)
-
-        weight_r *= g_scale
-        su /= g_scale
-
-        if verbose:
-            rms = weight_r.square().mean().sqrt()
-            print(f"     - global scale: {g_scale:.6f}")
-            print(f"     - regularized rms:  {rms:.6f}")
 
         # Select device for work buffers (CPU is slower for small tensors but saves a lot of VRAM on big ones)
         # TODO: Use pynvml or mem_get_info to predict whether CPU buffer is needed
@@ -777,5 +846,10 @@ def quantize_exl3(
             "svh": svh,
             "trellis": trellis,
         }
+
+        quant_args.update({
+            "apply_out_scales": apply_out_scales,
+            "g_scale": g_scale,
+        })
 
     return weight_q, proxy_err, out_tensors
