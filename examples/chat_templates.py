@@ -138,6 +138,35 @@ class PromptFormat_phi(PromptFormat):
         ]
 
 
+class PromptFormat_glm(PromptFormat):
+    description = "ChatGLM(4) models"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages):
+        context = f"[gMASK]<sop><|system|>\n{system_prompt}"
+        for (u, a) in messages:
+            context += f"<|user|>\n{u}"
+            context += f"<|assistant|>\n"
+            if a is not None: context += f"{a}"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|user|>"),
+        ]
+
+
 class PromptFormat_mistral(PromptFormat):
     description = "Mistral-instruct models (v3)"
 
@@ -206,4 +235,5 @@ prompt_formats = {
     "phi": PromptFormat_phi,
     "mistral": PromptFormat_mistral,
     "gemma": PromptFormat_gemma,
+    "glm": PromptFormat_glm,
 }
