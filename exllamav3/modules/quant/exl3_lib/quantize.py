@@ -510,7 +510,7 @@ def g_scale_gss(
     for i in range(max(tiles_k, tiles_n)):
         for w in range(width):
             k = (i % tiles_k) * 16
-            n = ((i + width) % tiles_n) * 16
+            n = ((i + w) % tiles_n) * 16
             tile = weight_r[k : k + 16, n : n + 16].clone()
             tile = tile.view(256)
             tile = tile[tensor_core_perm(weight_r.device)]
@@ -543,8 +543,8 @@ def g_scale_gss(
         f1 = test_scale(x1)
         f2 = test_scale(x2)
         while abs(b - a) > tol:
-            if verbose:
-                print(f"     - gss: a = {a:.6f}, b = {b:.6f}")
+            # if verbose:
+                # print(f"     - gss: a = {a:.6f}, b = {b:.6f}")
             if f1 < f2:
                 b = x2
                 x2 = x1
@@ -558,12 +558,18 @@ def g_scale_gss(
                 x2 = b - resphi * (b - a)
                 f2 = test_scale(x2)
             delta2 = abs(b - a)
-            pb.update(100 - 100 * int(delta2 / delta1))
+            if pb:
+                pb.update(100 - 100 * int(delta2 / delta1))
 
         best_scale = (a + b) / 2
         if verbose:
             print(f"     - gss: min = {best_scale:.6f}, mse: {(f1 + f2) / 2:.6f}")
         return best_scale
+
+    devices = quant_args["devices"]
+    for device in devices:
+        torch.cuda.synchronize(device)
+
 
 
 def block_rms(x: torch.Tensor, dim: int, keepdim: bool = False, blocksize: int = 32):
