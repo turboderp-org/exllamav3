@@ -41,6 +41,9 @@ class Tokenizer:
         self.tokenizer_config_dict = maybe_read_json(self.path_tokenizer_config_json)
         self.added_tokens_dict = maybe_read_json(self.path_added_tokens_json)
 
+        # Disable truncation
+        self.tokenizer.no_truncation()
+
         # Deduce placeholders used for space and newline chars in raw vocabulary
         self.space_char_ = " "
         self.newline_char_ = "\n"
