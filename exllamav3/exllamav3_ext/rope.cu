@@ -72,35 +72,61 @@ void rope_kernel
             {
                 int iq = ((batch * seq_len + token_pos) * num_heads_q + head) * head_dim + t;
                 if (t < partial_head_dim / 2)
-                {
                     apply(q + iq, out_q + iq);
-                }
                 else
-                {
-                    iq += t;
-                    copy(q + iq, out_q + iq);
-                }
+                    copy(q + iq + t, out_q + iq + t);
             }
             else
             {
                 int khead = head - num_heads_q;
                 int ik = ((batch * seq_len + token_pos) * num_heads_k + khead) * head_dim + t;
                 if (t < partial_head_dim / 2)
-                {
                     apply(k + ik, out_k + ik);
-                }
                 else
-                {
-                    ik += t;
-                    copy(k + ik, out_k + ik);
-                }
+                    copy(k + ik + t, out_k + ik + t);
             }
             head += blockDim.y;
         }
     }
     else if constexpr (rope_mode == ROPESTYLE_GPTJ)
     {
-        // TODO: GPTJ
+        auto apply = [&] (const half* ptr, half* out_ptr)
+        {
+            float v1 = __half2float(ptr[0]);
+            float v2 = __half2float(ptr[1]);
+            float r1 = v1 * cos - v2 * sin;
+            float r2 = v2 * cos + v1 * sin;
+            out_ptr[0] = __float2half_rn(r1);
+            out_ptr[1] = __float2half_rn(r2);
+        };
+
+        auto copy = [&] (const half* ptr, half* out_ptr)
+        {
+            *((half2*) out_ptr) = *((half2*) ptr);
+        };
+
+        int head = threadIdx.y;
+        while (head < num_heads_q + num_heads_k)
+        {
+            if (head < num_heads_q)
+            {
+                int iq = ((batch * seq_len + token_pos) * num_heads_q + head) * head_dim + t * 2;
+                if (t < partial_head_dim / 2)
+                    apply(q + iq, out_q + iq);
+                else
+                    copy(q + iq, out_q + iq);
+            }
+            else
+            {
+                int khead = head - num_heads_q;
+                int ik = ((batch * seq_len + token_pos) * num_heads_k + khead) * head_dim + t * 2;
+                if (t < partial_head_dim / 2)
+                    apply(k + ik, out_k + ik);
+                else
+                    copy(k + ik, out_k + ik);
+            }
+            head += blockDim.y;
+        }
     }
 }
 
@@ -116,7 +142,7 @@ Apply position embeddings, works in-place
 - position: int, constant position offset (position ID of first token across batch)
 - positions: tensor of shape (bsz), (position ID of first token per seq), int, optional
 - position_ids: tensor of shape (bsz, seq_len), int, optional
-- rope_mode: ROPESTYLE_NEOX  TODO: ROPESTYLE_GPTJ
+- rope_mode: ROPESTYLE_NEOX
 - attn_factor: scale for sin/cos factors
 
 Either positions or position_ids overrides position
@@ -192,6 +218,6 @@ void rope
 
     #define ARGS q_ptr, out_q_ptr, k_ptr, out_k_ptr, inv_freq_ptr, bsz, seq_len, num_heads_q, num_heads_k, \
                  head_dim, partial_head_dim, position, positions_ptr, position_ids_ptr, attn_factor
-    if      (rope_mode == 1) rope_kernel<1><<<blocks, threads, 0, stream>>>(ARGS);
-    else if (rope_mode == 2) rope_kernel<2><<<blocks, threads, 0, stream>>>(ARGS);
+    if      (rope_mode == ROPESTYLE_GPTJ) rope_kernel<ROPESTYLE_GPTJ><<<blocks, threads, 0, stream>>>(ARGS);
+    else if (rope_mode == ROPESTYLE_NEOX) rope_kernel<ROPESTYLE_NEOX><<<blocks, threads, 0, stream>>>(ARGS);
 }

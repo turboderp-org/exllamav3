@@ -31,6 +31,12 @@ def _rotate_half(x):
     return torch.cat((-x2, x1), dim = -1)
 
 
+def _rotate_half_gptj(x):
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
 def _apply_rope_embed_qk(q, k, sin, cos):
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
@@ -212,7 +218,7 @@ class RoPE:
         position_ids: torch.Tensor | None = None,
         in_place = False,
     ):
-        # TODO: GPTJ?
+        # TODO: GPTJ, partial rotary factor
         if in_place:
             q_ = q
             k_ = k

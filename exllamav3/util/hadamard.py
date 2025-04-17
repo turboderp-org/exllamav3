@@ -131,7 +131,7 @@ def get_hadamard(n: int):
     return None
 
 @lru_cache(maxsize = 100)
-def get_hadamard_dt(n: int, device: torch.device, dtype: torch.dtype, scale = 1.0):
+def get_hadamard_dt(n: int, device: torch.device | str, dtype: torch.dtype, scale = 1.0):
     had = get_hadamard(n).to(device = device, dtype = dtype, copy = True)
     had *= scale
     return had
