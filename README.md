@@ -38,7 +38,7 @@ As for what is implemented, expect that some things may be a little broken at fi
 
 ### Installation
 
-Detailed installation instructions are coming soon, along with prebuilt wheels. For the time being, you can install the library with:
+Detailed installation instructions are coming soon, along with prebuilt wheels. For the time being, start by making sure you have the appropriate version of [PyTorch](https://pytorch.org/get-started/locally/) installed (CUDA 12.4 or later). Then:
 
 ```sh
 # Full installation
@@ -49,7 +49,7 @@ pip install .
 EXLLAMA_NOCOMPILE=1 pip install . 
 ```
 
-Note that the included scripts can run in JIT mode from the repo directory without installing the library.
+Note that the included scripts can run in JIT mode from the repo directory without installing the library. Until there are precompiled wheels you will also need the CUDA Toolkit installed. 
 
 ### Conversion
 
