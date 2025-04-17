@@ -329,3 +329,97 @@ void decode
             cols
         );
 }
+
+
+#define NUM_THREADS_TD 1024
+#define MAX_BINS 1024
+
+__global__ __launch_bounds__(NUM_THREADS_TD)
+void test_distribution_kernel
+(
+    const float* __restrict__ input_ptr,
+    float* __restrict__ dist_output_ptr,
+    float* __restrict__ ref_output_ptr,
+    uint64_t numel,
+    uint64_t num_bins,
+    float min_value,
+    float max_value
+)
+{
+    __shared__ int histogram[MAX_BINS];
+    auto reset_histogram = [&]()
+    {
+        for (int i = threadIdx.x; i < num_bins; i += NUM_THREADS_TD)
+            histogram[i] = 0;
+        __syncthreads();
+    };
+
+    auto write_histogram = [&](float* output_ptr, uint64_t sc)
+    {
+        float scf = (float) sc;
+        for (int i = threadIdx.x; i < num_bins; i += NUM_THREADS_TD)
+            output_ptr[i] = ((float) histogram[i]) / scf;
+        __syncthreads();
+    };
+
+    auto count = [&](float val)
+    {
+        val -= min_value;
+        val /= (max_value - min_value);
+        val *= (float) num_bins;
+        int idx = (int) val;
+        if (idx < 0) idx = 0;
+        if (idx > num_bins - 1) idx = num_bins - 1;
+        atomicAdd(&histogram[idx], 1);
+    };
+
+    reset_histogram();
+    for (uint64_t i = threadIdx.x; i < 65536; i += NUM_THREADS_TD)
+        count(decode_3inst_f((uint16_t) (i & 0xffff)));
+    __syncthreads();
+    write_histogram(ref_output_ptr, 65536);
+
+    reset_histogram();
+    for (uint64_t i = threadIdx.x; i < numel; i += NUM_THREADS_TD)
+        count(input_ptr[i]);
+    __syncthreads();
+    write_histogram(dist_output_ptr, numel);
+}
+
+/*
+Compare tensor distribution to codebook (not optimized)
+
+input: tensor, float, any shape
+dist_output: (empty) output histogram, float, shape (num_bins,)
+ref_output: (empty) output codebook histogram, float, shape (num_bins,)
+*/
+
+void test_distribution
+(
+    at::Tensor input,
+    at::Tensor dist_output,
+    at::Tensor ref_output,
+    float min_value,
+    float max_value
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(input, kFloat);
+
+    uint64_t numel = input.numel();
+    uint64_t num_bins = ref_output.numel();
+    TORCH_CHECK(num_bins <= MAX_BINS, "Too many bins");
+
+    test_distribution_kernel<<<1, NUM_THREADS_TD, 0, stream>>>
+    (
+        (const float*) input.data_ptr(),
+        (float*) dist_output.data_ptr(),
+        (float*) ref_output.data_ptr(),
+        numel,
+        num_bins,
+        min_value,
+        max_value
+    );
+}

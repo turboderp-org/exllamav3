@@ -17,3 +17,12 @@ void decode
     at::Tensor input_indices,
     at::Tensor output_tiles
 );
+
+void test_distribution
+(
+    at::Tensor input,
+    at::Tensor dist_output,
+    at::Tensor ref_output,
+    float min_value,
+    float max_value
+);

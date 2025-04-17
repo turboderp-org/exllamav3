@@ -34,6 +34,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("had_paley2", &had_paley2, "had_paley2");
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
+    m.def("test_distribution", &test_distribution, "test_distribution");
     m.def("decode", &decode, "decode");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
