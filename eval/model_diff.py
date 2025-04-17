@@ -70,6 +70,9 @@ def main(args):
         module_b.unload()
         free_mem()
 
+        if idx < args.keep_b:
+            state_a = state_b.clone()
+
         max_diff = 0
         rfn_error_sum = 0
         rows = state_a.shape[0]
@@ -91,5 +94,6 @@ if __name__ == "__main__":
     parser.add_argument("-ma", "--model_a", type = str, help = "Model A", required = True)
     parser.add_argument("-mb", "--model_b", type = str, help = "Model B", required = True)
     parser.add_argument("-r", "--rows", type = int, help = "Number of rows", default = 100)
+    parser.add_argument("-kb", "--keep_b", type = int, help = "Maintain B state for number of modules", default = 0)
     _args = parser.parse_args()
     main(_args)
