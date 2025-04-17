@@ -52,7 +52,7 @@ class RMSNorm(Module):
         x: torch.Tensor,
         params: dict,
         out_dtype: torch.dtype | None = None,
-    ) -> dict:
+    ) -> torch.Tensor:
         dtype = x.dtype
         x = x.float()
         var = x.pow(2).mean(dim = -1, keepdim = True) + self.rms_norm_eps
