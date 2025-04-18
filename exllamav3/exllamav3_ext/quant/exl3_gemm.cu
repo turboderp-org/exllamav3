@@ -102,7 +102,8 @@ bool launch
     int num_sms,
     const half* A_ptr,
     const uint16_t* B_ptr,
-    half* C_ptr,
+    void* C_ptr,
+    bool c_fp32,
     int size_m,
     int size_k,
     int size_n,
@@ -125,17 +126,17 @@ bool launch
     {
         constexpr int i = decltype(ic)::value;
         constexpr int i_b = i & 0x0f;
-        constexpr bool i_h = i & 0x10;
+        constexpr bool fp32 = i & 0x10;
 
-        if (K == i_b && (sv_ptr != nullptr) == i_h)
+        if (K == i_b && c_fp32 == fp32)
         {
             cudaFuncSetAttribute
             (
-                exl3_gemm_kernel<i_b, i_h, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>,
+                exl3_gemm_kernel<i_b, fp32, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 SMEM_MAX
             );
-            exl3_gemm_kernel<i_b, i_h, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
+            exl3_gemm_kernel<i_b, fp32, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
             <<<blocks, NUM_THREADS * TILESIZE_K / 16, SMEM_MAX, stream>>>
             (
                 A_ptr,
@@ -162,7 +163,7 @@ EXL3 matmul, A @ B -> C
 
 - A: row-major A tensor, shape (m, k), dtype float16, contiguous
 - B: EXL3-quantized B tensor, shape (k//16, n//16, 16*bits), dtype uint16
-- C: empty row-major C tensor, shape (m, n), dtype float16, contiguous. Does not need to be zero-initialized
+- C: empty row-major C tensor, shape (m, n), dtype float16 or float23, contiguous. Does not need to be zero-initialized
 - sv: optional, packed output sign flips, shape (n//16), dtype uint16
 
 If temp_A == A and su is not None, input transform is done in-place. EXL3 tensors quantized with the same H (e.g.
@@ -170,7 +171,7 @@ Q, K, V projections in normal transformer) will have the same input sign flips.
 
 limitations:
 - k % 16 == 0
-- k % 128 == 0
+- n % 128 == 0
 
 */
 int exl3_gemm
@@ -191,13 +192,15 @@ int exl3_gemm
     TORCH_CHECK_SHAPES(A, 0, C, 0, 1);
     TORCH_CHECK_DTYPE(A, kHalf);
     TORCH_CHECK_DTYPE(B, kShort);
-    TORCH_CHECK_DTYPE(C, kHalf);
+    bool c_fp32 = C.dtype() == at::kFloat;
+    if (!c_fp32) TORCH_CHECK_DTYPE(C, kHalf);
 
     // TODO: Input scale here to reduce Python overhead?
 
     // Get SV, optionally
     const uint16_t* sv_ptr = (const uint16_t*) OPTPTR(sv);
-    if (sv_ptr) TORCH_CHECK_SHAPES(sv.value(), 0, B, 1, 1);
+    if (sv_ptr) TORCH_CHECK(false, "sv_ptr is disabled");
+        // TORCH_CHECK_SHAPES(sv.value(), 0, B, 1, 1);
 
     // Device properties
     int device;
@@ -210,7 +213,7 @@ int exl3_gemm
     int bits = B.size(2) / 16;
     const half* A_ptr = (const half*) A.data_ptr();
     const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
-    half* C_ptr = (half*) C.data_ptr();
+    void* C_ptr = (void*) C.data_ptr();
     int size_m = A.size(0);
     int size_k = A.size(1);
     int size_n = B.size(1) * 16;
@@ -225,7 +228,7 @@ int exl3_gemm
         TORCH_CHECK(false, "exl3_gemm: no compatible kernel");
 
     bool launched;
-    #define ARGS bits, num_sms, A_ptr, B_ptr, C_ptr, size_m, size_k, size_n, locks, sv_ptr, stream
+    #define ARGS bits, num_sms, A_ptr, B_ptr, C_ptr, c_fp32, size_m, size_k, size_n, locks, sv_ptr, stream
     switch (selected_kernel)
     {
         //                         tsz_m   tsz_k   tsz_n  sh_st  fr_st  fuse_h

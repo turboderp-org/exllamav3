@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import to2
+from ...util import first_not_none
 
 class LinearFP16:
 
@@ -21,6 +22,7 @@ class LinearFP16:
         full_out_features: int | None = None,
         first_in_feature: int | None = None,
         first_out_feature: int | None = None,
+        out_dtype: torch.dtype | None = None
     ):
         if weight.dtype == torch.float: weight = weight.to(torch.half)
         if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
@@ -33,6 +35,7 @@ class LinearFP16:
         self.full_out_features = full_out_features
         self.first_in_feature = first_in_feature
         self.first_out_feature = first_out_feature
+        self.out_dtype = out_dtype
 
         if self.weight.shape[0] == full_in_features and self.weight.shape[0] != in_features:
             self.weight = self.weight[first_in_feature : first_in_feature + in_features, :]
@@ -63,12 +66,16 @@ class LinearFP16:
     ) -> torch.Tensor:
         bsz, seqlen, dim = x.shape
         x = x.view(-1, x.shape[-1])
-        y = torch.zeros((x.shape[0], self.out_features), dtype = torch.half, device = x.device)
+        y = torch.zeros(
+            (x.shape[0], self.out_features),
+            dtype = first_not_none(out_dtype, self.out_dtype, torch.half),
+            device = x.device
+        )
         ext.hgemm(x, self.weight, y)
         if self.bias is not None:
             y += self.bias
         y = y.view(bsz, seqlen, self.out_features)
-        return to2(y, out_dtype)
+        return y
 
     def get_weight_tensor(self) -> torch.Tensor:
         return self.weight

@@ -33,6 +33,7 @@ class Linear(Module):
         full_out_features: int | None = None,
         first_in_feature: int | None = None,
         first_out_feature: int | None = None,
+        out_dtype: torch.dtype | None = None
     ):
         super().__init__(config, key, qmap)
 
@@ -51,6 +52,7 @@ class Linear(Module):
         self.quant_type = None
         self.softcap = softcap
         self.is_sliced = in_features != full_in_features or out_features != full_out_features
+        self.out_dtype = out_dtype
 
         if caps is not None:
             self.caps.update(caps)
@@ -88,6 +90,7 @@ class Linear(Module):
                 self.full_out_features,
                 self.first_in_feature,
                 self.first_out_feature,
+                self.out_dtype
             )
             if self.is_sliced:
                 self.inner.swap_device = self.device
@@ -105,7 +108,13 @@ class Linear(Module):
             bias = self.pad_out(bias)
             if bias is not None:
                 bias = bias[self.frange[0] : self.frange[1]].contiguous()
-            self.inner = LinearFP16(self.in_features, self.out_features, weight, bias)
+            self.inner = LinearFP16(
+                self.in_features,
+                self.out_features,
+                weight,
+                bias,
+                out_dtype = self.out_dtype
+            )
             self.quant_type = "fp16"
             return True
         return False
@@ -139,6 +148,7 @@ class Linear(Module):
             svh,
             trellis,
             bias,
+            self.out_dtype
         )
         self.quant_type = "exl3"
         return True
@@ -206,7 +216,8 @@ class Linear(Module):
             out_tensors.get("suh"),
             out_tensors.get("svh"),
             out_tensors.get("trellis"),
-            orig_bias
+            orig_bias,
+            self.out_dtype
         )
 
         if return_weight_q:

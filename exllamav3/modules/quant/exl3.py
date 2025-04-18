@@ -2,6 +2,7 @@ from __future__ import annotations
 import torch
 from ...models.config import Config
 from ...util.tensor import to2
+from ...util import first_not_none
 import math
 from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n, tensor_core_perm, tensor_core_perm_i
 from ...ext import exllamav3_ext as ext
@@ -20,6 +21,7 @@ class LinearEXL3:
         svh: torch.Tensor | None = None,
         trellis: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
+        out_dtype: torch.dtype | None = None
     ):
         assert scale is None, "scale is no longer used"
         assert su is not None or suh is not None, "either su (packed) or suh (unpacked) is required"
@@ -35,16 +37,17 @@ class LinearEXL3:
         if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
 
         # self.scale = scale.item()
-        self.su = su
-        self.sv = sv
-        self.suh = suh
-        self.svh = svh
+        self.su = None
+        self.sv = None
+        self.suh = suh if suh is not None else self.unpack_bf(su)
+        self.svh = svh if svh is not None else self.unpack_bf(sv)
         self.trellis = trellis
         self.K = trellis.shape[-1] // 16
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
         self.swap_device = None
+        self.out_dtype = out_dtype
 
 
     def get_tensors(self, key: str):
@@ -75,34 +78,31 @@ class LinearEXL3:
         xh = torch.empty_like(x)
         ext.had_r_128(x, xh, self.suh, None, 1.0)
 
+        y = torch.empty(
+            (x.shape[0], self.out_features),
+            dtype = first_not_none(out_dtype, self.out_dtype, torch.half),
+            device = x.device
+        )
+
         if torch_mode:
-            y = torch.empty((x.shape[0], self.out_features), dtype = torch.half, device = x.device)
             w = self.get_inner_weight_tensor()
             ext.hgemm(xh, w, y)
-            ext.had_r_128(y, y, None, self.sv, 1.0)
-            if self.sv is None:
-                # TODO: Fuse out scales into had kernel
-                y *= self.svh
+            ext.had_r_128(y, y, None, self.svh, 1.0)
         else:
-            y = torch.empty((x.shape[0], self.out_features), dtype = torch.half, device = x.device)
-            ext.exl3_gemm(xh, self.trellis, y, self.sv, -1)
-            # ext.exl3_gemm(xh, self.trellis, y, None, -1)
-            if self.sv is None:
-                # TODO: Fuse out scales into GEMM kernel
-                ext.had_r_128(y, y, None, None, 1.0)
-                y *= self.svh
+            ext.exl3_gemm(xh, self.trellis, y, None, -1)
+            # TODO: Fuse out scales and had into GEMM kernel
+            ext.had_r_128(y, y, None, self.svh, 1.0)
 
         x = y.view(out_shape)
 
         if self.bias is not None:
-            x = x.to(self.bias.dtype)
             x += self.bias
 
-        return to2(x, out_dtype, input_dtype)
+        return x
 
 
     def unpack_bf(self, bitfield: torch.Tensor):
-        # TODO: Maybe custom kernel for this. Only used for full reconstruct though, not during inference
+        # TODO: Maybe custom kernel for this. Only used for full reconstruct and loading old models, not during inference
         bitfield = bitfield.view(torch.uint16).to(torch.int)
         masks = (1 << torch.arange(16)).to(bitfield.device)
         expanded = (bitfield.unsqueeze(-1) & masks) > 0

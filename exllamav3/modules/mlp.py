@@ -65,10 +65,12 @@ class GatedMLP(Module):
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
         intermediate_split_size: int | None = MAX_MLP_INTERMEDIATE,
+        interm_dtype: torch.dtype = None,
     ):
         super().__init__(config, key, None)
 
         self.out_dtype = out_dtype
+        self.interm_dtype = interm_dtype
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
 
@@ -127,6 +129,7 @@ class GatedMLP(Module):
                 fkey = fkey,
                 frange = frange_gate,
                 alt_key = a_key_g,
+                out_dtype = self.interm_dtype
             )
             up = Linear(
                 config = config,
@@ -141,6 +144,7 @@ class GatedMLP(Module):
                 fkey = fkey,
                 frange = frange_up,
                 alt_key = a_key_u,
+                out_dtype = self.interm_dtype
             )
             down = Linear(
                 config = config,
@@ -153,6 +157,7 @@ class GatedMLP(Module):
                 first_out_feature = 0,
                 qmap = qmap + ".down",
                 alt_key = a_key_d,
+                out_dtype = self.out_dtype
             )
 
             self.ups.append(up)

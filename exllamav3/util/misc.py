@@ -63,3 +63,7 @@ def human_time(seconds: float) -> str:
         return f"{minutes} minute{ms}"
     else:
         return f"< 1 minute"
+
+
+def first_not_none(*values):
+    return next((v for v in values if v is not None), None)

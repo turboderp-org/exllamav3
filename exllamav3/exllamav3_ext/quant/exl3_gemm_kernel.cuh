@@ -1,8 +1,12 @@
 
+// Disable for now
+const bool output_had = false;
+
 template
 <
     int bits,
-    bool output_had,
+//    bool output_had,
+    bool c_fp32,
     int TILESIZE_M,
     int TILESIZE_K,
     int TILESIZE_N,
@@ -14,7 +18,7 @@ void exl3_gemm_kernel
 (
     const half* __restrict__  A,
     const uint16_t* __restrict__ B,
-    half* __restrict__ C,
+    void* __restrict__ C,
     int size_m,
     int size_k,
     int size_n,
@@ -173,7 +177,9 @@ void exl3_gemm_kernel
 
     int gl_c_stride_n = TILESIZE_N;
     int gl_c_stride_m = TILESIZE_M * size_n;
-    half* gl_c_ptr = C + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
+
+    half* gl_c_ptr_16 = ((half*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
+    float* gl_c_ptr_32 = ((float*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
 
     register FragA frag_a[FRAG_STAGES][FRAGS_M];
     register FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
@@ -189,7 +195,10 @@ void exl3_gemm_kernel
             slice2_k = 0;
             slice2_k0 = 0;
             slice2_n++;
-            gl_c_ptr += gl_c_stride_n;
+            if constexpr (c_fp32)
+                gl_c_ptr_32 += gl_c_stride_n;
+            else
+                gl_c_ptr_16 += gl_c_stride_n;
         }
     };
 
@@ -339,6 +348,7 @@ void exl3_gemm_kernel
     // Output hadamard transform
     auto apply_output_had = [&] ()
     {
+    /*
         auto shuffle_had_fx32 = [&](float v)
         {
             for (int i = 1; i < 32; i <<= 1)
@@ -405,6 +415,7 @@ void exl3_gemm_kernel
             // Advance
             tile_idx += tile_stride;
         }
+        */
     };
 
     // Output reduction
@@ -439,17 +450,35 @@ void exl3_gemm_kernel
                     int c = (lane_id % 4) * 2;
                     if (r0 < max_m)
                     {
-                        half2* c_ptr = (half2*) (gl_c_ptr + r0 * size_n + (n0 + n) * 8 + c);
-                        float2 interm = __half22float2(*c_ptr);
-                        frag_c[m][n][0] += interm.x;
-                        frag_c[m][n][1] += interm.y;
+                        if constexpr (c_fp32)
+                        {
+                            float* c_ptr = gl_c_ptr_32 + r0 * size_n + (n0 + n) * 8 + c;
+                            frag_c[m][n][0] += *c_ptr++;
+                            frag_c[m][n][1] += *c_ptr++;
+                        }
+                        else
+                        {
+                            half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n + (n0 + n) * 8 + c);
+                            float2 interm = __half22float2(*c_ptr);
+                            frag_c[m][n][0] += interm.x;
+                            frag_c[m][n][1] += interm.y;
+                        }
                     }
                     if (r1 < max_m)
                     {
-                        half2* c_ptr = (half2*) (gl_c_ptr + r1 * size_n + (n0 + n) * 8 + c);
-                        float2 interm = __half22float2(*c_ptr);
-                        frag_c[m][n][2] += interm.x;
-                        frag_c[m][n][3] += interm.y;
+                        if constexpr (c_fp32)
+                        {
+                            float* c_ptr = gl_c_ptr_32 + r1 * size_n + (n0 + n) * 8 + c;
+                            frag_c[m][n][2] += *c_ptr++;
+                            frag_c[m][n][3] += *c_ptr++;
+                        }
+                        else
+                        {
+                            half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n + (n0 + n) * 8 + c);
+                            float2 interm = __half22float2(*c_ptr);
+                            frag_c[m][n][2] += interm.x;
+                            frag_c[m][n][3] += interm.y;
+                        }
                     }
                 }
             }
@@ -467,21 +496,39 @@ void exl3_gemm_kernel
                     int c = (lane_id % 4) * 2;
                     if (r0 < max_m)
                     {
-                        half2* c_ptr = (half2*) (gl_c_ptr + r0 * size_n + (n0 + n) * 8 + c);
-                        half2 sum = __floats2half2_rn(frag_c[m][n][0], frag_c[m][n][1]);
-                        *c_ptr = sum;
+                        if constexpr (c_fp32)
+                        {
+                            float* c_ptr = gl_c_ptr_32 + r0 * size_n + (n0 + n) * 8 + c;
+                            *c_ptr++ = frag_c[m][n][0];
+                            *c_ptr++ = frag_c[m][n][1];
+                        }
+                        else
+                        {
+                            half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n + (n0 + n) * 8 + c);
+                            half2 sum = __floats2half2_rn(frag_c[m][n][0], frag_c[m][n][1]);
+                            *c_ptr = sum;
+                        }
                     }
                     if (r1 < max_m)
                     {
-                        half2* c_ptr = (half2*) (gl_c_ptr + r1 * size_n + (n0 + n) * 8 + c);
-                        half2 sum = __floats2half2_rn(frag_c[m][n][2], frag_c[m][n][3]);
-                        *c_ptr = sum;
+                        if constexpr (c_fp32)
+                        {
+                            float* c_ptr = gl_c_ptr_32 + r1 * size_n + (n0 + n) * 8 + c;
+                            *c_ptr++ = frag_c[m][n][2];
+                            *c_ptr++ = frag_c[m][n][3];
+                        }
+                        else
+                        {
+                            half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n + (n0 + n) * 8 + c);
+                            half2 sum = __floats2half2_rn(frag_c[m][n][2], frag_c[m][n][3]);
+                            *c_ptr = sum;
+                        }
                     }
                 }
             }
         }
 
-        // Last block writes in row-major format and performs output hadamard transform
+        // Last block writes in row-major format
         if (!sub_k && last)
         {
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
@@ -493,15 +540,33 @@ void exl3_gemm_kernel
                     int c = (lane_id % 4) * 2;
                     if (r0 < max_m)
                     {
-                        half2* c_ptr = (half2*) (gl_c_ptr + r0 * size_n + (n0 + n) * 8 + c);
-                        half2 sum = __floats2half2_rn(frag_c[m][n][0], frag_c[m][n][1]);
-                        *c_ptr = sum;
+                        if constexpr (c_fp32)
+                        {
+                            float* c_ptr = gl_c_ptr_32 + r0 * size_n + (n0 + n) * 8 + c;
+                            *c_ptr++ = frag_c[m][n][0];
+                            *c_ptr++ = frag_c[m][n][1];
+                        }
+                        else
+                        {
+                            half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n + (n0 + n) * 8 + c);
+                            half2 sum = __floats2half2_rn(frag_c[m][n][0], frag_c[m][n][1]);
+                            *c_ptr = sum;
+                        }
                     }
                     if (r1 < max_m)
                     {
-                        half2* c_ptr = (half2*) (gl_c_ptr + r1 * size_n + (n0 + n) * 8 + c);
-                        half2 sum = __floats2half2_rn(frag_c[m][n][2], frag_c[m][n][3]);
-                        *c_ptr = sum;
+                        if constexpr (c_fp32)
+                        {
+                            float* c_ptr = gl_c_ptr_32 + r1 * size_n + (n0 + n) * 8 + c;
+                            *c_ptr++ = frag_c[m][n][2];
+                            *c_ptr++ = frag_c[m][n][3];
+                        }
+                        else
+                        {
+                            half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n + (n0 + n) * 8 + c);
+                            half2 sum = __floats2half2_rn(frag_c[m][n][2], frag_c[m][n][3]);
+                            *c_ptr = sum;
+                        }
                     }
                 }
             }
