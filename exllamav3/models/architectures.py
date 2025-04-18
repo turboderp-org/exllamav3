@@ -5,6 +5,7 @@ from .qwen2 import Qwen2Config, Qwen2Model
 from .phi3 import Phi3Config, Phi3Model
 from .gemma import Gemma2Config, Gemma2Model
 from .decilm import DeciLMConfig, DeciLMModel
+from .glm4 import Glm4Config, Glm4Model
 
 ARCHITECTURES = {
     "LlamaForCausalLM": {
@@ -36,6 +37,11 @@ ARCHITECTURES = {
         "architecture": "DeciLMForCausalLM",
         "config_class": DeciLMConfig,
         "model_class": DeciLMModel,
+    },
+    "Glm4ForCausalLM": {
+        "architecture": "Glm4ForCausalLM",
+        "config_class": Glm4Config,
+        "model_class": Glm4Model,
     },
 }
 
