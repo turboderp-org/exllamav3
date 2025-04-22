@@ -16,6 +16,7 @@ class CacheLayer(ABC):
         config: Config,
         attention: Attention,
         max_num_tokens: int,
+        **kwargs
     ):
         self.config = config
         self.attention = attention
@@ -30,7 +31,18 @@ class CacheLayer(ABC):
         pass
 
     @abstractmethod
-    def get_kv(self):
+    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor) -> tuple:
+        pass
+
+    @abstractmethod
+    def update_kv(
+        self,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int
+    ):
         pass
 
     @abstractmethod
@@ -45,6 +57,7 @@ class Cache:
         model: Model,
         max_num_tokens: int,
         layer_type: Type[CacheLayer] | None = None,
+        **kwargs
     ):
         """
         Create cache for model
@@ -71,7 +84,7 @@ class Cache:
 
         self.num_layers = len(self.model.get_cache_layers())
         self.layers = [
-            self.layer_type(self.config, attn, self.max_num_tokens)
+            self.layer_type(self.config, attn, self.max_num_tokens, **kwargs)
             for attn in self.model.get_cache_layers()
         ]
         self.attach_to_model()
@@ -107,8 +120,20 @@ class Cache:
             module.cache_layers.remove(layer)
 
 
-    def get_layer(self, idx: int) -> tuple:
-        return self.layers[idx].get_kv()
+    def get_layer(self, idx: int, cache_seqlens: torch.Tensor, block_table: torch.Tensor) -> tuple:
+        return self.layers[idx].get_kv(cache_seqlens, block_table)
+
+
+    def update_layer(
+        self,
+        idx: int,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int
+    ):
+        return self.layers[idx].update_kv(cache_seqlens, block_table, k, v, length)
 
 
     def copy_page(

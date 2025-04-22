@@ -1,4 +1,5 @@
 from . import Model, Config, Cache, Tokenizer
+from .cache import CacheLayer_fp16, CacheLayer_quant
 from argparse import ArgumentParser
 import torch
 
@@ -20,6 +21,7 @@ def add_args(
 
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = "Total cache size in tokens, default: 8192", default = 8192)
+        parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
 
     # TODO:
     # parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load in tensor-parallel mode")
@@ -69,7 +71,30 @@ def init(
     model = Model.from_config(config)
 
     # Cache
-    cache = Cache(model, max_num_tokens = args.cache_size) if "cache_size" in vars(args) else None
+    if "cache_size" in vars(args):
+        if args.cache_quant is not None:
+            split = [int(bits) for bits in args.cache_quant.split(",")]
+            if len(split) == 1:
+                k_bits = v_bits = split[0]
+            elif len(split) == 2:
+                k_bits, v_bits = tuple(split)
+            else:
+                raise ValueError("Specify either one or two bitrates for cache quantization")
+            cache = Cache(
+                model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_quant,
+                k_bits = k_bits,
+                v_bits = v_bits
+            )
+        else:
+            cache = Cache(
+                model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_fp16
+            )
+    else:
+        cache = None
 
     # Split
     if args.gpu_split is None or args.gpu_split == "auto":

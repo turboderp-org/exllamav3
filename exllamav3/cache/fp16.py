@@ -47,16 +47,24 @@ class CacheLayer_fp16(CacheLayer):
 
 
     @override
-    def get_kv(self):
+    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor) -> tuple:
         return self.k, self.v
+
+
+    @override
+    def update_kv(
+        self,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int
+    ):
+        pass
 
 
     @override
     def copy_page(self, source: CacheLayer_fp16, from_page: int, to_page: int, num_tokens: int):
         assert self.shape == source.shape
-        kd = self.k[to_page, :num_tokens, :, :]
-        vd = self.v[to_page, :num_tokens, :, :]
-        ks = source.k[from_page, :num_tokens, :, :]
-        vs = source.v[from_page, :num_tokens, :, :]
-        kd.copy_(ks, non_blocking = True)
-        vd.copy_(vs, non_blocking = True)
+        self.k[to_page, :num_tokens, :, :].copy_(source.k[from_page, :num_tokens, :, :], non_blocking = True)
+        self.v[to_page, :num_tokens, :, :].copy_(source.v[from_page, :num_tokens, :, :], non_blocking = True)

@@ -348,7 +348,7 @@ class Attention(Module):
 
         q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
 
-        cache_k, cache_v = cache.get_layer(self.layer_idx)
+        cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
         o = flash_attn_with_kvcache(
             q = q,
             k = k,
@@ -362,6 +362,7 @@ class Attention(Module):
             window_size = (self.sliding_window, self.sliding_window),
             softcap = self.logit_softcapping
         )
+        cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
 
         # TODO: Store updated cache layer
