@@ -68,12 +68,19 @@ class Cache:
             deleting the reference to the model, use detach_from_model
 
         :param layer_type:
-            Cache layer class, one of CacheLayer_fp16, CacheLayer_q4, CacheLayer_q6 etc.
+            Cache layer class, CacheLayer_fp16 or CacheLayer_quant
 
         :param max_num_tokens:
             Max number of total tokens in the cache. Must be a multiple of the page size (256). For use with the
             dynamic generator, this is the total number of tokens that can be allocated across concurrent jobs. For
             batched inference, seq_len * batch_size <= max_num_tokens
+
+        :param k_bits:
+            If layer_type == CacheLayer_quant, bits per element of the quantized keys tensor
+
+        :param v_bits:
+            If layer_type == CacheLayer_quant, bits per element of the quantized values tensor
+
         """
         self.model = model
         self.config = model.config
