@@ -13,7 +13,7 @@ applications the built-in generator offers more flexibility, though.
 """
 
 # Load model
-config = Config.from_directory("/mnt/str/eval_models/llama3.1-8b-instruct/exl3/2.0bpw/")
+config = Config.from_directory("/mnt/str/models/llama3.1-8b-instruct/exl3/4.0bpw/")
 model = Model.from_config(config)
 cache = Cache(model, max_num_tokens = 2048)
 model.load()
@@ -78,7 +78,7 @@ with Timer() as t:
             break
 
         # Append sampled token to context
-        context_ids = torch.cat((context_ids, sample), dim = -1)
+        context_ids = torch.cat((context_ids, sample.cpu()), dim = -1)
         token = vocab[token_id]
         response += token
         generated_tokens += 1
