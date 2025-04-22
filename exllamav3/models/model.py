@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Callable
 
 import torch
 import torch.nn.functional as F
@@ -102,6 +103,8 @@ class Model:
         max_chunk_size: int,
         max_output_size: int,
         max_output_factor: int,
+        callback_sync: Callable[[int, int], None],
+        generator: bool
     ):
         current_device_i = 0
         backup_shape = (1, max_chunk_size)
@@ -113,6 +116,9 @@ class Model:
         with ProgressBar(f"Loading" if progressbar else None, len(self.modules)) as progress:
 
             for idx, module in enumerate(self.modules):
+
+                if callback_sync: callback_sync(idx, len(self.modules))
+                if generator: yield idx, len(self.modules)
 
                 # Narrow state to max_output_size for logit output layer
                 is_logits_layer = module.caps.get("logits_output")
@@ -188,13 +194,19 @@ class Model:
                     # On to next module
                     break
 
+            if callback_sync: callback_sync(len(self.modules), len(self.modules))
+            if generator: yield len(self.modules), len(self.modules)
+
             dummy_state = None
             unset_memory_fraction(touched_devices)
             free_mem()
 
+        # Python will not run anything in an async function without at least one yield statement
+        if 'yield' in locals():
+            yield
 
-    @torch.inference_mode
-    def load(
+
+    def load_gen(
         self,
         device: torch.device | str | int | None = None,
         reserve_per_device: list[float] | float | None = None,
@@ -204,9 +216,11 @@ class Model:
         max_chunk_size: int = 2048,
         max_output_size: int = 32,
         max_output_factor: int = 1,
+        callback: Callable[[int, int], None] | None = None,
+        generator: bool = True
     ):
         """
-        Load model
+        Load model, generator function. For regular function, call load() with the same arguments
 
         :param device:
             (optional) If specified, load to single device, e.g. "cuda:0"
@@ -257,6 +271,13 @@ class Model:
 
         :param progressbar:
             Show rich progressbar while loading
+
+        :param callback:
+            If provided, called with (current_module, num_modules) for every module loaded. Don't specify a
+            callback function when using the
+
+        :param generator:
+            Always true when using the _gen function directly
         """
 
         free_mem()
@@ -310,7 +331,7 @@ class Model:
                     if x > 0
                 ]
 
-            self._load_autosplit(
+            yield from self._load_autosplit(
                 progressbar,
                 reserve_per_device,
                 use_per_device,
@@ -318,6 +339,8 @@ class Model:
                 max_chunk_size,
                 max_output_size,
                 max_output_factor,
+                callback,
+                generator
             )
 
         # Tensor-p load
@@ -325,6 +348,17 @@ class Model:
             raise NotImplementedError()
 
         self.config.stc.close()
+
+
+    @torch.inference_mode
+    def load(self, *args, **kwargs):
+        """
+        Load as a regular function, see arguments for load_gen().
+        """
+
+        kwargs["generator"] = False
+        f = self.load_gen(*args, **kwargs)
+        for _ in f: pass
 
 
     def get_load_metrics(self):
