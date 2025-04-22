@@ -65,6 +65,7 @@ class MarkdownConsoleStream:
         c, r = shutil.get_terminal_size(fallback = (80, 24))
         c -= 2
         self.console = console or Console(emoji_variant = "text", width = c)
+        self.width, self.height = self.console.size
         self._last_lines = []
 
     def __enter__(self):
@@ -77,6 +78,7 @@ class MarkdownConsoleStream:
         new_lines = self._render_to_lines(markdown_text)
         old_lines = self._last_lines
         prefix_length = self._common_prefix_length(old_lines, new_lines)
+        prefix_length = max(prefix_length, len(old_lines) - self.height, len(new_lines) - self.height)
         old_suffix_len = len(old_lines) - prefix_length
         new_suffix_len = len(new_lines) - prefix_length
         if old_suffix_len > 0:
