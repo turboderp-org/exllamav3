@@ -118,6 +118,14 @@ void quant_cache_cont_kernel
     quant_block<bits>(in, out, out_scales);
 }
 
+#define __(i) quant_cache_cont_kernel<i>
+constexpr auto quant_cache_cont_kernel_instances = std::array
+{
+    __(2), __(3), __(4), __(5), __(6), __(7), __(8)
+};
+#undef __
+
+
 template <int bits>
 __global__ __launch_bounds__(32)
 void dequant_cache_cont_kernel
@@ -132,6 +140,14 @@ void dequant_cache_cont_kernel
     out += 32 * blockIdx.x;
     dequant_block<bits>(in, in_scales, out);
 }
+
+#define __(i) dequant_cache_cont_kernel<i>
+constexpr auto dequant_cache_cont_kernel_instances = std::array
+{
+    __(2), __(3), __(4), __(5), __(6), __(7), __(8)
+};
+#undef __
+
 
 template <int k_bits, int v_bits>
 __global__ __launch_bounds__(1024)
@@ -159,6 +175,20 @@ void quant_cache_paged_kernel
     quant_block<k_bits>(k_in + sub_pos * 32, k_out + sub_pos * k_bits, k_out_scales + sub_pos);
     quant_block<v_bits>(v_in + sub_pos * 32, v_out + sub_pos * v_bits, v_out_scales + sub_pos);
 }
+
+#define __(i, j) quant_cache_paged_kernel<i, j>
+constexpr auto quant_cache_paged_kernel_instances = std::array
+{
+    std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
+    std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },
+    std::array{ __(4, 2), __(4, 3), __(4, 4), __(4, 5), __(4, 6), __(4, 7), __(4, 8) },
+    std::array{ __(5, 2), __(5, 3), __(5, 4), __(5, 5), __(5, 6), __(5, 7), __(5, 8) },
+    std::array{ __(6, 2), __(6, 3), __(6, 4), __(6, 5), __(6, 6), __(6, 7), __(6, 8) },
+    std::array{ __(7, 2), __(7, 3), __(7, 4), __(7, 5), __(7, 6), __(7, 7), __(7, 8) },
+    std::array{ __(8, 2), __(8, 3), __(8, 4), __(8, 5), __(8, 6), __(8, 7), __(8, 8) }
+};
+#undef __
+
 
 template <int k_bits, int v_bits>
 __global__ __launch_bounds__(1024)
@@ -190,3 +220,16 @@ void dequant_cache_paged_kernel
     dequant_block<k_bits>(k_in + addr * k_bits, k_in_scales + addr, k_out + addr * 32);
     dequant_block<v_bits>(v_in + addr * v_bits, v_in_scales + addr, v_out + addr * 32);
 }
+
+#define __(i, j) dequant_cache_paged_kernel<i, j>
+constexpr auto dequant_cache_paged_kernel_instances = std::array
+{
+    std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
+    std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },
+    std::array{ __(4, 2), __(4, 3), __(4, 4), __(4, 5), __(4, 6), __(4, 7), __(4, 8) },
+    std::array{ __(5, 2), __(5, 3), __(5, 4), __(5, 5), __(5, 6), __(5, 7), __(5, 8) },
+    std::array{ __(6, 2), __(6, 3), __(6, 4), __(6, 5), __(6, 6), __(6, 7), __(6, 8) },
+    std::array{ __(7, 2), __(7, 3), __(7, 4), __(7, 5), __(7, 6), __(7, 7), __(7, 8) },
+    std::array{ __(8, 2), __(8, 3), __(8, 4), __(8, 5), __(8, 6), __(8, 7), __(8, 8) }
+};
+#undef __

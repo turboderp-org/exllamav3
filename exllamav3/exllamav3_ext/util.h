@@ -109,8 +109,23 @@ static_for_pack<2, 3, 4, 6, 8>([&](auto ic)
     if (kernel_arg == i)
         launch_kernel_instance<i><<< ... >>>( ... )
 });
+
+// Ultimately much cleaner
+#define __(i, j) quant_cache_paged_kernel<i, j>
+constexpr auto quant_cache_paged_kernel_instances = std::array
+{
+    std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
+    std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },
+    std::array{ __(4, 2), __(4, 3), __(4, 4), __(4, 5), __(4, 6), __(4, 7), __(4, 8) },
+    std::array{ __(5, 2), __(5, 3), __(5, 4), __(5, 5), __(5, 6), __(5, 7), __(5, 8) },
+    std::array{ __(6, 2), __(6, 3), __(6, 4), __(6, 5), __(6, 6), __(6, 7), __(6, 8) },
+    std::array{ __(7, 2), __(7, 3), __(7, 4), __(7, 5), __(7, 6), __(7, 7), __(7, 8) },
+    std::array{ __(8, 2), __(8, 3), __(8, 4), __(8, 5), __(8, 6), __(8, 7), __(8, 8) }
+};
+#undef __
 */
 
+// This breaks with nesting on VC++ older than 17.13 (late 2024 preview)
 template <int... Values, class F>
 constexpr void static_for_pack(F&& f)
 {

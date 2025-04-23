@@ -37,21 +37,14 @@ void quant_cache_cont
     TORCH_CHECK(out.numel() == bsz * bits, "out is wrong size");
     TORCH_CHECK(out_scales.numel() == bsz, "out_scales is wrong size");
 
-    TORCH_CHECK(2 <= bits && bits <= 8, "Unsupported K/V cache bitrate");
+    TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
 
-    static_for_pack<2,3,4,5,6,7,8>([&](auto ic)
-    {
-        constexpr int i = decltype(ic)::value;
-        if (bits == i)
-        {
-            quant_cache_cont_kernel<i><<<bsz, 32, 0, stream>>>
-            (
-                (const half*) in.data_ptr(),
-                (uint32_t*) out.data_ptr(),
-                (half*) out_scales.data_ptr()
-            );
-        }
-    });
+    quant_cache_cont_kernel_instances[bits - 2]<<<bsz, 32, 0, stream>>>
+    (
+        (const half*) in.data_ptr(),
+        (uint32_t*) out.data_ptr(),
+        (half*) out_scales.data_ptr()
+    );
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -84,21 +77,14 @@ void dequant_cache_cont
     TORCH_CHECK(in.numel() == bsz * bits, "in is wrong size");
     TORCH_CHECK(in_scales.numel() == bsz, "in_scales is wrong size");
 
-    TORCH_CHECK(2 <= bits && bits <= 8, "Unsupported K/V cache bitrate");
+    TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
 
-    static_for_pack<2,3,4,5,6,7,8>([&](auto ic)
-    {
-        constexpr int i = decltype(ic)::value;
-        if (bits == i)
-        {
-            dequant_cache_cont_kernel<i><<<bsz, 32, 0, stream>>>
-            (
-                (const uint32_t*) in.data_ptr(),
-                (const half*) in_scales.data_ptr(),
-                (half*) out.data_ptr()
-            );
-        }
-    });
+    dequant_cache_cont_kernel_instances[bits - 2]<<<bsz, 32, 0, stream>>>
+    (
+        (const uint32_t*) in.data_ptr(),
+        (const half*) in_scales.data_ptr(),
+        (half*) out.data_ptr()
+    );
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -163,31 +149,22 @@ void quant_cache_paged
     dim3 blocks(tb_per_token, seq_len, bsz);
     dim3 threads(32 * tb_usage);
 
-    static_for_pack<2,3,4,5,6,7,8>([&](auto jc)
-    {
-        constexpr int j = decltype(jc)::value;
-        static_for_pack<2,3,4,5,6,7,8>([&](auto ic)
-        {
-            constexpr int i = decltype(ic)::value;
-            if (k_bits == i && v_bits == j)
-            {
-                quant_cache_paged_kernel<i, j><<<blocks, threads, 0, stream>>>
-                (
-                    (const half*) k_in.data_ptr(),
-                    (uint32_t*) k_out.data_ptr(),
-                    (half*) k_out_scales.data_ptr(),
-                    (const half*) v_in.data_ptr(),
-                    (uint32_t*) v_out.data_ptr(),
-                    (half*) v_out_scales.data_ptr(),
-                    (const uint32_t*) cache_seqlens.data_ptr(),
-                    (const uint32_t*) block_table.data_ptr(),
-                    page_size,
-                    blocks_per_seq,
-                    dim
-                );
-            }
-        });
-    });
+    TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
+
+    quant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    (
+        (const half*) k_in.data_ptr(),
+        (uint32_t*) k_out.data_ptr(),
+        (half*) k_out_scales.data_ptr(),
+        (const half*) v_in.data_ptr(),
+        (uint32_t*) v_out.data_ptr(),
+        (half*) v_out_scales.data_ptr(),
+        (const uint32_t*) cache_seqlens.data_ptr(),
+        (const uint32_t*) block_table.data_ptr(),
+        page_size,
+        blocks_per_seq,
+        dim
+    );
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -251,30 +228,21 @@ void dequant_cache_paged
     int k_bits = k_in.size(2) / warps_per_token;
     int v_bits = v_in.size(2) / warps_per_token;
 
-    static_for_pack<2,3,4,5,6,7,8>([&](auto jc)
-    {
-        constexpr int j = decltype(jc)::value;
-        static_for_pack<2,3,4,5,6,7,8>([&](auto ic)
-        {
-            constexpr int i = decltype(ic)::value;
-            if (k_bits == i && v_bits == j)
-            {
-                dequant_cache_paged_kernel<i, j><<<blocks, threads, 0, stream>>>
-                (
-                    (const uint32_t*) k_in.data_ptr(),
-                    (const half*) k_in_scales.data_ptr(),
-                    (half*) k_out.data_ptr(),
-                    (const uint32_t*) v_in.data_ptr(),
-                    (const half*) v_in_scales.data_ptr(),
-                    (half*) v_out.data_ptr(),
-                    (const uint32_t*) cache_seqlens.data_ptr(),
-                    (const uint32_t*) block_table.data_ptr(),
-                    page_size,
-                    pages_per_seq,
-                    warps_per_token
-                );
-            }
-        });
-    });
+    TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
+
+    dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    (
+        (const uint32_t*) k_in.data_ptr(),
+        (const half*) k_in_scales.data_ptr(),
+        (half*) k_out.data_ptr(),
+        (const uint32_t*) v_in.data_ptr(),
+        (const half*) v_in_scales.data_ptr(),
+        (half*) v_out.data_ptr(),
+        (const uint32_t*) cache_seqlens.data_ptr(),
+        (const uint32_t*) block_table.data_ptr(),
+        page_size,
+        pages_per_seq,
+        warps_per_token
+    );
     cuda_check(cudaPeekAtLastError());
 }

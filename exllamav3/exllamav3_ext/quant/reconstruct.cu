@@ -81,8 +81,14 @@ void reconstruct_kernel
     int4* tile_int4 = (reinterpret_cast<int4*> (tile));
     int4* out_int4 = ((int4*) g_unpacked) + (k * 16 + r) * 2 * blocks_n + n * 2 + c;
     *out_int4 = tile_int4[t];
-
 }
+
+#define __(i) reconstruct_kernel<i>
+constexpr auto reconstruct_kernel_instances = std::array
+{
+    __(1), __(2), __(3), __(4), __(5), __(6), __(7), __(8)
+};
+#undef __
 
 /*
 Reconstruct encoded+packed tensor
@@ -105,21 +111,13 @@ void reconstruct
     int rows = packed.size(0);
     int cols = packed.size(1);
 
-//    dim3 blockDim(128);
-//    dim3 gridDim(cols, rows);
     dim3 blockDim(256);
     dim3 gridDim(cols / 8, rows);
 
-//    DBGI3(cols, cols / 8, rows);
-
-    static_for_pack<1, 2, 3, 4, 5, 6, 7, 8>([&](auto ic)
-    {
-        constexpr int i = decltype(ic)::value;
-        if (K == i)
-            reconstruct_kernel<i><<<gridDim, blockDim, 0, stream>>>
-            (
-                (half*) unpacked.data_ptr(),
-                (const uint16_t*) packed.data_ptr()
-            );
-    });
+    reconstruct_kernel_instances[K - 1]<<<gridDim, blockDim, 0, stream>>>
+    (
+        (half*) unpacked.data_ptr(),
+        (const uint16_t*) packed.data_ptr()
+    );
+    cuda_check(cudaPeekAtLastError());
 }

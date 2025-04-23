@@ -186,6 +186,13 @@ void quantize_tiles_kernel
     backward(0, true, end_state);
 }
 
+#define __(i) quantize_tiles_kernel<i>
+constexpr auto quantize_tiles_kernel_instances = std::array
+{
+    __(1), __(2), __(3), __(4), __(5), __(6), __(7), __(8)
+};
+#undef __
+
 /*
 Quantize batch of tiles
 
@@ -247,19 +254,14 @@ void quantize_tiles
 
         int bsz = batch_j - batch_i;
 
-        static_for_pack<1, 2, 3, 4, 5, 6, 7, 8>([&](auto ic)
-        {
-            constexpr int i = decltype(ic)::value;
-            if (K == i)
-                quantize_tiles_kernel<i><<<bsz, threads, 0, stream>>>
-                (
-                    input_tiles_ptr,
-                    output_tiles_ptr,
-                    output_indices_ptr,
-                    temp_costs_ptr,
-                    temp_edges_ptr
-                );
-        });
+        quantize_tiles_kernel_instances[K - 1]<<<bsz, threads, 0, stream>>>
+        (
+            input_tiles_ptr,
+            output_tiles_ptr,
+            output_indices_ptr,
+            temp_costs_ptr,
+            temp_edges_ptr
+        );
         cuda_check(cudaPeekAtLastError());
 
         batch_i = batch_j;

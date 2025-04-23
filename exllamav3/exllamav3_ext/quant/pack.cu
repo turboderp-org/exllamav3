@@ -56,6 +56,13 @@ void pack_trellis_kernel
         ((uint32_t*) g_packed)[t] = SWAP16(((uint32_t*) s_packed)[t]);;
 }
 
+#define __(i) pack_trellis_kernel<i>
+constexpr auto pack_trellis_kernel_instances = std::array
+{
+    __(1), __(2), __(3), __(4), __(5), __(6), __(7), __(8)
+};
+#undef __
+
 void pack_trellis
 (
     at::Tensor packed,
@@ -77,16 +84,12 @@ void pack_trellis
     dim3 blockDim(128);
     dim3 gridDim(rows, cols);
 
-    static_for_pack<1, 2, 3, 4, 5, 6, 7, 8>([&](auto ic)
-    {
-        constexpr int i = decltype(ic)::value;
-        if (K == i)
-            pack_trellis_kernel<i><<<gridDim, blockDim, 0, stream>>>
-            (
-                (uint16_t*) packed.data_ptr(),
-                (const uint16_t*) unpacked.data_ptr()
-            );
-    });
+    pack_trellis_kernel_instances[K - 1]<<<gridDim, blockDim, 0, stream>>>
+    (
+        (uint16_t*) packed.data_ptr(),
+        (const uint16_t*) unpacked.data_ptr()
+    );
+    cuda_check(cudaPeekAtLastError());
 }
 
 template <int K>
@@ -134,6 +137,13 @@ void unpack_trellis_kernel
     ((uint32_t*)g_unpacked)[t] = word01;
 }
 
+#define __(i) unpack_trellis_kernel<i>
+constexpr auto unpack_trellis_kernel_instances = std::array
+{
+    __(1), __(2), __(3), __(4), __(5), __(6), __(7), __(8)
+};
+#undef __
+
 void unpack_trellis
 (
     at::Tensor unpacked,
@@ -155,16 +165,12 @@ void unpack_trellis
     dim3 blockDim(128);
     dim3 gridDim(cols, rows);
 
-    static_for_pack<1, 2, 3, 4, 5, 6, 7, 8>([&](auto ic)
-    {
-        constexpr int i = decltype(ic)::value;
-        if (K == i)
-            unpack_trellis_kernel<i><<<gridDim, blockDim, 0, stream>>>
-            (
-                (uint16_t*) unpacked.data_ptr(),
-                (const uint16_t*) packed.data_ptr()
-            );
-    });
+    unpack_trellis_kernel_instances[K - 1]<<<gridDim, blockDim, 0, stream>>>
+    (
+        (uint16_t*) unpacked.data_ptr(),
+        (const uint16_t*) packed.data_ptr()
+    );
+    cuda_check(cudaPeekAtLastError());
 }
 
 __global__ __launch_bounds__(32)
@@ -216,5 +222,6 @@ void pack_signs
         (const uint16_t*) unpacked.data_ptr(),
         cols
     );
+    cuda_check(cudaPeekAtLastError());
 }
 
