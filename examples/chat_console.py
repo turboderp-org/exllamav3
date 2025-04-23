@@ -65,7 +65,7 @@ class MarkdownConsoleStream:
         c, r = shutil.get_terminal_size(fallback = (80, 24))
         c -= 2
         self.console = console or Console(emoji_variant = "text", width = c)
-        self.width, self.height = self.console.size
+        self.height = r - 2
         self._last_lines = []
 
     def __enter__(self):
