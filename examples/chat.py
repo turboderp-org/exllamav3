@@ -51,6 +51,10 @@ def main(args):
 
     while True:
 
+        # Amnesia mode
+        if args.amnesia:
+            context = []
+
         # Get user prompt and add to context
         user_prompt = read_input_fn(args, user_name)
         context.append((user_prompt, None))
@@ -113,6 +117,7 @@ if __name__ == "__main__":
     parser.add_argument("-basic", "--basic_console", action = "store_true", help = "Use basic console output (no markdown and fancy prompt input")
     parser.add_argument("-rps", "--refresh_per_second", type = int, help = "Max updates per second in Markdown mode, default = 25", default = 25)
     parser.add_argument("-think", "--think", action = "store_true", help = "Use (very simplistic) reasoning template and formatting")
+    parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context with every new prompt")
     # TODO: Sampling options
     _args = parser.parse_args()
     main(_args)
