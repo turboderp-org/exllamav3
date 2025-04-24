@@ -49,6 +49,13 @@ prompt_formats = {
         "<start_of_turn>model\n"
         "```python\n{{problem}}",
         "    "
+    ),
+    "reka": (
+        "human: Complete the following Python function."
+        " Provide your reasoning in comments, but be concise and don't second-guess."
+        "\n\n{{problem}}"
+        " <sep> assistant: ```python\n{{problem}}",
+        "    "
     )
 }
 
