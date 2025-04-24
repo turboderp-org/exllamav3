@@ -9,6 +9,8 @@ class PromptFormat:
         raise NotImplementedError()
     def add_bos(self):
         raise NotImplementedError()
+    def thinktag(self):
+        return "<think>", "</think>"
 
 
 class PromptFormat_raw(PromptFormat):
@@ -227,6 +229,40 @@ class PromptFormat_gemma(PromptFormat):
             tokenizer.single_id("<start_of_turn>"),
         ]
 
+class PromptFormat_reka(PromptFormat):
+    description = "Reka Flash 3"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self):
+        return ""
+
+    def format(self, system_prompt, messages):
+        context = ""
+        first = True
+        for (u, a) in messages:
+            if first and system_prompt:
+                context += f"human: {system_prompt} {u} <sep> "
+                first = False
+            else:
+                context += f"human: {u} <sep> "
+            context += f"assistant:"
+            if a is not None: context += f" {a} <sep> "
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            "<sep>",
+        ]
+
+    def thinktag(self):
+        return " <reasoning>\n", "</reasoning>"
+
 
 prompt_formats = {
     "raw": PromptFormat_raw,
@@ -236,4 +272,5 @@ prompt_formats = {
     "mistral": PromptFormat_mistral,
     "gemma": PromptFormat_gemma,
     "glm": PromptFormat_glm,
+    "reka": PromptFormat_reka,
 }

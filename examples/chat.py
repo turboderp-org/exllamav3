@@ -7,8 +7,6 @@ from chat_templates import *
 import torch
 from chat_console import *
 
-thinktag = ("<think>", "</think>")
-
 @torch.inference_mode()
 def main(args):
 
@@ -63,7 +61,7 @@ def main(args):
         def get_input_ids():
             frm_context = prompt_format.format(system_prompt, context)
             if args.think:
-                frm_context += thinktag[0]
+                frm_context += prompt_format.thinktag()[0]
             ids_ = tokenizer.encode(frm_context, add_bos = add_bos, encode_special_tokens = True)
             exp_len_ = ids_.shape[-1] + max_response_tokens + 1
             return ids_, exp_len_
@@ -88,7 +86,7 @@ def main(args):
             while generator.num_remaining_jobs():
                 for r in generator.iterate():
                     chunk = r.get("text", "")
-                    s.stream(chunk, thinktag[1])
+                    s.stream(chunk, prompt_format.thinktag()[1])
                     if r["eos"] and r["eos_reason"] == "max_new_tokens":
                         ctx_exceeded = True
 
