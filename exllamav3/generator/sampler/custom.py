@@ -113,6 +113,26 @@ class SS_Sample(SS_Base):
         state.state = SS.DONE
 
 
+class SS_Sample_mn(SS_Sample):
+    """
+    Categorical sampling, but only using torch.multinomial (for testing/validation)
+    """
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.PROBS_N_S | SS.PROBS_N:
+                state.sample = torch.multinomial(state.probs, num_samples = 1)
+            case _:
+                raise ValueError("Sampling logic error")
+        state.state = SS.DONE
+
+    def prep(self, in_state: SS):
+        match in_state:
+            case SS.INIT | SS.LOGITS | SS.PROBS | SS.LOGITS_S | SS.PROBS_S:
+                return [SS_Normalize]
+            case _:
+                return None
+
+
 class SS_Temperature(SS_Base):
     """
     Modify distribution with temperature scaling
@@ -308,6 +328,7 @@ class CustomSampler(Sampler):
         tokenizer: Tokenizer | None = None,
         blocked_tokens: list[int] | None = None,
         allowed_tokens: list[int] | None = None,
+        return_state: bool = False
     ):
         out_shape = logits.shape[:-1]
 
@@ -343,6 +364,6 @@ class CustomSampler(Sampler):
         for ss in self.steps:
             assert state.state != SS.DONE, "Sampling logic error"
             ss.run(state)
-        assert state.state == SS.DONE, "Sampling logic error"
+        assert return_state or state.state == SS.DONE, "Sampling logic error"
 
-        return state.sample.view(out_shape)
+        return state if return_state else state.sample.view(out_shape)

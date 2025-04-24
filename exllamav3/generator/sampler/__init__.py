@@ -5,6 +5,7 @@ from .custom import (
     SS_Base,
     SS_Argmax,
     SS_Sample,
+    SS_Sample_mn,
     SS_Temperature,
     SS_Normalize,
     SS_Sort,
