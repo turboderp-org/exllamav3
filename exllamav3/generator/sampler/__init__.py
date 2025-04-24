@@ -8,6 +8,7 @@ from .custom import (
     SS_Temperature,
     SS_Normalize,
     SS_Sort,
+    SS_MinP,
     SS_TopK,
     SS_TopP,
     SS_NoOp,

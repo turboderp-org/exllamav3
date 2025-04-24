@@ -222,6 +222,33 @@ class SS_TopP(SS_Base):
                 return None
 
 
+class SS_MinP(SS_Base):
+    def __init__(self, min_p: float):
+        self.min_p = min_p
+        assert 0.0 < min_p <= 1.0
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.PROBS_N:
+                threshold = state.probs.amax(dim = -1, keepdim = True) * self.min_p
+                mask = state.probs >= threshold
+                state.probs *= mask
+                state.state = SS.PROBS
+            case SS.PROBS_N_S:
+                threshold = state.probs[:, :1] * self.min_p
+                mask = state.probs >= threshold
+                state.probs *= mask
+                state.state = SS.PROBS_S
+            case _:
+                raise ValueError("Sampling logic error")
+
+    def prep(self, in_state: SS):
+        match in_state:
+            case SS.INIT | SS.LOGITS | SS.PROBS | SS.LOGITS_S | SS.PROBS_S:
+                return [SS_Normalize]
+            case _:
+                return None
+
+
 class CustomSampler(Sampler):
     def __init__(
         self,

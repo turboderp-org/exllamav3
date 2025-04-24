@@ -6,8 +6,8 @@ class DefaultSampler(CustomSampler):
     """
     def __init__(self):
         super().__init__([
-            SS_Temperature(0.75),
-            SS_TopP(0.75),
+            SS_MinP(0.08),
+            SS_Temperature(0.8),
             SS_Sample()
         ])
 
