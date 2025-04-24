@@ -56,11 +56,17 @@ class SS_Base:
 
 
 class SS_NoOp(SS_Base):
+    """
+    Empty sampling step
+    """
     def run(self, state: SamplingState):
         pass
 
 
 class SS_Argmax(SS_Base):
+    """
+    Final sampling step: select most likely token
+    """
     def run(self, state: SamplingState):
         match state.state:
             case SS.INIT:
@@ -79,6 +85,9 @@ class SS_Argmax(SS_Base):
 
 
 class SS_Sample(SS_Base):
+    """
+    Final sampling step: categorical sampling, randomly sample from (truncated and/or modified) distribution
+    """
     def run(self, state: SamplingState):
         # TODO: Fused Gumbel noise + argmax kernel
         # TODO: Evaluate if multinomial sampling from sorted prob. distribution is more efficient
@@ -105,6 +114,9 @@ class SS_Sample(SS_Base):
 
 
 class SS_Temperature(SS_Base):
+    """
+    Modify distribution with temperature scaling
+    """
     def __init__(self, temperature: float):
         self.temperature = temperature
 
@@ -132,6 +144,9 @@ class SS_Temperature(SS_Base):
 
 
 class SS_Normalize(SS_Base):
+    """
+    Normalize distribution
+    """
     def run(self, state: SamplingState):
         match state.state:
             case SS.INIT:
@@ -154,6 +169,9 @@ class SS_Normalize(SS_Base):
 
 
 class SS_Sort(SS_Base):
+    """
+    Sort tokens by descending probability. state.indices
+    """
     def run(self, state: SamplingState):
         match state.state:
             case SS.INIT:
@@ -174,6 +192,9 @@ class SS_Sort(SS_Base):
 
 
 class SS_TopK(SS_Base):
+    """
+    Mask out all but the top K most likely tokens
+    """
     def __init__(self, top_k: int):
         assert top_k >= 1
         self.top_k = top_k
@@ -197,6 +218,10 @@ class SS_TopK(SS_Base):
 
 
 class SS_TopP(SS_Base):
+    """
+    Identify the smallest set of top tokens with a cumulative probability greater than P, mask out all
+    remainig tokens
+    """
     def __init__(self, top_p: float):
         self.top_p = top_p
         assert 0.0 < top_p <= 1.0
@@ -223,6 +248,9 @@ class SS_TopP(SS_Base):
 
 
 class SS_MinP(SS_Base):
+    """
+    Mask out all tokens whose probability is less than the top token's probability times min_p
+    """
     def __init__(self, min_p: float):
         self.min_p = min_p
         assert 0.0 < min_p <= 1.0
@@ -267,6 +295,8 @@ class CustomSampler(Sampler):
                 for prep_step in prep_steps:
                     self.steps.append(prep_step())
             self.steps.append(step)
+
+        # TODO: Identify and remove redundant sampling steps, add rules for fusing steps where possible
 
     @override
     @torch.inference_mode
