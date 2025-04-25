@@ -157,7 +157,8 @@ class GatedMLP(Module):
                 first_out_feature = 0,
                 qmap = qmap + ".down",
                 alt_key = a_key_d,
-                out_dtype = self.out_dtype
+                out_dtype = self.out_dtype,
+                allow_input_padding = True,
             )
 
             self.ups.append(up)

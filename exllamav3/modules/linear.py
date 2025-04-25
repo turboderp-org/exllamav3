@@ -33,7 +33,8 @@ class Linear(Module):
         full_out_features: int | None = None,
         first_in_feature: int | None = None,
         first_out_feature: int | None = None,
-        out_dtype: torch.dtype | None = None
+        out_dtype: torch.dtype | None = None,
+        allow_input_padding: bool = False,
     ):
         super().__init__(config, key, qmap)
 
@@ -54,6 +55,9 @@ class Linear(Module):
         self.softcap = softcap
         self.is_sliced = in_features != full_in_features or out_features != full_out_features
         self.out_dtype = out_dtype
+
+        assert self.in_features_unpadded == self.in_features or allow_input_padding, \
+            f"Input padding is not allowed for {self.key}, in_dim: {self.in_features_unpadded}, pad_to: {pad_to}"
 
         if caps is not None:
             self.caps.update(caps)
