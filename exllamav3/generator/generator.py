@@ -10,6 +10,7 @@ from .pagetable import PageTable
 from .job import Job
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler, GumbelSampler
+from .visualizer import CacheVisualizer
 import time
 import threading
 import numpy as np
@@ -27,6 +28,7 @@ class Generator:
         draft_model: Model | None = None,
         draft_cache: Cache | None = None,
         num_draft_tokens: int = 4,
+        show_visualizer: bool = False,
         **kwargs
     ):
         """
@@ -63,6 +65,9 @@ class Generator:
 
         :param num_draft_tokens:
             Number of future tokens to draft.
+
+        :param show_visualizer:
+            Open window to render visualization of cache (for debug/demonstration purposes)
 
         :param kwargs:
         """
@@ -115,6 +120,12 @@ class Generator:
                 dtype = torch.long,
                 pin_memory = False
             )
+
+        # Visualizer
+        if show_visualizer:
+            self.visualizer = CacheVisualizer(self.pagetable.max_pages)
+        else:
+            self.visualizer = None
 
         # TODO: (defrag)
 
@@ -269,9 +280,25 @@ class Generator:
         else:
             self.iterate_gen(results)
 
+        # Visualization
+        if self.visualizer:
+            self.update_visualizer()
+
         # Finished iteration
         return results
 
+
+    def update_visualizer(self):
+        chains = []
+        for job in self.active_jobs:
+            for seq in job.sequences:
+                idx = job.serial_number
+                chain = [page.page_index for page in seq.allocated_pages]
+                chains.append((idx, chain))
+        usage = []
+        for page in self.pagetable.all_pages:
+            usage.append(page.kv_position / PAGE_SIZE)
+        self.visualizer.update(chains, usage)
 
     def iterate_draftmodel_gen(self, results: list):
 

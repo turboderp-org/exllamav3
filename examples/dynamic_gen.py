@@ -17,11 +17,14 @@ Display modes for this demo:
 """
 display_mode = 1
 
+# Show graphical visualization of the paged cache (adds some overhead)
+show_visualization = False
+
 # Where to find our model
 model_dir = "/mnt/str/eval_models/llama3.1-8b-instruct/exl3/4.0bpw/"
 
 # Total number of tokens to allocate space for in the cache.
-total_context = 32768
+total_context = 16384
 
 # Max number of batches to run at once, assuming the sequences will fit within total_context.
 max_batch_size = 16
@@ -43,7 +46,6 @@ prompts = [
     "Can you guess the next number in this sequence: " + ", ".join(str(n) for n in range(200)),
     "Can you write a C++ quicksort implementation pretty please?",
     "Hello!",
-    "Hi there!",
     "What's the difference smoke and vapor?",
     "What seems out of place in this sequence: " + ", ".join(str(n if n != 123 else 69) for n in range(200)),
     "What seems out of place in this sequence: " + ", ".join(str(n if n != 42 else 111) for n in range(200)),
@@ -52,7 +54,6 @@ prompts = [
     "What seems out of place in this sequence: " + ", ".join(str(n if n != 42 else 111) for n in range(200)),
     "Please guess the next 20 numbers in this sequence: " + ", ".join(str(n) for n in range(700)),
     "Write a short essay about cell membranes.",
-    "What's up?",
     "How do I open a can of beans?",
     "How do I open a can of soup?",
     "How do I open a can of strawberry jam?",
@@ -72,19 +73,21 @@ prompts = [
     "How do I build a time machine?",
     "What seems out of place in this sequence: " + ", ".join(str(n if n != 123 else 69) for n in range(200)),
     "Is it legal to grow your own catnip?",
-    "What seems out of place in this sequence: " + ", ".join(str(n if n != 160 else 420) for n in range(400)),
-    "What seems out of place in this sequence: " + ", ".join(str(n if n != 161 else 421) for n in range(400)),
+    "What seems out of place in this sequence: " + ", ".join(str(n if n != 360 else 420) for n in range(400)),
+    "What seems out of place in this sequence: " + ", ".join(str(n if n != 361 else 421) for n in range(400)),
     "What's inside a black hole?",
+    "What seems out of place in this sequence: " + ", ".join(str(n if n != 360 else 420) for n in range(400)),
+    "What seems out of place in this sequence: " + ", ".join(str(n if n != 363 else 421) for n in range(400)),
     "What do the numbers 2, 4, 8, 16, 32 and 64 have in common?",
     "What do the numbers 2, 3, 5, 7, 11 and 13 have in common?",
     "Is there life on Mars?",
-    "Hello!",
-    "Hi!",
-    "Boop!",
-    "Why are cats better than dogs?",
-    "Why are cats better than dogs?",
     "Why are cats better than dogs?",
     "Write a parable about why cats are better than dogs.",
+    "Can you guess the next number in this sequence: " + ", ".join(str(n) for n in range(999)),
+    "Can you guess the next number in this sequence: " + ", ".join(str(n) for n in range(999)),
+    "Can you guess the next number in this sequence: " + ", ".join(str(n) for n in range(999)),
+    "Can you guess the next number in this sequence: " + ", ".join(str(n) for n in range(999)),
+    "Can you guess the next number in this sequence: " + ", ".join(str(n) for n in range(999)),
 ]
 
 term = Terminal()
@@ -92,7 +95,7 @@ term = Terminal()
 def main():
 
     # Load the model config
-    config = Config.from_directory("/mnt/str/eval_models/llama3.1-8b-instruct/exl3/2.0bpw/")
+    config = Config.from_directory("/mnt/str/models/llama3.1-8b-instruct/exl3/4.0bpw/")
 
     # Create the model from the config
     model = Model.from_config(config)
@@ -114,6 +117,7 @@ def main():
         tokenizer = tokenizer,
         max_batch_size = max_batch_size,
         max_chunk_size = max_chunk_size,
+        show_visualizer = show_visualization
     )
 
     # Create jobs
