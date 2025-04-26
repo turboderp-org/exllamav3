@@ -169,7 +169,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
             # --- Parameters ---
             stream: bool = request_data.get('stream', True)
-            max_tokens: int = request_data.get('max_tokens', 200) # Default max tokens
+            max_tokens: int = request_data.get('max_tokens', 2048) # Default max tokens
             temperature: float = request_data.get('temperature', 0.8)
             top_p: float = request_data.get('top_p', 0.8)
             top_k: int = request_data.get('top_k', 50)
@@ -225,7 +225,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
                 self.send_header('Cache-Control', 'no-cache')
-                self.send_header('Connection', 'keep-alive')
+                self.send_header('Connection', 'close')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
 
@@ -251,9 +251,10 @@ class APIHandler(BaseHTTPRequestHandler):
                         max_new_tokens=max_tokens,
                         sampler=sampler,
                         stop_conditions=stop_conditions,
-                        decode_special_tokens=True # Assuming we want special tokens decoded
+                        decode_special_tokens=False # Assuming we want special tokens decoded
                     )
                     generator.enqueue(job)
+                    finish_reason = None # Initialize finish_reason
 
                     # Iterate while the job is active
                     while generator.num_remaining_jobs() > 0 and not job_done:
@@ -281,10 +282,13 @@ class APIHandler(BaseHTTPRequestHandler):
                                         logger.warning("Client disconnected, cancelling job.") # Changed to logger.warning
                                         if job: generator.cancel(job) # Cancel the job if client disconnects
                                         job_done = True
+                                        # Optional: indicate reason, though not standard OpenAI
+                                        # finish_reason = "client_disconnect"
                                         break # Exit inner results loop
 
+                                # Check for EOS - this is now the primary way to set finish_reason in the loop
                                 if r["eos"]:
-                                    finish_reason = r.get("eos_reason", "stop")
+                                    finish_reason = r.get("eos_reason", "stop") # Capture reason from generator
                                     job_done = True
                                     break # Exit inner results loop
                         if job_done:
@@ -299,12 +303,14 @@ class APIHandler(BaseHTTPRequestHandler):
                         "choices": [{
                             "index": 0,
                             "delta": {},
-                            "finish_reason": finish_reason if finish_reason else "stop" # Provide default if None
+                            # Use the finish_reason determined during streaming, default to length
+                            "finish_reason": finish_reason if finish_reason else "length"
                         }],
                         # Usage info could be added here if tracked/available from Job results
                     }
                     self._send_sse_chunk(final_chunk)
                     self._send_sse_chunk("[DONE]")
+                    return
 
                 except Exception as e:
                     logger.exception(f"Error during streaming generation: {e}") # Use exception to include traceback
@@ -312,7 +318,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     try:
                         error_chunk: Dict[str, Any] = {"error": {"message": f"Generation error: {e}", "type": "generation_error"}}
                         self._send_sse_chunk(error_chunk)
-                        self._send_sse_chunk("[DONE]") # Still send DONE marker
+                        self._send_sse_chunk("[DONE]")
+
                     except:
                         pass # Ignore errors if we can't even send the error message
                     finally:
