@@ -23,7 +23,6 @@ Additionally, ExLlamaV2 is largely designed to run in a single process and CUDA 
 There's much that still needs to be added and/or ported over from ExLlamaV2. I've decided to release ExLlamaV3 in its current state to invite testing, feedback and contributions, but please be aware that it's not yet a viable replacement for ExLlamaV2. Currently on the to-do list:
 
 - Support for more architectures (Mixtral, Cohere and Deepseek are in the works)
-- Samplers (most notably repetition penalties and min-P are missing)
 - Constrained sampling (JSON filters etc.)
 - Multimodal support
 - LoRA support
