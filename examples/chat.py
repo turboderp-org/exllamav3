@@ -3,6 +3,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 from exllamav3 import Generator, Job, model_init
+from exllamav3.generator.sampler import ComboSampler
 from chat_templates import *
 import torch
 from chat_console import *
@@ -43,6 +44,20 @@ def main(args):
     )
     stop_conditions = prompt_format.stop_conditions(tokenizer)
 
+    # Sampler
+    sampler = ComboSampler(
+        rep_p = args.repetition_penalty,
+        pres_p = args.presence_penalty,
+        freq_p = args.frequency_penalty,
+        rep_sustain_range = args.penalty_range,
+        rep_decay_range = args.penalty_range,
+        temperature = args.temperature,
+        min_p = args.min_p,
+        top_k = args.top_k,
+        top_p = args.top_p,
+        temp_last = not args.temperature_first,
+    )
+
     # Main loop
     print("\n" + col_sysprompt + system_prompt.strip() + col_default)
     context = []
@@ -76,7 +91,8 @@ def main(args):
         job = Job(
             input_ids = ids,
             max_new_tokens =  max_response_tokens,
-            stop_conditions = stop_conditions
+            stop_conditions = stop_conditions,
+            sampler = sampler,
         )
         generator.enqueue(job)
 
@@ -113,9 +129,16 @@ if __name__ == "__main__":
     parser.add_argument("-sp", "--system_prompt", type = str, help = "Use custom system prompt")
     parser.add_argument("-maxr", "--max_response_tokens", type = int, default = 1000, help = "Max tokens per response, default = 1000")
     parser.add_argument("-basic", "--basic_console", action = "store_true", help = "Use basic console output (no markdown and fancy prompt input")
-    parser.add_argument("-rps", "--refresh_per_second", type = int, help = "Max updates per second in Markdown mode, default = 25", default = 25)
     parser.add_argument("-think", "--think", action = "store_true", help = "Use (very simplistic) reasoning template and formatting")
     parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context with every new prompt")
-    # TODO: Sampling options
+    parser.add_argument("-temp", "--temperature", type = float, help = "Sampling temperature", default = 0.8)
+    parser.add_argument("-temp_first", "--temperature_first", action = "store_true", help = "Apply temperature before truncation")
+    parser.add_argument("-repp", "--repetition_penalty", type = float, help = "Repetition penalty, HF style, 1 to disable (default: disabled)", default = 1.0)
+    parser.add_argument("-presp", "--presence_penalty", type = float, help = "Presence penalty, 0 to disable (default: disabled)", default = 0.0)
+    parser.add_argument("-freqp", "--frequency_penalty", type = float, help = "Frequency penalty, 0 to disable (default: disabled)", default = 0.0)
+    parser.add_argument("-penr", "--penalty_range", type = int, help = "Range for penalties, in tokens (default: 1024) ", default = 1024)
+    parser.add_argument("-minp", "--min_p", type = float, help = "Min-P truncation, 0 to disable (default: 0.08)", default = 0.08)
+    parser.add_argument("-topk", "--top_k", type = float, help = "Top-K truncation, 0 to disable (default: disabled)", default = 0)
+    parser.add_argument("-topp", "--top_p", type = float, help = "Top-P truncation, 1 to disable (default: disabled)", default = 1.0)
     _args = parser.parse_args()
     main(_args)
