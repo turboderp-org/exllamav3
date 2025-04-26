@@ -13,6 +13,8 @@ from .custom import (
     SS_TopK,
     SS_TopP,
     SS_NoOp,
+    SS_RepP,
+    SS_PresFreqP,
 )
 from .presets import (
     DefaultSampler,
@@ -22,4 +24,5 @@ from .presets import (
     GumbelSampler,
     TopKSampler,
     TopPSampler,
+    ComboSampler,
 )

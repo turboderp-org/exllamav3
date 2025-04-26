@@ -29,6 +29,7 @@ class SamplingState:
     sample: torch.Tensor | None = None
     probs: torch.Tensor | None = None
     indices: torch.Tensor | None = None
+    past_ids: torch.Tensor | None = None
     state: SS = SS.INIT
 
     def empty_sample(self):
@@ -53,6 +54,8 @@ class SS_Base:
         return None
     def alt(self):
         return None
+    def reqs_past_ids(self):
+        return False
 
 
 class SS_NoOp(SS_Base):
@@ -216,7 +219,6 @@ class SS_TopK(SS_Base):
     Mask out all but the top K most likely tokens
     """
     def __init__(self, top_k: int):
-        assert top_k >= 1
         self.top_k = top_k
 
     def run(self, state: SamplingState):
@@ -236,6 +238,11 @@ class SS_TopK(SS_Base):
             case _:
                 return None
 
+    def alt(self):
+        if self.top_k < 1:
+            return SS_NoOp()
+        return None
+
 
 class SS_TopP(SS_Base):
     """
@@ -245,6 +252,7 @@ class SS_TopP(SS_Base):
     def __init__(self, top_p: float):
         self.top_p = top_p
         assert 0.0 < top_p <= 1.0
+
     def run(self, state: SamplingState):
         match state.state:
             case SS.PROBS_N_S:
@@ -266,6 +274,11 @@ class SS_TopP(SS_Base):
             case _:
                 return None
 
+    def alt(self):
+        if self.top_p == 1.0 or self.top_p == 0.0:
+            return SS_NoOp()
+        return None
+
 
 class SS_MinP(SS_Base):
     """
@@ -274,6 +287,7 @@ class SS_MinP(SS_Base):
     def __init__(self, min_p: float):
         self.min_p = min_p
         assert 0.0 < min_p <= 1.0
+
     def run(self, state: SamplingState):
         match state.state:
             case SS.PROBS_N:
@@ -297,6 +311,131 @@ class SS_MinP(SS_Base):
                 return None
 
 
+class SS_RepP(SS_Base):
+    """
+    Apply Transformers style repetition penalties based on past token IDs. Must be the first step in sampler
+    chain.
+    """
+    def __init__(
+        self,
+        rep_p: float = 1.0,
+        sustain_range: int = int(10e7),
+        decay_range: int = 0
+    ):
+        """
+        :param rep_p:
+            Multiplicative penalty. rep_p = 1.0 means no penalty. Positive logits are divided by this value and
+            negative ones are multiplied by it. Recreates the method from the Transformers generate() pipeline,
+            following https://arxiv.org/pdf/1909.05858.pdf which relies on the assumption that logits output
+            straight from the model are "centered" around zero.
+         :param sustain_range:
+            Number of most recent past tokens over which to apply full penalty
+        :param decay_range:
+            Number tokens (after sustain_range) over which the penalty gradually fades out
+        """
+        self.rep_p = rep_p
+        self.sustain_range = sustain_range
+        self.decay_range = decay_range
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.INIT:
+                state.logits = torch.empty_like(state.in_logits, dtype = torch.float)
+                ext.apply_rep_pens(
+                    state.in_logits,
+                    state.logits,
+                    state.past_ids,
+                    self.rep_p,
+                    self.sustain_range,
+                    self.decay_range
+                )
+            case SS.LOGITS:
+                ext.apply_rep_pens(
+                    state.logits,
+                    state.logits,
+                    state.past_ids,
+                    self.rep_p,
+                    self.sustain_range,
+                    self.decay_range
+                )
+            case _:
+                raise ValueError("Sampling logic error")
+        state.state = SS.LOGITS
+
+    def alt(self):
+        if self.rep_p == 1.0 or self.sustain_range + self.decay_range <= 0:
+            return SS_NoOp()
+        return None
+
+    def reqs_past_ids(self):
+        return True
+
+
+class SS_PresFreqP(SS_Base):
+    """
+    Apply OAI-style presence and frequency penalties based on past token IDs. Must be the first step in the
+    sampler chain.
+    """
+    def __init__(
+        self,
+        pres_p: float = 0.0,
+        freq_p: float = 0.0,
+        sustain_range: int = int(10e7),
+        decay_range: int = 0
+    ):
+        """
+        :param pres_p:
+            Additive penalty, OAI style. 0.0 means no penalty. Added to logit once if a token appears in
+            past_ids
+        :param freq_p:
+            Additive penalty, OAI style. 0.0 means no penalty. Added to logit for every time a token is
+            encountered in past_ids
+         :param sustain_range:
+            Number of most recent past tokens over which to apply full penalty
+        :param decay_range:
+            Number tokens (after sustain_range) over which the penalty gradually fades out
+        """
+        self.pres_p = pres_p
+        self.freq_p = freq_p
+        self.sustain_range = sustain_range
+        self.decay_range = decay_range
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.INIT:
+                state.logits = torch.empty_like(state.in_logits, dtype = torch.float)
+                ext.apply_pres_freq_pens(
+                    state.in_logits,
+                    state.logits,
+                    state.past_ids,
+                    self.pres_p,
+                    self.freq_p,
+                    self.sustain_range,
+                    self.decay_range
+                )
+            case SS.LOGITS:
+                ext.apply_pres_freq_pens(
+                    state.logits,
+                    state.logits,
+                    state.past_ids,
+                    self.pres_p,
+                    self.freq_p,
+                    self.sustain_range,
+                    self.decay_range
+                )
+            case _:
+                raise ValueError("Sampling logic error")
+        state.state = SS.LOGITS
+
+    def alt(self):
+        if (self.pres_p == 0.0 and self.freq_p == 0.0) or self.sustain_range + self.decay_range <= 0:
+            return SS_NoOp()
+        return None
+
+    def reqs_past_ids(self):
+        return True
+
+
 class CustomSampler(Sampler):
     def __init__(
         self,
@@ -307,6 +446,7 @@ class CustomSampler(Sampler):
         self.steps = []
         state = SS.INIT
         for step in steps:
+            self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
             alt = step.alt()
             if alt:
                 step = alt
@@ -344,6 +484,8 @@ class CustomSampler(Sampler):
         dim = logits.shape[-1]
         bsz = logits.numel() // dim
 
+        # Prepare logit bias tensor
+
         # TODO: Extension function for this, combine with filter API when it's added
         if blocked_tokens is not None or allowed_tokens is not None:
             logits = logits.clone()
@@ -359,6 +501,7 @@ class CustomSampler(Sampler):
             dim = dim,
             bsz = bsz,
             in_logits = logits.view(bsz, dim),
+            past_ids = sequence_ids,
         )
 
         for ss in self.steps:
