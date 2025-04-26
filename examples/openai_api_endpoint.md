@@ -14,6 +14,11 @@ To run the server, execute the script from your terminal:
 python examples/openai_api_endpoint.py --model-dir /path/to/your/model [other_options]
 ```
 
+Example:
+```bash
+python examples/openai_api_endpoint.py --model_dir QwQ-32B-exl3-4bpw/ --port 9999 --host 0.0.0.0 --log-level DEBUG --cache_size 16384 --cache_quant 4
+ ```
+
 ### Command-Line Arguments
 
 The script accepts several arguments:
@@ -23,7 +28,7 @@ The script accepts several arguments:
 *   **`-H`, `--host`**: The hostname or IP address the server should bind to. (Default: `localhost`)
 *   **`--log-level`**: Sets the logging level. Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. (Default: `INFO`)
 
-**Note:** The script also accepts all arguments supported by `exllamav3.model_init.add_args()`, which are used for model initialization (e.g., `--gpu_split`, `--length`, `--batch_size`, etc.). Refer to the `model_init` documentation or source for a full list.
+**Note:** The script also accepts all arguments supported by `exllamav3.model_init.add_args()`, which are used for model initialization (e.g., `--gpu_split`, `--length`, `--batch_size`, `--cache_size`, `--cache_quant`, --etc.). Refer to the `model_init` documentation or source for a full list.
 
 ## API Endpoints
 
