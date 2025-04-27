@@ -17,6 +17,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 script_path: str = os.path.abspath(__file__)
 project_root: str = os.path.dirname(os.path.dirname(script_path))
 sys.path.insert(0, project_root)
+from exllamav3.cache import CacheLayer_fp16, CacheLayer_quant # For memory logging
 
 try:
     # Corrected imports based on package structure
@@ -51,6 +52,12 @@ def initialize_model(args: argparse.Namespace) -> None:
     model = initialized_model
     cache = initialized_cache
     tokenizer = initialized_tokenizer
+    # Log cache type based on args
+    if hasattr(args, 'cache_quant') and args.cache_quant is not None:
+        # Note: We can't access k_bits/v_bits here without duplicating logic from model_init.py
+        logger.info(f" -- Cache quantization requested (args.cache_quant = {args.cache_quant}). Quantized cache will be used if supported.")
+    else:
+        logger.info(f" -- Using FP16 cache (cache_quant not specified or None).")
 
 
     logger.info("Model loaded.")
@@ -65,6 +72,23 @@ def initialize_model(args: argparse.Namespace) -> None:
     if model and cache and tokenizer:
         generator = Generator(model, cache, tokenizer)
         logger.info("Generator created.")
+        # Log cache quantization setting unconditionally after generator init
+        if hasattr(args, 'cache_quant') and args.cache_quant is not None:
+            logger.info(f"Cache quantization setting (--cache_quant): {args.cache_quant}")
+        else:
+            logger.info("Cache quantization (--cache_quant) not specified, using FP16 cache.")
+        # Log memory usage
+            try:
+                model_bytes: int = generator.model.memory_footprint()
+                cache_bytes: int = generator.cache.memory_footprint()
+                model_mb: float = model_bytes / (1024 * 1024)
+                cache_mb: float = cache_bytes / (1024 * 1024)
+                total_mb: float = model_mb + cache_mb
+                logger.info(f"Memory usage: Model: {model_mb:.2f} MB, Cache: {cache_mb:.2f} MB, Total: {total_mb:.2f} MB")
+            except AttributeError:
+                logger.warning("Could not retrieve memory footprint. `memory_footprint()` method may not be available.")
+            except Exception as e:
+                logger.warning(f"An error occurred while logging memory usage: {e}")
     else:
         logger.error("Failed to initialize generator due to missing model, cache, or tokenizer.")
         # Potentially raise an error or exit if generator is critical
@@ -458,6 +482,47 @@ if __name__ == "__main__":
     logger.info(f"Starting OpenAI-compatible server on http://{args.host}:{args.port}...")
     logger.info(f"Using model: {model_name} from {args.model_dir}")
     logger.info("Endpoint available at POST /v1/chat/completions")
+    # --- Log Memory Usage ---
+    model_bits, _, model_vram_bits = model.get_storage_info()
+    model_bytes = model_vram_bits / 8
+    cache_bytes = 0
+    if cache: # Ensure cache object exists
+        for layer in cache.layers:
+            if isinstance(layer, CacheLayer_fp16):
+                if layer.k is not None: cache_bytes += layer.k.nbytes
+                if layer.v is not None: cache_bytes += layer.v.nbytes
+            elif isinstance(layer, CacheLayer_quant):
+                if layer.qk is not None: cache_bytes += layer.qk.nbytes
+                if layer.qv is not None: cache_bytes += layer.qv.nbytes
+                if layer.sk is not None: cache_bytes += layer.sk.nbytes
+                if layer.sv is not None: cache_bytes += layer.sv.nbytes
+
+    model_mb = model_bytes / (1024 * 1024)
+    cache_mb = cache_bytes / (1024 * 1024)
+    total_mb = model_mb + cache_mb
+    logger.info(f"Memory usage: Model: {model_mb:.2f} MB, Cache: {cache_mb:.2f} MB, Total: {total_mb:.2f} MB")
+    # --- Log VRAM Info ---
+    try:
+        if torch.cuda.is_available():
+            if generator and generator.cache and generator.cache.layers and generator.cache.layers[0].device.type == 'cuda':
+                device_idx: int = generator.cache.layers[0].device.index
+                device_name: str = torch.cuda.get_device_name(device_idx)
+                free_bytes, total_bytes = torch.cuda.mem_get_info(device_idx)
+                free_mb: float = free_bytes / (1024 * 1024)
+                total_mb: float = total_bytes / (1024 * 1024)
+                logger.info(f"VRAM Info ({device_name} - Device {device_idx}): Free: {free_mb:.2f} MB / Total: {total_mb:.2f} MB")
+            else:
+                logger.info("Model not on CUDA device, skipping VRAM info logging.")
+        else:
+            logger.info("CUDA not available, skipping VRAM info logging.")
+    except AttributeError as e:
+        # Specific handling for the 'device' attribute error
+        logger.warning(f"Could not retrieve VRAM info: {e}. This might happen if the loaded model object does not have a 'device' attribute, possibly due to the model type or an issue during initialization.")
+    except Exception as e:
+        # Generic exception handling for other errors
+        logger.warning(f"Could not retrieve VRAM info: {e}")
+    # --- End Log VRAM Info ---
+    # --- End Log Memory Usage ---
     logger.info("Model list available at GET /v1/models")
 
     try:
