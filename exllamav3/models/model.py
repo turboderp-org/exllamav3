@@ -199,7 +199,6 @@ class Model:
 
             dummy_state = None
             unset_memory_fraction(touched_devices)
-            free_mem()
 
         # Python will not run anything in an async function without at least one yield statement
         if 'yield' in locals():
@@ -348,6 +347,7 @@ class Model:
             raise NotImplementedError()
 
         self.config.stc.close()
+        free_mem()
 
 
     @torch.inference_mode
