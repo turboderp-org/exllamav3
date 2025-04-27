@@ -91,7 +91,7 @@ class CohereModel(Model):
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    qmap = "block.attn",
+                    qmap = "block.parallel",
                 ),
                 mlp = GatedMLP(
                     config = config,
@@ -101,7 +101,7 @@ class CohereModel(Model):
                     key_up = "up_proj",
                     key_gate = "gate_proj",
                     key_down = "down_proj",
-                    qmap = "block.mlp",
+                    qmap = "block.parallel",
                 ),
             )
             for idx in range(config.num_hidden_layers)
