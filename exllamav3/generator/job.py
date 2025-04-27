@@ -242,6 +242,12 @@ class Job:
         # self.alt_rope_embed = {}
         # self.alt_rope_offset = 0
 
+        # Pinned buffer for IDs during sampling
+        self.current_pinned_ids = None
+        if self.sampler.reqs_past_ids:
+            max_ids = max(len(seq.sequence_ids) for seq in self.sequences) + self.max_new_tokens + 8
+            self.pinned_ids = torch.empty((1, max_ids), dtype = torch.long, pin_memory = True)
+
 
     def __repr__(self):
         if self.serial_number is None:
@@ -326,7 +332,7 @@ class Job:
 
         next_token = self.sampler.forward(
             logits,
-            self.sequences[0].sequence_ids.torch(),
+            self.current_pinned_ids,
             self.rng.randint(0, (1<<32)-1),
             self.generator.tokenizer,
             blocked_tokens = blocked_tokens,
@@ -895,3 +901,9 @@ class Job:
                 self.pagetable.deallocate_pages(seq.allocated_pages)
                 seq.allocated_pages = []
 
+
+    def prepare_sampling_past_ids(self):
+        if not self.sampler.reqs_past_ids:
+            return
+        self.current_pinned_ids = self.pinned_ids[:, :len(self.sequences[0].sequence_ids)]
+        self.current_pinned_ids.copy_(self.sequences[0].sequence_ids.torch())

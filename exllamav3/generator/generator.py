@@ -440,6 +440,10 @@ class Generator:
             }
         )
 
+        # Prepare past IDs (for sequences that need them for repetition penalty etc.)
+        for job in self.active_jobs:
+            job.prepare_sampling_past_ids()
+
         # TODO: Batch sampling
 
         # Pass to jobs to sample

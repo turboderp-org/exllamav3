@@ -20,6 +20,7 @@
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
 #include "generator/gumbel.cuh"
+#include "generator/rep_pen.cuh"
 
 #include "cache/q_cache.cuh"
 
@@ -55,6 +56,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gumbel_noise_f16", &gumbel_noise_f16, "gumbel_noise_f16");
     m.def("gumbel_noise_f32", &gumbel_noise_f32, "gumbel_noise_f32");
     m.def("gumbel_noise_log", &gumbel_noise_log, "gumbel_noise_log");
+    m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
+    m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
 
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
     m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");

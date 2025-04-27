@@ -4,7 +4,7 @@ from ...tokenizer import Tokenizer
 
 class Sampler:
     def __init__(self):
-        pass
+        self.reqs_past_ids = False
 
     @abstractmethod
     def forward(
@@ -15,5 +15,6 @@ class Sampler:
         tokenizer: Tokenizer | None = None,
         blocked_tokens: list[int] | None = None,
         allowed_tokens: list[int] | None = None,
+        return_state: bool = False
     ):
         pass
