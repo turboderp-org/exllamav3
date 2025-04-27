@@ -8,6 +8,7 @@ from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP,
 from ..modules.attn import prepare_for_attn
 
 class Phi3Config(Config):
+    arch_string = "Phi3ForCausalLM"
 
     def __init__(
         self,
@@ -16,7 +17,6 @@ class Phi3Config(Config):
     ):
         super().__init__(
             directory,
-            kwargs.get("arch_string", "Phi3ForCausalLM"),
             Phi3Model,
             **kwargs
         )
@@ -51,6 +51,7 @@ class Phi3Config(Config):
 
 
 class Phi3Model(Model):
+    config_class = Phi3Config
 
     def __init__(
         self,

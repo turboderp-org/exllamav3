@@ -8,6 +8,7 @@ from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP,
 from ..modules.attn import prepare_for_attn
 
 class Gemma2Config(Config):
+    arch_string = "Gemma2ForCausalLM"
 
     def __init__(
         self,
@@ -16,7 +17,6 @@ class Gemma2Config(Config):
     ):
         super().__init__(
             directory,
-            kwargs.get("arch_string", "Gemma2ForCausalLM"),
             Gemma2Model,
             **kwargs
         )
@@ -53,6 +53,7 @@ class Gemma2Config(Config):
 
 
 class Gemma2Model(Model):
+    config_class = Gemma2Config
 
     def __init__(
         self,

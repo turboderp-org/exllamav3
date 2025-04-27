@@ -5,6 +5,7 @@ from .llama import LlamaConfig, LlamaModel
 # detects *.bias tensor
 
 class Qwen2Config(LlamaConfig):
+    arch_string = "Qwen2ForCausalLM"
 
     def __init__(
         self,
@@ -13,12 +14,12 @@ class Qwen2Config(LlamaConfig):
     ):
         super().__init__(
             directory,
-            arch_string = "Qwen2ForCausalLM",
             **kwargs
         )
 
 
 class Qwen2Model(LlamaModel):
+    config_class = Qwen2Config
 
     def __init__(
         self,

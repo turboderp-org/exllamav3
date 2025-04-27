@@ -10,13 +10,12 @@ from ..util.file import read_dict, no_value, no_default
 import uuid
 
 class Config(ABC):
-
+    arch_string = None
     load_isq: bool
 
     def __init__(
         self,
         directory: str,
-        expect_arch: str,
         model_class,
         **kwargs,
     ):
@@ -43,7 +42,7 @@ class Config(ABC):
             f"Multiple architectures defined in {self.config_filename}"
 
         arch = self.config_dict["architectures"][0]
-        assert arch == expect_arch, \
+        assert arch == self.arch_string, \
             f"Unexpected architecture {arch} in {self.config_filename}, should be {expect_arch}."
         self.architecture = arch
 

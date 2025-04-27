@@ -8,6 +8,7 @@ from ..modules import LayerNorm, Embedding, ParallelDecoderBlock, Attention, Gat
 from ..modules.attn import prepare_for_attn
 
 class CohereConfig(Config):
+    arch_string = "CohereForCausalLM"
 
     def __init__(
         self,
@@ -16,7 +17,6 @@ class CohereConfig(Config):
     ):
         super().__init__(
             directory,
-            kwargs.get("arch_string", "CohereForCausalLM"),
             CohereModel,
             **kwargs
         )
@@ -49,6 +49,7 @@ class CohereConfig(Config):
 
 
 class CohereModel(Model):
+    config_class = CohereConfig
 
     def __init__(
         self,

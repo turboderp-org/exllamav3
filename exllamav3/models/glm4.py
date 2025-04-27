@@ -8,6 +8,7 @@ from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP,
 from ..modules.attn import prepare_for_attn
 
 class Glm4Config(Config):
+    arch_string = "Glm4ForCausalLM"
 
     def __init__(
         self,
@@ -16,7 +17,6 @@ class Glm4Config(Config):
     ):
         super().__init__(
             directory,
-            kwargs.get("arch_string", "Glm4ForCausalLM"),
             Glm4Model,
             **kwargs
         )
@@ -46,6 +46,7 @@ class Glm4Config(Config):
 
 
 class Glm4Model(Model):
+    config_class = Glm4Config
 
     def __init__(
         self,

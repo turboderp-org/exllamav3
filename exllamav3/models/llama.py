@@ -8,6 +8,7 @@ from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP,
 from ..modules.attn import prepare_for_attn
 
 class LlamaConfig(Config):
+    arch_string = "LlamaForCausalLM"
 
     def __init__(
         self,
@@ -16,7 +17,6 @@ class LlamaConfig(Config):
     ):
         super().__init__(
             directory,
-            kwargs.get("arch_string", "LlamaForCausalLM"),
             LlamaModel,
             **kwargs
         )
@@ -46,6 +46,7 @@ class LlamaConfig(Config):
 
 
 class LlamaModel(Model):
+    config_class = LlamaConfig
 
     def __init__(
         self,
