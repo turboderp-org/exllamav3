@@ -482,47 +482,53 @@ if __name__ == "__main__":
     logger.info(f"Starting OpenAI-compatible server on http://{args.host}:{args.port}...")
     logger.info(f"Using model: {model_name} from {args.model_dir}")
     logger.info("Endpoint available at POST /v1/chat/completions")
-    # --- Log Memory Usage ---
+    # --- Log Memory Usage and VRAM Info per Device ---
     model_bits, _, model_vram_bits = model.get_storage_info()
     model_bytes = model_vram_bits / 8
-    cache_bytes = 0
+    model_mb = model_bytes / (1024 * 1024)
+    logger.info(f"Total Model Memory Usage: {model_mb:.2f} MB")
+
+    cache_bytes_per_device: Dict[int, int] = {}
     if cache: # Ensure cache object exists
         for layer in cache.layers:
-            if isinstance(layer, CacheLayer_fp16):
-                if layer.k is not None: cache_bytes += layer.k.nbytes
-                if layer.v is not None: cache_bytes += layer.v.nbytes
-            elif isinstance(layer, CacheLayer_quant):
-                if layer.qk is not None: cache_bytes += layer.qk.nbytes
-                if layer.qv is not None: cache_bytes += layer.qv.nbytes
-                if layer.sk is not None: cache_bytes += layer.sk.nbytes
-                if layer.sv is not None: cache_bytes += layer.sv.nbytes
+            device_idx = layer.device.index # Get device index for the layer
+            if device_idx not in cache_bytes_per_device:
+                cache_bytes_per_device[device_idx] = 0
 
-    model_mb = model_bytes / (1024 * 1024)
-    cache_mb = cache_bytes / (1024 * 1024)
-    total_mb = model_mb + cache_mb
-    logger.info(f"Memory usage: Model: {model_mb:.2f} MB, Cache: {cache_mb:.2f} MB, Total: {total_mb:.2f} MB")
-    # --- Log VRAM Info ---
+            if isinstance(layer, CacheLayer_fp16):
+                if layer.k is not None: cache_bytes_per_device[device_idx] += layer.k.nbytes
+                if layer.v is not None: cache_bytes_per_device[device_idx] += layer.v.nbytes
+            elif isinstance(layer, CacheLayer_quant):
+                if layer.qk is not None: cache_bytes_per_device[device_idx] += layer.qk.nbytes
+                if layer.qv is not None: cache_bytes_per_device[device_idx] += layer.qv.nbytes
+                if layer.sk is not None: cache_bytes_per_device[device_idx] += layer.sk.nbytes
+                if layer.sv is not None: cache_bytes_per_device[device_idx] += layer.sv.nbytes
+
     try:
         if torch.cuda.is_available():
-            if generator and generator.cache and generator.cache.layers and generator.cache.layers[0].device.type == 'cuda':
-                device_idx: int = generator.cache.layers[0].device.index
-                device_name: str = torch.cuda.get_device_name(device_idx)
-                free_bytes, total_bytes = torch.cuda.mem_get_info(device_idx)
-                free_mb: float = free_bytes / (1024 * 1024)
-                total_mb: float = total_bytes / (1024 * 1024)
-                logger.info(f"VRAM Info ({device_name} - Device {device_idx}): Free: {free_mb:.2f} MB / Total: {total_mb:.2f} MB")
+            # Get unique device indices from cache layers
+            device_indices = sorted(list(cache_bytes_per_device.keys()))
+
+            if device_indices:
+                for device_idx in device_indices:
+                    device_name: str = torch.cuda.get_device_name(device_idx)
+                    free_bytes, total_bytes = torch.cuda.mem_get_info(device_idx)
+                    free_mb: float = free_bytes / (1024 * 1024)
+                    total_mb: float = total_bytes / (1024 * 1024)
+
+                    # Include cache memory for this device in the log
+                    cache_mb_this_device = cache_bytes_per_device.get(device_idx, 0) / (1024 * 1024)
+
+                    logger.info(f"Device {device_idx} ({device_name}): VRAM Free: {free_mb:.2f} MB / Total: {total_mb:.2f} MB, Cache on this device: {cache_mb_this_device:.2f} MB")
             else:
-                logger.info("Model not on CUDA device, skipping VRAM info logging.")
+                logger.info("No CUDA devices found in cache layers, skipping per-device VRAM/Cache info logging.")
         else:
             logger.info("CUDA not available, skipping VRAM info logging.")
     except AttributeError as e:
-        # Specific handling for the 'device' attribute error
         logger.warning(f"Could not retrieve VRAM info: {e}. This might happen if the loaded model object does not have a 'device' attribute, possibly due to the model type or an issue during initialization.")
     except Exception as e:
-        # Generic exception handling for other errors
-        logger.warning(f"Could not retrieve VRAM info: {e}")
-    # --- End Log VRAM Info ---
-    # --- End Log Memory Usage ---
+        logger.warning(f"An error occurred while logging VRAM info: {e}")
+    # --- End Log Memory Usage and VRAM Info per Device ---
     logger.info("Model list available at GET /v1/models")
 
     try:
