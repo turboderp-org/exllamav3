@@ -264,6 +264,49 @@ class PromptFormat_reka(PromptFormat):
         return " <reasoning>\n", "</reasoning>"
 
 
+class PromptFormat_cohere(PromptFormat):
+    description = "Cohere"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self):
+        return (
+            "## Task and Context\n"
+            "You help people answer their questions and other requests interactively. You will be asked a very "
+            "wide array of requests on all kinds of topics. You should focus on serving the user's needs as "
+            "best you can, which will be wide-ranging.\n\n"
+            "## Style Guide\n"
+            "Unless the user asks for a different style of answer, you should answer in full sentences, using "
+            "proper grammar and spelling."
+        )
+
+    def format(self, system_prompt, messages):
+        context = ""
+        if system_prompt:
+            context += "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>"
+            context += system_prompt
+            context += "<|END_OF_TURN_TOKEN|>"
+        for (u, a) in messages:
+            context += "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>"
+            context += u
+            context += "<|END_OF_TURN_TOKEN|>"
+            context += "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+            if a is not None:
+                context += a
+                context += "<|END_OF_TURN_TOKEN|>"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            "<|END_OF_TURN_TOKEN|>",
+        ]
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -273,4 +316,5 @@ prompt_formats = {
     "gemma": PromptFormat_gemma,
     "glm": PromptFormat_glm,
     "reka": PromptFormat_reka,
+    "cohere": PromptFormat_cohere,
 }
