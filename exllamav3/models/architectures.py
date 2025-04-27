@@ -6,6 +6,7 @@ from .phi3 import Phi3Config, Phi3Model
 from .gemma import Gemma2Config, Gemma2Model
 from .decilm import DeciLMConfig, DeciLMModel
 from .glm4 import Glm4Config, Glm4Model
+from .cohere import CohereConfig, CohereModel
 
 ARCHITECTURES = {
     "LlamaForCausalLM": {
@@ -42,6 +43,11 @@ ARCHITECTURES = {
         "architecture": "Glm4ForCausalLM",
         "config_class": Glm4Config,
         "model_class": Glm4Model,
+    },
+    "CohereForCausalLM": {
+        "architecture": "CohereForCausalLM",
+        "config_class": CohereConfig,
+        "model_class": CohereModel,
     },
 }
 
