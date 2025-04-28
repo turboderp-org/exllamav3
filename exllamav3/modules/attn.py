@@ -133,7 +133,7 @@ class Attention(Module):
         head_dim: int,
         num_q_heads: int,
         num_kv_heads: int,
-        rope_settings: RopeSettings,
+        rope_settings: RopeSettings | None,
         sm_scale: float | None = None,
         key_q: str | None = None,
         key_k: str | None = None,
@@ -194,10 +194,11 @@ class Attention(Module):
         for cl in self.cache_layers:
             cl.alloc(device)
 
-        self.rope = RoPE(
-            device,
-            self.rope_settings,
-        )
+        if self.rope_settings:
+            self.rope = RoPE(
+                device,
+                self.rope_settings,
+            )
 
         # self.join_qkv_fwd = (
         #     (self.q_proj.quant_type, self.k_proj.quant_type, self.v_proj.quant_type)
@@ -276,7 +277,8 @@ class Attention(Module):
 
         # TODO: q/k norms
 
-        q, k = self.rope.apply(q, k, position, positions, position_ids)
+        if self.rope:
+            q, k = self.rope.apply(q, k, position, positions, position_ids)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -307,7 +309,8 @@ class Attention(Module):
 
         # TODO: q/k norms
 
-        q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
+        if self.rope:
+            q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
 
         o = flash_attn_func(
             q = q,
@@ -346,7 +349,8 @@ class Attention(Module):
 
         # TODO: q/k norms
 
-        q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
+        if self.rope:
+            q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
 
         cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
         o = flash_attn_with_kvcache(

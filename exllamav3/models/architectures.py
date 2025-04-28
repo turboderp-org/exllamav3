@@ -6,6 +6,7 @@ from .gemma2 import Gemma2Model
 from .decilm import DeciLMModel
 from .glm4 import Glm4Model
 from .cohere import CohereModel
+from .cohere2 import Cohere2Model
 
 ARCHITECTURES = {
     m.config_class.arch_string: {
@@ -21,6 +22,7 @@ ARCHITECTURES = {
         DeciLMModel,
         Glm4Model,
         CohereModel,
+        Cohere2Model,
     ]
 }
 
