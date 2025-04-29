@@ -174,7 +174,7 @@ class Attention(Module):
         self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim, qmap = qmap + ".input", fkey = fkey, frange = frange_q)
         self.k_proj = Linear(config, f"{key}.{key_k}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_k)
         self.v_proj = Linear(config, f"{key}.{key_v}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_v)
-        self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o")
+        self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o", out_dtype = out_dtype)
 
         self.register_submodule(self.q_proj)
         self.register_submodule(self.k_proj)
