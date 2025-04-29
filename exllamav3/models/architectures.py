@@ -1,6 +1,7 @@
 from .llama import LlamaModel
 from .mistral import MistralModel
 from .qwen2 import Qwen2Model
+from .qwen3 import Qwen3Model
 from .phi3 import Phi3Model
 from .gemma2 import Gemma2Model
 from .decilm import DeciLMModel
@@ -17,6 +18,7 @@ ARCHITECTURES = {
         LlamaModel,
         MistralModel,
         Qwen2Model,
+        Qwen3Model,
         Phi3Model,
         Gemma2Model,
         DeciLMModel,
