@@ -101,7 +101,7 @@ class PromptFormat_chatml(PromptFormat):
         return context
 
     def add_bos(self):
-        return True
+        return False
 
     def stop_conditions(self, tokenizer):
         return [
