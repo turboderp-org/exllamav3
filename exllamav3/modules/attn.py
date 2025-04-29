@@ -6,7 +6,7 @@ from torch import nn
 from ..models import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
-from . import Module, Linear
+from . import Module, Linear, RMSNorm
 from ..device import get_device_context, release_device_context
 from ..constants import PAGE_SIZE
 from ..cache import Cache
@@ -143,7 +143,9 @@ class Attention(Module):
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         sliding_window: int  = -1,
-        logit_softcapping: float = 0.0
+        logit_softcapping: float = 0.0,
+        q_norm: RMSNorm | None = None,
+        k_norm: RMSNorm | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -178,6 +180,16 @@ class Attention(Module):
         self.register_submodule(self.k_proj)
         self.register_submodule(self.v_proj)
         self.register_submodule(self.o_proj)
+
+        if q_norm:
+            assert k_norm, "Must have both Q and K norms, or neither"
+            self.q_norm = q_norm
+            self.k_norm = k_norm
+            self.register_submodule(self.q_norm)
+            self.register_submodule(self.k_norm)
+        else:
+            self.q_norm = None
+            self.k_norm = None
 
         self.caps.update({
             "kv_cache": True
@@ -275,7 +287,9 @@ class Attention(Module):
         assert self.logit_softcapping == 0.0, \
             "Torch SDPA does not support logit softcapping"
 
-        # TODO: q/k norms
+        if self.q_norm:
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
             q, k = self.rope.apply(q, k, position, positions, position_ids)
@@ -307,7 +321,9 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        # TODO: q/k norms
+        if self.q_norm:
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
             q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
@@ -347,7 +363,9 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        # TODO: q/k norms
+        if self.q_norm:
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
             q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
