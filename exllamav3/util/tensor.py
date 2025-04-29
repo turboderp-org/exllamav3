@@ -145,3 +145,25 @@ def to2(
     elif dtype2 is not None:
         x = x.to(dtype2)
     return x
+
+
+def save_tensor_image(
+    t: torch.Tensor,
+    path: str,
+):
+    import matplotlib.cm as cm
+    from PIL import Image
+
+    t = t.detach().to("cpu", copy = True).float()
+
+    k = 3
+    mu, sigma = t.mean(), t.std()
+    lo, hi = mu - k * sigma, mu + k * sigma
+    t.clamp_(lo, hi)
+    t -= lo
+    t /= (hi - lo + 1e-8)
+
+    rgba = cm.get_cmap("gnuplot2")(t.numpy())
+    rgb8 = (rgba[..., :3] * 255).astype("uint8")
+    im = Image.fromarray(rgb8)
+    im.save(path)

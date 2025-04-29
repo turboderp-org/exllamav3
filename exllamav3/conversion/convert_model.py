@@ -8,6 +8,7 @@ from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem
 from ..util import Timer, human_time
+from ..util.tensor import save_tensor_image
 from .calibration_data import get_default_calibration
 from .compile import compile_model, dsize
 from safetensors.torch import save_file
@@ -32,6 +33,7 @@ parser.add_argument("-lcpi", "--last_checkpoint_index", type = int, default = No
 parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mode")
 parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
+parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
 
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--out_scales", dest = "out_scales_", action = "store_true", help = "Always enable out channel scales  (for debug purposes)")
@@ -87,9 +89,11 @@ def save_tensor(tensor, filename: str, args):
 def prepare_env(args):
     qtensors_dir = os.path.join(args["work_dir"], "qtensors")
     ckpt_dir = os.path.join(args["work_dir"], "ckpt")
+    images_dir = os.path.join(args["work_dir"], "images")
     os.makedirs(args["work_dir"], exist_ok = True)
     os.makedirs(qtensors_dir, exist_ok = True)
     os.makedirs(ckpt_dir, exist_ok = True)
+    os.makedirs(images_dir, exist_ok = True)
 
 
 def prepare(args) -> (dict, bool, str, str):
@@ -144,6 +148,7 @@ def prepare(args) -> (dict, bool, str, str):
         override(arg_, can_override if not args.override_anyway else True, default)
 
     # Momentary args
+    in_args["image_dump"] = args.image_dump
     in_args["verbose"] = args.verbose
     in_args["apply_out_scales"] = args.out_scales_
 
@@ -303,6 +308,15 @@ def main(args, job_state):
                 f" ## Logic error, no quantization strategy for module"
             assert all(isinstance(linear.inner, LinearFP16) for linear in linears)
 
+            # Write images
+            if args["image_dump"]:
+                for linear in linears:
+                    filename = f"images/{linear.key}.jpg"
+                    print(f" -- Saving image: {filename}")
+                    w = linear.inner.get_weight_tensor()
+                    assert w.dim() == 2
+                    save_tensor_image(w, os.path.join(args["work_dir"], filename))
+
             # Move original tensors to system RAM (load to GPU one by one when quantizing)
             for linear in linears:
                 linear.inner.swap_cpu()
@@ -317,11 +331,14 @@ def main(args, job_state):
                     "apply_out_scales": args["apply_out_scales"],
                 }
                 with Timer() as t:
+                    sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
+                        if args["image_dump"] else None
                     proxy_err = linear.convert_exl3(
                         capture_H[linear.qmap],
                         quant_args = quant_args,
                         progress_str = f" -- <step>: {linear.key}",
-                        verbose = args["verbose"]
+                        verbose = args["verbose"],
+                        save_reg = sr
                     )
                     assert isinstance(linear.inner, LinearEXL3)
                     linear.inner.swap_cpu()

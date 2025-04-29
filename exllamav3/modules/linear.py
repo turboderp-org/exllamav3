@@ -195,7 +195,8 @@ class Linear(Module):
         quant_args: dict,
         progress_str: str | None = None,
         return_weight_q: bool = False,
-        verbose: bool = False
+        verbose: bool = False,
+        save_reg: str = None
     ):
         assert isinstance(self.inner, LinearFP16), \
             "Inner layer is already quant type"
@@ -213,7 +214,8 @@ class Linear(Module):
             return_weight_q,
             progress_str,
             verbose,
-            swap_to_device
+            swap_to_device,
+            save_reg = save_reg
         )
 
         self.inner = LinearEXL3(
