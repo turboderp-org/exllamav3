@@ -100,11 +100,20 @@ class ComboSampler(CustomSampler):
         stack = [
             SS_RepP(rep_p, rep_sustain_range, rep_decay_range),
             SS_PresFreqP(pres_p, freq_p, rep_sustain_range, rep_decay_range),
-            SS_Temperature(temperature if not temp_last else 1.0),
-            SS_MinP(min_p),
-            SS_TopK(top_k),
-            SS_TopP(top_p),
-            SS_Temperature(temperature if temp_last else 1.0),
-            SS_Sample()
         ]
+
+        if temperature == 0.0:
+            stack += [
+                SS_Argmax()
+            ]
+        else:
+            stack += [
+                SS_Temperature(temperature if not temp_last else 1.0),
+                SS_MinP(min_p),
+                SS_TopK(top_k),
+                SS_TopP(top_p),
+                SS_Temperature(temperature if temp_last else 1.0),
+                SS_Sample()
+            ]
+
         super().__init__(stack)
