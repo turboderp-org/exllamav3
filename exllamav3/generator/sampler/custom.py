@@ -286,7 +286,7 @@ class SS_MinP(SS_Base):
     """
     def __init__(self, min_p: float):
         self.min_p = min_p
-        assert 0.0 <= min_p < 1.0
+        assert 0.0 <= min_p <= 1.0
 
     def run(self, state: SamplingState):
         match state.state:
