@@ -286,7 +286,7 @@ class SS_MinP(SS_Base):
     """
     def __init__(self, min_p: float):
         self.min_p = min_p
-        assert 0.0 < min_p <= 1.0
+        assert 0.0 <= min_p < 1.0
 
     def run(self, state: SamplingState):
         match state.state:
@@ -309,6 +309,11 @@ class SS_MinP(SS_Base):
                 return [SS_Normalize]
             case _:
                 return None
+
+    def alt(self):
+        if self.min_p == 0.0:
+            return SS_NoOp()
+        return None
 
 
 class SS_RepP(SS_Base):
