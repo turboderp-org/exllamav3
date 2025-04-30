@@ -115,6 +115,8 @@ class Qwen3Model(Model):
                     key_gate = "gate_proj",
                     key_down = "down_proj",
                     qmap = "block.mlp",
+                    interm_dtype = torch.half,
+                    out_dtype = torch.float,
                 ),
             )
             for idx in range(config.num_hidden_layers)
