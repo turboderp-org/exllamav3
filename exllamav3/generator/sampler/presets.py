@@ -109,11 +109,12 @@ class ComboSampler(CustomSampler):
         else:
             stack += [
                 SS_Temperature(temperature if not temp_last else 1.0),
-                SS_MinP(min_p),
+                SS_MinP(min_p) if min_p else None,
                 SS_TopK(top_k),
-                SS_TopP(top_p),
+                SS_TopP(top_p) if top_p else None,
                 SS_Temperature(temperature if temp_last else 1.0),
                 SS_Sample()
             ]
+            stack = [s for s in stack if s is not None]
 
         super().__init__(stack)
