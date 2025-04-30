@@ -251,7 +251,7 @@ class SS_TopP(SS_Base):
     """
     def __init__(self, top_p: float):
         self.top_p = top_p
-        assert 0.0 < top_p <= 1.0
+        assert 0.0 <= top_p <= 1.0
 
     def run(self, state: SamplingState):
         match state.state:
@@ -275,7 +275,7 @@ class SS_TopP(SS_Base):
                 return None
 
     def alt(self):
-        if self.top_p == 1.0 or self.top_p == 0.0:
+        if self.top_p == 1.0:
             return SS_NoOp()
         return None
 
