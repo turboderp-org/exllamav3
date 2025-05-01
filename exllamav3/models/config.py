@@ -43,7 +43,7 @@ class Config(ABC):
 
         arch = self.config_dict["architectures"][0]
         assert arch == self.arch_string, \
-            f"Unexpected architecture {arch} in {self.config_filename}, should be {expect_arch}."
+            f"Unexpected architecture {arch} in {self.config_filename}, should be {self.arch_string}."
         self.architecture = arch
 
         # Special mode to load tensors from across multiple variants of the same model
