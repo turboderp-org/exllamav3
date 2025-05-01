@@ -1,5 +1,4 @@
 from __future__ import annotations
-import tkinter as tk
 from collections import deque
 import math
 
@@ -37,6 +36,8 @@ class CacheVisualizer:
             gap: float = 0.75,
             margin: int = 25
     ):
+        import tkinter as tk
+
         self.num_pages = num_pages
         self.window_size = window_size
         self.gap = gap
@@ -176,7 +177,6 @@ class CacheVisualizer:
                     col = bcol
                 else:
                     col = self.root.tk.call("tk::Darken", bcol, 60)
-
 
                 x0, y0 = out_handles[page_a].popleft()
                 x1, y1 = in_handles[page_b].popleft()
