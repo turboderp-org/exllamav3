@@ -245,7 +245,13 @@ class Linear(Module):
                 "first_key": self.key,
                 "count": 0,
                 "finalized": False,
+                "num_total": 0,
+                "inf_nan": torch.zeros(2, dtype = torch.long, device = self.device),
             }
+
+        params["capture"][self.qmap]["num_total"] += x.numel()
+        ext.count_inf_nan(x, params["capture"][self.qmap]["inf_nan"])
+
         if params["capture"][self.qmap]["first_key"] == self.key:
             rows = np.prod(x.shape[:-1])
             dim = x.shape[-1]

@@ -16,6 +16,7 @@
 #include "quant/reconstruct.cuh"
 #include "quant/hadamard.cuh"
 #include "quant/exl3_gemm.cuh"
+#include "quant/util.cuh"
 
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
@@ -66,4 +67,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dequant_cache_cont", &dequant_cache_cont, "dequant_cache_cont");
     m.def("quant_cache_paged", &quant_cache_paged, "quant_cache_paged");
     m.def("dequant_cache_paged", &dequant_cache_paged, "dequant_cache_paged");
+
+    m.def("count_inf_nan", &count_inf_nan, "count_inf_nan");
 }

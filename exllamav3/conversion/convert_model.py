@@ -299,6 +299,13 @@ def main(args, job_state):
 
                 # Swap captured H to system RAM
                 for k, v in capture_H.items():
+                    infs, nans = v["inf_nan"][0].item(), v["inf_nan"][1].item()
+                    if infs or nans:
+                        numel = v["num_total"]
+                        print(f" !! Warning: {k} state has {infs:,} inf values and {nans:,} NaN values (out of {numel:,})")
+
+                # Swap captured H to system RAM
+                for k, v in capture_H.items():
                     v["H_swap_device"] = v["H"].device
                     v["H"] = v["H"].cpu()
 
