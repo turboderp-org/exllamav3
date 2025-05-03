@@ -177,6 +177,12 @@ class GatedMLP(Module):
 
 
     @override
+    def can_defer_load(self):
+        if self.num_slices > 1: return False
+        return super().can_defer_load()
+
+
+    @override
     def load(self, device: torch.Device, load_slice: int | None = None, **kwargs):
         if load_slice is None:
             super().load(device, **kwargs)

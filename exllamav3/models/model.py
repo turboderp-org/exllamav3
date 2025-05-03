@@ -154,7 +154,12 @@ class Model:
                             backup_dtype = dummy_state.dtype
 
                         # Load module
+                        defer = module.can_defer_load()
+                        if defer:
+                            self.config.stc.begin_deferred_load()
                         module.load(load_device)
+                        if defer:
+                            self.config.stc.end_deferred_load()
 
                         # Forward dummy state through module
                         dummy_state = module.prepare_for_device(dummy_state, {})
@@ -173,6 +178,7 @@ class Model:
 
                     # We're not good
                     except Exception as e:
+                        self.config.stc.abort_deferred_load()
                         if e.__class__.__name__ == "OutOfMemoryError" or \
                             "CUDA out of memory" in str(e) or \
                             "HIP out of memory" in str(e):

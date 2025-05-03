@@ -42,6 +42,10 @@ class Module(ABC):
         for module in self.modules:
             yield from module
 
+    def can_defer_load(self):
+        if len(self.modules) == 0: return True
+        return all(module.can_defer_load() for module in self.modules)
+
     def load(self, device: torch.Device, **kwargs):
         self.device = device
         for module in self.modules:

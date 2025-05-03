@@ -32,15 +32,13 @@ class LayerNorm(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
-        weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device)
-        bias = self.config.stc.get_tensor(f"{self.key}.bias", self.device, optional = True)
-        if weight.dtype == torch.float: weight = weight.to(torch.half)
-        if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
+        weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, float2half = True)
+        bias = self.config.stc.get_tensor(f"{self.key}.bias", self.device, optional = True, float2half = True)
         self._numel = weight.numel() + (bias.numel() if bias is not None else 0)
         self.weight = weight
-        self.weight_f = weight.to(torch.float)
+        self.weight_f = None
         self.bias = bias
-        self.bias_f = bias.to(torch.float) if self.bias is not None else None
+        self.bias_f = None
 
     @override
     def unload(self):
@@ -58,13 +56,25 @@ class LayerNorm(Module):
             t[f"{self.key}.bias"] = self.bias.contiguous()
         return t
 
+    def _weight_f(self):
+        if self.weight_f is None:
+            self.weight_f = self.weight.to(torch.float)
+        return self.weight_f
+
+    def _bias_f(self):
+        if self.bias is None:
+            return None
+        if self.bias_f is None:
+            self.bias_f = self.bias.to(torch.float)
+        return self.bias_f
+
     def forward_torch(
         self,
         x: torch.Tensor,
         params: dict,
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-        w, b = (self.weight_f, self.bias_f) if x.dtype == torch.float else (self.weight, self.bias)
+        w, b = (self._weight_f(), self._bias_f()) if x.dtype == torch.float else (self.weight, self.bias)
         x = F.layer_norm(x, x.shape[-1:], w, b, eps = self.layernorm_eps)
         return x.to(out_dtype or self.out_dtype)
 
@@ -79,6 +89,6 @@ class LayerNorm(Module):
         params: dict,
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-        w, b = (self.weight_f, self.bias_f) if x.dtype == torch.float else (self.weight, self.bias)
+        w, b = (self._weight_f(), self._bias_f()) if x.dtype == torch.float else (self.weight, self.bias)
         x = F.layer_norm(x, x.shape[-1:], w, b, eps = self.layernorm_eps)
         return x.to(out_dtype or self.out_dtype)

@@ -8,6 +8,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <Python.h>
 #include "util.h"
+#include "stloader.cuh"
 
 void stloader_read
 (
@@ -62,7 +63,6 @@ void stloader_read
             #ifdef __linux__
                 ssize_t br = pread(fileno(file), load_buffer + pos_a, pos_b - pos_a, offset + pos_a);
                 if (br != pos_b - pos_a) goto error;
-//                int sr = fseek(file, offset + pos_a, SEEK_SET);
             #else
                 int sr = _fseeki64(file, static_cast<__int64>(offset + pos_a), SEEK_SET);
                 if (sr) goto error;
@@ -176,3 +176,115 @@ void stloader_close_file(std::vector<uintptr_t> handles)
         fclose(file);
     }
 }
+
+void stloader_deferred_cpu(std::vector<TensorLoadJob> const& jobs)
+{
+    Py_BEGIN_ALLOW_THREADS
+    volatile bool load_failed = false;
+
+    auto load_worker = [&] (int base_index)
+    {
+        int index = base_index;
+        while (index < jobs.size())
+        {
+            TensorLoadJob const& job = jobs[index];
+            FILE* file = reinterpret_cast<FILE*>(job.handles[base_index]);
+            uint8_t* dest = reinterpret_cast<uint8_t*>(job.destination);
+
+            #ifdef __linux__
+                ssize_t br = pread(fileno(file), dest, job.bytesize, job.file_offset);
+                if (br != job.bytesize) goto error;
+            #else
+                int sr = _fseeki64(file, static_cast<__int64>(job.file_offset), SEEK_SET);
+                if (sr) goto error;
+                size_t br = fread(dest, 1, job.bytesize, file);
+                if (br != job.bytesize) goto error;
+            #endif
+
+            if (job.bf16_to_fp16)
+                inplace_bf16_to_fp16_cpu(dest, job.bytesize / 2);
+
+            index += STLOADER_THREADS;
+        }
+
+        return;
+
+        error:
+        load_failed = true;
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < STLOADER_THREADS && i < jobs.size(); ++i)
+        threads.emplace_back(load_worker, i);
+    for (auto& thread : threads)
+        thread.join();
+
+    TORCH_CHECK(!load_failed, "I/O error reading tensor");
+
+    Py_END_ALLOW_THREADS
+}
+
+// TODO: GPUDirect version
+void stloader_deferred_cuda(std::vector<TensorLoadJob> const& jobs)
+{
+    Py_BEGIN_ALLOW_THREADS
+    volatile bool load_failed = false;
+
+    auto load_worker = [&] (int base_index)
+    {
+        uint8_t* temp = nullptr;
+        int index = base_index;
+        while (index < jobs.size())
+        {
+            TensorLoadJob const& job = jobs[index];
+            FILE* file = reinterpret_cast<FILE*>(job.handles[base_index]);
+            uint8_t* dest = reinterpret_cast<uint8_t*>(job.destination);
+            temp = (uint8_t*) malloc(job.bytesize);
+
+            #ifdef __linux__
+                ssize_t br = pread(fileno(file), temp, job.bytesize, job.file_offset);
+                if (br != job.bytesize) goto error;
+            #else
+                int sr = _fseeki64(file, static_cast<__int64>(job.file_offset), SEEK_SET);
+                if (sr) goto error;
+                size_t br = fread(temp, 1, job.bytesize, file);
+                if (br != job.bytesize) goto error;
+            #endif
+
+            cudaSetDevice(job.device_id);
+
+            cudaError_t cr = cudaMemcpy(dest, temp, job.bytesize, cudaMemcpyDefault);
+            cudaDeviceSynchronize();
+            if (cr != cudaSuccess)
+            {
+                fprintf(stderr, "GPUassert: %s\n", cudaGetErrorString(cr));
+                goto error;
+            }
+
+            if (job.bf16_to_fp16)
+                inplace_bf16_to_fp16_cuda(dest, job.bytesize / 2);
+
+            free(temp);
+            temp = nullptr;
+
+            index += STLOADER_THREADS;
+        }
+
+        return;
+
+        error:
+        if (temp) free(temp);
+        load_failed = true;
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < STLOADER_THREADS && i < jobs.size(); ++i)
+        threads.emplace_back(load_worker, i);
+    for (auto& thread : threads)
+        thread.join();
+
+    TORCH_CHECK(!load_failed, "I/O error reading tensor");
+
+    Py_END_ALLOW_THREADS
+}
+

@@ -24,9 +24,8 @@ class LinearFP16:
         first_out_feature: int | None = None,
         out_dtype: torch.dtype | None = None
     ):
-        if weight.dtype == torch.float: weight = weight.to(torch.half)
+        self.weight = weight
         if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
-        self.weight = weight.T
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
@@ -48,8 +47,6 @@ class LinearFP16:
             w = torch.empty(self.weight.shape, dtype = self.weight.dtype, device = self.weight.device)
             w.copy_(self.weight)
             self.weight = w
-        else:
-            self.weight = self.weight.contiguous()
 
     def get_tensors(self, key: str):
         t = {}
@@ -64,7 +61,7 @@ class LinearFP16:
         params: dict,
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-        bsz, seqlen, dim = x.shape
+        out_shape = x.shape[:-1] + (self.out_features,)
         x = x.view(-1, x.shape[-1])
         y = torch.zeros(
             (x.shape[0], self.out_features),
@@ -74,7 +71,7 @@ class LinearFP16:
         ext.hgemm(x, self.weight, y)
         if self.bias is not None:
             y += self.bias
-        y = y.view(bsz, seqlen, self.out_features)
+        y = y.view(out_shape)
         return y
 
     def get_weight_tensor(self) -> torch.Tensor:
