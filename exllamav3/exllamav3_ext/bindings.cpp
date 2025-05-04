@@ -2,6 +2,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <cuda_fp16.h>
+
 #include "stloader.h"
 #include "hadamard.h"
 
@@ -16,6 +18,7 @@
 #include "quant/reconstruct.cuh"
 #include "quant/hadamard.cuh"
 #include "quant/exl3_gemm.cuh"
+#include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
 
 #include "generator/strings.h"
@@ -50,7 +53,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
-    m.def("exl3_gemm_num_kernel_variants", &exl3_gemm_num_kernel_variants, "exl3_gemm_num_kernel_variants");
+    m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
+    m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
     m.def("hgemm", &hgemm, "hgemm");
     m.def("rope", &rope, "rope");
     m.def("silu_mul", &silu_mul, "silu_mul");

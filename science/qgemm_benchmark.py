@@ -8,8 +8,8 @@ from tabulate import tabulate
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
-K = 8
-runs = 200
+K = 1
+runs = 50
 
 shapes_m = [1, 4, 16, 17, 32]
 
@@ -30,11 +30,11 @@ shapes_kn = [
 
 devices = [
     "cuda:1",
-    "cuda:2",
-    "cuda:3",
+    # "cuda:2",
+    # "cuda:3",
 ]
 
-kernels = range(1, 1 + ext.exl3_gemm_num_kernel_variants())
+kernels = range(1, 1 + ext.exl3_gemm_num_kernel_shapes())
 
 @torch.inference_mode()
 def main():
@@ -60,6 +60,8 @@ def main():
                 proto_a = torch.randn((m, k), dtype = torch.half, device = device)
                 proto_b = torch.zeros((k // 16, n // 16, 16 * K), dtype = torch.short, device = device)
                 proto_c = torch.zeros((m, n), dtype = torch.half, device = device)
+                proto_suh = torch.randn((k,), dtype = torch.half, device = device)
+                proto_svh = torch.randn((n,), dtype = torch.half, device = device)
 
                 # Create enough clones to cycle through to prevent L2 cache from skewing results
                 assume_cache = 512 * 1024**2
@@ -68,9 +70,11 @@ def main():
                 a = [proto_a.clone() for _ in range(num_buffers)]
                 b = [proto_b.clone() for _ in range(num_buffers)]
                 c = [proto_c.clone() for _ in range(num_buffers)]
+                suh = [proto_suh.clone() for _ in range(num_buffers)]
+                svh = [proto_svh.clone() for _ in range(num_buffers)]
 
                 # Get preferred kernel for current shape
-                pref = ext.exl3_gemm(a[0], b[0], c[0], None, -1)
+                pref = ext.exl3_gemm(a[0], b[0], c[0], suh[0], a[0], svh[0], -1)
 
                 # Test all kernels
                 kresults = []
@@ -78,8 +82,8 @@ def main():
                     print(".", end = "", flush = True)
 
                     # Test if kernel is compatible
-                    compat = ext.exl3_gemm(a[0], b[0], c[0], None, kernel)
-                    if compat == 0:
+                    compat = ext.exl3_gemm_shape_compat(kernel, m, k, n, K)
+                    if not compat:
                         results[-1][-1].append("N/A")
                         kresults.append(1e6)
                         continue
@@ -87,14 +91,14 @@ def main():
                     # Warmup passes for good measure
                     for i_ in range(10):
                         i = i_ % num_buffers
-                        ext.exl3_gemm(a[i], b[i], c[i], None, kernel)
+                        ext.exl3_gemm(a[i], b[i], c[i], suh[i], a[i], svh[i], kernel)
 
                     # Test
                     dummy = c[0][0, 0].item()
                     with Timer() as t:
                         for i_ in range(runs):
                             i = i_ % num_buffers
-                            ext.exl3_gemm(a[i], b[i], c[i], None, kernel)
+                            ext.exl3_gemm(a[i], b[i], c[i], suh[i], a[i], svh[i], kernel)
                         dummy = c[i][0, 0].item()
 
                     mean_time_ms = t.interval / runs * 1000
