@@ -33,7 +33,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     py::class_<TensorLoadJob>(m, "TensorLoadJob")
         .def(py::init<std::vector<uintptr_t>, size_t, size_t, uintptr_t, bool, bool, bool, int>());
     m.def("stloader_deferred_cpu", &stloader_deferred_cpu, py::arg("jobs"));
-    m.def("stloader_deferred_cuda", &stloader_deferred_cuda, py::arg("jobs"));
+    m.def("stloader_deferred_cuda", &stloader_deferred_cuda, py::arg("jobs"), py::arg("max_chunk_size"));
 
     m.def("rms_norm", &rms_norm, "rms_norm");
     m.def("softcap", &softcap, "softcap");

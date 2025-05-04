@@ -29,4 +29,4 @@ struct TensorLoadJob {
 };
 
 void stloader_deferred_cpu(std::vector<TensorLoadJob> const& jobs);
-void stloader_deferred_cuda(std::vector<TensorLoadJob> const& jobs);
+void stloader_deferred_cuda(std::vector<TensorLoadJob> const& jobs, size_t max_chunk_size);

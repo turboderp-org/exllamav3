@@ -1,4 +1,7 @@
 from __future__ import annotations
+
+from dataclasses import dataclass
+
 import torch
 import os, glob
 import numpy as np
@@ -8,7 +11,7 @@ from ..util import Timer, cuda_sync_active
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
 
-MAX_DEFERRED_LOAD_CHUNK = 8*1024**2
+MAX_DEFERRED_LOAD_CHUNK = 2*1024**2
 
 def convert_dtype(dt: str):
     if dt == "I32": return torch.int, np.int32, 4
@@ -27,6 +30,24 @@ def read_header(filename: str) -> dict:
         header = json.loads(header_json.decode("utf-8"))
         header["_header_offset"] = fp.tell()
         return header
+
+
+@dataclass
+class STCMetrics:
+    bytes_loaded: int = 0
+    time_elapsed: float = 0.0
+    deferred_tensors: int = 0
+    deferred_passes: int = 0
+    direct_tensors: int = 0
+    total_chunks: int = 0
+    def bandwidth(self):
+        return self.bytes_loaded / (1024 ** 3) / self.time_elapsed
+    def print(self):
+        print(f" -- Total size: {self.bytes_loaded:,} bytes, {self.bytes_loaded / 1024**3:.2f} GB")
+        print(f" -- Load time: {self.time_elapsed:.3f} seconds")
+        print(f" -- Bandwidth: {self.bandwidth():.3f} GB / s")
+        print(f" -- Deferred: {self.deferred_tensors:,} tensors in {self.deferred_passes:,} passes, {self.total_chunks:,} chunks")
+        print(f" -- Direct: {self.direct_tensors:,} tensors")
 
 
 class SafetensorsCollection:
@@ -53,8 +74,7 @@ class SafetensorsCollection:
         self.handles: dict[str, list | None] = {}
         self.load_method = load_method or "mt_fread"
 
-        self.bytes_loaded = 0
-        self.time_elapsed = 0
+        self.metrics = STCMetrics()
 
         self.tensor_files = []
         self.add_tensor_files(directory)
@@ -269,6 +289,7 @@ class SafetensorsCollection:
                         "device_id": tensor.device.index if tensor.is_cuda else -1,
                         "transpose": transpose,
                     })
+                    self.metrics.deferred_tensors += 1
 
                 case "mt_fread":
                     h = self.handles[filename]
@@ -296,6 +317,7 @@ class SafetensorsCollection:
                         padded[tuple(slice(0, s) for s in tensor.shape)].copy_(tensor)
                         tensor = padded
                     tensor = tensor.contiguous()
+                    self.metrics.direct_tensors += 1
 
 
                 case "python":
@@ -314,12 +336,13 @@ class SafetensorsCollection:
                             padded[tuple(slice(0, s) for s in tensor.shape)].copy_(tensor)
                             tensor = padded
                         tensor = tensor.to(device).contiguous()
+                    self.metrics.direct_tensors += 1
 
                 case _:
                     raise ValueError(f"Invalid load_method: {load_method}")
 
-        self.bytes_loaded += bytesize
-        self.time_elapsed += timer.interval
+        self.metrics.bytes_loaded += bytesize
+        self.metrics.time_elapsed += timer.interval
 
         return tensor
 
@@ -330,11 +353,6 @@ class SafetensorsCollection:
             if h:
                 ext.stloader_close_file(h)
                 self.handles[filename] = None
-
-
-    def get_metrics(self):
-        bandwidth = self.bytes_loaded / (1024**3) / self.time_elapsed
-        return self.bytes_loaded, self.time_elapsed, bandwidth
 
 
     @lru_cache
@@ -399,9 +417,9 @@ class SafetensorsCollection:
                 return wl
 
             for filename, loads in cpu_loads.items():
-                # print(filename, "CPU", len(loads))
-                loads = sorted(loads, key = lambda c: c["file_offset"])
+                loads = sorted(loads, key = lambda c: -c["bytesize"])
                 workload = make_workload(loads)
+                self.metrics.total_chunks += len(workload)
                 ext.stloader_deferred_cpu(workload)
                 for w in loads:
                     if w["temp_tensor"] is not None:
@@ -412,10 +430,10 @@ class SafetensorsCollection:
                         w["dest_tensor"][unpadded_idx].copy_(src)
 
             for filename, loads in cuda_loads.items():
-                # print(filename, "CUDA", len(loads))
-                loads = sorted(loads, key = lambda c: c["file_offset"])
+                loads = sorted(loads, key = lambda c: -c["bytesize"])
                 workload = make_workload(loads)
-                ext.stloader_deferred_cuda(workload)
+                self.metrics.total_chunks += len(workload)
+                ext.stloader_deferred_cuda(workload, MAX_DEFERRED_LOAD_CHUNK)
                 for w in loads:
                     if w["temp_tensor"] is not None:
                         src = w["temp_tensor"]
@@ -424,7 +442,8 @@ class SafetensorsCollection:
                         unpadded_idx = tuple(slice(0, s) for s in src.shape)
                         w["dest_tensor"][unpadded_idx].copy_(src)
 
-        self.time_elapsed += timer.interval
+        self.metrics.time_elapsed += timer.interval
+        self.metrics.deferred_passes += 1
 
         self.deferred_mode = False
         self.deferred_loads = []

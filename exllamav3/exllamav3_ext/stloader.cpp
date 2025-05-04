@@ -10,6 +10,8 @@
 #include "util.h"
 #include "stloader.cuh"
 
+uint8_t* host_buffers[STLOADER_THREADS] = {nullptr};
+
 void stloader_read
 (
     std::vector<uintptr_t> handles,
@@ -174,7 +176,14 @@ void stloader_close_file(std::vector<uintptr_t> handles)
     {
         FILE* file = reinterpret_cast<FILE*>(handles[i]);
         fclose(file);
+
+        if (host_buffers[i])
+        {
+            cudaFreeHost(host_buffers[i]);
+            host_buffers[i] = nullptr;
+        }
     }
+
 }
 
 void stloader_deferred_cpu(std::vector<TensorLoadJob> const& jobs)
@@ -224,22 +233,26 @@ void stloader_deferred_cpu(std::vector<TensorLoadJob> const& jobs)
     Py_END_ALLOW_THREADS
 }
 
-// TODO: GPUDirect version
-void stloader_deferred_cuda(std::vector<TensorLoadJob> const& jobs)
+// TODO: GPUDirect option
+void stloader_deferred_cuda(std::vector<TensorLoadJob> const& jobs, size_t max_chunk_size)
 {
     Py_BEGIN_ALLOW_THREADS
     volatile bool load_failed = false;
 
     auto load_worker = [&] (int base_index)
     {
-        uint8_t* temp = nullptr;
+        cudaError_t cr;
+
+        if (!host_buffers[base_index])
+            cudaMallocHost((void **) &host_buffers[base_index], max_chunk_size);
+        uint8_t* temp = host_buffers[base_index];
+
         int index = base_index;
         while (index < jobs.size())
         {
             TensorLoadJob const& job = jobs[index];
             FILE* file = reinterpret_cast<FILE*>(job.handles[base_index]);
             uint8_t* dest = reinterpret_cast<uint8_t*>(job.destination);
-            temp = (uint8_t*) malloc(job.bytesize);
 
             #ifdef __linux__
                 ssize_t br = pread(fileno(file), temp, job.bytesize, job.file_offset);
@@ -253,7 +266,7 @@ void stloader_deferred_cuda(std::vector<TensorLoadJob> const& jobs)
 
             cudaSetDevice(job.device_id);
 
-            cudaError_t cr = cudaMemcpy(dest, temp, job.bytesize, cudaMemcpyDefault);
+            cudaError_t cr = cudaMemcpyAsync(dest, temp, job.bytesize, cudaMemcpyDefault);
             cudaDeviceSynchronize();
             if (cr != cudaSuccess)
             {
@@ -264,16 +277,12 @@ void stloader_deferred_cuda(std::vector<TensorLoadJob> const& jobs)
             if (job.bf16_to_fp16)
                 inplace_bf16_to_fp16_cuda(dest, job.bytesize / 2);
 
-            free(temp);
-            temp = nullptr;
-
             index += STLOADER_THREADS;
         }
 
         return;
 
         error:
-        if (temp) free(temp);
         load_failed = true;
     };
 
