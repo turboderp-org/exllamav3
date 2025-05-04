@@ -8,7 +8,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <Python.h>
 #include "util.h"
-#include "stloader.cuh"
+#include "stloader_cu.cuh"
 
 uint8_t* host_buffers[STLOADER_THREADS] = {nullptr};
 
