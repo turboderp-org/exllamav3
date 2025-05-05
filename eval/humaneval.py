@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os, sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from exllamav3 import model_init, Generator, Job, TopPSampler
+from exllamav3 import model_init, Generator, Job, ComboSampler
 from exllamav3.util.progress import ProgressBar
 import argparse, contextlib, subprocess
 from human_eval.data import write_jsonl, read_problems
@@ -56,6 +56,21 @@ prompt_formats = {
         "\n\n{{problem}}"
         " <sep> assistant: ```python\n{{problem}}",
         "    "
+    ),
+    "chatml": (
+        "<|im_start|>system\n"
+        "You are a helpful AI coding assistant.<|im_end|>\n"
+        "<|im_start|>user\n"
+        "Complete the following Python function:\n\n{{problem}}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        "Sure! Here is how you might implement the function:\n\n```python\n{{problem}}",
+        "    "
+    ),
+    "deepseek": (
+        "You are a helpful AI coding assistant.\n"
+        "<｜User｜>Complete the following Python function:\n\n{{problem}}"
+        "<｜Assistant｜>Sure! Here is how you might implement the function:\n\n```python\n{{problem}}",
+        "    "
     )
 }
 
@@ -83,9 +98,13 @@ def main(args):
         max_batch_size = 256,
         tokenizer = tokenizer
     )
-    sampler = TopPSampler(
+    sampler = ComboSampler(
+        rep_p = args.rep_p,
+        temperature = args.temperature,
+        min_p = args.min_p,
+        top_k = args.top_k,
         top_p = args.top_p,
-        temperature = args.temperature
+        temp_last = args.temp_last
     )
 
     # Get problems
@@ -169,7 +188,11 @@ if __name__ == "__main__":
     parser.add_argument("-v", "--verbose", action = "store_true", help = "Spam completions to console while generating")
     parser.add_argument("-e", "--eval", action = "store_true", help = "Run evaluation script on output file after sampling")
     parser.add_argument("-temp", "--temperature", type = float, help = "Sampling temperature (0 for greedy), default: 0.6", default = 0.6)
+    parser.add_argument("-minp", "--min_p", type = float, help = "Min-p sampling, default: 0.0 (disabled)", default = 0.0)
+    parser.add_argument("-topk", "--top_k", type = float, help = "Top-k sampling, default: 0.0 (disabled)", default = 0.0)
     parser.add_argument("-topp", "--top_p", type = float, help = "Top-p sampling, default: 0.6", default = 0.6)
+    parser.add_argument("-templast", "--temp_last", action = "store_true", help = "Use temperature last")
+    parser.add_argument("-repp", "--rep_p", type = float, help = "Repetition penalty, default: 1.0 (disabled)", default = 1.0)
     parser.add_argument("--max_tokens", type = int, default = 768, help = "Max number of tokens for each completion")
     _args = parser.parse_args()
     main(_args)
