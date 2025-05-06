@@ -258,8 +258,12 @@ class SafetensorsCollection:
                 case "defer":
                     h = self.handles[filename]
                     if not h:
-                        h = ext.stloader_open_file(filename)
-                        self.handles[filename] = h
+                        try:
+                            h = ext.stloader_open_file(filename)
+                            self.handles[filename] = h
+                        except RuntimeError as e:
+                            print(f" ## Error opening {filename}")
+                            raise e
                     bf16_to_fp16 = (dtype == torch.bfloat16 and not allow_bf16)
                     fp32_to_fp16 = (dtype == torch.float and float2half)
                     load_shape = tuple(shape)
@@ -294,8 +298,12 @@ class SafetensorsCollection:
                 case "mt_fread":
                     h = self.handles[filename]
                     if not h:
-                        h = ext.stloader_open_file(filename)
-                        self.handles[filename] = h
+                        try:
+                            h = ext.stloader_open_file(filename)
+                            self.handles[filename] = h
+                        except RuntimeError as e:
+                            print(f" ## Error opening {filename}")
+                            raise e
                     tensor = torch.empty(shape, dtype = dtype, device = device)
                     assert tensor.is_contiguous()
                     if device != "cpu":

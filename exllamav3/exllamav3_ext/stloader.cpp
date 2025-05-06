@@ -9,6 +9,8 @@
 #include <Python.h>
 #include "util.h"
 #include "stloader_cu.cuh"
+#include <cerrno>
+#include <cstring>
 
 uint8_t* host_buffers[STLOADER_THREADS] = {nullptr};
 
@@ -47,6 +49,7 @@ void stloader_read
     Py_BEGIN_ALLOW_THREADS
 
     volatile bool load_failed = false;
+    volatile int load_errnum = 0;
     std::mutex mtx;
     std::deque<std::pair<size_t, size_t>> dq;
     std::condition_variable cv;
@@ -85,7 +88,8 @@ void stloader_read
 
         error:
         if (file && ferror(file))
-            printf("Error reading file: %s (errno: %d)\n", strerror(errno), errno);
+            printf(" ## Error reading file: %s (errno: %d)\n", strerror(errno), errno);
+        load_errnum = errno;
         load_failed = true;
     };
 
@@ -129,13 +133,14 @@ void stloader_read
 
             if (cr != cudaSuccess)
             {
-                fprintf(stderr, "GPUassert: %s\n", cudaGetErrorString(cr));
+                fprintf(stderr, " ## GPUassert: %s\n", cudaGetErrorString(cr));
                 goto error;
             }
         }
         return;
 
         error:
+        load_errnum = errno;
         load_failed = true;
     };
 
@@ -147,7 +152,12 @@ void stloader_read
     for (auto& thread : threads)
         thread.join();
 
-    TORCH_CHECK(!load_failed, "I/O error reading tensor");
+    if (load_failed)
+        TORCH_CHECK
+        (
+            false, " ## Error reading file: ", std::strerror(load_errnum),
+            " (errno=", load_errnum, ")"
+        );
 
     if (!target_cpu)
     {
@@ -164,7 +174,14 @@ std::vector<uintptr_t> stloader_open_file(const char* filename)
     for (int i = 0; i < STLOADER_THREADS; ++i)
     {
         FILE* file = fopen(filename, "rb");
-        TORCH_CHECK(file, "Error opening file");
+        if (!file)
+        {
+            int errnum = errno;
+            TORCH_CHECK(
+                false, " ## Error opening file '", filename, "': ",
+                std::strerror(errnum), " (errno=", errnum, ")"
+            );
+        }
         handles.push_back(reinterpret_cast<uintptr_t>(file));
     }
     return handles;
@@ -190,6 +207,7 @@ void stloader_deferred_cpu(std::vector<TensorLoadJob> const& jobs)
 {
     Py_BEGIN_ALLOW_THREADS
     volatile bool load_failed = false;
+    volatile int load_errnum = 0;
 
     auto load_worker = [&] (int base_index)
     {
@@ -219,6 +237,7 @@ void stloader_deferred_cpu(std::vector<TensorLoadJob> const& jobs)
         return;
 
         error:
+        load_errnum = errno;
         load_failed = true;
     };
 
@@ -238,6 +257,7 @@ void stloader_deferred_cuda(std::vector<TensorLoadJob> const& jobs, size_t max_c
 {
     Py_BEGIN_ALLOW_THREADS
     volatile bool load_failed = false;
+    volatile int load_errnum = 0;
 
     auto load_worker = [&] (int base_index)
     {
@@ -292,7 +312,12 @@ void stloader_deferred_cuda(std::vector<TensorLoadJob> const& jobs, size_t max_c
     for (auto& thread : threads)
         thread.join();
 
-    TORCH_CHECK(!load_failed, "I/O error reading tensor");
+    if (load_failed)
+        TORCH_CHECK
+        (
+            false, " ## Error reading file: ", std::strerror(load_errnum),
+            " (errno=", load_errnum, ")"
+        );
 
     Py_END_ALLOW_THREADS
 }
