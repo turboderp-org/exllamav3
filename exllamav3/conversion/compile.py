@@ -68,6 +68,7 @@ def compile_model(args, model, config, tokenizer):
             tensors = qtensors_stc.get_tensors(prefix, allow_bf16 = True)
             tensors = {k: v.contiguous() for k, v in tensors.items()}
             file_dict.update(tensors)
+            qtensors_stc.close()
         for name in file_dict.keys():
             map_dict[name] = filename
         save_file(file_dict, os.path.join(out_dir, filename))

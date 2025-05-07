@@ -272,6 +272,7 @@ def main(args, job_state):
             for m in module:
                 if m.used_alt_key and not slicing:
                     print(f"     - Cloned {m.key} from {m.alt_key}")
+            module.config.stc.close()
 
             # Skip modules without quant targets
             qmaps = module.get_qmaps()
