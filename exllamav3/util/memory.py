@@ -163,12 +163,15 @@ def list_gpu_tensors(min_size: int = 1, cuda_only: bool = True):
 
         # If object is a dictionary, iterate through all its items
         if isinstance(obj, dict):
-            for key, value in obj.items():
-                new_path = f"{path}['{key}']"
-                collect(new_path, value)
-                if id(value) not in visited:
-                    visited.add(id(value))
-                    queue.append((new_path, value))
+            try:
+                for key, value in obj.items():
+                    new_path = f"{path}['{key}']"
+                    collect(new_path, value)
+                    if id(value) not in visited:
+                        visited.add(id(value))
+                        queue.append((new_path, value))
+            except:
+                pass
 
         # Same for list, tuple, set
         if isinstance(obj, (list, tuple, set)):

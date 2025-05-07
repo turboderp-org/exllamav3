@@ -31,8 +31,7 @@ class RMSNorm(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
-        weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device)
-        if weight.dtype == torch.float: weight = weight.to(torch.half)
+        weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, float2half = True)
         self._numel = weight.numel()
         self.weight = nn.Parameter(weight, requires_grad = False)
 
@@ -73,6 +72,8 @@ class RMSNorm(Module):
         params: dict,
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
+
+        # TODO: Evalute whether a specialized kernel would be preferable for Q/K norms
 
         x_shape = x.shape
         x = x.view(-1, x.size(-1))

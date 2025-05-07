@@ -1,4 +1,7 @@
 from __future__ import annotations
+
+from dataclasses import dataclass
+
 import torch
 import os, glob
 import numpy as np
@@ -7,6 +10,8 @@ import mmap
 from ..util import Timer, cuda_sync_active
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
+
+MAX_DEFERRED_LOAD_CHUNK = 2*1024**2
 
 def convert_dtype(dt: str):
     if dt == "I32": return torch.int, np.int32, 4
@@ -25,6 +30,24 @@ def read_header(filename: str) -> dict:
         header = json.loads(header_json.decode("utf-8"))
         header["_header_offset"] = fp.tell()
         return header
+
+
+@dataclass
+class STCMetrics:
+    bytes_loaded: int = 0
+    time_elapsed: float = 0.0
+    deferred_tensors: int = 0
+    deferred_passes: int = 0
+    direct_tensors: int = 0
+    total_chunks: int = 0
+    def bandwidth(self):
+        return self.bytes_loaded / (1024 ** 3) / self.time_elapsed
+    def print(self):
+        print(f" -- Total size: {self.bytes_loaded:,} bytes, {self.bytes_loaded / 1024**3:.2f} GB")
+        print(f" -- Load time: {self.time_elapsed:.3f} seconds")
+        print(f" -- Bandwidth: {self.bandwidth():.3f} GB / s")
+        print(f" -- Deferred: {self.deferred_tensors:,} tensors in {self.deferred_passes:,} passes, {self.total_chunks:,} chunks")
+        print(f" -- Direct: {self.direct_tensors:,} tensors")
 
 
 class SafetensorsCollection:
@@ -51,13 +74,15 @@ class SafetensorsCollection:
         self.handles: dict[str, list | None] = {}
         self.load_method = load_method or "mt_fread"
 
-        self.bytes_loaded = 0
-        self.time_elapsed = 0
+        self.metrics = STCMetrics()
 
         self.tensor_files = []
         self.add_tensor_files(directory)
 
         self.new_tensors = None
+        self.deferred_mode = False
+        self.deferred_loads = []
+
 
     def add_tensor_files(
         self,
@@ -170,6 +195,7 @@ class SafetensorsCollection:
         return results
 
 
+    # TODO: deferred load
     def get_tensors(
         self,
         prefix: str,
@@ -185,12 +211,17 @@ class SafetensorsCollection:
         return result
 
 
+    # TODO: deferred load
     def get_tensor(
         self,
         key: str,
         device: torch.device | None = None,
         optional: bool = False,
-        allow_bf16: bool = False
+        allow_bf16: bool = False,
+        float2half: bool = False,
+        no_defer: bool = False,
+        transpose: bool = False,
+        pad_to: tuple = None,
     ) -> torch.Tensor | None:
 
         if device is None:
@@ -219,38 +250,107 @@ class SafetensorsCollection:
             f"Incorrect size of {key} in {filename}"
 
         load_method = self.load_method
+        if load_method == "mt_fread" and self.deferred_mode and not no_defer:
+            load_method = "defer"
 
-        with Timer() as timer:
+        with (Timer() as timer):
             match load_method:
+                case "defer":
+                    h = self.handles[filename]
+                    if not h:
+                        try:
+                            h = ext.stloader_open_file(filename)
+                            self.handles[filename] = h
+                        except RuntimeError as e:
+                            print(f" ## Error opening {filename}")
+                            raise e
+                    bf16_to_fp16 = (dtype == torch.bfloat16 and not allow_bf16)
+                    fp32_to_fp16 = (dtype == torch.float and float2half)
+                    load_shape = tuple(shape)
+                    load_shape_t = load_shape if not transpose else (shape[1], shape[0])
+                    load_dtype = dtype
+                    if bf16_to_fp16 and load_dtype == torch.bfloat16:
+                        load_dtype = torch.half
+                    final_shape = pad_to if pad_to is not None else load_shape_t
+                    final_dtype = dtype if not (bf16_to_fp16 or fp32_to_fp16) else torch.float16
+                    if final_shape == load_shape_t:
+                        tensor = torch.empty(final_shape, dtype = final_dtype, device = device)
+                    else:
+                        tensor = torch.zeros(final_shape, dtype = final_dtype, device = device)
+                    if transpose or fp32_to_fp16 or final_shape != load_shape_t:
+                        temp_tensor = torch.empty(load_shape, dtype = load_dtype, device = device)
+                    else:
+                        temp_tensor = None
+                    self.deferred_loads.append({
+                        "filename": filename,
+                        "file_offset": offset + beg,
+                        "bytesize": bytesize,
+                        "temp_tensor": temp_tensor,
+                        "dest_tensor": tensor,
+                        "bf16_to_fp16": bf16_to_fp16,
+                        "fp32_to_fp16": fp32_to_fp16,
+                        "cuda": tensor.is_cuda,
+                        "device_id": tensor.device.index if tensor.is_cuda else -1,
+                        "transpose": transpose,
+                    })
+                    self.metrics.deferred_tensors += 1
+
                 case "mt_fread":
                     h = self.handles[filename]
                     if not h:
-                        h = ext.stloader_open_file(filename)
-                        self.handles[filename] = h
+                        try:
+                            h = ext.stloader_open_file(filename)
+                            self.handles[filename] = h
+                        except RuntimeError as e:
+                            print(f" ## Error opening {filename}")
+                            raise e
                     tensor = torch.empty(shape, dtype = dtype, device = device)
+                    assert tensor.is_contiguous()
                     if device != "cpu":
                         cuda_sync_active()
-                    assert tensor.is_contiguous()
                     ext.stloader_read(
                         h,
                         offset + beg,
                         bytesize,
                         tensor,
                     )
+                    if tensor.dtype == torch.bfloat16 and not allow_bf16:
+                        tensor = tensor.to(torch.float16)
+                    if tensor.dtype == torch.float and float2half:
+                        tensor = tensor.to(torch.float16)
+                    if transpose:
+                        tensor = tensor.T
+                    if pad_to is not None:
+                        padded = torch.zeros(pad_to, dtype = tensor.dtype, device = tensor.device)
+                        padded[tuple(slice(0, s) for s in tensor.shape)].copy_(tensor)
+                        tensor = padded
+                    tensor = tensor.contiguous()
+                    self.metrics.direct_tensors += 1
+
+
                 case "python":
                     with open(filename, "rb") as fp:
                         fp.seek(offset + beg)
                         buffer = bytearray(fp.read(bytesize))
                         tensor = torch.frombuffer(buffer, dtype = dtype, count = numel).reshape(shape)
-                        tensor = tensor.to(device)
+                        if tensor.dtype == torch.bfloat16 and not allow_bf16:
+                            tensor = tensor.to(torch.float16)
+                        if tensor.dtype == torch.float and float2half:
+                            tensor = tensor.to(torch.float16)
+                        if transpose:
+                            tensor = tensor.T
+                        if pad_to is not None:
+                            padded = torch.zeros(pad_to, dtype = tensor.dtype, device = tensor.device)
+                            padded[tuple(slice(0, s) for s in tensor.shape)].copy_(tensor)
+                            tensor = padded
+                        tensor = tensor.to(device).contiguous()
+                    self.metrics.direct_tensors += 1
+
                 case _:
                     raise ValueError(f"Invalid load_method: {load_method}")
 
-        self.bytes_loaded += bytesize
-        self.time_elapsed += timer.interval
-
-        if tensor.dtype == torch.bfloat16 and not allow_bf16:
-            tensor = tensor.to(torch.float16)
+        self.metrics.bytes_loaded += bytesize
+        self.metrics.time_elapsed += timer.interval
 
         return tensor
 
@@ -263,11 +363,6 @@ class SafetensorsCollection:
                 self.handles[filename] = None
 
 
-    def get_metrics(self):
-        bandwidth = self.bytes_loaded / (1024**3) / self.time_elapsed
-        return self.bytes_loaded, self.time_elapsed, bandwidth
-
-
     @lru_cache
     def max_key_len(self):
         l = max(len(k) for k in self.tensor_file_map.keys())
@@ -276,6 +371,95 @@ class SafetensorsCollection:
 
     def set_new_tensors(self, new_tensors):
         self.new_tensors = new_tensors
+
+
+    def begin_deferred_load(self):
+        assert not self.deferred_mode
+        self.deferred_mode = True
+
+
+    def end_deferred_load(self):
+        assert self.deferred_mode
+
+        with (Timer() as timer):
+
+            cpu_loads = {}
+            cuda_loads = {}
+            for load in self.deferred_loads:
+                filenmame = load["filename"]
+                cuda = load["cuda"]
+                if cuda:
+                    if not filenmame in cuda_loads:
+                        cuda_loads[filenmame] = []
+                    cuda_loads[filenmame].append(load)
+                else:
+                    if not filenmame in cpu_loads:
+                        cpu_loads[filenmame] = []
+                    cpu_loads[filenmame].append(load)
+
+            def make_workload(l):
+                wl = []
+                for w in l:
+                    if w["temp_tensor"] is not None:
+                        dst = w["temp_tensor"].data_ptr()
+                    else:
+                        # Not transposing, padding or converting fp32->fp16, load directly
+                        dst = w["dest_tensor"].data_ptr()
+                    bytesize = w["bytesize"]
+                    src = w["file_offset"]
+                    while bytesize > 0:
+                        j = ext.TensorLoadJob(
+                            self.handles[w["filename"]],
+                            src,
+                            min(bytesize, MAX_DEFERRED_LOAD_CHUNK),
+                            dst,
+                            w["bf16_to_fp16"],
+                            w["fp32_to_fp16"],
+                            w["cuda"],
+                            w["device_id"]
+                        )
+                        src += MAX_DEFERRED_LOAD_CHUNK
+                        dst += MAX_DEFERRED_LOAD_CHUNK
+                        bytesize -= MAX_DEFERRED_LOAD_CHUNK
+                        wl.append(j)
+                return wl
+
+            for filename, loads in cpu_loads.items():
+                loads = sorted(loads, key = lambda c: -c["bytesize"])
+                workload = make_workload(loads)
+                self.metrics.total_chunks += len(workload)
+                ext.stloader_deferred_cpu(workload)
+                for w in loads:
+                    if w["temp_tensor"] is not None:
+                        src = w["temp_tensor"]
+                        if w["transpose"]:
+                            src = src.T
+                        unpadded_idx = tuple(slice(0, s) for s in src.shape)
+                        w["dest_tensor"][unpadded_idx].copy_(src)
+
+            for filename, loads in cuda_loads.items():
+                loads = sorted(loads, key = lambda c: -c["bytesize"])
+                workload = make_workload(loads)
+                self.metrics.total_chunks += len(workload)
+                ext.stloader_deferred_cuda(workload, MAX_DEFERRED_LOAD_CHUNK)
+                for w in loads:
+                    if w["temp_tensor"] is not None:
+                        src = w["temp_tensor"]
+                        if w["transpose"]:
+                            src = src.T
+                        unpadded_idx = tuple(slice(0, s) for s in src.shape)
+                        w["dest_tensor"][unpadded_idx].copy_(src)
+
+        self.metrics.time_elapsed += timer.interval
+        self.metrics.deferred_passes += 1
+
+        self.deferred_mode = False
+        self.deferred_loads = []
+
+
+    def abort_deferred_load(self):
+        self.deferred_mode = False
+        self.deferred_loads = []
 
 
 class VariantSafetensorsCollection:

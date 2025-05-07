@@ -88,11 +88,13 @@ def main(args):
                 ids, exp_len = get_input_ids()
 
         # Inference
+        tt = prompt_format.thinktag()
         job = Job(
             input_ids = ids,
             max_new_tokens =  max_response_tokens,
             stop_conditions = stop_conditions,
             sampler = sampler,
+            banned_strings = [tt[0], tt[1]] if args.no_think else None
         )
         generator.enqueue(job)
 
@@ -102,7 +104,7 @@ def main(args):
             while generator.num_remaining_jobs():
                 for r in generator.iterate():
                     chunk = r.get("text", "")
-                    s.stream(chunk, prompt_format.thinktag()[1])
+                    s.stream(chunk, tt[0], tt[1])
                     if r["eos"] and r["eos_reason"] == "max_new_tokens":
                         ctx_exceeded = True
 
@@ -130,6 +132,7 @@ if __name__ == "__main__":
     parser.add_argument("-maxr", "--max_response_tokens", type = int, default = 1000, help = "Max tokens per response, default = 1000")
     parser.add_argument("-basic", "--basic_console", action = "store_true", help = "Use basic console output (no markdown and fancy prompt input")
     parser.add_argument("-think", "--think", action = "store_true", help = "Use (very simplistic) reasoning template and formatting")
+    parser.add_argument("-no_think", "--no_think", action = "store_true", help = "Suppress think tags (won't necessarily stop reasoning model from reasoning anyway)")
     parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context with every new prompt")
     parser.add_argument("-temp", "--temperature", type = float, help = "Sampling temperature", default = 0.8)
     parser.add_argument("-temp_first", "--temperature_first", action = "store_true", help = "Apply temperature before truncation")

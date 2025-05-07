@@ -125,7 +125,7 @@ class GatedMLP(Module):
                 full_out_features = intermediate_size,
                 first_in_feature = 0,
                 first_out_feature = a,
-                qmap = qmap + ".up",
+                qmap = qmap + ".input",
                 fkey = fkey,
                 frange = frange_gate,
                 alt_key = a_key_g,
@@ -140,7 +140,7 @@ class GatedMLP(Module):
                 full_out_features = intermediate_size,
                 first_in_feature = 0,
                 first_out_feature = a,
-                qmap = qmap + ".up",
+                qmap = qmap + ".input",
                 fkey = fkey,
                 frange = frange_up,
                 alt_key = a_key_u,
@@ -174,6 +174,12 @@ class GatedMLP(Module):
         match activation_fn:
             case "silu": self.activation_fn_call = ext.silu_mul
             case "gelu": self.activation_fn_call = ext.gelu_mul
+
+
+    @override
+    def can_defer_load(self):
+        if self.num_slices > 1: return False
+        return super().can_defer_load()
 
 
     @override

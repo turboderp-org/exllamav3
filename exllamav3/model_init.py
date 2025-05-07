@@ -18,6 +18,7 @@ def add_args(
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
+    parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
 
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = "Total cache size in tokens, default: 8192", default = 8192)
@@ -112,5 +113,9 @@ def init(
         tokenizer = Tokenizer.from_config(config)
     else:
         tokenizer = None
-    
+
+    # Metrics
+    if args.load_metrics:
+        config.stc.metrics.print()
+
     return model, config, cache, tokenizer

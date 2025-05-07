@@ -75,23 +75,21 @@ class LinearEXL3:
 
         torch_mode = params.get("reconstruct", x.shape[0] > 32)
 
-        xh = torch.empty_like(x)
-        ext.had_r_128(x, xh, self.suh, None, 1.0)
-
         y = torch.empty(
             (x.shape[0], self.out_features),
             dtype = first_not_none(out_dtype, self.out_dtype, torch.half),
             device = x.device
         )
 
+        xh = torch.empty_like(x)
+
         if torch_mode:
+            ext.had_r_128(x, xh, self.suh, None, 1.0)
             w = self.get_inner_weight_tensor()
             ext.hgemm(xh, w, y)
             ext.had_r_128(y, y, None, self.svh, 1.0)
         else:
-            ext.exl3_gemm(xh, self.trellis, y, None, -1)
-            # TODO: Fuse out scales and had into GEMM kernel
-            ext.had_r_128(y, y, None, self.svh, 1.0)
+            ext.exl3_gemm(x, self.trellis, y, self.suh, xh, self.svh, -1)
 
         x = y.view(out_shape)
 

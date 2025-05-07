@@ -50,7 +50,7 @@ class Streamer_basic:
         if not self.all_text.endswith("\n"):
             print()
 
-    def stream(self, text: str, end_think_tag):
+    def stream(self, text: str, think_tag, end_think_tag):
         if self.all_text or not text.startswith(" "):
             print_text = text
         else:
@@ -142,22 +142,28 @@ class Streamer_rich:
         if self.is_live:
             self.live.__exit__(exc_type, exc_value, traceback)
 
-    def stream(self, text: str, end_think_tag: str):
+    def stream(self, text: str, think_tag: str, end_think_tag: str):
         if self.args.think and not self.is_live:
-            if self.think_text or not text.startswith(" "):
-                print_text = text
-            else:
-                print_text = text[1:]
+            print_text = text
+            if not self.think_text:
+                print_text = print_text.lstrip()
             self.think_text += print_text
-            print(print_text, end = "", flush = True)
             if end_think_tag in self.think_text:
+                print(print_text.rstrip(), flush = True)
+                print()
                 self.begin()
-        else:
-            if self.all_text or not text.startswith(" "):
-                print_text = text
             else:
-                print_text = text[1:]
+                print(print_text, end = "", flush = True)
+
+        else:
+            print_text = text
+            if not self.all_text.strip():
+                print_text = print_text.lstrip()
+                if print_text.startswith("```"):
+                    print_text = "\n" + print_text
             self.all_text += text
             self.all_print_text += print_text
             formatted_text = self.all_print_text
+            formatted_text = formatted_text.replace(think_tag, f"`{think_tag}`")
+            formatted_text = formatted_text.replace(end_think_tag, f"`{end_think_tag}`")
             self.live.update(formatted_text)

@@ -1,4 +1,5 @@
 import torch
+from gptqmodel.nn_modules.qlinear.marlin import MarlinQuantLinear
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from aqlm import QuantizedLinear
 from awq.modules.linear import WQLinear_GEMM
@@ -75,7 +76,15 @@ def get_storage_info(model):
                 "scales": module.scales,
             })
             sum_numel += module.in_features * module.out_features
-
+        elif any(isinstance(module, x) for x in [MarlinQuantLinear]):
+            sum_bits += get_tensors_size({
+                "g_idx": module.g_idx,
+                "g_idx_sort_indices": module.g_idx_sort_indices,
+                "qweight": module.qweight,
+                "qzeros": module.qzeros,
+                "scales": module.scales,
+            })
+            sum_numel += module.in_features * module.out_features
     vram_bits = head_numel * head_bpw + sum_bits
     return sum_bits / sum_numel, head_bpw, vram_bits
 

@@ -4,6 +4,7 @@ from .llama import LlamaConfig, LlamaModel
 # Mistral is identical to Llama
 
 class MistralConfig(LlamaConfig):
+    arch_string = "MistralForCausalLM"
 
     def __init__(
         self,
@@ -12,12 +13,12 @@ class MistralConfig(LlamaConfig):
     ):
         super().__init__(
             directory,
-            arch_string = "MistralForCausalLM",
             **kwargs
         )
 
 
 class MistralModel(LlamaModel):
+    config_class = MistralConfig
 
     def __init__(
         self,

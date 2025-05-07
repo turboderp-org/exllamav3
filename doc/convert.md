@@ -45,6 +45,8 @@ does.
 
 - **--override_anyway**: Allow resuming even when overriding settings that will break the existing job. 
 
+- **-img / image_dump**: Save all tensors as images in the working directory. May require a large amount of system memory and disk space, can be slow.  
+
 ### Examples
 
 #### Converting

@@ -35,6 +35,7 @@ class Linear(Module):
         first_out_feature: int | None = None,
         out_dtype: torch.dtype | None = None,
         allow_input_padding: bool = False,
+        post_scale: float = 1.0,
     ):
         super().__init__(config, key, qmap)
 
@@ -43,18 +44,19 @@ class Linear(Module):
         self.in_features = (in_features + pad_to - 1) // pad_to * pad_to
         self.out_features_unpadded = out_features
         self.out_features = (out_features + pad_to - 1) // pad_to * pad_to
-        self.full_in_features = full_in_features
-        self.full_out_features = full_out_features
-        self.first_in_feature = first_in_feature
-        self.first_out_feature = first_out_feature
+        self.full_in_features = full_in_features if full_in_features is not None else self.in_features
+        self.full_out_features = full_out_features if full_out_features is not None else self.out_features
+        self.first_in_feature = first_in_feature if first_in_feature is not None else 0
+        self.first_out_feature = first_out_feature if first_out_feature is not None else 0
         self.inner = None
         self.qbits_key = qbits_key
         self.fkey = fkey
         self.frange = frange
         self.quant_type = None
         self.softcap = softcap
-        self.is_sliced = in_features != full_in_features or out_features != full_out_features
+        self.is_sliced = self.in_features != self.full_in_features or self.out_features != self.full_out_features
         self.out_dtype = out_dtype
+        self.post_scale = post_scale
 
         assert self.in_features_unpadded == self.in_features or allow_input_padding, \
             f"Input padding is not allowed for {self.key}, in_dim: {self.in_features_unpadded}, pad_to: {pad_to}"
@@ -67,11 +69,11 @@ class Linear(Module):
         if w is None or self.out_features == self.out_features_unpadded and self.in_features == self.in_features_unpadded:
             return w
         if w.dim() == 2:
-            padded = torch.zeros((self.out_features, self.in_features), dtype = w.dtype, device = w.device)
+            padded = torch.zeros((self.in_features, self.out_features), dtype = w.dtype, device = w.device)
             if self.out_features != self.out_features_unpadded:
-                padded[:w.shape[0], :] = w
-            elif self.in_features != self.in_features_unpadded:
                 padded[:, :w.shape[1]] = w
+            elif self.in_features != self.in_features_unpadded:
+                padded[:w.shape[0], :] = w
         else:
             assert w.dim() == 1
             padded = torch.zeros((self.out_features,), dtype = w.dtype, device = w.device)
@@ -80,15 +82,24 @@ class Linear(Module):
 
 
     def load_fp16(self, key: str) -> bool:
-        if self.config.stc.has_tensor_group(
-            key,
-            ["weight"]
-        ):
+        if self.config.stc.has_tensor_group(key, ["weight"]):
             self.used_alt_key = key == self.alt_key
-            weight = self.config.stc.get_tensor(key + ".weight", "cpu" if self.is_sliced else self.device)
-            weight = self.pad_out(weight)
-            bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
-            bias = self.pad_out(bias)
+            weight = self.config.stc.get_tensor(
+                key + ".weight",
+                "cpu" if self.is_sliced else self.device,
+                float2half = True,
+                transpose = True,
+                pad_to = (self.in_features, self.out_features)
+            )
+            # weight = self.pad_out(weight)
+            bias = self.config.stc.get_tensor(
+                key + ".bias",
+                "cpu" if self.is_sliced else self.device,
+                float2half = True,
+                optional = True,
+                pad_to = (self.out_features,)
+            )
+            # bias = self.pad_out(bias)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
@@ -105,21 +116,22 @@ class Linear(Module):
                 self.inner.unswap_cpu()
             self.quant_type = "fp16"
             return True
-        elif self.fkey and self.config.stc.has_tensor_group(
-            self.fkey,
-            ["weight"]
-        ):
-            weight = self.config.stc.get_tensor(self.fkey + ".weight", self.device)
+        elif self.fkey and self.config.stc.has_tensor_group(self.fkey, ["weight"]):
+            weight = self.config.stc.get_tensor(
+                self.fkey + ".weight",
+                self.device,
+                no_defer = True
+            )
             weight = weight[self.frange[0] : self.frange[1]].contiguous()
             weight = self.pad_out(weight)
-            bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
+            bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True, no_defer = True)
             bias = self.pad_out(bias)
             if bias is not None:
                 bias = bias[self.frange[0] : self.frange[1]].contiguous()
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
-                weight,
+                weight.T,
                 bias,
                 out_dtype = self.out_dtype
             )
@@ -139,9 +151,9 @@ class Linear(Module):
             return False
         self.used_alt_key = key == self.alt_key
         scale = self.config.stc.get_tensor(key + ".scale", self.device, optional = True)
-        su = self.config.stc.get_tensor(key + ".su", self.device, optional = True)
+        su = self.config.stc.get_tensor(key + ".su", self.device, optional = True, no_defer = True)
         suh = self.config.stc.get_tensor(key + ".suh", self.device, optional = True)
-        sv = self.config.stc.get_tensor(key + ".sv", self.device, optional = True)
+        sv = self.config.stc.get_tensor(key + ".sv", self.device, optional = True, no_defer = True)
         svh = self.config.stc.get_tensor(key + ".svh", self.device, optional = True)
         trellis = self.config.stc.get_tensor(key + ".trellis", self.device)
         bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
@@ -160,6 +172,12 @@ class Linear(Module):
         )
         self.quant_type = "exl3"
         return True
+
+
+    @override
+    def can_defer_load(self):
+        if self.is_sliced: return False
+        return super().can_defer_load()
 
 
     @override
@@ -193,7 +211,8 @@ class Linear(Module):
         quant_args: dict,
         progress_str: str | None = None,
         return_weight_q: bool = False,
-        verbose: bool = False
+        verbose: bool = False,
+        save_reg: str = None
     ):
         assert isinstance(self.inner, LinearFP16), \
             "Inner layer is already quant type"
@@ -211,7 +230,8 @@ class Linear(Module):
             return_weight_q,
             progress_str,
             verbose,
-            swap_to_device
+            swap_to_device,
+            save_reg = save_reg
         )
 
         self.inner = LinearEXL3(
@@ -241,7 +261,13 @@ class Linear(Module):
                 "first_key": self.key,
                 "count": 0,
                 "finalized": False,
+                "num_total": 0,
+                "inf_nan": torch.zeros(2, dtype = torch.long, device = self.device),
             }
+
+        params["capture"][self.qmap]["num_total"] += x.numel()
+        ext.count_inf_nan(x, params["capture"][self.qmap]["inf_nan"])
+
         if params["capture"][self.qmap]["first_key"] == self.key:
             rows = np.prod(x.shape[:-1])
             dim = x.shape[-1]
@@ -270,6 +296,8 @@ class Linear(Module):
         x = self.inner.forward(x, params, out_dtype)
         if self.softcap != 0.0:
             ext.softcap(x, x, self.softcap)
+        if self.post_scale != 1.0:
+            x *= self.post_scale
         return x
 
 

@@ -6,6 +6,7 @@ from ....util.progress import ProgressBar
 from ....util.memory import free_mem, list_gpu_tensors
 from ....util.hadamard import get_hadamard_dt
 from ....util import cuda_sync_active
+from ....util.tensor import save_tensor_image
 from functools import lru_cache
 
 # Constant
@@ -709,7 +710,8 @@ def quantize_exl3(
     return_weight_q: bool,
     progress_str: str | None = None,
     verbose: bool = False,
-    swap_to_device: torch.device | None = None
+    swap_to_device: torch.device | None = None,
+    save_reg: str = None
 ):
     """
     :param weight:
@@ -736,6 +738,9 @@ def quantize_exl3(
 
     :param swap_to_device:
         If input tensor is on CPU, move to this device before quantization
+
+    :param save_reg:
+        Save regularized tensor as image to the provided path
 
     :return:
         tuple:
@@ -785,6 +790,9 @@ def quantize_exl3(
             H_diag,
             pb
         )
+
+        if save_reg:
+            save_tensor_image(weight_r, save_reg)
 
         if verbose:
             rms = weight_r.square().mean().sqrt()

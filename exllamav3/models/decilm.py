@@ -8,6 +8,7 @@ from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP,
 from ..modules.attn import prepare_for_attn
 
 class DeciLMConfig(Config):
+    arch_string = "DeciLMForCausalLM"
 
     def __init__(
         self,
@@ -16,7 +17,6 @@ class DeciLMConfig(Config):
     ):
         super().__init__(
             directory,
-            kwargs.get("arch_string", "DeciLMForCausalLM"),
             DeciLMModel,
             **kwargs
         )
@@ -49,6 +49,7 @@ class DeciLMConfig(Config):
 
 
 class DeciLMModel(Model):
+    config_class = DeciLMConfig
 
     def __init__(
         self,

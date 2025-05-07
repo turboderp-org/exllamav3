@@ -6,7 +6,7 @@ from torch import nn
 from ..models import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
-from . import Module, Linear
+from . import Module, Linear, RMSNorm
 from ..device import get_device_context, release_device_context
 from ..constants import PAGE_SIZE
 from ..cache import Cache
@@ -133,7 +133,7 @@ class Attention(Module):
         head_dim: int,
         num_q_heads: int,
         num_kv_heads: int,
-        rope_settings: RopeSettings,
+        rope_settings: RopeSettings | None,
         sm_scale: float | None = None,
         key_q: str | None = None,
         key_k: str | None = None,
@@ -143,7 +143,9 @@ class Attention(Module):
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         sliding_window: int  = -1,
-        logit_softcapping: float = 0.0
+        logit_softcapping: float = 0.0,
+        q_norm: RMSNorm | None = None,
+        k_norm: RMSNorm | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -169,15 +171,25 @@ class Attention(Module):
         else:
             fkey, frange_q, frange_k, frange_v = None, None, None, None
 
-        self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim, qmap = qmap + ".qkv", fkey = fkey, frange = frange_q)
-        self.k_proj = Linear(config, f"{key}.{key_k}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".qkv", fkey = fkey, frange = frange_k)
-        self.v_proj = Linear(config, f"{key}.{key_v}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".qkv", fkey = fkey, frange = frange_v)
-        self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o")
+        self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim, qmap = qmap + ".input", fkey = fkey, frange = frange_q)
+        self.k_proj = Linear(config, f"{key}.{key_k}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_k)
+        self.v_proj = Linear(config, f"{key}.{key_v}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_v)
+        self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o", out_dtype = out_dtype)
 
         self.register_submodule(self.q_proj)
         self.register_submodule(self.k_proj)
         self.register_submodule(self.v_proj)
         self.register_submodule(self.o_proj)
+
+        if q_norm:
+            assert k_norm, "Must have both Q and K norms, or neither"
+            self.q_norm = q_norm
+            self.k_norm = k_norm
+            self.register_submodule(self.q_norm)
+            self.register_submodule(self.k_norm)
+        else:
+            self.q_norm = None
+            self.k_norm = None
 
         self.caps.update({
             "kv_cache": True
@@ -194,10 +206,11 @@ class Attention(Module):
         for cl in self.cache_layers:
             cl.alloc(device)
 
-        self.rope = RoPE(
-            device,
-            self.rope_settings,
-        )
+        if self.rope_settings:
+            self.rope = RoPE(
+                device,
+                self.rope_settings,
+            )
 
         # self.join_qkv_fwd = (
         #     (self.q_proj.quant_type, self.k_proj.quant_type, self.v_proj.quant_type)
@@ -274,9 +287,12 @@ class Attention(Module):
         assert self.logit_softcapping == 0.0, \
             "Torch SDPA does not support logit softcapping"
 
-        # TODO: q/k norms
+        if self.q_norm:
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
-        q, k = self.rope.apply(q, k, position, positions, position_ids)
+        if self.rope:
+            q, k = self.rope.apply(q, k, position, positions, position_ids)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -305,9 +321,12 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        # TODO: q/k norms
+        if self.q_norm:
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
-        q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
+        if self.rope:
+            q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
 
         o = flash_attn_func(
             q = q,
@@ -344,9 +363,12 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        # TODO: q/k norms
+        if self.q_norm:
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
-        q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
+        if self.rope:
+            q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
 
         cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
         o = flash_attn_with_kvcache(
