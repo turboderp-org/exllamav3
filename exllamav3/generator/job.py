@@ -583,7 +583,9 @@ class Job:
             if not "�" in test_decode:
                 self.held_text = test_decode
             else:
-                return emit(results)
+                # Don't hold forever if a broken generation yields a replacement character but never completes
+                # the Unicode symbol
+                return emit(results, emit_held = (len(test_decode) > 20))
 
         # Hold text as long as it contains part of a banned string
 
