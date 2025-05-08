@@ -7,22 +7,15 @@ namespace cg = cooperative_groups;
 #include "../../util.cuh"
 #include "../../ptx.cuh"
 #include "../exl3_gemm_kernel.cuh"
+#include "../exl3_gemv_kernel.cuh"
 #include "exl3_comp_unit_1.cuh"
 
 fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b1[] = {
-    nullptr,
-    exl3_gemm_kernel<1, true, EXL3_GEMM_SHAPE_1>,
-    exl3_gemm_kernel<1, true, EXL3_GEMM_SHAPE_2>,
-    exl3_gemm_kernel<1, true, EXL3_GEMM_SHAPE_3>,
-    exl3_gemm_kernel<1, true, EXL3_GEMM_SHAPE_4>
+    EXL3_GEMM_KERNEL_INSTANCES(1, true)
 };
 
 fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b1[] = {
-    nullptr,
-    exl3_gemm_kernel<1, false, EXL3_GEMM_SHAPE_1>,
-    exl3_gemm_kernel<1, false, EXL3_GEMM_SHAPE_2>,
-    exl3_gemm_kernel<1, false, EXL3_GEMM_SHAPE_3>,
-    exl3_gemm_kernel<1, false, EXL3_GEMM_SHAPE_4>
+    EXL3_GEMM_KERNEL_INSTANCES(1, false)
 };
 
 

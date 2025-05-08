@@ -6,8 +6,11 @@ __device__ inline half decode_3inst(uint32_t x)
 {
     x *= 89226354u;
     x += 64248484u;
-    x &= 0b10001111111111111000111111111111u;
-    x ^= 0b00111011011000000011101101100000u;
+    x = (x & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    // x &= 0b10001111111111111000111111111111u;
+    // x ^= 0b00111011011000000011101101100000u;
+    // Compiler doesn't automatically generate LOP3
+    asm volatile ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
     half2_uint32 xu(x);
     return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
 }
@@ -18,10 +21,13 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
     x1 *= 89226354u;
     x0 += 64248484u;
     x1 += 64248484u;
-    x0 &= 0b10001111111111111000111111111111u;
-    x1 &= 0b10001111111111111000111111111111u;
-    x0 ^= 0b00111011011000000011101101100000u;
-    x1 ^= 0b00111011011000000011101101100000u;
+    // x0 &= 0b10001111111111111000111111111111u;
+    // x1 &= 0b10001111111111111000111111111111u;
+    // x0 ^= 0b00111011011000000011101101100000u;
+    // x1 ^= 0b00111011011000000011101101100000u;
+    // Compiler doesn't automatically generate LOP3
+    asm volatile ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
+    asm volatile ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
     half2_uint32 xu0(x0);
     half2_uint32 xu1(x1);
     half2 d0 = __halves2half2(__low2half(xu0.as_half2), __low2half(xu1.as_half2));

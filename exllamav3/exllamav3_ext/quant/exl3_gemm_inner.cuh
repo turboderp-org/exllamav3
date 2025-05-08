@@ -30,7 +30,6 @@ void exl3_gemm_kernel_inner
     const int sh_a_stage_size = TILESIZE_M * TILESIZE_K;                         // in halfs
     const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;   // in uint16s
     const int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS;                            // in floats
-    // TODO: Maybe flush global->shared pipeline before reduction step so sh_c can share memory with sh_a and sh_b
 
     // Sanity checks
     static_assert(EXL3_GEMM_BASE_THREADS == 256);
@@ -213,7 +212,6 @@ void exl3_gemm_kernel_inner
                 for (int i = 0; i < load_a_iters; ++i)
                 {
                     // TODO: Rearrange into ldmatrix friendly layout while loading?
-                    // @p seems to crash on Blackwell but does not perform better on Ampere and Ada anyway
                     // cp_async_pred(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_a_gl[i], pred_a_gl[i]);
                     if (pred_a_gl[i]) cp_async(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_a_gl[i]);
                 }
@@ -226,7 +224,6 @@ void exl3_gemm_kernel_inner
                 #pragma unroll
                 for (int i = 0; i < load_b_iters; ++i)
                 {
-                    // @p seems to crash on Blackwell but does not perform better on Ampere and Ada anyway
                     // cp_async_pred(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_b_gl[i], pred_b_gl[i]);
                     if (pred_b_gl[i]) cp_async(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_b_gl[i]);
                 }
@@ -585,6 +582,44 @@ void exl3_gemm_kernel_inner
             wait_stage();
             load_frags(0);
             matmul(2);
+            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
+            advance2();
+            if (!slice2_iters) break;
+        }
+    }
+
+    if constexpr (FRAG_STAGES == 4)
+    {
+        while (true)
+        {
+            async_load_gl();
+            wait_stage();
+            load_frags(1);
+            matmul(0);
+            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
+            advance2();
+            if (!slice2_iters) break;
+
+            async_load_gl();
+            wait_stage();
+            load_frags(2);
+            matmul(1);
+            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
+            advance2();
+            if (!slice2_iters) break;
+
+            async_load_gl();
+            wait_stage();
+            load_frags(3);
+            matmul(2);
+            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
+            advance2();
+            if (!slice2_iters) break;
+
+            async_load_gl();
+            wait_stage();
+            load_frags(0);
+            matmul(3);
             if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
             advance2();
             if (!slice2_iters) break;

@@ -27,13 +27,23 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
 
 typedef void (*fp_exl3_gemm_kernel) (EXL3_GEMM_ARGS);
 
-#define EXL3_GEMM_SHAPE_1     16,     16,    128,     3,     1
-#define EXL3_GEMM_SHAPE_2     16,     32,    128,     4,     2
-#define EXL3_GEMM_SHAPE_3     16,     32,    256,     4,     2
-#define EXL3_GEMM_SHAPE_4     16,     16,    512,     4,     2
+#define EXL3_GEMM_SHAPE_1     16,     16,    128,     3,     2
+#define EXL3_GEMM_SHAPE_2     16,     32,    128,     4,     3
+#define EXL3_GEMM_SHAPE_3     16,     32,    256,     4,     3
+#define EXL3_GEMM_SHAPE_4     16,     16,    512,     4,     3
+
+#define EXL3_GEMM_NUM_SHAPES 4
 
 #define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16
 #define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512
+#define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256
+
+#define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32) \
+    nullptr, \
+    exl3_gemm_kernel<_bits, _c_fp32, EXL3_GEMM_SHAPE_1>, \
+    exl3_gemm_kernel<_bits, _c_fp32, EXL3_GEMM_SHAPE_2>, \
+    exl3_gemm_kernel<_bits, _c_fp32, EXL3_GEMM_SHAPE_3>, \
+    exl3_gemm_kernel<_bits, _c_fp32, EXL3_GEMM_SHAPE_4>
 
 #define EXL3_GEMM_BASE_THREADS 256
 

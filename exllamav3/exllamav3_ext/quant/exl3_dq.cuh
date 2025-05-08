@@ -4,12 +4,12 @@
 
 __device__ __forceinline__ uint32_t fshift(uint32_t b, uint32_t a, int shift)
 {
-    // uint64_t merged = ((uint64_t)b << 32) | (uint64_t) a;
-    // return (uint32_t)(merged >> shift);
+     uint64_t merged = ((uint64_t)a << 32) | (uint64_t) b;
+     return (uint32_t)(merged >> shift);
 
-    // Conditional funnel shift is somehow faster
-    if (shift < 32) return __funnelshift_r(b, a, shift);
-    return a >> (shift - 32);
+    // Conditional funnel shift is somehow no longer faster
+    // if (shift < 32) return __funnelshift_r(b, a, shift);
+    // return a >> (shift - 32);
 }
 
 template <int bits>

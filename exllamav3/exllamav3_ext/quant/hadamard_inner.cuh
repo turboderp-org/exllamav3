@@ -1,3 +1,4 @@
+#pragma once
 
 // Hadamard transform 128-element vector across one warp, with optional pre and post scales
 
