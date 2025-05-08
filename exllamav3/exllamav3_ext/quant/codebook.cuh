@@ -6,7 +6,6 @@ __device__ inline half decode_3inst(uint32_t x)
 {
     x *= 89226354u;
     x += 64248484u;
-    x = (x & 0x8FFF8FFFu) ^ 0x3B603B60u;
     // x &= 0b10001111111111111000111111111111u;
     // x ^= 0b00111011011000000011101101100000u;
     // Compiler doesn't automatically generate LOP3
