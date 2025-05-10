@@ -55,6 +55,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
+    m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
     m.def("hgemm", &hgemm, "hgemm");
     m.def("rope", &rope, "rope");
     m.def("silu_mul", &silu_mul, "silu_mul");

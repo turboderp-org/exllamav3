@@ -17,4 +17,10 @@ fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b3[] = {
     EXL3_GEMM_KERNEL_INSTANCES(3, false)
 };
 
+fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b3[] = {
+    EXL3_MGEMM_KERNEL_INSTANCES(3, true)
+};
 
+fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b3[] = {
+    EXL3_MGEMM_KERNEL_INSTANCES(3, false)
+};
