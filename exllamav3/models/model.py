@@ -27,6 +27,9 @@ class Model:
         self.logit_layer_idx = None
         self.first_block_idx = None
 
+        # Calibration options
+        self.calibration_all_experts = False
+
 
     def __iter__(self):
         for module in self.modules:

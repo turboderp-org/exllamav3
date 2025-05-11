@@ -44,7 +44,7 @@ def allocate_transformer(
         assert d
         if isinstance(g, list):
             for m in (g, u, d):
-                key_ = m[0].key.replace(".slice.0", ".slice.*")
+                key_ = m[0].key.replace(".slice.0", ".slice.*").replace(".experts.0.", ".experts.*.")
                 keys += [key_]
                 numels += [sum(mm.weights_numel() for mm in m)]
                 for mm in m:
@@ -65,7 +65,7 @@ def allocate_transformer(
         assert d
         if isinstance(u, list):
             for m in (u, d):
-                key_ = m[0].key.replace(".slice.0", ".slice.*")
+                key_ = m[0].key.replace(".slice.0", ".slice.*").replace(".experts.0.", ".experts.*.")
                 keys += [m]
                 numels += [sum(mm.weights_numel() for mm in m)]
                 for mm in m:
