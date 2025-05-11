@@ -16,7 +16,7 @@ from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
 
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
-def _strings_to_utf32(strings: list[str]) -> (np.array, list[int]):
+def _strings_to_utf32(strings: list[str]) -> tuple[np.ndarray, np.ndarray] | None:
 
     if not strings: return bytearray(), None
 
