@@ -66,6 +66,15 @@ prompt_formats = {
         "Sure! Here is how you might implement the function:\n\n```python\n{{problem}}",
         "    "
     ),
+    "qwen3": (
+        "<|im_start|>system\n"
+        "You are a helpful AI coding assistant.<|im_end|>\n"
+        "<|im_start|>user\n"
+        "Complete the following Python function:\n\n{{problem}}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        "<think>\n\n</think>\n\nSure! Here is how you might implement the function:\n\n```python\n{{problem}}",
+        "    "
+    ),
     "deepseek": (
         "You are a helpful AI coding assistant.\n"
         "<｜User｜>Complete the following Python function:\n\n{{problem}}"
@@ -99,7 +108,6 @@ def main(args):
         tokenizer = tokenizer
     )
     sampler = ComboSampler(
-        rep_p = args.rep_p,
         temperature = args.temperature,
         min_p = args.min_p,
         top_k = args.top_k,
@@ -189,10 +197,9 @@ if __name__ == "__main__":
     parser.add_argument("-e", "--eval", action = "store_true", help = "Run evaluation script on output file after sampling")
     parser.add_argument("-temp", "--temperature", type = float, help = "Sampling temperature (0 for greedy), default: 0.6", default = 0.6)
     parser.add_argument("-minp", "--min_p", type = float, help = "Min-p sampling, default: 0.0 (disabled)", default = 0.0)
-    parser.add_argument("-topk", "--top_k", type = float, help = "Top-k sampling, default: 0.0 (disabled)", default = 0.0)
+    parser.add_argument("-topk", "--top_k", type = int, help = "Top-k sampling, default: 0 (disabled)", default = 0)
     parser.add_argument("-topp", "--top_p", type = float, help = "Top-p sampling, default: 0.6", default = 0.6)
     parser.add_argument("-templast", "--temp_last", action = "store_true", help = "Use temperature last")
-    parser.add_argument("-repp", "--rep_p", type = float, help = "Repetition penalty, default: 1.0 (disabled)", default = 1.0)
     parser.add_argument("--max_tokens", type = int, default = 768, help = "Max number of tokens for each completion")
     _args = parser.parse_args()
     main(_args)
