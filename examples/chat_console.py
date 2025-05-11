@@ -15,7 +15,14 @@ col_bot = "\u001b[34;1m"  # Blue
 col_think1 = "\u001b[35;1m"  # Bright magenta
 col_think2 = "\u001b[35m"  # Magenta
 col_error = "\u001b[31;1m"  # Bright red
+col_info = "\u001b[32;1m"  # Bright red
 col_sysprompt = "\u001b[37;1m"  # Grey
+
+def print_error(text):
+    print(col_error + "\nError: " + col_default + text)
+
+def print_info(text):
+    print(col_info + "\nInfo: " + col_default + text)
 
 def read_input_console(args, user_name):
     print("\n" + col_user + user_name + ": " + col_default, end = '', flush = True)
