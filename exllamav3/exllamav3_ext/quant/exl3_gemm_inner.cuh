@@ -66,7 +66,7 @@ void exl3_gemm_kernel_inner
     int slice_len = slice_end - slice_beg;
     if (slice_len < 1) return;
 
-    auto index_m = [&] (int slice_i) { return blockIdx.y; };
+    auto index_m = [&] (int slice_i) { return 0; }; //blockIdx.y; };
     auto index_k = [&] (int slice_i) { return (slice_i % tiles.k); };
     auto index_n = [&] (int slice_i) { return (slice_i / tiles.k); };
 

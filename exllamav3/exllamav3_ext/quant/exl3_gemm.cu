@@ -197,6 +197,7 @@ int exl3_mgemm
     int device;
     cudaGetDevice(&device);
     int num_sms = DevCtx::instance().get_num_sms(device);
+    int total_sms = num_sms;
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);
 
@@ -218,6 +219,10 @@ int exl3_mgemm
         &num_sms
     );
     if (!kernel) return 0;
+
+    // Launch bigger grid if possible
+    int concurrency = MIN(total_sms / num_sms, bszm_out);
+    dim3 block_grid(num_sms, 1, concurrency);
 
     // Launch
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
@@ -242,7 +247,7 @@ int exl3_mgemm
     cudaLaunchCooperativeKernel
     (
         (void*)kernel,
-        num_sms,
+        block_grid,
         block_dim,
         kernelArgs,
         SMEM_MAX,

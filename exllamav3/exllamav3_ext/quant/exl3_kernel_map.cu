@@ -105,7 +105,7 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     {
         int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
         int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
-        // decided experimentally, TODO: maybe test more
+        // decided experimentally, TODO: evaluate if Ampere would benefit from larger grid
         int max_slices = size_k / tilesize_k * size_n / tilesize_n / 12;
         *num_sms = MIN(max_slices, *num_sms);
     }
@@ -166,6 +166,7 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
     {
         int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
         int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
+        // decided experimentally, TODO: evaluate if Ampere would benefit from larger grid
         int max_slices = size_k / tilesize_k * size_n / tilesize_n / 12;
         *num_sms = MIN(max_slices, *num_sms);
     }
