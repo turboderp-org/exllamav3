@@ -102,7 +102,7 @@ class ComboSampler(CustomSampler):
             SS_PresFreqP(pres_p, freq_p, rep_sustain_range, rep_decay_range),
         ]
 
-        if temperature == 0.0:
+        if temperature == 0.0 or top_k == 1:
             stack += [
                 SS_Argmax()
             ]
