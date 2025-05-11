@@ -75,7 +75,8 @@ void apply_rep_pens_kernel
 
         float w = v > 0.0f ? v / rep_p : v * rep_p;
         float f = factors[i] + 1e-30;
-        float o = v * (1.0f - f) + w * f;
+        float f1 = (1.0f - f) + 1e-30;
+        float o = v * f1 + w * f;
         out_logits[i + range_min] = o;
     }
 }
