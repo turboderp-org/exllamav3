@@ -63,12 +63,16 @@ class LinearFP16:
     ) -> torch.Tensor:
         out_shape = x.shape[:-1] + (self.out_features,)
         x = x.view(-1, x.shape[-1])
+        dtype = first_not_none(out_dtype, self.out_dtype, torch.half)
         y = torch.zeros(
             (x.shape[0], self.out_features),
-            dtype = first_not_none(out_dtype, self.out_dtype, torch.half),
+            dtype = dtype,
             device = x.device
         )
-        ext.hgemm(x, self.weight, y)
+        if dtype == x.dtype:
+            torch.matmul(x, self.weight, out = y)
+        else:
+            ext.hgemm(x, self.weight, y)
         if self.bias is not None:
             y += self.bias
         y = y.view(out_shape)
