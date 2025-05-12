@@ -27,6 +27,9 @@ class Model:
         self.logit_layer_idx = None
         self.first_block_idx = None
 
+        # Calibration options
+        self.calibration_all_experts = False
+
 
     def __iter__(self):
         for module in self.modules:
@@ -89,7 +92,12 @@ class Model:
     def _load_single(self, progressbar: bool, device: torch.device):
         with ProgressBar(f"Loading" if progressbar else None, len(self.modules)) as progress:
             for idx, module in enumerate(self.modules):
+                defer = module.can_defer_load()
+                if defer:
+                    self.config.stc.begin_deferred_load()
                 module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
+                if defer:
+                    self.config.stc.end_deferred_load()
                 progress.update(idx + 1)
 
 

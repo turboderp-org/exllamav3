@@ -278,7 +278,9 @@ def main(args, job_state):
             qmaps = module.get_qmaps()
             if len(qmaps) > 0:
 
-                # Capture calibration input states during forward pass
+                # Capture calibration input states during forward pass. For block-sparse models, all expert layers
+                # are activated to ensure all down projections capture at least some calibration data. When the
+                # state is advanced later, only selected experts will be used.
                 with ProgressBar(f" -- Capturing: {module.key}" + slice_str, len(state)) as progress:
                     capture_H = {}
                     ref_states = []
@@ -287,12 +289,20 @@ def main(args, job_state):
                         params = {
                             "attn_mode": "flash_attn_nc",
                             "capture": capture_H,
+                            "activate_all_experts": model.calibration_all_experts,
                         }
                         if slicing:
                              params["q_mlp_slice"] = current_slice
                         rs = module.prepare_for_device(state[i], params)
                         rs = module.forward(rs, params)
                         if i < num_ref_states:
+                            if model.calibration_all_experts:
+                                # Reference state for measuring error need, with only selected experts
+                                params = { "attn_mode": "flash_attn_nc" }
+                                if slicing:
+                                    params["q_mlp_slice"] = current_slice
+                                rs = module.prepare_for_device(state[i], params)
+                                rs = module.forward(rs, params)
                             ref_states.append(rs.cpu())
                         rs = None
                 print(f" -- Captured: {module.key}" + slice_str)

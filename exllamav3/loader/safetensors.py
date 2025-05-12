@@ -228,7 +228,10 @@ class SafetensorsCollection:
             device = torch.device("cpu")
 
         if self.new_tensors and key in self.new_tensors:
-            return self.new_tensors[key].to(device)
+            tensor = self.new_tensors[key].to(device)
+            if transpose:
+                tensor = tensor.T.contiguous()
+            return tensor
 
         if not key in self.tensor_file_map:
             if not optional:

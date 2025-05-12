@@ -219,7 +219,8 @@ class SS_TopK(SS_Base):
     Mask out all but the top K most likely tokens
     """
     def __init__(self, top_k: int):
-        self.top_k = top_k
+        assert isinstance(top_k, int) or top_k.is_integer(), "top_k value must be integer"
+        self.top_k = int(top_k)
 
     def run(self, state: SamplingState):
         match state.state:

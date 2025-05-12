@@ -80,6 +80,7 @@ class Generator:
 
         # Paging
         self.pagetable = PageTable(self, cache)
+        self.max_total_tokens = PAGE_SIZE * self.pagetable.max_pages
 
         # Draft model
         self.draft_model = draft_model
@@ -563,7 +564,7 @@ class Generator:
         prompt: list[tuple] | list[str] | tuple | str,
         max_new_tokens: int | None = None,
         min_new_tokens: int = 0,
-        seed: int or None = None,
+        seed: int | None = None,
         sampler: Sampler | list[Sampler] | None = None,
         token_healing: bool = False,
         encode_special_tokens: bool = False,

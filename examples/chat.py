@@ -5,6 +5,7 @@ import argparse
 from exllamav3 import Generator, Job, model_init
 from exllamav3.generator.sampler import ComboSampler
 from chat_templates import *
+from chat_util import *
 import torch
 from chat_console import *
 
@@ -61,6 +62,7 @@ def main(args):
     # Main loop
     print("\n" + col_sysprompt + system_prompt.strip() + col_default)
     context = []
+    response = ""
 
     while True:
 
@@ -68,8 +70,29 @@ def main(args):
         if args.amnesia:
             context = []
 
-        # Get user prompt and add to context
+        # Get user prompt
         user_prompt = read_input_fn(args, user_name)
+
+        # Intercept commands
+        if user_prompt.startswith("/"):
+            c = user_prompt.strip()
+            match c:
+                case "/x":
+                    print_info("Exiting")
+                    break
+                case "/cc":
+                    snippet = copy_last_codeblock(response)
+                    if not snippet:
+                        print_error("No code block found in last response")
+                    else:
+                        num_lines = len(snippet.split("\n"))
+                        print_info(f"Copied {num_lines} line{'s' if num_lines > 1 else ''} to the clipboard")
+                    continue
+                case _:
+                    print_error(f"Unknown command: {c}")
+                    continue
+
+        # Add to context
         context.append((user_prompt, None))
 
         # Tokenize context and trim from head if too long
@@ -141,7 +164,7 @@ if __name__ == "__main__":
     parser.add_argument("-freqp", "--frequency_penalty", type = float, help = "Frequency penalty, 0 to disable (default: disabled)", default = 0.0)
     parser.add_argument("-penr", "--penalty_range", type = int, help = "Range for penalties, in tokens (default: 1024) ", default = 1024)
     parser.add_argument("-minp", "--min_p", type = float, help = "Min-P truncation, 0 to disable (default: 0.08)", default = 0.08)
-    parser.add_argument("-topk", "--top_k", type = float, help = "Top-K truncation, 0 to disable (default: disabled)", default = 0)
+    parser.add_argument("-topk", "--top_k", type = int, help = "Top-K truncation, 0 to disable (default: disabled)", default = 0)
     parser.add_argument("-topp", "--top_p", type = float, help = "Top-P truncation, 1 to disable (default: disabled)", default = 1.0)
     _args = parser.parse_args()
     main(_args)

@@ -105,7 +105,7 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     {
         int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
         int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
-        // decided experimentally, TODO: maybe test more
+        // decided experimentally, TODO: evaluate if Ampere would benefit from larger grid
         int max_slices = size_k / tilesize_k * size_n / tilesize_n / 12;
         *num_sms = MIN(max_slices, *num_sms);
     }
@@ -137,6 +137,67 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
             case 6: return tfp_exl3_gemm_kernel_fp16_b6[shape_idx];
             case 7: return tfp_exl3_gemm_kernel_fp16_b7[shape_idx];
             case 8: return tfp_exl3_gemm_kernel_fp16_b8[shape_idx];
+            default: TORCH_CHECK(false, "No kernel for GEMM shape");
+        }
+    }
+}
+
+fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
+(
+    int cc,
+    int size_m,
+    int size_k,
+    int size_n,
+    int bits,
+    bool c_fp32,
+    int force_shape_idx,
+    int* out_block_dim,
+    int* out_shape_idx,
+    int* num_sms
+)
+{
+    int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, bits) : force_shape_idx;
+    TORCH_CHECK(shape_idx > 0, "exl3_mgemm: no compatible kernel");
+    if (out_shape_idx) *out_shape_idx = shape_idx;
+    if (out_block_dim) *out_block_dim = exl3_gemm_blockdim[shape_idx];
+
+    // Avoid empty blocks
+    if (num_sms)
+    {
+        int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
+        int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
+        // decided experimentally, TODO: evaluate if Ampere would benefit from larger grid
+        int max_slices = size_k / tilesize_k * size_n / tilesize_n / 12;
+        *num_sms = MIN(max_slices, *num_sms);
+    }
+
+    if (c_fp32)
+    {
+        switch (bits)
+        {
+            case 1: return tfp_exl3_mgemm_kernel_fp32_b1[shape_idx];
+            case 2: return tfp_exl3_mgemm_kernel_fp32_b2[shape_idx];
+            case 3: return tfp_exl3_mgemm_kernel_fp32_b3[shape_idx];
+            case 4: return tfp_exl3_mgemm_kernel_fp32_b4[shape_idx];
+            case 5: return tfp_exl3_mgemm_kernel_fp32_b5[shape_idx];
+            case 6: return tfp_exl3_mgemm_kernel_fp32_b6[shape_idx];
+            case 7: return tfp_exl3_mgemm_kernel_fp32_b7[shape_idx];
+            case 8: return tfp_exl3_mgemm_kernel_fp32_b8[shape_idx];
+            default: TORCH_CHECK(false, "No kernel for GEMM shape");
+        }
+    }
+    else
+    {
+        switch (bits)
+        {
+            case 1: return tfp_exl3_mgemm_kernel_fp16_b1[shape_idx];
+            case 2: return tfp_exl3_mgemm_kernel_fp16_b2[shape_idx];
+            case 3: return tfp_exl3_mgemm_kernel_fp16_b3[shape_idx];
+            case 4: return tfp_exl3_mgemm_kernel_fp16_b4[shape_idx];
+            case 5: return tfp_exl3_mgemm_kernel_fp16_b5[shape_idx];
+            case 6: return tfp_exl3_mgemm_kernel_fp16_b6[shape_idx];
+            case 7: return tfp_exl3_mgemm_kernel_fp16_b7[shape_idx];
+            case 8: return tfp_exl3_mgemm_kernel_fp16_b8[shape_idx];
             default: TORCH_CHECK(false, "No kernel for GEMM shape");
         }
     }

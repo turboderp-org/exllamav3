@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 from ..util.tensor import to2
 from ..models import Config
-from . import Module, RMSNorm, LayerNorm, Attention, GatedMLP, MLP
+from . import Module, RMSNorm, LayerNorm, Attention, GatedMLP, MLP, BlockSparseMLP
 from ..conversion.allocation import allocate_transformer
 
 class TransformerBlock(Module):
@@ -18,7 +18,7 @@ class TransformerBlock(Module):
         attn: Attention | None = None,
         attn_post_norm: RMSNorm | None = None,
         mlp_norm: RMSNorm | LayerNorm | None = None,
-        mlp: MLP | GatedMLP | None = None,
+        mlp: MLP | GatedMLP | BlockSparseMLP | None = None,
         mlp_post_norm: RMSNorm | None = None,
         qmap: str | None = None,
         qbits_key: str = "bits",
@@ -83,7 +83,7 @@ class TransformerBlock(Module):
             self.attn.k_proj if self.attn else None,
             self.attn.v_proj if self.attn else None,
             self.attn.o_proj if self.attn else None,
-            self.mlp.gates if isinstance(self.mlp, GatedMLP) else None,
+            self.mlp.gates if any(isinstance(self.mlp, x) for x in [GatedMLP, BlockSparseMLP]) else None,
             self.mlp.ups if self.mlp else None,
             self.mlp.downs if self.mlp else None,
         )
@@ -152,7 +152,7 @@ class ParallelDecoderBlock(Module):
             self.attn.k_proj if self.attn else None,
             self.attn.v_proj if self.attn else None,
             self.attn.o_proj if self.attn else None,
-            self.mlp.gates if isinstance(self.mlp, GatedMLP) else None,
+            self.mlp.gates if any(isinstance(self.mlp, x) for x in [GatedMLP, BlockSparseMLP]) else None,
             self.mlp.ups if self.mlp else None,
             self.mlp.downs if self.mlp else None,
         )

@@ -2,6 +2,7 @@ from .llama import LlamaModel
 from .mistral import MistralModel
 from .qwen2 import Qwen2Model
 from .qwen3 import Qwen3Model
+from .qwen3_moe import Qwen3MoeModel
 from .phi3 import Phi3Model
 from .gemma2 import Gemma2Model
 from .decilm import DeciLMModel
@@ -19,6 +20,7 @@ ARCHITECTURES = {
         MistralModel,
         Qwen2Model,
         Qwen3Model,
+        Qwen3MoeModel,
         Phi3Model,
         Gemma2Model,
         DeciLMModel,
