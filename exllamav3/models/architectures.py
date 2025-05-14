@@ -1,5 +1,6 @@
 from .llama import LlamaModel
 from .mistral import MistralModel
+from .mixtral import MixtralModel
 from .qwen2 import Qwen2Model
 from .qwen3 import Qwen3Model
 from .qwen3_moe import Qwen3MoeModel
@@ -18,6 +19,7 @@ ARCHITECTURES = {
     } for m in [
         LlamaModel,
         MistralModel,
+        MixtralModel,
         Qwen2Model,
         Qwen3Model,
         Qwen3MoeModel,
