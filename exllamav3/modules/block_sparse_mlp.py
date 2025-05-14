@@ -77,6 +77,7 @@ class BlockSparseMLP(Module):
             out_features = num_experts,
             qmap = None,
             out_dtype = torch.half,
+            pad_to = 1,
         )
         self.register_submodule(self.routing_gate)
 
