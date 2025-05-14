@@ -149,7 +149,11 @@ def plot(results, args):
             "imat": "brown",
             "GGUF": "red",
             "VPTQ": "blue",
+            "****": "black",
         }
+        for k, v in d.items():
+            if f"[{v}]" in s:
+                return v
         for k, v in d.items():
             if k in s:
                 return v
@@ -170,7 +174,7 @@ def plot(results, args):
             continue
         x.append(x_)
         y.append(y_)
-        labels.append(r["label"] + f"\n{y_:.3f}")
+        labels.append(r["label"].split("[")[0].strip() + f"\n{y_:.3f}")
         color = get_color(r["label"])
         colors.append(color)
         if color != "black":
