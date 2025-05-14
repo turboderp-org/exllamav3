@@ -15,8 +15,12 @@ def get_storage_info(model):
             head_bpw = get_tensor_size(module.q_tensors) / module.numel()
             head_numel = module.numel()
         elif isinstance(module, ExLlamaV2Linear):
-            sum_bits += get_tensor_size(module.q_tensors)
-            sum_numel += module.numel()
+            if module.linear:
+                sum_bits += get_tensor_size({"t": module.linear.weight})
+                sum_numel += module.numel()
+            else:
+                sum_bits += get_tensor_size(module.q_tensors)
+                sum_numel += module.numel()
     vram_bits = head_numel * head_bpw + sum_bits
     return sum_bits / sum_numel, head_bpw, vram_bits
 
