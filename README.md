@@ -1,14 +1,12 @@
 
 # <img src="doc/cat.png" width="40"> ExLlamaV3
 
-This is an **early preview release** of ExLlamaV3. Please note: ↙
+ExLlamaV3 is still in development. Please note: ↙
 
 - The framework <u>is not yet fully optimized</u>. Performance is lacking, especially on Ampere, and there may be a significant CPU bottleneck on slower processors until the extension functions are fully built out.
 - AMD GPUs (ROCm) are not yet supported.
 - [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) is currently required. I hope to switch over to [FlashInfer](https://github.com/flashinfer-ai/flashinfer/tree/main) in time, but there are some obstacles to overcome first. 
 - A number of important features are yet to be added, such as tensor parallelism and multimodal support.
-- There are no release builds yet.
-- Integration into [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) is planned when all the core functionality is in place.
 
 ## Why?
 
@@ -22,7 +20,7 @@ Additionally, ExLlamaV2 is largely designed to run in a single process and CUDA 
 
 There's much that still needs to be added and/or ported over from ExLlamaV2. I've decided to release ExLlamaV3 in its current state to invite testing, feedback and contributions, but please be aware that it's not yet a viable replacement for ExLlamaV2. Currently on the to-do list:
 
-- Support for more architectures (Mixtral, Cohere and Deepseek are in the works)
+- Support for more architectures
 - Constrained sampling (JSON filters etc.)
 - Multimodal support
 - LoRA support
