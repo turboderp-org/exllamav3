@@ -89,7 +89,7 @@ class Linear(Module):
                 "cpu" if self.is_sliced else self.device,
                 float2half = True,
                 transpose = True,
-                pad_to = (self.in_features, self.out_features)
+                pad_to = (self.in_features, self.out_features) if not self.is_sliced else None
             )
             # weight = self.pad_out(weight)
             bias = self.config.stc.get_tensor(
@@ -97,7 +97,7 @@ class Linear(Module):
                 "cpu" if self.is_sliced else self.device,
                 float2half = True,
                 optional = True,
-                pad_to = (self.out_features,)
+                pad_to = (self.out_features,) if not self.is_sliced else None
             )
             # bias = self.pad_out(bias)
             self.inner = LinearFP16(
