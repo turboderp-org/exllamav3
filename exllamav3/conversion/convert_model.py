@@ -377,6 +377,7 @@ def main(args, job_state):
 
             # Unload module
             module.unload()
+            config.stc.close()
 
         # Save layer tensors to working directory
         save_tensor(q_tensors, f"qtensors/{module.key}.safetensors", args)
