@@ -222,6 +222,7 @@ def plot(results, args):
     plt.show()
 
 
+@torch.inference_mode()
 def main(args):
     with open(args.dataspec, "r", encoding = "utf8") as f:
         test_data_spec = json.load(f)
