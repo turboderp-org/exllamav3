@@ -13,6 +13,7 @@ class MistralConfig(LlamaConfig):
     ):
         super().__init__(
             directory,
+            derived_model = {"text": MistralModel},
             **kwargs
         )
 

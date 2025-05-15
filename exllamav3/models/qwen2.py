@@ -14,6 +14,7 @@ class Qwen2Config(LlamaConfig):
     ):
         super().__init__(
             directory,
+            derived_model = {"text": Qwen2Model},
             **kwargs
         )
 

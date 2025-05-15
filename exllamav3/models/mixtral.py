@@ -17,7 +17,7 @@ class MixtralConfig(Config):
     ):
         super().__init__(
             directory,
-            MixtralModel,
+            {"text": MixtralModel},
             **kwargs
         )
 

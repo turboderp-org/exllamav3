@@ -13,11 +13,12 @@ class LlamaConfig(Config):
     def __init__(
         self,
         directory: str,
+        derived_model: dict | None = None,
         **kwargs,
     ):
         super().__init__(
             directory,
-            LlamaModel,
+            derived_model if derived_model else {"text": LlamaModel},
             **kwargs
         )
 

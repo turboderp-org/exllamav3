@@ -48,11 +48,26 @@ class Model:
 
 
     @staticmethod
-    def from_config(config: Config, **kwargs):
+    def from_config(
+        config: Config,
+        component: str = "text",
+        **kwargs
+    ):
         """
         Create model instance from config
+
+        :param config:
+            Config created with Config.from_directory()
+
+        :param component:
+            Which component model to load, for models with multiple component.
+            # TODO: Implement multimodal components
         """
-        model = config.model_class(config, **kwargs)
+
+        assert component in config.model_classes, \
+            f"{config.architecture} does not define a '{component}` component model"
+
+        model = config.model_classes[component](config, **kwargs)
         return model
 
 
@@ -420,3 +435,8 @@ class Model:
 
     def get_name(self):
         return self.__class__.__name__
+
+
+    @staticmethod
+    def get_additional_compiled_tensors(config: Config):
+        return {}

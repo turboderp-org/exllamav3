@@ -17,7 +17,7 @@ class Phi3Config(Config):
     ):
         super().__init__(
             directory,
-            Phi3Model,
+            {"text": Phi3Model},
             **kwargs
         )
 

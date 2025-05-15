@@ -17,7 +17,7 @@ class Qwen3Config(Config):
     ):
         super().__init__(
             directory,
-            Qwen3Model,
+            {"text": Qwen3Model},
             **kwargs
         )
 

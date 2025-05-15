@@ -5,6 +5,7 @@ from ..loader.safetensors import SafetensorsCollection
 from ..version import __version__
 from safetensors.torch import save_file
 from ..util.memory import free_mem
+from ..modules import Module
 from .quant_config import update_config, create_quantization_config_json
 
 def tsize(t):
@@ -53,6 +54,21 @@ def compile_model(args, model, config, tokenizer):
         total_size += size
         out_map[-1].append(module)
 
+    # Additional tensors
+    extra_tensors = {}
+    for _, cls in config.model_classes.items():
+        extra_tensors.update(cls.get_additional_compiled_tensors(config))
+    for key, data in extra_tensors.items():
+        size = data["n_bytes"]
+        if size > max_shard_bytes:
+            print(f" !! Warning, unable to fit module {module.key} in single shard of {args['shard_size']} MB")
+        if current_shard_size + size > max_shard_bytes and current_shard_size > 0:
+            current_shard_size = 0
+            out_map.append([])
+        current_shard_size += size
+        total_size += size
+        out_map[-1].append(key)
+
     # Write model tensors
     map_dict = {}
     num_files = len(out_map)
@@ -63,12 +79,16 @@ def compile_model(args, model, config, tokenizer):
         )
         print(f" -- Writing {filename}")
         file_dict = {}
-        for module in modules:
-            prefix = module.key
-            tensors = qtensors_stc.get_tensors(prefix, allow_bf16 = True)
-            tensors = {k: v.contiguous() for k, v in tensors.items()}
+        for m in modules:
+            if isinstance(m, Module):
+                prefix = m.key
+                tensors = qtensors_stc.get_tensors(prefix, allow_bf16 = True)
+                tensors = {k: v.contiguous() for k, v in tensors.items()}
+                qtensors_stc.close()
+            elif isinstance(m, str):
+                tensor = config.stc.get_tensor(m, allow_bf16 = True)
+                tensors = {m: tensor.contiguous()}
             file_dict.update(tensors)
-            qtensors_stc.close()
         for name in file_dict.keys():
             map_dict[name] = filename
         save_file(file_dict, os.path.join(out_dir, filename))

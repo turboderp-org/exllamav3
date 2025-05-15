@@ -17,7 +17,7 @@ class Glm4Config(Config):
     ):
         super().__init__(
             directory,
-            Glm4Model,
+            {"text": Glm4Model},
             **kwargs
         )
 

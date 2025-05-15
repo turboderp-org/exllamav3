@@ -17,7 +17,7 @@ class DeciLMConfig(Config):
     ):
         super().__init__(
             directory,
-            DeciLMModel,
+            {"text": DeciLMModel},
             **kwargs
         )
 

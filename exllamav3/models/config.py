@@ -16,7 +16,7 @@ class Config(ABC):
     def __init__(
         self,
         directory: str,
-        model_class,
+        model_classes: dict,
         **kwargs,
     ):
         """
@@ -30,7 +30,7 @@ class Config(ABC):
         """
 
         self.directory = directory
-        self.model_class = model_class
+        self.model_classes = model_classes
         self.uuid = uuid.uuid4()
 
         # Verify architecture

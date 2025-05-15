@@ -17,7 +17,7 @@ class Gemma2Config(Config):
     ):
         super().__init__(
             directory,
-            Gemma2Model,
+            {"text": Gemma2Model},
             **kwargs
         )
 

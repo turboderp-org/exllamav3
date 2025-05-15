@@ -17,7 +17,7 @@ class Cohere2Config(Config):
     ):
         super().__init__(
             directory,
-            Cohere2Model,
+            {"text": Cohere2Model},
             **kwargs
         )
 
