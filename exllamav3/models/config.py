@@ -146,14 +146,23 @@ class Config(ABC):
         return config
 
 
-    def read_rope_settings_default(self, rope_style: RopeStyle):
+    def read_rope_settings_default(
+        self,
+        rope_style: RopeStyle,
+        default_rope_theta: float = 10000.0,
+        default_partial_rotary_factor: float = 1.0,
+        config_dict: dict | None = None,
+    ):
+        if config_dict is None:
+            config_dict = self.config_dict
+
         return RopeSettings(
             head_dim = self.head_dim,
-            rope_theta = self.read_cfg(float, "rope_theta", 10000.0),
-            rope_scaling = self.read_cfg(dict, "rope_scaling", None),
-            partial_rotary_factor = self.read_cfg(float, "partial_rotary_factor", 1.0),
-            max_position_embeddings = self.read_cfg(int, "max_position_embeddings", None),
-            original_max_position_embeddings = self.read_cfg(int, "original_max_position_embeddings", None),
+            rope_theta = read_dict(config_dict, float, "rope_theta", default_rope_theta),
+            rope_scaling = read_dict(config_dict, dict, "rope_scaling", None),
+            partial_rotary_factor = read_dict(config_dict, float, "partial_rotary_factor", default_partial_rotary_factor),
+            max_position_embeddings = read_dict(config_dict, int, "max_position_embeddings", None),
+            original_max_position_embeddings = read_dict(config_dict, int, "original_max_position_embeddings", None),
             rope_style = rope_style,
         )
 
