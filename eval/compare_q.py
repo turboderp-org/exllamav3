@@ -12,12 +12,15 @@ import json
 import matplotlib.pyplot as plt
 from adjustText import adjust_text
 import glob
+from safetensors.torch import save_file
+from safetensors import safe_open
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
 # Lookup tables to ensure test functions are cacheable
 
 from compare_q_transformers import (
+    load_transformers_auto_bf16,
     load_transformers_auto,
     load_transformers,
     fwd_transformers,
@@ -37,6 +40,7 @@ from compare_q_llamacpp import (
 )
 
 load_fns = {
+    "transformers_auto_bf16": load_transformers_auto_bf16,
     "transformers_auto": load_transformers_auto,
     "transformers": load_transformers,
     "exllamav2": load_exllamav2,
@@ -54,6 +58,28 @@ fwd_fns = {
 tokenize_fns = {
     "transformers": tokenize_transformers,
 }
+
+# Util fn
+
+def load_tensor(filename):
+    with safe_open(filename, framework = "pt", device = "cpu") as f:
+        if "tensor" in f.keys():
+            return f.get_tensor("tensor")
+        else:
+            tensors = []
+            i = 0
+            while f"tensor.{i}" in f.keys():
+                tensors.append(f.get_tensor(f"tensor.{i}"))
+                i += 1
+            return tensors
+
+def save_tensor(tensor, filename: str):
+    if isinstance(tensor, dict):
+        save_file({k: v for k, v in tensor.items()}, filename)
+    elif isinstance(tensor, list):
+        save_file({f"tensor.{i}": t for i, t in enumerate(tensor)}, filename)
+    else:
+        save_file({f"tensor": tensor}, filename)
 
 # Tokenize ppl test data
 
@@ -84,7 +110,7 @@ def get_test_data(spec: dict):
 # Run ppl test
 
 @disk_lru_cache("test_ppl")
-def test_ppl(data_spec: dict, spec: dict):
+def test_ppl(data_spec: dict, spec: dict, logits_file: str):
     load_fn = load_fns[spec["load_fn"]]
     fwd_fn = fwd_fns[spec["fwd_fn"]]
     model_dir = spec["model_dir"]
@@ -99,15 +125,47 @@ def test_ppl(data_spec: dict, spec: dict):
 
     logprob_sum = 0.0
     logprob_count = 0
+    kl_div_sum_ab = 0.0
+    kl_div_count = 0.0
 
     print(f"Testing: {model_dir} ({spec['label']})")
+
+    if logits_file:
+        if "out_logits" in spec:
+            collect_logits = True
+            ref_logits = []
+        else:
+            collect_logits = False
+            ref_logits = load_tensor(logits_file)
 
     with ProgressBar("Evaluating", rows) as pb:
         for row in range(rows):
             pb.update(row)
             input_ids = eval_ids[row:row + 1, :]
             logits = fwd_fn(model_instance, input_ids)
-            logits = logits[:, :-1, :].float()
+            logits = logits.float()
+
+            # kld
+            if logits_file and row < 10:
+                probs_a = torch.softmax(logits, dim = -1)
+                if collect_logits:
+                    ref_logits.append(logits.cpu())
+                    kl_div_count += 1
+                else:
+                    probs_b = torch.softmax(ref_logits[row].to(logits.device), dim = -1)
+                    vs = min(probs_a.shape[-1], probs_b.shape[-1])
+                    probs_a = probs_a[..., :vs]
+                    probs_b = probs_b[..., :vs]
+                    for r in range(probs_a.shape[1]):
+                        kl_div = F.kl_div(torch.log(probs_a[:, r:r+1, :] + 1e-10), probs_b[:, r:r+1, :], reduction = 'sum')
+                        kl_div_sum_ab += kl_div.item()
+                        kl_div_count += 1
+                    del kl_div
+                    del probs_b
+                del probs_a
+
+            # ppl
+            logits = logits[:, :-1, :]
             logits += 1e-10
             log_probs = F.log_softmax(logits, dim = -1)
             del logits
@@ -120,23 +178,35 @@ def test_ppl(data_spec: dict, spec: dict):
             del target_log_probs
             del target_ids
             torch.cuda.empty_cache()
+
         pb.update(rows)
         mean_log_prob = logprob_sum / logprob_count
         perplexity = math.exp(-mean_log_prob)
+        kl_div = kl_div_sum_ab / kl_div_count
+
+    if collect_logits:
+        save_tensor(ref_logits, logits_file)
 
     print(f"Perplexity: {perplexity:.6f}")
+    print(f"KL div: {kl_div:.6f}")
 
     del model_instance
     del eval_ids
 
     free_mem()
-    return {
+    res = {
         "label": spec.get("label", spec.get("model_dir")),
         "layer_bpw": bpw_layer,
         "head_bpw": bpw_head,
         "vram_gb": vram_gb,
-        "ppl": perplexity,
+        "ppl": perplexity
     }
+    if logits_file:
+        res.update({
+            "kld": kl_div
+        })
+
+    return res
 
 
 def plot(results, args):
@@ -169,7 +239,7 @@ def plot(results, args):
     colors = []
     for r in results:
         x_ = r["vram_gb"] if args.vram else r["layer_bpw"]
-        y_ = r["ppl"]
+        y_ = r["ppl"] if not args.kld else r["kld"]
         if x_ > args.max_x or y_ > args.max_y:
             continue
         x.append(x_)
@@ -216,10 +286,19 @@ def plot(results, args):
         plt.plot(x, y, color = col, linestyle=':')
 
     plt.xlabel("VRAM // GB (decoder + head)" if args.vram else "bits per weight (decoder only)")
-    plt.ylabel("Perplexity")
+    plt.ylabel("Perplexity" if not args.kld else "KL divergence")
     plt.title(args.title)
     plt.grid(True)
     plt.show()
+
+
+def dict_hash(x: dict) -> str:
+    import hashlib
+    key = str(json.dumps(x, sort_keys = True))
+    encoded_string = key.encode('utf-8')
+    hash_object = hashlib.sha256(encoded_string)
+    hex_digest = hash_object.hexdigest()
+    return hex_digest
 
 
 @torch.inference_mode()
@@ -244,9 +323,20 @@ def main(args):
         for spec in models_spec:
             disk_lru_cache_clear("test_ppl", test_data_spec, spec)
 
+    logits_file = None
+    for idx, spec in enumerate(models_spec):
+        if "out_logits" in spec:
+            logits_dir = spec["out_logits"]
+            if not os.path.exists(logits_dir):
+                os.makedirs(logits_dir)
+            logits_file = os.path.join(logits_dir, dict_hash(test_data_spec) + ".safetensors")
+            logits_idx = idx
+    if logits_file is not None:
+        models_spec = [models_spec[logits_idx]] + models_spec[:logits_idx] + models_spec[logits_idx + 1:]
+
     results = []
     for spec in models_spec:
-        r = test_ppl(test_data_spec, spec)
+        r = test_ppl(test_data_spec, spec, logits_file)
         print(r)
         results.append(r)
 
@@ -267,6 +357,7 @@ if __name__ == "__main__":
     parser.add_argument("-mx", "--max_x", type = float, default = 999999, help = "Don't plot results beyond X value")
     parser.add_argument("-my", "--max_y", type = float, default = 999999, help = "Don't plot results beyond Y value")
     parser.add_argument("-t", "--title", type = str, default = "Very plot", help = "Plot title")
+    parser.add_argument("-kld", "--kld", action = "store_true", help = "Test KL divergence")
     _args = parser.parse_args()
     main(_args)
 

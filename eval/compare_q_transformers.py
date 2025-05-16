@@ -89,11 +89,11 @@ def get_storage_info(model):
     return sum_bits / sum_numel, head_bpw, vram_bits
 
 @torch.inference_mode
-def load_transformers(model_dir: str, auto = False):
+def load_transformers(model_dir: str, auto = False, bf16 = False):
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         device_map = "auto" if auto else "cuda:0",
-        torch_dtype = torch.half
+        torch_dtype = torch.bfloat16 if bf16 else torch.half
     )
     bpw_layer, bpw_head, vram_bits = get_storage_info(model)
     return model, bpw_layer, bpw_head, vram_bits
@@ -101,6 +101,10 @@ def load_transformers(model_dir: str, auto = False):
 @torch.inference_mode
 def load_transformers_auto(model_dir: str):
     return load_transformers(model_dir, auto = True)
+
+@torch.inference_mode
+def load_transformers_auto_bf16(model_dir: str):
+    return load_transformers(model_dir, auto = True, bf16 = True)
 
 @torch.inference_mode
 def fwd_transformers(model_instance, input_ids: torch.Tensor):
