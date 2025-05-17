@@ -23,26 +23,19 @@ def get_storage_info(model_dir):
     head_numel = 0
     for tensor_info in tensors:
         name = tensor_info.name
-        if any(name.endswith(k) for k in [
-            ".ffn_down.weight",
-            ".ffn_gate.weight",
-            ".ffn_up.weight",
-            ".attn_q.weight",
-            ".attn_k.weight",
-            ".attn_v.weight",
-            ".attn_output.weight",
-        ]):
-            sum_bits += tensor_info.n_bytes * 8
-            sum_numel += tensor_info.n_elements
         if (name == "token_embd.weight" and head_bpw == 0) or \
             name == "output.weight":
             head_bpw = tensor_info.n_bytes * 8 / tensor_info.n_elements
             head_numel = tensor_info.n_elements
+        elif name.endswith(".weight"):
+            sum_bits += tensor_info.n_bytes * 8
+            sum_numel += tensor_info.n_elements
     vram_bits = head_numel * head_bpw + sum_bits
     return sum_bits / sum_numel, head_bpw, vram_bits
 
 def load_llamacpp(model_dir: str):
     init_backend()
+    bpw_layer, bpw_head, vram_bits = get_storage_info(model_dir)
     model = Llama(
         model_path = model_dir,
         logits_all = True,
@@ -50,7 +43,6 @@ def load_llamacpp(model_dir: str):
         n_ctx = 2048,
         n_gpu_layers = 999
     )
-    bpw_layer, bpw_head, vram_bits = get_storage_info(model_dir)
     return model, bpw_layer, bpw_head, vram_bits
 
 def fwd_llamacpp(model_instance, input_ids: torch.Tensor):
