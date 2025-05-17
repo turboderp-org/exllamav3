@@ -25,6 +25,7 @@ def main(args):
     system_prompt = prompt_format.default_system_prompt() if not args.system_prompt else args.system_prompt
     add_bos = prompt_format.add_bos()
     max_response_tokens = args.max_response_tokens
+    multiline = args.multiline
 
     if args.basic_console:
         read_input_fn = read_input_ptk
@@ -71,25 +72,49 @@ def main(args):
             context = []
 
         # Get user prompt
-        user_prompt = read_input_fn(args, user_name)
+        user_prompt = read_input_fn(args, user_name, multiline)
 
         # Intercept commands
         if user_prompt.startswith("/"):
-            c = user_prompt.strip()
-            match c:
+            c = user_prompt.strip().split(" ")
+            match c[0]:
+
+                # Exit app
                 case "/x":
                     print_info("Exiting")
                     break
+
+                # Copy codeblock to clipboard
                 case "/cc":
-                    snippet = copy_last_codeblock(response)
+                    try:
+                        b = int(c[1])
+                    except:
+                        b = 1
+                    snippet = copy_last_codeblock(response, b)
                     if not snippet:
                         print_error("No code block found in last response")
                     else:
                         num_lines = len(snippet.split("\n"))
                         print_info(f"Copied {num_lines} line{'s' if num_lines > 1 else ''} to the clipboard")
                     continue
+
+                # Toggle multiline mode
+                case "/mli":
+                    multiline = not multiline
+                    if multiline:
+                        print_info("Enabled multiline mode")
+                    else:
+                        print_info("Disabled multiline mode")
+                    continue
+
+                # Clear context
+                case "/clear":
+                    context = []
+                    print_info("Cleared context")
+                    continue
+
                 case _:
-                    print_error(f"Unknown command: {c}")
+                    print_error(f"Unknown command: {c[0]}")
                     continue
 
         # Add to context

@@ -24,21 +24,21 @@ def print_error(text):
 def print_info(text):
     print(col_info + "\nInfo: " + col_default + text)
 
-def read_input_console(args, user_name):
+def read_input_console(args, user_name, multiline: bool):
     print("\n" + col_user + user_name + ": " + col_default, end = '', flush = True)
-    if args.multiline:
+    if multiline:
         user_prompt = sys.stdin.read().rstrip()
     else:
         user_prompt = input().strip()
     return user_prompt
 
-def read_input_rich(args, user_name):
+def read_input_rich(args, user_name, multiline: bool):
     user_prompt = Prompt.ask("\n" + col_user + user_name + col_default)
     return user_prompt
 
-def read_input_ptk(args, user_name):
+def read_input_ptk(args, user_name, multiline: bool):
     print()
-    user_prompt = ptk_prompt(ANSI(col_user + user_name + col_default + ": "), multiline = args.multiline)
+    user_prompt = ptk_prompt(ANSI(col_user + user_name + col_default + ": "), multiline = multiline)
     return user_prompt
 
 class Streamer_basic:
