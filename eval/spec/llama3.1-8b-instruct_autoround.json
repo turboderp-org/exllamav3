@@ -1,0 +1,8 @@
+[
+    {
+        "model_dir": "/mnt/str/models/llama3.1-8b-instruct/autoround/4bit-asym",
+        "load_fn": "transformers",
+        "fwd_fn": "transformers",
+        "label": "AutoRound 4bit asym"
+    }
+]
