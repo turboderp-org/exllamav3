@@ -423,7 +423,7 @@ class Model:
         head_bpw = 0
         head_numel = 0
         for module in self:
-            if module.key == "lm_head":
+            if module.key.endswith("lm_head"):
                 head_bpw = get_tensor_size(module.get_tensors()) / module.weights_numel()
                 head_numel = module.weights_numel()
             elif isinstance(module, Linear):
