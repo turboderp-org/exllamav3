@@ -5,7 +5,8 @@ import torch
 
 def add_args(
     parser: ArgumentParser,
-    cache: bool = True
+    cache: bool = True,
+    default_cache_size = 8192,
 ):
     """
     Add standard model loading arguments to command line parser
@@ -15,13 +16,16 @@ def add_args(
 
     :param cache:
         bool, include cache arguments. If present, model_init.init() will also return cache
+
+    :param default_cache_size:
+        Default value for -cs / --cache_size argument
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
 
     if cache:
-        parser.add_argument("-cs", "--cache_size", type = int, help = "Total cache size in tokens, default: 8192", default = 8192)
+        parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
 
     # TODO:
