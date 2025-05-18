@@ -130,6 +130,7 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
 
     print(f"Testing: {model_dir} ({spec['label']})")
 
+    collect_logits = False
     if logits_file:
         if "out_logits" in spec:
             collect_logits = True
@@ -180,15 +181,17 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
             torch.cuda.empty_cache()
 
         pb.update(rows)
-        mean_log_prob = logprob_sum / logprob_count
-        perplexity = math.exp(-mean_log_prob)
+
+    mean_log_prob = logprob_sum / logprob_count
+    perplexity = math.exp(-mean_log_prob)
+    if logits_file:
         kl_div = kl_div_sum_ab / kl_div_count
+        print(f"KL div: {kl_div:.6f}")
 
     if collect_logits:
         save_tensor(ref_logits, logits_file)
 
     print(f"Perplexity: {perplexity:.6f}")
-    print(f"KL div: {kl_div:.6f}")
 
     del model_instance
     del eval_ids
