@@ -81,25 +81,28 @@ class Linear(Module):
         return padded.contiguous()
 
 
+    def apply_fp8_scales_(self, weight: torch.Tensor, scale_inv: torch.Tensor):
+        ws = weight.shape
+        ss = scale_inv.shape
+        assert len(ws) == len(ss) == 2
+        assert all(w == s * 128 for w, s in zip(ws, ss))
+        weight = weight.view(ss[0], 128, ss[1], 128)
+        scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
+        weight *= scale_inv
+        return weight
+
+
     def load_fp16(self, key: str) -> bool:
         if self.config.stc.has_tensor_group(key, ["weight"]):
             self.used_alt_key = key == self.alt_key
-            weight = self.config.stc.get_tensor(
-                key + ".weight",
-                "cpu" if self.is_sliced else self.device,
-                float2half = True,
-                transpose = True,
-                pad_to = (self.in_features, self.out_features) if not self.is_sliced else None
-            )
-            # weight = self.pad_out(weight)
-            bias = self.config.stc.get_tensor(
-                key + ".bias",
-                "cpu" if self.is_sliced else self.device,
-                float2half = True,
-                optional = True,
-                pad_to = (self.out_features,) if not self.is_sliced else None
-            )
-            # bias = self.pad_out(bias)
+            dev = "cpu" if self.is_sliced else self.device
+            pad1 = (self.out_features,) if not self.is_sliced else None
+            pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
+            weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = True, pad_to = pad2)
+            bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
+            scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, float2half = True, optional = True)
+            if scale_inv is not None:
+                self.apply_fp8_scales_(weight, scale_inv)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
