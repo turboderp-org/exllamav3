@@ -319,10 +319,6 @@ def main(args):
             m = json.load(f)
             models_spec += m
 
-    if args.clear_cache:
-        for spec in models_spec:
-            disk_lru_cache_clear("test_ppl", test_data_spec, spec)
-
     logits_file = None
     for idx, spec in enumerate(models_spec):
         if "out_logits" in spec:
@@ -333,6 +329,18 @@ def main(args):
             logits_idx = idx
     if logits_file is not None:
         models_spec = [models_spec[logits_idx]] + models_spec[:logits_idx] + models_spec[logits_idx + 1:]
+
+    if args.mask:
+        masks = args.mask.split(";")
+        ms = []
+        for spec in models_spec:
+            if any(m.upper() in spec["label"].upper() for m in masks):
+                ms.append(spec)
+        models_spec = ms
+
+    if args.clear_cache:
+        for spec in models_spec:
+            disk_lru_cache_clear("test_ppl", test_data_spec, spec, logits_file)
 
     results = []
     for spec in models_spec:
@@ -358,6 +366,7 @@ if __name__ == "__main__":
     parser.add_argument("-my", "--max_y", type = float, default = 999999, help = "Don't plot results beyond Y value")
     parser.add_argument("-t", "--title", type = str, default = "Very plot", help = "Plot title")
     parser.add_argument("-kld", "--kld", action = "store_true", help = "Test KL divergence")
+    parser.add_argument("-mask", "--mask", type = str, help = "Semicolon-separated list of strings to match against model labels for inclusion")
     _args = parser.parse_args()
     main(_args)
 
