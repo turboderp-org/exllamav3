@@ -7,9 +7,12 @@ import matplotlib.pyplot as plt
 
 torch.set_printoptions(precision = 8, sci_mode = False, linewidth = 200)
 
+mcg_mult = 0
+mul1_mult = 0xAD9A2EC5
+
 r = torch.arange(65536, device = "cuda:0", dtype = torch.short).unsqueeze(0)
 codebook_lut = torch.zeros_like(r, dtype = torch.float)
-ext.decode(r, codebook_lut)
+ext.decode(r, codebook_lut, mcg_mult, mul1_mult)
 codebook_lut = codebook_lut[0]
 
 # RMS of codebook

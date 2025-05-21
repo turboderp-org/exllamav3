@@ -13,7 +13,7 @@ import math
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
 device = "cuda:2"
-test_model = "/mnt/str/eval_models/llama3.1-8b-instruct/hf/"
+test_model = "/mnt/str/models/llama3.1-8b-instruct/hf/"
 test_keys = [
     "model.layers.0.self_attn.q_proj",
     "model.layers.0.self_attn.k_proj",
@@ -61,15 +61,23 @@ w_tol_per_K = {
 }
 
 
+@pytest.mark.parametrize("cb", [(0, 0, 1.24371088), (0xcaf6a435, 0, 1.24371088), (0, 0xad9a2ec5, 1.0)])
 @pytest.mark.parametrize("batch_size", [1, 16, 17, 128])
-@pytest.mark.parametrize("K", [1])
+@pytest.mark.parametrize("K", [1, 2, 3, 4, 5, 6, 7, 8])
 @torch.inference_mode()
-def test_encode(batch_size, K):
+def test_encode(batch_size, K, cb):
 
     torch.manual_seed(0)
-    scale = 1.491
+    mcg, mul1, scale = cb
     in_tile = torch.randn((batch_size, 256), device = device) * scale
-    out_tile, out_idx = quantize_tiles(in_tile, {"K": K})
+    out_tile, out_idx = quantize_tiles(
+        in_tile,
+        {
+            "K": K,
+            "mcg_mult": mcg,
+            "mul1_mult": mul1,
+        }
+    )
 
     # Test tail-biting
     first_col = out_idx[:, 0].to(torch.int32) & 0xFFFF
@@ -83,13 +91,15 @@ def test_encode(batch_size, K):
     assert mse < max_mse_per_K[K]
 
 
+@pytest.mark.parametrize("cb", [(0, 0, 1.24371088), (0xcaf6a435, 0, 1.24371088), (0, 0xad9a2ec5, 1.0)])
 @pytest.mark.parametrize("batch_size", [1, 64])
 @pytest.mark.parametrize("K", [1, 2, 3, 4, 5, 6, 7, 8])
 @torch.inference_mode()
-def test_encode_ideal(batch_size, K):
+def test_encode_ideal(batch_size, K, cb):
 
     # Create random, valid, tail-biting encoding
     torch.manual_seed(0)
+    mcg, mul1, scale = cb
     encoded = torch.randint(low = 0, high = 65535, size = (batch_size, 256), device = device)
     for i in range(256):
         x = encoded[:, i]
@@ -104,17 +114,27 @@ def test_encode_ideal(batch_size, K):
 
     # Decode
     decoded = torch.empty_like(encoded, dtype = torch.float)
-    ext.decode(encoded, decoded)
+    ext.decode(encoded, decoded, mcg, mul1)
 
     # Should quantize with zero loss
-    out_tile, out_idx = quantize_tiles(decoded, {"K": K})
+    out_tile, out_idx = quantize_tiles(
+        decoded,
+        {
+            "K": K,
+            "mcg_mult": mcg,
+            "mul1_mult": mul1,
+        }
+    )
     torch.testing.assert_close(out_tile, decoded, rtol = 1e-6, atol = 1e-6)
 
 
+@pytest.mark.parametrize("cb", [(0, 0, 1.24371088), (0xcaf6a435, 0, 1.24371088), (0, 0xad9a2ec5, 1.0)])
 @pytest.mark.parametrize("K", [1, 2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("test_key", test_keys)
 @torch.inference_mode()
-def test_quant_dequant(K, test_key):
+def test_quant_dequant(K, test_key, cb):
+
+    mcg, mul1, scale = cb
 
     # Grab unquantized linear layer from model
     linear = model.find_module(test_key)
@@ -139,6 +159,10 @@ def test_quant_dequant(K, test_key):
     quant_args = {
         "K": K,
         "seed": 1,
+        "apply_out_scales": None,
+        "mcg_mult": mcg,
+        "mul1_mult": mul1,
+        "devices": [device]
     }
     proxy_err, weight_q = linear.convert_exl3(capture_H[linear.qmap], quant_args, return_weight_q = True)
     weight_q = weight_q.half()

@@ -9,12 +9,13 @@
 
 // TODO: Benchmark, profile, unit test
 
-template <int K>
+template <int K, int cb>
 __global__ __launch_bounds__(256)
 void reconstruct_kernel
 (
     half* __restrict__ g_unpacked,
-    const uint16_t* __restrict__ g_packed
+    const uint16_t* __restrict__ g_packed,
+    uint32_t mult
 )
 {
     constexpr int packed_size = 256 * K / 16;  // in uint16s
@@ -36,7 +37,7 @@ void reconstruct_kernel
 
     // Dequant
     register FragB frag[2];
-    dq_dispatch<K>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
+    dq_dispatch<K, cb>(s_packed[warp_id], lane_id * 8, frag[0], frag[1], mult);
 
     // Shuffle from tensor core layout to row major tile
 //    __shared__ half tile[16 * 8 * 16];
@@ -83,10 +84,12 @@ void reconstruct_kernel
     *out_int4 = tile_int4[t];
 }
 
-#define __(i) reconstruct_kernel<i>
+#define __(i, cb) reconstruct_kernel<i, cb>
 constexpr auto reconstruct_kernel_instances = std::array
 {
-    __(1), __(2), __(3), __(4), __(5), __(6), __(7), __(8)
+    __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
+    __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
+    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2)
 };
 #undef __
 
@@ -97,7 +100,9 @@ void reconstruct
 (
     at::Tensor unpacked,
     at::Tensor packed,
-    int K
+    int K,
+    uint32_t mcg_mult,
+    uint32_t mul1_mult
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
@@ -114,10 +119,24 @@ void reconstruct
     dim3 blockDim(256);
     dim3 gridDim(cols / 8, rows);
 
-    reconstruct_kernel_instances[K - 1]<<<gridDim, blockDim, 0, stream>>>
+    int cbi = K - 1;
+    uint32_t mult = 0;
+    if (mcg_mult)
+    {
+        mult = mcg_mult;
+        cbi += 8;
+    }
+    else if (mul1_mult)
+    {
+        mult = mul1_mult;
+        cbi += 16;
+    }
+
+    reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
-        (const uint16_t*) packed.data_ptr()
+        (const uint16_t*) packed.data_ptr(),
+        mult
     );
     cuda_check(cudaPeekAtLastError());
 }

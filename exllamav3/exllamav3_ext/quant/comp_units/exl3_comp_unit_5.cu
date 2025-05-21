@@ -9,18 +9,4 @@ namespace cg = cooperative_groups;
 #include "../exl3_gemm_kernel.cuh"
 #include "exl3_comp_unit_5.cuh"
 
-fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b5[] = {
-    EXL3_GEMM_KERNEL_INSTANCES(5, true)
-};
-
-fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b5[] = {
-    EXL3_GEMM_KERNEL_INSTANCES(5, false)
-};
-
-fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b5[] = {
-    EXL3_MGEMM_KERNEL_INSTANCES(5, true)
-};
-
-fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b5[] = {
-    EXL3_MGEMM_KERNEL_INSTANCES(5, false)
-};
+ALL_EXL3_KERNEL_INSTANCES(5)

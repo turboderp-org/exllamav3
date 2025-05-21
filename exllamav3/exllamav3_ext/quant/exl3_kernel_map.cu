@@ -92,7 +92,8 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     int force_shape_idx,
     int* out_block_dim,
     int* out_shape_idx,
-    int* num_sms
+    int* num_sms,
+    int cb
 )
 {
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, bits) : force_shape_idx;
@@ -110,18 +111,20 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
         *num_sms = MIN(max_slices, *num_sms);
     }
 
+    int kernel_idx = shape_idx + (EXL3_GEMM_NUM_SHAPES + 1) * cb;
+
     if (c_fp32)
     {
         switch (bits)
         {
-            case 1: return tfp_exl3_gemm_kernel_fp32_b1[shape_idx];
-            case 2: return tfp_exl3_gemm_kernel_fp32_b2[shape_idx];
-            case 3: return tfp_exl3_gemm_kernel_fp32_b3[shape_idx];
-            case 4: return tfp_exl3_gemm_kernel_fp32_b4[shape_idx];
-            case 5: return tfp_exl3_gemm_kernel_fp32_b5[shape_idx];
-            case 6: return tfp_exl3_gemm_kernel_fp32_b6[shape_idx];
-            case 7: return tfp_exl3_gemm_kernel_fp32_b7[shape_idx];
-            case 8: return tfp_exl3_gemm_kernel_fp32_b8[shape_idx];
+            case 1: return tfp_exl3_gemm_kernel_fp32_b1[kernel_idx];
+            case 2: return tfp_exl3_gemm_kernel_fp32_b2[kernel_idx];
+            case 3: return tfp_exl3_gemm_kernel_fp32_b3[kernel_idx];
+            case 4: return tfp_exl3_gemm_kernel_fp32_b4[kernel_idx];
+            case 5: return tfp_exl3_gemm_kernel_fp32_b5[kernel_idx];
+            case 6: return tfp_exl3_gemm_kernel_fp32_b6[kernel_idx];
+            case 7: return tfp_exl3_gemm_kernel_fp32_b7[kernel_idx];
+            case 8: return tfp_exl3_gemm_kernel_fp32_b8[kernel_idx];
             default: TORCH_CHECK(false, "No kernel for GEMM shape");
         }
     }
@@ -129,14 +132,14 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     {
         switch (bits)
         {
-            case 1: return tfp_exl3_gemm_kernel_fp16_b1[shape_idx];
-            case 2: return tfp_exl3_gemm_kernel_fp16_b2[shape_idx];
-            case 3: return tfp_exl3_gemm_kernel_fp16_b3[shape_idx];
-            case 4: return tfp_exl3_gemm_kernel_fp16_b4[shape_idx];
-            case 5: return tfp_exl3_gemm_kernel_fp16_b5[shape_idx];
-            case 6: return tfp_exl3_gemm_kernel_fp16_b6[shape_idx];
-            case 7: return tfp_exl3_gemm_kernel_fp16_b7[shape_idx];
-            case 8: return tfp_exl3_gemm_kernel_fp16_b8[shape_idx];
+            case 1: return tfp_exl3_gemm_kernel_fp16_b1[kernel_idx];
+            case 2: return tfp_exl3_gemm_kernel_fp16_b2[kernel_idx];
+            case 3: return tfp_exl3_gemm_kernel_fp16_b3[kernel_idx];
+            case 4: return tfp_exl3_gemm_kernel_fp16_b4[kernel_idx];
+            case 5: return tfp_exl3_gemm_kernel_fp16_b5[kernel_idx];
+            case 6: return tfp_exl3_gemm_kernel_fp16_b6[kernel_idx];
+            case 7: return tfp_exl3_gemm_kernel_fp16_b7[kernel_idx];
+            case 8: return tfp_exl3_gemm_kernel_fp16_b8[kernel_idx];
             default: TORCH_CHECK(false, "No kernel for GEMM shape");
         }
     }
@@ -153,7 +156,8 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
     int force_shape_idx,
     int* out_block_dim,
     int* out_shape_idx,
-    int* num_sms
+    int* num_sms,
+    int cb
 )
 {
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, bits) : force_shape_idx;
@@ -171,18 +175,20 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
         *num_sms = MIN(max_slices, *num_sms);
     }
 
+    int kernel_idx = shape_idx + (EXL3_GEMM_NUM_SHAPES + 1) * cb;
+
     if (c_fp32)
     {
         switch (bits)
         {
-            case 1: return tfp_exl3_mgemm_kernel_fp32_b1[shape_idx];
-            case 2: return tfp_exl3_mgemm_kernel_fp32_b2[shape_idx];
-            case 3: return tfp_exl3_mgemm_kernel_fp32_b3[shape_idx];
-            case 4: return tfp_exl3_mgemm_kernel_fp32_b4[shape_idx];
-            case 5: return tfp_exl3_mgemm_kernel_fp32_b5[shape_idx];
-            case 6: return tfp_exl3_mgemm_kernel_fp32_b6[shape_idx];
-            case 7: return tfp_exl3_mgemm_kernel_fp32_b7[shape_idx];
-            case 8: return tfp_exl3_mgemm_kernel_fp32_b8[shape_idx];
+            case 1: return tfp_exl3_mgemm_kernel_fp32_b1[kernel_idx];
+            case 2: return tfp_exl3_mgemm_kernel_fp32_b2[kernel_idx];
+            case 3: return tfp_exl3_mgemm_kernel_fp32_b3[kernel_idx];
+            case 4: return tfp_exl3_mgemm_kernel_fp32_b4[kernel_idx];
+            case 5: return tfp_exl3_mgemm_kernel_fp32_b5[kernel_idx];
+            case 6: return tfp_exl3_mgemm_kernel_fp32_b6[kernel_idx];
+            case 7: return tfp_exl3_mgemm_kernel_fp32_b7[kernel_idx];
+            case 8: return tfp_exl3_mgemm_kernel_fp32_b8[kernel_idx];
             default: TORCH_CHECK(false, "No kernel for GEMM shape");
         }
     }
@@ -190,14 +196,14 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
     {
         switch (bits)
         {
-            case 1: return tfp_exl3_mgemm_kernel_fp16_b1[shape_idx];
-            case 2: return tfp_exl3_mgemm_kernel_fp16_b2[shape_idx];
-            case 3: return tfp_exl3_mgemm_kernel_fp16_b3[shape_idx];
-            case 4: return tfp_exl3_mgemm_kernel_fp16_b4[shape_idx];
-            case 5: return tfp_exl3_mgemm_kernel_fp16_b5[shape_idx];
-            case 6: return tfp_exl3_mgemm_kernel_fp16_b6[shape_idx];
-            case 7: return tfp_exl3_mgemm_kernel_fp16_b7[shape_idx];
-            case 8: return tfp_exl3_mgemm_kernel_fp16_b8[shape_idx];
+            case 1: return tfp_exl3_mgemm_kernel_fp16_b1[kernel_idx];
+            case 2: return tfp_exl3_mgemm_kernel_fp16_b2[kernel_idx];
+            case 3: return tfp_exl3_mgemm_kernel_fp16_b3[kernel_idx];
+            case 4: return tfp_exl3_mgemm_kernel_fp16_b4[kernel_idx];
+            case 5: return tfp_exl3_mgemm_kernel_fp16_b5[kernel_idx];
+            case 6: return tfp_exl3_mgemm_kernel_fp16_b6[kernel_idx];
+            case 7: return tfp_exl3_mgemm_kernel_fp16_b7[kernel_idx];
+            case 8: return tfp_exl3_mgemm_kernel_fp16_b8[kernel_idx];
             default: TORCH_CHECK(false, "No kernel for GEMM shape");
         }
     }

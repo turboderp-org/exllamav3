@@ -1,5 +1,6 @@
 from ..models import Config, Model
 import os, json
+import torch
 
 def update_config(
     config_dict: dict
@@ -32,8 +33,18 @@ def create_quantization_config_json(
         qformat = module.quant_format_id()
         if qformat == "exl3":
             shape = stored_tensors[f"{module.key}.trellis"]["shape"]
+
+            mul1 = config.stc.get_tensor(f"{module.key}.mul1", optional = True, no_defer = True)
+            mul1_mult = mul1.view(torch.uint32).item() if mul1 is not None else 0
+            mcg = config.stc.get_tensor(f"{module.key}.mcg", optional = True, no_defer = True)
+            mcg_mult = mcg.view(torch.uint32).item() if mcg is not None else 0
+
             module_dict["quant_format"] = "exl3"
             module_dict["bits_per_weight"] = shape[-1] // 16
+            if mul1_mult:
+                module_dict["mul1_multiplier"] = mul1_mult
+            if mcg_mult:
+                module_dict["mcg_multiplier"] = mcg_mult
 
         storage_dict[module.key] = module_dict
 

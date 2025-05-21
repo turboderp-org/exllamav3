@@ -37,6 +37,11 @@ class MultiLinear:
         self.ptrs_svh = torch.tensor([l.inner.svh.data_ptr() for l in linears], dtype = torch.long, device = device)
         self.ptrs_trellis = torch.tensor([l.inner.trellis.data_ptr() for l in linears], dtype = torch.long, device = device)
 
+        self.mcg_mult = linears[0].inner.mcg_mult
+        assert all(l.inner.mcg_mult == self.mcg_mult for l in linears[1:])
+        self.mul1_mult = linears[0].inner.mul1_mult
+        assert all(l.inner.mul1_mult == self.mul1_mult for l in linears[1:])
+
     def unload(self):
         pass
 
@@ -251,7 +256,9 @@ class BlockSparseMLP(Module):
                 selected_experts,
                 None,
                 self.multi_gate.K,
-                -1
+                -1,
+                self.multi_gate.mcg_mult,
+                self.multi_gate.mul1_mult,
             )
 
             # Up
@@ -265,7 +272,9 @@ class BlockSparseMLP(Module):
                 selected_experts,
                 None,
                 self.multi_up.K,
-                -1
+                -1,
+                self.multi_up.mcg_mult,
+                self.multi_up.mul1_mult,
             )
 
             # Activation
@@ -282,7 +291,9 @@ class BlockSparseMLP(Module):
                 selected_experts,
                 routing_weights,
                 self.multi_down.K,
-                -1
+                -1,
+                self.multi_down.mcg_mult,
+                self.multi_down.mul1_mult,
             )
 
             final_hidden_states = out_d.sum(dim = 0)

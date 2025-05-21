@@ -20,8 +20,10 @@ class LinearEXL3:
         suh: torch.Tensor | None = None,
         svh: torch.Tensor | None = None,
         trellis: torch.Tensor | None = None,
+        mcg: torch.Tensor | None = None,
+        mul1: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
-        out_dtype: torch.dtype | None = None
+        out_dtype: torch.dtype | None = None,
     ):
         assert scale is None, "scale is no longer used"
         assert su is not None or suh is not None, "either su (packed) or suh (unpacked) is required"
@@ -48,6 +50,13 @@ class LinearEXL3:
         self.bias = bias
         self.swap_device = None
         self.out_dtype = out_dtype
+        self.mcg_mult = None
+
+        self.mcg = mcg
+        self.mcg_mult = mcg.view(torch.uint32).item() if mcg is not None else 0
+
+        self.mul1 = mul1
+        self.mul1_mult = mul1.view(torch.uint32).item() if mul1 is not None else 0
 
 
     def get_tensors(self, key: str):
@@ -59,6 +68,8 @@ class LinearEXL3:
         if self.svh is not None: t[f"{key}.svh"] = self.svh.contiguous()
         t[f"{key}.trellis"] = self.trellis.contiguous()
         if self.bias is not None: t[f"{key}.bias"] = self.bias.contiguous()
+        if self.mcg_mult: t[f"{key}.mcg"] = self.mcg
+        if self.mul1_mult: t[f"{key}.mul1"] = self.mul1
         return t
 
 
@@ -89,7 +100,7 @@ class LinearEXL3:
             ext.hgemm(xh, w, y)
             ext.had_r_128(y, y, None, self.svh, 1.0)
         else:
-            ext.exl3_gemm(x, self.trellis, y, self.suh, xh, self.svh, -1)
+            ext.exl3_gemm(x, self.trellis, y, self.suh, xh, self.svh, -1, self.mcg_mult, self.mul1_mult)
 
         x = y.view(out_shape)
 
@@ -124,7 +135,7 @@ class LinearEXL3:
 
     def get_inner_weight_tensor(self):
         w = torch.zeros((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
-        ext.reconstruct(w, self.trellis, self.K)
+        ext.reconstruct(w, self.trellis, self.K, self.mcg_mult, self.mul1_mult)
         return w
 
 

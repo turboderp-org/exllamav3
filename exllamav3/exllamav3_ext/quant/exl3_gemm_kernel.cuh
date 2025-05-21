@@ -35,8 +35,8 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     while (size_m_ > 0)
     {
         exl3_gemm_kernel_inner
-        <bits, c_fp32, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
-        (A_, B, C_, size_m_, size_k, size_n, locks);
+        <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
+        (A_, B, C_, size_m_, size_k, size_n, locks, mult);
 
         A_ += 16 * size_k;
         if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
@@ -130,10 +130,11 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             if (B)
             {
                 int lock_offs = blockIdx.z * size_n / 128;
+
                 exl3_gemm_kernel_inner
-                <bits, c_fp32, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
-                (A_, B, C_, size_m_, size_k, size_n, locks + lock_offs);
-            }
+                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
+                (A_, B, C_, size_m_, size_k, size_n, locks + lock_offs, mult);
+             }
 
             A_ += 16 * size_k;
             if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);

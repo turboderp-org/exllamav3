@@ -10,7 +10,9 @@ int exl3_gemm
     const c10::optional<at::Tensor>& suh,
     const c10::optional<at::Tensor>& A_had,
     const c10::optional<at::Tensor>& svh,
-    int force_shape_idx
+    int force_shape_idx,
+    uint32_t mcg_mult,
+    uint32_t mul1_mult
 );
 
 int exl3_mgemm
@@ -24,5 +26,7 @@ int exl3_mgemm
     const c10::optional<at::Tensor>& indices,
     const c10::optional<at::Tensor>& weights,
     int K,
-    int force_shape_idx
+    int force_shape_idx,
+    uint32_t mcg_mult,
+    uint32_t mul1_mult
 );

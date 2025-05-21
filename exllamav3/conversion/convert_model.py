@@ -16,6 +16,9 @@ from safetensors import safe_open
 import os, shutil
 import json
 
+col_default = "\u001b[0m"
+col_red = "\u001b[31;1m"
+
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
 parser = argparse.ArgumentParser()
@@ -34,6 +37,8 @@ parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mo
 parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
+parser.add_argument("-mcg", "--mcg_multiplier", type = str, default = None, help = "MCG multiplier - EXPERIMENTAL, DO NOT USE")
+parser.add_argument("-mul1", "--mul1_multiplier", type = str, default = None, help = "MUL1 multiplier - EXPERIMENTAL, DO NOT USE")
 
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--out_scales", dest = "out_scales_", action = "store_true", help = "Always enable out channel scales  (for debug purposes)")
@@ -96,13 +101,15 @@ def prepare_env(args):
     os.makedirs(images_dir, exist_ok = True)
 
 
-def prepare(args) -> (dict, bool, str, str):
+def prepare(args) -> (dict, dict, bool, str):
     if not args.work_dir:
         return None, None, False, "Must specify --work_dir"
     if not args.in_dir and not args.resume:
         return None, None, False, "Specify either --in_dir to start a new job or --resume to resume an interrupted job"
     if not args.out_dir and not args.resume:
         return None, None, False, "Must specify --out_dir or --resume"
+    if args.mcg_multiplier and args.mul1_multiplier:
+        return None, None, False, "Cannot specify both MCG and MUL1 arguments"
 
     in_args = { "work_dir": args.work_dir }
     if args.resume:
@@ -144,6 +151,8 @@ def prepare(args) -> (dict, bool, str, str):
         ("last_checkpoint_index", True, -1),
         ("devices", True, None),
         ("device_ratios", True, None),
+        ("mcg_multiplier", True, ""),
+        ("mul1_multiplier", True, ""),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -164,12 +173,25 @@ def prepare(args) -> (dict, bool, str, str):
         save_dict("args.json", in_args, in_args)
         save_dict("ckpt/job.json", job_state, in_args)
 
+    warn_experimental = False
     print(f"    Input directory: {in_args['in_dir']}")
     print(f"    Output directory: {in_args['out_dir']}")
     print(f"    Working directory: {in_args['work_dir']}")
     print(f"    Calibration size: {in_args['cal_rows']} rows, {in_args['cal_cols']} columns")
     print(f"    Target bitrate: {in_args['bits']} (decoder), {in_args['head_bits']} (head)")
     print(f"    Output scales: " + {True: "always", False: "never", None: "auto"}[in_args["apply_out_scales"]])
+    if in_args.get("mcg_multiplier"):
+        warn_experimental = True
+        print(f"    {col_red}MCG multiplier (experimental): {in_args.get('mcg_multiplier')} {col_default}")
+    if in_args.get("mul1_multiplier"):
+        warn_experimental = True
+        print(f"    {col_red}MUL1 multiplier (experimental): {in_args.get('mul1_multiplier')} {col_default}")
+
+    if warn_experimental:
+        print(
+            f" !! {col_red}WARNING, experimental options are selected. The quantized model may not work in future "
+            f"versions of ExLlamaV3 {col_default}"
+        )
 
     return in_args, job_state, True, None
 
@@ -348,6 +370,15 @@ def main(args, job_state):
                     "device_ratios": device_ratios,
                     "apply_out_scales": args["apply_out_scales"],
                 }
+                if args.get("mcg_multiplier"):
+                    quant_args.update({
+                        "mcg_mult": int(args["mcg_multiplier"], 0)
+                    })
+                if args.get("mul1_multiplier"):
+                    quant_args.update({
+                        "mul1_mult": int(args["mul1_multiplier"], 0)
+                    })
+
                 with Timer() as t:
                     sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
                         if args["image_dump"] else None

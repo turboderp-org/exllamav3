@@ -18,7 +18,8 @@ void exl3_gemm_kernel_inner
     int size_m,
     int size_k,
     int size_n,
-    int* __restrict__ locks
+    int* __restrict__ locks,
+    uint32_t mult
 )
 {
     const int TILEBLOCKS_M = TILESIZE_M / 16;
@@ -263,7 +264,7 @@ void exl3_gemm_kernel_inner
             int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
             const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * 256 / 16 * bits);
 
-            dq_dispatch<bits>(shb, r0 * 16 + c0, frag_b[buf][n2], frag_b[buf][n2 + 1]);
+            dq_dispatch<bits, cb>(shb, r0 * 16 + c0, frag_b[buf][n2], frag_b[buf][n2 + 1], mult);
         }
 
         __syncthreads();

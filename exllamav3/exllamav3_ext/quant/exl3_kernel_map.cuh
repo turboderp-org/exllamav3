@@ -7,6 +7,7 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
 #define EXL3_GEMM_T_ARGS \
     int bits, \
     bool c_fp32, \
+    int cb, \
     int TILESIZE_M, \
     int TILESIZE_K, \
     int TILESIZE_N, \
@@ -23,7 +24,8 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     int* __restrict__ locks, \
     const half* __restrict__ suh, \
     half* __restrict__ A_had, \
-    const half* __restrict__ svh
+    const half* __restrict__ svh, \
+    uint32_t mult
 
 #define EXL3_MGEMM_ARGS \
     const half* __restrict__  A, \
@@ -39,7 +41,8 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     const uint64_t* B_indices, \
     const half* B_weights, \
     int bszm_in, \
-    int bszm_out
+    int bszm_out, \
+    uint32_t mult
 
 typedef void (*fp_exl3_gemm_kernel) (EXL3_GEMM_ARGS);
 typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
@@ -49,27 +52,59 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 #define EXL3_GEMM_SHAPE_3     16,     32,    256,     4,     3
 #define EXL3_GEMM_SHAPE_4     16,     16,    512,     4,     3
 
-#define EXL3_GEMM_NUM_SHAPES 4
-
 #define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16
 #define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512
 #define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256
 
-#define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32) \
-    nullptr, \
-    exl3_gemm_kernel<_bits, _c_fp32, EXL3_GEMM_SHAPE_1>, \
-    exl3_gemm_kernel<_bits, _c_fp32, EXL3_GEMM_SHAPE_2>, \
-    exl3_gemm_kernel<_bits, _c_fp32, EXL3_GEMM_SHAPE_3>, \
-    exl3_gemm_kernel<_bits, _c_fp32, EXL3_GEMM_SHAPE_4>
+#define EXL3_GEMM_NUM_SHAPES 4
 
-#define EXL3_MGEMM_KERNEL_INSTANCES(_bits, _c_fp32) \
+// Shape 1 not currently used anywhere
+#define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, \
-    exl3_mgemm_kernel<_bits, _c_fp32, EXL3_GEMM_SHAPE_1>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, EXL3_GEMM_SHAPE_2>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, EXL3_GEMM_SHAPE_3>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, EXL3_GEMM_SHAPE_4>
+    nullptr, \
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+
+#define EXL3_MGEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
+    nullptr, \
+    nullptr, \
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
 
 #define EXL3_GEMM_BASE_THREADS 256
+
+#define ALL_EXL3_KERNEL_EXTERNS(K) \
+    extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K[]; \
+    extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K[]; \
+    extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K[]; \
+    extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K[]; \
+
+#define ALL_EXL3_KERNEL_INSTANCES(K) \
+    fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K[] = { \
+        EXL3_GEMM_KERNEL_INSTANCES(K, true, 0), \
+        EXL3_GEMM_KERNEL_INSTANCES(K, true, 1), \
+        EXL3_GEMM_KERNEL_INSTANCES(K, true, 2) \
+    }; \
+    \
+    fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K[] = { \
+        EXL3_GEMM_KERNEL_INSTANCES(K, false, 0), \
+        EXL3_GEMM_KERNEL_INSTANCES(K, false, 1), \
+        EXL3_GEMM_KERNEL_INSTANCES(K, false, 2) \
+    }; \
+    \
+    fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K[] = { \
+        EXL3_MGEMM_KERNEL_INSTANCES(K, true, 0), \
+        EXL3_MGEMM_KERNEL_INSTANCES(K, true, 1), \
+        EXL3_MGEMM_KERNEL_INSTANCES(K, true, 2) \
+    }; \
+    \
+    fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K[] = { \
+        EXL3_MGEMM_KERNEL_INSTANCES(K, false, 0), \
+        EXL3_MGEMM_KERNEL_INSTANCES(K, false, 1), \
+        EXL3_MGEMM_KERNEL_INSTANCES(K, false, 2) \
+    };
 
 fp_exl3_gemm_kernel select_exl3_gemm_kernel
 (
@@ -82,7 +117,8 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     int force_shape_idx,
     int* out_block_dim,
     int* out_shape_idx,
-    int* out_num_sms
+    int* out_num_sms,
+    int cb
 );
 
 fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
@@ -96,5 +132,6 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
     int force_shape_idx,
     int* out_block_dim,
     int* out_shape_idx,
-    int* out_num_sms
+    int* out_num_sms,
+    int cb
 );

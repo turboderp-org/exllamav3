@@ -34,7 +34,9 @@ int exl3_gemm
     const c10::optional<at::Tensor>& suh,
     const c10::optional<at::Tensor>& A_had,
     const c10::optional<at::Tensor>& svh,
-    int force_shape_idx
+    int force_shape_idx,
+    uint32_t mcg_mult,
+    uint32_t mul1_mult
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -82,13 +84,19 @@ int exl3_gemm
     int size_n = B.size(1) * 16;
 
     // Select kernel
+    TORCH_CHECK(!(mcg_mult && mul1_mult), "Specified both mcg_mult and mul1_mult")
+    int cb = 0;
+    uint32_t mult = 0;
+    if (mcg_mult) { cb = 1; mult = mcg_mult; }
+    if (mul1_mult) { cb = 2; mult = mul1_mult; }
+
     int selected_shape;
     int block_dim;
     fp_exl3_gemm_kernel kernel = select_exl3_gemm_kernel
     (
         cc, size_m, size_k, size_n, bits, c_fp32,
         force_shape_idx, &block_dim, &selected_shape,
-        &num_sms
+        &num_sms, cb
     );
     if (!kernel) return 0;
 
@@ -106,6 +114,7 @@ int exl3_gemm
         (void*)& suh_ptr,
         (void*)& A_had_ptr,
         (void*)& svh_ptr,
+        (void*)& mult
     };
     cudaLaunchCooperativeKernel
     (
@@ -146,7 +155,9 @@ int exl3_mgemm
     const c10::optional<at::Tensor>& indices,
     const c10::optional<at::Tensor>& weights,
     int K,
-    int force_shape_idx
+    int force_shape_idx,
+    uint32_t mcg_mult,
+    uint32_t mul1_mult
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -175,12 +186,12 @@ int exl3_mgemm
     const long* indices_ptr = (const long*) OPTPTR(indices);
     const half* weights_ptr = (const half*) OPTPTR(weights);
 
-    int num_B = 0;
+    // int num_B = 0;
     if (indices)
     {
         TORCH_CHECK_DIM(indices.value(), 2);
         TORCH_CHECK_SHAPES(indices.value(), 1, C, 0, 1);
-        num_B = indices.value().size(1);
+        // num_B = indices.value().size(1);
     }
     else TORCH_CHECK(false, "Must specify indices");
 
@@ -210,13 +221,19 @@ int exl3_mgemm
     const uintptr_t* svh_ptr_ptr = (const uintptr_t*) svh.data_ptr();
 
     // Select kernel
+    TORCH_CHECK(!(mcg_mult && mul1_mult), "Specified both mcg_mult and mul1_mult")
+    int cb = 0;
+    uint32_t mult = 0;
+    if (mcg_mult) { cb = 1; mult = mcg_mult; }
+    if (mul1_mult) { cb = 2; mult = mul1_mult; }
+
     int selected_shape;
     int block_dim;
     fp_exl3_mgemm_kernel kernel = select_exl3_mgemm_kernel
     (
         cc, size_m, size_k, size_n, K, c_fp32,
         force_shape_idx, &block_dim, &selected_shape,
-        &num_sms
+        &num_sms, cb
     );
     if (!kernel) return 0;
 
@@ -241,7 +258,8 @@ int exl3_mgemm
         (void*)& indices_ptr,
         (void*)& weights_ptr,
         (void*)& bszm_in,
-        (void*)& bszm_out
+        (void*)& bszm_out,
+        (void*)& mult
     };
 
     cudaLaunchCooperativeKernel
