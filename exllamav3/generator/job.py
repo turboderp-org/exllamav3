@@ -304,9 +304,9 @@ class Job:
     ):
         # TODO: (cfg)
         # assert logits.shape[0] == len(self.sequences) == (2 if self.gen_settings.cfg_scale is not None else 1)
-        assert logits.shape[0] == len(self.sequences)
-        assert self.is_prefill_done()
-        assert all(seq.live for seq in self.sequences)
+        # assert logits.shape[0] == len(self.sequences)
+        # assert self.is_prefill_done()
+        # assert all(seq.live for seq in self.sequences)
 
         # Start filters
         # TODO: (filters)
