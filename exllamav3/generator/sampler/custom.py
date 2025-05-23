@@ -56,6 +56,8 @@ class SS_Base:
         return None
     def reqs_past_ids(self):
         return False
+    def reqs_torch_seed(self):
+        return False
 
 
 class SS_NoOp(SS_Base):
@@ -135,6 +137,9 @@ class SS_Sample_mn(SS_Sample):
             case _:
                 return None
 
+    def reqs_torch_seed(self):
+        return True
+
 
 class SS_Temperature(SS_Base):
     """
@@ -193,7 +198,7 @@ class SS_Normalize(SS_Base):
 
 class SS_Sort(SS_Base):
     """
-    Sort tokens by descending probability. state.indices
+    Sort tokens by descending probability.
     """
     def run(self, state: SamplingState):
         match state.state:
@@ -453,6 +458,7 @@ class CustomSampler(Sampler):
         state = SS.INIT
         for step in steps:
             self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
+            self.reqs_torch_seed = self.reqs_torch_seed or step.reqs_torch_seed()
             alt = step.alt()
             if alt:
                 step = alt
@@ -484,8 +490,9 @@ class CustomSampler(Sampler):
         if rand_u32 is None:
             rand_u32 = random.randint(0, (1<<32) - 1)
         else:
-            torch.manual_seed(rand_u32)
-            random.seed(rand_u32)
+            if self.reqs_torch_seed:
+                torch.manual_seed(rand_u32)
+                random.seed(rand_u32)
 
         dim = logits.shape[-1]
         bsz = logits.numel() // dim

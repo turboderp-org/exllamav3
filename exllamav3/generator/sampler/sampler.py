@@ -5,6 +5,7 @@ from ...tokenizer import Tokenizer
 class Sampler:
     def __init__(self):
         self.reqs_past_ids = False
+        self.reqs_torch_seed = False
 
     @abstractmethod
     def forward(
