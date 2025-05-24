@@ -44,6 +44,7 @@ class MultiLinear:
 
     def unload(self):
         pass
+from ..util import profile_opt
 
 
 class BlockSparseMLP(Module):

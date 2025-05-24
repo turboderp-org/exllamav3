@@ -14,6 +14,7 @@ from .visualizer import CacheVisualizer
 import time
 import threading
 import numpy as np
+from ..util import profile_opt
 
 class Generator:
 

@@ -11,6 +11,7 @@ from ..device import get_device_context, release_device_context
 from ..constants import PAGE_SIZE
 from ..cache import Cache
 from flash_attn import flash_attn_func, flash_attn_with_kvcache
+from ..util import profile_opt
 
 """
 SDPA:

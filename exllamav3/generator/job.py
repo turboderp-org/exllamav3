@@ -14,6 +14,7 @@ import time
 from ..ext import exllamav3_ext as ext
 from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
+from ..util import profile_opt
 
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
 def _strings_to_utf32(strings: list[str]) -> tuple[np.ndarray, np.ndarray] | None:

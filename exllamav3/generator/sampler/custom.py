@@ -8,6 +8,7 @@ from ...util.tensor import buffered_arange
 import random
 from dataclasses import dataclass
 from enum import Enum
+from ...util import profile_opt
 
 class SS(Enum):
     INIT = 0  # only state.in_logits is valid
