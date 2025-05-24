@@ -187,13 +187,12 @@ class BlockSparseMLP(Module):
         bsz = y.shape[0]
 
         router_logits = self.routing_gate.forward(y, params)
-        routing_weights = F.softmax(router_logits, dim = -1)
         routing_weights, selected_experts = torch.topk(
-            routing_weights,
+            router_logits,
             self.num_experts if activate_all_experts else self.num_experts_per_tok,
             dim = -1
         )
-        routing_weights /= routing_weights.sum(dim = -1, keepdim = True)
+        routing_weights = torch.softmax(routing_weights, dim = -1)
 
         # Torch path
         if bsz > 1 or not self.is_quantized:
