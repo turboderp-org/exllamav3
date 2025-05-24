@@ -12,6 +12,8 @@ from ..constants import PAGE_SIZE
 from ..cache import Cache
 from flash_attn import flash_attn_func, flash_attn_with_kvcache
 from ..util import profile_opt
+from .multilinear import MultiLinear
+from ..ext import exllamav3_ext as ext
 
 """
 SDPA:
@@ -197,6 +199,7 @@ class Attention(Module):
         })
 
         self.cache_layers = []
+        self.multi_kv = None
 
 
     @override
@@ -213,10 +216,16 @@ class Attention(Module):
                 self.rope_settings,
             )
 
-        # self.join_qkv_fwd = (
-        #     (self.q_proj.quant_type, self.k_proj.quant_type, self.v_proj.quant_type)
-        #     == ("exl3", "exl3", "exl3")
-        # )
+        # Test if K and V proj can be fused
+        if (
+            self.k_proj.quant_type == "exl3" and
+            self.v_proj.quant_type == "exl3" and
+            self.k_proj.out_features == self.v_proj.out_features and
+            self.k_proj.inner.K == self.v_proj.inner.K and
+            self.k_proj.inner.bias is None and
+            self.v_proj.inner.bias is None
+        ):
+            self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
 
 
     @override
@@ -228,6 +237,10 @@ class Attention(Module):
             cl.free()
 
         self.rope = None
+
+        if self.multi_kv is not None:
+            self.multi_kv.unload()
+            self.multi_kv = None
 
 
     @override
@@ -254,9 +267,34 @@ class Attention(Module):
 
 
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
+        bsz, q_len, dim = x.shape
         q = self.q_proj.forward(x, params)
-        k = self.k_proj.forward(x, params)
-        v = self.v_proj.forward(x, params)
+
+        if self.multi_kv is None or bsz * q_len > 32:
+            k = self.k_proj.forward(x, params)
+            v = self.v_proj.forward(x, params)
+
+        else:
+            x = x.view(1, bsz * q_len, dim)
+            kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+            kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
+            ext.exl3_mgemm(
+                x,
+                self.multi_kv.ptrs_trellis,
+                kv,
+                self.multi_kv.ptrs_suh,
+                kvh,
+                self.multi_kv.ptrs_svh,
+                None,
+                None,
+                self.multi_kv.K,
+                -1,
+                self.multi_kv.mcg_mult,
+                self.multi_kv.mul1_mult,
+            )
+            k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
+            v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
+
         return q, k, v
 
 

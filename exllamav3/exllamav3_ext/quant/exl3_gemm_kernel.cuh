@@ -89,7 +89,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         if (j >= bszm) j = -1;
         else
         {
-            mat_index = (int) B_indices[j];
+            mat_index = B_indices ? (int) B_indices[j] : j;
             B = B_list[mat_index];
         }
 

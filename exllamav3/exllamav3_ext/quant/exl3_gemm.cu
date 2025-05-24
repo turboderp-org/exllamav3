@@ -193,7 +193,7 @@ int exl3_mgemm
         TORCH_CHECK_SHAPES(indices.value(), 1, C, 0, 1);
         // num_B = indices.value().size(1);
     }
-    else TORCH_CHECK(false, "Must specify indices");
+    //else TORCH_CHECK(false, "Must specify indices");
 
     if (weights)
     {
