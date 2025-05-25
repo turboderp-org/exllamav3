@@ -340,17 +340,20 @@ class Job:
             allowed_tokens = allowed_tokens,
         )
 
-        if self.return_probs:
-            # TODO
-            pass
-        else:
-            next_prob = None
+        if self.return_probs or self.return_top_tokens > 0:
+            probs = torch.softmax(logits.float(), dim = -1)
 
-        if self.return_top_tokens:
-            # TODO
-            pass
-        else:
-            next_k_tokens, next_k_probs = None, None
+            if self.return_probs:
+                next_prob = torch.gather(probs.squeeze(0), dim = 1, index = next_token)
+            else:
+                next_prob = None
+
+            if self.return_top_tokens > 0:
+                sorted_probs, sorted_indices = torch.sort(probs, dim = -1, descending = True)
+                next_k_tokens = sorted_indices[:, :, :self.return_top_tokens]
+                next_k_probs = sorted_probs[:, :, :self.return_top_tokens]
+            else:
+                next_k_tokens, next_k_probs = None, None
 
         return next_token, next_k_tokens, next_k_probs, next_prob
 
