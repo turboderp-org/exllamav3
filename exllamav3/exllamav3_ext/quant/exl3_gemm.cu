@@ -10,6 +10,7 @@ namespace cg = cooperative_groups;
 #include "exl3_gemm_kernel.cuh"
 #include "exl3_kernel_map.cuh"
 #include "exl3_devctx.cuh"
+#include <set>
 
 /*
 EXL3 matmul, A @ B -> C
@@ -25,6 +26,8 @@ limitations:
 - k % 16 == 0
 - n % 128 == 0
 */
+
+std::set<void*> kernel_attr_set{};
 
 int exl3_gemm
 (
@@ -44,8 +47,8 @@ int exl3_gemm
 
     TORCH_CHECK_DIM(B, 3);
     TORCH_CHECK_SHAPES(A, 1, B, 0, 16);
-    TORCH_CHECK_SHAPES(C, 1, B, 1, 16);
-    TORCH_CHECK_SHAPES(A, 0, C, 0, 1);
+    TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
+//    TORCH_CHECK_SHAPES(A, 0, C, 0, 1);
     TORCH_CHECK_DTYPE(A, kHalf);
     TORCH_CHECK_DTYPE(B, kShort);
     bool c_fp32 = C.dtype() == at::kFloat;
@@ -56,16 +59,16 @@ int exl3_gemm
     half* A_had_ptr = nullptr;
     if (suh_ptr)
     {
-        TORCH_CHECK_SHAPES(suh.value(), 0, A, 1, 1);
+//        TORCH_CHECK_SHAPES(suh.value(), 0, A, 1, 1);
         A_had_ptr = (half*) OPTPTR(A_had);
-        TORCH_CHECK(A_had_ptr, "Must supply A_had with suh");
-        TORCH_CHECK_SHAPES_FULL(A_had.value(), A);
+//        TORCH_CHECK(A_had_ptr, "Must supply A_had with suh");
+//        TORCH_CHECK_SHAPES_FULL(A_had.value(), A);
     }
 
     // Get SV, optionally
     const half* svh_ptr = (const half*) OPTPTR(svh);
-    if (svh_ptr)
-        TORCH_CHECK_SHAPES(svh.value(), 0, B, 1, 16);
+//    if (svh_ptr)
+//        TORCH_CHECK_SHAPES(svh.value(), 0, B, 1, 16);
 
     // Device properties
     int device;
@@ -101,7 +104,11 @@ int exl3_gemm
     if (!kernel) return 0;
 
     // Launch
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+    if (kernel_attr_set.find((void*)kernel) == kernel_attr_set.end())
+    {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        kernel_attr_set.insert((void*)kernel);
+    }
     void* kernelArgs[] =
     {
         (void*)& A_ptr,
@@ -242,7 +249,11 @@ int exl3_mgemm
     dim3 block_grid(num_sms, 1, concurrency);
 
     // Launch
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+    if (kernel_attr_set.find((void*)kernel) == kernel_attr_set.end())
+    {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        kernel_attr_set.insert((void*)kernel);
+    }
     void* kernelArgs[] =
     {
         (void*)& A_ptr,

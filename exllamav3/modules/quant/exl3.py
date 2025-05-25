@@ -6,6 +6,7 @@ from ...util import first_not_none
 import math
 from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n, tensor_core_perm, tensor_core_perm_i
 from ...ext import exllamav3_ext as ext
+from ...util import profile_opt
 
 class LinearEXL3:
 
@@ -81,33 +82,29 @@ class LinearEXL3:
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
         out_shape = x.shape[:-1] + (self.out_features,)
-        input_dtype = x.dtype
         x = x.view(-1, self.in_features)
 
         torch_mode = params.get("reconstruct", x.shape[0] > 32)
-
-        y = torch.empty(
-            (x.shape[0], self.out_features),
-            dtype = first_not_none(out_dtype, self.out_dtype, torch.half),
-            device = x.device
-        )
-
-        xh = torch.empty_like(x)
+        ret_dtype = out_dtype or self.out_dtype or torch.half
 
         if torch_mode:
+            y = torch.empty(out_shape, dtype = ret_dtype, device = x.device)
+            y_ = y.view(x.shape[0], self.out_features)
+            xh = torch.empty_like(x)
             ext.had_r_128(x, xh, self.suh, None, 1.0)
             w = self.get_inner_weight_tensor()
-            ext.hgemm(xh, w, y)
-            ext.had_r_128(y, y, None, self.svh, 1.0)
+            # TODO: Test torch.matmul for Blackwell
+            ext.hgemm(xh, w, y_)
+            ext.had_r_128(y_, y_, None, self.svh, 1.0)
         else:
+            y = torch.empty(out_shape, dtype = ret_dtype, device = x.device)
+            xh = torch.empty_like(x)
             ext.exl3_gemm(x, self.trellis, y, self.suh, xh, self.svh, -1, self.mcg_mult, self.mul1_mult)
 
-        x = y.view(out_shape)
-
         if self.bias is not None:
-            x += self.bias
+            y += self.bias
 
-        return x
+        return y
 
 
     def unpack_bf(self, bitfield: torch.Tensor):
