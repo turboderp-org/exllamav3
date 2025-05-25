@@ -63,8 +63,8 @@ class LinearFP16:
     ) -> torch.Tensor:
         out_shape = x.shape[:-1] + (self.out_features,)
         x = x.view(-1, x.shape[-1])
-        dtype = first_not_none(out_dtype, self.out_dtype, torch.half)
-        y = torch.zeros(
+        dtype = out_dtype or self.out_dtype or torch.half
+        y = torch.empty(
             (x.shape[0], self.out_features),
             dtype = dtype,
             device = x.device
