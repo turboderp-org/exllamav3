@@ -47,7 +47,7 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
 typedef void (*fp_exl3_gemm_kernel) (EXL3_GEMM_ARGS);
 typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 
-#define EXL3_GEMM_SHAPE_1     16,     16,    128,     3,     2
+#define EXL3_GEMM_SHAPE_1     16,     16,    128,     6,     5
 #define EXL3_GEMM_SHAPE_2     16,     32,    128,     4,     3
 #define EXL3_GEMM_SHAPE_3     16,     32,    256,     4,     3
 #define EXL3_GEMM_SHAPE_4     16,     16,    512,     4,     3
@@ -61,14 +61,14 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 // Shape 1 not currently used anywhere
 #define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, \
-    nullptr, \
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
 
 #define EXL3_MGEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, \
-    nullptr, \
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>

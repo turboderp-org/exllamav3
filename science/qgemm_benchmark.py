@@ -8,12 +8,13 @@ from tabulate import tabulate
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
-K = 8
-runs = 50
+K = 1
+runs = 60
 
 shapes_m = [1, 4, 16]
 
 shapes_kn = [
+    (2048, 4096),
     (4096, 14336),
     (14336, 4096),
     (4096, 1024),
@@ -34,7 +35,7 @@ devices = [
     "cuda:3",
 ]
 
-kernels = range(2, 1 + ext.exl3_gemm_num_kernel_shapes())
+kernels = range(1, 1 + ext.exl3_gemm_num_kernel_shapes())
 mcg_mult = 0
 mul1_mult = 0
 

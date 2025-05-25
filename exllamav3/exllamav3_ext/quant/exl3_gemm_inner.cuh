@@ -523,17 +523,20 @@ void exl3_gemm_kernel_inner
     // dequantization overhead, but we need two different iterations of the main loop to avoid confusing the compiler
     // and making it (sometimes) place the fragment arrays in local memory
 
+    #define FSTAGE(_load, _mul) \
+        async_load_gl(); \
+        wait_stage(); \
+        load_frags(_load); \
+        matmul(_mul); \
+        if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; } \
+        advance2(); \
+        if (!slice2_iters) break; \
+
     if constexpr (FRAG_STAGES == 1)
     {
         while (true)
         {
-            async_load_gl();
-            wait_stage();
-            load_frags(0);
-            matmul(0);
-            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
-            advance2();
-            if (!slice2_iters) break;
+            FSTAGE(0, 0);
         }
     }
 
@@ -541,21 +544,8 @@ void exl3_gemm_kernel_inner
     {
         while (true)
         {
-            async_load_gl();
-            wait_stage();
-            load_frags(1);
-            matmul(0);
-            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
-            advance2();
-            if (!slice2_iters) break;
-
-            async_load_gl();
-            wait_stage();
-            load_frags(0);
-            matmul(1);
-            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
-            advance2();
-            if (!slice2_iters) break;
+            FSTAGE(1, 0);
+            FSTAGE(0, 1);
         }
     }
 
@@ -563,29 +553,9 @@ void exl3_gemm_kernel_inner
     {
         while (true)
         {
-            async_load_gl();
-            wait_stage();
-            load_frags(1);
-            matmul(0);
-            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
-            advance2();
-            if (!slice2_iters) break;
-
-            async_load_gl();
-            wait_stage();
-            load_frags(2);
-            matmul(1);
-            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
-            advance2();
-            if (!slice2_iters) break;
-
-            async_load_gl();
-            wait_stage();
-            load_frags(0);
-            matmul(2);
-            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
-            advance2();
-            if (!slice2_iters) break;
+            FSTAGE(1, 0);
+            FSTAGE(2, 1);
+            FSTAGE(0, 2);
         }
     }
 
@@ -593,37 +563,22 @@ void exl3_gemm_kernel_inner
     {
         while (true)
         {
-            async_load_gl();
-            wait_stage();
-            load_frags(1);
-            matmul(0);
-            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
-            advance2();
-            if (!slice2_iters) break;
+            FSTAGE(1, 0);
+            FSTAGE(2, 1);
+            FSTAGE(3, 2);
+            FSTAGE(0, 3);
+        }
+    }
 
-            async_load_gl();
-            wait_stage();
-            load_frags(2);
-            matmul(1);
-            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
-            advance2();
-            if (!slice2_iters) break;
-
-            async_load_gl();
-            wait_stage();
-            load_frags(3);
-            matmul(2);
-            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
-            advance2();
-            if (!slice2_iters) break;
-
-            async_load_gl();
-            wait_stage();
-            load_frags(0);
-            matmul(3);
-            if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; }
-            advance2();
-            if (!slice2_iters) break;
+    if constexpr (FRAG_STAGES == 5)
+    {
+        while (true)
+        {
+            FSTAGE(1, 0);
+            FSTAGE(2, 1);
+            FSTAGE(3, 2);
+            FSTAGE(4, 3);
+            FSTAGE(0, 4);
         }
     }
 }
