@@ -28,6 +28,8 @@
 
 #include "cache/q_cache.cuh"
 
+#include "libtorch/blocksparse_mlp.h"
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("stloader_read", &stloader_read, "stloader_read");
@@ -78,4 +80,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dequant_cache_paged", &dequant_cache_paged, "dequant_cache_paged");
 
     m.def("count_inf_nan", &count_inf_nan, "count_inf_nan");
+
+    m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
 }

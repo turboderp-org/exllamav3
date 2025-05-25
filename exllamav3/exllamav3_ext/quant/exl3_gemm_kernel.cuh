@@ -183,4 +183,41 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 
         cg::this_grid().sync();
     }
+
+    // Final reduction
+    if (B_weights && blockIdx.z == 0)
+    {
+        int total_warps = size_m * size_n / 32;
+        int warps_grid = gridDim.x * blockDim.x / 32;
+        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+        int this_lane = threadIdx.x % 32;
+
+        for(; this_warp < total_warps; this_warp += warps_grid)
+        {
+            if constexpr (c_fp32)
+            {
+                float* C__ = ((float*) C) + this_warp * 32 + this_lane;
+                float* C___ = C__;
+                float sum = *C___;
+                for (int j = 1; j < bszm; ++j)
+                {
+                    C___ += size_m * size_n;
+                    sum += *C___;
+                }
+                *C__ = sum;
+            }
+            else
+            {
+                half* C__ = ((half*) C) + this_warp * 32 + this_lane;
+                half* C___ = C__;
+                half sum = *C___;
+                for (int j = 1; j < bszm; ++j)
+                {
+                    C___ += size_m * size_n;
+                    sum = __hadd(sum, *C___);
+                }
+                *C__ = sum;
+            }
+        }
+    }
 }

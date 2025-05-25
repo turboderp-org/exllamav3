@@ -11,6 +11,51 @@ from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..util import first_not_none
 from ..util import profile_opt
+from dataclasses import dataclass
+
+
+@dataclass
+class RoutingCFG:
+    gate_tensor: torch.Tensor
+    num_experts: int
+    num_experts_per_tok: int
+    router_logits_bsz1: torch.Tensor
+    routing_weights_bsz1: torch.Tensor
+    selected_experts_bsz1: torch.Tensor
+
+def routing(bsz, cfg, y, params):
+    activate_all_experts = params.get("activate_all_experts")
+
+    if bsz == 1 and not activate_all_experts:
+        torch.matmul(y, cfg.gate_tensor, out = cfg.router_logits_bsz1)
+        torch.topk(
+            cfg.router_logits_bsz1,
+            cfg.num_experts_per_tok,
+            dim = -1,
+            out = (cfg.routing_weights_bsz1, cfg.selected_experts_bsz1),
+            sorted = False
+        )
+        torch.softmax(cfg.routing_weights_bsz1, dim = -1, out = cfg.routing_weights_bsz1)
+        return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+
+    else:
+        router_logits = torch.matmul(y, cfg.gate_tensor)
+        routing_weights, selected_experts = torch.topk(
+            router_logits,
+            cfg.num_experts if activate_all_experts else cfg.num_experts_per_tok,
+            dim = -1
+        )
+        routing_weights = torch.softmax(routing_weights, dim = -1)
+        return selected_experts, routing_weights
+
+
+@dataclass
+class ExpertsCFG:
+    yh: torch.Tensor
+    interm_g: torch.Tensor
+    interm_u: torch.Tensor
+    interm_a: torch.Tensor
+    out_d: torch.Tensor
 
 
 class BlockSparseMLP(Module):
@@ -102,6 +147,8 @@ class BlockSparseMLP(Module):
         self.multi_up = None
         self.multi_down = None
 
+        self.routing_cfg = None
+        self.experts_cfg = None
 
     @override
     def load(self, device: torch.Device, **kwargs):
@@ -125,6 +172,44 @@ class BlockSparseMLP(Module):
             self.multi_up = MultiLinear(self. device, self.ups)
             self.multi_down = MultiLinear(self. device, self.downs)
 
+        router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
+        routing_weights_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.half, device = self.device)
+        selected_experts_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.long, device = self.device)
+
+        self.routing_cfg = RoutingCFG(
+            gate_tensor = self.routing_gate.inner.weight,
+            num_experts = self.num_experts,
+            num_experts_per_tok = self.num_experts_per_tok,
+            router_logits_bsz1 = router_logits_bsz1,
+            routing_weights_bsz1 = routing_weights_bsz1,
+            selected_experts_bsz1 = selected_experts_bsz1
+        )
+
+        yh = torch.empty(
+            (self.num_experts_per_tok, 1, self.hidden_size),
+            dtype = torch.half,
+            device = self.device
+        )
+        interm_g = torch.empty(
+            (self.num_experts_per_tok, 1, self.intermediate_size),
+            dtype = self.interm_dtype,
+            device = self.device
+        )
+        interm_u = torch.empty_like(interm_g)
+        interm_a = torch.empty_like(interm_u, dtype = torch.half) if self.interm_dtype != torch.half else interm_u
+        out_d = torch.empty(
+            (self.num_experts_per_tok, 1, self.hidden_size),
+            dtype = first_not_none(self.out_dtype, torch.half),
+            device = self.device
+        )
+
+        self.experts_cfg = ExpertsCFG(
+            yh = yh,
+            interm_g = interm_g,
+            interm_u = interm_u,
+            interm_a = interm_a,
+            out_d = out_d
+        )
 
     @override
     def unload(self):
@@ -137,6 +222,8 @@ class BlockSparseMLP(Module):
         if self.multi_down is not None:
             self.multi_down.unload()
             self.multi_down = None
+        self.routing_cfg = None
+        self.experts_cfg = None
         super().unload()
 
 
@@ -148,18 +235,11 @@ class BlockSparseMLP(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        activate_all_experts = params.get("activate_all_experts", False)
-
         y = x.view(-1, self.hidden_size)
         bsz = y.shape[0]
 
-        router_logits = self.routing_gate.forward(y, params)
-        routing_weights, selected_experts = torch.topk(
-            router_logits,
-            self.num_experts if activate_all_experts else self.num_experts_per_tok,
-            dim = -1
-        )
-        routing_weights = torch.softmax(routing_weights, dim = -1)
+        # selected_experts, routing_weights = routing(bsz, self.routing_cfg, y, params)
+        selected_experts, routing_weights = ext.blocksparse_mlp_routing(bsz, self.routing_cfg, y, params)
 
         # Torch path
         if bsz > 1 or not self.is_quantized:
@@ -193,31 +273,16 @@ class BlockSparseMLP(Module):
         # TODO: Find good solution for 1 < bsz < 32
         else:
             y = y.unsqueeze(0)
-            yh = torch.empty(
-                (self.num_experts_per_tok, bsz, y.shape[-1]),
-                dtype = y.dtype,
-                device = y.device
-            )
-            interm_g = torch.empty(
-                (self.num_experts_per_tok, bsz, self.intermediate_size),
-                dtype = self.interm_dtype,
-                device = y.device
-            )
-            interm_u = torch.empty_like(interm_g)
-            interm_a = torch.empty_like(interm_u, dtype = torch.half) if self.interm_dtype != torch.half else interm_u
-            out_d = torch.empty(
-                (self.num_experts_per_tok, bsz, self.hidden_size),
-                dtype = first_not_none(out_dtype, self.out_dtype, torch.half),
-                device = y.device
-            )
+
+            cfg = self.experts_cfg
 
             # Gate
             ext.exl3_mgemm(
                 y,
                 self.multi_gate.ptrs_trellis,
-                interm_g,
+                cfg.interm_g,
                 self.multi_gate.ptrs_suh,
-                yh,
+                cfg.yh,
                 self.multi_gate.ptrs_svh,
                 selected_experts,
                 None,
@@ -231,9 +296,9 @@ class BlockSparseMLP(Module):
             ext.exl3_mgemm(
                 y,
                 self.multi_up.ptrs_trellis,
-                interm_u,
+                cfg.interm_u,
                 self.multi_up.ptrs_suh,
-                yh,
+                cfg.yh,
                 self.multi_up.ptrs_svh,
                 selected_experts,
                 None,
@@ -244,15 +309,15 @@ class BlockSparseMLP(Module):
             )
 
             # Activation
-            self.activation_fn_call(interm_g, interm_u, interm_a)
+            self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a)
 
             # Down
             ext.exl3_mgemm(
-                interm_a,
+                cfg.interm_a,
                 self.multi_down.ptrs_trellis,
-                out_d,
+                cfg.out_d,
                 self.multi_down.ptrs_suh,
-                interm_a,
+                cfg.interm_a,
                 self.multi_down.ptrs_svh,
                 selected_experts,
                 routing_weights,
@@ -262,5 +327,5 @@ class BlockSparseMLP(Module):
                 self.multi_down.mul1_mult,
             )
 
-            final_hidden_states = out_d.sum(dim = 0)
+            final_hidden_states = cfg.out_d[:1, ...]
             return final_hidden_states.view(x.shape)
