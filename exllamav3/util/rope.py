@@ -293,6 +293,10 @@ class RoPE:
         positions: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         in_place = False,
+        q_norm: torch.Tensor | None = None,
+        k_norm: torch.Tensor | None = None,
+        norm_eps: float = 1e-6,
+        norm_constant_bias: float = 0.0
     ):
         q = q.contiguous()
         if k is not None: k = k.contiguous()
@@ -314,16 +318,18 @@ class RoPE:
             out_k = k
 
         ext.rope(
-            q,
-            out_q,
-            k,
-            out_k,
+            q, out_q,
+            k, out_k,
             self.inv_freq,
             position,
             positions,
             position_ids,
             self.rope_settings.rope_style,
-            self.attn_factor
+            self.attn_factor,
+            q_norm,
+            k_norm,
+            norm_eps,
+            norm_constant_bias
         )
             
         if squeeze:

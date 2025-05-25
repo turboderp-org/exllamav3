@@ -199,7 +199,7 @@ class BlockSparseMLP(Module):
         interm_a = torch.empty_like(interm_u, dtype = torch.half) if self.interm_dtype != torch.half else interm_u
         out_d = torch.empty(
             (self.num_experts_per_tok, 1, self.hidden_size),
-            dtype = first_not_none(self.out_dtype, torch.half),
+            dtype = self.out_dtype or torch.half,
             device = self.device
         )
 

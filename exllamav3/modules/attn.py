@@ -190,6 +190,9 @@ class Attention(Module):
             self.k_norm = k_norm
             self.register_submodule(self.q_norm)
             self.register_submodule(self.k_norm)
+            self.norm_eps = q_norm.rms_norm_eps
+            self.norm_constant_bias = q_norm.constant_bias
+            assert self.norm_eps == k_norm.rms_norm_eps
         else:
             self.q_norm = None
             self.k_norm = None
@@ -200,6 +203,11 @@ class Attention(Module):
 
         self.cache_layers = []
         self.multi_kv = None
+
+        self.q_norm_tensor = None
+        self.k_norm_tensor = None
+        self.norm_eps = 1e-6
+        self.norm_constant_bias = 0.0
 
 
     @override
@@ -227,6 +235,11 @@ class Attention(Module):
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
 
+        # Head norm
+        if self.q_norm:
+            self.q_norm_tensor = self.q_norm.weight.data
+            self.k_norm_tensor = self.k_norm.weight.data
+
 
     @override
     def unload(self):
@@ -241,6 +254,9 @@ class Attention(Module):
         if self.multi_kv is not None:
             self.multi_kv.unload()
             self.multi_kv = None
+
+        self.q_norm_tensor = None
+        self.k_norm_tensor = None
 
 
     @override
@@ -326,12 +342,21 @@ class Attention(Module):
         assert self.logit_softcapping == 0.0, \
             "Torch SDPA does not support logit softcapping"
 
-        if self.q_norm:
+        if self.rope:
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
+                self.norm_eps,
+                self.norm_constant_bias
+            )
+        elif self.q_norm:
             q = self.q_norm.forward(q, params, out_dtype = torch.half)
             k = self.k_norm.forward(k, params, out_dtype = torch.half)
-
-        if self.rope:
-            q, k = self.rope.apply(q, k, position, positions, position_ids)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -360,12 +385,21 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        if self.q_norm:
+        if self.rope:
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
+                self.norm_eps,
+                self.norm_constant_bias
+            )
+        elif self.q_norm:
             q = self.q_norm.forward(q, params, out_dtype = torch.half)
             k = self.k_norm.forward(k, params, out_dtype = torch.half)
-
-        if self.rope:
-            q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
 
         o = flash_attn_func(
             q = q,
@@ -380,6 +414,7 @@ class Attention(Module):
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
 
 
     def decode_flash_attn(
@@ -402,12 +437,21 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        if self.q_norm:
+        if self.rope:
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
+                self.norm_eps,
+                self.norm_constant_bias
+            )
+        elif self.q_norm:
             q = self.q_norm.forward(q, params, out_dtype = torch.half)
             k = self.k_norm.forward(k, params, out_dtype = torch.half)
-
-        if self.rope:
-            q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
 
         cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
         o = flash_attn_with_kvcache(
