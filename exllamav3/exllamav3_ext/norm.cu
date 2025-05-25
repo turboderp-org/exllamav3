@@ -170,10 +170,9 @@ void rms_norm
 )
 {
     TORCH_CHECK_DTYPE(w, kHalf);
-    TORCH_CHECK_DIV(x, 1, 4);
-    TORCH_CHECK_SHAPES(x, 1, w, 0, 1);
-    TORCH_CHECK_SHAPES(x, 0, y, 0, 1);
-    TORCH_CHECK_SHAPES(x, 1, y, 1, 1);
+    TORCH_CHECK_DIV(x, -1, 4);
+    TORCH_CHECK_SHAPES(x, -1, w, 0, 1);
+    TORCH_CHECK_SHAPES_FULL(x, y);
 
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -182,8 +181,9 @@ void rms_norm
     bool output_fp32 = y.dtype() == at::kFloat;
     bool input_fp16 = !input_fp32;
     bool output_fp16 = !output_fp32;
-    int rows = x.size(0);
-    int dim = x.size(1);
+    int rows = 1;
+    for (int i = 0; i < x.dim() - 1; ++i) rows *= x.size(i);
+    int dim = x.size(-1);
     dim3 blockDim(NUM_THREADS, 1, 1);
     dim3 gridDim(rows, 1, 1);
 

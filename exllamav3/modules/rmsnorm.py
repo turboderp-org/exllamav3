@@ -69,12 +69,10 @@ class RMSNorm(Module):
     def forward(
         self,
         x: torch.Tensor,
-        params: dict,
+        params,
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
 
-        x_shape = x.shape
-        x = x.view(-1, x.size(-1))
         y = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
         ext.rms_norm(x, self.weight, y, self.rms_norm_eps, self.constant_bias)
-        return y.view(x_shape)
+        return y
