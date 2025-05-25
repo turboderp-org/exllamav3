@@ -25,10 +25,24 @@ class RopeSettings:
     override_max_position_embeddings: int | None = None
 
 
-def _rotate_half(x):
+def _rotate_half_neox(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim = -1)
+
+def _apply_rope_embed_q_neox(q, sin, cos):
+    q = q.transpose(1, 2)
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    q = (q * cos) + (_rotate_half_neox(q) * sin)
+    q = q.transpose(1, 2)
+    return q
+
+def _apply_rope_embed_qk_neox(q, k, sin, cos):
+    return (
+        _apply_rope_embed_q_neox(q, sin, cos),
+        _apply_rope_embed_q_neox(k, sin, cos)
+    )
 
 
 def _rotate_half_gptj(x):
@@ -36,26 +50,19 @@ def _rotate_half_gptj(x):
     x2 = x[..., 1::2]
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
-
-def _apply_rope_embed_qk(q, k, sin, cos):
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
-    q = (q * cos) + (_rotate_half(q) * sin)
-    k = (k * cos) + (_rotate_half(k) * sin)
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    return q, k
-
-
-def _apply_rope_embed_q(q, sin, cos):
+def _apply_rope_embed_q_gptj(q, sin, cos):
     q = q.transpose(1, 2)
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
-    q = (q * cos) + (_rotate_half(q) * sin)
+    q = (q * cos) + (_rotate_half_gptj(q) * sin)
     q = q.transpose(1, 2)
     return q
+
+def _apply_rope_embed_qk_gptj(q, k, sin, cos):
+    return (
+        _apply_rope_embed_q_gptj(q, sin, cos),
+        _apply_rope_embed_q_gptj(k, sin, cos)
+    )
 
 
 class RoPE:
@@ -182,7 +189,7 @@ class RoPE:
 
     def compute_sincos(self, position_ids: torch.Tensor):
         rs = self.rope_settings
-        freqs = torch.einsum("i,j->ij", position_ids, self.inv_freq)
+        freqs = torch.einsum("i,j->ij", position_ids.float(), self.inv_freq)
         sin = freqs.sin()
         cos = freqs.cos()
         if self.attn_factor != 1.0:
@@ -195,7 +202,7 @@ class RoPE:
             case RopeStyle.GPTJ:
                 sin = torch.repeat_interleave(sin, 2, dim = -1)
                 cos = torch.repeat_interleave(cos, 2, dim = -1)
-        return sin.half(), cos.half()
+        return sin, cos
 
 
     def expand_cache(self, pos_id_end: int):
@@ -222,6 +229,9 @@ class RoPE:
         if in_place:
             q_ = q
             k_ = k
+
+        q = q.float()
+        k = k.float()
 
         if len(q.shape) == 3:
             q = q.unsqueeze(0)
@@ -250,13 +260,22 @@ class RoPE:
             cos = self.cached_cos[pos : pos + qlen].unsqueeze(0)
 
         if k is not None:
-            q, k = _apply_rope_embed_qk(q, k, sin, cos)
+            if self.rope_settings.rope_style == RopeStyle.NEOX:
+                q, k = _apply_rope_embed_qk_neox(q, k, sin, cos)
+            else:
+                q, k = _apply_rope_embed_qk_gptj(q, k, sin, cos)
         else:
-            q = _apply_rope_embed_q(q, sin, cos)
+            if self.rope_settings.rope_style == RopeStyle.NEOX:
+                q = _apply_rope_embed_q_neox(q, sin, cos)
+            else:
+                q = _apply_rope_embed_q_gptj(q, sin, cos)
 
         if squeeze:
             q = q.squeeze(0)
             k = k.squeeze(0) if k is not None else k
+
+        q = q.half()
+        k = k.half()
 
         if in_place:
             q_.copy_(q)
