@@ -196,6 +196,8 @@ class Attention(Module):
         else:
             self.q_norm = None
             self.k_norm = None
+            self.norm_eps = 1e-6
+            self.norm_constant_bias = 0.0
 
         self.caps.update({
             "kv_cache": True
@@ -206,8 +208,6 @@ class Attention(Module):
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
-        self.norm_eps = 1e-6
-        self.norm_constant_bias = 0.0
 
 
     @override
