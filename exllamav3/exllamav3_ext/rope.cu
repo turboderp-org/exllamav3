@@ -132,7 +132,7 @@ void rope_kernel
         {
             half2 *tptr = (half2*)(sh_head + t * 2);
             half2 *wptr = (half2*)(norm_weight + t * 2);
-            int lane_id = threadIdx.x % 32;
+            // int lane_id = threadIdx.x % 32;
             int warp_id = threadIdx.x / 32;
             int warps = blockDim.x / 32;
 

@@ -9,7 +9,7 @@
 #include "../reduction.cuh"
 
 constexpr float NEG_INF_F32 = -std::numeric_limits<float>::infinity();
-constexpr float POS_INF_F32 = std::numeric_limits<float>::infinity();
+// constexpr float POS_INF_F32 = std::numeric_limits<float>::infinity();
 
 #define NUM_THREADS 1024
 
