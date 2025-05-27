@@ -25,6 +25,7 @@
 #include "generator/sampling_basic.cuh"
 #include "generator/gumbel.cuh"
 #include "generator/rep_pen.cuh"
+#include "generator/cache.cuh"
 
 #include "cache/q_cache.cuh"
 
@@ -70,6 +71,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gumbel_noise_log", &gumbel_noise_log, "gumbel_noise_log");
     m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
     m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
+
+    m.def("cache_rotate", &cache_rotate, "cache_rotate");
 
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
     m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
