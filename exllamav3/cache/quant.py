@@ -98,3 +98,7 @@ class CacheLayer_quant(CacheLayer):
         self.qv[to_page, :num_tokens, :].copy_(source.qv[from_page, :num_tokens, :], non_blocking = True)
         self.sk[to_page, :num_tokens, :].copy_(source.sk[from_page, :num_tokens, :], non_blocking = True)
         self.sv[to_page, :num_tokens, :].copy_(source.sv[from_page, :num_tokens, :], non_blocking = True)
+
+    @override
+    def get_tensors(self):
+        return [self.qk, self.qv, self.sk, self.sv]

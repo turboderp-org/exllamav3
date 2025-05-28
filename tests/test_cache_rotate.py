@@ -37,15 +37,23 @@ def test_rope(cache_dim, cache_dtype, full):
     if not full:
         order = order[:num_pages // 4]
 
+    order = order.repeat_interleave(2)
+    m1 = torch.tensor([-1], device = device, dtype = torch.int)
+    order = torch.cat([m1, order, m1], dim = -1)
+    if not full:
+        order = torch.cat([order, order], dim = -1)
+
     ref_cache = cache.clone()
     ref_order = order.tolist()
 
     for _ in range(3):
         temp = torch.empty_like(ref_cache[0])
-        temp.copy_(ref_cache[ref_order[0], ...])
-        for a, b in pairwise(ref_order):
-            ref_cache[a, ...].copy_(ref_cache[b, ...])
-        ref_cache[ref_order[-1], ...].copy_(temp)
+        for i in range(0, len(ref_order), 2):
+            a = ref_order[i]
+            b = ref_order[i + 1]
+            dst = ref_cache[a, ...] if a >= 0 else temp
+            src = ref_cache[b, ...] if b >= 0 else temp
+            dst.copy_(src)
 
         temp = torch.empty_like(cache[0])
         ext.cache_rotate(cache, order, temp)

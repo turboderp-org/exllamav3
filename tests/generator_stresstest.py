@@ -1,6 +1,6 @@
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ArgmaxSampler
+from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ArgmaxSampler, CacheLayer_quant
 import random
 
 """
@@ -9,12 +9,22 @@ the paging and caching logic is sound. Each prompt is an increasing sequence of 
 is verified as a correct continuation of the sequence.   
 """
 
-model_dir = "/mnt/str/eval_models/llama3.1-8b-instruct/exl3/4.0bpw/"
+# ANSI codes
+ESC = "\u001b"
+col_default = "\u001b[0m"
+col_yellow = "\u001b[33;1m"
+col_blue = "\u001b[34;1m"
+col_green = "\u001b[32;1m"
+col_red = "\u001b[31;1m"
+col_gray = "\u001b[37;1m"
+
+model_dir = "/mnt/str/models/llama3.2-1b-instruct/exl3/5.0bpw/"
 cache_size = 16384
 draft_model_dir = None
-prompt_len = (50, 8192)
-completion_len = (50, 2048)
-target_q_depth = (0, 20)
+prompt_len = (50, 4096)
+completion_len = (50, 768)
+target_q_depth = (0, 25)
+force_depth_0_interval = 3
 prefixes = ["All the numbers: ", "It never ends: ", "Counting forever: "]
 suffix = ", ".join([str(i) for i in range(prompt_len[1])])
 random.seed(0)
@@ -29,8 +39,14 @@ else:
 
 config = Config.from_directory(model_dir)
 model = Model.from_config(config)
-cache = Cache(model, max_num_tokens = cache_size)
-model.load("cuda:1")
+cache = Cache(
+    model,
+    max_num_tokens = cache_size,
+    # layer_type = CacheLayer_quant,
+    # k_bits = 5,
+    # v_bits = 3,
+)
+model.load("cuda:2")
 
 tokenizer = Tokenizer.from_config(config)
 
@@ -40,6 +56,7 @@ generator = Generator(
     draft_model = draft_model,
     draft_cache = draft_cache,
     tokenizer = tokenizer,
+    show_visualizer = True,  # Slows down the test but makes it less boring
 )
 
 def start_new_job():
@@ -87,11 +104,13 @@ def iterate():
             else:
                 print("Sus!")
                 print("--------")
-                print(full)
+                pr = result["identifier"]
+                print(col_green + pr + col_red + full[len(pr):] + col_default)
                 print("--------")
 
 # Main loop
 next_target_q_depth = 0
+depth_0_interval = force_depth_0_interval
 while True:
 
     # Iterate until target q depth is reached
@@ -99,13 +118,19 @@ while True:
         print(f" - Generating, target depth {next_target_q_depth}")
     while generator.num_remaining_jobs() > next_target_q_depth:
         iterate()
-        # print ("iter:", generator.num_remaining_jobs())
-    next_target_q_depth = random.randint(target_q_depth[0], target_q_depth[1])
+
+    next_target_q_depth = random.randint(target_q_depth[0] + 1, target_q_depth[1])
 
     # Start new jobs until target queue depth is achieved
     if generator.num_remaining_jobs() < next_target_q_depth:
         print(f" - Creating jobs, target depth {next_target_q_depth}")
     while generator.num_remaining_jobs() < next_target_q_depth:
         start_new_job()
-        # print ("add:", generator.num_remaining_jobs())
-    next_target_q_depth = random.randint(target_q_depth[0], generator.num_remaining_jobs() - 1)
+
+    # Force the queue to reach zero depth to trigger more defragmentation steps
+    depth_0_interval -= 1
+    if depth_0_interval == 0:
+        next_target_q_depth = 0
+        depth_0_interval = force_depth_0_interval
+    else:
+        next_target_q_depth = random.randint(target_q_depth[0], generator.num_remaining_jobs() - 1)

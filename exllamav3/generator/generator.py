@@ -30,6 +30,7 @@ class Generator:
         draft_cache: Cache | None = None,
         num_draft_tokens: int = 4,
         show_visualizer: bool = False,
+        enable_defrag: bool = True,
         **kwargs
     ):
         """
@@ -69,6 +70,9 @@ class Generator:
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
+
+        :param enable_defrag:
+            Defragment cache periodically
 
         :param kwargs:
         """
@@ -129,7 +133,8 @@ class Generator:
         else:
             self.visualizer = None
 
-        # TODO: (defrag)
+        # Defrag
+        self.enable_defrag = enable_defrag
 
 
     def num_remaining_jobs(self):
@@ -195,10 +200,8 @@ class Generator:
         elif job in self.active_jobs:
             job.deallocate_pages()
             self.active_jobs.remove(job)
-
-        # TODO: (defrag)
-        # if num_jobs and not self.num_remaining_jobs():
-        #     self.pagetable.defrag()
+        if num_jobs and not self.num_remaining_jobs():
+            self.pagetable.defrag()
 
 
     @torch.inference_mode
@@ -297,9 +300,9 @@ class Generator:
                 idx = job.serial_number
                 chain = [page.page_index for page in seq.allocated_pages]
                 chains.append((idx, chain))
-        usage = []
+        usage = [0] * self.pagetable.max_pages
         for page in self.pagetable.all_pages:
-            usage.append(page.kv_position / PAGE_SIZE)
+            usage[page.page_index] = page.kv_position / PAGE_SIZE
         self.visualizer.update(chains, usage)
 
     def iterate_draftmodel_gen(self, results: list):
@@ -503,15 +506,12 @@ class Generator:
         #     mt_sample = False
 
         # Release pages for completed jobs
-        # num_jobs = self.num_remaining_jobs()
+        num_jobs = self.num_remaining_jobs()
         for job in completed_jobs:
             job.deallocate_pages()
             self.active_jobs.remove(job)
-
-        # Defrag
-        # TODO: (defrag)
-        # if num_jobs and not self.num_remaining_jobs():
-        #     self.pagetable.defrag()
+        if num_jobs and not self.num_remaining_jobs():
+            self.pagetable.defrag()
 
 
     def iterate_start_jobs(self, results: list):

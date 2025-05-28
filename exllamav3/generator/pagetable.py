@@ -1,4 +1,5 @@
 from __future__ import annotations
+from functools import lru_cache
 import torch
 import hashlib
 from dataclasses import dataclass
@@ -7,9 +8,12 @@ from ..cache.cache import Cache
 if TYPE_CHECKING:
     from .generator import Generator
 from ..constants import PAGE_SIZE
-from collections import deque
+from collections import deque, defaultdict
 from itertools import pairwise
 from ..util.tensor import SeqTensor
+from exllamav3.ext import exllamav3_ext as ext
+import time
+from ..util import profile_opt
 
 
 def _tensor_blake2b_checksum(tensor: torch.Tensor, prev_hash: bytes | None) -> bytes:
@@ -60,6 +64,8 @@ class CachePage:
 
     # Used by defragmenter
     new_page_index: int
+    children: list[CachePage]
+    longest_chain: int
 
     def __repr__(self):
         return (
@@ -68,7 +74,7 @@ class CachePage:
             f"kvp {self.kv_position}"
         )
 
-    # Copy page state so page can be reverted even
+    # Copy page state so page can be reverted
     def backup(self):
         self.phash_revert = self.phash
         self.prev_hash_revert = self.prev_hash
@@ -221,6 +227,7 @@ class PageTable:
         self.unreferenced_pages = {}
         self.all_pages = []
         self.reset_page_table()
+        self.last_defrag_serial = self.max_pages
 
 
     def reset_page_table(self):
@@ -242,17 +249,18 @@ class PageTable:
                 sequence = torch.empty((1, PAGE_SIZE), dtype = torch.long),
                 ref_count = 0,
                 access_serial = idx,
-                access_serial_revert = 0,
+                access_serial_revert = idx,
                 kv_position = 0,
                 kv_position_revert = 0,
                 can_revert = False,
-                new_page_index = 0
+                new_page_index = 0,
+                children = [],
+                longest_chain = 1,
             )
             self.all_pages.append(cp)
             self.unreferenced_pages[h] = cp
         self.access_serial = self.max_pages
-        # TODO: (defrag)
-        # self.last_defrag_serial = self.access_serial
+        self.last_defrag_serial = self.access_serial
 
 
     def print_page_list(self, short: bool = True):
@@ -268,11 +276,6 @@ class PageTable:
             if short: print(ref, end = "")
             else: print(str(cp) + f", ref {ref}")
         print()
-
-
-    def defrag(self):
-        # TODO: (defrag)
-        pass
 
 
     def allocate_pages(
@@ -359,3 +362,204 @@ class PageTable:
 
     def num_unreferenced_pages(self):
         return len(self.unreferenced_pages)
+
+
+    def defrag(self, debug = False):
+
+        if not self.generator.enable_defrag:
+            return
+
+        # Defragment once job queue is empty and all pages have been touched at least once
+        if self.access_serial < self.last_defrag_serial + self.max_pages:
+            return
+        self.last_defrag_serial = self.access_serial
+
+        assert not self.referenced_pages
+
+        if debug:
+            torch.cuda.synchronize()
+            time_begin = time.time()
+
+        # Build page index
+        page_index = {}
+        def build_page_index():
+            nonlocal page_index
+            page_index = {}
+            for page in self.all_pages:
+                page_index[page.phash] = page
+                page.children = []
+                page.longest_chain = 1
+        build_page_index()
+
+        # Find cached sequences that can be recovered
+        root_pages = []
+        def build_root_pages():
+            nonlocal root_pages
+            root_pages = []
+            for page in self.all_pages:
+                if page.prev_hash is None:
+                    root_pages.append(page)
+                else:
+                    parent = page_index.get(page.prev_hash)
+                    if parent is not None:
+                        parent.children.append(page)
+        build_root_pages()
+
+        # Measure recoverable sequence length
+        def measure(p):
+            p.longest_chain = 1
+            if p.children:
+                p.longest_chain += max([measure(pc) for pc in p.children])
+            return p.longest_chain
+
+        for page in root_pages:
+            measure(page)
+
+        # Recursively sort branches by length
+        def sort_seq(p):
+            if len(p.children) > 1:
+                p.children = sorted(p.children, key = lambda x: x.longest_chain, reverse = True)
+            for pc in p.children:
+                sort_seq(pc)
+
+        for page in root_pages:
+            sort_seq(page)
+
+        # Process roots in order of increasing age
+        root_pages = sorted(root_pages, key = lambda x: x.access_serial)
+
+        # Maintain the longest sequence for each tree and create new root nodes from trimmed branches
+        index = 0
+        while index < len(root_pages):
+            page = root_pages[index]
+            while page.children:
+                root_pages += page.children[1:]
+                page.children = page.children[:1]
+                page = page.children[0]
+            index += 1
+
+        # Reorder partial sequences into the longest possible contiguous strings
+        new_page_index = 0
+        shift_counts = defaultdict(int)
+        non_orphaned_pages = []
+        orphans = page_index
+        for page in root_pages:
+            while True:
+                non_orphaned_pages.append(page)
+                del orphans[page.phash]
+                page.new_page_index = new_page_index
+                shift = page.new_page_index - page.page_index
+                shift_counts[shift] += 1
+                new_page_index += 1
+                if not page.children:
+                    break
+                page = page.children[0]
+
+        # Move orphans to end of cache, ordered by last access
+        if orphans:
+            orphans = list(orphans.values())
+            orphans = sorted(orphans, key = lambda x: x.page_index)
+            access_serials = [page.access_serial for page in orphans]
+            access_serials = sorted(access_serials)
+            for page, access_serial in zip(orphans, access_serials):
+                page.access_serial = access_serial
+                page.new_page_index = new_page_index
+                shift = page.new_page_index - page.page_index
+                shift_counts[shift] += 1
+                new_page_index += 1
+
+        assert new_page_index == self.max_pages
+
+        # Adjust overall shift to minimize page copies
+        shift_adjust = max(shift_counts, key = shift_counts.get)
+
+        # Order of operations
+        if debug:
+            print("Page shifts")
+
+        defrag_map = {}
+        for page in self.all_pages:
+            page.new_page_index = (page.new_page_index - shift_adjust + self.max_pages) % self.max_pages
+            if page.page_index != page.new_page_index:
+                defrag_map[page.new_page_index] = page.page_index
+                if debug:
+                    print(f"{page.new_page_index:2} ← {page.page_index:2}")
+
+        # Don't bother if less than 10% of cache is fragmented
+        if len(defrag_map) <= max(self.max_pages // 10, 2):
+            return
+
+        # Get all tensors to reshuffle
+        cache_tensors = self.cache.get_all_tensors()
+
+        if debug:
+            print("Page rotations")
+
+        # Find page rotations
+        all_rotations = []
+        while defrag_map:
+
+            # Get first dst,src pair in new loop
+            dst = next(iter(defrag_map))
+            src = defrag_map[dst]
+            del defrag_map[dst]
+            rotation = [dst, src]
+
+            # Walk around loop
+            while True:
+                if src == rotation[0]:
+                    rotation = [-1, src] + rotation[:-1] + [-1]
+                    all_rotations += rotation
+                    break
+                dst = src
+                src = defrag_map[dst]
+                del defrag_map[dst]
+                rotation += [dst, src]
+
+            if debug:
+                print(" ← ".join([".."] + [f"{rotation[i + 1]:2}" for i in range(0, len(rotation) - 2, 2)] + [".."]))
+
+        # Rotate pages
+        all_rotations_cpu = torch.tensor(all_rotations, dtype = torch.int)
+        @lru_cache
+        def get_all_rotations(device):
+            nonlocal all_rotations_cpu
+            return all_rotations_cpu.to(device)
+
+        @lru_cache
+        def get_buffer(shape, device, dtype):
+            return torch.empty(shape, device = device, dtype = dtype)
+
+        for cache in cache_tensors:
+            buffer = get_buffer(cache[0].shape, cache.device, cache.dtype)
+            all_rotations = get_all_rotations(cache.device)
+            ext.cache_rotate(cache, all_rotations, buffer)
+
+        # Write new page indices
+        for page in self.all_pages:
+            page.page_index = page.new_page_index
+
+        # Debug stuff
+        if debug:
+            build_page_index()
+            build_root_pages()
+
+            def dbg_walk(l, p):
+                nonlocal walks
+                l = l + [p]
+                if not p.children:
+                    walks.append(l)
+                else:
+                    for p in p.children:
+                        dbg_walk(l, p)
+
+            print("Cache seqs")
+            for page in root_pages:
+                walks = []
+                dbg_walk([], page)
+                for pp in walks:
+                    print(" → ".join([f"{p.page_index:2}" for p in pp]))
+
+            torch.cuda.synchronize()
+            elapsed = time.time() - time_begin
+            print(f"Defrag latency: {elapsed:.5f} s")

@@ -49,6 +49,10 @@ class CacheLayer(ABC):
     def copy_page(self, source: CacheLayer, from_page: int, to_page: int, num_tokens: int):
         pass
 
+    @abstractmethod
+    def get_tensors(self):
+        pass
+
 
 class Cache:
 
@@ -154,3 +158,10 @@ class Cache:
         for src, dst in zip(target.layers, self.layers):
             assert type(src) is type(dst)
             dst.copy_page(src, from_page, to_page, num_tokens)
+
+
+    def get_all_tensors(self):
+        tensors = []
+        for layer in self.layers:
+            tensors += layer.get_tensors()
+        return tensors

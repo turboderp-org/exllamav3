@@ -68,3 +68,7 @@ class CacheLayer_fp16(CacheLayer):
         assert self.shape == source.shape
         self.k[to_page, :num_tokens, :, :].copy_(source.k[from_page, :num_tokens, :, :], non_blocking = True)
         self.v[to_page, :num_tokens, :, :].copy_(source.v[from_page, :num_tokens, :, :], non_blocking = True)
+
+    @override
+    def get_tensors(self):
+        return [self.k, self.v]
