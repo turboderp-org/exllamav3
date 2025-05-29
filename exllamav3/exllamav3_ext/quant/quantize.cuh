@@ -24,9 +24,9 @@ void decode
 
 void test_distribution
 (
-    at::Tensor input,
-    at::Tensor dist_output,
-    at::Tensor ref_output,
+    at::Tensor& input,
+    at::Tensor& dist_output,
+    const c10::optional<at::Tensor>& ref_output,
     float min_value,
     float max_value,
     uint32_t mcg_mult,

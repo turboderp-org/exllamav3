@@ -406,18 +406,21 @@ void test_distribution_kernel
         atomicAdd(&histogram[idx], 1);
     };
 
-    reset_histogram();
-    for (uint64_t i = threadIdx.x; i < 65536; i += NUM_THREADS_TD)
+    if (ref_output_ptr)
     {
-        if (mcg_mult)
-            count(decode_3inst_f<1>((uint16_t) (i & 0xffff), mcg_mult));
-        else if (mul1_mult)
-            count(decode_3inst_f<2>((uint16_t) (i & 0xffff), mul1_mult));
-        else
-            count(decode_3inst_f<0>((uint16_t) (i & 0xffff), 0));
+        reset_histogram();
+        for (uint64_t i = threadIdx.x; i < 65536; i += NUM_THREADS_TD)
+        {
+            if (mcg_mult)
+                count(decode_3inst_f<1>((uint16_t) (i & 0xffff), mcg_mult));
+            else if (mul1_mult)
+                count(decode_3inst_f<2>((uint16_t) (i & 0xffff), mul1_mult));
+            else
+                count(decode_3inst_f<0>((uint16_t) (i & 0xffff), 0));
+        }
+        __syncthreads();
+        write_histogram(ref_output_ptr, 65536);
     }
-    __syncthreads();
-    write_histogram(ref_output_ptr, 65536);
 
     reset_histogram();
     for (uint64_t i = threadIdx.x; i < numel; i += NUM_THREADS_TD)
@@ -431,14 +434,14 @@ Compare tensor distribution to codebook (not optimized)
 
 input: tensor, float, any shape
 dist_output: (empty) output histogram, float, shape (num_bins,)
-ref_output: (empty) output codebook histogram, float, shape (num_bins,)
+ref_output, optional: (empty) output codebook histogram, float, shape (num_bins,)
 */
 
 void test_distribution
 (
-    at::Tensor input,
-    at::Tensor dist_output,
-    at::Tensor ref_output,
+    at::Tensor& input,
+    at::Tensor& dist_output,
+    const c10::optional<at::Tensor>& ref_output,
     float min_value,
     float max_value,
     uint32_t mcg_mult,
@@ -451,14 +454,17 @@ void test_distribution
     TORCH_CHECK_DTYPE(input, kFloat);
 
     uint64_t numel = input.numel();
-    uint64_t num_bins = ref_output.numel();
+    float* ref_output_ptr = (float*) OPTPTR(ref_output);
+    uint64_t num_bins = dist_output.numel();
     TORCH_CHECK(num_bins <= MAX_BINS, "Too many bins");
+    if (ref_output_ptr)
+        TORCH_CHECK(num_bins == ref_output.value().numel());
 
     test_distribution_kernel<<<1, NUM_THREADS_TD, 0, stream>>>
     (
         (const float*) input.data_ptr(),
         (float*) dist_output.data_ptr(),
-        (float*) ref_output.data_ptr(),
+        (float*) ref_output_ptr,
         numel,
         num_bins,
         min_value,

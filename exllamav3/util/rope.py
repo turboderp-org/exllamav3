@@ -225,7 +225,7 @@ class RoPE:
         position_ids: torch.Tensor | None = None,
         in_place = False,
     ):
-        # TODO: GPTJ, partial rotary factor
+        # TODO: partial rotary factor
         if in_place:
             q_ = q
             k_ = k
