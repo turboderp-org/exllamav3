@@ -6,7 +6,7 @@ from torch import nn
 from ..models import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
-from . import Module, Linear, RMSNorm
+from . import Module, Linear, RMSNorm, LayerNorm
 from ..device import get_device_context, release_device_context
 from ..constants import PAGE_SIZE
 from ..cache import Cache
@@ -147,8 +147,8 @@ class Attention(Module):
         out_dtype: torch.dtype | None = None,
         sliding_window: int  = -1,
         logit_softcapping: float = 0.0,
-        q_norm: RMSNorm | None = None,
-        k_norm: RMSNorm | None = None,
+        q_norm: RMSNorm | LayerNorm | None = None,
+        k_norm: RMSNorm | LayerNorm | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -190,9 +190,13 @@ class Attention(Module):
             self.k_norm = k_norm
             self.register_submodule(self.q_norm)
             self.register_submodule(self.k_norm)
-            self.norm_eps = q_norm.rms_norm_eps
-            self.norm_constant_bias = q_norm.constant_bias
-            assert self.norm_eps == k_norm.rms_norm_eps
+            if isinstance(q_norm, RMSNorm):
+                self.norm_eps = q_norm.rms_norm_eps
+                self.norm_constant_bias = q_norm.constant_bias
+                assert self.norm_eps == k_norm.rms_norm_eps
+            else:
+                self.norm_eps = q_norm.layernorm_eps
+                self.norm_constant_bias = 0.0
         else:
             self.q_norm = None
             self.k_norm = None
@@ -236,7 +240,7 @@ class Attention(Module):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
 
         # Head norm
-        if self.q_norm:
+        if self.q_norm and isinstance(self.q_norm, RMSNorm):
             self.q_norm_tensor = self.q_norm.weight.data
             self.k_norm_tensor = self.k_norm.weight.data
 
@@ -342,6 +346,10 @@ class Attention(Module):
         assert self.logit_softcapping == 0.0, \
             "Torch SDPA does not support logit softcapping"
 
+        if self.q_norm and (not self.rope or not self.q_norm_tensor):
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
+
         if self.rope:
             q, k = self.rope.apply(
                 q, k,
@@ -354,9 +362,6 @@ class Attention(Module):
                 self.norm_eps,
                 self.norm_constant_bias
             )
-        elif self.q_norm:
-            q = self.q_norm.forward(q, params, out_dtype = torch.half)
-            k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -385,6 +390,10 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
+        if self.q_norm and (not self.rope or not self.q_norm_tensor):
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
+
         if self.rope:
             q, k = self.rope.apply(
                 q, k,
@@ -397,9 +406,6 @@ class Attention(Module):
                 self.norm_eps,
                 self.norm_constant_bias
             )
-        elif self.q_norm:
-            q = self.q_norm.forward(q, params, out_dtype = torch.half)
-            k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         o = flash_attn_func(
             q = q,
@@ -437,6 +443,11 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
+        # TODO: Add LayerNorm option to fused norm/RoPE kernel
+        if self.q_norm and (not self.rope or not self.q_norm_tensor):
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
+
         if self.rope:
             q, k = self.rope.apply(
                 q, k,
@@ -449,9 +460,6 @@ class Attention(Module):
                 self.norm_eps,
                 self.norm_constant_bias
             )
-        elif self.q_norm:
-            q = self.q_norm.forward(q, params, out_dtype = torch.half)
-            k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
         o = flash_attn_with_kvcache(

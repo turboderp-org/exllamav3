@@ -90,5 +90,12 @@ class LayerNorm(Module):
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         w, b = (self._weight_f(), self._bias_f()) if x.dtype == torch.float else (self.weight, self.bias)
-        x = F.layer_norm(x, x.shape[-1:], w, b, eps = self.layernorm_eps)
+        d = w.dim()
+        if d == 1:
+            x = F.layer_norm(x, x.shape[-1:], w, b, eps = self.layernorm_eps)
+        else:
+            x = F.layer_norm(x, x.shape[-1:], None, None, eps = self.layernorm_eps)
+            x *= w
+            if b is not None:
+                x += b
         return x.to(out_dtype or self.out_dtype)
