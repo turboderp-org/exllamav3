@@ -822,18 +822,25 @@ def quantize_exl3(
         pb.update(tiles_k)
 
         # Metrics
-        E = weight_r - weight_q  # may run on CPU
-        W = weight_r
-        Hd = H.to(device)
-        del weight_r
-        E = E.to(device)
-        num = torch.einsum("ik,ij,jk->", E, Hd, E).item()
-        del E
-        W = W.to(device)
-        den = torch.einsum("ik,ij,jk->", W, Hd, W).item()
-        del W
-        del Hd
-        proxy_err = num / max(den, 1e-8)
+        try:
+            E = weight_r - weight_q  # may run on CPU
+            W = weight_r
+            Hd = H.to(device)
+            weight_r = None
+            E = E.to(device)
+            num = torch.einsum("ik,ij,jk->", E, Hd, E).item()
+            E = None
+            W = W.to(device)
+            den = torch.einsum("ik,ij,jk->", W, Hd, W).item()
+            W = None
+            Hd = None
+            proxy_err = num / max(den, 1e-8)
+        except torch.OutOfMemoryError:
+            weight_r = None
+            E = None
+            W = None
+            Hd = None
+            proxy_err = -1.0
 
         # free_mem()
 
