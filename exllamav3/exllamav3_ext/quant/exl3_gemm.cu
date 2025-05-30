@@ -27,7 +27,7 @@ limitations:
 - n % 128 == 0
 */
 
-std::set<void*> kernel_attr_set{};
+std::set<void*> kernel_attr_set[MAX_DEVICES] = {};
 
 int exl3_gemm
 (
@@ -104,10 +104,10 @@ int exl3_gemm
     if (!kernel) return 0;
 
     // Launch
-    if (kernel_attr_set.find((void*)kernel) == kernel_attr_set.end())
+    if (kernel_attr_set[device].find((void*)kernel) == kernel_attr_set[device].end())
     {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
-        kernel_attr_set.insert((void*)kernel);
+        kernel_attr_set[device].insert((void*)kernel);
     }
     void* kernelArgs[] =
     {
@@ -249,10 +249,10 @@ int exl3_mgemm
     dim3 block_grid(num_sms, 1, concurrency);
 
     // Launch
-    if (kernel_attr_set.find((void*)kernel) == kernel_attr_set.end())
+    if (kernel_attr_set[device].find((void*)kernel) == kernel_attr_set[device].end())
     {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
-        kernel_attr_set.insert((void*)kernel);
+        kernel_attr_set[device].insert((void*)kernel);
     }
     void* kernelArgs[] =
     {
