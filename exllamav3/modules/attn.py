@@ -346,7 +346,7 @@ class Attention(Module):
         assert self.logit_softcapping == 0.0, \
             "Torch SDPA does not support logit softcapping"
 
-        if self.q_norm and (not self.rope or not self.q_norm_tensor):
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
             q = self.q_norm.forward(q, params, out_dtype = torch.half)
             k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
@@ -390,7 +390,7 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        if self.q_norm and (not self.rope or not self.q_norm_tensor):
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
             q = self.q_norm.forward(q, params, out_dtype = torch.half)
             k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
@@ -444,7 +444,7 @@ class Attention(Module):
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
         # TODO: Add LayerNorm option to fused norm/RoPE kernel
-        if self.q_norm and (not self.rope or not self.q_norm_tensor):
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
             q = self.q_norm.forward(q, params, out_dtype = torch.half)
             k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
