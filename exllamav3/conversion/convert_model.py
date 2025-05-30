@@ -9,6 +9,7 @@ from ..util.progress import ProgressBar
 from ..util.memory import free_mem
 from ..util import Timer, human_time
 from ..util.tensor import save_tensor_image
+from ..util.measures import cosine_error, sqnr
 from .calibration_data import get_default_calibration
 from .compile import compile_model, dsize
 from safetensors.torch import save_file
@@ -227,7 +228,9 @@ def get_state_error(x, ref):
      x = x.view(-1, x.shape[-1]).float()
      ref = ref.view(-1, ref.shape[-1]).float()
      err = torch.linalg.norm(x - ref, 'fro') / torch.linalg.norm(ref, 'fro')
-     return err.item()
+     sq = sqnr(x, ref)
+     cos = cosine_error(x, ref)
+     return err.item(), cos, sq
 
 
 @torch.inference_mode()
@@ -430,6 +433,8 @@ def main(args, job_state):
 
         # Advance state
         error = 0
+        cos_error = 0
+        sqnr_ = 0
         with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
             for i in range(len(state)):
                 progress.update(i)
@@ -441,16 +446,23 @@ def main(args, job_state):
                     state[i] = module.forward(state[i], params).cpu()
                 if i < num_ref_states and len(linears):
                     ref_states[i] = ref_states[i].to(state[i].device)
-                    error += get_state_error(state[i], ref_states[i])
+                    rfn, cos, sq = get_state_error(state[i], ref_states[i])
+                    error += rfn
+                    cos_error += cos
+                    sqnr_ += sq
                     ref_states[i] = None
         error /= num_ref_states
+        cos_error /= num_ref_states
+        sqnr_ /= num_ref_states
 
         # Feedback after module
         module_time = time.time() - start_module_time
         print(
             f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
             (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"   no_weights") +
-            (f"        rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
+            (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
+            f"  cos: {cos_error:.6f}"
+            f"  sqnr: {sqnr_:.6f}"
             f"  [{module_time:.2f} s]"
         )
         sys.stdout.flush()
