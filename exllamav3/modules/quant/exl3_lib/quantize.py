@@ -642,8 +642,9 @@ def regularize(
     sv: torch.Tensor,
     quant_args: dict,
     verbose: bool,
-    H_diag: torch.Tensor,
-    pb: ProgressBar
+    H_diag: torch.Tensor | None,
+    pb: ProgressBar | None,
+    skip_g_scale: bool = False
 ):
     force_out_scales = quant_args["apply_out_scales"]
 
@@ -660,17 +661,21 @@ def regularize(
     # the input to the linear layer is very irregular. After some testing, set the cutoff at 15% of the RMS sum
     # on 2% of the channels
     # TODO: More science
-    diag = H_diag.sqrt()
-    diag, _ = torch.sort(diag, descending = True)
-    cutoff = diag.shape[0] // 50
-    skew_factor = diag[:cutoff].sum() / diag.sum()
-    if verbose:
-        print(f"     - input state skew: {skew_factor.item():.6f}")
+    if H_diag is not None:
+        diag = H_diag.sqrt()
+        diag, _ = torch.sort(diag, descending = True)
+        cutoff = diag.shape[0] // 50
+        skew_factor = diag[:cutoff].sum() / diag.sum()
+        if verbose:
+            print(f"     - input state skew: {skew_factor.item():.6f}")
 
-    if force_out_scales is None:
-        apply_out_scales = skew_factor.item() < 0.15
+        if force_out_scales is None:
+            apply_out_scales = skew_factor.item() < 0.15
+        else:
+            apply_out_scales = force_out_scales
+
     else:
-        apply_out_scales = force_out_scales
+        apply_out_scales = True if force_out_scales is None else force_out_scales
 
     # Apply output scales
     if apply_out_scales:
@@ -695,7 +700,10 @@ def regularize(
     blockwise_preapply_had_l_(weight, had_k)
 
     # Determine best scale for matrix by test quantizing a sample of tiles along a wrapped diagonal
-    g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
+    if not skip_g_scale:
+        g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
+    else:
+        g_scale = 1.0
     weight *= g_scale
     su /= g_scale
 
