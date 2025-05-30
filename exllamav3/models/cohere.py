@@ -30,6 +30,8 @@ class CohereConfig(Config):
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
 
+        self.use_qk_norm = self.read_cfg(int, "use_qk_norm", False)
+
         # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
         self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
@@ -93,6 +95,16 @@ class CohereModel(Model):
                     key_v = "v_proj",
                     key_o = "o_proj",
                     qmap = "block.parallel",
+                    q_norm = LayerNorm(
+                        config = config,
+                        key = f"model.layers.{idx}.self_attn.q_norm",
+                        layernorm_eps = config.layernorm_eps,
+                    ) if config.use_qk_norm else None,
+                    k_norm = LayerNorm(
+                        config = config,
+                        key = f"model.layers.{idx}.self_attn.k_norm",
+                        layernorm_eps = config.layernorm_eps,
+                    ) if config.use_qk_norm else None,
                 ),
                 mlp = GatedMLP(
                     config = config,
@@ -103,6 +115,7 @@ class CohereModel(Model):
                     key_gate = "gate_proj",
                     key_down = "down_proj",
                     qmap = "block.parallel",
+                    out_dtype = torch.float,
                 ),
             )
             for idx in range(config.num_hidden_layers)
