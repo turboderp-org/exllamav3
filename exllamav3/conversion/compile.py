@@ -112,17 +112,17 @@ def compile_model(args, model, config, tokenizer):
             ignored_files.append(f)
             continue
         filtered_files.append(f)
+    for f in filtered_files:
+        print(f"     - {f}")
+        source_file_path = os.path.join(in_dir, f)
+        target_file_path = os.path.join(out_dir, f)
+        shutil.copy(source_file_path, target_file_path)
     if ignored_files:
         print(f" !! Warning, the following file(s) will not be included in output model:")
         for f in ignored_files[:10]:
             print(f"     - {f}")
         if len(ignored_files) > 10:
             print(f"     - (+ {len(ignored_files) - 10} more)")
-    for f in filtered_files:
-        print(f"     - {f}")
-        source_file_path = os.path.join(in_dir, f)
-        target_file_path = os.path.join(out_dir, f)
-        shutil.copy(source_file_path, target_file_path)
 
     # Write new model.safetensors.index.json maybe
     if num_files > 1:
