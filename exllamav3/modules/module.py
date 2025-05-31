@@ -36,11 +36,17 @@ class Module(ABC):
         self.caps = {}
         self.qmap = qmap
         self.num_slices = 1
+        self.qbits_mod_key = ""
 
     def __iter__(self):
         yield self
         for module in self.modules:
             yield from module
+
+    def find_module(self, key: str):
+        for module in self:
+            if module.key == key:
+                return module
 
     def can_defer_load(self):
         if len(self.modules) == 0: return True

@@ -28,8 +28,8 @@ class MLP(Module):
 
         self.out_dtype = out_dtype
 
-        self.up = Linear(config, f"{key}.{key_up}", hidden_size, intermediate_size, qmap = qmap + ".up")
-        self.down = Linear(config, f"{key}.{key_down}", intermediate_size, hidden_size, qmap = qmap + ".down")
+        self.up = Linear(config, f"{key}.{key_up}", hidden_size, intermediate_size, qmap = qmap + ".up", qbits_mod_key = "u")
+        self.down = Linear(config, f"{key}.{key_down}", intermediate_size, hidden_size, qmap = qmap + ".down", qbits_mod_key = "d")
 
         self.register_submodule(self.up)
         self.register_submodule(self.down)
@@ -129,7 +129,8 @@ class GatedMLP(Module):
                 fkey = fkey,
                 frange = frange_gate,
                 alt_key = a_key_g,
-                out_dtype = self.interm_dtype
+                out_dtype = self.interm_dtype,
+                qbits_mod_key = "g"
             )
             up = Linear(
                 config = config,
@@ -144,7 +145,8 @@ class GatedMLP(Module):
                 fkey = fkey,
                 frange = frange_up,
                 alt_key = a_key_u,
-                out_dtype = self.interm_dtype
+                out_dtype = self.interm_dtype,
+                qbits_mod_key = "u"
             )
             down = Linear(
                 config = config,
@@ -159,6 +161,7 @@ class GatedMLP(Module):
                 alt_key = a_key_d,
                 out_dtype = self.out_dtype,
                 allow_input_padding = True,
+                qbits_mod_key = "d"
             )
 
             self.ups.append(up)

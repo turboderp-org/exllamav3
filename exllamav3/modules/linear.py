@@ -24,6 +24,7 @@ class Linear(Module):
         qmap: str | None = None,
         alt_key: str | None = None,
         qbits_key: str = "bits",
+        qbits_mod_key: str = "",
         fkey : str | None = None,
         frange: tuple[int, int] | None = None,
         caps: dict = None,
@@ -50,6 +51,7 @@ class Linear(Module):
         self.first_out_feature = first_out_feature if first_out_feature is not None else 0
         self.inner = None
         self.qbits_key = qbits_key
+        self.qbits_mod_key = qbits_mod_key
         self.fkey = fkey
         self.frange = frange
         self.quant_type = None

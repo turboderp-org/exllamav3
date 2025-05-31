@@ -40,6 +40,7 @@ parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
 parser.add_argument("-mcg", "--mcg_multiplier", type = str, default = None, help = "MCG multiplier - EXPERIMENTAL, DO NOT USE")
 parser.add_argument("-mul1", "--mul1_multiplier", type = str, default = None, help = "MUL1 multiplier - EXPERIMENTAL, DO NOT USE")
+parser.add_argument("-strat", "--strategy", type = str, default = None, help = "Modifiers for quantization strategy - EXPERIMENTAL")
 
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--out_scales", dest = "out_scales_", action = "store_true", help = "Always enable out channel scales  (for debug purposes)")
@@ -154,6 +155,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("device_ratios", True, None),
         ("mcg_multiplier", True, ""),
         ("mul1_multiplier", True, ""),
+        ("strategy", False, ""),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -233,6 +235,32 @@ def get_state_error(x, ref):
      return err.item(), cos, sq
 
 
+def mod_strategy(args, module, strategy, idx):
+    mod_arg = args.get("strategy")
+    if not mod_arg:
+        return strategy
+
+    s_layers = [""] + mod_arg.split(";")
+    if idx >= len(s_layers):
+        return strategy
+
+    s = s_layers[idx]
+    mod = {}
+    while s:
+        l, m = s[0], s[1]
+        s = s[2:]
+        mod[l] = int(m)
+
+    new_strategy = {}
+    for key, bits in strategy.items():
+        submodule = module.find_module(key)
+        modifier = mod.get(submodule.qbits_mod_key, 0)
+        new_strategy[key] = min(bits + modifier, 8)
+
+    # TODO: Automate this, also calculate overall increase in bitrate, track in job.json across resumes
+    return new_strategy
+
+
 @torch.inference_mode()
 def main(args, job_state):
 
@@ -281,6 +309,7 @@ def main(args, job_state):
             },
             job_state["surplus_bits"],
         )
+        strategy = mod_strategy(args, module, strategy, idx)
         job_state["surplus_bits"] = surplus
 
         # Slice module if necessary
