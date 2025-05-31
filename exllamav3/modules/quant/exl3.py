@@ -131,7 +131,7 @@ class LinearEXL3:
 
 
     def get_inner_weight_tensor(self):
-        w = torch.zeros((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
+        w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
         ext.reconstruct(w, self.trellis, self.K, self.mcg_mult, self.mul1_mult)
         return w
 
