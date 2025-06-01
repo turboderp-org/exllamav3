@@ -7,3 +7,5 @@ from .layernorm import LayerNorm
 from .embedding import Embedding
 from .attn import Attention
 from .transformer import TransformerBlock, ParallelDecoderBlock
+
+from .conv import Conv
