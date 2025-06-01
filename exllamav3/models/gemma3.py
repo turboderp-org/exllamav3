@@ -65,12 +65,70 @@ class Gemma3Config(Config):
         self.final_logit_softcapping = self.read_cfg(float, "text_config->final_logit_softcapping", 0.0)
 
 
+class Gemma3TextConfig(Config):
+    arch_string = "Gemma3ForCausalLM"
+
+    def __init__(
+        self,
+        directory: str,
+        **kwargs,
+    ):
+        super().__init__(
+            directory,
+            {"text": Gemma3TextModel},
+            **kwargs
+        )
+
+        # Gemma3 quirk, vocab size is implicit on HF versions
+        if self.vocab_size is None:
+            self.vocab_size = 262208
+
+        # Attention params
+        self.head_dim = self.read_cfg(int, "head_dim", 256)
+        self.hidden_size = self.read_cfg(int, "hidden_size", 2304)
+        self.num_q_heads = self.read_cfg(int, "num_attention_heads", 8)
+        self.num_kv_heads = self.read_cfg(int, "num_key_value_heads", 4)
+
+        self.query_pre_attn_scalar = self.read_cfg(float, "query_pre_attn_scalar", 256)
+        self.attn_logit_softcapping = self.read_cfg(float, "attn_logit_softcapping", 0.0)
+        self.sliding_window = self.read_cfg(int, "sliding_window", 4096)
+        self.sliding_window_pattern = self.read_cfg(int, "sliding_window_pattern", 6)
+
+        if not self.head_dim:
+            self.head_dim = self.hidden_size // self.num_q_heads
+
+        # MLP params
+        self.intermediate_size = self.read_cfg(int, "intermediate_size", 9216)
+
+        # Norms
+        self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", 1e-6)
+
+        # Layers
+        self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
+        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", True)
+
+        # RoPE
+        self.rope_settings_global = self.read_rope_settings_default(
+            RopeStyle.NEOX,
+            default_rope_theta = 1e6,
+        )
+        self.rope_settings_local = self.read_rope_settings_default(
+            RopeStyle.NEOX,
+            default_rope_theta = 1e4,
+            config_dict = {}
+        )
+
+        # Output softcap
+        self.final_logit_softcapping = self.read_cfg(float, "final_logit_softcapping", 0.0)
+
+
 class Gemma3Model(Model):
     config_class = Gemma3Config
 
     def __init__(
         self,
-        config: Gemma3Config,
+        config: Gemma3Config | Gemma3TextConfig,
+        key_prefix = "language_model.",
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -78,7 +136,7 @@ class Gemma3Model(Model):
         self.modules += [
             Embedding(
                 config = config,
-                key = "language_model.model.embed_tokens",
+                key = key_prefix + "model.embed_tokens",
                 vocab_size = config.vocab_size,
                 hidden_size = config.hidden_size,
                 normalize = True,
@@ -95,16 +153,16 @@ class Gemma3Model(Model):
         self.modules += [
             TransformerBlock(
                 config = config,
-                key = f"language_model.model.layers.{idx}",
+                key = key_prefix + f"model.layers.{idx}",
                 attn_norm = RMSNorm(
                     config = config,
-                    key = f"language_model.model.layers.{idx}.input_layernorm",
+                    key = key_prefix + f"model.layers.{idx}.input_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                     constant_bias = 1.0,
                 ),
                 attn = Attention(
                     config = config,
-                    key = f"language_model.model.layers.{idx}.self_attn",
+                    key = key_prefix + f"model.layers.{idx}.self_attn",
                     layer_idx = idx,
                     hidden_size = config.hidden_size,
                     head_dim = config.head_dim,
@@ -121,33 +179,33 @@ class Gemma3Model(Model):
                     qmap = "block.attn",
                     q_norm = RMSNorm(
                         config = config,
-                        key = f"language_model.model.layers.{idx}.self_attn.q_norm",
+                        key = key_prefix + f"model.layers.{idx}.self_attn.q_norm",
                         rms_norm_eps = config.rms_norm_eps,
                         constant_bias = 1.0,
                     ),
                     k_norm = RMSNorm(
                         config = config,
-                        key = f"language_model.model.layers.{idx}.self_attn.k_norm",
+                        key = key_prefix + f"model.layers.{idx}.self_attn.k_norm",
                         rms_norm_eps = config.rms_norm_eps,
                         constant_bias = 1.0,
                     ),
                 ),
                 attn_post_norm = RMSNorm(
                     config = config,
-                    key = f"language_model.model.layers.{idx}.post_attention_layernorm",
+                    key = key_prefix + f"model.layers.{idx}.post_attention_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                     constant_bias = 1.0,
                     out_dtype = torch.float,
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
-                    key = f"language_model.model.layers.{idx}.pre_feedforward_layernorm",
+                    key = key_prefix + f"model.layers.{idx}.pre_feedforward_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                     constant_bias = 1.0,
                 ),
                 mlp = GatedMLP(
                     config = config,
-                    key = f"language_model.model.layers.{idx}.mlp",
+                    key = key_prefix + f"model.layers.{idx}.mlp",
                     hidden_size = config.hidden_size,
                     intermediate_size = config.intermediate_size,
                     key_up = "up_proj",
@@ -158,7 +216,7 @@ class Gemma3Model(Model):
                 ),
                 mlp_post_norm = RMSNorm(
                     config = config,
-                    key = f"language_model.model.layers.{idx}.post_feedforward_layernorm",
+                    key = key_prefix + f"model.layers.{idx}.post_feedforward_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                     constant_bias = 1.0,
                     out_dtype = torch.float,
@@ -172,16 +230,16 @@ class Gemma3Model(Model):
         self.modules += [
             RMSNorm(
                 config = config,
-                key = "language_model.model.norm",
+                key = key_prefix + "model.norm",
                 rms_norm_eps = config.rms_norm_eps,
                 out_dtype = torch.half,
                 constant_bias = 1.0,
             ),
             Linear(
                 config = config,
-                key = "language_model.lm_head",
+                key = key_prefix + "lm_head",
                 qbits_key = "head_bits",
-                alt_key = "language_model.model.embed_tokens",
+                alt_key = key_prefix + "model.embed_tokens",
                 in_features = config.hidden_size,
                 out_features = config.vocab_size,
                 qmap = "block",
@@ -221,3 +279,14 @@ class Gemma3VisionModel(Model):
         vlm_tensors = config.stc.list_tensors(prefix = "vision_tower")
         mmp_tensors = config.stc.list_tensors(prefix = "multi_modal_projector")
         return vlm_tensors | mmp_tensors
+
+
+class Gemma3TextModel(Gemma3Model):
+    config_class = Gemma3TextConfig
+
+    def __init__(
+        self,
+        config: Gemma3TextConfig,
+        **kwargs
+    ):
+        super().__init__(config, key_prefix = "", **kwargs)
