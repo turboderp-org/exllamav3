@@ -11,6 +11,7 @@ from .decilm import DeciLMModel
 from .glm4 import Glm4Model
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
+from .mimo import MiMoModel
 
 ARCHITECTURES = {
     m.config_class.arch_string: {
@@ -31,6 +32,7 @@ ARCHITECTURES = {
         Glm4Model,
         CohereModel,
         Cohere2Model,
+        MiMoModel,
     ]
 }
 
