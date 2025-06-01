@@ -6,6 +6,9 @@ from exllamav3.util import synchronized
 from exllamav3.util.file import maybe_read_json
 from exllamav3.models import Config
 from functools import lru_cache
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from . import MMEmbedding
 
 class Tokenizer:
 
@@ -14,6 +17,8 @@ class Tokenizer:
         config: Config,
     ):
         self.config = config
+
+        # TODO: Profile/optimize
 
         # Defaults
         self.unk_token = "<unk>"
@@ -229,19 +234,6 @@ class Tokenizer:
     # Encode string with special tokens
 
     def encode_special(self, text: str) -> list[int]:
-        # if self.special_delimiters is None:
-        #     self.special_delimiters = re.compile("(" + "|".join(map(re.escape, self.extended_piece_to_id.keys())) + ")")
-        #
-        # split = self.special_delimiters.split(text)
-        # encoded = []
-        #
-        # i = 0
-        # while i < len(split):
-        #     if split[i] != "": encoded += self.tokenizer.encode(split[i], add_special_tokens = False).ids
-        #     if i + 1 < len(split): encoded += [self.extended_piece_to_id[split[i + 1]]]
-        #     i += 2
-
-        # TODO: Test if the above is actually no longer needed (was written for SentencePiece lib)
         encoded = self.tokenizer.encode(text, add_special_tokens = False).ids
         return encoded
 
@@ -249,21 +241,21 @@ class Tokenizer:
         self,
         text: str,
         special: bool,
-        # embeddings: list[ExLlamaV2MMEmbedding]
+        embeddings: list[MMEmbedding]
     ):
         out_parts = []
 
-        # if embeddings:
-        #     aliases = {e.text_alias: e for e in embeddings}
-        #     split_pattern = r"(" + "|".join(re.escape(k) for k in aliases.keys()) + ")"
-        #     in_parts = re.split(split_pattern, text)
-        # else:
-        aliases = {}
-        in_parts = [text]
+        if embeddings:
+            aliases = {e.text_alias: e for e in embeddings}
+            split_pattern = r"(" + "|".join(re.escape(k) for k in aliases.keys()) + ")"
+            in_parts = re.split(split_pattern, text)
+        else:
+            aliases = {}
+            in_parts = [text]
 
         for text in in_parts:
             if text in aliases:
-                out_parts += aliases[text].get_ids()
+                out_parts += aliases[text].token_list
             else:
                 if special:
                     out_parts += self.encode_special(text)
@@ -281,7 +273,7 @@ class Tokenizer:
         add_eos: bool = False,
         encode_special_tokens: bool = False,
         return_offsets: bool = False,
-        # embeddings: list[ExLlamaV2MMEmbedding] | None = None
+        embeddings: list[MMEmbedding] | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
         """
@@ -303,21 +295,21 @@ class Tokenizer:
         :param return_offsets:
             Also return a tensor of padding lengths
 
-        # :param embeddings:
-        #     List of ExLlamaV2MMEmbeddings. If present, aliases in the input will be replaced with token ID ranges.
+        :param embeddings:
+            List of MMEmbeddings. If present, aliases in the input will be replaced with token ID ranges.
 
         :return:
             Tensor of shape (batch_size, max_seq_len), optionally offsets Tensor of shape (batch_size)
         """
 
-        # if embeddings is None:
-        embeddings = []
+        if embeddings is None:
+            embeddings = []
 
         if isinstance(text, list):
 
             # text is a list of strings
 
-            list_ids = [self.encode_special_or_unspecial(t, encode_special_tokens) for t in text]
+            list_ids = [self.encode_special_or_unspecial(t, encode_special_tokens, embeddings) for t in text]
 
             if add_bos and self.bos_token_id is not None:
                 for ids in list_ids: ids.insert(0, self.bos_token_id)
@@ -346,7 +338,7 @@ class Tokenizer:
             # text is a single string
 
             # ids = self.encode_special(text) if encode_special_tokens else self.encode_unspecial(text)
-            ids = self.encode_special_or_unspecial(text, encode_special_tokens)
+            ids = self.encode_special_or_unspecial(text, encode_special_tokens, embeddings)
             if add_bos and self.bos_token_id is not None:
                 ids.insert(0, self.bos_token_id)
             if add_eos and self.eos_token_id is not None:

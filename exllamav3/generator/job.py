@@ -15,6 +15,7 @@ from ..ext import exllamav3_ext as ext
 from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
 from ..util import profile_opt
+from ..tokenizer import MMEmbedding
 
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
 def _strings_to_utf32(strings: list[str]) -> tuple[np.ndarray, np.ndarray] | None:
@@ -56,7 +57,7 @@ class Job:
         token_healing: bool = False,
         identifier: object | None = None,
         banned_strings: list[str] | None = None,
-#        embeddings: list[MMEmbedding] | None = None,
+        embeddings: list[MMEmbedding] | None = None,
         **kwargs
     ):
         """
@@ -122,8 +123,8 @@ class Job:
             Arbitrary object to return with every stream event relating to this job, e.g. an index to identify the
             output as belonging to a specific position in a batch
 
-        # :param embeddings:
-        #     Optional list of MMEmbeddings to use, or list of lists for batched generation TODO
+        :param embeddings:
+            Optional list of MMEmbeddings to use, or list of lists for batched generation
 
         :param kwargs:
         """
@@ -238,9 +239,8 @@ class Job:
         # self.filter_prefer_eos = filter_prefer_eos
 
         # Embeddings
-        # TODO: (embeddings)
-        # self.embeddings = embeddings or []
-        # self.alt_rope_embed = {}
+        self.embeddings = embeddings or []
+        # self.alt_rope_embed = {}  # TODO
         # self.alt_rope_offset = 0
 
         # Pinned buffer for IDs during sampling
@@ -849,7 +849,8 @@ class Job:
                         "attn_mode": "flash_attn",
                         "block_table": seq.block_index_tensor,
                         "cache": self.generator.cache,
-                        "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32)
+                        "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                        "indexed_embeddings": self.embeddings
                     }
                 )
 

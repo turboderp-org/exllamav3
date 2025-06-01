@@ -15,6 +15,7 @@ import time
 import threading
 import numpy as np
 from ..util import profile_opt
+from ..tokenizer import MMEmbedding
 
 class Generator:
 
@@ -332,9 +333,9 @@ class Generator:
 
         # Indexed embeddings not supported when drafting
         # TODO: Allow multimodal draft model, perhaps with dummy embeddings?
-        # for job in self.active_jobs:  TODO: (embeddings)
-        #     assert not job.embeddings, \
-        #         "Embeddings not supported while using draft model."
+        for job in self.active_jobs:
+            assert not job.embeddings, \
+                "MM embeddings not supported while using draft model."
 
         # Collect input IDs
         input_ids_list = []
@@ -370,7 +371,7 @@ class Generator:
                 "attn_mode": "flash_attn",
                 "block_table": block_index,
                 "cache": self.draft_cache,
-                "cache_seqlens": cache_seqlens,
+                "cache_seqlens": cache_seqlens
             }
         )
 
@@ -406,7 +407,7 @@ class Generator:
 
         # Collect input IDs and indexed embeddings
         input_ids_list = []
-        active_embeddings = []  # TODO (embeddings)
+        active_embeddings = []
         logit_mapping = []
         # rope_offsets_list = [] if self.model.config.arch.lm.mrope else None  # TODO (embeddings)
         for job in self.active_jobs:
@@ -417,8 +418,8 @@ class Generator:
                 job.time_first_token = time.time()
             job_ids = job.get_input_ids_list(draft_tokens, len(input_ids_list), add_to_cache = True)
             input_ids_list += job_ids
-            # active_embeddings += job.embeddings  # TODO (embeddings)
-            # if rope_offsets_list is not None:
+            active_embeddings += job.embeddings
+            # if rope_offsets_list is not None:   # TODO (embeddings)
             #     rope_offsets_list += [job.alt_rope_offset] * len(job_ids)
         logit_mapping.append(len(input_ids_list))
         batch_ids = torch.cat(input_ids_list, dim = 0)
@@ -442,6 +443,7 @@ class Generator:
                 "block_table": block_index,
                 "cache": self.cache,
                 "cache_seqlens": cache_seqlens,
+                "indexed_embeddings": active_embeddings
             }
         )
 
@@ -577,7 +579,7 @@ class Generator:
         # filters: list[list[Filter]] | list[Filter] | None = None,
         # filter_prefer_eos: bool = False,
         return_last_results: bool = False,
-        # embeddings: list[MMEmbedding] | list[list[MMEmbedding]] | None = None,
+        embeddings: list[MMEmbedding] | list[list[MMEmbedding]] | None = None,
         **kwargs
     ):
         """
@@ -638,8 +640,8 @@ class Generator:
         :param return_last_results:
             If True, returns the last results dict for each job
 
-        # :param embeddings:
-        #     Optional list of ExLlamaV2MMEmbeddings to use for, or list of lists for batched generation TODO
+        :param embeddings:
+            Optional list of ExLlamaV2MMEmbeddings to use for, or list of lists for batched generation
 
         :return:
             Completion(s): (str or list[str] depending on the type of the input prompt argument)
@@ -652,7 +654,7 @@ class Generator:
         else:
             prompts = [prompt]
             # filters = [filters]  # TODO: (filters)
-            # embeddings = [embeddings]
+            embeddings = [embeddings]
 
         # if not filters:
         #     filters = [None] * len(prompts)
@@ -661,11 +663,11 @@ class Generator:
         #         all((f is None or isinstance(f, list)) for f in filters), \
         #         "If using filters, must provide one filter list (or None-value) per prompt."
 
-        # if not embeddings:
-        #     embeddings = [None] * len(prompts)
-        # else:
-        #     assert len(embeddings) == len(prompts) and all((isinstance(f, list) or not f) for f in embeddings), \
-        #         "Must provide one list of embeddings per prompt."
+        if not embeddings:
+            embeddings = [None] * len(prompts)
+        else:
+            assert len(embeddings) == len(prompts) and all((isinstance(f, list) or not f) for f in embeddings), \
+                "Must provide one list of embeddings per prompt."
 
         prompts = prompt if isinstance(prompt, list) else [prompt]
         batch_size = len(prompts)
@@ -675,14 +677,14 @@ class Generator:
                     p,
                     encode_special_tokens = encode_special_tokens,
                     add_bos = add_bos,
-                    # embeddings = embeddings[idx]
+                    embeddings = embeddings[idx]
                 )
             elif isinstance(p, tuple):
                 input_ids = [self.tokenizer.encode(
                     p_,
                     encode_special_tokens = encode_special_tokens,
                     add_bos = add_bos,
-                    # embeddings = embeddings[idx]
+                    embeddings = embeddings[idx]
                 ) for p_ in p]
             else:
                 assert False, "Unexpected type in prompt"
@@ -706,7 +708,7 @@ class Generator:
                 # filter_prefer_eos = filter_prefer_eos,
                 token_healing = token_healing,
                 decode_special_tokens = decode_special_tokens,
-                # embeddings = embeddings[idx] or []
+                embeddings = embeddings[idx] or []
             )
 
             if seed is not None: seed += 1
