@@ -21,6 +21,7 @@ class Model:
         self.config = config
 
         self.modules = []
+        self.caps = {}
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
@@ -65,7 +66,7 @@ class Model:
         """
 
         assert component in config.model_classes, \
-            f"{config.architecture} does not define a '{component}` component model"
+            f"{config.architecture} does not define a '{component}' component model"
 
         model = config.model_classes[component](config, **kwargs)
         return model
@@ -116,6 +117,10 @@ class Model:
                 progress.update(idx + 1)
 
 
+    def default_load_shape_dtype(self, chunk_size):
+        return (1, chunk_size), torch.long
+
+
     # Load with split
     def _load_autosplit(
         self,
@@ -127,11 +132,10 @@ class Model:
         max_output_size: int,
         max_output_factor: int,
         callback_sync: Callable[[int, int], None],
-        generator: bool
+        generator: bool,
     ):
         current_device_i = 0
-        backup_shape = (1, max_chunk_size)
-        backup_dtype = torch.long
+        backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
         dummy_state = None
         prev_load_device = None
         touched_devices = []
