@@ -37,6 +37,7 @@ class Linear(Module):
         out_dtype: torch.dtype | None = None,
         allow_input_padding: bool = False,
         post_scale: float = 1.0,
+        transposed_load: bool = True
     ):
         super().__init__(config, key, qmap)
 
@@ -59,6 +60,7 @@ class Linear(Module):
         self.is_sliced = self.in_features != self.full_in_features or self.out_features != self.full_out_features
         self.out_dtype = out_dtype
         self.post_scale = post_scale
+        self.transposed_load = transposed_load
 
         assert self.in_features_unpadded == self.in_features or allow_input_padding, \
             f"Input padding is not allowed for {self.key}, in_dim: {self.in_features_unpadded}, pad_to: {pad_to}"
@@ -100,7 +102,7 @@ class Linear(Module):
             dev = "cpu" if self.is_sliced else self.device
             pad1 = (self.out_features,) if not self.is_sliced else None
             pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
-            weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = True, pad_to = pad2)
+            weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2)
             bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
             scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, float2half = True, optional = True)
             if scale_inv is not None:
