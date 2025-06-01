@@ -21,15 +21,33 @@ class MLP(Module):
         key_down: str | None = None,
         key_fused_gate_up: str | None = None,
         qmap: str | None = None,
-        out_dtype: torch.dtype = None
+        out_dtype: torch.dtype = None,
+        activation_fn: str = "silu",
+        pad_to = 128,
     ):
         super().__init__(config, key, None)
         assert key_fused_gate_up is None
 
         self.out_dtype = out_dtype
 
-        self.up = Linear(config, f"{key}.{key_up}", hidden_size, intermediate_size, qmap = qmap + ".up", qbits_mod_key = "u")
-        self.down = Linear(config, f"{key}.{key_down}", intermediate_size, hidden_size, qmap = qmap + ".down", qbits_mod_key = "d")
+        self.up = Linear(
+            config,
+            f"{key}.{key_up}",
+            hidden_size,
+            intermediate_size,
+            qmap = qmap + ".up",
+            qbits_mod_key = "u",
+            pad_to = pad_to
+        )
+        self.down = Linear(
+            config,
+            f"{key}.{key_down}",
+            intermediate_size,
+            hidden_size,
+            qmap = qmap + ".down",
+            qbits_mod_key = "d",
+            pad_to = pad_to
+        )
 
         self.register_submodule(self.up)
         self.register_submodule(self.down)
