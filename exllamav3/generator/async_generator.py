@@ -5,7 +5,7 @@ import asyncio
 
 class AsyncGenerator:
     """
-    Async wrapper for dynamic generator. See definition of ExLlamaV2DynamicGenerator.
+    Async wrapper for dynamic generator. See definition of Generator.
     """
     def __init__(self, *args, **kwargs):
         self.generator = Generator(*args, **kwargs)
@@ -64,7 +64,7 @@ class AsyncGenerator:
 
 class AsyncJob:
     """
-    Async wrapper for dynamic generator job. See definition of ExLlamaV2DynamicJob.
+    Async wrapper for dynamic generator job. See definition of DynamicJob.
     """
     def __init__(self, generator: AsyncGenerator, *args: object, **kwargs: object):
         self.generator = generator

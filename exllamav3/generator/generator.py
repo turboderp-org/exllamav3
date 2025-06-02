@@ -631,7 +631,7 @@ class Generator:
             Only return completion. If False, returned string will include the input prompt.
 
         # :param filters:
-        #     (List of) list of ExLlamaV2Filters to apply during generation. Each prompt in a batch needs
+        #     (List of) list of Filters to apply during generation. Each prompt in a batch needs
         #     its own filter list, or a value of None to disable filters for individual prompts. TODO
 
         # :param filter_prefer_eos:
@@ -641,7 +641,7 @@ class Generator:
             If True, returns the last results dict for each job
 
         :param embeddings:
-            Optional list of ExLlamaV2MMEmbeddings to use for, or list of lists for batched generation
+            Optional list of MMEmbeddings to use for, or list of lists for batched generation
 
         :return:
             Completion(s): (str or list[str] depending on the type of the input prompt argument)
