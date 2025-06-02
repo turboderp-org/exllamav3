@@ -6,7 +6,7 @@ ExLlamaV3 is still in development. Please note: ↙
 - The framework <u>is not yet fully optimized</u>. Performance is lacking, especially on Ampere, and there may be a significant CPU bottleneck on slower processors until the extension functions are fully built out.
 - AMD GPUs (ROCm) are not yet supported.
 - [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) is currently required. I hope to switch over to [FlashInfer](https://github.com/flashinfer-ai/flashinfer/tree/main) in time, but there are some obstacles to overcome first. 
-- A number of important features are yet to be added, such as tensor parallelism and multimodal support.
+- A number of important features are yet to be added, such as tensor parallelism.
 
 ## Why?
 
@@ -22,7 +22,6 @@ There's much that still needs to be added and/or ported over from ExLlamaV2. I'v
 
 - Support for more architectures
 - Constrained sampling (JSON filters etc.)
-- Multimodal support
 - LoRA support
 - ROCm support
 - Tensor-parallel inference
