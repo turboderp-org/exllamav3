@@ -6,3 +6,4 @@ rich
 typing_extensions
 safetensors>=0.3.2
 ninja
+pillow
