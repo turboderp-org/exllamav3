@@ -1,3 +1,4 @@
 blessed
 prompt_toolkit
 pyperclip
+requests
