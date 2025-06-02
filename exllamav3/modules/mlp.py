@@ -52,6 +52,13 @@ class MLP(Module):
         self.register_submodule(self.up)
         self.register_submodule(self.down)
 
+        self.activation_fn = activation_fn
+
+        match activation_fn:
+            case "silu": self.activation_fn_call = F.silu
+            case "gelu": self.activation_fn_call = lambda x: F.gelu(x, approximate = "tanh")
+
+
     @override
     def forward(
         self,
@@ -61,7 +68,7 @@ class MLP(Module):
     ) -> torch.Tensor:
 
         x = self.up.forward(x, params)
-        x = F.silu(x)
+        x = self.activation_fn_call(x)
         x = self.down.forward(x, params)
 
         return to2(x, out_dtype, self.out_dtype)
