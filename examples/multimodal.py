@@ -48,7 +48,7 @@ def main():
     config = Config.from_directory(model_dir)
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens = cache_size)
-    model.load("cuda:2", progressbar = True)
+    model.load(progressbar = True)
     tokenizer = Tokenizer.from_config(config)
 
     # Load the image component model
@@ -64,10 +64,7 @@ def main():
 
     # Process images
     image_embeddings = [
-        vision_model.get_image_embeddings(
-            tokenizer = tokenizer,
-            image = get_image(**img_args),
-        )
+        vision_model.get_image_embeddings(tokenizer = tokenizer, image = get_image(**img_args))
         for img_args in images
     ]
 
@@ -96,12 +93,12 @@ def main():
         generator.enqueue(job)
 
         print()
-        print(prompt, end = ""); sys.stdout.flush()
+        print(prompt, end = "", flush = True)
         while generator.num_remaining_jobs():
             results = generator.iterate()
             for result in results:
                 text = result.get("text", "")
-                print(text, end = ""); sys.stdout.flush()
+                print(text, end = "", flush = True)
         print()
 
     # Non-streaming
