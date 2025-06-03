@@ -39,3 +39,30 @@ def normalize_image(
     std = np.array(std, dtype = image.dtype)
     image = (image - mean) / std
     return image
+
+
+def size_to_longest_edge_and_patch_size(
+    input_size: tuple,
+    max_size: tuple,
+    patch_size: tuple,
+) -> tuple:
+    """
+    Compute the output size for resizing an image while maintaining aspect ratio and constraining to a
+    maximum bounding box while keeping each dimension a multiple of the corresponding patch dimension.
+    """
+
+    assert all(p % d == 0 for p, d in zip(max_size, patch_size)), \
+        "max_size must be a multiple of patch_size"
+
+    # Reduce to bounding box
+
+    ratio = max(input_size[0] / max_size[0], input_size[1] / max_size[1])
+    if ratio > 1:
+        output_size = tuple(int(np.ceil(d / ratio)) for d in input_size)
+    else:
+        output_size = input_size
+
+    # Align size to patch grid
+
+    output_size = tuple((((d + p - 1) // p) * p) for d, p in zip(output_size, patch_size))
+    return output_size
