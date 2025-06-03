@@ -8,13 +8,17 @@ import requests
 import torch
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth=200)
 
-mode = "gemma3"
+mode = "mistral3"
 cache_size = 8192
 streaming = True
 
-if mode == "gemma3":
-    prompt_format = "gemma"
-    model_dir = "/mnt/str/models/gemma3-4b-it/exl3/5.0bpw/"
+match mode:
+    case "gemma3":
+        prompt_format = "gemma"
+        model_dir = "/mnt/str/models/gemma3-4b-it/exl3/5.0bpw/"
+    case "mistral3":
+        prompt_format = "mistral"
+        model_dir = "/mnt/str/models/mistral-small-3.1-24b-instruct/exl3/8.0bpw_H8"
 
 images = [
     # Cat

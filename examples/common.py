@@ -65,3 +65,5 @@ def get_stop_conditions(prompt_format, tokenizer):
             return [tokenizer.eos_token_id, "<end_of_turn>"]
         case "chatml":
             return [tokenizer.eos_token_id, "<|im_end|>"]
+        case "mistral":
+            return [tokenizer.eos_token_id]
