@@ -17,6 +17,7 @@ class MLP(Module):
         key: str,
         hidden_size: int,
         intermediate_size: int,
+        out_size: int | None = None,
         key_up: str | None = None,
         key_down: str | None = None,
         key_fused_gate_up: str | None = None,
@@ -43,7 +44,7 @@ class MLP(Module):
             config,
             f"{key}.{key_down}",
             intermediate_size,
-            hidden_size,
+            hidden_size if out_size is None else out_size,
             qmap = qmap + ".down",
             qbits_mod_key = "d",
             pad_to = pad_to
