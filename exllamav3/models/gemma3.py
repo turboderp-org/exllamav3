@@ -318,6 +318,7 @@ class Gemma3TextModel(Gemma3Model):
     ):
         super().__init__(config, key_prefix = "", **kwargs)
 
+
 class Gemma3MMPool(Module):
 
     def __init__(
@@ -506,7 +507,7 @@ class Gemma3VisionModel(Model):
         image = image * rescale_factor
         image = normalize_image(image, image_mean, image_std)
 
-        # Convert to tensor, shape (3, resized_height, resized_width)
+        # Convert to tensor, shape (1, 3, resized_height, resized_width)
         image = image.transpose(2, 0, 1)
         image = torch.from_numpy(image).half().unsqueeze(0)
         return image, new_size
