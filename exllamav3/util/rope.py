@@ -296,7 +296,8 @@ class RoPE:
         q_norm: torch.Tensor | None = None,
         k_norm: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
-        norm_constant_bias: float = 0.0
+        norm_constant_bias: float = 0.0,
+        inv_freq: torch.Tensor | None = None
     ):
         q = q.contiguous()
         if k is not None: k = k.contiguous()
@@ -320,7 +321,7 @@ class RoPE:
         ext.rope(
             q, out_q,
             k, out_k,
-            self.inv_freq,
+            self.inv_freq if inv_freq is None else inv_freq,
             position,
             positions,
             position_ids,

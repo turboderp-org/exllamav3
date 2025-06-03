@@ -34,7 +34,8 @@ void rope_kernel
     const half* __restrict__ q_norm,
     const half* __restrict__ k_norm,
     float norm_eps,
-    float norm_constant_bias
+    float norm_constant_bias,
+    bool inv_freq_table
 )
 {
     // Get position
@@ -49,10 +50,22 @@ void rope_kernel
     // Load inv_freq, compute sin/cos
     int t = threadIdx.x;
     int t_head = threadIdx.y;
-    float fr = inv_freq[t];
-    float pf = __int2float_rn(pos);
-    float sin = __sinf(fr * pf) * attn_factor;
-    float cos = __cosf(fr * pf) * attn_factor;
+
+    float sin;
+    float cos;
+    if (!inv_freq_table)
+    {
+        float fr = inv_freq[t];
+        float pf = __int2float_rn(pos);
+        sin = __sinf(fr * pf) * attn_factor;
+        cos = __cosf(fr * pf) * attn_factor;
+    }
+    else
+    {
+        float fr = inv_freq[pos * partial_head_dim / 2 + t];
+        sin = __sinf(fr) * attn_factor;
+        cos = __cosf(fr) * attn_factor;
+    }
 
     // Shared buffer
     __shared__ half norm_head[MAX_NUM_THREADS * 2];
@@ -216,7 +229,7 @@ void rope
     int num_heads_q = q.size(2);
     int num_heads_k = 0;
     int head_dim = q.size(3);
-    int partial_head_dim = inv_freq.size(0) * 2;
+    int partial_head_dim = inv_freq.size(-1) * 2;
 
     const half* q_ptr = (half*) q.data_ptr();
     half* out_q_ptr = (half*) out_q.data_ptr();
@@ -237,7 +250,13 @@ void rope
 
     const float* inv_freq_ptr = (const float*) inv_freq.data_ptr();
     TORCH_CHECK_DTYPE(inv_freq, kFloat);
-    TORCH_CHECK_DIM(inv_freq, 1);
+    bool inv_freq_table = false;
+    if (inv_freq.dim() > 1)
+    {
+        TORCH_CHECK_DIM(inv_freq, 2);
+        TORCH_CHECK_SHAPES(q, 3, inv_freq, 1, 2);
+        inv_freq_table = true;
+    }
 
     uint32_t* positions_ptr = (uint32_t*) OPTPTR(positions);
     uint32_t* position_ids_ptr = (uint32_t*) OPTPTR(position_ids);
@@ -276,7 +295,7 @@ void rope
 
     #define ARGS q_ptr, out_q_ptr, k_ptr, out_k_ptr, inv_freq_ptr, bsz, seq_len, num_heads_q, num_heads_k, \
                  head_dim, partial_head_dim, position, positions_ptr, position_ids_ptr, attn_factor, \
-                 q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias
+                 q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table
 
     if      (rope_mode == ROPESTYLE_GPTJ) rope_kernel<ROPESTYLE_GPTJ><<<blocks, threads, 0, stream>>>(ARGS);
     else if (rope_mode == ROPESTYLE_NEOX) rope_kernel<ROPESTYLE_NEOX><<<blocks, threads, 0, stream>>>(ARGS);

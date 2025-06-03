@@ -335,6 +335,7 @@ class Attention(Module):
         position = params.get("position", 0)
         positions = get_for_device(params, "positions", self.device, None)
         position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
 
         q, k, v = self.project_qkv(x, params)
         q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
@@ -360,7 +361,8 @@ class Attention(Module):
                 self.q_norm_tensor,
                 self.k_norm_tensor,
                 self.norm_eps,
-                self.norm_constant_bias
+                self.norm_constant_bias,
+                inv_freq
             )
 
         q = q.transpose(1, 2)
@@ -384,6 +386,7 @@ class Attention(Module):
         position = params.get("position", 0)
         positions = get_for_device(params, "positions", self.device, None)
         position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
 
         q, k, v = self.project_qkv(x, params)
         q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
@@ -404,7 +407,8 @@ class Attention(Module):
                 self.q_norm_tensor,
                 self.k_norm_tensor,
                 self.norm_eps,
-                self.norm_constant_bias
+                self.norm_constant_bias,
+                inv_freq,
             )
 
         o = flash_attn_func(
@@ -436,6 +440,7 @@ class Attention(Module):
         position = params.get("position", 0)
         positions = get_for_device(params, "positions", self.device, None)
         position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
         causal = params.get("causal", True)
 
         q, k, v = self.project_qkv(x, params)
@@ -458,7 +463,8 @@ class Attention(Module):
                 self.q_norm_tensor,
                 self.k_norm_tensor,
                 self.norm_eps,
-                self.norm_constant_bias
+                self.norm_constant_bias,
+                inv_freq
             )
 
         cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
