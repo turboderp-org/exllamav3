@@ -121,6 +121,10 @@ class Model:
         return (1, chunk_size), torch.long
 
 
+    def default_load_params(self):
+        return {}
+
+
     # Load with split
     def _load_autosplit(
         self,
@@ -139,6 +143,7 @@ class Model:
         dummy_state = None
         prev_load_device = None
         touched_devices = []
+        params = self.default_load_params()
 
         with ProgressBar(f"Loading" if progressbar else None, len(self.modules)) as progress:
 
@@ -189,8 +194,8 @@ class Model:
                             self.config.stc.end_deferred_load()
 
                         # Forward dummy state through module
-                        dummy_state = module.prepare_for_device(dummy_state, {})
-                        dummy_state = module.forward(dummy_state, {})
+                        dummy_state = module.prepare_for_device(dummy_state, params)
+                        dummy_state = module.forward(dummy_state, params)
 
                         # Account for max_output_factor after last layer,
                         if is_logits_layer:
