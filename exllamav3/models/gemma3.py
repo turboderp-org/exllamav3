@@ -485,7 +485,7 @@ class Gemma3VisionModel(Model):
         image: Image
     ) -> (torch.Tensor, tuple):
         """
-        Convert input image to the standard size expected by the Siglip vision tower
+        Convert input image to the standard size and format expected by the Siglip vision tower
         """
 
         size = tuple(self.config.vision_pp.size[d] for d in ["height", "width"])

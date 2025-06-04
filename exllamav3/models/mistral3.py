@@ -392,7 +392,10 @@ class Mistral3VisionModel(Model):
         image: Image
     ) -> (torch.Tensor, tuple):
         """
-        Convert input image to the standard size expected by the Siglip vision tower
+        Convert input image to the size and format expected by the vision tower. Image is scaled proportionally to
+        fit a bounding box of longest_edge x longest_edge pixels as defined by the preprocessor config, while still
+        being divisible into tiles of spatial_merge_size x spatial_merge_size input patches. Each such tile will be
+        merged into one multimodal feature token by the vision tower.
         """
 
         patch_2d = (

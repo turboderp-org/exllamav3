@@ -96,7 +96,6 @@ class SS_Sample(SS_Base):
     """
     def run(self, state: SamplingState):
         # TODO: Fused Gumbel noise + argmax kernel
-        # TODO: Evaluate if multinomial sampling from sorted prob. distribution is more efficient
         match state.state:
             case SS.INIT:
                 state.logits = torch.empty_like(state.in_logits)

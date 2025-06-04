@@ -64,7 +64,7 @@ class AsyncGenerator:
 
 class AsyncJob:
     """
-    Async wrapper for dynamic generator job. See definition of DynamicJob.
+    Async wrapper for dynamic generator job. See definition of Job.
     """
     def __init__(self, generator: AsyncGenerator, *args: object, **kwargs: object):
         self.generator = generator
