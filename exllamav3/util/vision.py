@@ -55,14 +55,12 @@ def size_to_longest_edge_and_patch_size(
         "max_size must be a multiple of patch_size"
 
     # Reduce to bounding box
-
     ratio = max(input_size[0] / max_size[0], input_size[1] / max_size[1])
     if ratio > 1:
-        output_size = tuple(int(np.ceil(d / ratio)) for d in input_size)
+        output_size = tuple(max(1, int(np.floor(d / ratio))) for d in input_size)
     else:
         output_size = input_size
 
     # Align size to patch grid
-
     output_size = tuple((((d + p - 1) // p) * p) for d, p in zip(output_size, patch_size))
     return output_size
