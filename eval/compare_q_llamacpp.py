@@ -23,11 +23,10 @@ def get_storage_info(model_dir):
     head_numel = 0
     for tensor_info in tensors:
         name = tensor_info.name
-        if (name == "token_embd.weight" and head_bpw == 0) or \
-            name == "output.weight":
+        if (name == "token_embd.weight" and head_bpw == 0) or name == "output.weight":
             head_bpw = tensor_info.n_bytes * 8 / tensor_info.n_elements
             head_numel = tensor_info.n_elements
-        elif name.endswith(".weight"):
+        elif name.endswith(".weight") and name != "token_embd.weight" and not name.endswith("norm.weight"):
             sum_bits += tensor_info.n_bytes * 8
             sum_numel += tensor_info.n_elements
     vram_bits = head_numel * head_bpw + sum_bits
