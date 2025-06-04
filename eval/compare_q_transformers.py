@@ -1,12 +1,34 @@
 import torch
-from gptqmodel.nn_modules.qlinear.marlin import MarlinQuantLinear
-from gptqmodel.nn_modules.qlinear.tritonv2 import TritonV2QuantLinear
-from gptqmodel.nn_modules.qlinear.exllamav2 import ExllamaV2QuantLinear
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from aqlm import QuantizedLinear
-from awq.modules.linear import WQLinear_GEMM
-from vptq import VQuantLinear
-from bitsandbytes.nn import Linear4bit
+
+try:
+    from gptqmodel.nn_modules.qlinear.marlin import MarlinQuantLinear
+    from gptqmodel.nn_modules.qlinear.tritonv2 import TritonV2QuantLinear
+    from gptqmodel.nn_modules.qlinear.exllamav2 import ExllamaV2QuantLinear
+except ModuleNotFoundError:
+    MarlinQuantLinear = None
+    TritonV2QuantLinear = None
+    ExllamaV2QuantLinear = None
+
+try:
+    from aqlm import QuantizedLinear
+except ModuleNotFoundError:
+    QuantizedLinear = None
+
+try:
+    from awq.modules.linear import WQLinear_GEMM
+except ModuleNotFoundError:
+    WQLinear_GEMM = None
+
+try:
+    from vptq import VQuantLinear
+except ModuleNotFoundError:
+    VQuantLinear = None
+
+try:
+    from bitsandbytes.nn import Linear4bit
+except ModuleNotFoundError:
+    Linear4bit = None
 
 def get_tensors_size(tensors):
     return 8 * sum(t.element_size() * t.numel() for t in tensors.values() if t is not None)

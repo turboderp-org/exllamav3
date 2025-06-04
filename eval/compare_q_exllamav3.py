@@ -1,6 +1,9 @@
 import torch
-from exllamav3 import Config, Model, Tokenizer, Cache
-from exllamav3.modules import Linear
+try:
+    from exllamav3 import Config, Model, Tokenizer, Cache
+    from exllamav3.modules import Linear
+except ModuleNotFoundError:
+    pass
 
 def get_tensor_size(tensors):
     return 8 * sum(t.element_size() * t.numel() for t in tensors.values())

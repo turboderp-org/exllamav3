@@ -1,7 +1,9 @@
 import torch
-from any_precision.modules.AnyPrecisionForCausalLM import AnyPrecisionForCausalLM
-from any_precision.modules.AnyPrecisionLinear import AnyPrecisionLinear
-from transformers import AutoModelForCausalLM
+try:
+    from any_precision.modules.AnyPrecisionForCausalLM import AnyPrecisionForCausalLM
+    from any_precision.modules.AnyPrecisionLinear import AnyPrecisionLinear
+except ModuleNotFoundError:
+    pass
 
 def get_tensors_size(tensors):
     return 8 * sum(t.element_size() * t.numel() for t in tensors.values() if t is not None)
