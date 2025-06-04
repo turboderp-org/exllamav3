@@ -1,0 +1,38 @@
+[
+    {
+        "model_dir": "/mnt/str/models/llama3.1-8b-instruct/anyp/2bit-lnq",
+        "load_fn": "anyprecision",
+        "fwd_fn": "anyprecision",
+        "label": "AnyP 2bit-GuidedQuant-LNQ"
+    },
+    {
+        "model_dir": "/mnt/str/models/llama3.1-8b-instruct/anyp/3bit-lnq",
+        "load_fn": "anyprecision",
+        "fwd_fn": "anyprecision",
+        "label": "AnyP 3bit-GuidedQuant-LNQ"
+    },
+    {
+        "model_dir": "/mnt/str/models/llama3.1-8b-instruct/anyp/4bit-lnq",
+        "load_fn": "anyprecision",
+        "fwd_fn": "anyprecision",
+        "label": "AnyP 4bit-GuidedQuant-LNQ"
+    },
+    {
+        "model_dir": "/mnt/str/models/llama3.1-8b-instruct/anyp/2bit-squeezellm",
+        "load_fn": "anyprecision",
+        "fwd_fn": "anyprecision",
+        "label": "AnyP 2bit-SqueezeLLM"
+    },
+    {
+        "model_dir": "/mnt/str/models/llama3.1-8b-instruct/anyp/3bit-squeezellm",
+        "load_fn": "anyprecision",
+        "fwd_fn": "anyprecision",
+        "label": "AnyP 3bit-SqueezeLLM"
+    },
+    {
+        "model_dir": "/mnt/str/models/llama3.1-8b-instruct/anyp/4bit-squeezellm",
+        "load_fn": "anyprecision",
+        "fwd_fn": "anyprecision",
+        "label": "AnyP 4bit-SqueezeLLM"
+    }
+]

@@ -38,6 +38,10 @@ from compare_q_llamacpp import (
     load_llamacpp,
     fwd_llamacpp
 )
+from compare_q_anyprecision import (
+    load_anyprecision,
+    fwd_anyprecision,
+)
 
 load_fns = {
     "transformers_auto_bf16": load_transformers_auto_bf16,
@@ -46,6 +50,7 @@ load_fns = {
     "exllamav2": load_exllamav2,
     "exllamav3": load_exllamav3,
     "llamacpp": load_llamacpp,
+    "anyprecision": load_anyprecision,
 }
 
 fwd_fns = {
@@ -53,6 +58,7 @@ fwd_fns = {
     "exllamav2": fwd_exllamav2,
     "exllamav3": fwd_exllamav3,
     "llamacpp": fwd_llamacpp,
+    "anyprecision": fwd_anyprecision,
 }
 
 tokenize_fns = {
