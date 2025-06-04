@@ -13,7 +13,7 @@ from chat_console import *
 def main(args):
 
     # Prompt format
-    if args.modes:
+    if args.modes or args.mode is None:
         print("Available modes:")
         for k, v in prompt_formats.items():
             print(f" - {k:16} {v.description}")
@@ -171,7 +171,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     model_init.add_args(parser, cache = True)
-    parser.add_argument("-mode", "--mode", type = str, help = "Prompt mode", required = True)
+    parser.add_argument("-mode", "--mode", type = str, help = "Prompt mode", default = None)
     parser.add_argument("-modes", "--modes", action = "store_true", help = "List available prompt modes and exit")
     parser.add_argument("-un", "--user_name", type = str, default = "User", help = "User name (raw mode only)")
     parser.add_argument("-bn", "--bot_name", type = str, default = "Assistant", help = "Bot name (raw mode only)")

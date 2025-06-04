@@ -112,7 +112,7 @@ class PromptFormat_chatml(PromptFormat):
 
 
 class PromptFormat_phi(PromptFormat):
-    description = "Phi3/Phi4 instruct models"
+    description = "Phi3/Phi4 instruct models (note, some Phi4 models use ChatML)"
 
     def __init__(self, *args):
         super().__init__(*args)
