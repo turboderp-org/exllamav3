@@ -7,6 +7,7 @@ from exllamav3.util.file import maybe_read_json
 from exllamav3.models import Config
 from functools import lru_cache
 from typing import TYPE_CHECKING
+from ..util import profile_opt
 if TYPE_CHECKING:
     from . import MMEmbedding
 
@@ -159,7 +160,7 @@ class Tokenizer:
         self.actual_vocab_size = 1 + max(
             list(self.extended_id_to_piece.keys()) + \
             list(self.unspecial_id_to_piece.keys()) + \
-            [self.tokenizer.get_vocab_size() - 1]
+            [self.raw_vocab_size() - 1]
         )
 
         # Useful token IDs
@@ -182,8 +183,12 @@ class Tokenizer:
         self.get_id_to_piece_list(False)
         self.get_piece_to_id_dict()
 
-
-    # Get single token
+    @lru_cache
+    def raw_vocab_size(self):
+        """
+        Cache this function because it's suspiciously slow in HF Tokenizers
+        """
+        return self.tokenizer.get_vocab_size()
 
     def single_token(self, token_id: int) -> torch.Tensor:
         """
@@ -211,7 +216,6 @@ class Tokenizer:
         return tid
 
     # Encode string with added, unspecial tokens
-
     def encode_unspecial(self, text: str) -> list[int]:
         if not self.unspecial_piece_to_id:
             return self.tokenizer.encode(text, add_special_tokens = False).ids
@@ -377,14 +381,14 @@ class Tokenizer:
 
         if not decode_special_tokens:
 
-            max_token = self.tokenizer.get_vocab_size()
+            max_token = self.raw_vocab_size()
             seq = [t for t in seq if (t != self.pad_token_id and t < max_token and t != self.eos_token_id)]
             if self.eos_token_id in seq: seq = seq[:seq.index(self.eos_token_id)]
             return self.decode_unspecial(seq)
 
         else:
 
-            max_token = self.tokenizer.get_vocab_size()
+            max_token = self.raw_vocab_size()
             seq = [t for t in seq if (t != self.pad_token_id and t < max_token)]
             text = ""
             start = 0
@@ -481,14 +485,10 @@ class Tokenizer:
     # Get ordinals of single-byte tokens
 
     @synchronized
+    @lru_cache
     def get_id_to_ord_list(self):
-        if self.id_to_ord is not None: return self.id_to_ord
 
-        self.id_to_ord = []
-        for idx in range(self.tokenizer.get_vocab_size()):
-            p = self.tokenizer.id_to_token(idx)
-            if not p: p = ""
-            self.id_to_ord.append(self.tokenizer.token_to_id(p))
+        self.id_to_ord = list(range(self.raw_vocab_size()))
 
         def clean_special_chars(p):
             p = p.replace(self.space_char_, " ")
@@ -506,7 +506,7 @@ class Tokenizer:
                 if o <= 255: return o
             return -1
 
-        i = self.tokenizer.get_vocab_size()
+        i = self.raw_vocab_size()
         while True:
             if i in self.extended_id_to_piece:
                 self.id_to_ord.append(piece_to_ord(self.extended_id_to_piece[i]))
@@ -518,41 +518,36 @@ class Tokenizer:
                 break
             i += 1
 
-        return self.id_to_ord
-
     # Copy vocabulary from model
 
+    @lru_cache
+    def get_fixed_vocab(self):
+        test_enc = self.tokenizer.encode(" t", add_special_tokens = False)
+        test_count = len(test_enc.ids)
+        assert test_count > 0, "Tokenizer error, test string encodes to zero tokens"
+        test_id = test_enc.ids[0]
+        test_piece = self.tokenizer.decode([test_id])
+
+        if test_count == 1 and len(test_piece) == len(" t"):
+            vocab = self.tokenizer.decode_batch(
+                [[i] for i in range(self.raw_vocab_size())]
+            )
+        else:
+            prefix_id = self.tokenizer.encode(" ", add_special_tokens = False).ids[0]
+            prefix_piece = self.tokenizer.decode([prefix_id])
+            prefix_len = len(prefix_piece)
+            vocab = self.tokenizer.decode_batch(
+                [[prefix_id, i] for i in range(self.raw_vocab_size())]
+            )
+            vocab = [v[prefix_len:] for v in vocab]
+
+        return vocab
+
     @synchronized
+    @lru_cache
     def get_id_to_piece_list(self, include_special_tokens = False):
 
-        def enumerate_tokens():
-            if self.vocab is not None: return enumerate(self.vocab)
-            self.vocab = []
-
-            test_enc = self.tokenizer.encode(" t", add_special_tokens=False)
-            test_count = len(test_enc.ids)
-            assert test_count > 0, "Tokenizer error, test string encodes to zero tokens"
-            test_id = test_enc.ids[0]
-            test_piece = self.tokenizer.decode([test_id])
-
-            if test_count == 1 and len(test_piece) == len(" t"):
-                for i in range(self.tokenizer.get_vocab_size()):
-                    d = self.tokenizer.decode([i])
-                    self.vocab.append(d)
-            else:
-                prefix_id = self.tokenizer.encode(" ", add_special_tokens=False).ids[0]
-                prefix_piece = self.tokenizer.decode([prefix_id])
-                prefix_len = len(prefix_piece)
-                for i in range(self.tokenizer.get_vocab_size()):
-                    dt = self.tokenizer.decode([prefix_id, i])
-                    d = dt[prefix_len:]
-                    self.vocab.append(d)
-
-            return enumerate(self.vocab)
-
         if include_special_tokens:
-            if self.id_to_piece_with_special is not None: return self.id_to_piece_with_special
-
             id_to_piece_extended = self.get_id_to_piece_list().copy()
             for k, v in self.extended_id_to_piece.items():
                 id_to_piece_extended[k] = v
@@ -560,13 +555,9 @@ class Tokenizer:
             self.id_to_piece_with_special = id_to_piece_extended
             return self.id_to_piece_with_special
 
-        if self.id_to_piece is not None: return self.id_to_piece
+        self.id_to_piece = self.get_fixed_vocab()
 
-        self.id_to_piece = [""] * self.tokenizer.get_vocab_size()
-        for idx, p in enumerate_tokens():
-            self.id_to_piece[idx] = p
-
-        i = self.tokenizer.get_vocab_size()
+        i = self.raw_vocab_size()
         while True:
             if i in self.extended_id_to_piece:
                 self.id_to_piece.append(self.extended_id_to_piece[i])
@@ -581,8 +572,8 @@ class Tokenizer:
         return self.id_to_piece
 
     @synchronized
+    @lru_cache
     def get_piece_to_id_dict(self):
-        if self.piece_to_id is not None: return self.piece_to_id
         all_pieces = self.get_id_to_piece_list()
         self.piece_to_id = {piece: idx for idx, piece in enumerate(all_pieces)}
         return self.piece_to_id
