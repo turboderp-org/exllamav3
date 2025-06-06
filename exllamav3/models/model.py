@@ -451,3 +451,11 @@ class Model:
     @staticmethod
     def get_additional_compiled_tensors(config: Config):
         return {}
+
+
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        """
+        Convenience function for formatting a single chat request with the default template associated with the
+        model's architecture, to simplify example and test scripts. Doesn't consider the model's actual Jinja template.
+        """
+        raise NotImplementedError

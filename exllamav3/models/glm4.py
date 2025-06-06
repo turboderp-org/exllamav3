@@ -158,3 +158,13 @@ class Glm4Model(Model):
         params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
+
+
+    @override
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        p = f"[gMASK]<sop>"
+        if system_prompt:
+            p += f"<|system|>\n{system_prompt}"
+        p += f"<|user|>\n{prompt}"
+        p += f"<|assistant|>\n"
+        return p

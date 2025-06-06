@@ -308,6 +308,16 @@ class Gemma3Model(Model):
         return input_ids
 
 
+    @override
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        p = "<bos><start_of_turn>user\n"
+        if system_prompt:
+            p += "{system_prompt}\n\n"
+        p += f"{prompt}\n"
+        p += f"<start_of_turn>model\n"
+        return p
+
+
 class Gemma3TextModel(Gemma3Model):
     config_class = Gemma3TextConfig
 

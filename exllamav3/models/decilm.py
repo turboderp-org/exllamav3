@@ -175,3 +175,15 @@ class DeciLMModel(Model):
         params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
+
+
+    @override
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        p = "<s>"
+        if system_prompt:
+            p += f"### System:\n"
+            p += f"{system_prompt}\n"
+        p += f"### User:\n"
+        p += f"{prompt}\n"
+        p += f"### Assistant:\n"
+        return p

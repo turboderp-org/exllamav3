@@ -151,3 +151,12 @@ class MixtralModel(Model):
         params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
+
+
+    @override
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        p = "<s>[INST]"
+        if system_prompt:
+            p += f" {system_prompt}\n\n"
+        p += f" {prompt} [/INST]"
+        return p

@@ -150,3 +150,13 @@ class Phi3Model(Model):
         params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
+
+
+    @override
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        p = "<s>"
+        if system_prompt:
+            p += f"<|system|>\n{system_prompt}<|end|>\n"
+        p += f"<|user|>\n{prompt}<|end|>\n"
+        p += f"<|assistant|>\n"
+        return p

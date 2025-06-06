@@ -1,4 +1,4 @@
-
+from typing import override
 from .llama import LlamaConfig, LlamaModel
 
 # Mistral is identical to Llama
@@ -27,3 +27,11 @@ class MistralModel(LlamaModel):
         **kwargs
     ):
         super().__init__(config, **kwargs)
+
+    @override
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        p = "<s>[INST]"
+        if system_prompt:
+            p += f" {system_prompt}\n\n"
+        p += f" {prompt} [/INST]"
+        return p

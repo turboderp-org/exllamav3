@@ -144,3 +144,14 @@ class LlamaModel(Model):
         params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
+
+
+    @override
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        # Llama3 prompt
+        p = "<|begin_of_text|>"
+        if system_prompt:
+            p += f"<|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
+        p += f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
+        p += f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+        return p

@@ -165,3 +165,15 @@ class Qwen3MoeModel(Model):
         params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
+
+
+    @override
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        p = ""
+        if system_prompt:
+            p += f"<|im_start|>system\n"
+            p += f"{system_prompt}<|im_end|>\n"
+        p += f"<|im_start|>user\n"
+        p += f"{prompt}<|im_end|>\n"
+        p += f"<|im_start|>assistant\n"
+        return p

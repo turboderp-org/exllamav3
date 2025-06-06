@@ -152,3 +152,13 @@ class Cohere2Model(Model):
         params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
+
+
+    @override
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        p = "<BOS_TOKEN>"
+        if system_prompt:
+            p += f"<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{system_prompt}<|END_OF_TURN_TOKEN|>"
+        p += f"<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{prompt}<|END_OF_TURN_TOKEN|>"
+        p += f"<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+        return p

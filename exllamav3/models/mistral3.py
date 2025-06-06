@@ -208,6 +208,15 @@ class Mistral3Model(Model):
         return input_ids
 
 
+    @override
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        p = "<s>"
+        if system_prompt:
+            p += f"[SYSTEM_PROMPT]{system_prompt}[/SYSTEM_PROMPT]"
+        p += f"[INST]{prompt}[/INST]"
+        return p
+
+
 class Mistral3PatchMerger(Module):
 
     def __init__(
