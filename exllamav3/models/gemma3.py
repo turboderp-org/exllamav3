@@ -528,31 +528,47 @@ class Gemma3VisionModel(Model):
     def get_image_embeddings(
         self,
         tokenizer: Tokenizer,
-        image: Image,
+        image: Image | list[Image],
         text_alias: str | None = None,
     ):
-        image_tensor, prep_image_size = self.preprocess(image)
+        if isinstance(image, list):
+            assert text_alias is None, \
+                "Cannot apply single alias to list of images"
+            image_tensor = []
+            for i in image:
+                t, prep_image_size = self.preprocess(i)
+                image_tensor.append(t)
+            image_tensor = torch.cat(image_tensor, dim = 0)
+            return_batch = True
+        else:
+            image_tensor, prep_image_size = self.preprocess(image)
+            image = [image]
+            return_batch = False
 
         embedding_tensor = self.forward(
             image_tensor,
             params = {"causal": False}
-        ).cpu().squeeze(0)
+        ).cpu()
 
-        num_emb_tokens = embedding_tensor.shape[0]
-        id_start = tokenizer.single_id("<start_of_image>")
-        id_end = tokenizer.single_id("<end_of_image>")
-        token_string = torch.tensor([[id_start] + [-1] * num_emb_tokens + [id_end]], dtype = torch.long)
+        num_emb_tokens = embedding_tensor.shape[1]
+        mmes = []
+        for i in range(embedding_tensor.shape[0]):
+            id_start = tokenizer.single_id("<start_of_image>")
+            id_end = tokenizer.single_id("<end_of_image>")
+            token_string = torch.tensor([[id_start] + [-1] * num_emb_tokens + [id_end]], dtype = torch.long)
 
-        mme = MMEmbedding(
-            embeddings = embedding_tensor,
-            text_alias = text_alias,
-            token_string = token_string
-        )
+            mme = MMEmbedding(
+                embeddings = embedding_tensor[i],
+                text_alias = text_alias,
+                token_string = token_string
+            )
 
-        mme.metadata.update({
-            "original_size": image.size,
-            "preprocessed_size": prep_image_size,
-            "model_architecture": self.config.architecture,
-        })
+            mme.metadata.update({
+                "original_size": image[i].size,
+                "preprocessed_size": prep_image_size,
+                "model_architecture": self.config.architecture,
+            })
 
-        return mme
+            mmes.append(mme)
+
+        return mmes if return_batch else mmes[0]
