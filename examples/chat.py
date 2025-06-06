@@ -26,6 +26,7 @@ def main(args):
     add_bos = prompt_format.add_bos()
     max_response_tokens = args.max_response_tokens
     multiline = args.multiline
+    show_tps = args.show_tps
 
     if args.basic_console:
         read_input_fn = read_input_ptk
@@ -113,6 +114,15 @@ def main(args):
                     print_info("Cleared context")
                     continue
 
+                # Toggle TPS
+                case "/tps":
+                    multiline = not multiline
+                    if multiline:
+                        print_info("Enabled tokens/second output")
+                    else:
+                        print_info("Disabled tokens/second output")
+                    continue
+
                 case _:
                     print_error(f"Unknown command: {c[0]}")
                     continue
@@ -162,6 +172,20 @@ def main(args):
                 "and was cut short." + col_default
             )
 
+        if show_tps:
+            prompt_tokens = ids.shape[-1]
+            cached_tokens = r["cached_tokens"]
+            new_tokens = prompt_tokens - cached_tokens
+            prompt_tps = new_tokens / r["time_prefill"]
+            new_tokens = r["new_tokens"]
+            tps = new_tokens / r["time_generate"]
+            print(
+                "\n"
+                f"Context: {col_info}{new_tokens:,}{col_default} new tokens at {col_info}{prompt_tps:.3f}{col_default} t/s - "
+                f"{col_info}{cached_tokens:,}{col_default} tokens cached - "
+                f"Generate: {col_info}{new_tokens:,}{col_default} tokens at {col_info}{tps:.3f}{col_default} t/s"
+            )
+
         # Add response to context
         response = s.all_text.strip()
 
@@ -191,5 +215,6 @@ if __name__ == "__main__":
     parser.add_argument("-minp", "--min_p", type = float, help = "Min-P truncation, 0 to disable (default: 0.08)", default = 0.08)
     parser.add_argument("-topk", "--top_k", type = int, help = "Top-K truncation, 0 to disable (default: disabled)", default = 0)
     parser.add_argument("-topp", "--top_p", type = float, help = "Top-P truncation, 1 to disable (default: disabled)", default = 1.0)
+    parser.add_argument("-tps", "--show_tps", action = "store_true", help = "Show tokens/second after every reply")
     _args = parser.parse_args()
     main(_args)

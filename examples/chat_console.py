@@ -15,7 +15,7 @@ col_bot = "\u001b[34;1m"  # Blue
 col_think1 = "\u001b[35;1m"  # Bright magenta
 col_think2 = "\u001b[35m"  # Magenta
 col_error = "\u001b[31;1m"  # Bright red
-col_info = "\u001b[32;1m"  # Bright red
+col_info = "\u001b[32;1m"  # Green
 col_sysprompt = "\u001b[37;1m"  # Grey
 
 def print_error(text):
