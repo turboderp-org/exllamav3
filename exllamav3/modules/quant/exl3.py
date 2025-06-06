@@ -93,7 +93,6 @@ class LinearEXL3:
             xh = torch.empty_like(x)
             ext.had_r_128(x, xh, self.suh, None, 1.0)
             w = self.get_inner_weight_tensor()
-            # TODO: Test torch.matmul for Blackwell
             ext.hgemm(xh, w, y_)
             ext.had_r_128(y_, y_, None, self.svh, 1.0)
         else:
