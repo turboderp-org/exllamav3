@@ -94,6 +94,8 @@ class Model:
             params = {}
         x = self.prepare_inputs(input_ids, params)
         for idx, module in enumerate(self.modules):
+            if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
+                x = x[..., -num:, :].contiguous()
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
         return x
