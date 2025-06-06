@@ -450,9 +450,15 @@ class Mistral3VisionModel(Model):
     def get_image_embeddings(
         self,
         tokenizer: Tokenizer,
-        image: Image,
+        image: Image | list[Image],
         text_alias: str | None = None,
     ):
+        if isinstance(image, list):
+            assert text_alias is None, "Cannot apply single alias to list of images"
+
+            # Images in Mistral3 have uneven numbers of MM tokens so each image is actually processed at bsz 1
+            return [self.get_image_embeddings(tokenizer, i) for i in image]
+
         image_tensor, prep_image_size = self.preprocess(image)
         features_size = (
             prep_image_size[1] // self.config.vision_pp.patch_size,

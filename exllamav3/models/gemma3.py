@@ -389,7 +389,10 @@ class Gemma3VisionModel(Model):
     ):
         super().__init__(config, **kwargs)
         self.config = config
-        self.caps.update({"image_input": True})
+        self.caps.update({
+            "image_input": True,
+            "fixed_size_image_embeddings": True
+        })
 
         self.modules += [
             Conv(
@@ -532,8 +535,7 @@ class Gemma3VisionModel(Model):
         text_alias: str | None = None,
     ):
         if isinstance(image, list):
-            assert text_alias is None, \
-                "Cannot apply single alias to list of images"
+            assert text_alias is None, "Cannot apply single alias to list of images"
             image_tensor = []
             for i in image:
                 t, prep_image_size = self.preprocess(i)
