@@ -25,6 +25,7 @@ class LinearEXL3:
         mul1: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
         out_dtype: torch.dtype | None = None,
+        transformers_fix: bool = False
     ):
         assert scale is None, "scale is no longer used"
         assert su is not None or suh is not None, "either su (packed) or suh (unpacked) is required"
@@ -38,6 +39,8 @@ class LinearEXL3:
         assert len(trellis.shape) == 3, "trellis must have dim = 3"
 
         if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
+
+        self.transformers_fix = transformers_fix
 
         # self.scale = scale.item()
         self.su = None
@@ -107,13 +110,18 @@ class LinearEXL3:
 
 
     def unpack_bf(self, bitfield: torch.Tensor):
+        # For some reason this operation causes a GPU assert on Transformers. Running on CPU seems to fix it
+        device = bitfield.device
+        if self.transformers_fix:
+            bitfield = bitfield.cpu()
+
         # TODO: Maybe custom kernel for this. Only used for full reconstruct and loading old models, not during inference
         bitfield = bitfield.view(torch.uint16).to(torch.int)
         masks = (1 << torch.arange(16)).to(bitfield.device)
         expanded = (bitfield.unsqueeze(-1) & masks) > 0
         expanded = expanded.flatten()
         expanded = torch.where(expanded, torch.tensor(-1.0, dtype = torch.float16), torch.tensor(1.0, dtype = torch.float16))
-        return expanded.contiguous()
+        return expanded.contiguous().to(device)
 
 
     def get_weight_tensor(self):
