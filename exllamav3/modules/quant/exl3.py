@@ -12,7 +12,7 @@ class LinearEXL3:
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         in_features: int,
         out_features: int,
         scale: torch.Tensor | None = None,
