@@ -27,7 +27,7 @@ def create_quantization_config_json(
             continue
 
         module_dict = {}
-        stored_tensors = config.stc.list_tensors(module.key)
+        stored_tensors = config.stc.list_tensors(module.key, only_serializable = True)
         module_dict["stored_tensors"] = stored_tensors
 
         qformat = module.quant_format_id()

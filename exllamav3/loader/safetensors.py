@@ -188,6 +188,7 @@ class SafetensorsCollection:
     def list_tensors(
         self,
         prefix: str,
+        only_serializable: bool = False
     ) -> dict:
         assert self.new_tensors is None  # TODO
         keys = [
@@ -204,12 +205,13 @@ class SafetensorsCollection:
             results[key] = {
                 "shape": h["shape"],
                 "n_bytes": end - beg,
-                "dtype": str(dtype),
+                "dtype": str(dtype)
             }
+            if not only_serializable:
+                results[key]["torch_dtype"] = dtype
         return results
 
 
-    # TODO: deferred load
     def get_tensors(
         self,
         prefix: str,
@@ -225,7 +227,6 @@ class SafetensorsCollection:
         return result
 
 
-    # TODO: deferred load
     def get_tensor(
         self,
         key: str,
