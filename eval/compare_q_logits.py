@@ -68,7 +68,7 @@ def main(args):
         del logits
 
     collect_logits = torch.cat(collect_logits, dim = 0)
-    collect_logits = collect_logits.split(1, 0)
+    collect_logits = list(collect_logits.split(1, 0))
 
     print(f" -- Writing {args.out_logits}")
     save_tensor(collect_logits, args.out_logits)
