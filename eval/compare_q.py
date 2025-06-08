@@ -42,6 +42,10 @@ from compare_q_anyprecision import (
     load_anyprecision,
     fwd_anyprecision,
 )
+from compare_q_qtip import (
+    load_qtip,
+    fwd_qtip,
+)
 
 load_fns = {
     "transformers_auto_bf16": load_transformers_auto_bf16,
@@ -51,6 +55,7 @@ load_fns = {
     "exllamav3": load_exllamav3,
     "llamacpp": load_llamacpp,
     "anyprecision": load_anyprecision,
+    "qtip": load_qtip,
 }
 
 fwd_fns = {
@@ -59,6 +64,7 @@ fwd_fns = {
     "exllamav3": fwd_exllamav3,
     "llamacpp": fwd_llamacpp,
     "anyprecision": fwd_anyprecision,
+    "qtip": fwd_qtip,
 }
 
 tokenize_fns = {
@@ -230,6 +236,7 @@ def plot(results, args):
             "imat": "brown",
             "GGUF": "red",
             "VPTQ": "blue",
+            "QTIP": "teal",
             "****": "black",
         }
         for k, v in d.items():

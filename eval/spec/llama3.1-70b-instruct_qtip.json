@@ -1,0 +1,20 @@
+[
+    {
+        "model_dir": "/mnt/str/models/llama3.1-70b-instruct/qtip/2bit-hyb-yaqa",
+        "load_fn": "qtip",
+        "fwd_fn": "qtip",
+        "label": "QTIP 2bit-HYB-YAQA"
+    },
+    {
+        "model_dir": "/mnt/str/models/llama3.1-70b-instruct/qtip/3bit-hyb-yaqa",
+        "load_fn": "qtip",
+        "fwd_fn": "qtip",
+        "label": "QTIP 3bit-HYB-YAQA"
+    },
+    {
+        "model_dir": "/mnt/str/models/llama3.1-70b-instruct/qtip/4bit-hyb-yaqa",
+        "load_fn": "qtip",
+        "fwd_fn": "qtip",
+        "label": "QTIP 4bit-HYB-YAQA"
+    },
+]
