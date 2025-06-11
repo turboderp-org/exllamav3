@@ -4,4 +4,3 @@ from .tokenizer import Tokenizer, MMEmbedding
 from .cache import Cache, CacheLayer_fp16, CacheLayer_quant
 from .generator import Generator, Job, AsyncGenerator, AsyncJob
 from .generator.sampler import *
-from . import integration
