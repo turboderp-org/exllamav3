@@ -3,7 +3,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, Gemma3ForConditionalGeneration
-from exllamav3.integration import patch_transformers
+from exllamav3.integration.transformers import patch_transformers
 
 # At the moment, ExLlamaV3 integrates into Transformers by injecting a couple of classes into Transformers' lists
 # of recognized quantization formats. Expect this method to change
