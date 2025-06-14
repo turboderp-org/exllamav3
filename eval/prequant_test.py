@@ -201,8 +201,8 @@ def inspect_module(args, module):
         # bitrate = args.regularize_bits
         stddev = w.std(unbiased = False)
 
-        min_value = -stddev * 3
-        max_value = stddev * 3
+        min_value = -stddev * 4
+        max_value = stddev * 4
         bins = torch.empty((nbins // 2,), dtype = torch.long, device = w.device)
         ext.histogram(w, bins, min_value, max_value, False)
 
@@ -226,8 +226,8 @@ def inspect_module(args, module):
         )
 
         r_stddev = w.std(unbiased = False)
-        r_min_value = -r_stddev * 3
-        r_max_value = r_stddev * 3
+        r_min_value = -r_stddev * 4
+        r_max_value = r_stddev * 4
         r_bins = torch.empty((nbins // 2,), dtype = torch.long, device = w.device)
         ext.histogram(w, r_bins, r_min_value, r_max_value, False)
 
@@ -291,7 +291,12 @@ def main(args):
         config.stc.begin_deferred_load()
         module.load(torch.device(args.device) if not module.caps.get("prefer_cpu") else "cpu")
         config.stc.end_deferred_load()
-        inspect_module(args, module)
+        if (
+            (args.from_layer is None or idx >= args.from_layer) and
+            (args.to_layer is None or idx < args.to_layer) and
+            not args.no_inspect_modules
+        ):
+            inspect_module(args, module)
 
         # Forward pass
         print(f" -- Forward pass")
@@ -299,7 +304,8 @@ def main(args):
         params = {}
         state = module.prepare_for_device(state, params)
         state = module.forward(state, params)
-        inspect_state(args, state)
+        if (args.from_layer is None or idx >= args.from_layer) and (args.to_layer is None or idx < args.to_layer):
+            inspect_state(args, state)
 
         # Unload current module
         module.unload()
@@ -344,6 +350,9 @@ if __name__ == "__main__":
     parser.add_argument("-hb", "--histogram_bins", type = int, help = "Histogram bins", default = 160)
     parser.add_argument("-bos", "--bos", action = "store_true", help = "Add BOS token on each row")
     parser.add_argument("-skip", "--skip_tokens", type = int, help = "Skip tokens at start of context", default = 0)
+    parser.add_argument("-fl", "--from_layer", type = int, help = "From layer", default = None)
+    parser.add_argument("-tl", "--to_layer", type = int, help = "To layer", default = None)
+    parser.add_argument("-nim", "--no_inspect_modules", action = "store_true", help = "Skip module inspection")
     # parser.add_argument("-rb", "--regularize_bits", type = int, help = "Target bitrate for regularization test", default = 4)
     _args = parser.parse_args()
     main(_args)
