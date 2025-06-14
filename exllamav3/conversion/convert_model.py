@@ -376,8 +376,9 @@ def main(args, job_state):
 
             # Get submodules to quantize
             linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]
-            assert all(linear.key in strategy for linear in linears), \
-                f" ## Logic error, no quantization strategy for module"
+            for linear in linears:
+                assert linear.key in strategy, \
+                    f" ## Logic error, no quantization strategy for module {linear.key}"
             assert all(isinstance(linear.inner, LinearFP16) for linear in linears)
 
             # Write images
