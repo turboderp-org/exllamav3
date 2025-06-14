@@ -128,7 +128,7 @@ class BlockSparseMLP(Module):
                 in_features = intermediate_size,
                 out_features = hidden_size,
                 qmap = qmap + f".{idx}.down",
-                out_dtype = torch.half,
+                out_dtype = self.out_dtype,
                 allow_input_padding = True,
             )
 
@@ -262,8 +262,9 @@ class BlockSparseMLP(Module):
             def mlp(exp_i, xc):
                 g = self.gates[exp_i].forward(xc, params)
                 u = self.ups[exp_i].forward(xc, params)
-                self.activation_fn_call(g, u, u)
-                return self.downs[exp_i].forward(u, params)
+                a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
+                self.activation_fn_call(g, u, a)
+                return self.downs[exp_i].forward(a, params)
 
             for expert_idx in range(self.num_experts):
                 if expert_count[expert_idx] == 0:
