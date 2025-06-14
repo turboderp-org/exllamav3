@@ -345,7 +345,7 @@ class BlockSparseMLP(Module):
             #     selected_experts, routing_weights = routing_ds3(bsz, self.routing_cfg, y, params)
         else:
             # selected_experts, routing_weights = routing(bsz, self.routing_cfg, y, params)
-            selected_experts, routing_weights = ext.blocksparse_mlp_routing(bsz, self.routing_cfg, y, params, False)
+            selected_experts, routing_weights = ext.blocksparse_mlp_routing(bsz, self.routing_cfg, y, params)
 
         # Torch path
         if bsz > 1 or not self.is_quantized:
