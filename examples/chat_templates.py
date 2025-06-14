@@ -307,6 +307,45 @@ class PromptFormat_cohere(PromptFormat):
         ]
 
 
+class PromptFormat_dots(PromptFormat):
+    description = "Dots"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self):
+        return "You are a helpful assistant."
+
+    def format(self, system_prompt, messages):
+        context = ""
+        if system_prompt:
+            context += "<|system|>"
+            context += system_prompt
+            context += "<|endofsystem|>"
+        for (u, a) in messages:
+            context += "<|userprompt|>"
+            context += u
+            context += "<|endofuserprompt|>"
+            context += "<|response|>"
+            if a is not None:
+                context += a
+                context += "<|endofresponse|>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|endofresponse|>"),
+            "<|endofresponse|>",
+        ]
+
+    def thinktag(self):
+        return "<|sec-cot|>", "<|sec-end-cot|>"
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -317,4 +356,5 @@ prompt_formats = {
     "glm": PromptFormat_glm,
     "reka": PromptFormat_reka,
     "cohere": PromptFormat_cohere,
+    "dots": PromptFormat_dots,
 }
