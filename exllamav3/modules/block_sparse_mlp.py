@@ -12,6 +12,7 @@ from ..constants import MAX_MLP_INTERMEDIATE
 from ..util import first_not_none
 from ..util import profile_opt
 from dataclasses import dataclass
+from .mlp import MLP, GatedMLP
 
 
 @dataclass
@@ -76,6 +77,7 @@ class BlockSparseMLP(Module):
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
         interm_dtype: torch.dtype = None,
+        shared_experts: MLP | GatedMLP | None = None
     ):
         super().__init__(config, key, None)
 
@@ -150,6 +152,11 @@ class BlockSparseMLP(Module):
         self.routing_cfg = None
         self.experts_cfg = None
 
+        self.shared_experts = shared_experts
+        if shared_experts is not None:
+            self.register_submodule(shared_experts)
+
+
     @override
     def load(self, device: torch.Device, **kwargs):
         super().load(device, **kwargs)
@@ -168,9 +175,9 @@ class BlockSparseMLP(Module):
 
         # Make fused modules
         if self.is_quantized:
-            self.multi_gate = MultiLinear(self. device, self.gates)
-            self.multi_up = MultiLinear(self. device, self.ups)
-            self.multi_down = MultiLinear(self. device, self.downs)
+            self.multi_gate = MultiLinear(self.device, self.gates)
+            self.multi_up = MultiLinear(self.device, self.ups)
+            self.multi_down = MultiLinear(self.device, self.downs)
 
         router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
         routing_weights_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.half, device = self.device)
@@ -267,6 +274,8 @@ class BlockSparseMLP(Module):
                 final_hidden_states.index_add_(0, top_x, current_state)
 
             final_hidden_states = final_hidden_states.reshape(x.shape)
+            if self.shared_experts:
+                final_hidden_states += self.shared_experts.forward(x, params)
             return to2(final_hidden_states, out_dtype, self.out_dtype)
 
         # Fused path
@@ -329,3 +338,7 @@ class BlockSparseMLP(Module):
 
             final_hidden_states = cfg.out_d[:1, ...]
             return final_hidden_states.view(x.shape)
+            final_hidden_states = final_hidden_states.view(x.shape)
+            if self.shared_experts:
+                final_hidden_states += self.shared_experts.forward(x, params)
+            return final_hidden_states
