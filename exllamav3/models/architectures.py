@@ -1,6 +1,7 @@
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
+from .dots1 import Dots1Model
 from .gemma2 import Gemma2Model
 from .gemma3 import Gemma3Model, Gemma3TextModel
 from .glm4 import Glm4Model
@@ -23,6 +24,7 @@ ARCHITECTURES = {
         CohereModel,
         Cohere2Model,
         DeciLMModel,
+        Dots1Model,
         Gemma2Model,
         Gemma3Model,
         Gemma3TextModel,
