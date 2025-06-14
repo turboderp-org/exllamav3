@@ -57,7 +57,7 @@ class Linear(Module):
         self.frange = frange
         self.quant_type = None
         self.softcap = softcap
-        self.is_sliced = self.in_features != self.full_in_features or self.out_features != self.full_out_features
+        self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
         self.out_dtype = out_dtype
         self.post_scale = post_scale
         self.transposed_load = transposed_load
