@@ -64,17 +64,19 @@ class LinearEXL3:
 
 
     def get_tensors(self, key: str):
-        t = {}
-        # t[f"{key}.scale"] = torch.tensor([self.scale], dtype = torch.float, device = self.su.device)
-        if self.su is not None: t[f"{key}.su"] = self.su.contiguous()
-        if self.suh is not None: t[f"{key}.suh"] = self.suh.contiguous()
-        if self.sv is not None: t[f"{key}.sv"] = self.sv.contiguous()
-        if self.svh is not None: t[f"{key}.svh"] = self.svh.contiguous()
-        t[f"{key}.trellis"] = self.trellis.contiguous()
-        if self.bias is not None: t[f"{key}.bias"] = self.bias.contiguous()
-        if self.mcg_mult: t[f"{key}.mcg"] = self.mcg
-        if self.mul1_mult: t[f"{key}.mul1"] = self.mul1
-        return t
+        return {
+            f"{key}.{subkey}": tensor.contiguous()
+            for subkey, tensor in [
+                ("su", self.su),
+                ("sv", self.sv),
+                ("suh", self.suh),
+                ("svh", self.svh),
+                ("trellis", self.trellis),
+                ("bias", self.bias),
+                ("mcg", self.mcg),
+                ("mul1", self.mul1),
+            ] if tensor is not None
+        }
 
 
     def forward(
