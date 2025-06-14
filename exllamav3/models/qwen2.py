@@ -1,4 +1,4 @@
-from typing import override
+from typing_extensions import override
 from .llama import LlamaConfig, LlamaModel
 
 # Qwen2 is identical to Llama except for bias on Q, K and V projections, but Linear module automatically

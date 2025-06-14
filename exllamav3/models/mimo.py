@@ -1,4 +1,4 @@
-from typing import override
+from typing_extensions import override
 from .llama import LlamaConfig, LlamaModel
 
 # Identical to Llama except for MTP layers, ignored for now (TODO:)
