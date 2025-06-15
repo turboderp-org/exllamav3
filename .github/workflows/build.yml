@@ -26,7 +26,7 @@ jobs:
         # Ubuntu 20.04 CUDA
 
         # Python 3.10
-#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.11
           - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
@@ -40,19 +40,19 @@ jobs:
         # Windows 2022 CUDA
 
         # Python 3.10
-#          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.11
-#          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.12
-#          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.13
           - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # sdist
-#          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.7.0', cudaarch: ''                              }
+          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.7.0', cudaarch: ''                              }
 
       fail-fast: false
 
@@ -140,14 +140,19 @@ jobs:
           echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           echo "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-        # TODO: Find specific sub-packages
+      # "network" method is currently broken due to an NVIDIA driver dependency issue
+      # https://forums.developer.nvidia.com/t/nvidia-driver-570-installation-is-broken-again/335219
+      # "local" works but can only build one wheel per run due to a log artifact produced with the same filename by
+      # each job, during installation
+      # TODO: Find specific sub-packages
       - name: Install Linux CUDA ${{ matrix.cuda }}
         uses: Jimver/cuda-toolkit@v0.2.24
         id: cuda-toolkit-Linux
         with:
           cuda: "${{ matrix.cuda }}"
           linux-local-args: '["--toolkit"]'
-          method: "local"
+          # method: "local"
+          method: "network"
         if: runner.os != 'Windows' && matrix.cuda != ''
 
       - name: Install CUDA build Dependencies
