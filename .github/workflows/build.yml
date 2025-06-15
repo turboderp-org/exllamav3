@@ -139,6 +139,16 @@ jobs:
           echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           echo "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+        # Attempt to pin nvidia-persistenced to exactly 570.148.08-1ubuntu1 until dependency issue is fixed in CUDA
+        # https://forums.developer.nvidia.com/t/nvidia-driver-570-installation-is-broken-again/335219
+      - name: Pin nvidia-persistenced 570.148.08
+        if: runner.os != 'Windows' && matrix.cuda != ''
+        run: |
+          echo 'Package: nvidia-persistenced
+Pin: version 570.148.08-1ubuntu1
+Pin-Priority: 1001' | sudo tee /etc/apt/preferences.d/99-nvidia-persistenced
+          sudo apt-get update
   
         # TODO: Find specific sub-packages
       - name: Install Linux CUDA ${{ matrix.cuda }}
