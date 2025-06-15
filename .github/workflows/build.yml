@@ -145,14 +145,9 @@ jobs:
       - name: Pin nvidia-persistenced 570.148.08
         if: runner.os != 'Windows' && matrix.cuda != ''
         run: |
-          # Write an apt-preferences file that forces the exact build
-          sudo tee /etc/apt/preferences.d/99-nvidia-persistenced >/dev/null <<'EOF'
-          Package: nvidia-persistenced
-          Pin: version 570.148.08-1ubuntu1
-          Pin-Priority: 1001
-          EOF
-      
           sudo apt-get update
+          sudo apt-get install -y --allow-downgrades nvidia-persistenced=570.148.08-1ubuntu1
+          sudo apt-mark hold nvidia-persistenced
 
         # TODO: Find specific sub-packages
       - name: Install Linux CUDA ${{ matrix.cuda }}
