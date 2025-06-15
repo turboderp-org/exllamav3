@@ -165,7 +165,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --allow-downgrades nvidia-persistenced=575.57.08-0ubuntu1
           sudo apt-mark hold nvidia-persistenced
-          sudo apt-get install -y --allow-downgrades libnvidia-cfg1=575.57.08-0ubuntu1
           sudo apt-mark hold libnvidia-cfg1
 
         # TODO: Find specific sub-packages
