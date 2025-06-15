@@ -142,29 +142,29 @@ jobs:
 
         # Attempt to pin nvidia-persistenced to exactly 575.57.08-0ubuntu1 until dependency issue is fixed in CUDA
         # https://forums.developer.nvidia.com/t/nvidia-driver-570-installation-is-broken-again/335219
-      - name: Enable NVIDIA CUDA APT repo
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          UBUNTU=$(lsb_release -rs | tr -d '.')
-          DIST="ubuntu${UBUNTU}"
-          ARCH="x86_64"
-          sudo mkdir -p /usr/share/keyrings
-          curl -fsSL \
-            https://developer.download.nvidia.com/compute/cuda/repos/${DIST}/${ARCH}/cuda-archive-keyring.gpg |
-            sudo tee /usr/share/keyrings/cuda-archive-keyring.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] \
-            https://developer.download.nvidia.com/compute/cuda/repos/${DIST}/${ARCH}/ /" |
-            sudo tee /etc/apt/sources.list.d/cuda.list
-          sudo apt-get update -y
-
-      - name: Pin nvidia-persistenced 575.57.08-0ubuntu1
-        if: runner.os != 'Windows' && matrix.cuda != ''
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --allow-downgrades nvidia-persistenced=575.57.08-0ubuntu1 libnvidia-cfg1=575.57.08-0ubuntu1
-          sudo apt-mark hold nvidia-persistenced libnvidia-cfg1
+#      - name: Enable NVIDIA CUDA APT repo
+#        if: runner.os == 'Linux'
+#        shell: bash
+#        run: |
+#          set -euo pipefail
+#          UBUNTU=$(lsb_release -rs | tr -d '.')
+#          DIST="ubuntu${UBUNTU}"
+#          ARCH="x86_64"
+#          sudo mkdir -p /usr/share/keyrings
+#          curl -fsSL \
+#            https://developer.download.nvidia.com/compute/cuda/repos/${DIST}/${ARCH}/cuda-archive-keyring.gpg |
+#            sudo tee /usr/share/keyrings/cuda-archive-keyring.gpg >/dev/null
+#          echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] \
+#            https://developer.download.nvidia.com/compute/cuda/repos/${DIST}/${ARCH}/ /" |
+#            sudo tee /etc/apt/sources.list.d/cuda.list
+#          sudo apt-get update -y
+#
+#      - name: Pin nvidia-persistenced 575.57.08-0ubuntu1
+#        if: runner.os != 'Windows' && matrix.cuda != ''
+#        run: |
+#          sudo apt-get update
+#          sudo apt-get install -y --allow-downgrades nvidia-persistenced=575.57.08-0ubuntu1 libnvidia-cfg1=575.57.08-0ubuntu1
+#          sudo apt-mark hold nvidia-persistenced libnvidia-cfg1
 
         # TODO: Find specific sub-packages
       - name: Install Linux CUDA ${{ matrix.cuda }}
@@ -173,7 +173,7 @@ jobs:
         with:
           cuda: "${{ matrix.cuda }}"
           linux-local-args: '["--toolkit"]'
-          method: "network"
+          method: "local"
         if: runner.os != 'Windows' && matrix.cuda != ''
 
       - name: Install CUDA build Dependencies
