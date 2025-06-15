@@ -26,7 +26,7 @@ jobs:
         # Ubuntu 20.04 CUDA
 
         # Python 3.10
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.11
           - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
@@ -35,24 +35,24 @@ jobs:
           - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.13
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Windows 2022 CUDA
 
         # Python 3.10
-          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.11
-          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.12
-          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.13
-          - { artname: 'wheel', os: windows-2022, pyver: '3.13', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # sdist
-          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.7.0', cudaarch: ''                              }
+#          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.7.0', cudaarch: ''                              }
 
       fail-fast: false
 
@@ -139,32 +139,6 @@ jobs:
           echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           echo "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-        # Attempt to pin nvidia-persistenced to exactly 575.57.08-0ubuntu1 until dependency issue is fixed in CUDA
-        # https://forums.developer.nvidia.com/t/nvidia-driver-570-installation-is-broken-again/335219
-#      - name: Enable NVIDIA CUDA APT repo
-#        if: runner.os == 'Linux'
-#        shell: bash
-#        run: |
-#          set -euo pipefail
-#          UBUNTU=$(lsb_release -rs | tr -d '.')
-#          DIST="ubuntu${UBUNTU}"
-#          ARCH="x86_64"
-#          sudo mkdir -p /usr/share/keyrings
-#          curl -fsSL \
-#            https://developer.download.nvidia.com/compute/cuda/repos/${DIST}/${ARCH}/cuda-archive-keyring.gpg |
-#            sudo tee /usr/share/keyrings/cuda-archive-keyring.gpg >/dev/null
-#          echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] \
-#            https://developer.download.nvidia.com/compute/cuda/repos/${DIST}/${ARCH}/ /" |
-#            sudo tee /etc/apt/sources.list.d/cuda.list
-#          sudo apt-get update -y
-#
-#      - name: Pin nvidia-persistenced 575.57.08-0ubuntu1
-#        if: runner.os != 'Windows' && matrix.cuda != ''
-#        run: |
-#          sudo apt-get update
-#          sudo apt-get install -y --allow-downgrades nvidia-persistenced=575.57.08-0ubuntu1 libnvidia-cfg1=575.57.08-0ubuntu1
-#          sudo apt-mark hold nvidia-persistenced libnvidia-cfg1
 
         # TODO: Find specific sub-packages
       - name: Install Linux CUDA ${{ matrix.cuda }}
