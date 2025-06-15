@@ -142,16 +142,16 @@ jobs:
 
         # Attempt to pin nvidia-persistenced to exactly 570.148.08-1ubuntu1 until dependency issue is fixed in CUDA
         # https://forums.developer.nvidia.com/t/nvidia-driver-570-installation-is-broken-again/335219
-      - name: Pin nvidia-persistenced 570.148.08
-        if: runner.os != 'Windows' && matrix.cuda != ''
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --allow-downgrades nvidia-persistenced=570.148.08-1ubuntu1
-          sudo apt-mark hold nvidia-persistenced
+#      - name: Pin nvidia-persistenced 570.148.08
+#        if: runner.os != 'Windows' && matrix.cuda != ''
+#        run: |
+#          sudo apt-get update
+#          sudo apt-get install -y --allow-downgrades nvidia-persistenced=570.148.08-1ubuntu1
+#          sudo apt-mark hold nvidia-persistenced
 
         # TODO: Find specific sub-packages
       - name: Install Linux CUDA ${{ matrix.cuda }}
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.25
         id: cuda-toolkit-Linux
         with:
           cuda: "${{ matrix.cuda }}"
