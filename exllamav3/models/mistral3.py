@@ -66,13 +66,21 @@ class Mistral3Config(Config):
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX, config_dict = text_cfg)
 
         # Vision model settings
+        def unpack_patch_size(patch_temp: dict | int):
+            if isinstance(patch_temp, dict):
+                h, w = (patch_temp.get(x) for x in ["height", "width"])
+                assert w == h, f"Pixtral image preprocessor requires square patches, not {h} x {w}"
+                patch_temp = h
+            assert isinstance(patch_temp, int), "Unexpected type for patch_size"
+            return patch_temp
+
         self.vision = SimpleNamespace()
         self.vision.head_dim = self.read_cfg(int, ["vision_config->head_dim"], no_default)
         self.vision.num_q_heads = self.read_cfg(int, ["vision_config->num_attention_heads"], no_default)
         self.vision.num_kv_heads = self.read_cfg(int, ["vision_config->num_key_value_heads"], self.vision.num_q_heads)
         self.vision.multimodal_projector_bias = self.read_cfg(bool, ["multimodal_projector_bias"], False)
         self.vision.hidden_size = self.read_cfg(int, ["vision_config->hidden_size"], no_default)
-        self.vision.patch_size = self.read_cfg(int, ["vision_config->patch_size"], 14)
+        self.vision.patch_size = unpack_patch_size(self.read_cfg(object, ["vision_config->patch_size"], int(14)))
         self.vision.num_hidden_layers = self.read_cfg(int, ["vision_config->num_hidden_layers"], 24)
         self.vision.intermediate_size = self.read_cfg(int, ["vision_config->intermediate_size"], no_default)
         self.vision.merger_intermediate_size = self.vision.intermediate_size
@@ -94,7 +102,7 @@ class Mistral3Config(Config):
         with open(prep_path, encoding = "utf8") as f:
                 read_prep_config = json.load(f)
         image_processor_type = read_dict(read_prep_config, str, ["image_processor_type"], no_default)
-        assert image_processor_type == "PixtralImageProcessorFast", \
+        assert image_processor_type in ["PixtralImageProcessor", "PixtralImageProcessorFast"], \
             f"Wrong image processor type: {image_processor_type}"
         self.vision_pp = SimpleNamespace()
         self.vision_pp.image_mean = read_dict(read_prep_config, list, ["image_mean"], no_default)
@@ -102,7 +110,8 @@ class Mistral3Config(Config):
         self.vision_pp.resample = read_dict(read_prep_config, int, ["resample"], no_default)
         self.vision_pp.rescale_factor = read_dict(read_prep_config, float, ["rescale_factor"], no_default)
         self.vision_pp.size = read_dict(read_prep_config, dict, ["size"], no_default)
-        self.vision_pp.patch_size = read_dict(read_prep_config, int, ["patch_size"], no_default)
+        self.vision_pp.patch_size = unpack_patch_size(read_dict(read_prep_config, object, ["patch_size"], no_default))
+
         assert self.vision.patch_size == self.vision_pp.patch_size, \
             "Vision model and vision preprocessor patch sizes do not match"
 
