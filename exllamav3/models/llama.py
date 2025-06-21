@@ -106,6 +106,7 @@ class LlamaModel(Model):
                     key_gate = "gate_proj",
                     key_down = "down_proj",
                     qmap = "block.mlp",
+                    out_dtype = torch.float,
                 ),
             )
             for idx in range(config.num_hidden_layers)
