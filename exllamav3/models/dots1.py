@@ -143,7 +143,7 @@ class Dots1Model(Model):
                         qmap = "block.mlp",
                         interm_dtype = torch.half,
                         out_dtype = torch.float,
-                        deepseekv3_routing = True,
+                        router_type = "dots",
                         routed_scaling_factor = config.routed_scaling_factor,
                         n_group = 1,
                         topk_group = 1,

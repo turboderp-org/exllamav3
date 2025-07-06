@@ -29,7 +29,7 @@ class RoutingCFG:
     topk_group: int | None
 
 
-def routing(bsz, cfg, y, params):
+def routing_std(bsz, cfg, y, params):
     activate_all_experts = params.get("activate_all_experts")
 
     if bsz == 1 and not activate_all_experts:
@@ -55,7 +55,7 @@ def routing(bsz, cfg, y, params):
         return selected_experts, routing_weights
 
 
-# TODO: Optimize (for DS3)
+# TODO: Optimize top_k groups (for DS3)
 def routing_ds3(bsz, cfg, y, params):
     activate_all_experts = params.get("activate_all_experts")
     router_logits = torch.matmul(y, cfg.gate_tensor)
@@ -147,11 +147,12 @@ class BlockSparseMLP(Module):
         key_gate: str | None = None,
         key_down: str | None = None,
         key_routing_gate: str | None = None,
+        key_e_score_bias: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
         interm_dtype: torch.dtype = None,
-        deepseekv3_routing: bool = False,
+        router_type: str = "std",
         routed_scaling_factor: float | None = None,
         n_group: int | None = None,
         topk_group: int | None = None,
@@ -167,7 +168,6 @@ class BlockSparseMLP(Module):
         self.num_experts_per_tok = num_experts_per_tok
         self.hidden_size = hidden_size
 
-        self.deepseekv3_routing = deepseekv3_routing
         self.routed_scaling_factor = routed_scaling_factor
         self.n_group = n_group
         self.topk_group = topk_group
@@ -236,10 +236,17 @@ class BlockSparseMLP(Module):
         self.experts_cfg = None
 
         self.e_score_correction_bias = None
+        self.e_score_correction_bias_key = key_e_score_bias or "gate.e_score_correction_bias"
 
         self.shared_experts = shared_experts
         if shared_experts is not None:
             self.register_submodule(shared_experts)
+
+        match router_type:
+            case "std": self.routing_fn = routing_std
+            case "ds3": self.routing_fn = routing_ds3
+            case "dots": self.routing_fn = routing_dots
+            case _: raise ValueError(f"Unknown router type {router_type}")
 
 
     @override
@@ -247,7 +254,7 @@ class BlockSparseMLP(Module):
         super().load(device, **kwargs)
 
         self.e_score_correction_bias = \
-            self.config.stc.get_tensor(self.key + ".gate.e_score_correction_bias", self.device, optional = True)
+            self.config.stc.get_tensor(f"{self.key}.{self.e_score_correction_bias_key}", self.device, optional = True)
 
         # Test if experts can be fused
         num_exl3_tensors = 0
@@ -338,14 +345,7 @@ class BlockSparseMLP(Module):
         y = x.view(-1, self.hidden_size)
         bsz = y.shape[0]
 
-        if self.deepseekv3_routing:
-            if self.n_group == 1 and self.topk_group == 1:
-                selected_experts, routing_weights = routing_dots(bsz, self.routing_cfg, y, params)
-            # else:
-            #     selected_experts, routing_weights = routing_ds3(bsz, self.routing_cfg, y, params)
-        else:
-            # selected_experts, routing_weights = routing(bsz, self.routing_cfg, y, params)
-            selected_experts, routing_weights = ext.blocksparse_mlp_routing(bsz, self.routing_cfg, y, params)
+        selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, y, params)
 
         # Torch path
         if bsz > 1 or not self.is_quantized:
