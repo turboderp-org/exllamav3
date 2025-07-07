@@ -530,7 +530,8 @@ class Tokenizer:
 
         if test_count == 1 and len(test_piece) == len(" t"):
             vocab = self.tokenizer.decode_batch(
-                [[i] for i in range(self.raw_vocab_size())]
+                [[i] for i in range(self.raw_vocab_size())],
+                skip_special_tokens = False
             )
         else:
             prefix_id = self.tokenizer.encode(" ", add_special_tokens = False).ids[0]
