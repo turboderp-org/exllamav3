@@ -175,13 +175,13 @@ def main(args):
         if show_tps:
             prompt_tokens = ids.shape[-1]
             cached_tokens = r["cached_tokens"]
-            new_tokens = prompt_tokens - cached_tokens
-            prompt_tps = new_tokens / r["time_prefill"]
+            new_ctx_tokens = prompt_tokens - cached_tokens
+            prompt_tps = new_ctx_tokens / r["time_prefill"]
             new_tokens = r["new_tokens"]
             tps = new_tokens / r["time_generate"]
             print(
                 "\n"
-                f"Context: {col_info}{new_tokens:,}{col_default} new tokens at {col_info}{prompt_tps:.3f}{col_default} t/s - "
+                f"Context: {col_info}{new_ctx_tokens:,}{col_default} new tokens at {col_info}{prompt_tps:.3f}{col_default} t/s - "
                 f"{col_info}{cached_tokens:,}{col_default} tokens cached - "
                 f"Generate: {col_info}{new_tokens:,}{col_default} tokens at {col_info}{tps:.3f}{col_default} t/s"
             )
