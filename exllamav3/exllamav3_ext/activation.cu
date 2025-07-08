@@ -10,6 +10,13 @@
 #define ACT_SILU 0
 #define ACT_GELU 1
 
+__device__ inline half2 clamp_half2_to_finite(half2 v)
+{
+    const half2 max_h2 = __float2half2_rn(65504.0f);
+    const half2 min_h2 = __float2half2_rn(-65504.0f);
+    return __hmax2(__hmin2(v, max_h2), min_h2);
+}
+
 __device__ __forceinline__ half _silu(half x)
 {
     half one = __float2half(1.0f);
@@ -114,7 +121,9 @@ void act_mul_kernel_f
 
     x2.x *= y2.x;
     x2.y *= y2.y;
-    ((half2*) z)[idx] = __float22half2_rn(x2);
+    half2 r = __float22half2_rn(x2);
+    r = clamp_half2_to_finite(r);
+    ((half2*) z)[idx] = r;
 }
 
 // silu(x) * y -> z, in-place if z == x or z == y
