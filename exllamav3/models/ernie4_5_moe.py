@@ -130,7 +130,7 @@ class Ernie4_5MoEModel(Model):
                         key_routing_gate = "gate",
                         key_e_score_bias = "moe_statics.e_score_correction_bias",
                         qmap = "block.mlp",
-                        interm_dtype = torch.half,
+                        interm_dtype = torch.float,
                         out_dtype = torch.float,
                         routed_scaling_factor = 1.0,
                         n_group = 1,
