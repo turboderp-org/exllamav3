@@ -1,0 +1,34 @@
+sources:
+  - id: A
+    model_dir: /mnt/str/models/ernie-4.5-300b-a47b-base-pt/exl3/3.0bpw/
+overrides:
+  - key: "*.self_attn.*"
+    source: A
+  - key: "model.layers.0.*"
+    source: A
+  - key: "model.layers.1.*"
+    source: A
+  - key: "model.layers.2.*"
+    source: A
+  - key: "model.layers.7.*"
+    source: A
+  - key: "model.layers.42.*"
+    source: A
+  - key: "model.layers.38.*"
+    source: A
+  - key: "model.layers.41.*"
+    source: A
+  - key: "model.layers.37.*"
+    source: A
+  - key: "model.layers.36.*"
+    source: A
+  - key: "model.layers.34.*"
+    source: A
+  - key: "model.layers.39.*"
+    source: A
+  - key: "model.layers.33.*"
+    source: A
+  - key: "model.layers.40.*"
+    source: A
+  - key: "model.layers.35.*"
+    source: A

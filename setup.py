@@ -93,7 +93,8 @@ setup(
         "rich",
         "typing_extensions",
         "ninja",
-        "safetensors>=0.3.2"
+        "safetensors>=0.3.2",
+        "pyyaml"
     ],
     include_package_data=True,
     package_data = {

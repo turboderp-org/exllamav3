@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 import os, json
 from ..util.rope import RopeSettings, RopeStyle
-from ..loader import SafetensorsCollection, VariantSafetensorsCollection
+from ..loader import SafetensorsCollection
 from ..util.file import read_dict, no_value, no_default
 import uuid
 
@@ -46,13 +46,8 @@ class Config(ABC):
             f"Unexpected architecture {arch} in {self.config_filename}, should be {self.arch_string}."
         self.architecture = arch
 
-        # Special mode to load tensors from across multiple variants of the same model
-        if kwargs.get("st_variants"):
-            self.stc = VariantSafetensorsCollection(kwargs.get("st_variants"))
-
         # Collect all .safetensors files in directory
-        else:
-            self.stc = SafetensorsCollection(directory, load_method = kwargs.get("load_method"))
+        self.stc = SafetensorsCollection(directory, load_method = kwargs.get("load_method"))
 
         # Standard params, vocab
         self.bos_token_id = self.read_cfg(int, "bos_token_id", None)

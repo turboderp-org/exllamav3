@@ -1,7 +1,9 @@
 from . import Model, Config, Cache, Tokenizer
+from .loader import SafetensorsCollection, VariantSafetensorsCollection
 from .cache import CacheLayer_fp16, CacheLayer_quant
 from argparse import ArgumentParser
 import torch
+import yaml
 
 def add_args(
     parser: ArgumentParser,
@@ -23,6 +25,7 @@ def add_args(
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
+    parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
@@ -73,6 +76,28 @@ def init(
     # Config
     config = Config.from_directory(args.model_dir)
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
+
+    # Override tensors
+    if args.override:
+        with open(args.override, "r") as f:
+            comp = yaml.safe_load(f)
+        sources = {s["id"]: s["model_dir"] for s in comp["sources"]}
+        overrides = {o["key"]: sources[o["source"]] for o in comp["overrides"]}
+        collections = {}
+        for o_key, o_dir in overrides.items():
+            if o_dir not in collections:
+                collections[o_dir] = []
+            collections[o_dir].append(o_key)
+        if len(collections):
+            vstc = VariantSafetensorsCollection(config.stc)
+            for o_dir, o_keys in collections.items():
+                printp(not quiet, f" -- Overriding from: {o_dir}:")
+                for o_key in o_keys:
+                    printp(not quiet, f"      {o_key}")
+                vstc.add_stc(o_keys, SafetensorsCollection(o_dir))
+            config.stc = vstc
+
+    # Model instance
     model = Model.from_config(config)
 
     # Cache
