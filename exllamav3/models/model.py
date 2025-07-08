@@ -346,13 +346,13 @@ class Model:
 
             if not upd:
                 if reserve_per_device is None:
-                    reserve_per_device = [0.25] * num_devices
+                    reserve_per_device = [0.5] * num_devices
                 elif any(isinstance(reserve_per_device, t) for t in [float, int]):
                     reserve_per_device = [reserve_per_device] * num_devices
                 elif not isinstance(reserve_per_device, list):
                     raise ValueError("reserve_per_device must be float or list[float]")
                 while len(reserve_per_device) < num_devices:
-                    reserve_per_device.append(0.25)
+                    reserve_per_device.append(0.5)
                 reserve_per_device = [int(x * 1024**3) for x in reserve_per_device]
                 active_devices = [
                     i for i in range(num_devices)
