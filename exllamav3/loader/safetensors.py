@@ -1,7 +1,5 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
-
 import torch
 import os, glob
 import numpy as np
@@ -186,16 +184,23 @@ class SafetensorsCollection:
         return bytesize
 
 
+    @lru_cache
+    def get_tensor_file_map_trie(self):
+        import marisa_trie
+        trie = marisa_trie.Trie(self.tensor_file_map.keys())
+        return trie
+
+
     def list_tensors(
         self,
         prefix: str,
         only_serializable: bool = False
     ) -> dict:
         assert self.new_tensors is None  # TODO
-        keys = [
-            key for key in self.tensor_file_map.keys()
-            if key == prefix or key.startswith(prefix + ".")
-        ]
+        keys = [self.tensor_file_map.get(prefix)]
+        if keys[0] is None:
+            keys = []
+        keys += self.get_tensor_file_map_trie().keys(prefix + ".")
         results = {}
         for key in keys:
             filename = self.tensor_file_map[key]
@@ -220,10 +225,10 @@ class SafetensorsCollection:
         allow_bf16: bool = False,
     ) -> dict:
         assert self.new_tensors is None  # TODO
-        keys = [
-            key for key in self.tensor_file_map.keys()
-            if key == prefix or key.startswith(prefix + ".")
-        ]
+        keys = [self.tensor_file_map.get(prefix)]
+        if keys[0] is None:
+            keys = []
+        keys += self.get_tensor_file_map_trie().keys(prefix + ".")
         result = {key: self.get_tensor(key, device, allow_bf16 = allow_bf16) for key in keys}
         return result
 
@@ -481,6 +486,10 @@ class SafetensorsCollection:
         self.deferred_loads = []
 
 
+    def find_stc(self, key):
+        return self
+
+
 # noinspection PyMissingConstructor
 class VariantSafetensorsCollection(SafetensorsCollection):
 
@@ -535,10 +544,10 @@ class VariantSafetensorsCollection(SafetensorsCollection):
         self,
         prefix: str,
     ):
-        keys = [
-            key for key in self.main.tensor_file_map.keys()
-            if key == prefix or key.startswith(prefix + ".")
-        ]
+        keys = [self.main.tensor_file_map.get(prefix)]
+        if keys[0] is None:
+            keys = []
+        keys += self.main.get_tensor_file_map_trie().keys(prefix + ".")
         sizes = [self.get_tensor_size(key) for key in keys]
         return sizes
 
@@ -557,10 +566,10 @@ class VariantSafetensorsCollection(SafetensorsCollection):
         prefix: str,
         only_serializable: bool = False
     ) -> dict:
-        keys = [
-            key for key in self.main.tensor_file_map.keys()
-            if key == prefix or key.startswith(prefix + ".")
-        ]
+        keys = [self.main.tensor_file_map.get(prefix)] or []
+        if keys[0] is None:
+            keys = []
+        keys += self.main.get_tensor_file_map_trie().keys(prefix + ".")
         results = {}
         for key in keys:
             stc = self.find_stc(key)

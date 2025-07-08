@@ -8,3 +8,4 @@ safetensors>=0.3.2
 ninja
 pillow
 pyyaml
+marisa_trie

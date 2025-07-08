@@ -94,7 +94,8 @@ setup(
         "typing_extensions",
         "ninja",
         "safetensors>=0.3.2",
-        "pyyaml"
+        "pyyaml",
+        "marisa_trie"
     ],
     include_package_data=True,
     package_data = {
