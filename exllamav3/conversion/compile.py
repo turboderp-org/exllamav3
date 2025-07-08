@@ -20,9 +20,12 @@ def compile_model(args, model, config, tokenizer):
 
     in_dir = args["in_dir"]
     out_dir = args["out_dir"]
-    work_dir = args["work_dir"]
-    qtensors_dir = os.path.join(work_dir, "qtensors")
-    qtensors_stc = SafetensorsCollection(qtensors_dir)
+    if args.get("model_stc"):
+        qtensors_stc = config.stc
+    else:
+        work_dir = args["work_dir"]
+        qtensors_dir = os.path.join(work_dir, "qtensors")
+        qtensors_stc = SafetensorsCollection(qtensors_dir)
 
     # Prepare output directory
     if not os.path.exists(out_dir):
@@ -140,24 +143,29 @@ def compile_model(args, model, config, tokenizer):
     print(f" -- Writing config.json")
     with open(os.path.join(in_dir, "config.json"), "r") as f:
         config_dict = json.load(f)
-    qcfg = {
-        "quant_method": "exl3",
-        "version": __version__,
-        "bits": args["bits"],
-        "head_bits": args["head_bits"],
-        "calibration": {
-            "rows": args["cal_rows"],
-            "cols": args["cal_cols"],
-        },
-        "out_scales": {True: "always", False: "never", None: "auto"}[args["apply_out_scales"]],
-    }
-    if any(args.get(x) for x in ["mcg_multiplier", "mul1_multiplier"]):
-        exp_qcfg = {}
-        if args.get("mcg_multiplier"):
-            exp_qcfg["mcg_multiplier"] = args.get("mcg_multiplier")
-        if args.get("mul1_multiplier"):
-            exp_qcfg["mul1_multiplier"] = args.get("mul1_multiplier")
-        qcfg["experimental_options"] = exp_qcfg
+    if "quantization_config" in config_dict:
+        qcfg = config_dict["quantization_config"]
+        qcfg["bits"] = args["bits"]
+        qcfg["head_bits"] = args["head_bits"]
+    else:
+        qcfg = {
+            "quant_method": "exl3",
+            "version": __version__,
+            "bits": args["bits"],
+            "head_bits": args["head_bits"],
+            "calibration": {
+                "rows": args["cal_rows"],
+                "cols": args["cal_cols"],
+            },
+            "out_scales": {True: "always", False: "never", None: "auto"}[args["apply_out_scales"]],
+        }
+        if any(args.get(x) for x in ["mcg_multiplier", "mul1_multiplier"]):
+            exp_qcfg = {}
+            if args.get("mcg_multiplier"):
+                exp_qcfg["mcg_multiplier"] = args.get("mcg_multiplier")
+            if args.get("mul1_multiplier"):
+                exp_qcfg["mul1_multiplier"] = args.get("mul1_multiplier")
+            qcfg["experimental_options"] = exp_qcfg
 
     update_config(config_dict)
     config_dict["quantization_config"] = qcfg
@@ -169,5 +177,3 @@ def compile_model(args, model, config, tokenizer):
     create_quantization_config_json(out_dir)
 
     print(f" -- Finished compiling model to {out_dir}")
-
-

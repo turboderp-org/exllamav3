@@ -435,10 +435,16 @@ class Model:
         head_numel = 0
         for module in self:
             if module.key.endswith("lm_head"):
-                head_bpw = get_tensor_size(module.get_tensors()) / module.weights_numel()
+                if module.device is not None:
+                    head_bpw = get_tensor_size(module.get_tensors()) / module.weights_numel()
+                else:
+                    head_bpw = sum(self.config.stc.get_tensor_sizes(module.key)) / module.weights_numel() * 8
                 head_numel = module.weights_numel()
             elif isinstance(module, Linear):
-                sum_bits += get_tensor_size(module.get_tensors())
+                if module.device is not None:
+                    sum_bits += get_tensor_size(module.get_tensors())
+                else:
+                    sum_bits += sum(self.config.stc.get_tensor_sizes(module.key)) * 8
                 sum_numel += module.weights_numel()
         vram_bits = head_numel * head_bpw + sum_bits
         return sum_bits / sum_numel, head_bpw, vram_bits

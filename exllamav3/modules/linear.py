@@ -284,7 +284,7 @@ class Linear(Module):
         if params["capture"][self.qmap]["first_key"] == self.key:
             rows = np.prod(x.shape[:-1])
             dim = x.shape[-1]
-            x = x.view((rows, dim)).to(torch.float, copy = True)
+            x = x.view((rows, dim)).to(torch.float, copy = True)  # TODO: Why copy here?
 
             params["capture"][self.qmap]["H"].addmm_(x.T, x)
             params["capture"][self.qmap]["count"] += rows
