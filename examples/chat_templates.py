@@ -346,6 +346,40 @@ class PromptFormat_dots(PromptFormat):
         return "<|sec-cot|>", "<|sec-end-cot|>"
 
 
+class PromptFormat_ernie(PromptFormat):
+    description = "Ernie"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self):
+        return "You are a helpful assistant."
+
+    def format(self, system_prompt, messages):
+        context = "<|begin_of_sentence|>"
+        if system_prompt:
+            context += system_prompt
+            context += "\n"
+        for (u, a) in messages:
+            context += "User: "
+            context += u
+            context += "\n"
+            context += "Assistant: "
+            if a is not None:
+                context += a
+                context += "<|end_of_sentence|>"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|end_of_sentence|>")
+        ]
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -357,4 +391,5 @@ prompt_formats = {
     "reka": PromptFormat_reka,
     "cohere": PromptFormat_cohere,
     "dots": PromptFormat_dots,
+    "ernie": PromptFormat_ernie,
 }
