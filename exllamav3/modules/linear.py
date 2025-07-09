@@ -138,8 +138,12 @@ class Linear(Module):
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
-                weight.T,
+                weight.T.contiguous(),
                 bias,
+                self.full_in_features,
+                self.full_out_features,
+                self.first_in_feature,
+                self.first_out_feature,
                 out_dtype = self.out_dtype
             )
             self.quant_type = "fp16"
