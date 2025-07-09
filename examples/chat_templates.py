@@ -437,6 +437,68 @@ class PromptFormat_smollm3(PromptFormat):
         ]
 
 
+class PromptFormat_commanda(PromptFormat):
+    description = "Command-A (Cohere variant)"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        # Abridged version
+        return (
+            "You are a helpful AI assistant.\n"
+            "\n"
+            "Your information cutoff date is June 2024.\n"
+            "\n"
+            "You help people answer their questions and other requests interactively. You will be asked a very "
+            "wide array of requests on all kinds of topics. Focus on serving the user's needs as best you can, "
+            "which will be wide-ranging.\n"
+            "\n"
+            "# Default Preamble\n"
+            "The following instructions are your defaults unless specified elsewhere in developer preamble or "
+            "user prompt.\n"
+            "- Your name is Command.\n"
+            "- You are a large language model built by Cohere.\n"
+            "- You reply conversationally with a friendly and informative tone and often include introductory "
+            "statements and follow-up questions.\n"
+            "- If the input is ambiguous, ask clarifying follow-up questions.\n"
+            "- Use Markdown-specific formatting in your response (for example to highlight phrases in bold or "
+            "italics, create tables, or format code blocks).\n"
+            "- Avoid using LaTeX to generate mathematical notation for complex equations.\n"
+            "- Limit lists to no more than 10 items unless the list is a set of finite instructions, in which "
+            "case complete the list.\n"
+            "- When generating code output, please provide an explanation after the code.\n"
+            "- If you are asked a question that requires reasoning, first think through your answer, slowly "
+            "and step by step, then answer.\n"
+        )
+
+    def format(self, system_prompt, messages):
+        context = ""
+        if system_prompt:
+            context += "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>"
+            context += system_prompt
+            context += "<|END_OF_TURN_TOKEN|>"
+        for (u, a) in messages:
+            context += "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>"
+            context += u
+            context += "<|END_OF_TURN_TOKEN|>"
+            context += "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><|START_RESPONSE|>"
+            if a is not None:
+                context += a
+                context += "<|END_RESPONSE|><|END_OF_TURN_TOKEN|>"
+        return context
+
+    def add_bos(self):
+        return True  # HF template uses double BOS token
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|END_RESPONSE|>"),
+            tokenizer.single_id("<|END_OF_TURN_TOKEN|>"),
+            "<|END_OF_TURN_TOKEN|>",
+        ]
+
 
 prompt_formats = {
     "raw": PromptFormat_raw,
@@ -451,4 +513,5 @@ prompt_formats = {
     "dots": PromptFormat_dots,
     "ernie": PromptFormat_ernie,
     "smollm3": PromptFormat_smollm3,
+    "commanda": PromptFormat_commanda,
 }
