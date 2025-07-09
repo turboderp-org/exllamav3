@@ -22,7 +22,7 @@ def main(args):
     user_name = args.user_name
     bot_name = args.bot_name
     prompt_format = prompt_formats[args.mode](user_name, bot_name)
-    system_prompt = prompt_format.default_system_prompt() if not args.system_prompt else args.system_prompt
+    system_prompt = prompt_format.default_system_prompt(args.think) if not args.system_prompt else args.system_prompt
     add_bos = prompt_format.add_bos()
     max_response_tokens = args.max_response_tokens
     multiline = args.multiline

@@ -3,7 +3,7 @@ class PromptFormat:
     def __init__(self, user_name, bot_name):
         self.user_name = user_name
         self.bot_name = bot_name
-    def default_system_prompt(self):
+    def default_system_prompt(self, think):
         raise NotImplementedError()
     def format(self, system_prompt, messages):
         raise NotImplementedError()
@@ -19,7 +19,7 @@ class PromptFormat_raw(PromptFormat):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def default_system_prompt(self):
+    def default_system_prompt(self, think):
         return (
             f"This is a conversation between a helpful AI assistant " +
             (f"named {self.bot_name} " if self.bot_name != "Assistant" else "") +
@@ -54,7 +54,7 @@ class PromptFormat_llama3(PromptFormat):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def default_system_prompt(self):
+    def default_system_prompt(self, think):
         return (
             """Assist users with tasks and answer questions to the best of your knowledge. Provide helpful and informative """
             """responses. Be conversational and engaging. If you are unsure or lack knowledge on a topic, admit it and try """
@@ -87,7 +87,7 @@ class PromptFormat_chatml(PromptFormat):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def default_system_prompt(self):
+    def default_system_prompt(self, think):
         return (
             f"You are {self.bot_name}, a large language model. Answer as concisely as possible."
         )
@@ -117,7 +117,7 @@ class PromptFormat_phi(PromptFormat):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def default_system_prompt(self):
+    def default_system_prompt(self, think):
         return (
             f"You are a helpful AI assistant."
         )
@@ -146,7 +146,7 @@ class PromptFormat_glm(PromptFormat):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def default_system_prompt(self):
+    def default_system_prompt(self, think):
         return (
             f"You are a helpful AI assistant."
         )
@@ -175,7 +175,7 @@ class PromptFormat_mistral(PromptFormat):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def default_system_prompt(self):
+    def default_system_prompt(self, think):
         return (
             """You are a helpful AI assistant."""
         )
@@ -207,7 +207,7 @@ class PromptFormat_gemma(PromptFormat):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def default_system_prompt(self):
+    def default_system_prompt(self, think):
         return ""
 
     def format(self, system_prompt, messages):
@@ -235,7 +235,7 @@ class PromptFormat_reka(PromptFormat):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def default_system_prompt(self):
+    def default_system_prompt(self, think):
         return ""
 
     def format(self, system_prompt, messages):
@@ -270,7 +270,7 @@ class PromptFormat_cohere(PromptFormat):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def default_system_prompt(self):
+    def default_system_prompt(self, think):
         return (
             "## Task and Context\n"
             "You help people answer their questions and other requests interactively. You will be asked a very "
@@ -313,7 +313,7 @@ class PromptFormat_dots(PromptFormat):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def default_system_prompt(self):
+    def default_system_prompt(self, think):
         return "You are a helpful assistant."
 
     def format(self, system_prompt, messages):
@@ -352,7 +352,7 @@ class PromptFormat_ernie(PromptFormat):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def default_system_prompt(self):
+    def default_system_prompt(self, think):
         return "You are a helpful assistant."
 
     def format(self, system_prompt, messages):
@@ -380,6 +380,64 @@ class PromptFormat_ernie(PromptFormat):
         ]
 
 
+class PromptFormat_smollm3(PromptFormat):
+    description = "SmolLM3 format (ChatML)"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        from datetime import datetime
+        today_str = datetime.today().strftime("%d %B %Y")
+        sp = (
+            "## Metadata\n"
+            "\n"
+            "Knowledge Cutoff Date: June 2025\n"
+            f"Today Date: {today_str}\n"
+            f"Reasoning Mode: {'/think' if think else '/no_think'}\n"
+            "\n"
+            "## Custom Instructions\n"
+            "\n"
+        )
+        if think:
+            sp += (
+                "You are a helpful AI assistant named SmolLM, trained by Hugging Face. Your role as an assistant involves "
+                "thoroughly exploring questions through a systematic thinking process before providing the final precise "
+                "and accurate solutions. This requires engaging in a comprehensive cycle of analysis, summarizing, "
+                "exploration, reassessment, reflection, backtracking, and iteration to develop well-considered thinking "
+                "process. Please structure your response into two main sections: Thought and Solution using the specified "
+                "format: <think> Thought section </think> Solution section. In the Thought section, detail your reasoning "
+                "process in steps. Each step should include detailed considerations such as analysing questions, "
+                "summarizing relevant findings, brainstorming new ideas, verifying the accuracy of the current steps, "
+                "refining any errors, and revisiting previous steps. In the Solution section, based on various attempts, "
+                "explorations, and reflections from the Thought section, systematically present the final solution that "
+                "you deem correct. The Solution section should be logical, accurate, and concise and detail necessary "
+                "steps needed to reach the conclusion.\n\n"
+            )
+        else:
+            sp += "You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\n"
+        return sp
+
+    def format(self, system_prompt, messages):
+        context = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        for (u, a) in messages:
+            context += f"<|im_start|>user\n{u}<|im_end|>\n"
+            context += f"<|im_start|>assistant\n"
+            if a is not None: context += f"{a}<|im_end|>\n"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|im_end|>"),
+            """<|im_end|>"""
+        ]
+
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -392,4 +450,5 @@ prompt_formats = {
     "cohere": PromptFormat_cohere,
     "dots": PromptFormat_dots,
     "ernie": PromptFormat_ernie,
+    "smollm3": PromptFormat_smollm3,
 }
