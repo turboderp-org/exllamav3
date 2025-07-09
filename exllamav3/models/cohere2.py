@@ -109,6 +109,8 @@ class Cohere2Model(Model):
                     key = f"model.layers.{idx}.mlp",
                     hidden_size = config.hidden_size,
                     intermediate_size = config.intermediate_size,
+                    interm_dtype = torch.float,
+                    out_dtype = torch.float,
                     key_up = "up_proj",
                     key_gate = "gate_proj",
                     key_down = "down_proj",
