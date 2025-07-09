@@ -240,8 +240,9 @@ class GatedMLP(Module):
         for s in r:
             g = self.gates[s].forward(x, params)
             u = self.ups[s].forward(x, params)
-            self.activation_fn_call(g, u, u)
-            d_ = self.downs[s].forward(u, params)
+            a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+            self.activation_fn_call(g, u, a)
+            d_ = self.downs[s].forward(a, params)
             if d is None: d = d_
             else: d += d_
             del d_
