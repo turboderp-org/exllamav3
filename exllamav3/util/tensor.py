@@ -5,7 +5,7 @@ class SeqTensor:
 
     PAGE_SIZE = 256
 
-    tensor: torch.Tensor
+    tensor: torch.Tensor | None
     seq_dim: int
     seq_len: int
     seq_cap: int
@@ -28,13 +28,23 @@ class SeqTensor:
         shape = list(shape)
         shape[seq_dim] = self.seq_cap = init_cap
         shape = tuple(shape)
-        self.tensor = torch.empty(shape, dtype = dtype, device = device)
+        # Lazily allocate inner Tensor object to avoid committing too much virtual memory, which can crash the
+        # process on Windows
+        # self.tensor = torch.empty(shape, dtype = dtype, device = device)
+        self.init_shape = shape
+        self.dtype = dtype
+        self.device = device
+        self.tensor = None
 
     def __len__(self):
         return self.seq_len
 
     def __bool__(self):
         return self.seq_len > 0
+
+    def _ensure_init(self):
+        if self.tensor is None:
+            self.tensor = torch.empty(self.init_shape, dtype = self.dtype, device = self.device)
 
     @staticmethod
     def from_tensor(tensor: torch.Tensor, seq_dim: int):
@@ -56,6 +66,7 @@ class SeqTensor:
         self.append(new_data)
 
     def append(self, new_data: SeqTensor | torch.tensor | None):
+        self._ensure_init()
         if new_data is None: return
         if isinstance(new_data, SeqTensor):
             new_data = new_data.torch()
@@ -78,6 +89,7 @@ class SeqTensor:
         self.seq_len = new_len
 
     def torch(self):
+        self._ensure_init()
         s = self.tensor.narrow(self.seq_dim, 0, self.seq_len)
         return s
 
@@ -85,6 +97,7 @@ class SeqTensor:
         return SeqTensor.from_tensor(self.torch_slice(a, b), self.seq_dim)
 
     def torch_slice(self, a: int | None, b: int | None):
+        self._ensure_init()
         if a is None and b is None:
             return self.torch()
         elif b is None:

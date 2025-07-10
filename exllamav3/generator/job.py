@@ -16,10 +16,11 @@ from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
 from ..util import profile_opt
 from ..tokenizer import MMEmbedding
+from functools import lru_cache
 
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
-def _strings_to_utf32(strings: list[str]) -> tuple[np.ndarray, np.ndarray] | None:
-
+@lru_cache(100)
+def _strings_to_utf32(strings: tuple[str]) -> tuple[np.ndarray, np.ndarray] | None:
     if not strings: return bytearray(), None
 
     encoded_strings = [s.encode("utf-32-le") for s in strings]
@@ -199,7 +200,7 @@ class Job:
                 else:
                     raise ValueError("Unsupported type in stop_conditions")
             self.stop_strings_utf32_buffer, self.stop_strings_utf32_offsets = \
-                _strings_to_utf32(list(self.stop_strings))
+                _strings_to_utf32(tuple(list(self.stop_strings)))
         else:
             self.stop_strings_utf32_buffer, self.stop_strings_utf32_offsets = None, None
 
@@ -213,7 +214,7 @@ class Job:
             #     "Cannot combine banned strings with filters"
             self.banned_strings = [s.lower() for s in banned_strings]
             self.banned_strings_utf32_buffer, self.banned_strings_utf32_offsets = \
-                _strings_to_utf32(self.banned_strings)
+                _strings_to_utf32(tuple(self.banned_strings))
         else:
             self.banned_strings = []
             self.banned_strings_utf32_buffer, self.banned_strings_utf32_offsets = None, None
@@ -245,9 +246,7 @@ class Job:
 
         # Pinned buffer for IDs during sampling
         self.current_pinned_ids = None
-        if self.sampler.reqs_past_ids:
-            max_ids = max(len(seq.sequence_ids) for seq in self.sequences) + self.max_new_tokens + 8
-            self.pinned_ids = torch.empty((1, max_ids), dtype = torch.long, pin_memory = True)
+        self.pinned_ids = None  # Lazy alloc
 
 
     def __repr__(self):
@@ -910,5 +909,8 @@ class Job:
     def prepare_sampling_past_ids(self):
         if not self.sampler.reqs_past_ids:
             return
+        if self.pinned_ids is None:
+            max_ids = max(len(seq.sequence_ids) for seq in self.sequences) + self.max_new_tokens + 8
+            self.pinned_ids = torch.empty((1, max_ids), dtype = torch.long, pin_memory = True)
         self.current_pinned_ids = self.pinned_ids[:, :len(self.sequences[0].sequence_ids)]
         self.current_pinned_ids.copy_(self.sequences[0].sequence_ids.torch())
