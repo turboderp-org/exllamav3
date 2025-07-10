@@ -36,9 +36,13 @@ def read_input_rich(args, user_name, multiline: bool):
     user_prompt = Prompt.ask("\n" + col_user + user_name + col_default)
     return user_prompt
 
-def read_input_ptk(args, user_name, multiline: bool):
+def read_input_ptk(args, user_name, multiline: bool, prefix: str = None):
     print()
-    user_prompt = ptk_prompt(ANSI(col_user + user_name + col_default + ": "), multiline = multiline)
+    user_prompt = ptk_prompt(
+        ANSI(col_user + user_name + col_default + ": "),
+        multiline = multiline,
+        default = prefix or ""
+    )
     return user_prompt
 
 class Streamer_basic:
