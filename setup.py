@@ -95,7 +95,9 @@ setup(
         "ninja",
         "safetensors>=0.3.2",
         "pyyaml",
-        "marisa_trie"
+        "marisa_trie",
+        "kbnf>=0.4.2",
+        "formatron>=0.5.0"
     ],
     include_package_data=True,
     package_data = {

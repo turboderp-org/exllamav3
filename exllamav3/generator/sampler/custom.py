@@ -478,8 +478,7 @@ class CustomSampler(Sampler):
         sequence_ids: torch.Tensor | None = None,
         rand_u32: int | None = None,
         tokenizer: Tokenizer | None = None,
-        blocked_tokens: list[int] | None = None,
-        allowed_tokens: list[int] | None = None,
+        logit_mask: torch.Tensor | None = None,
         return_state: bool = False
     ):
         out_shape = logits.shape[:-1]
@@ -497,17 +496,9 @@ class CustomSampler(Sampler):
         dim = logits.shape[-1]
         bsz = logits.numel() // dim
 
-        # Prepare logit bias tensor
-
-        # TODO: Extension function for this, combine with filter API when it's added
-        if blocked_tokens is not None or allowed_tokens is not None:
-            logits = logits.clone()
-        if blocked_tokens is not None:
-            logits[..., blocked_tokens] = float('-inf')
-        if allowed_tokens is not None:
-            mask = torch.zeros(logits.shape[-1], dtype = torch.bool, device = logits.device)
-            mask[allowed_tokens] = True
-            logits[..., ~mask] = float('-inf')
+        # Apply logit mask/bias tensor
+        if logit_mask is not None:
+            logits = logits + logit_mask
 
         state = SamplingState(
             rand_u32 = rand_u32,

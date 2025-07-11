@@ -600,3 +600,13 @@ class Tokenizer:
         id_to_piece = self.get_id_to_piece_list()
         prefix = id_to_piece[prefix_id]
         return self.get_tokens_with_prefix_string(prefix)
+
+    @lru_cache
+    def get_vocab_dict(self):
+        """
+        Return tokenizer (dictionary for Formatron)
+        """
+        return {
+            self.tokenizer.id_to_token(i): i
+            for i in range(self.tokenizer.get_vocab_size())
+        }

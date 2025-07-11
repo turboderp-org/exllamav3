@@ -8,6 +8,7 @@ if TYPE_CHECKING:
 from ..constants import PAGE_SIZE
 import numpy as np
 from .pagetable import CachePage, Sequence, tensor_hash_checksum, random_hash
+from .filter import Filter
 import random
 from collections import deque
 import time
@@ -53,8 +54,7 @@ class Job:
         return_top_tokens: int = 0,
         return_logits: bool = False,
         return_probs: bool = False,
-#        filters: list[Filter] | None = None,
-#        filter_prefer_eos: bool = False,
+        filters: list[Filter] | None = None,
         token_healing: bool = False,
         identifier: object | None = None,
         banned_strings: list[str] | None = None,
@@ -106,13 +106,8 @@ class Job:
         :param return_probs:
             Return final sampling probability for each chosen token.
 
-        # :param filters:
-        #     List of Filters to apply during generation. TODO
-
-        # :param filter_prefer_eos:
-        #     If True, the sampler will prefer whatever token the filter presents as an EOS condition, e.g.
-        #     the outer closing bracket in a JSON grammar, as soon as that (sub)token is legal under the TODO
-        #     grammar.
+        :param filters:
+            List of Filters to apply during generation.
 
         :param token_healing:
             Resample the last token of the input with a prefix constraint. E.g. if the last token is
@@ -209,9 +204,8 @@ class Job:
 
         # Banned strings
         if banned_strings:
-            # TODO: (filters)
-            # assert filters is None or len(filters) == 0, \
-            #     "Cannot combine banned strings with filters"
+            assert filters is None or len(filters) == 0, \
+                "Cannot combine banned strings with filters"
             self.banned_strings = [s.lower() for s in banned_strings]
             self.banned_strings_utf32_buffer, self.banned_strings_utf32_offsets = \
                 _strings_to_utf32(tuple(self.banned_strings))
@@ -235,9 +229,12 @@ class Job:
         self.total_pages = 0
 
         # Filters
-        # TODO: (filters)
-        # self.filters = filters if filters is not None else []
-        # self.filter_prefer_eos = filter_prefer_eos
+        self.filters = filters if filters is not None else []
+        self.filter_futures = []
+        self.logit_masks = []
+        self.pinned_logit_mask = None
+        self.device_logit_mask = None
+        self.logits_device = None
 
         # Embeddings
         self.embeddings = embeddings or []
@@ -247,6 +244,17 @@ class Job:
         # Pinned buffer for IDs during sampling
         self.current_pinned_ids = None
         self.pinned_ids = None  # Lazy alloc
+
+
+    def get_pinned_logit_mask(self):
+        if self.pinned_logit_mask is None:
+            self.pinned_logit_mask = torch.empty(
+                (1, self.generator.padded_vocab_size),
+                dtype = torch.half,
+                device = "cpu",
+                pin_memory = True
+            )
+        return self.pinned_logit_mask
 
 
     def __repr__(self):
@@ -298,6 +306,65 @@ class Job:
         return input_ids_list
 
 
+    def prepare_logit_mask(self):
+
+        logit_mask = None
+        healing = self.prefix_token is not None and self.new_tokens == -1
+
+        # Finish filters and compile logit mask, but delay to avoid conflict with token healing
+        if not healing:
+            f_idx = 0
+            for f in self.filters:
+                if not f.is_active:
+                    continue
+                if f.use_background_worker():
+                    f_mask = self.filter_futures[f_idx].result()
+                else:
+                    f_mask = self.logit_masks[f_idx]
+                if logit_mask is None:
+                    logit_mask = self.get_pinned_logit_mask()
+                    logit_mask.copy_(f_mask)
+                else:
+                    logit_mask += f_mask
+                f_idx += 1
+            self.filter_futures.clear()
+            self.logit_masks.clear()
+
+        # Add individually blocked tokens to mask
+        blocked_tokens = []
+        if self.checkpoint and self.checkpoint["offset"] == 0:
+            blocked_tokens += self.checkpoint["explored_tokens"]
+        if self.new_tokens < self.min_new_tokens:
+            blocked_tokens = blocked_tokens + self.stop_tokens_list
+        if blocked_tokens:
+            if logit_mask is None:
+                logit_mask = self.get_pinned_logit_mask()
+                logit_mask.zero_()
+            logit_mask[:, blocked_tokens] = float("-inf")
+
+        # Mask out all but allowed tokens (token healing)
+        allowed_tokens = []
+        if healing:
+            allowed_tokens += self.generator.tokenizer.get_tokens_with_prefix_id(self.prefix_token)
+        if allowed_tokens:
+            if logit_mask is None:
+                logit_mask = self.get_pinned_logit_mask()
+                logit_mask.fill_(float("-inf"))
+                logit_mask[:, allowed_tokens] = 0
+            else:
+                inv_mask = torch.full_like(logit_mask, float("-inf"))
+                inv_mask[:, allowed_tokens] = 0
+                logit_mask += inv_mask
+
+        # If any logits need masking, move mask to device.
+        if logit_mask is not None:
+            # logit_mask references the pinned host buffer for this job, which is correctly filled in at this point
+            # Copy on the default stream so subsequent sampling blocks until mask is copied to device memory
+            self.device_logit_mask = logit_mask.to(self.logits_device, non_blocking = True)
+        else:
+            self.device_logit_mask = None
+
+
     def receive_logits(
         self,
         logits: torch.Tensor,
@@ -308,35 +375,12 @@ class Job:
         # assert self.is_prefill_done()
         # assert all(seq.live for seq in self.sequences)
 
-        # Start filters
-        # TODO: (filters)
-        # if self.new_tokens == 0:
-        #     for f in self.filters:
-        #         f.background_drop()
-        #         f.begin("")
-
-        # Sample
-
-        blocked_tokens = (
-            self.checkpoint["explored_tokens"] if self.checkpoint and self.checkpoint["offset"] == 0
-            else None
-        )
-
-        if self.new_tokens < self.min_new_tokens:
-            blocked_tokens = blocked_tokens + self.stop_tokens_list if blocked_tokens else self.stop_tokens_list
-
-        # TODO: logit mask tensor for blocked/allowed/prefix tokens
-        allowed_tokens = None
-        if self.prefix_token is not None and self.new_tokens == -1:
-            allowed_tokens = self.generator.tokenizer.get_tokens_with_prefix_id(self.prefix_token)
-
         next_token = self.sampler.forward(
             logits,
             self.current_pinned_ids,
             self.rng.randint(0, (1<<32)-1),
             self.generator.tokenizer,
-            blocked_tokens = blocked_tokens,
-            allowed_tokens = allowed_tokens,
+            logit_mask = self.device_logit_mask
         )
 
         next_prob, next_k_tokens, next_k_probs = None, None, None
@@ -362,31 +406,25 @@ class Job:
         next_k_tokens: torch.Tensor | None,
         next_k_probs: torch.Tensor | None,
         next_prob: torch.Tensor | None,
-        # filter_eos: bool | None,
         results: list,
         first_sample_in_sd_batch: bool = True
     ):
         next_token = next_token.cpu()
+        next_token_i = next_token.item()
 
-        # Feed filters
-
-        # TODO: (filters)
-        # if self.new_tokens >= 0:
-        #     all_mask = True
-        #     for f in self.filters:
-        #         f.feed(next_token)
-        #         if not f.can_mask_logits() or not f.use_background_worker():
-        #             all_mask = False
-        #     if first_sample_in_sd_batch and self.generator.filter_queue is not None:
-        #         if all_mask:
-        #             # Using logit mask(s)
-        #             for f in self.filters:
-        #                 self.generator.filter_queue.append((f, True))
-        #         else:
-        #             # Using allowed token list(s)
-        #             for f in self.filters:
-        #                 if f.use_background_worker():
-        #                     self.generator.filter_queue.append((f, False))
+        # Activate/advance filters if not healing
+        filter_eos_condition = False
+        if self.new_tokens >= 0:
+            for f in self.filters:
+                if not f.is_active and next_token_i == f.trigger_token:
+                    f.is_active = True
+                    f.reset()
+                elif f.is_active:
+                    f.accept_token(next_token_i)
+                    if f.is_completed():
+                        f.is_active = False
+                        if f.eos_after_completed:
+                            filter_eos_condition = True
 
         # Accept token
         self.new_tokens += 1
@@ -571,9 +609,9 @@ class Job:
         if self.new_tokens >= self.max_new_tokens - self.generator.num_draft_tokens:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "max_new_tokens")
 
-        # End now if newly added token ends a filter
-        # if filter_eos:  # TODO: (filters)
-        #     return emit(results, emit_eos = True, emit_held = True, eos_reason = "end_filter")
+        # End on filter completed
+        if filter_eos_condition:
+            return emit(results, emit_eos = True, emit_held = True, eos_reason = "end_filter")
 
         # Hold text if it contains an incomplete character
         if 1 <= self.held_text.count("�") < 5:
@@ -914,3 +952,11 @@ class Job:
             self.pinned_ids = torch.empty((1, max_ids), dtype = torch.long, pin_memory = True)
         self.current_pinned_ids = self.pinned_ids[:, :len(self.sequences[0].sequence_ids)]
         self.current_pinned_ids.copy_(self.sequences[0].sequence_ids.torch())
+
+
+    def activate(self):
+        self.logits_device = self.generator.model.modules[-1].device
+        for f in self.filters:
+            f.attach(self)
+            f.reset()
+            f.is_active = f.trigger_token is None

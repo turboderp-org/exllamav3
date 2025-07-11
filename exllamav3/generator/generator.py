@@ -8,6 +8,7 @@ from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
 from .pagetable import PageTable
 from .job import Job
+from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler, GumbelSampler
 from .visualizer import CacheVisualizer
@@ -243,10 +244,10 @@ class Generator:
 
                 optional, if eos:
                     "eos_reason":  - one of:
-                        "stop_token"
-                        "stop_string"
-                        "max_new_tokens"
-                        "end_filter"
+                        "stop_token"  (stop token was reached)
+                        "stop_string"  (stop string was completed)
+                        "max_new_tokens"  (max_new_tokens reached)
+                        "end_filter"  (filter reached end state with eos_after_completed = True)
                     optional, if "eos_reason" == "stop_token":
                         "eos_triggering_token_id": int
                         "eos_triggering_token_str": str
@@ -305,6 +306,7 @@ class Generator:
         for page in self.pagetable.all_pages:
             usage[page.page_index] = page.kv_position / PAGE_SIZE
         self.visualizer.update(chains, usage)
+
 
     def iterate_draftmodel_gen(self, results: list):
 
@@ -425,15 +427,15 @@ class Generator:
         batch_ids = torch.cat(input_ids_list, dim = 0)
 
         # GPU workload is scheduled here, so launch any sampling filters that can run in the background
-        # TODO: (filters)
-        # if self.filter_queue:
-        #     for f, p in self.filter_queue:
-        #         if p:
-        #             f.background_prepare_logit_mask(self.filter_pool)
-        #         else:
-        #             f.background_next(self.filter_pool)
-        #     # time.sleep(0)
-        #     self.filter_queue.clear()
+        for job in self.active_jobs:
+            if job.new_tokens < 0: continue
+            assert len(job.filter_futures) == 0
+            for f in job.filters:
+                if not f.is_active: continue
+                if f.use_background_worker():
+                    job.filter_futures.append(self.filter_pool.submit(f.get_next_logit_mask))
+                else:
+                    job.filter_futures.append(None)
 
         # Get logit batch from model
         batch_logits = self.model.forward(
@@ -447,8 +449,20 @@ class Generator:
             }
         )
 
-        # Prepare past IDs (for sequences that need them for repetition penalty etc.)
+        # Run foreground filters here, while GPU workload is queued up and running
         for job in self.active_jobs:
+            if job.new_tokens < 0: continue
+            assert len(job.logit_masks) == 0
+            for f in job.filters:
+                if not f.is_active: continue
+                if f.use_background_worker():
+                    job.logit_masks.append(None)
+                else:
+                    job.logit_masks.append(f.get_next_logit_mask())
+
+        # Prepare past IDs (for sequences that need them for repetition penalty etc.) and logit masks where needed
+        for job in self.active_jobs:
+            job.prepare_logit_mask()
             job.prepare_sampling_past_ids()
 
         # TODO: Batch sampling
@@ -497,16 +511,6 @@ class Generator:
                         job.accepted_draft_tokens += 1
             j += 1
 
-        # if self.max_sampling_threads > 1 and len(self.active_jobs) >= self.min_sampling_threads:
-        #     mt_sample = True
-        #     futures = deque()
-        #     for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
-        #         if a == b: continue
-        #         job_logits = batch_logits[a:b, :1, :]
-        #         futures.append(self.sampling_pool.submit(job.receive_logits, job_logits))
-        # else:
-        #     mt_sample = False
-
         # Release pages for completed jobs
         num_jobs = self.num_remaining_jobs()
         for job in completed_jobs:
@@ -546,6 +550,7 @@ class Generator:
                 # Add job to active list
                 self.pending_jobs.remove(job)
                 self.active_jobs.append(job)
+                job.activate()
 
                 # Allocate pages for job
                 job.allocate_pages()
@@ -576,8 +581,7 @@ class Generator:
         add_bos: bool = False,
         abort_event: threading.Event | None = None,
         completion_only: bool = False,
-        # filters: list[list[Filter]] | list[Filter] | None = None,
-        # filter_prefer_eos: bool = False,
+        filters: list[list[Filter]] | list[Filter] | None = None,
         return_last_results: bool = False,
         embeddings: list[MMEmbedding] | list[list[MMEmbedding]] | None = None,
         **kwargs
@@ -630,12 +634,9 @@ class Generator:
         :param completion_only:
             Only return completion. If False, returned string will include the input prompt.
 
-        # :param filters:
-        #     (List of) list of Filters to apply during generation. Each prompt in a batch needs
-        #     its own filter list, or a value of None to disable filters for individual prompts. TODO
-
-        # :param filter_prefer_eos:
-        #     If True, always sample the tokenizer's defined EOS token as soon as it's allowed by the filters TODO
+        :param filters:
+            (List of) list of Filters to apply during generation. Each prompt in a batch needs
+            its own filter list, or a value of None to disable filters for individual prompts.
 
         :param return_last_results:
             If True, returns the last results dict for each job
@@ -653,15 +654,15 @@ class Generator:
             prompts = prompt
         else:
             prompts = [prompt]
-            # filters = [filters]  # TODO: (filters)
+            filters = [filters]
             embeddings = [embeddings]
 
-        # if not filters:
-        #     filters = [None] * len(prompts)
-        # else:
-        #     assert len(filters) == len(prompts) and \
-        #         all((f is None or isinstance(f, list)) for f in filters), \
-        #         "If using filters, must provide one filter list (or None-value) per prompt."
+        if not filters:
+            filters = [None] * len(prompts)
+        else:
+            assert len(filters) == len(prompts) and \
+                all((f is None or isinstance(f, list)) for f in filters), \
+                "If using filters, must provide one filter list (or None-value) per prompt."
 
         if not embeddings:
             embeddings = [None] * len(prompts)
@@ -704,8 +705,7 @@ class Generator:
                 seed = seed,
                 stop_conditions = stop_conditions,
                 sampler = p_sampler,
-                # filters = filters[idx] or [],
-                # filter_prefer_eos = filter_prefer_eos,
+                filters = filters[idx] or [],
                 token_healing = token_healing,
                 decode_special_tokens = decode_special_tokens,
                 embeddings = embeddings[idx] or []
