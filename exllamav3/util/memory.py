@@ -4,6 +4,8 @@ import torch
 import gc
 import sys
 
+from pydantic import PydanticUserError
+
 # @lru_cache
 # def init_pynvml():
 #     pynvml.nvmlInit()
@@ -153,13 +155,16 @@ def list_gpu_tensors(min_size: int = 1, cuda_only: bool = True):
         path, obj = queue.popleft()
 
         # Iterate over entries in object with __dict__ attribute
-        if hasattr(obj, '__dict__'):
-            for attr, value in obj.__dict__.items():
-                new_path = f"{path}.{attr}"
-                collect(new_path, value)
-                if id(value) not in visited:
-                    visited.add(id(value))
-                    queue.append((new_path, value))
+        try:
+            if hasattr(obj, '__dict__'):
+                for attr, value in obj.__dict__.items():
+                    new_path = f"{path}.{attr}"
+                    collect(new_path, value)
+                    if id(value) not in visited:
+                        visited.add(id(value))
+                        queue.append((new_path, value))
+        except PydanticUserError:
+            pass
 
         # If object is a dictionary, iterate through all its items
         if isinstance(obj, dict):
