@@ -6,7 +6,7 @@ from exllamav3 import model_init, Generator, Job
 import argparse, contextlib
 import torch
 import util
-import random
+import random, math
 from datasets import load_dataset
 from exllamav3.util.file import disk_lru_cache, disk_lru_cache_clear
 from exllamav3.util.progress import ProgressBar
@@ -63,6 +63,15 @@ def main(args):
                 problem["choices"] = [problem["choices"][i] for i in perm]
                 problem["answer"] = perm.index(problem["answer"])
 
+    # Random sample subset of questions
+    n_sample = args.random_sample
+    if n_sample:
+        full_len = len(dataset_all)
+        assert n_sample <= full_len, f"Dataset only has {full_len} questions."
+        random.seed(0)
+        random.shuffle(dataset_all)
+        dataset_all = dataset_all[:n_sample]
+
     # Format
     def format_question(question: str, choices: list[str], answer: int | None):
         f = question + "\n"
@@ -116,7 +125,7 @@ def main(args):
 
     # Evaluate
     def print_results(p_subject):
-        nonlocal dataset_all
+        nonlocal dataset_all, n_sample
         total = 0
         correct = 0
         confidence_sum = 0.0
@@ -130,15 +139,25 @@ def main(args):
                 correct += 1
             confidence_sum += q["correct_answer_confidence"]
         if p_subject is None:
-            p_subject = "all"
-        print(
-            f"{p_subject:40}: {correct: 5}/{total: 5} = {correct/total*100:6.2f}% correct, "
-            f"({confidence_sum/total*100:6.2f}% confidence)"
-        )
+            p_subject = "all subjects"
+        score = correct / total
+        conf = confidence_sum / total
+        if n_sample:
+            p_subject = f"all subjects, {total} random samples"
+            interval = math.sqrt(score * (1 - score) / total * (full_len - total) / (full_len - 1))
+            print(
+                f"{p_subject:40}: {correct: 5}/{total: 5} = {score * 100:6.2f}% +/- {interval * 100: 6.2f}%"
+                + (" (95% CI)" if total == n_sample else "")
+            )
+        else:
+            print(f"{p_subject:40}: {correct: 5}/{total: 5} = {score * 100:6.2f}% correct, ({conf * 100:6.2f}% prob.)")
 
     with ProgressBar("Testing", total_jobs, transient = False) as progress:
+        last_update = 0
+        update_interval = (n_sample or 0) // 10
         while generator.num_remaining_jobs():
             results = generator.iterate()
+            tested = total_jobs - generator.num_remaining_jobs()
             for result in results:
                 if not result["eos"]:
                     continue
@@ -153,9 +172,12 @@ def main(args):
                 q["answer_correct"] = favored_anwser == correct_answer
                 sub = q["subject"]
                 num_remaining[sub] -= 1
-                if num_remaining[sub] == 0:
+                if num_remaining[sub] == 0 and not n_sample:
                     print_results(sub)
-                progress.update(total_jobs - generator.num_remaining_jobs())
+                progress.update(tested)
+            if n_sample and tested > last_update + update_interval:
+                last_update = tested
+                print_results(None)
 
     print_results(None)
 
@@ -169,5 +191,6 @@ if __name__ == "__main__":
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     parser.add_argument("-skip", "--skip_subjects", type = int, default = 0, help = "Skip number of categories")
     parser.add_argument("-mqps", "--max_q_per_subject", type = int, default = None, help = "Max questions per subject (default: unlimited)")
+    parser.add_argument("-r", "--random_sample", type = int, default = None, help = "Randomly sample number of questions across subjects")
     _args = parser.parse_args()
     main(_args)
