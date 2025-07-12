@@ -14,14 +14,12 @@ As the name implies, the original intention for ExLlama was to run inference on 
 
 Additionally, ExLlamaV2 is largely designed to run in a single process and CUDA doesn't like this very much when spreading a workload across multiple GPUs. It's a fundamental design feature in the CUDA runtime, and it has become a major obstacle to tensor-parallel inference, demand for which seems to keep increasing. This shortcoming is not easily addressed without a rewrite. Moreover, the **EXL2** format doesn't lend itself well to parallel inference in the first place due its input channel permutation.
 
- Aside from lifting a few of the most successful features from V2 (such as the generator), ExLlamaV3 is largely rewritten from scratch to provide a cleaner, more modular framework for supporting newer architectures. It also introduces a new SOTA quantization format based on [**QTIP**](https://github.com/Cornell-RelaxML/qtip) (see below).
+Aside from lifting a few of the most successful features from V2 (such as the generator), ExLlamaV3 is largely rewritten from scratch to provide a cleaner, more modular framework for supporting newer architectures. It also introduces a new SOTA quantization format based on [**QTIP**](https://github.com/Cornell-RelaxML/qtip) (see below).
 
 ## What's missing?
 
 There's much that still needs to be added and/or ported over from ExLlamaV2. I've decided to release ExLlamaV3 in its current state to invite testing, feedback and contributions, but please be aware that it's not yet a viable replacement for ExLlamaV2. Currently on the to-do list:
 
-- Support for more architectures
-- Constrained sampling (JSON filters etc.)
 - LoRA support
 - ROCm support
 - Tensor-parallel inference
