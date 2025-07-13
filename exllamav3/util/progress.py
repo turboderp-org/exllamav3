@@ -15,6 +15,7 @@ class ProgressBar:
                 TimeElapsedColumn(),
                 TimeRemainingColumn(),
                 transient = transient,
+                speed_estimate_period = 600.0,
             )
             self.task_id = self.progress.add_task(text, total = count)
 
