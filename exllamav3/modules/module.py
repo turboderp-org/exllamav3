@@ -1,11 +1,15 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 import torch
+import os
 import torch.nn.functional as F
 from torch import nn
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..models import Config
+
+# Use host bounce when moving state from device to device in layer split
+no_p2p_copy = os.environ.get('EXLLAMA_NO_P2P_COPY', None)
 
 class Module(ABC):
 
@@ -63,8 +67,13 @@ class Module(ABC):
             module.unload()
 
     def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        global no_p2p_copy
         if x.device != self.device:
-            x = x.to(self.device)
+            if no_p2p_copy:
+                print(".")
+                x = x.cpu().to(self.device)
+            else:
+                x = x.to(self.device)
         return x
 
     def get_qmaps(self):
