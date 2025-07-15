@@ -500,6 +500,45 @@ class PromptFormat_commanda(PromptFormat):
         ]
 
 
+class PromptFormat_exaone(PromptFormat):
+    description = "EXAONE (EXAONE4)"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        # Abridged version
+        return (
+            "You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages):
+        context = ""
+        if system_prompt:
+            context += "[|system|]\n"
+            context += system_prompt
+            context += "[|endofturn|]\n"
+        for (u, a) in messages:
+            context += "[|user|]\n"
+            context += u
+            context += "[|endofturn|]\n"
+            context += "[|assistant|]\n"
+            if a is not None:
+                context += a
+                context += "[|endofturn|]\n"
+        return context
+
+    def add_bos(self):
+        return False  # HF template uses double BOS token
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("[|endofturn|]"),
+            "[|endofturn|]",
+        ]
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -514,4 +553,5 @@ prompt_formats = {
     "ernie": PromptFormat_ernie,
     "smollm3": PromptFormat_smollm3,
     "commanda": PromptFormat_commanda,
+    "exaone": PromptFormat_exaone,
 }
