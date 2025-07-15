@@ -57,6 +57,8 @@ class TransformerBlock(Module):
         if self.attn:
             if self.attn_norm:
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
+            else:
+                y = x.half()
             y = self.attn.forward(y, params)
             if params.get("prefill"): return x
             if self.attn_post_norm:
@@ -66,6 +68,8 @@ class TransformerBlock(Module):
         if self.mlp:
             if self.mlp_norm:
                 y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
+            else:
+                y = x.half()
             y = self.mlp.forward(y, params)
             if self.mlp_post_norm:
                 y = self.mlp_post_norm.forward(y, params)
