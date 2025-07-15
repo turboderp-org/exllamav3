@@ -53,7 +53,7 @@ def main(args):
     bpw_layer, bpw_head, vram_bits = model.get_storage_info()
 
     # Dataset
-    eval_ids = get_test_tokens(tokenizer, args.rows)
+    eval_ids = get_test_tokens(tokenizer, args.rows, eval_len = args.length)
 
     # Test
     logprob_sum = 0.0
@@ -90,5 +90,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     model_init.add_args(parser, cache = False)
     parser.add_argument("-r", "--rows", type = int, help = "Number of rows", default = 100)
+    parser.add_argument("-l", "--length", type = int, help = "Length", default = 2048)
     _args = parser.parse_args()
     main(_args)
