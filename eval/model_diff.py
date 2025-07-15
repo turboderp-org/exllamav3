@@ -13,6 +13,21 @@ import torch
 import torch.nn.functional as F
 import math
 import yaml
+from safetensors.torch import save_file
+
+def save_tensor(tensor, path: str, tensor_name: str = None):
+    if isinstance(tensor, dict):
+        save_file({
+            k: v for k, v in tensor.items()
+        }, path)
+    elif isinstance(tensor, list):
+        save_file({
+            f"tensor.{i}": t for i, t in enumerate(tensor)
+        }, path)
+    else:
+        save_file({
+            tensor_name or f"tensor": tensor
+        }, path)
 
 
 @disk_lru_cache("get_dataset_text")
@@ -79,6 +94,12 @@ def main(args):
     state_a = eval_ids
     state_b = eval_ids
 
+    # Save input IDs
+    if args.save_input_ids:
+        print(f" -- Saving input IDs to: {args.save_input_ids}")
+        save_tensor(eval_ids, args.save_input_ids, "input_ids")
+
+    # Inference
     for idx, (module_a, module_b) in enumerate(zip(model_a.modules, model_b.modules)):
 
         config_a.stc.begin_deferred_load()
@@ -131,6 +152,14 @@ def main(args):
             f"   sqnr: {sqnr_:9.6f}"
             f"   cos_err: {cos_error:.6f}"
         )
+
+    # Save logits
+    if args.save_logits_a:
+        print(f" -- Saving model A logits to: {args.save_logits_a}")
+        save_tensor(state_a, args.save_logits_a, "logits")
+    if args.save_logits_b:
+        print(f" -- Saving model B logits to: {args.save_logits_b}")
+        save_tensor(state_b, args.save_logits_b, "logits")
 
     # Compare logits
     topk_max = args.topk_max
@@ -238,6 +267,8 @@ if __name__ == "__main__":
     parser.add_argument("-tkm", "--topk_max", type = int, default = 5, help = "Max top-K interval to test")
     parser.add_argument("-d", "--device", type = int, help = "CUDA device index", default = 0)
     parser.add_argument("-or", "--override", type = str, help = "Model A tensor override spec (YAML)", default = None)
-
+    parser.add_argument("-si", "--save_input_ids", type = str, help = "Save input IDs (filename)", default = None)
+    parser.add_argument("-sla", "--save_logits_a", type = str, help = "Save model A logits (filename)", default = None)
+    parser.add_argument("-slb", "--save_logits_b", type = str, help = "Save model B logits (filename)", default = None)
     _args = parser.parse_args()
     main(_args)
