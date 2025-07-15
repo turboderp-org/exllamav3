@@ -149,11 +149,9 @@ class Ernie4_5Model(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        p = ""
+        p = "<|begin_of_sentence|>"
         if system_prompt:
-            p += f"<|im_start|>system\n"
-            p += f"{system_prompt}<|im_end|>\n"
-        p += f"<|im_start|>user\n"
-        p += f"{prompt}<|im_end|>\n"
-        p += f"<|im_start|>assistant\n"
+            p += f"{system_prompt}\n"
+        p += f"User: {prompt}\n"
+        p += f"Assistant: "
         return p
