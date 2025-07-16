@@ -4,6 +4,8 @@ try:
     from any_precision.modules.AnyPrecisionLinear import AnyPrecisionLinear
 except ModuleNotFoundError:
     pass
+except ImportError:
+    pass
 
 def get_tensors_size(tensors):
     return 8 * sum(t.element_size() * t.numel() for t in tensors.values() if t is not None)
