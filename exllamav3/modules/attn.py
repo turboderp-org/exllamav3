@@ -149,6 +149,9 @@ class Attention(Module):
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
+        q_proj: Module | None = None,
+        kv_proj: Module | None = None,
+        o_proj: Module | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -174,15 +177,32 @@ class Attention(Module):
         else:
             fkey, frange_q, frange_k, frange_v = None, None, None, None
 
-        self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim, qmap = qmap + ".input", fkey = fkey, frange = frange_q, qbits_mod_key = "q")
-        self.k_proj = Linear(config, f"{key}.{key_k}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_k, qbits_mod_key = "k")
-        self.v_proj = Linear(config, f"{key}.{key_v}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_v, qbits_mod_key = "v")
-        self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o", out_dtype = out_dtype, qbits_mod_key = "o")
+        if key_q:
+            self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim, qmap = qmap + ".input", fkey = fkey, frange = frange_q, qbits_mod_key = "q")
+            self.register_submodule(self.q_proj)
+        else:
+            assert q_proj
+            self.q_proj = q_proj
+            self.register_submodule(self.q_proj)
 
-        self.register_submodule(self.q_proj)
-        self.register_submodule(self.k_proj)
-        self.register_submodule(self.v_proj)
-        self.register_submodule(self.o_proj)
+        if key_k:
+            assert key_v
+            self.k_proj = Linear(config, f"{key}.{key_k}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_k, qbits_mod_key = "k")
+            self.v_proj = Linear(config, f"{key}.{key_v}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_v, qbits_mod_key = "v")
+            self.register_submodule(self.k_proj)
+            self.register_submodule(self.v_proj)
+        else:
+            assert kv_proj
+            self.kv_proj = kv_proj
+            self.register_submodule(self.kv_proj)
+
+        if key_o:
+            self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o", out_dtype = out_dtype, qbits_mod_key = "o")
+            self.register_submodule(self.o_proj)
+        else:
+            assert o_proj
+            self.o_proj = o_proj
+            self.register_submodule(self.o_proj)
 
         if q_norm:
             assert k_norm, "Must have both Q and K norms, or neither"
