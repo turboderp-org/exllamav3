@@ -24,6 +24,7 @@ def add_args(
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
+    parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
@@ -134,7 +135,7 @@ def init(
 
     # Load model
     printp(not quiet, f" -- Loading {args.model_dir}")
-    model.load(use_per_device = split, progressbar = progress, **kwargs)
+    model.load(use_per_device = split, tensor_p = args.tensor_parallel, progressbar = progress, **kwargs)
 
     # Load tokenizer
     if load_tokenizer:
