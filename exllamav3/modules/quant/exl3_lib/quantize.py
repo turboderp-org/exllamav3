@@ -831,15 +831,24 @@ def quantize_exl3(
 
         # Metrics
         try:
+            def block_trace(A, B, block_size = 1024):
+                total = 0.0
+                for j_start in range(0, B.shape[1], block_size):
+                    j_end = min(j_start + block_size, B.shape[1])
+                    B_block = B[:, j_start:j_end]
+                    A_j_block = A[j_start:j_end, :]
+                    partial = torch.einsum("ik,ij,jk->", A, B_block, A_j_block)
+                    total += partial.item()
+                return total
             E = weight_r - weight_q  # may run on CPU
             W = weight_r
             Hd = H.to(device)
             weight_r = None
             E = E.to(device)
-            num = torch.einsum("ik,ij,jk->", E, Hd, E).item()
+            num = block_trace(E, Hd)
             E = None
             W = W.to(device)
-            den = torch.einsum("ik,ij,jk->", W, Hd, W).item()
+            den = block_trace(W, Hd)
             W = None
             Hd = None
             proxy_err = num / max(den, 1e-8)
