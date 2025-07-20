@@ -53,6 +53,14 @@ class CacheLayer(ABC):
     def get_tensors(self):
         pass
 
+    @abstractmethod
+    def storage_size(self):
+        pass
+
+    @abstractmethod
+    def overhead_size(self):
+        pass
+
 
 class Cache:
 

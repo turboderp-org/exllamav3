@@ -9,6 +9,7 @@ from .cache import CacheLayer
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..modules import Attention
+import numpy as np
 
 class CacheLayer_fp16(CacheLayer):
 
@@ -69,6 +70,17 @@ class CacheLayer_fp16(CacheLayer):
         self.k[to_page, :num_tokens, :, :].copy_(source.k[from_page, :num_tokens, :, :], non_blocking = True)
         self.v[to_page, :num_tokens, :, :].copy_(source.v[from_page, :num_tokens, :, :], non_blocking = True)
 
+
     @override
     def get_tensors(self):
         return [self.k, self.v]
+
+
+    @override
+    def storage_size(self):
+        return 2 * np.prod(self.shape) * torch.half.itemsize
+
+
+    @override
+    def overhead_size(self):
+        return 0

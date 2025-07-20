@@ -67,3 +67,18 @@ def human_time(seconds: float) -> str:
 
 def first_not_none(*values):
     return next((v for v in values if v is not None), None)
+
+
+def ratio_split(d, weights, chunk_size = 128):
+    assert d % chunk_size == 0, "Total must be divisible by chunk size"
+    total_chunks = d // chunk_size
+    total_weight = sum(weights)
+    ideal_chunks = [total_chunks * w / total_weight for w in weights]
+    base_chunks = [int(c) for c in ideal_chunks]
+    remainder = total_chunks - sum(base_chunks)
+    residuals = [c - int(c) for c in ideal_chunks]
+    for i in sorted(range(len(residuals)), key = lambda i: -residuals[i])[:remainder]:
+        base_chunks[i] += 1
+    final_alloc = [c * chunk_size for c in base_chunks]
+    assert sum(final_alloc) == d
+    return final_alloc

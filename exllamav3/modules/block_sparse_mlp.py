@@ -13,6 +13,7 @@ from ..util import first_not_none
 from ..util import profile_opt
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
+from ..util.tp_split import TPAllocation
 
 
 @dataclass
@@ -448,3 +449,37 @@ class BlockSparseMLP(Module):
         if self.e_score_correction_bias is not None:
             t[f"{self.key}.gate.e_score_correction_bias"] = self.e_score_correction_bias.contiguous()
         return t
+
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        storage = 0
+        storage += self.routing_gate.storage_size()
+        for g in self.gates: storage += g.storage_size()
+        for u in self.ups: storage += u.storage_size()
+        for d in self.downs: storage += d.storage_size()
+        # TODO: More precise overhead estimate accounting for gate etc.
+        overhead_d = self.hidden_size * (self.out_dtype or torch.half).itemsize
+        overhead_s = 4 * self.intermediate_size * (self.interm_dtype or torch.half).itemsize
+        if self.interm_dtype != torch.half:
+            overhead_s += self.intermediate_size * torch.half.itemsize
+        recons = max(
+            self.gates[0].recons_size(),
+            self.ups[0].recons_size(),
+            self.downs[0].recons_size()
+        )
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = 1,
+            channel_unit = "experts",
+            storage_per_device = 0,
+            storage_to_split = storage,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = self.num_experts,
+            limit_key = "moe"
+        )
+        tpa_list = [tpa]
+        if self.shared_experts:
+            tpa_list += self.shared_experts.make_tp_allocation()
+        return tpa_list

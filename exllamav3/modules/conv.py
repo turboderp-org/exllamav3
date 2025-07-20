@@ -6,6 +6,7 @@ from torch import nn
 from ..models import Config
 from . import Module
 from ..ext import exllamav3_ext as ext
+from ..util.tp_split import TPAllocation
 
 class Conv(Module):
 
@@ -84,3 +85,7 @@ class Conv(Module):
             y = y.view(-1, self.out_channels).unsqueeze(0)
 
         return y
+
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        raise NotImplementedError()

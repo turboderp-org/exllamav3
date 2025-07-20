@@ -14,6 +14,7 @@ from flash_attn import flash_attn_func, flash_attn_with_kvcache
 from ..util import profile_opt
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
+from ..util.tp_split import TPAllocation
 
 """
 SDPA:
@@ -508,3 +509,40 @@ class Attention(Module):
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        storage = 0
+        storage += self.q_proj.storage_size()
+        storage += self.k_proj.storage_size()
+        storage += self.v_proj.storage_size()
+        storage += self.o_proj.storage_size()
+        for cl in self.cache_layers:
+            storage += cl.storage_size()
+        overhead_d = 0
+        overhead_d += self.hidden_size * (self.out_dtype or torch.half).itemsize
+        overhead_s = 0
+        for cl in self.cache_layers:
+            overhead_s += cl.overhead_size()
+        overhead_s += 2 * self.num_q_heads * self.head_dim * torch.half.itemsize  # q, o
+        overhead_s += 2 * self.num_kv_heads * self.head_dim * torch.half.itemsize  # k, v
+        recons = max(
+            self.q_proj.recons_size(),
+            self.k_proj.recons_size(),
+            self.v_proj.recons_size(),
+            self.o_proj.recons_size(),
+        )
+        # TODO: Account for flash-attn temp VRAM usage
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = 1,
+            channel_unit = "heads",
+            storage_per_device = 0,
+            storage_to_split = storage,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = self.num_kv_heads,
+            limit_key = "attn"
+        )
+        return [tpa]

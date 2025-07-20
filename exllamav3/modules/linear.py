@@ -1,4 +1,5 @@
 from __future__ import annotations
+from functools import lru_cache
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
@@ -11,6 +12,7 @@ from .quant.exl3_lib import quantize_exl3
 from ..ext import exllamav3_ext as ext
 from ..conversion.allocation import allocate_linear
 from ..util.memory import free_mem
+from ..util.tp_split import TPAllocation
 
 
 class Linear(Module):
@@ -332,3 +334,37 @@ class Linear(Module):
             return "exl3"
         else:
             return None
+
+
+    @lru_cache
+    def storage_size(self):
+        # alt_key is only used when loading unquantized model
+        if self.is_exl3_storage(self.key):
+            return sum(self.config.stc.get_tensor_sizes(prefix = self.key))
+        else:
+            return 2 * self.in_features * self.out_features
+
+
+    def recons_size(self):
+        return 2 * self.in_features * self.out_features
+
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        storage = 0
+        storage += self.storage_size()
+        overhead_d = self.out_features * (self.out_dtype or torch.half).itemsize
+        overhead_s = self.out_features * (self.out_dtype or torch.half).itemsize
+        recons = self.recons_size()
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = 128,
+            channel_unit = "channels",
+            storage_per_device = 0,
+            storage_to_split = storage,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = self.out_features // 128,
+            limit_key = "linear"
+        )
+        return [tpa]

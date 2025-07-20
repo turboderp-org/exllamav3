@@ -6,6 +6,7 @@ from torch import nn
 from ..models import Config
 from . import Module
 from ..ext import exllamav3_ext as ext
+from ..util.tp_split import TPAllocation
 
 class RMSNorm(Module):
 
@@ -76,3 +77,14 @@ class RMSNorm(Module):
         y = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
         ext.rms_norm(x, self.weight, y, self.rms_norm_eps, self.constant_bias)
         return y
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        stc = self.config.stc
+        storage = sum(stc.get_tensor_sizes(self.key))
+        overhead = storage // 2 * (self.out_dtype or torch.half).itemsize
+        tpa = TPAllocation(
+            key = self.key,
+            storage_per_device = storage,
+            overhead_per_device = overhead,
+        )
+        return [tpa]

@@ -7,6 +7,7 @@ from ..models import Config
 from ..util.tensor import to2
 from . import Module
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
+from ..util.tp_split import TPAllocation
 
 class Embedding(Module):
 
@@ -117,3 +118,6 @@ class Embedding(Module):
             if self.normalize:
                 x *= x.shape[-1] ** 0.5
             return x
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        return []

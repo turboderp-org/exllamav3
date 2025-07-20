@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from exllamav3.ext import exllamav3_ext as ext
 if TYPE_CHECKING:
     from ..modules import Attention
+import numpy as np
 
 class CacheLayer_quant(CacheLayer):
 
@@ -99,6 +100,21 @@ class CacheLayer_quant(CacheLayer):
         self.sk[to_page, :num_tokens, :].copy_(source.sk[from_page, :num_tokens, :], non_blocking = True)
         self.sv[to_page, :num_tokens, :].copy_(source.sv[from_page, :num_tokens, :], non_blocking = True)
 
+
     @override
     def get_tensors(self):
         return [self.qk, self.qv, self.sk, self.sv]
+
+
+    @override
+    def storage_size(self):
+        return (
+            np.prod(self.qshape_k) * torch.int.itemsize +
+            np.prod(self.qshape_v) * torch.int.itemsize +
+            2 * np.prod(self.qshape_s) * torch.half.itemsize
+        )
+
+
+    @override
+    def overhead_size(self):
+        return 2 * np.prod(self.shape) * torch.half.itemsize

@@ -8,6 +8,7 @@ from ..util.tensor import to2
 from . import Module, Linear
 from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
+from ..util.tp_split import TPAllocation
 
 class MLP(Module):
 
@@ -30,6 +31,8 @@ class MLP(Module):
         assert key_fused_gate_up is None
 
         self.out_dtype = out_dtype
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
 
         self.up = Linear(
             config,
@@ -75,6 +78,31 @@ class MLP(Module):
         return to2(x, out_dtype, self.out_dtype)
 
 
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        storage = 0
+        storage += self.up.storage_size()
+        storage += self.down.storage_size()
+        overhead_d = self.hidden_size * (self.out_dtype or torch.half).itemsize
+        overhead_s = self.intermediate_size * torch.half.itemsize
+        recons = max(
+            self.up.recons_size(),
+            self.down.recons_size()
+        )
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = 128,
+            channel_unit = "channels",
+            storage_per_device = 0,
+            storage_to_split = storage,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = self.intermediate_size // 128,
+            limit_key = "mlp",
+        )
+        return [tpa]
+
+
 class GatedMLP(Module):
 
     def __init__(
@@ -100,6 +128,7 @@ class GatedMLP(Module):
         self.interm_dtype = interm_dtype
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
+        self.hidden_size = hidden_size
 
         if key_fused_gate_up:
             assert not intermediate_split_size or intermediate_size <= intermediate_split_size, \
@@ -248,3 +277,32 @@ class GatedMLP(Module):
             del d_
 
         return to2(d, out_dtype, self.out_dtype)
+
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        storage = 0
+        for g in self.gates: storage += g.storage_size()
+        for u in self.ups: storage += u.storage_size()
+        for d in self.downs: storage += d.storage_size()
+        overhead_d = self.hidden_size * (self.out_dtype or torch.half).itemsize
+        overhead_s = 2 * self.intermediate_size * (self.interm_dtype or torch.half).itemsize
+        if self.interm_dtype != torch.half:
+            overhead_s += self.intermediate_size * torch.half.itemsize
+        recons = max(
+            self.gates[0].recons_size(),
+            self.ups[0].recons_size(),
+            self.downs[0].recons_size()
+        )
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = 128 if self.num_slices == 1 else 128,
+            channel_unit = "channels" if self.num_slices == 1 else "slices",
+            storage_per_device = 0,
+            storage_to_split = storage,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = self.intermediate_size // 128 if self.num_slices == 1 else self.num_slices,
+            limit_key = "mlp"
+        )
+        return [tpa]
