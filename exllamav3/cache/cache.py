@@ -134,7 +134,7 @@ class Cache:
             model = self.model
         model_num_layers = len(model.get_cache_layers())
         assert model_num_layers == self.num_layers, \
-            f"Cannot detach cache with {self.num_layers} layers from model with {model_num_layers()} layers."
+            f"Cannot detach cache with {self.num_layers} layers from model with {model_num_layers} layers."
         for layer, module in zip(self.layers, model.get_cache_layers()):
             module.cache_layers.remove(layer)
 
