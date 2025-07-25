@@ -3,7 +3,6 @@ from collections import deque
 import torch
 import gc
 import sys
-
 from pydantic import PydanticUserError
 
 # @lru_cache
@@ -50,7 +49,6 @@ def unset_memory_fraction(active_devices: list[int]):
 def free_mem():
     gc.collect()
     torch.cuda.empty_cache()
-
 
 
 def list_gpu_tensors(min_size: int = 1, cuda_only: bool = True):
@@ -220,4 +218,3 @@ def list_gpu_tensors(min_size: int = 1, cuda_only: bool = True):
         print()
         headers = ["size // MB", "path", "shape", "dtype"]
         print(tabulate(devices[k], headers = headers, tablefmt = "github", intfmt=","))
-

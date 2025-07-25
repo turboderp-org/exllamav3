@@ -17,6 +17,7 @@ import threading
 import numpy as np
 from ..util import profile_opt
 from ..tokenizer import MMEmbedding
+from ..util import profile_opt
 
 class Generator:
 

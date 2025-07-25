@@ -447,7 +447,6 @@ class Attention(Module):
         return o
 
 
-
     def decode_flash_attn(
         self,
         x: torch.Tensor,

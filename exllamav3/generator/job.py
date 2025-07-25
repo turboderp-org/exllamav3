@@ -18,6 +18,7 @@ from ..util.tensor import SeqTensor
 from ..util import profile_opt
 from ..tokenizer import MMEmbedding
 from functools import lru_cache
+from ..util import profile_opt
 
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
 @lru_cache(100)

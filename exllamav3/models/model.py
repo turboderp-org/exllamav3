@@ -1,8 +1,6 @@
 from __future__ import annotations
-
 from functools import lru_cache
 from typing import Callable
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -37,6 +35,7 @@ class Model:
             yield from module
 
 
+    @lru_cache
     def find_module(self, key: str):
         for module in self:
             if module.key == key:
@@ -62,7 +61,6 @@ class Model:
 
         :param component:
             Which component model to load, for models with multiple component.
-            # TODO: Implement multimodal components
         """
 
         assert component in config.model_classes, \
@@ -73,8 +71,8 @@ class Model:
 
 
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
-        params["input_ids"] = input_ids
-        return input_ids
+        # Overridden by model arch class
+        raise NotImplementedError
 
 
     @torch.inference_mode

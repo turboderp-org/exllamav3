@@ -351,7 +351,6 @@ class SafetensorsCollection:
                     tensor = tensor.contiguous()
                     self.metrics.direct_tensors += 1
 
-
                 case "python":
                     with open(filename, "rb") as fp:
                         fp.seek(offset + beg)
@@ -410,16 +409,16 @@ class SafetensorsCollection:
             cpu_loads = {}
             cuda_loads = {}
             for load in self.deferred_loads:
-                filenmame = load["filename"]
+                filename = load["filename"]
                 cuda = load["cuda"]
                 if cuda:
-                    if not filenmame in cuda_loads:
-                        cuda_loads[filenmame] = []
-                    cuda_loads[filenmame].append(load)
+                    if not filename in cuda_loads:
+                        cuda_loads[filename] = []
+                    cuda_loads[filename].append(load)
                 else:
-                    if not filenmame in cpu_loads:
-                        cpu_loads[filenmame] = []
-                    cpu_loads[filenmame].append(load)
+                    if not filename in cpu_loads:
+                        cpu_loads[filename] = []
+                    cpu_loads[filename].append(load)
 
             def make_workload(l):
                 wl = []

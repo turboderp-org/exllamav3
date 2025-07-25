@@ -443,6 +443,7 @@ class BlockSparseMLP(Module):
                 final_hidden_states += self.shared_experts.forward(x, params)
             return final_hidden_states
 
+
     @override
     def get_tensors(self):
         t = super().get_tensors()
