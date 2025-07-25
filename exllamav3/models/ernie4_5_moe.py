@@ -190,7 +190,6 @@ class Ernie4_5MoEModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
-        params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 
