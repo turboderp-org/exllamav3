@@ -13,7 +13,7 @@ class Embedding(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         vocab_size: int,
         hidden_size: int,
@@ -121,3 +121,37 @@ class Embedding(Module):
 
     def make_tp_allocation(self) -> list[TPAllocation]:
         return []
+
+    def tp_export(self, plan):
+        assert self.device is not None, "Cannot export module for TP before loading."
+        self.embedding.weight.share_memory_()
+        return {
+            "cls": Embedding,
+            "kwargs": {
+                "key": self.key,
+                "vocab_size": self.vocab_size,
+                "hidden_size": self.hidden_size,
+                "out_dtype": self.out_dtype,
+                "normalize": self.normalize,
+            },
+            "embedding.weight": self.embedding.weight,
+            "device": self.device
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        module = Embedding(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = exported["device"]
+        module.embedding = nn.Embedding(
+            module.vocab_size,
+            module.hidden_size,
+            device = "meta"
+        )
+        emb = torch.empty_like(exported["embedding.weight"])
+        emb.copy_(exported["embedding.weight"])
+        module.embedding.weight = nn.Parameter(emb)
+        torch.cuda.synchronize()
+        return module
