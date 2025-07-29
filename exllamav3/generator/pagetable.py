@@ -369,6 +369,10 @@ class PageTable:
         if not self.generator.enable_defrag:
             return
 
+        # Disable for tensor-P models  TODO: Fix
+        if self.generator.model.loaded_tp:
+            return
+
         # Defragment once job queue is empty and all pages have been touched at least once
         if self.access_serial < self.last_defrag_serial + self.max_pages:
             return
@@ -520,6 +524,7 @@ class PageTable:
                 print(" ← ".join([".."] + [f"{rotation[i + 1]:2}" for i in range(0, len(rotation) - 2, 2)] + [".."]))
 
         # Rotate pages
+        # TODO: Multiprocess version for TP split models
         all_rotations_cpu = torch.tensor(all_rotations, dtype = torch.int)
         @lru_cache
         def get_all_rotations(device):

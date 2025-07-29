@@ -240,11 +240,14 @@ class Attention(Module):
         })
 
         self.cache_layers = []
+        self.tp_cache_lookup = {}
         self.multi_kv = None
         self.tp_reduce = False
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
+
+        self.has_split_cache = False
 
 
     def load_local(self, device, **kwargs):

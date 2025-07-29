@@ -16,13 +16,14 @@ class CacheLayer_quant(CacheLayer):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         attention: Attention,
+        cache_id: int,
         max_num_tokens: int,
         k_bits: int,
         v_bits: int,
     ):
-        super().__init__(config, attention, max_num_tokens)
+        super().__init__(config, attention, cache_id, max_num_tokens)
 
         assert max_num_tokens % PAGE_SIZE == 0, \
             f"max_num_tokens must be a multiple of {PAGE_SIZE}."
@@ -117,4 +118,17 @@ class CacheLayer_quant(CacheLayer):
 
     @override
     def overhead_size(self):
-        return 2 * np.prod(self.shape) * torch.half.itemsize
+        return 2 * np.prod(self.shape[2:]) * torch.half.itemsize
+
+
+    @override
+    def tp_export(self, plan):
+        return {
+            "cls": CacheLayer_quant,
+            "args": {
+                "cache_id": self.cache_id,
+                "max_num_tokens": self.max_num_tokens,
+                "k_bits": self.k_bits,
+                "v_bits": self.v_bits,
+            }
+        }

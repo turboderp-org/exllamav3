@@ -15,11 +15,12 @@ class CacheLayer_fp16(CacheLayer):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         attention: Attention,
+        cache_id: int,
         max_num_tokens: int,
     ):
-        super().__init__(config, attention, max_num_tokens)
+        super().__init__(config, attention, cache_id, max_num_tokens)
 
         assert max_num_tokens % PAGE_SIZE == 0, \
             f"max_num_tokens must be a multiple of {PAGE_SIZE}."
@@ -84,3 +85,14 @@ class CacheLayer_fp16(CacheLayer):
     @override
     def overhead_size(self):
         return 0
+
+
+    @override
+    def tp_export(self, plan):
+        return {
+            "cls": CacheLayer_fp16,
+            "args": {
+                "cache_id": self.cache_id,
+                "max_num_tokens": self.max_num_tokens
+            }
+        }
