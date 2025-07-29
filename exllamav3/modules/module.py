@@ -16,7 +16,7 @@ class Module(ABC):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         qmap: str | None,
     ):
@@ -119,3 +119,17 @@ class Module(ABC):
         for m in self.modules:
             tpa_list += m.make_tp_allocation()
         return tpa_list
+
+    def tp_export(self, plan):
+        """
+        Create serializable (dict) collection of module parameters and shared weights to pass to child process.
+        """
+        raise NotImplementedError()
+
+    @staticmethod
+    def tp_import(local_context, plan, loaded):
+        """
+        Reconstruct module in child process from exported parameters and shared weights, sliced as necessary for
+        TP according to plan.
+        """
+        raise NotImplementedError()
