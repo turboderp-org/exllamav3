@@ -3,6 +3,7 @@ import threading
 import time
 import torch
 
+import socket, contextlib
 
 lock = threading.RLock()
 
@@ -82,3 +83,9 @@ def ratio_split(d, weights, chunk_size = 128):
     final_alloc = [c * chunk_size for c in base_chunks]
     assert sum(final_alloc) == d
     return final_alloc
+
+
+def find_free_port() -> int:
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
