@@ -19,7 +19,7 @@ class Linear(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         in_features: int,
         out_features: int,
@@ -368,3 +368,47 @@ class Linear(Module):
             limit_key = "linear"
         )
         return [tpa]
+
+
+    def tp_export(self, plan):
+        assert self.device is not None and self.inner is not None, "Cannot export module for TP before loading."
+
+        return {
+            "cls": Linear,
+            "kwargs": {
+                "key": self.key,
+                "in_features": self.in_features,
+                "out_features": self.out_features,
+                "out_dtype": self.out_dtype,
+                "alt_key": self.alt_key,
+                "caps": self.caps,
+                "softcap": self.softcap,
+                "full_in_features": self.full_in_features,
+                "full_out_features": self.full_out_features,
+                "first_in_feature": self.first_in_feature,
+                "first_out_feature": self.first_out_feature,
+                "post_scale": self.post_scale,
+            },
+            "inner": self.inner.tp_export(plan),
+            "device": self.device
+        }
+
+
+    @staticmethod
+    def tp_import_split(local_context, exported, plan, split):
+        device = local_context["device"]
+        module = Linear(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+        module.inner = exported["inner"]["cls"].tp_import_split(local_context, exported["inner"], plan, split)
+        module.quant_type = module.inner.quant_type
+        return module
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        key = exported["kwargs"]["key"]
+        first, last = plan[key] if key in plan else (None, None)
+        split = (True, first, last) if first is not None else None
+        return Linear.tp_import_split(local_context, exported, plan, split)
