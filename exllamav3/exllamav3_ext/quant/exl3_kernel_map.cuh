@@ -1,6 +1,6 @@
 #pragma once
 
-int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits);
+int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits, bool multi);
 int exl3_gemm_num_kernel_shapes();
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int bits);
 
