@@ -9,6 +9,8 @@ from ...util import first_not_none
 
 class LinearFP16:
 
+    quant_type: str = "fp16"
+
     in_features: int
     out_features: int
 
@@ -103,6 +105,54 @@ class LinearFP16:
         if self.bias is not None:
             self.bias = self.bias.to(self.swap_device)
         self.swap_device = None
+
+    def tp_export(self, plan):
+        self.weight.share_memory_()
+        if self.bias is not None:
+            self.bias.share_memory_()
+        return {
+            "cls": LinearFP16,
+            "in_features": self.in_features,
+            "out_features": self.out_features,
+            "weight": self.weight,
+            "bias": self.bias,
+            "out_dtype": self.out_dtype,
+        }
+
+    @staticmethod
+    def tp_import_split(local_context, exported, plan, split, dbg = False):
+        device = local_context["device"]
+        w = exported["weight"]
+        b = exported["bias"]
+
+        if split is not None:
+            split_out, first, last = split
+        else:
+            split_out, first, last = True, 0, exported["out_features"]
+
+        if split_out:
+            w = w[:, first : last].to(device)
+            b = b[first : last].to(device) if b is not None else None
+            in_features = exported["in_features"]
+            out_features = last - first
+        else:
+            w = w[first: last, :].to(device)
+            b = b.to(device) if (b is not None and first == 0) else None
+            in_features = last - first
+            out_features = exported["out_features"]
+
+        module = LinearFP16(
+            in_features = in_features,
+            out_features = out_features,
+            weight = w,
+            bias = b,
+            full_in_features = in_features,
+            full_out_features = out_features,
+            first_in_feature = 0,
+            first_out_feature = 0,
+            out_dtype = exported["out_dtype"],
+        )
+        return module
 
 
 class LinearFP16_torch:
