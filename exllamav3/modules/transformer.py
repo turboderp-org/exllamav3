@@ -8,7 +8,7 @@ from ..models import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedMLP, MLP, BlockSparseMLP
 from ..conversion.allocation import allocate_transformer
 from ..util import profile_opt
-from ..util.tp_split import TPAllocation
+import torch.distributed as dist
 
 class TransformerBlock(Module):
 
@@ -195,10 +195,17 @@ class ParallelDecoderBlock(Module):
 
         y = self.input_norm.forward(x, params, out_dtype = torch.half)
         y1 = self.attn.forward(y, params)
-        x += y1
-        if params.get("prefill"): return x
-        y2 = self.mlp.forward(y, params)
-        x += y2
+        if not params.get("prefill"):
+            y2 = self.mlp.forward(y, params)
+            y1 += y2
+
+            if self.tp_reduce:
+                if y1.dtype == torch.float32:
+                    # TODO: Evaluate precision loss from reducing in BF16
+                    y1 = y1.to(torch.bfloat16)
+                dist.all_reduce(y1, async_op = False)
+
+            x += y1
 
         return to2(x, out_dtype, self.out_dtype)
 
