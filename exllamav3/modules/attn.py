@@ -15,6 +15,7 @@ from ..util import profile_opt
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..models.model_tp_alloc import TPAllocation
+import torch.distributed as dist
 
 """
 SDPA:
@@ -315,17 +316,26 @@ class Attention(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        bsz, seqlen, _ = x.shape
-        attn_mode = params.get("attn_mode", "flash_attn_nc")
-        match attn_mode:
-            case "sdpa_nc":
-                x = self.decode_sdpa_nc(x, bsz, seqlen, params)
-            case "flash_attn":
-                x = self.decode_flash_attn(x, bsz, seqlen, params)
-            case "flash_attn_nc":
-                x = self.decode_flash_attn_nc(x, bsz, seqlen, params)
-            case _:
-                raise ValueError(f"Unknown attn_mode: {attn_mode}")
+        if self.num_kv_heads == 0:
+            x = torch.zeros_like(x, dtype = self.out_dtype)
+        else:
+            bsz, seqlen, _ = x.shape
+            attn_mode = params.get("attn_mode", "flash_attn_nc")
+            match attn_mode:
+                case "sdpa_nc":
+                    x = self.decode_sdpa_nc(x, bsz, seqlen, params)
+                case "flash_attn":
+                    x = self.decode_flash_attn(x, bsz, seqlen, params)
+                case "flash_attn_nc":
+                    x = self.decode_flash_attn_nc(x, bsz, seqlen, params)
+                case _:
+                    raise ValueError(f"Unknown attn_mode: {attn_mode}")
+
+        if self.tp_reduce:
+            if x.dtype == torch.float32:
+                # TODO: Evaluate precision loss from reducing in BF16
+                x = x.to(torch.bfloat16)
+            dist.all_reduce(x, async_op = False)
 
         return to2(x, out_dtype, self.out_dtype)
 
@@ -510,7 +520,11 @@ class Attention(Module):
                 inv_freq
             )
 
-        cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
+        if self.has_split_cache:
+            cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table)
+        else:
+            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
+
         o = flash_attn_with_kvcache(
             q = q,
             k = k,
@@ -524,10 +538,13 @@ class Attention(Module):
             window_size = (self.sliding_window, self.sliding_window),
             softcap = self.logit_softcapping
         )
-        cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
 
-        # TODO: Store updated cache layer
+        if self.has_split_cache:
+            self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
+        else:
+            cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
+
+        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
