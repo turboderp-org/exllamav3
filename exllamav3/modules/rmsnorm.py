@@ -12,7 +12,7 @@ class RMSNorm(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         rms_norm_eps: float,
         out_dtype: torch.dtype | None = None,
@@ -88,3 +88,31 @@ class RMSNorm(Module):
             overhead_per_device = overhead,
         )
         return [tpa]
+
+    def tp_export(self, plan):
+        assert self.device is not None, "Cannot export module for TP before loading."
+        self.weight.share_memory_()
+        return {
+            "cls": RMSNorm,
+            "kwargs": {
+                "key": self.key,
+                "rms_norm_eps": self.rms_norm_eps,
+                "out_dtype": self.out_dtype,
+                "constant_bias": self.constant_bias,
+            },
+            "weight": self.weight,
+            # "weight": make_mp_reference(self.weight),
+            "device": self.device,
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        device = local_context["device"]
+        module = RMSNorm(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+        module.weight = nn.Parameter(exported["weight"].to(module.device))
+        torch.cuda.synchronize()
+        return module
