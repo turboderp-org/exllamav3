@@ -116,3 +116,20 @@ class RMSNorm(Module):
         module.weight = nn.Parameter(exported["weight"].to(module.device))
         torch.cuda.synchronize()
         return module
+
+    @staticmethod
+    def tp_import_split(local_context, exported, plan, split):
+        device = local_context["device"]
+        first, last = split
+        module = RMSNorm(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+
+        w = exported["weight"]
+        if w.dim() == 2:
+            w = w[first : last, :]
+        module.weight = nn.Parameter(w.to(module.device).contiguous())
+
+        return module
