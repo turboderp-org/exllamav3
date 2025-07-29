@@ -150,9 +150,11 @@ class Attention(Module):
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
-        q_proj: Module | None = None,
-        kv_proj: Module | None = None,
-        o_proj: Module | None = None,
+        q_proj: Linear | Module | None = None,
+        k_proj: Linear | Module | None = None,
+        v_proj: Linear | Module | None = None,
+        kv_proj: Linear | Module | None = None,
+        o_proj: Linear | Module | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -193,9 +195,15 @@ class Attention(Module):
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
         else:
-            assert kv_proj
-            self.kv_proj = kv_proj
-            self.register_submodule(self.kv_proj)
+            if kv_proj:
+                self.kv_proj = kv_proj
+                self.register_submodule(self.kv_proj)
+            else:
+                assert k_proj and v_proj
+                self.k_proj = k_proj
+                self.v_proj = v_proj
+                self.register_submodule(self.k_proj)
+                self.register_submodule(self.v_proj)
 
         if key_o:
             self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o", out_dtype = out_dtype, qbits_mod_key = "o")
