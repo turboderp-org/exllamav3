@@ -2,8 +2,8 @@ import math
 import threading
 import time
 import torch
-
 import socket, contextlib
+import weakref
 
 lock = threading.RLock()
 
@@ -89,3 +89,26 @@ def find_free_port() -> int:
     with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
+
+
+class Cleanupper:
+    """
+    Utility class to call cleanup functions at the end of the __main__ scope. Similar functionality to
+    atexit but called before Python starts tearing down objects/threads.
+    """
+
+    def __init__(self):
+        self.atexit_fns = []
+        weakref.finalize(self, self._shutdown)
+
+    def register_atexit(self, fn):
+        self.atexit_fns.append(fn)
+
+    def unregister_atexit(self, fn):
+        if fn in self.atexit_fns:
+            self.atexit_fns.remove(fn)
+
+    def _shutdown(self):
+        for fn in self.atexit_fns:
+            fn()
+        self.atexit_fns = []
