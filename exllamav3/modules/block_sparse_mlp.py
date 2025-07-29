@@ -138,12 +138,13 @@ class BlockSparseMLP(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         hidden_size: int,
         intermediate_size: int,
         num_experts: int,
         num_experts_per_tok: int,
+        num_local_experts: int | None = None,
         key_up: str | None = None,
         key_gate: str | None = None,
         key_down: str | None = None,
@@ -154,14 +155,17 @@ class BlockSparseMLP(Module):
         activation_fn: str = "silu",
         interm_dtype: torch.dtype = None,
         router_type: str = "std",
+        routing_gate: Linear | None = None,
         routed_scaling_factor: float | None = None,
         n_group: int | None = None,
         topk_group: int | None = None,
-        shared_experts: MLP | GatedMLP | None = None
         shared_experts: MLP | GatedMLP | None = None,
         gates: list[Linear | Module] = None,
         ups: list[Linear | Module] = None,
         downs: list[Linear | Module] = None,
+        routing_first: int | None = None,
+        routing_last: int | None = None,
+        routing_rank: int | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -171,22 +175,34 @@ class BlockSparseMLP(Module):
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
+        self.num_local_experts = num_local_experts if num_local_experts is not None else num_experts
         self.hidden_size = hidden_size
+        self.router_type = router_type
+
+        self.routing_first = routing_first
+        self.routing_last = routing_last
+        self.routing_rank = routing_rank
 
         self.routed_scaling_factor = routed_scaling_factor
         self.n_group = n_group
         self.topk_group = topk_group
 
-        self.routing_gate = Linear(
-            config = config,
-            key = f"{key}.{key_routing_gate}",
-            in_features = hidden_size,
-            out_features = num_experts,
-            qmap = None,
-            out_dtype = torch.half,
-            pad_to = 1,
-        )
-        self.register_submodule(self.routing_gate)
+        if routing_gate is None and key_routing_gate is None:
+            self.routing_gate = None
+        elif routing_gate is None:
+            self.routing_gate = Linear(
+                config = config,
+                key = f"{key}.{key_routing_gate}",
+                in_features = hidden_size,
+                out_features = num_experts,
+                qmap = None,
+                out_dtype = torch.half,
+                pad_to = 1,
+            )
+            self.register_submodule(self.routing_gate)
+        else:
+            self.routing_gate = routing_gate
+            self.register_submodule(self.routing_gate)
 
         if gates is not None:
             assert ups is not None and len(ups) == len(gates)
@@ -262,13 +278,10 @@ class BlockSparseMLP(Module):
             case "dots": self.routing_fn = routing_dots
             case _: raise ValueError(f"Unknown router type {router_type}")
 
+        self.tp_reduce = False
 
-    @override
-    def load(self, device: torch.Device, **kwargs):
-        super().load(device, **kwargs)
 
-        self.e_score_correction_bias = \
-            self.config.stc.get_tensor(f"{self.key}.{self.e_score_correction_bias_key}", self.device, optional = True)
+    def load_local(self, **kwargs):
 
         # Test if experts can be fused
         num_exl3_tensors = 0
@@ -287,23 +300,6 @@ class BlockSparseMLP(Module):
             self.multi_gate = MultiLinear(self.device, self.gates)
             self.multi_up = MultiLinear(self.device, self.ups)
             self.multi_down = MultiLinear(self.device, self.downs)
-
-        router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
-        routing_weights_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.half, device = self.device)
-        selected_experts_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.long, device = self.device)
-
-        self.routing_cfg = RoutingCFG(
-            gate_tensor = self.routing_gate.inner.weight,
-            num_experts = self.num_experts,
-            num_experts_per_tok = self.num_experts_per_tok,
-            router_logits_bsz1 = router_logits_bsz1,
-            routing_weights_bsz1 = routing_weights_bsz1,
-            selected_experts_bsz1 = selected_experts_bsz1,
-            e_score_correction_bias = self.e_score_correction_bias,
-            routed_scaling_factor = self.routed_scaling_factor,
-            n_group = self.n_group,
-            topk_group = self.topk_group,
-        )
 
         yh = torch.empty(
             (self.num_experts_per_tok, 1, self.hidden_size),
@@ -330,6 +326,37 @@ class BlockSparseMLP(Module):
             interm_a = interm_a,
             out_d = out_d
         )
+
+    def load_routing(self, **kwargs):
+
+        router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
+        routing_weights_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.half, device = self.device)
+        selected_experts_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.long, device = self.device)
+
+        self.routing_cfg = RoutingCFG(
+            gate_tensor = self.routing_gate.inner.weight,
+            num_experts = self.num_experts,
+            num_experts_per_tok = self.num_experts_per_tok,
+            router_logits_bsz1 = router_logits_bsz1,
+            routing_weights_bsz1 = routing_weights_bsz1,
+            selected_experts_bsz1 = selected_experts_bsz1,
+            e_score_correction_bias = self.e_score_correction_bias,
+            routed_scaling_factor = self.routed_scaling_factor,
+            n_group = self.n_group,
+            topk_group = self.topk_group,
+        )
+
+
+    @override
+    def load(self, device: torch.Device, **kwargs):
+        super().load(device, **kwargs)
+
+        self.e_score_correction_bias = \
+            self.config.stc.get_tensor(f"{self.key}.{self.e_score_correction_bias_key}", self.device, optional = True)
+
+        self.load_local(**kwargs)
+        self.load_routing(**kwargs)
+
 
     @override
     def unload(self):
@@ -497,3 +524,84 @@ class BlockSparseMLP(Module):
         if self.shared_experts:
             tpa_list += self.shared_experts.make_tp_allocation()
         return tpa_list
+
+
+    def tp_export(self, plan):
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            return child.tp_export(plan) if child is not None else None
+
+        return {
+            "cls": BlockSparseMLP,
+            "kwargs": {
+                "key": self.key,
+                "hidden_size": self.hidden_size,
+                "intermediate_size": self.intermediate_size,
+                "activation_fn": self.activation_fn,
+                "num_experts": self.num_experts,
+                "num_experts_per_tok": self.num_experts_per_tok,
+                "out_dtype": self.out_dtype,
+                "interm_dtype": self.interm_dtype,
+                "router_type": self.router_type,
+                "routed_scaling_factor": self.routed_scaling_factor,
+                "n_group": self.n_group,
+                "topk_group": self.topk_group,
+            },
+            "routing_gate": _export(self.routing_gate),
+            "e_score_correction_bias": self.e_score_correction_bias,
+            "gates": [_export(self.gates[i]) for i in range(self.num_experts)],
+            "ups": [_export(self.ups[i]) for i in range(self.num_experts)],
+            "downs": [_export(self.downs[i]) for i in range(self.num_experts)],
+            "shared_experts": self.shared_experts.tp_export(plan) if self.shared_experts is not None else None,
+            "device": self.device,
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan, **kwargs):
+        key = exported["kwargs"]["key"]
+        device = local_context["device"]
+        output_rank = local_context["output_rank"]
+        rank = local_context["rank"]
+        first, last = plan[key]
+        num_local_experts = last - first
+
+        def _import(name):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import(local_context, exported[name], plan) \
+                if exported.get(name) else None
+
+        def _import_no_reduce(name):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import(local_context, exported[name], plan, skip_reduction = True) \
+                if exported.get(name) else None
+
+        def _import_i(name, i):
+            nonlocal exported, plan
+            return exported[name][i]["cls"].tp_import(local_context, exported[name][i], plan) \
+                if exported.get(name) else None
+
+        module = BlockSparseMLP(
+            config = None,
+            **exported["kwargs"],
+            num_local_experts = num_local_experts,
+            gates = [_import_i("gates", i) for i in range(first, last)],
+            ups = [_import_i("ups", i) for i in range(first, last)],
+            downs = [_import_i("downs", i) for i in range(first, last)],
+            shared_experts = _import_no_reduce("shared_experts"),
+            routing_gate = _import("routing_gate") if rank == output_rank else None,
+            routing_first = first,
+            routing_last = last,
+            routing_rank = output_rank,
+        )
+
+        module.device = device
+        module.e_score_correction_bias = exported["e_score_correction_bias"].to(device) if rank == output_rank else None
+        if num_local_experts > 0:
+            module.load_local()
+        if rank == output_rank:
+            module.load_routing()
+        if not kwargs.get("skip_reduction"):
+            module.tp_reduce = True
+        return module
