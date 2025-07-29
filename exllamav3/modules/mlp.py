@@ -14,7 +14,7 @@ class MLP(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         hidden_size: int,
         intermediate_size: int,
@@ -100,6 +100,9 @@ class GatedMLP(Module):
         intermediate_split_size: int | None = MAX_MLP_INTERMEDIATE,
         interm_dtype: torch.dtype = None,
         pad_to = 128,
+        gates: list[Linear | Module] = None,
+        ups: list[Linear | Module] = None,
+        downs: list[Linear | Module] = None,
     ):
         super().__init__(config, key, None)
 
@@ -118,99 +121,108 @@ class GatedMLP(Module):
         else:
             fkey, frange_gate, frange_up = None, None, None
 
-        if intermediate_split_size and intermediate_size > intermediate_split_size:
-            num_slices = (intermediate_size + intermediate_split_size - 1) // intermediate_split_size
-            interm_slice = intermediate_size // num_slices // 128 * 128
-            interm_split = [interm_slice for _ in range(num_slices)]
-            interm_split[-1] += intermediate_size - sum(interm_split)
-            self.num_slices = num_slices
+        if gates is not None:
+            assert ups is not None and len(ups) == len(gates)
+            assert downs is not None and len(downs) == len(gates)
+            self.num_slices = len(gates)
+            self.gates = gates
+            self.ups = ups
+            self.downs = downs
+
         else:
-            interm_split = [intermediate_size]
-            self.num_slices = 1
-
-        self.gates = []
-        self.ups = []
-        self.downs = []
-
-        a = 0
-        for idx, sp in enumerate(interm_split):
-            b = a + sp
-
-            if self.num_slices > 1:
-                s_key_g = f"{key}.{key_gate}.slice.{idx}"
-                s_key_u = f"{key}.{key_up}.slice.{idx}"
-                s_key_d = f"{key}.{key_down}.slice.{idx}"
-                a_key_g = f"{key}.{key_gate}"
-                a_key_u = f"{key}.{key_up}"
-                a_key_d = f"{key}.{key_down}"
+            if intermediate_split_size and intermediate_size > intermediate_split_size:
+                num_slices = (intermediate_size + intermediate_split_size - 1) // intermediate_split_size
+                interm_slice = intermediate_size // num_slices // 128 * 128
+                interm_split = [interm_slice for _ in range(num_slices)]
+                interm_split[-1] += intermediate_size - sum(interm_split)
+                self.num_slices = num_slices
             else:
-                s_key_g = f"{key}.{key_gate}"
-                s_key_u = f"{key}.{key_up}"
-                s_key_d = f"{key}.{key_down}"
-                a_key_g = None
-                a_key_u = None
-                a_key_d = None
+                interm_split = [intermediate_size]
+                self.num_slices = 1
 
-            gate = Linear(
-                config = config,
-                key = s_key_g,
-                in_features = hidden_size,
-                out_features = b - a,
-                full_in_features = hidden_size,
-                full_out_features = intermediate_size,
-                first_in_feature = 0,
-                first_out_feature = a,
-                qmap = qmap + ".input",
-                fkey = fkey,
-                frange = frange_gate,
-                alt_key = a_key_g,
-                out_dtype = self.interm_dtype,
-                qbits_mod_key = "g",
-                pad_to = pad_to
-            )
-            up = Linear(
-                config = config,
-                key = s_key_u,
-                in_features = hidden_size,
-                out_features = b - a,
-                full_in_features = hidden_size,
-                full_out_features = intermediate_size,
-                first_in_feature = 0,
-                first_out_feature = a,
-                qmap = qmap + ".input",
-                fkey = fkey,
-                frange = frange_up,
-                alt_key = a_key_u,
-                out_dtype = self.interm_dtype,
-                qbits_mod_key = "u",
-                pad_to = pad_to
-            )
-            down = Linear(
-                config = config,
-                key = s_key_d,
-                in_features = b - a,
-                out_features = hidden_size,
-                full_in_features = intermediate_size,
-                full_out_features = hidden_size,
-                first_in_feature = a,
-                first_out_feature = 0,
-                qmap = qmap + ".down",
-                alt_key = a_key_d,
-                out_dtype = self.out_dtype,
-                allow_input_padding = True,
-                qbits_mod_key = "d",
-                pad_to = pad_to
-            )
+            self.gates = []
+            self.ups = []
+            self.downs = []
 
-            self.ups.append(up)
-            self.gates.append(gate)
-            self.downs.append(down)
+            a = 0
+            for idx, sp in enumerate(interm_split):
+                b = a + sp
 
-            self.register_submodule(up)
-            self.register_submodule(gate)
-            self.register_submodule(down)
+                if self.num_slices > 1:
+                    s_key_g = f"{key}.{key_gate}.slice.{idx}"
+                    s_key_u = f"{key}.{key_up}.slice.{idx}"
+                    s_key_d = f"{key}.{key_down}.slice.{idx}"
+                    a_key_g = f"{key}.{key_gate}"
+                    a_key_u = f"{key}.{key_up}"
+                    a_key_d = f"{key}.{key_down}"
+                else:
+                    s_key_g = f"{key}.{key_gate}"
+                    s_key_u = f"{key}.{key_up}"
+                    s_key_d = f"{key}.{key_down}"
+                    a_key_g = None
+                    a_key_u = None
+                    a_key_d = None
 
-            a = b
+                gate = Linear(
+                    config = config,
+                    key = s_key_g,
+                    in_features = hidden_size,
+                    out_features = b - a,
+                    full_in_features = hidden_size,
+                    full_out_features = intermediate_size,
+                    first_in_feature = 0,
+                    first_out_feature = a,
+                    qmap = qmap + ".input",
+                    fkey = fkey,
+                    frange = frange_gate,
+                    alt_key = a_key_g,
+                    out_dtype = self.interm_dtype,
+                    qbits_mod_key = "g",
+                    pad_to = pad_to
+                )
+                up = Linear(
+                    config = config,
+                    key = s_key_u,
+                    in_features = hidden_size,
+                    out_features = b - a,
+                    full_in_features = hidden_size,
+                    full_out_features = intermediate_size,
+                    first_in_feature = 0,
+                    first_out_feature = a,
+                    qmap = qmap + ".input",
+                    fkey = fkey,
+                    frange = frange_up,
+                    alt_key = a_key_u,
+                    out_dtype = self.interm_dtype,
+                    qbits_mod_key = "u",
+                    pad_to = pad_to
+                )
+                down = Linear(
+                    config = config,
+                    key = s_key_d,
+                    in_features = b - a,
+                    out_features = hidden_size,
+                    full_in_features = intermediate_size,
+                    full_out_features = hidden_size,
+                    first_in_feature = a,
+                    first_out_feature = 0,
+                    qmap = qmap + ".down",
+                    alt_key = a_key_d,
+                    out_dtype = self.out_dtype,
+                    allow_input_padding = True,
+                    qbits_mod_key = "d",
+                    pad_to = pad_to
+                )
+
+                self.ups.append(up)
+                self.gates.append(gate)
+                self.downs.append(down)
+
+                self.register_submodule(up)
+                self.register_submodule(gate)
+                self.register_submodule(down)
+
+                a = b
 
         match activation_fn:
             case "silu": self.activation_fn_call = ext.silu_mul
