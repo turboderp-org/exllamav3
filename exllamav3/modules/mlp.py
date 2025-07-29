@@ -86,7 +86,7 @@ class GatedMLP(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         hidden_size: int,
         intermediate_size: int,
@@ -111,6 +111,8 @@ class GatedMLP(Module):
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
         self.hidden_size = hidden_size
+        self.intermediate_split_size = intermediate_split_size
+        self.pad_to = pad_to
 
         if key_fused_gate_up:
             assert not intermediate_split_size or intermediate_size <= intermediate_split_size, \
@@ -228,6 +230,8 @@ class GatedMLP(Module):
             case "silu": self.activation_fn_call = ext.silu_mul
             case "gelu": self.activation_fn_call = ext.gelu_mul
 
+        self.tp_reduce = False
+
 
     @override
     def can_defer_load(self):
@@ -297,3 +301,63 @@ class GatedMLP(Module):
             limit_key = "mlp"
         )
         return [tpa]
+
+
+    def tp_export(self, plan):
+        assert self.device is not None, "Cannot export module for TP before loading."
+        assert self.pad_to == 128, "Cannot export module for TP unless pad_to == 128."
+
+        def _export(child):
+            return child.tp_export(plan) if child is not None else None
+
+        return {
+            "cls": GatedMLP,
+            "kwargs": {
+                "key": self.key,
+                "hidden_size": self.hidden_size,
+                "intermediate_size": self.intermediate_size,
+                "activation_fn": self.activation_fn,
+                "out_dtype": self.out_dtype,
+                "interm_dtype": self.interm_dtype,
+                "intermediate_split_size": self.intermediate_split_size,
+            },
+            "gates": [_export(self.gates[i]) for i in range(self.num_slices)],
+            "ups": [_export(self.ups[i]) for i in range(self.num_slices)],
+            "downs": [_export(self.downs[i]) for i in range(self.num_slices)],
+            "device": self.device,
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan, **kwargs):
+        key = exported["kwargs"]["key"]
+        device = local_context["device"]
+        first, last = plan[key]
+        num_slices = len(exported["gates"])
+
+        if first >= last:
+            num_slices = 0
+
+        # TODO: Sliced split
+
+        gu_split = (True, first, last)
+        d_split = (False, first, last)
+
+        def _import_i_split(name, i, split):
+            nonlocal exported, plan
+            return exported[name][i]["cls"].tp_import_split(local_context, exported[name][i], plan, split) \
+                if exported.get(name) else None
+
+        module = GatedMLP(
+            config = None,
+            **exported["kwargs"],
+            gates = [_import_i_split("gates", i, gu_split) for i in range(num_slices)],
+            ups = [_import_i_split("ups", i, gu_split) for i in range(num_slices)],
+            downs = [_import_i_split("downs", i, d_split) for i in range(num_slices)],
+        )
+
+        module.device = device
+        if not kwargs.get("skip_reduction"):
+            module.tp_reduce = True
+        torch.cuda.synchronize()
+        return module
