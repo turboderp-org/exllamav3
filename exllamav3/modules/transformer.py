@@ -159,7 +159,7 @@ class ParallelDecoderBlock(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         input_norm: RMSNorm | LayerNorm | None = None,
         attn: Attention | None = None,
@@ -181,6 +181,8 @@ class ParallelDecoderBlock(Module):
         self.register_submodule(self.mlp)
 
         self.num_slices = mlp.num_slices if mlp else 1
+
+        self.tp_reduce = False
 
 
     @override
@@ -222,3 +224,47 @@ class ParallelDecoderBlock(Module):
         if not self.attn and not self.mlp:
             name += " (no-op)"
         return name
+
+
+    def tp_export(self, plan):
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            return child.tp_export(plan) if child is not None else None
+
+        return {
+            "cls": ParallelDecoderBlock,
+            "kwargs": {
+                "key": self.key,
+                "out_dtype": self.out_dtype,
+            },
+            **{name: _export(getattr(self, name, None)) for name in (
+                "input_norm",
+                "attn",
+                "mlp",
+            )},
+            "device": self.device,
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        device = local_context["device"]
+
+        def _import(name, **kwargs):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import(local_context, exported[name], plan, **kwargs) \
+                if exported.get(name) else None
+
+        module = ParallelDecoderBlock(
+            config = None,
+            **exported["kwargs"],
+            input_norm = _import("input_norm"),
+            attn = _import("attn", skip_reduction = True),
+            mlp = _import("mlp", skip_reduction = True),
+        )
+        module.device = device
+
+        # Use single reduction for sum of mlp and attn
+        module.tp_reduce = True
+        return module
