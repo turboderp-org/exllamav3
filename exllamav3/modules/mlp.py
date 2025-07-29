@@ -9,6 +9,7 @@ from . import Module, Linear
 from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..models.model_tp_alloc import TPAllocation
+import torch.distributed as dist
 
 class MLP(Module):
 
@@ -257,19 +258,29 @@ class GatedMLP(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        qs = params.get("q_mlp_slice")
-        r = [qs] if qs is not None else range(0, self.num_slices)
-        d = None
+        if self.num_slices == 0:
+            d = torch.zeros_like(x, dtype = self.out_dtype)
+        else:
+            qs = params.get("q_mlp_slice")
+            r = [qs] if qs is not None else range(0, self.num_slices)
+            d = None
 
-        for s in r:
-            g = self.gates[s].forward(x, params)
-            u = self.ups[s].forward(x, params)
-            a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
-            self.activation_fn_call(g, u, a)
-            d_ = self.downs[s].forward(a, params)
-            if d is None: d = d_
-            else: d += d_
-            del d_
+            for s in r:
+                g = self.gates[s].forward(x, params)
+                u = self.ups[s].forward(x, params)
+                a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                self.activation_fn_call(g, u, a)
+                d_ = self.downs[s].forward(a, params)
+
+                if d is None: d = d_
+                else: d += d_
+                del d_
+
+        if self.tp_reduce:
+            if d.dtype == torch.float32:
+                # TODO: Evaluate precision loss from reducing in BF16
+                d = d.to(torch.bfloat16)
+            dist.all_reduce(d, async_op = False)
 
         return to2(d, out_dtype, self.out_dtype)
 
