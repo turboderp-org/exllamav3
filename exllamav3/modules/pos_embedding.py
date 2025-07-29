@@ -7,7 +7,7 @@ from ..models import Config
 from . import Module
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import to2
-from ..util.tp_split import TPAllocation
+from ..models.model_tp_alloc import TPAllocation
 
 class PosEmbedding(Module):
 

@@ -12,7 +12,7 @@ from .quant.exl3_lib import quantize_exl3
 from ..ext import exllamav3_ext as ext
 from ..conversion.allocation import allocate_linear
 from ..util.memory import free_mem
-from ..util.tp_split import TPAllocation
+from ..models.model_tp_alloc import TPAllocation
 
 
 class Linear(Module):

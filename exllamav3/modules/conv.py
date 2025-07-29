@@ -6,7 +6,7 @@ from torch import nn
 from ..models import Config
 from . import Module
 from ..ext import exllamav3_ext as ext
-from ..util.tp_split import TPAllocation
+from ..models.model_tp_alloc import TPAllocation
 
 class Conv(Module):
 
@@ -88,4 +88,4 @@ class Conv(Module):
 
 
     def make_tp_allocation(self) -> list[TPAllocation]:
-        raise NotImplementedError()
+        raise NotImplementedError("TP not implemented for Conv layer.")

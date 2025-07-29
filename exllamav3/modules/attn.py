@@ -14,7 +14,7 @@ from flash_attn import flash_attn_func, flash_attn_with_kvcache
 from ..util import profile_opt
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
-from ..util.tp_split import TPAllocation
+from ..models.model_tp_alloc import TPAllocation
 
 """
 SDPA:
@@ -531,17 +531,26 @@ class Attention(Module):
             self.v_proj.recons_size(),
             self.o_proj.recons_size(),
         )
+        channel_width = 1
+        channels_to_split = self.num_kv_heads
+        while channel_width * self.head_dim < 128:
+            assert channels_to_split % 2 == 0, \
+                "Model's K/V heads cannot divide into 128-channel tensors"
+            channel_width *= 2
+            channels_to_split //= 2
+        assert (channel_width * self.head_dim) % 128 == 0, \
+            "Model's K/V heads cannot divide into 128-channel tensors"
         # TODO: Account for flash-attn temp VRAM usage
         tpa = TPAllocation(
             key = self.key,
-            channel_width = 1,
+            channel_width = channel_width,
             channel_unit = "heads",
             storage_per_device = 0,
             storage_to_split = storage,
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
             recons_temp = recons,
-            channels_to_split = self.num_kv_heads,
+            channels_to_split = channels_to_split,
             limit_key = "attn"
         )
         return [tpa]

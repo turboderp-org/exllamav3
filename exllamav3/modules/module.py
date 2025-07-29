@@ -7,7 +7,7 @@ from torch import nn
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..models import Config
-from ..util.tp_split import TPAllocation
+from ..models.model_tp_alloc import TPAllocation
 
 # Use host bounce when moving state from device to device in layer split
 no_p2p_copy = os.environ.get('EXLLAMA_NO_P2P_COPY', None)

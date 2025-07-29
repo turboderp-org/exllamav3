@@ -13,7 +13,7 @@ from ..util import first_not_none
 from ..util import profile_opt
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
-from ..util.tp_split import TPAllocation
+from ..models.model_tp_alloc import TPAllocation
 
 
 @dataclass

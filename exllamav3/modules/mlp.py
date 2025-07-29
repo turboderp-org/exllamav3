@@ -8,7 +8,7 @@ from ..util.tensor import to2
 from . import Module, Linear
 from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
-from ..util.tp_split import TPAllocation
+from ..models.model_tp_alloc import TPAllocation
 
 class MLP(Module):
 
@@ -79,28 +79,7 @@ class MLP(Module):
 
 
     def make_tp_allocation(self) -> list[TPAllocation]:
-        storage = 0
-        storage += self.up.storage_size()
-        storage += self.down.storage_size()
-        overhead_d = self.hidden_size * (self.out_dtype or torch.half).itemsize
-        overhead_s = self.intermediate_size * torch.half.itemsize
-        recons = max(
-            self.up.recons_size(),
-            self.down.recons_size()
-        )
-        tpa = TPAllocation(
-            key = self.key,
-            channel_width = 128,
-            channel_unit = "channels",
-            storage_per_device = 0,
-            storage_to_split = storage,
-            overhead_per_device = overhead_d,
-            overhead_to_split = overhead_s,
-            recons_temp = recons,
-            channels_to_split = self.intermediate_size // 128,
-            limit_key = "mlp",
-        )
-        return [tpa]
+        raise NotImplementedError("TP not implemented for (non-gated) MLP layer.")
 
 
 class GatedMLP(Module):
