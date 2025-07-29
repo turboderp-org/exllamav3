@@ -14,6 +14,7 @@ from ..util import profile_opt
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
 from ..models.model_tp_alloc import TPAllocation
+import torch.distributed as dist
 
 
 @dataclass
@@ -386,102 +387,141 @@ class BlockSparseMLP(Module):
         y = x.view(-1, self.hidden_size)
         bsz = y.shape[0]
 
-        selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, y, params)
+        # Routing
+        if self.routing_gate is not None:
+            selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, y, params)
+        else:
+            selected_experts = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.long, device = self.device)
+            routing_weights = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.half, device = self.device)
+
+        # Broadcast routing indices and weights
+        if self.routing_rank is not None:
+            dist.broadcast(selected_experts, src = self.routing_rank)
+            dist.broadcast(routing_weights, src = self.routing_rank)
 
         # Torch path
         if bsz > 1 or not self.is_quantized:
             final_hidden_states = torch.zeros_like(y, dtype = self.out_dtype)
 
-            expert_mask = torch.nn.functional.one_hot(
-                selected_experts,
-                num_classes = self.num_experts
-            )
-            expert_count = expert_mask.view(-1, self.num_experts).sum(dim = 0).cpu()
-            expert_mask = expert_mask.permute(2, 1, 0)
+            if self.routing_rank is None:
+                expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
+            else:
+                # TODO: profile, maybe optimize
+                selected_experts -= self.routing_first
+                invalid = (selected_experts < 0) | (selected_experts >= self.num_local_experts)
+                shifted = torch.where(invalid, torch.zeros_like(selected_experts), selected_experts + 1)
+                expert_mask = F.one_hot(shifted, num_classes = self.num_local_experts + 1)[..., 1:]
+                # routing_weights[invalid] = 0.0
 
-            def mlp(exp_i, xc):
-                g = self.gates[exp_i].forward(xc, params)
-                u = self.ups[exp_i].forward(xc, params)
-                a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
-                self.activation_fn_call(g, u, a)
-                return self.downs[exp_i].forward(a, params)
+            if self.num_local_experts is None or self.num_local_experts > 0:
 
-            for expert_idx in range(self.num_experts):
-                if expert_count[expert_idx] == 0:
-                    continue
-                idx, top_x = torch.where(expert_mask[expert_idx])
-                current_state = y[None, top_x].reshape(-1, self.hidden_size)
-                current_state = mlp(expert_idx, current_state) * routing_weights[top_x, idx, None]
-                final_hidden_states.index_add_(0, top_x, current_state)
+                num_ex = self.num_local_experts or self.num_experts
+                expert_count = expert_mask.view(-1, num_ex).sum(dim = 0).cpu()
+                expert_mask = expert_mask.permute(2, 1, 0)
+
+                def mlp(exp_i, xc):
+                    g = self.gates[exp_i].forward(xc, params)
+                    u = self.ups[exp_i].forward(xc, params)
+                    a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
+                    self.activation_fn_call(g, u, a)
+                    return self.downs[exp_i].forward(a, params)
+
+                for expert_idx in range(num_ex):
+                    if expert_count[expert_idx] == 0:
+                        continue
+                    idx, top_x = torch.where(expert_mask[expert_idx])
+                    current_state = y[None, top_x].reshape(-1, self.hidden_size)
+                    current_state = mlp(expert_idx, current_state) * routing_weights[top_x, idx, None]
+                    final_hidden_states.index_add_(0, top_x, current_state)
 
             final_hidden_states = final_hidden_states.reshape(x.shape)
-            if self.shared_experts:
-                final_hidden_states += self.shared_experts.forward(x, params)
-            return to2(final_hidden_states, out_dtype, self.out_dtype)
+            final_hidden_states = to2(final_hidden_states, out_dtype, self.out_dtype)
 
         # Fused path
         # TODO: Find good solution for 1 < bsz < 32
         else:
-            y = y.unsqueeze(0)
 
-            cfg = self.experts_cfg
+            # TODO: custom kernel
+            if self.routing_rank is not None:
+                selected_experts -= self.routing_first
+                mask = (selected_experts >= 0) & (selected_experts < self.num_local_experts).squeeze(0)
+                selected_experts = selected_experts[mask].unsqueeze(0)
+                routing_weights = routing_weights[mask].unsqueeze(0)
 
-            # Gate
-            ext.exl3_mgemm(
-                y,
-                self.multi_gate.ptrs_trellis,
-                cfg.interm_g,
-                self.multi_gate.ptrs_suh,
-                cfg.yh,
-                self.multi_gate.ptrs_svh,
-                selected_experts,
-                None,
-                self.multi_gate.K,
-                -1,
-                self.multi_gate.mcg_mult,
-                self.multi_gate.mul1_mult,
-            )
+            if selected_experts.shape[-1] == 0:
+                final_hidden_states = torch.zeros_like(y, dtype = self.out_dtype)
+            else:
+                y = y.unsqueeze(0)
 
-            # Up
-            ext.exl3_mgemm(
-                y,
-                self.multi_up.ptrs_trellis,
-                cfg.interm_u,
-                self.multi_up.ptrs_suh,
-                cfg.yh,
-                self.multi_up.ptrs_svh,
-                selected_experts,
-                None,
-                self.multi_up.K,
-                -1,
-                self.multi_up.mcg_mult,
-                self.multi_up.mul1_mult,
-            )
+                cfg = self.experts_cfg
 
-            # Activation
-            self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a)
+                # Gate
+                ext.exl3_mgemm(
+                    y,
+                    self.multi_gate.ptrs_trellis,
+                    cfg.interm_g,
+                    self.multi_gate.ptrs_suh,
+                    cfg.yh,
+                    self.multi_gate.ptrs_svh,
+                    selected_experts,
+                    None,
+                    self.multi_gate.K,
+                    -1,
+                    self.multi_gate.mcg_mult,
+                    self.multi_gate.mul1_mult,
+                )
 
-            # Down
-            ext.exl3_mgemm(
-                cfg.interm_a,
-                self.multi_down.ptrs_trellis,
-                cfg.out_d,
-                self.multi_down.ptrs_suh,
-                cfg.interm_a,
-                self.multi_down.ptrs_svh,
-                selected_experts,
-                routing_weights,
-                self.multi_down.K,
-                -1,
-                self.multi_down.mcg_mult,
-                self.multi_down.mul1_mult,
-            )
+                # Up
+                ext.exl3_mgemm(
+                    y,
+                    self.multi_up.ptrs_trellis,
+                    cfg.interm_u,
+                    self.multi_up.ptrs_suh,
+                    cfg.yh,
+                    self.multi_up.ptrs_svh,
+                    selected_experts,
+                    None,
+                    self.multi_up.K,
+                    -1,
+                    self.multi_up.mcg_mult,
+                    self.multi_up.mul1_mult,
+                )
 
-            final_hidden_states = cfg.out_d[:1, ...]
+                # Activation
+                self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a)
+
+                # Down
+                ext.exl3_mgemm(
+                    cfg.interm_a,
+                    self.multi_down.ptrs_trellis,
+                    cfg.out_d,
+                    self.multi_down.ptrs_suh,
+                    cfg.interm_a,
+                    self.multi_down.ptrs_svh,
+                    selected_experts,
+                    routing_weights,
+                    self.multi_down.K,
+                    -1,
+                    self.multi_down.mcg_mult,
+                    self.multi_down.mul1_mult,
+                )
+
+                final_hidden_states = cfg.out_d[:1, ...]
+
             final_hidden_states = final_hidden_states.view(x.shape)
-            if self.shared_experts:
-                final_hidden_states += self.shared_experts.forward(x, params)
-            return final_hidden_states
+
+        # Shared experts
+        if self.shared_experts:
+            final_hidden_states += self.shared_experts.forward(x, params)
+
+        # Output reduction
+        if self.tp_reduce:
+            if final_hidden_states.dtype == torch.float32:
+                # TODO: Evaluate precision loss from reducing in BF16
+                final_hidden_states = final_hidden_states.to(torch.bfloat16)
+            dist.all_reduce(final_hidden_states, async_op = False)
+
+        return final_hidden_states
 
 
     @override
