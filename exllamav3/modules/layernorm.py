@@ -138,3 +138,26 @@ class LayerNorm(Module):
         module.weight = nn.Parameter(exported["weight"].to(module.device))
         torch.cuda.synchronize()
         return module
+
+    @staticmethod
+    def tp_import_split(local_context, exported, plan, split):
+        device = local_context["device"]
+        first, last = split
+        module = LayerNorm(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+
+        w = exported["weight"]
+        if w.dim() == 2 and w.shape[0] > 1:
+            w = w[first : last, :]
+        module.weight = nn.Parameter(w.to(module.device).contiguous())
+
+        b = exported["bias"]
+        if b is not None:
+            if b.dim() == 2 and b.shape[0] > 1:
+                b = b[first : last, :]
+            module.bias = nn.Parameter(b.to(module.device).contiguous())
+
+        return module
