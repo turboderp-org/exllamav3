@@ -10,6 +10,8 @@ from ...util import profile_opt
 
 class LinearEXL3:
 
+    quant_type: str = "exl3"
+
     def __init__(
         self,
         config: Config | None,
@@ -172,3 +174,75 @@ class LinearEXL3:
         if self.trellis is not None: self.trellis = self.trellis.to(self.swap_device)
         if self.bias is not None: self.bias = self.bias.to(self.swap_device)
         self.swap_device = None
+
+
+    def tp_export(self, plan):
+        self.suh.share_memory_()
+        self.svh.share_memory_()
+        self.trellis.share_memory_()
+        if self.bias is not None:
+            self.bias.share_memory_()
+        if self.mcg is not None:
+            self.mcg.share_memory_()
+        if self.mul1 is not None:
+            self.mul1.share_memory_()
+        return {
+            "cls": LinearEXL3,
+            "in_features": self.in_features,
+            "out_features": self.out_features,
+            "suh": self.suh,
+            "svh": self.svh,
+            "trellis": self.trellis,
+            "bias": self.bias,
+            "mcg": self.mcg,
+            "mul1": self.mul1,
+            "out_dtype": self.out_dtype,
+        }
+
+
+    @staticmethod
+    def tp_import_split(local_context, exported, plan, split):
+        device = local_context["device"]
+        suh = exported["suh"]
+        svh = exported["svh"]
+        trellis = exported["trellis"]
+        bias = exported["bias"]
+        mcg = exported["mcg"]
+        mul1 = exported["mul1"]
+
+        if split is not None:
+            split_out, first, last = split
+        else:
+            split_out, first, last = True, 0, exported["out_features"]
+
+        if split_out:
+            suh = suh.to(device).contiguous()
+            svh = svh[first : last].to(device).contiguous()
+            trellis = trellis[:, first // 16 : last // 16, :].to(device).contiguous()
+            bias = bias[first : last].to(device).contiguous() if bias is not None else None
+            in_features = exported["in_features"]
+            out_features = last - first
+        else:
+            suh = suh[first : last].to(device).contiguous()
+            svh = svh.to(device).contiguous()
+            trellis = trellis[first // 16 : last // 16, :, :].to(device).contiguous()
+            bias = bias.to(device).contiguous() if (bias is not None and first == 0) else None
+            in_features = last - first
+            out_features = exported["out_features"]
+
+        module = LinearEXL3(
+            config = None,
+            in_features = in_features,
+            out_features = out_features,
+            scale = None,
+            su = None,
+            sv = None,
+            suh = suh,
+            svh = svh,
+            trellis = trellis,
+            mcg = mcg.to(device) if mcg is not None else mcg,
+            mul1 = mul1.to(device) if mul1 is not None else None,
+            bias = bias,
+            out_dtype = exported["out_dtype"],
+        )
+        return module
