@@ -16,6 +16,13 @@ def touch_device(device: int):
     d = d + d
 
 
+# Touch device and measure VRAM (child process)
+def touch_device_measure_vram(local_context: dict):
+    device = local_context["device"]
+    touch_device(device)
+    return torch.cuda.mem_get_info(device)
+
+
 # Reserve byte amount on device
 def set_memory_fraction_reserve(
     reserve: int,

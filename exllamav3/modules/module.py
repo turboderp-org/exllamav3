@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..models import Config
 from ..models.model_tp_alloc import TPAllocation
+from functools import lru_cache
 
 # Use host bounce when moving state from device to device in layer split
 no_p2p_copy = os.environ.get('EXLLAMA_NO_P2P_COPY', None)
@@ -133,3 +134,7 @@ class Module(ABC):
         TP according to plan.
         """
         raise NotImplementedError()
+
+    @lru_cache
+    def all_cache_modules(self) -> list[Module]:
+        return [m for m in self if m.caps.get("kv_cache")]
