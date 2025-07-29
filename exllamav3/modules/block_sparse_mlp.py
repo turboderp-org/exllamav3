@@ -158,6 +158,10 @@ class BlockSparseMLP(Module):
         n_group: int | None = None,
         topk_group: int | None = None,
         shared_experts: MLP | GatedMLP | None = None
+        shared_experts: MLP | GatedMLP | None = None,
+        gates: list[Linear | Module] = None,
+        ups: list[Linear | Module] = None,
+        downs: list[Linear | Module] = None,
     ):
         super().__init__(config, key, None)
 
@@ -184,45 +188,54 @@ class BlockSparseMLP(Module):
         )
         self.register_submodule(self.routing_gate)
 
-        self.gates = []
-        self.ups = []
-        self.downs = []
+        if gates is not None:
+            assert ups is not None and len(ups) == len(gates)
+            assert downs is not None and len(downs) == len(gates)
+            self.num_slices = len(gates)
+            self.gates = gates
+            self.ups = ups
+            self.downs = downs
 
-        for idx in range(num_experts):
+        else:
+            self.gates = []
+            self.ups = []
+            self.downs = []
 
-            gate = Linear(
-                config = config,
-                key = f"{key}.{key_gate}".replace("{expert_idx}", str(idx)),
-                in_features = hidden_size,
-                out_features = intermediate_size,
-                qmap = qmap + ".input",
-                out_dtype = self.interm_dtype
-            )
-            up = Linear(
-                config = config,
-                key = f"{key}.{key_up}".replace("{expert_idx}", str(idx)),
-                in_features = hidden_size,
-                out_features = intermediate_size,
-                qmap = qmap + ".input",
-                out_dtype = self.interm_dtype
-            )
-            down = Linear(
-                config = config,
-                key = f"{key}.{key_down}".replace("{expert_idx}", str(idx)),
-                in_features = intermediate_size,
-                out_features = hidden_size,
-                qmap = qmap + f".{idx}.down",
-                out_dtype = self.out_dtype,
-                allow_input_padding = True,
-            )
+            for idx in range(self.num_local_experts):
 
-            self.ups.append(up)
-            self.gates.append(gate)
-            self.downs.append(down)
+                gate = Linear(
+                    config = config,
+                    key = f"{key}.{key_gate}".replace("{expert_idx}", str(idx)),
+                    in_features = hidden_size,
+                    out_features = intermediate_size,
+                    qmap = qmap + ".input",
+                    out_dtype = self.interm_dtype
+                )
+                up = Linear(
+                    config = config,
+                    key = f"{key}.{key_up}".replace("{expert_idx}", str(idx)),
+                    in_features = hidden_size,
+                    out_features = intermediate_size,
+                    qmap = qmap + ".input",
+                    out_dtype = self.interm_dtype
+                )
+                down = Linear(
+                    config = config,
+                    key = f"{key}.{key_down}".replace("{expert_idx}", str(idx)),
+                    in_features = intermediate_size,
+                    out_features = hidden_size,
+                    qmap = qmap + f".{idx}.down",
+                    out_dtype = self.out_dtype,
+                    allow_input_padding = True,
+                )
 
-            self.register_submodule(up)
-            self.register_submodule(gate)
-            self.register_submodule(down)
+                self.ups.append(up)
+                self.gates.append(gate)
+                self.downs.append(down)
+
+                self.register_submodule(up)
+                self.register_submodule(gate)
+                self.register_submodule(down)
 
         match activation_fn:
             case "silu": self.activation_fn_call = ext.silu_mul
