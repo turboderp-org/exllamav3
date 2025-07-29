@@ -14,7 +14,7 @@ class TransformerBlock(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         attn_norm: RMSNorm | LayerNorm | None = None,
         attn: Attention | None = None,
@@ -106,6 +106,53 @@ class TransformerBlock(Module):
         if not self.attn and not self.mlp:
             name += " (no-op)"
         return name
+
+
+    def tp_export(self, plan):
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            return child.tp_export(plan) if child is not None else None
+
+        return {
+            "cls": TransformerBlock,
+            "kwargs": {
+                "key": self.key,
+                "out_dtype": self.out_dtype,
+            },
+            **{name: _export(getattr(self, name, None)) for name in (
+                "attn_norm",
+                "attn",
+                "attn_post_norm",
+                "mlp_norm",
+                "mlp",
+                "mlp_post_norm",
+            )},
+            "device": self.device,
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        device = local_context["device"]
+
+        def _import(name):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import(local_context, exported[name], plan) \
+                if exported.get(name) else None
+
+        module = TransformerBlock(
+            config = None,
+            **exported["kwargs"],
+            attn_norm = _import("attn_norm"),
+            attn = _import("attn"),
+            attn_post_norm = _import("attn_post_norm"),
+            mlp_norm = _import("mlp_norm"),
+            mlp = _import("mlp"),
+            mlp_post_norm = _import("mlp_post_norm"),
+        )
+        module.device = device
+        return module
 
 
 class ParallelDecoderBlock(Module):
