@@ -193,14 +193,14 @@ int exl3_mgemm
     const long* indices_ptr = (const long*) OPTPTR(indices);
     const half* weights_ptr = (const half*) OPTPTR(weights);
 
-    // int num_B = 0;
     if (indices)
     {
         TORCH_CHECK_DIM(indices.value(), 2);
-        TORCH_CHECK_SHAPES(indices.value(), 1, C, 0, 1);
-        // num_B = indices.value().size(1);
+        int num_indices = indices.value().size(1);
+        TORCH_CHECK(num_indices <= bszm_in || num_indices <= bszm_out, "mgemm: too many indices for tensor batch");
+        if (bszm_in > num_indices) bszm_in = num_indices;
+        if (bszm_out > num_indices) bszm_out = num_indices;
     }
-    //else TORCH_CHECK(false, "Must specify indices");
 
     if (weights)
     {
