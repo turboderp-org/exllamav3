@@ -130,7 +130,7 @@ class Attention(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         layer_idx: int,
         hidden_size: int,
@@ -171,6 +171,9 @@ class Attention(Module):
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
         self.logit_softcapping = logit_softcapping
+
+        if self.num_kv_heads == 0:
+            return
 
         if key_fused_qkv:
             fkey = f"{key}.{key_fused_qkv}"
@@ -238,16 +241,18 @@ class Attention(Module):
 
         self.cache_layers = []
         self.multi_kv = None
+        self.tp_reduce = False
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
 
 
-    @override
-    def load(self, device: torch.Device, **kwargs):
-        self.device_context = get_device_context(self.config, device)
-        super().load(device)
+    def load_local(self, device, **kwargs):
 
+        if self.num_kv_heads == 0:
+            return
+
+        # Cache
         for cl in self.cache_layers:
             cl.alloc(device)
 
@@ -272,6 +277,13 @@ class Attention(Module):
         if self.q_norm and isinstance(self.q_norm, RMSNorm):
             self.q_norm_tensor = self.q_norm.weight.data
             self.k_norm_tensor = self.k_norm.weight.data
+
+
+    @override
+    def load(self, device: torch.Device, **kwargs):
+        self.device_context = get_device_context(self.config, device)
+        super().load(device)
+        self.load_local(device, **kwargs)
 
 
     @override
@@ -562,3 +574,102 @@ class Attention(Module):
             limit_key = "attn"
         )
         return [tpa]
+
+
+    def tp_export(self, plan):
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            return child.tp_export(plan) if child is not None else None
+
+        return {
+            "cls": Attention,
+            "kwargs": {
+                "key": self.key,
+                "layer_idx": self.layer_idx,
+                "hidden_size": self.hidden_size,
+                "head_dim": self.head_dim,
+                "rope_settings": self.rope_settings,
+                "sm_scale": self.sm_scale,
+                "out_dtype": self.out_dtype,
+                "sliding_window": self.sliding_window,
+                "logit_softcapping": self.logit_softcapping,
+            },
+            "num_kv_heads": self.num_kv_heads,
+            **{name: _export(getattr(self, name, None)) for name in (
+                "q_norm",
+                "k_norm",
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "kv_proj",
+                "o_proj",
+            )},
+            "device": self.device,
+            "cache_layers": [
+                cl.tp_export(plan) for cl in self.cache_layers
+            ],
+            "n_gqa": self.num_q_heads // self.num_kv_heads
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan, **kwargs):
+        key = exported["kwargs"]["key"]
+        head_dim = exported["kwargs"]["head_dim"]
+        n_gqa = exported["n_gqa"]
+        device = local_context["device"]
+        first, last = plan[key]
+        num_kv_heads = last - first
+        num_q_heads = num_kv_heads * n_gqa
+
+        q_split = (True, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+            if num_kv_heads else None
+        kv_split = (True, first * head_dim, last * head_dim) \
+            if num_kv_heads else None
+        o_split = (False, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+            if num_kv_heads else None
+        norm_q_split = (first * n_gqa, last * n_gqa) \
+            if num_kv_heads else None
+        norm_k_split = (first, last) \
+            if num_kv_heads else None
+
+        # def _import(name):
+        #     nonlocal exported, plan
+        #     return exported[name]["cls"].tp_import(local_context, exported[name], plan) \
+        #         if exported.get(name) else None
+
+        def _import_split(name, split):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import_split(local_context, exported[name], plan, split) \
+                if split and exported.get(name) else None
+
+        module = Attention(
+            config = None,
+            **exported["kwargs"],
+            num_q_heads = num_q_heads,
+            num_kv_heads = num_kv_heads,
+            q_norm = _import_split("q_norm", norm_q_split),
+            k_norm = _import_split("k_norm", norm_k_split),
+            q_proj = _import_split("q_proj", q_split),
+            k_proj = _import_split("k_proj", kv_split),
+            v_proj = _import_split("v_proj", kv_split),
+            kv_proj = _import_split("kv_proj", kv_split),
+            o_proj = _import_split("o_proj", o_split),
+        )
+
+        if num_kv_heads:
+            cache_layers = exported["cache_layers"]
+            if len(cache_layers):
+                module.has_split_cache = True
+                for cl in exported["cache_layers"]:
+                    cli = cl["cls"](None, module, **cl["args"])
+                    module.cache_layers.append(cli)
+                    module.tp_cache_lookup[cl["args"]["cache_id"]] = cli
+
+        module.device = device
+        if not kwargs.get("skip_reduction"):
+            module.tp_reduce = True
+        module.load_local(device)
+        torch.cuda.synchronize()
+        return module
