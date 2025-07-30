@@ -8,6 +8,8 @@ template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
 void exl3_gemm_kernel(EXL3_GEMM_ARGS)
 {
+    auto grid = cg::this_grid();
+
     if (suh)
     {
         int total_warps = size_m * size_k / 128;
@@ -24,7 +26,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
                 0.088388347648f  // 1/sqrt(128)
             );
 
-        cg::this_grid().sync();
+        grid.sync();
         A = A_had;
     }
 
@@ -42,7 +44,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
         if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
         else                  C_ = (void*) (((half*) C_) + 16 * size_n);
         size_m_ -= 16;
-        cg::this_grid().sync();
+        grid.sync();
     }
 
     if (svh)
@@ -81,6 +83,8 @@ __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
 void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 {
     int bszm = MAX(bszm_in, bszm_out);
+    auto grid = cg::this_grid();
+
     for (int i = 0; i < bszm; i += gridDim.z)
     {
         int j = i + blockIdx.z;
@@ -115,7 +119,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                     0.088388347648f  // 1/sqrt(128)
                 );
         }
-        cg::this_grid().sync();
+        grid.sync();
 
         // Matmul
 
@@ -140,7 +144,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
             else                  C_ = (void*) (((half*) C_) + 16 * size_n);
             size_m_ -= 16;
-            cg::this_grid().sync();
+            grid.sync();
         }
 
         // Had and output scales
@@ -181,7 +185,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             }
         }
 
-        cg::this_grid().sync();
+        grid.sync();
     }
 
     // Final reduction
