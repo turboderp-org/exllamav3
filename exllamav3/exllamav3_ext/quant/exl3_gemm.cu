@@ -159,12 +159,14 @@ int exl3_mgemm
     const at::Tensor& suh,
     const at::Tensor& A_had,
     const at::Tensor& svh,
-    const c10::optional<at::Tensor>& indices,
-    const c10::optional<at::Tensor>& weights,
+    c10::optional<at::Tensor>& indices,
+    c10::optional<at::Tensor>& weights,
     int K,
     int force_shape_idx,
     uint32_t mcg_mult,
-    uint32_t mul1_mult
+    uint32_t mul1_mult,
+    int min_index,
+    int max_index
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -270,7 +272,9 @@ int exl3_mgemm
         (void*)& weights_ptr,
         (void*)& bszm_in,
         (void*)& bszm_out,
-        (void*)& mult
+        (void*)& mult,
+        (void*)& min_index,
+        (void*)& max_index
     };
 
     cudaLaunchCooperativeKernel

@@ -133,6 +133,8 @@ class ExpertsCFG:
     interm_u: torch.Tensor
     interm_a: torch.Tensor
     out_d: torch.Tensor
+    min_expert: int
+    max_expert: int
 
 
 class BlockSparseMLP(Module):
@@ -320,12 +322,17 @@ class BlockSparseMLP(Module):
             device = self.device
         )
 
+        mine, maxe = self.routing_first, self.routing_last
+        if mine is None or maxe - mine == self.num_experts:
+            mine, maxe = -1, -1
         self.experts_cfg = ExpertsCFG(
             yh = yh,
             interm_g = interm_g,
             interm_u = interm_u,
             interm_a = interm_a,
-            out_d = out_d
+            out_d = out_d,
+            min_expert = mine,
+            max_expert = maxe,
         )
 
     def load_routing(self, **kwargs):
@@ -441,74 +448,68 @@ class BlockSparseMLP(Module):
         # TODO: Find good solution for 1 < bsz < 32
         else:
 
-            # TODO: custom kernel
-            if self.routing_rank is not None:
-                selected_experts -= self.routing_first
-                mask = (selected_experts >= 0) & (selected_experts < self.num_local_experts).squeeze(0)
-                selected_experts = selected_experts[mask].unsqueeze(0)
-                routing_weights = routing_weights[mask].unsqueeze(0)
+            y = y.unsqueeze(0)
 
-            if selected_experts.shape[-1] == 0:
-                final_hidden_states = torch.zeros_like(y, dtype = self.out_dtype)
-            else:
-                y = y.unsqueeze(0)
+            cfg = self.experts_cfg
 
-                cfg = self.experts_cfg
+            # Gate
+            ext.exl3_mgemm(
+                y,
+                self.multi_gate.ptrs_trellis,
+                cfg.interm_g,
+                self.multi_gate.ptrs_suh,
+                cfg.yh,
+                self.multi_gate.ptrs_svh,
+                selected_experts,
+                None,
+                self.multi_gate.K,
+                -1,
+                self.multi_gate.mcg_mult,
+                self.multi_gate.mul1_mult,
+                cfg.min_expert,
+                cfg.max_expert
+            )
 
-                # Gate
-                ext.exl3_mgemm(
-                    y,
-                    self.multi_gate.ptrs_trellis,
-                    cfg.interm_g,
-                    self.multi_gate.ptrs_suh,
-                    cfg.yh,
-                    self.multi_gate.ptrs_svh,
-                    selected_experts,
-                    None,
-                    self.multi_gate.K,
-                    -1,
-                    self.multi_gate.mcg_mult,
-                    self.multi_gate.mul1_mult,
-                )
+            # Up
+            ext.exl3_mgemm(
+                y,
+                self.multi_up.ptrs_trellis,
+                cfg.interm_u,
+                self.multi_up.ptrs_suh,
+                cfg.yh,
+                self.multi_up.ptrs_svh,
+                selected_experts,
+                None,
+                self.multi_up.K,
+                -1,
+                self.multi_up.mcg_mult,
+                self.multi_up.mul1_mult,
+                cfg.min_expert,
+                cfg.max_expert
+            )
 
-                # Up
-                ext.exl3_mgemm(
-                    y,
-                    self.multi_up.ptrs_trellis,
-                    cfg.interm_u,
-                    self.multi_up.ptrs_suh,
-                    cfg.yh,
-                    self.multi_up.ptrs_svh,
-                    selected_experts,
-                    None,
-                    self.multi_up.K,
-                    -1,
-                    self.multi_up.mcg_mult,
-                    self.multi_up.mul1_mult,
-                )
+            # Activation
+            self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a)
 
-                # Activation
-                self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a)
+            # Down
+            ext.exl3_mgemm(
+                cfg.interm_a,
+                self.multi_down.ptrs_trellis,
+                cfg.out_d,
+                self.multi_down.ptrs_suh,
+                cfg.interm_a,
+                self.multi_down.ptrs_svh,
+                selected_experts,
+                routing_weights,
+                self.multi_down.K,
+                -1,
+                self.multi_down.mcg_mult,
+                self.multi_down.mul1_mult,
+                cfg.min_expert,
+                cfg.max_expert
+            )
 
-                # Down
-                ext.exl3_mgemm(
-                    cfg.interm_a,
-                    self.multi_down.ptrs_trellis,
-                    cfg.out_d,
-                    self.multi_down.ptrs_suh,
-                    cfg.interm_a,
-                    self.multi_down.ptrs_svh,
-                    selected_experts,
-                    routing_weights,
-                    self.multi_down.K,
-                    -1,
-                    self.multi_down.mcg_mult,
-                    self.multi_down.mul1_mult,
-                )
-
-                final_hidden_states = cfg.out_d[:1, ...]
-
-            final_hidden_states = final_hidden_states.view(x.shape)
+            final_hidden_states = cfg.out_d[:1, ...].view(x.shape)
 
         # Shared experts
         if self.shared_experts:

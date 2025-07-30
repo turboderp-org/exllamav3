@@ -77,6 +77,11 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     }
 }
 
+#define MAX_INDICES 128
+
+__device__ int64_t v_indices[128];
+__device__ half v_weights[128];
+__device__ int bszm_sync;
 
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
@@ -84,6 +89,36 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 {
     int bszm = MAX(bszm_in, bszm_out);
     auto grid = cg::this_grid();
+
+    // Pack indices within min_index <= idx < max_index
+
+    if (min_index >= 0)
+    {
+        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
+        {
+            int j = 0;
+            for (int i = 0; i < bszm; ++i)
+            {
+                int idx = B_indices[i];
+                if (idx >= min_index && idx < max_index)
+                {
+                    v_indices[j] = idx - min_index;
+                    if (B_weights) v_weights[j] = B_weights[i];
+                    j++;
+                }
+            }
+            bszm_sync = j;
+            for (; j < bszm; ++j)
+            {
+                v_indices[j] = -1;
+            }
+        }
+        __threadfence();
+        grid.sync();
+        B_indices = v_indices;
+        if (B_weights) B_weights = v_weights;
+        bszm = bszm_sync;
+    }
 
     for (int i = 0; i < bszm; i += gridDim.z)
     {
@@ -94,7 +129,10 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         else
         {
             mat_index = B_indices ? (int) B_indices[j] : j;
-            B = B_list[mat_index];
+            if (mat_index >= 0)
+            {
+                B = B_list[mat_index];
+            }
         }
 
         // Had and input scales
@@ -202,11 +240,11 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             {
                 float* C__ = ((float*) C) + this_warp * 32 + this_lane;
                 float* C___ = C__;
-                float sum = *C___;
-                for (int j = 1; j < bszm; ++j)
+                float sum = 0.0f;
+                for (int j = 0; j < bszm; ++j)
                 {
-                    C___ += size_m * size_n;
                     sum += *C___;
+                    C___ += size_m * size_n;
                 }
                 *C__ = sum;
             }
@@ -214,11 +252,11 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             {
                 half* C__ = ((half*) C) + this_warp * 32 + this_lane;
                 half* C___ = C__;
-                half sum = *C___;
-                for (int j = 1; j < bszm; ++j)
+                half sum = {};
+                for (int j = 0; j < bszm; ++j)
                 {
-                    C___ += size_m * size_n;
                     sum = __hadd(sum, *C___);
+                    C___ += size_m * size_n;
                 }
                 *C__ = sum;
             }
