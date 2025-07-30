@@ -115,7 +115,6 @@ class Module(ABC):
         return self.__class__.__name__
 
     def make_tp_allocation(self) -> list[TPAllocation]:
-        assert len(self.modules), "Tried to get TPAllocators from empty module list"
         tpa_list = []
         for m in self.modules:
             tpa_list += m.make_tp_allocation()

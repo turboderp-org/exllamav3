@@ -287,28 +287,30 @@ class GatedMLP(Module):
 
     def make_tp_allocation(self) -> list[TPAllocation]:
         storage = 0
+        ims = min(self.intermediate_size, self.intermediate_split_size)
         for g in self.gates: storage += g.storage_size()
         for u in self.ups: storage += u.storage_size()
         for d in self.downs: storage += d.storage_size()
         overhead_d = self.hidden_size * (self.out_dtype or torch.half).itemsize
-        overhead_s = 2 * self.intermediate_size * (self.interm_dtype or torch.half).itemsize
+        overhead_s = 2 * ims * (self.interm_dtype or torch.half).itemsize
         if self.interm_dtype != torch.half:
-            overhead_s += self.intermediate_size * torch.half.itemsize
+            overhead_s += ims * torch.half.itemsize
         recons = max(
             self.gates[0].recons_size(),
             self.ups[0].recons_size(),
             self.downs[0].recons_size()
         )
+        slice = self.num_slices > 1
         tpa = TPAllocation(
             key = self.key,
-            channel_width = 128 if self.num_slices == 1 else 128,
-            channel_unit = "channels" if self.num_slices == 1 else "slices",
+            channel_width = 1 if slice else 128,
+            channel_unit = "slices" if slice else "channels",
             storage_per_device = 0,
             storage_to_split = storage,
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
             recons_temp = recons,
-            channels_to_split = self.intermediate_size // 128 if self.num_slices == 1 else self.num_slices,
+            channels_to_split = self.num_slices if slice else self.intermediate_size // 128,
             limit_key = "mlp"
         )
         return [tpa]
@@ -349,23 +351,44 @@ class GatedMLP(Module):
         if first >= last:
             num_slices = 0
 
-        # TODO: Sliced split
-
-        gu_split = (True, first, last)
-        d_split = (False, first, last)
-
         def _import_i_split(name, i, split):
             nonlocal exported, plan
             return exported[name][i]["cls"].tp_import_split(local_context, exported[name][i], plan, split) \
                 if exported.get(name) else None
 
-        module = GatedMLP(
-            config = None,
-            **exported["kwargs"],
-            gates = [_import_i_split("gates", i, gu_split) for i in range(num_slices)],
-            ups = [_import_i_split("ups", i, gu_split) for i in range(num_slices)],
-            downs = [_import_i_split("downs", i, d_split) for i in range(num_slices)],
-        )
+        def _import_i(name, i):
+            nonlocal exported, plan
+            return exported[name][i]["cls"].tp_import(local_context, exported[name][i], plan) \
+                if exported.get(name) else None
+
+        if num_slices == 1:
+            gu_split = (True, first, last)
+            d_split = (False, first, last)
+            module = GatedMLP(
+                config = None,
+                **exported["kwargs"],
+                gates = [_import_i_split("gates", 0, gu_split)],
+                ups = [_import_i_split("ups", 0, gu_split)],
+                downs = [_import_i_split("downs", 0, d_split)],
+            )
+
+        elif num_slices > 1:
+            module = GatedMLP(
+                config = None,
+                **exported["kwargs"],
+                gates = [_import_i("gates", i) for i in range(first, last)],
+                ups = [_import_i("ups", i) for i in range(first, last)],
+                downs = [_import_i("downs", i) for i in range(first, last)],
+            )
+
+        else:
+            module = GatedMLP(
+                config = None,
+                **exported["kwargs"],
+                gates = [],
+                ups = [],
+                downs = [],
+            )
 
         module.device = device
         if not kwargs.get("skip_reduction"):
