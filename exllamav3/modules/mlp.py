@@ -58,6 +58,7 @@ class MLP(Module):
         match activation_fn:
             case "silu": self.activation_fn_call = F.silu
             case "gelu": self.activation_fn_call = lambda x: F.gelu(x, approximate = "tanh")
+            case "relu2": self.activation_fn_call = lambda x: torch.square(F.relu(x))
 
 
     @override
@@ -206,6 +207,7 @@ class GatedMLP(Module):
 
         match activation_fn:
             case "silu": self.activation_fn_call = ext.silu_mul
+            case "relu2": self.activation_fn_call = ext.relu2_mul
             case "gelu": self.activation_fn_call = ext.gelu_mul
 
 

@@ -1,3 +1,4 @@
+from .arcee import ArceeModel
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
@@ -25,6 +26,7 @@ ARCHITECTURES = {
         "config_class": m.config_class,
         "model_class": m,
     } for m in [
+        ArceeModel,
         CohereModel,
         Cohere2Model,
         DeciLMModel,
