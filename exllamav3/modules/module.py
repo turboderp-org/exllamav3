@@ -120,7 +120,7 @@ class Module(ABC):
             tpa_list += m.make_tp_allocation()
         return tpa_list
 
-    def tp_export(self, plan):
+    def tp_export(self, plan, producer):
         """
         Create serializable (dict) collection of module parameters and shared weights to pass to child process.
         """

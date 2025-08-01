@@ -370,9 +370,8 @@ class Linear(Module):
         return [tpa]
 
 
-    def tp_export(self, plan):
+    def tp_export(self, plan, producer):
         assert self.device is not None and self.inner is not None, "Cannot export module for TP before loading."
-
         return {
             "cls": Linear,
             "kwargs": {
@@ -389,7 +388,7 @@ class Linear(Module):
                 "first_out_feature": self.first_out_feature,
                 "post_scale": self.post_scale,
             },
-            "inner": self.inner.tp_export(plan),
+            "inner": self.inner.tp_export(plan, producer),
             "device": self.device
         }
 

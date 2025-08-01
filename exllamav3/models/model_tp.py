@@ -14,8 +14,8 @@ from .config import Config
 import traceback
 from functools import lru_cache
 from ..util.misc import Cleanupper
+from .model_tp_util import SMProducer, SMConsumer
 
-SHM_BUFFER_SIZE = 512 * 1024 * 1024
 cleanupper = Cleanupper()
 
 def mp_warmup_nccl(device):
@@ -25,8 +25,14 @@ def mp_warmup_nccl(device):
     dist.all_reduce(x)
     print(x)
 
-
-def mp_model_worker(conn, device: int, rank: int, world_size: int, output_rank: int, init_method: str):
+def mp_model_worker(
+    conn,
+    device: int,
+    rank: int,
+    world_size: int,
+    output_rank: int,
+    init_method: str,
+):
     with torch.inference_mode():
 
         # Local context dict
@@ -37,7 +43,6 @@ def mp_model_worker(conn, device: int, rank: int, world_size: int, output_rank: 
             "rank": rank,
             "world_size": world_size,
             "output_rank": output_rank,
-            "deferred_copies": []
         }
 
         # Process group
@@ -76,6 +81,25 @@ def mp_set_plan(local_context: dict, plan: dict, active_devices: list):
     """
     local_context["plan"] = plan
     local_context["active_devices"] = active_devices
+
+
+def mp_set_consumer(local_context: dict, producer_exp: SMProducer | dict):
+    """
+    Used by TP loader
+    """
+    local_context["consumer"] = SMConsumer(
+        producer_imp = producer_exp,
+        device = local_context["device"],
+        pin_memory = False
+    )
+
+
+def mp_close_consumer(local_context: dict):
+    """
+    Used by TP loader
+    """
+    local_context["consumer"].close()
+    del local_context["consumer"]
 
 
 def mp_model_append(local_context: dict, exported: dict):
@@ -171,7 +195,7 @@ class PseudoParentConn:
         rank: int,
         world_size: int,
         output_rank: int,
-        init_method: str
+        init_method: str,
     ):
         self.result = None
 
@@ -182,7 +206,6 @@ class PseudoParentConn:
             "rank": rank,
             "world_size": world_size,
             "output_rank": output_rank,
-            "deferred_copies": []
         }
 
         # Process group
@@ -281,7 +304,7 @@ class Model_TPMixin:
                     rank,
                     len(self.active_devices),
                     output_rank,
-                    init_method
+                    init_method,
                 )
                 self.mp_child_conn[device] = PseudoChildConn()
                 self.mp_children[device] = PseudoChild()
@@ -294,7 +317,7 @@ class Model_TPMixin:
                         rank,
                         len(self.active_devices),
                         output_rank,
-                        init_method
+                        init_method,
                     )
                 )
                 self.mp_children[device].start()
@@ -370,13 +393,25 @@ class Model_TPMixin:
         return result
 
 
-    def tp_worker_dispatch_wait_multi(self, active_devices: list[int], fn, args):
-        for device in active_devices:
-            self.tp_worker_dispatch(device, fn, args)
+    def tp_worker_dispatch_multi(self, active_devices: list[int], fn, args, dev_args: list | None = None):
+        for idx, device in enumerate(active_devices):
+            d_args = args
+            if dev_args is not None:
+                d_args = d_args + dev_args[idx]
+            conn = self.mp_parent_conn[device]
+            conn.send((fn, d_args))
+
+
+    def tp_worker_wait_multi(self, active_devices: list[int]):
         r = []
         for device in active_devices:
             r.append(self.tp_worker_result(device))
         return r
+
+
+    def tp_worker_dispatch_wait_multi(self, active_devices: list[int], fn, args, dev_args: list | None = None):
+        self.tp_worker_dispatch_multi(active_devices, fn, args, dev_args)
+        return self.tp_worker_wait_multi(active_devices)
 
 
     def tp_cache_page_copy(self, cache_id: int, from_page: int, to_page: int, num_tokens: int):
@@ -454,6 +489,15 @@ class Model_TPMixin:
         plan = allocator.compile_tp_plan()
         self.tp_worker_dispatch_wait_multi(self.active_devices, mp_set_plan, (plan, self.active_devices))
 
+        # Distribution pipeline
+        producer = SMProducer()
+        self.tp_worker_dispatch_wait_multi(
+            self.active_devices,
+            mp_set_consumer,
+            (),
+            [(producer.export(d),) if d != tp_output_device else (producer,) for d in active_devices]
+        )
+
         # Begin loading modules
         with (ProgressBar(f"Loading" if progressbar else None, len(modules)) as progress):
             for idx, module in enumerate(modules):
@@ -468,11 +512,11 @@ class Model_TPMixin:
                     config.stc.end_deferred_load()
 
                 # Do module-specific device/process split
-                exported = module.tp_export(plan)
+                exported = module.tp_export(plan, producer)
                 self.tp_worker_dispatch_wait_multi(self.active_devices, mp_model_append, (exported,))
-                # self.perform_deferred_mp_copies()
+                producer.clear()
 
-                # Release CPU tensors if no longer needed
+                # Release loaded module
                 module.unload()
 
                 # Progress and callbacks per fully loaded module
@@ -483,6 +527,10 @@ class Model_TPMixin:
             # Append final gather layer
             if last_module.caps["logits_output"]:
                 self.tp_worker_dispatch_wait_multi(self.active_devices, mp_model_append_gather, ())
+
+        # Distribution pipeline
+        self.tp_worker_dispatch_wait_multi(self.active_devices, mp_close_consumer, ())
+        producer.close()
 
         config.stc.close()
         self.loaded_tp = True

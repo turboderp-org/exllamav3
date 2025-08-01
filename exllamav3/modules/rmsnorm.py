@@ -89,9 +89,8 @@ class RMSNorm(Module):
         )
         return [tpa]
 
-    def tp_export(self, plan):
+    def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
-        self.weight.share_memory_()
         return {
             "cls": RMSNorm,
             "kwargs": {
@@ -100,25 +99,27 @@ class RMSNorm(Module):
                 "out_dtype": self.out_dtype,
                 "constant_bias": self.constant_bias,
             },
-            "weight": self.weight,
-            # "weight": make_mp_reference(self.weight),
+            "weight": producer.send(self.weight),
             "device": self.device,
         }
 
     @staticmethod
     def tp_import(local_context, exported, plan):
+        consumer = local_context["consumer"]
         device = local_context["device"]
         module = RMSNorm(
             config = None,
             **exported["kwargs"],
         )
         module.device = device
-        module.weight = nn.Parameter(exported["weight"].to(module.device))
+        w = consumer.recv(exported["weight"], cuda = True)
+        module.weight = nn.Parameter(w)
         torch.cuda.synchronize()
         return module
 
     @staticmethod
     def tp_import_split(local_context, exported, plan, split):
+        consumer = local_context["consumer"]
         device = local_context["device"]
         first, last = split
         module = RMSNorm(
@@ -127,7 +128,7 @@ class RMSNorm(Module):
         )
         module.device = device
 
-        w = exported["weight"]
+        w = consumer.recv(exported["weight"], cuda = True)
         if w.dim() == 2:
             w = w[first : last, :]
         module.weight = nn.Parameter(w.to(module.device).contiguous())

@@ -108,11 +108,12 @@ class TransformerBlock(Module):
         return name
 
 
-    def tp_export(self, plan):
+    def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
 
         def _export(child):
-            return child.tp_export(plan) if child is not None else None
+            nonlocal producer
+            return child.tp_export(plan, producer) if child is not None else None
 
         return {
             "cls": TransformerBlock,
@@ -233,11 +234,12 @@ class ParallelDecoderBlock(Module):
         return name
 
 
-    def tp_export(self, plan):
+    def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
 
         def _export(child):
-            return child.tp_export(plan) if child is not None else None
+            nonlocal producer
+            return child.tp_export(plan, producer) if child is not None else None
 
         return {
             "cls": ParallelDecoderBlock,

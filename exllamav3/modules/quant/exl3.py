@@ -176,39 +176,31 @@ class LinearEXL3:
         self.swap_device = None
 
 
-    def tp_export(self, plan):
-        self.suh.share_memory_()
-        self.svh.share_memory_()
-        self.trellis.share_memory_()
-        if self.bias is not None:
-            self.bias.share_memory_()
-        if self.mcg is not None:
-            self.mcg.share_memory_()
-        if self.mul1 is not None:
-            self.mul1.share_memory_()
+    def tp_export(self, plan, producer):
         return {
             "cls": LinearEXL3,
             "in_features": self.in_features,
             "out_features": self.out_features,
-            "suh": self.suh,
-            "svh": self.svh,
-            "trellis": self.trellis,
-            "bias": self.bias,
-            "mcg": self.mcg,
-            "mul1": self.mul1,
+            "suh": producer.send(self.suh),
+            "svh": producer.send(self.svh),
+            "trellis": producer.send(self.trellis),
+            "bias": producer.send(self.bias),
+            "mcg": producer.send(self.mcg),
+            "mul1": producer.send(self.mul1),
             "out_dtype": self.out_dtype,
         }
 
 
     @staticmethod
     def tp_import_split(local_context, exported, plan, split):
+        consumer = local_context["consumer"]
         device = local_context["device"]
-        suh = exported["suh"]
-        svh = exported["svh"]
-        trellis = exported["trellis"]
-        bias = exported["bias"]
-        mcg = exported["mcg"]
-        mul1 = exported["mul1"]
+        id_suh = exported["suh"]
+        id_svh = exported["svh"]
+        id_trellis = exported["trellis"]
+        id_bias = exported["bias"]
+        mcg = consumer.recv(exported["mcg"], cuda = True)
+        mul1 = consumer.recv(exported["mul1"], cuda = True)
 
         if split is not None:
             split_out, first, last = split
@@ -216,17 +208,17 @@ class LinearEXL3:
             split_out, first, last = True, 0, exported["out_features"]
 
         if split_out:
-            suh = suh.to(device).contiguous()
-            svh = svh[first : last].to(device).contiguous()
-            trellis = trellis[:, first // 16 : last // 16, :].to(device).contiguous()
-            bias = bias[first : last].to(device).contiguous() if bias is not None else None
+            suh = consumer.recv(id_suh, cuda = True)
+            svh = consumer.recv(id_svh, cuda = True, slice_dim = 0, first = first, last = last)
+            trellis = consumer.recv(id_trellis, cuda = True, slice_dim = 1, first = first // 16, last = last // 16)
+            bias = consumer.recv(id_bias, cuda = True, slice_dim = 0, first = first, last = last)
             in_features = exported["in_features"]
             out_features = last - first
         else:
-            suh = suh[first : last].to(device).contiguous()
-            svh = svh.to(device).contiguous()
-            trellis = trellis[first // 16 : last // 16, :, :].to(device).contiguous()
-            bias = bias.to(device).contiguous() if (bias is not None and first == 0) else None
+            suh = consumer.recv(id_suh, cuda = True, slice_dim = 0, first = first, last = last)
+            svh = consumer.recv(id_svh, cuda = True)
+            trellis = consumer.recv(id_trellis, cuda = True, slice_dim = 0, first = first // 16, last = last // 16)
+            bias = consumer.recv(id_bias, cuda = True)
             in_features = last - first
             out_features = exported["out_features"]
 
@@ -240,8 +232,8 @@ class LinearEXL3:
             suh = suh,
             svh = svh,
             trellis = trellis,
-            mcg = mcg.to(device) if mcg is not None else mcg,
-            mul1 = mul1.to(device) if mul1 is not None else None,
+            mcg = mcg,
+            mul1 = mul1,
             bias = bias,
             out_dtype = exported["out_dtype"],
         )

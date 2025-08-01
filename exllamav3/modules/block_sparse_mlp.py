@@ -567,11 +567,12 @@ class BlockSparseMLP(Module):
         return tpa_list
 
 
-    def tp_export(self, plan):
+    def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
 
         def _export(child):
-            return child.tp_export(plan) if child is not None else None
+            nonlocal producer
+            return child.tp_export(plan, producer) if child is not None else None
 
         return {
             "cls": BlockSparseMLP,
@@ -590,17 +591,19 @@ class BlockSparseMLP(Module):
                 "topk_group": self.topk_group,
             },
             "routing_gate": _export(self.routing_gate),
-            "e_score_correction_bias": self.e_score_correction_bias,
+            "e_score_correction_bias": producer.send(self.e_score_correction_bias),
             "gates": [_export(self.gates[i]) for i in range(self.num_experts)],
             "ups": [_export(self.ups[i]) for i in range(self.num_experts)],
             "downs": [_export(self.downs[i]) for i in range(self.num_experts)],
-            "shared_experts": self.shared_experts.tp_export(plan) if self.shared_experts is not None else None,
+            "shared_experts": self.shared_experts.tp_export(plan, producer) \
+                if self.shared_experts is not None else None,
             "device": self.device,
         }
 
 
     @staticmethod
     def tp_import(local_context, exported, plan, **kwargs):
+        consumer = local_context["consumer"]
         key = exported["kwargs"]["key"]
         device = local_context["device"]
         output_rank = local_context["output_rank"]
@@ -638,7 +641,7 @@ class BlockSparseMLP(Module):
         )
 
         module.device = device
-        module.e_score_correction_bias = exported["e_score_correction_bias"].to(device) if rank == output_rank else None
+        module.e_score_correction_bias = consumer.recv(exported["e_score_correction_bias"], cuda = True)
         if num_local_experts > 0:
             module.load_local()
         if rank == output_rank:

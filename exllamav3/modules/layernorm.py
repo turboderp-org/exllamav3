@@ -112,9 +112,8 @@ class LayerNorm(Module):
         )
         return [tpa]
 
-    def tp_export(self, plan):
+    def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
-        self.weight.share_memory_()
         return {
             "cls": LayerNorm,
             "kwargs": {
@@ -122,25 +121,27 @@ class LayerNorm(Module):
                 "layernorm_eps": self.layernorm_eps,
                 "out_dtype": self.out_dtype,
             },
-            "weight": self.weight,
+            "weight": producer.send(self.weight),
             "bias": self.bias,
             "device": self.device,
         }
 
     @staticmethod
     def tp_import(local_context, exported, plan):
+        consumer = local_context["consumer"]
         device = local_context["device"]
         module = LayerNorm(
             config = None,
             **exported["kwargs"],
         )
         module.device = device
-        module.weight = nn.Parameter(exported["weight"].to(module.device))
-        torch.cuda.synchronize()
+        w = consumer.recv(exported["weight"], cuda = True)
+        module.weight = nn.Parameter(w)
         return module
 
     @staticmethod
     def tp_import_split(local_context, exported, plan, split):
+        consumer = local_context["consumer"]
         device = local_context["device"]
         first, last = split
         module = LayerNorm(
@@ -149,15 +150,15 @@ class LayerNorm(Module):
         )
         module.device = device
 
-        w = exported["weight"]
+        w = consumer.recv(exported["weight"], cuda = True)
         if w.dim() == 2 and w.shape[0] > 1:
             w = w[first : last, :]
-        module.weight = nn.Parameter(w.to(module.device).contiguous())
+        module.weight = nn.Parameter(w.contiguous())
 
-        b = exported["bias"]
+        b = consumer.recv(exported["bias"], cuda = True)
         if b is not None:
             if b.dim() == 2 and b.shape[0] > 1:
                 b = b[first : last, :]
-            module.bias = nn.Parameter(b.to(module.device).contiguous())
+            module.bias = nn.Parameter(b.contiguous())
 
         return module
