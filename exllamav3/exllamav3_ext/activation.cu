@@ -211,6 +211,7 @@ void gelu_mul
             (half*) z.data_ptr(),
             numel
         );
+        cuda_check(cudaPeekAtLastError());
     }
     else
     {
@@ -221,5 +222,6 @@ void gelu_mul
             (half*) z.data_ptr(),
             numel
         );
+        cuda_check(cudaPeekAtLastError());
     }
 }

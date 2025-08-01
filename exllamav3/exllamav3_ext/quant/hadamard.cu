@@ -76,6 +76,7 @@ void had_r_128
             (const half*) OPTPTR(post_scale),
             r_scale
         );
+        cuda_check(cudaPeekAtLastError());
     }
 
     else if (input.dtype() == at::kFloat)
@@ -89,6 +90,7 @@ void had_r_128
             (const half*) OPTPTR(post_scale),
             r_scale
         );
+        cuda_check(cudaPeekAtLastError());
     }
 
     else TORCH_CHECK(false, "unsupported datatype");

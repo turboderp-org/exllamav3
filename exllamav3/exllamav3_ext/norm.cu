@@ -233,4 +233,6 @@ void rms_norm
         );
     else
         TORCH_CHECK(false, "rms_norm: Invalid datatypes for input/output, must be half or float")
+
+    cuda_check(cudaPeekAtLastError());
 }

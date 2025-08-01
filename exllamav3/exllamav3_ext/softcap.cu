@@ -77,6 +77,7 @@ void softcap
             numel,
             scale
         );
+        cuda_check(cudaPeekAtLastError());
     }
     else if (x.dtype() == at::kHalf)
     {
@@ -87,6 +88,7 @@ void softcap
             numel,
             scale
         );
+        cuda_check(cudaPeekAtLastError());
     }
     else
     {
