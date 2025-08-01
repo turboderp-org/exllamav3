@@ -15,3 +15,10 @@ void gelu_mul
     const at::Tensor& y,
     at::Tensor& z
 );
+
+void relu2_mul
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z
+);

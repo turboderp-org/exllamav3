@@ -65,6 +65,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("rope", &rope, "rope");
     m.def("silu_mul", &silu_mul, "silu_mul");
     m.def("gelu_mul", &gelu_mul, "gelu_mul");
+    m.def("relu2_mul", &relu2_mul, "relu2_mul");
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
