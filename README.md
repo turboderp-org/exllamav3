@@ -1,13 +1,6 @@
 
 # <img src="doc/cat.png" width="40"> ExLlamaV3
 
-ExLlamaV3 is still in development. Please note: ↙
-
-- The framework <u>is not yet fully optimized</u>. Performance is lacking, especially on Ampere, and there may be a significant CPU bottleneck on slower processors until the extension functions are fully built out.
-- AMD GPUs (ROCm) are not yet supported.
-- [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) is currently required. I hope to switch over to [FlashInfer](https://github.com/flashinfer-ai/flashinfer/tree/main) in time, but there are some obstacles to overcome first. 
-- A number of important features are yet to be added, such as tensor parallelism.
-
 ## Why?
 
 As the name implies, the original intention for ExLlama was to run inference on quantized Llama models. ExLlamaV2 was able to support a number of other architectures by treating every new model as (more or less) a Llama variant with optional features. However, as new models are increasingly moving away from the basic transformer template, this approach is no longer sustainable.  
@@ -18,12 +11,13 @@ Aside from lifting a few of the most successful features from V2 (such as the ge
 
 ## What's missing?
 
-There's much that still needs to be added and/or ported over from ExLlamaV2. I've decided to release ExLlamaV3 in its current state to invite testing, feedback and contributions, but please be aware that it's not yet a viable replacement for ExLlamaV2. Currently on the to-do list:
+Currently on the to-do list:
 
+- Lots of optimization
 - LoRA support
 - ROCm support
-- Tensor-parallel inference
-- Lots of optimization
+- More sampling functions
+- More quantization modes (FP4 etc.)
 
 As for what is implemented, expect that some things may be a little broken at first. Please be patient and/or contribute. 👉👈 
 
