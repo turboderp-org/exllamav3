@@ -162,7 +162,7 @@ class SMConsumer:
 
     def __init__(
         self,
-        producer_imp: dict,
+        producer_imp: dict | SMProducer,
         device: int | None = None,
         pin_memory: bool = False,
     ):
@@ -258,4 +258,5 @@ class SMConsumer:
     def close(self):
         if self.pin_memory:
             _cuda_host_unregister(self.arena.data_ptr())
-        self.shm.close()
+        if self.producer is not None:
+            self.shm.close()
