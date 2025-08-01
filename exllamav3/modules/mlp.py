@@ -10,55 +10,119 @@ from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
 
 class MLP(Module):
-
     def __init__(
         self,
         config: Config,
         key: str,
         hidden_size: int,
         intermediate_size: int,
-        out_size: int | None = None,
         key_up: str | None = None,
         key_down: str | None = None,
-        key_fused_gate_up: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
+        intermediate_split_size: int | None = MAX_MLP_INTERMEDIATE,
+        interm_dtype: torch.dtype = None,
         pad_to = 128,
     ):
         super().__init__(config, key, None)
-        assert key_fused_gate_up is None
 
         self.out_dtype = out_dtype
-
-        self.up = Linear(
-            config,
-            f"{key}.{key_up}",
-            hidden_size,
-            intermediate_size,
-            qmap = qmap + ".up",
-            qbits_mod_key = "u",
-            pad_to = pad_to
-        )
-        self.down = Linear(
-            config,
-            f"{key}.{key_down}",
-            intermediate_size,
-            hidden_size if out_size is None else out_size,
-            qmap = qmap + ".down",
-            qbits_mod_key = "d",
-            pad_to = pad_to
-        )
-
-        self.register_submodule(self.up)
-        self.register_submodule(self.down)
-
+        self.interm_dtype = interm_dtype
         self.activation_fn = activation_fn
+        self.intermediate_size = intermediate_size
+
+        fkey, frange_up = None, None
+
+        if intermediate_split_size and intermediate_size > intermediate_split_size:
+            num_slices = (intermediate_size + intermediate_split_size - 1) // intermediate_split_size
+            interm_slice = intermediate_size // num_slices // 128 * 128
+            interm_split = [interm_slice for _ in range(num_slices)]
+            interm_split[-1] += intermediate_size - sum(interm_split)
+            self.num_slices = num_slices
+        else:
+            interm_split = [intermediate_size]
+            self.num_slices = 1
+
+        self.ups = []
+        self.downs = []
+
+        a = 0
+        for idx, sp in enumerate(interm_split):
+            b = a + sp
+
+            if self.num_slices > 1:
+                s_key_u = f"{key}.{key_up}.slice.{idx}"
+                s_key_d = f"{key}.{key_down}.slice.{idx}"
+                a_key_u = f"{key}.{key_up}"
+                a_key_d = f"{key}.{key_down}"
+            else:
+                s_key_u = f"{key}.{key_up}"
+                s_key_d = f"{key}.{key_down}"
+                a_key_u = None
+                a_key_d = None
+
+            up = Linear(
+                config = config,
+                key = s_key_u,
+                in_features = hidden_size,
+                out_features = b - a,
+                full_in_features = hidden_size,
+                full_out_features = intermediate_size,
+                first_in_feature = 0,
+                first_out_feature = a,
+                qmap = qmap + ".input",
+                fkey = fkey,
+                frange = frange_up,
+                alt_key = a_key_u,
+                out_dtype = self.interm_dtype,
+                qbits_mod_key = "u",
+                pad_to = pad_to
+            )
+            down = Linear(
+                config = config,
+                key = s_key_d,
+                in_features = b - a,
+                out_features = hidden_size,
+                full_in_features = intermediate_size,
+                full_out_features = hidden_size,
+                first_in_feature = a,
+                first_out_feature = 0,
+                qmap = qmap + ".down",
+                alt_key = a_key_d,
+                out_dtype = self.out_dtype,
+                allow_input_padding = True,
+                qbits_mod_key = "d",
+                pad_to = pad_to
+            )
+
+            self.ups.append(up)
+            self.downs.append(down)
+
+            self.register_submodule(up)
+            self.register_submodule(down)
+
+            a = b
 
         match activation_fn:
             case "silu": self.activation_fn_call = F.silu
             case "gelu": self.activation_fn_call = lambda x: F.gelu(x, approximate = "tanh")
             case "relu2": self.activation_fn_call = lambda x: torch.square(F.relu(x))
+
+
+    @override
+    def can_defer_load(self):
+        if self.num_slices > 1: return False
+        return super().can_defer_load()
+
+
+    @override
+    def load(self, device: torch.Device, load_slice: int | None = None, **kwargs):
+        if load_slice is None:
+            super().load(device, **kwargs)
+        else:
+            self.ups[load_slice].load(device, **kwargs)
+            self.downs[load_slice].load(device, **kwargs)
 
 
     @override
@@ -69,11 +133,21 @@ class MLP(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        x = self.up.forward(x, params)
-        x = self.activation_fn_call(x)
-        x = self.down.forward(x, params)
+        qs = params.get("q_mlp_slice")
+        r = [qs] if qs is not None else range(0, self.num_slices)
+        d = None
 
-        return to2(x, out_dtype, self.out_dtype)
+        for s in r:
+            u = self.ups[s].forward(x, params)
+            a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+            a = self.activation_fn_call(u)
+            d_ = self.downs[s].forward(a, params)
+            if d is None: d = d_
+            else: d += d_
+            del d_
+
+        return to2(d, out_dtype, self.out_dtype)
+
 
 
 class GatedMLP(Module):
