@@ -107,6 +107,7 @@ class LlamaModel(Model):
                     key_down = "down_proj",
                     qmap = "block.mlp",
                     out_dtype = torch.float,
+                    interm_dtype = torch.float,
                 ),
             )
             for idx in range(config.num_hidden_layers)
@@ -142,7 +143,6 @@ class LlamaModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
-        params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 

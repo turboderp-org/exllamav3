@@ -11,6 +11,8 @@ from ..util import profile_opt
 if TYPE_CHECKING:
     from . import MMEmbedding
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 class Tokenizer:
 
     def __init__(

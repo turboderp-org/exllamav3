@@ -1,27 +1,25 @@
 from __future__ import annotations
-
 from functools import lru_cache
 from typing import Callable
-
 import torch
-import torch.nn.functional as F
-from torch import nn
-import os, json
 from .config import Config
-from ..util.progress import ProgressBar
-from ..util.memory import set_memory_fraction_reserve, set_memory_fraction_use, unset_memory_fraction, free_mem
+from ..util.memory import free_mem
+from .model_tp import Model_TPMixin
+from .model_ls import Model_LSMixin
 
-class Model:
+class Model(Model_TPMixin, Model_LSMixin):
 
     def __init__(
         self,
         config: Config,
         **kwargs,
     ):
+        super().__init__()
         self.config = config
 
         self.modules = []
         self.caps = {}
+        self.active_devices = []
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
@@ -37,6 +35,7 @@ class Model:
             yield from module
 
 
+    @lru_cache
     def find_module(self, key: str):
         for module in self:
             if module.key == key:
@@ -62,7 +61,6 @@ class Model:
 
         :param component:
             Which component model to load, for models with multiple component.
-            # TODO: Implement multimodal components
         """
 
         assert component in config.model_classes, \
@@ -73,19 +71,19 @@ class Model:
 
 
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
-        params["input_ids"] = input_ids
-        return input_ids
+        # Overridden by model arch class
+        raise NotImplementedError
 
 
     @torch.inference_mode
-    def prefill(self, input_ids: torch.Tensor, params: dict):
+    def prefill(self, input_ids: torch.Tensor, params: dict | None = None):
+        if params is None:
+            params = {}
         x = self.prepare_inputs(input_ids, params)
-        for idx, module in enumerate(self.modules):
-            params["prefill"] = (idx == self.last_kv_module_idx)
-            x = module.prepare_for_device(x, params)
-            x = module.forward(x, params)
-            if idx == self.last_kv_module_idx:
-                break
+        if self.loaded_tp:
+            return self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
+        else:
+            return self.prefill_ls(x, params, self.last_kv_module_idx, self.modules)
 
 
     @torch.inference_mode
@@ -93,161 +91,23 @@ class Model:
         if params is None:
             params = {}
         x = self.prepare_inputs(input_ids, params)
-        for idx, module in enumerate(self.modules):
-            if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
-                x = x[..., -num:, :].contiguous()
-            x = module.prepare_for_device(x, params)
-            x = module.forward(x, params)
-        return x
+        if self.loaded_tp:
+            return self.forward_tp(x, params, self.last_kv_module_idx, self.modules)
+        else:
+            return self.forward_ls(x, params, self.last_kv_module_idx, self.modules)
 
 
     def unload(self):
         for module in self.modules:
             module.unload()
-
-
-    # Load to single device
-    def _load_single(self, progressbar: bool, device: torch.device):
-        with ProgressBar(f"Loading" if progressbar else None, len(self.modules)) as progress:
-            for idx, module in enumerate(self.modules):
-                defer = module.can_defer_load()
-                if defer:
-                    self.config.stc.begin_deferred_load()
-                module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
-                if defer:
-                    self.config.stc.end_deferred_load()
-                progress.update(idx + 1)
-
-
-    def default_load_shape_dtype(self, chunk_size):
-        return (1, chunk_size), torch.long
-
-
-    def default_load_params(self):
-        return {}
-
-
-    # Load with split
-    def _load_autosplit(
-        self,
-        progressbar: bool,
-        reserve_per_device: list[int] | None,
-        use_per_device: list[int] | None,
-        active_devices: list[int],
-        max_chunk_size: int,
-        max_output_size: int,
-        max_output_factor: int,
-        callback_sync: Callable[[int, int], None],
-        generator: bool,
-    ):
-        current_device_i = 0
-        backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
-        dummy_state = None
-        prev_load_device = None
-        touched_devices = []
-        params = self.default_load_params()
-
-        with ProgressBar(f"Loading" if progressbar else None, len(self.modules)) as progress:
-
-            for idx, module in enumerate(self.modules):
-
-                if callback_sync: callback_sync(idx, len(self.modules))
-                if generator: yield idx, len(self.modules)
-
-                # Narrow state to max_output_size for logit output layer
-                is_logits_layer = module.caps.get("logits_output")
-                if is_logits_layer:
-                    b, c, d = backup_shape
-                    backup_shape = (b, min(max_output_size, c), d)
-                    if dummy_state is not None:
-                        dummy_state = dummy_state[:, :max_output_size, :]
-
-                while True:
-                    try:
-                        # Select device
-                        load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else \
-                            torch.device(active_devices[current_device_i])
-
-                        # Set VRAM limit if new device
-                        if load_device != torch.device("cpu") and load_device != prev_load_device:
-                            prev_load_device = load_device
-                            i = active_devices[current_device_i]
-                            if reserve_per_device is not None:
-                                set_memory_fraction_reserve(reserve_per_device[i], i)
-                            elif use_per_device is not None:
-                                 set_memory_fraction_use(use_per_device[i], i)
-                            else:
-                                raise RuntimeError("Logic error")
-                            touched_devices.append(i)
-
-                        # (Re)create or backup hidden state (metadata)
-                        if dummy_state is None:
-                            dummy_state = torch.zeros(backup_shape, dtype = backup_dtype, device = load_device)
-                        else:
-                            backup_shape = dummy_state.shape
-                            backup_dtype = dummy_state.dtype
-
-                        # Load module
-                        defer = module.can_defer_load()
-                        if defer:
-                            self.config.stc.begin_deferred_load()
-                        module.load(load_device)
-                        if defer:
-                            self.config.stc.end_deferred_load()
-
-                        # Forward dummy state through module
-                        dummy_state = module.prepare_for_device(dummy_state, params)
-                        dummy_state = module.forward(dummy_state, params)
-
-                        # Account for max_output_factor after last layer,
-                        if is_logits_layer:
-                            extra_dummy_states = [
-                                torch.empty_like(dummy_state)
-                                for _ in range(max_output_factor - 1)
-                            ]
-
-                        # We're good
-                        fail = False
-                        progress.update(idx + 1)
-
-                    # We're not good
-                    except Exception as e:
-                        self.config.stc.abort_deferred_load()
-                        if e.__class__.__name__ == "OutOfMemoryError" or \
-                            "CUDA out of memory" in str(e) or \
-                            "HIP out of memory" in str(e):
-                            # Exception object will hold references to tensors so we can't free them here
-                            fail = True
-                        else:
-                            raise
-
-                    # Module failed to load with an OoM error, so advance to the next device if possible
-                    if fail:
-                        module.unload()
-                        dummy_state = None
-                        free_mem()
-                        current_device_i += 1
-                        if current_device_i >= len(active_devices):
-                            raise RuntimeError("Insufficient VRAM in split for model and cache")
-                        continue
-
-                    # On to next module
-                    break
-
-            if callback_sync: callback_sync(len(self.modules), len(self.modules))
-            if generator: yield len(self.modules), len(self.modules)
-
-            dummy_state = None
-            unset_memory_fraction(touched_devices)
-
-        # Python will not run anything in an async function without at least one yield statement
-        if 'yield' in locals():
-            yield
+        self.active_devices = []
+        self.unload_tp()
 
 
     def load_gen(
         self,
         device: torch.device | str | int | None = None,
+        tp_output_device: torch.device | str | int | None = None,
         reserve_per_device: list[float] | float | None = None,
         use_per_device: list[float] | float | None = None,
         tensor_p: bool = False,
@@ -256,13 +116,18 @@ class Model:
         max_output_size: int = 32,
         max_output_factor: int = 1,
         callback: Callable[[int, int], None] | None = None,
-        generator: bool = True
+        generator: bool = True,
+        tp_dev_limits: dict | None = None
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
 
         :param device:
             (optional) If specified, load to single device, e.g. "cuda:0"
+
+        :param tp_output_device:
+            (optional) If loading with tensor_p == True, device on which to gather output logits. Must be one of
+            the active devices in the split. Default is first device in split
 
         :param reserve_per_device:
             (optional) Amount of memory to reserve for any device. Either a value in GB to apply on all devices
@@ -292,7 +157,8 @@ class Model:
             model.load(use_per_device = [23, 0, 23])
 
         :param tensor_p:
-            Load in tensor-parallel mode (not implemented yet)  TODO
+            Load in tensor-parallel mode. By default, attempt to split model according to available VRAM.
+            Allocation can be overridden with use_per_device or modified by reserve_per_device.
 
         :param max_chunk_size:
             The maximum number of tokens to expect in a single forward pass. Informs the layer split only, and
@@ -317,6 +183,14 @@ class Model:
 
         :param generator:
             Always true when using the _gen function directly
+
+        :param tp_dev_limits:
+            (optional, TP only) Dictionary of module categories and max parallelism for each. Categories are
+            "mlp", "attn", "moe", "linear" (i.e. output layer). Example:
+            tp_dev_limits = {
+                "attn": 2,  # Each attn layer uses at most two devices for tensor parallelism
+                "moe": 3,  # etc.
+            }
         """
 
         free_mem()
@@ -334,10 +208,10 @@ class Model:
                 "Cannot specify reserve_per_device or use_per_device when loading to single device."
             assert not tensor_p, \
                 "Cannot use tensor_p when loading to single device."
-            self._load_single(progressbar, device)
+            self._load_single(progressbar, device, self.config, self.modules)
 
-        # Split load
-        elif not tensor_p:
+        # Use/reserve
+        else:
             rpd = reserve_per_device is not None
             upd = use_per_device is not None
             assert not (rpd and upd), \
@@ -370,23 +244,46 @@ class Model:
                     if x > 0
                 ]
 
-            yield from self._load_autosplit(
-                progressbar,
-                reserve_per_device,
-                use_per_device,
-                active_devices,
-                max_chunk_size,
-                max_output_size,
-                max_output_factor,
-                callback,
-                generator
-            )
+            # Split load
+            if not tensor_p:
+                yield from self._load_autosplit(
+                    progressbar,
+                    reserve_per_device,
+                    use_per_device,
+                    active_devices,
+                    max_chunk_size,
+                    max_output_size,
+                    max_output_factor,
+                    callback,
+                    generator,
+                    self.config,
+                    self.modules,
+                )
 
-        # Tensor-p load
-        else:
-            raise NotImplementedError()
+            # Tensor-P load:
+            else:
+                if tp_output_device is None:
+                    tp_output_device = active_devices[0]
+                else:
+                    assert torch.device(tp_output_device).index in active_devices, \
+                        "Output device must be part of split."
 
-        self.config.stc.close()
+                yield from self._load_tp(
+                    progressbar,
+                    reserve_per_device,
+                    use_per_device,
+                    active_devices,
+                    max_chunk_size,
+                    max_output_size,
+                    max_output_factor,
+                    callback,
+                    generator,
+                    tp_output_device,
+                    self.config,
+                    self.modules,
+                    tp_dev_limits,
+                )
+
         free_mem()
 
 

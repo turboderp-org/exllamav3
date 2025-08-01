@@ -128,7 +128,7 @@ class Ernie4_5MoEModel(Model):
                         key_gate = "experts.{expert_idx}.gate_proj",
                         key_down = "experts.{expert_idx}.down_proj",
                         key_routing_gate = "gate",
-                        key_e_score_bias = "moe_statics.e_score_correction_bias",
+                        key_e_score_bias = "gate.e_score_correction_bias",
                         qmap = "block.mlp",
                         interm_dtype = torch.float,
                         out_dtype = torch.float,
@@ -190,7 +190,6 @@ class Ernie4_5MoEModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
-        params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 

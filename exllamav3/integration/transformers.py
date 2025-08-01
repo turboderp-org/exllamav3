@@ -141,7 +141,7 @@ class Exl3HfLinear(torch.nn.Module):
 class Exl3HfQuantizer(HfQuantizer):
 
     requires_calibration = False
-    required_packages = None    # TODO: should be "exllamav3>=0.0.4" once that is released (?)
+    required_packages = "exllamav3>=0.0.5"
     requires_parameters_quantization = False
 
     def __init__(self, quantization_config: QuantizationConfigMixin, **kwargs):

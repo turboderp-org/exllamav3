@@ -76,8 +76,11 @@ def main(args):
             context = []
 
         # Get user prompt
-        user_prompt = read_input_fn(args, user_name, multiline)
-        prefix = ""
+        try:
+            user_prompt = read_input_fn(args, user_name, multiline)
+            prefix = ""
+        except KeyboardInterrupt:
+            user_prompt = "/x"
 
         # Intercept commands
         if user_prompt.startswith("/"):

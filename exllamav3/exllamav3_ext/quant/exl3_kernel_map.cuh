@@ -1,6 +1,6 @@
 #pragma once
 
-int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits);
+int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits, bool multi);
 int exl3_gemm_num_kernel_shapes();
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int bits);
 
@@ -38,11 +38,13 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     const half** __restrict__ suh_list, \
     half* __restrict__ A_had, \
     const half** __restrict__ svh_list, \
-    const uint64_t* B_indices, \
-    const half* B_weights, \
+    int64_t* B_indices, \
+    half* B_weights, \
     int bszm_in, \
     int bszm_out, \
-    uint32_t mult
+    uint32_t mult, \
+    int min_index, \
+    int max_index
 
 typedef void (*fp_exl3_gemm_kernel) (EXL3_GEMM_ARGS);
 typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);

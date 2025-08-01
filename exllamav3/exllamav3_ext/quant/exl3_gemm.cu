@@ -159,12 +159,14 @@ int exl3_mgemm
     const at::Tensor& suh,
     const at::Tensor& A_had,
     const at::Tensor& svh,
-    const c10::optional<at::Tensor>& indices,
-    const c10::optional<at::Tensor>& weights,
+    c10::optional<at::Tensor>& indices,
+    c10::optional<at::Tensor>& weights,
     int K,
     int force_shape_idx,
     uint32_t mcg_mult,
-    uint32_t mul1_mult
+    uint32_t mul1_mult,
+    int min_index,
+    int max_index
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -193,14 +195,14 @@ int exl3_mgemm
     const long* indices_ptr = (const long*) OPTPTR(indices);
     const half* weights_ptr = (const half*) OPTPTR(weights);
 
-    // int num_B = 0;
     if (indices)
     {
         TORCH_CHECK_DIM(indices.value(), 2);
-        TORCH_CHECK_SHAPES(indices.value(), 1, C, 0, 1);
-        // num_B = indices.value().size(1);
+        int num_indices = indices.value().size(1);
+        TORCH_CHECK(num_indices <= bszm_in || num_indices <= bszm_out, "mgemm: too many indices for tensor batch");
+        if (bszm_in > num_indices) bszm_in = num_indices;
+        if (bszm_out > num_indices) bszm_out = num_indices;
     }
-    //else TORCH_CHECK(false, "Must specify indices");
 
     if (weights)
     {
@@ -270,7 +272,9 @@ int exl3_mgemm
         (void*)& weights_ptr,
         (void*)& bszm_in,
         (void*)& bszm_out,
-        (void*)& mult
+        (void*)& mult,
+        (void*)& min_index,
+        (void*)& max_index
     };
 
     cudaLaunchCooperativeKernel
