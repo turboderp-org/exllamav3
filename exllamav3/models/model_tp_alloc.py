@@ -125,31 +125,23 @@ class TPAllocator:
 
 
     def print_split(self):
-        for c in self.components:
-            if c.channel_unit is None:
-                continue
-            print(f"{c.key:50}", end = "")
-            print(f"{c.channel_unit:12}", end = "")
-            for s in c.current_split:
-                print(f"{s * c.channel_width: 10}", end = "")
-            print()
-        print("-" * (62 + 10 * len(self.estimate_total)))
-        print(f"{'Storage':50}", end = "")
-        print(f"{'GB':12}", end = "")
-        for e in self.estimate_storage:
-            print(f"{e / 1024**3:10.2f}", end = "")
-        print()
-        print(f"{'Overhead':50}", end = "")
-        print(f"{'GB':12}", end = "")
-        for e in self.estimate_overhead:
-            print(f"{e / 1024**3:10.2f}", end = "")
-        print()
-        print("-" * (62 + 10 * len(self.estimate_total)))
-        print(f"{'Total':50}", end = "")
-        print(f"{'GB':12}", end = "")
-        for e in self.estimate_total:
-            print(f"{e / 1024**3:10.2f}", end = "")
-        print()
+        n_columns = len(self.estimate_total)
+        def _divider():
+            nonlocal n_columns
+            print("    " + "-" * (62 + 10 * n_columns))
+        def _columns(t, u, d):
+            print(f"    {t:<50}{u:<12}" + "".join([f"{d_:>10}" for d_ in d]))
+
+        print(" -- Model split:")
+        _divider()
+        _columns("", "Units", [f"CUDA:{i}" for i in range(n_columns)])
+        _divider()
+        for c in (c for c in self.components if c.channel_unit):
+            _columns(c.key, c.channel_unit, [f"{s * c.channel_width}" for s in c.current_split])
+        _divider()
+        _columns("Storage", "GB", [f"{e / 1024**3:10.2f}" for e in self.estimate_storage])
+        _columns("Overhead", "GB", [f"{e / 1024**3:10.2f}" for e in self.estimate_overhead])
+        _columns("Total", "GB", [f"{e / 1024**3:10.2f}" for e in self.estimate_total])
 
 
     def compile_tp_plan(self):
