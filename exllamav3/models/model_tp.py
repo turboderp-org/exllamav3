@@ -368,3 +368,11 @@ class Model_TPMixin:
                 return_tensors.append(r)
         assert len(return_tensors) == 1, "TP logic error"
         return return_tensors[0]
+
+
+    def tp_rotate_cache_pages(self, cache_id: int, all_rotations: torch.Tensor):
+        all_rotations = self.tp_producer.send(all_rotations)
+        self.tp_worker_dispatch_wait_multi(self.active_devices, mp_rotate_cache_pages, (
+            cache_id,
+            all_rotations
+        ))

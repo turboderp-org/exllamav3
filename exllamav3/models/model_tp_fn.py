@@ -2,6 +2,8 @@ import torch
 import torch.distributed as dist
 import traceback
 from .model_tp_shared import SMProducer, SMConsumer
+from ..ext import exllamav3_ext as ext
+from functools import lru_cache
 
 def mp_warmup_nccl(device):
     """
@@ -190,6 +192,29 @@ def mp_cache_page_copy(
     for idx, module in enumerate(kv_modules):
         cache_layer = module.tp_cache_lookup[cache_id]
         cache_layer.copy_page(cache_layer, from_page, to_page, num_tokens)
+
+
+def mp_rotate_cache_pages(
+    local_context: dict,
+    cache_id: int,
+    all_rotations: dict,
+):
+    consumer = local_context["inf_consumer"]
+    all_rotations = consumer.recv(all_rotations, cuda = True)
+    kv_modules = local_context["kv_modules"]
+
+    @lru_cache
+    def get_buffer(shape, device, dtype):
+        return torch.empty(shape, device = device, dtype = dtype)
+
+    cache_tensors = []
+    for idx, module in enumerate(kv_modules):
+        cache_layer = module.tp_cache_lookup[cache_id]
+        cache_tensors += cache_layer.get_tensors()
+
+    for cache in cache_tensors:
+        buffer = get_buffer(cache[0].shape, cache.device, cache.dtype)
+        ext.cache_rotate(cache, all_rotations, buffer)
 
 
 class PseudoParentConn:
