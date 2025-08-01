@@ -26,8 +26,15 @@ def init_pg(device: int, rank: int, world_size: int, output_rank: int, init_meth
         "world_size": world_size,
         "output_rank": output_rank,
     }
-    dist.init_process_group("nccl", rank = rank, world_size = world_size, init_method = init_method)
+    print(f" -- NCCL init: world_size {world_size}, rank {rank}, device {device}, init_method {init_method}")
     torch.cuda.set_device(device)
+    dist.init_process_group(
+        "nccl",
+        rank = rank,
+        world_size = world_size,
+        init_method = init_method,
+        # device_id = torch.device(device),  # (causes mysterious slowdowns)
+    )
     mp_warmup_nccl(device)
     return local_context
 
