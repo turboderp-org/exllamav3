@@ -37,15 +37,18 @@ def mp_model_worker(
     world_size: int,
     output_rank: int,
     init_method: str,
+    producer: dict,
 ):
     with torch.inference_mode():
         local_context = init_pg(device, rank, world_size, output_rank, init_method)
+        local_context["inf_consumer"] = SMConsumer(producer, device = device, pin_memory = True)
 
         # Dispatch loop
         while True:
             msg = conn.recv()
             if msg == "quit":
                 torch.cuda.synchronize()
+                local_context["inf_consumer"].close()
                 dist.barrier()
                 dist.destroy_process_group()
                 break
@@ -134,7 +137,7 @@ def mp_model_append_gather(local_context: dict):
 
 def mp_model_forward(
     local_context: dict,
-    shared_input: torch.tensor,
+    shared_input: dict,
     params: dict,
     last_kv_module_idx: int,
     prefill: bool,
@@ -146,7 +149,20 @@ def mp_model_forward(
     dist.barrier()
 
     modules = local_context["modules"]
-    x = shared_input
+    consumer = local_context["inf_consumer"]
+
+    for tensor_param in [
+        "block_table",
+        "cache_seqlens",
+        "positions",
+        "position_ids",
+    ]:
+        p = params.get(tensor_param)
+        if p is not None:
+            params[tensor_param] = consumer.recv(p, cuda = True)
+
+    x = consumer.recv(shared_input)
+
     for idx, module in enumerate(modules):
         logits_layer = module.caps.get("logits_output")
         if logits_layer and (num := params.get("last_tokens_only")):
@@ -190,8 +206,10 @@ class PseudoParentConn:
         world_size: int,
         output_rank: int,
         init_method: str,
+        producer: SMProducer
     ):
         self.local_context = init_pg(device, rank, world_size, output_rank, init_method)
+        self.local_context["inf_consumer"] = SMConsumer(producer, device = device, pin_memory = True)
         self.result = None
 
 
@@ -207,6 +225,7 @@ class PseudoParentConn:
 
 
     def close(self, *args, **kwargs):
+        self.local_context["inf_consumer"].close()
         self.local_context = {}
 
 

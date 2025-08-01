@@ -24,7 +24,7 @@ class Model_TPMixin:
         self.mp_child_conn = []
         self.loaded_tp = False
         self.tp_output_device = None
-
+        self.tp_producer = None
 
     def create_tp_context(self):
         """
@@ -54,6 +54,8 @@ class Model_TPMixin:
         self.mp_children: list = [None] * num_devices
         self.mp_parent_conn: list = [None] * num_devices
         self.mp_child_conn: list = [None] * num_devices
+        self.tp_producer = SMProducer(buffer_size = 64 * 1024**2)
+
         for rank, device in enumerate(self.active_devices):
             if self.tp_output_device == device:
                 self.mp_parent_conn[device] = PseudoParentConn(
@@ -62,6 +64,7 @@ class Model_TPMixin:
                     len(self.active_devices),
                     output_rank,
                     init_method,
+                    self.tp_producer
                 )
                 self.mp_child_conn[device] = PseudoChildConn()
                 self.mp_children[device] = PseudoChild()
@@ -75,6 +78,7 @@ class Model_TPMixin:
                         len(self.active_devices),
                         output_rank,
                         init_method,
+                        self.tp_producer.export()
                     )
                 )
                 self.mp_children[device].start()
@@ -114,6 +118,9 @@ class Model_TPMixin:
         self.mp_children = []
         self.mp_parent_conn = []
         self.mp_child_conn = []
+
+        self.tp_producer.close()
+        self.tp_producer = None
 
         # Unregister exit hook
         cleanupper.unregister_atexit(self.destroy_tp_context)
@@ -248,7 +255,7 @@ class Model_TPMixin:
             self.active_devices,
             mp_set_consumer,
             (),
-            [(producer.export(d),) if d != tp_output_device else (producer,) for d in active_devices]
+            [(producer.export(),) if d != tp_output_device else (producer,) for d in active_devices]
         )
 
         # Begin loading modules
@@ -301,6 +308,7 @@ class Model_TPMixin:
 
 
     def prepare_inputs_for_tp(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        self.tp_producer.clear()
         # Use ID of Cache object as reference to avoid having to pickle it
         if "cache" in params:
             params["cache"] = id(params["cache"])
@@ -311,11 +319,10 @@ class Model_TPMixin:
             "positions",
             "position_ids",
         ]:
-            if params.get(tensor_param) is not None:
-                params[tensor_param].share_memory_()
-        x = x.clone()
-        x.share_memory_()
-        return x
+            p = params.get(tensor_param)
+            if p is not None:
+                params[tensor_param] = self.tp_producer.send(p)
+        return self.tp_producer.send(x)
 
 
     def prefill_tp(
@@ -327,7 +334,6 @@ class Model_TPMixin:
     ):
         x = self.prepare_inputs_for_tp(x, params)
         for device in self.active_devices:
-            # print("device", device, "launch prefill")
             self.tp_worker_dispatch(device, mp_model_forward, (
                 x,
                 params,
@@ -349,7 +355,6 @@ class Model_TPMixin:
     ):
         x = self.prepare_inputs_for_tp(x, params)
         for device in self.active_devices:
-            # print("device", device, "launch forward")
             self.tp_worker_dispatch(device, mp_model_forward, (
                 x,
                 params,

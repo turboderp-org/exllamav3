@@ -105,7 +105,7 @@ class SMProducer:
         # Pre-touch buffer to avoid page faults later
         self.buf[: self.buffer_size: 4096] = 0
 
-    def export(self, device):
+    def export(self):
         return {
             "shm_name": self.shm_name,
             "buffer_size": self.buffer_size,
