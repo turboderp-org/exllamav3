@@ -117,6 +117,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         max_output_factor: int = 1,
         callback: Callable[[int, int], None] | None = None,
         generator: bool = True,
+        tp_dev_limits: dict | None = None
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -182,6 +183,14 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         :param generator:
             Always true when using the _gen function directly
+
+        :param tp_dev_limits:
+            (optional, TP only) Dictionary of module categories and max parallelism for each. Categories are
+            "mlp", "attn", "moe", "linear" (i.e. output layer). Example:
+            tp_dev_limits = {
+                "attn": 2,  # Each attn layer uses at most two devices for tensor parallelism
+                "moe": 3,  # etc.
+            }
         """
 
         free_mem()
@@ -272,6 +281,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     tp_output_device,
                     self.config,
                     self.modules,
+                    tp_dev_limits,
                 )
 
         free_mem()

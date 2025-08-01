@@ -70,6 +70,7 @@ class TPAllocator:
         max_mem: list[int],
     ):
         self.num_devices = len(max_mem)
+        active_devices = [i for i in range(self.num_devices) if max_mem[i] > 0]
         storage_sum = [0] * self.num_devices
         overhead_max = [0] * self.num_devices
 
@@ -86,10 +87,9 @@ class TPAllocator:
             # Mask out devices to satisy max split per component type
             if c.max_devices is not None or c.limit_key:
                 dev_limit = self.dev_limits.get(c.limit_key, c.max_devices)
-                if dev_limit == 1:  # TODO
-                    for i in range(dev_limit, len(rem_mem_s)):
-                        rem_mem_s[i] = 0
-                elif dev_limit is not None:
+                if dev_limit is not None:
+                    dev_limit = min(dev_limit, len(active_devices))
+                if dev_limit is not None:
                     top_k_mask_(rem_mem_s, dev_limit)
 
             # Active devices on layer

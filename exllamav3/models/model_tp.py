@@ -197,8 +197,10 @@ class Model_TPMixin:
         tp_output_device: torch.device | int | str,
         config: Config,
         modules: list,
+        dev_limits: dict | None,
     ):
         assert use_per_device is None or reserve_per_device is None
+        if dev_limits is None: dev_limits = {}
 
         # Set output device
         if tp_output_device is None:
@@ -233,13 +235,7 @@ class Model_TPMixin:
             components,
             num_tokens = max_chunk_size,
             output_num_tokens = max_output_size,
-            dev_limits = {
-                # TODO: Args for max parallelism per component
-                # "mlp": min(4, len(self.active_devices)),
-                # "attn": min(3, len(self.active_devices)),
-                # "linear": 1,
-                # "moe": min(1, len(self.active_devices)),
-            }
+            dev_limits = dev_limits,
         )
         allocator.initial_split(max_mem)
         allocator.print_split()
