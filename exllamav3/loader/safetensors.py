@@ -9,6 +9,7 @@ from ..util import Timer, cuda_sync_active
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
 from fnmatch import fnmatch
+import time
 
 MAX_DEFERRED_LOAD_CHUNK = 2*1024**2
 
@@ -47,16 +48,20 @@ def read_header(filename: str) -> dict:
 class STCMetrics:
     bytes_loaded: int = 0
     time_elapsed: float = 0.0
+    total_open_elapsed: float = 0.0
     deferred_tensors: int = 0
     deferred_passes: int = 0
     direct_tensors: int = 0
     total_chunks: int = 0
+    def bandwidth_total(self):
+        return self.bytes_loaded / (1024 ** 3) / (self.total_open_elapsed + 1e-8)
     def bandwidth(self):
-        return self.bytes_loaded / (1024 ** 3) / self.time_elapsed
+        return self.bytes_loaded / (1024 ** 3) / (self.time_elapsed + 1e-8)
     def print(self):
         print(f" -- Total size: {self.bytes_loaded:,} bytes, {self.bytes_loaded / 1024**3:.2f} GB")
         print(f" -- Load time: {self.time_elapsed:.3f} seconds")
-        print(f" -- Bandwidth: {self.bandwidth():.3f} GB / s")
+        print(f" -- Overhead: {self.total_open_elapsed - self.time_elapsed:.3f} seconds")
+        print(f" -- Bandwidth: {self.bandwidth():.3f} GB/s  /  {self.bandwidth_total():.3f} GB/s")
         print(f" -- Deferred: {self.deferred_tensors:,} tensors in {self.deferred_passes:,} passes, {self.total_chunks:,} chunks")
         print(f" -- Direct: {self.direct_tensors:,} tensors")
 
@@ -86,6 +91,7 @@ class SafetensorsCollection:
         self.load_method = load_method or "mt_fread"
 
         self.metrics = STCMetrics()
+        self.first_open_time = None
 
         self.tensor_files = []
         self.add_tensor_files(directory)
@@ -277,6 +283,9 @@ class SafetensorsCollection:
         if load_method == "mt_fread" and self.deferred_mode and not no_defer:
             load_method = "defer"
 
+        if self.first_open_time is None:
+            self.first_open_time = time.time()
+
         with (Timer() as timer):
             match load_method:
                 case "defer":
@@ -380,6 +389,9 @@ class SafetensorsCollection:
 
     def close(self):
         assert self.new_tensors is None
+        if self.first_open_time is not None:
+            self.metrics.total_open_elapsed += time.time() - self.first_open_time
+            self.first_open_time = None
         for filename, h in self.handles.items():
             if h:
                 ext.stloader_close_file(h)
