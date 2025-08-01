@@ -160,10 +160,10 @@ class SafetensorsCollection:
         prefix: str,
     ):
         assert self.new_tensors is None  # TODO
-        keys = [
-            key for key in self.tensor_file_map.keys()
-            if key == prefix or key.startswith(prefix + ".")
-        ]
+        keys = [self.tensor_file_map.get(prefix)]
+        if keys[0] is None:
+            keys = []
+        keys += self.get_tensor_file_map_trie().keys(prefix + ".")
         sizes = [self.get_tensor_size(key) for key in keys]
         return sizes
 
@@ -551,6 +551,7 @@ class VariantSafetensorsCollection(SafetensorsCollection):
         return True
 
 
+    @lru_cache
     def get_tensor_sizes(
         self,
         prefix: str,
