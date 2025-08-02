@@ -64,7 +64,9 @@ class OutputGather(Module):
                 if src == self.rank:
                     out_slice.copy_(x)
                 else:
-                    dist.recv(out_slice, src = src)
+                    rbuf = torch.empty_like(out_slice)
+                    dist.recv(rbuf, src = src)
+                    out_slice.copy_(rbuf)
         else:
             dist.send(x, dst = self.output_rank)
 
