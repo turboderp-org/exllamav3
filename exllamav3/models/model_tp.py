@@ -300,6 +300,8 @@ class Model_TPMixin:
 
 
     def unload_tp(self):
+        if not self.loaded_tp:
+            return
         self.destroy_tp_context()
         self.loaded_tp = False
         self.tp_output_device = None
