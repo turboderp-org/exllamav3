@@ -72,7 +72,6 @@ class Module(ABC):
         global no_p2p_copy
         if x.device != self.device:
             if no_p2p_copy:
-                print(".")
                 x = x.cpu().to(self.device)
             else:
                 x = x.to(self.device)
