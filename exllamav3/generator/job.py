@@ -956,7 +956,7 @@ class Job:
 
 
     def activate(self):
-        self.logits_device = self.generator.model.modules[-1].device
+        self.logits_device = self.generator.model.output_device
         for f in self.filters:
             f.attach(self)
             f.reset()

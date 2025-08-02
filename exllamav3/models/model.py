@@ -20,6 +20,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.modules = []
         self.caps = {}
         self.active_devices = []
+        self.output_device = None
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
@@ -102,6 +103,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             module.unload()
         self.active_devices = []
         self.unload_tp()
+        self.output_device = None
 
 
     def load_gen(
@@ -259,6 +261,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     self.config,
                     self.modules,
                 )
+                self.output_device = self.modules[-1].device
 
             # Tensor-P load:
             else:
@@ -283,6 +286,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     self.modules,
                     tp_dev_limits,
                 )
+                self.output_device = tp_output_device
 
         free_mem()
 
