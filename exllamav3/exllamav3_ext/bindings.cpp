@@ -12,6 +12,7 @@
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
+#include "routing.cuh"
 
 #include "quant/quantize.cuh"
 #include "quant/pack.cuh"
@@ -45,6 +46,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("rms_norm", &rms_norm, "rms_norm");
     m.def("softcap", &softcap, "softcap");
+
+    m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
+    m.def("routing_std", &routing_std, "routing_std");
 
     m.def("had_paley", &had_paley, "had_paley");
     m.def("had_paley2", &had_paley2, "had_paley2");

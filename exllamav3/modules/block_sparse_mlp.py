@@ -32,28 +32,32 @@ class RoutingCFG:
 
 
 def routing_std(bsz, cfg, y, params):
-    activate_all_experts = params.get("activate_all_experts")
-
-    if bsz == 1 and not activate_all_experts:
+    if bsz == 1:
         torch.matmul(y, cfg.gate_tensor, out = cfg.router_logits_bsz1)
-        torch.topk(
+        ext.routing_std(
             cfg.router_logits_bsz1,
-            cfg.num_experts_per_tok,
-            dim = -1,
-            out = (cfg.routing_weights_bsz1, cfg.selected_experts_bsz1),
-            sorted = False
+            cfg.selected_experts_bsz1,
+            cfg.routing_weights_bsz1,
         )
-        torch.softmax(cfg.routing_weights_bsz1, dim = -1, out = cfg.routing_weights_bsz1)
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
-
     else:
         router_logits = torch.matmul(y, cfg.gate_tensor)
-        routing_weights, selected_experts = torch.topk(
-            router_logits,
-            cfg.num_experts if activate_all_experts else cfg.num_experts_per_tok,
-            dim = -1
-        )
-        routing_weights = torch.softmax(routing_weights, dim = -1)
+        activate_all_experts = params.get("activate_all_experts")
+        if activate_all_experts:
+            routing_weights = torch.softmax(router_logits, dim = -1)
+            selected_experts = (
+                torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
+                .repeat((bsz, 1))
+            )
+            return selected_experts, routing_weights
+        else:
+            routing_weights = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device)
+            selected_experts = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.long, device = y.device)
+            ext.routing_std(
+                router_logits,
+                selected_experts,
+                routing_weights,
+            )
         return selected_experts, routing_weights
 
 
@@ -63,7 +67,10 @@ def routing_ds3(bsz, cfg, y, params):
     router_logits = torch.matmul(y, cfg.gate_tensor)
 
     scores = router_logits.sigmoid()
-    scores_for_choice = scores.view(-1, cfg.num_experts) + cfg.e_score_correction_bias.unsqueeze(0)
+    scores_for_choice = scores.view(-1, cfg.num_experts)
+    if cfg.e_score_correction_bias is not None:
+        scores_for_choice = scores_for_choice + cfg.e_score_correction_bias.unsqueeze(0)
+
     group_scores = (
         scores_for_choice.view(-1, cfg.n_group, cfg.num_experts // cfg.n_group)
         .topk(2, dim = -1)[0]
@@ -93,36 +100,39 @@ def routing_ds3(bsz, cfg, y, params):
 
 
 def routing_dots(bsz, cfg, y, params):
-    activate_all_experts = params.get("activate_all_experts")
 
-    if bsz == 1 and not activate_all_experts:
+    if bsz == 1:
         torch.matmul(y, cfg.gate_tensor, out = cfg.router_logits_bsz1)
-        cfg.router_logits_bsz1 += cfg.e_score_correction_bias
-        torch.topk(
+        ext.routing_ds3_nogroup(
             cfg.router_logits_bsz1,
-            cfg.num_experts_per_tok,
-            dim = -1,
-            out = (cfg.routing_weights_bsz1, cfg.selected_experts_bsz1),
-            sorted = False
+            cfg.e_score_correction_bias,
+            cfg.selected_experts_bsz1,
+            cfg.routing_weights_bsz1,
+            cfg.routed_scaling_factor
         )
-        # TODO: Custom kernel for sigmoid normalization
-        cfg.routing_weights_bsz1.sigmoid_()
-        factor = cfg.routed_scaling_factor / (cfg.routing_weights_bsz1.sum(dim = -1, keepdim = True) + 1e-20)
-        cfg.routing_weights_bsz1 *= factor
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
 
     else:
         router_logits = torch.matmul(y, cfg.gate_tensor)
-        router_logits += cfg.e_score_correction_bias
-        routing_weights, selected_experts = torch.topk(
-            router_logits,
-            cfg.num_experts if activate_all_experts else cfg.num_experts_per_tok,
-            dim = -1
-        )
-        # TODO: Custom kernel for sigmoid normalization
-        routing_weights.sigmoid_()
-        factor = cfg.routed_scaling_factor / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
-        routing_weights *= factor
+        activate_all_experts = params.get("activate_all_experts")
+        if activate_all_experts:
+            routing_weights = router_logits.sigmoid()
+            factor = cfg.routed_scaling_factor / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
+            routing_weights *= factor
+            selected_experts = (
+                torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
+                .repeat((bsz, 1))
+            )
+        else:
+            routing_weights = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device)
+            selected_experts = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.long, device = y.device)
+            ext.routing_ds3_nogroup(
+                router_logits,
+                cfg.e_score_correction_bias,
+                selected_experts,
+                routing_weights,
+                cfg.routed_scaling_factor
+            )
         return selected_experts, routing_weights
 
 
@@ -152,7 +162,7 @@ class BlockSparseMLP(Module):
         key_gate: str | None = None,
         key_down: str | None = None,
         key_routing_gate: str | None = None,
-        key_e_score_bias: str | None = None,
+        key_e_score_bias: str | None = "gate.e_score_correction_bias",
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
@@ -269,7 +279,7 @@ class BlockSparseMLP(Module):
         self.experts_cfg = None
 
         self.e_score_correction_bias = None
-        self.e_score_correction_bias_key = key_e_score_bias or "gate.e_score_correction_bias"
+        self.e_score_correction_bias_key = key_e_score_bias
 
         self.shared_experts = shared_experts
         if shared_experts is not None:
@@ -359,8 +369,12 @@ class BlockSparseMLP(Module):
     def load(self, device: torch.Device, **kwargs):
         super().load(device, **kwargs)
 
-        self.e_score_correction_bias = \
-            self.config.stc.get_tensor(f"{self.key}.{self.e_score_correction_bias_key}", self.device, optional = True)
+        self.e_score_correction_bias = self.config.stc.get_tensor(
+            f"{self.key}.{self.e_score_correction_bias_key}",
+            self.device,
+            optional = True,
+            float2half = True,
+        )
 
         self.load_local(**kwargs)
         self.load_routing(**kwargs)
