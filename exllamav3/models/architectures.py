@@ -9,6 +9,7 @@ from .exaone4 import Exaone4Model
 from .gemma2 import Gemma2Model
 from .gemma3 import Gemma3Model, Gemma3TextModel
 from .glm4 import Glm4Model
+from .glm4_moe import Glm4MoeModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
 from .mistral import MistralModel
@@ -38,6 +39,7 @@ ARCHITECTURES = {
         Gemma3Model,
         Gemma3TextModel,
         Glm4Model,
+        Glm4MoeModel,
         LlamaModel,
         MiMoModel,
         MistralModel,
