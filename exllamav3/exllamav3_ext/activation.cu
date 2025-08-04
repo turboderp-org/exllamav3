@@ -96,10 +96,10 @@ void act_mul_kernel_h
     const half* __restrict__ x,
     const half* __restrict__ y,
     half* __restrict__ z,
-    int numel
+    size_t numel
 )
 {
-    int idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
+    size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
     if (idx >= numel / 2) return;
 
     half2 x2 = ((const half2*) x)[idx];
@@ -120,10 +120,10 @@ void act_mul_kernel_f
     const float* __restrict__ x,
     const float* __restrict__ y,
     half* __restrict__ z,
-    int numel
+    size_t numel
 )
 {
-    int idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
+    size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
     if (idx >= numel / 2) return;
 
     float2 x2 = ((const float2*) x)[idx];
@@ -177,8 +177,8 @@ void silu_mul
 
     TORCH_CHECK_DTYPE(z, kHalf);
 
-    int numel = x.numel();
-    int blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     if (float_input)
     {
         act_mul_kernel_f<ACT_SILU><<<blocks, NUM_THREADS, 0, stream>>>
@@ -226,8 +226,8 @@ void gelu_mul
 
     TORCH_CHECK_DTYPE(z, kHalf);
 
-    int numel = x.numel();
-    int blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     if (float_input)
     {
         act_mul_kernel_f<ACT_GELU><<<blocks, NUM_THREADS, 0, stream>>>
@@ -275,8 +275,8 @@ void relu2_mul
 
     TORCH_CHECK_DTYPE(z, kHalf);
 
-    int numel = x.numel();
-    int blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     if (float_input)
     {
         act_mul_kernel_f<ACT_RELU2><<<blocks, NUM_THREADS, 0, stream>>>
