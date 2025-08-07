@@ -2,19 +2,17 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
-from torch import nn
-from ..models import Config
+from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
-from ..device import get_device_context, release_device_context
 from ..constants import PAGE_SIZE
 from ..cache import Cache
 from flash_attn import flash_attn_func, flash_attn_with_kvcache
 from ..util import profile_opt
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
-from ..models.model_tp_alloc import TPAllocation
+from ..model.model_tp_alloc import TPAllocation
 import torch.distributed as dist
 
 """
@@ -159,7 +157,6 @@ class Attention(Module):
     ):
         super().__init__(config, key, None)
 
-        self.device_context = None
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.head_dim = head_dim
@@ -285,14 +282,12 @@ class Attention(Module):
 
     @override
     def load(self, device: torch.Device, **kwargs):
-        self.device_context = get_device_context(self.config, device)
         super().load(device)
         self.load_local(device, **kwargs)
 
 
     @override
     def unload(self):
-        self.device_context = release_device_context(self.config, self.device)
         super().unload()
 
         for cl in self.cache_layers:

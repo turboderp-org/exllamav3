@@ -1,24 +1,23 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from .config import Config, no_default
-from .model import Model
-from ..util.rope import RopeSettings, RopeStyle
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
+from ..model.config import Config, no_default
+from ..model.model import Model
+from ..util.rope import RopeStyle
+from ..modules import LayerNorm, Embedding, ParallelDecoderBlock, Attention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 
-class LlamaConfig(Config):
-    arch_string = "LlamaForCausalLM"
+class CohereConfig(Config):
+    arch_string = "CohereForCausalLM"
 
     def __init__(
         self,
         directory: str,
-        derived_model: dict | None = None,
         **kwargs,
     ):
         super().__init__(
             directory,
-            derived_model if derived_model else {"text": LlamaModel},
+            {"text": CohereModel},
             **kwargs
         )
 
@@ -31,27 +30,32 @@ class LlamaConfig(Config):
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
 
+        self.use_qk_norm = self.read_cfg(int, "use_qk_norm", False)
+
         # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
         self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
 
         # Norms
-        self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
+        self.layernorm_eps = self.read_cfg(float, "layer_norm_eps", 1e-05)
 
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
-        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
+        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", True)
 
         # RoPE
-        self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
+        self.rope_settings = self.read_rope_settings_default(RopeStyle.GPTJ)
+
+        # Logit scale
+        self.logit_scale = self.read_cfg(float, "logit_scale", 0.0625)
 
 
-class LlamaModel(Model):
-    config_class = LlamaConfig
+class CohereModel(Model):
+    config_class = CohereConfig
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: CohereConfig,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -68,13 +72,13 @@ class LlamaModel(Model):
         self.first_block_idx = len(self.modules)
 
         self.modules += [
-            TransformerBlock(
+            ParallelDecoderBlock(
                 config = config,
                 key = f"model.layers.{idx}",
-                attn_norm = RMSNorm(
+                input_norm = LayerNorm(
                     config = config,
                     key = f"model.layers.{idx}.input_layernorm",
-                    rms_norm_eps = config.rms_norm_eps,
+                    layernorm_eps = config.layernorm_eps,
                 ),
                 attn = Attention(
                     config = config,
@@ -90,12 +94,17 @@ class LlamaModel(Model):
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    qmap = "block.attn",
-                ),
-                mlp_norm = RMSNorm(
-                    config = config,
-                    key = f"model.layers.{idx}.post_attention_layernorm",
-                    rms_norm_eps = config.rms_norm_eps,
+                    qmap = "block.parallel",
+                    q_norm = LayerNorm(
+                        config = config,
+                        key = f"model.layers.{idx}.self_attn.q_norm",
+                        layernorm_eps = config.layernorm_eps,
+                    ) if config.use_qk_norm else None,
+                    k_norm = LayerNorm(
+                        config = config,
+                        key = f"model.layers.{idx}.self_attn.k_norm",
+                        layernorm_eps = config.layernorm_eps,
+                    ) if config.use_qk_norm else None,
                 ),
                 mlp = GatedMLP(
                     config = config,
@@ -105,9 +114,8 @@ class LlamaModel(Model):
                     key_up = "up_proj",
                     key_gate = "gate_proj",
                     key_down = "down_proj",
-                    qmap = "block.mlp",
+                    qmap = "block.parallel",
                     out_dtype = torch.float,
-                    interm_dtype = torch.float,
                 ),
             )
             for idx in range(config.num_hidden_layers)
@@ -120,10 +128,10 @@ class LlamaModel(Model):
             head_alt_key = "model.embed_tokens"
 
         self.modules += [
-            RMSNorm(
+            LayerNorm(
                 config = config,
                 key = "model.norm",
-                rms_norm_eps = config.rms_norm_eps,
+                layernorm_eps = config.layernorm_eps,
                 out_dtype = torch.half,
             ),
             Linear(
@@ -134,7 +142,8 @@ class LlamaModel(Model):
                 in_features = config.hidden_size,
                 out_features = config.vocab_size,
                 qmap = "block",
-                caps = {"logits_output": True}
+                caps = {"logits_output": True},
+                post_scale = config.logit_scale
             )
         ]
 
@@ -149,10 +158,9 @@ class LlamaModel(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        # Llama3 prompt
-        p = "<|begin_of_text|>"
+        p = "<BOS_TOKEN>"
         if system_prompt:
-            p += f"<|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
-        p += f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
-        p += f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+            p += f"<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{system_prompt}<|END_OF_TURN_TOKEN|>"
+        p += f"<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{prompt}<|END_OF_TURN_TOKEN|>"
+        p += f"<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
         return p

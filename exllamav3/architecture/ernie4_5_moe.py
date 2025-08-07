@@ -1,14 +1,14 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from .config import Config, no_default
-from .model import Model
-from ..util.rope import RopeSettings, RopeStyle
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, BlockSparseMLP, GatedMLP, Linear
+from ..model.config import Config, no_default
+from ..model.model import Model
+from ..util.rope import RopeStyle
+from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear, BlockSparseMLP
 from ..modules.attn import prepare_for_attn
 
-class Dots1Config(Config):
-    arch_string = "Dots1ForCausalLM"
+class Ernie4_5MoEConfig(Config):
+    arch_string = "Ernie4_5_MoeForCausalLM"
 
     def __init__(
         self,
@@ -17,7 +17,7 @@ class Dots1Config(Config):
     ):
         super().__init__(
             directory,
-            {"text": Dots1Model},
+            {"text": Ernie4_5MoEModel},
             **kwargs
         )
 
@@ -32,15 +32,14 @@ class Dots1Config(Config):
 
         # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
-        self.assert_cfg(str, "scoring_func", "noaux_tc", True)
-        self.assert_cfg(bool, "norm_topk_prob", True, True)
         self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
+        self.assert_cfg(str, "moe_gate_act", "softmax", True)
+        self.num_shared_experts = self.read_cfg(int, "moe_num_shared_experts", 0)
         self.moe_intermediate_size = self.read_cfg(int, "moe_intermediate_size", no_default)
-        self.num_shared_experts = self.read_cfg(int, "n_shared_experts", 1)
-        self.num_experts = self.read_cfg(int, "n_routed_experts", 128)
-        self.num_experts_per_tok = self.read_cfg(int, "num_experts_per_tok", 8)
-        self.first_k_dense_replace = self.read_cfg(int, "first_k_dense_replace", 3)
-        self.routed_scaling_factor = self.read_cfg(float, "routed_scaling_factor", 2.5)
+        self.num_experts = self.read_cfg(int, "moe_num_experts", no_default)
+        self.num_experts_per_tok = self.read_cfg(int, "moe_k", no_default)
+        self.first_k_dense_replace = self.read_cfg(int, "moe_layer_start_index", 0)
+        self.assert_cfg(int, "moe_layer_interval", 1, True)
 
         # Norms
         self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
@@ -50,15 +49,15 @@ class Dots1Config(Config):
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
 
         # RoPE
-        self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
+        self.rope_settings = self.read_rope_settings_default(RopeStyle.GPTJ)
 
 
-class Dots1Model(Model):
-    config_class = Dots1Config
+class Ernie4_5MoEModel(Model):
+    config_class = Ernie4_5MoEConfig
 
     def __init__(
         self,
-        config: Dots1Config,
+        config: Ernie4_5MoEConfig,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -97,18 +96,7 @@ class Dots1Model(Model):
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    qmap = "block.attn",
-                    q_norm = RMSNorm(
-                        config = config,
-                        key = f"model.layers.{idx}.self_attn.q_norm",
-                        rms_norm_eps = config.rms_norm_eps,
-                    ),
-                    k_norm = RMSNorm(
-                        config = config,
-                        key = f"model.layers.{idx}.self_attn.k_norm",
-                        rms_norm_eps = config.rms_norm_eps,
-                    ),
-                    out_dtype = torch.float
+                    qmap = "block.attn"
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
@@ -140,33 +128,34 @@ class Dots1Model(Model):
                         key_gate = "experts.{expert_idx}.gate_proj",
                         key_down = "experts.{expert_idx}.down_proj",
                         key_routing_gate = "gate",
+                        key_e_score_bias = "gate.e_score_correction_bias",
                         qmap = "block.mlp",
-                        interm_dtype = torch.half,
+                        interm_dtype = torch.float,
                         out_dtype = torch.float,
-                        router_type = "dots",
-                        routed_scaling_factor = config.routed_scaling_factor,
+                        routed_scaling_factor = 1.0,
                         n_group = 1,
                         topk_group = 1,
-                        shared_experts = GatedMLP(
-                            config = config,
-                            key = f"model.layers.{idx}.mlp.shared_experts",
-                            hidden_size = config.hidden_size,
-                            intermediate_size = config.moe_intermediate_size * config.num_shared_experts,
-                            key_up = "up_proj",
-                            key_gate = "gate_proj",
-                            key_down = "down_proj",
-                            qmap = "block.mlp",
-                            interm_dtype = torch.half,
-                            out_dtype = torch.float,
+                        shared_experts = (
+                            GatedMLP(
+                                config = config,
+                                key = f"model.layers.{idx}.mlp.shared_experts",
+                                hidden_size = config.hidden_size,
+                                intermediate_size = config.moe_intermediate_size * config.num_shared_experts,
+                                key_up = "up_proj",
+                                key_gate = "gate_proj",
+                                key_down = "down_proj",
+                                qmap = "block.mlp",
+                                interm_dtype = torch.half,
+                                out_dtype = torch.float,
+                            )
+                            if config.num_shared_experts > 0 else
+                            None
                         ),
                     )
                 )
             )
             for idx in range(config.num_hidden_layers)
         ]
-
-        # TODO: The first attn.o_proj is irregular and breaks quantization. For now, skip quantizing it
-        self.modules[self.first_block_idx].attn.o_proj.qmap = None
 
         self.last_kv_module_idx = len(self.modules) - 1
 
@@ -207,9 +196,9 @@ class Dots1Model(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        p = ""
+        p = "<|begin_of_sentence|>"
         if system_prompt:
-            p += f"<|system|>{system_prompt}<|endofsystem|>"
-        p += f"<|userprompt|>{prompt}<|endofuserprompt|>"
-        p += f"<|response|>"
+            p += f"{system_prompt}\n"
+        p += f"User: {prompt}\n"
+        p += f"Assistant: "
         return p

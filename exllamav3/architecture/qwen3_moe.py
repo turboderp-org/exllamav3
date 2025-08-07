@@ -1,14 +1,14 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from .config import Config, no_default
-from .model import Model
-from ..util.rope import RopeSettings, RopeStyle
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
+from ..model.config import Config, no_default
+from ..model.model import Model
+from ..util.rope import RopeStyle
+from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, BlockSparseMLP, Linear
 from ..modules.attn import prepare_for_attn
 
-class Phi3Config(Config):
-    arch_string = "Phi3ForCausalLM"
+class Qwen3MoeConfig(Config):
+    arch_string = "Qwen3MoeForCausalLM"
 
     def __init__(
         self,
@@ -17,7 +17,7 @@ class Phi3Config(Config):
     ):
         super().__init__(
             directory,
-            {"text": Phi3Model},
+            {"text": Qwen3MoeModel},
             **kwargs
         )
 
@@ -30,9 +30,12 @@ class Phi3Config(Config):
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
 
-        # MLP
+        # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
-        self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
+        self.assert_cfg(bool, "norm_topk_prob", True, True)
+        self.moe_intermediate_size = self.read_cfg(int, "moe_intermediate_size", no_default)
+        self.num_experts = self.read_cfg(int, "num_experts", no_default)
+        self.num_experts_per_tok = self.read_cfg(int, "num_experts_per_tok", no_default)
 
         # Norms
         self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
@@ -45,17 +48,12 @@ class Phi3Config(Config):
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
 
-    @override
-    def override_dynamic_seq_len(self, new_max_position_embeddings: int):
-        self.rope_settings.override_max_position_embeddings = new_max_position_embeddings
-
-
-class Phi3Model(Model):
-    config_class = Phi3Config
+class Qwen3MoeModel(Model):
+    config_class = Qwen3MoeConfig
 
     def __init__(
         self,
-        config: Phi3Config,
+        config: Qwen3MoeConfig,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -94,24 +92,38 @@ class Phi3Model(Model):
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    key_fused_qkv = "qkv_proj",
                     qmap = "block.attn",
+                    q_norm = RMSNorm(
+                        config = config,
+                        key = f"model.layers.{idx}.self_attn.q_norm",
+                        rms_norm_eps = config.rms_norm_eps,
+                    ),
+                    k_norm = RMSNorm(
+                        config = config,
+                        key = f"model.layers.{idx}.self_attn.k_norm",
+                        rms_norm_eps = config.rms_norm_eps,
+                    ),
+                    out_dtype = torch.float
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
                     key = f"model.layers.{idx}.post_attention_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                 ),
-                mlp = GatedMLP(
+                mlp = BlockSparseMLP(
                     config = config,
                     key = f"model.layers.{idx}.mlp",
                     hidden_size = config.hidden_size,
-                    intermediate_size = config.intermediate_size,
-                    key_up = "up_proj",
-                    key_gate = "gate_proj",
-                    key_down = "down_proj",
-                    key_fused_gate_up = "gate_up_proj",
+                    intermediate_size = config.moe_intermediate_size,
+                    num_experts = self.config.num_experts,
+                    num_experts_per_tok = self.config.num_experts_per_tok,
+                    key_up = "experts.{expert_idx}.up_proj",
+                    key_gate = "experts.{expert_idx}.gate_proj",
+                    key_down = "experts.{expert_idx}.down_proj",
+                    key_routing_gate = "gate",
                     qmap = "block.mlp",
+                    interm_dtype = torch.half,
+                    out_dtype = torch.float,
                 ),
             )
             for idx in range(config.num_hidden_layers)
@@ -144,6 +156,9 @@ class Phi3Model(Model):
 
         self.logit_layer_idx = len(self.modules) - 1
 
+        # Activate all experts during H capture pass in quantization
+        self.calibration_all_experts = True
+
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
@@ -153,9 +168,11 @@ class Phi3Model(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        p = "<s>"
+        p = ""
         if system_prompt:
-            p += f"<|system|>\n{system_prompt}<|end|>\n"
-        p += f"<|user|>\n{prompt}<|end|>\n"
-        p += f"<|assistant|>\n"
+            p += f"<|im_start|>system\n"
+            p += f"{system_prompt}<|im_end|>\n"
+        p += f"<|im_start|>user\n"
+        p += f"{prompt}<|im_end|>\n"
+        p += f"<|im_start|>assistant\n"
         return p

@@ -1,14 +1,14 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from .config import Config, no_default
-from .model import Model
-from ..util.rope import RopeSettings, RopeStyle
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, BlockSparseMLP, Linear
+from ..model.config import Config, no_default
+from ..model.model import Model
+from ..util.rope import RopeStyle
+from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 
-class MixtralConfig(Config):
-    arch_string = "MixtralForCausalLM"
+class Ernie4_5Config(Config):
+    arch_string = "Ernie4_5_ForCausalLM"
 
     def __init__(
         self,
@@ -17,7 +17,7 @@ class MixtralConfig(Config):
     ):
         super().__init__(
             directory,
-            {"text": MixtralModel},
+            {"text": Ernie4_5Model},
             **kwargs
         )
 
@@ -32,9 +32,7 @@ class MixtralConfig(Config):
 
         # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
-        self.moe_intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
-        self.num_experts = self.read_cfg(int, "num_local_experts", no_default)
-        self.num_experts_per_tok = self.read_cfg(int, "num_experts_per_tok", no_default)
+        self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
 
         # Norms
         self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
@@ -44,15 +42,15 @@ class MixtralConfig(Config):
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
 
         # RoPE
-        self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
+        self.rope_settings = self.read_rope_settings_default(RopeStyle.GPTJ)
 
 
-class MixtralModel(Model):
-    config_class = MixtralConfig
+class Ernie4_5Model(Model):
+    config_class = Ernie4_5Config
 
     def __init__(
         self,
-        config: MixtralConfig,
+        config: Ernie4_5Config,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -91,28 +89,24 @@ class MixtralModel(Model):
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    qmap = "block.attn",
-                    out_dtype = torch.float
+                    qmap = "block.attn"
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
                     key = f"model.layers.{idx}.post_attention_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                 ),
-                mlp = BlockSparseMLP(
+                mlp = GatedMLP(
                     config = config,
-                    key = f"model.layers.{idx}.block_sparse_moe",
+                    key = f"model.layers.{idx}.mlp",
                     hidden_size = config.hidden_size,
-                    intermediate_size = config.moe_intermediate_size,
-                    num_experts = self.config.num_experts,
-                    num_experts_per_tok = self.config.num_experts_per_tok,
-                    key_up = "experts.{expert_idx}.w3",
-                    key_gate = "experts.{expert_idx}.w1",
-                    key_down = "experts.{expert_idx}.w2",
-                    key_routing_gate = "gate",
+                    intermediate_size = config.intermediate_size,
+                    key_up = "up_proj",
+                    key_gate = "gate_proj",
+                    key_down = "down_proj",
                     qmap = "block.mlp",
                     interm_dtype = torch.half,
-                    out_dtype = torch.half,
+                    out_dtype = torch.float,
                 ),
             )
             for idx in range(config.num_hidden_layers)
@@ -154,8 +148,9 @@ class MixtralModel(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        p = "<s>[INST]"
+        p = "<|begin_of_sentence|>"
         if system_prompt:
-            p += f" {system_prompt}\n\n"
-        p += f" {prompt} [/INST]"
+            p += f"{system_prompt}\n"
+        p += f"User: {prompt}\n"
+        p += f"Assistant: "
         return p

@@ -4,9 +4,9 @@ import os, json
 import numpy as np
 import torch
 import torch.nn.functional as F
-from .config import Config, no_default
-from .model import Model
-from ..util.rope import RopeSettings, RopeStyle
+from ..model.config import Config
+from ..model.model import Model
+from ..util.rope import RopeStyle
 from ..util.file import read_dict, no_value, no_default
 from ..util.vision import convert_to_rgb, normalize_image
 from ..modules import (

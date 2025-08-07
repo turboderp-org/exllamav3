@@ -1,14 +1,14 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from .config import Config, no_default
-from .model import Model
-from ..util.rope import RopeSettings, RopeStyle
-from ..modules import LayerNorm, Embedding, ParallelDecoderBlock, Attention, GatedMLP, Linear
+from ..model.config import Config, no_default
+from ..model.model import Model
+from ..util.rope import RopeStyle
+from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, BlockSparseMLP, Linear
 from ..modules.attn import prepare_for_attn
 
-class Cohere2Config(Config):
-    arch_string = "Cohere2ForCausalLM"
+class MixtralConfig(Config):
+    arch_string = "MixtralForCausalLM"
 
     def __init__(
         self,
@@ -17,7 +17,7 @@ class Cohere2Config(Config):
     ):
         super().__init__(
             directory,
-            {"text": Cohere2Model},
+            {"text": MixtralModel},
             **kwargs
         )
 
@@ -27,37 +27,32 @@ class Cohere2Config(Config):
         self.num_q_heads = self.read_cfg(int, "num_attention_heads", no_default)
         self.num_kv_heads = self.read_cfg(int, "num_key_value_heads", self.num_q_heads)
 
-        self.sliding_window = self.read_cfg(int, "sliding_window", -1)
-        self.sliding_window_pattern = self.read_cfg(int, "sliding_window_pattern", 1)
-        self.assert_cfg(str, "order_of_interleaved_layers", "local_attn_first")
-
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
 
         # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
-        self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
+        self.moe_intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
+        self.num_experts = self.read_cfg(int, "num_local_experts", no_default)
+        self.num_experts_per_tok = self.read_cfg(int, "num_experts_per_tok", no_default)
 
         # Norms
-        self.layernorm_eps = self.read_cfg(float, "layer_norm_eps", 1e-05)
+        self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
 
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
-        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", True)
+        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
 
         # RoPE
-        self.rope_settings = self.read_rope_settings_default(RopeStyle.GPTJ)
-
-        # Logit scale
-        self.logit_scale = self.read_cfg(float, "logit_scale", 0.0625)
+        self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
 
-class Cohere2Model(Model):
-    config_class = Cohere2Config
+class MixtralModel(Model):
+    config_class = MixtralConfig
 
     def __init__(
         self,
-        config: Cohere2Config,
+        config: MixtralConfig,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -73,19 +68,14 @@ class Cohere2Model(Model):
 
         self.first_block_idx = len(self.modules)
 
-        swa = [
-            config.sliding_window if (idx + 1) % config.sliding_window_pattern != 0 else -1
-            for idx in range(config.num_hidden_layers)
-        ]
-
         self.modules += [
-            ParallelDecoderBlock(
+            TransformerBlock(
                 config = config,
                 key = f"model.layers.{idx}",
-                input_norm = LayerNorm(
+                attn_norm = RMSNorm(
                     config = config,
                     key = f"model.layers.{idx}.input_layernorm",
-                    layernorm_eps = config.layernorm_eps,
+                    rms_norm_eps = config.rms_norm_eps,
                 ),
                 attn = Attention(
                     config = config,
@@ -95,26 +85,34 @@ class Cohere2Model(Model):
                     head_dim = config.head_dim,
                     num_q_heads = config.num_q_heads,
                     num_kv_heads = config.num_kv_heads,
-                    rope_settings = config.rope_settings if swa[idx] >= 0 else None,
+                    rope_settings = config.rope_settings,
                     sm_scale = None,
-                    sliding_window = swa[idx],
                     key_q = "q_proj",
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    qmap = "block.parallel",
+                    qmap = "block.attn",
+                    out_dtype = torch.float
                 ),
-                mlp = GatedMLP(
+                mlp_norm = RMSNorm(
                     config = config,
-                    key = f"model.layers.{idx}.mlp",
+                    key = f"model.layers.{idx}.post_attention_layernorm",
+                    rms_norm_eps = config.rms_norm_eps,
+                ),
+                mlp = BlockSparseMLP(
+                    config = config,
+                    key = f"model.layers.{idx}.block_sparse_moe",
                     hidden_size = config.hidden_size,
-                    intermediate_size = config.intermediate_size,
-                    interm_dtype = torch.float,
-                    out_dtype = torch.float,
-                    key_up = "up_proj",
-                    key_gate = "gate_proj",
-                    key_down = "down_proj",
-                    qmap = "block.parallel",
+                    intermediate_size = config.moe_intermediate_size,
+                    num_experts = self.config.num_experts,
+                    num_experts_per_tok = self.config.num_experts_per_tok,
+                    key_up = "experts.{expert_idx}.w3",
+                    key_gate = "experts.{expert_idx}.w1",
+                    key_down = "experts.{expert_idx}.w2",
+                    key_routing_gate = "gate",
+                    qmap = "block.mlp",
+                    interm_dtype = torch.half,
+                    out_dtype = torch.half,
                 ),
             )
             for idx in range(config.num_hidden_layers)
@@ -127,10 +125,10 @@ class Cohere2Model(Model):
             head_alt_key = "model.embed_tokens"
 
         self.modules += [
-            LayerNorm(
+            RMSNorm(
                 config = config,
                 key = "model.norm",
-                layernorm_eps = config.layernorm_eps,
+                rms_norm_eps = config.rms_norm_eps,
                 out_dtype = torch.half,
             ),
             Linear(
@@ -141,8 +139,7 @@ class Cohere2Model(Model):
                 in_features = config.hidden_size,
                 out_features = config.vocab_size,
                 qmap = "block",
-                caps = {"logits_output": True},
-                post_scale = config.logit_scale
+                caps = {"logits_output": True}
             )
         ]
 
@@ -157,9 +154,8 @@ class Cohere2Model(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        p = "<BOS_TOKEN>"
+        p = "<s>[INST]"
         if system_prompt:
-            p += f"<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{system_prompt}<|END_OF_TURN_TOKEN|>"
-        p += f"<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{prompt}<|END_OF_TURN_TOKEN|>"
-        p += f"<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+            p += f" {system_prompt}\n\n"
+        p += f" {prompt} [/INST]"
         return p

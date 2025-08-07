@@ -3,11 +3,11 @@ from typing_extensions import override
 import torch
 import torch.nn.functional as F
 from torch import nn
-from ..models import Config
+from ..model.config import Config
 from ..util.tensor import to2
 from . import Module
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
-from ..models.model_tp_alloc import TPAllocation
+from ..model.model_tp_alloc import TPAllocation
 
 class Embedding(Module):
 

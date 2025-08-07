@@ -1,23 +1,23 @@
-from __future__ import annotations
 from typing_extensions import override
 import torch
-from .config import Config, no_default
-from .model import Model
-from ..util.rope import RopeSettings, RopeStyle
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, BlockSparseMLP, Linear
+from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, MLP, Linear
+from ..model.config import Config, no_default
+from ..model.model import Model
+from ..util.rope import RopeStyle
 from ..modules.attn import prepare_for_attn
 
-class Qwen3MoeConfig(Config):
-    arch_string = "Qwen3MoeForCausalLM"
+class ArceeConfig(Config):
+    arch_string = "ArceeForCausalLM"
 
     def __init__(
         self,
         directory: str,
+        derived_model: dict | None = None,
         **kwargs,
     ):
         super().__init__(
             directory,
-            {"text": Qwen3MoeModel},
+            derived_model if derived_model else {"text": ArceeModel},
             **kwargs
         )
 
@@ -31,11 +31,8 @@ class Qwen3MoeConfig(Config):
             self.head_dim = self.hidden_size // self.num_q_heads
 
         # MLP params
-        self.assert_cfg(str, "hidden_act", "silu", True)
-        self.assert_cfg(bool, "norm_topk_prob", True, True)
-        self.moe_intermediate_size = self.read_cfg(int, "moe_intermediate_size", no_default)
-        self.num_experts = self.read_cfg(int, "num_experts", no_default)
-        self.num_experts_per_tok = self.read_cfg(int, "num_experts_per_tok", no_default)
+        self.assert_cfg(str, "hidden_act", "relu2", True)
+        self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
 
         # Norms
         self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
@@ -48,12 +45,12 @@ class Qwen3MoeConfig(Config):
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
 
-class Qwen3MoeModel(Model):
-    config_class = Qwen3MoeConfig
+class ArceeModel(Model):
+    config_class = ArceeConfig
 
     def __init__(
         self,
-        config: Qwen3MoeConfig,
+        config: ArceeConfig,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -93,36 +90,21 @@ class Qwen3MoeModel(Model):
                     key_v = "v_proj",
                     key_o = "o_proj",
                     qmap = "block.attn",
-                    q_norm = RMSNorm(
-                        config = config,
-                        key = f"model.layers.{idx}.self_attn.q_norm",
-                        rms_norm_eps = config.rms_norm_eps,
-                    ),
-                    k_norm = RMSNorm(
-                        config = config,
-                        key = f"model.layers.{idx}.self_attn.k_norm",
-                        rms_norm_eps = config.rms_norm_eps,
-                    ),
-                    out_dtype = torch.float
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
                     key = f"model.layers.{idx}.post_attention_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                 ),
-                mlp = BlockSparseMLP(
+                mlp = MLP(
                     config = config,
                     key = f"model.layers.{idx}.mlp",
                     hidden_size = config.hidden_size,
-                    intermediate_size = config.moe_intermediate_size,
-                    num_experts = self.config.num_experts,
-                    num_experts_per_tok = self.config.num_experts_per_tok,
-                    key_up = "experts.{expert_idx}.up_proj",
-                    key_gate = "experts.{expert_idx}.gate_proj",
-                    key_down = "experts.{expert_idx}.down_proj",
-                    key_routing_gate = "gate",
+                    intermediate_size = config.intermediate_size,
+                    key_up = "up_proj",
+                    key_down = "down_proj",
                     qmap = "block.mlp",
-                    interm_dtype = torch.half,
+                    activation_fn = "relu2",
                     out_dtype = torch.float,
                 ),
             )
@@ -156,23 +138,16 @@ class Qwen3MoeModel(Model):
 
         self.logit_layer_idx = len(self.modules) - 1
 
-        # Activate all experts during H capture pass in quantization
-        self.calibration_all_experts = True
-
-
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 
-
     @override
-    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        p = ""
+    def default_chat_prompt(self, prompt: str, system_prompt: str | None = None) -> str:
+        p = "<|begin_of_text|>"
         if system_prompt:
-            p += f"<|im_start|>system\n"
-            p += f"{system_prompt}<|im_end|>\n"
-        p += f"<|im_start|>user\n"
-        p += f"{prompt}<|im_end|>\n"
-        p += f"<|im_start|>assistant\n"
+            p += f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        p += f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         return p
