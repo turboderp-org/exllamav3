@@ -144,7 +144,7 @@ class Glm4MoeModel(Model):
                         qmap = "block.mlp",
                         interm_dtype = torch.half,
                         out_dtype = torch.float,
-                        router_type = "dots",
+                        router_type = "ds3",
                         routed_scaling_factor = config.routed_scaling_factor,
                         n_group = 1,
                         topk_group = 1,
