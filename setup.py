@@ -70,6 +70,7 @@ setup(
     version=version,
     packages=[
         "exllamav3",
+        "exllamav3.architecture",
         "exllamav3.generator",
         "exllamav3.generator.sampler",
         "exllamav3.generator.filter",
