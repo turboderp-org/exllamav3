@@ -75,6 +75,8 @@ setup(
         "exllamav3.generator.sampler",
         "exllamav3.generator.filter",
         "exllamav3.conversion",
+        "exllamav3.integration",
+        "exllamav3.architecture",
         "exllamav3.model",
         "exllamav3.modules",
         "exllamav3.modules.quant",
