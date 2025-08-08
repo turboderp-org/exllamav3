@@ -64,12 +64,12 @@ void warp_radixsort_posf32_pl(float& key, float& payload, int& idx, int* src_lan
     #pragma unroll
     for (int bit = 0; bit < 31; ++bit)
     {
-        unsigned int b = (ku >> bit) & 1;
+        unsigned int b = (ku >> bit) & 1u;
         unsigned int ones = __ballot_sync(active, b);
         unsigned int zeros = active ^ ones;
         int nzeros = __popc(zeros);
 
-        unsigned int below = (1 << lane_id) - 1;
+        unsigned int below = (1u << lane_id) - 1u;
         int r0 = __popc(zeros & below);
         int r1 = __popc(ones & below);
 
@@ -117,13 +117,40 @@ __global__ void routing_ds3_nogroup_kernel
     float* sh_o = reinterpret_cast<float*>(sh_v + K_ * num_warps);
     int* sh_idx = reinterpret_cast<int*>(sh_o + K_ * num_warps);
     int* perm = reinterpret_cast<int*>(sh_idx + K_ * num_warps);
+    float* reduce = reinterpret_cast<float*>(perm + 32 * num_warps);
 
     // Input sigmoid and optional bias
 
     int idx = t;  // output index
     float v = sigmoid_stable_hf(__half2float(scores[t]));  // sort key
     float o = v ;  // output weight
-    if (bias) v += __half2float(bias[t]);
+
+    // Add bias
+    if (bias)
+    {
+        v += __half2float(bias[t]);
+
+        float minv = v;
+        for (int offset = 32 >> 1; offset > 0; offset >>= 1)
+            minv = fminf(minv, __shfl_down_sync(0xffffffff, minv, offset));
+        if (lane_id == 0)
+            reduce[warp_id] = minv;
+
+        __syncthreads();
+
+        if (warp_id == 0)
+        {
+            minv = lane_id < num_warps ? reduce[lane_id] : 1e30;
+            for (int offset = 32 >> 1; offset > 0; offset >>= 1)
+                minv = fminf(minv, __shfl_down_sync(0xffffffff, minv, offset));
+            if (lane_id == 0)
+                reduce[0] = minv;
+        }
+
+        __syncthreads();
+
+        v -= reduce[0];
+    }
 
     // Sort by v
 
@@ -375,7 +402,9 @@ void routing_std
     int num_warps = CEIL_DIVIDE(num_experts, 32);
     int num_threads = num_warps * 32;
     int K_ = K + (K & 1);
-    size_t shmem = num_warps * K_ * (sizeof(float) + sizeof(int)) + num_threads * sizeof(int);
+    size_t shmem = num_warps * K_ * (sizeof(float) + sizeof(int))
+                 + num_threads * sizeof(int)
+                 + num_warps * sizeof(float);
 
     int num_blocks = bsz;
     routing_std_kernel<<<bsz, num_threads, shmem, stream>>>
