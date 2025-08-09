@@ -7,7 +7,7 @@
 #include "reduction.cuh"
 
 #define MAX_NUM_EXPERTS 512
-#define MAX_K 16
+#define MAX_K 128
 
 
 __device__ __forceinline__
