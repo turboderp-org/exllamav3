@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from ..util.tensor import to2
-from ..models import Config
+from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedMLP, MLP, BlockSparseMLP
 from ..conversion.allocation import allocate_transformer
 from ..util import profile_opt

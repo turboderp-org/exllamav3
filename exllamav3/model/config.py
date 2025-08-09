@@ -122,7 +122,7 @@ class Config(ABC):
             Architecture-specific config deriving from Exl2Config
         """
 
-        from exllamav3.models.architectures import get_architectures
+        from exllamav3.architecture.architectures import get_architectures
         architectures = get_architectures()
 
         config_filename = os.path.join(directory, "config.json")

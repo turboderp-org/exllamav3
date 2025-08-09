@@ -1,23 +1,24 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from .config import Config, no_default
-from .model import Model
-from ..util.rope import RopeSettings, RopeStyle
-from ..modules import LayerNorm, Embedding, ParallelDecoderBlock, Attention, GatedMLP, Linear
+from ..model.config import Config, no_default
+from ..model.model import Model
+from ..util.rope import RopeStyle
+from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 
-class CohereConfig(Config):
-    arch_string = "CohereForCausalLM"
+class LlamaConfig(Config):
+    arch_string = "LlamaForCausalLM"
 
     def __init__(
         self,
         directory: str,
+        derived_model: dict | None = None,
         **kwargs,
     ):
         super().__init__(
             directory,
-            {"text": CohereModel},
+            derived_model if derived_model else {"text": LlamaModel},
             **kwargs
         )
 
@@ -30,32 +31,27 @@ class CohereConfig(Config):
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
 
-        self.use_qk_norm = self.read_cfg(int, "use_qk_norm", False)
-
         # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
         self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
 
         # Norms
-        self.layernorm_eps = self.read_cfg(float, "layer_norm_eps", 1e-05)
+        self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
 
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
-        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", True)
+        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
 
         # RoPE
-        self.rope_settings = self.read_rope_settings_default(RopeStyle.GPTJ)
-
-        # Logit scale
-        self.logit_scale = self.read_cfg(float, "logit_scale", 0.0625)
+        self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
 
-class CohereModel(Model):
-    config_class = CohereConfig
+class LlamaModel(Model):
+    config_class = LlamaConfig
 
     def __init__(
         self,
-        config: CohereConfig,
+        config: LlamaConfig,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -72,13 +68,13 @@ class CohereModel(Model):
         self.first_block_idx = len(self.modules)
 
         self.modules += [
-            ParallelDecoderBlock(
+            TransformerBlock(
                 config = config,
                 key = f"model.layers.{idx}",
-                input_norm = LayerNorm(
+                attn_norm = RMSNorm(
                     config = config,
                     key = f"model.layers.{idx}.input_layernorm",
-                    layernorm_eps = config.layernorm_eps,
+                    rms_norm_eps = config.rms_norm_eps,
                 ),
                 attn = Attention(
                     config = config,
@@ -94,17 +90,12 @@ class CohereModel(Model):
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    qmap = "block.parallel",
-                    q_norm = LayerNorm(
-                        config = config,
-                        key = f"model.layers.{idx}.self_attn.q_norm",
-                        layernorm_eps = config.layernorm_eps,
-                    ) if config.use_qk_norm else None,
-                    k_norm = LayerNorm(
-                        config = config,
-                        key = f"model.layers.{idx}.self_attn.k_norm",
-                        layernorm_eps = config.layernorm_eps,
-                    ) if config.use_qk_norm else None,
+                    qmap = "block.attn",
+                ),
+                mlp_norm = RMSNorm(
+                    config = config,
+                    key = f"model.layers.{idx}.post_attention_layernorm",
+                    rms_norm_eps = config.rms_norm_eps,
                 ),
                 mlp = GatedMLP(
                     config = config,
@@ -114,8 +105,9 @@ class CohereModel(Model):
                     key_up = "up_proj",
                     key_gate = "gate_proj",
                     key_down = "down_proj",
-                    qmap = "block.parallel",
+                    qmap = "block.mlp",
                     out_dtype = torch.float,
+                    interm_dtype = torch.float,
                 ),
             )
             for idx in range(config.num_hidden_layers)
@@ -128,10 +120,10 @@ class CohereModel(Model):
             head_alt_key = "model.embed_tokens"
 
         self.modules += [
-            LayerNorm(
+            RMSNorm(
                 config = config,
                 key = "model.norm",
-                layernorm_eps = config.layernorm_eps,
+                rms_norm_eps = config.rms_norm_eps,
                 out_dtype = torch.half,
             ),
             Linear(
@@ -142,8 +134,7 @@ class CohereModel(Model):
                 in_features = config.hidden_size,
                 out_features = config.vocab_size,
                 qmap = "block",
-                caps = {"logits_output": True},
-                post_scale = config.logit_scale
+                caps = {"logits_output": True}
             )
         ]
 
@@ -158,9 +149,10 @@ class CohereModel(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        p = "<BOS_TOKEN>"
+        # Llama3 prompt
+        p = "<|begin_of_text|>"
         if system_prompt:
-            p += f"<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{system_prompt}<|END_OF_TURN_TOKEN|>"
-        p += f"<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{prompt}<|END_OF_TURN_TOKEN|>"
-        p += f"<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+            p += f"<|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
+        p += f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
+        p += f"<|start_header_id|>assistant<|end_header_id|>\n\n"
         return p

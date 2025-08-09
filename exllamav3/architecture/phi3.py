@@ -1,14 +1,14 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from .config import Config, no_default
-from .model import Model
-from ..util.rope import RopeSettings, RopeStyle
+from ..model.config import Config, no_default
+from ..model.model import Model
+from ..util.rope import RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 
-class Glm4Config(Config):
-    arch_string = "Glm4ForCausalLM"
+class Phi3Config(Config):
+    arch_string = "Phi3ForCausalLM"
 
     def __init__(
         self,
@@ -17,7 +17,7 @@ class Glm4Config(Config):
     ):
         super().__init__(
             directory,
-            {"text": Glm4Model},
+            {"text": Phi3Model},
             **kwargs
         )
 
@@ -30,7 +30,7 @@ class Glm4Config(Config):
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
 
-        # MLP params
+        # MLP
         self.assert_cfg(str, "hidden_act", "silu", True)
         self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
 
@@ -42,15 +42,20 @@ class Glm4Config(Config):
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
 
         # RoPE
-        self.rope_settings = self.read_rope_settings_default(RopeStyle.GPTJ)
+        self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
 
-class Glm4Model(Model):
-    config_class = Glm4Config
+    @override
+    def override_dynamic_seq_len(self, new_max_position_embeddings: int):
+        self.rope_settings.override_max_position_embeddings = new_max_position_embeddings
+
+
+class Phi3Model(Model):
+    config_class = Phi3Config
 
     def __init__(
         self,
-        config: Glm4Config,
+        config: Phi3Config,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -89,13 +94,8 @@ class Glm4Model(Model):
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
+                    key_fused_qkv = "qkv_proj",
                     qmap = "block.attn",
-                ),
-                attn_post_norm = RMSNorm(
-                    config = config,
-                    key = f"model.layers.{idx}.post_self_attn_layernorm",
-                    rms_norm_eps = config.rms_norm_eps,
-                    out_dtype = torch.float
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
@@ -112,14 +112,6 @@ class Glm4Model(Model):
                     key_down = "down_proj",
                     key_fused_gate_up = "gate_up_proj",
                     qmap = "block.mlp",
-                    interm_dtype = torch.half,
-                    out_dtype = torch.float,
-                ),
-                mlp_post_norm = RMSNorm(
-                    config = config,
-                    key = f"model.layers.{idx}.post_mlp_layernorm",
-                    rms_norm_eps = config.rms_norm_eps,
-                    out_dtype = torch.float
                 ),
             )
             for idx in range(config.num_hidden_layers)
@@ -161,9 +153,9 @@ class Glm4Model(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        p = f"[gMASK]<sop>"
+        p = "<s>"
         if system_prompt:
-            p += f"<|system|>\n{system_prompt}"
-        p += f"<|user|>\n{prompt}"
+            p += f"<|system|>\n{system_prompt}<|end|>\n"
+        p += f"<|user|>\n{prompt}<|end|>\n"
         p += f"<|assistant|>\n"
         return p

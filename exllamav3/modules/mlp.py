@@ -3,12 +3,12 @@ from typing_extensions import override
 import torch
 import torch.nn.functional as F
 from torch import nn
-from ..models import Config
+from ..model.config import Config
 from ..util.tensor import to2
 from . import Module, Linear
 from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
-from ..models.model_tp_alloc import TPAllocation
+from ..model.model_tp_alloc import TPAllocation
 import torch.distributed as dist
 
 class MLP(Module):

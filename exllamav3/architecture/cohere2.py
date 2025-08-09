@@ -1,23 +1,23 @@
+from __future__ import annotations
 from typing_extensions import override
 import torch
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, MLP, Linear
-from .config import Config, no_default
-from .model import Model
+from ..model.config import Config, no_default
+from ..model.model import Model
 from ..util.rope import RopeStyle
+from ..modules import LayerNorm, Embedding, ParallelDecoderBlock, Attention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 
-class ArceeConfig(Config):
-    arch_string = "ArceeForCausalLM"
+class Cohere2Config(Config):
+    arch_string = "Cohere2ForCausalLM"
 
     def __init__(
         self,
         directory: str,
-        derived_model: dict | None = None,
         **kwargs,
     ):
         super().__init__(
             directory,
-            derived_model if derived_model else {"text": ArceeModel},
+            {"text": Cohere2Model},
             **kwargs
         )
 
@@ -27,30 +27,37 @@ class ArceeConfig(Config):
         self.num_q_heads = self.read_cfg(int, "num_attention_heads", no_default)
         self.num_kv_heads = self.read_cfg(int, "num_key_value_heads", self.num_q_heads)
 
+        self.sliding_window = self.read_cfg(int, "sliding_window", -1)
+        self.sliding_window_pattern = self.read_cfg(int, "sliding_window_pattern", 1)
+        self.assert_cfg(str, "order_of_interleaved_layers", "local_attn_first")
+
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
 
         # MLP params
-        self.assert_cfg(str, "hidden_act", "relu2", True)
+        self.assert_cfg(str, "hidden_act", "silu", True)
         self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
 
         # Norms
-        self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
+        self.layernorm_eps = self.read_cfg(float, "layer_norm_eps", 1e-05)
 
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
-        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
+        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", True)
 
         # RoPE
-        self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
+        self.rope_settings = self.read_rope_settings_default(RopeStyle.GPTJ)
+
+        # Logit scale
+        self.logit_scale = self.read_cfg(float, "logit_scale", 0.0625)
 
 
-class ArceeModel(Model):
-    config_class = ArceeConfig
+class Cohere2Model(Model):
+    config_class = Cohere2Config
 
     def __init__(
         self,
-        config: ArceeConfig,
+        config: Cohere2Config,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -66,14 +73,19 @@ class ArceeModel(Model):
 
         self.first_block_idx = len(self.modules)
 
+        swa = [
+            config.sliding_window if (idx + 1) % config.sliding_window_pattern != 0 else -1
+            for idx in range(config.num_hidden_layers)
+        ]
+
         self.modules += [
-            TransformerBlock(
+            ParallelDecoderBlock(
                 config = config,
                 key = f"model.layers.{idx}",
-                attn_norm = RMSNorm(
+                input_norm = LayerNorm(
                     config = config,
                     key = f"model.layers.{idx}.input_layernorm",
-                    rms_norm_eps = config.rms_norm_eps,
+                    layernorm_eps = config.layernorm_eps,
                 ),
                 attn = Attention(
                     config = config,
@@ -83,29 +95,26 @@ class ArceeModel(Model):
                     head_dim = config.head_dim,
                     num_q_heads = config.num_q_heads,
                     num_kv_heads = config.num_kv_heads,
-                    rope_settings = config.rope_settings,
+                    rope_settings = config.rope_settings if swa[idx] >= 0 else None,
                     sm_scale = None,
+                    sliding_window = swa[idx],
                     key_q = "q_proj",
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    qmap = "block.attn",
+                    qmap = "block.parallel",
                 ),
-                mlp_norm = RMSNorm(
-                    config = config,
-                    key = f"model.layers.{idx}.post_attention_layernorm",
-                    rms_norm_eps = config.rms_norm_eps,
-                ),
-                mlp = MLP(
+                mlp = GatedMLP(
                     config = config,
                     key = f"model.layers.{idx}.mlp",
                     hidden_size = config.hidden_size,
                     intermediate_size = config.intermediate_size,
-                    key_up = "up_proj",
-                    key_down = "down_proj",
-                    qmap = "block.mlp",
-                    activation_fn = "relu2",
+                    interm_dtype = torch.float,
                     out_dtype = torch.float,
+                    key_up = "up_proj",
+                    key_gate = "gate_proj",
+                    key_down = "down_proj",
+                    qmap = "block.parallel",
                 ),
             )
             for idx in range(config.num_hidden_layers)
@@ -118,10 +127,10 @@ class ArceeModel(Model):
             head_alt_key = "model.embed_tokens"
 
         self.modules += [
-            RMSNorm(
+            LayerNorm(
                 config = config,
                 key = "model.norm",
-                rms_norm_eps = config.rms_norm_eps,
+                layernorm_eps = config.layernorm_eps,
                 out_dtype = torch.half,
             ),
             Linear(
@@ -132,22 +141,25 @@ class ArceeModel(Model):
                 in_features = config.hidden_size,
                 out_features = config.vocab_size,
                 qmap = "block",
-                caps = {"logits_output": True}
+                caps = {"logits_output": True},
+                post_scale = config.logit_scale
             )
         ]
 
         self.logit_layer_idx = len(self.modules) - 1
 
+
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
-        params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 
+
     @override
-    def default_chat_prompt(self, prompt: str, system_prompt: str | None = None) -> str:
-        p = "<|begin_of_text|>"
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        p = "<BOS_TOKEN>"
         if system_prompt:
-            p += f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-        p += f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+            p += f"<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>{system_prompt}<|END_OF_TURN_TOKEN|>"
+        p += f"<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{prompt}<|END_OF_TURN_TOKEN|>"
+        p += f"<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
         return p

@@ -1,9 +1,9 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from .config import Config, no_default
-from .model import Model
-from ..util.rope import RopeSettings, RopeStyle
+from ..model.config import Config, no_default
+from ..model.model import Model
+from ..util.rope import RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 

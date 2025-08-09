@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from ..constants import PAGE_SIZE
-from ..models import Model, Config
+from ..model import Model, Config
 from .cache import CacheLayer
 from typing import TYPE_CHECKING
 from exllamav3.ext import exllamav3_ext as ext

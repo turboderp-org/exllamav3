@@ -4,7 +4,7 @@ from typing import Type
 import torch
 import torch.nn.functional as F
 from torch import nn
-from ..models import Model, Config
+from ..model import Model, Config
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..modules import Attention

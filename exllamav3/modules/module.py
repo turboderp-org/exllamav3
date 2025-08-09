@@ -6,8 +6,8 @@ import torch.nn.functional as F
 from torch import nn
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from ..models import Config
-from ..models.model_tp_alloc import TPAllocation
+    from ..model.config import Config
+from ..model.model_tp_alloc import TPAllocation
 from functools import lru_cache
 
 # Use host bounce when moving state from device to device in layer split

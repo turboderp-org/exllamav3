@@ -1,10 +1,7 @@
 from __future__ import annotations
 import torch
-from ...models.config import Config
-from ...util.tensor import to2
-from ...util import first_not_none
-import math
-from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n, tensor_core_perm, tensor_core_perm_i
+from ...model.config import Config
+from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n
 from ...ext import exllamav3_ext as ext
 from ...util import profile_opt
 

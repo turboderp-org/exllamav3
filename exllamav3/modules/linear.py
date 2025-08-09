@@ -5,14 +5,14 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from torch import nn
-from ..models import Config
+from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearFP16_torch, LinearEXL3
 from .quant.exl3_lib import quantize_exl3
 from ..ext import exllamav3_ext as ext
 from ..conversion.allocation import allocate_linear
 from ..util.memory import free_mem
-from ..models.model_tp_alloc import TPAllocation
+from ..model.model_tp_alloc import TPAllocation
 
 
 class Linear(Module):

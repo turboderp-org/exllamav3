@@ -1,4 +1,4 @@
-from ..models import Config, Model
+from ..model import Config, Model
 import os, json
 import torch
 
