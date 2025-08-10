@@ -6,6 +6,9 @@ from .model_tp_cuda import cuda_host_register, cuda_host_unregister, CUDA_HOST_R
 from ..ext import exllamav3_ext as ext
 from multiprocessing import shared_memory, Barrier
 
+GLOBALS_SIZE = 32768
+SHBUF_SIZE = 16 * 1024 ** 2
+SHBUF_SIZE_S = 16 * 1024
 
 class TPBackend:
 
@@ -27,6 +30,9 @@ class TPBackendNCCL:
         active_devices: list[int],
         output_device: int,
         init_method: str,
+        master: bool,
+        uuid: str,
+        shbuf_size: int = SHBUF_SIZE,
     ):
         self.active_devices = active_devices
         self.world_size = len(active_devices)
@@ -40,6 +46,15 @@ class TPBackendNCCL:
             init_method = init_method,
         )
         self.mp_warmup_nccl(device)
+        self.fallback = TPBackendNative(
+            device,
+            active_devices,
+            output_device,
+            init_method,
+            master,
+            uuid,
+            shbuf_size
+        )
 
 
     def mp_warmup_nccl(self, device):
@@ -56,6 +71,7 @@ class TPBackendNCCL:
 
     def close(self):
         dist.barrier()
+        self.fallback.close()
         dist.destroy_process_group()
 
 
@@ -64,8 +80,9 @@ class TPBackendNCCL:
 
 
     def broadcast(self, tensor: torch.Tensor, src_device: int):
-        src_rank = self.active_devices.index(src_device)
-        dist.broadcast(tensor, src = src_rank)
+        self.fallback.broadcast(tensor, src_device)
+        # src_rank = self.active_devices.index(src_device)
+        # dist.broadcast(tensor, src = src_rank)
 
 
     def all_reduce(self, tensor: torch.Tensor):
@@ -87,36 +104,33 @@ class TPBackendNCCL:
         out_device: int,
         ldims: list[int]
     ):
-        dst_rank = self.active_devices.index(out_device)
-        d_ldims = [0] * (max(self.active_devices) + 1)
-        for d, m in zip(gather_devices, ldims):
-            d_ldims[d] = m
-        ldims = [d_ldims[d] for d in self.active_devices]
-
-        if self.rank == dst_rank:
-            od = 0
-            for src, ldim in enumerate(ldims):
-                if ldim == 0:
-                    continue
-                out_slice = out_tensor[..., od : od + ldim]
-                od += ldim
-                if src == self.rank:
-                    out_slice.copy(tensor)
-                else:
-                    # print(f"rank {self.rank} recv {out_slice.shape[-1]} from {src}")
-                    rbuf = torch.empty_like(out_slice)
-                    dist.recv(rbuf, src = src)
-                    out_slice.copy_(rbuf)
-        elif tensor.shape[-1] > 0:
-            # print(f"rank {self.rank} send {tensor.shape[-1]} to {dst_rank}")
-            dist.send(tensor, dst = dst_rank)
+        self.fallback.gather(tensor, out_tensor, gather_devices, out_device, ldims)
+        # dst_rank = self.active_devices.index(out_device)
+        # d_ldims = [0] * (max(self.active_devices) + 1)
+        # for d, m in zip(gather_devices, ldims):
+        #     d_ldims[d] = m
+        # ldims = [d_ldims[d] for d in self.active_devices]
+        #
+        # if self.rank == dst_rank:
+        #     od = 0
+        #     for src, ldim in enumerate(ldims):
+        #         if ldim == 0:
+        #             continue
+        #         out_slice = out_tensor[..., od : od + ldim]
+        #         od += ldim
+        #         if src == self.rank:
+        #             out_slice.copy(tensor)
+        #         else:
+        #             # print(f"rank {self.rank} recv {out_slice.shape[-1]} from {src}")
+        #             rbuf = torch.empty_like(out_slice)
+        #             dist.recv(rbuf, src = src)
+        #             out_slice.copy_(rbuf)
+        # elif tensor.shape[-1] > 0:
+        #     # print(f"rank {self.rank} send {tensor.shape[-1]} to {dst_rank}")
+        #     dist.send(tensor, dst = dst_rank)
 
 
 class TPBackendNative:
-
-    GLOBALS_SIZE = 32768
-    SHBUF_SIZE = 16 * 1024 ** 2
-    SHBUF_SIZE_S = 16 * 1024
 
     def __init__(
         self,
@@ -138,9 +152,9 @@ class TPBackendNative:
         self.shbuf_size = shbuf_size
         self.master = master
 
-        size_g = self.GLOBALS_SIZE
+        size_g = GLOBALS_SIZE
         size_b = self.shbuf_size
-        size_s = self.SHBUF_SIZE_S
+        size_s = SHBUF_SIZE_S
 
         if master:
             self.shm_g = shared_memory.SharedMemory(create = True, size = size_g, name = self.shm_g_name)
@@ -221,7 +235,7 @@ class TPBackendNative:
                 src_device,
                 tensor,
                 self.ptr_s,
-                self.SHBUF_SIZE_S
+                SHBUF_SIZE_S
             )
         else:
             ext.pg_broadcast(

@@ -30,6 +30,8 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
                 active_devices = active_devices,
                 output_device = output_device,
                 init_method = backend_args["init_method"],
+                master = device == active_devices[0],
+                uuid = backend_args["uuid"],
             )
         case "native":
             backend = TPBackendNative(

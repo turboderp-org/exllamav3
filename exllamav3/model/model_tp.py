@@ -48,7 +48,8 @@ class Model_TPMixin:
                 # Master address and port for the process group
                 backend_args = {
                     "type": tp_backend,
-                    "init_method": f"tcp://{master_addr}:{master_port}"
+                    "init_method": f"tcp://{master_addr}:{master_port}",
+                    "uuid": uuid.uuid4().hex,
                 }
             case "native":
                 backend_args = {
