@@ -350,7 +350,9 @@ void routing_ds3_nogroup
     int num_warps = CEIL_DIVIDE(num_experts, 32);
     int num_threads = num_warps * 32;
     int K_ = K + (K & 1);
-    size_t shmem = num_warps * K_ * (2 * sizeof(float) + sizeof(int)) + num_threads * sizeof(int);
+    size_t shmem = num_warps * K_ * (2 * sizeof(float) + sizeof(int))
+                 + num_threads * sizeof(int)
+                 + num_warps * sizeof(float);
 
     int num_blocks = bsz;
     routing_ds3_nogroup_kernel<<<bsz, num_threads, shmem, stream>>>
