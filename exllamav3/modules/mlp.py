@@ -166,10 +166,9 @@ class MLP(Module):
             del d_
 
         if self.tp_reduce:
-            if d.dtype == torch.float32:
-                # TODO: Evaluate precision loss from reducing in BF16
-                d = d.to(torch.bfloat16)
-            dist.all_reduce(d, async_op = False)
+            # TODO: FP16 reduce in native backend
+            d = d.float()
+            params["backend"].all_reduce(d)
 
         return to2(d, out_dtype, self.out_dtype)
 
@@ -476,10 +475,9 @@ class GatedMLP(Module):
                 del d_
 
         if self.tp_reduce:
-            if d.dtype == torch.float32:
-                # TODO: Evaluate precision loss from reducing in BF16
-                d = d.to(torch.bfloat16)
-            dist.all_reduce(d, async_op = False)
+            # TODO: FP16 reduce in native backend
+            d = d.float()
+            params["backend"].all_reduce(d)
 
         return to2(d, out_dtype, self.out_dtype)
 

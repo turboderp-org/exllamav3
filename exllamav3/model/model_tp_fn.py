@@ -1,23 +1,15 @@
 import torch
-import torch.distributed as dist
 import traceback
 from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
-
-def mp_warmup_nccl(device):
-    """
-    NCCL does lazy initialization which causes the first reduction operation to take an exceedingly long time
-    (20+ seconds). This seems to lead to race conditions or timeouts if it happens during a forward pass. Called
-    by TP loader as soon as processes are spawned and process group is initialized.
-    """
-    print(f" -- NCCL warmup, device {device}, please wait...")
-    x = torch.ones((6,), device = device)
-    dist.all_reduce(x)
-    print(f" -- Finished NCCL warmup, device {device}")
+from .model_tp_backend import TPBackendNCCL, TPBackendNative
 
 
-def init_pg(device: int, rank: int, world_size: int, output_rank: int, init_method: str):
+def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict):
+    rank = active_devices.index(device)
+    output_rank = active_devices.index(output_device)
+    world_size = len(active_devices)
     local_context = {
         "device": device,
         "modules": [],
@@ -25,31 +17,46 @@ def init_pg(device: int, rank: int, world_size: int, output_rank: int, init_meth
         "rank": rank,
         "world_size": world_size,
         "output_rank": output_rank,
+        "active_devices": active_devices,
+        "output_device": output_device,
     }
-    print(f" -- NCCL init: world_size {world_size}, rank {rank}, device {device}, init_method {init_method}")
+
     torch.cuda.set_device(device)
-    dist.init_process_group(
-        "nccl",
-        rank = rank,
-        world_size = world_size,
-        init_method = init_method,
-        # device_id = torch.device(device),  # (causes mysterious slowdowns)
-    )
-    mp_warmup_nccl(device)
+
+    match backend_args["type"]:
+        case "nccl":
+            backend = TPBackendNCCL(
+                device = device,
+                active_devices = active_devices,
+                output_device = output_device,
+                init_method = backend_args["init_method"],
+            )
+        case "native":
+            backend = TPBackendNative(
+                device = device,
+                active_devices = active_devices,
+                output_device = output_device,
+                init_method = backend_args["init_method"],  ##
+                master = device == active_devices[0],
+                uuid = backend_args["uuid"],
+            )
+        case _:
+            raise ValueError("Unknown backend type")
+
+    local_context["backend"] = backend
     return local_context
 
 
 def mp_model_worker(
     conn,
     device: int,
-    rank: int,
-    world_size: int,
-    output_rank: int,
-    init_method: str,
+    active_devices: list[int],
+    output_device: int,
+    backend_args: dict,
     producer: dict,
 ):
     with torch.inference_mode():
-        local_context = init_pg(device, rank, world_size, output_rank, init_method)
+        local_context = init_pg(device, active_devices, output_device, backend_args)
         local_context["inf_consumer"] = SMConsumer(producer, device = device, pin_memory = True)
 
         # Dispatch loop
@@ -58,8 +65,7 @@ def mp_model_worker(
             if msg == "quit":
                 torch.cuda.synchronize()
                 local_context["inf_consumer"].close()
-                dist.barrier()
-                dist.destroy_process_group()
+                local_context["backend"].close()
                 break
             func, args = msg
             try:
@@ -127,19 +133,26 @@ def mp_model_append_gather(local_context: dict):
     device = local_context["device"]
     plan = local_context["plan"]
     active_devices = local_context["active_devices"]
+    output_device = local_context["output_device"]
 
     last_key = modules[-1].key
+    gather_devices = []
+    ldims = []
+    for i, i_device in enumerate(sorted(active_devices)):
+        ldim = plan[i_device][last_key][1] - plan[i_device][last_key][0]
+        if ldim > 0 or i_device == output_device:
+            gather_devices.append(i_device)
+            ldims.append(ldim)
+
     module = OutputGather(
         config = None,
         key = "output_gather",
-        rank = local_context["rank"],
-        world_size = local_context["world_size"],
-        output_rank = local_context["output_rank"],
-        splits = [
-            (plan[active_devices[i]][last_key][0], plan[active_devices[i]][last_key][1])
-            for i in range(local_context["world_size"])
-        ],
+        device = device,
+        output_device = output_device,
+        gather_devices = gather_devices,
+        ldims = ldims,
     )
+
     modules.append(module)
     return None
 
@@ -154,8 +167,8 @@ def mp_model_forward(
     """
     Forward pass for parallel slice of a model
     """
-    # This seems to be needed (why?)
-    dist.barrier()
+    backend = local_context["backend"]
+    backend.fwd_barrier()
 
     modules = local_context["modules"]
     consumer = local_context["inf_consumer"]
@@ -169,6 +182,8 @@ def mp_model_forward(
         p = params.get(tensor_param)
         if p is not None:
             params[tensor_param] = consumer.recv(p, cuda = True)
+
+    params["backend"] = backend
 
     x = consumer.recv(shared_input)
 
@@ -234,13 +249,13 @@ class PseudoParentConn:
     def __init__(
         self,
         device: int,
-        rank: int,
-        world_size: int,
-        output_rank: int,
-        init_method: str,
+        active_devices: list[int],
+        output_device: int,
+        backend_args: dict,
         producer: SMProducer
     ):
-        self.local_context = init_pg(device, rank, world_size, output_rank, init_method)
+        self.local_context = init_pg(device, active_devices, output_device, backend_args)
+
         self.local_context["inf_consumer"] = SMConsumer(producer, device = device, pin_memory = True)
         self.result = None
 
@@ -263,8 +278,7 @@ class PseudoParentConn:
 
     def quit(self):
         torch.cuda.synchronize()
-        dist.barrier()
-        dist.destroy_process_group()
+        self.local_context["backend"].close()
 
 
 class PseudoChildConn:

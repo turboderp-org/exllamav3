@@ -28,6 +28,7 @@ def add_args(
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
     parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
+    parser.add_argument("-tpb", "--tp_backend", type = str, help = "Tensor-parallel backend, either 'nccl' (default) or 'native' (experimental)", default = "nccl")
     parser.add_argument("-tp_attn", "--tp_max_parallelism_attn", type = int, help = "(TP) Maximum parallelism for attention layers", default = None)
     parser.add_argument("-tp_mlp", "--tp_max_parallelism_mlp", type = int, help = "(TP) Maximum parallelism for MLP layers", default = None)
     parser.add_argument("-tp_moe", "--tp_max_parallelism_moe", type = int, help = "(TP) Maximum parallelism for MoE layers", default = None)
@@ -156,6 +157,7 @@ def init(
         tensor_p = args.tensor_parallel,
         progressbar = progress,
         tp_dev_limits = tp_dev_limits,
+        tp_backend = args.tp_backend,
         **kwargs
     )
 

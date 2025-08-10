@@ -327,10 +327,9 @@ class Attention(Module):
                     raise ValueError(f"Unknown attn_mode: {attn_mode}")
 
         if self.tp_reduce:
-            if x.dtype == torch.float32:
-                # TODO: Evaluate precision loss from reducing in BF16
-                x = x.to(torch.bfloat16)
-            dist.all_reduce(x, async_op = False)
+            # TODO: FP16 reduce in native backend
+            x = x.float()
+            params["backend"].all_reduce(x)
 
         return to2(x, out_dtype, self.out_dtype)
 

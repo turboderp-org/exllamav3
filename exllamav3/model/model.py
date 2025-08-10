@@ -119,7 +119,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         max_output_factor: int = 1,
         callback: Callable[[int, int], None] | None = None,
         generator: bool = True,
-        tp_dev_limits: dict | None = None
+        tp_dev_limits: dict | None = None,
+        tp_backend: str = "nccl"
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -193,6 +194,9 @@ class Model(Model_TPMixin, Model_LSMixin):
                 "attn": 2,  # Each attn layer uses at most two devices for tensor parallelism
                 "moe": 3,  # etc.
             }
+
+        :param tp_backend:
+            str, either "nccl" (default) or "native"
         """
 
         free_mem()
@@ -285,6 +289,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     self.config,
                     self.modules,
                     tp_dev_limits,
+                    tp_backend,
                 )
                 self.output_device = tp_output_device
 

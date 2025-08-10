@@ -178,7 +178,7 @@ class BlockSparseMLP(Module):
         downs: list[Linear | Module] = None,
         routing_first: int | None = None,
         routing_last: int | None = None,
-        routing_rank: int | None = None,
+        routing_device: int | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -194,7 +194,7 @@ class BlockSparseMLP(Module):
 
         self.routing_first = routing_first
         self.routing_last = routing_last
-        self.routing_rank = routing_rank
+        self.routing_device = routing_device
 
         self.routed_scaling_factor = routed_scaling_factor
         self.n_group = n_group
@@ -375,7 +375,6 @@ class BlockSparseMLP(Module):
             optional = True,
             float2half = True,
         )
-
         self.load_local(**kwargs)
         self.load_routing(**kwargs)
 
@@ -416,15 +415,15 @@ class BlockSparseMLP(Module):
             routing_weights = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.half, device = self.device)
 
         # Broadcast routing indices and weights
-        if self.routing_rank is not None:
-            dist.broadcast(selected_experts, src = self.routing_rank)
-            dist.broadcast(routing_weights, src = self.routing_rank)
+        if self.routing_device is not None:
+            params["backend"].broadcast(selected_experts, src_device = self.routing_device)
+            params["backend"].broadcast(routing_weights, src_device = self.routing_device)
 
         # Torch path
         if bsz > 1 or not self.is_quantized:
             final_hidden_states = torch.zeros_like(y, dtype = self.out_dtype)
 
-            if self.routing_rank is None:
+            if self.routing_device is None:
                 expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
             else:
                 # TODO: profile, maybe optimize
@@ -531,10 +530,9 @@ class BlockSparseMLP(Module):
 
         # Output reduction
         if self.tp_reduce:
-            if final_hidden_states.dtype == torch.float32:
-                # TODO: Evaluate precision loss from reducing in BF16
-                final_hidden_states = final_hidden_states.to(torch.bfloat16)
-            dist.all_reduce(final_hidden_states, async_op = False)
+            # TODO: FP16 reduce in native backend
+            final_hidden_states = final_hidden_states.float()
+            params["backend"].all_reduce(final_hidden_states)
 
         return final_hidden_states
 
@@ -620,8 +618,7 @@ class BlockSparseMLP(Module):
         consumer = local_context["consumer"]
         key = exported["kwargs"]["key"]
         device = local_context["device"]
-        output_rank = local_context["output_rank"]
-        rank = local_context["rank"]
+        output_device = local_context["output_device"]
         first, last = plan[key]
         num_local_experts = last - first
 
@@ -648,17 +645,17 @@ class BlockSparseMLP(Module):
             ups = [_import_i("ups", i) for i in range(first, last)],
             downs = [_import_i("downs", i) for i in range(first, last)],
             shared_experts = _import_no_reduce("shared_experts"),
-            routing_gate = _import("routing_gate") if rank == output_rank else None,
+            routing_gate = _import("routing_gate") if device == output_device else None,
             routing_first = first,
             routing_last = last,
-            routing_rank = output_rank,
+            routing_device = output_device,
         )
 
         module.device = device
         module.e_score_correction_bias = consumer.recv(exported["e_score_correction_bias"], cuda = True)
         if num_local_experts > 0:
             module.load_local()
-        if rank == output_rank:
+        if module.routing_gate is not None:
             module.load_routing()
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
