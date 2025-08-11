@@ -277,6 +277,9 @@ class Model_TPMixin:
             for idx, module in enumerate(modules):
                 last_module = module
 
+                if callback_sync: callback_sync(idx, len(modules))
+                if generator: yield idx, len(modules)
+
                 # Load module to CPU
                 defer = module.can_defer_load()
                 if defer:
@@ -295,12 +298,14 @@ class Model_TPMixin:
 
                 # Progress and callbacks per fully loaded module
                 progress.update(idx + 1)
-                if callback_sync: callback_sync(len(modules), len(modules))
-                if generator: yield len(modules), len(modules)
 
             # Append final gather layer
             if last_module.caps["logits_output"]:
                 self.tp_worker_dispatch_wait_multi(self.active_devices, mp_model_append_gather, ())
+
+            # Final callback, 100% loaded
+            if callback_sync: callback_sync(len(modules), len(modules))
+            if generator: yield len(modules), len(modules)
 
         # Distribution pipeline
         self.tp_worker_dispatch_wait_multi(self.active_devices, mp_close_consumer, ())
