@@ -201,10 +201,7 @@ class ParallelDecoderBlock(Module):
             y1 += y2
 
             if self.tp_reduce:
-                if y1.dtype == torch.float32:
-                    # TODO: Evaluate precision loss from reducing in BF16
-                    y1 = y1.to(torch.bfloat16)
-                dist.all_reduce(y1, async_op = False)
+                params["backend"].all_reduce(y1)
 
             x += y1
 

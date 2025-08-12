@@ -244,3 +244,67 @@ static __forceinline__ __device__ uint32_t bfe64(uint32_t lo, uint32_t hi, int o
 
     return static_cast<uint32_t>(result64);
 }
+
+// Memory ops
+
+__device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
+{
+    asm volatile("st.global.wt.u32 [%0], %1;" :: "l"(p), "r"(v));
+}
+
+__device__ __forceinline__ void stg_wt_u128(uint4* p, const uint4 v)
+{
+    asm volatile ("st.global.wt.v4.u32 [%0], {%1,%2,%3,%4};"
+                  :: "l"(p),
+                     "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w));
+}
+
+__device__ __forceinline__ uint32_t ldg_cv_u32(const uint32_t* p)
+{
+    uint32_t v;
+    asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ uint4 ldg_cv_u128(const uint4* p)
+{
+    uint4 v;
+    asm volatile ("ld.global.cv.v4.u32 {%0,%1,%2,%3}, [%4];"
+                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                  : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ uint32_t ldg_acquire_sys_u32(const uint32_t* p)
+{
+    uint32_t v;
+    asm volatile("ld.global.acquire.sys.u32 %0, [%1];"
+                 : "=r"(v) : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ uint64_t ldg_acquire_sys_u64(const uint64_t* p)
+{
+    uint64_t v;
+    asm volatile("ld.global.acquire.sys.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void stg_release_sys_u32(uint32_t* p, uint32_t v)
+{
+    asm volatile("st.global.release.sys.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+}
+
+__device__ __forceinline__ void stg_release_sys_u64(uint64_t* p, uint64_t v)
+{
+    asm volatile("st.global.release.sys.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+}
+
+// Global time in nanoseconds
+
+__device__ __forceinline__ uint64_t globaltimer_ns()
+{
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}

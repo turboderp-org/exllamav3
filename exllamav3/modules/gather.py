@@ -9,20 +9,19 @@ class OutputGather(Module):
         self,
         config: None,
         key: str,
-        rank: int,
-        world_size: int,
-        output_rank: int,
-        splits: list[(int, int)],
-        gather_dim: int = -1
+        device: int,
+        output_device: int,
+        gather_devices: list[int],
+        ldims: list[int],
     ):
         super().__init__(config, key, None)
-        self.rank = rank
-        self.world_size = world_size
-        self.output_rank = output_rank
+        self.device = device
+        self.output_device = output_device
+        self.gather_devices = gather_devices
+        self.ldims = ldims
+        self.odim = sum(ldims)
+        self.active = device == output_device or device in gather_devices
 
-        self.splits = splits
-        self.output_dim = sum(s[1] - s[0] for s in splits)
-        self.gather_dim = gather_dim
 
     @override
     def load(self, device: torch.Device, **kwargs):
@@ -42,32 +41,24 @@ class OutputGather(Module):
         x: torch.Tensor,
         params: dict,
         out_dtype: torch.dtype | None = None
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
 
-        if self.world_size == 1 and self.output_rank == self.rank:
+        if len(self.gather_devices) == 1 and self.device == self.output_device:
             return x
 
-        gather_dim = self.gather_dim % x.ndim
+        if not self.active:
+            return None
 
-        # Allocate output buffer only on the gather rank
-        if self.rank == self.output_rank:
+        backend = params["backend"]
+
+        if self.output_device == self.device:
             out_shape = list(x.shape)
-            out_shape[gather_dim] = self.output_dim
-            out = torch.empty(*out_shape, dtype = x.dtype, device = x.device)
+            out_shape[-1] = self.odim
+            out_tensor = torch.empty(*out_shape, dtype = x.dtype, device = x.device)
         else:
-            out = None
+            out_tensor = None
 
-        # output_rank receives, other ranks send
-        if self.rank == self.output_rank:
-            for src, s in enumerate(self.splits):
-                out_slice = out.narrow(gather_dim, s[0], s[1] - s[0])
-                if src == self.rank:
-                    out_slice.copy_(x)
-                else:
-                    rbuf = torch.empty_like(out_slice)
-                    dist.recv(rbuf, src = src)
-                    out_slice.copy_(rbuf)
-        else:
-            dist.send(x, dst = self.output_rank)
+        # print(f"Gather:  device {self.device}, ldims {self.ldims}")
 
-        return out
+        backend.gather(x, out_tensor, self.gather_devices, self.output_device, self.ldims)
+        return out_tensor

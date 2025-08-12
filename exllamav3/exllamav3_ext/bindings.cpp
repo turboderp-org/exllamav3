@@ -32,6 +32,12 @@
 
 #include "histogram.cuh"
 
+#include "parallel/context.cuh"
+#include "parallel/broadcast.cuh"
+#include "parallel/barrier.cuh"
+#include "parallel/gather.cuh"
+#include "parallel/all_reduce.cuh"
+
 #include "libtorch/blocksparse_mlp.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -52,6 +58,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("had_paley", &had_paley, "had_paley");
     m.def("had_paley2", &had_paley2, "had_paley2");
+
+    m.def("pg_init_context", &pg_init_context, "pg_init_context");
+    m.def("pg_broadcast", &pg_broadcast, "pg_broadcast");
+    m.def("pg_broadcast_ll", &pg_broadcast_ll, "pg_broadcast_ll");
+    m.def("pg_barrier", &pg_barrier, "pg_barrier");
+    m.def("pg_gather", &pg_gather, "pg_gather");
+    m.def("pg_all_reduce", &pg_all_reduce, "pg_all_reduce");
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
     m.def("test_distribution", &test_distribution, "test_distribution");

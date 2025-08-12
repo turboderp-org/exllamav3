@@ -13,6 +13,8 @@ from .config import Config
 from ..util.misc import Cleanupper
 from .model_tp_shared import SMProducer
 from .model_tp_fn import *
+from .model_tp_backend import TPBackend, TPBackendNCCL, TPBackendNative
+import uuid
 
 cleanupper = Cleanupper()
 
@@ -25,8 +27,9 @@ class Model_TPMixin:
         self.loaded_tp = False
         self.tp_output_device = None
         self.tp_producer = None
+        self.tp_backend = None
 
-    def create_tp_context(self):
+    def create_tp_context(self, tp_backend: str):
         """
         Create child processes and pipes
         """
@@ -36,15 +39,27 @@ class Model_TPMixin:
         multiprocessing.set_start_method('spawn')
         torch.multiprocessing.set_sharing_strategy('file_system')
 
-        # Get target rank for the final logits gather
-        for rank, device in enumerate(self.active_devices):
-            if device == self.tp_output_device:
-                output_rank = rank
-
-        # Master address and port for the process group
+        # Backend args
+        self.tp_backend = tp_backend
         master_addr = os.environ.get("EXLLAMA_MASTER_ADDR", "127.0.0.1")
         master_port = os.environ.get("EXLLAMA_MASTER_PORT", find_free_port())
-        init_method = f"tcp://{master_addr}:{master_port}"
+        match tp_backend:
+            case "nccl":
+                # Master address and port for the process group
+                backend_args = {
+                    "type": tp_backend,
+                    "init_method": f"tcp://{master_addr}:{master_port}",
+                    "uuid": uuid.uuid4().hex,
+                }
+            case "native":
+                backend_args = {
+                    "type": tp_backend,
+                    "init_method": f"tcp://{master_addr}:{master_port}",
+                    "uuid": uuid.uuid4().hex,
+                }
+            case _:
+                raise ValueError(f"Unkwown backend type: {tp_backend}")
+
 
         # Spawn child processes, each running the mp_model_worker function
         num_devices = max(self.active_devices) + 1
@@ -60,10 +75,9 @@ class Model_TPMixin:
             if self.tp_output_device == device:
                 self.mp_parent_conn[device] = PseudoParentConn(
                     device,
-                    rank,
-                    len(self.active_devices),
-                    output_rank,
-                    init_method,
+                    self.active_devices,
+                    self.tp_output_device,
+                    backend_args,
                     self.tp_producer
                 )
                 self.mp_child_conn[device] = PseudoChildConn()
@@ -74,10 +88,9 @@ class Model_TPMixin:
                     target = mp_model_worker, args = (
                         self.mp_child_conn[device],
                         device,
-                        rank,
-                        len(self.active_devices),
-                        output_rank,
-                        init_method,
+                        self.active_devices,
+                        self.tp_output_device,
+                        backend_args,
                         self.tp_producer.export()
                     )
                 )
@@ -205,6 +218,7 @@ class Model_TPMixin:
         config: Config,
         modules: list,
         dev_limits: dict | None,
+        tp_backend: str,
     ):
         assert use_per_device is None or reserve_per_device is None
         if dev_limits is None: dev_limits = {}
@@ -220,7 +234,7 @@ class Model_TPMixin:
 
         # Create TP context
         self.active_devices = active_devices
-        self.create_tp_context()
+        self.create_tp_context(tp_backend)
 
         # Split model
         num_devices = max(self.active_devices) + 1
@@ -263,6 +277,9 @@ class Model_TPMixin:
             for idx, module in enumerate(modules):
                 last_module = module
 
+                if callback_sync: callback_sync(idx, len(modules))
+                if generator: yield idx, len(modules)
+
                 # Load module to CPU
                 defer = module.can_defer_load()
                 if defer:
@@ -281,12 +298,14 @@ class Model_TPMixin:
 
                 # Progress and callbacks per fully loaded module
                 progress.update(idx + 1)
-                if callback_sync: callback_sync(len(modules), len(modules))
-                if generator: yield len(modules), len(modules)
 
             # Append final gather layer
             if last_module.caps["logits_output"]:
                 self.tp_worker_dispatch_wait_multi(self.active_devices, mp_model_append_gather, ())
+
+            # Final callback, 100% loaded
+            if callback_sync: callback_sync(len(modules), len(modules))
+            if generator: yield len(modules), len(modules)
 
         # Distribution pipeline
         self.tp_worker_dispatch_wait_multi(self.active_devices, mp_close_consumer, ())
