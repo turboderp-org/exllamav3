@@ -113,16 +113,27 @@ class Model_LSMixin:
                         if defer:
                             config.stc.end_deferred_load()
 
+                        # Account for cache quant temporary tensors
+                        qcache_overhead = []
+                        for cm in module.all_cache_modules():
+                            for cl in cm.cache_layers:
+                                qcache_overhead.append(cl.get_kv_alloc_placeholder())
+
                         # Forward dummy state through module
                         dummy_state = module.prepare_for_device(dummy_state, params)
                         dummy_state = module.forward(dummy_state, params)
 
                         # Account for max_output_factor after last layer,
+                        extra_dummy_states = None
                         if is_logits_layer:
                             extra_dummy_states = [
                                 torch.empty_like(dummy_state)
                                 for _ in range(max_output_factor - 1)
                             ]
+
+                        # Dereference extra dummy tensors
+                        extra_dummy_states = None
+                        qcache_overhead = None
 
                         # We're good
                         fail = False
