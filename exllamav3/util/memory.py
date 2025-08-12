@@ -31,6 +31,7 @@ def set_memory_fraction_reserve(
     touch_device(device)
     free, total = torch.cuda.mem_get_info(device)
     fraction = (free - reserve) / total
+    fraction = max(0.01, fraction)
     torch.cuda.set_per_process_memory_fraction(fraction, device = device)
 
 
