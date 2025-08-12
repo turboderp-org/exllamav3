@@ -54,6 +54,11 @@ class CacheLayer_fp16(CacheLayer):
 
 
     @override
+    def get_kv_alloc_placeholder(self):
+        return None
+
+
+    @override
     def update_kv(
         self,
         cache_seqlens: torch.Tensor,

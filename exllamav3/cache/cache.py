@@ -67,6 +67,12 @@ class CacheLayer(ABC):
     def tp_export(self, plan):
         pass
 
+    @abstractmethod
+    def get_kv_alloc_placeholder(self):
+        # Used by layersplit loader to simulate dequant overhead, if any. Returns a reference to hold while
+        # inference is simulated, or None for unquantized cache
+        pass
+
 
 class Cache:
 

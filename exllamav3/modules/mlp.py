@@ -10,6 +10,7 @@ from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
 import torch.distributed as dist
+from .multilinear import MultiLinear
 
 class MLP(Module):
 
@@ -430,6 +431,7 @@ class GatedMLP(Module):
             case "gelu": self.activation_fn_call = ext.gelu_mul
 
         self.tp_reduce = False
+        self.multi_gu: list[MultiLinear | None] = [None] * self.num_slices
 
 
     @override
@@ -447,6 +449,33 @@ class GatedMLP(Module):
             self.ups[load_slice].load(device, **kwargs)
             self.downs[load_slice].load(device, **kwargs)
 
+        self.load_local(device, load_slice or 0, **kwargs)
+
+
+    def load_local(self, device: torch.Device, load_slice: int, **kwargs):
+
+        # Test if K and V proj can be fused
+        if (
+            device != torch.device("cpu") and
+            self.gates[load_slice].quant_type == "exl3" and
+            self.ups[load_slice].quant_type == "exl3" and
+            self.gates[load_slice].out_features == self.ups[load_slice].out_features and
+            self.gates[load_slice].inner.K == self.ups[load_slice].inner.K and
+            self.gates[load_slice].inner.bias is None and
+            self.ups[load_slice].inner.bias is None
+        ):
+            self.multi_gu[load_slice] = MultiLinear(self. device, [self.gates[load_slice], self.ups[load_slice]])
+
+
+    @override
+    def unload(self):
+        super().unload()
+
+        for i in range(self.num_slices):
+            if self.multi_gu[i] is not None:
+                self.multi_gu[i].unload()
+                self.multi_gu[i] = None
+
 
     @override
     def forward(
@@ -455,6 +484,7 @@ class GatedMLP(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+        bsz, q_len, dim = x.shape
 
         if self.num_slices == 0:
             d = torch.zeros_like(x, dtype = self.out_dtype)
@@ -464,8 +494,34 @@ class GatedMLP(Module):
             d = None
 
             for s in r:
-                g = self.gates[s].forward(x, params)
-                u = self.ups[s].forward(x, params)
+
+                if self.multi_gu[s] is None or bsz * q_len > 32:
+                    g = self.gates[s].forward(x, params)
+                    u = self.ups[s].forward(x, params)
+
+                else:
+                    x = x.view(1, bsz * q_len, dim)
+                    guh = torch.empty((2, bsz * q_len, self.multi_gu[s].out_features), dtype = self.interm_dtype, device = x.device)
+                    gu = torch.empty((2, bsz * q_len, self.multi_gu[s].out_features), dtype = self.interm_dtype, device = x.device)
+                    ext.exl3_mgemm(
+                        x,
+                        self.multi_gu[s].ptrs_trellis,
+                        gu,
+                        self.multi_gu[s].ptrs_suh,
+                        guh,
+                        self.multi_gu[s].ptrs_svh,
+                        None,
+                        None,
+                        self.multi_gu[s].K,
+                        -1,
+                        self.multi_gu[s].mcg_mult,
+                        self.multi_gu[s].mul1_mult,
+                        -1,
+                        -1
+                    )
+                    g = gu[0].view(bsz, q_len, self.multi_gu[s].out_features)
+                    u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)
+
                 a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
                 self.activation_fn_call(g, u, a)
                 d_ = self.downs[s].forward(a, params)
@@ -562,6 +618,7 @@ class GatedMLP(Module):
         if num_slices == 1:
             gu_split = (True, first, last)
             d_split = (False, first, last)
+            exported["kwargs"]["intermediate_size"] = last - first
             module = GatedMLP(
                 config = None,
                 **exported["kwargs"],
@@ -591,5 +648,7 @@ class GatedMLP(Module):
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+        for i in range(module.num_slices):
+            module.load_local(device, i)
         torch.cuda.synchronize()
         return module

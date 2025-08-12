@@ -403,6 +403,7 @@ class Linear(Module):
         module.device = device
         module.inner = exported["inner"]["cls"].tp_import_split(local_context, exported["inner"], plan, split)
         module.quant_type = module.inner.quant_type
+        module.out_features = module.inner.out_features
         return module
 
     @staticmethod
