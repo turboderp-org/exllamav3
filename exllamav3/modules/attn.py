@@ -265,6 +265,7 @@ class Attention(Module):
 
         # Test if K and V proj can be fused
         if (
+            device != torch.device("cpu") and
             self.k_proj.quant_type == "exl3" and
             self.v_proj.quant_type == "exl3" and
             self.k_proj.out_features == self.v_proj.out_features and
