@@ -5,8 +5,7 @@ from ..ext import exllamav3_ext as ext
 from functools import lru_cache
 from .model_tp_backend import TPBackendNCCL, TPBackendNative
 
-
-def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict):
+def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict, master: bool = False):
     rank = active_devices.index(device)
     output_rank = active_devices.index(output_device)
     world_size = len(active_devices)
@@ -30,7 +29,7 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
                 active_devices = active_devices,
                 output_device = output_device,
                 init_method = backend_args["init_method"],
-                master = device == active_devices[0],
+                master = master,
                 uuid = backend_args["uuid"],
             )
         case "native":
@@ -39,7 +38,7 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
                 active_devices = active_devices,
                 output_device = output_device,
                 init_method = backend_args["init_method"],  ##
-                master = device == active_devices[0],
+                master = master,
                 uuid = backend_args["uuid"],
             )
         case _:
@@ -258,6 +257,7 @@ class PseudoParentConn:
     ):
         self.local_context = init_pg(device, active_devices, output_device, backend_args)
 
+        self.local_context = init_pg(device, active_devices, output_device, backend_args, master = True)
         self.local_context["inf_consumer"] = SMConsumer(producer, device = device, pin_memory = True)
         self.result = None
 
