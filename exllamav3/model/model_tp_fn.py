@@ -4,6 +4,7 @@ from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
 from .model_tp_backend import TPBackendNCCL, TPBackendNative
+from ..util import log_tp, set_t0
 
 def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict, master: bool = False):
     rank = active_devices.index(device)
@@ -55,7 +56,11 @@ def mp_model_worker(
     output_device: int,
     backend_args: dict,
     producer: dict,
+    dbg_t0_: float
 ):
+    set_t0("TP", dbg_t0_)
+    log_tp(device, f"Child process launched")
+
     with torch.inference_mode():
         local_context = init_pg(device, active_devices, output_device, backend_args)
         local_context["inf_consumer"] = SMConsumer(producer, device = device, pin_memory = True)
@@ -253,9 +258,11 @@ class PseudoParentConn:
         active_devices: list[int],
         output_device: int,
         backend_args: dict,
-        producer: SMProducer
+        producer: SMProducer,
+        dbg_t0_: float
     ):
-        self.local_context = init_pg(device, active_devices, output_device, backend_args)
+        set_t0("TP", dbg_t0_)
+        log_tp(None, f"Pseudoprocess created, device {device}")
 
         self.local_context = init_pg(device, active_devices, output_device, backend_args, master = True)
         self.local_context["inf_consumer"] = SMConsumer(producer, device = device, pin_memory = True)
@@ -276,6 +283,7 @@ class PseudoParentConn:
     def close(self, *args, **kwargs):
         self.local_context["inf_consumer"].close()
         self.local_context = {}
+        log_tp(None, f"Pseudoprocess closed")
 
 
     def quit(self):

@@ -15,6 +15,7 @@ from .model_tp_shared import SMProducer
 from .model_tp_fn import *
 from .model_tp_backend import TPBackend, TPBackendNCCL, TPBackendNative
 import uuid
+from ..util import log_tp, global_t0
 
 cleanupper = Cleanupper()
 
@@ -33,6 +34,7 @@ class Model_TPMixin:
         """
         Create child processes and pipes
         """
+        log_tp(None, "Creating TP context")
 
         # Must use spawn method to avoid CUDA errors. Docs say this should always be set by __main__ but seems
         # to work okay here
@@ -60,7 +62,6 @@ class Model_TPMixin:
             case _:
                 raise ValueError(f"Unkwown backend type: {tp_backend}")
 
-
         # Spawn child processes, each running the mp_model_worker function
         num_devices = max(self.active_devices) + 1
         assert not self.mp_children
@@ -72,13 +73,15 @@ class Model_TPMixin:
         self.tp_producer = SMProducer(buffer_size = 64 * 1024**2)
 
         for rank, device in enumerate(self.active_devices):
+            log_tp(None, f"Spawning child process: {device}")
             if self.tp_output_device == device:
                 self.mp_parent_conn[device] = PseudoParentConn(
                     device,
                     self.active_devices,
                     self.tp_output_device,
                     backend_args,
-                    self.tp_producer
+                    self.tp_producer,
+                    global_t0
                 )
                 self.mp_child_conn[device] = PseudoChildConn()
                 self.mp_children[device] = PseudoChild()
@@ -91,7 +94,8 @@ class Model_TPMixin:
                         self.active_devices,
                         self.tp_output_device,
                         backend_args,
-                        self.tp_producer.export()
+                        self.tp_producer.export(),
+                        global_t0
                     )
                 )
                 self.mp_children[device].start()
@@ -99,11 +103,15 @@ class Model_TPMixin:
         # Install exit hook to avoid child processes hanging if main process exits before unloading model
         cleanupper.register_atexit(self.destroy_tp_context)
 
+        log_tp(None, "TP context created")
+
 
     def destroy_tp_context(self):
         """
         Destroy child processes (when unloading TP model or atexit)
         """
+        log_tp(None, "Destroying TP context")
+
         # Destroy process group in child processes
         for device, (parent_conn, child) in enumerate(zip(self.mp_parent_conn, self.mp_children)):
             if device == self.tp_output_device or child is None:
@@ -122,11 +130,14 @@ class Model_TPMixin:
             enumerate(zip(self.mp_parent_conn, self.mp_child_conn, self.mp_children)):
             if device == self.tp_output_device or child is None:
                 continue
+            log_tp(None, f"Attempting to destroy child, device {device}")
             child.join(timeout = 2)
             if child.is_alive():
+                log_tp(None, f"Terminating child, device {device}")
                 child.terminate()
             child_conn.close()
             parent_conn.close()
+            log_tp(None, f"Closed connections, device {device}")
 
         self.mp_children = []
         self.mp_parent_conn = []
@@ -137,6 +148,7 @@ class Model_TPMixin:
 
         # Unregister exit hook
         cleanupper.unregister_atexit(self.destroy_tp_context)
+        log_tp(None, "Destroyed TP context")
 
 
     def tp_worker_dispatch_single(self, device, fn, args):

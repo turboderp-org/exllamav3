@@ -5,6 +5,7 @@ import numpy as np
 from .model_tp_cuda import cuda_host_register, cuda_host_unregister, CUDA_HOST_REGISTER_PORTABLE
 from ..ext import exllamav3_ext as ext
 from multiprocessing import shared_memory, Barrier
+from ..util import log_tp
 
 GLOBALS_SIZE = 32768
 SHBUF_SIZE = 16 * 1024 ** 2
@@ -157,9 +158,13 @@ class TPBackendNative:
         size_s = SHBUF_SIZE_S
 
         if master:
+            log_tp(device, f"Creating SHMs")
             self.shm_g = shared_memory.SharedMemory(create = True, size = size_g, name = self.shm_g_name)
+            log_tp(device, f"Created SHM: {self.shm_g_name}, {size_g} bytes")
             self.shm_b = shared_memory.SharedMemory(create = True, size = size_b, name = self.shm_b_name)
+            log_tp(device, f"Created SHM: {self.shm_b_name}, {size_b} bytes")
             self.shm_s = shared_memory.SharedMemory(create = True, size = size_s, name = self.shm_s_name)
+            log_tp(device, f"Created SHM: {self.shm_s_name}, {size_s} bytes")
             self.buf_g = np.ndarray((size_g,), dtype = np.uint8, buffer = self.shm_g.buf)
             self.buf_b = np.ndarray((size_b,), dtype = np.uint8, buffer = self.shm_b.buf)
             self.buf_s = np.ndarray((size_s,), dtype = np.uint8, buffer = self.shm_s.buf)
@@ -171,17 +176,26 @@ class TPBackendNative:
             self.shm_b = None
             self.shm_s = None
             deadline = time.time() + 5
+            log_tp(device, f"Opening SHMs")
+            first_fnf = True
             while True:
                 try:
                     if self.shm_g is None:
                         self.shm_g = shared_memory.SharedMemory(name = self.shm_g_name)
+                        log_tp(device, f"Opened SHM {self.shm_g_name}")
                     if self.shm_b is None:
                         self.shm_b = shared_memory.SharedMemory(name = self.shm_b_name)
+                        log_tp(device, f"Opened SHM {self.shm_b_name}")
                     if self.shm_s is None:
                         self.shm_s = shared_memory.SharedMemory(name = self.shm_s_name)
+                        log_tp(device, f"Opened SHM {self.shm_s_name}")
                     break
                 except FileNotFoundError:
+                    if first_fnf:
+                        log_tp(device, f"Waiting for SHM to appear")
+                        first_fnf = False
                     if time.time() > deadline:
+                        log_tp(device, f"Timeout opening SHM")
                         raise TimeoutError("Timeout waiting for master process to create SHM")
                     time.sleep(0.05)
 
@@ -200,25 +214,35 @@ class TPBackendNative:
         self.ptr_g = self.tensor_g.data_ptr()
         self.ptr_b = self.tensor_b.data_ptr()
         self.ptr_s = self.tensor_s.data_ptr()
+        log_tp(device, f"Host register G")
         cuda_host_register(self.ptr_g, self.tensor_g.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
+        log_tp(device, f"Host register B")
         cuda_host_register(self.ptr_b, self.tensor_b.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
+        log_tp(device, f"Host register S")
         cuda_host_register(self.ptr_s, self.tensor_s.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
 
         # Init global context
         if master:
+            log_tp(device, f"Initializing global context")
             ext.pg_init_context(self.ptr_g)
 
 
     def close(self):
+        log_tp(self.device, f"Host register G")
         cuda_host_unregister(self.ptr_g)
+        log_tp(self.device, f"Host register B")
         cuda_host_unregister(self.ptr_b)
+        log_tp(self.device, f"Host register S")
         cuda_host_unregister(self.ptr_s)
         self.shm_g.close()
         self.shm_b.close()
         self.shm_s.close()
         if self.master:
+            log_tp(self.device, f"Master unlink G")
             self.shm_g.unlink()
+            log_tp(self.device, f"Master unlink B")
             self.shm_b.unlink()
+            log_tp(self.device, f"Master unlink S")
             self.shm_s.unlink()
 
 
