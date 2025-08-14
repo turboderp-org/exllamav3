@@ -175,7 +175,7 @@ class TPBackendNative:
             self.shm_g = None
             self.shm_b = None
             self.shm_s = None
-            deadline = time.time() + 5
+            deadline = time.time() + 15
             log_tp(device, f"Opening SHMs")
             first_fnf = True
             while True:
