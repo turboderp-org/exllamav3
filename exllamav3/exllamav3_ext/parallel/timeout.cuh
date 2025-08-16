@@ -9,11 +9,10 @@ __device__ __forceinline__ uint64_t sync_deadline()
 __device__ __forceinline__ bool check_timeout(PGContext* ctx, uint64_t deadline, const char* name)
 {
     bool timeout = globaltimer_ns() >= deadline;
-    if (timeout)
+    if (timeout && threadIdx.x == 0)
     {
-        ctx->sync_timeout = 1;
-        if (threadIdx.x == 0)
-            printf(" ## Synchronization timeout in kernel: %s\n\n", name);
+        stg_release_sys_u32(&ctx->sync_timeout, 1);
+        printf(" ## Synchronization timeout in kernel: %s\n\n", name);
     }
     return timeout;
 }

@@ -32,5 +32,7 @@ def log(s: str, t: str):
 def log_tp(device: int | None, t: str):
     if device is None:
         log("TP", f"main process, {t}")
+    elif device == -1:
+        log("TP", f"CPU process, {t}")
     else:
         log("TP", f"device {device}, {t}")

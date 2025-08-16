@@ -92,7 +92,7 @@ if build_jit:
 
     # nvcc flags
 
-    extra_cuda_cflags = ["-lineinfo", "-O3"]
+    extra_cuda_cflags = ["-lineinfo", "-O3", "-Xcompiler \"-O3 -mavx2\""]
 
     if torch.version.hip:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]

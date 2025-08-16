@@ -7,9 +7,11 @@ from ..ext import exllamav3_ext as ext
 from multiprocessing import shared_memory, Barrier
 from ..util import log_tp
 
-GLOBALS_SIZE = 32768
+GLOBALS_SIZE = 128*1024
 SHBUF_SIZE = 16 * 1024 ** 2
+SHBUF_SIZE_R = 17 * 128 * 1024
 SHBUF_SIZE_S = 16 * 1024
+MAX_CPU_REDUCE = SHBUF_SIZE_R // 17 // 256 * 256
 
 class TPBackend:
 
@@ -35,10 +37,16 @@ class TPBackendNCCL:
         uuid: str,
         shbuf_size: int = SHBUF_SIZE,
     ):
+        self.device = device
+        if device < 0:
+            log_tp(device, f"NCCL init: skip CPU process")
+            return
+
         self.active_devices = active_devices
         self.world_size = len(active_devices)
         self.rank = active_devices.index(device)
 
+        log_tp(device, f"NCCL init: world_size {self.world_size}, rank {self.rank}, device {device}, init_method {init_method}")
         print(f" -- NCCL init: world_size {self.world_size}, rank {self.rank}, device {device}, init_method {init_method}")
         dist.init_process_group(
             "nccl",
@@ -71,6 +79,10 @@ class TPBackendNCCL:
 
 
     def close(self):
+        if self.device < 0:
+            log_tp(self.device, f"NCCL close: skip CPU process")
+            return
+
         dist.barrier()
         self.fallback.close()
         dist.destroy_process_group()
@@ -86,8 +98,7 @@ class TPBackendNCCL:
         # dist.broadcast(tensor, src = src_rank)
 
 
-    def all_reduce(self, tensor: torch.Tensor):
-        # TODO: Evaluate precision loss from reducing in BF16
+    def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
         if tensor.dtype == torch.float32:
             temp = tensor.to(torch.bfloat16)
             dist.all_reduce(temp, async_op = False)
@@ -131,6 +142,14 @@ class TPBackendNCCL:
         #     dist.send(tensor, dst = dst_rank)
 
 
+    def run_cpu_reduce_jobs(self):
+        pass
+
+
+    def end_cpu_reduce_jobs(self):
+        pass
+
+
 class TPBackendNative:
 
     def __init__(
@@ -142,19 +161,24 @@ class TPBackendNative:
         master: bool,
         uuid: str,
         shbuf_size: int = SHBUF_SIZE,
+        cpu: bool = False
     ):
         self.uuid = uuid
         self.shm_g_name = uuid + "_g"
         self.shm_b_name = uuid + "_b"
+        self.shm_r_name = uuid + "_r"
         self.shm_s_name = uuid + "_s"
         self.device = device
         self.max_num_devices = max(active_devices) + 1
         self.active_devices = active_devices
         self.shbuf_size = shbuf_size
         self.master = master
+        self.cpu = cpu
+        self.cpu_is_pinned = False
 
         size_g = GLOBALS_SIZE
         size_b = self.shbuf_size
+        size_r = SHBUF_SIZE_R
         size_s = SHBUF_SIZE_S
 
         if master:
@@ -163,17 +187,22 @@ class TPBackendNative:
             log_tp(device, f"Created SHM: {self.shm_g_name}, {size_g} bytes")
             self.shm_b = shared_memory.SharedMemory(create = True, size = size_b, name = self.shm_b_name)
             log_tp(device, f"Created SHM: {self.shm_b_name}, {size_b} bytes")
+            self.shm_r = shared_memory.SharedMemory(create = True, size = size_r, name = self.shm_r_name)
+            log_tp(device, f"Created SHM: {self.shm_r_name}, {size_r} bytes")
             self.shm_s = shared_memory.SharedMemory(create = True, size = size_s, name = self.shm_s_name)
             log_tp(device, f"Created SHM: {self.shm_s_name}, {size_s} bytes")
             self.buf_g = np.ndarray((size_g,), dtype = np.uint8, buffer = self.shm_g.buf)
             self.buf_b = np.ndarray((size_b,), dtype = np.uint8, buffer = self.shm_b.buf)
+            self.buf_r = np.ndarray((size_r,), dtype = np.uint8, buffer = self.shm_r.buf)
             self.buf_s = np.ndarray((size_s,), dtype = np.uint8, buffer = self.shm_s.buf)
             self.buf_g[:] = 0
             self.buf_b[: size_b: 4096] = 0
+            self.buf_r[:] = 0
             self.buf_s[:] = 0
         else:
             self.shm_g = None
             self.shm_b = None
+            self.shm_r = None
             self.shm_s = None
             deadline = time.time() + 15
             log_tp(device, f"Opening SHMs")
@@ -186,6 +215,9 @@ class TPBackendNative:
                     if self.shm_b is None:
                         self.shm_b = shared_memory.SharedMemory(name = self.shm_b_name)
                         log_tp(device, f"Opened SHM {self.shm_b_name}")
+                    if self.shm_r is None:
+                        self.shm_r = shared_memory.SharedMemory(name = self.shm_r_name)
+                        log_tp(device, f"Opened SHM {self.shm_r_name}")
                     if self.shm_s is None:
                         self.shm_s = shared_memory.SharedMemory(name = self.shm_s_name)
                         log_tp(device, f"Opened SHM {self.shm_s_name}")
@@ -210,16 +242,21 @@ class TPBackendNative:
             return torch.as_tensor(np_view)
         self.tensor_g = get_local_tensor(self.shm_g.buf, size_g)
         self.tensor_b = get_local_tensor(self.shm_b.buf, size_b)
+        self.tensor_r = get_local_tensor(self.shm_r.buf, size_r)
         self.tensor_s = get_local_tensor(self.shm_s.buf, size_s)
         self.ptr_g = self.tensor_g.data_ptr()
         self.ptr_b = self.tensor_b.data_ptr()
+        self.ptr_r = self.tensor_r.data_ptr()
         self.ptr_s = self.tensor_s.data_ptr()
-        log_tp(device, f"Host register G")
-        cuda_host_register(self.ptr_g, self.tensor_g.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
-        log_tp(device, f"Host register B")
-        cuda_host_register(self.ptr_b, self.tensor_b.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
-        log_tp(device, f"Host register S")
-        cuda_host_register(self.ptr_s, self.tensor_s.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
+        if not self.cpu:
+            log_tp(device, f"Host register G")
+            cuda_host_register(self.ptr_g, self.tensor_g.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
+            log_tp(device, f"Host register B")
+            cuda_host_register(self.ptr_b, self.tensor_b.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
+            log_tp(device, f"Host register R")
+            cuda_host_register(self.ptr_r, self.tensor_r.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
+            log_tp(device, f"Host register S")
+            cuda_host_register(self.ptr_s, self.tensor_s.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
 
         # Init global context
         if master:
@@ -228,20 +265,30 @@ class TPBackendNative:
 
 
     def close(self):
-        log_tp(self.device, f"Host register G")
-        cuda_host_unregister(self.ptr_g)
-        log_tp(self.device, f"Host register B")
-        cuda_host_unregister(self.ptr_b)
-        log_tp(self.device, f"Host register S")
-        cuda_host_unregister(self.ptr_s)
+        if not self.cpu:
+            log_tp(self.device, f"Host unregister G")
+            cuda_host_unregister(self.ptr_g)
+            log_tp(self.device, f"Host unregister B")
+            cuda_host_unregister(self.ptr_b)
+            log_tp(self.device, f"Host unregister R")
+            cuda_host_unregister(self.ptr_r)
+            log_tp(self.device, f"Host unregister S")
+            cuda_host_unregister(self.ptr_s)
         self.shm_g.close()
+        log_tp(self.device, f"Closed {self.shm_g_name}")
         self.shm_b.close()
+        log_tp(self.device, f"Closed {self.shm_b_name}")
+        self.shm_r.close()
+        log_tp(self.device, f"Closed {self.shm_r_name}")
         self.shm_s.close()
+        log_tp(self.device, f"Closed {self.shm_s_name}")
         if self.master:
             log_tp(self.device, f"Master unlink G")
             self.shm_g.unlink()
             log_tp(self.device, f"Master unlink B")
             self.shm_b.unlink()
+            log_tp(self.device, f"Master unlink R")
+            self.shm_r.unlink()
             log_tp(self.device, f"Master unlink S")
             self.shm_s.unlink()
 
@@ -273,16 +320,29 @@ class TPBackendNative:
             )
 
 
-    def all_reduce(self, tensor: torch.Tensor):
-        ext.pg_all_reduce(
+    def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        # if tensor.numel() * 2 < MAX_CPU_REDUCE:
+        ext.pg_all_reduce_cpu(
             self.ptr_g,
             self.active_devices,
             self.device,
             self.active_devices[0],
             tensor,
-            self.ptr_b,
-            self.shbuf_size
+            contribution,
+            self.ptr_r,
+            SHBUF_SIZE_R,
+            self.master
         )
+        # else:
+        #     ext.pg_all_reduce(
+        #         self.ptr_g,
+        #         self.active_devices,
+        #         self.device,
+        #         self.active_devices[0],
+        #         tensor,
+        #         self.ptr_b,
+        #         self.shbuf_size
+        #     )
 
 
     def gather(
@@ -310,3 +370,21 @@ class TPBackendNative:
             self.ptr_b,
             self.shbuf_size
         )
+
+
+    def run_cpu_reduce_jobs(self):
+        # if not self.cpu_is_pinned:
+        #     set_process_priority_and_affinity()
+        #     self.cpu_is_pinned = True
+        ext.run_cpu_reduce_jobs(
+            self.ptr_g,
+            self.ptr_r,
+            SHBUF_SIZE_R,
+        )
+
+
+    def end_cpu_reduce_jobs(self):
+        if self.master:
+            ext.end_cpu_reduce_jobs(
+                self.ptr_g,
+            )

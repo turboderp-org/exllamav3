@@ -67,12 +67,12 @@ class Model_TPMixin:
         assert not self.mp_children
         assert not self.mp_parent_conn
         assert not self.mp_child_conn
-        self.mp_children: list = [None] * num_devices
-        self.mp_parent_conn: list = [None] * num_devices
-        self.mp_child_conn: list = [None] * num_devices
+        self.mp_children: list = [None] * (num_devices + 1)
+        self.mp_parent_conn: list = [None] * (num_devices + 1)
+        self.mp_child_conn: list = [None] * (num_devices + 1)
         self.tp_producer = SMProducer(buffer_size = 64 * 1024**2)
 
-        for rank, device in enumerate(self.active_devices):
+        for rank, device in enumerate(self.active_devices + [-1]):
             log_tp(None, f"Spawning child process: {device}")
             if self.tp_output_device == device:
                 self.mp_parent_conn[device] = PseudoParentConn(
@@ -365,6 +365,8 @@ class Model_TPMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
+        self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
+
         x = self.prepare_inputs_for_tp(x, params)
         for device in self.active_devices:
             self.tp_worker_dispatch(device, mp_model_forward, (
@@ -376,6 +378,8 @@ class Model_TPMixin:
         for device in self.active_devices:
             r = self.tp_worker_result(device)
             assert r is None, "TP logic error"
+
+        self.tp_worker_result(-1)
         return None
 
 
@@ -386,6 +390,8 @@ class Model_TPMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
+        self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
+
         x = self.prepare_inputs_for_tp(x, params)
         for device in self.active_devices:
             self.tp_worker_dispatch(device, mp_model_forward, (
@@ -400,6 +406,8 @@ class Model_TPMixin:
             if r is not None:
                 return_tensors.append(r)
         assert len(return_tensors) == 1, "TP logic error"
+
+        self.tp_worker_result(-1)
         return return_tensors[0]
 
 
