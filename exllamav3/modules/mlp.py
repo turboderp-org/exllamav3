@@ -20,6 +20,7 @@ class MLP(Module):
         key: str,
         hidden_size: int,
         intermediate_size: int,
+        out_size: int | None = None,
         key_up: str | None = None,
         key_down: str | None = None,
         qmap: str | None = None,
@@ -40,6 +41,7 @@ class MLP(Module):
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
         self.intermediate_split_size = intermediate_split_size
+        self.out_size = out_size or hidden_size
 
         fkey, frange_up = None, None
 
@@ -99,9 +101,9 @@ class MLP(Module):
                     config = config,
                     key = s_key_d,
                     in_features = b - a,
-                    out_features = hidden_size,
+                    out_features = self.out_size,
                     full_in_features = intermediate_size,
-                    full_out_features = hidden_size,
+                    full_out_features = self.out_size,
                     first_in_feature = a,
                     first_out_feature = 0,
                     qmap = qmap + ".down",
