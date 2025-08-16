@@ -118,6 +118,7 @@ class Model_TPMixin:
                 continue
             if child.is_alive():
                 try:
+                    log_tp(device, f"Closing backend, device {device}")
                     parent_conn.send("quit")
                 except Exception:
                     pass

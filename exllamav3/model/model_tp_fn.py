@@ -70,6 +70,7 @@ def mp_model_worker(
         while True:
             msg = conn.recv()
             if msg == "quit":
+                log_tp(device, f"Child worker exiting")
                 torch.cuda.synchronize()
                 local_context["inf_consumer"].close()
                 local_context["backend"].close()
@@ -280,8 +281,11 @@ class PseudoParentConn:
 
 
     def send(self, msg):
-        fn, args = msg
-        self.result = fn(self.local_context, *args)
+        if msg == "quit":
+            log_tp(self.device, f"Pseudoprocess worker quit message")
+        else:
+            fn, args = msg
+            self.result = fn(self.local_context, *args)
 
 
     def recv(self):
@@ -293,7 +297,7 @@ class PseudoParentConn:
     def close(self, *args, **kwargs):
         self.local_context["inf_consumer"].close()
         self.local_context = {}
-        log_tp(None, f"Pseudoprocess closed")
+        log_tp(self.device, f"Pseudoprocess closed")
 
 
     def quit(self):
