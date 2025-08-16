@@ -120,7 +120,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         callback: Callable[[int, int], None] | None = None,
         generator: bool = True,
         tp_dev_limits: dict | None = None,
-        tp_backend: str = "nccl"
+        tp_backend: str = "native"
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
