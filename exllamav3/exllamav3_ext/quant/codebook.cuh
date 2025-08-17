@@ -94,29 +94,29 @@ __device__ inline float decode_3inst_f_diff(uint64_t x, float d, uint32_t mult)
 // "2MAD" procedural codebook, much more overhead than 3INST, slightly better distribution at 2bpw
 // Not used currently
 
-__device__ inline half decode_2mad(uint64_t x)
-{
-    x = x * 264435761u + 1013904223u;
-    x = ((x * 1664525u) >> 32) + x;
-    int32_t c = (int32_t) __dp4a((uint32_t) x, 0x01010101u, 0xFFFFFE02u);
-    half y = __hmul(__int2half_rn(c), __float2half_rn(0.008415));
-    return y;
-}
-
-__device__ inline float decode_2mad_f(uint64_t x)
-{
-    x = x * 264435761u + 1013904223u;
-    x = ((x * 1664525u) >> 32) + x;
-    int32_t c = (int32_t) __dp4a((uint32_t) x, 0x01010101u, 0xFFFFFE02u);
-    float y = __int2float_rn(c) * 0.008415f;
-    return y;
-}
-
-__device__ inline float decode_2mad_f_diff(uint64_t x, float d)
-{
-    x = x * 264435761u + 1013904223u;
-    x = ((x * 1664525u) >> 32) + x;
-    int32_t c = (int32_t) __dp4a((uint32_t) x, 0x01010101u, 0xFFFFFE02u);
-    float y = fma(__int2float_rn(c), 0.008415f, -d);
-    return y;
-}
+//__device__ inline half decode_2mad(uint64_t x)
+//{
+//    x = x * 264435761u + 1013904223u;
+//    x = ((x * 1664525u) >> 32) + x;
+//    int32_t c = (int32_t) __dp4a((uint32_t) x, 0x01010101u, 0xFFFFFE02u);
+//    half y = __hmul(__int2half_rn(c), __float2half_rn(0.008415));
+//    return y;
+//}
+//
+//__device__ inline float decode_2mad_f(uint64_t x)
+//{
+//    x = x * 264435761u + 1013904223u;
+//    x = ((x * 1664525u) >> 32) + x;
+//    int32_t c = (int32_t) __dp4a((uint32_t) x, 0x01010101u, 0xFFFFFE02u);
+//    float y = __int2float_rn(c) * 0.008415f;
+//    return y;
+//}
+//
+//__device__ inline float decode_2mad_f_diff(uint64_t x, float d)
+//{
+//    x = x * 264435761u + 1013904223u;
+//    x = ((x * 1664525u) >> 32) + x;
+//    int32_t c = (int32_t) __dp4a((uint32_t) x, 0x01010101u, 0xFFFFFE02u);
+//    float y = fma(__int2float_rn(c), 0.008415f, -d);
+//    return y;
+//}
