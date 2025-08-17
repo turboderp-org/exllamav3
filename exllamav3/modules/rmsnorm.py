@@ -3,15 +3,16 @@ from typing_extensions import override
 import torch
 import torch.nn.functional as F
 from torch import nn
-from ..models import Config
+from ..model.config import Config
 from . import Module
 from ..ext import exllamav3_ext as ext
+from ..model.model_tp_alloc import TPAllocation
 
 class RMSNorm(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         rms_norm_eps: float,
         out_dtype: torch.dtype | None = None,
@@ -76,3 +77,60 @@ class RMSNorm(Module):
         y = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
         ext.rms_norm(x, self.weight, y, self.rms_norm_eps, self.constant_bias)
         return y
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        stc = self.config.stc
+        storage = sum(stc.get_tensor_sizes(self.key))
+        overhead = storage // 2 * (self.out_dtype or torch.half).itemsize
+        tpa = TPAllocation(
+            key = self.key,
+            storage_per_device = storage,
+            overhead_per_device = overhead,
+        )
+        return [tpa]
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+        return {
+            "cls": RMSNorm,
+            "kwargs": {
+                "key": self.key,
+                "rms_norm_eps": self.rms_norm_eps,
+                "out_dtype": self.out_dtype,
+                "constant_bias": self.constant_bias,
+            },
+            "weight": producer.send(self.weight),
+            "device": self.device,
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        module = RMSNorm(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+        w = consumer.recv(exported["weight"], cuda = True)
+        module.weight = nn.Parameter(w)
+        torch.cuda.synchronize()
+        return module
+
+    @staticmethod
+    def tp_import_split(local_context, exported, plan, split):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        first, last = split
+        module = RMSNorm(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+
+        w = consumer.recv(exported["weight"], cuda = True)
+        if w.dim() == 2:
+            w = w[first : last, :]
+        module.weight = nn.Parameter(w.to(module.device).contiguous())
+
+        return module

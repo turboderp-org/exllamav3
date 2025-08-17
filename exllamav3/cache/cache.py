@@ -4,7 +4,7 @@ from typing import Type
 import torch
 import torch.nn.functional as F
 from torch import nn
-from ..models import Model, Config
+from ..model import Model, Config
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..modules import Attention
@@ -13,13 +13,15 @@ class CacheLayer(ABC):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         attention: Attention,
+        cache_id: int,
         max_num_tokens: int,
         **kwargs
     ):
         self.config = config
         self.attention = attention
+        self.cache_id = cache_id
         self.max_num_tokens = max_num_tokens
 
     @abstractmethod
@@ -51,6 +53,24 @@ class CacheLayer(ABC):
 
     @abstractmethod
     def get_tensors(self):
+        pass
+
+    @abstractmethod
+    def storage_size(self):
+        pass
+
+    @abstractmethod
+    def overhead_size(self):
+        pass
+
+    @abstractmethod
+    def tp_export(self, plan):
+        pass
+
+    @abstractmethod
+    def get_kv_alloc_placeholder(self):
+        # Used by layersplit loader to simulate dequant overhead, if any. Returns a reference to hold while
+        # inference is simulated, or None for unquantized cache
         pass
 
 
@@ -95,7 +115,7 @@ class Cache:
 
         self.num_layers = len(self.model.get_cache_layers())
         self.layers = [
-            self.layer_type(self.config, attn, self.max_num_tokens, **kwargs)
+            self.layer_type(self.config, attn, id(self), self.max_num_tokens, **kwargs)
             for attn in self.model.get_cache_layers()
         ]
         self.attach_to_model()
@@ -126,7 +146,7 @@ class Cache:
             model = self.model
         model_num_layers = len(model.get_cache_layers())
         assert model_num_layers == self.num_layers, \
-            f"Cannot detach cache with {self.num_layers} layers from model with {model_num_layers()} layers."
+            f"Cannot detach cache with {self.num_layers} layers from model with {model_num_layers} layers."
         for layer, module in zip(self.layers, model.get_cache_layers()):
             module.cache_layers.remove(layer)
 
@@ -154,10 +174,15 @@ class Cache:
         to_page: int,
         num_tokens: int,
     ):
+        assert target == self or (not target.model.loaded_tp and not self.model.loaded_tp), \
+            "Cannot copy pages between TP and non-TP caches, or between distinct TP caches."
         assert target.num_layers == self.num_layers
-        for src, dst in zip(target.layers, self.layers):
-            assert type(src) is type(dst)
-            dst.copy_page(src, from_page, to_page, num_tokens)
+        if not self.model.loaded_tp:
+            for src, dst in zip(target.layers, self.layers):
+                assert type(src) is type(dst)
+                dst.copy_page(src, from_page, to_page, num_tokens)
+        else:
+            self.model.tp_cache_page_copy(id(self), from_page, to_page, num_tokens)
 
 
     def get_all_tensors(self):

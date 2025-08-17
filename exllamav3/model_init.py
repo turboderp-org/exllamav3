@@ -27,12 +27,18 @@ def add_args(
     parser.add_argument("-lm", "--load_metrics", action = "store_true", help = "Show metrics from loader")
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
+    parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
+    parser.add_argument("-tpb", "--tp_backend", type = str, help = "Tensor-parallel backend, either 'native' (default) or 'nccl'", default = "native")
+    parser.add_argument("-tp_attn", "--tp_max_parallelism_attn", type = int, help = "(TP) Maximum parallelism for attention layers", default = None)
+    parser.add_argument("-tp_mlp", "--tp_max_parallelism_mlp", type = int, help = "(TP) Maximum parallelism for MLP layers", default = None)
+    parser.add_argument("-tp_moe", "--tp_max_parallelism_moe", type = int, help = "(TP) Maximum parallelism for MoE layers", default = None)
+    parser.add_argument("-tp_linear", "--tp_max_parallelism_linear", type = int, help = "(TP) Maximum parallelism for linear (output) layers", default = None)
+
+    parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose output while loading")
+
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
-
-    # TODO:
-    # parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load in tensor-parallel mode")
 
 
 def init(
@@ -132,9 +138,31 @@ def init(
     else:
         split = [float(alloc) for alloc in args.gpu_split.split(",")]
 
+    # Parallelism limits
+    tp_dev_limits = {}
+    for key, arg_name in [
+        ("attn", "tp_max_parallelism_attn"),
+        ("mlp", "tp_max_parallelism_mlp"),
+        ("moe", "tp_max_parallelism_moe"),
+        ("linear", "tp_max_parallelism_linear"),
+    ]:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            tp_dev_limits[key] = value
+    if len(tp_dev_limits) and not args.tensor_parallel:
+        printp(not quiet, " !! Warning, parallelism are do not applied to layer-split model")
+
     # Load model
     printp(not quiet, f" -- Loading {args.model_dir}")
-    model.load(use_per_device = split, progressbar = progress, **kwargs)
+    model.load(
+        use_per_device = split,
+        tensor_p = args.tensor_parallel,
+        progressbar = progress,
+        tp_dev_limits = tp_dev_limits,
+        tp_backend = args.tp_backend,
+        verbose = args.verbose,
+        **kwargs
+    )
 
     # Load tokenizer
     if load_tokenizer:

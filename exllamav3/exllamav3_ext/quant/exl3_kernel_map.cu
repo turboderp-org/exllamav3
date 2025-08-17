@@ -28,18 +28,18 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits, bool
     {
         case CC_OLD:
         case CC_AMPERE:
-            if (bits <= 4)
+            if (mod_256 && bits <= 4)
             {
                 if (size_n <= 2048 || size_k <= 2048) return 2;
                 return 3;
             }
-            if (size_n < 4096) return size_k > 8192 ? 3 : 2;
+            if (mod_256 && size_n < 4096) return size_k > 8192 ? 3 : 2;
             if (mod_512 && (size_n * size_k) > (4096 * 4096) && bits <= 6) return 4;
             if (mod_256) return 3;
             return 2;
 
         case CC_ADA:
-            if (bits <= 3)
+            if (mod_256 && bits <= 3)
             {
                 if (size_k <= 2048 && !multi) return 2;
                 if (size_n < 4096 && size_k <= 12288) return 2;
@@ -58,11 +58,11 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits, bool
             }
             if (bits >= 7)
             {
-                if (size_n <= 8192) return size_k > 32768 ? 3 : 2;
+                if (mod_256 && size_n <= 8192) return size_k > 32768 ? 3 : 2;
                 if (mod_512 && size_n > 32768) return 4;
                 return 2;
             }
-            if (size_n <= 4096) return (size_k && bits >= 3) > 8192 ? 3 : 2;
+            if (mod_256 && size_n <= 4096) return size_k > 8192 && bits >= 3 ? 3 : 2;
             if (mod_512 && size_n > 16384) return 4;
             if (mod_256) return 3;
             return 2;
@@ -102,6 +102,8 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
 )
 {
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, bits, false) : force_shape_idx;
+//    DBGI3(cc, size_n, shape_idx);
+
     TORCH_CHECK(shape_idx > 0, "exl3_gemm: no compatible kernel");
     if (out_shape_idx) *out_shape_idx = shape_idx;
     if (out_block_dim) *out_block_dim = exl3_gemm_blockdim[shape_idx];

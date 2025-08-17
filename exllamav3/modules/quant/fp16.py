@@ -9,6 +9,8 @@ from ...util import first_not_none
 
 class LinearFP16:
 
+    quant_type: str = "fp16"
+
     in_features: int
     out_features: int
 
@@ -103,6 +105,52 @@ class LinearFP16:
         if self.bias is not None:
             self.bias = self.bias.to(self.swap_device)
         self.swap_device = None
+
+    def tp_export(self, plan, producer):
+        return {
+            "cls": LinearFP16,
+            "in_features": self.in_features,
+            "out_features": self.out_features,
+            "weight": producer.send(self.weight),
+            "bias": producer.send(self.bias),
+            "out_dtype": self.out_dtype,
+        }
+
+    @staticmethod
+    def tp_import_split(local_context, exported, plan, split, dbg = False):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        id_w = exported["weight"]
+        id_b = exported["bias"]
+
+        if split is not None:
+            split_out, first, last = split
+        else:
+            split_out, first, last = True, 0, exported["out_features"]
+
+        if split_out:
+            w = consumer.recv(id_w, cuda = True, slice_dim = 1, first = first, last = last)
+            b = consumer.recv(id_b, cuda = True, slice_dim = 0, first = first, last = last)
+            in_features = exported["in_features"]
+            out_features = last - first
+        else:
+            w = consumer.recv(id_w, cuda = True, slice_dim = 0, first = first, last = last)
+            b = consumer.recv(id_b, cuda = True) if (first == 0) else None
+            in_features = last - first
+            out_features = exported["out_features"]
+
+        module = LinearFP16(
+            in_features = in_features,
+            out_features = out_features,
+            weight = w,
+            bias = b,
+            full_in_features = in_features,
+            full_out_features = out_features,
+            first_in_feature = 0,
+            first_out_feature = 0,
+            out_dtype = exported["out_dtype"],
+        )
+        return module
 
 
 class LinearFP16_torch:

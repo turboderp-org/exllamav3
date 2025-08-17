@@ -6,7 +6,9 @@ import torch.nn.functional as F
 from torch import nn
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from ..models import Config
+    from ..model.config import Config
+from ..model.model_tp_alloc import TPAllocation
+from functools import lru_cache
 
 # Use host bounce when moving state from device to device in layer split
 no_p2p_copy = os.environ.get('EXLLAMA_NO_P2P_COPY', None)
@@ -15,7 +17,7 @@ class Module(ABC):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         qmap: str | None,
     ):
@@ -70,7 +72,6 @@ class Module(ABC):
         global no_p2p_copy
         if x.device != self.device:
             if no_p2p_copy:
-                print(".")
                 x = x.cpu().to(self.device)
             else:
                 x = x.to(self.device)
@@ -95,7 +96,7 @@ class Module(ABC):
         self,
         x: torch.Tensor,
         params: dict,
-        out_dtype: torch.dtype
+        out_dtype: torch.dtype = torch.half
     ) -> torch.Tensor:
         pass
 
@@ -111,3 +112,27 @@ class Module(ABC):
 
     def get_name(self):
         return self.__class__.__name__
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        tpa_list = []
+        for m in self.modules:
+            tpa_list += m.make_tp_allocation()
+        return tpa_list
+
+    def tp_export(self, plan, producer):
+        """
+        Create serializable (dict) collection of module parameters and shared weights to pass to child process.
+        """
+        raise NotImplementedError()
+
+    @staticmethod
+    def tp_import(local_context, plan, loaded):
+        """
+        Reconstruct module in child process from exported parameters and shared weights, sliced as necessary for
+        TP according to plan.
+        """
+        raise NotImplementedError()
+
+    @lru_cache
+    def all_cache_modules(self) -> list[Module]:
+        return [m for m in self if m.caps.get("kv_cache")]

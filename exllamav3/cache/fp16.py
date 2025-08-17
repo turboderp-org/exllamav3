@@ -4,21 +4,23 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from ..constants import PAGE_SIZE
-from ..models import Model, Config
+from ..model import Model, Config
 from .cache import CacheLayer
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..modules import Attention
+import numpy as np
 
 class CacheLayer_fp16(CacheLayer):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         attention: Attention,
+        cache_id: int,
         max_num_tokens: int,
     ):
-        super().__init__(config, attention, max_num_tokens)
+        super().__init__(config, attention, cache_id, max_num_tokens)
 
         assert max_num_tokens % PAGE_SIZE == 0, \
             f"max_num_tokens must be a multiple of {PAGE_SIZE}."
@@ -52,6 +54,11 @@ class CacheLayer_fp16(CacheLayer):
 
 
     @override
+    def get_kv_alloc_placeholder(self):
+        return None
+
+
+    @override
     def update_kv(
         self,
         cache_seqlens: torch.Tensor,
@@ -69,6 +76,28 @@ class CacheLayer_fp16(CacheLayer):
         self.k[to_page, :num_tokens, :, :].copy_(source.k[from_page, :num_tokens, :, :], non_blocking = True)
         self.v[to_page, :num_tokens, :, :].copy_(source.v[from_page, :num_tokens, :, :], non_blocking = True)
 
+
     @override
     def get_tensors(self):
         return [self.k, self.v]
+
+
+    @override
+    def storage_size(self):
+        return 2 * np.prod(self.shape) * torch.half.itemsize
+
+
+    @override
+    def overhead_size(self):
+        return 0
+
+
+    @override
+    def tp_export(self, plan):
+        return {
+            "cls": CacheLayer_fp16,
+            "args": {
+                "cache_id": self.cache_id,
+                "max_num_tokens": self.max_num_tokens
+            }
+        }

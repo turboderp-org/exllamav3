@@ -2,14 +2,16 @@ from __future__ import annotations
 import torch
 import os, json, re
 from tokenizers import Tokenizer as HFTokenizer, models
-from exllamav3.util import synchronized
-from exllamav3.util.file import maybe_read_json
-from exllamav3.models import Config
+from ..util import synchronized
+from ..util.file import maybe_read_json
+from ..model.config import Config
 from functools import lru_cache
 from typing import TYPE_CHECKING
 from ..util import profile_opt
 if TYPE_CHECKING:
     from . import MMEmbedding
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class Tokenizer:
 

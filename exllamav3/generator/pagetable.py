@@ -489,13 +489,10 @@ class PageTable:
         if len(defrag_map) <= max(self.max_pages // 10, 2):
             return
 
-        # Get all tensors to reshuffle
-        cache_tensors = self.cache.get_all_tensors()
-
+        # Find page rotations
         if debug:
             print("Page rotations")
 
-        # Find page rotations
         all_rotations = []
         while defrag_map:
 
@@ -530,10 +527,14 @@ class PageTable:
         def get_buffer(shape, device, dtype):
             return torch.empty(shape, device = device, dtype = dtype)
 
-        for cache in cache_tensors:
-            buffer = get_buffer(cache[0].shape, cache.device, cache.dtype)
-            all_rotations = get_all_rotations(cache.device)
-            ext.cache_rotate(cache, all_rotations, buffer)
+        if self.generator.model.loaded_tp:
+            self.generator.model.tp_rotate_cache_pages(id(self.cache), all_rotations_cpu)
+        else:
+            cache_tensors = self.cache.get_all_tensors()
+            for cache in cache_tensors:
+                buffer = get_buffer(cache[0].shape, cache.device, cache.dtype)
+                all_rotations = get_all_rotations(cache.device)
+                ext.cache_rotate(cache, all_rotations, buffer)
 
         # Write new page indices
         for page in self.all_pages:

@@ -62,6 +62,9 @@ def main(args):
         temp_last = not args.temperature_first,
     )
 
+    # Single prompt mode
+    single_prompt = args.prompt
+
     # Main loop
     print("\n" + col_sysprompt + system_prompt.strip() + col_default)
     context = []
@@ -76,8 +79,18 @@ def main(args):
             context = []
 
         # Get user prompt
-        user_prompt = read_input_fn(args, user_name, multiline)
-        prefix = ""
+        if single_prompt is not None:
+            # This round, use provided prompt from cmdline
+            user_prompt = single_prompt
+            prefix = ""
+            # Next round, exit
+            single_prompt = "/x"
+        else:
+            try:
+                user_prompt = read_input_fn(args, user_name, multiline)
+                prefix = ""
+            except KeyboardInterrupt:
+                user_prompt = "/x"
 
         # Intercept commands
         if user_prompt.startswith("/"):
@@ -282,5 +295,6 @@ if __name__ == "__main__":
     parser.add_argument("-topk", "--top_k", type = int, help = "Top-K truncation, 0 to disable (default: disabled)", default = 0)
     parser.add_argument("-topp", "--top_p", type = float, help = "Top-P truncation, 1 to disable (default: disabled)", default = 1.0)
     parser.add_argument("-tps", "--show_tps", action = "store_true", help = "Show tokens/second after every reply")
+    parser.add_argument("-prompt", "--prompt", type = str, help = "Run single prompt, then exit")
     _args = parser.parse_args()
     main(_args)

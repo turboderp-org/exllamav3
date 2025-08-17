@@ -9,3 +9,4 @@ from .attn import Attention
 from .transformer import TransformerBlock, ParallelDecoderBlock
 from .conv import Conv
 from .pos_embedding import PosEmbedding
+from .gather import OutputGather

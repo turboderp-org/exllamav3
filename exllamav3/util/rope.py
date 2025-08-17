@@ -136,19 +136,25 @@ class RoPE:
 
     def _rope_params_yarn(self):
         rs = self.rope_settings
-        assert rs.max_position_embeddings is not None, \
+        max_position_embeddings = rs.override_max_position_embeddings or rs.max_position_embeddings
+        assert max_position_embeddings is not None, \
             "YaRN scaling requires explicit max_position_embeddings"
         base = rs.rope_theta
         dim = int(rs.head_dim * rs.partial_rotary_factor)
-        factor = rs.rope_scaling.get("factor")
+        original_max_position_embeddings = rs.rope_scaling.get("original_max_position_embeddings")
+        if original_max_position_embeddings is not None:
+            factor = max_position_embeddings / original_max_position_embeddings
+        else:
+            factor = rs.rope_scaling.get("factor")
+            original_max_position_embeddings = max_position_embeddings
         attn_factor = rs.rope_scaling.get("attention_factor", 0.1 * math.log(factor) + 1.0)
         beta_fast = rs.rope_scaling.get("beta_fast", 32)
         beta_slow = rs.rope_scaling.get("beta_slow", 1)
-        def find_correction_dim(num_rotations):
-            return (dim * math.log(rs.max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
-        def find_correction_range(low_rot, high_rot):
-            _low = math.floor(find_correction_dim(low_rot))
-            _high = math.ceil(find_correction_dim(high_rot))
+        def find_correction_dim(_num_rotations, _dim, _base, _max_position_embeddings):
+            return (_dim * math.log(_max_position_embeddings / (_num_rotations * 2 * math.pi))) / (2 * math.log(_base))
+        def find_correction_range(_low_rot, _high_rot, _dim, _base, _max_position_embeddings):
+            _low = math.floor(find_correction_dim(_low_rot, _dim, _base, _max_position_embeddings))
+            _high = math.ceil(find_correction_dim(_high_rot, _dim, _base, _max_position_embeddings))
             return max(_low, 0), min(_high, dim - 1)
         def linear_ramp_factor(_min, _max, _dim):
             if _min == _max:
@@ -159,7 +165,7 @@ class RoPE:
         pos_freqs = base ** (torch.arange(0, dim, 2, device = self.device).float() / dim)
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (factor * pos_freqs)
-        low, high = find_correction_range(beta_fast, beta_slow)
+        low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_max_position_embeddings)
         inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, dim // 2).float()
         inv_freq = inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
         inv_freq += inv_freq_extrapolation * inv_freq_extrapolation_factor

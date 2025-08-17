@@ -3,10 +3,11 @@ from typing_extensions import override
 import torch
 import torch.nn.functional as F
 from torch import nn
-from ..models import Config
+from ..model.config import Config
 from . import Module
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import to2
+from ..model.model_tp_alloc import TPAllocation
 
 class PosEmbedding(Module):
 
@@ -74,3 +75,6 @@ class PosEmbedding(Module):
         # TODO: Support position offset and position IDs for chunking (and GPT2 etc.)
 
         return to2(x, out_dtype, self.out_dtype)
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        return []

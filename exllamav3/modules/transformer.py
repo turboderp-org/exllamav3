@@ -4,16 +4,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from ..util.tensor import to2
-from ..models import Config
+from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedMLP, MLP, BlockSparseMLP
 from ..conversion.allocation import allocate_transformer
 from ..util import profile_opt
+import torch.distributed as dist
 
 class TransformerBlock(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         attn_norm: RMSNorm | LayerNorm | None = None,
         attn: Attention | None = None,
@@ -107,11 +108,59 @@ class TransformerBlock(Module):
         return name
 
 
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            nonlocal producer
+            return child.tp_export(plan, producer) if child is not None else None
+
+        return {
+            "cls": TransformerBlock,
+            "kwargs": {
+                "key": self.key,
+                "out_dtype": self.out_dtype,
+            },
+            **{name: _export(getattr(self, name, None)) for name in (
+                "attn_norm",
+                "attn",
+                "attn_post_norm",
+                "mlp_norm",
+                "mlp",
+                "mlp_post_norm",
+            )},
+            "device": self.device,
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        device = local_context["device"]
+
+        def _import(name):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import(local_context, exported[name], plan) \
+                if exported.get(name) else None
+
+        module = TransformerBlock(
+            config = None,
+            **exported["kwargs"],
+            attn_norm = _import("attn_norm"),
+            attn = _import("attn"),
+            attn_post_norm = _import("attn_post_norm"),
+            mlp_norm = _import("mlp_norm"),
+            mlp = _import("mlp"),
+            mlp_post_norm = _import("mlp_post_norm"),
+        )
+        module.device = device
+        return module
+
+
 class ParallelDecoderBlock(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         input_norm: RMSNorm | LayerNorm | None = None,
         attn: Attention | None = None,
@@ -134,6 +183,8 @@ class ParallelDecoderBlock(Module):
 
         self.num_slices = mlp.num_slices if mlp else 1
 
+        self.tp_reduce = False
+
 
     @override
     def forward(
@@ -145,10 +196,14 @@ class ParallelDecoderBlock(Module):
 
         y = self.input_norm.forward(x, params, out_dtype = torch.half)
         y1 = self.attn.forward(y, params)
-        x += y1
-        if params.get("prefill"): return x
-        y2 = self.mlp.forward(y, params)
-        x += y2
+        if not params.get("prefill"):
+            y2 = self.mlp.forward(y, params)
+            y1 += y2
+
+            if self.tp_reduce:
+                params["backend"].all_reduce(y1)
+
+            x += y1
 
         return to2(x, out_dtype, self.out_dtype)
 
@@ -174,3 +229,48 @@ class ParallelDecoderBlock(Module):
         if not self.attn and not self.mlp:
             name += " (no-op)"
         return name
+
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            nonlocal producer
+            return child.tp_export(plan, producer) if child is not None else None
+
+        return {
+            "cls": ParallelDecoderBlock,
+            "kwargs": {
+                "key": self.key,
+                "out_dtype": self.out_dtype,
+            },
+            **{name: _export(getattr(self, name, None)) for name in (
+                "input_norm",
+                "attn",
+                "mlp",
+            )},
+            "device": self.device,
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        device = local_context["device"]
+
+        def _import(name, **kwargs):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import(local_context, exported[name], plan, **kwargs) \
+                if exported.get(name) else None
+
+        module = ParallelDecoderBlock(
+            config = None,
+            **exported["kwargs"],
+            input_norm = _import("input_norm"),
+            attn = _import("attn", skip_reduction = True),
+            mlp = _import("mlp", skip_reduction = True),
+        )
+        module.device = device
+
+        # Use single reduction for sum of mlp and attn
+        module.tp_reduce = True
+        return module

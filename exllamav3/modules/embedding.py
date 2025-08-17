@@ -3,16 +3,17 @@ from typing_extensions import override
 import torch
 import torch.nn.functional as F
 from torch import nn
-from ..models import Config
+from ..model.config import Config
 from ..util.tensor import to2
 from . import Module
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
+from ..model.model_tp_alloc import TPAllocation
 
 class Embedding(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         vocab_size: int,
         hidden_size: int,
@@ -117,3 +118,38 @@ class Embedding(Module):
             if self.normalize:
                 x *= x.shape[-1] ** 0.5
             return x
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        return []
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+        return {
+            "cls": Embedding,
+            "kwargs": {
+                "key": self.key,
+                "vocab_size": self.vocab_size,
+                "hidden_size": self.hidden_size,
+                "out_dtype": self.out_dtype,
+                "normalize": self.normalize,
+            },
+            "embedding.weight": producer.send(self.embedding.weight),
+            "device": self.device
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        consumer = local_context["consumer"]
+        module = Embedding(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = exported["device"]
+        module.embedding = nn.Embedding(
+            module.vocab_size,
+            module.hidden_size,
+            device = "meta"
+        )
+        emb = consumer.recv(exported["embedding.weight"], cuda = False)
+        module.embedding.weight = nn.Parameter(emb)
+        return module

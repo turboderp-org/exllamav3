@@ -1,7 +1,6 @@
 from __future__ import annotations
 import torch
-from dataclasses import dataclass
-from ..models.model import Model
+from ..model.model import Model
 from ..cache.cache import Cache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
@@ -17,6 +16,7 @@ import threading
 import numpy as np
 from ..util import profile_opt
 from ..tokenizer import MMEmbedding
+from ..util import profile_opt
 
 class Generator:
 

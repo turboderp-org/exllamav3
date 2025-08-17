@@ -51,6 +51,16 @@ __device__ inline half warp_reduce_max_h(half v)
     return v;
 }
 
+__device__ inline float warp_reduce_max_f(float v)
+{
+    for (int offset = 32 >> 1; offset > 0; offset >>= 1)
+    {
+        float other_v = __shfl_down_sync(0xffffffff, v, offset);
+        v = fmaxf(v, other_v);
+    }
+    return v;
+}
+
 __device__ inline half block_reduce_max_h(half v, int num_threads)
 {
     __shared__ half shared[32];
@@ -79,6 +89,32 @@ __device__ inline float warp_reduce_sum_f(float v)
         float other_v = __shfl_down_sync(0xffffffff, v, offset);
         v += other_v;
     }
+    return v;
+}
+
+__device__ inline float warp_reduce_sum_last_k(float v, int K)
+{
+    int lane_id = threadIdx.x % 32;
+    if (lane_id < (32 - K)) v = 0.0f;
+    for (int offset = 32 >> 1; offset > 0; offset >>= 1)
+    {
+        float other_v = __shfl_down_sync(0xffffffff, v, offset);
+        v += other_v;
+    }
+    v = __shfl_sync(0xffffffffu, v, 0);
+    return v;
+}
+
+__device__ inline float warp_reduce_sum_first_k(float v, int K)
+{
+    int lane_id = threadIdx.x % 32;
+    if (lane_id >= K) v = 0.0f;
+    for (int offset = 32 >> 1; offset > 0; offset >>= 1)
+    {
+        float other_v = __shfl_down_sync(0xffffffff, v, offset);
+        v += other_v;
+    }
+    v = __shfl_sync(0xffffffffu, v, 0);
     return v;
 }
 

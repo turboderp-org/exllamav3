@@ -2,18 +2,18 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
-from torch import nn
-from ..models import Config
+from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
-from ..device import get_device_context, release_device_context
 from ..constants import PAGE_SIZE
 from ..cache import Cache
 from flash_attn import flash_attn_func, flash_attn_with_kvcache
 from ..util import profile_opt
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
+from ..model.model_tp_alloc import TPAllocation
+import torch.distributed as dist
 
 """
 SDPA:
@@ -129,7 +129,7 @@ class Attention(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         layer_idx: int,
         hidden_size: int,
@@ -149,10 +149,14 @@ class Attention(Module):
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
+        q_proj: Linear | Module | None = None,
+        k_proj: Linear | Module | None = None,
+        v_proj: Linear | Module | None = None,
+        kv_proj: Linear | Module | None = None,
+        o_proj: Linear | Module | None = None,
     ):
         super().__init__(config, key, None)
 
-        self.device_context = None
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.head_dim = head_dim
@@ -166,6 +170,9 @@ class Attention(Module):
         self.sliding_window = sliding_window
         self.logit_softcapping = logit_softcapping
 
+        if self.num_kv_heads == 0:
+            return
+
         if key_fused_qkv:
             fkey = f"{key}.{key_fused_qkv}"
             frange_q = (0, num_q_heads * head_dim)
@@ -174,15 +181,38 @@ class Attention(Module):
         else:
             fkey, frange_q, frange_k, frange_v = None, None, None, None
 
-        self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim, qmap = qmap + ".input", fkey = fkey, frange = frange_q, qbits_mod_key = "q")
-        self.k_proj = Linear(config, f"{key}.{key_k}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_k, qbits_mod_key = "k")
-        self.v_proj = Linear(config, f"{key}.{key_v}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_v, qbits_mod_key = "v")
-        self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o", out_dtype = out_dtype, qbits_mod_key = "o")
+        if key_q:
+            self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim, qmap = qmap + ".input", fkey = fkey, frange = frange_q, qbits_mod_key = "q")
+            self.register_submodule(self.q_proj)
+        else:
+            assert q_proj
+            self.q_proj = q_proj
+            self.register_submodule(self.q_proj)
 
-        self.register_submodule(self.q_proj)
-        self.register_submodule(self.k_proj)
-        self.register_submodule(self.v_proj)
-        self.register_submodule(self.o_proj)
+        if key_k:
+            assert key_v
+            self.k_proj = Linear(config, f"{key}.{key_k}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_k, qbits_mod_key = "k")
+            self.v_proj = Linear(config, f"{key}.{key_v}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_v, qbits_mod_key = "v")
+            self.register_submodule(self.k_proj)
+            self.register_submodule(self.v_proj)
+        else:
+            if kv_proj:
+                self.kv_proj = kv_proj
+                self.register_submodule(self.kv_proj)
+            else:
+                assert k_proj and v_proj
+                self.k_proj = k_proj
+                self.v_proj = v_proj
+                self.register_submodule(self.k_proj)
+                self.register_submodule(self.v_proj)
+
+        if key_o:
+            self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o", out_dtype = out_dtype, qbits_mod_key = "o")
+            self.register_submodule(self.o_proj)
+        else:
+            assert o_proj
+            self.o_proj = o_proj
+            self.register_submodule(self.o_proj)
 
         if q_norm:
             assert k_norm, "Must have both Q and K norms, or neither"
@@ -208,17 +238,22 @@ class Attention(Module):
         })
 
         self.cache_layers = []
+        self.tp_cache_lookup = {}
         self.multi_kv = None
+        self.tp_reduce = False
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
 
+        self.has_split_cache = False
 
-    @override
-    def load(self, device: torch.Device, **kwargs):
-        self.device_context = get_device_context(self.config, device)
-        super().load(device)
 
+    def load_local(self, device, **kwargs):
+
+        if self.num_kv_heads == 0:
+            return
+
+        # Cache
         for cl in self.cache_layers:
             cl.alloc(device)
 
@@ -230,6 +265,7 @@ class Attention(Module):
 
         # Test if K and V proj can be fused
         if (
+            device != torch.device("cpu") and
             self.k_proj.quant_type == "exl3" and
             self.v_proj.quant_type == "exl3" and
             self.k_proj.out_features == self.v_proj.out_features and
@@ -246,8 +282,13 @@ class Attention(Module):
 
 
     @override
+    def load(self, device: torch.Device, **kwargs):
+        super().load(device)
+        self.load_local(device, **kwargs)
+
+
+    @override
     def unload(self):
-        self.device_context = release_device_context(self.config, self.device)
         super().unload()
 
         for cl in self.cache_layers:
@@ -271,17 +312,24 @@ class Attention(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        bsz, seqlen, _ = x.shape
-        attn_mode = params.get("attn_mode", "flash_attn_nc")
-        match attn_mode:
-            case "sdpa_nc":
-                x = self.decode_sdpa_nc(x, bsz, seqlen, params)
-            case "flash_attn":
-                x = self.decode_flash_attn(x, bsz, seqlen, params)
-            case "flash_attn_nc":
-                x = self.decode_flash_attn_nc(x, bsz, seqlen, params)
-            case _:
-                raise ValueError(f"Unknown attn_mode: {attn_mode}")
+        if self.num_kv_heads == 0:
+            x = torch.zeros_like(x, dtype = self.out_dtype)
+            if self.tp_reduce:
+                params["backend"].all_reduce(x, False)
+        else:
+            bsz, seqlen, _ = x.shape
+            attn_mode = params.get("attn_mode", "flash_attn_nc")
+            match attn_mode:
+                case "sdpa_nc":
+                    x = self.decode_sdpa_nc(x, bsz, seqlen, params)
+                case "flash_attn":
+                    x = self.decode_flash_attn(x, bsz, seqlen, params)
+                case "flash_attn_nc":
+                    x = self.decode_flash_attn_nc(x, bsz, seqlen, params)
+                case _:
+                    raise ValueError(f"Unknown attn_mode: {attn_mode}")
+            if self.tp_reduce:
+                params["backend"].all_reduce(x)
 
         return to2(x, out_dtype, self.out_dtype)
 
@@ -311,6 +359,8 @@ class Attention(Module):
                 -1,
                 self.multi_kv.mcg_mult,
                 self.multi_kv.mul1_mult,
+                -1,
+                -1
             )
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
@@ -426,7 +476,6 @@ class Attention(Module):
         return o
 
 
-
     def decode_flash_attn(
         self,
         x: torch.Tensor,
@@ -467,7 +516,11 @@ class Attention(Module):
                 inv_freq
             )
 
-        cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
+        if self.has_split_cache:
+            cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table)
+        else:
+            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
+
         o = flash_attn_with_kvcache(
             q = q,
             k = k,
@@ -481,10 +534,159 @@ class Attention(Module):
             window_size = (self.sliding_window, self.sliding_window),
             softcap = self.logit_softcapping
         )
-        cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
 
-        # TODO: Store updated cache layer
+        if self.has_split_cache:
+            self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
+        else:
+            cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
+
+        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        storage = 0
+        storage += self.q_proj.storage_size()
+        storage += self.k_proj.storage_size()
+        storage += self.v_proj.storage_size()
+        storage += self.o_proj.storage_size()
+        for cl in self.cache_layers:
+            storage += cl.storage_size()
+        overhead_d = 0
+        overhead_d += self.hidden_size * (self.out_dtype or torch.half).itemsize
+        overhead_s = 0
+        for cl in self.cache_layers:
+            overhead_s += cl.overhead_size()
+        overhead_s += 2 * self.num_q_heads * self.head_dim * torch.half.itemsize  # q, o
+        overhead_s += 2 * self.num_kv_heads * self.head_dim * torch.half.itemsize  # k, v
+        recons = max(
+            self.q_proj.recons_size(),
+            self.k_proj.recons_size(),
+            self.v_proj.recons_size(),
+            self.o_proj.recons_size(),
+        )
+        channel_width = 1
+        channels_to_split = self.num_kv_heads
+        while channel_width * self.head_dim < 128:
+            assert channels_to_split % 2 == 0, \
+                "Model's K/V heads cannot divide into 128-channel tensors"
+            channel_width *= 2
+            channels_to_split //= 2
+        assert (channel_width * self.head_dim) % 128 == 0, \
+            "Model's K/V heads cannot divide into 128-channel tensors"
+        # TODO: Account for flash-attn temp VRAM usage
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = channel_width,
+            channel_unit = "heads",
+            storage_per_device = 0,
+            storage_to_split = storage,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = channels_to_split,
+            limit_key = "attn"
+        )
+        return [tpa]
+
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            nonlocal producer
+            return child.tp_export(plan, producer) if child is not None else None
+
+        return {
+            "cls": Attention,
+            "kwargs": {
+                "key": self.key,
+                "layer_idx": self.layer_idx,
+                "hidden_size": self.hidden_size,
+                "head_dim": self.head_dim,
+                "rope_settings": self.rope_settings,
+                "sm_scale": self.sm_scale,
+                "out_dtype": self.out_dtype,
+                "sliding_window": self.sliding_window,
+                "logit_softcapping": self.logit_softcapping,
+            },
+            "num_kv_heads": self.num_kv_heads,
+            **{name: _export(getattr(self, name, None)) for name in (
+                "q_norm",
+                "k_norm",
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "kv_proj",
+                "o_proj",
+            )},
+            "device": self.device,
+            "cache_layers": [
+                cl.tp_export(plan) for cl in self.cache_layers
+            ],
+            "n_gqa": self.num_q_heads // self.num_kv_heads
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan, **kwargs):
+        key = exported["kwargs"]["key"]
+        head_dim = exported["kwargs"]["head_dim"]
+        n_gqa = exported["n_gqa"]
+        device = local_context["device"]
+        first, last = plan[key]
+        num_kv_heads = last - first
+        num_q_heads = num_kv_heads * n_gqa
+
+        q_split = (True, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+            if num_kv_heads else None
+        kv_split = (True, first * head_dim, last * head_dim) \
+            if num_kv_heads else None
+        o_split = (False, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+            if num_kv_heads else None
+        norm_q_split = (first * n_gqa, last * n_gqa) \
+            if num_kv_heads else None
+        norm_k_split = (first, last) \
+            if num_kv_heads else None
+
+        # def _import(name):
+        #     nonlocal exported, plan
+        #     return exported[name]["cls"].tp_import(local_context, exported[name], plan) \
+        #         if exported.get(name) else None
+
+        def _import_split(name, split):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import_split(local_context, exported[name], plan, split) \
+                if split and exported.get(name) else None
+
+        module = Attention(
+            config = None,
+            **exported["kwargs"],
+            num_q_heads = num_q_heads,
+            num_kv_heads = num_kv_heads,
+            q_norm = _import_split("q_norm", norm_q_split),
+            k_norm = _import_split("k_norm", norm_k_split),
+            q_proj = _import_split("q_proj", q_split),
+            k_proj = _import_split("k_proj", kv_split),
+            v_proj = _import_split("v_proj", kv_split),
+            kv_proj = _import_split("kv_proj", kv_split),
+            o_proj = _import_split("o_proj", o_split),
+        )
+
+        if num_kv_heads:
+            cache_layers = exported["cache_layers"]
+            if len(cache_layers):
+                module.has_split_cache = True
+                for cl in exported["cache_layers"]:
+                    cli = cl["cls"](None, module, **cl["args"])
+                    module.cache_layers.append(cli)
+                    module.tp_cache_lookup[cl["args"]["cache_id"]] = cli
+
+        module.device = device
+        if not kwargs.get("skip_reduction"):
+            module.tp_reduce = True
+        module.load_local(device)
+        torch.cuda.synchronize()
+        return module

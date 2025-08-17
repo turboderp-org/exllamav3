@@ -12,6 +12,7 @@
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
+#include "routing.cuh"
 
 #include "quant/quantize.cuh"
 #include "quant/pack.cuh"
@@ -31,6 +32,12 @@
 
 #include "histogram.cuh"
 
+#include "parallel/context.cuh"
+#include "parallel/broadcast.cuh"
+#include "parallel/barrier.cuh"
+#include "parallel/gather.cuh"
+#include "parallel/all_reduce.cuh"
+
 #include "libtorch/blocksparse_mlp.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -46,8 +53,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("rms_norm", &rms_norm, "rms_norm");
     m.def("softcap", &softcap, "softcap");
 
+    m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
+    m.def("routing_std", &routing_std, "routing_std");
+
     m.def("had_paley", &had_paley, "had_paley");
     m.def("had_paley2", &had_paley2, "had_paley2");
+
+    m.def("pg_init_context", &pg_init_context, "pg_init_context");
+    m.def("pg_broadcast", &pg_broadcast, "pg_broadcast");
+    m.def("pg_broadcast_ll", &pg_broadcast_ll, "pg_broadcast_ll");
+    m.def("pg_barrier", &pg_barrier, "pg_barrier");
+    m.def("pg_gather", &pg_gather, "pg_gather");
+    m.def("pg_all_reduce", &pg_all_reduce, "pg_all_reduce");
+    m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
+    m.def("run_cpu_reduce_jobs", &run_cpu_reduce_jobs, "run_cpu_reduce_jobs");
+    m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
     m.def("test_distribution", &test_distribution, "test_distribution");
@@ -65,6 +85,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("rope", &rope, "rope");
     m.def("silu_mul", &silu_mul, "silu_mul");
     m.def("gelu_mul", &gelu_mul, "gelu_mul");
+    m.def("relu2_mul", &relu2_mul, "relu2_mul");
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");

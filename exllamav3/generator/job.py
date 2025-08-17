@@ -18,6 +18,7 @@ from ..util.tensor import SeqTensor
 from ..util import profile_opt
 from ..tokenizer import MMEmbedding
 from functools import lru_cache
+from ..util import profile_opt
 
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
 @lru_cache(100)
@@ -955,7 +956,7 @@ class Job:
 
 
     def activate(self):
-        self.logits_device = self.generator.model.modules[-1].device
+        self.logits_device = self.generator.model.output_device
         for f in self.filters:
             f.attach(self)
             f.reset()

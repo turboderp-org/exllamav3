@@ -61,6 +61,7 @@ void hgemm
                      a_ptr, size_k,
             &beta_,  c_ptr, size_n
         );
+        cuda_check(cudaPeekAtLastError());
     }
     else
     {
@@ -79,5 +80,6 @@ void hgemm
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP
         );
+        cuda_check(cudaPeekAtLastError());
     }
 }

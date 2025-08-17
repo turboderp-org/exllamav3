@@ -3,7 +3,6 @@ from collections import deque
 import torch
 import gc
 import sys
-
 from pydantic import PydanticUserError
 
 # @lru_cache
@@ -17,6 +16,13 @@ def touch_device(device: int):
     d = d + d
 
 
+# Touch device and measure VRAM (child process)
+def touch_device_measure_vram(local_context: dict):
+    device = local_context["device"]
+    touch_device(device)
+    return torch.cuda.mem_get_info(device)
+
+
 # Reserve byte amount on device
 def set_memory_fraction_reserve(
     reserve: int,
@@ -25,6 +31,7 @@ def set_memory_fraction_reserve(
     touch_device(device)
     free, total = torch.cuda.mem_get_info(device)
     fraction = (free - reserve) / total
+    fraction = max(0.01, fraction)
     torch.cuda.set_per_process_memory_fraction(fraction, device = device)
 
 
@@ -50,7 +57,6 @@ def unset_memory_fraction(active_devices: list[int]):
 def free_mem():
     gc.collect()
     torch.cuda.empty_cache()
-
 
 
 def list_gpu_tensors(min_size: int = 1, cuda_only: bool = True):
@@ -220,4 +226,3 @@ def list_gpu_tensors(min_size: int = 1, cuda_only: bool = True):
         print()
         headers = ["size // MB", "path", "shape", "dtype"]
         print(tabulate(devices[k], headers = headers, tablefmt = "github", intfmt=","))
-

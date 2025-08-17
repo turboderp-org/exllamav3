@@ -1,14 +1,13 @@
 from __future__ import annotations
 import torch
-from ...models.config import Config
-from ...util.tensor import to2
-from ...util import first_not_none
-import math
-from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n, tensor_core_perm, tensor_core_perm_i
+from ...model.config import Config
+from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n
 from ...ext import exllamav3_ext as ext
 from ...util import profile_opt
 
 class LinearEXL3:
+
+    quant_type: str = "exl3"
 
     def __init__(
         self,
@@ -172,3 +171,67 @@ class LinearEXL3:
         if self.trellis is not None: self.trellis = self.trellis.to(self.swap_device)
         if self.bias is not None: self.bias = self.bias.to(self.swap_device)
         self.swap_device = None
+
+
+    def tp_export(self, plan, producer):
+        return {
+            "cls": LinearEXL3,
+            "in_features": self.in_features,
+            "out_features": self.out_features,
+            "suh": producer.send(self.suh),
+            "svh": producer.send(self.svh),
+            "trellis": producer.send(self.trellis),
+            "bias": producer.send(self.bias),
+            "mcg": producer.send(self.mcg),
+            "mul1": producer.send(self.mul1),
+            "out_dtype": self.out_dtype,
+        }
+
+
+    @staticmethod
+    def tp_import_split(local_context, exported, plan, split):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        id_suh = exported["suh"]
+        id_svh = exported["svh"]
+        id_trellis = exported["trellis"]
+        id_bias = exported["bias"]
+        mcg = consumer.recv(exported["mcg"], cuda = True)
+        mul1 = consumer.recv(exported["mul1"], cuda = True)
+
+        if split is not None:
+            split_out, first, last = split
+        else:
+            split_out, first, last = True, 0, exported["out_features"]
+
+        if split_out:
+            suh = consumer.recv(id_suh, cuda = True)
+            svh = consumer.recv(id_svh, cuda = True, slice_dim = 0, first = first, last = last)
+            trellis = consumer.recv(id_trellis, cuda = True, slice_dim = 1, first = first // 16, last = last // 16)
+            bias = consumer.recv(id_bias, cuda = True, slice_dim = 0, first = first, last = last)
+            in_features = exported["in_features"]
+            out_features = last - first
+        else:
+            suh = consumer.recv(id_suh, cuda = True, slice_dim = 0, first = first, last = last)
+            svh = consumer.recv(id_svh, cuda = True)
+            trellis = consumer.recv(id_trellis, cuda = True, slice_dim = 0, first = first // 16, last = last // 16)
+            bias = consumer.recv(id_bias, cuda = True)
+            in_features = last - first
+            out_features = exported["out_features"]
+
+        module = LinearEXL3(
+            config = None,
+            in_features = in_features,
+            out_features = out_features,
+            scale = None,
+            su = None,
+            sv = None,
+            suh = suh,
+            svh = svh,
+            trellis = trellis,
+            mcg = mcg,
+            mul1 = mul1,
+            bias = bias,
+            out_dtype = exported["out_dtype"],
+        )
+        return module

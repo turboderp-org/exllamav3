@@ -1,23 +1,25 @@
 from __future__ import annotations
+from functools import lru_cache
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
 import numpy as np
 from torch import nn
-from ..models import Config
+from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearFP16_torch, LinearEXL3
 from .quant.exl3_lib import quantize_exl3
 from ..ext import exllamav3_ext as ext
 from ..conversion.allocation import allocate_linear
 from ..util.memory import free_mem
+from ..model.model_tp_alloc import TPAllocation
 
 
 class Linear(Module):
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         key: str,
         in_features: int,
         out_features: int,
@@ -332,3 +334,81 @@ class Linear(Module):
             return "exl3"
         else:
             return None
+
+
+    @lru_cache
+    def storage_size(self):
+        # alt_key is only used when loading unquantized model
+        if self.is_exl3_storage(self.key):
+            return sum(self.config.stc.get_tensor_sizes(prefix = self.key))
+        else:
+            return 2 * self.in_features * self.out_features
+
+
+    def recons_size(self):
+        return 2 * self.in_features * self.out_features
+
+
+    def make_tp_allocation(self) -> list[TPAllocation]:
+        storage = 0
+        storage += self.storage_size()
+        overhead_d = self.out_features * (self.out_dtype or torch.half).itemsize
+        overhead_s = self.out_features * (self.out_dtype or torch.half).itemsize
+        recons = self.recons_size()
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = 128,
+            channel_unit = "channels",
+            storage_per_device = 0,
+            storage_to_split = storage,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = self.out_features // 128,
+            limit_key = "linear"
+        )
+        return [tpa]
+
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None and self.inner is not None, "Cannot export module for TP before loading."
+        return {
+            "cls": Linear,
+            "kwargs": {
+                "key": self.key,
+                "in_features": self.in_features,
+                "out_features": self.out_features,
+                "out_dtype": self.out_dtype,
+                "alt_key": self.alt_key,
+                "caps": self.caps,
+                "softcap": self.softcap,
+                "full_in_features": self.full_in_features,
+                "full_out_features": self.full_out_features,
+                "first_in_feature": self.first_in_feature,
+                "first_out_feature": self.first_out_feature,
+                "post_scale": self.post_scale,
+            },
+            "inner": self.inner.tp_export(plan, producer),
+            "device": self.device
+        }
+
+
+    @staticmethod
+    def tp_import_split(local_context, exported, plan, split):
+        device = local_context["device"]
+        module = Linear(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+        module.inner = exported["inner"]["cls"].tp_import_split(local_context, exported["inner"], plan, split)
+        module.quant_type = module.inner.quant_type
+        module.out_features = module.inner.out_features
+        return module
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        key = exported["kwargs"]["key"]
+        first, last = plan[key] if key in plan else (None, None)
+        split = (True, first, last) if first is not None else None
+        return Linear.tp_import_split(local_context, exported, plan, split)

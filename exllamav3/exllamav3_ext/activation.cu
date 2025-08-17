@@ -9,6 +9,7 @@
 #define NUM_THREADS 256
 #define ACT_SILU 0
 #define ACT_GELU 1
+#define ACT_RELU2 2
 
 __device__ inline half2 clamp_half2_to_finite(half2 v)
 {
@@ -68,6 +69,26 @@ __device__ __forceinline__ half2 _gelu(half2 x)
     return __halves2half2(_gelu(__low2half(x)), _gelu(__high2half(x)));
 }
 
+__device__ __forceinline__ half _relu2(half x)
+{
+    float xf = __half2float(x);
+    xf = fmaxf(0.0f, xf);
+    xf = xf * xf;
+    return __float2half_rn(xf);
+}
+
+__device__ __forceinline__ float _relu2(float x)
+{
+    x = fmaxf(0.0f, x);
+    x = x * x;
+    return x;
+}
+
+__device__ __forceinline__ half2 _relu2(half2 x)
+{
+    return __halves2half2(_relu2(__low2half(x)), _relu2(__high2half(x)));
+}
+
 template <int activation_type>
 __global__ __launch_bounds__(NUM_THREADS)
 void act_mul_kernel_h
@@ -75,10 +96,10 @@ void act_mul_kernel_h
     const half* __restrict__ x,
     const half* __restrict__ y,
     half* __restrict__ z,
-    int numel
+    size_t numel
 )
 {
-    int idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
+    size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
     if (idx >= numel / 2) return;
 
     half2 x2 = ((const half2*) x)[idx];
@@ -99,10 +120,10 @@ void act_mul_kernel_f
     const float* __restrict__ x,
     const float* __restrict__ y,
     half* __restrict__ z,
-    int numel
+    size_t numel
 )
 {
-    int idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
+    size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
     if (idx >= numel / 2) return;
 
     float2 x2 = ((const float2*) x)[idx];
@@ -117,6 +138,11 @@ void act_mul_kernel_f
     {
         x2.x = _gelu(x2.x);
         x2.y = _gelu(x2.y);
+    }
+    else if constexpr (activation_type == ACT_RELU2)
+    {
+        x2.x = _relu2(x2.x);
+        x2.y = _relu2(x2.y);
     }
 
     x2.x *= y2.x;
@@ -151,8 +177,8 @@ void silu_mul
 
     TORCH_CHECK_DTYPE(z, kHalf);
 
-    int numel = x.numel();
-    int blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     if (float_input)
     {
         act_mul_kernel_f<ACT_SILU><<<blocks, NUM_THREADS, 0, stream>>>
@@ -200,8 +226,8 @@ void gelu_mul
 
     TORCH_CHECK_DTYPE(z, kHalf);
 
-    int numel = x.numel();
-    int blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
     if (float_input)
     {
         act_mul_kernel_f<ACT_GELU><<<blocks, NUM_THREADS, 0, stream>>>
@@ -211,10 +237,59 @@ void gelu_mul
             (half*) z.data_ptr(),
             numel
         );
+        cuda_check(cudaPeekAtLastError());
     }
     else
     {
         act_mul_kernel_h<ACT_GELU><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const half*) x.data_ptr(),
+            (const half*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            numel
+        );
+        cuda_check(cudaPeekAtLastError());
+    }
+}
+
+void relu2_mul
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    bool float_input = x.dtype() == at::kFloat;
+    if (float_input)
+    {
+        TORCH_CHECK_DTYPE(y, kFloat);
+    }
+    else
+    {
+        TORCH_CHECK_DTYPE(x, kHalf);
+        TORCH_CHECK_DTYPE(y, kHalf);
+    }
+
+    TORCH_CHECK_DTYPE(z, kHalf);
+
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    if (float_input)
+    {
+        act_mul_kernel_f<ACT_RELU2><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const float*) x.data_ptr(),
+            (const float*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            numel
+        );
+    }
+    else
+    {
+        act_mul_kernel_h<ACT_RELU2><<<blocks, NUM_THREADS, 0, stream>>>
         (
             (const half*) x.data_ptr(),
             (const half*) y.data_ptr(),

@@ -63,6 +63,7 @@
 #define DBGIX(__x, __y) printf("%s, %s: %i, %x\n", #__x, #__y, __x, __y)
 #define DBGIX2(__x, __y, __z) printf("%s, %s, %s: %i, %x, %x\n", #__x, #__y, #__z, __x, __y, __z)
 #define DBGIF(__x, __y) printf("%s, %s: %i, %f\n", #__x, #__y, __x, __y)
+#define DBGIF2(__x, __y, __z) printf("%s, %s, %s: %i, %f, %f\n", #__x, #__y, #__z, __x, __y, __z)
 #define DBGF(__x) printf("%s: %f\n", #__x, __x)
 #define DBGF2(__x, __y) printf("%s, %s: %f, %f\n", #__x, #__y, __x, __y)
 #define DBGF3(__x, __y, __z) printf("%s, %s, %s: %f, %f, %f\n", #__x, #__y, #__z, __x, __y, __z)
@@ -75,6 +76,8 @@
 #define DBGI2H2(__x, __y, __z, __w) printf("%s, %s, %s, %s: %i, %i, %f, %f\n", #__x, #__y, #__z, #__w, __x, __y, __half2float(__z), __half2float(__w))
 #define DBGIH3(__x, __y, __z, __w) printf("%s, %s, %s, %s: %i, %f, %f, %f\n", #__x, #__y, #__z, #__w, __x, __half2float(__y), __half2float(__z), __half2float(__w))
 #define DBGIH4(__x, __y, __z, __w, __v) printf("%s, %s, %s, %s, %s: %i, %f, %f, %f, %f\n", #__x, #__y, #__z, #__w, #__v, __x, __half2float(__y), __half2float(__z), __half2float(__w), __half2float(__v))
+#define DBGA(__x) printf("%s: %016llx\n", #__x, __x)
+#define DBGIA(__x, __y) printf("%s, %s: %i, %016llx\n", #__x, #__y, __x, __y)
 
 #define TIME_START \
     auto start = std::chrono::high_resolution_clock::now()
