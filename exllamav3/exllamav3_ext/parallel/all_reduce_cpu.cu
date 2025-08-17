@@ -1,7 +1,7 @@
+#include <cuda_fp16.h>
 #include "all_reduce.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_fp16.h>
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 #include "../util.h"
