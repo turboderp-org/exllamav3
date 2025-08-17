@@ -24,12 +24,14 @@ if windows:
     extra_cflags += ["/Ox", "/arch:AVX2"]
     extra_cuda_cflags += ["-Xcompiler", "/Ox", "-Xcompiler", "/arch:AVX2"]
     extra_cuda_cflags += [
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF2_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "-U__CUDA_NO_HALF_MATH_FUNCTIONS",
-        "-D__CUDA_NO_BFLOAT16_MATH_FUNCTIONS__",
+        "-gencode=arch=compute_80,code=sm_80",
+        "-gencode=arch=compute_86,code=sm_86",
+        "-gencode=arch=compute_89,code=sm_89",
+        "-gencode=arch=compute_89,code=compute_89",
+        "-gencode=arch=compute_90,code=sm_90",
+        "-gencode=arch=compute_100,code=sm_100",
+        "-gencode=arch=compute_120,code=sm_120",
+        "-gencode=arch=compute_120,code=compute_120",
     ]
     if ext_debug:
         extra_cflags += ["/Zi"]
