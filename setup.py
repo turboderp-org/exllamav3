@@ -29,6 +29,7 @@ if windows:
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
         "-U__CUDA_NO_HALF_MATH_FUNCTIONS",
+        "-D__CUDA_NO_BFLOAT16_MATH_FUNCTIONS__",
     ]
     if ext_debug:
         extra_cflags += ["/Zi"]
