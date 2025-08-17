@@ -354,7 +354,7 @@ void routing_ds3_nogroup
                  + num_threads * sizeof(int)
                  + num_warps * sizeof(float);
 
-    int num_blocks = bsz;
+    //int num_blocks = bsz;
     routing_ds3_nogroup_kernel<<<bsz, num_threads, shmem, stream>>>
     (
         (const half*) scores.data_ptr(),
@@ -408,7 +408,7 @@ void routing_std
                  + num_threads * sizeof(int)
                  + num_warps * sizeof(float);
 
-    int num_blocks = bsz;
+    //int num_blocks = bsz;
     routing_std_kernel<<<bsz, num_threads, shmem, stream>>>
     (
         (const half*) scores.data_ptr(),

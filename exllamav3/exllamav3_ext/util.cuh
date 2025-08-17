@@ -4,9 +4,9 @@ typedef struct __align__(8) half4
 {
     half2 x;
     half2 y;
-    __host__ __device__ half4() = default;
-    __host__ __device__ half4(half2 x_, half2 y_) : x(x_), y(y_) {}
-    __host__ __device__ half4(half h0, half h1, half h2, half h3) :
+    __device__ half4() = default;
+    __device__ half4(half2 x_, half2 y_) : x(x_), y(y_) {}
+    __device__ half4(half h0, half h1, half h2, half h3) :
          x(__halves2half2(h0, h1)),
          y(__halves2half2(h2, h3)) {}
 }
@@ -18,9 +18,9 @@ typedef struct __align__(16) half8
     half2 y;
     half2 z;
     half2 w;
-    __host__ __device__ half8() = default;
-    __host__ __device__ half8(half2 x_, half2 y_, half2 z_, half2 w_) : x(x_), y(y_), z(z_), w(w_) {}
-    __host__ __device__ half8(half h0, half h1, half h2, half h3, half h4, half h5, half h6, half h7) :
+     __device__ half8() = default;
+     __device__ half8(half2 x_, half2 y_, half2 z_, half2 w_) : x(x_), y(y_), z(z_), w(w_) {}
+     __device__ half8(half h0, half h1, half h2, half h3, half h4, half h5, half h6, half h7) :
          x(__halves2half2(h0, h1)),
          y(__halves2half2(h2, h3)),
          z(__halves2half2(h4, h5)),
