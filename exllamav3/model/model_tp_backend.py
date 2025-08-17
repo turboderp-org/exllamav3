@@ -231,6 +231,12 @@ class TPBackendNative:
                         raise TimeoutError("Timeout waiting for master process to create SHM")
                     time.sleep(0.05)
 
+        # Create local tensors/flags
+        if self.device >= 0:
+            self.abort_flag = torch.zeros((1,), device = self.device, dtype = torch.int)
+        else:
+            self.abort_flag = None
+
         # Create pinned, shared tensors
         def get_local_tensor(shm_buf, _buffer_size):
             np_view = np.ndarray(
@@ -294,7 +300,7 @@ class TPBackendNative:
 
 
     def fwd_barrier(self):
-        ext.pg_barrier(self.ptr_g, self.active_devices, self.device)
+        ext.pg_barrier(self.ptr_g, self.active_devices, self.device, self.abort_flag)
 
 
     def broadcast(self, tensor: torch.Tensor, src_device: int):
@@ -306,7 +312,8 @@ class TPBackendNative:
                 src_device,
                 tensor,
                 self.ptr_s,
-                SHBUF_SIZE_S
+                SHBUF_SIZE_S,
+                self.abort_flag
             )
         else:
             ext.pg_broadcast(
@@ -316,7 +323,8 @@ class TPBackendNative:
                 src_device,
                 tensor,
                 self.ptr_b,
-                self.shbuf_size
+                self.shbuf_size,
+                self.abort_flag
             )
 
 
@@ -331,7 +339,8 @@ class TPBackendNative:
             contribution,
             self.ptr_r,
             SHBUF_SIZE_R,
-            self.master
+            self.master,
+            self.abort_flag
         )
         # else:
         #     ext.pg_all_reduce(
@@ -341,7 +350,8 @@ class TPBackendNative:
         #         self.active_devices[0],
         #         tensor,
         #         self.ptr_b,
-        #         self.shbuf_size
+        #         self.shbuf_size,
+        #         self.abort_flag
         #     )
 
 
@@ -368,7 +378,8 @@ class TPBackendNative:
             out_tensor,
             ldims,
             self.ptr_b,
-            self.shbuf_size
+            self.shbuf_size,
+            self.abort_flag
         )
 
 

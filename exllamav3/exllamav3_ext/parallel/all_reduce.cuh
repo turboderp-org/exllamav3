@@ -10,7 +10,8 @@ void pg_all_reduce
     int master_device,
     at::Tensor& tensor,
     uintptr_t shbuf,
-    size_t shbuf_size
+    size_t shbuf_size,
+    at::Tensor& abort_flag
 );
 
 void pg_all_reduce_cpu
@@ -23,7 +24,8 @@ void pg_all_reduce_cpu
     bool contributor,
     uintptr_t shbuf,
     size_t shbuf_size,
-    bool is_master
+    bool is_master,
+    at::Tensor& abort_flag
 );
 
 void run_cpu_reduce_jobs

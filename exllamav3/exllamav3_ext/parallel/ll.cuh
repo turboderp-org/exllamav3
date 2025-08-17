@@ -6,7 +6,7 @@ __device__ __forceinline__ uint32_t synced_read_uint32
     uint64_t* p,
     uint32_t cookie,
     uint64_t deadline,
-    bool& timeout,
+    uint32_t *timeout,
     const char* timeout_name
 )
 {
@@ -22,8 +22,8 @@ __device__ __forceinline__ uint32_t synced_read_uint32
         if (sleep < SYNC_MAX_SLEEP) sleep *= 2;
         else
         {
-            timeout = check_timeout(ctx, deadline, timeout_name);
-            if (timeout) break;
+            *timeout = check_timeout(ctx, deadline, timeout_name);
+            if (*timeout) break;
         }
     }
 

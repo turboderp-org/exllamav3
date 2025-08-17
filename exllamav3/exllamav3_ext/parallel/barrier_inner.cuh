@@ -4,11 +4,10 @@ __device__ __forceinline__ void pg_barrier_inner
     PGContext* __restrict__ ctx,
     uint32_t device_mask,
     int this_device,
-    int coordinator_device
+    int coordinator_device,
+    uint32_t* abort_flag
 )
 {
-    bool timeout = false;
-
     if (!blockIdx.x && !blockIdx.y && !blockIdx.z && !threadIdx.x && !threadIdx.y && !threadIdx.z)
     {
         uint32_t* epoch_ptr     = &ctx->barrier_epoch;
@@ -47,8 +46,8 @@ __device__ __forceinline__ void pg_barrier_inner
                 {
                     __nanosleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
-                    else timeout = check_timeout(ctx, deadline, "barrier");
-                    if (timeout) break;
+                    else *abort_flag = check_timeout(ctx, deadline, "barrier");
+                    if (*abort_flag) break;
                 }
                 else sleep = SYNC_MIN_SLEEP;
             }
@@ -66,8 +65,8 @@ __device__ __forceinline__ void pg_barrier_inner
             {
                 __nanosleep(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
-                else timeout = check_timeout(ctx, deadline, "barrier");
-                if (timeout) break;
+                else *abort_flag = check_timeout(ctx, deadline, "barrier");
+                if (*abort_flag) break;
             }
         }
     }

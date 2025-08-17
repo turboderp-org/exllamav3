@@ -296,8 +296,6 @@ void perform_cpu_reduce
     }
 }
 
-__device__ bool pg_all_reduce_cpu_kernel_timeout;
-
 #define PARCK_MODE_FLOAT 0
 #define PARCK_MODE_HALF 1
 #define PARCK_MODE_BF16 2
@@ -314,7 +312,8 @@ void pg_all_reduce_cpu_kernel
     uint8_t* __restrict__ shbuf_ptr,
     size_t data_size,
     size_t shbuf_size,
-    bool contributor
+    bool contributor,
+    uint32_t* abort_flag
 )
 {
     // Indexing
@@ -335,8 +334,6 @@ void pg_all_reduce_cpu_kernel
 
     int t = threadIdx.x;
     int dir = blockIdx.x;
-    if (t == 0)
-        pg_all_reduce_cpu_kernel_timeout = false;
     auto grid = cg::this_grid();
 
     // Get device stage
@@ -453,14 +450,12 @@ void pg_all_reduce_cpu_kernel
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                     else if (check_timeout(ctx, deadline, "pg_all_reduce_cpu_kernel"))
                     {
-                        DBGI2(ep, stage);
-                        to = true;
+                        *abort_flag = 1;
                         break;
                     }
                 }
             }
             __syncthreads();
-            if (to) pg_all_reduce_cpu_kernel_timeout = true;
 
             // Recv float
             if constexpr (dtype == PARCK_MODE_FLOAT)
@@ -512,7 +507,7 @@ void pg_all_reduce_cpu_kernel
         }
 
         grid.sync();
-        if (pg_all_reduce_cpu_kernel_timeout) break;
+        if (*abort_flag) break;
     }
 }
 
@@ -526,7 +521,8 @@ void pg_all_reduce_cpu
     bool contributor,
     uintptr_t shbuf,
     size_t shbuf_size,
-    bool is_master
+    bool is_master,
+    at::Tensor& abort_flag
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(this_device);
@@ -543,6 +539,7 @@ void pg_all_reduce_cpu
 
     TORCH_CHECK(cpu_data_size % 16 == 0, "data_size must be multiple of 16");
 
+    uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
     void* kernelArgs[] =
     {
         (void*)& ctx,
@@ -553,7 +550,8 @@ void pg_all_reduce_cpu
         (void*)& shbuf_ptr,
         (void*)& device_data_size,
         (void*)& shbuf_size,
-        (void*)& contributor
+        (void*)& contributor,
+        (void*)& abort_flag_ptr
     };
 
     dim3 block_grid(2);
