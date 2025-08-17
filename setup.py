@@ -22,7 +22,14 @@ extra_cuda_cflags = ["-lineinfo", "-O3"]
 
 if windows:
     extra_cflags += ["/Ox", "/arch:AVX2"]
-    extra_cuda_cflags += ["-Xcompiler", "/O2", "-Xcompiler", "/arch:AVX2"]
+    extra_cuda_cflags += ["-Xcompiler", "/Ox", "-Xcompiler", "/arch:AVX2"]
+    extra_cuda_cflags += [
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-U__CUDA_NO_HALF_MATH_FUNCTIONS",
+    ]
     if ext_debug:
         extra_cflags += ["/Zi"]
         extra_cuda_cflags += ["-Xcompiler", "/Zi"]
