@@ -17,12 +17,21 @@ if precompile and not torch:
 
 windows = os.name == "nt"
 
-extra_cflags = ["/Ox"] if windows else ["-O3"]
+extra_cflags = []
+extra_cuda_cflags = ["-lineinfo", "-O3"]
 
-if ext_debug:
-    extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
-
-extra_cuda_cflags = ["-lineinfo", "-O3", "-Xcompiler \"-O3 -mavx2\""]
+if windows:
+    extra_cflags += ["/Ox", "/arch:AVX2"]
+    extra_cuda_cflags += ["-Xcompiler", "/O2", "-Xcompiler", "/arch:AVX2"]
+    if ext_debug:
+        extra_cflags += ["/Zi"]
+        extra_cuda_cflags += ["-Xcompiler", "/Zi"]
+else:
+    extra_cflags += ["-Ofast", "-mavx2"]
+    extra_cuda_cflags += ["-Xcompiler=-O3", "-Xcompiler=-mavx2"]
+    if ext_debug:
+        extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
+        extra_cuda_cflags += ["-Xcompiler=-g"]
 
 if torch and torch_version.hip:
     extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
