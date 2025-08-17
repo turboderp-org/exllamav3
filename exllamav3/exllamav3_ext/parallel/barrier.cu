@@ -14,18 +14,19 @@ __global__ void pg_barrier_kernel
     PGContext* __restrict__ ctx,
     uint32_t device_mask,
     int this_device,
-    int coordinator_device
+    int coordinator_device,
+    uint32_t* abort_flag
 )
 {
-    pg_barrier_inner(ctx, device_mask, this_device, coordinator_device);
+    pg_barrier_inner(ctx, device_mask, this_device, coordinator_device, abort_flag);
 }
-
 
 void pg_barrier
 (
     uintptr_t ctx,
     std::vector<uintptr_t> devices,
-    int this_device
+    int this_device,
+    at::Tensor& abort_flag
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(this_device);
@@ -40,7 +41,8 @@ void pg_barrier
         (PGContext*) ctx,  // Shared, pinned
         device_mask,
         this_device,
-        devices[0]
+        devices[0],
+        (uint32_t*) abort_flag.data_ptr()
     );
     cuda_check(cudaPeekAtLastError());
 }

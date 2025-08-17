@@ -112,3 +112,26 @@ class Cleanupper:
         for fn in self.atexit_fns:
             fn()
         self.atexit_fns = []
+
+
+def set_process_priority_and_affinity():
+    import psutil, os
+    import multiprocessing as mp
+
+    p = psutil.Process(os.getpid())
+    # Try to bump priority slightly. May need sudo (?)
+    try:
+        p.nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS if os.name == "nt" else -5)
+    except PermissionError:
+        pass
+    except Exception as e:
+        pass
+
+    # Pin to a core
+    # TODO: Pick an idle core automatically?
+    try:
+        p.cpu_affinity([0])  # pick an isolated/quiet core if possible
+    except AttributeError:
+        pass
+    except Exception as e:
+        pass

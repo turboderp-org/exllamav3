@@ -67,12 +67,12 @@ class Model_TPMixin:
         assert not self.mp_children
         assert not self.mp_parent_conn
         assert not self.mp_child_conn
-        self.mp_children: list = [None] * num_devices
-        self.mp_parent_conn: list = [None] * num_devices
-        self.mp_child_conn: list = [None] * num_devices
+        self.mp_children: list = [None] * (num_devices + 1)
+        self.mp_parent_conn: list = [None] * (num_devices + 1)
+        self.mp_child_conn: list = [None] * (num_devices + 1)
         self.tp_producer = SMProducer(buffer_size = 64 * 1024**2)
 
-        for rank, device in enumerate(self.active_devices):
+        for rank, device in enumerate(self.active_devices + [-1]):
             log_tp(None, f"Spawning child process: {device}")
             if self.tp_output_device == device:
                 self.mp_parent_conn[device] = PseudoParentConn(
@@ -118,6 +118,7 @@ class Model_TPMixin:
                 continue
             if child.is_alive():
                 try:
+                    log_tp(device, f"Closing backend, device {device}")
                     parent_conn.send("quit")
                 except Exception:
                     pass
@@ -231,6 +232,7 @@ class Model_TPMixin:
         modules: list,
         dev_limits: dict | None,
         tp_backend: str,
+        verbose: bool
     ):
         assert use_per_device is None or reserve_per_device is None
         if dev_limits is None: dev_limits = {}
@@ -271,7 +273,8 @@ class Model_TPMixin:
             dev_limits = dev_limits,
         )
         allocator.initial_split(max_mem)
-        allocator.print_split()
+        if verbose:
+            allocator.print_split()
         plan = allocator.compile_tp_plan()
         self.tp_worker_dispatch_wait_multi(self.active_devices, mp_set_plan, (plan, self.active_devices))
 
@@ -285,7 +288,7 @@ class Model_TPMixin:
         )
 
         # Begin loading modules
-        with (ProgressBar(f"Loading" if progressbar else None, len(modules)) as progress):
+        with (ProgressBar(f"Loading (TP)" if progressbar else None, len(modules)) as progress):
             for idx, module in enumerate(modules):
                 last_module = module
 
@@ -365,6 +368,8 @@ class Model_TPMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
+        self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
+
         x = self.prepare_inputs_for_tp(x, params)
         for device in self.active_devices:
             self.tp_worker_dispatch(device, mp_model_forward, (
@@ -376,6 +381,8 @@ class Model_TPMixin:
         for device in self.active_devices:
             r = self.tp_worker_result(device)
             assert r is None, "TP logic error"
+
+        self.tp_worker_result(-1)
         return None
 
 
@@ -386,6 +393,8 @@ class Model_TPMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
+        self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
+
         x = self.prepare_inputs_for_tp(x, params)
         for device in self.active_devices:
             self.tp_worker_dispatch(device, mp_model_forward, (
@@ -400,6 +409,8 @@ class Model_TPMixin:
             if r is not None:
                 return_tensors.append(r)
         assert len(return_tensors) == 1, "TP logic error"
+
+        self.tp_worker_result(-1)
         return return_tensors[0]
 
 

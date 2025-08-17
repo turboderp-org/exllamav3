@@ -18,7 +18,7 @@ match mode:
         model_dir = "/mnt/str/models/gemma3-4b-it/exl3/5.0bpw/"
     case "mistral3":
         prompt_format = "mistral"
-        model_dir = "/mnt/str/models/mistral-small-3.1-24b-instruct/exl3/8.0bpw_H8"
+        model_dir = "/mnt/str/models/mistral-small-3.1-24b-instruct-2503/exl3/4.0bpw/"
 
 images = [
     # Cat

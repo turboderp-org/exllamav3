@@ -530,9 +530,7 @@ class BlockSparseMLP(Module):
 
         # Output reduction
         if self.tp_reduce:
-            # TODO: FP16 reduce in native backend
-            final_hidden_states = final_hidden_states.float()
-            params["backend"].all_reduce(final_hidden_states)
+            params["backend"].all_reduce(final_hidden_states, self.num_local_experts > 0 or bool(self.shared_experts))
 
         return final_hidden_states
 

@@ -7,7 +7,7 @@ from .model_tp_backend import TPBackendNCCL, TPBackendNative
 from ..util import log_tp, set_t0
 
 def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict, master: bool = False):
-    rank = active_devices.index(device)
+    rank = active_devices.index(device) if device >= 0 else -1
     output_rank = active_devices.index(output_device)
     world_size = len(active_devices)
     local_context = {
@@ -41,6 +41,7 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
                 init_method = backend_args["init_method"],  ##
                 master = master,
                 uuid = backend_args["uuid"],
+                cpu = device < 0
             )
         case _:
             raise ValueError("Unknown backend type")
@@ -69,6 +70,7 @@ def mp_model_worker(
         while True:
             msg = conn.recv()
             if msg == "quit":
+                log_tp(device, f"Child worker exiting")
                 torch.cuda.synchronize()
                 local_context["inf_consumer"].close()
                 local_context["backend"].close()
@@ -84,6 +86,11 @@ def mp_model_worker(
                 print("".join(tb.format()))
                 print("-" * 40)
                 conn.send(e)
+
+
+def mp_cpu_reduce(local_context: dict):
+    backend = local_context["backend"]
+    backend.run_cpu_reduce_jobs()
 
 
 def mp_set_plan(local_context: dict, plan: dict, active_devices: list):
@@ -202,7 +209,10 @@ def mp_model_forward(
         x = module.prepare_for_device(x, params)
         x = module.forward(x, params)
         if prefill and idx == last_kv_module_idx:
+            backend.end_cpu_reduce_jobs()
             return None
+
+    backend.end_cpu_reduce_jobs()
     return x
 
 
@@ -267,11 +277,15 @@ class PseudoParentConn:
         self.local_context = init_pg(device, active_devices, output_device, backend_args, master = True)
         self.local_context["inf_consumer"] = SMConsumer(producer, device = device, pin_memory = True)
         self.result = None
+        self.device = device
 
 
     def send(self, msg):
-        fn, args = msg
-        self.result = fn(self.local_context, *args)
+        if msg == "quit":
+            log_tp(self.device, f"Pseudoprocess worker quit message")
+        else:
+            fn, args = msg
+            self.result = fn(self.local_context, *args)
 
 
     def recv(self):
@@ -283,7 +297,7 @@ class PseudoParentConn:
     def close(self, *args, **kwargs):
         self.local_context["inf_consumer"].close()
         self.local_context = {}
-        log_tp(None, f"Pseudoprocess closed")
+        log_tp(self.device, f"Pseudoprocess closed")
 
 
     def quit(self):

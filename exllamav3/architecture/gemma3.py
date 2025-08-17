@@ -583,3 +583,8 @@ class Gemma3VisionModel(Model):
             mmes.append(mme)
 
         return mmes if return_batch else mmes[0]
+
+
+    @override
+    def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        return input_ids

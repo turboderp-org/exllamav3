@@ -12,5 +12,6 @@ void pg_gather
     c10::optional<at::Tensor>& out_tensor,
     std::vector<size_t> ldims,
     uintptr_t shbuf,
-    size_t shbuf_size
+    size_t shbuf_size,
+    at::Tensor& abort_flag
 );

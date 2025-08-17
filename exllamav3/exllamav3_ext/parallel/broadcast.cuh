@@ -10,7 +10,8 @@ void pg_broadcast
     int src_device,
     at::Tensor& tensor,
     uintptr_t shbuf,
-    size_t shbuf_size
+    size_t shbuf_size,
+    at::Tensor& abort_flag
 );
 
 void pg_broadcast_ll
@@ -21,5 +22,6 @@ void pg_broadcast_ll
     int src_device,
     at::Tensor& tensor,
     uintptr_t shbuf,
-    size_t shbuf_size
+    size_t shbuf_size,
+    at::Tensor& abort_flag
 );

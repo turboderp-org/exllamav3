@@ -25,16 +25,14 @@ void pg_all_reduce_kernel
     uint8_t* __restrict__ data_ptr,
     uint8_t* __restrict__ shbuf_ptr,
     size_t data_size,
-    size_t shbuf_size
+    size_t shbuf_size,
+    uint32_t* abort_flag
 )
 {
     int t = threadIdx.x;
     auto grid = cg::this_grid();
 
-    __shared__ bool timeout;
     __shared__ bool r;
-    timeout = false;
-
     int dir = blockIdx.x;
 
     int num_ranks = __popc(device_mask);
@@ -79,8 +77,8 @@ void pg_all_reduce_kernel
             {
                 __nanosleep(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
-                else timeout = check_timeout(ctx, deadline, "all_reduce");
-                if (timeout) break;
+                else *abort_flag = check_timeout(ctx, deadline, "all_reduce");
+                if (*abort_flag) break;
             }
         }
         __syncthreads();
@@ -168,8 +166,8 @@ void pg_all_reduce_kernel
                 {
                     __nanosleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
-                    else timeout = check_timeout(ctx, deadline, "all_reduce (1)");
-                    if (timeout) break;
+                    else *abort_flag = check_timeout(ctx, deadline, "all_reduce (1)");
+                    if (*abort_flag) break;
                 }
             }
         }
@@ -204,8 +202,8 @@ void pg_all_reduce_kernel
                 {
                     __nanosleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
-                    else timeout = check_timeout(ctx, deadline, "all_reduce (2)");
-                    if (timeout) break;
+                    else *abort_flag = check_timeout(ctx, deadline, "all_reduce (2)");
+                    if (*abort_flag) break;
                 }
             }
 
@@ -213,12 +211,12 @@ void pg_all_reduce_kernel
             wait_min_stage(ctx->reduce_stage_consumed + dst_rank, stage_end, deadline);
         }
 
-        if (timeout) break;
+        if (*abort_flag) break;
         grid.sync();
     }
 
     // Finished. Reset counters for next kernel
-    pg_barrier_inner(ctx, device_mask, this_device, master_device);
+    pg_barrier_inner(ctx, device_mask, this_device, master_device, abort_flag);
 
     if (t == 0)
     {
@@ -237,7 +235,8 @@ void pg_all_reduce
     int master_device,
     at::Tensor& tensor,
     uintptr_t shbuf,
-    size_t shbuf_size
+    size_t shbuf_size,
+    at::Tensor& abort_flag
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(this_device);
@@ -256,6 +255,7 @@ void pg_all_reduce
     int threads = (int) CEIL_DIVIDE(CEIL_DIVIDE(data_size / 16ll, num_ranks), 32ll) * 32ll;
     threads = MIN(threads, MAX_NUM_THREADS);
 
+    uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
     void* kernelArgs[] =
     {
         (void*)& ctx,
@@ -266,6 +266,7 @@ void pg_all_reduce
         (void*)& shbuf_ptr,
         (void*)& data_size,
         (void*)& shbuf_size,
+        (void*)& abort_flag_ptr
     };
 
     dim3 block_grid(2);

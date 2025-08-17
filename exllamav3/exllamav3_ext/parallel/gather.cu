@@ -35,15 +35,14 @@ void pg_gather_kernel
     int batch,
     uint8_t* __restrict__ shbuf_ptr,
     size_t data_size,
-    size_t shbuf_size
+    size_t shbuf_size,
+    uint32_t *abort_flag
 )
 {
     int t = threadIdx.x;
     auto grid = cg::this_grid();
 
-    __shared__ bool timeout;
     __shared__ uint32_t r;
-    timeout = false;
     uint8_t* data_end = data_ptr + data_size;
 
     // Divide shared buffer among ranks
@@ -81,8 +80,8 @@ void pg_gather_kernel
             {
                 __nanosleep(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
-                else timeout = check_timeout(ctx, deadline, "gather (0)");
-                if (timeout) break;
+                else *abort_flag = check_timeout(ctx, deadline, "gather (0)");
+                if (*abort_flag) break;
             }
         }
         __syncthreads();
@@ -174,8 +173,8 @@ void pg_gather_kernel
                 {
                     __nanosleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
-                    else timeout = check_timeout(ctx, deadline, "gather (1)");
-                    if (timeout) break;
+                    else *abort_flag = check_timeout(ctx, deadline, "gather (1)");
+                    if (*abort_flag) break;
                 }
             }
         }
@@ -220,8 +219,8 @@ void pg_gather_kernel
             {
                 __nanosleep(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
-                else timeout = check_timeout(ctx, deadline, "gather (2)");
-                if (timeout) break;
+                else *abort_flag = check_timeout(ctx, deadline, "gather (2)");
+                if (*abort_flag) break;
             }
         }
 
@@ -236,7 +235,7 @@ void pg_gather_kernel
     }
 
     grid.sync();
-    pg_barrier_inner(ctx, device_mask, this_device, out_device);
+    pg_barrier_inner(ctx, device_mask, this_device, out_device, abort_flag);
 }
 
 
@@ -250,7 +249,8 @@ void pg_gather
     c10::optional<at::Tensor>& out_tensor,
     std::vector<size_t> ldims,
     uintptr_t shbuf,
-    size_t shbuf_size
+    size_t shbuf_size,
+    at::Tensor& abort_flag
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(this_device);
@@ -284,6 +284,7 @@ void pg_gather
     if (this_device == out_device)
         num_blocks = num_ranks;
 
+    uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
     void* kernelArgs[] =
     {
         (void*)& ctx,  // Shared, pinned
@@ -296,7 +297,8 @@ void pg_gather
         (void*)& batch,
         (void*)& shbuf_ptr,
         (void*)& send_size,
-        (void*)& shbuf_size
+        (void*)& shbuf_size,
+        (void*)& abort_flag_ptr
     };
 
     dim3 block_grid(num_blocks);

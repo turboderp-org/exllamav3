@@ -517,3 +517,8 @@ class Mistral3VisionModel(Model):
         })
 
         return mme
+
+
+    @override
+    def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        return input_ids

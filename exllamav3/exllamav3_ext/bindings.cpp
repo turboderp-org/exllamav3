@@ -65,6 +65,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pg_barrier", &pg_barrier, "pg_barrier");
     m.def("pg_gather", &pg_gather, "pg_gather");
     m.def("pg_all_reduce", &pg_all_reduce, "pg_all_reduce");
+    m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
+    m.def("run_cpu_reduce_jobs", &run_cpu_reduce_jobs, "run_cpu_reduce_jobs");
+    m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
     m.def("test_distribution", &test_distribution, "test_distribution");

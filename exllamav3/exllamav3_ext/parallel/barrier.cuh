@@ -7,5 +7,6 @@ void pg_barrier
 (
     uintptr_t ctx,
     std::vector<uintptr_t> devices,
-    int this_device
+    int this_device,
+    at::Tensor& abort_flag
 );

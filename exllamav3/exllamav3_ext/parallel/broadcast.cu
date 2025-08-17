@@ -24,7 +24,8 @@ void pg_broadcast_kernel
     uint8_t* __restrict__ data_ptr,
     uint8_t* __restrict__ shbuf_ptr,
     size_t data_size,
-    size_t shbuf_size
+    size_t shbuf_size,
+    uint32_t* abort_flag
 )
 {
     int t = threadIdx.x;
@@ -36,7 +37,6 @@ void pg_broadcast_kernel
 
     uint8_t* data_end = data_ptr + data_size;
     uint32_t* broadcast_stages_ptr = &ctx->broadcast_stage_device[0];
-    bool timeout = false;
 
     // Producer
     if constexpr (is_producer)
@@ -78,15 +78,15 @@ void pg_broadcast_kernel
                     }
                     else __nanosleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
-                    timeout = check_timeout(ctx, deadline, "broadcast");
-                    if (timeout) break;
+                    else *abort_flag = check_timeout(ctx, deadline, "broadcast");
+                    if (*abort_flag) break;
                 }
             }
             __syncthreads();
         };
 
         // Producer loop
-        while (local_stage < num_stages && !timeout)
+        while (local_stage < num_stages && !(*abort_flag))
         {
             produce_next_stage();
             local_stage++;
@@ -113,8 +113,8 @@ void pg_broadcast_kernel
                 {
                     __nanosleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
-                    timeout = check_timeout(ctx, deadline, "broadcast");
-                    if (timeout) break;
+                    else *abort_flag = check_timeout(ctx, deadline, "broadcast");
+                    if (*abort_flag) break;
                 }
             }
             __syncthreads();
@@ -139,7 +139,7 @@ void pg_broadcast_kernel
         };
 
         // Consumer loop
-        while (local_stage < num_stages && !timeout)
+        while (local_stage < num_stages && !(*abort_flag))
         {
             wait_producer_stage(local_stage);
             consume_next_stage();
@@ -151,7 +151,7 @@ void pg_broadcast_kernel
     }
 
     // Finished. Barrier to make sure buffer is free on kernel exit
-    pg_barrier_inner(ctx, device_mask, this_device, src_device);
+    pg_barrier_inner(ctx, device_mask, this_device, src_device, abort_flag);
 
     // Clear stages for next kernel
     if constexpr (is_producer)
@@ -182,11 +182,11 @@ void pg_broadcast_ll_kernel
     uint8_t* __restrict__ data_ptr,
     uint8_t* __restrict__ shbuf_ptr,
     size_t data_size,
-    size_t shbuf_size
+    size_t shbuf_size,
+    uint32_t* abort_flag
 )
 {
     int t = threadIdx.x;
-    bool timeout = false;
 
     // Use barrier epoch to synchronize. The barrier at the end of this kernel ensures it will increment at
     // least once before the next broadcast. Only load in thread 0 to reduce PCIe traffic.
@@ -220,14 +220,14 @@ void pg_broadcast_ll_kernel
         else
         {
             uint64_t deadline = sync_deadline();
-            for (int i = t; i < chunk_items && !timeout; i += NUM_THREADS_LL)
-                chunk[i] = synced_read_uint32(ctx, shbuf_pack + i, cookie, deadline, timeout, "pg_broadcast_ll_kernel");
+            for (int i = t; i < chunk_items && !(*abort_flag); i += NUM_THREADS_LL)
+                chunk[i] = synced_read_uint32(ctx, shbuf_pack + i, cookie, deadline, abort_flag, "pg_broadcast_ll_kernel");
         }
 
         __syncthreads();
 
         // Make sure buffer is free for next iteration or kernel
-        pg_barrier_inner(ctx, device_mask, this_device, src_device);
+        pg_barrier_inner(ctx, device_mask, this_device, src_device, abort_flag);
     }
 }
 
@@ -240,7 +240,8 @@ void pg_broadcast
     int src_device,
     at::Tensor& tensor,
     uintptr_t shbuf,
-    size_t shbuf_size
+    size_t shbuf_size,
+    at::Tensor& abort_flag
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(this_device);
@@ -263,13 +264,16 @@ void pg_broadcast
         data_ptr, \
         shbuf_ptr, \
         data_size, \
-        shbuf_size
+        shbuf_size, \
+        (uint32_t*) abort_flag.data_ptr()
 
     if (this_device == src_device)
         pg_broadcast_kernel<true><<<1, NUM_THREADS, 0, stream>>>(ARGS);
     else
         pg_broadcast_kernel<false><<<1, NUM_THREADS, 0, stream>>>(ARGS);
     cuda_check(cudaPeekAtLastError());
+
+    #undef ARGS
 }
 
 
@@ -281,7 +285,8 @@ void pg_broadcast_ll
     int src_device,
     at::Tensor& tensor,
     uintptr_t shbuf,
-    size_t shbuf_size
+    size_t shbuf_size,
+    at::Tensor& abort_flag
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(this_device);
@@ -304,12 +309,15 @@ void pg_broadcast_ll
         data_ptr, \
         shbuf_ptr, \
         data_size, \
-        shbuf_size
+        shbuf_size, \
+        (uint32_t*) abort_flag.data_ptr()
 
     if (this_device == src_device)
         pg_broadcast_ll_kernel<true><<<1, NUM_THREADS_LL, 0, stream>>>(ARGS);
     else
         pg_broadcast_ll_kernel<false><<<1, NUM_THREADS_LL, 0, stream>>>(ARGS);
     cuda_check(cudaPeekAtLastError());
+
+    #undef ARGS
 }
 

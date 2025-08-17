@@ -314,6 +314,8 @@ class Attention(Module):
 
         if self.num_kv_heads == 0:
             x = torch.zeros_like(x, dtype = self.out_dtype)
+            if self.tp_reduce:
+                params["backend"].all_reduce(x, False)
         else:
             bsz, seqlen, _ = x.shape
             attn_mode = params.get("attn_mode", "flash_attn_nc")
@@ -326,11 +328,8 @@ class Attention(Module):
                     x = self.decode_flash_attn_nc(x, bsz, seqlen, params)
                 case _:
                     raise ValueError(f"Unknown attn_mode: {attn_mode}")
-
-        if self.tp_reduce:
-            # TODO: FP16 reduce in native backend
-            x = x.float()
-            params["backend"].all_reduce(x)
+            if self.tp_reduce:
+                params["backend"].all_reduce(x)
 
         return to2(x, out_dtype, self.out_dtype)
 

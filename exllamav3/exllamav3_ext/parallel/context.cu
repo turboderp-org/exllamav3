@@ -13,7 +13,19 @@ void pg_init_context(uintptr_t ctx)
     ctx_ptr->barrier_epoch = 1;
 
     for (int i = 0; i < MAX_DEVICES; ++i)
+    {
         ctx_ptr->barrier_epoch_device[i] = 0;
+        ctx_ptr->broadcast_stage_device[i] = 0;
+        ctx_ptr->reduce_stage_produced[i] = 0;
+        ctx_ptr->reduce_stage_consumed[i] = 0;
+        ctx_ptr->gather_stage_produced[i] = 0;
+        ctx_ptr->gather_stage_consumed[i] = 0;
+        ctx_ptr->cpusum_stage_device[i * REDUCE_STAGE_STRIDE] = 0;
+    }
+
+    ctx_ptr->reduce_jobs_head = 0;
+    ctx_ptr->reduce_jobs_tail = 0;
+    ctx_ptr->cpusum_stage_cpu = 0;
 }
 
 void pg_check_timeout(uintptr_t ctx)
