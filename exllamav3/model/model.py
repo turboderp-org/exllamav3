@@ -120,7 +120,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         callback: Callable[[int, int], None] | None = None,
         generator: bool = True,
         tp_dev_limits: dict | None = None,
-        tp_backend: str = "native"
+        tp_backend: str = "native",
+        verbose: bool = False
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -197,6 +198,9 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         :param tp_backend:
             str, either "nccl" (default) or "native"
+
+        :param verbose:
+            bool, more info while loading including full TP split
         """
 
         free_mem()
@@ -214,7 +218,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                 "Cannot specify reserve_per_device or use_per_device when loading to single device."
             assert not tensor_p, \
                 "Cannot use tensor_p when loading to single device."
-            self._load_single(progressbar, device, self.config, self.modules)
+            self._load_single(progressbar, device, self.config, self.modules, verbose)
 
         # Use/reserve
         else:
@@ -264,6 +268,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     generator,
                     self.config,
                     self.modules,
+                    verbose,
                 )
                 self.output_device = self.modules[-1].device
 
@@ -290,6 +295,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     self.modules,
                     tp_dev_limits,
                     tp_backend,
+                    verbose,
                 )
                 self.output_device = tp_output_device
 

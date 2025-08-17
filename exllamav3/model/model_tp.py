@@ -232,6 +232,7 @@ class Model_TPMixin:
         modules: list,
         dev_limits: dict | None,
         tp_backend: str,
+        verbose: bool
     ):
         assert use_per_device is None or reserve_per_device is None
         if dev_limits is None: dev_limits = {}
@@ -272,7 +273,8 @@ class Model_TPMixin:
             dev_limits = dev_limits,
         )
         allocator.initial_split(max_mem)
-        allocator.print_split()
+        if verbose:
+            allocator.print_split()
         plan = allocator.compile_tp_plan()
         self.tp_worker_dispatch_wait_multi(self.active_devices, mp_set_plan, (plan, self.active_devices))
 
@@ -286,7 +288,7 @@ class Model_TPMixin:
         )
 
         # Begin loading modules
-        with (ProgressBar(f"Loading" if progressbar else None, len(modules)) as progress):
+        with (ProgressBar(f"Loading (TP)" if progressbar else None, len(modules)) as progress):
             for idx, module in enumerate(modules):
                 last_module = module
 

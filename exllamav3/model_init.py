@@ -34,6 +34,8 @@ def add_args(
     parser.add_argument("-tp_moe", "--tp_max_parallelism_moe", type = int, help = "(TP) Maximum parallelism for MoE layers", default = None)
     parser.add_argument("-tp_linear", "--tp_max_parallelism_linear", type = int, help = "(TP) Maximum parallelism for linear (output) layers", default = None)
 
+    parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose output while loading")
+
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
@@ -158,6 +160,7 @@ def init(
         progressbar = progress,
         tp_dev_limits = tp_dev_limits,
         tp_backend = args.tp_backend,
+        verbose = args.verbose,
         **kwargs
     )
 

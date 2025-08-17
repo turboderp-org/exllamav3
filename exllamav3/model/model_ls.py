@@ -24,6 +24,7 @@ class Model_LSMixin:
         device: torch.device,
         config: Config,
         modules: list,
+        verbose: bool
     ):
         with ProgressBar(f"Loading" if progressbar else None, len(modules)) as progress:
             for idx, module in enumerate(modules):
@@ -57,6 +58,7 @@ class Model_LSMixin:
         generator: bool,
         config: Config,
         modules: list,
+        verbose: bool
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
@@ -65,7 +67,7 @@ class Model_LSMixin:
         touched_devices = []
         params = self.default_load_params()
 
-        with ProgressBar(f"Loading" if progressbar else None, len(modules)) as progress:
+        with ProgressBar(f"Loading (LS)" if progressbar else None, len(modules)) as progress:
 
             for idx, module in enumerate(modules):
 
