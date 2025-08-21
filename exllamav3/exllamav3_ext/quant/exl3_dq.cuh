@@ -163,38 +163,78 @@ __device__ __forceinline__ void dq8(const uint32_t* ptr, int t_offset, FragB& fr
 template <int cb>
 __device__ __forceinline__ void dq8_aligned_4bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1, uint32_t mult)
 {
-    int i1 = t_offset / 8;
-    int i0 = (i1 + 31) % 32;
-
-    uint32_t a = ptr[i0];
-    uint32_t b = ptr[i1];
-    uint32_t w7 = b & 0xffff;
-    uint32_t w6 = (b >> 4) & 0xffff;
-    uint32_t w5 = (b >> 8) & 0xffff;
-    uint32_t w4 = (b >> 12) & 0xffff;
-    uint32_t w3 = (b >> 16) & 0xffff;
-    uint32_t w2 = __funnelshift_r(b, a, 20);
-    uint32_t w1 = w2 >> 4;
-    uint32_t w0 = w2 >> 8;
-    w2 = w2 & 0xffff;
-    w1 = w1 & 0xffff;
-    w0 = w0 & 0xffff;
-    half2 d0d1 = decode_3inst_2<cb>(w0, w1, mult);
-    half2 d2d3 = decode_3inst_2<cb>(w2, w3, mult);
-    half2 d4d5 = decode_3inst_2<cb>(w4, w5, mult);
-    half2 d6d7 = decode_3inst_2<cb>(w6, w7, mult);
-    frag0[0] = d0d1;
-    frag0[1] = d2d3;
-    frag1[0] = d4d5;
-    frag1[1] = d6d7;
+    uint32_t i0, i1, a, b, s, w0, w1, w2, w3, w4, w5, w6, w7;
+    i1 = t_offset >> 3;
+    i0 = (i1 + 31) & 31;
+    a = ptr[i0];
+    b = ptr[i1];
+    FSHF_IMM(s, b, a, 20);
+    w7 = b & 0xffff;
+    BFE16_IMM(w6, b, 4);
+    BFE16_IMM(w5, b, 8);
+    BFE16_IMM(w4, b, 12);
+    BFE16_IMM(w3, b, 16);
+    w2 = s & 0xffff;
+    BFE16_IMM(w1, s, 4);
+    BFE16_IMM(w0, s, 8);
+    frag0[0] = decode_3inst_2<cb>(w0, w1, mult);
+    frag0[1] = decode_3inst_2<cb>(w2, w3, mult);
+    frag1[0] = decode_3inst_2<cb>(w4, w5, mult);
+    frag1[1] = decode_3inst_2<cb>(w6, w7, mult);
 }
 
 template <int cb>
-__device__ __forceinline__ void dq8_aligned_4bits_bfe(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1, uint32_t mult)
+__device__ __forceinline__ void dq8_aligned_2bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1, uint32_t mult)
+{
+    uint32_t i0, i1, a, b, w0, w1, w2, w3, w4, w5, w6, w7;
+    i1 = t_offset >> 4;
+    i0 = (i1 + 15) & 15;
+    a = ptr[i0];
+    b = ptr[i1];
+    b = fshift(b, a, ((~t_offset) & 8) << 1);
+    w7 = b & 0xffff;
+    BFE16_IMM(w6, b, 2);
+    BFE16_IMM(w5, b, 4);
+    BFE16_IMM(w4, b, 6);
+    BFE16_IMM(w3, b, 8);
+    BFE16_IMM(w2, b, 10);
+    BFE16_IMM(w1, b, 12);
+    BFE16_IMM(w0, b, 14);
+    frag0[0] = decode_3inst_2<cb>(w0, w1, mult);
+    frag0[1] = decode_3inst_2<cb>(w2, w3, mult);
+    frag1[0] = decode_3inst_2<cb>(w4, w5, mult);
+    frag1[1] = decode_3inst_2<cb>(w6, w7, mult);
+}
+
+template <int cb>
+__device__ __forceinline__ void dq8_aligned_1bit(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1, uint32_t mult)
+{
+    uint32_t i0, i1, a, b, w0, w1, w2, w3, w4, w5, w6, w7;
+    i1 = t_offset >> 5;
+    i0 = (i1 + 7) & 7;
+    a = ptr[i0];
+    b = ptr[i1];
+    b = fshift(b, a, ((~t_offset) & 24));
+    w7 = b & 0xffff;
+    BFE16_IMM(w6, b, 1);
+    BFE16_IMM(w5, b, 2);
+    BFE16_IMM(w4, b, 3);
+    BFE16_IMM(w3, b, 4);
+    BFE16_IMM(w2, b, 5);
+    BFE16_IMM(w1, b, 6);
+    BFE16_IMM(w0, b, 7);
+    frag0[0] = decode_3inst_2<cb>(w0, w1, mult);
+    frag0[1] = decode_3inst_2<cb>(w2, w3, mult);
+    frag1[0] = decode_3inst_2<cb>(w4, w5, mult);
+    frag1[1] = decode_3inst_2<cb>(w6, w7, mult);
+}
+
+
+template <int cb>
+__device__ __forceinline__ void dq8_aligned_4bits_bfe64(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1, uint32_t mult)
 {
     int i1 = t_offset / 8;
     int i0 = (i1 + 31) % 32;
-
     uint32_t a = ptr[i0];
     uint32_t b = ptr[i1];
     uint32_t w7 = bfe64(b, a, 0, 16);
@@ -205,14 +245,10 @@ __device__ __forceinline__ void dq8_aligned_4bits_bfe(const uint32_t* ptr, int t
     uint32_t w2 = bfe64(b, a, 20, 16);
     uint32_t w1 = bfe64(b, a, 24, 16);
     uint32_t w0 = bfe64(b, a, 28, 16);
-    half2 d0d1 = decode_3inst_2<cb>(w0, w1, mult);
-    half2 d2d3 = decode_3inst_2<cb>(w2, w3, mult);
-    half2 d4d5 = decode_3inst_2<cb>(w4, w5, mult);
-    half2 d6d7 = decode_3inst_2<cb>(w6, w7, mult);
-    frag0[0] = d0d1;
-    frag0[1] = d2d3;
-    frag1[0] = d4d5;
-    frag1[1] = d6d7;
+    frag0[0] = decode_3inst_2<cb>(w0, w1, mult);
+    frag0[1] = decode_3inst_2<cb>(w2, w3, mult);
+    frag1[0] = decode_3inst_2<cb>(w4, w5, mult);
+    frag1[1] = decode_3inst_2<cb>(w6, w7, mult);
 }
 
 template <int bits, int cb>
@@ -220,15 +256,15 @@ __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB&
 {
     if constexpr (bits == 1)
     {
-        dq8<bits, cb, 4>(ptr, idx, frag0, frag1, mult);
+        dq8_aligned_1bit<cb>(ptr, idx, frag0, frag1, mult);
     }
     else if constexpr (bits == 2)
     {
-        dq8<bits, cb, 4>(ptr, idx, frag0, frag1, mult);
+        dq8_aligned_2bits<cb>(ptr, idx, frag0, frag1, mult);
     }
     else if constexpr (bits == 3)
     {
-        dq8<bits, cb, 2>(ptr, idx, frag0, frag1, mult);
+        dq8<bits, cb, 4>(ptr, idx, frag0, frag1, mult);
     }
     else if constexpr (bits == 4)
     {

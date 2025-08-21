@@ -17,7 +17,7 @@ EXL3 matmul, A @ B -> C
 
 - A: row-major A tensor, shape (m, k), dtype float16, contiguous
 - B: EXL3-quantized B tensor, shape (k//16, n//16, 16*bits), dtype uint16
-- C: empty row-major C tensor, shape (m, n), dtype float16 or float23, contiguous. Does not need to be zero-initialized
+- C: empty row-major C tensor, shape (m, n), dtype float16 or float32, contiguous. Does not need to be zero-initialized
 - suh: optional, packed input scales/flips, shape (k//16), dtype float16
 - A_had: required if suh given, may be reference to A, temporary storage for input transform, size and dtype as A
 - svh: optional, packed output scales/flips, shape (n//16), dtype float16
