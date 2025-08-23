@@ -21,6 +21,10 @@ class Cohere2Config(Config):
             **kwargs
         )
 
+        # Layers
+        self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
+        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", True)
+
         # Attention params
         self.head_dim = self.read_cfg(int, "head_dim", None)
         self.hidden_size = self.read_cfg(int, "hidden_size", no_default)
@@ -28,8 +32,30 @@ class Cohere2Config(Config):
         self.num_kv_heads = self.read_cfg(int, "num_key_value_heads", self.num_q_heads)
 
         self.sliding_window = self.read_cfg(int, "sliding_window", -1)
-        self.sliding_window_pattern = self.read_cfg(int, "sliding_window_pattern", 1)
-        self.assert_cfg(str, "order_of_interleaved_layers", "local_attn_first")
+        sliding_window_pattern = self.read_cfg(int, "sliding_window_pattern", None)
+        layer_types = self.read_cfg(list, "layer_types", None)
+
+        if layer_types:
+            assert len(layer_types) == self.num_hidden_layers, \
+                "Length of layer_types key doesn't match number of hidden layers"
+            self.swa_pattern = []
+            for t in layer_types:
+                if t == "sliding_attention":
+                    self.swa_pattern.append(self.sliding_window)
+                elif t == "full_attention":
+                    self.swa_pattern.append(-1)
+                else:
+                    raise ValueError("Unknown layer type in layer_types")
+
+        elif sliding_window_pattern:
+            self.assert_cfg(str, "order_of_interleaved_layers", "local_attn_first")
+            self.swa_pattern = [
+                self.sliding_window if (idx + 1) % sliding_window_pattern != 0 else -1
+                for idx in range(self.num_hidden_layers)
+            ]
+
+        else:
+            self.swa_pattern = [-1 for _ in range(self.num_hidden_layers)]
 
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
@@ -40,10 +66,6 @@ class Cohere2Config(Config):
 
         # Norms
         self.layernorm_eps = self.read_cfg(float, "layer_norm_eps", 1e-05)
-
-        # Layers
-        self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
-        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", True)
 
         # RoPE
         self.rope_settings = self.read_rope_settings_default(RopeStyle.GPTJ)
@@ -73,15 +95,11 @@ class Cohere2Model(Model):
 
         self.first_block_idx = len(self.modules)
 
-        swa = [
-            config.sliding_window if (idx + 1) % config.sliding_window_pattern != 0 else -1
-            for idx in range(config.num_hidden_layers)
-        ]
-
         self.modules += [
             ParallelDecoderBlock(
                 config = config,
                 key = f"model.layers.{idx}",
+                out_dtype = torch.float,
                 input_norm = LayerNorm(
                     config = config,
                     key = f"model.layers.{idx}.input_layernorm",
@@ -95,14 +113,15 @@ class Cohere2Model(Model):
                     head_dim = config.head_dim,
                     num_q_heads = config.num_q_heads,
                     num_kv_heads = config.num_kv_heads,
-                    rope_settings = config.rope_settings if swa[idx] >= 0 else None,
+                    rope_settings = config.rope_settings if config.swa_pattern[idx] >= 0 else None,
                     sm_scale = None,
-                    sliding_window = swa[idx],
+                    sliding_window = config.swa_pattern[idx],
                     key_q = "q_proj",
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
                     qmap = "block.parallel",
+                    out_dtype = torch.float,
                 ),
                 mlp = GatedMLP(
                     config = config,

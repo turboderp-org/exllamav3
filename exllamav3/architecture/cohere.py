@@ -75,6 +75,7 @@ class CohereModel(Model):
             ParallelDecoderBlock(
                 config = config,
                 key = f"model.layers.{idx}",
+                out_dtype = torch.float,
                 input_norm = LayerNorm(
                     config = config,
                     key = f"model.layers.{idx}.input_layernorm",
@@ -105,6 +106,7 @@ class CohereModel(Model):
                         key = f"model.layers.{idx}.self_attn.k_norm",
                         layernorm_eps = config.layernorm_eps,
                     ) if config.use_qk_norm else None,
+                    out_dtype = torch.float,
                 ),
                 mlp = GatedMLP(
                     config = config,
@@ -115,6 +117,7 @@ class CohereModel(Model):
                     key_gate = "gate_proj",
                     key_down = "down_proj",
                     qmap = "block.parallel",
+                    interm_dtype = torch.float,
                     out_dtype = torch.float,
                 ),
             )
