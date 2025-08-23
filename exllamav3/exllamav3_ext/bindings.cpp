@@ -1,8 +1,8 @@
+#include <cuda_fp16.h>
+
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-
-#include <cuda_fp16.h>
 
 #include "stloader.h"
 #include "hadamard.h"

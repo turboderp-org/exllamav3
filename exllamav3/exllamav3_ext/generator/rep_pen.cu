@@ -1,7 +1,7 @@
+#include <cuda_fp16.h>
 #include "rep_pen.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_fp16.h>
 #include "../util.h"
 #include "../util.cuh"
 #include <limits>

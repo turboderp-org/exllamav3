@@ -60,7 +60,7 @@ def get_test_tokens(tokenizer, rows, bos, eval_len = 2048, eval_stride = 512):
 
 
 
-@torch.compile(fullgraph = True, mode = "reduce-overhead")
+# @torch.compile(fullgraph = True, mode = "reduce-overhead")
 def count_threshold(x: torch.Tensor, abs_threshold: float) -> torch.Tensor:
     return (x.abs() > abs_threshold).sum(dtype = torch.int64)
 
