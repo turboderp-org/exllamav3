@@ -45,6 +45,10 @@ class Gemma3Config(Config):
         if self.vocab_size is None:
             self.vocab_size = 262208
 
+        # Layers
+        self.num_hidden_layers = self.read_cfg(int, "text_config->num_hidden_layers", no_default)
+        self.tie_word_embeddings = self.read_cfg(bool, "text_config->tie_word_embeddings", True)
+
         # Attention params
         self.head_dim = self.read_cfg(int, "text_config->head_dim", 256)
         self.hidden_size = self.read_cfg(int, "text_config->hidden_size", 2304)
@@ -53,8 +57,31 @@ class Gemma3Config(Config):
 
         self.query_pre_attn_scalar = self.read_cfg(float, "text_config->query_pre_attn_scalar", 256)
         self.attn_logit_softcapping = self.read_cfg(float, "text_config->attn_logit_softcapping", 0.0)
+
         self.sliding_window = self.read_cfg(int, "text_config->sliding_window", 4096)
-        self.sliding_window_pattern = self.read_cfg(int, "text_config->sliding_window_pattern", 6)
+        layer_types = self.read_cfg(list, "layer_types", None)
+        sliding_window_pattern = self.read_cfg(int, "sliding_window_pattern", 6)
+
+        if layer_types:
+            assert len(layer_types) == self.num_hidden_layers, \
+                "Length of layer_types key doesn't match number of hidden layers"
+            self.swa_pattern = []
+            for t in layer_types:
+                if t == "sliding_attention":
+                    self.swa_pattern.append(self.sliding_window)
+                elif t == "full_attention":
+                    self.swa_pattern.append(-1)
+                else:
+                    raise ValueError("Unknown layer type in layer_types")
+
+        elif sliding_window_pattern:
+            self.swa_pattern = [
+                self.sliding_window if (idx + 1) % sliding_window_pattern != 0 else -1
+                for idx in range(self.num_hidden_layers)
+            ]
+
+        else:
+            self.swa_pattern = [-1 for _ in range(self.num_hidden_layers)]
 
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
@@ -64,10 +91,6 @@ class Gemma3Config(Config):
 
         # Norms
         self.rms_norm_eps = self.read_cfg(float, "text_config->rms_norm_eps", 1e-6)
-
-        # Layers
-        self.num_hidden_layers = self.read_cfg(int, "text_config->num_hidden_layers", no_default)
-        self.tie_word_embeddings = self.read_cfg(bool, "text_config->tie_word_embeddings", True)
 
         # RoPE
         self.rope_settings_global = self.read_rope_settings_default(
@@ -133,6 +156,10 @@ class Gemma3TextConfig(Config):
         if self.vocab_size is None:
             self.vocab_size = 262208
 
+        # Layers
+        self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
+        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", True)
+
         # Attention params
         self.head_dim = self.read_cfg(int, "head_dim", 256)
         self.hidden_size = self.read_cfg(int, "hidden_size", 2304)
@@ -141,8 +168,31 @@ class Gemma3TextConfig(Config):
 
         self.query_pre_attn_scalar = self.read_cfg(float, "query_pre_attn_scalar", 256)
         self.attn_logit_softcapping = self.read_cfg(float, "attn_logit_softcapping", 0.0)
+
         self.sliding_window = self.read_cfg(int, "sliding_window", 4096)
-        self.sliding_window_pattern = self.read_cfg(int, "sliding_window_pattern", 6)
+        layer_types = self.read_cfg(list, "layer_types", None)
+        sliding_window_pattern = self.read_cfg(int, "sliding_window_pattern", 6)
+
+        if layer_types:
+            assert len(layer_types) == self.num_hidden_layers, \
+                "Length of layer_types key doesn't match number of hidden layers"
+            self.swa_pattern = []
+            for t in layer_types:
+                if t == "sliding_attention":
+                    self.swa_pattern.append(self.sliding_window)
+                elif t == "full_attention":
+                    self.swa_pattern.append(-1)
+                else:
+                    raise ValueError("Unknown layer type in layer_types")
+
+        elif sliding_window_pattern:
+            self.swa_pattern = [
+                self.sliding_window if (idx + 1) % sliding_window_pattern != 0 else -1
+                for idx in range(self.num_hidden_layers)
+            ]
+
+        else:
+            self.swa_pattern = [-1 for _ in range(self.num_hidden_layers)]
 
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
@@ -152,10 +202,6 @@ class Gemma3TextConfig(Config):
 
         # Norms
         self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", 1e-6)
-
-        # Layers
-        self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
-        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", True)
 
         # RoPE
         self.rope_settings_global = self.read_rope_settings_default(
@@ -195,11 +241,6 @@ class Gemma3Model(Model):
 
         self.first_block_idx = len(self.modules)
 
-        is_local = [
-            bool((idx + 1) % config.sliding_window_pattern)
-            for idx in range(config.num_hidden_layers)
-        ]
-
         self.modules += [
             TransformerBlock(
                 config = config,
@@ -218,10 +259,10 @@ class Gemma3Model(Model):
                     head_dim = config.head_dim,
                     num_q_heads = config.num_q_heads,
                     num_kv_heads = config.num_kv_heads,
-                    rope_settings = config.rope_settings_local if is_local[idx] else config.rope_settings_global,
+                    rope_settings = config.rope_settings_global if config.swa_pattern[idx] == -1 else config.rope_settings_local,
                     sm_scale = config.query_pre_attn_scalar ** (-0.5),
                     logit_softcapping = config.attn_logit_softcapping,
-                    sliding_window = config.sliding_window if is_local[idx] else -1,
+                    sliding_window = config.swa_pattern[idx],
                     key_q = "q_proj",
                     key_k = "k_proj",
                     key_v = "v_proj",
