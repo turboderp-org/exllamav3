@@ -3,6 +3,8 @@ class PromptFormat:
     def __init__(self, user_name, bot_name):
         self.user_name = user_name
         self.bot_name = bot_name
+    def set_special(self, spc: dict):
+        pass
     def default_system_prompt(self, think):
         raise NotImplementedError()
     def format(self, system_prompt, messages):
@@ -539,6 +541,72 @@ class PromptFormat_exaone(PromptFormat):
         ]
 
 
+class PromptFormat_seed(PromptFormat):
+    description = "Seed-OSS"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.thinking_budget = 1024
+
+    def set_special(self, spc: dict):
+        self.thinking_budget = spc.get("thinking_budget", self.thinking_budget)
+
+    def default_system_prompt(self, think):
+        if think:
+            budget_reflections_v05 = {
+                0: 0,
+                512: 128,
+                1024: 256,
+                2048: 512,
+                4096: 512,
+                8192: 1024,
+                1e20: 1024
+            }
+            ns_interval = budget_reflections_v05[min([k for k in budget_reflections_v05 if k >= self.thinking_budget])]
+            return (
+                f"You are an intelligent assistant with reflective ability. In the process of thinking and reasoning, "
+                f"you need to strictly follow the thinking budget, which is {self.thinking_budget}. That is, you need to "
+                f"complete your thinking within {self.thinking_budget} tokens and start answering the user's questions. "
+                f"You will reflect on your thinking process every {ns_interval} tokens, stating how many tokens have "
+                f"been used and how many are left."
+            )
+        else:
+            return (
+                "You are an intelligent assistant that can answer questions in one step without the need for reasoning "
+                "and thinking, that is, your thinking budget is 0. Next, please skip the thinking process and directly "
+                "start answering the user's questions."
+            )
+
+    def format(self, system_prompt, messages):
+        context = ""
+        if system_prompt:
+            context += "<seed:bos>system\n"
+            context += system_prompt
+            context += "<seed:eos>"
+        for (u, a) in messages:
+            context += "<seed:bos>user\n"
+            context += u
+            context += "<seed:eos>"
+            context += "<seed:bos>assistant\n"
+            if a is not None:
+                context += a
+                context += "<seed:eos>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<seed:eos>"),
+            "<seed:eos>",
+        ]
+
+    def thinktag(self):
+        return "<seed:think>", "</seed:think>"
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -554,4 +622,5 @@ prompt_formats = {
     "smollm3": PromptFormat_smollm3,
     "commanda": PromptFormat_commanda,
     "exaone": PromptFormat_exaone,
+    "seed": PromptFormat_seed,
 }

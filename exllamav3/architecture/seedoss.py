@@ -1,8 +1,8 @@
 from typing_extensions import override
 from .llama import LlamaConfig, LlamaModel
 
-# Qwen2 is identical to Llama except for bias on Q, K and V projections, but Linear module automatically
-# detects *.bias tensor
+# Seed-OSS appears identical to Qwen2.5/Llama/etc.
+# TODO: Verify that the implementation is correct once Transformers support is merged
 
 class SeedOssConfig(LlamaConfig):
     arch_string = "SeedOssForCausalLM"

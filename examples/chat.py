@@ -22,9 +22,6 @@ def main(args):
 
     user_name = args.user_name
     bot_name = args.bot_name
-    prompt_format = prompt_formats[args.mode](user_name, bot_name)
-    system_prompt = prompt_format.default_system_prompt(args.think) if not args.system_prompt else args.system_prompt
-    add_bos = prompt_format.add_bos()
     max_response_tokens = args.max_response_tokens
     multiline = args.multiline
     show_tps = args.show_tps
@@ -35,6 +32,15 @@ def main(args):
     else:
         read_input_fn = read_input_ptk
         streamer_cm = Streamer_rich
+
+    # Prompt format
+    prompt_format = prompt_formats[args.mode](user_name, bot_name)
+    spc = {}
+    if args.think_budget is not None:
+        spc["thinking_budget"] = args.think_budget
+    prompt_format.set_special(spc)
+    system_prompt = prompt_format.default_system_prompt(args.think) if not args.system_prompt else args.system_prompt
+    add_bos = prompt_format.add_bos()
 
     # Load model
     model, config, cache, tokenizer = model_init.init(args)
@@ -284,6 +290,7 @@ if __name__ == "__main__":
     parser.add_argument("-basic", "--basic_console", action = "store_true", help = "Use basic console output (no markdown and fancy prompt input")
     parser.add_argument("-think", "--think", action = "store_true", help = "Use (very simplistic) reasoning template and formatting")
     parser.add_argument("-no_think", "--no_think", action = "store_true", help = "Suppress think tags (won't necessarily stop reasoning model from reasoning anyway)")
+    parser.add_argument("-think_budget", "--think_budget", type = int, help = "Thinking budget for supported models", default = None)
     parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context with every new prompt")
     parser.add_argument("-temp", "--temperature", type = float, help = "Sampling temperature", default = 0.8)
     parser.add_argument("-temp_first", "--temperature_first", action = "store_true", help = "Apply temperature before truncation")
