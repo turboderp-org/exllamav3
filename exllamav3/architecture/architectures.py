@@ -19,6 +19,7 @@ from .phi3 import Phi3Model
 from .qwen2 import Qwen2Model
 from .qwen3 import Qwen3Model
 from .qwen3_moe import Qwen3MoeModel
+from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
 
 ARCHITECTURES = {
@@ -49,6 +50,7 @@ ARCHITECTURES = {
         Qwen2Model,
         Qwen3Model,
         Qwen3MoeModel,
+        SeedOssModel,
         SmolLM3Model,
     ]
 }
