@@ -58,7 +58,7 @@ def main(args):
     vocab_size = tokenizer.actual_vocab_size
 
     # Dataset
-    eval_ids = get_test_tokens(tokenizer, args.rows, eval_len = args.length).cuda()
+    eval_ids = get_test_tokens(tokenizer, args.rows, eval_len = args.length).to(model.device)
 
     # Test
     logprob_sum = 0.0
