@@ -546,7 +546,7 @@ class Attention(Module):
         return o
 
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         storage += self.q_proj.storage_size()
         storage += self.k_proj.storage_size()
@@ -636,7 +636,8 @@ class Attention(Module):
         head_dim = exported["kwargs"]["head_dim"]
         n_gqa = exported["n_gqa"]
         device = local_context["device"]
-        first, last = plan[key]
+        first, last, unit = plan[key]
+        assert unit == "heads"
         num_kv_heads = last - first
         num_q_heads = num_kv_heads * n_gqa
 

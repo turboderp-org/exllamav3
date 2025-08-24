@@ -113,10 +113,10 @@ class Module(ABC):
     def get_name(self):
         return self.__class__.__name__
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         tpa_list = []
         for m in self.modules:
-            tpa_list += m.make_tp_allocation()
+            tpa_list += m.make_tp_allocation(options)
         return tpa_list
 
     def tp_export(self, plan, producer):

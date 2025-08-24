@@ -232,7 +232,8 @@ class Model_TPMixin:
         modules: list,
         dev_limits: dict | None,
         tp_backend: str,
-        verbose: bool
+        verbose: bool,
+        tp_options: dict,
     ):
         assert use_per_device is None or reserve_per_device is None
         if dev_limits is None: dev_limits = {}
@@ -265,7 +266,7 @@ class Model_TPMixin:
         # Define TP split
         components = []
         for m in modules:
-            components += m.make_tp_allocation()
+            components += m.make_tp_allocation(tp_options)
         allocator = TPAllocator(
             components,
             num_tokens = max_chunk_size,

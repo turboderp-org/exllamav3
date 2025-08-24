@@ -349,7 +349,7 @@ class Linear(Module):
         return 2 * self.in_features * self.out_features
 
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         storage += self.storage_size()
         overhead_d = self.out_features * (self.out_dtype or torch.half).itemsize
@@ -409,6 +409,7 @@ class Linear(Module):
     @staticmethod
     def tp_import(local_context, exported, plan):
         key = exported["kwargs"]["key"]
-        first, last = plan[key] if key in plan else (None, None)
+        first, last, unit = plan[key] if key in plan else (None, None, "channels")
+        assert unit == "channels"
         split = (True, first, last) if first is not None else None
         return Linear.tp_import_split(local_context, exported, plan, split)

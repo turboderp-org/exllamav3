@@ -155,6 +155,6 @@ class TPAllocator:
             for dev in range(self.num_devices):
                 idx_beg = idx_end
                 idx_end += c.current_split[dev]
-                plan[dev][key] = (idx_beg * cw, idx_end * cw)
+                plan[dev][key] = (idx_beg * cw, idx_end * cw, c.channel_unit)
         self.plan = plan
         return self.plan

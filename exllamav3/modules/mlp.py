@@ -174,7 +174,7 @@ class MLP(Module):
         return to2(d, out_dtype, self.out_dtype)
 
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         ims = min(self.intermediate_size, self.intermediate_split_size)
         for u in self.ups: storage += u.storage_size()
@@ -232,7 +232,7 @@ class MLP(Module):
     def tp_import(local_context, exported, plan, **kwargs):
         key = exported["kwargs"]["key"]
         device = local_context["device"]
-        first, last = plan[key]
+        first, last, unit = plan[key]
         num_slices = len(exported["ups"])
 
         if first >= last:
@@ -249,6 +249,7 @@ class MLP(Module):
                 if exported.get(name) else None
 
         if num_slices == 1:
+            assert unit == "channels"
             u_split = (True, first, last)
             d_split = (False, first, last)
             module = MLP(
@@ -259,6 +260,7 @@ class MLP(Module):
             )
 
         elif num_slices > 1:
+            assert unit == "slices"
             module = MLP(
                 config = None,
                 **exported["kwargs"],
@@ -538,7 +540,7 @@ class GatedMLP(Module):
         return to2(d, out_dtype, self.out_dtype)
 
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         ims = min(self.intermediate_size, self.intermediate_split_size)
         for g in self.gates: storage += g.storage_size()
@@ -599,7 +601,7 @@ class GatedMLP(Module):
     def tp_import(local_context, exported, plan, **kwargs):
         key = exported["kwargs"]["key"]
         device = local_context["device"]
-        first, last = plan[key]
+        first, last, unit = plan[key]
         num_slices = len(exported["gates"])
 
         if first >= last:
@@ -616,6 +618,7 @@ class GatedMLP(Module):
                 if exported.get(name) else None
 
         if num_slices == 1:
+            assert unit == "channels"
             gu_split = (True, first, last)
             d_split = (False, first, last)
             exported["kwargs"]["intermediate_size"] = last - first
@@ -628,6 +631,7 @@ class GatedMLP(Module):
             )
 
         elif num_slices > 1:
+            assert unit == "slices"
             module = GatedMLP(
                 config = None,
                 **exported["kwargs"],

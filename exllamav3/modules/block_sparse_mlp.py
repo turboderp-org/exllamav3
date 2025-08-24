@@ -419,11 +419,15 @@ class BlockSparseMLP(Module):
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
 
+        # Empty slice
+        if self.intermediate_size == 0 or self.num_local_experts == 0:
+            final_hidden_states = torch.zeros_like(x, dtype = self.out_dtype)
+
         # Torch path
-        if bsz > 1 or not self.is_quantized:
+        elif bsz > 1 or not self.is_quantized:
             final_hidden_states = torch.zeros_like(y, dtype = self.out_dtype)
 
-            if self.routing_device is None:
+            if self.routing_device is None or self.num_local_experts == self.num_experts:
                 expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
             else:
                 # TODO: profile, maybe optimize
@@ -460,7 +464,6 @@ class BlockSparseMLP(Module):
         # Fused path
         # TODO: Find good solution for 1 < bsz < 32
         else:
-
             y = y.unsqueeze(0)
 
             cfg = self.experts_cfg
@@ -530,7 +533,10 @@ class BlockSparseMLP(Module):
 
         # Output reduction
         if self.tp_reduce:
-            params["backend"].all_reduce(final_hidden_states, self.num_local_experts > 0 or bool(self.shared_experts))
+            params["backend"].all_reduce(
+                final_hidden_states,
+                (self.intermediate_size > 0 and self.num_local_experts > 0) or bool(self.shared_experts)
+            )
 
         return final_hidden_states
 
@@ -543,7 +549,7 @@ class BlockSparseMLP(Module):
         return t
 
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         storage += self.routing_gate.storage_size()
         for g in self.gates: storage += g.storage_size()
@@ -559,21 +565,22 @@ class BlockSparseMLP(Module):
             self.ups[0].recons_size(),
             self.downs[0].recons_size()
         )
+        use_tp_split = options.get("moe_tensor_split", False)
         tpa = TPAllocation(
             key = self.key,
-            channel_width = 1,
-            channel_unit = "experts",
+            channel_width = 128 if use_tp_split else 1,
+            channel_unit = "channels" if use_tp_split else "experts",
             storage_per_device = 0,
             storage_to_split = storage,
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
             recons_temp = recons,
-            channels_to_split = self.num_experts,
+            channels_to_split = self.intermediate_size // 128 if use_tp_split else self.num_experts,
             limit_key = "moe"
         )
         tpa_list = [tpa]
         if self.shared_experts:
-            tpa_list += self.shared_experts.make_tp_allocation()
+            tpa_list += self.shared_experts.make_tp_allocation(options)
         return tpa_list
 
 
@@ -617,8 +624,7 @@ class BlockSparseMLP(Module):
         key = exported["kwargs"]["key"]
         device = local_context["device"]
         output_device = local_context["output_device"]
-        first, last = plan[key]
-        num_local_experts = last - first
+        first, last, unit = plan[key]
 
         def _import(name):
             nonlocal exported, plan
@@ -635,23 +641,52 @@ class BlockSparseMLP(Module):
             return exported[name][i]["cls"].tp_import(local_context, exported[name][i], plan) \
                 if exported.get(name) else None
 
+        def _import_i_split(name, i, split):
+            nonlocal exported, plan
+            return exported[name][i]["cls"].tp_import_split(local_context, exported[name][i], plan, split) \
+                if exported.get(name) else None
+
+        # Tensor parallel
+        if unit == "channels":
+            num_local_experts = exported["kwargs"]["num_experts"]
+            gu_split = (True, first, last)
+            d_split = (False, first, last)
+            exported["kwargs"]["intermediate_size"] = last - first
+            gates = [_import_i_split("gates", i, gu_split) for i in range(num_local_experts)]
+            ups = [_import_i_split("ups", i, gu_split) for i in range(num_local_experts)]
+            downs = [_import_i_split("downs", i, d_split) for i in range(num_local_experts)]
+            routing_first = 0
+            routing_last = num_local_experts
+
+        # Expert parallel
+        elif unit == "experts":
+            num_local_experts = last - first
+            gates = [_import_i("gates", i) for i in range(first, last)]
+            ups = [_import_i("ups", i) for i in range(first, last)]
+            downs = [_import_i("downs", i) for i in range(first, last)]
+            routing_first = first
+            routing_last = last
+
+        else:
+            assert False
+
         module = BlockSparseMLP(
             config = None,
             **exported["kwargs"],
             num_local_experts = num_local_experts,
-            gates = [_import_i("gates", i) for i in range(first, last)],
-            ups = [_import_i("ups", i) for i in range(first, last)],
-            downs = [_import_i("downs", i) for i in range(first, last)],
+            gates = gates,
+            ups = ups,
+            downs = downs,
             shared_experts = _import_no_reduce("shared_experts"),
             routing_gate = _import("routing_gate") if device == output_device else None,
-            routing_first = first,
-            routing_last = last,
+            routing_first = routing_first,
+            routing_last = routing_last,
             routing_device = output_device,
         )
 
         module.device = device
         module.e_score_correction_bias = consumer.recv(exported["e_score_correction_bias"], cuda = True)
-        if num_local_experts > 0:
+        if unit == "channels" or num_local_experts > 0:
             module.load_local()
         if module.routing_gate is not None:
             module.load_routing()

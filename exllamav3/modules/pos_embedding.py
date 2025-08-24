@@ -76,5 +76,5 @@ class PosEmbedding(Module):
 
         return to2(x, out_dtype, self.out_dtype)
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         return []
