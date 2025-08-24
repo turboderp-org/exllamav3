@@ -38,8 +38,8 @@ class Model_TPMixin:
 
         # Must use spawn method to avoid CUDA errors. Docs say this should always be set by __main__ but seems
         # to work okay here
-        multiprocessing.set_start_method('spawn')
-        torch.multiprocessing.set_sharing_strategy('file_system')
+        multiprocessing.set_start_method("spawn", force = True)
+        torch.multiprocessing.set_sharing_strategy("file_system")
 
         # Backend args
         self.tp_backend = tp_backend
@@ -113,7 +113,8 @@ class Model_TPMixin:
         log_tp(None, "Destroying TP context")
 
         # Destroy process group in child processes
-        for device, (parent_conn, child) in enumerate(zip(self.mp_parent_conn, self.mp_children)):
+        for device, (parent_conn, child) in \
+                zip(list(range(len(self.mp_parent_conn))) + [-1], zip(self.mp_parent_conn, self.mp_children)):
             if device == self.tp_output_device or child is None:
                 continue
             if child.is_alive():
@@ -121,6 +122,7 @@ class Model_TPMixin:
                     log_tp(device, f"Closing backend, device {device}")
                     parent_conn.send("quit")
                 except Exception:
+                    log_tp(device, f"Exception while closing backend, device {device}")
                     pass
 
         # Destroy process group in main process. Called last since it blocks the main process
