@@ -30,7 +30,7 @@ __device__ inline void ptx_mma_m8n8k4
     float* c = reinterpret_cast<float*>(&frag_c);
     const float* d = reinterpret_cast<const float*>(&frag_c);
 
-    asm volatile
+    asm
     (
         "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%12,%13,%14,%15,%16,%17,%18,%19};\n"
@@ -60,7 +60,7 @@ __device__ inline void ptx_mma_m16n8k16
     float* c = reinterpret_cast<float*>(&frag_c);
     const float* d = reinterpret_cast<const float*>(&frag_c);
 
-    asm volatile
+    asm
     (
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
@@ -85,7 +85,7 @@ __device__ inline void ptx_mma_m16n8k16
     uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
     const uint32_t* d = reinterpret_cast<const uint32_t*>(&frag_c);
 
-    asm volatile
+    asm
     (
         "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
         "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%9};\n"
