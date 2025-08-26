@@ -1,13 +1,43 @@
 
 # <img src="doc/cat.png" width="40"> ExLlamaV3
 
-## Why?
+ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs. Headline features:
 
-As the name implies, the original intention for ExLlama was to run inference on quantized Llama models. ExLlamaV2 was able to support a number of other architectures by treating every new model as (more or less) a Llama variant with optional features. However, as new models are increasingly moving away from the basic transformer template, this approach is no longer sustainable.  
+- New [EXL3](doc/exl3.md) quantization format based on QTIP
+- Flexible tensor-parallel and expert-parallel inference for consumer hardware setups
+- OpenAI-compatible server provided via [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) 
+- Continuous, dynamic batching
+- HF Transformers plugin (see [here](examples/transformers_integration.py))
+- HF model support (see [supported architectures](#architecture-support))
+- Speculative decoding
+- 2-8 bit cache quantization
+- Multimodal support
 
-Additionally, ExLlamaV2 is largely designed to run in a single process and CUDA doesn't like this very much when spreading a workload across multiple GPUs. It's a fundamental design feature in the CUDA runtime, and it has become a major obstacle to tensor-parallel inference, demand for which seems to keep increasing. This shortcoming is not easily addressed without a rewrite. Moreover, the **EXL2** format doesn't lend itself well to parallel inference in the first place due its input channel permutation.
+The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://github.com/theroyallab/tabbyAPI/), which provides an OpenAI-compatible API for local or remote inference, with extended features like HF model downloading, embedding model support and support for HF Jinja2 chat templates.
 
-Aside from lifting a few of the most successful features from V2 (such as the generator), ExLlamaV3 is largely rewritten from scratch to provide a cleaner, more modular framework for supporting newer architectures. It also introduces a new SOTA quantization format based on [**QTIP**](https://github.com/Cornell-RelaxML/qtip) (see below).
+## Architecture support
+
+- **AFM** (ArceeForCausalLM)
+- **Command-R** etc. (CohereForCausalLM)
+- **Command-A**, **Command-R7B**, **Command-R+** etc. (Cohere2ForCausalLM)
+- **DeciLM**, **Nemotron** (DeciLMForCausalLM)
+- **dots.llm1** (Dots1ForCausalLM)
+- **ERNIE 4.5** (Ernie4_5_ForCausalLM, Ernie4_5_MoeForCausalLM)
+- **EXAONE 4.0** (Exaone4ForCausalLM)
+- **Gemma 2** (Gemma2ForCausalLM)
+- **Gemma 3** (Gemma3ForCausalLM, Gemma3ForConditionalGeneration) *- multimodal*
+- **GLM 4**, **GLM 4.5**, **GLM 4.5-Air**, (Glm4ForCausalLM, Glm4MoeForCausalLM)
+- **Llama**, **Llama 2**, **Llama 3**, **Llama 3.1-Nemotron** etc. (LlamaForCausalLM)
+- **MiMo-RL** (MiMoForCausalLM)
+- **Mistral**, **Mistral 3** etc. (MistralForCausalLM, Mistral3ForConditionalGeneration) *- multimodal*
+- **Mixtral** (MixtralForCausalLM)
+- **Phi3**, **Phi4** (Phi3ForCausalLM)
+- **Qwen 2**, **Qwen 2.5** (Qwen2ForCausalLM)
+- **Qwen 3** (Qwen3ForCausalLM, Qwen3MoeForCausalLM)
+- **SmolLM** (SmolLM3ForCausalLM)
+
+Always adding more, stay tuned.
+
 
 ## What's missing?
 
@@ -19,26 +49,58 @@ Currently on the to-do list:
 - More sampling functions
 - More quantization modes (FP4 etc.)
 
-As for what is implemented, expect that some things may be a little broken at first. Please be patient and/or contribute. 👉👈 
+As for what is implemented, expect that some things may be a little broken at first. Please be patient, raise issues and/or contribute. 👉👈 
+
 
 ## How to?
 
-### Installation
+[TabbyAPI](https://github.com/theroyallab/tabbyAPI/) has a startup script that manages and installs prerequisites if you want to get started quickly with inference in an OAI-compatible client. 
 
-Detailed installation instructions are coming soon, along with prebuilt wheels. For the time being, start by making sure you have the appropriate version of [PyTorch](https://pytorch.org/get-started/locally/) installed (CUDA 12.4 or later). Then:
+Otherwise, start by making sure you have the appropriate version of [PyTorch](https://pytorch.org/get-started/locally/) installed (CUDA 12.4 or later) since the Torch dependency is not automatically handled by `pip`. Then pick a method below:
+
+### Method 1: Installing from prebuilt wheel (recommended if you're unsure)
+
+Pick a wheel from the [releases page](https://github.com/turboderp-org/exllamav3/releases), then e.g.:
 
 ```sh
-# Full installation
-pip install -r requirements.txt
-pip install .
-
-# JIT mode
-EXLLAMA_NOCOMPILE=1 pip install . 
+pip install https://github.com/turboderp-org/exllamav3/releases/download/v0.0.6/exllamav3-0.0.6+cu128.torch2.8.0-cp313-cp313-linux_x86_64.whl
 ```
 
-Note that the included scripts can run in JIT mode from the repo directory without installing the library. Until there are precompiled wheels you will also need the CUDA Toolkit installed. 
+### Method 2: Installing from PyPi:
 
-### Conversion
+```sh
+pip install exllamav3
+```
+Note that the PyPi package does not contain a prebuilt extension and requires the CUDA toolkit and build prerequisites (i.e. VS Build Tools on Windows, gcc on Linux, `python-dev` headers etc.).    
+
+### Method 3: Building from source
+
+```sh
+# Clone the repo
+git clone https://github.com/turboderp-org/exllamav3
+cd exllamav3
+
+# (Optional) switch to dev branch for latest in-progress features
+git checkout dev
+
+# Install requirements (make sure you install Torch separately)
+pip install -r requirements.txt
+```
+
+At this point you should be able to run the conversion, eval and example scripts from the main repo directory, e.g. `python convert.py -i ...`
+
+To install the library for the active venv, run from the repo directory:
+
+```sh
+pip install .
+```
+
+Relevant env variables for building:
+- `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for compilation. Set this to a reasonable value like 4 in that case.  
+- `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch will build/load it at runtime instead.
+
+
+## Conversion
 
 To convert a model to EXL3 format, use:
 
@@ -47,17 +109,18 @@ To convert a model to EXL3 format, use:
 python convert.py -i <input_dir> -o <output_dir> -w <working_dir> -b <bitrate>
 
 # Resume an interrupted quant job
-convert.py -w <working_dir> -r
+python convert.py -w <working_dir> -r
 
 # More options
-convert.py -h
+python convert.py -h
 ```
 
 The working directory is temporary storage for state checkpoints and for storing quantized tensors until the converted model can be compiled. It should have enough free space to store an entire copy of the output model. Note that while EXL2 conversion by default resumes an interrupted job when pointed to an existing folder, EXL3 needs you to explicitly resume with the `-r`/`--resume` argument.    
 
 See [here](doc/convert.md) for more information.
 
-### Examples
+
+## Examples
 
 A number of example scripts are provided to showcase the features of the backend and generator. Some of them have hardcoded model paths and should be edited before you run them, but there is a simple CLI chatbot that you can start with:
 
@@ -66,6 +129,9 @@ python examples/chat.py -m <input_dir> -mode <prompt_mode>
 
 # E.g.:
 python examples/chat.py -m /mnt/models/llama3.1-8b-instruct-exl3 -mode llama3
+
+# Wealth of options
+python examples/chat.py -h
 ```
 
 ## EXL3 quantization
@@ -86,7 +152,21 @@ There are some benchmark results [here](doc/exl3.md), and a full writeup on the 
 
 Fun fact: Llama-3.1-70B-EXL3 is coherent at 1.6 bpw. With the output layer quantized to 3 bpw and a 4096-token cache, inference is possible in under 16 GB of VRAM. 
 
-A selection of EXL3-quantized models is available on [🤗 Hugging Face](https://huggingface.co/collections/turboderp/exl3-models-67f2dfe530f05cb9f596d21a).
+
+### Community
+
+You are always welcome to join the [ExLlama discord server](https://discord.gg/NSFwVuCjRq) ←🎮  
+
+
+### 🤗 HuggingFace repos
+
+A selection of EXL3-quantized models is available [here](https://huggingface.co/collections/turboderp/exl3-models-67f2dfe530f05cb9f596d21a). Also shout out the following lovely people:
+ 
+- [ArtusDev](https://huggingface.co/ArtusDev)
+- [MikeRoz](https://huggingface.co/MikeRoz) 
+- [MetaphoricalCode](https://huggingface.co/MetaphoricalCode) 
+- [Ready.Art](https://huggingface.co/ReadyArt) 
+- [isogen](https://huggingface.co/isogen/models)
 
 
 ## Acknowledgements
