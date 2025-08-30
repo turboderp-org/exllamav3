@@ -56,20 +56,23 @@ void exl3_gemm_kernel_inner
     int lane_id = t % 32;
 
     // Dimensions
-    Dim3 size = { size_m, size_k, size_n };
-    Dim3 tiles = { CEIL_DIVIDE(size_m, TILESIZE_M), size_k / TILESIZE_K, size_n / TILESIZE_N };
-    Dim3 blocks = { 1, tiles.k * TILEBLOCKS_K, tiles.n * TILEBLOCKS_N };
+    int tiles_m = CEIL_DIVIDE(size_m, TILESIZE_M);
+    int tiles_k = size_k / TILESIZE_K;
+    int tiles_n = size_n / TILESIZE_N;
+    int blocks_m = 1;
+    int blocks_k = tiles_k * TILEBLOCKS_K;
+    int blocks_n = tiles_n * TILEBLOCKS_N;
 
     // Start and end index of current slice, must span at least one tile
     int num_slices = gridDim.x;
-    int slice_beg = tiles.numel_b() * blockIdx.x / num_slices;
-    int slice_end = tiles.numel_b() * (blockIdx.x + 1) / num_slices;
+    int slice_beg = tiles_k * tiles_n * blockIdx.x / num_slices;
+    int slice_end = tiles_k * tiles_n * (blockIdx.x + 1) / num_slices;
     int slice_len = slice_end - slice_beg;
     if (slice_len < 1) return;
 
     auto index_m = [&] (int slice_i) { return 0; }; //blockIdx.y; };
-    auto index_k = [&] (int slice_i) { return (slice_i % tiles.k); };
-    auto index_n = [&] (int slice_i) { return (slice_i / tiles.k); };
+    auto index_k = [&] (int slice_i) { return (slice_i % tiles_k); };
+    auto index_n = [&] (int slice_i) { return (slice_i / tiles_k); };
 
     // Batch dimension
     int slice_m = index_m(slice_beg);
@@ -97,7 +100,7 @@ void exl3_gemm_kernel_inner
         pred_a_gl[i] = m < max_m;
     }
 
-    int gl_b_stride_k = blocks.n * TILEBLOCKS_K * 256 / 16 * bits;
+    int gl_b_stride_k = blocks_n * TILEBLOCKS_K * 256 / 16 * bits;
     const int gl_b_stride_n = TILEBLOCKS_N * 256 / 16 * bits;
     const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;
     const uint16_t* gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
@@ -110,7 +113,7 @@ void exl3_gemm_kernel_inner
     {
         int n = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_b_stride_n / 8);
         int k = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_b_stride_n / 8);
-        load_b_gl[i] = k * blocks.n * 256 / 16 * bits / 8 * k + n;
+        load_b_gl[i] = k * blocks_n * 256 / 16 * bits / 8 * k + n;
         pred_b_gl[i] = i * EXL3_GEMM_BASE_THREADS + t < sh0_b_stride_k / 8;
     }
 
@@ -123,7 +126,7 @@ void exl3_gemm_kernel_inner
         sh0_a_ptr = sh_a + stage * sh_a_stage_size;
         sh0_b_ptr = sh_b + stage * sh_b_stage_size;
 
-        if (slice0_k >= tiles.k)
+        if (slice0_k >= tiles_k)
         {
             slice0_k = 0;
             slice0_n++;
@@ -154,7 +157,7 @@ void exl3_gemm_kernel_inner
         sh1_a_ptr = sh_a + stage * sh_a_stage_size;
         sh1_b_ptr = sh_b + stage * sh_b_stage_size;
 
-        if (slice1_k >= tiles.k)
+        if (slice1_k >= tiles_k)
         {
             slice1_k = 0;
             slice1_n++;
@@ -182,7 +185,7 @@ void exl3_gemm_kernel_inner
         slice2_k++;
         slice2_iters--;
 
-        if (slice2_k >= tiles.k)
+        if (slice2_k >= tiles_k)
         {
             slice2_k = 0;
             slice2_k0 = 0;
@@ -255,16 +258,13 @@ void exl3_gemm_kernel_inner
         }
 
         // B fragments
-        int r0 = lane_id / 2;
-        int c0 = (lane_id % 2) * 8;
-
         #pragma unroll
         for (int n2 = 0; n2 < FRAGS_N_PER_WARP; n2 += 2)
         {
             int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
             const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * 256 / 16 * bits);
 
-            dq_dispatch<bits, cb>(shb, r0 * 16 + c0, frag_b[buf][n2], frag_b[buf][n2 + 1], mult);
+            dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1], mult);
         }
 
         __syncthreads();
@@ -343,14 +343,14 @@ void exl3_gemm_kernel_inner
 
         // Process (partial) slices within column in reverse order so the threadblock doing the bottom slice is
         // free to proceed to the next column right away
-        int lock_i = tiles.k - slice2_k - 1;
+        int lock_i = tiles_k - slice2_k - 1;
         int lock_d = slice2_k - slice2_k0 + 1;
-        int* lock = &locks[slice_m * blocks.n + slice2_n];
+        int* lock = &locks[slice_m * blocks_n + slice2_n];
 
         barrier_acquire(lock, lock_i);
 
         bool first = lock_i == 0;
-        bool last = lock_i + lock_d == tiles.k;
+        bool last = lock_i + lock_d == tiles_k;
 
         int n0 = warp_id * FRAGS_N_PER_WARP;
 
@@ -401,7 +401,7 @@ void exl3_gemm_kernel_inner
             }
         }
 
-        // All but last threadblock in column threadblocks write the intermediate result to global memory
+        // All but last threadblock in column write the intermediate result to global memory
         if (!sub_k && !last)
         {
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
@@ -528,7 +528,7 @@ void exl3_gemm_kernel_inner
         wait_stage(); \
         load_frags(_load); \
         matmul(_mul); \
-        if (slice2_k == tiles.k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; } \
+        if (slice2_k == tiles_k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; } \
         advance2(); \
         if (!slice2_iters) break; \
 
