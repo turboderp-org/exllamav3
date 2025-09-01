@@ -44,7 +44,9 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
         if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
         else                  C_ = (void*) (((half*) C_) + 16 * size_n);
         size_m_ -= 16;
-        grid.sync();
+
+        if (size_m_ > 0 || svh)
+            grid.sync();
     }
 
     if (svh)

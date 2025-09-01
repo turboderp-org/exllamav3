@@ -355,11 +355,12 @@ void exl3_gemm_kernel_inner
         int n0 = warp_id * FRAGS_N_PER_WARP;
 
         // Second and subsequent threadblocks in column read back the intermediate sum from global memory
-        // TODO: Use an intermediate layout to make these writes coalesce
         if (!sub_k && !first)
         {
+            #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             {
+                #pragma unroll
                 for (int m = 0; m < FRAGS_M; ++m)
                 {
                     int r0 = lane_id / 4 + 16 * m;
@@ -404,8 +405,10 @@ void exl3_gemm_kernel_inner
         // All but last threadblock in column write the intermediate result to global memory
         if (!sub_k && !last)
         {
+            #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             {
+                #pragma unroll
                 for (int m = 0; m < FRAGS_M; ++m)
                 {
                     int r0 = lane_id / 4 + 16 * m;
@@ -448,8 +451,10 @@ void exl3_gemm_kernel_inner
         // Last block writes in row-major format
         if (!sub_k && last)
         {
+            #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             {
+                #pragma unroll
                 for (int m = 0; m < FRAGS_M; ++m)
                 {
                     int r0 = lane_id / 4 + 16 * m;
@@ -504,12 +509,15 @@ void exl3_gemm_kernel_inner
     // Perform tensor core matmul on current tile
     auto matmul = [&] (int buf)
     {
+        #pragma unroll
         for (int m = 0; m < FRAGS_M; ++m)
+            #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 ptx_mma_m16n8k16(frag_a[buf][m], frag_b[buf][n], frag_c[m][n]);
     };
 
     // Start global to shared pipeline
+    #pragma unroll
     for (int i = 0; i < SH_STAGES - 1; ++i)
         async_load_gl();
     wait_stage();
