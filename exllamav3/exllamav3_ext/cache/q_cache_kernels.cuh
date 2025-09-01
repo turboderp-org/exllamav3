@@ -1,110 +1,117 @@
+#pragma once
 
-__device__ inline float shuffle_had_fx32(float v, int lane_id)
+#define MAX_WARPS 8
+#define ITER_PER_TB 32
+#define CQ_PAGE_SIZE 256
+
+
+__device__ __forceinline__ float shuffle_had_fx32(float v, int lane_id)
 {
+    #pragma unroll
     for (int i = 1; i < 32; i <<= 1)
     {
         float pv = __shfl_xor_sync(0xffffffff, v, i);
-        uint32_t* vi = reinterpret_cast<uint32_t*>(&v);
-        int32_t sfm = -static_cast<int16_t>(lane_id & i) >> 31;
-        *vi ^= (sfm & 0x80000000);
-        v = v + pv;
+        uint32_t vi = __float_as_uint(v);
+        int32_t sfm = -static_cast<int32_t>(lane_id & i) >> 31;
+        vi ^= (sfm & 0x80000000);
+        v = __uint_as_float(vi) + pv;
     }
     return v;
 }
 
-__device__ inline float shuffle_sum_fx32(float s)
+
+__device__ __forceinline__ float shuffle_sum_fx32(float s)
 {
+    #pragma unroll
     for (int i = 1; i < 32; i <<= 1)
         s += __shfl_xor_sync(0xffffffff, s, i);
     return s;
 }
 
-__device__ inline float shuffle_max_fx32(float s)
+
+__device__ __forceinline__ float shuffle_max_fx32(float s)
 {
+    #pragma unroll
     for (int i = 1; i < 32; i <<= 1)
         s = fmaxf(s, __shfl_xor_sync(0xffffffff, s, i));
     return s;
 }
 
-template <int bits>
-__device__ inline void quant_block
+
+template <int num_bits>
+__device__ __forceinline__ void quant_block
 (
-    const half* in,
-    uint32_t* out,
-    half* out_scales
+    const half* __restrict__ in,
+    uint32_t* __restrict__ out,
+    half* __restrict__ out_scales
 )
 {
-    int t = threadIdx.x % 32;
+    int t = threadIdx.x & 31;
 
     // Load, rotate and scale 32 values
     float v = __half2float(in[t]);
     v = shuffle_had_fx32(v, t);
-    v *= 0.17678f;  // 0.17678 = 1 / sqrt(32)
+    v *= 0.17677669529663688110f;  // = 1 / sqrt(32)
     float s = shuffle_max_fx32(fabsf(v) + 1e-10);
     half sh = __float2half_rn(s);
-    s = __half2float(sh);
     v /= s;
 
     // Quantize and clamp
-    int m = (1 << (bits - 1));
-    v *= __int2float_rn(m);
+    int m = (1 << (num_bits - 1));
+    constexpr float mf = (1 << (num_bits - 1));
+    v *= mf;
     int q = lrintf(v) + m;
-    q = max(min((1 << bits) - 1, q), 0);
+    q = max(min((1 << num_bits) - 1, q), 0);
 
     // Pack bits
-    register uint32_t bitplanes[bits];
-    for (int i = 0, mask = 1; mask <= m; ++i, mask <<= 1)
+    register uint32_t bitplanes[num_bits];
+    #pragma unroll
+    for (int i = 0, mask = 1; i < num_bits; ++i, mask <<= 1)
         bitplanes[i] = __ballot_sync(0xffffffff, q & mask);
 
     // Write output
-    if (t < bits)
+    if (t < num_bits)
         out[t] = bitplanes[t];
-    if (t == bits)
+    if (t == num_bits)
         *out_scales = sh;
 }
 
-#define MAX_WARPS 32
 
-template <int bits>
-__device__ inline void dequant_block
+template <int num_bits>
+__device__ __forceinline__ void dequant_block
 (
-    const uint32_t* in,
-    const half* in_scales,
-    half* out
+    const uint32_t* __restrict__ in,
+    const half* __restrict__ in_scales,
+    half* __restrict__ out
 )
 {
-    int t = threadIdx.x % 32;
-    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x & 31;
 
-    // Load scale and bitplanes
-    float s = __half2float(*in_scales);
-    __shared__ uint32_t bitplanes[MAX_WARPS][bits];
-    if (t < bits)
-        bitplanes[warp_id][t] = in[t];
-    __syncthreads();
+    // Load bitplanes
+    uint32_t word = (lane < num_bits) ? in[lane] : 0u;
 
-    // Unpack bits
-    int m = (1 << (bits - 1));
-    uint32_t mask = 1 << t;
-    int q = 0;
-    for (int i = 0; i < bits; ++i)
-        q |= ((bitplanes[warp_id][i] & mask) >> t) << i;
-
-    // Dequantize
-    float v = __int2float_rn(q - m);
-    v /= __int2float_rn(m);
+    // Dequantize at 1/sqrt(32) scale (preparing for Hadamard transform)
+    float mbit = -0.17677669529663688110f;
+    float v = -0.17677669529663688110f;
+    #pragma unroll
+    for (int i = num_bits - 1; i >= 0; --i)
+    {
+        uint32_t wi = __shfl_sync(0xffffffff, word, i);
+        v -= ((wi >> lane) & 1u) ? mbit : 0.0f;
+        mbit *= 0.5f;
+    }
 
     // Scale and rotate
-    v *= s;
-    v = shuffle_had_fx32(v, t);
-    v *= 0.17678f;  // 0.17678 = 1 / sqrt(32)
+    v *= __half2float(*in_scales);
+    v = shuffle_had_fx32(v, lane);
 
     // Store
-    out[t] = __float2half(v);
+    out[lane] = __float2half(v);
 }
 
+
 template <int bits>
-__global__ __launch_bounds__(1024)
+__global__ __launch_bounds__(MAX_WARPS * 32)
 void quant_cache_cont_kernel
 (
     const half* __restrict__ in,
@@ -127,7 +134,7 @@ constexpr auto quant_cache_cont_kernel_instances = std::array
 
 
 template <int bits>
-__global__ __launch_bounds__(32)
+__global__ __launch_bounds__(MAX_WARPS * 32)
 void dequant_cache_cont_kernel
 (
     const uint32_t* __restrict__ in,
@@ -150,7 +157,7 @@ constexpr auto dequant_cache_cont_kernel_instances = std::array
 
 
 template <int k_bits, int v_bits>
-__global__ __launch_bounds__(1024)
+__global__ __launch_bounds__(MAX_WARPS * 32)
 void quant_cache_paged_kernel
 (
     const half* __restrict__ k_in,
@@ -161,15 +168,15 @@ void quant_cache_paged_kernel
     half* __restrict__ v_out_scales,
     const uint32_t* __restrict__ cache_seqlens,
     const uint32_t* __restrict__ block_table,
-    int page_size,
+    // int page_size,
     int blocks_per_seq,
     int token_dim
 )
 {
     int batch_idx = blockIdx.z;
     int token_idx = blockIdx.y + cache_seqlens[batch_idx];
-    int page_idx = token_idx / page_size;
-    int token_pos = block_table[blocks_per_seq * batch_idx + page_idx] * page_size + (token_idx % page_size);
+    int page_idx = token_idx / CQ_PAGE_SIZE;
+    int token_pos = block_table[blocks_per_seq * batch_idx + page_idx] * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
     int sub_pos = (token_pos * token_dim + blockDim.x * blockIdx.x + threadIdx.x) / 32;
 
     quant_block<k_bits>(k_in + sub_pos * 32, k_out + sub_pos * k_bits, k_out_scales + sub_pos);
@@ -191,7 +198,7 @@ constexpr auto quant_cache_paged_kernel_instances = std::array
 
 
 template <int k_bits, int v_bits>
-__global__ __launch_bounds__(1024)
+__global__ __launch_bounds__(MAX_WARPS * 32)
 void dequant_cache_paged_kernel
 (
     const uint32_t* __restrict__ k_in,
@@ -202,23 +209,34 @@ void dequant_cache_paged_kernel
     half* __restrict__ v_out,
     const uint32_t* __restrict__ cache_seqlens,
     const uint32_t* __restrict__ block_table,
-    int page_size,
+    // int page_size,
     int pages_per_seq,
-    int warps_per_token
+    int warps_per_token,
+    int num_blocks
 )
 {
     int batch_idx = blockIdx.y;
-    int t_warp_id = (blockDim.x * blockIdx.x + threadIdx.x) / 32;
-    int token_idx = t_warp_id / warps_per_token;
+    int block_id = blockDim.x * (blockIdx.x * ITER_PER_TB);
+    int t_warp_id = (block_id + threadIdx.x) / 32;
+    int d_warp_id = blockDim.x / 32;
     int max_token_idx = cache_seqlens[batch_idx];
-    if (token_idx >= max_token_idx) return;
-    int page_idx = token_idx / page_size;
-    int page_sub = t_warp_id % (warps_per_token * page_size);
-    int mapped_page = block_table[batch_idx * pages_per_seq + page_idx];
-    int addr = mapped_page * page_size * warps_per_token + page_sub;
+    const uint32_t* b_block_table = block_table + batch_idx * pages_per_seq;
 
-    dequant_block<k_bits>(k_in + addr * k_bits, k_in_scales + addr, k_out + addr * 32);
-    dequant_block<v_bits>(v_in + addr * v_bits, v_in_scales + addr, v_out + addr * 32);
+    #pragma unroll 4
+    for (int iter = 0; iter < ITER_PER_TB; ++iter)
+    {
+        int token_idx = t_warp_id / warps_per_token;
+        if (token_idx >= max_token_idx) break;
+        int page_idx = token_idx / CQ_PAGE_SIZE;
+        int page_sub = t_warp_id - page_idx * CQ_PAGE_SIZE * warps_per_token;
+        int mapped_page = block_table[page_idx];
+        int addr = mapped_page * CQ_PAGE_SIZE * warps_per_token + page_sub;
+
+        dequant_block<k_bits>(k_in + addr * k_bits, k_in_scales + addr, k_out + addr * 32);
+        dequant_block<v_bits>(v_in + addr * v_bits, v_in_scales + addr, v_out + addr * 32);
+
+        t_warp_id += d_warp_id;
+    }
 }
 
 #define __(i, j) dequant_cache_paged_kernel<i, j>

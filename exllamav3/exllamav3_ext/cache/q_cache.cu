@@ -125,6 +125,7 @@ void quant_cache_paged
     TORCH_CHECK_DTYPE(v_out_scales, kHalf);
     TORCH_CHECK_SHAPES_FULL(k_in, v_in);
     TORCH_CHECK_SHAPES_FULL(k_out_scales, v_out_scales);
+    TORCH_CHECK(page_size == CQ_PAGE_SIZE, "Page size mismatch");
 
     int dim;
     if (k_in.dim() == 4)
@@ -161,7 +162,7 @@ void quant_cache_paged
         (half*) v_out_scales.data_ptr(),
         (const uint32_t*) cache_seqlens.data_ptr(),
         (const uint32_t*) block_table.data_ptr(),
-        page_size,
+        // page_size,
         blocks_per_seq,
         dim
     );
@@ -203,6 +204,7 @@ void dequant_cache_paged
     TORCH_CHECK_DTYPE(v_out, kHalf);
     TORCH_CHECK_SHAPES_FULL(k_in_scales, v_in_scales);
     TORCH_CHECK_SHAPES_FULL(k_out, v_out);
+    TORCH_CHECK(page_size == CQ_PAGE_SIZE, "Page size mismatch");
 
     int dim;
     if (k_out.dim() == 4)
@@ -219,8 +221,10 @@ void dequant_cache_paged
     int pages_per_seq = block_table.size(1);
     int warps_per_seq = pages_per_seq * page_size * warps_per_token;
 
-    int num_tb = CEIL_DIVIDE(32 * warps_per_seq, 1024);
-    int num_threads = MIN(32 * warps_per_seq, 1024);
+    int num_blocks = CEIL_DIVIDE(32 * warps_per_seq, 32 * MAX_WARPS);
+    int num_tb = CEIL_DIVIDE(num_blocks, ITER_PER_TB);
+
+    int num_threads = MIN(32 * warps_per_seq, 32 * MAX_WARPS);
     dim3 blocks(num_tb, bsz);
     dim3 threads(num_threads);
 
@@ -240,9 +244,10 @@ void dequant_cache_paged
         (half*) v_out.data_ptr(),
         (const uint32_t*) cache_seqlens.data_ptr(),
         (const uint32_t*) block_table.data_ptr(),
-        page_size,
+        // page_size,
         pages_per_seq,
-        warps_per_token
+        warps_per_token,
+        num_blocks
     );
     cuda_check(cudaPeekAtLastError());
 }
