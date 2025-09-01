@@ -110,6 +110,8 @@ void act_mul_kernel_h
         x2 = _silu(x2);
     else if constexpr (activation_type == ACT_GELU)
         x2 = _gelu(x2);
+    else if constexpr (activation_type == ACT_RELU2)
+        x2 = _relu2(x2);
 
     ((half2*) z)[idx] = __hmul2(x2, y2);
 }
