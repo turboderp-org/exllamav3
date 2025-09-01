@@ -7,6 +7,25 @@ __device__ inline half hreduce(half2 x)
     return __hadd(__low2half(x), __high2half(x));
 }
 
+__device__ inline float shuffle_had_f2x32(float& v, float& w, int lane_id)
+{
+    #pragma unroll
+    for (int i = 1; i < 32; i <<= 1)
+    {
+        uint64_t vw = ((uint64_t) __float_as_uint(v)) | (((uint64_t) __float_as_uint(w)) << 32);
+        uint64_t pvw = __shfl_xor_sync(0xffffffff, vw, i);
+        float pv = __uint_as_float((uint32_t) (pvw & 0xffffffff));
+        float pw = __uint_as_float((uint32_t) (pvw >> 32));
+        uint32_t vi = __float_as_uint(v);
+        uint32_t wi = __float_as_uint(w);
+        int32_t sfm = -static_cast<int16_t>(lane_id & i) >> 31;
+        vi ^= (sfm & 0x80000000);
+        wi ^= (sfm & 0x80000000);
+        v = __uint_as_float(vi) + pv;
+        w = __uint_as_float(wi) + pw;
+    }
+}
+
 __device__ inline float shuffle_had_fx32(float v, int lane_id)
 {
     for (int i = 1; i < 32; i <<= 1)
@@ -45,7 +64,7 @@ void had_hf_r_128_inner
     float r_scale
 )
 {
-    int t = threadIdx.x % 32;
+    int t = threadIdx.x & 31;
 
     // Load
     half4 v = ((half4*) input_ptr)[t];
@@ -64,18 +83,20 @@ void had_hf_r_128_inner
     float v1 = __half2float(__high2half(v.x));
     float v2 = __half2float(__low2half(v.y));
     float v3 = __half2float(__high2half(v.y));
-    float h0 = v0 + v1 + v2 + v3;
-    float h1 = v0 - v1 + v2 - v3;
-    float h2 = v0 + v1 - v2 - v3;
-    float h3 = v0 - v1 - v2 + v3;
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    float h0 = s0 + s1;
+    float h1 = d0 + d1;
+    float h2 = s0 - s1;
+    float h3 = d0 - d1;
 
     // 32 element had, warp shuffle
-    h0 = shuffle_had_fx32(h0, t) * r_scale;
-    h1 = shuffle_had_fx32(h1, t) * r_scale;
-    h2 = shuffle_had_fx32(h2, t) * r_scale;
-    h3 = shuffle_had_fx32(h3, t) * r_scale;
-    v.x = __floats2half2_rn(h0, h1);
-    v.y = __floats2half2_rn(h2, h3);
+    shuffle_had_f2x32(h0, h1, t);
+    shuffle_had_f2x32(h2, h3, t);
+    v.x = __floats2half2_rn(h0 * r_scale, h1 * r_scale);
+    v.y = __floats2half2_rn(h2 * r_scale, h3 * r_scale);
 
     // Post scale
     if (post_scale)
@@ -102,7 +123,7 @@ void had_ff_r_128_inner
     float r_scale
 )
 {
-    int t = threadIdx.x % 32;
+    int t = threadIdx.x & 31;
 
     // Load
     float4 v = ((float4*) input_ptr)[t];
@@ -123,16 +144,22 @@ void had_ff_r_128_inner
     float v1 = v.y;
     float v2 = v.z;
     float v3 = v.w;
-    float h0 = v0 + v1 + v2 + v3;
-    float h1 = v0 - v1 + v2 - v3;
-    float h2 = v0 + v1 - v2 - v3;
-    float h3 = v0 - v1 - v2 + v3;
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    v.x = s0 + s1;
+    v.y = d0 + d1;
+    v.z = s0 - s1;
+    v.w = d0 - d1;
 
     // 32 element had, warp shuffle
-    v.x = shuffle_had_fx32(h0, t) * r_scale;
-    v.y = shuffle_had_fx32(h1, t) * r_scale;
-    v.z = shuffle_had_fx32(h2, t) * r_scale;
-    v.w = shuffle_had_fx32(h3, t) * r_scale;
+    shuffle_had_f2x32(v.x, v.y, t);
+    shuffle_had_f2x32(v.z, v.w, t);
+    v.x *= r_scale;
+    v.y *= r_scale;
+    v.z *= r_scale;
+    v.w *= r_scale;
 
     // Post scale
     if (post_scale)
