@@ -34,7 +34,8 @@ __device__ inline float reduce(float sum, int warp_id, int lane_id)
     return sum;
 }
 
-__device__ inline void read_half4(float4& f4, const half4* addr, bool clamp)
+template <bool clamp>
+__device__ inline void read_half4(float4& f4, const half4* addr)
 {
     half4 h4;
     READ64(h4, addr);
@@ -42,7 +43,7 @@ __device__ inline void read_half4(float4& f4, const half4* addr, bool clamp)
     f4.y = HIGH_TO_FLOAT(h4.x);
     f4.z = LOW_TO_FLOAT(h4.y);
     f4.w = HIGH_TO_FLOAT(h4.y);
-    if (clamp)
+    if constexpr (clamp)
     {
         f4.x = CLAMP_FP16(f4.x);
         f4.y = CLAMP_FP16(f4.y);
@@ -120,7 +121,7 @@ void rms_norm_kernel
     for (int column = t; column < columns; column += NUM_THREADS)
     {
         float4 x4;
-        if constexpr (input_fp16) read_half4(x4, ((const half4*) (x + row * dim)) + column, true);
+        if constexpr (input_fp16) read_half4<true>(x4, ((const half4*) (x + row * dim)) + column);
         if constexpr (input_fp32) read_float4(x4, ((const float4*) (x + row * dim)) + column);
         sum = sum_sq4(sum, x4);
     }
@@ -133,11 +134,11 @@ void rms_norm_kernel
     for (int column = t; column < columns; column += NUM_THREADS)
     {
         float4 x4;
-        if constexpr (input_fp16) read_half4(x4, ((const half4*) (x + row * dim)) + column, true);
+        if constexpr (input_fp16) read_half4<true>(x4, ((const half4*) (x + row * dim)) + column);
         if constexpr (input_fp32) read_float4(x4, ((const float4*) (x + row * dim)) + column);
 
         float4 w4;
-        read_half4(w4, ((const half4*) w) + column, false);
+        read_half4<false>(w4, ((const half4*) w) + column);
         if (constant_bias != 0.0f)
         {
             w4.x += constant_bias;
