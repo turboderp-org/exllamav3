@@ -34,6 +34,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Phi3**, **Phi4** (Phi3ForCausalLM)
 - **Qwen 2**, **Qwen 2.5** (Qwen2ForCausalLM)
 - **Qwen 3** (Qwen3ForCausalLM, Qwen3MoeForCausalLM)
+- **Seed-OSS** (SeedOssForCausalLM)
 - **SmolLM** (SmolLM3ForCausalLM)
 
 Always adding more, stay tuned.
