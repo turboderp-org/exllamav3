@@ -96,6 +96,7 @@ class Phi3Model(Model):
                     key_o = "o_proj",
                     key_fused_qkv = "qkv_proj",
                     qmap = "block.attn",
+                    out_dtype = torch.float
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
@@ -112,6 +113,7 @@ class Phi3Model(Model):
                     key_down = "down_proj",
                     key_fused_gate_up = "gate_up_proj",
                     qmap = "block.mlp",
+                    out_dtype = torch.float,
                 ),
             )
             for idx in range(config.num_hidden_layers)
