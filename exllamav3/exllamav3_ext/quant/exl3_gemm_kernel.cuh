@@ -224,9 +224,10 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                     );
             }
         }
-
-        grid.sync();
     }
+
+    if (B_weights)
+        grid.sync();
 
     // Final reduction
     if (B_weights && blockIdx.z == 0)
