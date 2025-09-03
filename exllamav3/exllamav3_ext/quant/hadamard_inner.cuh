@@ -7,7 +7,36 @@ __device__ inline half hreduce(half2 x)
     return __hadd(__low2half(x), __high2half(x));
 }
 
-__device__ inline float shuffle_had_f2x32(float& v, float& w, int lane_id)
+__device__ inline void shuffle_had_f4x32(float& h0, float& h1, float& h2, float& h3, int lane_id)
+{
+    #pragma unroll
+    for (int i = 1; i < 32; i <<= 1)
+    {
+        uint32_t i0 = __float_as_uint(h0);
+        uint32_t i1 = __float_as_uint(h1);
+        uint32_t i2 = __float_as_uint(h2);
+        uint32_t i3 = __float_as_uint(h3);
+        uint64_t h01 =  (uint64_t) i0 | (((uint64_t) i1) << 32);
+        uint64_t h23 =  (uint64_t) i2 | (((uint64_t) i3) << 32);
+        uint64_t ph01 = __shfl_xor_sync(0xffffffff, h01, i);
+        uint64_t ph23 = __shfl_xor_sync(0xffffffff, h23, i);
+        float ph0 = __uint_as_float((uint32_t) (ph01 & 0xffffffff));
+        float ph1 = __uint_as_float((uint32_t) (ph01 >> 32));
+        float ph2 = __uint_as_float((uint32_t) (ph23 & 0xffffffff));
+        float ph3 = __uint_as_float((uint32_t) (ph23 >> 32));
+        int32_t sfm = -static_cast<int32_t>(lane_id & i) >> 31;
+        i0 ^= sfm & 0x80000000;
+        i1 ^= sfm & 0x80000000;
+        i2 ^= sfm & 0x80000000;
+        i3 ^= sfm & 0x80000000;
+        h0 = __uint_as_float(i0) + ph0;
+        h1 = __uint_as_float(i1) + ph1;
+        h2 = __uint_as_float(i2) + ph2;
+        h3 = __uint_as_float(i3) + ph3;
+    }
+}
+
+__device__ inline void shuffle_had_f2x32(float& v, float& w, int lane_id)
 {
     #pragma unroll
     for (int i = 1; i < 32; i <<= 1)
@@ -93,8 +122,7 @@ void had_hf_r_128_inner
     float h3 = d0 - d1;
 
     // 32 element had, warp shuffle
-    shuffle_had_f2x32(h0, h1, t);
-    shuffle_had_f2x32(h2, h3, t);
+    shuffle_had_f4x32(h0, h1, h2, h3, t);
     v.x = __floats2half2_rn(h0 * r_scale, h1 * r_scale);
     v.y = __floats2half2_rn(h2 * r_scale, h3 * r_scale);
 
