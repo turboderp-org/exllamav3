@@ -135,5 +135,7 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
     int* out_block_dim,
     int* out_shape_idx,
     int* out_num_sms,
-    int cb
+    int cb,
+    int bszm_in,
+    int bszm_out
 );

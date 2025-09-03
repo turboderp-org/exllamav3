@@ -19,10 +19,13 @@ namespace cg = cooperative_groups;
 #include "comp_units/exl3_comp_unit_7.cuh"
 #include "comp_units/exl3_comp_unit_8.cuh"
 
-int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits, bool multi)
+int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits, bool multi, int bszm_in, int bszm_out)
 {
     bool mod_256 = (size_n % 256 == 0);
     bool mod_512 = (size_n % 512 == 0);
+
+    size_k *= bszm_in;
+    size_n *= bszm_out;
 
     switch(cc)
     {
@@ -101,8 +104,7 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     int cb
 )
 {
-    int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, bits, false) : force_shape_idx;
-//    DBGI3(cc, size_n, shape_idx);
+    int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, bits, false, 1, 1) : force_shape_idx;
 
     TORCH_CHECK(shape_idx > 0, "exl3_gemm: no compatible kernel");
     if (out_shape_idx) *out_shape_idx = shape_idx;
@@ -163,10 +165,12 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
     int* out_block_dim,
     int* out_shape_idx,
     int* num_sms,
-    int cb
+    int cb,
+    int bszm_in,
+    int bszm_out
 )
 {
-    int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, bits, true) : force_shape_idx;
+    int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, bits, true, bszm_in, bszm_out) : force_shape_idx;
     TORCH_CHECK(shape_idx > 0, "exl3_mgemm: no compatible kernel");
     if (out_shape_idx) *out_shape_idx = shape_idx;
     if (out_block_dim) *out_block_dim = exl3_gemm_blockdim[shape_idx];
@@ -176,7 +180,7 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
     {
         int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
         int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
-        int max_slices = size_k / tilesize_k * size_n / tilesize_n / 24;
+        int max_slices = size_k / tilesize_k * size_n / tilesize_n / (*num_sms > 128 ? 20 : 24);
         *num_sms = MIN(max_slices, *num_sms);
     }
 

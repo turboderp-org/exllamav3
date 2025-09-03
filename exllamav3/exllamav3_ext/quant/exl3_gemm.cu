@@ -242,7 +242,7 @@ int exl3_mgemm
     (
         cc, size_m, size_k, size_n, K, c_fp32,
         force_shape_idx, &block_dim, &selected_shape,
-        &num_sms, cb
+        &num_sms, cb, bszm_in, bszm_out
     );
     if (!kernel) return 0;
 
