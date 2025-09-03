@@ -7,7 +7,7 @@ class PromptFormat:
         pass
     def default_system_prompt(self, think):
         raise NotImplementedError()
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         raise NotImplementedError()
     def add_bos(self):
         raise NotImplementedError()
@@ -28,7 +28,7 @@ class PromptFormat_raw(PromptFormat):
             (f"and a user named {self.user_name}." if self.user_name != "User" else """and a user.""")
         )
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = system_prompt + "\n"
         for (u, a) in messages:
             context += f"{self.user_name}: {u}\n"
@@ -64,7 +64,7 @@ class PromptFormat_llama3(PromptFormat):
             """guidelines and promote a safe and respectful interaction."""
         )
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = f"<|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
         for (u, a) in messages:
             context += f"<|start_header_id|>user<|end_header_id|>\n\n{u}<|eot_id|>"
@@ -94,7 +94,7 @@ class PromptFormat_chatml(PromptFormat):
             f"You are {self.bot_name}, a large language model. Answer as concisely as possible."
         )
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
         for (u, a) in messages:
             context += f"<|im_start|>user\n{u}<|im_end|>\n"
@@ -124,7 +124,7 @@ class PromptFormat_phi(PromptFormat):
             f"You are a helpful AI assistant."
         )
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = f"<|system|>\n{system_prompt}<|end|>\n"
         for (u, a) in messages:
             context += f"<|user|>\n{u}<|end|>\n"
@@ -153,7 +153,7 @@ class PromptFormat_glm(PromptFormat):
             f"You are a helpful AI assistant."
         )
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = f"[gMASK]<sop><|system|>\n{system_prompt}"
         for (u, a) in messages:
             context += f"<|user|>\n{u}"
@@ -182,7 +182,7 @@ class PromptFormat_mistral(PromptFormat):
             """You are a helpful AI assistant."""
         )
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = ""
         first = True
         for (u, a) in messages:
@@ -212,7 +212,7 @@ class PromptFormat_gemma(PromptFormat):
     def default_system_prompt(self, think):
         return ""
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = ""
         for (u, a) in messages:
             context += f"<start_of_turn>user\n"
@@ -240,7 +240,7 @@ class PromptFormat_reka(PromptFormat):
     def default_system_prompt(self, think):
         return ""
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = ""
         first = True
         for (u, a) in messages:
@@ -283,7 +283,7 @@ class PromptFormat_cohere(PromptFormat):
             "proper grammar and spelling."
         )
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = ""
         if system_prompt:
             context += "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>"
@@ -318,7 +318,7 @@ class PromptFormat_dots(PromptFormat):
     def default_system_prompt(self, think):
         return "You are a helpful assistant."
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = ""
         if system_prompt:
             context += "<|system|>"
@@ -357,7 +357,7 @@ class PromptFormat_ernie(PromptFormat):
     def default_system_prompt(self, think):
         return "You are a helpful assistant."
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = "<|begin_of_sentence|>"
         if system_prompt:
             context += system_prompt
@@ -420,7 +420,7 @@ class PromptFormat_smollm3(PromptFormat):
             sp += "You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\n"
         return sp
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
         for (u, a) in messages:
             context += f"<|im_start|>user\n{u}<|im_end|>\n"
@@ -474,7 +474,7 @@ class PromptFormat_commanda(PromptFormat):
             "and step by step, then answer.\n"
         )
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = ""
         if system_prompt:
             context += "<BOS_TOKEN><|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>"
@@ -514,7 +514,7 @@ class PromptFormat_exaone(PromptFormat):
             "You are a helpful AI assistant."
         )
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = ""
         if system_prompt:
             context += "[|system|]\n"
@@ -577,7 +577,7 @@ class PromptFormat_seed(PromptFormat):
                 "start answering the user's questions."
             )
 
-    def format(self, system_prompt, messages):
+    def format(self, system_prompt, messages, think):
         context = ""
         if system_prompt:
             context += "<seed:bos>system\n"
@@ -607,6 +607,54 @@ class PromptFormat_seed(PromptFormat):
         return "<seed:think>", "</seed:think>"
 
 
+class PromptFormat_apertus(PromptFormat):
+    description = "Apertus"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        from datetime import datetime
+        today_str = datetime.today().strftime("%Y-%m-%d")
+        return (
+            f"You are Apertus, a helpful assistant created by the SwissAI initiative.\n"
+            f"Knowledge cutoff: 2024-04\n"
+            f"Current date: {today_str}"
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = "<s>"
+        if system_prompt:
+            context += "<|system_start|>"
+            context += system_prompt
+            context += "<|system_end|>"
+        context += "<|developer_start|>Deliberation: "
+        context += "enabled" if think else "disabled"
+        context += "\nTool Capabilities: disabled<|developer_end|>"
+        for (u, a) in messages:
+            context += "<|user_start|>"
+            context += u
+            context += "<|user_end|>"
+            context += "<|assistant_start|>"
+            if a is not None:
+                context += a
+                context += "<|assistant_end|>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|assistant_end|>"),
+            "<|assistant_end|>",
+        ]
+
+    def thinktag(self):
+        return None, None
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -623,4 +671,5 @@ prompt_formats = {
     "commanda": PromptFormat_commanda,
     "exaone": PromptFormat_exaone,
     "seed": PromptFormat_seed,
+    "apertus": PromptFormat_apertus,
 }

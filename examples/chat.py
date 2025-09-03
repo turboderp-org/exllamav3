@@ -214,10 +214,10 @@ def main(args):
 
         # Tokenize context and trim from head if too long
         def get_input_ids(_prefix):
-            frm_context = prompt_format.format(system_prompt, context)
+            frm_context = prompt_format.format(system_prompt, context, args.think)
             if _prefix:
                 frm_context += prefix
-            elif args.think:
+            elif args.think and prompt_format.thinktag()[0] is not None:
                 frm_context += prompt_format.thinktag()[0]
             ids_ = tokenizer.encode(frm_context, add_bos = add_bos, encode_special_tokens = True)
             exp_len_ = ids_.shape[-1] + max_response_tokens + 1
@@ -241,13 +241,13 @@ def main(args):
 
         # Stream response
         ctx_exceeded = False
-        with streamer_cm(args, bot_name) as s:
+        with streamer_cm(args, bot_name, tt[0], tt[1]) as s:
             if prefix:
-                s.stream(prefix, tt[0], tt[1])
+                s.stream(prefix)
             while generator.num_remaining_jobs():
                 for r in generator.iterate():
                     chunk = r.get("text", "")
-                    s.stream(chunk, tt[0], tt[1])
+                    s.stream(chunk)
                     if r["eos"] and r["eos_reason"] == "max_new_tokens":
                         ctx_exceeded = True
 
