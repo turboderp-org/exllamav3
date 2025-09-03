@@ -1,4 +1,5 @@
 from .arcee import ArceeModel
+from .apertus import ApertusModel
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
@@ -29,6 +30,7 @@ ARCHITECTURES = {
         "model_class": m,
     } for m in [
         ArceeModel,
+        ApertusModel,
         CohereModel,
         Cohere2Model,
         DeciLMModel,
