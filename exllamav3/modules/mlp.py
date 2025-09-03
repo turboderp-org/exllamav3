@@ -23,6 +23,10 @@ class MLP(Module):
         out_size: int | None = None,
         key_up: str | None = None,
         key_down: str | None = None,
+        key_alpha_p: str | None = None,
+        key_alpha_n: str | None = None,
+        alpha_p: float | None = None,
+        alpha_n: float | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
@@ -123,11 +127,16 @@ class MLP(Module):
                 a = b
 
         self.activation_fn = activation_fn
+        self.key_alpha_p = key_alpha_p
+        self.key_alpha_n = key_alpha_n
+        self.alpha_p = alpha_p
+        self.alpha_n = alpha_n
 
         match activation_fn:
             case "silu": self.activation_fn_call = F.silu
             case "gelu": self.activation_fn_call = lambda x: F.gelu(x, approximate = "tanh")
             case "relu2": self.activation_fn_call = lambda x: torch.square(F.relu(x))
+            case "xielu": self.activation_fn_call = self.act_xielu
 
         self.tp_reduce = False
 
@@ -145,6 +154,34 @@ class MLP(Module):
         else:
             self.ups[load_slice].load(device, **kwargs)
             self.downs[load_slice].load(device, **kwargs)
+        if self.key_alpha_p:
+            self.alpha_p = self.config.stc.get_tensor(self.key_alpha_p, None, optional = False, allow_bf16 = True)
+        if self.key_alpha_n:
+            self.alpha_n = self.config.stc.get_tensor(self.key_alpha_n, None, optional = False, allow_bf16 = True)
+
+
+    @override
+    def unload(self):
+        super().unload()
+        self.alpha_p = None
+        self.alpha_n = None
+
+
+    def act_xielu_torch(self, x):
+        alpha_p = nn.functional.softplus(self.alpha_p.float()).item()
+        alpha_n = nn.functional.softplus(self.alpha_n.float()).item() + 0.5
+        eps = torch.tensor([-9.9838e-07], device = x.device)
+        return torch.where(
+            x > 0,
+            alpha_p * x * x + 0.5 * x,
+            (torch.expm1(torch.min(x, eps)) - x) * alpha_n + 0.5 * x,
+        ).half()
+
+
+    def act_xielu(self, x):
+        y = torch.empty_like(x, dtype = torch.half)
+        ext.xielu(x, y, self.alpha_p, self.alpha_n)
+        return y
 
 
     @override
@@ -172,6 +209,16 @@ class MLP(Module):
             params["backend"].all_reduce(d)
 
         return to2(d, out_dtype, self.out_dtype)
+
+
+    @override
+    def get_tensors(self):
+        t = super().get_tensors()
+        if self.alpha_p is not None:
+            t[self.key_alpha_p] = self.alpha_p
+        if self.alpha_n is not None:
+            t[self.key_alpha_n] = self.alpha_n
+        return t
 
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
@@ -222,6 +269,8 @@ class MLP(Module):
                 "interm_dtype": self.interm_dtype,
                 "intermediate_split_size": self.intermediate_split_size,
             },
+            "alpha_p": producer.send(self.alpha_p),
+            "alpha_n": producer.send(self.alpha_n),
             "ups": [_export(self.ups[i]) for i in range(self.num_slices)],
             "downs": [_export(self.downs[i]) for i in range(self.num_slices)],
             "device": self.device,
@@ -230,6 +279,7 @@ class MLP(Module):
 
     @staticmethod
     def tp_import(local_context, exported, plan, **kwargs):
+        consumer = local_context["consumer"]
         key = exported["kwargs"]["key"]
         device = local_context["device"]
         first, last, unit = plan[key]
@@ -277,6 +327,8 @@ class MLP(Module):
             )
 
         module.device = device
+        module.alpha_p = consumer.recv(exported["alpha_p"], cuda = False)
+        module.alpha_n = consumer.recv(exported["alpha_n"], cuda = False)
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
         torch.cuda.synchronize()
