@@ -303,6 +303,7 @@ class PseudoParentConn:
     def quit(self):
         torch.cuda.synchronize()
         self.local_context["backend"].close()
+        self.close()
 
 
 class PseudoChildConn:

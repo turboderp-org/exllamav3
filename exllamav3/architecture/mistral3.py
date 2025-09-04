@@ -162,6 +162,7 @@ class Mistral3Model(Model):
                     key_v = "v_proj",
                     key_o = "o_proj",
                     qmap = "block.attn",
+                    out_dtype = torch.float,
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
@@ -177,6 +178,8 @@ class Mistral3Model(Model):
                     key_gate = "gate_proj",
                     key_down = "down_proj",
                     qmap = "block.mlp",
+                    # interm_dtype = torch.float,
+                    out_dtype = torch.float,
                 ),
             )
             for idx in range(config.num_hidden_layers)

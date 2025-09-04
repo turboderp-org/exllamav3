@@ -94,7 +94,8 @@ class SmolLM3Model(Model):
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    qmap = "block.attn"
+                    qmap = "block.attn",
+                    out_dtype = torch.float,
                 ),
                 mlp_norm = RMSNorm(
                     config = config,

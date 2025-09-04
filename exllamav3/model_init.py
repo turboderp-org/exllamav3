@@ -33,6 +33,7 @@ def add_args(
     parser.add_argument("-tp_mlp", "--tp_max_parallelism_mlp", type = int, help = "(TP) Maximum parallelism for MLP layers", default = None)
     parser.add_argument("-tp_moe", "--tp_max_parallelism_moe", type = int, help = "(TP) Maximum parallelism for MoE layers", default = None)
     parser.add_argument("-tp_linear", "--tp_max_parallelism_linear", type = int, help = "(TP) Maximum parallelism for linear (output) layers", default = None)
+    parser.add_argument("-tp_moe_ts", "--tp_moe_tensor_split", action = "store_true", help = "(TP) Use tensor split for MoE layers rather than expert parallelism")
 
     parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose output while loading")
 
@@ -138,6 +139,11 @@ def init(
     else:
         split = [float(alloc) for alloc in args.gpu_split.split(",")]
 
+    # Parallelism options
+    tp_options = {
+        "moe_tensor_split": args.tp_moe_tensor_split
+    }
+
     # Parallelism limits
     tp_dev_limits = {}
     for key, arg_name in [
@@ -161,6 +167,7 @@ def init(
         tp_dev_limits = tp_dev_limits,
         tp_backend = args.tp_backend,
         verbose = args.verbose,
+        tp_options = tp_options,
         **kwargs
     )
 

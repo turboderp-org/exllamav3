@@ -121,7 +121,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         generator: bool = True,
         tp_dev_limits: dict | None = None,
         tp_backend: str = "native",
-        verbose: bool = False
+        verbose: bool = False,
+        tp_options: dict | None = None,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -201,6 +202,10 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         :param verbose:
             bool, more info while loading including full TP split
+
+        :param tp_options:
+            dict of optional values:
+                "moe_tensor_split": bool - use tensor split rather than expert parallelism for MoE layers
         """
 
         free_mem()
@@ -280,6 +285,9 @@ class Model(Model_TPMixin, Model_LSMixin):
                     assert torch.device(tp_output_device).index in active_devices, \
                         "Output device must be part of split."
 
+                if tp_options is None:
+                    tp_options = {}
+
                 yield from self._load_tp(
                     progressbar,
                     reserve_per_device,
@@ -296,6 +304,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     tp_dev_limits,
                     tp_backend,
                     verbose,
+                    tp_options,
                 )
                 self.output_device = tp_output_device
 

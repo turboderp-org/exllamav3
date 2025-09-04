@@ -105,6 +105,7 @@ class DeciLMModel(Model):
                     key_v = "v_proj",
                     key_o = "o_proj",
                     qmap = "block.attn",
+                    out_dtype = torch.float,
                 )
                 cache_layer_idx += 1
                 self.last_kv_module_idx = len(self.modules)

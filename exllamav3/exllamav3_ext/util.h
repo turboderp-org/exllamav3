@@ -78,6 +78,7 @@
 #define DBGIH4(__x, __y, __z, __w, __v) printf("%s, %s, %s, %s, %s: %i, %f, %f, %f, %f\n", #__x, #__y, #__z, #__w, #__v, __x, __half2float(__y), __half2float(__z), __half2float(__w), __half2float(__v))
 #define DBGA(__x) printf("%s: %016llx\n", #__x, __x)
 #define DBGIA(__x, __y) printf("%s, %s: %i, %016llx\n", #__x, #__y, __x, __y)
+#define DBGI2A(__x, __y, __z) printf("%s, %s, %s: %i, %i, %016llx\n", #__x, #__y, #__z, __x, __y, __z)
 
 #define TIME_START \
     auto start = std::chrono::high_resolution_clock::now()

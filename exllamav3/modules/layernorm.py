@@ -101,7 +101,7 @@ class LayerNorm(Module):
                 x += b
         return x.to(out_dtype or self.out_dtype)
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         stc = self.config.stc
         storage = sum(stc.get_tensor_sizes(self.key))
         overhead = storage // 2 * (self.out_dtype or torch.half).itemsize

@@ -119,7 +119,7 @@ class Embedding(Module):
                 x *= x.shape[-1] ** 0.5
             return x
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         return []
 
     def tp_export(self, plan, producer):

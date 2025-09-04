@@ -87,5 +87,5 @@ class Conv(Module):
         return y
 
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         raise NotImplementedError("TP not implemented for Conv layer.")

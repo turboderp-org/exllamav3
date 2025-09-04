@@ -100,6 +100,7 @@ class Qwen3Model(Model):
                         key = f"model.layers.{idx}.self_attn.k_norm",
                         rms_norm_eps = config.rms_norm_eps,
                     ),
+                    out_dtype = torch.float
                 ),
                 mlp_norm = RMSNorm(
                     config = config,

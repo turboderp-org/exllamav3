@@ -69,7 +69,7 @@ class SMProducer:
 
         # Copy to shared buffer
         t_cpu = tensor.cpu().contiguous()
-        src = t_cpu.numpy().view(np.uint8).ravel()
+        src = t_cpu.view(torch.uint8).numpy().view(np.uint8).ravel()
         dst = np.ndarray((nbytes,), dtype = np.uint8, buffer = self.shm.buf, offset = offset)
         np.copyto(dst, src, casting = "no")
 

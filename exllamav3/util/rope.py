@@ -88,6 +88,8 @@ class RoPE:
         match t:
             case None:
                 self.inv_freq, self.attn_factor = self._rope_params_default()
+            case "default":
+                self.inv_freq, self.attn_factor = self._rope_params_default()
             case "llama3":
                 self.inv_freq, self.attn_factor = self._rope_params_llama3()
             case "linear":

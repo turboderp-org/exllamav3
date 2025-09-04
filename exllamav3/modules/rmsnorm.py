@@ -78,7 +78,7 @@ class RMSNorm(Module):
         ext.rms_norm(x, self.weight, y, self.rms_norm_eps, self.constant_bias)
         return y
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         stc = self.config.stc
         storage = sum(stc.get_tensor_sizes(self.key))
         overhead = storage // 2 * (self.out_dtype or torch.half).itemsize
