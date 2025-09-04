@@ -18,6 +18,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 ## Architecture support
 
 - **AFM** (ArceeForCausalLM)
+- **Apertus** (ApertursForCausalLM)
 - **Command-R** etc. (CohereForCausalLM)
 - **Command-A**, **Command-R7B**, **Command-R+** etc. (Cohere2ForCausalLM)
 - **DeciLM**, **Nemotron** (DeciLMForCausalLM)
