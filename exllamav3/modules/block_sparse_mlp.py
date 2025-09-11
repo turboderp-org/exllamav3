@@ -294,6 +294,19 @@ class BlockSparseMLP(Module):
         self.tp_reduce = False
 
 
+    @override
+    def optimizer_targets(self):
+        g, u, d = [], [], []
+        for m in self.gates: g += m.optimizer_targets()
+        for m in self.ups: u += m.optimizer_targets()
+        for m in self.downs: d += m.optimizer_targets()
+        if self.shared_experts:
+            s = self.shared_experts.optimizer_targets()
+            return [s, [g + u, d]]
+        else:
+            return [[g + u, d]]
+
+
     def load_local(self, **kwargs):
 
         # Test if experts can be fused

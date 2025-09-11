@@ -136,3 +136,7 @@ class Module(ABC):
     @lru_cache
     def all_cache_modules(self) -> list[Module]:
         return [m for m in self if m.caps.get("kv_cache")]
+
+    @abstractmethod
+    def optimizer_targets(self):
+        pass

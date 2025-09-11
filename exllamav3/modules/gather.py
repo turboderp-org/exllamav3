@@ -22,6 +22,9 @@ class OutputGather(Module):
         self.odim = sum(ldims)
         self.active = device == output_device or device in gather_devices
 
+    @override
+    def optimizer_targets(self):
+        raise NotImplementedError()
 
     @override
     def load(self, device: torch.Device, **kwargs):

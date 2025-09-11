@@ -257,7 +257,6 @@ def mod_strategy(args, module, strategy, idx):
         modifier = mod.get(submodule.qbits_mod_key, 0)
         new_strategy[key] = min(bits + modifier, 8)
 
-    # TODO: Automate this, also calculate overall increase in bitrate, track in job.json across resumes
     return new_strategy
 
 

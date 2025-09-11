@@ -37,6 +37,10 @@ class Embedding(Module):
         })
 
     @override
+    def optimizer_targets(self):
+        return []
+
+    @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
         weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True)

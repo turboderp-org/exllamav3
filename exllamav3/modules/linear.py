@@ -71,6 +71,11 @@ class Linear(Module):
             self.caps.update(caps)
 
 
+    @override
+    def optimizer_targets(self):
+        return [self.key]
+
+
     def pad_out(self, w: torch.Tensor | None) -> torch.Tensor | None:
         if w is None or self.out_features == self.out_features_unpadded and self.in_features == self.in_features_unpadded:
             return w
@@ -118,7 +123,8 @@ class Linear(Module):
                 self.full_out_features,
                 self.first_in_feature,
                 self.first_out_feature,
-                self.out_dtype
+                self.out_dtype,
+                key = self.key
             )
             if self.is_sliced:
                 self.inner.swap_device = self.device
@@ -146,7 +152,8 @@ class Linear(Module):
                 self.full_out_features,
                 self.first_in_feature,
                 self.first_out_feature,
-                out_dtype = self.out_dtype
+                out_dtype = self.out_dtype,
+                key = self.key
             )
             self.quant_type = "fp16"
             return True
@@ -185,7 +192,8 @@ class Linear(Module):
             mcg,
             mul1,
             bias,
-            self.out_dtype
+            self.out_dtype,
+            key = self.key
         )
         self.quant_type = "exl3"
         return True
@@ -264,7 +272,8 @@ class Linear(Module):
             out_tensors.get("mcg"),
             out_tensors.get("mul1"),
             orig_bias,
-            self.out_dtype
+            self.out_dtype,
+            key = self.key
         )
 
         if return_weight_q:

@@ -30,6 +30,9 @@ class PosEmbedding(Module):
         self.embedding = None
         self._numel = vocab_size * hidden_size if vocab_size is not None else None
 
+    def optimizer_targets(self):
+        return []
+
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device

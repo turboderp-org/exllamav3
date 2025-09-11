@@ -48,6 +48,13 @@ class TransformerBlock(Module):
 
 
     @override
+    def optimizer_targets(self):
+        a = self.attn.optimizer_targets() if self.attn else []
+        m = self.mlp.optimizer_targets() if self.mlp else []
+        return [a, m]
+
+
+    @override
     def forward(
         self,
         x: torch.Tensor,
@@ -184,6 +191,13 @@ class ParallelDecoderBlock(Module):
         self.num_slices = mlp.num_slices if mlp else 1
 
         self.tp_reduce = False
+
+
+    @override
+    def optimizer_targets(self):
+        a = self.attn.optimizer_targets() if self.attn else []
+        m = self.mlp.optimizer_targets() if self.mlp else []
+        return [a, m]
 
 
     @override

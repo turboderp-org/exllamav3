@@ -31,6 +31,10 @@ class LayerNorm(Module):
         self._numel = None
 
     @override
+    def optimizer_targets(self):
+        return []
+
+    @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
         weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, float2half = True)

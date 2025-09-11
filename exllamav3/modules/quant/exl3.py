@@ -24,7 +24,8 @@ class LinearEXL3:
         mul1: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
         out_dtype: torch.dtype | None = None,
-        transformers_fix: bool = False
+        transformers_fix: bool = False,
+        key: str | None = None
     ):
         assert scale is None, "scale is no longer used"
         assert su is not None or suh is not None, "either su (packed) or suh (unpacked) is required"
@@ -40,6 +41,7 @@ class LinearEXL3:
         if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
 
         self.transformers_fix = transformers_fix
+        self.key = key
 
         # self.scale = scale.item()
         self.su = None
@@ -84,6 +86,11 @@ class LinearEXL3:
         params: dict,
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+
+        if "ovr" in params:
+            ovr = params["ovr"]
+            if self.key in ovr and ovr[self.key].inner is not self:
+                return ovr[self.key].forward(x, params, out_dtype)
 
         out_shape = x.shape[:-1] + (self.out_features,)
         x = x.view(-1, self.in_features)

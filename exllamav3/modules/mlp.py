@@ -142,6 +142,14 @@ class MLP(Module):
 
 
     @override
+    def optimizer_targets(self):
+        u, d = [], []
+        for m in self.ups: u += m.optimizer_targets()
+        for m in self.downs: d += m.optimizer_targets()
+        return [[u, d]]
+
+
+    @override
     def can_defer_load(self):
         if self.num_slices > 1: return False
         return super().can_defer_load()
@@ -486,6 +494,15 @@ class GatedMLP(Module):
 
         self.tp_reduce = False
         self.multi_gu: list[MultiLinear | None] = [None] * self.num_slices
+
+
+    @override
+    def optimizer_targets(self):
+        g, u, d = [], [], []
+        for m in self.gates: g += m.optimizer_targets()
+        for m in self.ups: u += m.optimizer_targets()
+        for m in self.downs: d += m.optimizer_targets()
+        return [[g + u, d]]
 
 
     @override
