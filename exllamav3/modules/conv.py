@@ -87,5 +87,10 @@ class Conv(Module):
         return y
 
 
+    @override
+    def optimizer_targets(self):
+        raise NotImplementedError()
+
+
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         raise NotImplementedError("TP not implemented for Conv layer.")
