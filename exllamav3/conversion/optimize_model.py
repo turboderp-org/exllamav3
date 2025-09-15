@@ -142,8 +142,8 @@ def main(args, job_state):
 
     # Optimize
     solution = optimize(meas, base_numel, base_cost, target_cost, meas["base_kld"], num_q)
-    for i, s in enumerate(solution):
-        print(i, s)
+    # for i, s in enumerate(solution):
+    #     print(i, s)
 
     # Tensor overrides
     groups = meas["groups"]
