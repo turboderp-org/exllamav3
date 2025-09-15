@@ -30,17 +30,19 @@ class Model(Model_TPMixin, Model_LSMixin):
         # Calibration options
         self.calibration_all_experts = False
 
+        # Modules dict
+        self.modules_dict = None
+
 
     def __iter__(self):
         for module in self.modules:
             yield from module
 
 
-    @lru_cache
     def find_module(self, key: str):
-        for module in self:
-            if module.key == key:
-                return module
+        if self.modules_dict is None:
+            self.modules_dict = {module.key: module for module in self}
+        return self.modules_dict[key]
 
 
     @lru_cache
