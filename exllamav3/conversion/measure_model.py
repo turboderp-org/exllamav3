@@ -383,7 +383,7 @@ def main(args, job_state):
     for i, g in enumerate(cand_groups):
         sg = []
         gstr = compact_alt([sg[len(prefix):].replace("_proj", "") for sg in g])
-        if len(gstr) > 68: gstr = gstr[65:] + "..."
+        if len(gstr) > 68: gstr = gstr[:65] + "..."
         for j in range(num_cand):
             print(
                 f"     {col_blue}{i:3} {col_purple}{j + 1:3}{col_default} | "
