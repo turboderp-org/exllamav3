@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import re
 from dataclasses import dataclass
 import torch
 import os, glob
@@ -513,15 +515,34 @@ class VariantSafetensorsCollection(SafetensorsCollection):
         self.stcs = []
 
 
+    def compile_star_globs(self, patterns, *, flags = 0):
+        # Turn list of filter globs into single, compiled regex
+        alts = []
+        seen = set()
+        for p in patterns:
+            p = re.sub(r'\*+', '*', p.strip())
+            if p in seen:
+                continue
+            seen.add(p)
+            if p == '*':
+                return re.compile(r'^.*$', flags)
+            frag = '.*'.join(map(re.escape, p.split('*')))
+            alts.append(frag)
+        if not alts:
+            return re.compile(r'^\b\B$', flags)
+        big = r'^(?:' + '|'.join(alts) + r')$'
+        return re.compile(big, flags)
+
+
     def add_stc(self, filters, stc):
-        self.stcs = [(filters, stc)] + self.stcs
+        rx = self.compile_star_globs(filters)
+        self.stcs = [(filters, rx, stc)] + self.stcs
 
 
     def find_stc(self, key):
-        for filters, stc in self.stcs:
-            for f in filters:
-                if fnmatch(key, f):
-                    return stc
+        for filters, rx, stc in self.stcs:
+            if rx.fullmatch(key):
+                return stc
         return self.main
 
 
@@ -625,7 +646,7 @@ class VariantSafetensorsCollection(SafetensorsCollection):
 
 
     def close(self):
-        for stc in [s for _, s in self.stcs] + [self.main]:
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
             stc.close()
 
 
@@ -638,15 +659,15 @@ class VariantSafetensorsCollection(SafetensorsCollection):
 
 
     def begin_deferred_load(self):
-        for stc in [s for _, s in self.stcs] + [self.main]:
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
             stc.begin_deferred_load()
 
 
     def end_deferred_load(self):
-        for stc in [s for _, s in self.stcs] + [self.main]:
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
             stc.end_deferred_load()
 
 
     def abort_deferred_load(self):
-        for stc in [s for _, s in self.stcs] + [self.main]:
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
             stc.abort_deferred_load()
