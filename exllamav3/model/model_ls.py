@@ -192,6 +192,7 @@ class Model_LSMixin:
             x = module.forward(x, params)
             if idx == last_kv_module_idx:
                 break
+        del params["prefill"]
         return None
 
 

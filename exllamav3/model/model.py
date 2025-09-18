@@ -50,6 +50,11 @@ class Model(Model_TPMixin, Model_LSMixin):
         return [m for m in self if m.caps.get("kv_cache")]
 
 
+    @lru_cache
+    def get_recurrent_layers(self):
+        return [m for m in self if m.caps.get("recurrent_cache")]
+
+
     @staticmethod
     def from_config(
         config: Config,
@@ -388,4 +393,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         model's architecture, to simplify example and test scripts. Doesn't consider the model's actual Jinja template.
         """
         raise NotImplementedError()
+
+
+    def batch_recurrent_states(self):
         raise NotImplementedError()

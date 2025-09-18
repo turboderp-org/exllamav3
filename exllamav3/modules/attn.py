@@ -74,13 +74,13 @@ def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         cache = params["cache"]
         cache_bsz, cache_max_seq_len = params["batch_shape"]
         past_len = params.get("past_len")
-        cache_seqlens = params.get("cache_seqlens")
-        position = params.get("position")
-        positions = params.get("positions")
-        position_ids = params.get("position_ids")
+        cache_seqlens = params.get("cache_seqlens") if past_len is None else None
+        position = params.get("position") if past_len is None else None
+        positions = params.get("positions") if past_len is None else None
+        position_ids = params.get("position_ids") if past_len is None else None
         assert cache_bsz >= bsz, "batch size too large for cache"
         assert cache_max_seq_len % PAGE_SIZE == 0, f"cache seq len must be a multiple of {PAGE_SIZE}"
-        assert (past_len is not None) ^ (cache_seqlens is not None), "Need either past_len or cache_seqlens"
+        # assert (past_len is not None) ^ (cache_seqlens is not None), "Need either past_len or cache_seqlens"
         assert bsz * cache_max_seq_len <= cache.max_num_tokens, "Cache too small for batch shape"
         cache_bsz = min(bsz, cache_bsz)
         num_pages = cache_bsz * cache_max_seq_len // PAGE_SIZE

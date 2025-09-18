@@ -210,6 +210,7 @@ def mp_model_forward(
         x = module.forward(x, params)
         if prefill and idx == last_kv_module_idx:
             backend.end_cpu_reduce_jobs()
+            del params["prefill"]
             return None
 
     backend.end_cpu_reduce_jobs()
