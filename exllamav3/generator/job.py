@@ -246,6 +246,9 @@ class Job:
         self.current_pinned_ids = None
         self.pinned_ids = None  # Lazy alloc
 
+        # Recurrent state
+        self.recurrent_state = None
+
 
     def get_pinned_logit_mask(self):
         if self.pinned_logit_mask is None:
@@ -737,6 +740,10 @@ class Job:
         self.pagetable = generator.pagetable
         self.skips = 0
 
+        # Compatibility checks
+        assert not self.banned_strings or self.generator.recurrent_cache is not None, \
+            "Cannot use banned strings on recurrent model"
+
         # Hash full pages of input IDs
         all_unique_hashes = set()
         all_unique_pages = 0
@@ -832,10 +839,11 @@ class Job:
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
-            # partially matches, then copy keys/values from there
+            # partially matches, then copy keys/values from there. Skip this step for recurrent models
+            # since the recurrent checkpoint will always be on a page boundary
             p0 = prefill_start // PAGE_SIZE
             p1 = prefill_end // PAGE_SIZE
-            if prefill_start == p0 * PAGE_SIZE:
+            if prefill_start == p0 * PAGE_SIZE and self.generator.recurrent_cache is None:
                 prev_hash = None if p0 == 0 else seq.allocated_pages[p0 - 1].phash
                 best_match = 0
                 best_match_page = None
@@ -888,6 +896,7 @@ class Job:
                         "block_table": seq.block_index_tensor,
                         "cache": self.generator.cache,
                         "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                        "recurrent_states": self.recurrent_state,
                         "indexed_embeddings": self.embeddings
                     }
                 )
@@ -929,8 +938,15 @@ class Job:
 
     def allocate_pages(self):
         for seq in self.sequences:
-            allocated_pages, cached_pages, non_sequential_pages = \
-                seq.allocate_pages(self.pagetable)
+            allocated_pages, cached_pages, non_sequential_pages, recurrent_state = \
+                seq.allocate_pages(self.pagetable, self.generator.recurrent_cache)
+
+            self.recurrent_state = None
+            if self.generator.recurrent_cache is not None:
+                if recurrent_state is None:
+                    self.recurrent_state = self.generator.recurrent_cache.get_empty_state()
+                else:
+                    self.recurrent_state = self.generator.recurrent_cache.get_unstashed(recurrent_state)
 
             # Metrics
             self.cached_pages += cached_pages
@@ -961,3 +977,11 @@ class Job:
             f.attach(self)
             f.reset()
             f.is_active = f.trigger_token is None
+
+    def maybe_stash_recurrent(self, cache, interval):
+        seq = self.sequences[0]
+        if seq.kv_position % interval == 0:
+            last_page = (seq.kv_position - 1) // PAGE_SIZE
+            page = seq.allocated_pages[last_page]
+            assert page.kv_position == PAGE_SIZE
+            cache.stash(page.phash, self.recurrent_state)

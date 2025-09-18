@@ -2,6 +2,7 @@ from __future__ import annotations
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
+from ..cache.recurrent import RecurrentCache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
@@ -33,6 +34,8 @@ class Generator:
         num_draft_tokens: int = 4,
         show_visualizer: bool = False,
         enable_defrag: bool = True,
+        recurrent_cache_size: int = 4 * 1024**3,
+        recurrent_checkpoint_interval: int = 2048,
         **kwargs
     ):
         """
@@ -76,6 +79,13 @@ class Generator:
         :param enable_defrag:
             Defragment cache periodically
 
+        :param recurrent_cache_size:
+            Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
+            Ignored if model doesn't use recurrent states
+
+        :param recurrent_checkpoint_interval:
+            Minimum number of tokens between recurrent checkpoints. Must be a multiple of the page size
+
         :param kwargs:
         """
 
@@ -99,6 +109,8 @@ class Generator:
                 "Must supply cache for draft model"
             assert draft_cache.max_num_tokens == cache.max_num_tokens, \
                 "Cache and draft cache must be same size"
+            assert not model.caps.get("recurrent_states"), \
+                "Speculative decoding with draft model not supported for recurrent model."
             self.num_draft_tokens = num_draft_tokens
         else:
             self.num_draft_tokens = 0
@@ -137,6 +149,16 @@ class Generator:
 
         # Defrag
         self.enable_defrag = enable_defrag
+
+        # Recurrent cache
+        self.recurrent_cache_size = recurrent_cache_size
+        if self.model.caps.get("recurrent_states"):
+            self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
+        else:
+            self.recurrent_cache = None
+        assert recurrent_checkpoint_interval % PAGE_SIZE == 0, \
+            "recurrent_checkpoint_interval must be a multiple of the page size (256)"
+        self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
 
 
     def num_remaining_jobs(self):
@@ -278,6 +300,10 @@ class Generator:
         for job in self.active_jobs:
             job.prefill(results)
 
+        # Recurrent checkpoints
+        if self.recurrent_cache is not None:
+            self.recurrent_checkpoint()
+
         # Generation with draft model
         if self.draft_model:
             draft_tokens = self.iterate_draftmodel_gen(results)
@@ -293,6 +319,11 @@ class Generator:
 
         # Finished iteration
         return results
+
+
+    def recurrent_checkpoint(self):
+        for job in self.active_jobs:
+            job.maybe_stash_recurrent(self.recurrent_cache, self.recurrent_checkpoint_interval)
 
 
     def update_visualizer(self):
@@ -407,6 +438,16 @@ class Generator:
                 cache_seqlens[batch] = seq.kv_position
                 batch += 1
 
+        # Collect recurrent states for batch
+        # TODO: Figure out a way to minimize redundant batching and unbatching
+        batch_states = None
+        if self.recurrent_cache is not None:
+            if batch_size == 1:
+                batch_states = self.active_jobs[0].recurrent_state
+            else:
+                states = [job.recurrent_state for job in self.active_jobs]
+                batch_states = {key: states[0].collect_batch([s[key] for s in states]) for key in states[0].keys()}
+
         # Collect input IDs and indexed embeddings
         input_ids_list = []
         active_embeddings = []
@@ -445,9 +486,18 @@ class Generator:
                 "block_table": block_index,
                 "cache": self.cache,
                 "cache_seqlens": cache_seqlens,
+                "recurrent_states": batch_states,
                 "indexed_embeddings": active_embeddings
             }
         )
+
+        # Split batched recurrent states
+        if self.recurrent_cache is not None:
+            if batch_size > 1:
+                for key, v in batch_states:
+                    v.distribute_batch([s[key] for s in states])
+                del batch_states
+                del states
 
         # Run foreground filters here, while GPU workload is queued up and running
         for job in self.active_jobs:
