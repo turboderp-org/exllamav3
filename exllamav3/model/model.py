@@ -75,7 +75,7 @@ class Model(Model_TPMixin, Model_LSMixin):
 
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         # Overridden by model arch class
-        raise NotImplementedError
+        raise NotImplementedError()
 
 
     @torch.inference_mode
@@ -387,4 +387,5 @@ class Model(Model_TPMixin, Model_LSMixin):
         Convenience function for formatting a single chat request with the default template associated with the
         model's architecture, to simplify example and test scripts. Doesn't consider the model's actual Jinja template.
         """
-        raise NotImplementedError
+        raise NotImplementedError()
+        raise NotImplementedError()
