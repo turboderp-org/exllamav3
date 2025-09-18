@@ -35,6 +35,9 @@ class Model(Model_TPMixin, Model_LSMixin):
         # Modules dict
         self.modules_dict = None
 
+        # Check compatibility
+        self.check_compat()
+
 
     def __iter__(self):
         for module in self.modules:
@@ -402,3 +405,10 @@ class Model(Model_TPMixin, Model_LSMixin):
 
     def batch_recurrent_states(self):
         raise NotImplementedError()
+
+
+    def check_compat(self):
+        """
+        Decide if any model-specific requirements are met when creating Model
+        """
+        pass
