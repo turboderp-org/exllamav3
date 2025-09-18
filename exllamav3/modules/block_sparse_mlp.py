@@ -162,6 +162,7 @@ class BlockSparseMLP(Module):
         key_gate: str | None = None,
         key_down: str | None = None,
         key_routing_gate: str | None = None,
+        key_shared_gate: str | None = None,
         key_e_score_bias: str | None = "gate.e_score_correction_bias",
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
@@ -169,6 +170,7 @@ class BlockSparseMLP(Module):
         interm_dtype: torch.dtype = None,
         router_type: str = "std",
         routing_gate: Linear | None = None,
+        shared_gate: Linear | None = None,
         routed_scaling_factor: float | None = None,
         n_group: int | None = None,
         topk_group: int | None = None,
@@ -216,6 +218,23 @@ class BlockSparseMLP(Module):
         else:
             self.routing_gate = routing_gate
             self.register_submodule(self.routing_gate)
+
+        if shared_gate is None and key_shared_gate is None:
+            self.shared_gate = None
+        elif shared_gate is None:
+            self.shared_gate = Linear(
+                config = config,
+                key = f"{key}.{key_shared_gate}",
+                in_features = hidden_size,
+                out_features = 1,
+                qmap = None,
+                out_dtype = torch.float,
+                pad_to = 1,
+            )
+            self.register_submodule(self.shared_gate)
+        else:
+            self.shared_gate = shared_gate
+            self.register_submodule(self.shared_gate)
 
         if gates is not None:
             assert ups is not None and len(ups) == len(gates)
@@ -542,7 +561,12 @@ class BlockSparseMLP(Module):
 
         # Shared experts
         if self.shared_experts:
-            final_hidden_states += self.shared_experts.forward(x, params)
+            y = self.shared_experts.forward(x, params)
+            if self.shared_gate:
+                z = self.shared_gate.forward(x, params)
+                z = F.sigmoid(z)
+                y *= z
+            final_hidden_states += y
 
         # Output reduction
         if self.tp_reduce:
