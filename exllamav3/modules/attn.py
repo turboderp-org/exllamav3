@@ -154,6 +154,7 @@ class Attention(Module):
         v_proj: Linear | Module | None = None,
         kv_proj: Linear | Module | None = None,
         o_proj: Linear | Module | None = None,
+        interleaved_gate: bool = False,
     ):
         super().__init__(config, key, None)
 
@@ -169,11 +170,13 @@ class Attention(Module):
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
         self.logit_softcapping = logit_softcapping
+        self.interleaved_gate = interleaved_gate
 
         if self.num_kv_heads == 0:
             return
 
         if key_fused_qkv:
+            assert not interleaved_gate, "Attn: interleaved_gate not implemented for fused QKV tensor"
             fkey = f"{key}.{key_fused_qkv}"
             frange_q = (0, num_q_heads * head_dim)
             frange_k = (frange_q[1], frange_q[1] + num_kv_heads * head_dim)
@@ -182,7 +185,8 @@ class Attention(Module):
             fkey, frange_q, frange_k, frange_v = None, None, None, None
 
         if key_q:
-            self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim, qmap = qmap + ".input", fkey = fkey, frange = frange_q, qbits_mod_key = "q")
+            f = 2 if interleaved_gate else 1
+            self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim * f, qmap = qmap + ".input", fkey = fkey, frange = frange_q, qbits_mod_key = "q")
             self.register_submodule(self.q_proj)
         else:
             assert q_proj
@@ -347,6 +351,12 @@ class Attention(Module):
         bsz, q_len, dim = x.shape
         q = self.q_proj.forward(x, params)
 
+        if self.interleaved_gate:
+            q, g = torch.chunk(q.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
+            g = g.reshape(bsz, q_len, -1)
+        else:
+            g = None
+
         if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
             v = self.v_proj.forward(x, params)
@@ -374,7 +384,7 @@ class Attention(Module):
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
 
-        return q, k, v
+        return q, k, v, g
 
 
     def project_o(self, o: torch.Tensor, bsz: int, seqlen: int, params: dict) -> torch.Tensor:
@@ -396,7 +406,7 @@ class Attention(Module):
         position_ids = get_for_device(params, "position_ids", self.device, None)
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
 
-        q, k, v = self.project_qkv(x, params)
+        q, k, v, g = self.project_qkv(x, params)
         q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -429,6 +439,7 @@ class Attention(Module):
         v = v.transpose(1, 2)
         o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa)
         o = o.transpose(1, 2)
+        if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -447,7 +458,7 @@ class Attention(Module):
         position_ids = get_for_device(params, "position_ids", self.device, None)
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
 
-        q, k, v = self.project_qkv(x, params)
+        q, k, v, g = self.project_qkv(x, params)
         q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -480,6 +491,7 @@ class Attention(Module):
             softcap = self.logit_softcapping
         )
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -501,7 +513,7 @@ class Attention(Module):
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
         causal = params.get("causal", True)
 
-        q, k, v = self.project_qkv(x, params)
+        q, k, v, g = self.project_qkv(x, params)
         q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -550,6 +562,7 @@ class Attention(Module):
             cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
 
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
