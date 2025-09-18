@@ -48,7 +48,7 @@ def main(args):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_dir,
         device_map = "auto",
-        torch_dtype = torch.half if args.tight else torch.float if args.fp32 else None,
+        torch_dtype = torch.half if args.tight else torch.float if args.fp32 else torch.bfloat16,
     )
     if args.tight:
         free_mem()
