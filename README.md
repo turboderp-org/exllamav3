@@ -15,6 +15,13 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
 
 The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://github.com/theroyallab/tabbyAPI/), which provides an OpenAI-compatible API for local or remote inference, with extended features like HF model downloading, embedding model support and support for HF Jinja2 chat templates.
 
+### ⚠️ Important
+
+- **Qwen3-Next** support is currently experimental and still requires profiling and optimization, so don't expect
+  optimal performance just yet. [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) is required
+  and this in turn requires Triton. [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) is supported and 
+  recommended but not required.
+
 ## Architecture support
 
 - **AFM** (ArceeForCausalLM)
@@ -35,6 +42,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Phi3**, **Phi4** (Phi3ForCausalLM)
 - **Qwen 2**, **Qwen 2.5** (Qwen2ForCausalLM)
 - **Qwen 3** (Qwen3ForCausalLM, Qwen3MoeForCausalLM)
+- **Qwen 3-Next** (Qwen3NextForCausalLM)
 - **Seed-OSS** (SeedOssForCausalLM)
 - **SmolLM** (SmolLM3ForCausalLM)
 
