@@ -126,7 +126,7 @@ class LayerNorm(Module):
                 "out_dtype": self.out_dtype,
             },
             "weight": producer.send(self.weight),
-            "bias": self.bias,
+            "bias": producer.send(self.bias),
             "device": self.device,
         }
 
