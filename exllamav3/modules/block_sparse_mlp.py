@@ -564,9 +564,9 @@ class BlockSparseMLP(Module):
             y = self.shared_experts.forward(x, params)
             if self.shared_gate:
                 z = self.shared_gate.forward(x, params)
-                z = F.sigmoid(z)
-                y *= z
-            final_hidden_states += y
+                ext.add_sigmoid_gate(y, z, final_hidden_states)
+            else:
+                final_hidden_states += y
 
         # Output reduction
         if self.tp_reduce:

@@ -97,6 +97,12 @@ __device__ __forceinline__ float _xielu(float x, float alpha_p, float alpha_n)
 }
 
 
+__device__ __forceinline__ float _sigmoid_fast_exp(float x)
+{
+    return 1.0f / (1.0f + __expf(-x));
+}
+
+
 template <int activation_type>
 __global__ __launch_bounds__(NUM_THREADS)
 void act_mul_kernel_h
@@ -189,3 +195,22 @@ void xielu_kernel_f
 }
 
 
+__global__ __launch_bounds__(NUM_THREADS)
+void add_sigmoid_kernel_f
+(
+    const float* __restrict__ px,
+    const float* __restrict__ py,
+    float* __restrict__ pz,
+    size_t numel,
+    size_t dim
+)
+{
+    size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
+    size_t gidx = idx / dim;
+    if (idx >= numel) return;
+    float x = px[idx];
+    float y = py[gidx];
+    float z = pz[idx];
+    z += x * _sigmoid_fast_exp(y);
+    pz[idx] = z;
+}
