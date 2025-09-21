@@ -51,7 +51,7 @@ class GatedRMSNorm(Module):
             f"{self.key}.weight": self.weight.data
         }
 
-    def forward_torch(
+    def forward(
         self,
         x: torch.Tensor,
         params: dict,
@@ -74,15 +74,15 @@ class GatedRMSNorm(Module):
     def weights_numel(self):
         return self._numel
 
-    @override
-    def forward(
-        self,
-        x: torch.Tensor,
-        params,
-        out_dtype: torch.dtype | None = None,
-        gate: torch.Tensor = None,
-    ) -> torch.Tensor:
-        return self.forward_torch(x, params, out_dtype, gate)
+    # @override
+    # def forward_torch(
+    #     self,
+    #     x: torch.Tensor,
+    #     params,
+    #     out_dtype: torch.dtype | None = None,
+    #     gate: torch.Tensor = None,
+    # ) -> torch.Tensor:
+    #     return self.forward_torch(x, params, out_dtype, gate)
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         stc = self.config.stc
