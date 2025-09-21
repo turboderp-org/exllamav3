@@ -190,6 +190,7 @@ class BlockSparseMLP(Module):
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
+        self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 32)
         self.num_local_experts = num_local_experts if num_local_experts is not None else num_experts
         self.hidden_size = hidden_size
         self.router_type = router_type
@@ -456,7 +457,7 @@ class BlockSparseMLP(Module):
             final_hidden_states = torch.zeros_like(x, dtype = self.out_dtype)
 
         # Torch path
-        elif bsz > 1 or not self.is_quantized:
+        elif bsz >= self.f_threshold or not self.is_quantized:
             final_hidden_states = torch.zeros_like(y, dtype = self.out_dtype)
 
             if self.routing_device is None or self.num_local_experts == self.num_experts:
@@ -494,7 +495,91 @@ class BlockSparseMLP(Module):
             final_hidden_states = to2(final_hidden_states, out_dtype, self.out_dtype)
 
         # Fused path
-        # TODO: Find good solution for 1 < bsz < 32
+        elif bsz > 1:
+
+            final_hidden_states = torch.empty_like(y, dtype = self.out_dtype)
+
+            y = y.unsqueeze(1).unsqueeze(1)
+            selected_experts = selected_experts.unsqueeze(1)
+            routing_weights = routing_weights.unsqueeze(1)
+
+            # yh = torch.empty((bsz, self.num_experts_per_tok, 1, self.hidden_size), dtype = torch.half, device = self.device)
+            # interm_g = torch.empty((bsz, self.num_experts_per_tok, 1, self.intermediate_size), dtype = self.interm_dtype, device = self.device)
+            # interm_u = torch.empty_like(interm_g)
+            # interm_a = torch.empty_like(interm_u, dtype = torch.half) if self.interm_dtype != torch.half else interm_u
+            # out_d = torch.empty((bsz, self.num_experts_per_tok, 1, self.hidden_size), dtype = self.out_dtype or torch.half, device = self.device)
+
+            cfg = self.experts_cfg
+
+            mine, maxe = self.routing_first, self.routing_last
+            if mine is None or maxe - mine == self.num_experts:
+                mine, maxe = -1, -1
+
+            for i in range(bsz):
+
+                # Gate
+                ext.exl3_mgemm(
+                    y[i],
+                    self.multi_gate.ptrs_trellis,
+                    cfg.interm_g,
+                    self.multi_gate.ptrs_suh,
+                    cfg.yh,
+                    self.multi_gate.ptrs_svh,
+                    selected_experts[i],
+                    None,
+                    self.multi_gate.K,
+                    -1,
+                    self.multi_gate.mcg_mult,
+                    self.multi_gate.mul1_mult,
+                    mine,
+                    maxe,
+                )
+
+                # Up
+                ext.exl3_mgemm(
+                    y[i],
+                    self.multi_up.ptrs_trellis,
+                    cfg.interm_u,
+                    self.multi_up.ptrs_suh,
+                    cfg.yh,
+                    self.multi_up.ptrs_svh,
+                    selected_experts[i],
+                    None,
+                    self.multi_up.K,
+                    -1,
+                    self.multi_up.mcg_mult,
+                    self.multi_up.mul1_mult,
+                    mine,
+                    maxe,
+                )
+
+                # Activation
+                self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a)
+
+                # Down
+                ext.exl3_mgemm(
+                    cfg.interm_a,
+                    self.multi_down.ptrs_trellis,
+                    cfg.out_d,
+                    self.multi_down.ptrs_suh,
+                    cfg.interm_a,
+                    self.multi_down.ptrs_svh,
+                    selected_experts[i],
+                    routing_weights[i],
+                    self.multi_down.K,
+                    -1,
+                    self.multi_down.mcg_mult,
+                    self.multi_down.mul1_mult,
+                    mine,
+                    maxe,
+                )
+
+                t = cfg.out_d[0]
+                final_hidden_states[i:i+1] = t
+
+            final_hidden_states = final_hidden_states.view(x.shape)
+
+        # Bsz 1
         else:
             y = y.unsqueeze(0)
 
