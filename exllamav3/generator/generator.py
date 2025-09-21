@@ -446,7 +446,7 @@ class Generator:
                 batch_states = self.active_jobs[0].recurrent_state
             else:
                 states = [job.recurrent_state for job in self.active_jobs]
-                batch_states = {key: states[0].collect_batch([s[key] for s in states]) for key in states[0].keys()}
+                batch_states = {key: states[0][key].collect_batch([s[key] for s in states]) for key in states[0].keys()}
 
         # Collect input IDs and indexed embeddings
         input_ids_list = []
@@ -494,7 +494,7 @@ class Generator:
         # Split batched recurrent states
         if self.recurrent_cache is not None:
             if batch_size > 1:
-                for key, v in batch_states:
+                for key, v in batch_states.items():
                     v.distribute_batch([s[key] for s in states])
                 del batch_states
                 del states
