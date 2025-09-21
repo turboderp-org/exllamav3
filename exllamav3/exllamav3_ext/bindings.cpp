@@ -13,6 +13,7 @@
 #include "activation.cuh"
 #include "softcap.cuh"
 #include "routing.cuh"
+#include "gdn.cuh"
 
 #include "quant/quantize.cuh"
 #include "quant/pack.cuh"

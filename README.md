@@ -189,3 +189,4 @@ This project owes its existence to a wonderful community of FOSS developers and 
 - [QTIP](https://github.com/Cornell-RelaxML/qtip)
 - [Transformers](https://github.com/huggingface/transformers)
 - [Marlin](https://github.com/IST-DASLab/marlin)
+- [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention)

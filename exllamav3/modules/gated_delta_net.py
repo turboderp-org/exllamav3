@@ -1,7 +1,5 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
-
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
@@ -203,11 +201,14 @@ class GatedDeltaNet(Module):
         self.num_v_groups = num_v_heads // num_k_heads
         self.rms_norm_eps = rms_norm_eps
         self.conv_kernel_size = conv_kernel_size
+        self.k_dim = self.k_head_dim * self.num_k_heads
+        self.v_dim = self.v_head_dim * self.num_v_heads
 
         self.out_dtype = out_dtype
 
-        fdim_qkvz = 2 * self.num_k_heads * self.k_head_dim + 2 * self.v_head_dim * self.num_v_heads
+        fdim_qkvz = 2 * self.num_k_heads * self.k_head_dim + 2 * self.num_v_heads * self.v_head_dim
         fdim_ba = 2 * self.num_v_heads
+        self.fdim_qkv = 2 * self.num_k_heads * self.k_head_dim + self.num_v_heads * self.v_head_dim
 
         if key_fused_qkvz:
             self.qkvz_proj = Linear(config, f"{key}.{key_fused_qkvz}", hidden_size, fdim_qkvz, qmap = qmap + ".input", out_dtype = torch.float)
@@ -243,6 +244,7 @@ class GatedDeltaNet(Module):
             "recurrent_cache": True
         })
 
+        self.prealloc_split = None
         # self.cache_layers = []
         # self.tp_cache_lookup = {}
         # self.multi_kv = None
@@ -270,6 +272,13 @@ class GatedDeltaNet(Module):
         self.norm.load(device, **kwargs)
         self.load_local(device, **kwargs)
 
+        # Preallocate (mixed_qkv, z, beta, g) tensors for bsz 1, seqlen 1
+        self.prealloc_split = (
+            torch.zeros((1, self.fdim_qkv, 1), dtype = torch.bfloat16, device = device),
+            torch.zeros((1, 1, self.num_v_heads, self.v_head_dim), dtype = torch.bfloat16, device = device),
+            torch.zeros((1, 1, self.num_v_heads), dtype = torch.bfloat16, device = device),
+            torch.zeros((1, 1, self.num_v_heads), dtype = torch.float, device = device)
+        )
 
     @override
     def unload(self):
@@ -283,30 +292,45 @@ class GatedDeltaNet(Module):
 
 
     def split_fused_inputs(self, mixed_qkvz, mixed_ba):
-        new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
+        # mixed_qkvz and mixed_ba have same (bsz, seqlen)
+        # both are contiguous
+        bsz, seqlen, _ = mixed_qkvz.shape
+
+        mixed_qkvz = mixed_qkvz.view(
+            bsz,
+            seqlen,
             self.num_k_heads,
             2 * self.k_head_dim + 2 * self.v_head_dim * self.num_v_heads // self.num_k_heads,
         )
-        new_tensor_shape_ba = mixed_ba.size()[:-1] + (self.num_k_heads, 2 * self.num_v_heads // self.num_k_heads)
+        mixed_ba = mixed_ba.view(
+            bsz,
+            seqlen,
+            self.num_k_heads,
+            2 * self.num_v_heads // self.num_k_heads
+        )
 
-        mixed_qkvz = mixed_qkvz.view(*new_tensor_shape_qkvz)
-        mixed_ba = mixed_ba.view(*new_tensor_shape_ba)
         split_arg_list_qkvz = [
             self.k_head_dim,
             self.k_head_dim,
             (self.num_v_groups * self.v_head_dim),
             (self.num_v_groups * self.v_head_dim),
         ]
-        split_arg_list_ba = [self.num_v_heads // self.num_k_heads, self.num_v_heads // self.num_k_heads]
-        query, key, value, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim = 3)
+        split_arg_list_ba = [
+            self.num_v_heads // self.num_k_heads,
+            self.num_v_heads // self.num_k_heads
+        ]
+        q, k, v, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim = 3)
         b, a = torch.split(mixed_ba, split_arg_list_ba, dim = 3)
 
-        # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
-        value = value.reshape(value.size(0), value.size(1), -1, self.v_head_dim)
-        z = z.reshape(z.size(0), z.size(1), -1, self.v_head_dim)
-        b = b.reshape(b.size(0), b.size(1), self.num_v_heads)
-        a = a.reshape(a.size(0), a.size(1), self.num_v_heads)
-        return query, key, value, z, b, a
+        q = q.reshape(bsz, seqlen, -1)
+        k = k.reshape(bsz, seqlen, -1)
+        v = v.reshape(bsz, seqlen, -1)
+        z = z.reshape(bsz, seqlen, -1, self.v_head_dim)
+        b = b.reshape(bsz, seqlen, self.num_v_heads)
+        a = a.reshape(bsz, seqlen, self.num_v_heads)
+        mixed_qkv = torch.cat((q, k, v), dim = -1)
+        mixed_qkv = mixed_qkv.transpose(1, 2)
+        return mixed_qkv, z, b, a
 
 
     @override
@@ -336,16 +360,29 @@ class GatedDeltaNet(Module):
             save_state = False
 
         # Projections
-        qkvz = self.qkvz_proj.forward(x, params).to(torch.bfloat16)
-        ba = self.ba_proj.forward(x, params).to(torch.bfloat16)
-        q, k, v, z, b, a = self.split_fused_inputs(qkvz, ba)
-        q = q.reshape(bsz, seqlen, -1)
-        k = k.reshape(bsz, seqlen, -1)
-        v = v.reshape(bsz, seqlen, -1)
+        qkvz = self.qkvz_proj.forward(x, params)
+        ba = self.ba_proj.forward(x, params)
+
+        if bsz == 1 and seqlen == 1:
+            mixed_qkv, z, beta, g = self.prealloc_split
+        else:
+            mixed_qkv = torch.zeros((bsz, self.fdim_qkv, seqlen), dtype = torch.bfloat16, device = self.device)
+            z = torch.zeros((bsz, seqlen, self.num_v_heads, self.v_head_dim), dtype = torch.bfloat16, device = self.device)
+            beta = torch.zeros((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
+            g = torch.zeros((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
+
+        ext.gated_delta_net_fused_op(
+            qkvz, ba,
+            self.dt_bias,
+            self.a_log,
+            mixed_qkv, z, beta, g,
+            self.num_k_heads,
+            self.num_v_heads,
+            self.k_head_dim,
+            self.v_head_dim
+        )
 
         # Convolution
-        mixed_qkv = torch.cat((q, k, v), dim = -1).transpose(1, 2)
-
         if conv_state is None:
             if save_state:
                 conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
@@ -374,17 +411,10 @@ class GatedDeltaNet(Module):
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
         # Gate
-        k_dim = self.k_head_dim * self.num_k_heads
-        v_dim = self.v_head_dim * self.num_v_heads
-        q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
+        q, k, v = torch.split(mixed_qkv, [self.k_dim, self.k_dim, self.v_dim], dim = -1)
         q = q.view(bsz, seqlen, -1, self.k_head_dim)
         k = k.view(bsz, seqlen, -1, self.k_head_dim)
         v = v.view(bsz, seqlen, -1, self.v_head_dim)
-
-        if self.a_log_f_exp is None:
-            self.a_log_f_exp = -self.a_log.float().exp()
-        g = self.a_log_f_exp * F.softplus(a.float() + self.dt_bias)
-        beta = b.sigmoid()
 
         # Grouped attn
         if self.num_v_heads // self.num_k_heads > 1:
@@ -398,7 +428,7 @@ class GatedDeltaNet(Module):
                 g = g,
                 beta = beta,
                 initial_state = recurrent_state,
-                output_final_state = True,  # cache_params is not None,
+                output_final_state = save_state,
                 use_qk_l2norm_in_kernel = True,
             )
         else:
