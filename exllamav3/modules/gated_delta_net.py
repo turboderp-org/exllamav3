@@ -314,7 +314,6 @@ class GatedDeltaNet(Module):
         # TODO: Profile, optimize
 
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-        from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
         bsz, seqlen, _ = x.shape
 
