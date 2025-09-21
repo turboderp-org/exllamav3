@@ -32,12 +32,14 @@ cache_seqlens: shape (bsz)
 # Fallback functions if causal_conv1d not installed
 # TODO: Custom kernels
 
-def torch_causal_conv1d_update(
+def torch_causal_conv1d_update_function(
     x,
     conv_state,
     weight,
     bias = None,
-    activation = None,
+    activation = True,
+    cache_seqlens = None,
+    conv_state_indices = None
 ):
     bsz, dim, seq_len = x.shape
     state_len = conv_state.shape[-1]
@@ -49,12 +51,15 @@ def torch_causal_conv1d_update(
     y = y.to(x.dtype)
     return y
 
-def torch_causal_conv1d_fn(
+
+def torch_causal_conv1d_fwd_function(
     x,
     weight,
     bias,
-    activation = None,
     seq_idx = None,
+    initial_states = None,
+    final_states_out = None,
+    silu_activation = True,
 ):
     # Differs from Qwen3-Next Transformers impl. but corresponds better to causal_conv1d which uses zeros
     # as the initial state
@@ -66,11 +71,12 @@ def torch_causal_conv1d_fn(
     y = y.to(x.dtype)
     return y
 
+
 try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d.cpp_functions import causal_conv1d_update_function, causal_conv1d_fwd_function
 except ModuleNotFoundError:
-    causal_conv1d_update = torch_causal_conv1d_update
-    causal_conv1d_fn = torch_causal_conv1d_fn
+    causal_conv1d_update_function = torch_causal_conv1d_update_function
+    causal_conv1d_fwd_function = torch_causal_conv1d_fwd_function
 
 
 class GDN_RecurrentState(CacheableState):
@@ -344,20 +350,25 @@ class GatedDeltaNet(Module):
             if save_state:
                 conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
                 rs.last_conv_state = conv_state
-            mixed_qkv = causal_conv1d_fn(
-                x = mixed_qkv,
-                weight = self.conv1d_weight.squeeze(1),
-                bias = self.conv1d_bias,
-                activation = "silu",
-                seq_idx = None,
+            mixed_qkv = causal_conv1d_fwd_function(
+                mixed_qkv,
+                self.conv1d_weight.squeeze(1),
+                self.conv1d_bias,
+                None,
+                None,
+                None,
+                True,
             )
+
         else:
-            mixed_qkv = causal_conv1d_update(
+            mixed_qkv = causal_conv1d_update_function(
                 mixed_qkv,
                 conv_state,  # Updated inplace
                 self.conv1d_weight.squeeze(1),
                 self.conv1d_bias,
-                "silu",
+                True,
+                None,
+                None,
             )
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
