@@ -205,7 +205,6 @@ class Generator:
         job.prepare_for_queue(self, self.job_serial)
         self.job_serial += 1
         self.pending_jobs.append(job)
-        job.time_enqueue = time.time()
         return job.serial_number
 
 
@@ -521,6 +520,7 @@ class Generator:
 
         # Pass to jobs to sample
         completed_jobs = []
+        requeuing_jobs = []
         j = 0
         for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
             if a == b: continue
@@ -531,7 +531,7 @@ class Generator:
                 next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
                     token_logits,
                 )
-                eos, sampled_token = job.receive_sample(
+                eos, sampled_token, rq = job.receive_sample(
                     token_logits,
                     next_token,
                     next_k_tokens,
@@ -539,6 +539,11 @@ class Generator:
                     next_prob,
                     results,
                 )
+
+                # Requeue
+                if len(job.sequences) == 1 and rq:
+                    requeuing_jobs.append(job)
+                    break
 
                 # EOS
                 if eos:
@@ -565,9 +570,16 @@ class Generator:
 
         # Release pages for completed jobs
         num_jobs = self.num_remaining_jobs()
-        for job in completed_jobs:
+        for job in completed_jobs + requeuing_jobs:
             job.deallocate_pages()
             self.active_jobs.remove(job)
+
+        # Requeue jobs
+        for job in requeuing_jobs:
+            rq_job = job.prepare_for_requeue()
+            self.pending_jobs.append(rq_job)
+
+        # Defrag
         if num_jobs and not self.num_remaining_jobs():
             self.pagetable.defrag()
 
@@ -636,6 +648,7 @@ class Generator:
         filters: list[list[Filter]] | list[Filter] | None = None,
         return_last_results: bool = False,
         embeddings: list[MMEmbedding] | list[list[MMEmbedding]] | None = None,
+        max_rq_tokens: int | None = None,
         **kwargs
     ):
         """
@@ -695,6 +708,11 @@ class Generator:
 
         :param embeddings:
             Optional list of MMEmbeddings to use for, or list of lists for batched generation
+
+        :param max_rq_tokens:
+            Maximum number of tokens before job is requeued. Rounded to nearest page boundary. This limits how
+            many new pages are allocated in the cache for the job in any one round and allows a single job to use
+            the full cache size without limiting concurrency for other jobs.
 
         :return:
             Completion(s): (str or list[str] depending on the type of the input prompt argument)
@@ -760,7 +778,8 @@ class Generator:
                 filters = filters[idx] or [],
                 token_healing = token_healing,
                 decode_special_tokens = decode_special_tokens,
-                embeddings = embeddings[idx] or []
+                embeddings = embeddings[idx] or [],
+                max_rq_tokens = max_rq_tokens
             )
 
             if seed is not None: seed += 1

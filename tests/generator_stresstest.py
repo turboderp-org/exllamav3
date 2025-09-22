@@ -70,7 +70,8 @@ def start_new_job():
         input_ids = input_ids,
         max_new_tokens = random.randint(completion_len[0], completion_len[1]),
         sampler = ArgmaxSampler(),
-        identifier = prompt
+        identifier = prompt,
+        max_rq_tokens = 512,
     )
     generator.enqueue(job)
 
@@ -91,6 +92,9 @@ def iterate():
     num_pending = generator.num_pending_jobs()
     results = generator.iterate()
     for result in results:
+        if result.get("requeue"):
+            print(f"{str(result['job'])}  requeued")
+
         if result["eos"]:
             cached_tokens = result["cached_tokens"]
             cached_pages = result["cached_pages"]
