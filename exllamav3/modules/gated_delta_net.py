@@ -84,6 +84,39 @@ except ModuleNotFoundError:
     causal_conv1d_update_function = causal_conv1d_update_function_torch
     causal_conv1d_fwd_function = causal_conv1d_fwd_function_torch
 
+"""
+fla wrapper, reduce overhead by bypassing input_guard and torch custom ops stuff
+"""
+
+def fused_recurrent_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+):
+    from fla.ops.gated_delta_rule.fused_recurrent import fused_recurrent_gated_delta_rule_fwd
+
+    scale = k.shape[-1] ** -0.5
+    with torch.cuda.device(q.device.index):
+        o, final_state = fused_recurrent_gated_delta_rule_fwd(
+            q,
+            k,
+            v.contiguous(),
+            g,
+            None,
+            None,
+            beta,
+            scale,
+            initial_state.contiguous() if initial_state is not None else None,
+            output_final_state,
+            use_qk_l2norm_in_kernel,
+            None,
+        )
+    return o, final_state
 
 
 class GDN_RecurrentState(CacheableState):
@@ -356,9 +389,7 @@ class GatedDeltaNet(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        # TODO: Profile, optimize
-
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
         bsz, seqlen, _ = x.shape
 
@@ -458,11 +489,11 @@ class GatedDeltaNet(Module):
 
         # Norm
         z_shape_og = z.shape
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        core_attn_out = core_attn_out.view(-1, core_attn_out.shape[-1])
+        z = z.view(-1, z.shape[-1])
         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1)
+        core_attn_out = core_attn_out.view(z_shape_og)
+        core_attn_out = core_attn_out.view(core_attn_out.shape[0], core_attn_out.shape[1], -1)
 
         # Output projection
         x = self.o_proj.forward(core_attn_out, params)
