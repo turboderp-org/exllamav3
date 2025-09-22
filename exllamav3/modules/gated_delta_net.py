@@ -19,25 +19,14 @@ from .gated_rmsnorm import GatedRMSNorm
 from ..cache import CacheableState
 
 """
-batch_shape: tuple of (bsz, _)
-past_len: int (default: 0)
-
-*OR*
-
-cache_seqlens: shape (bsz) 
+causal_conv1d wrappers and fallback functions 
 """
 
-# Fallback functions if causal_conv1d not installed
-# TODO: Custom kernels
-
-def torch_causal_conv1d_update_function(
+def causal_conv1d_update_function_torch(
     x,
     conv_state,
     weight,
     bias = None,
-    activation = True,
-    cache_seqlens = None,
-    conv_state_indices = None
 ):
     bsz, dim, seq_len = x.shape
     state_len = conv_state.shape[-1]
@@ -50,14 +39,10 @@ def torch_causal_conv1d_update_function(
     return y
 
 
-def torch_causal_conv1d_fwd_function(
+def causal_conv1d_fwd_function_torch(
     x,
     weight,
     bias,
-    seq_idx = None,
-    initial_states = None,
-    final_states_out = None,
-    silu_activation = True,
 ):
     # Differs from Qwen3-Next Transformers impl. but corresponds better to causal_conv1d which uses zeros
     # as the initial state
@@ -70,11 +55,35 @@ def torch_causal_conv1d_fwd_function(
     return y
 
 
+def causal_conv1d_update_function_cu(
+    x,
+    conv_state,
+    weight,
+    bias = None,
+):
+    y = torch.empty_like(x)
+    causal_conv1d_cuda.causal_conv1d_update(x, conv_state, weight, bias, y, True, None, None)
+    return y
+
+
+def causal_conv1d_fwd_function_cu(
+    x,
+    weight,
+    bias,
+):
+    y = torch.empty_like(x)
+    causal_conv1d_cuda.causal_conv1d_fwd(x, weight, bias, None, None, y, None, True)
+    return y
+
+
 try:
-    from causal_conv1d.cpp_functions import causal_conv1d_update_function, causal_conv1d_fwd_function
+    import causal_conv1d_cuda
+    causal_conv1d_update_function = causal_conv1d_update_function_cu
+    causal_conv1d_fwd_function = causal_conv1d_fwd_function_cu
 except ModuleNotFoundError:
-    causal_conv1d_update_function = torch_causal_conv1d_update_function
-    causal_conv1d_fwd_function = torch_causal_conv1d_fwd_function
+    causal_conv1d_update_function = causal_conv1d_update_function_torch
+    causal_conv1d_fwd_function = causal_conv1d_fwd_function_torch
+
 
 
 class GDN_RecurrentState(CacheableState):
@@ -138,6 +147,13 @@ class GDN_RecurrentState(CacheableState):
 def prepare_for_recurrence(input_ids: torch.Tensor, params: dict, model) -> torch.Tensor:
     """
     Add linear attn parameters to state
+
+    batch_shape: tuple of (bsz, _)
+    past_len: int (default: 0)
+
+    *OR*
+
+    cache_seqlens: shape (bsz)
     """
     batch_shape = params.get("batch_shape")
     cache_seqlens = params.get("cache_seqlens")
@@ -229,7 +245,6 @@ class GatedDeltaNet(Module):
         self.register_submodule(self.norm)
 
         self.a_log = None
-        self.a_log_f_exp = None
         self.dt_bias = None
         self.conv1d_weight = None
         self.conv1d_bias = None
@@ -283,11 +298,11 @@ class GatedDeltaNet(Module):
     @override
     def unload(self):
         self.a_log = None
-        self.a_log_f_exp = None
         self.dt_bias = None
         self.conv1d_weight = None
         self.conv1d_bias = None
         self.norm.unload()
+        self.prealloc_split = None
         super().unload()
 
 
@@ -391,21 +406,13 @@ class GatedDeltaNet(Module):
                 mixed_qkv,
                 self.conv1d_weight.squeeze(1),
                 self.conv1d_bias,
-                None,
-                None,
-                None,
-                True,
             )
-
         else:
             mixed_qkv = causal_conv1d_update_function(
                 mixed_qkv,
                 conv_state,  # Updated inplace
                 self.conv1d_weight.squeeze(1),
                 self.conv1d_bias,
-                True,
-                None,
-                None,
             )
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
