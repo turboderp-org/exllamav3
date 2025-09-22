@@ -51,7 +51,7 @@ class GatedRMSNorm(Module):
             f"{self.key}.weight": self.weight.data
         }
 
-    def forward(
+    def forward_fla(
         self,
         x: torch.Tensor,
         params: dict,
@@ -70,19 +70,37 @@ class GatedRMSNorm(Module):
         x = x.to(out_dtype or self.out_dtype)
         return x
 
+    def forward_torch(
+        self,
+        x: torch.Tensor,
+        params,
+        out_dtype: torch.dtype | None = None,
+        gate: torch.Tensor = None,
+    ) -> torch.Tensor:
+        input_dtype = x.dtype
+        hidden_states = x.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.rms_norm_eps)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+        x = hidden_states.to(out_dtype or self.out_dtype)
+        return x
+
     @override
     def weights_numel(self):
         return self._numel
 
-    # @override
-    # def forward_torch(
-    #     self,
-    #     x: torch.Tensor,
-    #     params,
-    #     out_dtype: torch.dtype | None = None,
-    #     gate: torch.Tensor = None,
-    # ) -> torch.Tensor:
-    #     return self.forward_torch(x, params, out_dtype, gate)
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        params,
+        out_dtype: torch.dtype | None = None,
+        gate: torch.Tensor = None,
+    ) -> torch.Tensor:
+        y = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
+        ext.gated_rms_norm(x, self.weight, y, gate, self.rms_norm_eps, self.constant_bias)
+        return y
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         stc = self.config.stc
