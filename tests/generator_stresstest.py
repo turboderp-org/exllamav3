@@ -29,6 +29,8 @@ prefixes = ["All the numbers: ", "It never ends: ", "Counting forever: "]
 suffix = ", ".join([str(i) for i in range(prompt_len[1])])
 random.seed(0)
 
+global_iter = 0
+
 if draft_model_dir:
     draft_config = Config.from_directory(draft_model_dir)
     draft_model = Model.from_config(draft_config)
@@ -46,7 +48,7 @@ cache = Cache(
     # k_bits = 5,
     # v_bits = 3,
 )
-model.load("cuda:2")
+model.load(reserve_per_device = 5)
 
 tokenizer = Tokenizer.from_config(config)
 
@@ -79,6 +81,12 @@ def is_consecutive_integers(s: str) -> bool:
 
 
 def iterate():
+
+    global global_iter
+    global_iter += 1
+    if global_iter % 100 == 0:
+        generator.pagetable.validate_pagetable(generator.active_jobs)
+
     num_active = generator.num_active_jobs()
     num_pending = generator.num_pending_jobs()
     results = generator.iterate()
@@ -91,6 +99,7 @@ def iterate():
                 f"cached_p: {cached_pages}  cached_t: {cached_tokens}  -  ",
                 end = ""
             )
+
             full = result["identifier"] + result["full_completion"]
             full = full[full.find(": ") + 2:]
             full = full[:full.rfind(",")]

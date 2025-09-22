@@ -809,6 +809,8 @@ class Job:
             if seq.prefill_complete:
                 continue
 
+            cp_pos = next(iter(self.recurrent_state.values())).position if self.recurrent_state is not None else -1
+
             prefill_start = seq.kv_position
             prefill_end = seq.kv_position + self.generator.max_chunk_size
             prefill_end = (prefill_end // PAGE_SIZE) * PAGE_SIZE
@@ -817,8 +819,10 @@ class Job:
             p0 = prefill_start // PAGE_SIZE
             p1 = (prefill_end + PAGE_SIZE - 1) // PAGE_SIZE
             for local_idx in range(p0, p1):
+                if 0 <= cp_pos <= seq.kv_position:
+                    break
                 page = seq.allocated_pages[local_idx]
-                if page.kv_position == PAGE_SIZE:  # TODO: is this needed since seq.kv_position is set by seq.prepare?
+                if page.kv_position == PAGE_SIZE:
                     prefill_start = (local_idx + 1) * PAGE_SIZE
                     seq.kv_position = prefill_start
                     self.cached_pages += 1
@@ -828,6 +832,8 @@ class Job:
 
             p0 = prefill_start // PAGE_SIZE
             for local_idx in range(p0, p1):
+                if 0 <= cp_pos <= seq.kv_position:
+                    break
                 page = seq.allocated_pages[local_idx]
                 if page.kv_position == PAGE_SIZE:
                     prefill_end = local_idx * PAGE_SIZE
@@ -836,6 +842,7 @@ class Job:
             if prefill_end <= prefill_start:
                 continue
 
+            assert prefill_start % 256 == 0
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
@@ -848,7 +855,7 @@ class Job:
                 best_match = 0
                 best_match_page = None
                 for page in self.pagetable.all_pages:
-                    if page.prev_hash != prev_hash or page == seq.allocated_pages[p0]:
+                    if page.prev_hash != prev_hash or id(page) == id(seq.allocated_pages[p0]):
                         continue
                     match = ext.count_match_tensor(page.sequence, prefill_ids, page.kv_position)
                     if match > best_match:

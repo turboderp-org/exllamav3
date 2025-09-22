@@ -438,20 +438,11 @@ class Generator:
                 cache_seqlens[batch] = seq.kv_position
                 batch += 1
 
-        # Collect recurrent states for batch
-        # TODO: Figure out a way to minimize redundant batching and unbatching
-        batch_states = None
-        if self.recurrent_cache is not None:
-            if batch_size == 1:
-                batch_states = self.active_jobs[0].recurrent_state
-            else:
-                states = [job.recurrent_state for job in self.active_jobs]
-                batch_states = {key: states[0][key].collect_batch([s[key] for s in states]) for key in states[0].keys()}
-
         # Collect input IDs and indexed embeddings
         input_ids_list = []
         active_embeddings = []
         logit_mapping = []
+        batch_jobs = []
         # rope_offsets_list = [] if self.model.config.arch.lm.mrope else None  # TODO (embeddings)
         for job in self.active_jobs:
             logit_mapping.append(len(input_ids_list))
@@ -461,14 +452,25 @@ class Generator:
                 job.time_first_token = time.time()
             job_ids = job.get_input_ids_list(draft_tokens, len(input_ids_list), add_to_cache = True)
             input_ids_list += job_ids
+            batch_jobs.append(job)
             active_embeddings += job.embeddings
             # if rope_offsets_list is not None:   # TODO (embeddings)
             #     rope_offsets_list += [job.alt_rope_offset] * len(job_ids)
         logit_mapping.append(len(input_ids_list))
         batch_ids = torch.cat(input_ids_list, dim = 0)
 
+        # Collect recurrent states for batch
+        # TODO: Figure out a way to minimize redundant batching and unbatching
+        batch_states = None
+        if self.recurrent_cache is not None:
+            if batch_size == 1:
+                batch_states = batch_jobs[0].recurrent_state
+            else:
+                states = [job.recurrent_state for job in batch_jobs]
+                batch_states = {key: states[0][key].collect_batch([s[key] for s in states]) for key in states[0].keys()}
+
         # GPU workload is scheduled here, so launch any sampling filters that can run in the background
-        for job in self.active_jobs:
+        for job in batch_jobs:
             if job.new_tokens < 0: continue
             assert len(job.filter_futures) == 0
             for f in job.filters:
@@ -500,7 +502,7 @@ class Generator:
                 del states
 
         # Run foreground filters here, while GPU workload is queued up and running
-        for job in self.active_jobs:
+        for job in batch_jobs:
             if job.new_tokens < 0: continue
             assert len(job.logit_masks) == 0
             for f in job.filters:

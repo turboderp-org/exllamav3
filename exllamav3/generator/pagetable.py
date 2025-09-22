@@ -154,7 +154,9 @@ class CachePage:
         self.pagetable.unreferenced_pages[self.phash] = self
 
     # Update hash
-    def update_hash(self, newhash):
+    def update_hash(self, newhash = None):
+        if newhash is None:
+            newhash = tensor_hash_checksum(self.sequence, self.prev_hash)
         assert self.ref_count > 0
         assert self.kv_position == PAGE_SIZE
         del self.pagetable.referenced_pages[self.phash]
@@ -374,6 +376,8 @@ class PageTable:
         for page in allocated_pages:
             if page.kv_position == PAGE_SIZE:
                 cached_pages += 1
+            else:
+                break
 
         # If recurrent cache used, roll back to longest prefix, clear subsequent pages
         if recurrent_pages is not None:
@@ -381,8 +385,8 @@ class PageTable:
             for rp in recurrent_pages:
                 if rp < cached_pages:
                     max_recur = rp + 1
-            for cpi in range(max_recur, cached_pages):
-                allocated_pages[cpi].make_unique()
+            # for cpi in range(max_recur, cached_pages):
+            #     allocated_pages[cpi].make_unique()
             cached_pages = max_recur
 
         # Advance cache over prefilled pages
@@ -403,6 +407,59 @@ class PageTable:
 
     def num_unreferenced_pages(self):
         return len(self.unreferenced_pages)
+
+
+    def validate_pagetable(self, active_jobs):
+
+        def p_assert(exp):
+            # assert exp
+            if not exp:
+                xx = 0
+
+        # Check page collections
+        ids = set()
+        for p in self.referenced_pages.values():
+            p_assert(p.ref_count > 0)
+            ids.add(id(p))
+        for p in self.unreferenced_pages.values():
+            p_assert(p.ref_count == 0)
+            ids.add(id(p))
+        p_assert(len(ids) == self.max_pages)
+        p_assert(len(self.all_pages) == self.max_pages)
+
+        # Check job reference counts
+        refcounts = [0] * self.max_pages
+        for job in active_jobs:
+            for seq in job.sequences:
+                for page in seq.allocated_pages:
+                    refcounts[page.page_index] += 1
+
+        for page in self.all_pages:
+            p_assert(page.ref_count == refcounts[page.page_index])
+
+        # Check that all hashes are unique
+        hashes = set()
+        for page in self.all_pages:
+            p_assert(page.phash not in hashes)
+            hashes.add(page.phash)
+        p_assert(len(hashes) == self.max_pages)
+
+        # Check individual hashes
+        for page in self.all_pages:
+            if page.kv_position == PAGE_SIZE and page.phash[:8] != b'\x00\x00\x00\x00\x00\x00\x00\x00':
+                h = tensor_hash_checksum(page.sequence, page.prev_hash)
+                p_assert(page.phash == h)
+
+        # Check job sequences
+        for job in active_jobs:
+            for seq in job.sequences:
+                k, j = 0, 0
+                while j < seq.kv_position:
+                    i, j = j, min(j + PAGE_SIZE, seq.kv_position)
+                    jobt = seq.sequence_ids.torch()[:, i : j]
+                    paget = seq.allocated_pages[k].sequence[:, 0 : j - i]
+                    p_assert(torch.equal(jobt, paget))
+                    k += 1
 
 
     def defrag(self, debug = False):
