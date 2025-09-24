@@ -577,12 +577,8 @@ class GatedDeltaNet(Module):
                 rs.positions = [r + seqlen for r in rs.positions]
 
         # Norm
-        z_shape_og = z.shape
-        core_attn_out = core_attn_out.view(-1, core_attn_out.shape[-1])
-        z = z.view(-1, z.shape[-1])
         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
-        core_attn_out = core_attn_out.view(z_shape_og)
-        core_attn_out = core_attn_out.view(core_attn_out.shape[0], core_attn_out.shape[1], -1)
+        core_attn_out = core_attn_out.view(bsz, seqlen, self.num_v_heads * self.v_head_dim)
 
         # Output projection
         x = self.o_proj.forward(core_attn_out, params)
