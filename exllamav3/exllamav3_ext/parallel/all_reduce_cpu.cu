@@ -14,42 +14,8 @@ namespace cg = cooperative_groups;
 #include <thread>
 #include <cstring>
 #include <chrono>
+#include "../avx2_target.h"
 #include "all_reduce_cpu_avx2.h"
-
-#define NUM_THREADS 1024
-#define CPUREDUCE_CHUNK_SIZE (NUM_THREADS * 16)
-
-// Basic process-safe atomic reference with acquire/release semantics, Linux/Windows compatible
-template <typename T>
-struct atomic_ref
-{
-    T* p;
-    explicit atomic_ref(T* ptr) : p(ptr) {}
-
-    T load_relaxed() const noexcept
-    {
-        return *p;
-    }
-
-    T load_acquire() const noexcept
-    {
-        #if defined(_MSC_VER) && !defined(__clang__)
-            return (T)_InterlockedCompareExchange(reinterpret_cast<volatile T*>(p), 0, 0);
-        #else
-            return __atomic_load_n(p, __ATOMIC_ACQUIRE);
-        #endif
-    }
-
-    void store_release(T v)
-    {
-        #if defined(_MSC_VER) && !defined(__clang__)
-            _InterlockedExchange(reinterpret_cast<volatile T*>(p), (T)v);
-        #else
-            __atomic_store_n(p, v, __ATOMIC_RELEASE);
-        #endif
-    }
-};
-
 
 // Schedule CPU reduce job. Called by master device proces in all_reduce_cpu and assumes all
 // CUDA streams have kernels scheduled at the same time
@@ -165,135 +131,6 @@ void end_cpu_reduce_jobs
 {
     PGContext* ctx = (PGContext*) ctx_ptr;
     push_reduce_job_end(ctx);
-}
-
-
-// Perform reduction on current job
-void perform_cpu_reduce
-(
-    PGContext* ctx,
-    size_t data_size,
-    uint32_t device_mask,
-    uint8_t* shbuf_ptr,
-    size_t shbuf_size
-)
-{
-    // Indexing
-    const uint32_t buf_slot_size = (shbuf_size / (MAX_DEVICES + 1)) / 1024 * 1024;
-    const uint32_t max_buf_stages = buf_slot_size / CPUREDUCE_CHUNK_SIZE;
-    auto host_ptr = [&] (int device, uint32_t stage_idx)
-    {
-        return shbuf_ptr + buf_slot_size * device + (stage_idx % max_buf_stages) * CPUREDUCE_CHUNK_SIZE;
-    };
-
-    int num_chunks = (int) CEIL_DIVIDE(data_size, CPUREDUCE_CHUNK_SIZE);
-    size_t rem_data_size = data_size;
-
-    // Sync
-    atomic_ref<uint32_t> stage_(&ctx->cpusum_stage_cpu);
-    uint32_t stage = stage_.load_acquire();
-    uint32_t next_stage = (stage + 1u) & 0x7fffffffu;
-
-    // Timeout
-    const auto start = std::chrono::high_resolution_clock::now();
-
-    while (num_chunks)
-    {
-        // Stage 1: Participating devices are writing one chunk to their respective buffers and will
-        // store/release their respective flags. Devices without a contribution to the sum will set
-        // flags right away, with MSB set. First device to signal ready with a contribution is copied
-        // to the output buffer. Subsequent contributions are added in the order they arrive. Proceed
-        // to next stage only when all devices signal ready, include non-contributors since they will
-        // still need to sync before receiving the sum.
-
-        size_t stage_size = MIN(rem_data_size, CPUREDUCE_CHUNK_SIZE);
-        rem_data_size = MAX(rem_data_size - stage_size, 0);
-
-        uint32_t rem_devices = device_mask;
-        bool first_contribution = true;
-        int timeout_spin = 0;
-        while (true)
-        {
-            for (int device = 0; device < MAX_DEVICES; ++device)
-            {
-                if (!(rem_devices & (1 << device))) continue;
-
-                // Prefetch the stage and buffer if possible
-                // auto* device_stage_cookie_ptr = &ctx->cpusum_stage_device[device * REDUCE_STAGE_STRIDE];
-                // _mm_prefetch((const char*) device_stage_cookie_ptr, _MM_HINT_T0);
-                // #if defined(__GNUC__) || defined(__clang__)
-                //     uint8_t* likely_src = host_ptr(device, stage);
-                //    __builtin_prefetch(likely_src, 0, 1);
-                // #endif
-                // uint32_t device_stage = atomic_ref<uint32_t>(device_stage_cookie_ptr).load_acquire();
-
-                atomic_ref<uint32_t> device_stage_(&ctx->cpusum_stage_device[device * REDUCE_STAGE_STRIDE]);
-                uint32_t device_stage = device_stage_.load_acquire();
-                uint32_t no_contrib = device_stage & 0x80000000u;
-                device_stage &= 0x7fffffffu;
-
-                // Device is ready
-                if (device_stage != stage)
-                {
-                    rem_devices &= ~(1 << device);
-
-                    if (no_contrib == 0)
-                    {
-                        uint8_t* src = host_ptr(device, stage);
-                        uint8_t* dst = host_ptr(MAX_DEVICES, stage);
-
-                        // First contribution to this chunk: copy
-                        if (first_contribution)
-                        {
-                            // Warm destination before first contribution
-                            // #if defined(__GNUC__) || defined(__clang__)
-                            //   __builtin_prefetch(dst, 1, 3);
-                            // #endif
-
-                            memcpy(dst, src, stage_size);
-                            first_contribution = false;
-                        }
-
-                        // Subsequent contributions: accumulate
-                        else
-                        {
-                            bf16_add_inplace_avx2((uint16_t*) dst, (uint16_t*) src, CEIL_DIVIDE(stage_size, 64) * 32);
-                        }
-                    }
-                }
-            }
-            if (!rem_devices)
-                break;
-
-            // Pause every iter
-            _mm_pause();
-
-            // Check timeout every 10k iter
-            timeout_spin++;
-            if (timeout_spin > 10000)
-            {
-                timeout_spin = 0;
-                const auto now = std::chrono::high_resolution_clock::now();
-                const std::chrono::duration<double, std::milli> elapsed = now - start;
-                if (elapsed > std::chrono::duration<double, std::milli>(6000.0))
-                {
-                    printf(" ## CPU reduce process timeout\n");
-                    TORCH_CHECK(false, "CPU reduce process timeout");
-                }
-            }
-        }
-
-        // Stage 2: Reduced sum is ready, publish and release. All devices are now waiting for the flag and will
-        // begin reading back the sum for this stage and simultaneously transmit the next stage if any.
-        stage = next_stage;
-        next_stage = (stage + 1u) & 0x7fffffffu;
-        stage_.store_release(stage);
-
-        // We can exit here if we're done and start waiting for the next job. Devices will still be reading the last
-        // chunk, but the host buffer is reserved for this operation and we have at most two active stages in the
-        // buffer (and room for many more)
-        num_chunks--;
-    }
 }
 
 #define PARCK_MODE_FLOAT 0
@@ -528,6 +365,8 @@ void pg_all_reduce_cpu
     const at::cuda::OptionalCUDAGuard device_guard(this_device);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     pg_check_timeout(ctx);
+
+    TORCH_CHECK(is_avx2_supported(), "AVX2 is required for tensor-parallel inference using native backend");
 
     uint32_t device_mask = 0;
     for (int i : devices) device_mask |= (1 << i);
