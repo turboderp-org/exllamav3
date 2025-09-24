@@ -525,18 +525,16 @@ class GatedMLP(Module):
 
     def load_local(self, device: torch.Device, load_slice: int, **kwargs):
         # Test if gate and up proj can be fused
-        # TODO: Appears to be broken for MLPs using padding on gate/up. Disable until that's sorted out
-        pass
-        # if (
-        #     device != torch.device("cpu") and
-        #     self.gates[load_slice].quant_type == "exl3" and
-        #     self.ups[load_slice].quant_type == "exl3" and
-        #     self.gates[load_slice].out_features == self.ups[load_slice].out_features and
-        #     self.gates[load_slice].inner.K == self.ups[load_slice].inner.K and
-        #     self.gates[load_slice].inner.bias is None and
-        #     self.ups[load_slice].inner.bias is None
-        # ):
-        #     self.multi_gu[load_slice] = MultiLinear(self.device, [self.gates[load_slice], self.ups[load_slice]])
+        if (
+            device != torch.device("cpu") and
+            self.gates[load_slice].quant_type == "exl3" and
+            self.ups[load_slice].quant_type == "exl3" and
+            self.gates[load_slice].out_features == self.ups[load_slice].out_features and
+            self.gates[load_slice].inner.K == self.ups[load_slice].inner.K and
+            self.gates[load_slice].inner.bias is None and
+            self.ups[load_slice].inner.bias is None
+        ):
+            self.multi_gu[load_slice] = MultiLinear(self.device, [self.gates[load_slice], self.ups[load_slice]])
 
 
     @override
@@ -575,7 +573,7 @@ class GatedMLP(Module):
 
                 else:
                     x = x.view(1, bsz * q_len, dim)
-                    guh = torch.empty((2, bsz * q_len, self.multi_gu[s].out_features), dtype = self.interm_dtype, device = x.device)
+                    guh = torch.empty((2, bsz * q_len, dim), dtype = self.interm_dtype, device = x.device)
                     gu = torch.empty((2, bsz * q_len, self.multi_gu[s].out_features), dtype = self.interm_dtype, device = x.device)
                     ext.exl3_mgemm(
                         x,
