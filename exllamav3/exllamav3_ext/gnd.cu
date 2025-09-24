@@ -8,17 +8,25 @@
 #include "compat.cuh"
 #include <cmath>
 
+using bfloat16 = __nv_bfloat16;
+#define MAX_HEAD_DIM 128
+#define MAX_K_HEADS 16
+#define MAX_V_HEADS 32
+
+#define R_THREADS MAX_HEAD_DIM
+#define SUBK 4
+
 __device__ __forceinline__ float _sigmoid_fast_exp(float x)
 {
     return 1.0f / (1.0f + __expf(-x));
 }
 
-__device__ __forceinline__ __nv_bfloat16 trunc_bf16(float x)
+__device__ __forceinline__ bfloat16 trunc_bf16(float x)
 {
     return __float2bfloat16_rn(x);
 }
 
-__device__ __forceinline__ float untrunc_bf16(__nv_bfloat16 x)
+__device__ __forceinline__ float untrunc_bf16(bfloat16 x)
 {
     return __bfloat162float(x);
 }
@@ -29,15 +37,16 @@ __device__ __forceinline__ float softplus(float x)  // beta=1.0, linear threshol
     return log1pf(__expf(x));
 }
 
-__global__ void gated_delta_net_fused_op_kernel
+__global__ __launch_bounds__(MAX_HEAD_DIM)
+void gated_delta_net_fused_op_kernel
 (
     const float* __restrict__ in_qkvz,          // [B,S,Nk, Fseg], float32
     const float* __restrict__ in_ba,            // [B,S,Nk, 2*Ng], float32
-    const __nv_bfloat16* __restrict__ dt_bias,  // [Nv], bfloat16
-    const __nv_bfloat16* __restrict__ a_log,    // [Nv], bfloat16
-    __nv_bfloat16* __restrict__ out_qkv,        // [B, 2*Nk*Hk + Nv*Hv, S], bfloat16
-    __nv_bfloat16* __restrict__ out_z,          // [B, S, Nv, Hv], bfloat16
-    __nv_bfloat16* __restrict__ out_beta,       // [B, S, Nv], bfloat16
+    const bfloat16* __restrict__ dt_bias,       // [Nv], bfloat16
+    const bfloat16* __restrict__ a_log,         // [Nv], bfloat16
+    bfloat16* __restrict__ out_qkv,             // [B, 2*Nk*Hk + Nv*Hv, S], bfloat16
+    bfloat16* __restrict__ out_z,               // [B, S, Nv, Hv], bfloat16
+    bfloat16* __restrict__ out_beta,            // [B, S, Nv], bfloat16
     float* __restrict__ out_g,                  // [B, S, Nv], float32
     size_t B,
     size_t S,
@@ -184,19 +193,249 @@ void gated_delta_net_fused_op
 
     const int blocks = B * S * Nk;
     const int threads = MAX(Hk, Hv);
+    TORCH_CHECK(threads <= MAX_HEAD_DIM, "Max head dim exceeded");
 
     gated_delta_net_fused_op_kernel<<<blocks, threads, 0, stream>>>
     (
         (const float*) mixed_qkvz.data_ptr(),
         (const float*) mixed_ba.data_ptr(),
-        (const __nv_bfloat16*) dt_bias.data_ptr(),
-        (const __nv_bfloat16*) a_log.data_ptr(),
-        (__nv_bfloat16*) mixed_qkv.data_ptr(),
-        (__nv_bfloat16*) z.data_ptr(),
-        (__nv_bfloat16*) beta.data_ptr(),
+        (const bfloat16*) dt_bias.data_ptr(),
+        (const bfloat16*) a_log.data_ptr(),
+        (bfloat16*) mixed_qkv.data_ptr(),
+        (bfloat16*) z.data_ptr(),
+        (bfloat16*) beta.data_ptr(),
         (float*) g.data_ptr(),
         B, S, Nk, Ng, Hk, Hv
     );
 
     cuda_check(cudaPeekAtLastError());
+}
+
+
+__global__ __launch_bounds__(R_THREADS * SUBK)
+void cuda_recurrent_gated_delta_rule_kernel
+(
+    // k_dim = num_k_heads * k_head_dim
+    // v_dim = num_v_heads * v_head_dim
+    const bfloat16* __restrict__ mixed_qkv,     // [bsz, seqlen, (k_dim + k_dim + v_dim)]
+    const float* __restrict__ g,                // [bsz, seqlen, (group * num_k_heads)]
+    const bfloat16* __restrict__ beta,          // [bsz, seqlen, (group * num_k_heads)]
+    float* __restrict__ recurrent_state,        // [bsz, (group * num_k_heads), k_head_dim, v_head_dim]
+    bfloat16* __restrict__ core_attn_out,       // [bsz, seqlen, num_v_heads, v_head_dim]
+    int bsz,
+    int seqlen,
+    int num_k_heads,
+    int num_v_heads,
+    int k_head_dim,
+    int v_head_dim,
+    float scale
+)
+{
+    int group = num_v_heads / num_k_heads;
+
+    // Advance to batch item
+    int bi = blockIdx.x;
+    mixed_qkv +=        bi * seqlen * (2 * k_head_dim * num_k_heads + v_head_dim * num_v_heads);
+    g +=                bi * seqlen * (group * num_k_heads);
+    beta +=             bi * seqlen * (group * num_k_heads);
+    recurrent_state +=  bi * (group * num_k_heads) * k_head_dim * v_head_dim;
+    core_attn_out +=    bi * seqlen * num_v_heads * v_head_dim;
+
+    // Indexing
+    int t = threadIdx.x;
+    int bt = threadIdx.y;
+    int bts = k_head_dim / SUBK;
+    int lane = t % 32;
+    int warp = t / 32;
+    int head = blockIdx.y;
+    int k_head = head / group;
+
+    // Shared buffers
+    __shared__ float sh_red[2][MAX_HEAD_DIM / 32];
+    __shared__ float sh_k[MAX_HEAD_DIM];
+    __shared__ float sh_q[MAX_HEAD_DIM];
+    __shared__ float sh_dot1[MAX_HEAD_DIM];
+    __shared__ float sh_dot2[MAX_HEAD_DIM];
+
+    // Iterate over sequence dim
+    for (int s = 0; s < seqlen; ++s)
+    {
+        // Advance to q/k head
+        const bfloat16* gl_q = mixed_qkv + k_head * k_head_dim;
+        const bfloat16* gl_k = mixed_qkv + (num_k_heads + k_head) * k_head_dim;
+        const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * k_head_dim) + head * v_head_dim;
+        bfloat16* out = core_attn_out + head * v_head_dim;
+        float* gl_rs = recurrent_state + head * (k_head_dim * v_head_dim);
+
+        // Read q/k heads and apply L2 norm
+        float q, k;
+        if (t < k_head_dim && bt == 0)
+        {
+            q = __bfloat162float(gl_q[t]);
+            k = __bfloat162float(gl_k[t]);
+
+            float sumq = q * q;
+            float sumk = k * k;
+            #pragma unroll
+            for(int offset = 16; offset > 0; offset /= 2)
+            {
+                sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
+                sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+            }
+            if (lane == 0)
+            {
+                sh_red[0][warp] = sumq;
+                sh_red[1][warp] = sumk;
+            }
+        }
+        __syncthreads();
+
+        if (t < k_head_dim && bt == 0)
+        {
+            float sumq = lane < k_head_dim / 32 ? sh_red[0][lane] : 0.0f;
+            float sumk = lane < k_head_dim / 32 ? sh_red[1][lane] : 0.0f;
+            #pragma unroll
+            for(int offset = 16; offset > 0; offset /= 2)
+            {
+                sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
+                sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+            }
+
+            q = q * rsqrtf(sumq + 1e-6f);
+            k = k * rsqrtf(sumk + 1e-6f);
+
+            // Write q, k to shmem
+            sh_k[t] = k;
+            sh_q[t] = q;
+        }
+
+        if (t < v_head_dim && bt == 0)
+        {
+            sh_dot1[t] = 0.0f;
+            sh_dot2[t] = 0.0f;
+        }
+        __syncthreads();
+
+        if (t < v_head_dim)
+        {
+            // Dot products with last state
+            float sum = 0.0f;
+            float* sh_k_rd = sh_k + bt * bts;
+            float* rs_rd = gl_rs + t + bt * bts * v_head_dim;
+
+            // TODO: Could use tensor cores
+            for (int i = 0; i < k_head_dim / 16 / SUBK; ++i)
+            {
+                #pragma unroll
+                for (int j = 0; j < 16; ++j, rs_rd += v_head_dim, sh_k_rd++)
+                    sum = sum + *sh_k_rd * *rs_rd;
+            }
+            atomicAdd(sh_dot1 + t, sum);
+        }
+        __syncthreads();
+
+        if (t < v_head_dim)
+        {
+            float g_h = __expf(g[head]);
+            float beta_h = __bfloat162float(beta[head]);
+
+            float sum = sh_dot1[t];
+
+            // Read v head and update
+            float v = __bfloat162float(gl_v[t]) - sum * g_h;
+
+            // Update step
+            float v_out = 0.0f;
+            float* sh_k_rd = sh_k + bt * bts;
+            float* sh_q_rd = sh_q + bt * bts;
+            float* rs_rw = gl_rs + t + bt * bts * v_head_dim;
+
+            // TODO: Could use tensor cores
+            for (int i = 0; i < k_head_dim / 16 / SUBK; ++i)
+            {
+                #pragma unroll
+                for (int j = 0; j < 16; ++j, rs_rw += v_head_dim, sh_k_rd++, sh_q_rd++)
+                {
+                    // State update step, k x v
+                    float state = *rs_rw;
+                    state = state * g_h + *sh_k_rd * v * beta_h;
+                    *rs_rw = state;
+
+                    // Accumulate attn output
+                    v_out = v_out + *sh_q_rd * state;
+                }
+            }
+            atomicAdd(sh_dot2 + t, v_out);
+        }
+        __syncthreads();
+
+        if (t < v_head_dim && bt == 0)
+        {
+            float v_out = sh_dot2[t];
+
+            // Store attn output
+            if (bt == 0)
+                out[t] = __float2bfloat16_rz(v_out * scale);
+        }
+
+        // Next seq index
+        mixed_qkv +=        2 * k_head_dim * num_k_heads + v_head_dim * num_v_heads;
+        g +=                num_v_heads;
+        beta +=             num_v_heads;
+        core_attn_out +=    num_v_heads * v_head_dim;
+    }
+}
+
+
+void cuda_recurrent_gated_delta_rule
+(
+    const at::Tensor& mixed_qkv,
+    const at::Tensor& g,
+    const at::Tensor& beta,
+    at::Tensor& recurrent_state,
+    at::Tensor& core_attn_out,
+    int num_k_heads,
+    int num_v_heads,
+    int k_head_dim,
+    int v_head_dim
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(mixed_qkv.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    int bsz = mixed_qkv.size(0);
+    int seqlen = mixed_qkv.size(1);
+    int qkv_dim = mixed_qkv.size(2);
+
+    TORCH_CHECK(num_k_heads <= MAX_K_HEADS, "num_k_heads > MAX_K_HEADS");
+    TORCH_CHECK(num_v_heads <= MAX_V_HEADS, "num_v_heads > MAX_V_HEADS");
+    TORCH_CHECK(k_head_dim <= MAX_HEAD_DIM, "k_head_dim > MAX_HEAD_DIM");
+    TORCH_CHECK(v_head_dim <= MAX_HEAD_DIM, "v_head_dim > MAX_HEAD_DIM");
+
+    TORCH_CHECK_DTYPE(mixed_qkv, kBFloat16);
+    TORCH_CHECK_DTYPE(g, kFloat);
+    TORCH_CHECK_DTYPE(beta, kBFloat16);
+    TORCH_CHECK_DTYPE(recurrent_state, kFloat);
+    TORCH_CHECK_DTYPE(core_attn_out, kBFloat16);
+
+    dim3 blocks(bsz, num_v_heads);  // group * num_k_heads
+    dim3 threads(MAX(k_head_dim, v_head_dim), SUBK);
+
+    float scale = 1.0f / fsqrt(k_head_dim);
+
+    cuda_recurrent_gated_delta_rule_kernel<<<blocks, threads, 0, stream>>>
+    (
+        (const bfloat16*) mixed_qkv.data_ptr(),
+        (const float*) g.data_ptr(),
+        (const bfloat16*) beta.data_ptr(),
+        (float*) recurrent_state.data_ptr(),
+        (bfloat16*) core_attn_out.data_ptr(),
+        bsz,
+        seqlen,
+        num_k_heads,
+        num_v_heads,
+        k_head_dim,
+        v_head_dim,
+        scale
+    );
 }

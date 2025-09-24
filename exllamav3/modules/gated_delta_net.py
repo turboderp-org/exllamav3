@@ -119,6 +119,58 @@ def fused_recurrent_gated_delta_rule(
     return o, final_state
 
 
+def torch_recurrent_gated_delta_rule(
+    query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
+):
+    def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
+        inv_norm = 1 / torch.sqrt(
+            (x * x).sum(dim = dim, keepdim = True)
+            + eps
+        )
+        return x * inv_norm
+
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+
+    batch_size, sequence_length, num_heads, k_head_dim = key.shape
+
+    v_head_dim = value.shape[-1]
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query
+
+    core_attn_out = torch.zeros(batch_size, sequence_length, num_heads, v_head_dim).to(value)
+
+    last_recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        if initial_state is None
+        else initial_state.to(value)
+    )
+
+    query = query.float()
+    key = key.float()
+    value = value.float()
+    beta = beta.float()
+    g = g.float()
+
+    for i in range(sequence_length):
+        q_t = query[:, i, :]
+        k_t = key[:, i, :]
+        v_t = value[:, i, :]
+        g_t = g[:, i, :].exp().unsqueeze(-1)
+        beta_t = beta[:, i, :].unsqueeze(-1)
+        kv_mem = last_recurrent_state * k_t.unsqueeze(-1)
+        kv_mem = kv_mem.sum(dim = -2)
+        v_t = v_t - kv_mem * g_t
+        upd = k_t.unsqueeze(-1) * v_t.unsqueeze(-2) * beta_t.unsqueeze(-1)
+        last_recurrent_state = last_recurrent_state * g_t.unsqueeze(-1) + upd
+        core_attn_out[:, i, :] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2) * scale
+
+    if not output_final_state:
+        last_recurrent_state = None
+    return core_attn_out, last_recurrent_state
+
+
 class GDN_RecurrentState(CacheableState):
     def __init__(
         self,
@@ -446,21 +498,20 @@ class GatedDeltaNet(Module):
                 self.conv1d_bias,
             )
 
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-
-        # Gate
-        q, k, v = torch.split(mixed_qkv, [self.k_dim, self.k_dim, self.v_dim], dim = -1)
-        q = q.view(bsz, seqlen, -1, self.k_head_dim)
-        k = k.view(bsz, seqlen, -1, self.k_head_dim)
-        v = v.view(bsz, seqlen, -1, self.v_head_dim)
-
-        # Grouped attn
-        if self.num_v_heads // self.num_k_heads > 1:
-            q = q.repeat_interleave(self.num_v_groups, dim = 2)
-            k = k.repeat_interleave(self.num_v_groups, dim = 2)
-
         # Use chunked rule when advantageous
         if seqlen >= 32:
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+
+            q, k, v = torch.split(mixed_qkv, [self.k_dim, self.k_dim, self.v_dim], dim = -1)
+            q = q.view(bsz, seqlen, -1, self.k_head_dim)
+            k = k.view(bsz, seqlen, -1, self.k_head_dim)
+            v = v.view(bsz, seqlen, -1, self.v_head_dim)
+
+            # Grouped attn
+            if self.num_v_heads // self.num_k_heads > 1:
+                q = q.repeat_interleave(self.num_v_groups, dim = 2)
+                k = k.repeat_interleave(self.num_v_groups, dim = 2)
+
             core_attn_out, recurrent_state = chunk_gated_delta_rule(
                 q, k, v,
                 g = g,
@@ -469,14 +520,52 @@ class GatedDeltaNet(Module):
                 output_final_state = save_state,
                 use_qk_l2norm_in_kernel = True,
             )
+
         else:
-            core_attn_out, recurrent_state = fused_recurrent_gated_delta_rule(
-                q, k, v,
-                g = g,
-                beta = beta,
-                initial_state = recurrent_state,
-                output_final_state = save_state,
-                use_qk_l2norm_in_kernel = True,
+            # mixed_qkv = mixed_qkv.transpose(1, 2)
+            #
+            # q, k, v = torch.split(mixed_qkv, [self.k_dim, self.k_dim, self.v_dim], dim = -1)
+            # q = q.view(bsz, seqlen, -1, self.k_head_dim)
+            # k = k.view(bsz, seqlen, -1, self.k_head_dim)
+            # v = v.view(bsz, seqlen, -1, self.v_head_dim)
+            #
+            # # Grouped attn
+            # if self.num_v_heads // self.num_k_heads > 1:
+            #     q = q.repeat_interleave(self.num_v_groups, dim = 2)
+            #     k = k.repeat_interleave(self.num_v_groups, dim = 2)
+            #
+            # core_attn_out, recurrent_state = torch_recurrent_gated_delta_rule(
+            #     q, k, v,
+            #     g = g,
+            #     beta = beta,
+            #     initial_state = recurrent_state,
+            #     output_final_state = save_state,
+            #     use_qk_l2norm_in_kernel = True,
+            # )
+
+            if recurrent_state is None:
+                recurrent_state = torch.zeros(
+                    (bsz, self.num_v_heads, self.k_head_dim, self.v_head_dim),
+                    dtype = torch.float,
+                    device = self.device
+                )
+            core_attn_out = torch.empty(
+                (bsz, seqlen, self.num_v_heads, self.v_head_dim),
+                dtype = torch.bfloat16,
+                device = self.device,
+            )
+
+            mixed_qkv = mixed_qkv.transpose(1, 2).contiguous()
+            ext.cuda_recurrent_gated_delta_rule(
+                mixed_qkv,
+                g,
+                beta,
+                recurrent_state,
+                core_attn_out,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.k_head_dim,
+                self.v_head_dim
             )
 
         # Update cache

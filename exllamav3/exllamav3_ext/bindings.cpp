@@ -92,6 +92,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
+    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
