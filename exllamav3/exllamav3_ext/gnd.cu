@@ -421,7 +421,7 @@ void cuda_recurrent_gated_delta_rule
     dim3 blocks(bsz, num_v_heads);  // group * num_k_heads
     dim3 threads(MAX(k_head_dim, v_head_dim), SUBK);
 
-    float scale = 1.0f / fsqrt(k_head_dim);
+    float scale = 1.0f / sqrtf(k_head_dim);
 
     cuda_recurrent_gated_delta_rule_kernel<<<blocks, threads, 0, stream>>>
     (
