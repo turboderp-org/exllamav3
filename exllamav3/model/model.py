@@ -292,7 +292,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             # Tensor-P load:
             else:
                 if not self.caps.get("supports_tp"):
-                    raise NotImplemented(f"Tensor-parallel is not currently implemented for {self.config.architecture}")
+                    raise NotImplementedError(f"Tensor-parallel is not currently implemented for {self.config.architecture}")
 
                 if tp_output_device is None:
                     tp_output_device = active_devices[0]
