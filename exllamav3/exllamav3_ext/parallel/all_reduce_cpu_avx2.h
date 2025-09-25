@@ -31,7 +31,9 @@ struct atomic_ref
     T load_acquire() const noexcept
     {
         #if defined(_MSC_VER) && !defined(__clang__)
-            return (T)_InterlockedCompareExchange(reinterpret_cast<volatile T*>(p), 0, 0);
+            static_assert(sizeof(T) == 4, "MSVC path assumes 32-bit T");
+            long v = _InterlockedCompareExchange(reinterpret_cast<volatile long*>(p), 0L, 0L);
+            return static_cast<T>(static_cast<uint32_t>(v));
         #else
             return __atomic_load_n(p, __ATOMIC_ACQUIRE);
         #endif
@@ -40,7 +42,8 @@ struct atomic_ref
     void store_release(T v)
     {
         #if defined(_MSC_VER) && !defined(__clang__)
-            _InterlockedExchange(reinterpret_cast<volatile T*>(p), (T)v);
+            static_assert(sizeof(T) == 4, "MSVC path assumes 32-bit T");
+            (void)_InterlockedExchange(reinterpret_cast<volatile long*>(p), static_cast<long>(static_cast<uint32_t>(v)));
         #else
             __atomic_store_n(p, v, __ATOMIC_RELEASE);
         #endif
