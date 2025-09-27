@@ -28,19 +28,19 @@ void hgemm
 
     TORCH_CHECK_DTYPE(a, kHalf);
     TORCH_CHECK_DTYPE(b, kHalf);
-    TORCH_CHECK_DIM(a, 2);
     TORCH_CHECK_DIM(b, 2);
-    TORCH_CHECK_DIM(c, 2);
-    TORCH_CHECK_SHAPES(a, 0, c, 0, 1);
-    TORCH_CHECK_SHAPES(a, 1, b, 0, 1);
-    TORCH_CHECK_SHAPES(b, 1, c, 1, 1);
+    // TORCH_CHECK_SHAPES(a, 0, c, 0, 1);
+    TORCH_CHECK_SHAPES(a, -1, b, 0, 1);
+    TORCH_CHECK_SHAPES(b, 1, c, -1, 1);
 
     const half* a_ptr = (const half*) a.data_ptr();
     const half* b_ptr = (const half*) b.data_ptr();
 
-    int size_m = a.size(0);
-    int size_k = a.size(1);
-    int size_n = b.size(1);
+    int size_m = 1;
+    int dim = a.dim();
+    for (int d = 0; d < dim - 1; ++d) size_m *= a.size(d);
+    int size_k = a.size(-1);
+    int size_n = b.size(-1);
 
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
     cublasSetStream(cublas_handle, stream);

@@ -46,7 +46,7 @@ int exl3_gemm
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DIM(B, 3);
-    TORCH_CHECK_SHAPES(A, 1, B, 0, 16);
+    TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
     TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
 //    TORCH_CHECK_SHAPES(A, 0, C, 0, 1);
     TORCH_CHECK_DTYPE(A, kHalf);
@@ -82,8 +82,11 @@ int exl3_gemm
     const half* A_ptr = (const half*) A.data_ptr();
     const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
     void* C_ptr = (void*) C.data_ptr();
-    int size_m = A.size(0);
-    int size_k = A.size(1);
+
+    int size_m = 1;
+    int dim = A.dim();
+    for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
+    int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
 
     // Select kernel

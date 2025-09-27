@@ -1,22 +1,16 @@
 from __future__ import annotations
-from dataclasses import dataclass
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
-from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
-from . import Module, Linear, RMSNorm, LayerNorm
-from ..constants import PAGE_SIZE
-from ..cache import Cache
-from flash_attn import flash_attn_func, flash_attn_with_kvcache
+from . import Module, Linear
 from ..util import profile_opt
-from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
-import torch.distributed as dist
 from .gated_rmsnorm import GatedRMSNorm
 from ..cache import CacheableState
+from ..util.tensor import g_tensor_cache
 
 """
 causal_conv1d wrappers and fallback functions 

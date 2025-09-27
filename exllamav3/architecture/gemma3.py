@@ -387,6 +387,9 @@ class Gemma3MMPool(Module):
         self.patches_per_image = patches_per_image
         self.tokens_per_side = tokens_per_side
 
+    def optimizer_targets(self):
+        raise NotImplementedError()
+
     @override
     def load(self, device: torch.device, **kwargs):
         pass
