@@ -2,6 +2,7 @@ from __future__ import annotations
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
+from ..cache.recurrent import RecurrentCache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
@@ -33,6 +34,8 @@ class Generator:
         num_draft_tokens: int = 4,
         show_visualizer: bool = False,
         enable_defrag: bool = True,
+        recurrent_cache_size: int = 4 * 1024**3,
+        recurrent_checkpoint_interval: int = 2048,
         **kwargs
     ):
         """
@@ -76,6 +79,13 @@ class Generator:
         :param enable_defrag:
             Defragment cache periodically
 
+        :param recurrent_cache_size:
+            Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
+            Ignored if model doesn't use recurrent states
+
+        :param recurrent_checkpoint_interval:
+            Minimum number of tokens between recurrent checkpoints. Must be a multiple of the page size
+
         :param kwargs:
         """
 
@@ -99,6 +109,8 @@ class Generator:
                 "Must supply cache for draft model"
             assert draft_cache.max_num_tokens == cache.max_num_tokens, \
                 "Cache and draft cache must be same size"
+            assert not model.caps.get("recurrent_states"), \
+                "Speculative decoding with draft model not supported for recurrent model."
             self.num_draft_tokens = num_draft_tokens
         else:
             self.num_draft_tokens = 0
@@ -137,6 +149,16 @@ class Generator:
 
         # Defrag
         self.enable_defrag = enable_defrag
+
+        # Recurrent cache
+        self.recurrent_cache_size = recurrent_cache_size
+        if self.model.caps.get("recurrent_states"):
+            self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
+        else:
+            self.recurrent_cache = None
+        assert recurrent_checkpoint_interval % PAGE_SIZE == 0, \
+            "recurrent_checkpoint_interval must be a multiple of the page size (256)"
+        self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
 
 
     def num_remaining_jobs(self):
@@ -183,7 +205,6 @@ class Generator:
         job.prepare_for_queue(self, self.job_serial)
         self.job_serial += 1
         self.pending_jobs.append(job)
-        job.time_enqueue = time.time()
         return job.serial_number
 
 
@@ -278,6 +299,10 @@ class Generator:
         for job in self.active_jobs:
             job.prefill(results)
 
+        # Recurrent checkpoints
+        if self.recurrent_cache is not None:
+            self.recurrent_checkpoint()
+
         # Generation with draft model
         if self.draft_model:
             draft_tokens = self.iterate_draftmodel_gen(results)
@@ -293,6 +318,11 @@ class Generator:
 
         # Finished iteration
         return results
+
+
+    def recurrent_checkpoint(self):
+        for job in self.active_jobs:
+            job.maybe_stash_recurrent(self.recurrent_cache, self.recurrent_checkpoint_interval)
 
 
     def update_visualizer(self):
@@ -411,6 +441,7 @@ class Generator:
         input_ids_list = []
         active_embeddings = []
         logit_mapping = []
+        batch_jobs = []
         # rope_offsets_list = [] if self.model.config.arch.lm.mrope else None  # TODO (embeddings)
         for job in self.active_jobs:
             logit_mapping.append(len(input_ids_list))
@@ -420,14 +451,25 @@ class Generator:
                 job.time_first_token = time.time()
             job_ids = job.get_input_ids_list(draft_tokens, len(input_ids_list), add_to_cache = True)
             input_ids_list += job_ids
+            batch_jobs.append(job)
             active_embeddings += job.embeddings
             # if rope_offsets_list is not None:   # TODO (embeddings)
             #     rope_offsets_list += [job.alt_rope_offset] * len(job_ids)
         logit_mapping.append(len(input_ids_list))
         batch_ids = torch.cat(input_ids_list, dim = 0)
 
+        # Collect recurrent states for batch
+        # TODO: Figure out a way to minimize redundant batching and unbatching
+        batch_states = None
+        if self.recurrent_cache is not None:
+            if batch_size == 1:
+                batch_states = batch_jobs[0].recurrent_state
+            else:
+                states = [job.recurrent_state for job in batch_jobs]
+                batch_states = {key: states[0][key].collect_batch([s[key] for s in states]) for key in states[0].keys()}
+
         # GPU workload is scheduled here, so launch any sampling filters that can run in the background
-        for job in self.active_jobs:
+        for job in batch_jobs:
             if job.new_tokens < 0: continue
             assert len(job.filter_futures) == 0
             for f in job.filters:
@@ -445,12 +487,21 @@ class Generator:
                 "block_table": block_index,
                 "cache": self.cache,
                 "cache_seqlens": cache_seqlens,
+                "recurrent_states": batch_states,
                 "indexed_embeddings": active_embeddings
             }
         )
 
+        # Split batched recurrent states
+        if self.recurrent_cache is not None:
+            if batch_size > 1:
+                for key, v in batch_states.items():
+                    v.distribute_batch([s[key] for s in states])
+                del batch_states
+                del states
+
         # Run foreground filters here, while GPU workload is queued up and running
-        for job in self.active_jobs:
+        for job in batch_jobs:
             if job.new_tokens < 0: continue
             assert len(job.logit_masks) == 0
             for f in job.filters:
@@ -469,6 +520,7 @@ class Generator:
 
         # Pass to jobs to sample
         completed_jobs = []
+        requeuing_jobs = []
         j = 0
         for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
             if a == b: continue
@@ -479,7 +531,7 @@ class Generator:
                 next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
                     token_logits,
                 )
-                eos, sampled_token = job.receive_sample(
+                eos, sampled_token, rq = job.receive_sample(
                     token_logits,
                     next_token,
                     next_k_tokens,
@@ -487,6 +539,11 @@ class Generator:
                     next_prob,
                     results,
                 )
+
+                # Requeue
+                if len(job.sequences) == 1 and rq:
+                    requeuing_jobs.append(job)
+                    break
 
                 # EOS
                 if eos:
@@ -513,9 +570,16 @@ class Generator:
 
         # Release pages for completed jobs
         num_jobs = self.num_remaining_jobs()
-        for job in completed_jobs:
+        for job in completed_jobs + requeuing_jobs:
             job.deallocate_pages()
             self.active_jobs.remove(job)
+
+        # Requeue jobs
+        for job in requeuing_jobs:
+            rq_job = job.prepare_for_requeue()
+            self.pending_jobs.append(rq_job)
+
+        # Defrag
         if num_jobs and not self.num_remaining_jobs():
             self.pagetable.defrag()
 
@@ -584,6 +648,7 @@ class Generator:
         filters: list[list[Filter]] | list[Filter] | None = None,
         return_last_results: bool = False,
         embeddings: list[MMEmbedding] | list[list[MMEmbedding]] | None = None,
+        max_rq_tokens: int | None = None,
         **kwargs
     ):
         """
@@ -643,6 +708,11 @@ class Generator:
 
         :param embeddings:
             Optional list of MMEmbeddings to use for, or list of lists for batched generation
+
+        :param max_rq_tokens:
+            Maximum number of tokens before job is requeued. Rounded to nearest page boundary. This limits how
+            many new pages are allocated in the cache for the job in any one round and allows a single job to use
+            the full cache size without limiting concurrency for other jobs.
 
         :return:
             Completion(s): (str or list[str] depending on the type of the input prompt argument)
@@ -708,7 +778,8 @@ class Generator:
                 filters = filters[idx] or [],
                 token_healing = token_healing,
                 decode_special_tokens = decode_special_tokens,
-                embeddings = embeddings[idx] or []
+                embeddings = embeddings[idx] or [],
+                max_rq_tokens = max_rq_tokens
             )
 
             if seed is not None: seed += 1

@@ -13,6 +13,7 @@
 #include "activation.cuh"
 #include "softcap.cuh"
 #include "routing.cuh"
+#include "gdn.cuh"
 
 #include "quant/quantize.cuh"
 #include "quant/pack.cuh"
@@ -51,6 +52,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("stloader_deferred_cuda", &stloader_deferred_cuda, py::arg("jobs"), py::arg("max_chunk_size"));
 
     m.def("rms_norm", &rms_norm, "rms_norm");
+    m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
@@ -87,6 +89,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gelu_mul", &gelu_mul, "gelu_mul");
     m.def("relu2_mul", &relu2_mul, "relu2_mul");
     m.def("xielu", &xielu, "xielu");
+    m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
+
+    m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
+    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");

@@ -12,6 +12,18 @@ typedef struct __align__(8) half4
 }
 half4;
 
+typedef struct __align__(8) bfloat164
+{
+    __nv_bfloat162 x;
+    __nv_bfloat162 y;
+    __device__ bfloat164() = default;
+    __device__ bfloat164(__nv_bfloat162 x_, __nv_bfloat162 y_): x(x_), y(y_) {}
+    __device__ bfloat164(__nv_bfloat16 b0, __nv_bfloat16 b1, __nv_bfloat16 b2, __nv_bfloat16 b3) :
+        x(__halves2bfloat162(b0, b1)),
+        y(__halves2bfloat162(b2, b3)) {}
+}
+bfloat164;
+
 typedef struct __align__(16) half8
 {
     half2 x;
@@ -42,6 +54,9 @@ struct Dim3
 #define WRITE128(__x, __y) ((uint4*)__x)[0] = ((uint4*)(&__y))[0];
 #define READ64(__x, __y) ((uint2*)&__x)[0] = ((uint2*)(__y))[0];
 #define WRITE64(__x, __y) ((uint2*)__x)[0] = ((uint2*)(&__y))[0];
+
+#define LOW_TO_FLOAT(__x) __half2float(__low2half(__x))
+#define HIGH_TO_FLOAT(__x) __half2float(__high2half(__x))
 
 #define LOW_TO_FLOAT(__x) __half2float(__low2half(__x))
 #define HIGH_TO_FLOAT(__x) __half2float(__high2half(__x))

@@ -162,6 +162,7 @@ class BlockSparseMLP(Module):
         key_gate: str | None = None,
         key_down: str | None = None,
         key_routing_gate: str | None = None,
+        key_shared_gate: str | None = None,
         key_e_score_bias: str | None = "gate.e_score_correction_bias",
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
@@ -169,6 +170,7 @@ class BlockSparseMLP(Module):
         interm_dtype: torch.dtype = None,
         router_type: str = "std",
         routing_gate: Linear | None = None,
+        shared_gate: Linear | None = None,
         routed_scaling_factor: float | None = None,
         n_group: int | None = None,
         topk_group: int | None = None,
@@ -188,6 +190,7 @@ class BlockSparseMLP(Module):
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
+        self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 32)
         self.num_local_experts = num_local_experts if num_local_experts is not None else num_experts
         self.hidden_size = hidden_size
         self.router_type = router_type
@@ -216,6 +219,23 @@ class BlockSparseMLP(Module):
         else:
             self.routing_gate = routing_gate
             self.register_submodule(self.routing_gate)
+
+        if shared_gate is None and key_shared_gate is None:
+            self.shared_gate = None
+        elif shared_gate is None:
+            self.shared_gate = Linear(
+                config = config,
+                key = f"{key}.{key_shared_gate}",
+                in_features = hidden_size,
+                out_features = 1,
+                qmap = None,
+                out_dtype = torch.float,
+                pad_to = 1,
+            )
+            self.register_submodule(self.shared_gate)
+        else:
+            self.shared_gate = shared_gate
+            self.register_submodule(self.shared_gate)
 
         if gates is not None:
             assert ups is not None and len(ups) == len(gates)
@@ -292,6 +312,19 @@ class BlockSparseMLP(Module):
             case _: raise ValueError(f"Unknown router type {router_type}")
 
         self.tp_reduce = False
+
+
+    @override
+    def optimizer_targets(self):
+        g, u, d = [], [], []
+        for m in self.gates: g += m.optimizer_targets()
+        for m in self.ups: u += m.optimizer_targets()
+        for m in self.downs: d += m.optimizer_targets()
+        if self.shared_experts:
+            s = self.shared_experts.optimizer_targets()
+            return [s, [g + u, d]]
+        else:
+            return [[g + u, d]]
 
 
     def load_local(self, **kwargs):
@@ -424,7 +457,7 @@ class BlockSparseMLP(Module):
             final_hidden_states = torch.zeros_like(x, dtype = self.out_dtype)
 
         # Torch path
-        elif bsz > 1 or not self.is_quantized:
+        elif bsz >= self.f_threshold or not self.is_quantized:
             final_hidden_states = torch.zeros_like(y, dtype = self.out_dtype)
 
             if self.routing_device is None or self.num_local_experts == self.num_experts:
@@ -462,7 +495,91 @@ class BlockSparseMLP(Module):
             final_hidden_states = to2(final_hidden_states, out_dtype, self.out_dtype)
 
         # Fused path
-        # TODO: Find good solution for 1 < bsz < 32
+        elif bsz > 1:
+
+            final_hidden_states = torch.empty_like(y, dtype = self.out_dtype)
+
+            y = y.unsqueeze(1).unsqueeze(1)
+            selected_experts = selected_experts.unsqueeze(1)
+            routing_weights = routing_weights.unsqueeze(1)
+
+            # yh = torch.empty((bsz, self.num_experts_per_tok, 1, self.hidden_size), dtype = torch.half, device = self.device)
+            # interm_g = torch.empty((bsz, self.num_experts_per_tok, 1, self.intermediate_size), dtype = self.interm_dtype, device = self.device)
+            # interm_u = torch.empty_like(interm_g)
+            # interm_a = torch.empty_like(interm_u, dtype = torch.half) if self.interm_dtype != torch.half else interm_u
+            # out_d = torch.empty((bsz, self.num_experts_per_tok, 1, self.hidden_size), dtype = self.out_dtype or torch.half, device = self.device)
+
+            cfg = self.experts_cfg
+
+            mine, maxe = self.routing_first, self.routing_last
+            if mine is None or maxe - mine == self.num_experts:
+                mine, maxe = -1, -1
+
+            for i in range(bsz):
+
+                # Gate
+                ext.exl3_mgemm(
+                    y[i],
+                    self.multi_gate.ptrs_trellis,
+                    cfg.interm_g,
+                    self.multi_gate.ptrs_suh,
+                    cfg.yh,
+                    self.multi_gate.ptrs_svh,
+                    selected_experts[i],
+                    None,
+                    self.multi_gate.K,
+                    -1,
+                    self.multi_gate.mcg_mult,
+                    self.multi_gate.mul1_mult,
+                    mine,
+                    maxe,
+                )
+
+                # Up
+                ext.exl3_mgemm(
+                    y[i],
+                    self.multi_up.ptrs_trellis,
+                    cfg.interm_u,
+                    self.multi_up.ptrs_suh,
+                    cfg.yh,
+                    self.multi_up.ptrs_svh,
+                    selected_experts[i],
+                    None,
+                    self.multi_up.K,
+                    -1,
+                    self.multi_up.mcg_mult,
+                    self.multi_up.mul1_mult,
+                    mine,
+                    maxe,
+                )
+
+                # Activation
+                self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a)
+
+                # Down
+                ext.exl3_mgemm(
+                    cfg.interm_a,
+                    self.multi_down.ptrs_trellis,
+                    cfg.out_d,
+                    self.multi_down.ptrs_suh,
+                    cfg.interm_a,
+                    self.multi_down.ptrs_svh,
+                    selected_experts[i],
+                    routing_weights[i],
+                    self.multi_down.K,
+                    -1,
+                    self.multi_down.mcg_mult,
+                    self.multi_down.mul1_mult,
+                    mine,
+                    maxe,
+                )
+
+                t = cfg.out_d[0]
+                final_hidden_states[i:i+1] = t
+
+            final_hidden_states = final_hidden_states.view(x.shape)
+
+        # Bsz 1
         else:
             y = y.unsqueeze(0)
 
@@ -529,7 +646,12 @@ class BlockSparseMLP(Module):
 
         # Shared experts
         if self.shared_experts:
-            final_hidden_states += self.shared_experts.forward(x, params)
+            y = self.shared_experts.forward(x, params)
+            if self.shared_gate:
+                z = self.shared_gate.forward(x, params)
+                ext.add_sigmoid_gate(y, z, final_hidden_states)
+            else:
+                final_hidden_states += y
 
         # Output reduction
         if self.tp_reduce:

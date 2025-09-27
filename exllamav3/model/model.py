@@ -18,7 +18,9 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.config = config
 
         self.modules = []
-        self.caps = {}
+        self.caps = {
+            "supports_tp": True
+        }
         self.active_devices = []
         self.output_device = None
 
@@ -30,22 +32,32 @@ class Model(Model_TPMixin, Model_LSMixin):
         # Calibration options
         self.calibration_all_experts = False
 
+        # Modules dict
+        self.modules_dict = None
+
+        # Check compatibility
+        self.check_compat()
+
 
     def __iter__(self):
         for module in self.modules:
             yield from module
 
 
-    @lru_cache
     def find_module(self, key: str):
-        for module in self:
-            if module.key == key:
-                return module
+        if self.modules_dict is None:
+            self.modules_dict = {module.key: module for module in self}
+        return self.modules_dict[key]
 
 
     @lru_cache
     def get_cache_layers(self):
         return [m for m in self if m.caps.get("kv_cache")]
+
+
+    @lru_cache
+    def get_recurrent_layers(self):
+        return [m for m in self if m.caps.get("recurrent_cache")]
 
 
     @staticmethod
@@ -73,7 +85,7 @@ class Model(Model_TPMixin, Model_LSMixin):
 
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         # Overridden by model arch class
-        raise NotImplementedError
+        raise NotImplementedError()
 
 
     @torch.inference_mode
@@ -279,6 +291,9 @@ class Model(Model_TPMixin, Model_LSMixin):
 
             # Tensor-P load:
             else:
+                if not self.caps.get("supports_tp"):
+                    raise NotImplementedError(f"Tensor-parallel is not currently implemented for {self.config.architecture}")
+
                 if tp_output_device is None:
                     tp_output_device = active_devices[0]
                 else:
@@ -385,4 +400,15 @@ class Model(Model_TPMixin, Model_LSMixin):
         Convenience function for formatting a single chat request with the default template associated with the
         model's architecture, to simplify example and test scripts. Doesn't consider the model's actual Jinja template.
         """
-        raise NotImplementedError
+        raise NotImplementedError()
+
+
+    def batch_recurrent_states(self):
+        raise NotImplementedError()
+
+
+    def check_compat(self):
+        """
+        Decide if any model-specific requirements are met when creating Model
+        """
+        pass

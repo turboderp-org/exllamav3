@@ -112,12 +112,15 @@ class Cache:
 
         from .fp16 import CacheLayer_fp16
         self.layer_type = layer_type or CacheLayer_fp16
+        # self.recurrent_layer_type = recurrent_layer_type or RecurrentLayer_fp16
 
-        self.num_layers = len(self.model.get_cache_layers())
-        self.layers = [
-            self.layer_type(self.config, attn, id(self), self.max_num_tokens, **kwargs)
-            for attn in self.model.get_cache_layers()
-        ]
+        cl = self.model.get_cache_layers()
+        self.num_layers = len(cl)
+        self.layers = {
+            attn.layer_idx: self.layer_type(self.config, attn, id(self), self.max_num_tokens, **kwargs)
+            for attn in cl
+        }
+
         self.attach_to_model()
 
 
@@ -129,12 +132,11 @@ class Cache:
         """
         if model is None:
             model = self.model
-        model_num_layers = len(model.get_cache_layers())
-        assert model_num_layers == self.num_layers, \
-            f"Cannot attach cache with {self.num_layers} layers to model with {model_num_layers} layers."
-        for layer, module in zip(self.layers, model.get_cache_layers()):
-            assert layer not in module.cache_layers, \
-                "Cannot attach cache twice to the same model."
+
+        cl = model.get_cache_layers()
+        for module in cl:
+            layer = self.layers[module.layer_idx]
+            assert layer not in module.cache_layers, "Cannot attach cache twice to the same model."
             module.cache_layers.append(layer)
 
 
@@ -144,10 +146,10 @@ class Cache:
         """
         if model is None:
             model = self.model
-        model_num_layers = len(model.get_cache_layers())
-        assert model_num_layers == self.num_layers, \
-            f"Cannot detach cache with {self.num_layers} layers from model with {model_num_layers} layers."
-        for layer, module in zip(self.layers, model.get_cache_layers()):
+
+        cl = model.get_cache_layers()
+        for module in cl:
+            layer = self.layers[module.layer_idx]
             module.cache_layers.remove(layer)
 
 
@@ -178,7 +180,8 @@ class Cache:
             "Cannot copy pages between TP and non-TP caches, or between distinct TP caches."
         assert target.num_layers == self.num_layers
         if not self.model.loaded_tp:
-            for src, dst in zip(target.layers, self.layers):
+            for idx, src in self.layers.items():
+                dst = target.layers[idx]
                 assert type(src) is type(dst)
                 dst.copy_page(src, from_page, to_page, num_tokens)
         else:
@@ -187,6 +190,15 @@ class Cache:
 
     def get_all_tensors(self):
         tensors = []
-        for layer in self.layers:
+        for layer in self.layers.values():
             tensors += layer.get_tensors()
         return tensors
+
+
+    def new_recurrent_state(self):
+        rl = self.model.get_recurrent_layers()
+        state = {
+            attn.layer_idx: attn.new_recurrent_state()
+            for attn in rl
+        }
+        return state

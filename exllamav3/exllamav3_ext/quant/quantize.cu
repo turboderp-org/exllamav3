@@ -10,7 +10,7 @@
 #define NUM_THREADS 1024
 
 template <int K, int cb>
-__global__ __launch_bounds__(1024)
+__global__ __launch_bounds__(MIN(NUM_THREADS, 65536 >> K))
 void quantize_tiles_kernel
 (
     const float* __restrict__ input_tiles_ptr,
@@ -22,6 +22,7 @@ void quantize_tiles_kernel
 )
 {
     int tile_idx = blockIdx.x;
+    int thread = threadIdx.x;
 
     constexpr int Kr = 16 - K;
     constexpr int max_q = 1 << K;
@@ -30,49 +31,86 @@ void quantize_tiles_kernel
     const float* input_tile = input_tiles_ptr + 256 * tile_idx;
     float* output_tile = output_tiles_ptr + 256 * tile_idx;
     uint16_t* output_indices = output_indices_ptr + 256 * tile_idx;
-    float* temp_costs = temp_costs_ptr + 2 * edges * tile_idx;
-    float* temp_costs_inc = temp_costs + edges;
     uint16_t* temp_edges = temp_edges_ptr + 256 * edges * tile_idx;
+
+    // K >= 4 lets temp_costs fit in shmem, otherwise fall back to global temp buffer
+    __shared__ float sh_temp_costs[K >= 4 ? 2 * 65536 >> K : 1];
+    float* temp_costs = K >= 4 ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
+    float* temp_costs_inc = temp_costs + edges;
+
+    // Fetch input tile to shmem
+    __shared__ float sh_input_tile[256];
+    if (thread < 256) sh_input_tile[thread] = input_tile[thread];
+    __syncthreads();
 
     auto forward = [&](int roll, int pre_state)
     {
-        // Each thread iterates over all weights in the tile
-        for (int i = 0; i < 256; ++i)
+        int ri = roll % 256;
+
+        // temp_costs_inc[z] is the cost/cumulative error of an incoming edge from state (z & edge_mask)
+        float* t = temp_costs;
+        temp_costs = temp_costs_inc;
+        temp_costs_inc = t;
+
+        for (int out_edge_idx = thread; out_edge_idx < edges; out_edge_idx += NUM_THREADS)
         {
-            int ri = (i + roll) % 256;
+            float w = sh_input_tile[ri];
+
+            int state = out_edge_idx;
+            int in_edge_idx = state >> K;
+            float err = decode_3inst_f_diff<cb>(state, w, mult);
+            err = err * err;
+            if (pre_state >= 0 && in_edge_idx != pre_state) err = 1e30f;
+            float min_err = err;
+            int min_in_edge = in_edge_idx;
+
+            #pragma unroll
+            for (int k = 1; k < max_q; ++k)
+            {
+                state = (k << Kr) | out_edge_idx;
+                in_edge_idx = state >> K;
+                err = decode_3inst_f_diff<cb>(state, w, mult);
+                err = err * err;
+                if (pre_state >= 0 && in_edge_idx != pre_state) err = 1e30f;
+                if (err < min_err) { min_err = err; min_in_edge = in_edge_idx; }
+            }
+
+            temp_costs[out_edge_idx] = min_err;
+            temp_edges[edges * ri + out_edge_idx] = (uint16_t) min_in_edge;
+        }
+
+        // Next iteration depends on costs computed by current iteration
+        __syncthreads();
+
+        // Each thread iterates over all weights in the tile
+        for (int i = 1; i < 256; ++i)
+        {
+            ri = (i + roll) % 256;
 
             // Swap buffers.
-            // temp_costs_inc[z] is the cost/cumulative error of an incoming edge from state (z & edge_mask)
-            float* t = temp_costs;
+            t = temp_costs;
             temp_costs = temp_costs_inc;
             temp_costs_inc = t;
 
-            for (int out_edge_idx = threadIdx.x; out_edge_idx < edges; out_edge_idx += NUM_THREADS)
+            for (int out_edge_idx = thread; out_edge_idx < edges; out_edge_idx += NUM_THREADS)
             {
-                float w = input_tile[ri];
+                float w = sh_input_tile[ri];
 
-                float min_err = INFINITY;
-                int min_in_edge = 0;
+                int state = out_edge_idx;
+                int in_edge_idx = state >> K;
+                float err = decode_3inst_f_diff<cb>(state, w, mult);
+                err = err * err + temp_costs_inc[in_edge_idx];
+                float min_err = err;
+                int min_in_edge = in_edge_idx;
 
                 #pragma unroll
-                for (int k = 0; k < max_q; ++k)
+                for (int k = 1; k < max_q; ++k)
                 {
-                    int state = (k << Kr) | out_edge_idx;
-
-                    float err = decode_3inst_f_diff<cb>(state, w, mult);
-                    err = err * err;
-
-                    int in_edge_idx = state >> K;
-                    if (i > 0)
-                        err += temp_costs_inc[in_edge_idx];
-                    else if (pre_state >= 0 && in_edge_idx != pre_state)
-                        err = 1e30f;
-
-                    if (err < min_err)
-                    {
-                        min_err = err;
-                        min_in_edge = in_edge_idx;
-                    }
+                    state = (k << Kr) | out_edge_idx;
+                    in_edge_idx = state >> K;
+                    err = decode_3inst_f_diff<cb>(state, w, mult);
+                    err = err * err + temp_costs_inc[in_edge_idx];
+                    if (err < min_err) { min_err = err; min_in_edge = in_edge_idx; }
                 }
 
                 temp_costs[out_edge_idx] = min_err;
@@ -101,8 +139,8 @@ void quantize_tiles_kernel
         }
 
         // Shuffle reduction
-        int lane_id = threadIdx.x % 32;
-        int warp_id = threadIdx.x / 32;
+        int lane_id = thread % 32;
+        int warp_id = thread / 32;
 
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
@@ -125,8 +163,8 @@ void quantize_tiles_kernel
 
         if (warp_id == 0)
         {
-            local_min = lane_id * 32 < edges ? s_min[lane_id] : 1e31f;
-            local_idx = s_idx[lane_id];
+            local_min = lane_id * 32 < edges && thread < NUM_THREADS / 32 ? s_min[lane_id] : 1e31f;
+            local_idx = thread < NUM_THREADS ? s_idx[lane_id] : 0;
 
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1)
@@ -149,7 +187,7 @@ void quantize_tiles_kernel
         // Construct output tile. Since the graph has to be walked, this will run in a single thread per block.
         // Profiling says this is not a bottleneck
 
-        if (threadIdx.x == 0)
+        if (thread == 0)
         {
             for (int i = 255; i >= 0; --i)
             {
@@ -170,7 +208,7 @@ void quantize_tiles_kernel
 
         // Broadcast to block
         __shared__ int broadcast;
-        if (threadIdx.x == 0) broadcast = edge;
+        if (thread == 0) broadcast = edge;
         __syncthreads();
         edge = broadcast;
 

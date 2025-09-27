@@ -222,3 +222,35 @@ void xielu
         // );
     }
 }
+
+// x * sigmoid(y) + z -> z
+
+void add_sigmoid_gate
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(x, kFloat);
+    TORCH_CHECK_DTYPE(y, kFloat);
+    TORCH_CHECK_DTYPE(z, kFloat);
+
+    int dim = x.size(-1);
+    int gdim = y.size(-1);
+    TORCH_CHECK(gdim == 1, "gate must have size(-1) == 1")
+
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, NUM_THREADS);
+    add_sigmoid_kernel_f<<<blocks, NUM_THREADS, 0, stream>>>
+    (
+        (const float*) x.data_ptr(),
+        (const float*) y.data_ptr(),
+        (float*) z.data_ptr(),
+        numel,
+        dim
+    );
+}

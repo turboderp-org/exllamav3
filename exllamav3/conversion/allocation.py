@@ -16,6 +16,7 @@ def allocate_transformer(
     g: Linear | list[Linear] | None,
     u: Linear | list[Linear] | None,
     d: Linear | list[Linear] | None,
+    qkvz: Linear | None,
 ) -> (dict, int):
 
     # Submodules
@@ -38,6 +39,18 @@ def allocate_transformer(
             [0, 1, 1, 1],
             [0, 1, 2, 1],
             [1, 2, 2, 1],
+        ]
+
+    if qkvz is not None:
+        assert o
+        keys += [m.key for m in (qkvz, o)]
+        numels += [m.weights_numel() for m in (qkvz, o)]
+        for m in (qkvz, o):
+            out_keys[m.key] = m.key
+        perms_qkvo = [
+            [0, 0],
+            [1, 1],
+            [2, 2],
         ]
 
     if g is not None and u is not None:

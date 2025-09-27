@@ -24,7 +24,8 @@ class LinearFP16:
         full_out_features: int | None = None,
         first_in_feature: int | None = None,
         first_out_feature: int | None = None,
-        out_dtype: torch.dtype | None = None
+        out_dtype: torch.dtype | None = None,
+        key: str | None = None
     ):
         self.weight = weight
         if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
@@ -37,6 +38,7 @@ class LinearFP16:
         self.first_in_feature = first_in_feature
         self.first_out_feature = first_out_feature
         self.out_dtype = out_dtype
+        self.key = key
 
         if self.weight.shape[0] == full_in_features and self.weight.shape[0] < in_features:
             self.weight = self.weight[first_in_feature : first_in_feature + in_features, :]

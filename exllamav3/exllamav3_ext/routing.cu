@@ -343,9 +343,9 @@ void routing_ds3_nogroup
     int num_experts = scores.size(1);
     int K = topk_indices.size(1);
 
-    TORCH_CHECK(num_experts < MAX_NUM_EXPERTS, "Too many experts");
+    TORCH_CHECK(num_experts <= MAX_NUM_EXPERTS, "Too many experts");
     TORCH_CHECK(num_experts % 32 == 0, "num_experts must be a multiple of 32");
-    TORCH_CHECK(K < MAX_K, "Too many experts per token");
+    TORCH_CHECK(K <= MAX_K, "Too many experts per token");
 
     int num_warps = CEIL_DIVIDE(num_experts, 32);
     int num_threads = num_warps * 32;
@@ -398,8 +398,8 @@ void routing_std
     int num_experts = scores.size(1);
     int K = topk_indices.size(1);
 
-    TORCH_CHECK(num_experts < MAX_NUM_EXPERTS, "Too many experts");
-    TORCH_CHECK(K < MAX_K, "Too many experts per token");
+    TORCH_CHECK(num_experts <= MAX_NUM_EXPERTS, "Too many experts");
+    TORCH_CHECK(K <= MAX_K, "Too many experts per token");
 
     int num_warps = CEIL_DIVIDE(num_experts, 32);
     int num_threads = num_warps * 32;

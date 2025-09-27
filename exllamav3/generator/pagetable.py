@@ -13,6 +13,7 @@ from itertools import pairwise
 from ..util.tensor import SeqTensor
 from exllamav3.ext import exllamav3_ext as ext
 import time
+from ..cache import RecurrentCache
 from ..util import profile_opt
 
 
@@ -153,7 +154,9 @@ class CachePage:
         self.pagetable.unreferenced_pages[self.phash] = self
 
     # Update hash
-    def update_hash(self, newhash):
+    def update_hash(self, newhash = None):
+        if newhash is None:
+            newhash = tensor_hash_checksum(self.sequence, self.prev_hash)
         assert self.ref_count > 0
         assert self.kv_position == PAGE_SIZE
         del self.pagetable.referenced_pages[self.phash]
@@ -161,6 +164,16 @@ class CachePage:
         self.can_revert = False
         assert self.phash not in self.pagetable.referenced_pages
         self.pagetable.referenced_pages[self.phash] = self
+
+    # Clear allocated page to repeat prefill
+    def make_unique(self):
+        assert self.ref_count > 0
+        del self.pagetable.referenced_pages[self.phash]
+        self.phash = _randomhash()
+        assert self.phash not in self.pagetable.referenced_pages
+        self.pagetable.referenced_pages[self.phash] = self
+        self.prev_hash = None
+        self.kv_position = 0
 
 
 class Sequence:
@@ -204,11 +217,31 @@ class Sequence:
             dtype = torch.int32,
         )
 
-    def allocate_pages(self, pagetable: PageTable):
+    def allocate_pages(self, pagetable: PageTable, recurrent_cache: None | RecurrentCache):
+        # If recurrent model, find logest recurrent prefix
+        recurrent_pages = None
+        if recurrent_cache is not None:
+            recurrent_pages = []
+            for pi, ph in enumerate(self.page_hashes):
+                rs = recurrent_cache.get(ph)
+                if rs:
+                    recurrent_pages.append(pi)
+
+        # Allocate pages in KV cache, limit prefix caching to available recurrent states
         self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
-            pagetable.allocate_pages(self.page_hashes, self.new_unique_pages)
+            pagetable.allocate_pages(self.page_hashes, self.new_unique_pages, recurrent_pages)
+
+        # Prepare block index
         self.build_block_index_tensor()
-        return len(self.allocated_pages), cached_pages, non_sequential_pages
+
+        # If recurrent model, grab cached state for prefix length
+        recurrent_state = None
+        if recurrent_cache is not None:
+            if cached_pages > 0:
+                recurrent_state = recurrent_cache.get(self.page_hashes[cached_pages - 1])
+                assert recurrent_state is not None, "Failed to get cached recurrent state"
+
+        return len(self.allocated_pages), cached_pages, non_sequential_pages, recurrent_state
 
 
 class PageTable:
@@ -281,13 +314,14 @@ class PageTable:
     def allocate_pages(
         self,
         page_hashes: list,
-        new_unique_pages: int
+        new_unique_pages: int,
+        recurrent_pages: list[int] | None
     ):
         allocated_pages = []
         available_pages = None
 
         # Allocate whole pages
-        for h in page_hashes:
+        for lp, h in enumerate(page_hashes):
             self.access_serial += 1
 
             # Find matching referenced page
@@ -337,15 +371,26 @@ class PageTable:
             op.add_ref_unique(self.access_serial)
             allocated_pages.append(op)
 
-        # Advance cache over prefilled pages
-        kv_position = 0
+        # List prefilled pages
         cached_pages = 0
         for page in allocated_pages:
             if page.kv_position == PAGE_SIZE:
-                kv_position += PAGE_SIZE
                 cached_pages += 1
             else:
                 break
+
+        # If recurrent cache used, roll back to longest prefix, clear subsequent pages
+        if recurrent_pages is not None:
+            max_recur = 0
+            for rp in recurrent_pages:
+                if rp < cached_pages:
+                    max_recur = rp + 1
+            # for cpi in range(max_recur, cached_pages):
+            #     allocated_pages[cpi].make_unique()
+            cached_pages = max_recur
+
+        # Advance cache over prefilled pages
+        kv_position = cached_pages * PAGE_SIZE
 
         non_sequential_pages = 0
         for page_a, page_b in pairwise(allocated_pages):
@@ -362,6 +407,59 @@ class PageTable:
 
     def num_unreferenced_pages(self):
         return len(self.unreferenced_pages)
+
+
+    def validate_pagetable(self, active_jobs):
+
+        def p_assert(exp):
+            # assert exp
+            if not exp:
+                xx = 0
+
+        # Check page collections
+        ids = set()
+        for p in self.referenced_pages.values():
+            p_assert(p.ref_count > 0)
+            ids.add(id(p))
+        for p in self.unreferenced_pages.values():
+            p_assert(p.ref_count == 0)
+            ids.add(id(p))
+        p_assert(len(ids) == self.max_pages)
+        p_assert(len(self.all_pages) == self.max_pages)
+
+        # Check job reference counts
+        refcounts = [0] * self.max_pages
+        for job in active_jobs:
+            for seq in job.sequences:
+                for page in seq.allocated_pages:
+                    refcounts[page.page_index] += 1
+
+        for page in self.all_pages:
+            p_assert(page.ref_count == refcounts[page.page_index])
+
+        # Check that all hashes are unique
+        hashes = set()
+        for page in self.all_pages:
+            p_assert(page.phash not in hashes)
+            hashes.add(page.phash)
+        p_assert(len(hashes) == self.max_pages)
+
+        # Check individual hashes
+        for page in self.all_pages:
+            if page.kv_position == PAGE_SIZE and page.phash[:8] != b'\x00\x00\x00\x00\x00\x00\x00\x00':
+                h = tensor_hash_checksum(page.sequence, page.prev_hash)
+                p_assert(page.phash == h)
+
+        # Check job sequences
+        for job in active_jobs:
+            for seq in job.sequences:
+                k, j = 0, 0
+                while j < seq.kv_position:
+                    i, j = j, min(j + PAGE_SIZE, seq.kv_position)
+                    jobt = seq.sequence_ids.torch()[:, i : j]
+                    paget = seq.allocated_pages[k].sequence[:, 0 : j - i]
+                    p_assert(torch.equal(jobt, paget))
+                    k += 1
 
 
     def defrag(self, debug = False):

@@ -86,27 +86,17 @@ if build_jit:
     extra_cuda_cflags = ["-lineinfo", "-O3"]
 
     if windows:
-        extra_cflags += ["/Ox", "/arch:AVX2"]
-        extra_cuda_cflags += ["-Xcompiler", "/Ox", "-Xcompiler", "/arch:AVX2"]
-        # extra_cuda_cflags += [
-        #     "-gencode=arch=compute_80,code=sm_80",
-        #     "-gencode=arch=compute_86,code=sm_86",
-        #     "-gencode=arch=compute_89,code=sm_89",
-        #     "-gencode=arch=compute_89,code=compute_89",
-        #     "-gencode=arch=compute_90,code=sm_90",
-        #     "-gencode=arch=compute_100,code=sm_100",
-        #     "-gencode=arch=compute_120,code=sm_120",
-        #     "-gencode=arch=compute_120,code=compute_120",
-        # ]
+        extra_cflags += ["/Ox"]
+        extra_cuda_cflags += []
         if ext_debug:
             extra_cflags += ["/Zi"]
-            extra_cuda_cflags += ["-Xcompiler", "/Zi"]
+            extra_cuda_cflags += []
     else:
-        extra_cflags += ["-Ofast", "-mavx2"]
-        extra_cuda_cflags += ["-Xcompiler=-O3", "-Xcompiler=-mavx2"]
+        extra_cflags += ["-Ofast"]
+        extra_cuda_cflags += []
         if ext_debug:
             extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
-            extra_cuda_cflags += ["-Xcompiler=-g"]
+            extra_cuda_cflags += []
 
     if torch.version.hip:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]

@@ -14,6 +14,7 @@ from adjustText import adjust_text
 import glob
 from safetensors.torch import save_file
 from safetensors import safe_open
+import gc
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
@@ -377,6 +378,9 @@ def main(args):
         r = test_ppl(test_data_spec, spec, logits_file)
         print(r)
         results.append(r)
+
+        torch.cuda.empty_cache()
+        gc.collect()
 
     print("------")
     print(json.dumps(results, indent = 4))
