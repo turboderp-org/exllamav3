@@ -141,9 +141,11 @@ class Job:
 
         if rq_state is None:
             rq_state = {}
-            self.is_requeued = True
-        else:
             self.is_requeued = False
+            self.rq_new_tokens = 0
+        else:
+            self.is_requeued = True
+            self.rq_new_tokens = rq_state["rq_new_tokens"]
 
         self.generator = None
         self.pagetable = None
@@ -189,7 +191,6 @@ class Job:
             self.sequences.append(seq)
 
         # Generation parameters
-        assert max_new_tokens >= 2
         self.max_new_tokens = max_new_tokens - 1 or 100
         self.min_new_tokens = min_new_tokens
         self.new_tokens = 0 if self.prefix_token is None else -1
@@ -589,7 +590,7 @@ class Job:
                 self.is_finished = True
                 r.update({
                     "full_completion": self.full_completion,
-                    "new_tokens": self.new_tokens,
+                    "new_tokens": self.rq_new_tokens + self.new_tokens,
                     "prompt_tokens": len(self.sequences[0].input_ids),
                     "time_enqueued": self.time_enqueued,
                     "time_prefill": self.time_prefill,
@@ -796,6 +797,7 @@ class Job:
             "time_enqueued": self.time_enqueued,
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
+            "rq_new_tokens": self.new_tokens - 1
         }
 
         rq_job = Job(
