@@ -218,6 +218,8 @@ class Linear(Module):
 
     @override
     def unload(self):
+        if self.inner is not None:
+            self.inner.unload()
         self.device = None
         self.inner = None
 

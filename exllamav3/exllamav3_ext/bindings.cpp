@@ -40,6 +40,9 @@
 #include "parallel/all_reduce.cuh"
 
 #include "libtorch/blocksparse_mlp.h"
+#include "libtorch/gated_delta_net.h"
+#include "libtorch/linear.h"
+#include "libtorch/gated_rmsnorm.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -116,4 +119,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("histogram", &histogram, "histogram");
 
     m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
+
+    #include "libtorch/linear_bc.h"
+    #include "libtorch/gated_delta_net_bc.h"
+    #include "libtorch/gated_rmsnorm_bc.h"
 }

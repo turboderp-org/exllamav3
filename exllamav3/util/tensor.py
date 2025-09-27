@@ -180,3 +180,31 @@ def save_tensor_image(
     rgb8 = (rgba[..., :3] * 255).astype("uint8")
     im = Image.fromarray(rgb8)
     im.save(path)
+
+
+class GTensorCache:
+    def __init__(self):
+        self.cache = {}
+
+    def make_key(self, device, shape, dtype, x):
+        device = torch.device(device)
+        return f"{device}/{str(shape)}/{str(dtype)}/{x}"
+
+    def get(self, device, shape, dtype, x = ""):
+        key = self.make_key(device, shape, dtype, x)
+        if key not in self.cache:
+            refc, v = (0, torch.empty(shape, dtype = dtype, device = device))
+        else:
+            refc, v = self.cache[key]
+        self.cache[key] = (refc + 1, v)
+        return v
+
+    def drop(self, device, shape, dtype, x = ""):
+        key = self.make_key(device, shape, dtype, x)
+        refc, v = self.cache[key]
+        if refc == 1:
+            del self.cache[key]
+        else:
+            self.cache[key] = (refc - 1, v)
+
+g_tensor_cache = GTensorCache()

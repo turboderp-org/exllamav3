@@ -42,6 +42,7 @@ def causal_conv1d_fwd_function_torch(
     # as the initial state
     bsz, dim, seq_len = x.shape
     zero_state = torch.zeros((bsz, dim, weight.shape[-1]), dtype = x.dtype, device = x.device)
+
     y = torch.cat([zero_state, x], dim = -1).to(weight.dtype)
     y = F.conv1d(y, weight.unsqueeze(1), bias, padding = 0, groups = dim)
     y = F.silu(y[:, :, -seq_len:])
@@ -210,7 +211,6 @@ class GDN_RecurrentState(CacheableState):
         )
 
     def collect_batch(self, batch: list[GDN_RecurrentState]):
-        bsz = len(batch)
         lcs = torch.cat([b.last_conv_state for b in batch], dim = 0)
         lrs = torch.cat([b.last_recurrent_state for b in batch], dim = 0)
         positions = [b.position for b in batch]
@@ -301,18 +301,18 @@ class GatedDeltaNet(Module):
 
         self.out_dtype = out_dtype
 
-        fdim_qkvz = 2 * self.num_k_heads * self.k_head_dim + 2 * self.num_v_heads * self.v_head_dim
-        fdim_ba = 2 * self.num_v_heads
+        self.fdim_qkvz = 2 * self.num_k_heads * self.k_head_dim + 2 * self.num_v_heads * self.v_head_dim
+        self.fdim_ba = 2 * self.num_v_heads
         self.fdim_qkv = 2 * self.num_k_heads * self.k_head_dim + self.num_v_heads * self.v_head_dim
 
         if key_fused_qkvz:
-            self.qkvz_proj = Linear(config, f"{key}.{key_fused_qkvz}", hidden_size, fdim_qkvz, qmap = qmap + ".input", out_dtype = torch.float)
+            self.qkvz_proj = Linear(config, f"{key}.{key_fused_qkvz}", hidden_size, self.fdim_qkvz, qmap = qmap + ".input", out_dtype = torch.float)
             self.register_submodule(self.qkvz_proj)
         else:
             self.qkvz_proj = None
 
         if key_fused_ba:
-            self.ba_proj = Linear(config, f"{key}.{key_fused_ba}", hidden_size, fdim_ba, qmap = None, out_dtype = torch.float, pad_to = 1)
+            self.ba_proj = Linear(config, f"{key}.{key_fused_ba}", hidden_size, self.fdim_ba, qmap = None, out_dtype = torch.float, pad_to = 1)
             self.register_submodule(self.ba_proj)
         else:
             self.ba_proj = None
@@ -338,7 +338,9 @@ class GatedDeltaNet(Module):
             "recurrent_cache": True
         })
 
-        self.prealloc_split = None
+        self.bs = None
+        self.bsz1_pa_args = None
+
         # self.cache_layers = []
         # self.tp_cache_lookup = {}
         # self.multi_kv = None
@@ -353,8 +355,41 @@ class GatedDeltaNet(Module):
 
 
     def load_local(self, device, **kwargs):
-        pass
+        is_quantized = (
+            self.qkvz_proj is not None and self.qkvz_proj.quant_format_id() == "exl3" and
+            self.ba_proj is not None and self.ba_proj.quant_format_id() is None and
+            self.o_proj is not None and self.o_proj.quant_format_id() == "exl3"
+        )
 
+        if is_quantized:
+            self.bsz1_pa_args = [
+                (device, (1, self.fdim_qkv, 1), torch.bfloat16),
+                (device, (1, 1, self.num_v_heads, self.v_head_dim), torch.bfloat16, "a"),
+                (device, (1, 1, self.num_v_heads), torch.bfloat16),
+                (device, (1, 1, self.num_v_heads), torch.float),
+                (device, (1, 1, self.fdim_qkvz), torch.float),
+                (device, (1, 1, self.fdim_ba), torch.float),
+                (device, (1, self.fdim_qkv, self.conv_kernel_size + 1), torch.bfloat16, "a"),
+                (device, (1, self.fdim_qkv, 2), torch.bfloat16, "b"),
+                (device, (1, 1, self.num_v_heads, self.v_head_dim), torch.bfloat16, "b"),
+                (device, (1, 1, self.num_v_heads * self.v_head_dim), torch.half),
+            ]
+
+            self.bs = ext.BC_GatedDeltaNet(
+                *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
+                self.qkvz_proj.inner.bc,
+                self.ba_proj.inner.bc,
+                self.dt_bias,
+                self.a_log,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.k_head_dim,
+                self.v_head_dim,
+                self.conv1d_weight,
+                self.conv1d_bias,
+                self.norm.bc,
+                self.o_proj.inner.bc
+            )
 
     @override
     def load(self, device: torch.Device, **kwargs):
@@ -366,22 +401,17 @@ class GatedDeltaNet(Module):
         self.norm.load(device, **kwargs)
         self.load_local(device, **kwargs)
 
-        # Preallocate (mixed_qkv, z, beta, g) tensors for bsz 1, seqlen 1
-        self.prealloc_split = (
-            torch.zeros((1, self.fdim_qkv, 1), dtype = torch.bfloat16, device = device),
-            torch.zeros((1, 1, self.num_v_heads, self.v_head_dim), dtype = torch.bfloat16, device = device),
-            torch.zeros((1, 1, self.num_v_heads), dtype = torch.bfloat16, device = device),
-            torch.zeros((1, 1, self.num_v_heads), dtype = torch.float, device = device)
-        )
-
     @override
     def unload(self):
+        if self.bs is not None:
+            for arg in self.bsz1_pa_args:
+                g_tensor_cache.drop(*arg)
+            self.bs = None
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
         self.conv1d_bias = None
         self.norm.unload()
-        self.prealloc_split = None
         super().unload()
 
 
@@ -443,139 +473,132 @@ class GatedDeltaNet(Module):
         rs = params.get("recurrent_states")
         if rs is not None:
             rs = rs[self.layer_idx]
-            conv_state = rs.last_conv_state
-            recurrent_state = rs.last_recurrent_state
+            conv_state = rs.last_conv_state if rs.last_conv_state is not None else \
+                torch.zeros((bsz, self.fdim_qkv, self.conv_kernel_size), dtype = torch.bfloat16, device = x.device)
+            recurrent_state = rs.last_recurrent_state if rs.last_recurrent_state is not None else \
+                torch.zeros(
+                    (bsz, self.num_v_heads, self.k_head_dim, self.v_head_dim),
+                    dtype = torch.float,
+                    device = self.device
+                )
+
             save_state = True
         else:
             conv_state = None
             recurrent_state = None
             save_state = False
 
-        # Projections
-        qkvz = self.qkvz_proj.forward(x, params)
-        ba = self.ba_proj.forward(x, params)
-
-        if bsz == 1 and seqlen == 1:
-            mixed_qkv, z, beta, g = self.prealloc_split
-        else:
-            mixed_qkv = torch.zeros((bsz, self.fdim_qkv, seqlen), dtype = torch.bfloat16, device = self.device)
-            z = torch.zeros((bsz, seqlen, self.num_v_heads, self.v_head_dim), dtype = torch.bfloat16, device = self.device)
-            beta = torch.zeros((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
-            g = torch.zeros((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
-
-        ext.gated_delta_net_fused_op(
-            qkvz, ba,
-            self.dt_bias,
-            self.a_log,
-            mixed_qkv, z, beta, g,
-            self.num_k_heads,
-            self.num_v_heads,
-            self.k_head_dim,
-            self.v_head_dim
-        )
-
-        # Convolution
-        if conv_state is None:
-            if save_state:
-                conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
-                rs.last_conv_state = conv_state
-            mixed_qkv = causal_conv1d_fwd_function(
-                mixed_qkv,
-                self.conv1d_weight.squeeze(1),
-                self.conv1d_bias,
-            )
-        else:
+        # C++ path
+        if self.bs is not None and bsz == 1 and seqlen == 1 and save_state:
+            y = torch.empty_like(x)
+            mixed_qkv = self.bs.run_bsz1_a(x)
             mixed_qkv = causal_conv1d_update_function(
                 mixed_qkv,
                 conv_state,  # Updated inplace
                 self.conv1d_weight.squeeze(1),
                 self.conv1d_bias,
             )
+            self.bs.run_bsz1_b(mixed_qkv, y, recurrent_state)
+            x = y
 
-        # Use chunked rule when advantageous
-        if seqlen >= 32:
-            mixed_qkv = mixed_qkv.transpose(1, 2)
-
-            q, k, v = torch.split(mixed_qkv, [self.k_dim, self.k_dim, self.v_dim], dim = -1)
-            q = q.view(bsz, seqlen, -1, self.k_head_dim)
-            k = k.view(bsz, seqlen, -1, self.k_head_dim)
-            v = v.view(bsz, seqlen, -1, self.v_head_dim)
-
-            # Grouped attn
-            if self.num_v_heads // self.num_k_heads > 1:
-                q = q.repeat_interleave(self.num_v_groups, dim = 2)
-                k = k.repeat_interleave(self.num_v_groups, dim = 2)
-
-            core_attn_out, recurrent_state = chunk_gated_delta_rule(
-                q, k, v,
-                g = g,
-                beta = beta,
-                initial_state = recurrent_state,
-                output_final_state = save_state,
-                use_qk_l2norm_in_kernel = True,
-            )
-
+        # Torch path
         else:
-            # mixed_qkv = mixed_qkv.transpose(1, 2)
-            #
-            # q, k, v = torch.split(mixed_qkv, [self.k_dim, self.k_dim, self.v_dim], dim = -1)
-            # q = q.view(bsz, seqlen, -1, self.k_head_dim)
-            # k = k.view(bsz, seqlen, -1, self.k_head_dim)
-            # v = v.view(bsz, seqlen, -1, self.v_head_dim)
-            #
-            # # Grouped attn
-            # if self.num_v_heads // self.num_k_heads > 1:
-            #     q = q.repeat_interleave(self.num_v_groups, dim = 2)
-            #     k = k.repeat_interleave(self.num_v_groups, dim = 2)
-            #
-            # core_attn_out, recurrent_state = torch_recurrent_gated_delta_rule(
-            #     q, k, v,
-            #     g = g,
-            #     beta = beta,
-            #     initial_state = recurrent_state,
-            #     output_final_state = save_state,
-            #     use_qk_l2norm_in_kernel = True,
-            # )
+            # Projections
+            qkvz = self.qkvz_proj.forward(x, params)
+            ba = self.ba_proj.forward(x, params)
 
-            if recurrent_state is None:
-                recurrent_state = torch.zeros(
-                    (bsz, self.num_v_heads, self.k_head_dim, self.v_head_dim),
-                    dtype = torch.float,
-                    device = self.device
-                )
-            core_attn_out = torch.empty(
-                (bsz, seqlen, self.num_v_heads, self.v_head_dim),
-                dtype = torch.bfloat16,
-                device = self.device,
-            )
+            mixed_qkv = torch.zeros((bsz, self.fdim_qkv, seqlen), dtype = torch.bfloat16, device = self.device)
+            z = torch.zeros((bsz, seqlen, self.num_v_heads, self.v_head_dim), dtype = torch.bfloat16, device = self.device)
+            beta = torch.zeros((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
+            g = torch.zeros((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
 
-            mixed_qkv = mixed_qkv.transpose(1, 2).contiguous()
-            ext.cuda_recurrent_gated_delta_rule(
-                mixed_qkv,
-                g,
-                beta,
-                recurrent_state,
-                core_attn_out,
+            ext.gated_delta_net_fused_op(
+                qkvz, ba,
+                self.dt_bias,
+                self.a_log,
+                mixed_qkv, z, beta, g,
                 self.num_k_heads,
                 self.num_v_heads,
                 self.k_head_dim,
                 self.v_head_dim
             )
 
+            # Convolution
+            if conv_state is None:
+                if save_state:
+                    conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+                    rs.last_conv_state = conv_state
+                mixed_qkv = causal_conv1d_fwd_function(
+                    mixed_qkv,
+                    self.conv1d_weight.squeeze(1),
+                    self.conv1d_bias,
+                )
+            else:
+                mixed_qkv = causal_conv1d_update_function(
+                    mixed_qkv,
+                    conv_state,  # Updated inplace
+                    self.conv1d_weight.squeeze(1),
+                    self.conv1d_bias,
+                )
+
+            # Use chunked rule when advantageous
+            if seqlen >= 32:
+                mixed_qkv = mixed_qkv.transpose(1, 2)
+
+                q, k, v = torch.split(mixed_qkv, [self.k_dim, self.k_dim, self.v_dim], dim = -1)
+                q = q.view(bsz, seqlen, -1, self.k_head_dim)
+                k = k.view(bsz, seqlen, -1, self.k_head_dim)
+                v = v.view(bsz, seqlen, -1, self.v_head_dim)
+
+                # Grouped attn
+                if self.num_v_heads // self.num_k_heads > 1:
+                    q = q.repeat_interleave(self.num_v_groups, dim = 2)
+                    k = k.repeat_interleave(self.num_v_groups, dim = 2)
+
+                core_attn_out, recurrent_state = chunk_gated_delta_rule(
+                    q, k, v,
+                    g = g,
+                    beta = beta,
+                    initial_state = recurrent_state,
+                    output_final_state = save_state,
+                    use_qk_l2norm_in_kernel = True,
+                )
+
+            else:
+                core_attn_out = torch.empty(
+                    (bsz, seqlen, self.num_v_heads, self.v_head_dim),
+                    dtype = torch.bfloat16,
+                    device = self.device,
+                )
+
+                mixed_qkv = mixed_qkv.transpose(1, 2).contiguous()
+                ext.cuda_recurrent_gated_delta_rule(
+                    mixed_qkv,
+                    g,
+                    beta,
+                    recurrent_state,
+                    core_attn_out,
+                    self.num_k_heads,
+                    self.num_v_heads,
+                    self.k_head_dim,
+                    self.v_head_dim
+                )
+
+            # Norm
+            core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
+            core_attn_out = core_attn_out.view(bsz, seqlen, self.num_v_heads * self.v_head_dim)
+
+            # Output projection
+            x = self.o_proj.forward(core_attn_out, params)
+
         # Update cache
         if save_state:
             rs.last_recurrent_state = recurrent_state
+            rs.last_conv_state = conv_state
             if not rs.batched:
                 rs.position += seqlen
             else:
                 rs.positions = [r + seqlen for r in rs.positions]
-
-        # Norm
-        core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
-        core_attn_out = core_attn_out.view(bsz, seqlen, self.num_v_heads * self.v_head_dim)
-
-        # Output projection
-        x = self.o_proj.forward(core_attn_out, params)
 
         return to2(x, out_dtype, self.out_dtype)
 
