@@ -20,6 +20,7 @@ struct BC_LinearFP16
     {}
 
     void run(const at::Tensor& x, at::Tensor& y);
+    void run_cublas(const at::Tensor& x, at::Tensor& y);
 };
 
 struct BC_LinearEXL3
@@ -29,8 +30,8 @@ struct BC_LinearEXL3
     at::Tensor svh;
     int K;
     c10::optional<at::Tensor> bias;
-    int mcg_mult;
-    int mul1_mult;
+    uint32_t mcg_mult;
+    uint32_t mul1_mult;
     at::Tensor xh;
 
     BC_LinearEXL3
@@ -40,8 +41,8 @@ struct BC_LinearEXL3
         at::Tensor _svh,
         int _K,
         c10::optional<at::Tensor> _bias,
-        int _mcg_mult,
-        int _mul1_mult,
+        uint32_t _mcg_mult,
+        uint32_t _mul1_mult,
         at::Tensor _xh
     ) :
         trellis(std::move(_trellis)),

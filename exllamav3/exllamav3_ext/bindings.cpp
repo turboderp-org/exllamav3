@@ -40,10 +40,11 @@
 #include "parallel/gather.cuh"
 #include "parallel/all_reduce.cuh"
 
-#include "libtorch/blocksparse_mlp.h"
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/linear.h"
 #include "libtorch/gated_rmsnorm.h"
+#include "libtorch/mlp.h"
+#include "libtorch/blocksparse_mlp.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -124,4 +125,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
     #include "libtorch/gated_rmsnorm_bc.h"
+    #include "libtorch/mlp_bc.h"
+    #include "libtorch/blocksparse_mlp_bc.h"
 }

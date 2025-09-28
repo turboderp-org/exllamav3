@@ -11,6 +11,7 @@ from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
 import torch.distributed as dist
 from .multilinear import MultiLinear
+from ..util.tensor import g_tensor_cache
 
 class MLP(Module):
 
@@ -139,6 +140,8 @@ class MLP(Module):
             case "xielu": self.activation_fn_call = self.act_xielu
 
         self.tp_reduce = False
+
+        self.bc = None
 
 
     @override
@@ -495,6 +498,9 @@ class GatedMLP(Module):
         self.tp_reduce = False
         self.multi_gu: list[MultiLinear | None] = [None] * self.num_slices
 
+        self.bc = None
+        self.bsz1_pa_args = []
+
 
     @override
     def optimizer_targets(self):
@@ -536,10 +542,38 @@ class GatedMLP(Module):
         ):
             self.multi_gu[load_slice] = MultiLinear(self.device, [self.gates[load_slice], self.ups[load_slice]])
 
+        self.bc = None
+        if self.num_slices == 1 and self.multi_gu[0] is not None and self.downs[0].inner.bc is not None:
+            mgu = self.multi_gu[0]
+            self.bsz1_pa_args = [
+                (device, (2, 1, self.hidden_size), self.interm_dtype),
+                (device, (2, 1, mgu.out_features), self.interm_dtype),
+                (device, (1, 1, 1, mgu.out_features), torch.half)
+            ]
+            self.bc = ext.BC_GatedMLP(
+                *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
+                mgu.ptrs_trellis,
+                mgu.ptrs_suh,
+                mgu.ptrs_svh,
+                mgu.K,
+                mgu.mcg_mult,
+                mgu.mul1_mult,
+                self.activation_fn == "silu",
+                self.activation_fn == "gelu",
+                self.activation_fn == "relu2",
+                self.downs[0].inner.bc,
+            )
+
 
     @override
     def unload(self):
         super().unload()
+
+        if self.bc is not None:
+            for arg in self.bsz1_pa_args:
+                g_tensor_cache.drop(*arg)
+            self.bc = None
+            self.bsz1_pa_args = []
 
         for i in range(self.num_slices):
             if self.multi_gu[i] is not None:
@@ -570,6 +604,18 @@ class GatedMLP(Module):
                 if self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
+                    a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                    self.activation_fn_call(g, u, a)
+                    d_ = self.downs[s].forward(a, params)
+
+                    if d is None: d = d_
+                    else: d += d_
+                    del d_
+
+                elif self.bc is not None and bsz == 1 and q_len == 1:
+                    d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
+                    x = x.view(1, bsz * q_len, dim)
+                    self.bc.run_bsz1(x, d.view(x.shape))
 
                 else:
                     x = x.view(1, bsz * q_len, dim)
@@ -594,13 +640,14 @@ class GatedMLP(Module):
                     g = gu[0].view(bsz, q_len, self.multi_gu[s].out_features)
                     u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)
 
-                a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
-                self.activation_fn_call(g, u, a)
-                d_ = self.downs[s].forward(a, params)
+                    a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                    self.activation_fn_call(g, u, a)
+                    d_ = self.downs[s].forward(a, params)
 
-                if d is None: d = d_
-                else: d += d_
-                del d_
+                    if d is None: d = d_
+                    else: d += d_
+                    del d_
+
             if self.tp_reduce:
                 params["backend"].all_reduce(d)
 

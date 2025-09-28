@@ -19,6 +19,14 @@ void BC_LinearFP16::run(const at::Tensor& x, at::Tensor& y)
 }
 
 
+void BC_LinearFP16::run_cublas(const at::Tensor& x, at::Tensor& y)
+{
+    hgemm(x, weight, y);
+    if (bias)
+        y.add_(bias.value());
+}
+
+
 void BC_LinearEXL3::run(const at::Tensor& x, at::Tensor& y)
 {
     if (x.numel() == x.size(-1))

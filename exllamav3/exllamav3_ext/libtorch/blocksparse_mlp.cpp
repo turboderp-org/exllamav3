@@ -5,6 +5,8 @@
 #include <torch/extension.h>
 #include "../util.h"
 #include "../hgemm.cuh"
+#include "../quant/exl3_gemm.cuh"
+#include "../activation.cuh"
 
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     int bsz,
@@ -56,4 +58,87 @@ std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
 
         return {selected_experts, routing_weights};
     }
+}
+
+void BC_BlockSparseMLP::run_bsz1
+(
+    const at::Tensor& y,
+    at::Tensor& selected_experts,
+    at::Tensor& routing_weights
+)
+{
+    py::gil_scoped_release _;
+    const at::Tensor& yi = y.unsqueeze(0);
+
+    exl3_mgemm
+    (
+        yi,
+        gate_ptrs_trellis,
+        interm_g,
+        gate_ptrs_suh,
+        yh,
+        gate_ptrs_svh,
+        selected_experts,
+        {},
+        gate_K,
+        -1,
+        gate_mcg_mult,
+        gate_mul1_mult,
+        min_expert,
+        max_expert
+    );
+
+    exl3_mgemm(
+        yi,
+        up_ptrs_trellis,
+        interm_u,
+        up_ptrs_suh,
+        yh,
+        up_ptrs_svh,
+        selected_experts,
+        {},
+        up_K,
+        -1,
+        up_mcg_mult,
+        up_mul1_mult,
+        min_expert,
+        max_expert
+    );
+
+    if (act_silu)
+        silu_mul(interm_g, interm_u, interm_a);
+    else if (act_gelu)
+        gelu_mul(interm_g, interm_u, interm_a);
+
+    exl3_mgemm(
+        interm_a,
+        down_ptrs_trellis,
+        out_d,
+        down_ptrs_suh,
+        interm_a,
+        down_ptrs_svh,
+        selected_experts,
+        routing_weights,
+        down_K,
+        -1,
+        down_mcg_mult,
+        down_mul1_mult,
+        min_expert,
+        max_expert
+    );
+
+    if (shared_experts)
+    {
+        shared_experts->run_bsz1(yi, out_d_sh.value());
+        if (shared_gate)
+        {
+            shared_gate->run_cublas(yi, z.value());
+            add_sigmoid_gate(out_d_sh.value(), z.value(), out_d);
+        }
+        else
+        {
+            out_d.add_(out_d_sh.value());
+        }
+    }
+
 }

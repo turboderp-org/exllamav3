@@ -313,6 +313,9 @@ class BlockSparseMLP(Module):
 
         self.tp_reduce = False
 
+        self.bc = None
+        self.bc_sh_exp = False
+
 
     @override
     def optimizer_targets(self):
@@ -378,6 +381,58 @@ class BlockSparseMLP(Module):
             max_expert = maxe,
         )
 
+        cfg = self.experts_cfg
+        if self.is_quantized:
+
+            sh_exp = None
+            sh_exp_t = None
+            sh_gate = None
+            sh_gate_t = None
+            self.bc_sh_exp = False
+            if self.shared_experts and isinstance(self.shared_experts, GatedMLP) and self.shared_experts.bc is not None:
+                self.bc_sh_exp = True
+                sh_exp = self.shared_experts.bc
+                sh_exp_t = torch.empty_like(cfg.out_d)
+                if self.shared_gate:
+                    assert self.shared_gate.quant_type == "fp16"
+                    sh_gate = self.shared_gate.inner.bc
+                    sh_gate_t = torch.empty((1, 1, 1), dtype = self.shared_gate.out_dtype, device = self.device)
+
+            self.bc = ext.BC_BlockSparseMLP(
+                cfg.yh,
+                cfg.interm_g,
+                cfg.interm_u,
+                cfg.interm_a,
+                cfg.out_d,
+                sh_exp_t,
+                sh_gate_t,
+                cfg.min_expert,
+                cfg.max_expert,
+                self.multi_gate.ptrs_trellis,
+                self.multi_gate.ptrs_suh,
+                self.multi_gate.ptrs_svh,
+                self.multi_gate.K,
+                self.multi_gate.mcg_mult,
+                self.multi_gate.mul1_mult,
+                self.multi_up.ptrs_trellis,
+                self.multi_up.ptrs_suh,
+                self.multi_up.ptrs_svh,
+                self.multi_up.K,
+                self.multi_up.mcg_mult,
+                self.multi_up.mul1_mult,
+                self.multi_down.ptrs_trellis,
+                self.multi_down.ptrs_suh,
+                self.multi_down.ptrs_svh,
+                self.multi_down.K,
+                self.multi_down.mcg_mult,
+                self.multi_down.mul1_mult,
+                self.activation_fn == "silu",
+                self.activation_fn == "gelu",
+                sh_exp,
+                sh_gate
+            )
+
+
     def load_routing(self, **kwargs):
 
         router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
@@ -414,6 +469,7 @@ class BlockSparseMLP(Module):
 
     @override
     def unload(self):
+        self.bc = None
         if self.multi_gate is not None:
             self.multi_gate.unload()
             self.multi_gate = None
@@ -439,6 +495,7 @@ class BlockSparseMLP(Module):
 
         y = x.view(-1, self.hidden_size)
         bsz = y.shape[0]
+        bc_sh_exp = False
 
         # Routing
         if self.routing_gate is not None:
@@ -580,9 +637,13 @@ class BlockSparseMLP(Module):
             final_hidden_states = final_hidden_states.view(x.shape)
 
         # Bsz 1
+        elif self.bc is not None:
+            self.bc.run_bsz1(y, selected_experts, routing_weights)
+            final_hidden_states = self.experts_cfg.out_d[:1, ...].view(x.shape)
+            bc_sh_exp = self.bc_sh_exp
+
         else:
             y = y.unsqueeze(0)
-
             cfg = self.experts_cfg
 
             # Gate
@@ -645,7 +706,7 @@ class BlockSparseMLP(Module):
             final_hidden_states = cfg.out_d[:1, ...].view(x.shape)
 
         # Shared experts
-        if self.shared_experts:
+        if self.shared_experts and not bc_sh_exp:
             y = self.shared_experts.forward(x, params)
             if self.shared_gate:
                 z = self.shared_gate.forward(x, params)

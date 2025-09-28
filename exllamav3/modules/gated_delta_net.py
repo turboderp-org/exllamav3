@@ -343,8 +343,8 @@ class GatedDeltaNet(Module):
             "recurrent_cache": True
         })
 
-        self.bs = None
-        self.bsz1_pa_args = None
+        self.bc = None
+        self.bsz1_pa_args = []
 
         # self.cache_layers = []
         # self.tp_cache_lookup = {}
@@ -380,7 +380,7 @@ class GatedDeltaNet(Module):
                 (device, (1, 1, self.num_v_heads * self.v_head_dim), torch.half),
             ]
 
-            self.bs = ext.BC_GatedDeltaNet(
+            self.bc = ext.BC_GatedDeltaNet(
                 *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
                 self.qkvz_proj.inner.bc,
                 self.ba_proj.inner.bc,
@@ -408,10 +408,11 @@ class GatedDeltaNet(Module):
 
     @override
     def unload(self):
-        if self.bs is not None:
+        if self.bc is not None:
             for arg in self.bsz1_pa_args:
                 g_tensor_cache.drop(*arg)
-            self.bs = None
+            self.bc = None
+            self.bsz1_pa_args = []
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
@@ -492,16 +493,16 @@ class GatedDeltaNet(Module):
             save_state = False
 
         # C++ path
-        if self.bs is not None and bsz == 1 and seqlen == 1 and save_state:
+        if self.bc is not None and bsz == 1 and seqlen == 1 and save_state:
             y = torch.empty_like(x)
-            mixed_qkv = self.bs.run_bsz1_a(x)
+            mixed_qkv = self.bc.run_bsz1_a(x)
             mixed_qkv = causal_conv1d_update_function(
                 mixed_qkv,
                 conv_state,  # Updated inplace
                 self.conv1d_weight.squeeze(1),
                 self.conv1d_bias,
             )
-            self.bs.run_bsz1_b(mixed_qkv, y, recurrent_state)
+            self.bc.run_bsz1_b(mixed_qkv, y, recurrent_state)
             x = y
 
         # Torch path

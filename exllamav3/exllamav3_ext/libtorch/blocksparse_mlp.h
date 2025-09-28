@@ -3,8 +3,10 @@
 #include <ATen/Tensor.h>
 #include <vector>
 #include <pybind11/pybind11.h>
-
 namespace py = pybind11;
+
+#include "mlp.h"
+#include "linear.h"
 
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     int bsz,
@@ -12,3 +14,112 @@ std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     const at::Tensor& y,
     const py::dict& params
 );
+
+struct BC_BlockSparseMLP
+{
+    at::Tensor yh;
+    at::Tensor interm_g;
+    at::Tensor interm_u;
+    at::Tensor interm_a;
+    at::Tensor out_d;
+    c10::optional<at::Tensor> out_d_sh;
+    c10::optional<at::Tensor> z;
+    int min_expert;
+    int max_expert;
+    at::Tensor gate_ptrs_trellis;
+    at::Tensor gate_ptrs_suh;
+    at::Tensor gate_ptrs_svh;
+    int gate_K;
+    uint32_t gate_mcg_mult;
+    uint32_t gate_mul1_mult;
+    at::Tensor up_ptrs_trellis;
+    at::Tensor up_ptrs_suh;
+    at::Tensor up_ptrs_svh;
+    int up_K;
+    uint32_t up_mcg_mult;
+    uint32_t up_mul1_mult;
+    at::Tensor down_ptrs_trellis;
+    at::Tensor down_ptrs_suh;
+    at::Tensor down_ptrs_svh;
+    int down_K;
+    uint32_t down_mcg_mult;
+    uint32_t down_mul1_mult;
+    bool act_silu;
+    bool act_gelu;
+    std::shared_ptr<BC_GatedMLP> shared_experts;
+    std::shared_ptr<BC_LinearFP16> shared_gate;
+
+    BC_BlockSparseMLP
+    (
+        at::Tensor _yh,
+        at::Tensor _interm_g,
+        at::Tensor _interm_u,
+        at::Tensor _interm_a,
+        at::Tensor _out_d,
+        c10::optional<at::Tensor> _out_d_sh,
+        c10::optional<at::Tensor> _z,
+        int _min_expert,
+        int _max_expert,
+        at::Tensor _gate_ptrs_trellis,
+        at::Tensor _gate_ptrs_suh,
+        at::Tensor _gate_ptrs_svh,
+        int _gate_K,
+        uint32_t _gate_mcg_mult,
+        uint32_t _gate_mul1_mult,
+        at::Tensor _up_ptrs_trellis,
+        at::Tensor _up_ptrs_suh,
+        at::Tensor _up_ptrs_svh,
+        int _up_K,
+        uint32_t _up_mcg_mult,
+        uint32_t _up_mul1_mult,
+        at::Tensor _down_ptrs_trellis,
+        at::Tensor _down_ptrs_suh,
+        at::Tensor _down_ptrs_svh,
+        int _down_K,
+        uint32_t _down_mcg_mult,
+        uint32_t _down_mul1_mult,
+        bool _act_silu,
+        bool _act_gelu,
+        std::shared_ptr<BC_GatedMLP> _shared_experts,
+        std::shared_ptr<BC_LinearFP16> _shared_gate
+    ) :
+        yh                  (std::move(_yh)),
+        interm_g            (std::move(_interm_g)),
+        interm_u            (std::move(_interm_u)),
+        interm_a            (std::move(_interm_a)),
+        out_d               (std::move(_out_d)),
+        out_d_sh            (std::move(_out_d_sh)),
+        z                   (std::move(_z)),
+        min_expert          (_min_expert),
+        max_expert          (_max_expert),
+        gate_ptrs_trellis   (std::move(_gate_ptrs_trellis)),
+        gate_ptrs_suh       (std::move(_gate_ptrs_suh)),
+        gate_ptrs_svh       (std::move(_gate_ptrs_svh)),
+        gate_K              (_gate_K),
+        gate_mcg_mult       (_gate_mcg_mult),
+        gate_mul1_mult      (_gate_mul1_mult),
+        up_ptrs_trellis     (std::move(_up_ptrs_trellis)),
+        up_ptrs_suh         (std::move(_up_ptrs_suh)),
+        up_ptrs_svh         (std::move(_up_ptrs_svh)),
+        up_K                (_up_K),
+        up_mcg_mult         (_up_mcg_mult),
+        up_mul1_mult        (_up_mul1_mult),
+        down_ptrs_trellis   (std::move(_down_ptrs_trellis)),
+        down_ptrs_suh       (std::move(_down_ptrs_suh)),
+        down_ptrs_svh       (std::move(_down_ptrs_svh)),
+        down_K              (_down_K),
+        down_mcg_mult       (_down_mcg_mult),
+        down_mul1_mult      (_down_mul1_mult),
+        act_silu            (_act_silu),
+        act_gelu            (_act_gelu),
+        shared_experts      (_shared_experts),
+        shared_gate         (_shared_gate)
+    {}
+
+    void run_bsz1
+    (
+        const at::Tensor& y,
+        at::Tensor& selected_experts,
+        at::Tensor& routing_weights
+    );
+};
