@@ -79,6 +79,11 @@ except ModuleNotFoundError:
     causal_conv1d_update_function = causal_conv1d_update_function_torch
     causal_conv1d_fwd_function = causal_conv1d_fwd_function_torch
 
+try:
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+except ModuleNotFoundError:
+    chunk_gated_delta_rule = None
+
 """
 fla wrapper, reduce overhead by bypassing input_guard and torch custom ops stuff
 """
@@ -464,8 +469,6 @@ class GatedDeltaNet(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
-
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
         bsz, seqlen, _ = x.shape
 

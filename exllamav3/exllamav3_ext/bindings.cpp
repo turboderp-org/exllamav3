@@ -14,6 +14,7 @@
 #include "softcap.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
+#include "causal_conv1d.cuh"
 
 #include "quant/quantize.cuh"
 #include "quant/pack.cuh"
