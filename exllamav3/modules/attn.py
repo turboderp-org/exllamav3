@@ -379,7 +379,8 @@ class Attention(Module):
                 self.multi_kv.mcg_mult,
                 self.multi_kv.mul1_mult,
                 -1,
-                -1
+                -1,
+                0
             )
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)

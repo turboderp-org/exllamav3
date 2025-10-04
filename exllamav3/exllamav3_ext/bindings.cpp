@@ -23,6 +23,7 @@
 #include "quant/exl3_gemm.cuh"
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
+#include "quant/exl3_devctx.cuh"
 
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
@@ -87,6 +88,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
+    m.def("g_get_cc", &g_get_cc, "g_get_cc");
+    m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
     m.def("hgemm", &hgemm, "hgemm");
     m.def("rope", &rope, "rope");

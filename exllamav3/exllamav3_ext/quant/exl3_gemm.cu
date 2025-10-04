@@ -12,11 +12,17 @@ namespace cg = cooperative_groups;
 #include "exl3_devctx.cuh"
 #include <set>
 
+#define NEW_TUNE_GEMM
+#define NEW_TUNE_MGEMM
+
+int exl3_gemm_tilesize_k_g[] = {EXL3_GEMM_TILESIZE_K};
+int exl3_gemm_tilesize_n_g[] = {EXL3_GEMM_TILESIZE_N};
+
 /*
 EXL3 matmul, A @ B -> C
 
 - A: row-major A tensor, shape (m, k), dtype float16, contiguous
-- B: EXL3-quantized B tensor, shape (k//16, n//16, 16*bits), dtype uint16
+- B: EXL3-quantized B tensor, shape (k//16, n//16, 16*K), dtype uint16
 - C: empty row-major C tensor, shape (m, n), dtype float16 or float32, contiguous. Does not need to be zero-initialized
 - suh: optional, packed input scales/flips, shape (k//16), dtype float16
 - A_had: required if suh given, may be reference to A, temporary storage for input transform, size and dtype as A
@@ -39,7 +45,8 @@ int exl3_gemm
     const c10::optional<at::Tensor>& svh,
     int force_shape_idx,
     uint32_t mcg_mult,
-    uint32_t mul1_mult
+    uint32_t mul1_mult,
+    int force_num_sms
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -48,7 +55,7 @@ int exl3_gemm
     TORCH_CHECK_DIM(B, 3);
     TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
     TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
-//    TORCH_CHECK_SHAPES(A, 0, C, 0, 1);
+    // TORCH_CHECK_SHAPES(A, 0, C, 0, 1);
     TORCH_CHECK_DTYPE(A, kHalf);
     TORCH_CHECK_DTYPE(B, kShort);
     bool c_fp32 = C.dtype() == at::kFloat;
@@ -59,26 +66,26 @@ int exl3_gemm
     half* A_had_ptr = nullptr;
     if (suh_ptr)
     {
-//        TORCH_CHECK_SHAPES(suh.value(), 0, A, 1, 1);
+        // TORCH_CHECK_SHAPES(suh.value(), 0, A, 1, 1);
         A_had_ptr = (half*) OPTPTR(A_had);
-//        TORCH_CHECK(A_had_ptr, "Must supply A_had with suh");
-//        TORCH_CHECK_SHAPES_FULL(A_had.value(), A);
+        // TORCH_CHECK(A_had_ptr, "Must supply A_had with suh");
+        // TORCH_CHECK_SHAPES_FULL(A_had.value(), A);
     }
 
     // Get SV, optionally
     const half* svh_ptr = (const half*) OPTPTR(svh);
-//    if (svh_ptr)
-//        TORCH_CHECK_SHAPES(svh.value(), 0, B, 1, 16);
+    // if (svh_ptr)
+        // TORCH_CHECK_SHAPES(svh.value(), 0, B, 1, 16);
 
     // Device properties
     int device;
     cudaGetDevice(&device);
-    int num_sms = DevCtx::instance().get_num_sms(device);
+    int num_sms = force_num_sms ? force_num_sms : DevCtx::instance().get_num_sms(device);
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);
 
     // Dispatch
-    int bits = B.size(2) / 16;
+    int K = B.size(2) / 16;
     const half* A_ptr = (const half*) A.data_ptr();
     const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
     void* C_ptr = (void*) C.data_ptr();
@@ -96,21 +103,33 @@ int exl3_gemm
     if (mcg_mult) { cb = 1; mult = mcg_mult; }
     if (mul1_mult) { cb = 2; mult = mul1_mult; }
 
-    int selected_shape;
     int block_dim;
-    fp_exl3_gemm_kernel kernel = select_exl3_gemm_kernel
-    (
-        cc, size_m, size_k, size_n, bits, c_fp32,
-        force_shape_idx, &block_dim, &selected_shape,
-        &num_sms, cb
-    );
-    if (!kernel) return 0;
+    int shape_idx;
+    fp_exl3_gemm_kernel kernel;
+
+    #ifndef NEW_TUNE_GEMM
+        kernel = select_exl3_gemm_kernel
+        (
+            cc, size_m, size_k, size_n, K, c_fp32,
+            force_shape_idx, &block_dim, &shape_idx,
+            &num_sms, cb
+        );
+        if (!kernel) return 0;
+    #else
+        TResult* tr = select_exl3_gemm_mgemm_kernel_new(cc, size_m, size_k, size_n, K, c_fp32, force_shape_idx, force_num_sms, cb);
+        if (!tr) return 0;
+        num_sms = MIN(num_sms, tr->num_sms);
+        kernel = tr->kernel;
+        block_dim = tr->block_dim;
+        shape_idx = tr->shape_idx;
+    #endif
 
     // Launch
-    if (kernel_attr_set[device].find((void*)kernel) == kernel_attr_set[device].end())
+    if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
-        kernel_attr_set[device].insert((void*)kernel);
+        kernel_attr_set[device].insert((void*) kernel);
+        cuda_check(cudaPeekAtLastError());
     }
     void* kernelArgs[] =
     {
@@ -128,7 +147,7 @@ int exl3_gemm
     };
     cudaLaunchCooperativeKernel
     (
-        (void*)kernel,
+        (void*) kernel,
         num_sms,
         block_dim,
         kernelArgs,
@@ -136,14 +155,16 @@ int exl3_gemm
         stream
     );
     cuda_check(cudaPeekAtLastError());
-    return selected_shape;
+
+    // return selected_shape;
+    return shape_idx;
 }
 
 /*
 EXL3 multi matmul, A @ B -> C
 
 - A: row-major A tensor, shape (m, k), dtype float16, contiguous
-- B: EXL3-quantized B tensor, shape (k//16, n//16, 16*bits), dtype uint16
+- B: EXL3-quantized B tensor, shape (k//16, n//16, 16*K), dtype uint16
 - C: empty row-major C tensor, shape (m, n), dtype float16 or float23, contiguous. Does not need to be zero-initialized
 - suh: optional, packed input scales/flips, shape (k//16), dtype float16
 - A_had: required if suh given, may be reference to A, temporary storage for input transform, size and dtype as A
@@ -169,7 +190,8 @@ int exl3_mgemm
     uint32_t mcg_mult,
     uint32_t mul1_mult,
     int min_index,
-    int max_index
+    int max_index,
+    int force_num_sms
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -194,6 +216,7 @@ int exl3_mgemm
     int bsz = A.size(1);
     int bszm_in = A.size(0);
     int bszm_out = C.size(0);
+    int bszm = MAX(bszm_in, bszm_out);
 
     const long* indices_ptr = (const long*) OPTPTR(indices);
     const half* weights_ptr = (const half*) OPTPTR(weights);
@@ -219,8 +242,8 @@ int exl3_mgemm
     // Device properties
     int device;
     cudaGetDevice(&device);
-    int num_sms = DevCtx::instance().get_num_sms(device);
-    int total_sms = num_sms;
+    int total_sms = DevCtx::instance().get_num_sms(device);
+    int num_sms = force_num_sms ? force_num_sms : total_sms;
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);
 
@@ -239,25 +262,44 @@ int exl3_mgemm
     if (mcg_mult) { cb = 1; mult = mcg_mult; }
     if (mul1_mult) { cb = 2; mult = mul1_mult; }
 
-    int selected_shape;
+    int shape_idx;
     int block_dim;
-    fp_exl3_mgemm_kernel kernel = select_exl3_mgemm_kernel
-    (
-        cc, size_m, size_k, size_n, K, c_fp32,
-        force_shape_idx, &block_dim, &selected_shape,
-        &num_sms, cb, bszm_in, bszm_out
-    );
-    if (!kernel) return 0;
+    fp_exl3_mgemm_kernel kernel;
+    int concurrency;
+
+    #ifndef NEW_TUNE_MGEMM
+        kernel = select_exl3_mgemm_kernel
+        (
+            cc, size_m, size_k, size_n, K, c_fp32,
+            force_shape_idx, &block_dim, &shape_idx,
+            &num_sms, cb, bszm_in, bszm_out
+        );
+        if (!kernel) return 0;
+        concurrency = MIN(total_sms / num_sms, bszm_out);
+    #else
+        kernel = select_exl3_mgemm_kernel
+        (
+            cc, size_m, size_k, size_n, K, c_fp32,
+            force_shape_idx, &block_dim, &shape_idx,
+            &num_sms, cb, bszm_in, bszm_out
+        );
+        int tilesize_k = exl3_gemm_tilesize_k_g[shape_idx];
+        int tilesize_n = exl3_gemm_tilesize_n_g[shape_idx];
+        int tiles = MAX(size_k / tilesize_k * size_n / tilesize_n, 1);
+        num_sms = tiles;
+        if (num_sms * bszm > total_sms) num_sms = MAX(total_sms / bszm, 1);
+        if (num_sms <= total_sms && tiles / num_sms > 48) num_sms = MIN(total_sms, num_sms * 2);
+        concurrency = MIN(total_sms / num_sms, bszm);
+    #endif
 
     // Launch bigger grid if possible
-    int concurrency = MIN(total_sms / num_sms, bszm_out);
     dim3 block_grid(num_sms, 1, concurrency);
 
     // Launch
-    if (kernel_attr_set[device].find((void*)kernel) == kernel_attr_set[device].end())
+    if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
-        kernel_attr_set[device].insert((void*)kernel);
+        kernel_attr_set[device].insert((void*) kernel);
     }
     void* kernelArgs[] =
     {
@@ -279,10 +321,9 @@ int exl3_mgemm
         (void*)& min_index,
         (void*)& max_index
     };
-
     cudaLaunchCooperativeKernel
     (
-        (void*)kernel,
+        (void*) kernel,
         block_grid,
         block_dim,
         kernelArgs,
@@ -290,5 +331,5 @@ int exl3_mgemm
         stream
     );
     cuda_check(cudaPeekAtLastError());
-    return selected_shape;
+    return shape_idx;
 }

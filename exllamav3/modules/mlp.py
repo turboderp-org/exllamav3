@@ -635,7 +635,8 @@ class GatedMLP(Module):
                         self.multi_gu[s].mcg_mult,
                         self.multi_gu[s].mul1_mult,
                         -1,
-                        -1
+                        -1,
+                        0
                     )
                     g = gu[0].view(bsz, q_len, self.multi_gu[s].out_features)
                     u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)

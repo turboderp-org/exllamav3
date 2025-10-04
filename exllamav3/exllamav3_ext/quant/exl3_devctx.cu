@@ -56,3 +56,13 @@ int* DevCtx::get_locks(int device)
     }
     return (int*) locks[device];
 }
+
+int g_get_cc(int device)
+{
+    return DevCtx::instance().get_cc(device);
+}
+
+int g_get_num_sms(int device)
+{
+    return DevCtx::instance().get_num_sms(device);
+}
