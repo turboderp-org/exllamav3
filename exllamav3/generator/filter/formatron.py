@@ -1,11 +1,19 @@
 from .filter import Filter
 from ...tokenizer import Tokenizer
-from formatron.integrations.utils import get_original_characters, default_mask_logits_fn, get_bit_mask
-from formatron.formatter import FormatterBuilder
-from formatron.config import EngineGenerationConfig
-import kbnf
 import torch
 from functools import lru_cache
+
+try:
+    import kbnf
+    from formatron.integrations.utils import get_original_characters, default_mask_logits_fn, get_bit_mask
+    from formatron.formatter import FormatterBuilder
+    from formatron.config import EngineGenerationConfig
+    formatron_available = True
+except ModuleNotFoundError:
+    formatron_available = False
+except ImportError:
+    formatron_available = False
+
 
 @lru_cache(10)
 def create_engine_vocabulary(
@@ -31,6 +39,9 @@ class FormatronFilter(Filter):
         engine_config: EngineGenerationConfig = None,
         vocab_processors: list[callable] | None = None
     ):
+        if not formatron_available:
+            raise ValueError("Formatron package is not available.")
+
         super().__init__(tokenizer, trigger_token, prefix_str, eos_after_completed)
         assert formatter_builder is not None
         self._formatter = formatter_builder.build(
