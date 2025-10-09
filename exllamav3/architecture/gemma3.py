@@ -138,6 +138,11 @@ class Gemma3Config(Config):
         self.vision_pp.size = read_dict(read_prep_config, dict, ["size"], no_default)
 
 
+    def default_max_position_embeddings(self):
+        # Fixed for Gemma3, usually not present in config.json
+        return 131072
+
+
 class Gemma3TextConfig(Config):
     arch_string = "Gemma3ForCausalLM"
 
@@ -216,6 +221,11 @@ class Gemma3TextConfig(Config):
 
         # Output softcap
         self.final_logit_softcapping = self.read_cfg(float, "final_logit_softcapping", 0.0)
+
+
+    def default_max_position_embeddings(self):
+        # Fixed for Gemma2, usually not present in config.json
+        return 8192
 
 
 class Gemma3Model(Model):

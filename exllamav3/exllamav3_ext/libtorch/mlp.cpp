@@ -31,7 +31,8 @@ void BC_GatedMLP::run_bsz1
         gu_mcg_mult,
         gu_mul1_mult,
         -1,
-        -1
+        -1,
+        0
     );
 
     at::Tensor g = gu.select(0, 0).unsqueeze(0);

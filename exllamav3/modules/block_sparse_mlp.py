@@ -590,6 +590,7 @@ class BlockSparseMLP(Module):
                     self.multi_gate.mul1_mult,
                     mine,
                     maxe,
+                    0
                 )
 
                 # Up
@@ -608,6 +609,7 @@ class BlockSparseMLP(Module):
                     self.multi_up.mul1_mult,
                     mine,
                     maxe,
+                    0
                 )
 
                 # Activation
@@ -629,6 +631,7 @@ class BlockSparseMLP(Module):
                     self.multi_down.mul1_mult,
                     mine,
                     maxe,
+                    0
                 )
 
                 t = cfg.out_d[0]
@@ -661,7 +664,8 @@ class BlockSparseMLP(Module):
                 self.multi_gate.mcg_mult,
                 self.multi_gate.mul1_mult,
                 cfg.min_expert,
-                cfg.max_expert
+                cfg.max_expert,
+                0
             )
 
             # Up
@@ -679,7 +683,8 @@ class BlockSparseMLP(Module):
                 self.multi_up.mcg_mult,
                 self.multi_up.mul1_mult,
                 cfg.min_expert,
-                cfg.max_expert
+                cfg.max_expert,
+                0
             )
 
             # Activation
@@ -700,7 +705,8 @@ class BlockSparseMLP(Module):
                 self.multi_down.mcg_mult,
                 self.multi_down.mul1_mult,
                 cfg.min_expert,
-                cfg.max_expert
+                cfg.max_expert,
+                0
             )
 
             final_hidden_states = cfg.out_d[:1, ...].view(x.shape)

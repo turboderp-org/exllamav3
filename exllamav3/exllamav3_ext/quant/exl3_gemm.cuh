@@ -12,7 +12,8 @@ int exl3_gemm
     const c10::optional<at::Tensor>& svh,
     int force_shape_idx,
     uint32_t mcg_mult,
-    uint32_t mul1_mult
+    uint32_t mul1_mult,
+    int force_num_sms
 );
 
 int exl3_mgemm
@@ -30,5 +31,6 @@ int exl3_mgemm
     uint32_t mcg_mult,
     uint32_t mul1_mult,
     int min_index,
-    int max_index
+    int max_index,
+    int force_num_sms
 );

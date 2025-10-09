@@ -51,6 +51,18 @@ parser.add_argument("--override_anyway", action = "store_true", help = "Allow re
 
 num_ref_states = 5
 
+def check_system():
+    print("asdasdasd")
+    if os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") is not None:
+        print(
+            "\n"
+            f" !! {col_red}IMPORTANT: The environment variable TORCH_ALLOW_TF32_CUBLAS_OVERRIDE is set!{col_default}\n"
+            f" !! {col_red}This causes Torch to run in reduced precision mode, which is likely to cause this "
+            f"script to fail or result in broken models.{col_default}\n"
+            "\n"
+        )
+
+
 def save_dict(filename, dict_, args):
     path = os.path.join(args["work_dir"], filename)
     with open(path, "w", encoding = "utf8") as f:
@@ -104,6 +116,8 @@ def prepare_env(args):
 
 
 def prepare(args) -> (dict, dict, bool, str):
+    check_system()
+
     if not args.work_dir:
         return None, None, False, "Must specify --work_dir"
     if not args.in_dir and not args.resume:

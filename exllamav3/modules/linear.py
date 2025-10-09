@@ -1,5 +1,5 @@
 from __future__ import annotations
-from functools import lru_cache
+from functools import cached_property
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
@@ -347,13 +347,15 @@ class Linear(Module):
             return None
 
 
-    @lru_cache
-    def storage_size(self):
+    @cached_property
+    def _storage_size(self):
         # alt_key is only used when loading unquantized model
         if self.is_exl3_storage(self.key):
             return sum(self.config.stc.get_tensor_sizes(prefix = self.key))
         else:
             return 2 * self.in_features * self.out_features
+    def storage_size(self):
+        return self._storage_size
 
 
     def recons_size(self):

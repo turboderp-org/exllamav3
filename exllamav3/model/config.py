@@ -69,9 +69,14 @@ class Config(ABC):
         self.num_q_heads = -1
         self.num_kv_heads = -1
         self.pos_encoding_mode = "NONE"
+        self.max_position_embeddings = self.read_cfg(int, "max_position_embeddings", self.default_max_position_embeddings())
 
         # Load parameters
         self.load_isq = False
+
+
+    def default_max_position_embeddings(self):
+        return 8192
 
 
     def read_cfg(self, *args):

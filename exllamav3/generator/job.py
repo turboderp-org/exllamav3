@@ -842,7 +842,7 @@ class Job:
             self.max_rq_tokens = self.max_new_tokens + 1
 
         # Compatibility checks
-        assert not self.banned_strings or self.generator.recurrent_cache is not None, \
+        assert not self.banned_strings or self.generator.recurrent_cache is None, \
             "Cannot use banned strings on recurrent model"
 
         # Hash full pages of input IDs

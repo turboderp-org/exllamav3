@@ -7,6 +7,7 @@
 #include "../hgemm.cuh"
 #include "../quant/exl3_gemm.cuh"
 #include "../activation.cuh"
+#include "../add.cuh"
 
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     int bsz,
@@ -85,7 +86,8 @@ void BC_BlockSparseMLP::run_bsz1
         gate_mcg_mult,
         gate_mul1_mult,
         min_expert,
-        max_expert
+        max_expert,
+        0
     );
 
     exl3_mgemm(
@@ -102,7 +104,8 @@ void BC_BlockSparseMLP::run_bsz1
         up_mcg_mult,
         up_mul1_mult,
         min_expert,
-        max_expert
+        max_expert,
+        0
     );
 
     if (act_silu)
@@ -124,7 +127,8 @@ void BC_BlockSparseMLP::run_bsz1
         down_mcg_mult,
         down_mul1_mult,
         min_expert,
-        max_expert
+        max_expert,
+        0
     );
 
     if (shared_experts)
@@ -137,7 +141,7 @@ void BC_BlockSparseMLP::run_bsz1
         }
         else
         {
-            out_d.add_(out_d_sh.value());
+            add(out_d, out_d_sh.value(), out_d);
         }
     }
 
