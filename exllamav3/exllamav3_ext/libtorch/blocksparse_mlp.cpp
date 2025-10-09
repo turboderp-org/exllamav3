@@ -7,6 +7,7 @@
 #include "../hgemm.cuh"
 #include "../quant/exl3_gemm.cuh"
 #include "../activation.cuh"
+#include "../add.cuh"
 
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     int bsz,
@@ -140,7 +141,7 @@ void BC_BlockSparseMLP::run_bsz1
         }
         else
         {
-            out_d.add_(out_d_sh.value());
+            add(out_d, out_d_sh.value(), out_d);
         }
     }
 

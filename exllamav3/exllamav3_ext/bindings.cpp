@@ -15,6 +15,7 @@
 #include "routing.cuh"
 #include "gdn.cuh"
 #include "causal_conv1d.cuh"
+#include "add.cuh"
 
 #include "quant/quantize.cuh"
 #include "quant/pack.cuh"
@@ -98,6 +99,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("relu2_mul", &relu2_mul, "relu2_mul");
     m.def("xielu", &xielu, "xielu");
     m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
+    m.def("add", &add, "add");
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
     m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
