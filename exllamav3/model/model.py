@@ -1,5 +1,5 @@
 from __future__ import annotations
-from functools import lru_cache
+from functools import cached_property
 from typing import Callable
 import torch
 from .config import Config
@@ -50,14 +50,18 @@ class Model(Model_TPMixin, Model_LSMixin):
         return self.modules_dict[key]
 
 
-    @lru_cache
-    def get_cache_layers(self):
+    @cached_property
+    def _get_cache_layers(self):
         return [m for m in self if m.caps.get("kv_cache")]
+    def get_cache_layers(self):
+        return self._get_cache_layers
 
 
-    @lru_cache
-    def get_recurrent_layers(self):
+    @cached_property
+    def _get_recurrent_layers(self):
         return [m for m in self if m.caps.get("recurrent_cache")]
+    def get_recurrent_layers(self):
+        return self._get_recurrent_layers
 
 
     @staticmethod
