@@ -39,7 +39,7 @@ int DevCtx::get_cc(int device)
         if (prop.major >= 10) cc[device] = CC_BLACKWELL;
         else if (prop.major >= 9) cc[device] = CC_HOPPER;
         else if (prop.major >= 8 && prop.minor >= 9) cc[device] = CC_ADA;
-        else if (prop.major >= 8 && prop.minor >= 6) cc[device] = CC_AMPERE;
+        else if (prop.major >= 8) cc[device] = CC_AMPERE;
         else cc[device] = CC_OLD;
     }
     return cc[device];
