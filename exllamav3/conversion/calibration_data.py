@@ -64,12 +64,12 @@ def get_default_calibration(args, tokenizer):
 
     data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "standard_cal_data")
     files = [
-        ("c4.utf8", 10, shuffle_lines),
-        ("code.utf8", 15, split_raw),
-        ("multilingual.utf8", 15, shuffle_lines),
+        ("c4.utf8", 20, shuffle_lines),
+        ("code.utf8", 20, split_raw),
+        ("multilingual.utf8", 10, shuffle_lines),
         ("technical.utf8", 10, split_raw),
-        ("wiki.utf8", 48, split_wiki),
-        ("tiny.utf8", 10, split_tiny),
+        ("wiki.utf8", 50, split_wiki),
+        ("tiny.utf8", 5, split_tiny),
         (None, 20, random_data),
     ]
 

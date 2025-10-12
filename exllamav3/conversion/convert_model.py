@@ -30,7 +30,7 @@ parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in
 parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
 parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bits per weight, output (head) layer, default: 6")
 parser.add_argument("-resume", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
-parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 100")
+parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
 parser.add_argument("-cc", "--cal_cols", type = int, help = "Calibration data size, columns, default: 2048")
 parser.add_argument("-cpi", "--checkpoint_interval", type = int, default = 120, help = "Minimum checkpoint interval, in seconds")
 parser.add_argument("-lcpi", "--last_checkpoint_index", type = int, default = None, help = "Last module index to checkpoint (for debug purposes)")
@@ -161,7 +161,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("shard_size", True, 8192),
         ("bits", False, None),
         ("head_bits", False, 6),
-        ("cal_rows", False, 100),
+        ("cal_rows", False, 250),
         ("cal_cols", False, 2048),
         ("checkpoint_interval", True, None),
         ("last_checkpoint_index", True, -1),
