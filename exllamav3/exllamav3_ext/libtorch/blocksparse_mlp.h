@@ -30,20 +30,20 @@ struct BC_BlockSparseMLP
     at::Tensor gate_ptrs_suh;
     at::Tensor gate_ptrs_svh;
     int gate_K;
-    uint32_t gate_mcg_mult;
-    uint32_t gate_mul1_mult;
+    bool gate_mcg;
+    bool gate_mul1;
     at::Tensor up_ptrs_trellis;
     at::Tensor up_ptrs_suh;
     at::Tensor up_ptrs_svh;
     int up_K;
-    uint32_t up_mcg_mult;
-    uint32_t up_mul1_mult;
+    bool up_mcg;
+    bool up_mul1;
     at::Tensor down_ptrs_trellis;
     at::Tensor down_ptrs_suh;
     at::Tensor down_ptrs_svh;
     int down_K;
-    uint32_t down_mcg_mult;
-    uint32_t down_mul1_mult;
+    bool down_mcg;
+    bool down_mul1;
     bool act_silu;
     bool act_gelu;
     std::shared_ptr<BC_GatedMLP> shared_experts;
@@ -64,20 +64,20 @@ struct BC_BlockSparseMLP
         at::Tensor _gate_ptrs_suh,
         at::Tensor _gate_ptrs_svh,
         int _gate_K,
-        uint32_t _gate_mcg_mult,
-        uint32_t _gate_mul1_mult,
+        bool _gate_mcg,
+        bool _gate_mul1,
         at::Tensor _up_ptrs_trellis,
         at::Tensor _up_ptrs_suh,
         at::Tensor _up_ptrs_svh,
         int _up_K,
-        uint32_t _up_mcg_mult,
-        uint32_t _up_mul1_mult,
+        bool _up_mcg,
+        bool _up_mul1,
         at::Tensor _down_ptrs_trellis,
         at::Tensor _down_ptrs_suh,
         at::Tensor _down_ptrs_svh,
         int _down_K,
-        uint32_t _down_mcg_mult,
-        uint32_t _down_mul1_mult,
+        bool _down_mcg,
+        bool _down_mul1,
         bool _act_silu,
         bool _act_gelu,
         std::shared_ptr<BC_GatedMLP> _shared_experts,
@@ -96,20 +96,20 @@ struct BC_BlockSparseMLP
         gate_ptrs_suh       (std::move(_gate_ptrs_suh)),
         gate_ptrs_svh       (std::move(_gate_ptrs_svh)),
         gate_K              (_gate_K),
-        gate_mcg_mult       (_gate_mcg_mult),
-        gate_mul1_mult      (_gate_mul1_mult),
+        gate_mcg            (_gate_mcg),
+        gate_mul1           (_gate_mul1),
         up_ptrs_trellis     (std::move(_up_ptrs_trellis)),
         up_ptrs_suh         (std::move(_up_ptrs_suh)),
         up_ptrs_svh         (std::move(_up_ptrs_svh)),
         up_K                (_up_K),
-        up_mcg_mult         (_up_mcg_mult),
-        up_mul1_mult        (_up_mul1_mult),
+        up_mcg              (_up_mcg),
+        up_mul1             (_up_mul1),
         down_ptrs_trellis   (std::move(_down_ptrs_trellis)),
         down_ptrs_suh       (std::move(_down_ptrs_suh)),
         down_ptrs_svh       (std::move(_down_ptrs_svh)),
         down_K              (_down_K),
-        down_mcg_mult       (_down_mcg_mult),
-        down_mul1_mult      (_down_mul1_mult),
+        down_mcg            (_down_mcg),
+        down_mul1           (_down_mul1),
         act_silu            (_act_silu),
         act_gelu            (_act_gelu),
         shared_experts      (_shared_experts),

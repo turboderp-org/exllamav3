@@ -83,8 +83,8 @@ void BC_BlockSparseMLP::run_bsz1
         {},
         gate_K,
         -1,
-        gate_mcg_mult,
-        gate_mul1_mult,
+        gate_mcg,
+        gate_mul1,
         min_expert,
         max_expert,
         0
@@ -101,8 +101,8 @@ void BC_BlockSparseMLP::run_bsz1
         {},
         up_K,
         -1,
-        up_mcg_mult,
-        up_mul1_mult,
+        up_mcg,
+        up_mul1,
         min_expert,
         max_expert,
         0
@@ -124,8 +124,8 @@ void BC_BlockSparseMLP::run_bsz1
         routing_weights,
         down_K,
         -1,
-        down_mcg_mult,
-        down_mul1_mult,
+        down_mcg,
+        down_mul1,
         min_expert,
         max_expert,
         0

@@ -61,7 +61,7 @@ w_tol_per_K = {
 }
 
 
-@pytest.mark.parametrize("cb", [(0, 0, 1.24371088), (0xcaf6a435, 0, 1.24371088), (0, 0xad9a2ec5, 1.0)])
+@pytest.mark.parametrize("cb", [(False, False, 1.24371088), (True, False, 1.24371088), (False, True, 1.0)])
 @pytest.mark.parametrize("batch_size", [1, 16, 17, 128])
 @pytest.mark.parametrize("K", [1, 2, 3, 4, 5, 6, 7, 8])
 @torch.inference_mode()
@@ -74,8 +74,8 @@ def test_encode(batch_size, K, cb):
         in_tile,
         {
             "K": K,
-            "mcg_mult": mcg,
-            "mul1_mult": mul1,
+            "mcg": mcg,
+            "mul1": mul1,
         }
     )
 
@@ -91,7 +91,7 @@ def test_encode(batch_size, K, cb):
     assert mse < max_mse_per_K[K]
 
 
-@pytest.mark.parametrize("cb", [(0, 0, 1.24371088), (0xcaf6a435, 0, 1.24371088), (0, 0xad9a2ec5, 1.0)])
+@pytest.mark.parametrize("cb", [(False, False, 1.24371088), (True, False, 1.24371088), (False, True, 1.0)])
 @pytest.mark.parametrize("batch_size", [1, 64])
 @pytest.mark.parametrize("K", [1, 2, 3, 4, 5, 6, 7, 8])
 @torch.inference_mode()
@@ -121,14 +121,14 @@ def test_encode_ideal(batch_size, K, cb):
         decoded,
         {
             "K": K,
-            "mcg_mult": mcg,
-            "mul1_mult": mul1,
+            "mcg": mcg,
+            "mul1": mul1,
         }
     )
     torch.testing.assert_close(out_tile, decoded, rtol = 1e-6, atol = 1e-6)
 
 
-@pytest.mark.parametrize("cb", [(0, 0, 1.24371088), (0xcaf6a435, 0, 1.24371088), (0, 0xad9a2ec5, 1.0)])
+@pytest.mark.parametrize("cb", [(False, False, 1.24371088), (True, False, 1.24371088), (False, True, 1.0)])
 @pytest.mark.parametrize("K", [1, 2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("test_key", test_keys)
 @torch.inference_mode()
@@ -160,8 +160,8 @@ def test_quant_dequant(K, test_key, cb):
         "K": K,
         "seed": 1,
         "apply_out_scales": None,
-        "mcg_mult": mcg,
-        "mul1_mult": mul1,
+        "mcg": mcg,
+        "mul1": mul1,
         "devices": [device]
     }
     proxy_err, weight_q = linear.convert_exl3(capture_H[linear.qmap], quant_args, return_weight_q = True)

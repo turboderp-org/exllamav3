@@ -44,8 +44,8 @@ int exl3_gemm
     const c10::optional<at::Tensor>& A_had,
     const c10::optional<at::Tensor>& svh,
     int force_shape_idx,
-    uint32_t mcg_mult,
-    uint32_t mul1_mult,
+    bool mcg,
+    bool mul1,
     int force_num_sms
 )
 {
@@ -97,11 +97,10 @@ int exl3_gemm
     int size_n = B.size(1) * 16;
 
     // Select kernel
-    TORCH_CHECK(!(mcg_mult && mul1_mult), "Specified both mcg_mult and mul1_mult")
+    TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
     int cb = 0;
-    uint32_t mult = 0;
-    if (mcg_mult) { cb = 1; mult = mcg_mult; }
-    if (mul1_mult) { cb = 2; mult = mul1_mult; }
+    if (mcg) cb = 1;
+    if (mul1) cb = 2;
 
     int block_dim;
     int shape_idx;
@@ -142,8 +141,7 @@ int exl3_gemm
         (void*)& locks,
         (void*)& suh_ptr,
         (void*)& A_had_ptr,
-        (void*)& svh_ptr,
-        (void*)& mult
+        (void*)& svh_ptr
     };
     cudaLaunchCooperativeKernel
     (
@@ -187,8 +185,8 @@ int exl3_mgemm
     const c10::optional<at::Tensor>& weights,
     int K,
     int force_shape_idx,
-    uint32_t mcg_mult,
-    uint32_t mul1_mult,
+    bool mcg,
+    bool mul1,
     int min_index,
     int max_index,
     int force_num_sms
@@ -256,11 +254,10 @@ int exl3_mgemm
     const uintptr_t* svh_ptr_ptr = (const uintptr_t*) svh.data_ptr();
 
     // Select kernel
-    TORCH_CHECK(!(mcg_mult && mul1_mult), "Specified both mcg_mult and mul1_mult")
+    TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
     int cb = 0;
-    uint32_t mult = 0;
-    if (mcg_mult) { cb = 1; mult = mcg_mult; }
-    if (mul1_mult) { cb = 2; mult = mul1_mult; }
+    if (mcg) cb = 1;
+    if (mul1) cb = 2;
 
     int shape_idx;
     int block_dim;
@@ -317,7 +314,6 @@ int exl3_mgemm
         (void*)& weights_ptr,
         (void*)& bszm_in,
         (void*)& bszm_out,
-        (void*)& mult,
         (void*)& min_index,
         (void*)& max_index
     };

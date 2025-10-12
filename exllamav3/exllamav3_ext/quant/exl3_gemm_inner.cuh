@@ -18,8 +18,7 @@ void exl3_gemm_kernel_inner
     int size_m,
     int size_k,
     int size_n,
-    int* __restrict__ locks,
-    uint32_t mult
+    int* __restrict__ locks
 )
 {
     const int TILEBLOCKS_M = TILESIZE_M / 16;
@@ -56,11 +55,11 @@ void exl3_gemm_kernel_inner
     int lane_id = t % 32;
 
     // Dimensions
-    int tiles_m = CEIL_DIVIDE(size_m, TILESIZE_M);
+    //int tiles_m = CEIL_DIVIDE(size_m, TILESIZE_M);
     int tiles_k = size_k / TILESIZE_K;
     int tiles_n = size_n / TILESIZE_N;
-    int blocks_m = 1;
-    int blocks_k = tiles_k * TILEBLOCKS_K;
+    //int blocks_m = 1;
+    //int blocks_k = tiles_k * TILEBLOCKS_K;
     int blocks_n = tiles_n * TILEBLOCKS_N;
 
     // Start and end index of current slice, must span at least one tile
@@ -264,7 +263,7 @@ void exl3_gemm_kernel_inner
             int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
             const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * 256 / 16 * bits);
 
-            dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1], mult);
+            dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
         }
 
         __syncthreads();

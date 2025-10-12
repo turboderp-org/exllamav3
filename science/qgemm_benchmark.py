@@ -41,8 +41,8 @@ devices = [
 ]
 
 kernels = range(1, 1 + ext.exl3_gemm_num_kernel_shapes())
-mcg_mult = 0
-mul1_mult = 0
+mcg = False
+mul1 = False
 
 @torch.inference_mode()
 def main():
@@ -82,7 +82,7 @@ def main():
                 svh = [proto_svh.clone() for _ in range(num_buffers)]
 
                 # Get preferred kernel for current shape
-                pref = ext.exl3_gemm(a[0], b[0], c[0], suh[0], a[0], svh[0], -1, mcg_mult, mul1_mult, 0)
+                pref = ext.exl3_gemm(a[0], b[0], c[0], suh[0], a[0], svh[0], -1, mcg, mul1, 0)
 
                 # Test all kernels
                 kresults = []
@@ -99,14 +99,14 @@ def main():
                     # Warmup passes for good measure
                     for i_ in range(10):
                         i = i_ % num_buffers
-                        ext.exl3_gemm(a[i], b[i], c[i], suh[i], a[i], svh[i], kernel, mcg_mult, mul1_mult, 0)
+                        ext.exl3_gemm(a[i], b[i], c[i], suh[i], a[i], svh[i], kernel, mcg, mul1, 0)
 
                     # Test
                     dummy = c[0][0, 0].item()
                     with Timer() as t:
                         for i_ in range(runs):
                             i = i_ % num_buffers
-                            ext.exl3_gemm(a[i], b[i], c[i], suh[i], a[i], svh[i], kernel, mcg_mult, mul1_mult, 0)
+                            ext.exl3_gemm(a[i], b[i], c[i], suh[i], a[i], svh[i], kernel, mcg, mul1, 0)
                         dummy = c[i][0, 0].item()
 
                     mean_time_ms = t.interval / runs * 1000

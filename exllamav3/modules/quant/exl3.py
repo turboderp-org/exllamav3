@@ -56,13 +56,11 @@ class LinearEXL3:
         self.bias = bias
         self.swap_device = None
         self.out_dtype = out_dtype
-        self.mcg_mult = None
 
-        self.mcg = mcg
-        self.mcg_mult = mcg.view(torch.uint32).item() if mcg is not None else 0
-
-        self.mul1 = mul1
-        self.mul1_mult = mul1.view(torch.uint32).item() if mul1 is not None else 0
+        self.mcg_tensor = mcg
+        self.mul1_tensor = mul1
+        self.mcg = self.mcg_tensor is not None
+        self.mul1 = self.mul1_tensor is not None
 
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
         self.bc = ext.BC_LinearEXL3(
@@ -71,8 +69,8 @@ class LinearEXL3:
             self.svh,
             self.K,
             self.bias,
-            self.mcg_mult,
-            self.mul1_mult,
+            self.mcg,
+            self.mul1,
             g_tensor_cache.get(*self.bsz1_xh_args)
         )
 
@@ -91,8 +89,8 @@ class LinearEXL3:
                 ("svh", self.svh),
                 ("trellis", self.trellis),
                 ("bias", self.bias),
-                ("mcg", self.mcg),
-                ("mul1", self.mul1),
+                ("mcg", self.mcg_tensor),
+                ("mul1", self.mul1_tensor),
             ] if tensor is not None
         }
 
@@ -163,7 +161,7 @@ class LinearEXL3:
 
     def get_inner_weight_tensor(self):
         w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
-        ext.reconstruct(w, self.trellis, self.K, self.mcg_mult, self.mul1_mult)
+        ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
         return w
 
 

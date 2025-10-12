@@ -28,10 +28,10 @@ class MultiLinear:
         self.ptrs_svh = torch.tensor([l.inner.svh.data_ptr() for l in linears], dtype = torch.long, device = device)
         self.ptrs_trellis = torch.tensor([l.inner.trellis.data_ptr() for l in linears], dtype = torch.long, device = device)
 
-        self.mcg_mult = linears[0].inner.mcg_mult
-        assert all(l.inner.mcg_mult == self.mcg_mult for l in linears[1:])
-        self.mul1_mult = linears[0].inner.mul1_mult
-        assert all(l.inner.mul1_mult == self.mul1_mult for l in linears[1:])
+        self.mcg = linears[0].inner.mcg
+        assert all(l.inner.mcg == self.mcg for l in linears[1:])
+        self.mul1 = linears[0].inner.mul1
+        assert all(l.inner.mul1 == self.mul1 for l in linears[1:])
 
     def unload(self):
         pass

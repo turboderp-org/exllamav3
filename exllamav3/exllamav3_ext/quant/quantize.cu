@@ -17,8 +17,7 @@ void quantize_tiles_kernel
     float* __restrict__ output_tiles_ptr,
     uint16_t* __restrict__ output_indices_ptr,
     float* __restrict__ temp_costs_ptr,
-    uint16_t* __restrict__ temp_edges_ptr,
-    uint32_t mult
+    uint16_t* __restrict__ temp_edges_ptr
 )
 {
     int tile_idx = blockIdx.x;
@@ -58,7 +57,7 @@ void quantize_tiles_kernel
 
             int state = out_edge_idx;
             int in_edge_idx = state >> K;
-            float err = decode_3inst_f_diff<cb>(state, w, mult);
+            float err = decode_3inst_f_diff<cb>(state, w);
             err = err * err;
             if (pre_state >= 0 && in_edge_idx != pre_state) err = 1e30f;
             float min_err = err;
@@ -69,7 +68,7 @@ void quantize_tiles_kernel
             {
                 state = (k << Kr) | out_edge_idx;
                 in_edge_idx = state >> K;
-                err = decode_3inst_f_diff<cb>(state, w, mult);
+                err = decode_3inst_f_diff<cb>(state, w);
                 err = err * err;
                 if (pre_state >= 0 && in_edge_idx != pre_state) err = 1e30f;
                 if (err < min_err) { min_err = err; min_in_edge = in_edge_idx; }
@@ -98,7 +97,7 @@ void quantize_tiles_kernel
 
                 int state = out_edge_idx;
                 int in_edge_idx = state >> K;
-                float err = decode_3inst_f_diff<cb>(state, w, mult);
+                float err = decode_3inst_f_diff<cb>(state, w);
                 err = err * err + temp_costs_inc[in_edge_idx];
                 float min_err = err;
                 int min_in_edge = in_edge_idx;
@@ -108,7 +107,7 @@ void quantize_tiles_kernel
                 {
                     state = (k << Kr) | out_edge_idx;
                     in_edge_idx = state >> K;
-                    err = decode_3inst_f_diff<cb>(state, w, mult);
+                    err = decode_3inst_f_diff<cb>(state, w);
                     err = err * err + temp_costs_inc[in_edge_idx];
                     if (err < min_err) { min_err = err; min_in_edge = in_edge_idx; }
                 }
@@ -200,7 +199,7 @@ void quantize_tiles_kernel
                 if (write)
                 {
                     output_indices[ri] = (uint16_t) encoded;
-                    output_tile[ri] = __half2float(decode_3inst<cb>(encoded, mult));
+                    output_tile[ri] = __half2float(decode_3inst<cb>(encoded));
                 }
                 else if (ri == 0) break;
             }
@@ -253,8 +252,8 @@ void quantize_tiles
     at::Tensor temp_costs,
     at::Tensor temp_edges,
     int K,
-    uint32_t mcg_mult,
-    uint32_t mul1_mult
+    bool mcg,
+    bool mul1
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(input_tiles.device());
@@ -285,9 +284,8 @@ void quantize_tiles
     int max_batch_size = temp_costs.size(0);
 
     int cb = 0;
-    uint32_t mult = 0;
-    if (mcg_mult) { cb = 1; mult = mcg_mult; }
-    if (mul1_mult) { cb = 2; mult = mul1_mult; }
+    if (mcg) cb = 1;
+    if (mul1) cb = 2;
 
     int batch_i = 0;
     do
@@ -309,8 +307,7 @@ void quantize_tiles
             output_tiles_ptr,
             output_indices_ptr,
             temp_costs_ptr,
-            temp_edges_ptr,
-            mult
+            temp_edges_ptr
         );
         cuda_check(cudaPeekAtLastError());
 
@@ -326,8 +323,8 @@ void decode_kernel
     const uint16_t* __restrict__ input_tiles_ptr,
     T* __restrict__ output_tiles_ptr,
     int cols,
-    uint32_t mcg_mult,
-    uint32_t mul1_mult
+    bool mcg,
+    bool mul1
 )
 {
     int col = threadIdx.x + blockIdx.x * 64;
@@ -337,12 +334,12 @@ void decode_kernel
 
     uint32_t enc = (uint32_t) input_tiles_ptr[idx];
     half w;
-    if (mcg_mult)
-        w = decode_3inst<1>(enc, mcg_mult);
-    else if (mul1_mult)
-        w = decode_3inst<2>(enc, mul1_mult);
+    if (mcg)
+        w = decode_3inst<1>(enc);
+    else if (mul1)
+        w = decode_3inst<2>(enc);
     else
-        w = decode_3inst<0>(enc, 0);
+        w = decode_3inst<0>(enc);
 
     if constexpr (std::is_same_v<T, float>)
         output_tiles_ptr[idx] = __half2float(w);
@@ -355,15 +352,16 @@ Decode tensor
 
 input_indices: uint16_t
 output_tiles: float or half
-mcg_mult: MCG multiplier, or 0 to use default LCG
+mcg: use mcg codebook
+mul1: use mcg codebook
 */
 
 void decode
 (
     at::Tensor input_indices,
     at::Tensor output_tiles,
-    uint32_t mcg_mult,
-    uint32_t mul1_mult
+    bool mcg,
+    bool mul1
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(input_indices.device());
@@ -385,8 +383,8 @@ void decode
             (const uint16_t*) input_indices.data_ptr(),
             (float*) output_tiles.data_ptr(),
             cols,
-            mcg_mult,
-            mul1_mult
+            mcg,
+            mul1
         );
     else if (output_tiles.dtype() == at::kHalf)
         decode_kernel<<<gridDim, blockDim, 0, stream>>>
@@ -394,8 +392,8 @@ void decode
             (const uint16_t*) input_indices.data_ptr(),
             (half*) output_tiles.data_ptr(),
             cols,
-            mcg_mult,
-            mul1_mult
+            mcg,
+            mul1
         );
 }
 
@@ -413,8 +411,8 @@ void test_distribution_kernel
     uint64_t num_bins,
     float min_value,
     float max_value,
-    uint32_t mcg_mult,
-    uint32_t mul1_mult
+    bool mcg,
+    bool mul1
 )
 {
     __shared__ int histogram[MAX_BINS];
@@ -449,12 +447,12 @@ void test_distribution_kernel
         reset_histogram();
         for (uint64_t i = threadIdx.x; i < 65536; i += NUM_THREADS_TD)
         {
-            if (mcg_mult)
-                count(decode_3inst_f<1>((uint16_t) (i & 0xffff), mcg_mult));
-            else if (mul1_mult)
-                count(decode_3inst_f<2>((uint16_t) (i & 0xffff), mul1_mult));
+            if (mcg)
+                count(decode_3inst_f<1>((uint16_t) (i & 0xffff)));
+            else if (mul1)
+                count(decode_3inst_f<2>((uint16_t) (i & 0xffff)));
             else
-                count(decode_3inst_f<0>((uint16_t) (i & 0xffff), 0));
+                count(decode_3inst_f<0>((uint16_t) (i & 0xffff)));
         }
         __syncthreads();
         write_histogram(ref_output_ptr, 65536);
@@ -482,8 +480,8 @@ void test_distribution
     const c10::optional<at::Tensor>& ref_output,
     float min_value,
     float max_value,
-    uint32_t mcg_mult,
-    uint32_t mul1_mult
+    bool mcg,
+    bool mul1
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
@@ -507,7 +505,7 @@ void test_distribution
         num_bins,
         min_value,
         max_value,
-        mcg_mult,
-        mul1_mult
+        mcg,
+        mul1
     );
 }

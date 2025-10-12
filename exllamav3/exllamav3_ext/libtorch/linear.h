@@ -30,8 +30,8 @@ struct BC_LinearEXL3
     at::Tensor svh;
     int K;
     c10::optional<at::Tensor> bias;
-    uint32_t mcg_mult;
-    uint32_t mul1_mult;
+    bool mcg;
+    bool mul1;
     at::Tensor xh;
 
     BC_LinearEXL3
@@ -41,8 +41,8 @@ struct BC_LinearEXL3
         at::Tensor _svh,
         int _K,
         c10::optional<at::Tensor> _bias,
-        uint32_t _mcg_mult,
-        uint32_t _mul1_mult,
+        bool _mcg,
+        bool _mul1,
         at::Tensor _xh
     ) :
         trellis(std::move(_trellis)),
@@ -50,8 +50,8 @@ struct BC_LinearEXL3
         svh(std::move(_svh)),
         K(_K),
         bias(std::move(_bias)),
-        mcg_mult(_mcg_mult),
-        mul1_mult(_mul1_mult),
+        mcg(_mcg),
+        mul1(_mul1),
         xh(std::move(_xh))
     {}
 
