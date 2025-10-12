@@ -51,7 +51,6 @@ parser.add_argument("--override_anyway", action = "store_true", help = "Allow re
 num_ref_states = 5
 
 def check_system():
-    print("asdasdasd")
     if os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") is not None:
         print(
             "\n"
