@@ -9,7 +9,7 @@ import json
 import mmap
 from ..util import Timer, cuda_sync_active
 from ..ext import exllamav3_ext as ext
-from functools import lru_cache
+from functools import cached_property
 from fnmatch import fnmatch
 import time
 
@@ -192,11 +192,13 @@ class SafetensorsCollection:
         return bytesize
 
 
-    @lru_cache
-    def get_tensor_file_map_trie(self):
+    @cached_property
+    def _get_tensor_file_map_trie(self):
         import marisa_trie
         trie = marisa_trie.Trie(self.tensor_file_map.keys())
         return trie
+    def get_tensor_file_map_trie(self):
+        return self._get_tensor_file_map_trie
 
 
     def list_tensors(
@@ -400,10 +402,14 @@ class SafetensorsCollection:
                 self.handles[filename] = None
 
 
-    @lru_cache
-    def max_key_len(self):
+    @cached_property
+    def _max_key_len(self):
         l = max(len(k) for k in self.tensor_file_map.keys())
         return l
+
+
+    def max_key_len(self):
+        return self._max_key_len
 
 
     def set_new_tensors(self, new_tensors):
@@ -513,7 +519,7 @@ class VariantSafetensorsCollection(SafetensorsCollection):
     ):
         self.main = main
         self.stcs = []
-
+        self._get_tensor_sizes_cache = {}
 
     def compile_star_globs(self, patterns, *, flags = 0):
         # Turn list of filter globs into single, compiled regex
@@ -572,17 +578,18 @@ class VariantSafetensorsCollection(SafetensorsCollection):
         return True
 
 
-    @lru_cache
     def get_tensor_sizes(
         self,
         prefix: str,
     ):
-        keys = [self.main.tensor_file_map.get(prefix)]
-        if keys[0] is None:
-            keys = []
-        keys += self.main.get_tensor_file_map_trie().keys(prefix + ".")
-        sizes = [self.get_tensor_size(key) for key in keys]
-        return sizes
+        if prefix not in self._get_tensor_sizes_cache:
+            keys = [self.main.tensor_file_map.get(prefix)]
+            if keys[0] is None:
+                keys = []
+            keys += self.main.get_tensor_file_map_trie().keys(prefix + ".")
+            sizes = [self.get_tensor_size(key) for key in keys]
+            self._get_tensor_sizes_cache[prefix] = sizes
+        return self._get_tensor_sizes_cache[prefix]
 
 
     def get_tensor_size(

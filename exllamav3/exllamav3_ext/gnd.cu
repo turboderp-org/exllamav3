@@ -54,7 +54,8 @@ void gated_delta_net_fused_op_kernel
     size_t Ng,
     size_t Hk,
     size_t Hv
-){
+)
+{
     const size_t Nv   = Nk * Ng;
     const size_t Fseg = 2 * Hk + 2 * Ng * Hv;   // per-khead segment in mixed_qkvz
     const size_t Fba  = 2 * Ng;                 // per-khead segment in mixed_ba

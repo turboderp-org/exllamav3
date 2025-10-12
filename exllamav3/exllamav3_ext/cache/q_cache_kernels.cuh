@@ -229,7 +229,7 @@ void dequant_cache_paged_kernel
         if (token_idx >= max_token_idx) break;
         int page_idx = token_idx / CQ_PAGE_SIZE;
         int page_sub = t_warp_id - page_idx * CQ_PAGE_SIZE * warps_per_token;
-        int mapped_page = block_table[page_idx];
+        int mapped_page = b_block_table[page_idx];
         int addr = mapped_page * CQ_PAGE_SIZE * warps_per_token + page_sub;
 
         dequant_block<k_bits>(k_in + addr * k_bits, k_in_scales + addr, k_out + addr * 32);

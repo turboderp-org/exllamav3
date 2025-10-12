@@ -510,8 +510,23 @@ class PageTable:
                 p.longest_chain += max([measure(pc) for pc in p.children])
             return p.longest_chain
 
+        def measure_iterative(root):
+            stack = [(root, False)]
+            while stack:
+                node, visited = stack.pop()
+                if not visited:
+                    stack.append((node, True))
+                    for child in node.children:
+                        stack.append((child, False))
+                else:
+                    if node.children:
+                        node.longest_chain = 1 + max(child.longest_chain for child in node.children)
+                    else:
+                        node.longest_chain = 1
+            return root.longest_chain
+
         for page in root_pages:
-            measure(page)
+            measure_iterative(page)
 
         # Recursively sort branches by length
         def sort_seq(p):
@@ -520,8 +535,16 @@ class PageTable:
             for pc in p.children:
                 sort_seq(pc)
 
+        def sort_seq_iterative(root):
+            stack = [root]
+            while stack:
+                node = stack.pop()
+                if len(node.children) > 1:
+                    node.children = sorted(node.children, key = lambda x: x.longest_chain, reverse = True)
+                stack.extend(node.children)
+
         for page in root_pages:
-            sort_seq(page)
+            sort_seq_iterative(page)
 
         # Process roots in order of increasing age
         root_pages = sorted(root_pages, key = lambda x: x.access_serial)

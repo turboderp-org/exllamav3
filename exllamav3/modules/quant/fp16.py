@@ -52,6 +52,14 @@ class LinearFP16:
             w.copy_(self.weight)
             self.weight = w
 
+        self.bc = ext.BC_LinearFP16(
+            self.weight,
+            self.bias,
+        )
+
+    def unload(self):
+        pass
+
     def get_tensors(self, key: str):
         t = {}
         t[f"{key}.weight"] = self.weight.T.contiguous()

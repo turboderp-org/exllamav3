@@ -28,6 +28,7 @@ class GatedRMSNorm(Module):
         self.out_dtype = out_dtype
         self._numel = None
         self.constant_bias = constant_bias
+        self.bc = None
 
     @override
     def optimizer_targets(self):
@@ -40,8 +41,15 @@ class GatedRMSNorm(Module):
         self._numel = weight.numel()
         self.weight = nn.Parameter(weight, requires_grad = False)
 
+        self.bc = ext.BC_GatedRMSNorm(
+            self.weight,
+            self.rms_norm_eps,
+            self.constant_bias,
+        )
+
     @override
     def unload(self):
+        self.bc = None
         self.device = None
         self.weight = None
 

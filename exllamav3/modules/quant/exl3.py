@@ -4,6 +4,7 @@ from ...model.config import Config
 from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n
 from ...ext import exllamav3_ext as ext
 from ...util import profile_opt
+from ...util.tensor import g_tensor_cache
 
 class LinearEXL3:
 
@@ -63,6 +64,22 @@ class LinearEXL3:
         self.mul1 = mul1
         self.mul1_mult = mul1.view(torch.uint32).item() if mul1 is not None else 0
 
+        self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
+        self.bc = ext.BC_LinearEXL3(
+            self.trellis,
+            self.suh,
+            self.svh,
+            self.K,
+            self.bias,
+            self.mcg_mult,
+            self.mul1_mult,
+            g_tensor_cache.get(*self.bsz1_xh_args)
+        )
+
+
+    def unload(self):
+        g_tensor_cache.drop(*self.bsz1_xh_args)
+
 
     def get_tensors(self, key: str):
         return {
@@ -92,27 +109,26 @@ class LinearEXL3:
             if self.key in ovr and ovr[self.key].inner is not self:
                 return ovr[self.key].forward(x, params, out_dtype)
 
+        bsz = x.numel() // x.shape[-1]
+        torch_mode = params.get("reconstruct", bsz > 32)
+
         out_shape = x.shape[:-1] + (self.out_features,)
         x = x.view(-1, self.in_features)
-
-        torch_mode = params.get("reconstruct", x.shape[0] > 32)
-        ret_dtype = out_dtype or self.out_dtype or torch.half
+        y = torch.empty(out_shape, dtype = out_dtype or self.out_dtype or torch.half, device = x.device)
 
         if torch_mode:
-            y = torch.empty(out_shape, dtype = ret_dtype, device = x.device)
             y_ = y.view(x.shape[0], self.out_features)
             xh = torch.empty_like(x)
             ext.had_r_128(x, xh, self.suh, None, 1.0)
             w = self.get_inner_weight_tensor()
             ext.hgemm(xh, w, y_)
             ext.had_r_128(y_, y_, None, self.svh, 1.0)
-        else:
-            y = torch.empty(out_shape, dtype = ret_dtype, device = x.device)
-            xh = torch.empty_like(x)
-            ext.exl3_gemm(x, self.trellis, y, self.suh, xh, self.svh, -1, self.mcg_mult, self.mul1_mult)
+            if self.bias is not None:
+                y += self.bias
+            y = y.view(out_shape)
 
-        if self.bias is not None:
-            y += self.bias
+        else:
+            self.bc.run(x, y)
 
         return y
 

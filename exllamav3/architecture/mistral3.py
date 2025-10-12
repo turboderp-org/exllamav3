@@ -256,6 +256,8 @@ class Mistral3PatchMerger(Module):
 
         self.register_submodule(self.merging_layer)
 
+    def optimizer_targets(self):
+        raise NotImplementedError()
 
     @override
     def forward(

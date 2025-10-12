@@ -362,7 +362,7 @@ void gated_rms_norm
     TORCH_CHECK_DTYPE(g, kBFloat16);
     TORCH_CHECK_DIV(x, -1, 4);
     TORCH_CHECK_SHAPES(x, -1, w, 0, 1);
-    TORCH_CHECK_SHAPES_FULL(x, y);
+    // TORCH_CHECK_SHAPES_FULL(x, y);
     TORCH_CHECK_SHAPES_FULL(x, g);
 
     bool output_fp32 = y.dtype() == at::kFloat;
