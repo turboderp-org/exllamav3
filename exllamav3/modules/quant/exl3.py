@@ -203,8 +203,8 @@ class LinearEXL3:
             "svh": producer.send(self.svh),
             "trellis": producer.send(self.trellis),
             "bias": producer.send(self.bias),
-            "mcg": producer.send(self.mcg),
-            "mul1": producer.send(self.mul1),
+            "mcg": producer.send(self.mcg_tensor),
+            "mul1": producer.send(self.mul1_tensor),
             "out_dtype": self.out_dtype,
         }
 
