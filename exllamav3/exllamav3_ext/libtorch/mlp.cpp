@@ -28,8 +28,8 @@ void BC_GatedMLP::run_bsz1
         {},
         gu_K,
         -1,
-        gu_mcg_mult,
-        gu_mul1_mult,
+        gu_mcg,
+        gu_mul1,
         -1,
         -1,
         0

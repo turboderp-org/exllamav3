@@ -546,9 +546,9 @@ class GatedMLP(Module):
         if self.num_slices == 1 and self.multi_gu[0] is not None and self.downs[0].inner.bc is not None:
             mgu = self.multi_gu[0]
             self.bsz1_pa_args = [
-                (device, (2, 1, self.hidden_size), self.interm_dtype),
-                (device, (2, 1, mgu.out_features), self.interm_dtype),
-                (device, (1, 1, 1, mgu.out_features), torch.half)
+                (device, (2, 1, self.hidden_size), self.interm_dtype, "gu"),
+                (device, (2, 1, mgu.out_features), self.interm_dtype, "a1"),
+                (device, (1, 1, 1, mgu.out_features), torch.half, "a2")
             ]
             self.bc = ext.BC_GatedMLP(
                 *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
@@ -556,8 +556,8 @@ class GatedMLP(Module):
                 mgu.ptrs_suh,
                 mgu.ptrs_svh,
                 mgu.K,
-                mgu.mcg_mult,
-                mgu.mul1_mult,
+                mgu.mcg,
+                mgu.mul1,
                 self.activation_fn == "silu",
                 self.activation_fn == "gelu",
                 self.activation_fn == "relu2",
@@ -632,8 +632,8 @@ class GatedMLP(Module):
                         None,
                         self.multi_gu[s].K,
                         -1,
-                        self.multi_gu[s].mcg_mult,
-                        self.multi_gu[s].mul1_mult,
+                        self.multi_gu[s].mcg,
+                        self.multi_gu[s].mul1,
                         -1,
                         -1,
                         0

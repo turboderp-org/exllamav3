@@ -13,6 +13,9 @@ from functools import lru_cache
 had_k, had_n = 128, 128
 codebook_scale = 1.24371088
 
+codebook_mcg_mult = 0xCBAC1FED
+codebook_mul1_mult = 0x83DCD12D
+
 @lru_cache
 def tensor_core_perm(device):
     perm_a = [0] * 256
@@ -53,8 +56,8 @@ def quantize_tiles(tiles, quant_args: dict):
     assert tiles.dtype == torch.float
 
     K = quant_args["K"]
-    mcg_mult = quant_args.get("mcg_mult", 0)
-    mul1_mult = quant_args.get("mul1_mult", 0)
+    mcg = "mcg" in quant_args
+    mul1 = "mul1" in quant_args
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
     temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
@@ -65,8 +68,8 @@ def quantize_tiles(tiles, quant_args: dict):
         temp_costs,
         temp_edges,
         K,
-        mcg_mult,
-        mul1_mult,
+        mcg,
+        mul1,
     )
     return quantized_tiles, quantized_idx
 
@@ -146,8 +149,8 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
 
                 # Work buffers
                 K = quant_args["K"]
-                mcg_mult = quant_args.get("mcg_mult", 0)
-                mul1_mult = quant_args.get("mul1_mult", 0)
+                mcg = "mcg" in quant_args
+                mul1 = "mul1" in quant_args
                 temp_costs, temp_edges = get_temp_buffers(device, K)
 
                 ext.quantize_tiles(
@@ -157,8 +160,8 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
                     temp_costs,
                     temp_edges,
                     K,
-                    mcg_mult,
-                    mul1_mult
+                    mcg,
+                    mul1
                 )
 
                 # Async copy back to pinned memory
@@ -887,15 +890,16 @@ def quantize_exl3(
             "trellis": trellis,
         }
 
-        mcg_mult = quant_args.get("mcg_mult", 0)
-        if mcg_mult:
+        # Safetensors doesn't know what to do with a torch.uint32 tensor. Anyway, since the multipliers are now
+        # locked, the values in these tensors are never read, but they need to be present in the model files to
+        # indicate which codebook to use during inference, per individual tensor.
+        if quant_args.get("mcg"):
             out_tensors.update({
-                "mcg": torch.tensor(mcg_mult, dtype = torch.uint32).view(torch.int)
+                "mcg": torch.tensor(codebook_mcg_mult, dtype = torch.uint32).view(torch.int)
             })
-        mcg_mult = quant_args.get("mul1_mult", 0)
-        if mcg_mult:
+        if quant_args.get("mul1"):
             out_tensors.update({
-                "mul1": torch.tensor(mcg_mult, dtype = torch.uint32).view(torch.int)
+                "mul1": torch.tensor(codebook_mul1_mult, dtype = torch.uint32).view(torch.int)
             })
 
         quant_args.update({

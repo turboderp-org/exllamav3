@@ -14,8 +14,7 @@ __global__ __launch_bounds__(256)
 void reconstruct_kernel
 (
     half* __restrict__ g_unpacked,
-    const uint16_t* __restrict__ g_packed,
-    uint32_t mult
+    const uint16_t* __restrict__ g_packed
 )
 {
     constexpr int packed_size = 256 * K / 16;  // in uint16s
@@ -37,7 +36,7 @@ void reconstruct_kernel
 
     // Dequant
     register FragB frag[2];
-    dq_dispatch<K, cb>(s_packed[warp_id], lane_id * 8, frag[0], frag[1], mult);
+    dq_dispatch<K, cb>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
 
     // Shuffle from tensor core layout to row major tile
 //    __shared__ half tile[16 * 8 * 16];
@@ -101,8 +100,8 @@ void reconstruct
     at::Tensor unpacked,
     at::Tensor packed,
     int K,
-    uint32_t mcg_mult,
-    uint32_t mul1_mult
+    bool mcg,
+    bool mul1
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
@@ -120,23 +119,13 @@ void reconstruct
     dim3 gridDim(cols / 8, rows);
 
     int cbi = K - 1;
-    uint32_t mult = 0;
-    if (mcg_mult)
-    {
-        mult = mcg_mult;
-        cbi += 8;
-    }
-    else if (mul1_mult)
-    {
-        mult = mul1_mult;
-        cbi += 16;
-    }
+    if (mcg) cbi += 8;
+    else if (mul1) cbi += 16;
 
     reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
-        (const uint16_t*) packed.data_ptr(),
-        mult
+        (const uint16_t*) packed.data_ptr()
     );
     cuda_check(cudaPeekAtLastError());
 }

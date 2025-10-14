@@ -31,12 +31,12 @@ void BC_LinearEXL3::run(const at::Tensor& x, at::Tensor& y)
 {
     if (x.numel() == x.size(-1))
     {
-        exl3_gemm(x, trellis, y, suh, xh, svh, -1, mcg_mult, mul1_mult, 0);
+        exl3_gemm(x, trellis, y, suh, xh, svh, -1, mcg, mul1, 0);
     }
     else
     {
         at::Tensor xh_ = at::empty_like(x);
-        exl3_gemm(x, trellis, y, suh, xh_, svh, -1, mcg_mult, mul1_mult, 0);
+        exl3_gemm(x, trellis, y, suh, xh_, svh, -1, mcg, mul1, 0);
     }
 
     if (bias) y.add_(bias.value());

@@ -30,7 +30,7 @@ parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in
 parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
 parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bits per weight, output (head) layer, default: 6")
 parser.add_argument("-resume", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
-parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 100")
+parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
 parser.add_argument("-cc", "--cal_cols", type = int, help = "Calibration data size, columns, default: 2048")
 parser.add_argument("-cpi", "--checkpoint_interval", type = int, default = 120, help = "Minimum checkpoint interval, in seconds")
 parser.add_argument("-lcpi", "--last_checkpoint_index", type = int, default = None, help = "Last module index to checkpoint (for debug purposes)")
@@ -38,8 +38,7 @@ parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mo
 parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
-parser.add_argument("-mcg", "--mcg_multiplier", type = str, default = None, help = "MCG multiplier - EXPERIMENTAL, DO NOT USE")
-parser.add_argument("-mul1", "--mul1_multiplier", type = str, default = None, help = "MUL1 multiplier - EXPERIMENTAL, DO NOT USE")
+parser.add_argument("-cb", "--codebook", type = str, default = "mcg", help = "Codebook: mcg (default), mul1 or 3inst")
 parser.add_argument("-strat", "--strategy", type = str, default = None, help = "Modifiers for quantization strategy - EXPERIMENTAL")
 
 group = parser.add_mutually_exclusive_group()
@@ -52,7 +51,6 @@ parser.add_argument("--override_anyway", action = "store_true", help = "Allow re
 num_ref_states = 5
 
 def check_system():
-    print("asdasdasd")
     if os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") is not None:
         print(
             "\n"
@@ -124,8 +122,8 @@ def prepare(args) -> (dict, dict, bool, str):
         return None, None, False, "Specify either --in_dir to start a new job or --resume to resume an interrupted job"
     if not args.out_dir and not args.resume:
         return None, None, False, "Must specify --out_dir or --resume"
-    if args.mcg_multiplier and args.mul1_multiplier:
-        return None, None, False, "Cannot specify both MCG and MUL1 arguments"
+    if args.codebook not in ["mcg", "mul1", "3inst"]:
+        return None, None, False, "Codebook must be 'mcg', 'mul1' or '3inst'"
 
     in_args = { "work_dir": args.work_dir }
     if args.resume:
@@ -161,14 +159,13 @@ def prepare(args) -> (dict, dict, bool, str):
         ("shard_size", True, 8192),
         ("bits", False, None),
         ("head_bits", False, 6),
-        ("cal_rows", False, 100),
+        ("cal_rows", False, 250),
         ("cal_cols", False, 2048),
         ("checkpoint_interval", True, None),
         ("last_checkpoint_index", True, -1),
         ("devices", True, None),
         ("device_ratios", True, None),
-        ("mcg_multiplier", True, ""),
-        ("mul1_multiplier", True, ""),
+        ("codebook", True, "mcg"),
         ("strategy", False, ""),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
@@ -197,12 +194,7 @@ def prepare(args) -> (dict, dict, bool, str):
     print(f"    Calibration size: {in_args['cal_rows']} rows, {in_args['cal_cols']} columns")
     print(f"    Target bitrate: {in_args['bits']} (decoder), {in_args['head_bits']} (head)")
     print(f"    Output scales: " + {True: "always", False: "never", None: "auto"}[in_args["apply_out_scales"]])
-    if in_args.get("mcg_multiplier"):
-        warn_experimental = True
-        print(f"    {col_red}MCG multiplier (experimental): {in_args.get('mcg_multiplier')} {col_default}")
-    if in_args.get("mul1_multiplier"):
-        warn_experimental = True
-        print(f"    {col_red}MUL1 multiplier (experimental): {in_args.get('mul1_multiplier')} {col_default}")
+    print(f"    Codebook: {in_args['codebook']}")
 
     if warn_experimental:
         print(
@@ -416,13 +408,13 @@ def main(args, job_state):
                     "device_ratios": device_ratios,
                     "apply_out_scales": args["apply_out_scales"],
                 }
-                if args.get("mcg_multiplier"):
+                if args["codebook"] == "mcg":
                     quant_args.update({
-                        "mcg_mult": int(args["mcg_multiplier"], 0)
+                        "mcg": True
                     })
-                if args.get("mul1_multiplier"):
+                elif args["codebook"] == "mul1":
                     quant_args.update({
-                        "mul1_mult": int(args["mul1_multiplier"], 0)
+                        "mul1": True
                     })
 
                 with Timer() as t:

@@ -376,8 +376,8 @@ class Attention(Module):
                 None,
                 self.multi_kv.K,
                 -1,
-                self.multi_kv.mcg_mult,
-                self.multi_kv.mul1_mult,
+                self.multi_kv.mcg,
+                self.multi_kv.mul1,
                 -1,
                 -1,
                 0

@@ -158,14 +158,8 @@ def compile_model(args, model, config, tokenizer):
                 "cols": args["cal_cols"],
             },
             "out_scales": {True: "always", False: "never", None: "auto"}[args["apply_out_scales"]],
+            "codebook": args["codebook"],
         }
-        if any(args.get(x) for x in ["mcg_multiplier", "mul1_multiplier"]):
-            exp_qcfg = {}
-            if args.get("mcg_multiplier"):
-                exp_qcfg["mcg_multiplier"] = args.get("mcg_multiplier")
-            if args.get("mul1_multiplier"):
-                exp_qcfg["mul1_multiplier"] = args.get("mul1_multiplier")
-            qcfg["experimental_options"] = exp_qcfg
 
     update_config(config_dict)
     config_dict["quantization_config"] = qcfg

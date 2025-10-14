@@ -176,8 +176,9 @@ class Linear(Module):
         sv = self.config.stc.get_tensor(key + ".sv", self.device, optional = True, no_defer = True)
         svh = self.config.stc.get_tensor(key + ".svh", self.device, optional = True)
         trellis = self.config.stc.get_tensor(key + ".trellis", self.device)
-        mcg = self.config.stc.get_tensor(key + ".mcg", "cpu", no_defer = True, optional = True)
-        mul1 = self.config.stc.get_tensor(key + ".mul1", "cpu", no_defer = True, optional = True)
+        # TODO: We technically don't need to load these unless we need to save the tensors later
+        mcg = self.config.stc.get_tensor(key + ".mcg", "cpu", optional = True)
+        mul1 = self.config.stc.get_tensor(key + ".mul1", "cpu", optional = True)
         bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
         self.inner = LinearEXL3(
             self.config,
