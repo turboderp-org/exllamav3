@@ -7,6 +7,7 @@ namespace py = pybind11;
 
 #include "mlp.h"
 #include "linear.h"
+#include "../graph.cuh"
 
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     int bsz,
@@ -48,6 +49,8 @@ struct BC_BlockSparseMLP
     bool act_gelu;
     std::shared_ptr<BC_GatedMLP> shared_experts;
     std::shared_ptr<BC_LinearFP16> shared_gate;
+
+    Graph graph_bsz1;
 
     BC_BlockSparseMLP
     (
@@ -115,6 +118,14 @@ struct BC_BlockSparseMLP
         shared_experts      (_shared_experts),
         shared_gate         (_shared_gate)
     {}
+
+    void run_bsz1_gr
+    (
+        const at::Tensor& y,
+        at::Tensor& selected_experts,
+        at::Tensor& routing_weights,
+        Graph* graph
+    );
 
     void run_bsz1
     (

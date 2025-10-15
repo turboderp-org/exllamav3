@@ -35,7 +35,7 @@ limitations:
 
 std::set<void*> kernel_attr_set[MAX_DEVICES] = {};
 
-int exl3_gemm
+int exl3_gemm_gr
 (
     const at::Tensor& A,
     const at::Tensor& B,
@@ -46,11 +46,12 @@ int exl3_gemm
     int force_shape_idx,
     bool mcg,
     bool mul1,
-    int force_num_sms
+    int force_num_sms,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DIM(B, 3);
     TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
@@ -152,10 +153,43 @@ int exl3_gemm
         SMEM_MAX,
         stream
     );
-    cuda_check(cudaPeekAtLastError());
 
-    // return selected_shape;
+    if (graph) graph->record_param((void*) kernel, GP_gemm_A, 0);
+    if (graph) graph->record_param((void*) kernel, GP_gemm_C, 2);
+    if (graph) graph->record_param((void*) kernel, GP_end, 0);
+
+    cuda_check(cudaPeekAtLastError());
     return shape_idx;
+}
+
+int exl3_gemm
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const c10::optional<at::Tensor>& suh,
+    const c10::optional<at::Tensor>& A_had,
+    const c10::optional<at::Tensor>& svh,
+    int force_shape_idx,
+    bool mcg,
+    bool mul1,
+    int force_num_sms
+)
+{
+    return exl3_gemm_gr
+    (
+        A,
+        B,
+        C,
+        suh,
+        A_had,
+        svh,
+        force_shape_idx,
+        mcg,
+        mul1,
+        force_num_sms,
+        nullptr
+    );
 }
 
 /*
@@ -173,7 +207,7 @@ limitations:
 - n % 128 == 0
 */
 
-int exl3_mgemm
+int exl3_mgemm_gr
 (
     const at::Tensor& A,
     const at::Tensor& B,
@@ -189,11 +223,12 @@ int exl3_mgemm
     bool mul1,
     int min_index,
     int max_index,
-    int force_num_sms
+    int force_num_sms,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(A, kHalf);
     TORCH_CHECK_DTYPE(B, kLong);
@@ -317,6 +352,7 @@ int exl3_mgemm
         (void*)& min_index,
         (void*)& max_index
     };
+
     cudaLaunchCooperativeKernel
     (
         (void*) kernel,
@@ -326,6 +362,53 @@ int exl3_mgemm
         SMEM_MAX,
         stream
     );
+
+    if (graph) graph->record_param((void*) kernel, GP_mgemm_A, 0);
+    if (graph) graph->record_param((void*) kernel, GP_mgemm_C, 2);
+    if (graph) graph->record_param((void*) kernel, GP_mgemm_indices, 10);
+    if (graph) graph->record_param((void*) kernel, GP_mgemm_weights, 11);
+    if (graph) graph->record_param((void*) kernel, GP_end, 0);
+
     cuda_check(cudaPeekAtLastError());
     return shape_idx;
+}
+
+int exl3_mgemm
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const at::Tensor& suh,
+    const at::Tensor& A_had,
+    const at::Tensor& svh,
+    const c10::optional<at::Tensor>& indices,
+    const c10::optional<at::Tensor>& weights,
+    int K,
+    int force_shape_idx,
+    uint32_t mcg_mult,
+    uint32_t mul1_mult,
+    int min_index,
+    int max_index,
+    int force_num_sms
+)
+{
+    return exl3_mgemm_gr
+    (
+        A,
+        B,
+        C,
+        suh,
+        A_had,
+        svh,
+        indices,
+        weights,
+        K,
+        force_shape_idx,
+        mcg_mult,
+        mul1_mult,
+        min_index,
+        max_index,
+        force_num_sms,
+        nullptr
+    );
 }

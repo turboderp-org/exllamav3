@@ -6,6 +6,7 @@
 namespace py = pybind11;
 
 #include "linear.h"
+#include "../graph.cuh"
 
 struct BC_GatedMLP
 {
@@ -22,6 +23,9 @@ struct BC_GatedMLP
     bool act_gelu;
     bool act_relu2;
     std::shared_ptr<BC_LinearEXL3> down;
+
+    Graph graph_bsz1;
+
     BC_GatedMLP
     (
         at::Tensor _guh,
@@ -52,6 +56,13 @@ struct BC_GatedMLP
         act_relu2           (_act_relu2),
         down                (_down)
     {}
+
+    void run_bsz1_gr
+    (
+        const at::Tensor& x,
+        at::Tensor& d,
+        Graph* graph
+    );
 
     void run_bsz1
     (

@@ -17,15 +17,16 @@
 
 // silu(x) * y -> z, in-place if z == x or z == y
 
-void silu_mul
+void silu_mul_gr
 (
     const at::Tensor& x,
     const at::Tensor& y,
-    at::Tensor& z
+    at::Tensor& z,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     bool float_input = x.dtype() == at::kFloat;
     if (float_input)
@@ -51,6 +52,13 @@ void silu_mul
             (half*) z.data_ptr(),
             numel
         );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU>, GP_silu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU>, GP_silu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU>, GP_silu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
     }
     else
     {
@@ -61,20 +69,38 @@ void silu_mul
             (half*) z.data_ptr(),
             numel
         );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU>, GP_silu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU>, GP_silu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU>, GP_silu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
     }
 }
 
-// silu(x) * y -> z, in-place if z == x or z == y
-
-void gelu_mul
+void silu_mul
 (
     const at::Tensor& x,
     const at::Tensor& y,
     at::Tensor& z
 )
 {
+    silu_mul_gr(x, y, z, nullptr);
+}
+
+// silu(x) * y -> z, in-place if z == x or z == y
+
+void gelu_mul_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    Graph* graph
+)
+{
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     bool float_input = x.dtype() == at::kFloat;
     if (float_input)
@@ -100,6 +126,12 @@ void gelu_mul
             (half*) z.data_ptr(),
             numel
         );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_GELU>, GP_gelu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_GELU>, GP_gelu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_GELU>, GP_gelu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_GELU>, GP_end, 0);
+
         cuda_check(cudaPeekAtLastError());
     }
     else
@@ -111,21 +143,38 @@ void gelu_mul
             (half*) z.data_ptr(),
             numel
         );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_GELU>, GP_gelu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_GELU>, GP_gelu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_GELU>, GP_gelu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_GELU>, GP_end, 0);
+
         cuda_check(cudaPeekAtLastError());
     }
 }
 
-// relu^2(x) * y -> z
-
-void relu2_mul
+void gelu_mul
 (
     const at::Tensor& x,
     const at::Tensor& y,
     at::Tensor& z
 )
 {
+    gelu_mul_gr(x, y, z, nullptr);
+}
+
+// relu^2(x) * y -> z
+
+void relu2_mul_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    Graph* graph
+)
+{
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     bool float_input = x.dtype() == at::kFloat;
     if (float_input)
@@ -151,6 +200,13 @@ void relu2_mul
             (half*) z.data_ptr(),
             numel
         );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU2>, GP_relu2_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU2>, GP_relu2_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU2>, GP_relu2_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU2>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
     }
     else
     {
@@ -161,22 +217,40 @@ void relu2_mul
             (half*) z.data_ptr(),
             numel
         );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU2>, GP_relu2_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU2>, GP_relu2_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU2>, GP_relu2_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU2>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
     }
+}
+
+void relu2_mul
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z
+)
+{
+    relu2_mul_gr(x, y, z, nullptr);
 }
 
 // xielu(x, alpha_p, alpha_n) -> z
 // alpha_p and alpha_n must be CPU tensors
 
-void xielu
+void xielu_gr
 (
     const at::Tensor& x,
     at::Tensor& y,
     const at::Tensor& alpha_p,
-    const at::Tensor& alpha_n
+    const at::Tensor& alpha_n,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     bool float_input = x.dtype() == at::kFloat;
     if (!float_input) TORCH_CHECK_DTYPE(x, kHalf);
@@ -208,32 +282,39 @@ void xielu
             p,
             n
         );
+
+        if (graph) graph->record_param((void*) &xielu_kernel_f, GP_xielu_x, 0);
+        if (graph) graph->record_param((void*) &xielu_kernel_f, GP_xielu_y, 1);
+        if (graph) graph->record_param((void*) &xielu_kernel_f, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
     }
-    else
-    {
-        TORCH_CHECK(false, "xielu not implemented for float16 input dtype");
-        // xielu_kernel_h<<<blocks, NUM_THREADS, 0, stream>>>
-        // (
-        //     (const half*) x.data_ptr(),
-        //     (half*) y.data_ptr(),
-        //     numel,
-        //     alpha_p_v,
-        //     alpha_n_v
-        // );
-    }
+    else TORCH_CHECK(false, "xielu not implemented for float16 input dtype");
+}
+
+void xielu
+(
+    const at::Tensor& x,
+    at::Tensor& y,
+    const at::Tensor& alpha_p,
+    const at::Tensor& alpha_n
+)
+{
+    xielu_gr(x, y, alpha_p, alpha_n, nullptr);
 }
 
 // x * sigmoid(y) + z -> z
 
-void add_sigmoid_gate
+void add_sigmoid_gate_gr
 (
     const at::Tensor& x,
     const at::Tensor& y,
-    at::Tensor& z
+    at::Tensor& z,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(x, kFloat);
     TORCH_CHECK_DTYPE(y, kFloat);
@@ -245,7 +326,7 @@ void add_sigmoid_gate
 
     size_t numel = x.numel();
     size_t blocks = CEIL_DIVIDE(numel, NUM_THREADS);
-    add_sigmoid_kernel_f<<<blocks, NUM_THREADS, 0, stream>>>
+    add_sigmoid_kernel_f<<<blocks, NUM_THREADS, 0, graph ? graph->capture_stream : stream>>>
     (
         (const float*) x.data_ptr(),
         (const float*) y.data_ptr(),
@@ -253,4 +334,21 @@ void add_sigmoid_gate
         numel,
         dim
     );
+
+    if (graph) graph->record_param((void*) &add_sigmoid_kernel_f, GP_add_sigmoid_gate_x, 0);
+    if (graph) graph->record_param((void*) &add_sigmoid_kernel_f, GP_add_sigmoid_gate_y, 1);
+    if (graph) graph->record_param((void*) &add_sigmoid_kernel_f, GP_add_sigmoid_gate_z, 2);
+    if (graph) graph->record_param((void*) &add_sigmoid_kernel_f, GP_end, 0);
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+void add_sigmoid_gate
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z
+)
+{
+    add_sigmoid_gate_gr(x, y, z, nullptr);
 }

@@ -7,7 +7,7 @@
 #define MAX_TILES_C (1024 * 1024)
 
 // Treat hopper and blackwell as same arch for now
-#define MAX_DEVICES 32
+#define MAX_DEVICES 16
 #define CC_OLD        1
 #define CC_AMPERE     2
 #define CC_ADA        3

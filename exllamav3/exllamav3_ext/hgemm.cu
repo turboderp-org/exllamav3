@@ -12,15 +12,16 @@ Row-major matmul using cuBLAS, a @ b -> c
 - if c is float32, operation is float16 @ float16 -> float23
 */
 
-void hgemm
+void hgemm_gr
 (
     at::Tensor a,
     at::Tensor b,
-    at::Tensor c
+    at::Tensor c,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     bool output_fp32 = c.dtype() == at::kFloat;
     if (!output_fp32)
@@ -82,4 +83,14 @@ void hgemm
         );
         cuda_check(cudaPeekAtLastError());
     }
+}
+
+void hgemm
+(
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor c
+)
+{
+    hgemm_gr(a, b, c, nullptr);
 }

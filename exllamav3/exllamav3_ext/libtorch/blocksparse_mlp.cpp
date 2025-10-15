@@ -61,17 +61,18 @@ std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     }
 }
 
-void BC_BlockSparseMLP::run_bsz1
+void BC_BlockSparseMLP::run_bsz1_gr
 (
     const at::Tensor& y,
     at::Tensor& selected_experts,
-    at::Tensor& routing_weights
+    at::Tensor& routing_weights,
+    Graph* graph
 )
 {
     py::gil_scoped_release _;
     const at::Tensor& yi = y.unsqueeze(0);
 
-    exl3_mgemm
+    exl3_mgemm_gr
     (
         yi,
         gate_ptrs_trellis,
@@ -87,10 +88,12 @@ void BC_BlockSparseMLP::run_bsz1
         gate_mul1,
         min_expert,
         max_expert,
-        0
+        0,
+        graph
     );
 
-    exl3_mgemm(
+    exl3_mgemm_gr
+    (
         yi,
         up_ptrs_trellis,
         interm_u,
@@ -105,15 +108,17 @@ void BC_BlockSparseMLP::run_bsz1
         up_mul1,
         min_expert,
         max_expert,
-        0
+        0,
+        graph
     );
 
     if (act_silu)
-        silu_mul(interm_g, interm_u, interm_a);
+        silu_mul_gr(interm_g, interm_u, interm_a, graph);
     else if (act_gelu)
-        gelu_mul(interm_g, interm_u, interm_a);
+        gelu_mul_gr(interm_g, interm_u, interm_a, graph);
 
-    exl3_mgemm(
+    exl3_mgemm_gr
+    (
         interm_a,
         down_ptrs_trellis,
         out_d,
@@ -128,21 +133,80 @@ void BC_BlockSparseMLP::run_bsz1
         down_mul1,
         min_expert,
         max_expert,
-        0
+        0,
+        graph
     );
 
     if (shared_experts)
     {
-        shared_experts->run_bsz1(yi, out_d_sh.value());
+        shared_experts->run_bsz1_gr(yi, out_d_sh.value(), graph);
         if (shared_gate)
         {
-            shared_gate->run_cublas(yi, z.value());
-            add_sigmoid_gate(out_d_sh.value(), z.value(), out_d);
+            shared_gate->run_gr(yi, z.value(), graph);
+            add_sigmoid_gate_gr(out_d_sh.value(), z.value(), out_d, graph);
         }
         else
         {
-            add(out_d, out_d_sh.value(), out_d);
+            add_gr(out_d, out_d_sh.value(), out_d, graph);
         }
     }
+}
 
+void BC_BlockSparseMLP::run_bsz1
+(
+    const at::Tensor& y,
+    at::Tensor& selected_experts,
+    at::Tensor& routing_weights
+)
+{
+    c10::cuda::CUDAGuard device_guard(y.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    #define USE_GRAPH
+    #ifndef USE_GRAPH
+
+        run_bsz1_gr(y, selected_experts, routing_weights, nullptr);
+
+    #else
+
+        if (!graph_bsz1.ready)
+        {
+            graph_bsz1.capture_begin();
+            run_bsz1_gr(y, selected_experts, routing_weights, &graph_bsz1);
+            graph_bsz1.capture_end();
+        }
+
+        auto args = std::vector<PPTR>
+        {
+            PPTR(GP_mgemm_A,            (void*) y.data_ptr()),
+            PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()),
+            PPTR(GP_end,                nullptr),
+            PPTR(GP_mgemm_A,            (void*) y.data_ptr()),
+            PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()),
+            PPTR(GP_end,                nullptr),
+            PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()),
+            PPTR(GP_mgemm_weights,      (void*) routing_weights.data_ptr())
+        };
+
+        if (shared_experts && shared_gate)
+        {
+            args.push_back(PPTR(GP_end,                nullptr));
+            args.push_back(PPTR(GP_mgemm_A,            (void*) y.data_ptr()));
+            args.push_back(PPTR(GP_add_sigmoid_gate_z, (void*) out_d.data_ptr()));
+        }
+        else if (shared_experts)
+        {
+            args.push_back(PPTR(GP_end,                nullptr));
+            args.push_back(PPTR(GP_mgemm_A,            (void*) y.data_ptr()));
+            args.push_back(PPTR(GP_add_x,              (void*) out_d.data_ptr()));
+            args.push_back(PPTR(GP_add_z,              (void*) out_d.data_ptr()));
+        }
+        else
+        {
+            args.push_back(PPTR(GP_mgemm_C,            (void*) out_d.data_ptr()));
+        }
+
+        graph_bsz1.launch(args, stream);
+
+    #endif
 }

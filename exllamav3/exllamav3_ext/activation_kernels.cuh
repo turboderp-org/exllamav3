@@ -184,7 +184,6 @@ void xielu_kernel_f
     if (idx >= numel / 2) return;
 
     float2 x2 = ((const float2*) x)[idx];
-    float2 y2 = ((const float2*) y)[idx];
 
     x2.x = _xielu(x2.x, alpha_p, alpha_n);
     x2.y = _xielu(x2.y, alpha_p, alpha_n);
