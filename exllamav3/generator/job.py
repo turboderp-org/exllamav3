@@ -800,7 +800,11 @@ class Job:
             "rq_new_tokens": self.new_tokens - 1
         }
 
-        rq_job = Job(
+        serial_number = self.serial_number
+        generator = self.generator
+
+        rq_job = self
+        self.__init__(
             input_ids = new_input,
             max_new_tokens = self.max_new_tokens - last_completed_tokens,
             min_new_tokens = max(self.min_new_tokens - last_completed_tokens, 0),
@@ -818,7 +822,7 @@ class Job:
             rq_state = rq_state,
         )
 
-        rq_job.prepare_for_queue(self.generator, self.serial_number, rq = True)
+        rq_job.prepare_for_queue(generator, serial_number, rq = True)
         return rq_job
 
 
