@@ -68,7 +68,8 @@ class SMProducer:
         self.next_offset += nbytes_align
 
         # Copy to shared buffer
-        t_cpu = tensor.cpu().contiguous()
+        tensor_d = tensor.view((1,)) if len(tensor.shape) == 0 else tensor
+        t_cpu = tensor_d.cpu().contiguous()
         src = t_cpu.view(torch.uint8).numpy().view(np.uint8).ravel()
         dst = np.ndarray((nbytes,), dtype = np.uint8, buffer = self.shm.buf, offset = offset)
         np.copyto(dst, src, casting = "no")
