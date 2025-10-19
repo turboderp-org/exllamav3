@@ -95,10 +95,10 @@ __global__ void routing_ds3_nogroup_kernel
     const half* __restrict__ bias,
     int64_t* __restrict__ topk_indices,
     half* __restrict__ topk_weights,
-    float scaling_factor,
-    int num_experts,
-    int K,
-    int bsz
+    const float scaling_factor,
+    const int num_experts,
+    const int K,
+    const int bsz
 )
 {
     int row = blockIdx.x;
@@ -167,12 +167,12 @@ __global__ void routing_ds3_nogroup_kernel
         }
         __syncthreads();
 
-        num_experts = K * num_warps;
-        num_warps = CEIL_DIVIDE(num_experts, 32);
+        int num_experts_k = K * num_warps;
+        num_warps = CEIL_DIVIDE(num_experts_k, 32);
 
         if (warp_id < num_warps)
         {
-            if (t < num_experts)
+            if (t < num_experts_k)
             {
                 v = sh_v[t];
                 o = sh_o[t];
@@ -269,12 +269,12 @@ __global__ void routing_std_kernel
         }
         __syncthreads();
 
-        num_experts = K * num_warps;
-        num_warps = CEIL_DIVIDE(num_experts, 32);
+        int num_experts_k = K * num_warps;
+        num_warps = CEIL_DIVIDE(num_experts_k, 32);
 
         if (warp_id < num_warps)
         {
-            if (t < num_experts)
+            if (t < num_experts_k)
             {
                 v = sh_v[t];
                 idx = sh_idx[t];

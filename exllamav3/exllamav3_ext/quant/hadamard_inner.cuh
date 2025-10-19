@@ -7,7 +7,7 @@ __device__ inline half hreduce(half2 x)
     return __hadd(__low2half(x), __high2half(x));
 }
 
-__device__ inline void shuffle_had_f4x32(float& h0, float& h1, float& h2, float& h3, int lane_id)
+__device__ inline void shuffle_had_f4x32(float& h0, float& h1, float& h2, float& h3, const int lane_id)
 {
     #pragma unroll
     for (int i = 1; i < 32; i <<= 1)
@@ -36,7 +36,7 @@ __device__ inline void shuffle_had_f4x32(float& h0, float& h1, float& h2, float&
     }
 }
 
-__device__ inline void shuffle_had_f2x32(float& v, float& w, int lane_id)
+__device__ inline void shuffle_had_f2x32(float& v, float& w, const int lane_id)
 {
     #pragma unroll
     for (int i = 1; i < 32; i <<= 1)
@@ -55,7 +55,7 @@ __device__ inline void shuffle_had_f2x32(float& v, float& w, int lane_id)
     }
 }
 
-__device__ inline float shuffle_had_fx32(float v, int lane_id)
+__device__ inline float shuffle_had_fx32(float v, const int lane_id)
 {
     for (int i = 1; i < 32; i <<= 1)
     {
@@ -90,7 +90,7 @@ void had_hf_r_128_inner
     half* __restrict__ output_ptr,
     const half* __restrict__ pre_scale,
     const half* __restrict__ post_scale,
-    float r_scale
+    const float r_scale
 )
 {
     int t = threadIdx.x & 31;
@@ -148,7 +148,7 @@ void had_ff_r_128_inner
     float* __restrict__ output_ptr,
     const half* __restrict__ pre_scale,
     const half* __restrict__ post_scale,
-    float r_scale
+    const float r_scale
 )
 {
     int t = threadIdx.x & 31;

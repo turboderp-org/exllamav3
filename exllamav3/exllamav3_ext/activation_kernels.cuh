@@ -110,7 +110,7 @@ void act_mul_kernel_h
     const half* __restrict__ x,
     const half* __restrict__ y,
     half* __restrict__ z,
-    size_t numel
+    const size_t numel
 )
 {
     size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
@@ -137,7 +137,7 @@ void act_mul_kernel_f
     const float* __restrict__ x,
     const float* __restrict__ y,
     half* __restrict__ z,
-    size_t numel
+    const size_t numel
 )
 {
     size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
@@ -175,7 +175,7 @@ void xielu_kernel_f
 (
     const float* __restrict__ x,
     half* __restrict__ y,
-    size_t numel,
+    const size_t numel,
     float alpha_p,
     float alpha_n
 )
@@ -200,8 +200,8 @@ void add_sigmoid_kernel_f
     const float* __restrict__ px,
     const float* __restrict__ py,
     float* __restrict__ pz,
-    size_t numel,
-    size_t dim
+    const size_t numel,
+    const size_t dim
 )
 {
     size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);

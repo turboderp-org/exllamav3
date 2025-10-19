@@ -48,12 +48,12 @@ void gated_delta_net_fused_op_kernel
     bfloat16* __restrict__ out_z,               // [B, S, Nv, Hv], bfloat16
     bfloat16* __restrict__ out_beta,            // [B, S, Nv], bfloat16
     float* __restrict__ out_g,                  // [B, S, Nv], float32
-    size_t B,
-    size_t S,
-    size_t Nk,
-    size_t Ng,
-    size_t Hk,
-    size_t Hv
+    const size_t B,
+    const size_t S,
+    const size_t Nk,
+    const size_t Ng,
+    const size_t Hk,
+    const size_t Hv
 )
 {
     const size_t Nv   = Nk * Ng;
@@ -223,13 +223,13 @@ void cuda_recurrent_gated_delta_rule_kernel
     const bfloat16* __restrict__ beta,          // [bsz, seqlen, (group * num_k_heads)]
     float* __restrict__ recurrent_state,        // [bsz, (group * num_k_heads), k_head_dim, v_head_dim]
     bfloat16* __restrict__ core_attn_out,       // [bsz, seqlen, num_v_heads, v_head_dim]
-    int bsz,
-    int seqlen,
-    int num_k_heads,
-    int num_v_heads,
-    int k_head_dim,
-    int v_head_dim,
-    float scale
+    const int bsz,
+    const int seqlen,
+    const int num_k_heads,
+    const int num_v_heads,
+    const int k_head_dim,
+    const int v_head_dim,
+    const float scale
 )
 {
     int group = num_v_heads / num_k_heads;

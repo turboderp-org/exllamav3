@@ -21,21 +21,21 @@ void rope_kernel
     const half* __restrict__ k,
     half* __restrict__ out_k,
     const float* __restrict__ inv_freq,
-    int bsz,
-    int seq_len,
-    int num_heads_q,
-    int num_heads_k,
-    int head_dim,
-    int partial_head_dim,
-    int position,
+    const int bsz,
+    const int seq_len,
+    const int num_heads_q,
+    const int num_heads_k,
+    const int head_dim,
+    const int partial_head_dim,
+    const int position,
     const uint32_t* __restrict__ positions,
     const uint32_t* __restrict__ position_ids,
-    float attn_factor,
+    const float attn_factor,
     const half* __restrict__ q_norm,
     const half* __restrict__ k_norm,
-    float norm_eps,
-    float norm_constant_bias,
-    bool inv_freq_table
+    const float norm_eps,
+    const float norm_constant_bias,
+    const bool inv_freq_table
 )
 {
     // Get position

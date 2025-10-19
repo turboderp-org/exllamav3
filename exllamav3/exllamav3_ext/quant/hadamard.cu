@@ -13,7 +13,7 @@ void had_hf_r_128_kernel
     half* __restrict__ output_ptr,
     const half* __restrict__ pre_scale,
     const half* __restrict__ post_scale,
-    float r_scale
+    const float r_scale
 )
 {
     input_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
@@ -28,7 +28,7 @@ void had_ff_r_128_kernel
     float* __restrict__ output_ptr,
     const half* __restrict__ pre_scale,
     const half* __restrict__ post_scale,
-    float r_scale
+    const float r_scale
 )
 {
     input_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
@@ -47,7 +47,7 @@ void had_r_128
     const at::Tensor& output,
     const c10::optional<at::Tensor>& pre_scale,
     const c10::optional<at::Tensor>& post_scale,
-    float scale
+    const float scale
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());

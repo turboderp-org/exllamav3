@@ -24,11 +24,11 @@ void apply_rep_pens_kernel
     const void* __restrict__ in_logits,
     float* __restrict__ out_logits,
     const uint64_t* __restrict__ past_ids,
-    int past_len,
-    int vocab_size,
-    float rep_p,
-    int sustain_range,
-    int decay_range
+    const int past_len,
+    const int vocab_size,
+    const float rep_p,
+    const int sustain_range,
+    const int decay_range
 )
 {
     // Each block processes a range of the logits
@@ -132,12 +132,12 @@ void apply_pres_freq_pens_kernel
     const void* __restrict__ in_logits,
     float* __restrict__ out_logits,
     const uint64_t* __restrict__ past_ids,
-    int past_len,
-    int vocab_size,
-    float pres_p,
-    float freq_p,
-    int sustain_range,
-    int decay_range
+    const int past_len,
+    const int vocab_size,
+    const float pres_p,
+    const float freq_p,
+    const int sustain_range,
+    const int decay_range
 )
 {
     // Each block processes a range of the logits
