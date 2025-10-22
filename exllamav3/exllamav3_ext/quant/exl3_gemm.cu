@@ -10,6 +10,7 @@ namespace cg = cooperative_groups;
 #include "exl3_gemm_kernel.cuh"
 #include "exl3_kernel_map.cuh"
 #include "exl3_devctx.cuh"
+#include "exl3_gemv.cuh"
 #include <set>
 
 #define NEW_TUNE_GEMM
