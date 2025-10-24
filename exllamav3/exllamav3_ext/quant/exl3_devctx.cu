@@ -45,6 +45,17 @@ int DevCtx::get_cc(int device)
     return cc[device];
 }
 
+void* DevCtx::get_ws(int device)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!ws[device])
+    {
+        cudaSetDevice(device);
+        cudaMalloc(&ws[device], WORKSPACE_SIZE);
+    }
+    return ws[device];
+}
+
 int* DevCtx::get_locks(int device)
 {
     std::lock_guard<std::mutex> lock(mtx);

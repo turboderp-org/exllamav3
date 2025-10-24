@@ -67,6 +67,7 @@ public:
     std::vector<void*> current_values;
     std::vector<bool> node_needs_update;
 
+    bool need_cublas;
     bool ready;
 
     Graph();
