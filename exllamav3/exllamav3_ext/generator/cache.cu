@@ -14,8 +14,8 @@ void cache_rotate_kernel
     uint8_t* __restrict__ cache,
     const int32_t* __restrict__ order,
     uint8_t* __restrict__ temp,
-    size_t page_size,
-    size_t rotate_len
+    const size_t page_size,
+    const size_t rotate_len
 )
 {
     // Chunk for current CTA

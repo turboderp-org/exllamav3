@@ -26,16 +26,16 @@ __global__ __launch_bounds__(NUM_THREADS)
 void pg_gather_kernel
 (
     PGContext* __restrict__ ctx,
-    uint32_t device_mask,
-    int this_device,
-    int out_device,
+    const uint32_t device_mask,
+    const int this_device,
+    const int out_device,
     uint8_t* __restrict__ data_ptr,
     uint8_t* __restrict__ out_data_ptr,
-    Offsets all_offsets,
-    int batch,
+    const Offsets __grid_constant__ all_offsets,
+    const int batch,
     uint8_t* __restrict__ shbuf_ptr,
-    size_t data_size,
-    size_t shbuf_size,
+    const size_t data_size,
+    const size_t shbuf_size,
     uint32_t *abort_flag
 )
 {

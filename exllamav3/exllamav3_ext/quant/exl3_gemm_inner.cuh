@@ -15,9 +15,9 @@ void exl3_gemm_kernel_inner
     const half* __restrict__  A,
     const uint16_t* __restrict__ B,
     void* __restrict__ C,
-    int size_m,
-    int size_k,
-    int size_n,
+    const int size_m,
+    const int size_k,
+    const int size_n,
     int* __restrict__ locks
 )
 {

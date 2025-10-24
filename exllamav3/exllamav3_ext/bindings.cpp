@@ -22,6 +22,7 @@
 #include "quant/reconstruct.cuh"
 #include "quant/hadamard.cuh"
 #include "quant/exl3_gemm.cuh"
+#include "quant/exl3_gemv.cuh"
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -87,6 +88,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
+    m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
@@ -99,6 +101,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("relu2_mul", &relu2_mul, "relu2_mul");
     m.def("xielu", &xielu, "xielu");
     m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
+    m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");

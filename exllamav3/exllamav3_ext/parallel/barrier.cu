@@ -12,9 +12,9 @@
 __global__ void pg_barrier_kernel
 (
     PGContext* __restrict__ ctx,
-    uint32_t device_mask,
-    int this_device,
-    int coordinator_device,
+    const uint32_t device_mask,
+    const int this_device,
+    const int coordinator_device,
     uint32_t* abort_flag
 )
 {

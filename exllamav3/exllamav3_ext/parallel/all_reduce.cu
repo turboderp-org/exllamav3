@@ -19,13 +19,13 @@ __global__ __launch_bounds__(MAX_NUM_THREADS)
 void pg_all_reduce_kernel
 (
     PGContext* __restrict__ ctx,
-    uint32_t device_mask,
+    const uint32_t device_mask,
     int this_device,
     int master_device,
     uint8_t* __restrict__ data_ptr,
     uint8_t* __restrict__ shbuf_ptr,
-    size_t data_size,
-    size_t shbuf_size,
+    const size_t data_size,
+    const size_t shbuf_size,
     uint32_t* abort_flag
 )
 {

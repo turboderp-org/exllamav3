@@ -131,7 +131,7 @@ void rms_norm_kernel
     const float epsilon,
     const int rows,
     const int dim,
-    float constant_bias
+    const float constant_bias
 )
 {
     constexpr bool input_fp32 = std::is_same_v<input_t, float>;
