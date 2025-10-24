@@ -213,3 +213,47 @@ void add_sigmoid_kernel_f
     z += x * _sigmoid_fast_exp(y);
     pz[idx] = z;
 }
+
+// x * sigmoid(y @ w) + z -> z,
+// x: (bsz, dim)
+// y: (bsz, dim)
+// z: (bsz, dim)
+// w: (dim, 1)
+
+__global__ __launch_bounds__(NUM_THREADS_P)
+void add_sigmoid_proj_kernel_f
+(
+    const float* __restrict__ px,
+    const half* __restrict__ py,
+    float* __restrict__ pz,
+    const half* __restrict__ pw,
+    const size_t bsz,
+    const size_t dim
+)
+{
+    int b = blockIdx.x;
+    int t = threadIdx.x;
+    const float* pxb = px + dim * b;
+    const half* pyb = py + dim * b;
+    const float* pzb = pz + dim * b;
+
+    float yw = 0.0f;
+    for (size_t idx = t; idx < dim; idx += NUM_THREADS_P)
+    {
+        float w = __half2float(pw[idx]);
+        float y = __half2float(pyb[idx]);
+        yw += w * y;
+    }
+    yw = block_reduce_sum_broadcast_f(yw, NUM_THREADS_P);
+    float syw = _sigmoid_fast_exp(yw);
+
+    if (syw < 1e-8f) return;
+
+    for (size_t idx = t; idx < dim; idx += NUM_THREADS_P)
+    {
+        float x = px[idx];
+        float z = pz[idx];
+        z += x * syw;
+        pz[idx] = z;
+    }
+}

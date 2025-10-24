@@ -79,3 +79,20 @@ void add_sigmoid_gate
     const at::Tensor& y,
     at::Tensor& z
 );
+
+void add_sigmoid_gate_proj_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const at::Tensor& w,
+    Graph* graph
+);
+
+void add_sigmoid_gate_proj
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const at::Tensor& w
+);

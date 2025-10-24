@@ -392,7 +392,11 @@ class BlockSparseMLP(Module):
             if self.shared_experts and isinstance(self.shared_experts, GatedMLP) and self.shared_experts.bc is not None:
                 self.bc_sh_exp = True
                 sh_exp = self.shared_experts.bc
-                sh_exp_t = torch.empty_like(cfg.out_d)
+                sh_exp_t = torch.empty(
+                    (1, 1, self.hidden_size),
+                    dtype = self.out_dtype or torch.half,
+                    device = self.device
+                )
                 if self.shared_gate:
                     assert self.shared_gate.quant_type == "fp16"
                     sh_gate = self.shared_gate.inner.bc
@@ -715,8 +719,7 @@ class BlockSparseMLP(Module):
         if self.shared_experts and not bc_sh_exp:
             y = self.shared_experts.forward(x, params)
             if self.shared_gate:
-                z = self.shared_gate.forward(x, params)
-                ext.add_sigmoid_gate(y, z, final_hidden_states)
+                ext.add_sigmoid_gate_proj(y, x, final_hidden_states, self.shared_gate.inner.weight)
             else:
                 final_hidden_states += y
 

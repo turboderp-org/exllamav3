@@ -7,8 +7,10 @@
 #include "util.cuh"
 #include "compat.cuh"
 #include <cmath>
+#include "reduction.cuh"
 
 #define NUM_THREADS 256
+#define NUM_THREADS_P 1024
 #define ACT_SILU 0
 #define ACT_GELU 1
 #define ACT_RELU2 2
@@ -326,7 +328,7 @@ void add_sigmoid_gate_gr
 
     size_t numel = x.numel();
     size_t blocks = CEIL_DIVIDE(numel, NUM_THREADS);
-    add_sigmoid_kernel_f<<<blocks, NUM_THREADS, 0, graph ? graph->capture_stream : stream>>>
+    add_sigmoid_kernel_f<<<blocks, NUM_THREADS, 0, stream>>>
     (
         (const float*) x.data_ptr(),
         (const float*) y.data_ptr(),
@@ -351,4 +353,59 @@ void add_sigmoid_gate
 )
 {
     add_sigmoid_gate_gr(x, y, z, nullptr);
+}
+
+// x * sigmoid(y @ w) + z -> z
+
+void add_sigmoid_gate_proj_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const at::Tensor& w,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(x, kFloat);
+    TORCH_CHECK_DTYPE(y, kHalf);
+    TORCH_CHECK_DTYPE(z, kFloat);
+    TORCH_CHECK_DTYPE(w, kHalf);
+
+    int dim = x.size(-1);
+    int gdim = w.size(-1);
+    TORCH_CHECK(gdim == 1, "gate must have size(-1) == 1")
+    TORCH_CHECK_SHAPES(x, -1, w, -2, 1);
+    TORCH_CHECK_SHAPES(x, -1, y, -1, 1);
+
+    size_t bsz = x.numel() / dim;
+    add_sigmoid_proj_kernel_f<<<bsz, NUM_THREADS_P, 0, stream>>>
+    (
+        (const float*) x.data_ptr(),
+        (const half*) y.data_ptr(),
+        (float*) z.data_ptr(),
+        (const half*) w.data_ptr(),
+        bsz,
+        dim
+    );
+
+    if (graph) graph->record_param((void*) &add_sigmoid_proj_kernel_f, GP_add_sigmoid_gate_proj_x, 0);
+    if (graph) graph->record_param((void*) &add_sigmoid_proj_kernel_f, GP_add_sigmoid_gate_proj_y, 1);
+    if (graph) graph->record_param((void*) &add_sigmoid_proj_kernel_f, GP_add_sigmoid_gate_proj_z, 2);
+    if (graph) graph->record_param((void*) &add_sigmoid_proj_kernel_f, GP_end, 0);
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+void add_sigmoid_gate_proj
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const at::Tensor& w
+)
+{
+    add_sigmoid_gate_proj_gr(x, y, z, w, nullptr);
 }

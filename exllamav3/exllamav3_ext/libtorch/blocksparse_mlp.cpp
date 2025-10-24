@@ -142,8 +142,7 @@ void BC_BlockSparseMLP::run_bsz1_gr
         shared_experts->run_bsz1_gr(yi, out_d_sh.value(), graph);
         if (shared_gate)
         {
-            shared_gate->run_gr(yi, z.value(), graph);
-            add_sigmoid_gate_gr(out_d_sh.value(), z.value(), out_d, graph);
+            add_sigmoid_gate_proj_gr(out_d_sh.value(), yi, out_d, shared_gate->weight, graph);
         }
         else
         {
@@ -190,20 +189,21 @@ void BC_BlockSparseMLP::run_bsz1
 
         if (shared_experts && shared_gate)
         {
-            args.push_back(PPTR(GP_end,                nullptr));
-            args.push_back(PPTR(GP_mgemm_A,            (void*) y.data_ptr()));
-            args.push_back(PPTR(GP_add_sigmoid_gate_z, (void*) out_d.data_ptr()));
+            args.push_back(PPTR(GP_end,                         nullptr));
+            args.push_back(PPTR(GP_mgemm_A,                     (void*) y.data_ptr()));
+            args.push_back(PPTR(GP_add_sigmoid_gate_proj_y,     (void*) y.data_ptr()));
+            args.push_back(PPTR(GP_add_sigmoid_gate_proj_z,     (void*) out_d.data_ptr()));
         }
         else if (shared_experts)
         {
-            args.push_back(PPTR(GP_end,                nullptr));
-            args.push_back(PPTR(GP_mgemm_A,            (void*) y.data_ptr()));
-            args.push_back(PPTR(GP_add_x,              (void*) out_d.data_ptr()));
-            args.push_back(PPTR(GP_add_z,              (void*) out_d.data_ptr()));
+            args.push_back(PPTR(GP_end,                         nullptr));
+            args.push_back(PPTR(GP_mgemm_A,                     (void*) y.data_ptr()));
+            args.push_back(PPTR(GP_add_x,                       (void*) out_d.data_ptr()));
+            args.push_back(PPTR(GP_add_z,                       (void*) out_d.data_ptr()));
         }
         else
         {
-            args.push_back(PPTR(GP_mgemm_C,            (void*) out_d.data_ptr()));
+            args.push_back(PPTR(GP_mgemm_C,                     (void*) out_d.data_ptr()));
         }
 
         graph_bsz1.launch(args, stream);

@@ -42,6 +42,11 @@ enum GraphedParams
     GP_add_sigmoid_gate_y,
     GP_add_sigmoid_gate_z,
 
+    GP_add_sigmoid_gate_proj,
+    GP_add_sigmoid_gate_proj_x,
+    GP_add_sigmoid_gate_proj_y,
+    GP_add_sigmoid_gate_proj_z,
+
     GP_add_x,
     GP_add_y,
     GP_add_z
