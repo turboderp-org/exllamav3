@@ -183,12 +183,12 @@ void BC_BlockSparseMLP::run_bsz1
             PPTR(GP_mgemm_A,            (void*) y.data_ptr()),
             PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()),
             PPTR(GP_end,                nullptr),
-            PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()),
-            PPTR(GP_mgemm_weights,      (void*) routing_weights.data_ptr())
         };
 
         if (shared_experts && shared_gate)
         {
+            args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
             args.push_back(PPTR(GP_end,                         nullptr));
             args.push_back(PPTR(GP_mgemm_A,                     (void*) y.data_ptr()));
             args.push_back(PPTR(GP_add_sigmoid_gate_proj_y,     (void*) y.data_ptr()));
@@ -196,6 +196,8 @@ void BC_BlockSparseMLP::run_bsz1
         }
         else if (shared_experts)
         {
+            args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
             args.push_back(PPTR(GP_end,                         nullptr));
             args.push_back(PPTR(GP_mgemm_A,                     (void*) y.data_ptr()));
             args.push_back(PPTR(GP_add_x,                       (void*) out_d.data_ptr()));
@@ -204,6 +206,8 @@ void BC_BlockSparseMLP::run_bsz1
         else
         {
             args.push_back(PPTR(GP_mgemm_C,                     (void*) out_d.data_ptr()));
+            args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
         }
 
         graph_bsz1.launch(args, stream);
