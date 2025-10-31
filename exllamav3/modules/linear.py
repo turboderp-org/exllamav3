@@ -99,8 +99,8 @@ class Linear(Module):
         assert all(w == s * 128 for w, s in zip(ws, ss))
         weight = weight.view(ss[0], 128, ss[1], 128)
         scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
-        weight *= scale_inv
-        return weight
+        weight = weight.float() * scale_inv
+        return weight.view(ws).half()
 
 
     def load_fp16(self, key: str) -> bool:
@@ -109,11 +109,11 @@ class Linear(Module):
             dev = "cpu" if self.is_sliced else self.device
             pad1 = (self.out_features,) if not self.is_sliced else None
             pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
-            weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2)
+            scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+            weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = scale_inv is not None)
             bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
-            scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, float2half = True, optional = True)
             if scale_inv is not None:
-                self.apply_fp8_scales_(weight, scale_inv)
+                weight = self.apply_fp8_scales_(weight, scale_inv)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
