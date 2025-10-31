@@ -289,7 +289,7 @@ class Attention(Module):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
 
         # Head norm
-        if self.q_norm and isinstance(self.q_norm, RMSNorm):
+        if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
             self.q_norm_tensor = self.q_norm.weight.data
             self.k_norm_tensor = self.k_norm.weight.data
 
