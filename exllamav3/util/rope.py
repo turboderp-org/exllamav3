@@ -18,6 +18,7 @@ class RopeSettings:
     head_dim: int = 128
     rope_theta: float = 10000.0
     rope_scaling: dict | None = None
+    rotary_dim: int | None = None
     partial_rotary_factor: float = 1.0
     max_position_embeddings: int | None = None
     original_max_position_embeddings: int | None = None
@@ -105,7 +106,7 @@ class RoPE:
     def _rope_params_default(self):
         rs = self.rope_settings
         base = rs.rope_theta
-        dim = int(rs.head_dim * rs.partial_rotary_factor)
+        dim = rs.rotary_dim or int(rs.head_dim * rs.partial_rotary_factor)
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype = torch.int64, device = self.device).float() / dim))
         return inv_freq, 1.0
 
@@ -142,7 +143,7 @@ class RoPE:
         assert max_position_embeddings is not None, \
             "YaRN scaling requires explicit max_position_embeddings"
         base = rs.rope_theta
-        dim = int(rs.head_dim * rs.partial_rotary_factor)
+        dim = rs.rotary_dim or int(rs.head_dim * rs.partial_rotary_factor)
         original_max_position_embeddings = rs.rope_scaling.get("original_max_position_embeddings")
         if original_max_position_embeddings is not None:
             factor = max_position_embeddings / original_max_position_embeddings
@@ -177,7 +178,7 @@ class RoPE:
     def _rope_params_longrope(self):
         rs = self.rope_settings
         base = rs.rope_theta
-        dim = int(rs.head_dim * rs.partial_rotary_factor)
+        dim = rs.rotary_dim or int(rs.head_dim * rs.partial_rotary_factor)
         a = rs.max_position_embeddings
         a_override = rs.override_max_position_embeddings or a
         b = rs.rope_scaling.get("original_max_position_embeddings", rs.original_max_position_embeddings)
