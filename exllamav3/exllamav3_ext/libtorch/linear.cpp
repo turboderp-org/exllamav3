@@ -10,7 +10,7 @@
 
 void BC_LinearFP16::run_gr(const at::Tensor& x, at::Tensor& y, Graph* graph)
 {
-    if (x.dtype() == y.dtype() and !graph)
+    if (x.dtype() == y.dtype() && !graph)
         at::matmul_out(weight, x, y);
     else
         hgemm_gr(x, weight, y, graph);
