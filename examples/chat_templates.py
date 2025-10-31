@@ -655,6 +655,47 @@ class PromptFormat_apertus(PromptFormat):
         return None, None
 
 
+class PromptFormat_minimax(PromptFormat):
+    description = "Apertus"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = "]~!b["
+        if system_prompt:
+            context += "]~b]system\n"
+            context += system_prompt
+            context += "[e~[\n"
+        for (u, a) in messages:
+            context += "]~b]user\n"
+            context += u
+            context += "[e~[\n"
+            context += "]~b]ai\n"
+            if a is not None:
+                context += a
+                context += "[e~[\n"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("[e~["),
+            "[e~[",
+        ]
+
+    def thinktag(self):
+        return "<think>", "</think>"
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -672,4 +713,5 @@ prompt_formats = {
     "exaone": PromptFormat_exaone,
     "seed": PromptFormat_seed,
     "apertus": PromptFormat_apertus,
+    "minimax": PromptFormat_minimax,
 }
