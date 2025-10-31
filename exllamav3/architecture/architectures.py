@@ -13,6 +13,7 @@ from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
+from .minimax_m2 import MiniMaxM2Model
 from .mistral import MistralModel
 from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
@@ -46,6 +47,7 @@ ARCHITECTURES = {
         Glm4MoeModel,
         LlamaModel,
         MiMoModel,
+        MiniMaxM2Model,
         MistralModel,
         Mistral3Model,
         MixtralModel,
