@@ -45,7 +45,7 @@ def tensor_core_perm_i(device):
 @lru_cache
 def get_temp_buffers(device, K: int):
     max_batch_size = 256
-    temp_costs = torch.zeros((max_batch_size, 2, 65536 >> K), dtype = torch.float, device = device)
+    temp_costs = torch.zeros((max_batch_size, 2, 65536 >> K), dtype = torch.half, device = device)
     temp_edges = torch.zeros((max_batch_size, 256, 65536 >> K), dtype = torch.short, device = device)
     return temp_costs, temp_edges
 
