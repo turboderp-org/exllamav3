@@ -143,23 +143,45 @@ def compile_model(args, model, config, tokenizer):
     print(f" -- Writing config.json")
     with open(os.path.join(in_dir, "config.json"), "r") as f:
         config_dict = json.load(f)
-    if "quantization_config" in config_dict:
-        qcfg = config_dict["quantization_config"]
-        qcfg["bits"] = args["bits"]
-        qcfg["head_bits"] = args["head_bits"]
-    else:
-        qcfg = {
-            "quant_method": "exl3",
-            "version": __version__,
-            "bits": args["bits"],
-            "head_bits": args["head_bits"],
+
+    qcfg = {
+        "quant_method": "exl3",
+        "version": __version__,
+        "bits": args["bits"],
+        "head_bits": args["head_bits"],
+    }
+    if "cal_rows" in args:
+        qcfg.update({
             "calibration": {
                 "rows": args["cal_rows"],
                 "cols": args["cal_cols"],
-            },
-            "out_scales": {True: "always", False: "never", None: "auto"}[args["apply_out_scales"]],
-            "codebook": args["codebook"],
-        }
+            }
+        })
+    if "apply_out_scales" in args:
+        qcfg.update({
+            "out_scales": {True: "always", False: "never", None: "auto"}[args["apply_out_scales"]]
+        })
+    if "codebook" in args:
+        qcfg.update({
+            "codebook": args["codebook"]
+        })
+
+    if "quantization_config" in config_dict:
+        orig_qcfg = config_dict["quantization_config"].copy()
+        if orig_qcfg.get("quant_method") == "exl3":
+            qcfg = orig_qcfg
+            qcfg.update({
+                "bits": args["bits"],
+                "head_bits": args["head_bits"],
+            })
+            if "codebook" in args:
+                qcfg.update({
+                    "codebook": args["codebook"]
+                })
+        else:
+            qcfg.update({
+                "original_quantization_config": orig_qcfg
+            })
 
     update_config(config_dict)
     config_dict["quantization_config"] = qcfg
