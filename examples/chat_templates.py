@@ -656,7 +656,7 @@ class PromptFormat_apertus(PromptFormat):
 
 
 class PromptFormat_minimax(PromptFormat):
-    description = "Apertus"
+    description = "MiniMax"
 
     def __init__(self, *args):
         super().__init__(*args)
