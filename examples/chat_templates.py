@@ -91,7 +91,7 @@ class PromptFormat_chatml(PromptFormat):
 
     def default_system_prompt(self, think):
         return (
-            f"You are {self.bot_name}, a large language model. Answer as concisely as possible."
+            f"You are a helpful AI assistant."
         )
 
     def format(self, system_prompt, messages, think):
