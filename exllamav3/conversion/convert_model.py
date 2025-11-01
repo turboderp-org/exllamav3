@@ -16,6 +16,7 @@ from safetensors.torch import save_file
 from safetensors import safe_open
 import os, shutil
 import json
+import threading
 
 col_default = "\u001b[0m"
 col_red = "\u001b[31;1m"
@@ -40,6 +41,7 @@ parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
 parser.add_argument("-cb", "--codebook", type = str, default = "mcg", help = "Codebook: mcg (default), mul1 or 3inst")
 parser.add_argument("-strat", "--strategy", type = str, default = None, help = "Modifiers for quantization strategy - EXPERIMENTAL")
+parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "When possible, use new parallel mode for small tensors (MoE layers especially)")
 
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--out_scales", dest = "out_scales_", action = "store_true", help = "Always enable out channel scales  (for debug purposes)")
@@ -49,6 +51,10 @@ parser.set_defaults(out_scales_ = None)
 parser.add_argument("--override_anyway", action = "store_true", help = "Allow resuming even when overriding settings that will break the existing job.")
 
 num_ref_states = 5
+
+progress_lock = threading.Lock()
+curr_progress = 0
+max_progress = 0
 
 def check_system():
     if os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") is not None:
@@ -167,6 +173,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("device_ratios", True, None),
         ("codebook", True, "mcg"),
         ("strategy", False, ""),
+        ("parallel_mode", True, False),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -268,6 +275,7 @@ def mod_strategy(args, module, strategy, idx):
 
 @torch.inference_mode()
 def main(args, job_state):
+    global max_progress, curr_progress
 
     torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
@@ -399,47 +407,136 @@ def main(args, job_state):
             for linear in linears:
                 linear.inner.swap_cpu()
 
-            # Quantize module
-            for linear in linears:
-                quant_args = {
-                    "seed": idx,
-                    "K": strategy[linear.key],
-                    "devices": devices,
-                    "device_ratios": device_ratios,
-                    "apply_out_scales": args["apply_out_scales"],
-                }
-                if args["codebook"] == "mcg":
-                    quant_args.update({
-                        "mcg": True
-                    })
-                elif args["codebook"] == "mul1":
-                    quant_args.update({
-                        "mul1": True
-                    })
+            # Decide mode
+            # TODO: Might be useful to compare no. h-tiles per tensor, no. layers and no. SMs across GPUs
+            use_parallel_mode = False
+            if args["parallel_mode"] and len(linears) >= len(devices):
+                use_parallel_mode = True
 
-                with Timer() as t:
-                    sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
-                        if args["image_dump"] else None
-                    proxy_err = linear.convert_exl3(
-                        capture_H[linear.qmap],
-                        quant_args = quant_args,
-                        progress_str = f" -- <step>: {linear.key}",
-                        verbose = args["verbose"],
-                        save_reg = sr
+            # Quantize module, layer parallel
+            if use_parallel_mode:
+                assert not args["image_dump"], "Parallel mode is incompatible with --image_dump"
+
+                # Split workload
+                all_dev_linears = [[] for _ in devices]
+
+                tot_numel = sum(linear.weights_numel() for linear in linears)
+                if device_ratios is None:
+                    dev_numel = [tot_numel // len(devices) for _ in devices]
+                else:
+                    tot_split = sum(device_ratios)
+                    dev_numel = [tot_numel * r // tot_split for _, r in zip(devices, device_ratios)]
+
+                for linear in linears:
+                    l_numel = linear.weights_numel()
+                    fit = [d_numel - l_numel for d_numel in dev_numel]
+                    bestfit = max(range(len(fit)), key = lambda x: fit[x])
+                    dev_numel[bestfit] -= l_numel
+                    all_dev_linears[bestfit].append(linear)
+
+                with progress_lock:
+                    curr_progress = 0
+                    max_progress = len(linears)
+
+                # Worker thread
+                def work_thread(device_idx, dev_linears):
+                    global curr_progress
+
+                    for linear in dev_linears:
+                        quant_args_local = {
+                            "seed": idx,
+                            "K": strategy[linear.key],
+                            "devices": [device_idx],
+                            "apply_out_scales": args["apply_out_scales"],
+                        }
+                        if args["codebook"] == "mcg": quant_args_local.update({ "mcg": True })
+                        elif args["codebook"] == "mul1": quant_args_local.update({ "mul1": True })
+
+                        proxy_err = linear.convert_exl3(
+                            capture_H[linear.qmap],
+                            quant_args = quant_args_local,
+                            verbose = args["verbose"],
+                            save_reg = False,
+                            override_swap_device = device_idx
+                        )
+                        assert isinstance(linear.inner, LinearEXL3)
+                        linear.inner.swap_cpu()
+
+                        flags = "o" if quant_args_local["apply_out_scales"] else "."
+                        proxy_err_str = f"{proxy_err:8.6f}" if proxy_err >= 0.0 else "(OoM)   "
+                        print(
+                            f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
+                            f"  bpw: {quant_args_local['K']:5.2f}"
+                            f"  proxy_err: {proxy_err_str}"
+                            f"  {flags}"
+                            f"  g_sc: {quant_args_local['g_scale']:.6f}"
+                        )
+                        with progress_lock:
+                            curr_progress += 1
+
+                # Launch
+                threads = []
+                for i, device_idx in enumerate(devices):
+                    if len(all_dev_linears[i]):
+                        t = threading.Thread(target = work_thread, args = (device_idx, all_dev_linears[i]))
+                        t.daemon = True
+                        threads.append(t)
+                for t in threads:
+                    t.start()
+
+                try:
+                    with ProgressBar(" -- Quantizing (parallel)", max_progress, transient = True) as progress:
+                        while any(t.is_alive() for t in threads):
+                            progress.update(curr_progress)
+                            time.sleep(0.1)
+                except KeyboardInterrupt as e:
+                    # TODO: This is too hacky
+                    from signal import pthread_kill, SIGTSTP, SIGKILL
+                    for t in threads:
+                        pthread_kill(t.ident, SIGTSTP)
+                        pthread_kill(t.ident, SIGKILL)
+                    print("Aborted.")
+                    sys.exit()
+
+                for t in threads:
+                    t.join(timeout = 0.1)
+
+            # Quantize module, single GPU or tensor split
+            else:
+                for linear in linears:
+                    quant_args = {
+                        "seed": idx,
+                        "K": strategy[linear.key],
+                        "devices": devices,
+                        "device_ratios": device_ratios,
+                        "apply_out_scales": args["apply_out_scales"],
+                    }
+                    if args["codebook"] == "mcg": quant_args.update({ "mcg": True })
+                    elif args["codebook"] == "mul1": quant_args.update({ "mul1": True })
+
+                    with Timer() as t:
+                        sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
+                            if args["image_dump"] else None
+                        proxy_err = linear.convert_exl3(
+                            capture_H[linear.qmap],
+                            quant_args = quant_args,
+                            progress_str = f" -- <step>: {linear.key}",
+                            verbose = args["verbose"],
+                            save_reg = sr,
+                        )
+                        assert isinstance(linear.inner, LinearEXL3)
+                        linear.inner.swap_cpu()
+                    flags = "o" if quant_args["apply_out_scales"] else "."
+                    proxy_err_str = f"{proxy_err:8.6f}" if proxy_err >= 0.0 else "(OoM)   "
+                    print(
+                        f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
+                        f"  bpw: {quant_args['K']:5.2f}"
+                        f"  proxy_err: {proxy_err_str}"
+                        f"  {flags}"
+                        f"  g_sc: {quant_args['g_scale']:.6f}"
+                        f"  [{t.interval:4.2f} s]"
                     )
-                    assert isinstance(linear.inner, LinearEXL3)
-                    linear.inner.swap_cpu()
-                flags = "o" if quant_args["apply_out_scales"] else "."
-                proxy_err_str = f"{proxy_err:8.6f}" if proxy_err >= 0.0 else "(OoM)   "
-                print(
-                    f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
-                    f"  bpw: {quant_args['K']:5.2f}"
-                    f"  proxy_err: {proxy_err_str}"
-                    f"  {flags}"
-                    f"  g_sc: {quant_args['g_scale']:.6f}"
-                    f"  [{t.interval:4.2f} s]"
-                )
-                sys.stdout.flush()
+                    sys.stdout.flush()
 
             # Collect converted module tensors
             for m in module:

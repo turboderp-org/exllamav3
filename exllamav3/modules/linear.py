@@ -240,13 +240,17 @@ class Linear(Module):
         progress_str: str | None = None,
         return_weight_q: bool = False,
         verbose: bool = False,
-        save_reg: str = None
+        save_reg: str = None,
+        override_swap_device: torch.device | None = None
     ):
         assert isinstance(self.inner, LinearFP16), \
             "Inner layer is already quant type"
 
         # Destroy original layer here to save VRAM, we only need weights
         swap_to_device = self.inner.swap_device  # in case weights are swapped to CPU
+        if swap_to_device is not None and override_swap_device is not None:
+            swap_to_device = override_swap_device
+
         orig_weight = self.inner.get_weight_tensor().float()
         orig_bias = self.inner.get_bias_tensor()
         self.inner = None

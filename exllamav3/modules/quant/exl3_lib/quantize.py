@@ -8,6 +8,7 @@ from ....util.hadamard import get_hadamard_dt
 from ....util import cuda_sync_active
 from ....util.tensor import save_tensor_image
 from functools import lru_cache
+import threading
 
 # Constant
 had_k, had_n = 128, 128
@@ -442,56 +443,60 @@ def ldlq(
     return weight_q, encoded
 
 
+finalize_capture_H_mutex = threading.Lock()
+
 def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
-    # Unswap H
-    if "H_swap_device" in H_data:
-        H_data["H"] = H_data["H"].to(H_data["H_swap_device"])
-        del H_data["H_swap_device"]
+    with finalize_capture_H_mutex:
 
-    H = H_data["H"]
-    if H_data["finalized"]:
-        return H, H_data["L"], H_data["su"], H_data["diag"]
+        # Unswap H
+        if "H_swap_device" in H_data:
+            H_data["H"] = H_data["H"].to(H_data["H_swap_device"])
+            del H_data["H_swap_device"]
 
-    # Mean of samples summed up during forward pass
-    H /= H_data["count"]
+        H = H_data["H"]
+        if H_data["finalized"]:
+            return H, H_data["L"], H_data["su"], H_data["diag"]
 
-    # Regularize diagonal
-    diag_mean = torch.diag(H).mean()
-    idx = torch.arange(H.shape[0])
-    H[idx, idx] += quant_args.get("sigma_reg", 0.025) * diag_mean
+        # Mean of samples summed up during forward pass
+        H /= H_data["count"]
 
-    # Some tests
-    diag = H[idx, idx].clone()
+        # Regularize diagonal
+        diag_mean = torch.diag(H).mean()
+        idx = torch.arange(H.shape[0])
+        H[idx, idx] += quant_args.get("sigma_reg", 0.025) * diag_mean
 
-    if verbose:
-        print(f"     - H min/max: {H.min().item():.6f}   {H.max().item():.6f}")
-        print(f"     - H mean/std: {H.mean().item():.6f}   {H.std().item():.6f}")
-        print(f"     - H diag min/max: {diag.min():.6f}   {diag.max():.6f} ")
+        # Some tests
+        diag = H[idx, idx].clone()
 
-    # Random sign flips for input channel, fixed for the first linear layer to quantize with this H
-    k = H.shape[0]
-    su = (torch.randn(k, device = H.device).sign() + 1e-5).sign().to(torch.float).unsqueeze(1)
-    H_data["su"] = su
+        if verbose:
+            print(f"     - H min/max: {H.min().item():.6f}   {H.max().item():.6f}")
+            print(f"     - H mean/std: {H.mean().item():.6f}   {H.std().item():.6f}")
+            print(f"     - H diag min/max: {diag.min():.6f}   {diag.max():.6f} ")
 
-    # Input had
-    H *= su.T
-    blockwise_preapply_had_r_(H, had_k)
-    H *= su
-    blockwise_preapply_had_l_(H, had_k)
+        # Random sign flips for input channel, fixed for the first linear layer to quantize with this H
+        k = H.shape[0]
+        su = (torch.randn(k, device = H.device).sign() + 1e-5).sign().to(torch.float).unsqueeze(1)
+        H_data["su"] = su
 
-    # Get block LDL decomposition of H, zero diagonal
-    L, H = block_ldl(H, 16, verbose)
-    dr = torch.arange(k)
-    L[dr, dr] = 0
-    H_data["L"] = L
+        # Input had
+        H *= su.T
+        blockwise_preapply_had_r_(H, had_k)
+        H *= su
+        blockwise_preapply_had_l_(H, had_k)
 
-    # H is no longer needed except to compute proxy error so move to CPU
-    H = H.cpu()
-    H_data["H"] = H.cpu()
+        # Get block LDL decomposition of H, zero diagonal
+        L, H = block_ldl(H, 16, verbose)
+        dr = torch.arange(k)
+        L[dr, dr] = 0
+        H_data["L"] = L
 
-    H_data["finalized"] = True
-    H_data["diag"] = diag
-    return H, L, su, diag
+        # H is no longer needed except to compute proxy error so move to CPU
+        H = H.cpu()
+        H_data["H"] = H.cpu()
+
+        H_data["finalized"] = True
+        H_data["diag"] = diag
+        return H, L, su, diag
 
 
 def pack_trellis(encoded: torch.Tensor, quant_args: dict) -> torch.Tensor:
@@ -777,11 +782,19 @@ def quantize_exl3(
         if "seed" in quant_args:
             torch.manual_seed(quant_args["seed"])
 
+        devices = quant_args["devices"]
+        if weight.device != torch.device(devices[0]):
+            weight = weight.to(devices[0])
+
         device = weight.device if swap_to_device is None else swap_to_device
         k, n = weight.shape
 
         # Get H, LDL decomp. and input/output sign flips
         H, L, su, H_diag = finalize_capture_H(H_data, quant_args, verbose)
+        if H.is_cuda: H = H.to(device)
+        if L.is_cuda: L = L.to(device)
+        if su.is_cuda: su = su.to(device)
+        if H_diag.is_cuda: H_diag = H_diag.to(device)
         sv = (torch.randn(n, device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
 
         # Move stored L to CPU (if not already), move working L to device
