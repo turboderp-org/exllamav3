@@ -278,8 +278,17 @@ def main(args):
         if args.save:
             sr = response
             if args.save_svg:
-                m = re.search(r"<svg\b[^>]*>.*?</svg>", sr, flags = re.IGNORECASE | re.DOTALL)
-                sr = m.group(0).strip() if m else None
+                import re
+                b = [match.end() for match in re.finditer("</svg>", sr)]
+                if b:
+                    sr = sr[:b[-1]]
+                    a = [match.start() for match in re.finditer("<svg", sr)]
+                    if a:
+                        sr = sr[a[-1]:]
+                    else:
+                        sr = None
+                else:
+                    sr = None
                 if sr: print_info(f"Found SVG: {len(sr)} characters")
                 else: print_error(f"No SVG block found")
             if sr:
