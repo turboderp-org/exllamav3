@@ -139,10 +139,15 @@ class Linear(Module):
             )
             weight = weight[self.frange[0] : self.frange[1]].contiguous()
             weight = self.pad_out(weight)
-            bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True, no_defer = True)
-            bias = self.pad_out(bias)
+            bias = self.config.stc.get_tensor(
+                self.fkey + ".bias",
+                self.device,
+                optional = True,
+                no_defer = True
+            )
             if bias is not None:
                 bias = bias[self.frange[0] : self.frange[1]].contiguous()
+                bias = self.pad_out(bias)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,

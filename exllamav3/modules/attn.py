@@ -184,7 +184,7 @@ class Attention(Module):
         else:
             fkey, frange_q, frange_k, frange_v = None, None, None, None
 
-        if key_q:
+        if key_q or frange_q:
             f = 2 if interleaved_gate else 1
             self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim * f, qmap = qmap + ".input", fkey = fkey, frange = frange_q, qbits_mod_key = "q")
             self.register_submodule(self.q_proj)
@@ -193,8 +193,8 @@ class Attention(Module):
             self.q_proj = q_proj
             self.register_submodule(self.q_proj)
 
-        if key_k:
-            assert key_v
+        if key_k or frange_k:
+            assert key_v or frange_v
             self.k_proj = Linear(config, f"{key}.{key_k}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_k, qbits_mod_key = "k")
             self.v_proj = Linear(config, f"{key}.{key_v}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_v, qbits_mod_key = "v")
             self.register_submodule(self.k_proj)
