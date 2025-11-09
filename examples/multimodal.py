@@ -21,7 +21,7 @@ match mode:
         model_dir = "/mnt/str/models/mistral-small-3.1-24b-instruct-2503/exl3/4.0bpw/"
     case "qwen3":
         prompt_format = "chatml"
-        model_dir = "/mnt/str/models/qwen3-vl-8b-instruct/hf/"
+        model_dir = "/mnt/str/models/qwen3-vl-8b-instruct/exl3/3.5bpw"
 
 images = [
     # Cat
@@ -57,7 +57,7 @@ def main():
     # Config for text and vision model
     config = Config.from_directory(model_dir)
 
-    # Load the image component model
+    # Load the image component model (can also be loaded after main model)
     vision_model = Model.from_config(config, component = "vision")
     vision_model.load(device = 0, progressbar = True)
 
