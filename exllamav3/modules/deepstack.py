@@ -22,7 +22,7 @@ class DeepstackEmbed(Module):
 
     @override
     def get_tensors(self):
-        raise {}
+        return {}
 
     @override
     def forward(
