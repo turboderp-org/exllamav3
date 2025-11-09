@@ -591,7 +591,7 @@ def main(args, job_state):
         module_time = time.time() - start_module_time
         print(
             f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
-            (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"   no_weights") +
+            (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"  no_weights") +
             (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
             f"  cos: {cos_error:.6f}"
             f"  sqnr: {sqnr_:.6f}"

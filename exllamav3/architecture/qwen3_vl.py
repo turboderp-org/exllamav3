@@ -247,7 +247,7 @@ class Qwen3VLVisionModel(Model):
     @staticmethod
     @override
     def get_additional_compiled_tensors(config: Qwen3VLConfig) -> dict:
-        vlm_tensors = config.stc.list_tensors(key_prefix = "model.visual")
+        vlm_tensors = config.stc.list_tensors(prefix = "model.visual")
         return vlm_tensors
 
     def __init__(
