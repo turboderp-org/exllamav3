@@ -8,7 +8,7 @@ import requests
 import torch
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth=200)
 
-mode = "mistral3"
+mode = "qwen3"
 cache_size = 8192
 streaming = True
 
@@ -19,10 +19,13 @@ match mode:
     case "mistral3":
         prompt_format = "mistral"
         model_dir = "/mnt/str/models/mistral-small-3.1-24b-instruct-2503/exl3/4.0bpw/"
+    case "qwen3":
+        prompt_format = "chatml"
+        model_dir = "/mnt/str/models/qwen3-vl-8b-instruct/hf/"
 
 images = [
     # Cat
-    {"file": "media/cat.png"},
+    # {"file": "media/cat.png"},
 
     # Line drawing
     # {"file": "media/strawberry.png"},
@@ -32,6 +35,9 @@ images = [
 
     # Unrandom photo from picsum
     # {"url": "https://fastly.picsum.photos/id/451/800/600.jpg?hmac=B0-st7nsgJ0F8ufKM5HjVwP-1y_vIL60R-PpNFLITiQ"}
+
+    # Qwen3 demo image
+    {"url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"}
 ]
 
 system_prompt = "You are a very nice language model."
@@ -48,16 +54,18 @@ def get_image(file = None, url = None):
 
 def main():
 
-    # Load model with cache
+    # Config for text and vision model
     config = Config.from_directory(model_dir)
+
+    # Load the image component model
+    vision_model = Model.from_config(config, component = "vision")
+    vision_model.load(device = 0, progressbar = True)
+
+    # Load the text model
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens = cache_size)
     model.load(progressbar = True)
     tokenizer = Tokenizer.from_config(config)
-
-    # Load the image component model
-    vision_model = Model.from_config(config, component = "vision")
-    vision_model.load(progressbar = True)
 
     # Create generator
     generator = Generator(
