@@ -31,6 +31,7 @@ class MMEmbedding:
         embeddings: torch.Tensor,
         token_string: torch.Tensor,
         text_alias: str | None = None,
+        deepstack_embeddings: list[torch.Tensor] | None = None,
         grid_thw: tuple | None = None,
         mrope_merge_size: int | None = None
     ):
@@ -47,12 +48,17 @@ class MMEmbedding:
 
         global global_allocator
 
+        if deepstack_embeddings is not None:
+            assert all(de.shape == embeddings.shape for de in deepstack_embeddings), \
+                "Deepstack embeddings shape mismatch"
+
         self.metadata = {}
         self.full_length = token_string.shape[-1]
         self.mm_length = embeddings.shape[-2]
         self.first_index = global_allocator.allocate(self.mm_length)
         self.last_index = self.first_index + self.mm_length
         self.embeddings = embeddings
+        self.deepstack_embeddings = deepstack_embeddings
         self.text_alias = text_alias or f"<$EMB_{self.first_index}$>"
 
         # MRoPE

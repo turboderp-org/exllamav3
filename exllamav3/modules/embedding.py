@@ -94,6 +94,15 @@ class Embedding(Module):
             bsz, seq_len = input_ids.shape
             combined_emb = torch.empty((bsz, seq_len, self.hidden_size), device = self.device, dtype = out_dtype)
 
+            # Prepare deepstack embedding tensors
+            if any(ie.deepstack_embeddings is not None for ie in indexed_emb) and indexed_act:
+                assert all(ie.deepstack_embeddings is not None for ie in indexed_emb)
+                num_layers = len(indexed_emb[0].deepstack_embeddings)
+                assert all(num_layers == len(ie.deepstack_embeddings) is not None for ie in indexed_emb)
+                deepstack_emb = [torch.zeros_like(combined_emb) for _ in range(num_layers)]
+            else:
+                deepstack_emb = None
+
             # Insert standard embeddings
             if standard_mask.any():
                 for i in range(bsz):
@@ -112,6 +121,15 @@ class Embedding(Module):
                 for i in range(bsz):
                     indexed_ids_row = input_ids[i][im[i]] - ie.first_index
                     combined_emb[i][im[i]] = ie.embeddings[indexed_ids_row].to(out_dtype)
+
+                    # Prepare deepstack embeddings
+                    if ie.deepstack_embeddings is not None:
+                        for layer, de in enumerate(ie.deepstack_embeddings):
+                            deepstack_emb[layer][i][im[i]] = de[indexed_ids_row].to(out_dtype)
+
+            # Save deepstack embeddings to params
+            if deepstack_emb is not None:
+                params["deepstack_emb"] = deepstack_emb
 
             return combined_emb
 

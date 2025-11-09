@@ -19,6 +19,7 @@ class Conv(Module):
         kernel_size: tuple,
         out_dtype: torch.dtype | None = None,
         qmap: str | None = None,
+        flat: bool = False,
     ):
         super().__init__(config, key, None)
         assert qmap is None, "No quant scheme for Conv"
@@ -31,9 +32,14 @@ class Conv(Module):
         self.bias = None
         self.out_dtype = out_dtype
         self._numel = None
+        self.flat = True
 
-        self.dim = len(kernel_size)
-        assert self.dim in [2, 3], "Convolution must be 2D or 3D"
+        self.dims = len(kernel_size)
+        assert self.dims in [2, 3], "Convolution must be 2D or 3D"
+
+        self.flat = flat
+        self.dim = in_channels
+        for d in self.kernel_size: self.dim *= d
 
 
     @override
@@ -75,14 +81,29 @@ class Conv(Module):
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
 
-        if self.dim == 2:
+        bsz, seqlen, dim = x.shape
+
+        if self.dims == 2:
             y = F.conv2d(x, self.weight, self.bias, self.kernel_size)
             y = y.flatten(2).permute(0, 2, 1).contiguous()
 
-        elif self.dim == 3:
-            x = x.view(-1, self.in_channels, self.kernel_size[0], self.kernel_size[1], self.kernel_size[2])
-            y = F.conv3d(x, self.weight, self.bias, self.kernel_size)
-            y = y.view(-1, self.out_channels).unsqueeze(0)
+        elif self.dims == 3:
+            if self.flat:
+                x_flat = x.view(-1, self.dim)
+                w_flat = self.weight.view(self.weight.shape[0], -1).T.contiguous()
+                out_dtype = out_dtype or self.out_dtype
+                assert x_flat.dtype == torch.half
+                assert w_flat.dtype == torch.half
+                y = torch.empty((x_flat.shape[0], w_flat.shape[1]), dtype = out_dtype, device = x_flat.device)
+                ext.hgemm(x_flat, w_flat, y)
+                y = y.view(bsz, seqlen, self.out_channels)
+                if self.bias is not None:
+                    y += self.bias
+            else:
+                # Extremely inefficient for Qwen3
+                x = x.view(-1, self.in_channels, self.kernel_size[0], self.kernel_size[1], self.kernel_size[2])
+                y = F.conv3d(x, self.weight, self.bias, self.kernel_size)
+                y = y.view(bsz, seqlen, self.out_channels)
 
         return y
 

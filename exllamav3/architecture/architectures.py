@@ -22,6 +22,7 @@ from .qwen2 import Qwen2Model
 from .qwen3 import Qwen3Model
 from .qwen3_moe import Qwen3MoeModel
 from .qwen3_next import Qwen3NextModel
+from .qwen3_vl import Qwen3VLModel
 from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
 
@@ -56,6 +57,7 @@ ARCHITECTURES = {
         Qwen3Model,
         Qwen3MoeModel,
         Qwen3NextModel,
+        Qwen3VLModel,
         SeedOssModel,
         SmolLM3Model,
     ]

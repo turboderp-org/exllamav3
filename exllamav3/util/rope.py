@@ -387,3 +387,36 @@ class RoPE:
             out_k = out_k.squeeze(0) if out_k is not None else None
 
         return out_q, out_k
+
+
+def position_embedding_grid_2d(
+    grid_thw: tuple,
+    head_dim: int,
+    spatial_merge_size: int,
+    theta: float,
+):
+    """
+    Position IDs for Qwen2/3 grid
+    """
+
+    t, h, w = grid_thw
+    spm = spatial_merge_size
+
+    # Position IDs
+    hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+    hpos_ids = hpos_ids.reshape(h // spm, spm, w // spm, spm)
+    hpos_ids = hpos_ids.permute(0, 2, 1, 3)
+    hpos_ids = hpos_ids.flatten()
+    wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+    wpos_ids = wpos_ids.reshape(h // spm, spm, w // spm, spm)
+    wpos_ids = wpos_ids.permute(0, 2, 1, 3)
+    wpos_ids = wpos_ids.flatten()
+    ids = torch.stack([hpos_ids, wpos_ids], dim = -1).repeat(t, 1)
+
+    # Frequencies
+    dim = head_dim // 2
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype = torch.float) / dim))
+    seq = torch.arange(max(h, w), dtype = torch.float)
+    freqs = torch.outer(seq, inv_freq)
+    emb = freqs[ids].flatten(1)
+    return emb
