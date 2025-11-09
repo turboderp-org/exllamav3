@@ -429,12 +429,16 @@ class Generator:
         block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
         cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
         batch = 0
+        use_offsets = "mrope" in self.model.caps
+        positions = torch.zeros_like(cache_seqlens) if use_offsets else None
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
             for seq in job.sequences:
                 seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
                 block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
                 cache_seqlens[batch] = seq.kv_position
+                if use_offsets:
+                    positions[batch] = seq.kv_position + job.alt_rope_offset
                 batch += 1
 
         # Collect input IDs and indexed embeddings
@@ -442,7 +446,6 @@ class Generator:
         active_embeddings = []
         logit_mapping = []
         batch_jobs = []
-        # rope_offsets_list = [] if self.model.config.arch.lm.mrope else None  # TODO (embeddings)
         for job in self.active_jobs:
             logit_mapping.append(len(input_ids_list))
             if not job.is_prefill_done(): continue
@@ -453,8 +456,6 @@ class Generator:
             input_ids_list += job_ids
             batch_jobs.append(job)
             active_embeddings += job.embeddings
-            # if rope_offsets_list is not None:   # TODO (embeddings)
-            #     rope_offsets_list += [job.alt_rope_offset] * len(job_ids)
         logit_mapping.append(len(input_ids_list))
         batch_ids = torch.cat(input_ids_list, dim = 0)
 
@@ -488,7 +489,8 @@ class Generator:
                 "cache": self.cache,
                 "cache_seqlens": cache_seqlens,
                 "recurrent_states": batch_states,
-                "indexed_embeddings": active_embeddings
+                "indexed_embeddings": active_embeddings,
+                "positions": positions,
             }
         )
 

@@ -31,6 +31,8 @@ class MMEmbedding:
         embeddings: torch.Tensor,
         token_string: torch.Tensor,
         text_alias: str | None = None,
+        grid_thw: tuple | None = None,
+        mrope_merge_size: int | None = None
     ):
         """
         :param embeddings:
@@ -49,8 +51,13 @@ class MMEmbedding:
         self.full_length = token_string.shape[-1]
         self.mm_length = embeddings.shape[-2]
         self.first_index = global_allocator.allocate(self.mm_length)
+        self.last_index = self.first_index + self.mm_length
         self.embeddings = embeddings
         self.text_alias = text_alias or f"<$EMB_{self.first_index}$>"
+
+        # MRoPE
+        self.grid_thw = grid_thw
+        self.mrope_merge_size = mrope_merge_size
 
         r = torch.arange(self.first_index, self.first_index + self.mm_length, dtype = torch.long)
         m = (token_string == -1)

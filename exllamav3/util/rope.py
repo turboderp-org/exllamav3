@@ -82,23 +82,26 @@ class RoPE:
         self.cached_cos = None
         self.cached_sincos_max = 0
 
+        self.mrope_interleaved = None
+        self.mrope_section = None
+
         t = None
         rs = self.rope_settings
         if rs.rope_scaling is not None:
             t = rs.rope_scaling.get("rope_type", rs.rope_scaling.get("type"))
         match t:
             case None:
-                self.inv_freq, self.attn_factor = self._rope_params_default()
+                self._rope_params_default()
             case "default":
-                self.inv_freq, self.attn_factor = self._rope_params_default()
+                self._rope_params_default()
             case "llama3":
-                self.inv_freq, self.attn_factor = self._rope_params_llama3()
+                self._rope_params_llama3()
             case "linear":
-                self.inv_freq, self.attn_factor = self._rope_params_linear()
+                self._rope_params_linear()
             case "yarn":
-                self.inv_freq, self.attn_factor = self._rope_params_yarn()
+                self._rope_params_yarn()
             case "longrope" | "su":
-                self.inv_freq, self.attn_factor = self._rope_params_longrope()
+                self._rope_params_longrope()
             case _:
                 raise ValueError(f"Unknown rope_type: {t}")
 
@@ -108,33 +111,35 @@ class RoPE:
         base = rs.rope_theta
         dim = rs.rotary_dim or int(rs.head_dim * rs.partial_rotary_factor)
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype = torch.int64, device = self.device).float() / dim))
-        return inv_freq, 1.0
+        if rs.rope_scaling:
+            self.mrope_interleaved = rs.rope_scaling.get("mrope_interleaved")  # Ignored in HF impl., always True
+            self.mrope_section = rs.rope_scaling.get("mrope_section")
+        self.inv_freq, self.attn_factor = inv_freq, 1.0
 
 
     def _rope_params_llama3(self):
         rs = self.rope_settings
-        inv_freq, attention_factor = self._rope_params_default()
+        self._rope_params_default()
         factor = rs.rope_scaling.get("factor", 8.0)
         low_freq_factor = rs.rope_scaling.get("low_freq_factor", 1.0)
         high_freq_factor = rs.rope_scaling.get("high_freq_factor", 4.0)
         old_context_len = rs.rope_scaling.get("original_max_position_embeddings", 8192)
         low_freq_wavelen = old_context_len / low_freq_factor
         high_freq_wavelen = old_context_len / high_freq_factor
-        wavelen = 2 * math.pi / inv_freq
-        inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+        wavelen = 2 * math.pi / self.inv_freq
+        inv_freq_llama = torch.where(wavelen > low_freq_wavelen, self.inv_freq / factor, self.inv_freq)
         smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
         smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
         is_medium_freq = (wavelen >= high_freq_wavelen) * (wavelen <= low_freq_wavelen)
         inv_freq = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
-        return inv_freq, 1.0
+        self.inv_freq, self.attn_factor = inv_freq, 1.0
 
 
     def _rope_params_linear(self):
         rs = self.rope_settings
-        inv_freq, attention_factor = self._rope_params_default()
+        self._rope_params_default()
         factor = rs.rope_scaling.get("factor", 1.0)
-        inv_freq /= factor
-        return inv_freq, attention_factor
+        self.inv_freq /= factor
 
 
     def _rope_params_yarn(self):
@@ -172,7 +177,7 @@ class RoPE:
         inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, dim // 2).float()
         inv_freq = inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
         inv_freq += inv_freq_extrapolation * inv_freq_extrapolation_factor
-        return inv_freq, attn_factor
+        self.inv_freq, self.attn_factor = inv_freq, attn_factor
 
 
     def _rope_params_longrope(self):
@@ -193,7 +198,7 @@ class RoPE:
         else:
             scaling = 1.0
         inv_freq = 1.0 / (ext_factors * base ** (torch.arange(0, dim, 2, device = self.device).float() / dim))
-        return inv_freq, scaling
+        self.inv_freq, self.attn_factor = inv_freq, scaling
 
 
     def compute_sincos(self, position_ids: torch.Tensor):
@@ -292,6 +297,41 @@ class RoPE:
             return q_, k_
         else:
             return q, k
+
+
+    def get_mrope_freqs(
+        self,
+        input_ids: torch.Tensor,
+        embeddings: list,  #[MMEmbedding],
+        max_length: int,
+    ):
+        # Create 3D position IDs
+        ids = input_ids.squeeze(0).contiguous()
+        mrope_pos_ids = torch.zeros((3, max_length), dtype = torch.long).contiguous()
+        spans = []
+        grids = []
+        merge_size = None
+        for embedding in embeddings:
+            spans.append((embedding.first_index, embedding.last_index))
+            grids.append(embedding.grid_thw)
+            if merge_size:
+                assert merge_size == embedding.mrope_merge_size, "mrope_merge_size varies across MMEmbeddings"
+            else:
+                merge_size = embedding.mrope_merge_size
+        if merge_size is None: merge_size = 1
+        next_pos_idx = ext.gen_mrope_pos_ids(mrope_pos_ids, ids, merge_size, spans, grids)
+
+        # Interleave frequencies
+        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, 1, -1, 1)
+        position_ids_expanded = mrope_pos_ids[:, None, None, :].float()
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+        freqs_t = freqs[0]
+        for dim, offset in enumerate((1, 2), start = 1):  # H, W
+            length = self.mrope_section[dim] * 3
+            idx = slice(offset, length, 3)
+            freqs_t[..., idx] = freqs[dim, ..., idx]
+
+        return freqs_t.contiguous(), next_pos_idx
 
 
     def apply(

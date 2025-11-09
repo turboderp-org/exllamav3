@@ -71,6 +71,9 @@ class Config(ABC):
         self.pos_encoding_mode = "NONE"
         self.max_position_embeddings = self.read_cfg(int, "max_position_embeddings", self.default_max_position_embeddings())
 
+        # Main RoPE module (for MRoPE, individual attn layers have their own modules)
+        self.g_rope = None
+
         # Load parameters
         self.load_isq = False
 

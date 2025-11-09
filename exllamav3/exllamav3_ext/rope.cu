@@ -35,7 +35,8 @@ void rope_kernel
     const half* __restrict__ k_norm,
     const float norm_eps,
     const float norm_constant_bias,
-    const bool inv_freq_table
+    const bool inv_freq_table,
+    const int inv_freq_stride
 )
 {
     // Get position
@@ -62,7 +63,7 @@ void rope_kernel
     }
     else
     {
-        float fr = inv_freq[pos * partial_head_dim / 2 + t];
+        float fr = inv_freq[batch * inv_freq_stride + pos * partial_head_dim / 2 + t];
         sin = __sinf(fr) * attn_factor;
         cos = __cosf(fr) * attn_factor;
     }
@@ -230,6 +231,7 @@ void rope
     int num_heads_k = 0;
     int head_dim = q.size(3);
     int partial_head_dim = inv_freq.size(-1) * 2;
+    int inv_freq_stride = 0;
 
     const half* q_ptr = (half*) q.data_ptr();
     half* out_q_ptr = (half*) out_q.data_ptr();
@@ -253,9 +255,10 @@ void rope
     bool inv_freq_table = false;
     if (inv_freq.dim() > 1)
     {
-        TORCH_CHECK_DIM(inv_freq, 2);
-        TORCH_CHECK_SHAPES(q, 3, inv_freq, 1, 2);
+        TORCH_CHECK(inv_freq.dim() >= 2 || inv_freq.dim() <= 3);
+        TORCH_CHECK_SHAPES(q, 3, inv_freq, -1, 2);
         inv_freq_table = true;
+        inv_freq_stride = inv_freq.size(-1) * inv_freq.size(-2);
     }
 
     uint32_t* positions_ptr = (uint32_t*) OPTPTR(positions);
@@ -295,10 +298,81 @@ void rope
 
     #define ARGS q_ptr, out_q_ptr, k_ptr, out_k_ptr, inv_freq_ptr, bsz, seq_len, num_heads_q, num_heads_k, \
                  head_dim, partial_head_dim, position, positions_ptr, position_ids_ptr, attn_factor, \
-                 q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table
+                 q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table, inv_freq_stride
 
     if      (rope_mode == ROPESTYLE_GPTJ) rope_kernel<ROPESTYLE_GPTJ><<<blocks, threads, 0, stream>>>(ARGS);
     else if (rope_mode == ROPESTYLE_NEOX) rope_kernel<ROPESTYLE_NEOX><<<blocks, threads, 0, stream>>>(ARGS);
 
     cuda_check(cudaPeekAtLastError());
+}
+
+
+int64_t gen_mrope_pos_ids
+(
+    at::Tensor mrope_pos_ids,
+    at::Tensor ids,
+    int merge_size,
+    const std::vector<std::tuple<int64_t, int64_t>> &spans,
+    const std::vector<std::tuple<int64_t, int64_t, int64_t>> &grids
+)
+{
+    int max_length = mrope_pos_ids.size(1);
+    int in_length = ids.size(0);
+
+    int64_t* in_ids = (int64_t*) ids.data_ptr();
+    int64_t* pos_ids = (int64_t*) mrope_pos_ids.data_ptr();
+
+    int64_t* out_t = pos_ids;
+    int64_t* out_h = pos_ids + max_length;
+    int64_t* out_w = pos_ids + 2 * max_length;
+
+    int64_t base_t = 0;
+    int64_t next_base_t = 0;
+
+    for (int i = 0; i < max_length; ++i)
+    {
+        bool is_emb = false;
+        if (i < in_length)
+        {
+            int64_t id = in_ids[i];
+
+            for (int j = 0; j < spans.size(); ++j)
+            {
+                int64_t span_start = std::get<0>(spans[j]);
+                int64_t span_end = std::get<1>(spans[j]);
+                int64_t span = span_end - span_start;
+                if (id >= span_start && id < span_end)
+                {
+                    is_emb = true;
+                    int64_t k = id - span_start;
+                    int64_t grid_t = std::get<0>(grids[j]);
+                    int64_t grid_h = std::get<1>(grids[j]) / (int64_t)merge_size;
+                    int64_t grid_w = std::get<2>(grids[j]) / (int64_t)merge_size;
+                    int64_t k_t = base_t + (k / grid_w / grid_h) % grid_t;
+                    int64_t k_h = base_t + (k / grid_w) % grid_h;
+                    int64_t k_w = base_t + k % grid_w;
+                    *out_t++ = k_t;
+                    *out_h++ = k_h;
+                    *out_w++ = k_w;
+                    // DBGI3(k_t, k_h, k_w);
+                    next_base_t = std::max(next_base_t, k_t + 1);
+                    next_base_t = std::max(next_base_t, k_h + 1);
+                    next_base_t = std::max(next_base_t, k_w + 1);
+                    break;
+                }
+            }
+        }
+        if (!is_emb)
+        {
+            base_t = next_base_t;
+            *out_t++ = base_t;
+            *out_h++ = base_t;
+            *out_w++ = base_t;
+            // DBGI3(base_t, base_t, base_t);
+            base_t++;
+            next_base_t = base_t;
+        }
+    }
+
+    return next_base_t;
 }

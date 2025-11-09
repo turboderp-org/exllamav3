@@ -19,3 +19,12 @@ void rope
     float norm_eps,
     float norm_constant_bias
 );
+
+int64_t gen_mrope_pos_ids
+(
+    at::Tensor mrope_pos_ids,
+    at::Tensor ids,
+    int merge_size,
+    const std::vector<std::tuple<int64_t, int64_t>> &spans,
+    const std::vector<std::tuple<int64_t, int64_t, int64_t>> &grids
+);

@@ -267,8 +267,8 @@ class Job:
 
         # Embeddings
         self.embeddings = embeddings or []
-        # self.alt_rope_embed = {}  # TODO
-        # self.alt_rope_offset = 0
+        self.alt_rope_freqs = None
+        self.alt_rope_offset = 0
 
         # Pinned buffer for IDs during sampling
         self.current_pinned_ids = None
@@ -882,20 +882,18 @@ class Job:
         self.time_enqueue = time.time()
 
         # Prepare MRoPE embeddings
-        # TODO: (embeddings)
-        # if self.embeddings and generator.model.config.arch.lm.mrope:
-        #     ids = self.sequences[0].sequence_ids.torch()
-        #     e, offset = mrope.gen_mrope_embed(
-        #         generator.model.config,
-        #         ids,
-        #         self.embeddings,
-        #         ids.shape[-1],  # + self.max_new_tokens
-        #     )
-        #     self.alt_rope_embed = {"cpu": e}
-        #     self.alt_rope_offset = offset - ids.shape[-1]
-        # else:
-        #     self.alt_rope_embed = {}
-        #     self.alt_rope_offset = 0
+        if self.embeddings and generator.model.caps.get("mrope"):
+            ids = self.sequences[0].sequence_ids.torch()
+            freqs, offset = generator.model.g_rope.get_mrope_freqs(
+                ids,
+                self.embeddings,
+                ids.shape[-1]  # + self.max_new_tokens
+            )
+            self.alt_rope_freqs = freqs
+            self.alt_rope_offset = offset - ids.shape[-1]
+        else:
+            self.alt_rope_freqs = None
+            self.alt_rope_offset = 0
 
 
     def current_new_pages_required(self):
@@ -1012,7 +1010,8 @@ class Job:
                         "cache": self.generator.cache,
                         "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
                         "recurrent_states": self.recurrent_state,
-                        "indexed_embeddings": self.embeddings
+                        "indexed_embeddings": self.embeddings,
+                        "inv_freq": self.alt_rope_freqs,
                     }
                 )
 
