@@ -85,7 +85,7 @@ class Qwen3VLConfig(Config):
 
 
 def read_qwen3_vl_vision_config(config_dict: dict):
-    v = SimpleNamespace({
+    v = SimpleNamespace(**{
         k: read_dict(config_dict, t, k, no_default)
         for k, t in [
             ("deepstack_visual_indexes", list),
@@ -112,7 +112,7 @@ def read_qwen3_vl_vision_config(config_dict: dict):
 
 
 def read_qwen3_vl_pp_config(config_dict: dict):
-    pp = SimpleNamespace({
+    pp = SimpleNamespace(**{
         k: read_dict(config_dict, t, k, no_default)
         for k, t in [
             ("size", dict),
