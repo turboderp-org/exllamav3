@@ -191,7 +191,7 @@ class Job:
             self.sequences.append(seq)
 
         # Generation parameters
-        self.max_new_tokens = max_new_tokens - 1 or 100
+        self.max_new_tokens = max_new_tokens - 1 or 1
         self.min_new_tokens = min_new_tokens
         self.new_tokens = 0 if self.prefix_token is None else -1
         self.sampler = sampler
