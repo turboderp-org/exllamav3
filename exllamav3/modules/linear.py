@@ -29,6 +29,7 @@ class Linear(Module):
         qbits_mod_key: str = "",
         fkey : str | None = None,
         frange: tuple[int, int] | None = None,
+        fidx: int | None = None,
         caps: dict = None,
         softcap: float = 0.0,
         pad_to: int = 128,
@@ -57,6 +58,7 @@ class Linear(Module):
         self.qbits_mod_key = qbits_mod_key
         self.fkey = fkey
         self.frange = frange
+        self.fidx = fidx
         self.quant_type = None
         self.softcap = softcap
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
@@ -104,7 +106,9 @@ class Linear(Module):
 
 
     def load_fp16(self, key: str) -> bool:
+
         if self.config.stc.has_tensor_group(key, ["weight"]):
+
             self.used_alt_key = key == self.alt_key
             dev = "cpu" if self.is_sliced else self.device
             pad1 = (self.out_features,) if not self.is_sliced else None
@@ -131,7 +135,38 @@ class Linear(Module):
                 self.inner.unswap_cpu()
             self.quant_type = "fp16"
             return True
-        elif self.fkey and self.config.stc.has_tensor_group(self.fkey, ["weight"]):
+
+        # Special dumb loading mode for Qwen3VLMoE
+        elif self.fkey and self.config.stc.has_tensor(self.fkey) and self.fidx is not None:
+
+            # Load and split fused weight along first dim
+            weight = self.config.stc.get_tensor(
+                self.fkey,
+                self.device,
+                transpose = self.transposed_load,
+                no_defer = True,
+                fidx = self.fidx
+            )
+            if self.frange is not None:
+                weight = weight[self.frange[0] : self.frange[1]].contiguous()
+            weight = self.pad_out(weight)
+            self.inner = LinearFP16(
+                self.in_features,
+                self.out_features,
+                weight.T.contiguous(),
+                None,
+                self.full_in_features,
+                self.full_out_features,
+                self.first_in_feature,
+                self.first_out_feature,
+                out_dtype = self.out_dtype,
+                key = self.key
+            )
+            self.quant_type = "fp16"
+            return True
+
+        elif self.fkey and self.config.stc.has_tensor_group(self.fkey, ["weight"]) and self.frange is not None:
+
             weight = self.config.stc.get_tensor(
                 self.fkey + ".weight",
                 self.device,
@@ -162,6 +197,7 @@ class Linear(Module):
             )
             self.quant_type = "fp16"
             return True
+
         return False
 
 

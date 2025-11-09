@@ -161,6 +161,8 @@ class BlockSparseMLP(Module):
         key_up: str | None = None,
         key_gate: str | None = None,
         key_down: str | None = None,
+        key_gate_up_split: str | None = None,
+        key_down_split: str | None = None,
         key_routing_gate: str | None = None,
         key_shared_gate: str | None = None,
         key_e_score_bias: str | None = "gate.e_score_correction_bias",
@@ -255,6 +257,9 @@ class BlockSparseMLP(Module):
                 gate = Linear(
                     config = config,
                     key = f"{key}.{key_gate}".replace("{expert_idx}", str(idx)),
+                    fkey = f"{key}.{key_gate_up_split}",
+                    fidx = idx,
+                    frange = (0, intermediate_size),
                     in_features = hidden_size,
                     out_features = intermediate_size,
                     qmap = qmap + ".input",
@@ -263,6 +268,9 @@ class BlockSparseMLP(Module):
                 up = Linear(
                     config = config,
                     key = f"{key}.{key_up}".replace("{expert_idx}", str(idx)),
+                    fkey = f"{key}.{key_gate_up_split}",
+                    fidx = idx,
+                    frange = (intermediate_size, intermediate_size * 2),
                     in_features = hidden_size,
                     out_features = intermediate_size,
                     qmap = qmap + ".input",
@@ -271,6 +279,8 @@ class BlockSparseMLP(Module):
                 down = Linear(
                     config = config,
                     key = f"{key}.{key_down}".replace("{expert_idx}", str(idx)),
+                    fkey = f"{key}.{key_down_split}",
+                    fidx = idx,
                     in_features = intermediate_size,
                     out_features = hidden_size,
                     qmap = qmap + f".{idx}.down",
