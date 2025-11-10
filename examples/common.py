@@ -21,7 +21,7 @@ def format_prompt(prompt_format, sp, p):
         )
 
         case "mistral":
-            return f"<s>[INST] {sp}\n\n n{p}[/INST]"
+            return f"<s>[INST] {sp}\n\n{p}[/INST]"
 
         case "granite":
             return (
