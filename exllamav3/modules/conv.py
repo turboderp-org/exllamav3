@@ -81,13 +81,13 @@ class Conv(Module):
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
 
-        bsz, seqlen, dim = x.shape
-
         if self.dims == 2:
             y = F.conv2d(x, self.weight, self.bias, self.kernel_size)
             y = y.flatten(2).permute(0, 2, 1).contiguous()
 
         elif self.dims == 3:
+            bsz, seqlen, dim = x.shape
+
             if self.flat:
                 x_flat = x.view(-1, self.dim)
                 w_flat = self.weight.view(self.weight.shape[0], -1).T.contiguous()
