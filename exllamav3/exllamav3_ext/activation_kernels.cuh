@@ -110,7 +110,7 @@ void act_mul_kernel_h
     const half* __restrict__ x,
     const half* __restrict__ y,
     half* __restrict__ z,
-    size_t numel
+    const size_t numel
 )
 {
     size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
@@ -137,7 +137,7 @@ void act_mul_kernel_f
     const float* __restrict__ x,
     const float* __restrict__ y,
     half* __restrict__ z,
-    size_t numel
+    const size_t numel
 )
 {
     size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
@@ -175,7 +175,7 @@ void xielu_kernel_f
 (
     const float* __restrict__ x,
     half* __restrict__ y,
-    size_t numel,
+    const size_t numel,
     float alpha_p,
     float alpha_n
 )
@@ -184,7 +184,6 @@ void xielu_kernel_f
     if (idx >= numel / 2) return;
 
     float2 x2 = ((const float2*) x)[idx];
-    float2 y2 = ((const float2*) y)[idx];
 
     x2.x = _xielu(x2.x, alpha_p, alpha_n);
     x2.y = _xielu(x2.y, alpha_p, alpha_n);
@@ -201,8 +200,8 @@ void add_sigmoid_kernel_f
     const float* __restrict__ px,
     const float* __restrict__ py,
     float* __restrict__ pz,
-    size_t numel,
-    size_t dim
+    const size_t numel,
+    const size_t dim
 )
 {
     size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
@@ -213,4 +212,48 @@ void add_sigmoid_kernel_f
     float z = pz[idx];
     z += x * _sigmoid_fast_exp(y);
     pz[idx] = z;
+}
+
+// x * sigmoid(y @ w) + z -> z,
+// x: (bsz, dim)
+// y: (bsz, dim)
+// z: (bsz, dim)
+// w: (dim, 1)
+
+__global__ __launch_bounds__(NUM_THREADS_P)
+void add_sigmoid_proj_kernel_f
+(
+    const float* __restrict__ px,
+    const half* __restrict__ py,
+    float* __restrict__ pz,
+    const half* __restrict__ pw,
+    const size_t bsz,
+    const size_t dim
+)
+{
+    int b = blockIdx.x;
+    int t = threadIdx.x;
+    const float* pxb = px + dim * b;
+    const half* pyb = py + dim * b;
+    const float* pzb = pz + dim * b;
+
+    float yw = 0.0f;
+    for (size_t idx = t; idx < dim; idx += NUM_THREADS_P)
+    {
+        float w = __half2float(pw[idx]);
+        float y = __half2float(pyb[idx]);
+        yw += w * y;
+    }
+    yw = block_reduce_sum_broadcast_f(yw, NUM_THREADS_P);
+    float syw = _sigmoid_fast_exp(yw);
+
+    if (syw < 1e-8f) return;
+
+    for (size_t idx = t; idx < dim; idx += NUM_THREADS_P)
+    {
+        float x = px[idx];
+        float z = pz[idx];
+        z += x * syw;
+        pz[idx] = z;
+    }
 }

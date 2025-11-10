@@ -19,8 +19,8 @@ void gumbel_noise_kernel_f16
 (
     const half* __restrict__ in_logits,
     half* __restrict__ logits,
-    int size,
-    uint32_t random
+    const int size,
+    const uint32_t random
 )
 {
     int idx = (threadIdx.x + NUM_THREADS * blockIdx.x) * 2;
@@ -46,8 +46,8 @@ void gumbel_noise_kernel_f32
 (
     const float* __restrict__ in_logits,
     float* __restrict__ logits,
-    int size,
-    uint32_t random
+    const int size,
+    const uint32_t random
 )
 {
     int idx = threadIdx.x + NUM_THREADS * blockIdx.x;
@@ -68,8 +68,8 @@ void gumbel_noise_kernel_log
 (
     const float* __restrict__ probs,
     float* __restrict__ logits,
-    int size,
-    uint32_t random
+    const int size,
+    const uint32_t random
 )
 {
     int idx = threadIdx.x + NUM_THREADS * blockIdx.x;

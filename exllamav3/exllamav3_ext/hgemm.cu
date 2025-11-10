@@ -4,6 +4,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
 #include "util.cuh"
+#include "quant/exl3_devctx.cuh"
 
 /*
 
@@ -12,38 +13,43 @@ Row-major matmul using cuBLAS, a @ b -> c
 - if c is float32, operation is float16 @ float16 -> float23
 */
 
-void hgemm
+void hgemm_gr
 (
     at::Tensor a,
     at::Tensor b,
-    at::Tensor c
+    at::Tensor c,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     bool output_fp32 = c.dtype() == at::kFloat;
     if (!output_fp32)
         TORCH_CHECK_DTYPE(c, kHalf);
 
+    // Check shapes of a,b,c are compatible
     TORCH_CHECK_DTYPE(a, kHalf);
     TORCH_CHECK_DTYPE(b, kHalf);
     TORCH_CHECK_DIM(b, 2);
-    // TORCH_CHECK_SHAPES(a, 0, c, 0, 1);
     TORCH_CHECK_SHAPES(a, -1, b, 0, 1);
     TORCH_CHECK_SHAPES(b, 1, c, -1, 1);
 
     const half* a_ptr = (const half*) a.data_ptr();
     const half* b_ptr = (const half*) b.data_ptr();
 
-    int size_m = 1;
-    int dim = a.dim();
-    for (int d = 0; d < dim - 1; ++d) size_m *= a.size(d);
     int size_k = a.size(-1);
+    int size_m = a.numel() / size_k;
     int size_n = b.size(-1);
 
+    // Set cuBLAS modes and workspace
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
     cublasSetStream(cublas_handle, stream);
+    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
+    int device;
+    cudaGetDevice(&device);
+    void* ws = DevCtx::instance().get_ws(device);
+    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
 
     if (!output_fp32)
     {
@@ -51,7 +57,7 @@ void hgemm
         half beta_ = __float2half(0.0f);
 
         half* c_ptr = (half*) c.data_ptr();
-        cublasHgemm
+        auto r = cublasHgemm
         (
             cublas_handle,
             CUBLAS_OP_N,
@@ -61,6 +67,7 @@ void hgemm
                      a_ptr, size_k,
             &beta_,  c_ptr, size_n
         );
+        cublas_check(r);
         cuda_check(cudaPeekAtLastError());
     }
     else
@@ -69,7 +76,7 @@ void hgemm
         float beta_ = 0.0f;
 
         float* c_ptr = (float*) c.data_ptr();
-        cublasGemmEx
+        auto r = cublasGemmEx
         (
             cublas_handle,
             CUBLAS_OP_N, CUBLAS_OP_N,
@@ -80,6 +87,19 @@ void hgemm
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP
         );
+        cublas_check(r);
         cuda_check(cudaPeekAtLastError());
     }
+
+    if (graph) graph->need_cublas = true;
+}
+
+void hgemm
+(
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor c
+)
+{
+    hgemm_gr(a, b, c, nullptr);
 }

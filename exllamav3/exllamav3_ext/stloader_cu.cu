@@ -8,7 +8,7 @@
 void inplace_bf16_to_fp16_cpu
 (
     void* buffer,
-    size_t numel
+    const size_t numel
 )
 {
     const __nv_bfloat16* rd = (const __nv_bfloat16*) buffer;
@@ -27,7 +27,7 @@ __global__ __launch_bounds__(NUM_THREADS)
 void inplace_bf16_to_fp16_kernel
 (
     void* __restrict__ buffer,
-    size_t numel2
+    const size_t numel2
 )
 {
     size_t i = blockIdx.x * NUM_THREADS + threadIdx.x;
@@ -45,7 +45,7 @@ void inplace_bf16_to_fp16_kernel
 void inplace_bf16_to_fp16_cuda
 (
     void* buffer,
-    size_t numel
+    const size_t numel
 )
 {
     size_t blocks = CEIL_DIVIDE(numel / 2, NUM_THREADS);

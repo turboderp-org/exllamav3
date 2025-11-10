@@ -19,6 +19,8 @@ try:
     from awq.modules.linear import WQLinear_GEMM
 except ModuleNotFoundError:
     WQLinear_GEMM = None
+except ImportError:
+    WQLinear_GEMM = None
 
 try:
     from vptq import VQuantLinear

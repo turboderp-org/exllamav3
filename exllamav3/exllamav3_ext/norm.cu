@@ -131,7 +131,7 @@ void rms_norm_kernel
     const float epsilon,
     const int rows,
     const int dim,
-    float constant_bias
+    const float constant_bias
 )
 {
     constexpr bool input_fp32 = std::is_same_v<input_t, float>;
@@ -199,9 +199,16 @@ void rms_norm
     at::Tensor w,
     at::Tensor y,
     float epsilon,
-    float constant_bias
+    float constant_bias,
+    bool span_heads
 )
 {
+    if (span_heads)
+    {
+        x = x.flatten(-2);
+        y = y.flatten(-2);
+    }
+
     TORCH_CHECK_DTYPE(w, kHalf);
     TORCH_CHECK_DIV(x, -1, 4);
     TORCH_CHECK_SHAPES(x, -1, w, 0, 1);

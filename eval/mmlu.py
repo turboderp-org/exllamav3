@@ -74,7 +74,7 @@ def main(args):
 
     # Format
     def format_question(question: str, choices: list[str], answer: int | None):
-        f = question + "\n"
+        f = "Question: " + question + "\n"
         for i, c in enumerate(c_options):
             f += c + ". " + choices[i] + "\n"
         f += "Answer:"
@@ -93,7 +93,7 @@ def main(args):
                 if fewshots == args.fewshot_examples: break
                 if pq["subject"] != subject: continue
                 preprompt += format_question(pq["question"], pq["choices"], pq["answer"])
-            preprompt_ids[subject] = tokenizer.encode(preprompt, add_bos = True)
+            preprompt_ids[subject] = tokenizer.encode(preprompt, add_bos = False)
             progress.update(idx + 1)
 
     # Questions

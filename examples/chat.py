@@ -274,6 +274,30 @@ def main(args):
         # Add response to context
         response = s.all_text.strip()
 
+        # Optionally save output
+        if args.save:
+            sr = response
+            if args.save_svg:
+                import re
+                b = [match.end() for match in re.finditer("</svg>", sr)]
+                if b:
+                    sr = sr[:b[-1]]
+                    a = [match.start() for match in re.finditer("<svg", sr)]
+                    if a:
+                        sr = sr[a[-1]:]
+                    else:
+                        sr = None
+                else:
+                    sr = None
+                if sr: print_info(f"Found SVG: {len(sr)} characters")
+                else: print_error(f"No SVG block found")
+            if sr:
+                print_info(f"Writing response to: {args.save}")
+                with open(args.save, "w") as f:
+                    f.write(sr)
+            else:
+                print_info(f"Nothing to write")
+
         context[-1] = (user_prompt, response)
 
 
@@ -303,5 +327,7 @@ if __name__ == "__main__":
     parser.add_argument("-topp", "--top_p", type = float, help = "Top-P truncation, 1 to disable (default: disabled)", default = 1.0)
     parser.add_argument("-tps", "--show_tps", action = "store_true", help = "Show tokens/second after every reply")
     parser.add_argument("-prompt", "--prompt", type = str, help = "Run single prompt, then exit")
+    parser.add_argument("-save", "--save", type = str, help = "Save output to file (use with --prompt)")
+    parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")
     _args = parser.parse_args()
     main(_args)

@@ -6,8 +6,11 @@
 // Max allowable output size, in tiles. Used to allocate global lock buffer per device for sync across threadblocks
 #define MAX_TILES_C (1024 * 1024)
 
+// Workspace size
+#define WORKSPACE_SIZE (4*1024*1024)
+
 // Treat hopper and blackwell as same arch for now
-#define MAX_DEVICES 32
+#define MAX_DEVICES 16
 #define CC_OLD        1
 #define CC_AMPERE     2
 #define CC_ADA        3
@@ -21,12 +24,14 @@ private:
     int num_sms[MAX_DEVICES] = {};
     int cc[MAX_DEVICES] = {};
     void* locks[MAX_DEVICES] = {};
+    void* ws[MAX_DEVICES] = {};
     std::mutex mtx;
 
 public:
     static DevCtx& instance();
     int get_num_sms(int device);
     int get_cc(int device);
+    void* get_ws(int device);
     int* get_locks(int device);
 
 private:

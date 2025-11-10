@@ -169,8 +169,8 @@ void quant_cache_paged_kernel
     const uint32_t* __restrict__ cache_seqlens,
     const uint32_t* __restrict__ block_table,
     // int page_size,
-    int blocks_per_seq,
-    int token_dim
+    const int blocks_per_seq,
+    const int token_dim
 )
 {
     int batch_idx = blockIdx.z;
@@ -210,9 +210,9 @@ void dequant_cache_paged_kernel
     const uint32_t* __restrict__ cache_seqlens,
     const uint32_t* __restrict__ block_table,
     // int page_size,
-    int pages_per_seq,
-    int warps_per_token,
-    int num_blocks
+    const int pages_per_seq,
+    const int warps_per_token,
+    const int num_blocks
 )
 {
     int batch_idx = blockIdx.y;

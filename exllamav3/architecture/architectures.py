@@ -13,6 +13,7 @@ from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
+from .minimax_m2 import MiniMaxM2Model
 from .mistral import MistralModel
 from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
@@ -21,6 +22,8 @@ from .qwen2 import Qwen2Model
 from .qwen3 import Qwen3Model
 from .qwen3_moe import Qwen3MoeModel
 from .qwen3_next import Qwen3NextModel
+from .qwen3_vl import Qwen3VLModel
+from .qwen3_vl_moe import Qwen3VLMoeModel
 from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
 
@@ -46,6 +49,7 @@ ARCHITECTURES = {
         Glm4MoeModel,
         LlamaModel,
         MiMoModel,
+        MiniMaxM2Model,
         MistralModel,
         Mistral3Model,
         MixtralModel,
@@ -54,6 +58,8 @@ ARCHITECTURES = {
         Qwen3Model,
         Qwen3MoeModel,
         Qwen3NextModel,
+        Qwen3VLModel,
+        Qwen3VLMoeModel,
         SeedOssModel,
         SmolLM3Model,
     ]

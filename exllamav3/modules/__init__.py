@@ -12,3 +12,5 @@ from .transformer import TransformerBlock, ParallelDecoderBlock
 from .conv import Conv
 from .pos_embedding import PosEmbedding
 from .gather import OutputGather
+from .qwen3_vl_pos_embedding import Qwen3VLPosEmbedding
+from .deepstack import DeepstackEmbed

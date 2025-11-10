@@ -291,6 +291,7 @@ class GatedDeltaNet(Module):
         out_dtype: torch.dtype | None = None,
     ):
         super().__init__(config, key, None)
+        self.module_name = "GatedDeltaNet"
 
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size

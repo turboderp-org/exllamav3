@@ -29,6 +29,7 @@ class Linear(Module):
         qbits_mod_key: str = "",
         fkey : str | None = None,
         frange: tuple[int, int] | None = None,
+        fidx: int | None = None,
         caps: dict = None,
         softcap: float = 0.0,
         pad_to: int = 128,
@@ -57,6 +58,7 @@ class Linear(Module):
         self.qbits_mod_key = qbits_mod_key
         self.fkey = fkey
         self.frange = frange
+        self.fidx = fidx
         self.quant_type = None
         self.softcap = softcap
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
@@ -99,21 +101,23 @@ class Linear(Module):
         assert all(w == s * 128 for w, s in zip(ws, ss))
         weight = weight.view(ss[0], 128, ss[1], 128)
         scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
-        weight *= scale_inv
-        return weight
+        weight = weight.float() * scale_inv
+        return weight.view(ws).half()
 
 
     def load_fp16(self, key: str) -> bool:
+
         if self.config.stc.has_tensor_group(key, ["weight"]):
+
             self.used_alt_key = key == self.alt_key
             dev = "cpu" if self.is_sliced else self.device
             pad1 = (self.out_features,) if not self.is_sliced else None
             pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
-            weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2)
+            scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+            weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = scale_inv is not None)
             bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
-            scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, float2half = True, optional = True)
             if scale_inv is not None:
-                self.apply_fp8_scales_(weight, scale_inv)
+                weight = self.apply_fp8_scales_(weight, scale_inv)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
@@ -131,7 +135,38 @@ class Linear(Module):
                 self.inner.unswap_cpu()
             self.quant_type = "fp16"
             return True
-        elif self.fkey and self.config.stc.has_tensor_group(self.fkey, ["weight"]):
+
+        # Special dumb loading mode for Qwen3VLMoE
+        elif self.fkey and self.config.stc.has_tensor(self.fkey) and self.fidx is not None:
+
+            # Load and split fused weight along first dim
+            weight = self.config.stc.get_tensor(
+                self.fkey,
+                self.device,
+                transpose = self.transposed_load,
+                no_defer = True,
+                fidx = self.fidx
+            )
+            if self.frange is not None:
+                weight = weight[self.frange[0] : self.frange[1]].contiguous()
+            weight = self.pad_out(weight)
+            self.inner = LinearFP16(
+                self.in_features,
+                self.out_features,
+                weight.T.contiguous(),
+                None,
+                self.full_in_features,
+                self.full_out_features,
+                self.first_in_feature,
+                self.first_out_feature,
+                out_dtype = self.out_dtype,
+                key = self.key
+            )
+            self.quant_type = "fp16"
+            return True
+
+        elif self.fkey and self.config.stc.has_tensor_group(self.fkey, ["weight"]) and self.frange is not None:
+
             weight = self.config.stc.get_tensor(
                 self.fkey + ".weight",
                 self.device,
@@ -139,10 +174,15 @@ class Linear(Module):
             )
             weight = weight[self.frange[0] : self.frange[1]].contiguous()
             weight = self.pad_out(weight)
-            bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True, no_defer = True)
-            bias = self.pad_out(bias)
+            bias = self.config.stc.get_tensor(
+                self.fkey + ".bias",
+                self.device,
+                optional = True,
+                no_defer = True
+            )
             if bias is not None:
                 bias = bias[self.frange[0] : self.frange[1]].contiguous()
+                bias = self.pad_out(bias)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
@@ -157,6 +197,7 @@ class Linear(Module):
             )
             self.quant_type = "fp16"
             return True
+
         return False
 
 
@@ -240,13 +281,17 @@ class Linear(Module):
         progress_str: str | None = None,
         return_weight_q: bool = False,
         verbose: bool = False,
-        save_reg: str = None
+        save_reg: str = None,
+        override_swap_device: torch.device | None = None
     ):
         assert isinstance(self.inner, LinearFP16), \
             "Inner layer is already quant type"
 
         # Destroy original layer here to save VRAM, we only need weights
         swap_to_device = self.inner.swap_device  # in case weights are swapped to CPU
+        if swap_to_device is not None and override_swap_device is not None:
+            swap_to_device = override_swap_device
+
         orig_weight = self.inner.get_weight_tensor().float()
         orig_bias = self.inner.get_bias_tensor()
         self.inner = None

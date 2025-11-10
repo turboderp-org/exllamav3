@@ -5,12 +5,14 @@
 //#include <torch/extension.h>
 #include "util.h"
 #include "util.cuh"
+#include "quant/exl3_devctx.cuh"
 
 Graph::Graph()
 {
     ready = false;
     graph = NULL;
     graph_exec = NULL;
+    need_cublas = false;
 }
 
 Graph::~Graph()
@@ -62,13 +64,10 @@ void Graph::capture_end()
         if (t == cudaGraphNodeTypeKernel)
         {
             cudaGraphKernelNodeGetParams(nodes[n], &node_params[n]);
-//            DBGX(node_params[n].func);
 
             for(; c < graph_sites.size(); c++)
             {
                 void* func = std::get<0>(graph_sites[c]);
-//                DBGX(func);
-
                 if (func != node_params[n].func) break;
 
                 int param_id     = std::get<1>(graph_sites[c]);
@@ -76,8 +75,6 @@ void Graph::capture_end()
 
                 graph_node_sites.push_back(std::tuple<int, int, int>(n, param_id, param_offset));
                 if (param_id == GP_end) { c++; break; }
-
-//                DBGI2(param_id, param_offset);
             }
         }
 
@@ -100,6 +97,17 @@ void Graph::record_param(void* kernel, int param_id, int param_offset)
 
 void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
 {
+    if (need_cublas)
+    {
+        cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
+        cublasSetStream(cublas_handle, stream);
+        cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
+        int device;
+        cudaGetDevice(&device);
+        void* ws = DevCtx::instance().get_ws(device);
+        cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
+    }
+
     int p = 0;
     int n = 0;
     while (true)
@@ -112,18 +120,12 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
                 int node_idx     = std::get<0>(graph_node_sites[n]);
                 int param_offset = std::get<2>(graph_node_sites[n]);
 
-//                DBGI3(p, node_idx, param_offset);
-
                 void** p_old_value = (void**) node_params[node_idx].kernelParams[param_offset];
                 if (*p_old_value != new_value)
                 {
                     *p_old_value = new_value;
                     node_needs_update[node_idx] = true;
                 }
-            }
-            else
-            {
-//                DBGI(p);
             }
             p++;
         }
@@ -135,9 +137,7 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
 
     for (int n = 0; n < nodes.size(); ++n)
     {
-//        DBGI(n);
         if (!node_needs_update[n]) continue;
-//        printf("update\n");
         cudaGraphExecKernelNodeSetParams(graph_exec, nodes[n], &node_params[n]);
         node_needs_update[n] = false;
     }

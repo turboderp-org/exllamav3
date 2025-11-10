@@ -2,7 +2,7 @@
 
 #include "codebook.cuh"
 
-__device__ __forceinline__ uint32_t fshift(uint32_t b, uint32_t a, int shift)
+__device__ __forceinline__ uint32_t fshift(const uint32_t b, const uint32_t a, int shift)
 {
      uint64_t merged = ((uint64_t)a << 32) | (uint64_t) b;
      return (uint32_t)(merged >> shift);

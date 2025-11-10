@@ -2,7 +2,7 @@
 #include "gated_rmsnorm.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
+//#include <torch/extension.h>
 #include "../util.h"
 #include "../norm.cuh"
 

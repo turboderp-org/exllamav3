@@ -5,22 +5,22 @@ int exl3_gemm_num_kernel_shapes();
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int bits);
 
 #define EXL3_GEMM_T_ARGS \
-    int bits, \
-    bool c_fp32, \
-    int cb, \
-    int TILESIZE_M, \
-    int TILESIZE_K, \
-    int TILESIZE_N, \
-    int SH_STAGES, \
-    int FRAG_STAGES
+    const int bits, \
+    const bool c_fp32, \
+    const int cb, \
+    const int TILESIZE_M, \
+    const int TILESIZE_K, \
+    const int TILESIZE_N, \
+    const int SH_STAGES, \
+    const int FRAG_STAGES
 
 #define EXL3_GEMM_ARGS \
     const half* __restrict__  A, \
     const uint16_t* __restrict__ B, \
     void* __restrict__ C, \
-    int size_m, \
-    int size_k, \
-    int size_n, \
+    const int size_m, \
+    const int size_k, \
+    const int size_n, \
     int* __restrict__ locks, \
     const half* __restrict__ suh, \
     half* __restrict__ A_had, \
@@ -30,19 +30,19 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     const half* __restrict__  A, \
     const uint16_t** __restrict__ B_list, \
     void* __restrict__ C, \
-    int size_m, \
-    int size_k, \
-    int size_n, \
+    const int size_m, \
+    const int size_k, \
+    const int size_n, \
     int* __restrict__ locks, \
     const half** __restrict__ suh_list, \
     half* __restrict__ A_had, \
     const half** __restrict__ svh_list, \
     int64_t* B_indices, \
     half* B_weights, \
-    int bszm_in, \
-    int bszm_out, \
-    int min_index, \
-    int max_index
+    const int bszm_in, \
+    const int bszm_out, \
+    const int min_index, \
+    const int max_index
 
 typedef void (*fp_exl3_gemm_kernel) (EXL3_GEMM_ARGS);
 typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
@@ -108,34 +108,34 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 
 fp_exl3_gemm_kernel select_exl3_gemm_kernel
 (
-    int cc,
-    int size_m,
-    int size_k,
-    int size_n,
-    int bits,
-    bool c_fp32,
-    int force_shape_idx,
+    const int cc,
+    const int size_m,
+    const int size_k,
+    const int size_n,
+    const int bits,
+    const bool c_fp32,
+    const int force_shape_idx,
     int* out_block_dim,
     int* out_shape_idx,
     int* out_num_sms,
-    int cb
+    const int cb
 );
 
 fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
 (
-    int cc,
-    int size_m,
-    int size_k,
-    int size_n,
-    int K,
-    bool c_fp32,
-    int force_shape_idx,
+    const int cc,
+    const int size_m,
+    const int size_k,
+    const int size_n,
+    const int K,
+    const bool c_fp32,
+    const int force_shape_idx,
     int* out_block_dim,
     int* out_shape_idx,
     int* out_num_sms,
-    int cb,
-    int bszm_in,
-    int bszm_out
+    const int cb,
+    const int bszm_in,
+    const int bszm_out
 );
 
 struct TSample {
@@ -171,13 +171,13 @@ struct TResult
 
 TResult* select_exl3_gemm_mgemm_kernel_new
 (
-    int cc,
-    int size_m,
-    int size_k,
-    int size_n,
-    int K,
-    bool c_fp32,
-    int force_shape_idx,
-    int force_num_sms,
-    int cb
+    const int cc,
+    const int size_m,
+    const int size_k,
+    const int size_n,
+    const int K,
+    const bool c_fp32,
+    const int force_shape_idx,
+    const int force_num_sms,
+    const int cb
 );

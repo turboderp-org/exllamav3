@@ -17,7 +17,8 @@ class RMSNorm(Module):
         rms_norm_eps: float,
         out_dtype: torch.dtype | None = None,
         qmap: str | None = None,
-        constant_bias: float = 0.0
+        constant_bias: float = 0.0,
+        span_heads: bool = False
     ):
         super().__init__(config, key, None)
         assert qmap is None, "No quant scheme for RMSNorm"
@@ -28,6 +29,7 @@ class RMSNorm(Module):
         self.out_dtype = out_dtype
         self._numel = None
         self.constant_bias = constant_bias
+        self.span_heads = span_heads
 
     @override
     def optimizer_targets(self):
@@ -79,7 +81,7 @@ class RMSNorm(Module):
     ) -> torch.Tensor:
 
         y = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
-        ext.rms_norm(x, self.weight, y, self.rms_norm_eps, self.constant_bias)
+        ext.rms_norm(x, self.weight, y, self.rms_norm_eps, self.constant_bias, self.span_heads)
         return y
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:

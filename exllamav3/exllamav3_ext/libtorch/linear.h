@@ -5,6 +5,8 @@
 #include <pybind11/pybind11.h>
 namespace py = pybind11;
 
+#include "../graph.cuh"
+
 struct BC_LinearFP16
 {
     at::Tensor weight;
@@ -19,8 +21,9 @@ struct BC_LinearFP16
         bias(std::move(_bias))
     {}
 
+    void run_gr(const at::Tensor& x, at::Tensor& y, Graph* graph);
     void run(const at::Tensor& x, at::Tensor& y);
-    void run_cublas(const at::Tensor& x, at::Tensor& y);
+    // void run_cublas(const at::Tensor& x, at::Tensor& y);
 };
 
 struct BC_LinearEXL3
@@ -55,5 +58,6 @@ struct BC_LinearEXL3
         xh(std::move(_xh))
     {}
 
+    void run_gr(const at::Tensor& x, at::Tensor& y, Graph* graph);
     void run(const at::Tensor& x, at::Tensor& y);
 };

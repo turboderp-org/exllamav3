@@ -67,8 +67,8 @@ void argmax_sample_kernel
 (
     const half* __restrict__ logits,
     uint64_t* __restrict__ ids,
-    int num_logits,
-    int max_logit
+    const int num_logits,
+    const int max_logit
 )
 {
     const half* logits_ptr = logits + num_logits * blockIdx.x;
@@ -95,9 +95,9 @@ void gumbel_sample_kernel
 (
     const half* __restrict__ logits,
     uint64_t* __restrict__ ids,
-    int num_logits,
-    int max_logit,
-    uint32_t random
+    const int num_logits,
+    const int max_logit,
+    const uint32_t random
 )
 {
     const half* logits_ptr = logits + num_logits * blockIdx.x;

@@ -8,5 +8,5 @@ void had_r_128
     const at::Tensor& output,
     const c10::optional<at::Tensor>& pre_scale,
     const c10::optional<at::Tensor>& post_scale,
-    float scale
+    const float scale
 );

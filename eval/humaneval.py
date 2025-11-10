@@ -80,6 +80,16 @@ prompt_formats = {
         "<｜User｜>Complete the following Python function:\n\n{{problem}}"
         "<｜Assistant｜>Sure! Here is how you might implement the function:\n\n```python\n{{problem}}",
         "    "
+    ),
+    "minimax": (
+        "]~!b[]~b]system\n"
+        "You are a helpful AI coding assistant.[e~[\n"
+        "]~b]user\n"
+        "Complete the following Python function:\n\n{{problem}}[e~[\n"
+        "]~b]ai\n"
+        "<think> </think>"
+        "Sure! Here is how you might implement the function:\n\n```python\n{{problem}}",
+        "    "
     )
 }
 
@@ -134,7 +144,7 @@ def main(args):
                     input_ids = input_ids,
                     sampler = sampler,
                     max_new_tokens = args.max_tokens,
-                    stop_conditions = [tokenizer.eos_token_id],
+                    stop_conditions = [tokenizer.eos_token_id, "```"],
                     token_healing = True,
                     identifier = (problem_id, s),
                     min_new_tokens = 6

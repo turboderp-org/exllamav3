@@ -128,6 +128,26 @@ class LinearEXL3:
         else:
             self.bc.run(x, y)
 
+            # y2 = y  #.half()  #.clone()
+            #
+            # y2_ = y2.view(x.shape[0], self.out_features)
+            # xh = torch.zeros_like(x)
+            # ext.had_r_128(x, xh, self.suh, None, 1.0)
+            #
+            # # y2_= y2_.float()
+            # # ext.exl3_gemm(xh, self.trellis, y2_, None, None, None, -1, self.mcg, self.mul1, 0)
+            # ext.exl3_gemv(xh, self.trellis, y2_, None, None, None, self.mcg, self.mul1)
+            # # y2_ = y2_.half()
+            #
+            # ext.had_r_128(y2_, y2_, None, self.svh, 1.0)
+            # if self.bias is not None:
+            #     y2 += self.bias
+            #
+            # y2 = y2_.view_as(y2)
+            # y2 = y2.view(out_shape)
+            # xx = 0
+            # return y2
+
         return y
 
 

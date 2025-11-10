@@ -138,3 +138,27 @@ __device__ inline float block_reduce_sum_f(float v, int num_threads)
     }
     return v;
 }
+
+__device__ inline float block_reduce_sum_broadcast_f(float v, int num_threads)
+{
+    __shared__ float shared[32];
+
+    int lane_id = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+
+    v = warp_reduce_sum_f(v);
+
+    if (lane_id == 0) shared[warp_id] = v;
+    __syncthreads();
+
+    int max_warp_id = num_threads / 32;
+    if (warp_id == 0)
+    {
+        v = lane_id < max_warp_id ? shared[lane_id] : 0.0f;
+        v = warp_reduce_sum_f(v);
+        shared[0] = v;
+    }
+    __syncthreads();
+    v = shared[0];
+    return v;
+}

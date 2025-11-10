@@ -21,6 +21,7 @@ def convert_dtype(dt: str):
     elif dt == "F16": return torch.float16, np.float16, 2
     elif dt == "BF16": return torch.bfloat16, np.float16, 2
     elif dt == "F32": return torch.float, np.float32, 4
+    elif dt == "F8_E4M3": return torch.float8_e4m3fn, np.int8, 1
     else:
         raise ValueError(f"Unknown dtype {dt}")
 
@@ -253,10 +254,14 @@ class SafetensorsCollection:
         no_defer: bool = False,
         transpose: bool = False,
         pad_to: tuple = None,
+        fidx: int = None,
     ) -> torch.Tensor | None:
 
         if device is None:
             device = torch.device("cpu")
+
+        if fidx is not None:
+            assert no_defer, "Cannot load fused tensor in deferred mode"
 
         if self.new_tensors and key in self.new_tensors:
             tensor = self.new_tensors[key].to(device)
@@ -282,6 +287,14 @@ class SafetensorsCollection:
         numel = np.prod(shape)
         assert numel * esize == bytesize, \
             f"Incorrect size of {key} in {filename}"
+
+        if fidx is not None:
+            assert shape[0] > fidx, f"Batch tensor {key} has shape {shape}, index {fidx} is out of bounds"
+            shape = shape[1:]
+            numel = np.prod(shape)
+            beg += esize * numel * fidx
+            end = beg + esize * numel
+            bytesize = end - beg
 
         load_method = self.load_method
         if load_method == "mt_fread" and self.deferred_mode and not no_defer:

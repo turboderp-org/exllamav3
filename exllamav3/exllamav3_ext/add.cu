@@ -14,13 +14,14 @@ __global__ void kernel \
     const xt* __restrict__ x, \
     const yt* __restrict__ y, \
     zt* __restrict__ z, \
-    const uint64_t numel \
+    const uint64_t numel_x, \
+    const uint64_t numel_y \
 ) \
 { \
     uint64_t idx = ((uint64_t)blockIdx.x * NUM_THREADS + (uint64_t)threadIdx.x); \
-    if (idx >= numel) return; \
+    if (idx >= numel_x) return; \
     xt a = x[idx]; \
-    yt b = y[idx]; \
+    yt b = y[idx % numel_y]; \
     z[idx] = fn; \
 }
 
@@ -54,8 +55,15 @@ void add_gr
     auto xt = x.dtype();
     auto yt = y.dtype();
     auto zt = z.dtype();
-    uint64_t numel = x.numel();
-    int blocks = (int) CEIL_DIVIDE(numel, (uint64_t) NUM_THREADS);
+    uint64_t numel_x = x.numel();
+    int blocks = (int) CEIL_DIVIDE(numel_x, (uint64_t) NUM_THREADS);
+
+    uint64_t numel_y = y.numel();
+    if (numel_y != numel_x)
+    {
+        TORCH_CHECK(numel_y < numel_x, "Tensor shape mismatch (y > x)");
+        TORCH_CHECK(numel_x % numel_y == 0, "Tensor shape mismatch (y must divide x)");
+    }
 
     #define INSTANCE(xt_, yt_, zt_, xt__, yt__, zt__, kernel) \
     if (xt == xt_ && yt == yt_ && zt == zt_) \
@@ -65,7 +73,8 @@ void add_gr
             (const xt__*) x.data_ptr(), \
             (const yt__*) y.data_ptr(), \
             (zt__*) z.data_ptr(), \
-            numel \
+            numel_x, \
+            numel_y \
         ); \
         if (graph) graph->record_param((void*) &kernel, GP_add_x, 0); \
         if (graph) graph->record_param((void*) &kernel, GP_add_y, 1); \
