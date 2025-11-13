@@ -157,17 +157,19 @@ class PromptFormat_glm(PromptFormat):
         context = f"[gMASK]<sop><|system|>\n{system_prompt}"
         for (u, a) in messages:
             context += f"<|user|>\n{u}"
-            context += f"<|assistant|>\n"
+            context += f"<|assistant|>"
             if a is not None: context += f"{a}"
         return context
 
     def add_bos(self):
-        return True
+        return False
 
     def stop_conditions(self, tokenizer):
         return [
             tokenizer.eos_token_id,
             tokenizer.single_id("<|user|>"),
+            tokenizer.single_id("</answer>"),
+            tokenizer.single_id("<|observation|>"),
         ]
 
 

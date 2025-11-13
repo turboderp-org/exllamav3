@@ -8,7 +8,7 @@ import requests
 import torch
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth=200)
 
-mode = "qwen3"
+mode = "glm"
 cache_size = 8192
 streaming = True
 
@@ -21,11 +21,14 @@ match mode:
         model_dir = "/mnt/str/models/mistral-small-3.1-24b-instruct-2503/exl3/4.0bpw/"
     case "qwen3":
         prompt_format = "chatml"
-        model_dir = "/mnt/str/models/qwen3-vl-8b-instruct/exl3/3.5bpw"
+        model_dir = "/mnt/str/models/qwen3-vl-30b-a3b-instruct/exl3/5.00bpw"
+    case "glm":
+        prompt_format = "glmv"
+        model_dir = "/mnt/str/models/glm4.1v-9b-thinking/exl3/2.0bpw"
 
 images = [
     # Cat
-    # {"file": "media/cat.png"},
+    {"file": "media/cat.png"},
 
     # Line drawing
     # {"file": "media/strawberry.png"},
@@ -37,7 +40,7 @@ images = [
     # {"url": "https://fastly.picsum.photos/id/451/800/600.jpg?hmac=B0-st7nsgJ0F8ufKM5HjVwP-1y_vIL60R-PpNFLITiQ"}
 
     # Qwen3 demo image
-    {"url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"}
+    # {"url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"}
 ]
 
 system_prompt = "You are a very nice language model."
@@ -59,7 +62,7 @@ def main():
 
     # Load the image component model (can also be loaded after main model)
     vision_model = Model.from_config(config, component = "vision")
-    vision_model.load(device = 0, progressbar = True)
+    vision_model.load(progressbar = True)
 
     # Load the text model
     model = Model.from_config(config)
@@ -96,7 +99,7 @@ def main():
 
         job = Job(
             input_ids = input_ids,
-            max_new_tokens = 500,
+            max_new_tokens = 1000,
             decode_special_tokens = True,
             stop_conditions = get_stop_conditions(prompt_format, tokenizer),
             embeddings = image_embeddings,

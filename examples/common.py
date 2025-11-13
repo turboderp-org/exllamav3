@@ -48,6 +48,13 @@ def format_prompt(prompt_format, sp, p):
                 f"<start_of_turn>model\n"
             )
 
+        case "glmv":
+            return (
+                f"[gMASK]<sop><|system|>\n{sp}"
+                f"<|user|>\n{p}"
+                f"<|assistant|>\n<think>"
+            )
+
         case _:
             raise ValueError("Unknown prompt format")
 
@@ -67,3 +74,5 @@ def get_stop_conditions(prompt_format, tokenizer):
             return [tokenizer.eos_token_id, "<|im_end|>"]
         case "mistral":
             return [tokenizer.eos_token_id]
+        case "glmv":
+            return [tokenizer.eos_token_id, "</answer>"]
