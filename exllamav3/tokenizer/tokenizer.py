@@ -77,18 +77,18 @@ class Tokenizer:
         # Add special tokens from tokenizer_config.json
         atd = self.tokenizer_config_dict.get("added_tokens_decoder", {})
         for (k, v) in atd.items():
-            if not v["special"]:
-                continue
             token_id = int(k)
             token_str = v["content"]
             self.extended_piece_to_id[token_str] = token_id
+            if not v["special"]:
+                self.unspecial_piece_to_id[token_str] = token_id
 
         # Remove unspecial added tokens that exist in the base tokenizer already, but only if they decode correctly
         # see https://github.com/huggingface/tokenizers/issues/1392
         ok_tokens = []
         for p, i in self.unspecial_piece_to_id.items():
             try:
-                itp = self.tokenizer.decode([i])
+                itp = self.tokenizer.decode([i], skip_special_tokens = False)
                 if itp == p: ok_tokens.append(p)
             except IndexError:
                 pass
@@ -218,9 +218,9 @@ class Tokenizer:
         return tid
 
     # Encode string with added, unspecial tokens
-    def encode_unspecial(self, text: str) -> list[int]:
+    def encode_part(self, text: str, special: bool) -> list[int]:
         if not self.unspecial_piece_to_id:
-            return self.tokenizer.encode(text, add_special_tokens = False).ids
+            return self.tokenizer.encode(text, add_special_tokens = special).ids
 
         if self.unspecial_delimiters is None:
             self.unspecial_delimiters = re.compile(
@@ -231,17 +231,13 @@ class Tokenizer:
 
         i = 0
         while i < len(split):
-            if split[i] != "": encoded += self.tokenizer.encode(split[i], add_special_tokens = False).ids
+            if split[i] != "": encoded += self.tokenizer.encode(split[i], add_special_tokens = special).ids
             if i + 1 < len(split): encoded += [self.unspecial_piece_to_id[split[i + 1]]]
             i += 2
 
         return encoded
 
     # Encode string with special tokens
-
-    def encode_special(self, text: str) -> list[int]:
-        encoded = self.tokenizer.encode(text, add_special_tokens = False).ids
-        return encoded
 
     def encode_special_or_unspecial(
         self,
@@ -263,10 +259,7 @@ class Tokenizer:
             if text in aliases:
                 out_parts += aliases[text].token_list
             else:
-                if special:
-                    out_parts += self.encode_special(text)
-                else:
-                    out_parts += self.encode_unspecial(text)
+                out_parts += self.encode_part(text, special)
 
         return out_parts
 
