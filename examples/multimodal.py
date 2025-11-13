@@ -24,7 +24,7 @@ match mode:
         model_dir = "/mnt/str/models/qwen3-vl-30b-a3b-instruct/exl3/5.00bpw"
     case "glm":
         prompt_format = "glmv"
-        model_dir = "/mnt/str/models/glm4.1v-9b-thinking/exl3/2.0bpw"
+        model_dir = "/mnt/str/models/glm4.5v/exl3/4.00bpw"
 
 images = [
     # Cat

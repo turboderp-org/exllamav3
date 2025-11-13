@@ -7,6 +7,10 @@ from ..util.rope import RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear, BlockSparseMLP
 from ..modules.attn import prepare_for_attn
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .glm4v_moe import Glm4VMoeConfig
+
 class Glm4MoeConfig(Config):
     arch_string = "Glm4MoeForCausalLM"
 
@@ -58,7 +62,8 @@ class Glm4MoeModel(Model):
 
     def __init__(
         self,
-        config: Glm4MoeConfig,
+        config: Glm4MoeConfig | Glm4VMoeConfig,
+        key_prefix: str = "model",
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -66,7 +71,7 @@ class Glm4MoeModel(Model):
         self.modules += [
             Embedding(
                 config = config,
-                key = "model.embed_tokens",
+                key = f"{key_prefix}.embed_tokens",
                 vocab_size = config.vocab_size,
                 hidden_size = config.hidden_size,
             )
@@ -77,15 +82,15 @@ class Glm4MoeModel(Model):
         self.modules += [
             TransformerBlock(
                 config = config,
-                key = f"model.layers.{idx}",
+                key = f"{key_prefix}.layers.{idx}",
                 attn_norm = RMSNorm(
                     config = config,
-                    key = f"model.layers.{idx}.input_layernorm",
+                    key = f"{key_prefix}.layers.{idx}.input_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                 ),
                 attn = Attention(
                     config = config,
-                    key = f"model.layers.{idx}.self_attn",
+                    key = f"{key_prefix}.layers.{idx}.self_attn",
                     layer_idx = idx,
                     hidden_size = config.hidden_size,
                     head_dim = config.head_dim,
@@ -100,25 +105,25 @@ class Glm4MoeModel(Model):
                     qmap = "block.attn",
                     q_norm = RMSNorm(
                         config = config,
-                        key = f"model.layers.{idx}.self_attn.q_norm",
+                        key = f"{key_prefix}.layers.{idx}.self_attn.q_norm",
                         rms_norm_eps = config.rms_norm_eps,
                     ) if config.use_qk_norm else None,
                     k_norm = RMSNorm(
                         config = config,
-                        key = f"model.layers.{idx}.self_attn.k_norm",
+                        key = f"{key_prefix}.layers.{idx}.self_attn.k_norm",
                         rms_norm_eps = config.rms_norm_eps,
                     ) if config.use_qk_norm else None,
                     out_dtype = torch.float
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
-                    key = f"model.layers.{idx}.post_attention_layernorm",
+                    key = f"{key_prefix}.layers.{idx}.post_attention_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                 ),
                 mlp = (
                     GatedMLP(
                         config = config,
-                        key = f"model.layers.{idx}.mlp",
+                        key = f"{key_prefix}.layers.{idx}.mlp",
                         hidden_size = config.hidden_size,
                         intermediate_size = config.intermediate_size,
                         key_up = "up_proj",
@@ -131,7 +136,7 @@ class Glm4MoeModel(Model):
                     if idx < config.first_k_dense_replace else
                     BlockSparseMLP(
                         config = config,
-                        key = f"model.layers.{idx}.mlp",
+                        key = f"{key_prefix}.layers.{idx}.mlp",
                         hidden_size = config.hidden_size,
                         intermediate_size = config.moe_intermediate_size,
                         num_experts = config.num_experts,
@@ -150,7 +155,7 @@ class Glm4MoeModel(Model):
                         topk_group = 1,
                         shared_experts = GatedMLP(
                             config = config,
-                            key = f"model.layers.{idx}.mlp.shared_experts",
+                            key = f"{key_prefix}.layers.{idx}.mlp.shared_experts",
                             hidden_size = config.hidden_size,
                             intermediate_size = config.moe_intermediate_size * config.num_shared_experts,
                             key_up = "up_proj",
@@ -170,12 +175,12 @@ class Glm4MoeModel(Model):
 
         head_alt_key = None
         if config.tie_word_embeddings and not self.config.stc.has_tensor("lm_head"):
-            head_alt_key = "model.embed_tokens"
+            head_alt_key = f"{key_prefix}.embed_tokens"
 
         self.modules += [
             RMSNorm(
                 config = config,
-                key = "model.norm",
+                key = f"{key_prefix}.norm",
                 rms_norm_eps = config.rms_norm_eps,
                 out_dtype = torch.half,
             ),

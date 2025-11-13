@@ -28,6 +28,10 @@ from ..tokenizer import Tokenizer, MMEmbedding
 from PIL import Image
 import os, json
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .glm4v_moe import Glm4VMoeConfig
+
 class Glm4VConfig(Config):
     arch_string = "Glm4vForConditionalGeneration"
 
@@ -262,7 +266,7 @@ class Glm4VVisionModel(Model):
 
     def __init__(
         self,
-        config: Glm4VConfig,
+        config: Glm4VConfig | Glm4VMoeConfig,
         key_prefix = "model.visual",
         **kwargs
     ):

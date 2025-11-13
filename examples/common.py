@@ -75,4 +75,4 @@ def get_stop_conditions(prompt_format, tokenizer):
         case "mistral":
             return [tokenizer.eos_token_id]
         case "glmv":
-            return [tokenizer.eos_token_id, "</answer>"]
+            return [tokenizer.eos_token_id, "</answer>", "<|user|>"]
