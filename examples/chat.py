@@ -277,18 +277,8 @@ def main(args):
         # Optionally save output
         if args.save:
             sr = response
-            if args.save_svg:
-                import re
-                b = [match.end() for match in re.finditer("</svg>", sr)]
-                if b:
-                    sr = sr[:b[-1]]
-                    a = [match.start() for match in re.finditer("<svg", sr)]
-                    if a:
-                        sr = sr[a[-1]:]
-                    else:
-                        sr = None
-                else:
-                    sr = None
+            if sr and args.save_svg:
+                sr = extract_svg(sr)
                 if sr: print_info(f"Found SVG: {len(sr)} characters")
                 else: print_error(f"No SVG block found")
             if sr:
