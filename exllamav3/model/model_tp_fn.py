@@ -191,6 +191,7 @@ def mp_model_forward(
         "cache_seqlens",
         "positions",
         "position_ids",
+        "indexed_embeddings",
     ]:
         p = params.get(tensor_param)
         if p is not None:
