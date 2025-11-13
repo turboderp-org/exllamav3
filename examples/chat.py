@@ -77,6 +77,7 @@ def main(args):
     tt = prompt_format.thinktag()
     banned_strings = [tt[0], tt[1]] if args.no_think else []
     response = ""
+    last_tokens = None
 
     while True:
 
@@ -204,6 +205,14 @@ def main(args):
                         except:
                             print_error(f"Error loading {c[1]}")
                         continue
+
+                # Print token IDs for last response
+                case "/t":
+                    if last_tokens is None:
+                        print_error(f"Unknown command: {c[0]}")
+                        continue
+                    print_tokens(last_tokens, tokenizer.get_id_to_piece_list())
+                    continue
 
                 case _:
                     print_error(f"Unknown command: {c[0]}")

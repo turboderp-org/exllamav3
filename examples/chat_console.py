@@ -6,6 +6,7 @@ from rich.markdown import Markdown
 from rich.console import Console
 from prompt_toolkit import prompt as ptk_prompt
 from prompt_toolkit.formatted_text import ANSI
+import time, os
 
 # ANSI codes
 ESC = "\u001b"
@@ -181,3 +182,21 @@ class Streamer_rich:
                 formatted_text = formatted_text.replace(self.think_tag, f"`{self.think_tag}`")
                 formatted_text = formatted_text.replace(self.end_think_tag, f"`{self.end_think_tag}`")
             self.live.update(formatted_text)
+
+def print_tokens(
+    ids: list,
+    vocab: list,
+    ids_per_line = 10,
+):
+    print()
+    line = ""
+    for pos in range(len(ids)):
+        t = ids[pos]
+        p = repr(vocab[t])[1:-1].replace(" ", "␣")
+        line += f"{col_user}{t:6}{col_default} "
+        line += f"{p:10} " if len(p) <= 10 else f"{p[:9]}… "
+        if (pos + 1) % ids_per_line == 0 or pos == len(ids) - 1:
+            line = line.replace("␣", f"{col_bot}␣{col_default}").replace("…", f"{col_error}…{col_default}")
+            ppos = pos // ids_per_line * ids_per_line
+            print(f"{col_info}{ppos:6} {col_default}: {line}")
+            line = ""
