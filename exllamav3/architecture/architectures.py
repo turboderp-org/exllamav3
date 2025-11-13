@@ -11,6 +11,7 @@ from .gemma2 import Gemma2Model
 from .gemma3 import Gemma3Model, Gemma3TextModel
 from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
+from .glm4v import Glm4VModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
 from .minimax_m2 import MiniMaxM2Model
@@ -47,6 +48,7 @@ ARCHITECTURES = {
         Gemma3TextModel,
         Glm4Model,
         Glm4MoeModel,
+        Glm4VModel,
         LlamaModel,
         MiMoModel,
         MiniMaxM2Model,

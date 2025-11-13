@@ -101,3 +101,46 @@ def smart_resize(
         h_bar = math.ceil(height * beta / factor) * factor
         w_bar = math.ceil(width * beta / factor) * factor
     return h_bar, w_bar
+
+
+def smart_resize_t(
+    num_frames: int,
+    size: tuple,
+    temporal_factor: int = 2,
+    factor: int = 28,
+    min_pixels: int = 112 * 112,
+    max_pixels: int = 14 * 14 * 2 * 2 * 2 * 6144
+):
+    """
+    Rescales the image so that the following conditions are met:
+
+    1. Both dimensions (height and width) are divisible by 'factor'.
+    2. The total number of pixels (across all frames) is within the range ['min_pixels', 'max_pixels'].
+    3. The aspect ratio of the image is maintained as closely as possible.
+
+    Adapted from:
+    https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_vl/image_processing_qwen2_vl.py
+    """
+
+    height, width = size
+
+    if num_frames < temporal_factor:
+        raise ValueError(f"t:{num_frames} must be larger than temporal_factor:{temporal_factor}")
+    if height < factor or width < factor:
+        raise ValueError(f"height:{height} or width:{width} must be larger than factor:{factor}")
+    elif max(height, width) / min(height, width) > 200:
+        raise ValueError(f"absolute aspect ratio must be smaller than 200, got {max(height, width) / min(height, width)}")
+
+    h_bar = round(height / factor) * factor
+    w_bar = round(width / factor) * factor
+    t_bar = round(num_frames / temporal_factor) * temporal_factor
+
+    if t_bar * h_bar * w_bar > max_pixels:
+        beta = math.sqrt((num_frames * height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif t_bar * h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (num_frames * height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+    return h_bar, w_bar

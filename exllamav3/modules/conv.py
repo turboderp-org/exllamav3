@@ -20,6 +20,7 @@ class Conv(Module):
         out_dtype: torch.dtype | None = None,
         qmap: str | None = None,
         flat: bool = False,
+        reshape2d: bool = False,
     ):
         super().__init__(config, key, None)
         assert qmap is None, "No quant scheme for Conv"
@@ -32,7 +33,8 @@ class Conv(Module):
         self.bias = None
         self.out_dtype = out_dtype
         self._numel = None
-        self.flat = True
+        self.flat = flat
+        self.reshape2d = reshape2d
 
         self.dims = len(kernel_size)
         assert self.dims in [2, 3], "Convolution must be 2D or 3D"
@@ -82,7 +84,9 @@ class Conv(Module):
     ) -> torch.Tensor:
 
         if self.dims == 2:
-            y = F.conv2d(x, self.weight, self.bias, self.kernel_size)
+            if self.reshape2d:
+                x = x.view(-1, self.kernel_size[0], self.kernel_size[1], x.shape[-1]).permute(0, 3, 1, 2)
+            y = F.conv2d(x.to(self.weight.dtype), self.weight, self.bias, self.kernel_size)
             y = y.flatten(2).permute(0, 2, 1).contiguous()
 
         elif self.dims == 3:

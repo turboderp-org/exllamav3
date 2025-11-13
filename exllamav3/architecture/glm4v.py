@@ -2,14 +2,12 @@ from __future__ import annotations
 from typing_extensions import override
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from ..model.config import Config, no_default
 from ..model.model import Model
-from ..util.rope import RopeStyle, position_embedding_grid_2d, RopeSettings, RoPE
-from ..util.vision import convert_to_rgb, normalize_image, smart_resize
-from ..modules.attn import prepare_for_attn
+from ..util.rope import RopeStyle, position_embedding_grid_2d, RopeSettings
 from ..util.file import read_dict, no_value, no_default
+from ..util.vision import convert_to_rgb, normalize_image, smart_resize
 from ..modules import (
     Module,
     RMSNorm,
@@ -19,19 +17,19 @@ from ..modules import (
     GatedMLP,
     Linear,
     Conv,
-    MLP,
     LayerNorm,
-    Qwen3VLPosEmbedding
+    Glm4VPosEmbedding,
+    MLP
 )
-from .qwen3 import Qwen3Model
 from ..modules.attn import prepare_for_attn
-from ..tokenizer import Tokenizer, MMEmbedding
+from .glm4 import Glm4Model
 from types import SimpleNamespace
+from ..tokenizer import Tokenizer, MMEmbedding
 from PIL import Image
 import os, json
 
-class Qwen3VLConfig(Config):
-    arch_string = "Qwen3VLForConditionalGeneration"
+class Glm4VConfig(Config):
+    arch_string = "Glm4vForConditionalGeneration"
 
     def __init__(
         self,
@@ -40,7 +38,7 @@ class Qwen3VLConfig(Config):
     ):
         super().__init__(
             directory,
-            {"text": Qwen3VLModel, "vision": Qwen3VLVisionModel},
+            {"text": Glm4VModel, "vision": Glm4VVisionModel},
             **kwargs
         )
 
@@ -66,52 +64,52 @@ class Qwen3VLConfig(Config):
 
         # RoPE
         self.rope_settings = self.read_rope_settings_default(
-            RopeStyle.NEOX,
-            default_rope_theta = 5000000,
+            RopeStyle.GPTJ,
+            default_rope_theta = 10000,
             config_dict = self.read_cfg(dict, "text_config", no_default)
         )
 
         # Vision model settings
         read_vision_config = self.read_cfg(dict, "vision_config", no_default)
-        self.vision = read_qwen3_vl_vision_config(read_vision_config)
+        self.vision = read_glm4v_vision_config(read_vision_config)
 
         prep_path = os.path.join(self.directory, "preprocessor_config.json")
         with open(prep_path, encoding = "utf8") as f:
             read_prep_config = json.load(f)
-        self.vision_pp = read_qwen3_vl_pp_config(read_prep_config)
+        self.vision_pp = read_glm4v_pp_config(read_prep_config)
 
-        self.vision_start_token_id = self.read_cfg(int, "vision_start_token_id", 151652)
-        self.vision_end_token_id = self.read_cfg(int, "vision_end_token_id", 151653)
+        self.vision_start_token_id = self.read_cfg(int, "image_start_token_id", 151339)
+        self.vision_end_token_id = self.read_cfg(int, "image_end_token_id", 151340)
 
 
-def read_qwen3_vl_vision_config(config_dict: dict):
+def read_glm4v_vision_config(config_dict: dict):
     v = SimpleNamespace(**{
         k: read_dict(config_dict, t, k, no_default)
         for k, t in [
-            ("deepstack_visual_indexes", list),
             ("depth", int),
             ("hidden_act", str),
             ("hidden_size", int),
             ("intermediate_size", int),
             ("num_heads", int),
-            ("num_position_embeddings", int),
             ("out_hidden_size", int),
             ("patch_size", int),
             ("spatial_merge_size", int),
             ("temporal_patch_size", int),
             ("model_type", str),
+            ("attention_bias", bool),
+            ("image_size", int),
+            ("rms_norm_eps", float),
         ]
     })
     v.num_channels = 3
     v.head_dim = v.hidden_size // v.num_heads
     v.rope_theta = 10000.0
-    v.layernorm_eps = 1e-6
-    assert v.model_type in ["qwen3_vl", "qwen3_vl_moe"], \
-        "Expected vision_config->model_type to be 'qwen3_vl' or 'qwen3_vl_moe'"
+    assert v.model_type in ["glm4v", "glm4v_moe"], \
+        "Expected vision_config->model_type to be 'glm4v' or 'glm4v_moe'"
     return v
 
 
-def read_qwen3_vl_pp_config(config_dict: dict):
+def read_glm4v_pp_config(config_dict: dict):
     pp = SimpleNamespace(**{
         k: read_dict(config_dict, t, k, no_default)
         for k, t in [
@@ -128,53 +126,69 @@ def read_qwen3_vl_pp_config(config_dict: dict):
     pp.rescale_factor = 1 / 255
     pp.min_pixels = pp.size["shortest_edge"]  # Mislabeled in preprocessor_config
     pp.max_pixels = pp.size["longest_edge"]
-    assert pp.image_processor_type == "Qwen2VLImageProcessorFast", \
-        "Expected image_processor_type to be 'Qwen2VLImageProcessorFast'"
+    assert pp.image_processor_type == "Glm4vImageProcessor", \
+        "Expected image_processor_type to be 'Glm4vImageProcessor'"
     return pp
 
 
-class Qwen3VLModel(Qwen3Model):
-    config_class = Qwen3VLConfig
+class Glm4VModel(Glm4Model):
+    config_class = Glm4VConfig
 
     def __init__(
         self,
-        config: Qwen3VLConfig,
+        config: Glm4VConfig,
         **kwargs
     ):
         super().__init__(config, key_prefix = "model.language_model", **kwargs)
 
 
-class Qwen3VLVisionPatchMerger(Module):
+class Glm4VVisionPatchMerger(Module):
 
     def __init__(
         self,
         config: Config,
         key: str,
+        key_gate: str,
         key_up: str,
         key_down: str,
+        key_proj: str,
         key_norm: str,
         hidden_size: int,
-        merge_size: int,
-        out_hidden_size: int,
+        interm_size: int,
         use_postshuffle_norm: bool = False,
-        extract: int | None = None,
         out_dtype: torch.dtype | None = None,
         qmap: str | None = None,
     ):
         super().__init__(config, key, None)
-        self.in_size = hidden_size * merge_size
-        self.interm_size = hidden_size * merge_size
-        self.out_size = out_hidden_size
+        self.hidden_size = hidden_size
+        self.interm_size = interm_size
         self.out_dtype = out_dtype
         self.use_postshuffle_norm = use_postshuffle_norm
-        self.extract = extract
 
+        self.proj = Linear(
+            config = config,
+            key = f"{key}.{key_proj}",
+            in_features = self.hidden_size,
+            out_features = self.hidden_size,
+            qmap = qmap + ".input",
+            out_dtype = torch.half,
+            pad_to = 1
+        )
+        self.gate = Linear(
+            config = config,
+            key = f"{key}.{key_gate}",
+            in_features = self.hidden_size,
+            out_features = self.interm_size,
+            qmap = qmap + ".post_norm",
+            out_dtype = torch.half,
+            pad_to = 1
+        )
         self.up = Linear(
             config = config,
             key = f"{key}.{key_up}",
-            in_features = self.in_size,
+            in_features = self.hidden_size,
             out_features = self.interm_size,
-            qmap = qmap + ".input",
+            qmap = qmap + ".post_norm",
             out_dtype = torch.half,
             pad_to = 1
         )
@@ -182,32 +196,38 @@ class Qwen3VLVisionPatchMerger(Module):
             config = config,
             key = f"{key}.{key_down}",
             in_features = self.interm_size,
-            out_features = self.out_size,
+            out_features = self.hidden_size,
             qmap = qmap + ".down",
             out_dtype = self.out_dtype,
             allow_input_padding = True,
             pad_to = 1
         )
 
+        self.register_submodule(self.proj)
+        self.register_submodule(self.gate)
         self.register_submodule(self.up)
         self.register_submodule(self.down)
 
-        if key_norm:
-            self.norm = LayerNorm(
-                config = config,
-                key = f"{key}.{key_norm}",
-                layernorm_eps = 1e-6,
-                out_dtype = torch.half,
-            )
-            self.register_submodule(self.norm)
+        self.norm = LayerNorm(
+            config = config,
+            key = f"{key}.{key_norm}",
+            layernorm_eps = 1e-6,
+            out_dtype = torch.half,
+        )
+        self.register_submodule(self.norm)
 
     def optimizer_targets(self):
         raise NotImplementedError()
 
     @override
     def weights_numel(self):
-        numel = self.up.weights_numel() + self.down.weights_numel()
-        if self.norm: numel += self.norm.weights_numel()
+        numel = (
+            self.gate.weights_numel() +
+            self.up.weights_numel() +
+            self.down.weights_numel() +
+            self.proj.weights_numel() +
+            self.norm.weights_numel()
+        )
         return numel
 
     @override
@@ -218,40 +238,31 @@ class Qwen3VLVisionPatchMerger(Module):
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
 
-        bsz, seqlen, dim = x.shape
-        y = x
-        if self.use_postshuffle_norm:
-            y = y.view(-1, self.in_size)
-            y = self.norm.forward(y, params).to(torch.half)
-        else:
-            y = self.norm.forward(y, params).to(torch.half)
-            y = y.view(-1, self.in_size)
-
-        y = self.up.forward(y, params)
+        seqlen, _, dim = x.shape
+        x = x.view(-1, self.hidden_size)
+        y = self.proj.forward(x.half(), params)
+        y = self.norm.forward(y, params).half()
         y = F.gelu(y, approximate = "tanh")
+        g = self.gate.forward(y, params)
+        g = F.silu(g)
+        y = self.up.forward(y, params)
+        y *= g
         y = self.down.forward(y, params)
-        y = y.view(bsz, -1, self.out_size)
-
-        if self.extract is not None:
-            if "deepstack" not in params:
-                params["deepstack"] = []
-            params["deepstack"].append(y.cpu())
-            return x
-        else:
-            return y
+        y = y.view(1, -1, self.hidden_size)
+        return y
 
 
-class Qwen3VLVisionModel(Model):
+class Glm4VVisionModel(Model):
 
     @staticmethod
     @override
-    def get_additional_compiled_tensors(config: Qwen3VLConfig) -> dict:
+    def get_additional_compiled_tensors(config: Glm4VConfig) -> dict:
         vlm_tensors = config.stc.list_tensors(prefix = "model.visual")
         return vlm_tensors
 
     def __init__(
         self,
-        config: Qwen3VLConfig,
+        config: Glm4VConfig,
         key_prefix = "model.visual",
         **kwargs
     ):
@@ -272,10 +283,15 @@ class Qwen3VLVisionModel(Model):
                 flat = True,
                 out_dtype = torch.float,
             ),
-            Qwen3VLPosEmbedding(
+            RMSNorm(
                 config = config,
-                key = f"{key_prefix}.pos_embed",
-                num_position_embeddings = v.num_position_embeddings,
+                key = f"{key_prefix}.post_conv_layernorm",
+                rms_norm_eps = v.rms_norm_eps
+            ),
+            Glm4VPosEmbedding(
+                config = config,
+                key = f"{key_prefix}.embeddings.position_embedding",
+                num_position_embeddings = (v.image_size // v.patch_size) ** 2,
                 spatial_merge_size = v.spatial_merge_size,
                 hidden_size = v.hidden_size,
                 out_dtype = torch.float,
@@ -288,10 +304,10 @@ class Qwen3VLVisionModel(Model):
                 TransformerBlock(
                     config = config,
                     key = f"{key_prefix}.blocks.{idx}",
-                    attn_norm = LayerNorm(
+                    attn_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.blocks.{idx}.norm1",
-                        layernorm_eps = v.layernorm_eps
+                        rms_norm_eps = v.rms_norm_eps
                     ),
                     attn = Attention(
                         config = config,
@@ -309,54 +325,51 @@ class Qwen3VLVisionModel(Model):
                         key_o = "proj",
                         qmap = "block.attn",
                     ),
-                    mlp_norm = LayerNorm(
+                    mlp_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.blocks.{idx}.norm2",
-                        layernorm_eps = v.layernorm_eps
+                        rms_norm_eps = v.rms_norm_eps
                     ),
-                    mlp = MLP(
+                    mlp = GatedMLP(
                         config = config,
                         key = f"{key_prefix}.blocks.{idx}.mlp",
                         hidden_size = v.hidden_size,
                         intermediate_size = v.intermediate_size,
-                        key_up = "linear_fc1",
-                        key_down = "linear_fc2",
-                        activation_fn = "gelu",
+                        key_gate = "gate_proj",
+                        key_up = "up_proj",
+                        key_down = "down_proj",
+                        activation_fn = "silu",
                         qmap = "block.mlp",
                         pad_to = 1,
                     ),
                 )
             ]
 
-            if idx in v.deepstack_visual_indexes:
-                merger_idx = v.deepstack_visual_indexes.index(idx)
-                self.modules += [
-                    Qwen3VLVisionPatchMerger(
-                        config = config,
-                        key = f"{key_prefix}.deepstack_merger_list.{merger_idx}",
-                        key_norm = "norm",
-                        key_up = "linear_fc1",
-                        key_down = "linear_fc2",
-                        hidden_size = v.hidden_size,
-                        merge_size = v.spatial_merge_size ** 2,
-                        out_hidden_size = v.out_hidden_size,
-                        use_postshuffle_norm = True,
-                        extract = merger_idx,
-                        out_dtype = torch.float,
-                        qmap = "block",
-                    )
-                ]
-
         self.modules += [
-            Qwen3VLVisionPatchMerger(
+            RMSNorm(
+                config = config,
+                key = f"{key_prefix}.post_layernorm",
+                rms_norm_eps = v.rms_norm_eps
+            ),
+            Conv(
+                config = config,
+                key = f"{key_prefix}.downsample",
+                in_channels = v.hidden_size,
+                out_channels = v.hidden_size,
+                kernel_size = (v.spatial_merge_size, v.spatial_merge_size),
+                out_dtype = torch.float,
+                reshape2d = True,
+            ),
+            Glm4VVisionPatchMerger(
                 config = config,
                 key = f"{key_prefix}.merger",
-                key_norm = "norm",
-                key_up = "linear_fc1",
-                key_down = "linear_fc2",
-                hidden_size = v.hidden_size,
-                merge_size = v.spatial_merge_size ** 2,
-                out_hidden_size = v.out_hidden_size,
+                key_gate = "gate_proj",
+                key_up = "up_proj",
+                key_down = "down_proj",
+                key_proj = "proj",
+                key_norm = "post_projection_norm",
+                hidden_size = v.out_hidden_size,
+                interm_size = v.intermediate_size,
                 out_dtype = torch.float,
                 qmap = "block",
             )
@@ -443,15 +456,15 @@ class Qwen3VLVisionModel(Model):
         return (
             (
                 1,
-                11008,
-                1536,
+                14308,
+                1176,
             ),
             torch.half
         )
 
 
     def default_load_params(self):
-        return { "grid_thw": torch.tensor([[1, 86, 128]]) }
+        return { "grid_thw": torch.tensor([[1, 98, 146]]) }
 
 
     def get_image_embeddings(
@@ -480,7 +493,7 @@ class Qwen3VLVisionModel(Model):
         params = {
             "causal": False,
             "grid_thw": torch.tensor([grid_thw], dtype = torch.int),
-            "inv_freq": inv_freq
+            "inv_freq": inv_freq,
         }
 
         embedding_tensor = self.forward(
@@ -499,7 +512,6 @@ class Qwen3VLVisionModel(Model):
                 embeddings = embedding_tensor[i],
                 text_alias = text_alias,
                 token_string = token_string,
-                deepstack_embeddings = [de.squeeze(0) for de in params["deepstack"]] if "deepstack" in params else None,
                 grid_thw = grid_thw,
                 mrope_merge_size = v.spatial_merge_size
             )

@@ -3,9 +3,13 @@ from typing_extensions import override
 import torch
 from ..model.config import Config, no_default
 from ..model.model import Model
-from ..util.rope import RopeStyle
+from ..util.rope import RopeStyle, RoPE
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .glm4v import Glm4VConfig
 
 class Glm4Config(Config):
     arch_string = "Glm4ForCausalLM"
@@ -50,7 +54,8 @@ class Glm4Model(Model):
 
     def __init__(
         self,
-        config: Glm4Config,
+        config: Glm4Config | Glm4VConfig,
+        key_prefix: str = "model",
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -58,7 +63,7 @@ class Glm4Model(Model):
         self.modules += [
             Embedding(
                 config = config,
-                key = "model.embed_tokens",
+                key = f"{key_prefix}.embed_tokens",
                 vocab_size = config.vocab_size,
                 hidden_size = config.hidden_size,
             )
@@ -69,15 +74,15 @@ class Glm4Model(Model):
         self.modules += [
             TransformerBlock(
                 config = config,
-                key = f"model.layers.{idx}",
+                key = f"{key_prefix}.layers.{idx}",
                 attn_norm = RMSNorm(
                     config = config,
-                    key = f"model.layers.{idx}.input_layernorm",
+                    key = f"{key_prefix}.layers.{idx}.input_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                 ),
                 attn = Attention(
                     config = config,
-                    key = f"model.layers.{idx}.self_attn",
+                    key = f"{key_prefix}.layers.{idx}.self_attn",
                     layer_idx = idx,
                     hidden_size = config.hidden_size,
                     head_dim = config.head_dim,
@@ -94,18 +99,18 @@ class Glm4Model(Model):
                 ),
                 attn_post_norm = RMSNorm(
                     config = config,
-                    key = f"model.layers.{idx}.post_self_attn_layernorm",
+                    key = f"{key_prefix}.layers.{idx}.post_self_attn_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                     out_dtype = torch.float
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
-                    key = f"model.layers.{idx}.post_attention_layernorm",
+                    key = f"{key_prefix}.layers.{idx}.post_attention_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                 ),
                 mlp = GatedMLP(
                     config = config,
-                    key = f"model.layers.{idx}.mlp",
+                    key = f"{key_prefix}.layers.{idx}.mlp",
                     hidden_size = config.hidden_size,
                     intermediate_size = config.intermediate_size,
                     key_up = "up_proj",
@@ -118,7 +123,7 @@ class Glm4Model(Model):
                 ),
                 mlp_post_norm = RMSNorm(
                     config = config,
-                    key = f"model.layers.{idx}.post_mlp_layernorm",
+                    key = f"{key_prefix}.layers.{idx}.post_mlp_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                     out_dtype = torch.float
                 ),
@@ -130,12 +135,12 @@ class Glm4Model(Model):
 
         head_alt_key = None
         if config.tie_word_embeddings and not self.config.stc.has_tensor("lm_head"):
-            head_alt_key = "model.embed_tokens"
+            head_alt_key = f"{key_prefix}.embed_tokens"
 
         self.modules += [
             RMSNorm(
                 config = config,
-                key = "model.norm",
+                key = f"{key_prefix}.norm",
                 rms_norm_eps = config.rms_norm_eps,
                 out_dtype = torch.half,
             ),
@@ -152,6 +157,10 @@ class Glm4Model(Model):
         ]
 
         self.logit_layer_idx = len(self.modules) - 1
+
+        # Generator needs MRoPE freqs when using MMEmbeddings
+        self.caps.update({"mrope": True})
+        self.g_rope = RoPE("cpu", config.rope_settings)
 
 
     @override
