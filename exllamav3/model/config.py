@@ -50,9 +50,9 @@ class Config(ABC):
         self.stc = SafetensorsCollection(directory, load_method = kwargs.get("load_method"))
 
         # Standard params, vocab
-        self.bos_token_id = self.read_cfg(int, "bos_token_id", None)
-        self.eos_token_id = self.read_cfg([int, list], "eos_token_id", None)
-        self.pad_token_id = self.read_cfg(int, "pad_token_id", None)
+        self.bos_token_id = self.read_cfg(int, ["bos_token_id", "text_config->bos_token_id"], None)
+        self.eos_token_id = self.read_cfg([int, list], ["eos_token_id", "text_config->eos_token_id"], None)
+        self.pad_token_id = self.read_cfg(int, ["pad_token_id", "text_config->pad_token_id"], None)
         self.vocab_size = self.read_cfg(int, ["vocab_size", "text_config->vocab_size"], None)
         if isinstance(self.eos_token_id, list):
             self.eos_token_id_list = self.eos_token_id
