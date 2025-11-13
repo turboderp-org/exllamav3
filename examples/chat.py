@@ -52,7 +52,7 @@ def main(args):
         cache = cache,
         tokenizer = tokenizer,
     )
-    stop_conditions = prompt_format.stop_conditions(tokenizer)
+    stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
 
     # Sampler
     sampler = ComboSampler(
