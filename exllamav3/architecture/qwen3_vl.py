@@ -30,6 +30,11 @@ from types import SimpleNamespace
 from PIL import Image
 import os, json
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .qwen3_vl_moe import Qwen3VLMoeConfig
+
+
 class Qwen3VLConfig(Config):
     arch_string = "Qwen3VLForConditionalGeneration"
 
@@ -251,7 +256,7 @@ class Qwen3VLVisionModel(Model):
 
     def __init__(
         self,
-        config: Qwen3VLConfig,
+        config: Qwen3VLConfig | Qwen3VLMoeConfig,
         key_prefix = "model.visual",
         **kwargs
     ):
