@@ -1,31 +1,7 @@
 from __future__ import annotations
-from typing_extensions import override
-import numpy as np
-import torch
-import torch.nn.functional as F
 from ..model.config import Config, no_default
-from ..model.model import Model
-from ..util.rope import RopeStyle, position_embedding_grid_2d, RopeSettings
-from ..util.file import read_dict, no_value, no_default
-from ..util.vision import convert_to_rgb, normalize_image, smart_resize
-from ..modules import (
-    Module,
-    RMSNorm,
-    Embedding,
-    TransformerBlock,
-    Attention,
-    GatedMLP,
-    Linear,
-    Conv,
-    LayerNorm,
-    Glm4VPosEmbedding,
-    MLP
-)
-from ..modules.attn import prepare_for_attn
+from ..util.rope import RopeStyle
 from .glm4_moe import Glm4MoeModel
-from types import SimpleNamespace
-from ..tokenizer import Tokenizer, MMEmbedding
-from PIL import Image
 import os, json
 from .glm4v import read_glm4v_vision_config, read_glm4v_pp_config, Glm4VVisionModel
 

@@ -3,15 +3,14 @@ from typing_extensions import override
 import numpy as np
 import torch
 import torch.nn.functional as F
-from ..model.config import Config, no_default
+from ..model.config import Config
 from ..model.model import Model
 from ..util.rope import RopeStyle, position_embedding_grid_2d, RopeSettings
-from ..util.file import read_dict, no_value, no_default
+from ..util.file import read_dict, no_default
 from ..util.vision import convert_to_rgb, normalize_image, smart_resize
 from ..modules import (
     Module,
     RMSNorm,
-    Embedding,
     TransformerBlock,
     Attention,
     GatedMLP,
@@ -19,9 +18,7 @@ from ..modules import (
     Conv,
     LayerNorm,
     Glm4VPosEmbedding,
-    MLP
 )
-from ..modules.attn import prepare_for_attn
 from .glm4 import Glm4Model
 from types import SimpleNamespace
 from ..tokenizer import Tokenizer, MMEmbedding

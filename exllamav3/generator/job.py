@@ -1,21 +1,17 @@
 from __future__ import annotations
 import torch
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
-from ..cache.cache import Cache
 if TYPE_CHECKING:
     from .generator import Generator
 from ..constants import PAGE_SIZE
 import numpy as np
-from .pagetable import CachePage, Sequence, tensor_hash_checksum, random_hash
+from .pagetable import Sequence, tensor_hash_checksum, random_hash
 from .filter import Filter
 import random
-from collections import deque
 import time
 from ..ext import exllamav3_ext as ext
 from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
-from ..util import profile_opt
 from ..tokenizer import MMEmbedding
 from functools import lru_cache
 from ..util import profile_opt

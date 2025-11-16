@@ -1,8 +1,6 @@
 from __future__ import annotations
-import torch
 import multiprocessing
 from multiprocessing import Process, Pipe
-import torch.distributed as dist
 from ..util import find_free_port
 from .model_tp_alloc import TPAllocator
 import os
@@ -11,9 +9,7 @@ from ..util.memory import touch_device_measure_vram
 from ..util.progress import ProgressBar
 from .config import Config
 from ..util.misc import Cleanupper
-from .model_tp_shared import SMProducer
 from .model_tp_fn import *
-from .model_tp_backend import TPBackend, TPBackendNCCL, TPBackendNative
 import uuid
 from ..util import log_tp, global_t0
 

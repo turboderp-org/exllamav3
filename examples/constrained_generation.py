@@ -6,7 +6,6 @@ from formatron.formatter import FormatterBuilder
 from pydantic import conlist
 from typing import Literal, Optional
 from formatron.extractor import NonterminalExtractor
-import json
 
 def get_superhero_filter(tokenizer) -> list[Filter]:
 

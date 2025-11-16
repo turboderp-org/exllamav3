@@ -5,12 +5,12 @@ import torch.nn.functional as F
 from ..model.config import Config
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear
-from ..util import profile_opt
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
 from ..cache import CacheableState
 from ..util.tensor import g_tensor_cache
+from ..util import profile_opt
 
 """
 causal_conv1d wrappers and fallback functions 

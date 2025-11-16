@@ -1,8 +1,5 @@
 import re
-import sys
 import pyperclip
-import time
-import os
 
 def copy_last_codeblock(text: str, num) -> str | None:
     pattern = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)

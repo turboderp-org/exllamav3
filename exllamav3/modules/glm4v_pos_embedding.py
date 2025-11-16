@@ -2,11 +2,8 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
-from torch import nn
 from ..model.config import Config
 from . import Module
-from ..ext import exllamav3_ext as ext
-from ..model.model_tp_alloc import TPAllocation
 from ..util.tensor import get_for_device, to2
 
 class Glm4VPosEmbedding(Module):

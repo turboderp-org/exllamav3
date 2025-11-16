@@ -2,7 +2,6 @@ from . import Model, Config, Cache, Tokenizer
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
 from .cache import CacheLayer_fp16, CacheLayer_quant
 from argparse import ArgumentParser
-import torch
 import yaml
 
 def add_args(

@@ -7,13 +7,11 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
-from ..cache import Cache
 from flash_attn import flash_attn_func, flash_attn_with_kvcache
-from ..util import profile_opt
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
-import torch.distributed as dist
+from ..util import profile_opt
 
 """
 SDPA:

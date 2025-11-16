@@ -5,8 +5,8 @@ import argparse
 from exllamav3.util.file import disk_lru_cache, disk_lru_cache_clear
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.memory import free_mem
-from exllamav3 import Config, Model, Cache, Tokenizer, model_init
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from exllamav3 import Config, Tokenizer, model_init
+from transformers import AutoModelForCausalLM
 from datasets import load_dataset
 import torch
 import torch.nn.functional as F

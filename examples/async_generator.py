@@ -1,6 +1,6 @@
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from exllamav3 import Model, Config, Cache, Tokenizer, AsyncGenerator, AsyncJob, Sampler
+from exllamav3 import Model, Config, Cache, Tokenizer, AsyncGenerator, AsyncJob
 import asyncio
 
 """

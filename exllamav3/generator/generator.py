@@ -10,12 +10,10 @@ from .pagetable import PageTable
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
-from .sampler import Sampler, GumbelSampler
+from .sampler import Sampler
 from .visualizer import CacheVisualizer
 import time
 import threading
-import numpy as np
-from ..util import profile_opt
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 

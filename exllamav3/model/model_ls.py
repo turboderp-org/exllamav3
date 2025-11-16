@@ -1,5 +1,4 @@
 from __future__ import annotations
-from functools import lru_cache
 from typing import Callable
 import torch
 from ..util.memory import (

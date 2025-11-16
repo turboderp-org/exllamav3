@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from ..model.config import Config
 from ..model.model import Model
 from ..util.rope import RopeSettings, RopeStyle
-from ..util.file import read_dict, no_value, no_default
+from ..util.file import read_dict, no_default
 from ..util.vision import size_to_longest_edge_and_patch_size, convert_to_rgb, normalize_image
 from ..util.tensor import to2
 from ..modules import (
@@ -20,7 +20,6 @@ from ..modules import (
     Linear,
     Conv,
     MLP,
-    LayerNorm,
 )
 from ..modules.attn import prepare_for_attn
 from ..tokenizer import Tokenizer, MMEmbedding

@@ -3,8 +3,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 from transformers import AutoTokenizer
 from exllamav3.util.progress import ProgressBar
-from exllamav3.util.file import disk_lru_cache, disk_lru_cache_clear
-from exllamav3 import Config, Model, Cache, Tokenizer, model_init, Generator, Job
+from exllamav3.util.file import disk_lru_cache
+from exllamav3 import model_init, Generator, Job
 from datasets import load_dataset
 import torch
 import time

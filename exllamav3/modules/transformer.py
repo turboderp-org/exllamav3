@@ -1,14 +1,11 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-import torch.nn.functional as F
-from torch import nn
 from ..util.tensor import to2
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP
 from ..conversion.allocation import allocate_transformer
 from ..util import profile_opt
-import torch.distributed as dist
 
 class TransformerBlock(Module):
 

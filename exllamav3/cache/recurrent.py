@@ -1,7 +1,5 @@
 from collections import OrderedDict
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
-
 
 class CacheableState(ABC):
     def __init__(self):

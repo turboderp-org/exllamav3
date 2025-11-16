@@ -4,7 +4,7 @@ import time
 import numpy as np
 from .model_tp_cuda import cuda_host_register, cuda_host_unregister, CUDA_HOST_REGISTER_PORTABLE
 from ..ext import exllamav3_ext as ext
-from multiprocessing import shared_memory, Barrier
+from multiprocessing import shared_memory
 from ..util import log_tp
 
 GLOBALS_SIZE = 128*1024

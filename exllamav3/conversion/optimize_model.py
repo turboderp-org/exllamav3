@@ -1,14 +1,9 @@
 import argparse
 import torch
 from .. import Config, Model, Tokenizer
-from ..util.progress import ProgressBar
-from .calibration_data import get_default_calibration
-from ..modules import Linear
 import json
-import torch.nn.functional as F
-import math
 from .compile import compile_model
-from ..loader.safetensors import SafetensorsCollection, VariantSafetensorsCollection
+from ..loader.safetensors import VariantSafetensorsCollection
 
 col_default = "\u001b[0m"
 col_red = "\u001b[31;1m"

@@ -1,8 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-import torch.nn.functional as F
-from torch import nn
 from ..constants import PAGE_SIZE
 from ..model import Model, Config
 from .cache import CacheLayer

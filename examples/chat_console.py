@@ -1,7 +1,6 @@
 import sys, shutil
 
 from rich.prompt import Prompt
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.console import Console
 from prompt_toolkit import prompt as ptk_prompt

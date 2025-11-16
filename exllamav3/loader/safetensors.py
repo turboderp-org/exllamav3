@@ -6,11 +6,9 @@ import torch
 import os, glob
 import numpy as np
 import json
-import mmap
 from ..util import Timer, cuda_sync_active
 from ..ext import exllamav3_ext as ext
 from functools import cached_property
-from fnmatch import fnmatch
 import time
 
 MAX_DEFERRED_LOAD_CHUNK = 2*1024**2

@@ -2,10 +2,9 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
-from exllamav3.util.file import disk_lru_cache, disk_lru_cache_clear
+from exllamav3.util.file import disk_lru_cache
 from exllamav3.util.progress import ProgressBar
-from exllamav3.util.memory import free_mem
-from exllamav3 import Config, Model, Cache, Tokenizer, model_init
+from exllamav3 import model_init
 from datasets import load_dataset
 import torch
 import torch.nn.functional as F

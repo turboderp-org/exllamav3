@@ -9,7 +9,6 @@ from . import Module, Linear
 from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
-import torch.distributed as dist
 from .multilinear import MultiLinear
 from ..util.tensor import g_tensor_cache
 

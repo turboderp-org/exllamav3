@@ -1,6 +1,6 @@
 from __future__ import annotations
 import torch
-import os, json, re
+import os, re
 from tokenizers import Tokenizer as HFTokenizer, models
 from ..util import synchronized
 from ..util.file import maybe_read_json
