@@ -245,6 +245,7 @@ class ParallelDecoderBlock(Module):
             self.mlp.gates if any(isinstance(self.mlp, x) for x in [GatedMLP, BlockSparseMLP]) else None,
             self.mlp.ups if self.mlp else None,
             self.mlp.downs if self.mlp else None,
+            None
         )
 
 
