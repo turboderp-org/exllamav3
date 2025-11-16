@@ -48,6 +48,10 @@ def main(args):
         text_vm_sum = file.read()
     with open(os.path.join(texts_dir, "variable_man_char.txt"), "r") as file:
         text_vm_char = file.read()
+    with open(os.path.join(texts_dir, "human-fulllen-nucleotide.txt"), "r") as file:
+        text_vm_sum = file.read()
+    with open(os.path.join(texts_dir, "simple-life-genome.txt"), "r") as file:
+        text_vm_char = file.read()
 
     # Template
     def make_job(instruction):
