@@ -353,7 +353,7 @@ class Model_TPMixin:
             "cache_seqlens",
             "positions",
             "position_ids",
-            "indexed_embeddings",
+            # "indexed_embeddings",
         ]:
             p = params.get(tensor_param)
             if p is not None:
