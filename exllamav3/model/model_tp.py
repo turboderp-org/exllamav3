@@ -12,6 +12,7 @@ from ..util.misc import Cleanupper
 from .model_tp_fn import *
 import uuid
 from ..util import log_tp, global_t0
+from ..tokenizer.mm_embedding import send_embeddings
 
 cleanupper = Cleanupper()
 
@@ -341,7 +342,6 @@ class Model_TPMixin:
         cleanupper.unregister_atexit(self.destroy_tp_context)
 
 
-
     def prepare_inputs_for_tp(self, x: torch.Tensor, params: dict) -> torch.Tensor:
         self.tp_producer.clear()
         # Use ID of Cache object as reference to avoid having to pickle it
@@ -353,11 +353,15 @@ class Model_TPMixin:
             "cache_seqlens",
             "positions",
             "position_ids",
-            # "indexed_embeddings",
         ]:
             p = params.get(tensor_param)
             if p is not None:
                 params[tensor_param] = self.tp_producer.send(p)
+
+        p = params.get("indexed_embeddings")
+        if p is not None:
+            params["indexed_embeddings"] = send_embeddings(self.tp_producer, p)
+
         return self.tp_producer.send(x)
 
 

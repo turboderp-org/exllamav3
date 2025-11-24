@@ -4,6 +4,7 @@ from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
 from .model_tp_backend import TPBackendNCCL, TPBackendNative
+from ..tokenizer.mm_embedding import recv_embeddings
 from ..util import log_tp, set_t0
 
 def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict, master: bool = False):
@@ -191,11 +192,14 @@ def mp_model_forward(
         "cache_seqlens",
         "positions",
         "position_ids",
-        # "indexed_embeddings",
     ]:
         p = params.get(tensor_param)
         if p is not None:
             params[tensor_param] = consumer.recv(p, cuda = True)
+
+    p = params.get("indexed_embeddings")
+    if p is not None:
+        params["indexed_embeddings"] = recv_embeddings(consumer, p)
 
     params["backend"] = backend
 

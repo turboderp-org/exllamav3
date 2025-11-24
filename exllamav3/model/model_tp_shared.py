@@ -6,6 +6,7 @@ import uuid
 from .model_tp_cuda import cuda_host_register, cuda_host_unregister, CUDA_HOST_REGISTER_PORTABLE
 
 DEFAULT_BUFFER_SIZE = 2 * 1024 ** 3
+MAX_CACHE_PER_PROCESS = 4 * 1024**3
 
 _torch_dtypes = {
     "torch.uint8": torch.uint8,
@@ -37,13 +38,17 @@ class SMProducer:
         # Pre-touch buffer to avoid page faults later
         self.buf[: self.buffer_size: 4096] = 0
 
+        # Cache
+        self.cached_cpu_tensors = {}
+        self.cache_size = 0
+
     def export(self):
         return {
             "shm_name": self.shm_name,
             "buffer_size": self.buffer_size,
         }
 
-    def send(self, tensor: torch.Tensor | None) -> dict:
+    def send(self, tensor: torch.Tensor | None, cache_id: int = None) -> dict:
 
         # None tensor
         if tensor is None:
@@ -74,6 +79,22 @@ class SMProducer:
         dst = np.ndarray((nbytes,), dtype = np.uint8, buffer = self.shm.buf, offset = offset)
         np.copyto(dst, src, casting = "no")
 
+        # Cache
+        if nbytes > MAX_CACHE_PER_PROCESS:
+            cache_id = None
+
+        if cache_id is not None:
+            if cache_id in self.cached_cpu_tensors:
+                # print("sending cache ref:", cache_id)
+                return {
+                    "method": "cached",
+                    "cache_id": cache_id,
+                }
+            while self.cache_size + nbytes > MAX_CACHE_PER_PROCESS:
+                self.cached_cpu_tensors.pop(next(iter(self.cached_cpu_tensors)))
+            self.cached_cpu_tensors[cache_id] = tensor
+            # print("caching send:", cache_id)
+
         # Data is now buffered in shared memory space, store metadata and offset
         return {
             "method": "buffer",
@@ -81,6 +102,7 @@ class SMProducer:
             "nbytes": nbytes,
             "dtype": str(tensor.dtype),
             "shape": tuple(tensor.shape),
+            "cache_id": cache_id
         }
 
     def clear(self):
@@ -142,6 +164,11 @@ class SMConsumer:
                 cuda_host_register(self.arena.data_ptr(), self.arena.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
                 self.producer.buf_is_pinned = True
 
+        # Cache
+        self.cached_cpu_tensors = {}
+        self.cache_size = 0
+
+
     def recv(
         self,
         imp: dict,
@@ -158,6 +185,13 @@ class SMConsumer:
         if imp["method"] == "none_tensor":
             return None
 
+        # Send was cached
+        cache_id = imp["cache_id"]
+        if imp["method"] == "cached":
+            # print("receiving cached:", cache_id)
+            assert not cuda, "Cannot share cached tensor for CUDA"
+            return self.cached_cpu_tensors[imp["cache_id"]]
+
         # Fallback method
         if imp["method"] == "share_memory":
             tensor = imp["shared_tensor"]
@@ -169,6 +203,12 @@ class SMConsumer:
             dtype = _torch_dtypes[imp["dtype"]]
             shape = imp["shape"]
             tensor = self.arena.narrow(0, offset, nbytes).view(dtype).view(shape)
+            if cache_id is not None:
+                # print("caching recv:", cache_id)
+                assert not cuda, "Cannot share cached tensor for CUDA"
+                while self.cache_size + nbytes > MAX_CACHE_PER_PROCESS:
+                    self.cached_cpu_tensors.pop(next(iter(self.cached_cpu_tensors)))
+                self.cached_cpu_tensors[cache_id] = tensor.clone(memory_format = torch.contiguous_format)
 
         # Slice before cloning
         if slice_dim is not None:
@@ -182,7 +222,7 @@ class SMConsumer:
                 copy = True,
                 memory_format = torch.contiguous_format
             )
-        else:
+        elif imp["method"] != "share_memory" or not tensor.is_contiguous():
             tensor = tensor.clone(memory_format = torch.contiguous_format)
 
         return tensor
