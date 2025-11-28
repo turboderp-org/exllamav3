@@ -182,7 +182,7 @@ class SMConsumer:
             torch.cuda.set_device(self.device)
 
         # Get method
-        method = imp["method"]
+        method = imp.get("method")
 
         # Send was None
         if method == "none_tensor":
