@@ -28,12 +28,13 @@ class MMEmbedding:
 
     def __init__(
         self,
-        embeddings: torch.Tensor,
-        token_string: torch.Tensor,
+        embeddings: torch.Tensor | None = None,
+        token_string: torch.Tensor | None = None,
         text_alias: str | None = None,
         deepstack_embeddings: list[torch.Tensor] | None = None,
         grid_thw: tuple | None = None,
-        mrope_merge_size: int | None = None
+        mrope_merge_size: int | None = None,
+        imp: dict | None = None
     ):
         """
         :param embeddings:
@@ -45,6 +46,21 @@ class MMEmbedding:
         :param text_alias:
             Text string to represent this embedding for tokenizing
         """
+
+        if imp:
+            self.metadata = imp["metadata"]
+            self.full_length = imp["full_length"]
+            self.mm_length = imp["mm_length"]
+            self.first_index = imp["first_index"]
+            self.last_index = imp["last_index"]
+            self.text_alias = imp["text_alias"]
+            self.grid_thw = imp["grid_thw"]
+            self.mrope_merge_size = imp["mrope_merge_size"]
+            self.embeddings = imp["embeddings"]
+            self.deepstack_embeddings = imp["deepstack_embeddings"]
+            self.token_string = None
+            self.token_list = None
+            return
 
         global global_allocator
 
@@ -65,8 +81,45 @@ class MMEmbedding:
         self.grid_thw = grid_thw
         self.mrope_merge_size = mrope_merge_size
 
+        # not exported for TP
         r = torch.arange(self.first_index, self.first_index + self.mm_length, dtype = torch.long)
         m = (token_string == -1)
         token_string.masked_scatter_(m, r)
         self.token_string = token_string
         self.token_list = token_string[0].tolist()
+
+
+def send_embeddings(producer, ies: list[MMEmbedding]):
+    return {
+        "method": "list",
+        "data": [
+            {
+                "metadata": ie.metadata,
+                "full_length": ie.full_length,
+                "mm_length": ie.mm_length,
+                "first_index": ie.first_index,
+                "last_index": ie.last_index,
+                "text_alias": ie.text_alias,
+                "grid_thw": ie.grid_thw,
+                "mrope_merge_size": ie.mrope_merge_size,
+                "embeddings": producer.send(ie.embeddings, cache_id = id(ie.embeddings)),
+                "deepstack_embeddings": [
+                    producer.send(dse, cache_id = id(dse))
+                    for dse in ie.deepstack_embeddings
+                ] if ie.deepstack_embeddings is not None else None
+            }
+            for ie in ies
+        ]
+    }
+
+
+def recv_embeddings(consumer, recv) -> list[MMEmbedding]:
+    result = []
+    assert recv.get("method") == "list", "Consumer expected list"
+    for imp in recv["data"]:
+        imp["embeddings"] = consumer.recv(imp["embeddings"])
+        imp["deepstack_embeddings"] = [
+            consumer.recv(dse) for dse in imp["deepstack_embeddings"]
+        ] if imp.get("deepstack_embeddings") else None
+        result.append(MMEmbedding(imp = imp))
+    return result

@@ -2,8 +2,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import torch
 import os
-import torch.nn.functional as F
-from torch import nn
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..model.config import Config

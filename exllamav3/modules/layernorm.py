@@ -5,7 +5,6 @@ import torch.nn.functional as F
 from torch import nn
 from ..model.config import Config
 from . import Module
-from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 
 class LayerNorm(Module):

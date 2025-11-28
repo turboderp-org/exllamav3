@@ -1,8 +1,6 @@
 from __future__ import annotations
-import torch
 import multiprocessing
 from multiprocessing import Process, Pipe
-import torch.distributed as dist
 from ..util import find_free_port
 from .model_tp_alloc import TPAllocator
 import os
@@ -11,11 +9,10 @@ from ..util.memory import touch_device_measure_vram
 from ..util.progress import ProgressBar
 from .config import Config
 from ..util.misc import Cleanupper
-from .model_tp_shared import SMProducer
 from .model_tp_fn import *
-from .model_tp_backend import TPBackend, TPBackendNCCL, TPBackendNative
 import uuid
 from ..util import log_tp, global_t0
+from ..tokenizer.mm_embedding import send_embeddings
 
 cleanupper = Cleanupper()
 
@@ -345,7 +342,6 @@ class Model_TPMixin:
         cleanupper.unregister_atexit(self.destroy_tp_context)
 
 
-
     def prepare_inputs_for_tp(self, x: torch.Tensor, params: dict) -> torch.Tensor:
         self.tp_producer.clear()
         # Use ID of Cache object as reference to avoid having to pickle it
@@ -361,6 +357,11 @@ class Model_TPMixin:
             p = params.get(tensor_param)
             if p is not None:
                 params[tensor_param] = self.tp_producer.send(p)
+
+        p = params.get("indexed_embeddings")
+        if p is not None:
+            params["indexed_embeddings"] = send_embeddings(self.tp_producer, p)
+
         return self.tp_producer.send(x)
 
 

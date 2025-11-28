@@ -1,7 +1,6 @@
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3 import Model, Config, Cache, Tokenizer, Generator, Job, GreedySampler
-from exllamav3.util import Timer
 from common import format_prompt, get_stop_conditions
 
 """

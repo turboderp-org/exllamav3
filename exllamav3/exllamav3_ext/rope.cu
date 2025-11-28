@@ -256,7 +256,7 @@ void rope
     if (inv_freq.dim() > 1)
     {
         TORCH_CHECK(inv_freq.dim() >= 2 || inv_freq.dim() <= 3);
-        TORCH_CHECK_SHAPES(q, 3, inv_freq, -1, 2);
+        // TORCH_CHECK_SHAPES(q, 3, inv_freq, -1, 2);
         inv_freq_table = true;
         inv_freq_stride = inv_freq.size(-1) * inv_freq.size(-2);
     }

@@ -1,7 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-import torch.nn.functional as F
 from torch import nn
 from ..model.config import Config
 from . import Module

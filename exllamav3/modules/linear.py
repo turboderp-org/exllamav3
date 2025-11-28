@@ -2,16 +2,13 @@ from __future__ import annotations
 from functools import cached_property
 from typing_extensions import override
 import torch
-import torch.nn.functional as F
 import numpy as np
-from torch import nn
 from ..model.config import Config
 from . import Module
-from .quant import LinearFP16, LinearFP16_torch, LinearEXL3
+from .quant import LinearFP16, LinearEXL3
 from .quant.exl3_lib import quantize_exl3
 from ..ext import exllamav3_ext as ext
 from ..conversion.allocation import allocate_linear
-from ..util.memory import free_mem
 from ..model.model_tp_alloc import TPAllocation
 
 

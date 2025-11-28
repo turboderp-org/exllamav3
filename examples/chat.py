@@ -52,7 +52,7 @@ def main(args):
         cache = cache,
         tokenizer = tokenizer,
     )
-    stop_conditions = prompt_format.stop_conditions(tokenizer)
+    stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
 
     # Sampler
     sampler = ComboSampler(
@@ -77,6 +77,7 @@ def main(args):
     tt = prompt_format.thinktag()
     banned_strings = [tt[0], tt[1]] if args.no_think else []
     response = ""
+    last_tokens = None
 
     while True:
 
@@ -205,6 +206,14 @@ def main(args):
                             print_error(f"Error loading {c[1]}")
                         continue
 
+                # Print token IDs for last response
+                case "/t":
+                    if last_tokens is None:
+                        print_error(f"Unknown command: {c[0]}")
+                        continue
+                    print_tokens(last_tokens, tokenizer.get_id_to_piece_list())
+                    continue
+
                 case _:
                     print_error(f"Unknown command: {c[0]}")
                     continue
@@ -241,23 +250,37 @@ def main(args):
 
         # Stream response
         ctx_exceeded = False
-        with streamer_cm(args, bot_name, tt[0], tt[1]) as s:
+        with (
+            KeyReader() as keyreader,
+            streamer_cm(args, bot_name, tt[0], tt[1]) as s
+        ):
             if prefix:
                 s.stream(prefix)
             while generator.num_remaining_jobs():
                 for r in generator.iterate():
                     chunk = r.get("text", "")
                     s.stream(chunk)
+                    token_ids = r.get("token_ids")
+                    if token_ids is not None:
+                        ids = torch.cat((ids, token_ids), dim = -1)
                     if r["eos"] and r["eos_reason"] == "max_new_tokens":
                         ctx_exceeded = True
 
-        if ctx_exceeded:
-            print(
-                "\n" + col_error + f" !! Response exceeded {max_response_tokens} tokens "
-                "and was cut short." + col_default
-            )
+                # Check for keypress while streaming
+                keypress = keyreader.getkey()
+                match keypress:
+                    case "\x1b":
+                        print(f"\n\n{col_error} !! Aborted.{col_default}")
+                        generator.cancel(job)
+                        r = None
+                        break
 
-        if show_tps:
+        last_tokens = ids[0].tolist()
+
+        if ctx_exceeded:
+            print(f"\n{col_error} !! Response exceeded {max_response_tokens} tokens and was cut short.{col_default}")
+
+        if show_tps and r:
             prompt_tokens = ids.shape[-1]
             cached_tokens = r["cached_tokens"]
             new_ctx_tokens = prompt_tokens - cached_tokens
@@ -277,18 +300,8 @@ def main(args):
         # Optionally save output
         if args.save:
             sr = response
-            if args.save_svg:
-                import re
-                b = [match.end() for match in re.finditer("</svg>", sr)]
-                if b:
-                    sr = sr[:b[-1]]
-                    a = [match.start() for match in re.finditer("<svg", sr)]
-                    if a:
-                        sr = sr[a[-1]:]
-                    else:
-                        sr = None
-                else:
-                    sr = None
+            if sr and args.save_svg:
+                sr = extract_svg(sr)
                 if sr: print_info(f"Found SVG: {len(sr)} characters")
                 else: print_error(f"No SVG block found")
             if sr:

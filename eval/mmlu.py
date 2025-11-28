@@ -1,14 +1,12 @@
 from __future__ import annotations
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from exllamav3 import model_init
 from exllamav3 import model_init, Generator, Job
-import argparse, contextlib
+import argparse
 import torch
-import util
 import random, math
 from datasets import load_dataset
-from exllamav3.util.file import disk_lru_cache, disk_lru_cache_clear
+from exllamav3.util.file import disk_lru_cache
 from exllamav3.util.progress import ProgressBar
 
 @disk_lru_cache("get_dataset_mmlu")

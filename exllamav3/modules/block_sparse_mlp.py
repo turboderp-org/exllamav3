@@ -2,19 +2,15 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
-from torch import nn
 from ..model.config import Config
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
-from ..constants import MAX_MLP_INTERMEDIATE
-from ..util import first_not_none
-from ..util import profile_opt
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
 from ..model.model_tp_alloc import TPAllocation
-import torch.distributed as dist
+from ..util import profile_opt
 
 
 @dataclass

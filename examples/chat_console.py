@@ -1,11 +1,11 @@
 import sys, shutil
 
 from rich.prompt import Prompt
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.console import Console
 from prompt_toolkit import prompt as ptk_prompt
 from prompt_toolkit.formatted_text import ANSI
+import time, os
 
 # ANSI codes
 ESC = "\u001b"
@@ -181,3 +181,99 @@ class Streamer_rich:
                 formatted_text = formatted_text.replace(self.think_tag, f"`{self.think_tag}`")
                 formatted_text = formatted_text.replace(self.end_think_tag, f"`{self.end_think_tag}`")
             self.live.update(formatted_text)
+
+class KeyReader:
+    """
+    Cross-platform, non-blocking key reader.
+    Usage:
+        with KeyReader() as keys:
+            k = keys.getkey()        # non-blocking (returns None if no key)
+            k = keys.getkey(timeout) # wait up to `timeout` seconds
+    """
+    def __init__(self):
+        self._platform = 'nt' if os.name == 'nt' else 'posix'
+        self._entered = False
+        # POSIX fields
+        self._old_termios = None
+        self.disabled = False
+
+    def __enter__(self):
+        try:
+            if self._platform == 'posix':
+                import termios, tty
+                self._termios = termios
+                self._tty = tty
+                self._fd = sys.stdin.fileno()
+                self._old_termios = self._termios.tcgetattr(self._fd)
+                # cbreak mode lets us read single characters without Enter
+                self._tty.setcbreak(self._fd)
+            self._entered = True
+            return self
+        except termios.error:
+            self.disabled = True
+            return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.disabled and self._platform == 'posix' and self._old_termios:
+            self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old_termios)
+        self._entered = False
+
+    def getkey(self, timeout=0.0):
+        """
+        Returns a single-character string if a key is pressed, or None.
+        `timeout` is seconds to wait (float). 0.0 => non-blocking poll.
+        """
+        if self.disabled:
+            return None
+
+        if not self._entered:
+            raise RuntimeError("Use KeyReader as a context manager")
+
+        if self._platform == 'nt':
+            import msvcrt
+            # busy-wait with tiny sleeps if a timeout is requested
+            end = None if timeout is None else (time.time() + timeout)
+            while True:
+                if msvcrt.kbhit():
+                    b = msvcrt.getch()
+                    # Handle special keys (arrows, function keys) which come as a prefix + code
+                    if b in (b'\x00', b'\xe0'):  # special prefix
+                        _ = msvcrt.getch()       # consume the second byte
+                        return None              # ignore special keys for simplicity
+                    try:
+                        return b.decode('utf-8', errors='ignore').lower()
+                    except Exception:
+                        return None
+                if timeout == 0.0:
+                    return None
+                if end is not None and time.time() >= end:
+                    return None
+                time.sleep(0.005)
+        else:
+            import select
+            r, _, _ = select.select([sys.stdin], [], [], timeout)
+            if r:
+                try:
+                    ch = sys.stdin.read(1)
+                except (IOError, OSError):
+                    return None
+                return (ch or "").lower() or None
+            return None
+
+def print_tokens(
+    ids: list,
+    vocab: list,
+    ids_per_line = 10,
+):
+    print()
+    line = ""
+    for pos in range(len(ids)):
+        t = ids[pos]
+        p = repr(vocab[t])[1:-1].replace(" ", "␣")
+        line += f"{col_user}{t:6}{col_default} "
+        line += f"{p:10} " if len(p) <= 10 else f"{p[:9]}… "
+        if (pos + 1) % ids_per_line == 0 or pos == len(ids) - 1:
+            line = line.replace("␣", f"{col_bot}␣{col_default}").replace("…", f"{col_error}…{col_default}")
+            ppos = pos // ids_per_line * ids_per_line
+            print(f"{col_info}{ppos:6} {col_default}: {line}")
+            line = ""

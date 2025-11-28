@@ -3,8 +3,8 @@ import torch
 from ...model.config import Config
 from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n
 from ...ext import exllamav3_ext as ext
-from ...util import profile_opt
 from ...util.tensor import g_tensor_cache
+from ...util import profile_opt
 
 class LinearEXL3:
 

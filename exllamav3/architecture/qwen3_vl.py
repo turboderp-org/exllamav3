@@ -2,21 +2,16 @@ from __future__ import annotations
 from typing_extensions import override
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from ..model.config import Config, no_default
+from ..model.config import Config
 from ..model.model import Model
-from ..util.rope import RopeStyle, position_embedding_grid_2d, RopeSettings, RoPE
+from ..util.rope import RopeStyle, position_embedding_grid_2d, RopeSettings
 from ..util.vision import convert_to_rgb, normalize_image, smart_resize
-from ..modules.attn import prepare_for_attn
-from ..util.file import read_dict, no_value, no_default
+from ..util.file import read_dict,  no_default
 from ..modules import (
     Module,
-    RMSNorm,
-    Embedding,
     TransformerBlock,
     Attention,
-    GatedMLP,
     Linear,
     Conv,
     MLP,
@@ -24,11 +19,15 @@ from ..modules import (
     Qwen3VLPosEmbedding
 )
 from .qwen3 import Qwen3Model
-from ..modules.attn import prepare_for_attn
 from ..tokenizer import Tokenizer, MMEmbedding
 from types import SimpleNamespace
 from PIL import Image
 import os, json
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .qwen3_vl_moe import Qwen3VLMoeConfig
+
 
 class Qwen3VLConfig(Config):
     arch_string = "Qwen3VLForConditionalGeneration"
@@ -122,7 +121,6 @@ def read_qwen3_vl_pp_config(config_dict: dict):
             ("image_mean", list),
             ("image_std", list),
             ("image_processor_type", str),
-            ("size", dict),
         ]
     })
     pp.resample = 3
@@ -252,7 +250,7 @@ class Qwen3VLVisionModel(Model):
 
     def __init__(
         self,
-        config: Qwen3VLConfig,
+        config: Qwen3VLConfig | Qwen3VLMoeConfig,
         key_prefix = "model.visual",
         **kwargs
     ):
@@ -441,7 +439,6 @@ class Qwen3VLVisionModel(Model):
 
 
     def default_load_shape_dtype(self, chunk_size):
-        # TODO: Sane load shape (?)
         return (
             (
                 1,
@@ -478,10 +475,11 @@ class Qwen3VLVisionModel(Model):
             image_tensor = image_tensor.unsqueeze(0)
             return_batch = False
 
+        inv_freq = position_embedding_grid_2d(grid_thw, v.head_dim, v.spatial_merge_size, v.rope_theta)
         params = {
             "causal": False,
             "grid_thw": torch.tensor([grid_thw], dtype = torch.int),
-            "inv_freq": position_embedding_grid_2d(grid_thw, v.head_dim, v.spatial_merge_size, v.rope_theta)
+            "inv_freq": inv_freq
         }
 
         embedding_tensor = self.forward(

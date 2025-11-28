@@ -2,7 +2,6 @@ from __future__ import annotations
 from typing_extensions import override
 from . import Module
 import torch
-import torch.distributed as dist
 
 class OutputGather(Module):
     def __init__(

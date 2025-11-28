@@ -2,20 +2,17 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
-from exllamav3.util.file import disk_lru_cache, disk_lru_cache_clear
+from exllamav3.util.file import disk_lru_cache
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.memory import free_mem
-from exllamav3 import Config, Model, Cache, Tokenizer, model_init
+from exllamav3 import Config, Model, Tokenizer
 from exllamav3.ext import exllamav3_ext as ext
 from datasets import load_dataset
 from exllamav3.modules import Linear
-from exllamav3.modules.quant import LinearFP16, LinearEXL3
 from exllamav3.modules.quant.exl3_lib.quantize import regularize
 import torch
 import torch.nn.functional as F
 import math
-import numpy as np
-import termplotlib as tpl
 
 # ANSI codes
 ESC = "\u001b"

@@ -1,33 +1,7 @@
 from __future__ import annotations
-from typing_extensions import override
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from ..model.config import Config, no_default
-from ..model.model import Model
-from ..util.rope import RopeStyle, position_embedding_grid_2d, RopeSettings, RoPE
-from ..util.vision import convert_to_rgb, normalize_image, smart_resize
-from ..modules.attn import prepare_for_attn
-from ..util.file import read_dict, no_value, no_default
-from ..modules import (
-    Module,
-    RMSNorm,
-    Embedding,
-    TransformerBlock,
-    Attention,
-    GatedMLP,
-    Linear,
-    Conv,
-    MLP,
-    LayerNorm,
-    Qwen3VLPosEmbedding
-)
+from ..util.rope import RopeStyle
 from .qwen3_moe import Qwen3MoeModel
-from ..modules.attn import prepare_for_attn
-from ..tokenizer import Tokenizer, MMEmbedding
-from types import SimpleNamespace
-from PIL import Image
 import os, json
 from .qwen3_vl import read_qwen3_vl_vision_config, read_qwen3_vl_pp_config, Qwen3VLVisionModel
 

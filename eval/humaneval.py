@@ -3,7 +3,7 @@ import os, sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3 import model_init, Generator, Job, ComboSampler
 from exllamav3.util.progress import ProgressBar
-import argparse, contextlib, subprocess
+import argparse, subprocess
 from human_eval.data import write_jsonl, read_problems
 from pathlib import Path
 
