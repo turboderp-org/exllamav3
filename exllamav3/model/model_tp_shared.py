@@ -189,7 +189,7 @@ class SMConsumer:
             return None
 
         # Send was cached
-        cache_id = imp.get("cache_id", None)  # Always initialize
+        cache_id = imp.get("cache_id")  # Always initialize
         if method == "cached":
             # print("receiving cached:", cache_id)
             assert not cuda, "Cannot share cached tensor for CUDA"
