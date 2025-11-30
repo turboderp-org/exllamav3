@@ -181,19 +181,22 @@ class SMConsumer:
         if cuda:
             torch.cuda.set_device(self.device)
 
+        # Get method
+        method = imp.get("method")
+
         # Send was None
-        if imp["method"] == "none_tensor":
+        if method == "none_tensor":
             return None
 
         # Send was cached
-        cache_id = imp["cache_id"]
-        if imp["method"] == "cached":
+        cache_id = imp.get("cache_id")  # Always initialize
+        if method == "cached":
             # print("receiving cached:", cache_id)
             assert not cuda, "Cannot share cached tensor for CUDA"
-            return self.cached_cpu_tensors[imp["cache_id"]]
+            return self.cached_cpu_tensors[cache_id]
 
         # Fallback method
-        if imp["method"] == "share_memory":
+        if method == "share_memory":
             tensor = imp["shared_tensor"]
 
         # Construct Torch tensor in shared memory
