@@ -205,6 +205,33 @@ class PromptFormat_mistral(PromptFormat):
         ]
 
 
+class PromptFormat_mistral3(PromptFormat):
+    description = "Mistral3/Ministral-instruct models"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            """You are a helpful AI assistant."""
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = f"[SYSTEM_PROMPT]{system_prompt}[/SYSTEM_PROMPT]"
+        for (u, a) in messages:
+            context += f"[INST]{u}[/INST]"
+            if a is not None: context += f"{a}"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id
+        ]
+
+
 class PromptFormat_gemma(PromptFormat):
     description = "Gemma"
 
@@ -704,6 +731,7 @@ prompt_formats = {
     "chatml": PromptFormat_chatml,
     "phi": PromptFormat_phi,
     "mistral": PromptFormat_mistral,
+    "mistral3": PromptFormat_mistral3,
     "gemma": PromptFormat_gemma,
     "glm": PromptFormat_glm,
     "reka": PromptFormat_reka,
