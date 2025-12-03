@@ -367,7 +367,7 @@ class SafetensorsCollection:
                     if tensor.dtype == torch.float and float2half:
                         tensor = tensor.to(torch.float16)
                     if transpose:
-                        tensor = tensor.T
+                        tensor = tensor.T if len(tensor.shape) > 0 else tensor
                     if pad_to is not None:
                         padded = torch.zeros(pad_to, dtype = tensor.dtype, device = tensor.device)
                         padded[tuple(slice(0, s) for s in tensor.shape)].copy_(tensor)
