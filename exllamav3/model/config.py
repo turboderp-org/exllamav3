@@ -158,8 +158,8 @@ class Config(ABC):
 
         return RopeSettings(
             head_dim = self.head_dim,
-            rope_theta = read_dict(config_dict, float, "rope_theta", default_rope_theta),
-            rope_scaling = read_dict(config_dict, dict, "rope_scaling", None),
+            rope_theta = read_dict(config_dict, float, ["rope_theta", "rope_parameters->rope_theta"], default_rope_theta),
+            rope_scaling = read_dict(config_dict, dict, ["rope_scaling", "rope_parameters"], None),
             rotary_dim = read_dict(config_dict, int, "rotary_dim", None),
             partial_rotary_factor = read_dict(config_dict, float, "partial_rotary_factor", default_partial_rotary_factor),
             max_position_embeddings = read_dict(config_dict, int, "max_position_embeddings", None),
