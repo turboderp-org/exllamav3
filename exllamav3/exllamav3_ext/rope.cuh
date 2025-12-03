@@ -17,7 +17,9 @@ void rope
     const c10::optional<at::Tensor>& q_norm,
     const c10::optional<at::Tensor>& k_norm,
     float norm_eps,
-    float norm_constant_bias
+    float norm_constant_bias,
+    float llama_4_scaling_beta,
+    int llama_4_scaling_original
 );
 
 int64_t gen_mrope_pos_ids

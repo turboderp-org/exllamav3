@@ -30,13 +30,15 @@ void rope_kernel
     const int position,
     const uint32_t* __restrict__ positions,
     const uint32_t* __restrict__ position_ids,
-    const float attn_factor,
+    float attn_factor,
     const half* __restrict__ q_norm,
     const half* __restrict__ k_norm,
     const float norm_eps,
     const float norm_constant_bias,
     const bool inv_freq_table,
-    const int inv_freq_stride
+    const int inv_freq_stride,
+    const float llama_4_scaling_beta,
+    const int llama_4_scaling_original
 )
 {
     // Get position
@@ -47,6 +49,13 @@ void rope_kernel
         pos = token_pos + positions[batch];
     else if (position_ids)
         pos = position_ids[batch * seq_len + token_pos];
+
+    // Apply Llama 4 scaling
+    if (llama_4_scaling_beta > 0.0f)
+    {
+        float scaling = 1.0f + llama_4_scaling_beta * __logf(1.0f + (float)(pos / llama_4_scaling_original));
+        attn_factor *= scaling;
+    }
 
     // Load inv_freq, compute sin/cos
     int t = threadIdx.x;
@@ -219,7 +228,9 @@ void rope
     const c10::optional<at::Tensor>& q_norm,
     const c10::optional<at::Tensor>& k_norm,
     float norm_eps,
-    float norm_constant_bias
+    float norm_constant_bias,
+    float llama_4_scaling_beta,
+    int llama_4_scaling_original
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(q.device());
@@ -298,7 +309,8 @@ void rope
 
     #define ARGS q_ptr, out_q_ptr, k_ptr, out_k_ptr, inv_freq_ptr, bsz, seq_len, num_heads_q, num_heads_k, \
                  head_dim, partial_head_dim, position, positions_ptr, position_ids_ptr, attn_factor, \
-                 q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table, inv_freq_stride
+                 q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table, inv_freq_stride, \
+                 llama_4_scaling_beta, llama_4_scaling_original
 
     if      (rope_mode == ROPESTYLE_GPTJ) rope_kernel<ROPESTYLE_GPTJ><<<blocks, threads, 0, stream>>>(ARGS);
     else if (rope_mode == ROPESTYLE_NEOX) rope_kernel<ROPESTYLE_NEOX><<<blocks, threads, 0, stream>>>(ARGS);
