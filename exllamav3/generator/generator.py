@@ -512,7 +512,7 @@ class Generator:
                     job.logit_masks.append(f.get_next_logit_mask())
 
         # Prepare past IDs (for sequences that need them for repetition penalty etc.) and logit masks where needed
-        for job in self.active_jobs:
+        for job in batch_jobs:
             job.prepare_logit_mask()
             job.prepare_sampling_past_ids()
 
