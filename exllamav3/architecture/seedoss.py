@@ -2,7 +2,6 @@ from typing_extensions import override
 from .llama import LlamaConfig, LlamaModel
 
 # Seed-OSS appears identical to Qwen2.5/Llama/etc.
-# TODO: Verify that the implementation is correct once Transformers support is merged
 
 class SeedOssConfig(LlamaConfig):
     arch_string = "SeedOssForCausalLM"

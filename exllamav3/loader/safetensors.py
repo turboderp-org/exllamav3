@@ -160,7 +160,7 @@ class SafetensorsCollection:
         self,
         prefix: str,
     ):
-        assert self.new_tensors is None  # TODO
+        assert self.new_tensors is None
         keys = [self.tensor_file_map.get(prefix)]
         if keys[0] is None:
             keys = []
@@ -174,7 +174,7 @@ class SafetensorsCollection:
         key: str,
         optional: bool = False
     ):
-        assert self.new_tensors is None  # TODO
+        assert self.new_tensors is None
         if not key in self.tensor_file_map:
             if not optional:
                 raise ValueError(f"Required tensor {key} not found in any *.safetensors file in {self.directory}")
@@ -205,7 +205,7 @@ class SafetensorsCollection:
         prefix: str,
         only_serializable: bool = False
     ) -> dict:
-        assert self.new_tensors is None  # TODO
+        assert self.new_tensors is None
         keys = [self.tensor_file_map.get(prefix)]
         if keys[0] is None:
             keys = []
@@ -233,7 +233,7 @@ class SafetensorsCollection:
         device: torch.device | None = None,
         allow_bf16: bool = False,
     ) -> dict:
-        assert self.new_tensors is None  # TODO
+        assert self.new_tensors is None
         keys = [self.tensor_file_map.get(prefix)]
         if keys[0] is None:
             keys = []
