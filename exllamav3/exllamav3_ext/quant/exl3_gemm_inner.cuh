@@ -286,12 +286,19 @@ void exl3_gemm_kernel_inner
         auto store = [&] (int i, int m, int n)
         {
             // TODO: Shuffle to avoid bank conflicts here? Doesn't seem to be a bottleneck
-            // TODO: Always accumulates entire C fragment, could be limited when size_m < 16
             if (sub_k == i)
             {
                 float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
-                for (int i = 0; i < 4; ++i)
-                    *sh_red++ = frag_c[m][n][i];
+                if (size_m <= 8)
+                {
+                    #pragma unroll
+                    for (int i = 0; i < 2; ++i) *sh_red++ = frag_c[m][n][i];
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) *sh_red++ = frag_c[m][n][i];
+                }
             }
             __syncthreads();
         };
@@ -301,35 +308,47 @@ void exl3_gemm_kernel_inner
             if (sub_k == i)
             {
                 float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
-                for (int i = 0; i < 4; ++i)
-                    frag_c[m][n][i] += *sh_red++;
+                if (size_m <= 8)
+                {
+                    #pragma unroll
+                    for (int i = 0; i < 2; ++i) frag_c[m][n][i] += *sh_red++;
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) frag_c[m][n][i] += *sh_red++;
+                }
             }
             __syncthreads();
         };
 
+        #pragma unroll
         for (int m = 0; m < FRAGS_M; ++m)
-        for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
         {
-            if constexpr (TILEBLOCKS_K == 2)
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             {
-                store(1, m, n);
-                add(0, m, n);
-            }
-            if constexpr (TILEBLOCKS_K == 3)
-            {
-                store(1, m, n);
-                add(0, m, n);
-                store(2, m, n);
-                add(0, m, n);
-            }
-            if constexpr (TILEBLOCKS_K == 4)
-            {
-                store(3, m, n);
-                add(2, m, n);
-                store(1, m, n);
-                add(0, m, n);
-                store(2, m, n);
-                add(0, m, n);
+                if constexpr (TILEBLOCKS_K == 2)
+                {
+                    store(1, m, n);
+                    add(0, m, n);
+                }
+                if constexpr (TILEBLOCKS_K == 3)
+                {
+                    store(1, m, n);
+                    add(0, m, n);
+                    store(2, m, n);
+                    add(0, m, n);
+                }
+                if constexpr (TILEBLOCKS_K == 4)
+                {
+                    store(3, m, n);
+                    add(2, m, n);
+                    store(1, m, n);
+                    add(0, m, n);
+                    store(2, m, n);
+                    add(0, m, n);
+                }
             }
         }
     };
