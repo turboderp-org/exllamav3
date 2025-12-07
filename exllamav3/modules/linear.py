@@ -94,10 +94,11 @@ class Linear(Module):
     def apply_fp8_scales_(self, weight: torch.Tensor, scale_inv: torch.Tensor):
         ws = weight.shape
         ss = scale_inv.shape
-        assert len(ws) == len(ss) == 2
-        assert all(w == s * 128 for w, s in zip(ws, ss))
-        weight = weight.view(ss[0], 128, ss[1], 128)
-        scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
+        if len(ss) > 0:
+            assert len(ws) == len(ss) == 2
+            assert all(w == s * 128 for w, s in zip(ws, ss))
+            weight = weight.view(ss[0], 128, ss[1], 128)
+            scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
         weight = weight.float() * scale_inv
         return weight.view(ws).half()
 

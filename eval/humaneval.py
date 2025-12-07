@@ -114,7 +114,7 @@ def main(args):
     generator = Generator(
         model = model,
         cache = cache,
-        max_batch_size = 256,
+        max_batch_size = args.max_batch_size,
         tokenizer = tokenizer
     )
     sampler = ComboSampler(
@@ -214,6 +214,7 @@ if __name__ == "__main__":
     parser.add_argument("-topk", "--top_k", type = int, help = "Top-k sampling, default: 0 (disabled)", default = 0)
     parser.add_argument("-topp", "--top_p", type = float, help = "Top-p sampling, default: 0.6", default = 0.6)
     parser.add_argument("-templast", "--temp_last", action = "store_true", help = "Use temperature last")
-    parser.add_argument("--max_tokens", type = int, default = 768, help = "Max number of tokens for each completion")
+    parser.add_argument("--max_tokens", type = int, default = 1024, help = "Max number of tokens for each completion")
+    parser.add_argument("-mbs", "--max_batch_size", type = int, default = 256, help = "Max batch size")
     _args = parser.parse_args()
     main(_args)

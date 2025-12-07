@@ -105,7 +105,8 @@ __global__ void routing_ds3_nogroup_kernel
     int t = threadIdx.x;
     int lane_id = t % 32;
     int warp_id = t / 32;
-    int num_warps = num_experts / 32;
+    int num_warps = CEIL_DIVIDE(num_experts, 32);
+    bool mask = t < num_experts;
 
     scores += num_experts * row;
     topk_indices += K * row;
@@ -119,16 +120,15 @@ __global__ void routing_ds3_nogroup_kernel
     int* perm = reinterpret_cast<int*>(sh_idx + K_ * num_warps);
     float* reduce = reinterpret_cast<float*>(perm + 32 * num_warps);
 
-    // Input sigmoid and optional bias
+    // Input sigmoid
+    int idx = mask ? t : -1;  // output index
+    float v = mask ? sigmoid_stable_hf(__half2float(scores[t])) : 0.0f;  // sort key
+    float o = v;  // output weight
 
-    int idx = t;  // output index
-    float v = sigmoid_stable_hf(__half2float(scores[t]));  // sort key
-    float o = v ;  // output weight
-
-    // Add bias
+    // Add bias and shift sigmoid(logits) to be non-negative before radix sort
     if (bias)
     {
-        v += __half2float(bias[t]);
+        v += mask ? __half2float(bias[t]) : 1e30;
 
         float minv = v;
         for (int offset = 32 >> 1; offset > 0; offset >>= 1)
@@ -150,10 +150,10 @@ __global__ void routing_ds3_nogroup_kernel
         __syncthreads();
 
         v -= reduce[0];
+        if (!mask) v = 0.0f;
     }
 
     // Sort by v
-
     warp_radixsort_posf32_pl(v, o, idx, perm + warp_id * 32);
 
     while (num_warps > 1)
@@ -172,7 +172,7 @@ __global__ void routing_ds3_nogroup_kernel
 
         if (warp_id < num_warps)
         {
-            if (t < num_experts_k)
+            if (t < num_experts_k && mask)
             {
                 v = sh_v[t];
                 o = sh_o[t];
@@ -190,7 +190,6 @@ __global__ void routing_ds3_nogroup_kernel
     }
 
     // Normalize output in warp 0 lanes 32-K .. K, store result
-
     if (warp_id == 0)
     {
         float sum = warp_reduce_sum_last_k(o, K) + 1e-20;
@@ -344,7 +343,6 @@ void routing_ds3_nogroup
     int K = topk_indices.size(1);
 
     TORCH_CHECK(num_experts <= MAX_NUM_EXPERTS, "Too many experts");
-    TORCH_CHECK(num_experts % 32 == 0, "num_experts must be a multiple of 32");
     TORCH_CHECK(K <= MAX_K, "Too many experts per token");
 
     int num_warps = CEIL_DIVIDE(num_experts, 32);

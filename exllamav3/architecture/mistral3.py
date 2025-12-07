@@ -98,8 +98,14 @@ class Mistral3Config(Config):
 
         # Vision preprocessor
         prep_path = os.path.join(self.directory, "preprocessor_config.json")
-        with open(prep_path, encoding = "utf8") as f:
+        if os.path.exists(prep_path):
+            with open(prep_path, encoding = "utf8") as f:
                 read_prep_config = json.load(f)
+        else:
+            prep_path = os.path.join(self.directory, "processor_config.json")
+            with open(prep_path, encoding = "utf8") as f:
+                read_prep_config = json.load(f)
+                read_prep_config = read_prep_config["image_processor"]
         image_processor_type = read_dict(read_prep_config, str, ["image_processor_type"], no_default)
         assert image_processor_type in ["PixtralImageProcessor", "PixtralImageProcessorFast"], \
             f"Wrong image processor type: {image_processor_type}"

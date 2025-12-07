@@ -1,7 +1,7 @@
 from typing_extensions import override
 from .llama import LlamaConfig, LlamaModel
 
-# Identical to Llama except for MTP layers, ignored for now (TODO:)
+# Identical to Llama except for MTP layers, ignored for now
 
 class MiMoConfig(LlamaConfig):
     arch_string = "MiMoForCausalLM"

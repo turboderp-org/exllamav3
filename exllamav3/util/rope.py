@@ -24,7 +24,7 @@ class RopeSettings:
     original_max_position_embeddings: int | None = None
     rope_style: RopeStyle = RopeStyle.NEOX
     override_max_position_embeddings: int | None = None
-
+    llama_4_scaling_beta: float = 0.0
 
 def _rotate_half_neox(x):
     x1 = x[..., : x.shape[-1] // 2]
@@ -84,6 +84,9 @@ class RoPE:
 
         self.mrope_interleaved = None
         self.mrope_section = None
+
+        self.llama_4_scaling_beta = 0.0
+        self.llama_4_scaling_original = 1  # Unused when beta=0
 
         t = None
         rs = self.rope_settings
@@ -158,6 +161,8 @@ class RoPE:
         attn_factor = rs.rope_scaling.get("attention_factor", 0.1 * math.log(factor) + 1.0)
         beta_fast = rs.rope_scaling.get("beta_fast", 32)
         beta_slow = rs.rope_scaling.get("beta_slow", 1)
+        self.llama_4_scaling_beta = rs.rope_scaling.get("llama_4_scaling_beta", 0.0)
+        self.llama_4_scaling_original = original_max_position_embeddings
         def find_correction_dim(_num_rotations, _dim, _base, _max_position_embeddings):
             return (_dim * math.log(_max_position_embeddings / (_num_rotations * 2 * math.pi))) / (2 * math.log(_base))
         def find_correction_range(_low_rot, _high_rot, _dim, _base, _max_position_embeddings):
@@ -379,7 +384,9 @@ class RoPE:
             q_norm,
             k_norm,
             norm_eps,
-            norm_constant_bias
+            norm_constant_bias,
+            self.llama_4_scaling_beta,
+            self.llama_4_scaling_original,
         )
             
         if squeeze:
