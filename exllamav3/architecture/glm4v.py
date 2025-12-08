@@ -105,8 +105,9 @@ def read_glm4v_vision_config(config_dict: dict):
     v.num_channels = 3
     v.head_dim = v.hidden_size // v.num_heads
     v.rope_theta = 10000.0
-    assert v.model_type in ["glm4v", "glm4v_moe"], \
-        "Expected vision_config->model_type to be 'glm4v' or 'glm4v_moe'"
+    assert v.model_type in ["glm4v", "glm4v_moe", "glm4v_moe_vision", "glm4v_vision"], \
+        "Expected vision_config->model_type to be 'glm4v', 'glm4v_moe', 'glm4v_vision'" \
+        "or 'glm4v_moe_vision'"
     return v
 
 
@@ -127,8 +128,9 @@ def read_glm4v_pp_config(config_dict: dict):
     pp.rescale_factor = 1 / 255
     pp.min_pixels = pp.size["shortest_edge"]  # Mislabeled in preprocessor_config
     pp.max_pixels = pp.size["longest_edge"]
-    assert pp.image_processor_type == "Glm4vImageProcessor", \
-        "Expected image_processor_type to be 'Glm4vImageProcessor'"
+    assert pp.image_processor_type in ["Glm4vImageProcessor", "Glm46VImageProcessor"], \
+        f"Expected image_processor_type to be 'Glm4vImageProcessor' or 'Glm46VImageProcessor'," \
+        f"got: {pp.image_processor_type}"
     return pp
 
 
