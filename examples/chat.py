@@ -53,6 +53,7 @@ def main(args):
         tokenizer = tokenizer,
     )
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
+    stop_conditions += config.eos_token_id_list
 
     # Sampler
     sampler = ComboSampler(
