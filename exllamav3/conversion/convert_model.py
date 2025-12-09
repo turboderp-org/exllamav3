@@ -222,6 +222,8 @@ def get_base_model(args):
     tokenizer = Tokenizer.from_config(config)
     print(f" -- Loaded tokenizer")
     print(f"    Vocab size: {tokenizer.actual_vocab_size}")
+    if hasattr(config, "rope_settings"):
+        config.rope_settings.print()
     return config, model, tokenizer
 
 
