@@ -25,6 +25,9 @@ from ..modules.attn import prepare_for_attn
 from ..tokenizer import Tokenizer, MMEmbedding
 from types import SimpleNamespace
 from PIL import Image
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .ministral3 import Ministral3Config
 
 class Mistral3Config(Config):
     arch_string = "Mistral3ForConditionalGeneration"
@@ -126,7 +129,7 @@ class Mistral3Model(Model):
 
     def __init__(
         self,
-        config: Mistral3Config,
+        config: Mistral3Config | Ministral3Config,
         key_prefix = "language_model.",
         **kwargs
     ):
