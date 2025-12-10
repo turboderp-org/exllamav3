@@ -366,7 +366,7 @@ def main(args, job_state):
                         rs = module.forward(rs, params)
                         if i < num_ref_states:
                             if model.calibration_all_experts:
-                                # Reference state for measuring error need, with only selected experts
+                                # Do not activate all experts for reference state, for error measurement
                                 params = { "attn_mode": "flash_attn_nc" }
                                 if slicing:
                                     params["q_mlp_slice"] = current_slice
@@ -377,7 +377,7 @@ def main(args, job_state):
                 print(f" -- Captured: {module.key}" + slice_str)
                 sys.stdout.flush()
 
-                # Swap captured H to system RAM
+                # Check for infs or NaNs in H
                 for k, v in capture_H.items():
                     infs, nans = v["inf_nan"][0].item(), v["inf_nan"][1].item()
                     if infs or nans:
