@@ -46,22 +46,27 @@ jobs:
         # Python 3.10
           - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
           - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.11
           - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
           - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.12
           - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
           - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.13
           - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
           - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # sdist
           - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.7.0', cudaarch: ''                              }
           - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.8.0', cudaarch: ''                              }
+          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.9.0', cudaarch: ''                              }
 
       fail-fast: false
 
