@@ -26,6 +26,18 @@ class RopeSettings:
     override_max_position_embeddings: int | None = None
     llama_4_scaling_beta: float = 0.0
 
+    def print(self):
+        print(f" -- RoPE settings")
+        print(f"    head_dim: {self.head_dim}")
+        print(f"    rope_scaling: {self.rope_scaling}")
+        print(f"    rope_theta: {self.rope_theta}")
+        print(f"    rotary_dim: {self.rotary_dim}")
+        print(f"    partial_rotary_factor: {self.partial_rotary_factor}")
+        print(f"    max_position_embeddings: {self.max_position_embeddings}")
+        print(f"    original_max_position_embeddings: {self.original_max_position_embeddings}")
+        print(f"    rope_style: {self.rope_style.name}")
+        print(f"    llama_4_scaling_beta: {self.llama_4_scaling_beta}")
+
 def _rotate_half_neox(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
