@@ -130,6 +130,10 @@ def prepare(args) -> (dict, dict, bool, str):
         return None, None, False, "Must specify --out_dir or --resume"
     if args.codebook not in ["mcg", "mul1", "3inst"]:
         return None, None, False, "Codebook must be 'mcg', 'mul1' or '3inst'"
+    if args.bits is not None and (args.bits > 8 or args.bits < 1):
+        return None, None, False, "--bits must be between 1 and 8"
+    if args.head_bits is not None and (args.head_bits > 8 or args.head_bits < 1) and args.head_bits != 16:
+        return None, None, False, "--head_bits must be between 1 and 8, or 16"
 
     in_args = { "work_dir": args.work_dir }
     if args.resume:
@@ -412,7 +416,7 @@ def main(args, job_state):
             # Decide mode
             # TODO: Might be useful to compare no. h-tiles per tensor, no. layers and no. SMs across GPUs
             use_parallel_mode = False
-            if args["parallel_mode"] and len(linears) >= len(devices):
+            if args["parallel_mode"] and len(linears) >= len(devices) and all(b <= 8 for _, b in strategy.items()):
                 use_parallel_mode = True
 
             # Quantize module, layer parallel
@@ -506,39 +510,46 @@ def main(args, job_state):
             # Quantize module, single GPU or tensor split
             else:
                 for linear in linears:
-                    quant_args = {
-                        "seed": idx,
-                        "K": strategy[linear.key],
-                        "devices": devices,
-                        "device_ratios": device_ratios,
-                        "apply_out_scales": args["apply_out_scales"],
-                    }
-                    if args["codebook"] == "mcg": quant_args.update({ "mcg": True })
-                    elif args["codebook"] == "mul1": quant_args.update({ "mul1": True })
-
-                    with Timer() as t:
-                        sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
-                            if args["image_dump"] else None
-                        proxy_err = linear.convert_exl3(
-                            capture_H[linear.qmap],
-                            quant_args = quant_args,
-                            progress_str = f" -- <step>: {linear.key}",
-                            verbose = args["verbose"],
-                            save_reg = sr,
+                    if strategy[linear.key] == 16:
+                        print(
+                            f" -- Unquantized: {linear.key:{config.stc.max_key_len() + 6}}"
+                            f"  bpw: {16:5.2f}"
                         )
-                        assert isinstance(linear.inner, LinearEXL3)
-                        linear.inner.swap_cpu()
-                    flags = "o" if quant_args["apply_out_scales"] else "."
-                    proxy_err_str = f"{proxy_err:8.6f}" if proxy_err >= 0.0 else "(OoM)   "
-                    print(
-                        f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
-                        f"  bpw: {quant_args['K']:5.2f}"
-                        f"  proxy_err: {proxy_err_str}"
-                        f"  {flags}"
-                        f"  g_sc: {quant_args['g_scale']:.6f}"
-                        f"  [{t.interval:4.2f} s]"
-                    )
-                    sys.stdout.flush()
+                        sys.stdout.flush()
+                    else:
+                        quant_args = {
+                            "seed": idx,
+                            "K": strategy[linear.key],
+                            "devices": devices,
+                            "device_ratios": device_ratios,
+                            "apply_out_scales": args["apply_out_scales"],
+                        }
+                        if args["codebook"] == "mcg": quant_args.update({ "mcg": True })
+                        elif args["codebook"] == "mul1": quant_args.update({ "mul1": True })
+
+                        with Timer() as t:
+                            sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
+                                if args["image_dump"] else None
+                            proxy_err = linear.convert_exl3(
+                                capture_H[linear.qmap],
+                                quant_args = quant_args,
+                                progress_str = f" -- <step>: {linear.key}",
+                                verbose = args["verbose"],
+                                save_reg = sr,
+                            )
+                            assert isinstance(linear.inner, LinearEXL3)
+                            linear.inner.swap_cpu()
+                        flags = "o" if quant_args["apply_out_scales"] else "."
+                        proxy_err_str = f"{proxy_err:8.6f}" if proxy_err >= 0.0 else "(OoM)   "
+                        print(
+                            f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
+                            f"  bpw: {quant_args['K']:5.2f}"
+                            f"  proxy_err: {proxy_err_str}"
+                            f"  {flags}"
+                            f"  g_sc: {quant_args['g_scale']:.6f}"
+                            f"  [{t.interval:4.2f} s]"
+                        )
+                        sys.stdout.flush()
 
             # Collect converted module tensors
             for m in module:
