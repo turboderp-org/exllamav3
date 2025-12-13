@@ -20,6 +20,7 @@ from .ministral3 import Ministral3Model
 from .mistral import MistralModel
 from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
+from .olmo3 import Olmo3Model
 from .phi3 import Phi3Model
 from .qwen2 import Qwen2Model
 from .qwen3 import Qwen3Model
@@ -59,6 +60,7 @@ ARCHITECTURES = {
         MistralModel,
         Mistral3Model,
         MixtralModel,
+        Olmo3Model,
         Phi3Model,
         Qwen2Model,
         Qwen3Model,
