@@ -91,7 +91,21 @@ class Linear(Module):
         return padded.contiguous()
 
 
-    def apply_fp8_scales_(self, weight: torch.Tensor, scale_inv: torch.Tensor):
+    # Row scales (Transformers-specific?)
+    def apply_fp8_scales_(self, weight: torch.Tensor, scale: torch.Tensor):
+        ws = weight.shape
+        ss = scale.shape
+        assert len(ss) == 0 or len(ws) == len(ss) == 2
+        if len(ss) == 2:
+            if 1 < ss[0] < ws[0]:
+                scale = torch.nn.functional.pad(scale, (0, 0, 0, ws[0] - ss[0]), "constant", 1)
+            if 1 < ss[1] < ws[1]:
+                scale = torch.nn.functional.pad(scale, (0, ws[1] - ss[1]), "constant", 1)
+        weight = weight.float() * scale
+        return weight.view(ws).half()
+
+
+    def apply_fp8_scales_inv_(self, weight: torch.Tensor, scale_inv: torch.Tensor):
         ws = weight.shape
         ss = scale_inv.shape
         if len(ss) > 0:
@@ -111,11 +125,16 @@ class Linear(Module):
             dev = "cpu" if self.is_sliced else self.device
             pad1 = (self.out_features,) if not self.is_sliced else None
             pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
+            scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
             scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
-            weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = scale_inv is not None)
+            assert scale is None or scale_inv is None
+            no_defer = scale is not None or scale_inv is not None
+            weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
             bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
-            if scale_inv is not None:
-                weight = self.apply_fp8_scales_(weight, scale_inv)
+            if scale is not None:
+                weight = self.apply_fp8_scales_(weight, scale)
+            elif scale_inv is not None:
+                weight = self.apply_fp8_scales_inv_(weight, scale_inv)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
