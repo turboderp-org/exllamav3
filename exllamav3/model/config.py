@@ -152,13 +152,17 @@ class Config(ABC):
         default_rope_theta: float = 10000.0,
         default_partial_rotary_factor: float = 1.0,
         config_dict: dict | None = None,
+        theta_key: str | list = None
     ):
         if config_dict is None:
             config_dict = self.config_dict
 
+        if theta_key is None:
+            theta_key = ["rope_theta", "rope_parameters->rope_theta"]
+
         return RopeSettings(
             head_dim = self.head_dim,
-            rope_theta = read_dict(config_dict, float, ["rope_theta", "rope_parameters->rope_theta"], default_rope_theta),
+            rope_theta = read_dict(config_dict, float, theta_key, default_rope_theta),
             rope_scaling = read_dict(config_dict, dict, ["rope_scaling", "rope_parameters"], None),
             rotary_dim = read_dict(config_dict, int, "rotary_dim", None),
             partial_rotary_factor = read_dict(config_dict, float, ["partial_rotary_factor", "rope_parameters->partial_rotary_factor"], default_partial_rotary_factor),
