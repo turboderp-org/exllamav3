@@ -282,7 +282,7 @@ def main(args):
             print(f"\n{col_error} !! Response exceeded {max_response_tokens} tokens and was cut short.{col_default}")
 
         if show_tps and r:
-            prompt_tokens = ids.shape[-1]
+            prompt_tokens = r["prompt_tokens"]
             cached_tokens = r["cached_tokens"]
             new_ctx_tokens = prompt_tokens - cached_tokens
             prompt_tps = new_ctx_tokens / r["time_prefill"]
@@ -349,5 +349,6 @@ if __name__ == "__main__":
     parser.add_argument("-prompt", "--prompt", type = str, help = "Run single prompt, then exit")
     parser.add_argument("-save", "--save", type = str, help = "Save output to file (use with --prompt)")
     parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")
+    parser.add_argument("-dbg", "--debug", action = "store_true", help = "Print extra debug stuff")
     _args = parser.parse_args()
     main(_args)
