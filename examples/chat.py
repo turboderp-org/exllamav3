@@ -295,6 +295,12 @@ def main(args):
                 f"Generate: {col_info}{new_tokens:,}{col_default} tokens at {col_info}{tps:.3f}{col_default} t/s"
             )
 
+        if args.debug:
+            from pprint import pprint
+            print()
+            pprint(r, compact = True, indent = 4)
+            print()
+
         # Add response to context
         response = s.all_text.strip()
 
