@@ -152,7 +152,8 @@ class Config(ABC):
         default_rope_theta: float = 10000.0,
         default_partial_rotary_factor: float = 1.0,
         config_dict: dict | None = None,
-        theta_key: str | list = None
+        theta_key: str | list = None,
+        override_type: str = None,
     ):
         if config_dict is None:
             config_dict = self.config_dict
@@ -169,6 +170,7 @@ class Config(ABC):
             max_position_embeddings = read_dict(config_dict, int, "max_position_embeddings", None),
             original_max_position_embeddings = read_dict(config_dict, int, "original_max_position_embeddings", None),
             rope_style = rope_style,
+            override_type = override_type
         )
 
 
