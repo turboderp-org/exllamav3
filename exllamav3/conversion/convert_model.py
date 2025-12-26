@@ -158,7 +158,12 @@ class PrefetchManager:
     def cleanup(self):
         """Clean up any running prefetch thread."""
         if self.prefetch_thread is not None and self.prefetch_thread.is_alive():
-            self.prefetch_ready.wait(timeout=30)
+            completed = self.prefetch_ready.wait(timeout=30)
+            if not completed and self.prefetch_thread.is_alive():
+                print(
+                    f"{col_red}Warning:{col_default} Prefetch thread did not finish within 30 seconds "
+                    "and may still be running during cleanup."
+                )
         self.prefetch_tensors = None
 
 
