@@ -71,6 +71,7 @@ class PrefetchManager:
         self.prefetch_slice = None
         self.prefetch_ready = threading.Event()
         self.prefetch_error = None
+        self.prefetch_module_key = None
 
     def start_prefetch(self, module, module_idx, load_slice=None):
         """Start prefetching a module's weights in background thread."""
@@ -83,29 +84,43 @@ class PrefetchManager:
         self.prefetch_module_idx = module_idx
         self.prefetch_slice = load_slice
         self.prefetch_error = None
+        self.prefetch_module_key = module.key
+
+        # IMPORTANT: Get tensor keys and file mappings in main thread to avoid GIL issues
+        # SafeTensorsCollection is not thread-safe, so we gather everything here
+        stc = self.config.stc
+        prefix = module.key
+        trie = stc.get_tensor_file_map_trie()
+        all_keys = trie.keys()
+        matching_keys = [key for key in all_keys if isinstance(key, str) and key.startswith(prefix + ".")]
+        
+        # Get file paths for each key from tensor_file_map
+        tensor_info = {}
+        for key in matching_keys:
+            if key in stc.tensor_file_map:
+                file_path = stc.tensor_file_map[key]
+                tensor_info[key] = file_path
+
+        slice_str = f" (slice {load_slice + 1}/{module.num_slices})" if load_slice is not None else ""
+        module_key = module.key
 
         def prefetch_worker():
             try:
-                # Pre-load tensors to CPU memory
-                tensors = {}
-                slice_str = f" (slice {load_slice + 1}/{module.num_slices})" if load_slice is not None else ""
-                print(f" -- [Prefetch] Starting: {module.key}{slice_str}")
+                print(f" -- [Prefetch] Starting: {module_key}{slice_str} ({len(tensor_info)} tensors)")
                 
-                # Use the config's safetensors cache to load tensors to CPU
-                for m in module:
-                    if hasattr(m, 'key'):
-                        # Get tensor keys for this submodule
-                        tensor_keys = m.get_tensor_keys() if hasattr(m, 'get_tensor_keys') else []
-                        for key in tensor_keys:
-                            try:
-                                tensor = self.config.stc.get_tensor(key, device="cpu")
-                                if tensor is not None:
-                                    tensors[key] = tensor
-                            except Exception:
-                                pass  # Tensor might not exist or be in different shard
+                # Load tensors to CPU using safetensors directly (thread-safe)
+                tensors = {}
+                for key, file_path in tensor_info.items():
+                    try:
+                        with safe_open(file_path, framework="pt", device="cpu") as f:
+                            if key in f.keys():
+                                tensors[key] = f.get_tensor(key)
+                    except Exception:
+                        pass  # Tensor might not exist or file error
                 
                 self.prefetch_tensors = tensors
-                print(f" -- [Prefetch] Ready: {module.key}{slice_str} ({len(tensors)} tensors)")
+                total_bytes = sum(t.numel() * t.element_size() for t in tensors.values()) if tensors else 0
+                print(f" -- [Prefetch] Ready: {module_key}{slice_str} ({len(tensors)} tensors, {total_bytes / 1024**2:.1f} MB)")
             except Exception as e:
                 self.prefetch_error = e
                 print(f" !! [Prefetch] Error: {e}")

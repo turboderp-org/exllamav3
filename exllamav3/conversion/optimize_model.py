@@ -22,6 +22,12 @@ parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Outpu
 parser.add_argument("-b", "--bitrate", type = float, default = None, help = "Target bitrate")
 parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in MB, default: 8192", default = 8192)
 parser.add_argument("-i", "--in_dir", nargs = "+", type = str, default = None, help = "Optional input (quantized model) directories")
+parser.add_argument(
+    "--use_weighted_kld",
+    action = "store_true",
+    default = False,
+    help = "If measurement.json contains layerwise weighted KL-div (dkld_weighted), use it instead of raw dkld."
+)
 
 def prepare(args) -> (dict, dict, bool, str):
     if not args.measurement:
@@ -39,6 +45,7 @@ def prepare(args) -> (dict, dict, bool, str):
         "bitrate": args.bitrate,
         "shard_size": args.shard_size,
         "in_dir": args.in_dir,
+        "use_weighted_kld": args.use_weighted_kld,
     }
 
     job_state = {}
@@ -57,7 +64,14 @@ def prepare(args) -> (dict, dict, bool, str):
     return in_args, job_state, True, None
 
 
-def optimize(meas, base_numel, base_cost, target_cost, base_kld, num_q):
+def _get_dkld(candidate: dict, use_weighted: bool) -> float:
+    """Return dkld or dkld_weighted depending on flag and availability."""
+    if use_weighted and "dkld_weighted" in candidate:
+        return candidate["dkld_weighted"]
+    return candidate["dkld"]
+
+
+def optimize(meas, base_numel, base_cost, target_cost, base_kld, num_q, use_weighted_kld: bool = False):
     groups = meas["groups"]
     num_groups = len(groups)
     solution = [0] * num_groups
@@ -69,6 +83,8 @@ def optimize(meas, base_numel, base_cost, target_cost, base_kld, num_q):
         return -((-dkld) ** 0.69)
 
     print(" -- Optimizing...")
+    if use_weighted_kld:
+        print("    (using layerwise-weighted KL-div)")
     while True:
         best = None
         best_r = 0.0
@@ -77,10 +93,10 @@ def optimize(meas, base_numel, base_cost, target_cost, base_kld, num_q):
             s = solution[i]
             for j, c in enumerate(cand):
                 if j < s or j >= num_q: continue
-                dk = adjust(c["dkld"])
+                dk = adjust(_get_dkld(c, use_weighted_kld))
                 db = c["dbits"]
                 if s > 0:
-                    dk -= adjust(cand[s - 1]["dkld"])
+                    dk -= adjust(_get_dkld(cand[s - 1], use_weighted_kld))
                     db -= cand[s - 1]["dbits"]
                 r = 1e10 * dk / (db + 1)
                 if r < best_r and budget > db:
@@ -136,7 +152,8 @@ def main(args, job_state):
     target_cost = args["bitrate"] * base_numel
 
     # Optimize
-    solution = optimize(meas, base_numel, base_cost, target_cost, meas["base_kld"], num_q)
+    use_weighted = args.get("use_weighted_kld", False)
+    solution = optimize(meas, base_numel, base_cost, target_cost, meas["base_kld"], num_q, use_weighted_kld=use_weighted)
     # for i, s in enumerate(solution):
     #     print(i, s)
 
