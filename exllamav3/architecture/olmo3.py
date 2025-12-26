@@ -54,6 +54,7 @@ class Olmo3Config(Config):
 
         # RoPE
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
+        self.rope_settings_swa = self.read_rope_settings_default(RopeStyle.NEOX, override_type = "default")
 
         # Vision placeholders
         self.vision = None
@@ -94,7 +95,11 @@ class Olmo3Model(Model):
                         head_dim = config.head_dim,
                         num_q_heads = config.num_q_heads,
                         num_kv_heads = config.num_kv_heads,
-                        rope_settings = config.rope_settings,
+                        rope_settings = (
+                            config.rope_settings
+                            if config.swa_pattern[idx] == -1 else
+                            config.rope_settings_swa
+                        ),
                         sm_scale = None,
                         key_q = "q_proj",
                         key_k = "k_proj",
