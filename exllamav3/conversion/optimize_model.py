@@ -66,8 +66,12 @@ def prepare(args) -> (dict, dict, bool, str):
 
 def _get_dkld(candidate: dict, use_weighted: bool) -> float:
     """Return dkld or dkld_weighted depending on flag and availability."""
-    if use_weighted and "dkld_weighted" in candidate:
-        return candidate["dkld_weighted"]
+    if use_weighted:
+        if "dkld_weighted" in candidate:
+            return candidate["dkld_weighted"]
+        # Requested weighted KL-div but only unweighted value is available.
+        print(f"{col_yellow}Warning:{col_default} dkld_weighted is missing for a candidate; "
+              f"falling back to unweighted dkld.")
     return candidate["dkld"]
 
 
