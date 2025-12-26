@@ -91,8 +91,13 @@ class PrefetchManager:
         stc = self.config.stc
         prefix = module.key
         trie = stc.get_tensor_file_map_trie()
-        all_keys = trie.keys()
-        matching_keys = [key for key in all_keys if isinstance(key, str) and key.startswith(prefix + ".")]
+        full_prefix = prefix + "."
+        keys_with_prefix = getattr(trie, "keys_with_prefix", None)
+        if callable(keys_with_prefix):
+            matching_keys = [key for key in keys_with_prefix(full_prefix) if isinstance(key, str)]
+        else:
+            all_keys = trie.keys()
+            matching_keys = [key for key in all_keys if isinstance(key, str) and key.startswith(full_prefix)]
         
         # Get file paths for each key from tensor_file_map
         tensor_info = {}
