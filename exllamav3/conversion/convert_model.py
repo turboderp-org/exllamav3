@@ -120,8 +120,8 @@ class PrefetchManager:
                         with safe_open(file_path, framework="pt", device="cpu") as f:
                             if key in f.keys():
                                 tensors[key] = f.get_tensor(key)
-                    except Exception:
-                        pass  # Tensor might not exist or file error
+                    except Exception as e:
+                        print(f"{col_red} !! [Prefetch] Failed to load tensor '{key}' from '{file_path}': {e}{col_default}")
                 
                 self.prefetch_tensors = tensors
                 total_bytes = sum(t.numel() * t.element_size() for t in tensors.values()) if tensors else 0
