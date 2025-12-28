@@ -160,7 +160,7 @@ def _is_moe_arch(config) -> bool:
     )
 
 
-def _layer_weight(idx: int, num_layers: int, mode: str, exp_: float) -> float:
+def _layer_weight(idx: int, num_layers: int, mode: str, exponent: float) -> float:
     if num_layers <= 1:
         return 1.0
     if mode == "uniform":
@@ -172,7 +172,7 @@ def _layer_weight(idx: int, num_layers: int, mode: str, exp_: float) -> float:
     if mode == "sqrt":
         return float(math.sqrt(x))
     if mode == "exp":
-        return float(x**exp_)
+        return float(x**exponent)
     raise ValueError(f"Unknown layer weighting mode: {mode!r}")
 
 
