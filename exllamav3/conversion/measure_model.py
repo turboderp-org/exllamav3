@@ -17,18 +17,74 @@ col_purple = "\u001b[35;1m"
 col_cyan = "\u001b[36;1m"
 col_white = "\u001b[37;1m"
 
-torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
+torch.set_printoptions(precision=5, sci_mode=False, linewidth=200)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("-i", "--in_dir", nargs = "+", type = str, default = None, help = "Input (model) directories")
-parser.add_argument("-r", "--ref_dir", type = str, default = None, help = "Reference unquantized model")
-parser.add_argument("-l", "--level", type = int, default = 2, help = "Optimization level, 0-3, default: 2 (recommended)")
-parser.add_argument("-o", "--out_file", type = str, default = None, help = "Output file")
-parser.add_argument("-cr", "--cal_rows", type = int, default = 10, help = "Calibration data size, rows, default: 8")
-parser.add_argument("-cc", "--cal_cols", type = int, default = 1024, help = "Calibration data size, columns, default: 1024")
+parser.add_argument(
+    "-i",
+    "--in_dir",
+    nargs="+",
+    type=str,
+    default=None,
+    help="Input (model) directories",
+)
+parser.add_argument(
+    "-r", "--ref_dir", type=str, default=None, help="Reference unquantized model"
+)
+parser.add_argument(
+    "-l",
+    "--level",
+    type=int,
+    default=2,
+    help="Optimization level, 0-3, default: 2 (recommended)",
+)
+parser.add_argument("-o", "--out_file", type=str, default=None, help="Output file")
+parser.add_argument(
+    "-cr",
+    "--cal_rows",
+    type=int,
+    default=10,
+    help="Calibration data size, rows, default: 8",
+)
+parser.add_argument(
+    "-cc",
+    "--cal_cols",
+    type=int,
+    default=1024,
+    help="Calibration data size, columns, default: 1024",
+)
 # parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use, e.g. --devices 0,1,2")
-parser.add_argument("-d", "--device", type = int, default = 0, help = "Device index")
-parser.add_argument("-ms", "--max_sys", type = float, default = 8, help = "Max system memory for state data, in GB")
+parser.add_argument("-d", "--device", type=int, default=0, help="Device index")
+parser.add_argument(
+    "-ms",
+    "--max_sys",
+    type=float,
+    default=8,
+    help="Max system memory for state data, in GB",
+)
+parser.add_argument(
+    "--kld_expert_mode",
+    type=str,
+    default="auto",
+    choices=["auto", "sparse", "all"],
+    help="How to route experts when computing KL-div. 'all' uses activate_all_experts=True (old behavior). "
+    "'sparse' uses activate_all_experts=False (matches inference). 'auto' uses 'sparse' for MoE arches.",
+)
+parser.add_argument(
+    "--layer_weight",
+    type=str,
+    default="uniform",
+    choices=["uniform", "linear", "sqrt", "exp"],
+    help="Layerwise importance weighting applied to each group's KL-div contribution. "
+    "This is written to measurement.json and used by optimize_model.py if supported.",
+)
+parser.add_argument(
+    "--layer_weight_exp",
+    type=float,
+    default=2.0,
+    help="Exponent used when --layer_weight=exp. Weight for layer i is (i/(L-1))**layer_weight_exp.",
+)
+
 
 def prepare(args) -> (dict, dict, bool, str):
     if not args.in_dir:
@@ -48,7 +104,7 @@ def prepare(args) -> (dict, dict, bool, str):
         "cal_rows": args.cal_rows,
         "cal_cols": args.cal_cols,
         "device": args.device,
-        "max_sys": args.max_sys
+        "max_sys": args.max_sys,
     }
 
     job_state = {}
@@ -58,7 +114,9 @@ def prepare(args) -> (dict, dict, bool, str):
     for d in in_args["in_dir"]:
         print(f"    - {d}")
     print(f"    Output file: {in_args['out_file']}")
-    print(f"    Calibration size: {in_args['cal_rows']} rows, {in_args['cal_cols']} columns")
+    print(
+        f"    Calibration size: {in_args['cal_rows']} rows, {in_args['cal_cols']} columns"
+    )
 
     if warn_experimental:
         print(
@@ -72,7 +130,7 @@ def prepare(args) -> (dict, dict, bool, str):
 def prepare_state(args, job_state, config, model, tokenizer):
     print(f" -- Preparing input state")
     state = get_default_calibration(args, tokenizer)
-    return state[:args["cal_rows"]]
+    return state[: args["cal_rows"]]
 
 
 def kldiv(s, ref):
@@ -82,14 +140,45 @@ def kldiv(s, ref):
     max_batch = 512
     kld = 0
     for i in range(0, bsz, max_batch):
-        ref_probs = torch.softmax(r[i : i+max_batch, ...].to(s.device), dim = -1, dtype = torch.float)
-        s_probs = torch.softmax(s[i : i+max_batch, ...], dim = -1, dtype = torch.float)
-        kld += F.kl_div(torch.log(s_probs + 1e-10), ref_probs, reduction = "sum").item()
+        ref_probs = torch.softmax(
+            r[i : i + max_batch, ...].to(s.device), dim=-1, dtype=torch.float
+        )
+        s_probs = torch.softmax(s[i : i + max_batch, ...], dim=-1, dtype=torch.float)
+        kld += F.kl_div(torch.log(s_probs + 1e-10), ref_probs, reduction="sum").item()
     return kld / bsz
 
 
+def _is_moe_arch(config) -> bool:
+    # Best-effort detection; exact names depend on architecture modules.
+    arch = str(getattr(config, "architecture", "") or "").lower()
+    arch_string = str(getattr(config, "arch_string", "") or "").lower()
+    return (
+        ("moe" in arch)
+        or ("moe" in arch_string)
+        or ("mixtral" in arch)
+        or ("mixtral" in arch_string)
+    )
+
+
+def _layer_weight(idx: int, num_layers: int, mode: str, exponent: float) -> float:
+    if num_layers <= 1:
+        return 1.0
+    if mode == "uniform":
+        return 1.0
+    # Normalize to [0, 1]
+    x = idx / (num_layers - 1)
+    if mode == "linear":
+        return float(x)
+    if mode == "sqrt":
+        return float(math.sqrt(x))
+    if mode == "exp":
+        return float(x**exponent)
+    raise ValueError(f"Unknown layer weighting mode: {mode!r}")
+
+
 def lcp(seqs):
-    if not seqs: return []
+    if not seqs:
+        return []
     m = min(len(s) for s in seqs)
     i = 0
     while i < m and all(s[i] == seqs[0][i] for s in seqs):
@@ -101,9 +190,10 @@ def compact_alt(strings):
     seqs = [s.split(".") for s in strings]
 
     def render(seqs):
-        if not seqs: return ""
+        if not seqs:
+            return ""
         prefix = lcp(seqs)
-        tails = [s[len(prefix):] for s in seqs]
+        tails = [s[len(prefix) :] for s in seqs]
         if all(not t for t in tails):
             return " ".join(prefix)
 
@@ -130,7 +220,6 @@ def compact_alt(strings):
 
 @torch.inference_mode()
 def main(args, job_state):
-
     torch.set_grad_enabled(False)
     device = torch.device(args["device"])
 
@@ -152,14 +241,26 @@ def main(args, job_state):
     num_q = len(model_q)
     num_cand = num_q - 1
 
+    # Determine expert routing mode for KL
+    if args.get("kld_expert_mode") == "auto":
+        kld_sparse = _is_moe_arch(config_ref)
+    else:
+        kld_sparse = args.get("kld_expert_mode") == "sparse"
+
     # Sanity checks
     storage_info = [mq.get_storage_info() for mq in model_q]
     if any(storage_info[i + 1][0] <= storage_info[i][0] for i in range(num_cand)):
-        print(f" !! {col_red}Warning, input quantized models should be in order of increasing bitrate{col_default}")
-    if any(cq.hidden_size != config_ref.hidden_size for cq in config_q) \
-        or any(cq.arch_string != config_ref.arch_string for cq in config_q) \
-        or any(mq.get_layout_tree(4) != r_layout for mq in model_q):
-        print(f" !! {col_red}Warning, input models do not match reference model{col_default}")
+        print(
+            f" !! {col_red}Warning, input quantized models should be in order of increasing bitrate{col_default}"
+        )
+    if (
+        any(cq.hidden_size != config_ref.hidden_size for cq in config_q)
+        or any(cq.arch_string != config_ref.arch_string for cq in config_q)
+        or any(mq.get_layout_tree(4) != r_layout for mq in model_q)
+    ):
+        print(
+            f" !! {col_red}Warning, input models do not match reference model{col_default}"
+        )
 
     # Optimizer targets
     targets_per_layer = []
@@ -167,7 +268,8 @@ def main(args, job_state):
     for module in model_ref.modules[:-1]:
         r_targets = module.optimizer_targets()
         s_targets = []
-        def flatten(node, maxdepth, depth = 0):
+
+        def flatten(node, maxdepth, depth=0):
             nonlocal s_targets
             l = []
             for n in node:
@@ -181,6 +283,7 @@ def main(args, job_state):
             if depth == maxdepth:
                 s_targets.append(l)
             return l
+
         flatten(r_targets, args["level"])
         targets_per_layer.append(s_targets)
         total_targets += len(s_targets)
@@ -188,7 +291,7 @@ def main(args, job_state):
 
     # Get initial state
     init_states_ref = prepare_state(args, job_state, config_ref, model_ref, tokenizer)
-    init_states_ref = torch.cat(init_states_ref, dim = 0)
+    init_states_ref = torch.cat(init_states_ref, dim=0)
 
     # Chunk to limit system RAM
     print(f" -- Total optimized params: {total_targets}")
@@ -228,10 +331,13 @@ def main(args, job_state):
         l = 2
         for idx in range(num_modules):
             for t in targets_per_layer[idx]:
-                if len(t) > 0: l += num_cand
+                if len(t) > 0:
+                    l += num_cand
             pb_total += l
 
-        with ProgressBar(f"Measuring ({chunk_idx + 1}/{len(tpl_chunks)})", pb_total) as pb:
+        with ProgressBar(
+            f"Measuring ({chunk_idx + 1}/{len(tpl_chunks)})", pb_total
+        ) as pb:
             for idx in range(num_modules):
                 last_fwd = idx == len(model_ref.modules) - 1
 
@@ -244,6 +350,7 @@ def main(args, job_state):
                 config_ref.stc.close()
 
                 # Reference forward pass
+                # Always run ref with all experts enabled so expert weights get exercised.
                 params = {"activate_all_experts": True, "attn_mode": "flash_attn_nc"}
                 s = module.prepare_for_device(states_ref, params)
                 s = module.forward(s, params)
@@ -261,11 +368,15 @@ def main(args, job_state):
                 # Load next quantized modules
                 modules = []
                 for q in range(num_q):
-                    if q > 0 and (not targets_per_layer[idx] or not targets_per_layer[idx][0]):
+                    if q > 0 and (
+                        not targets_per_layer[idx] or not targets_per_layer[idx][0]
+                    ):
                         modules.append(None)
                         continue
                     module = model_q[q].modules[idx]
-                    print(f" -- Loading module ({col_purple}{q}{col_default}): {col_green}{module.key}{col_default}")
+                    print(
+                        f" -- Loading module ({col_purple}{q}{col_default}): {col_green}{module.key}{col_default}"
+                    )
                     config = config_q[q]
                     config.stc.begin_deferred_load()
                     module.load(device if not module.caps.get("prefer_cpu") else "cpu")
@@ -275,7 +386,11 @@ def main(args, job_state):
                     del module
 
                 # Advance base state
-                params = {"activate_all_experts": True, "attn_mode": "flash_attn_nc"}
+                # For KL measurement, optionally match inference routing (sparse experts).
+                params = {
+                    "activate_all_experts": (not kld_sparse),
+                    "attn_mode": "flash_attn_nc",
+                }
                 s = modules[0].prepare_for_device(states_q, params)
                 s = modules[0].forward(s, params)
                 if last_fwd:
@@ -295,7 +410,10 @@ def main(args, job_state):
                     # Propagate candidates
                     for i in range(len(cand_states[k])):
                         states_c = cand_states[k][i]
-                        params = {"activate_all_experts": True, "attn_mode": "flash_attn_nc"}
+                        params = {
+                            "activate_all_experts": (not kld_sparse),
+                            "attn_mode": "flash_attn_nc",
+                        }
                         s = modules[0].prepare_for_device(states_c, params)
                         s = modules[0].forward(s, params)
                         if last_fwd:
@@ -314,7 +432,9 @@ def main(args, job_state):
                         if len(t) == 0:
                             continue
                         group_idx = len(cand_groups)
-                        tt = compact_alt((b[:-5] if b.endswith("_proj") else b) for b in t)
+                        tt = compact_alt(
+                            (b[:-5] if b.endswith("_proj") else b) for b in t
+                        )
                         if len(tt) > 150:
                             tt = tt[:97] + "..."
                         print(
@@ -323,13 +443,14 @@ def main(args, job_state):
                         )
                         cand_kld[k].append(0)
                         params = {
-                            "activate_all_experts": True,
+                            "activate_all_experts": (not kld_sparse),
                             "attn_mode": "flash_attn_nc",
-                            "ovr": {key : model_q[k + 1].find_module(key) for key in t}
+                            "ovr": {key: model_q[k + 1].find_module(key) for key in t},
                         }
                         s = modules[0].prepare_for_device(states_q, params)
                         s = modules[0].forward(s, params)
                         if last_fwd:
+                            # Note: kldiv returns the mean KL-divergence across the batch
                             cand_kld[k][i] = kldiv(s, new_states_ref) - base_kld
                         else:
                             cand_states[k].append(s.cpu())
@@ -338,8 +459,13 @@ def main(args, job_state):
                         pb.update(pb_prog)
                         pb_prog += 1
                         cand_costs[k].append(
-                            sum(model_q[k + 1].find_module(tt).storage_size() for tt in t) * 8 -
-                            sum(model_q[0].find_module(tt).storage_size() for tt in t) * 8
+                            sum(
+                                model_q[k + 1].find_module(tt).storage_size()
+                                for tt in t
+                            )
+                            * 8
+                            - sum(model_q[0].find_module(tt).storage_size() for tt in t)
+                            * 8
                         )
                         if last_k:
                             cand_groups.append(t)
@@ -374,16 +500,21 @@ def main(args, job_state):
         all_groups += c
     prefix = lcp(all_groups)
     print(" -- Results")
-    print(f"    idx      | parts                                                                |              d. bits |  d. KL-div")
-    print(f"    ---------|----------------------------------------------------------------------|----------------------|-----------")
+    print(
+        f"    idx      | parts                                                                |              d. bits |  d. KL-div"
+    )
+    print(
+        f"    ---------|----------------------------------------------------------------------|----------------------|-----------"
+    )
     print(
         f"       {col_blue}-{col_default}     |                                                                      |"
         f"                      | {col_green}{base_kld:10.5f}{col_default}"
     )
     for i, g in enumerate(cand_groups):
         sg = []
-        gstr = compact_alt([sg[len(prefix):].replace("_proj", "") for sg in g])
-        if len(gstr) > 68: gstr = gstr[:65] + "..."
+        gstr = compact_alt([sg[len(prefix) :].replace("_proj", "") for sg in g])
+        if len(gstr) > 68:
+            gstr = gstr[:65] + "..."
         for j in range(num_cand):
             print(
                 f"     {col_blue}{i:3} {col_purple}{j + 1:3}{col_default} | "
@@ -393,6 +524,46 @@ def main(args, job_state):
             )
 
     # Compile and write results
+    # Layerwise weighting (by module index) - written to JSON and applied to dkld
+    num_layers = len(model_ref.modules)
+    layer_weights = [
+        _layer_weight(
+            i,
+            num_layers,
+            args.get("layer_weight", "uniform"),
+            args.get("layer_weight_exp", 2.0),
+        )
+        for i in range(num_layers)
+    ]
+
+    # Apply weights to candidate dkld by group/module index. This is a proxy: groups are generated in streaming
+    # order, and each group originates from the current module (idx in loop).
+    # We store both raw and weighted values so older tooling can still interpret.
+    weighted_cand_kld = [row[:] for row in cand_kld]
+    # Reconstruct which module each group came from by replaying the same counting logic: each non-empty target
+    # at module idx appended one group.
+    group_module_idx = []
+    for midx, targets in enumerate(tpl):
+        for t in targets:
+            if len(t) > 0:
+                group_module_idx.append(midx)
+    # Safety: sizes should match in non-chunked; in chunked, tpl was chunk-specific. For chunked, we can't
+    # perfectly recover across chunks here, so we fall back to uniform weighting.
+    if len(group_module_idx) == len(cand_groups):
+        for gi, midx in enumerate(group_module_idx):
+            w = layer_weights[midx]
+            for j in range(num_cand):
+                # Guard against possible dimension mismatches between group indices and candidate KLD rows.
+                if gi < len(weighted_cand_kld[j]):
+                    weighted_cand_kld[j][gi] *= w
+    else:
+        if args.get("layer_weight", "uniform") != "uniform":
+            print(
+                f" !! {col_yellow}Warning: layer weighting unavailable in chunked mode, "
+                f"falling back to uniform{col_default}"
+            )
+        group_module_idx = None
+
     results = {
         "base": {
             "dir": dir_q[0],
@@ -409,9 +580,19 @@ def main(args, job_state):
             {
                 "idx": idx,
                 "layers": layers,
+                "module_idx": (
+                    group_module_idx[idx] if group_module_idx is not None else None
+                ),
+                "weight": (
+                    layer_weights[group_module_idx[idx]]
+                    if group_module_idx is not None
+                    and group_module_idx[idx] is not None
+                    else 1.0
+                ),
                 "candidates": [
                     {
                         "dkld": cand_kld[j][idx],
+                        "dkld_weighted": weighted_cand_kld[j][idx],
                         "dbits": cand_costs[j][idx],
                     }
                     for j in range(num_cand)
@@ -420,12 +601,16 @@ def main(args, job_state):
             for idx, layers in enumerate(cand_groups)
         ],
         "base_kld": base_kld,
-        "arch_string": config_ref.arch_string
+        "kld_expert_mode": ("sparse" if kld_sparse else "all"),
+        "layer_weight": args.get("layer_weight", "uniform"),
+        "layer_weight_exp": args.get("layer_weight_exp", 2.0),
+        "layer_weights": layer_weights,
+        "arch_string": config_ref.arch_string,
     }
     filename = args["out_file"]
     print(f" -- Writing {filename}")
-    with open(filename, "w", encoding = "utf8") as f:
-        f.write(json.dumps(results, indent = 4))
+    with open(filename, "w", encoding="utf8") as f:
+        f.write(json.dumps(results, indent=4))
 
     # Done
     print(" -- Done")

@@ -42,6 +42,7 @@ parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save 
 parser.add_argument("-cb", "--codebook", type = str, default = "mcg", help = "Codebook: mcg (default), mul1 or 3inst")
 parser.add_argument("-strat", "--strategy", type = str, default = None, help = "Modifiers for quantization strategy - EXPERIMENTAL")
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "When possible, use new parallel mode for small tensors (MoE layers especially)")
+parser.add_argument("-pf", "--prefetch", action = "store_true", help = "Prefetch next module weights to CPU while quantizing current module")
 
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--out_scales", dest = "out_scales_", action = "store_true", help = "Always enable out channel scales  (for debug purposes)")
@@ -55,6 +56,121 @@ num_ref_states = 5
 progress_lock = threading.Lock()
 curr_progress = 0
 max_progress = 0
+
+
+class PrefetchManager:
+    """
+    Async prefetcher that loads next module's weights to CPU while current module is being quantized.
+    This hides I/O latency behind GPU compute time.
+    """
+    def __init__(self, config):
+        self.config = config
+        self.prefetch_thread = None
+        self.prefetch_tensors = None
+        self.prefetch_module_idx = -1
+        self.prefetch_slice = None
+        self.prefetch_ready = threading.Event()
+        self.prefetch_error = None
+        self.prefetch_module_key = None
+
+    def start_prefetch(self, module, module_idx, load_slice=None):
+        """Start prefetching a module's weights in background thread."""
+        # Wait for any previous prefetch to complete first
+        if self.prefetch_thread is not None and self.prefetch_thread.is_alive():
+            self.prefetch_thread.join()
+
+        self.prefetch_ready.clear()
+        self.prefetch_tensors = None
+        self.prefetch_module_idx = module_idx
+        self.prefetch_slice = load_slice
+        self.prefetch_error = None
+        self.prefetch_module_key = module.key
+
+        # IMPORTANT: Get tensor keys and file mappings in main thread to avoid GIL issues
+        # SafeTensorsCollection is not thread-safe, so we gather everything here
+        stc = self.config.stc
+        prefix = module.key
+        trie = stc.get_tensor_file_map_trie()
+        full_prefix = prefix + "."
+        keys_with_prefix = getattr(trie, "keys_with_prefix", None)
+        if callable(keys_with_prefix):
+            matching_keys = [key for key in keys_with_prefix(full_prefix) if isinstance(key, str)]
+        else:
+            all_keys = trie.keys()
+            matching_keys = [key for key in all_keys if isinstance(key, str) and key.startswith(full_prefix)]
+        
+        # Get file paths for each key from tensor_file_map
+        tensor_info = {}
+        for key in matching_keys:
+            if key in stc.tensor_file_map:
+                file_path = stc.tensor_file_map[key]
+                tensor_info[key] = file_path
+
+        slice_str = f" (slice {load_slice + 1}/{module.num_slices})" if load_slice is not None else ""
+        module_key = module.key
+
+        def prefetch_worker():
+            try:
+                print(f" -- [Prefetch] Starting: {module_key}{slice_str} ({len(tensor_info)} tensors)")
+                
+                # Load tensors to CPU using safetensors directly (thread-safe)
+                tensors = {}
+                for key, file_path in tensor_info.items():
+                    try:
+                        with safe_open(file_path, framework="pt", device="cpu") as f:
+                            if key in f.keys():
+                                tensors[key] = f.get_tensor(key)
+                    except Exception as e:
+                        print(f"{col_red} !! [Prefetch] Failed to load tensor '{key}' from '{file_path}': {e}{col_default}")
+                
+                self.prefetch_tensors = tensors
+                total_bytes = sum(t.numel() * t.element_size() for t in tensors.values()) if tensors else 0
+                print(f" -- [Prefetch] Ready: {module_key}{slice_str} ({len(tensors)} tensors, {total_bytes / 1024**2:.1f} MB)")
+            except Exception as e:
+                self.prefetch_error = e
+                print(f" !! [Prefetch] Error: {e}")
+            finally:
+                self.prefetch_ready.set()
+
+        self.prefetch_thread = threading.Thread(target=prefetch_worker, daemon=True)
+        self.prefetch_thread.start()
+
+    def wait_for_prefetch(self, module_idx, load_slice=None):
+        """Wait for prefetch to complete and return True if tensors are available."""
+        if self.prefetch_thread is None:
+            return False
+        
+        # Check if this is the module we prefetched
+        if self.prefetch_module_idx != module_idx or self.prefetch_slice != load_slice:
+            return False
+        
+        # Wait for prefetch to complete
+        self.prefetch_ready.wait()
+        
+        if self.prefetch_error is not None:
+            return False
+        
+        return self.prefetch_tensors is not None and len(self.prefetch_tensors) > 0
+
+    def get_prefetched_tensors(self):
+        """Get prefetched tensors and clear the cache."""
+        tensors = self.prefetch_tensors
+        self.prefetch_tensors = None
+        self.prefetch_module_idx = -1
+        self.prefetch_slice = None
+        return tensors
+
+    def cleanup(self):
+        """Clean up any running prefetch thread."""
+        if self.prefetch_thread is not None and self.prefetch_thread.is_alive():
+            completed = self.prefetch_ready.wait(timeout=30)
+            if not completed and self.prefetch_thread.is_alive():
+                print(
+                    f"{col_red}Warning:{col_default} Prefetch thread did not finish within 30 seconds "
+                    "and may still be running during cleanup."
+                )
+        self.prefetch_tensors = None
+
 
 def check_system():
     if os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") is not None:
@@ -174,6 +290,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("codebook", True, "mcg"),
         ("strategy", False, ""),
         ("parallel_mode", True, False),
+        ("prefetch", True, False),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -301,6 +418,13 @@ def main(args, job_state):
     # Get initial state or resume state
     state = prepare_state(args, job_state, config, model, tokenizer)
 
+    # Initialize prefetch manager if enabled
+    prefetcher = None
+    use_prefetch = args.get("prefetch", False)
+    if use_prefetch:
+        prefetcher = PrefetchManager(config)
+        print(f" -- Prefetch mode enabled")
+
     # Iterate over modules
     for idx, module in enumerate(model.modules):
 
@@ -408,6 +532,25 @@ def main(args, job_state):
             # Move original tensors to system RAM (load to GPU one by one when quantizing)
             for linear in linears:
                 linear.inner.swap_cpu()
+
+            # Start prefetching next module while we quantize this one
+            if use_prefetch and prefetcher is not None:
+                # Determine next module/slice to prefetch
+                next_module_idx = None
+                next_slice = None
+                if slicing and current_slice < module.num_slices - 1:
+                    # Prefetch next slice of current module
+                    next_module_idx = idx
+                    next_slice = current_slice + 1
+                elif idx + 1 < len(model.modules):
+                    # Prefetch first slice of next module
+                    next_module_idx = idx + 1
+                    next_module = model.modules[next_module_idx]
+                    next_slice = 0 if next_module.num_slices > 1 else None
+                
+                if next_module_idx is not None:
+                    next_mod = model.modules[next_module_idx]
+                    prefetcher.start_prefetch(next_mod, next_module_idx, next_slice)
 
             # Decide mode
             # TODO: Might be useful to compare no. h-tiles per tensor, no. layers and no. SMs across GPUs
@@ -626,6 +769,10 @@ def main(args, job_state):
             os.rename(ckpt_dir, ckpt_dir_old)
             os.rename(ckpt_dir_new, ckpt_dir)
             last_checkpoint_time = time.time()
+
+    # Clean up prefetcher
+    if prefetcher is not None:
+        prefetcher.cleanup()
 
     # Compile model
     compile_model(args, model, config, tokenizer)

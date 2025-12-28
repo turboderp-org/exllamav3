@@ -9,3 +9,9 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
+
+# macOS
+.DS_Store
+
+# ContextStream
+.contextstream/
