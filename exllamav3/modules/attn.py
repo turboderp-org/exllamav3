@@ -436,7 +436,7 @@ class Attention(Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa)
+        o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa, scale = self.sm_scale)
         o = o.transpose(1, 2)
         if self.interleaved_gate: o *= g.sigmoid()
 
