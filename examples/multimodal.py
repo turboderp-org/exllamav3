@@ -8,7 +8,7 @@ import requests
 import torch
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth=200)
 
-mode = "glm"
+mode = "hcx"
 cache_size = 8192
 streaming = True
 
@@ -25,6 +25,9 @@ match mode:
     case "glm":
         prompt_format = "glmv"
         model_dir = "/mnt/str/models/glm4.5v/exl3/4.00bpw"
+    case "hcx":
+        prompt_format = "chatml"
+        model_dir = "/mnt/str/models/hyperclovax-seed-think-32b/exl3/4.00bpw"
 
 images = [
     # Cat

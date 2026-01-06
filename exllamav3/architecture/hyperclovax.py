@@ -7,6 +7,10 @@ from ..util.rope import RopeStyle, RoPE
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear, DeepstackEmbed
 from ..modules.attn import prepare_for_attn
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .hcxvisionv2 import HCXVisionV2Config
+
 class HyperClovaxConfig(Config):
     arch_string = "HyperCLOVAXForCausalLM"
 
@@ -56,8 +60,10 @@ class HyperClovaxModel(Model):
 
     def __init__(
         self,
-        config: HyperClovaxConfig,
+        config: HyperClovaxConfig | HCXVisionV2Config,
         key_prefix: str = "model",
+        head_key: str = "lm_head",
+        post_norms: bool = True,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -106,7 +112,7 @@ class HyperClovaxModel(Model):
                         key = f"{key_prefix}.layers.{idx}.post_norm1",
                         rms_norm_eps = config.rms_norm_eps,
                         out_dtype = torch.float,
-                    ),
+                    ) if post_norms else None,
                     mlp_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.post_attention_layernorm",
@@ -129,7 +135,7 @@ class HyperClovaxModel(Model):
                         key = f"{key_prefix}.layers.{idx}.post_norm2",
                         rms_norm_eps = config.rms_norm_eps,
                         out_dtype = torch.float,
-                    ),
+                    ) if post_norms else None,
                 )
             ]
 
@@ -148,7 +154,7 @@ class HyperClovaxModel(Model):
             ),
             Linear(
                 config = config,
-                key = "lm_head",
+                key = head_key,
                 qbits_key = "head_bits",
                 alt_key = head_alt_key,
                 in_features = config.hidden_size,
