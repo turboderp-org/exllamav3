@@ -7,7 +7,7 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
-from flash_attn import flash_attn_func, flash_attn_with_kvcache
+from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
@@ -153,6 +153,7 @@ class Attention(Module):
         kv_proj: Linear | Module | None = None,
         o_proj: Linear | Module | None = None,
         interleaved_gate: bool = False,
+        use_cu_seqlens: bool = False,
     ):
         super().__init__(config, key, None)
 
@@ -169,6 +170,7 @@ class Attention(Module):
         self.sliding_window = sliding_window
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
+        self.use_cu_seqlens = use_cu_seqlens
 
         if self.num_kv_heads == 0:
             return
@@ -480,15 +482,32 @@ class Attention(Module):
                 inv_freq,
             )
 
-        o = flash_attn_func(
-            q = q,
-            k = k,
-            v = v,
-            causal = causal,
-            softmax_scale = self.sm_scale,
-            window_size = (self.sliding_window, self.sliding_window),
-            softcap = self.logit_softcapping
-        )
+        if self.use_cu_seqlens and (cu_seqlens := get_for_device(params, "cu_seqlens", self.device, None)) is not None:
+            max_seqlen = params["max_seqlen"]
+            o = flash_attn_varlen_func(
+                q = q.squeeze(0),
+                k = k.squeeze(0),
+                v = v.squeeze(0),
+                cu_seqlens_q = cu_seqlens,
+                cu_seqlens_k = cu_seqlens,
+                max_seqlen_q = max_seqlen,
+                max_seqlen_k = max_seqlen,
+                causal = causal,
+                softmax_scale = self.sm_scale,
+                window_size = (self.sliding_window, self.sliding_window),
+                softcap = self.logit_softcapping
+            )
+        else:
+            o = flash_attn_func(
+                q = q,
+                k = k,
+                v = v,
+                causal = causal,
+                softmax_scale = self.sm_scale,
+                window_size = (self.sliding_window, self.sliding_window),
+                softcap = self.logit_softcapping
+            )
+
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.interleaved_gate: o *= g.sigmoid()
 
