@@ -33,6 +33,7 @@ from .qwen3_vl import Qwen3VLModel
 from .qwen3_vl_moe import Qwen3VLMoeModel
 from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
+from .solar_open_moe import SolarOpenMoeModel
 
 ARCHITECTURES = {
     m.config_class.arch_string: {
@@ -76,6 +77,7 @@ ARCHITECTURES = {
         Qwen3VLMoeModel,
         SeedOssModel,
         SmolLM3Model,
+        SolarOpenMoeModel,
     ]
 }
 
