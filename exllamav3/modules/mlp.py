@@ -35,6 +35,7 @@ class MLP(Module):
         pad_to = 128,
         ups: list[Linear | Module] = None,
         downs: list[Linear | Module] = None,
+        interm_scale: float | None = None
     ):
         super().__init__(config, key, None)
 
@@ -46,6 +47,8 @@ class MLP(Module):
         self.intermediate_size = intermediate_size
         self.intermediate_split_size = intermediate_split_size
         self.out_size = out_size or hidden_size
+        self.interm_scale = interm_scale
+        self.interm_rscale = None if interm_scale is None else 1.0 / interm_scale
 
         fkey, frange_up = None, None
 
@@ -209,8 +212,17 @@ class MLP(Module):
         for s in r:
             u = self.ups[s].forward(x, params)
             # TODO: mixed precision activation kernel?
+
             a = self.activation_fn_call(u)
+            if self.interm_rscale is not None:
+                a *= self.interm_rscale
+            if self.interm_dtype == torch.float:
+                a = a.half()
+
             d_ = self.downs[s].forward(a, params)
+            if self.interm_scale is not None:
+                d_ *= self.interm_scale
+
             if d is None: d = d_
             else: d += d_
             del d_

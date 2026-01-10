@@ -10,6 +10,7 @@
 #define ROPESTYLE_NONE 0
 #define ROPESTYLE_GPTJ 1
 #define ROPESTYLE_NEOX 2
+#define ROPESTYLE_NANOCHAT 3
 #define MAX_NUM_THREADS 1024
 
 template <int rope_mode>
@@ -38,7 +39,8 @@ void rope_kernel
     const bool inv_freq_table,
     const int inv_freq_stride,
     const float llama_4_scaling_beta,
-    const int llama_4_scaling_original
+    const int llama_4_scaling_original,
+    bool post_rope_norm
 )
 {
     // Get position
@@ -135,6 +137,15 @@ void rope_kernel
                     sh_head[t] = __float2half_rn(r1);
                     sh_head[t + partial_head_dim / 2] = __float2half_rn(r2);
                 }
+                else if constexpr (rope_mode == ROPESTYLE_NANOCHAT)
+                {
+                    float v1 = __half2float(sh_head[t]);
+                    float v2 = __half2float(sh_head[t + partial_head_dim / 2]);
+                    float r1 = v1 * cos + v2 * sin;
+                    float r2 = v2 * cos - v1 * sin;
+                    sh_head[t] = __float2half_rn(r1);
+                    sh_head[t + partial_head_dim / 2] = __float2half_rn(r2);
+                }
                 else if constexpr (rope_mode == ROPESTYLE_GPTJ)
                 {
                     half2 *tptr = (half2*)(sh_head + t * 2);
@@ -183,10 +194,41 @@ void rope_kernel
             __syncthreads();
         };
 
+        // RMS Norm, unweighted
+        auto apply_norm_uw = [&] ()
+        {
+            half2 *tptr = (half2*)(sh_head + t * 2);
+            // int lane_id = threadIdx.x % 32;
+            int warp_id = threadIdx.x / 32;
+            int warps = blockDim.x / 32;
+
+            // Sum of squares
+            half2 v = *tptr;
+            float v1 = __low2float(v);
+            float v2 = __high2float(v);
+            float sum = v1 * v1 + v2 * v2;
+            sums[warps * t_head + warp_id] = warp_reduce_sum_f(sum);
+            __syncthreads();
+
+            sum = sums[warps * t_head];
+            for (int i = 1; i < warps; ++i) sum += sums[warps * t_head + i];
+
+            // Normalize and downcast
+            float rmf = rsqrtf(sum / (float) head_dim + norm_eps);
+            v1 *= rmf;
+            v2 *= rmf;
+            v = __floats2half2_rn(v1, v2);
+
+            // Store
+            *tptr = v;
+            __syncthreads();
+        };
+
         // Do the things
         load_head();
         if (q_norm) apply_norm();
         apply_rope();
+        if (post_rope_norm) apply_norm_uw();
         store_head();
     }
 }
@@ -230,7 +272,8 @@ void rope
     float norm_eps,
     float norm_constant_bias,
     float llama_4_scaling_beta,
-    int llama_4_scaling_original
+    int llama_4_scaling_original,
+    bool post_rope_norm
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(q.device());
@@ -310,10 +353,11 @@ void rope
     #define ARGS q_ptr, out_q_ptr, k_ptr, out_k_ptr, inv_freq_ptr, bsz, seq_len, num_heads_q, num_heads_k, \
                  head_dim, partial_head_dim, position, positions_ptr, position_ids_ptr, attn_factor, \
                  q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table, inv_freq_stride, \
-                 llama_4_scaling_beta, llama_4_scaling_original
+                 llama_4_scaling_beta, llama_4_scaling_original, post_rope_norm
 
-    if      (rope_mode == ROPESTYLE_GPTJ) rope_kernel<ROPESTYLE_GPTJ><<<blocks, threads, 0, stream>>>(ARGS);
-    else if (rope_mode == ROPESTYLE_NEOX) rope_kernel<ROPESTYLE_NEOX><<<blocks, threads, 0, stream>>>(ARGS);
+    if      (rope_mode == ROPESTYLE_GPTJ)       rope_kernel<ROPESTYLE_GPTJ><<<blocks, threads, 0, stream>>>(ARGS);
+    else if (rope_mode == ROPESTYLE_NEOX)       rope_kernel<ROPESTYLE_NEOX><<<blocks, threads, 0, stream>>>(ARGS);
+    else if (rope_mode == ROPESTYLE_NANOCHAT)   rope_kernel<ROPESTYLE_NANOCHAT><<<blocks, threads, 0, stream>>>(ARGS);
 
     cuda_check(cudaPeekAtLastError());
 }

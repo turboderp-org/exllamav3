@@ -154,6 +154,7 @@ class Attention(Module):
         o_proj: Linear | Module | None = None,
         interleaved_gate: bool = False,
         use_cu_seqlens: bool = False,
+        post_rope_norm: bool = False
     ):
         super().__init__(config, key, None)
 
@@ -171,6 +172,11 @@ class Attention(Module):
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
         self.use_cu_seqlens = use_cu_seqlens
+        self.post_rope_norm = post_rope_norm
+
+        if post_rope_norm:
+            assert q_norm is None and k_norm is None, \
+                "Post-RoPE norm only supported without weights"
 
         if self.num_kv_heads == 0:
             return
@@ -432,7 +438,8 @@ class Attention(Module):
                 self.k_norm_tensor,
                 self.norm_eps,
                 self.norm_constant_bias,
-                inv_freq
+                inv_freq,
+                self.post_rope_norm
             )
 
         q = q.transpose(1, 2)
@@ -480,6 +487,7 @@ class Attention(Module):
                 self.norm_eps,
                 self.norm_constant_bias,
                 inv_freq,
+                self.post_rope_norm
             )
 
         if self.use_cu_seqlens and (cu_seqlens := get_for_device(params, "cu_seqlens", self.device, None)) is not None:
@@ -552,7 +560,8 @@ class Attention(Module):
                 self.k_norm_tensor,
                 self.norm_eps,
                 self.norm_constant_bias,
-                inv_freq
+                inv_freq,
+                self.post_rope_norm
             )
 
         if self.has_split_cache:
@@ -651,6 +660,7 @@ class Attention(Module):
                 "out_dtype": self.out_dtype,
                 "sliding_window": self.sliding_window,
                 "logit_softcapping": self.logit_softcapping,
+                "post_rope_norm": self.post_rope_norm,
             },
             "num_kv_heads": self.num_kv_heads,
             **{name: _export(getattr(self, name, None)) for name in (

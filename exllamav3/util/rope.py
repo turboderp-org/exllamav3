@@ -12,6 +12,7 @@ class RopeStyle(IntEnum):
     NONE = 0
     GPTJ = 1
     NEOX = 2
+    NANOCHAT = 3
 
 @dataclass
 class RopeSettings:
@@ -365,7 +366,8 @@ class RoPE:
         k_norm: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
         norm_constant_bias: float = 0.0,
-        inv_freq: torch.Tensor | None = None
+        inv_freq: torch.Tensor | None = None,
+        post_rope_norm: bool = False
     ):
         q = q.contiguous()
         if k is not None: k = k.contiguous()
@@ -401,6 +403,7 @@ class RoPE:
             norm_constant_bias,
             self.llama_4_scaling_beta,
             self.llama_4_scaling_original,
+            post_rope_norm
         )
             
         if squeeze:
