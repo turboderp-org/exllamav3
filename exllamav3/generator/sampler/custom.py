@@ -9,6 +9,7 @@ import random
 from dataclasses import dataclass
 from enum import Enum
 from ...util import profile_opt
+import torch.nn.functional as F
 
 class SS(Enum):
     INIT = 0  # only state.in_logits is valid
@@ -498,6 +499,9 @@ class CustomSampler(Sampler):
 
         # Apply logit mask/bias tensor
         if logit_mask is not None:
+            pad = logits.shape[-1] - logit_mask.shape[-1]
+            if pad > 0:
+                logit_mask = F.pad(logit_mask, (0, pad), value = float("-inf"))
             logits = logits + logit_mask
 
         state = SamplingState(
