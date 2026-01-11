@@ -1,6 +1,7 @@
 from . import Model, Config, Cache, Tokenizer
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
 from .cache import CacheLayer_fp16, CacheLayer_quant
+from .generator.sampler import ComboSampler
 from argparse import ArgumentParser
 import yaml
 
@@ -8,6 +9,7 @@ def add_args(
     parser: ArgumentParser,
     cache: bool = True,
     default_cache_size = 8192,
+    add_sampling_args: bool = False
 ):
     """
     Add standard model loading arguments to command line parser
@@ -20,6 +22,9 @@ def add_args(
 
     :param default_cache_size:
         Default value for -cs / --cache_size argument
+
+    :param add_sampling_args:
+        bool, add sampling arguments
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
@@ -36,9 +41,44 @@ def add_args(
 
     parser.add_argument("-lv", "--load_verbose", action = "store_true", help = "Verbose output while loading")
 
+    if add_sampling_args:
+        parser.add_argument("-temp", "--temperature", type = float, help = "Sampling temperature", default = 0.8)
+        parser.add_argument("-temp_first", "--temperature_first", action = "store_true", help = "Apply temperature before truncation")
+        parser.add_argument("-repp", "--repetition_penalty", type = float, help = "Repetition penalty, HF style, 1 to disable (default: disabled)", default = 1.0)
+        parser.add_argument("-presp", "--presence_penalty", type = float, help = "Presence penalty, 0 to disable (default: disabled)", default = 0.0)
+        parser.add_argument("-freqp", "--frequency_penalty", type = float, help = "Frequency penalty, 0 to disable (default: disabled)", default = 0.0)
+        parser.add_argument("-penr", "--penalty_range", type = int, help = "Range for penalties, in tokens (default: 1024) ", default = 1024)
+        parser.add_argument("-minp", "--min_p", type = float, help = "Min-P truncation, 0 to disable (default: 0.08)", default = 0.08)
+        parser.add_argument("-topk", "--top_k", type = int, help = "Top-K truncation, 0 to disable (default: disabled)", default = 0)
+        parser.add_argument("-topp", "--top_p", type = float, help = "Top-P truncation, 1 to disable (default: disabled)", default = 1.0)
+
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
+
+
+def get_arg_sampler(args):
+    """
+    Create CompoSampler from default args above
+
+    :param args:
+        args from ArgumentParser
+
+    :return:
+        ComboSampler
+    """
+    return ComboSampler(
+        rep_p = args.repetition_penalty,
+        pres_p = args.presence_penalty,
+        freq_p = args.frequency_penalty,
+        rep_sustain_range = args.penalty_range,
+        rep_decay_range = args.penalty_range,
+        temperature = args.temperature,
+        min_p = args.min_p,
+        top_k = args.top_k,
+        top_p = args.top_p,
+        temp_last = not args.temperature_first,
+    )
 
 
 def init(
