@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from . import Model, Config, Cache, Tokenizer
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
 from .cache import CacheLayer_fp16, CacheLayer_quant
@@ -9,7 +11,8 @@ def add_args(
     parser: ArgumentParser,
     cache: bool = True,
     default_cache_size = 8192,
-    add_sampling_args: bool = False
+    add_sampling_args: bool = False,
+    default_sampling_args: dict = None
 ):
     """
     Add standard model loading arguments to command line parser
@@ -25,6 +28,9 @@ def add_args(
 
     :param add_sampling_args:
         bool, add sampling arguments
+
+    :param default_sampling_args:
+        dict of default values
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
@@ -42,15 +48,25 @@ def add_args(
     parser.add_argument("-lv", "--load_verbose", action = "store_true", help = "Verbose output while loading")
 
     if add_sampling_args:
-        parser.add_argument("-temp", "--temperature", type = float, help = "Sampling temperature", default = 0.8)
+        defs = default_sampling_args if default_sampling_args is not None else {}
+        d = SimpleNamespace()
+        d.temperature = defs.get("temperature", 0.8)
+        d.repetition_penalty = defs.get("repetition_penalty", 1.0)
+        d.presence_penalty = defs.get("presence_penalty", 0.0)
+        d.frequency_penalty = defs.get("frequency_penalty", 0.0)
+        d.penalty_range = defs.get("penalty_range", 1024)
+        d.min_p = defs.get("min_p", 0.08)
+        d.top_k = defs.get("top_k", 0)
+        d.top_p = defs.get("top_p", 1.0)
+        parser.add_argument("-temp", "--temperature", type = float, help = f"Sampling temperature (default: {d.temperature:.1f})", default = d.temperature)
         parser.add_argument("-temp_first", "--temperature_first", action = "store_true", help = "Apply temperature before truncation")
-        parser.add_argument("-repp", "--repetition_penalty", type = float, help = "Repetition penalty, HF style, 1 to disable (default: disabled)", default = 1.0)
-        parser.add_argument("-presp", "--presence_penalty", type = float, help = "Presence penalty, 0 to disable (default: disabled)", default = 0.0)
-        parser.add_argument("-freqp", "--frequency_penalty", type = float, help = "Frequency penalty, 0 to disable (default: disabled)", default = 0.0)
-        parser.add_argument("-penr", "--penalty_range", type = int, help = "Range for penalties, in tokens (default: 1024) ", default = 1024)
-        parser.add_argument("-minp", "--min_p", type = float, help = "Min-P truncation, 0 to disable (default: 0.08)", default = 0.08)
-        parser.add_argument("-topk", "--top_k", type = int, help = "Top-K truncation, 0 to disable (default: disabled)", default = 0)
-        parser.add_argument("-topp", "--top_p", type = float, help = "Top-P truncation, 1 to disable (default: disabled)", default = 1.0)
+        parser.add_argument("-repp", "--repetition_penalty", type = float, help = f"Repetition penalty, HF style, 1 to disable (default: {d.repetition_penalty:.1f})", default = d.repetition_penalty)
+        parser.add_argument("-presp", "--presence_penalty", type = float, help = f"Presence penalty, 0 to disable (default: {d.presence_penalty:.1f})", default = d.presence_penalty)
+        parser.add_argument("-freqp", "--frequency_penalty", type = float, help = f"Frequency penalty, 0 to disable (default: {d.frequency_penalty:.1f})", default = d.frequency_penalty)
+        parser.add_argument("-penr", "--penalty_range", type = int, help = f"Range for penalties, in tokens (default: {d.penalty_range})", default = d.penalty_range)
+        parser.add_argument("-minp", "--min_p", type = float, help = f"Min-P truncation, 0 to disable (default: {d.min_p:.2f})", default = d.min_p)
+        parser.add_argument("-topk", "--top_k", type = int, help = f"Top-K truncation, 0 to disable (default: {d.top_k})", default = d.top_k)
+        parser.add_argument("-topp", "--top_p", type = float, help = f"Top-P truncation, 1 to disable (default: {d.top_p:.2f})", default = d.top_p)
 
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
