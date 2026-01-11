@@ -37,6 +37,7 @@ class Tokenizer:
         self.unspecial_piece_to_id = {}
         self.unspecial_id_to_piece = {}
         self.vocab = None
+        self.hf_tokenizer = None
 
         # Regex
         self.ord_exp = re.compile(r"^<0x([0-9A-Fa-f]+)>$")
@@ -621,3 +622,35 @@ class Tokenizer:
         }
     def get_vocab_dict(self):
         return self._get_vocab_dict
+
+    def hf_chat_template(
+        self,
+        messages: list,
+        add_generation_prompt: bool = True
+    ):
+        """
+        Tokenize with HF tokenizer. Requires `transformers`
+
+        :param messages:
+            HF-formatted list of messages, e.g.
+                [{
+                    "role": "user",
+                    "content": "Hello."
+                }]
+
+        :param add_generation_prompt:
+            bool, add generation prompt
+
+        :return:
+            Topken IDs tensor, shape (1, num_tokens)
+        """
+
+        from transformers import AutoTokenizer
+        if self.hf_tokenizer is None:
+            self.hf_tokenizer = AutoTokenizer.from_pretrained(self.config.directory)
+        ids = self.hf_tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt = add_generation_prompt
+        )["input_ids"]
+        ids = torch.tensor(ids, dtype = torch.long).unsqueeze(0)
+        return ids

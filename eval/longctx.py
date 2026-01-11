@@ -2,7 +2,6 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
-from transformers import AutoTokenizer
 from exllamav3.util.progress import ProgressBar
 from exllamav3 import Config, Model, Cache, Tokenizer, model_init, Generator, Job, GreedySampler
 import torch
@@ -26,9 +25,6 @@ def main(args):
 
     print(f" -- Model: {args.model_dir}")
     print(f" -- Bitrate: {bpw_layer:.2f} bpw / {bpw_head:.2f} bpw (head)")
-
-    # Load Transformers tokenizers
-    t_tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
 
     # Get
     texts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_texts")
@@ -55,8 +51,7 @@ def main(args):
             "role": "user",
             "content": instruction
         }]
-        input_ids = t_tokenizer.apply_chat_template(chat, add_generation_prompt = True)
-        input_ids = torch.tensor(input_ids, dtype = torch.long).unsqueeze(0)
+        input_ids = tokenizer.hf_chat_template(chat, add_generation_prompt = True)
         job = Job(
             input_ids = input_ids,
             max_new_tokens = 768,
