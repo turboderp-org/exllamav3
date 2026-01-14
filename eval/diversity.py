@@ -3,7 +3,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 from exllamav3.util.progress import ProgressBar
-from exllamav3 import model_init, Generator, Job, FormatronFilter
+from exllamav3 import model_init, Generator, Job, FormatronFilter, GreedySampler
 from formatron.formatter import FormatterBuilder
 from formatron.schemas.dict_inference import infer_mapping
 import torch
@@ -116,13 +116,15 @@ def main(args):
             schema = infer_mapping(ex_dict)
             f.append_line(f"{prefix}{f.json(schema, capture_name = 'json')}")
             filters = [FormatronFilter(tokenizer, eos_after_completed = True, formatter_builder = f)]
+            sampler = GreedySampler()
         else:
             filters = None
+            sampler = model_init.get_arg_sampler(args)
         job = Job(
             input_ids = input_ids,
             max_new_tokens = args.max_tokens,
             stop_conditions = config.eos_token_id_list,
-            sampler = model_init.get_arg_sampler(args),
+            sampler = sampler,
             filters = filters,
             max_rq_tokens = 512,
         )
