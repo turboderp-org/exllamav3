@@ -21,6 +21,12 @@ class SS(Enum):
     PROBS_N = 6  # state.probs is valid and normalized
     PROBS_N_S = 7  # state.probs is valid and normalized, indices are valid
 
+def clamp(n, smallest, largest):
+    return max(smallest, min(n, largest))
+
+def conditional(condition, a, b):
+    return a if condition else b
+
 @dataclass
 class SamplingState:
     rand_u32: int
@@ -446,6 +452,84 @@ class SS_PresFreqP(SS_Base):
 
     def reqs_past_ids(self):
         return True
+
+
+class SS_AdaptiveP(SS_Base):
+    """
+    Implements Adaptive-P sampler. Maintains state but does not remember past states (keeps future state in case
+    of rollback).
+    """
+    def __init__(
+        self,
+        target: float = 1.0,
+        decay: float = 0.0
+    ):
+        self.target = target
+        self.decay = decay
+        clamped_decay = max(min(decay, 0.99), 0.0)
+        self.weighted_sum = target / (1.0 - clamped_decay)
+        self.total_weight = 1.0 / (1.0 - clamped_decay)
+
+        self.DISTRIBUTION_WIDTH = 0.3
+        self.PEAK_LOGIT_VALUE = 5.0
+        self.SHARPNESS = 10.0
+        self.INV_WIDTH = 1.0 / self.DISTRIBUTION_WIDTH
+
+        # self.log = []
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.PROBS_N_S:
+                target = clamp(self.target, 0.0, 1.0)
+                adapted_target = conditional(
+                    self.total_weight == 0.0,
+                    target,
+                    2.0 * target - (self.weighted_sum / self.total_weight)
+                )
+                adapted_target = clamp(adapted_target, 0.0, 1.0)
+
+                state.logits = torch.empty_like(state.in_logits, dtype = torch.float)
+                ext.adaptivep_gumbel_noise_f32(
+                    state.probs,
+                    state.logits,
+                    state.rand_u32,
+                    adapted_target,
+                    self.INV_WIDTH,
+                    self.PEAK_LOGIT_VALUE,
+                    self.SHARPNESS
+                )
+
+                temp = torch.argmax(state.logits, dim = -1)
+                state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
+                sampled_prob = state.probs[0, temp].item()
+
+                # self.log.append((adapted_target, sampled_prob))
+                # if len(self.log) == 300:
+                #     print("\n\n\n")
+                #     s = 0
+                #     for i, (a, b) in enumerate(self.log):
+                #         s += b
+                #         m = s / (i + 1)
+                #         print(f"{i};{a};{b};{m}")
+                #     print("\n\n\n")
+
+                self.weighted_sum = sampled_prob + self.decay * self.weighted_sum
+                self.total_weight = 1.0 + self.decay * self.total_weight
+            case _:
+                raise ValueError("Sampling logic error")
+        state.state = SS.DONE
+
+    def prep(self, in_state: SS):
+        match in_state:
+            case SS.INIT | SS.LOGITS | SS.PROBS | SS.LOGITS_S | SS.PROBS_S:
+                return [SS_Normalize, SS_Sort]
+            case _:
+                return None
+
+    def alt(self):
+        if self.target == 1.0:
+            return SS_NoOp()
+        return None
 
 
 class CustomSampler(Sampler):
