@@ -16,7 +16,8 @@ def maybe_set_arch_list_env():
     arch_list = []
     for i in range(torch.cuda.device_count()):
         capability = torch.cuda.get_device_capability(i)
-        supported_sm = [int(arch.split('_')[1])
+        # Strip known NVIDIA suffixes: 'a' (accelerated) or 'f' (family)
+        supported_sm = [int(arch.split('_')[1].rstrip('af'))
                         for arch in torch.cuda.get_arch_list() if 'sm_' in arch]
         if not supported_sm:
             continue
