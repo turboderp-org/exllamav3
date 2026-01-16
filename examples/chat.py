@@ -3,7 +3,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 from exllamav3 import Generator, Job, model_init
-from exllamav3.generator.sampler import ComboSampler
 from chat_templates import *
 from chat_util import *
 from chat_io import *
@@ -53,21 +52,11 @@ def main(args):
         tokenizer = tokenizer,
     )
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
-    stop_conditions += config.eos_token_id_list
+    if config.eos_token_id_list and all(config.eos_token_id_list):
+        stop_conditions += config.eos_token_id_list
 
     # Sampler
-    sampler = ComboSampler(
-        rep_p = args.repetition_penalty,
-        pres_p = args.presence_penalty,
-        freq_p = args.frequency_penalty,
-        rep_sustain_range = args.penalty_range,
-        rep_decay_range = args.penalty_range,
-        temperature = args.temperature,
-        min_p = args.min_p,
-        top_k = args.top_k,
-        top_p = args.top_p,
-        temp_last = not args.temperature_first,
-    )
+    sampler = model_init.get_arg_sampler(args)
 
     # Single prompt mode
     single_prompt = args.prompt
@@ -282,7 +271,7 @@ def main(args):
             print(f"\n{col_error} !! Response exceeded {max_response_tokens} tokens and was cut short.{col_default}")
 
         if show_tps and r:
-            prompt_tokens = ids.shape[-1]
+            prompt_tokens = r["prompt_tokens"]
             cached_tokens = r["cached_tokens"]
             new_ctx_tokens = prompt_tokens - cached_tokens
             prompt_tps = new_ctx_tokens / r["time_prefill"]
@@ -294,6 +283,12 @@ def main(args):
                 f"{col_info}{cached_tokens:,}{col_default} tokens cached - "
                 f"Generate: {col_info}{new_tokens:,}{col_default} tokens at {col_info}{tps:.3f}{col_default} t/s"
             )
+
+        if args.debug:
+            from pprint import pprint
+            print()
+            pprint(r, compact = True, indent = 4)
+            print()
 
         # Add response to context
         response = s.all_text.strip()
@@ -317,7 +312,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    model_init.add_args(parser, cache = True)
+    model_init.add_args(parser, cache = True, add_sampling_args = True)
     parser.add_argument("-mode", "--mode", type = str, help = "Prompt mode", default = None)
     parser.add_argument("-modes", "--modes", action = "store_true", help = "List available prompt modes and exit")
     parser.add_argument("-un", "--user_name", type = str, default = "User", help = "User name (raw mode only)")
@@ -330,18 +325,10 @@ if __name__ == "__main__":
     parser.add_argument("-no_think", "--no_think", action = "store_true", help = "Suppress think tags (won't necessarily stop reasoning model from reasoning anyway)")
     parser.add_argument("-think_budget", "--think_budget", type = int, help = "Thinking budget for supported models", default = None)
     parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context with every new prompt")
-    parser.add_argument("-temp", "--temperature", type = float, help = "Sampling temperature", default = 0.8)
-    parser.add_argument("-temp_first", "--temperature_first", action = "store_true", help = "Apply temperature before truncation")
-    parser.add_argument("-repp", "--repetition_penalty", type = float, help = "Repetition penalty, HF style, 1 to disable (default: disabled)", default = 1.0)
-    parser.add_argument("-presp", "--presence_penalty", type = float, help = "Presence penalty, 0 to disable (default: disabled)", default = 0.0)
-    parser.add_argument("-freqp", "--frequency_penalty", type = float, help = "Frequency penalty, 0 to disable (default: disabled)", default = 0.0)
-    parser.add_argument("-penr", "--penalty_range", type = int, help = "Range for penalties, in tokens (default: 1024) ", default = 1024)
-    parser.add_argument("-minp", "--min_p", type = float, help = "Min-P truncation, 0 to disable (default: 0.08)", default = 0.08)
-    parser.add_argument("-topk", "--top_k", type = int, help = "Top-K truncation, 0 to disable (default: disabled)", default = 0)
-    parser.add_argument("-topp", "--top_p", type = float, help = "Top-P truncation, 1 to disable (default: disabled)", default = 1.0)
     parser.add_argument("-tps", "--show_tps", action = "store_true", help = "Show tokens/second after every reply")
     parser.add_argument("-prompt", "--prompt", type = str, help = "Run single prompt, then exit")
     parser.add_argument("-save", "--save", type = str, help = "Save output to file (use with --prompt)")
     parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")
+    parser.add_argument("-dbg", "--debug", action = "store_true", help = "Print extra debug stuff")
     _args = parser.parse_args()
     main(_args)

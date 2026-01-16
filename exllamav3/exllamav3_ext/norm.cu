@@ -113,6 +113,14 @@ __device__ inline void apply4(float4& x4, const float4& w4, const float rmf)
     x4.w = x4.w * w4.w * rmf;
 }
 
+__device__ inline void apply4_nw(float4& x4, const float rmf)
+{
+    x4.x = x4.x * rmf;
+    x4.y = x4.y * rmf;
+    x4.z = x4.z * rmf;
+    x4.w = x4.w * rmf;
+}
+
 __device__ __forceinline__ float _silu(float x)
 {
     float e     = __expf(-x);
@@ -169,17 +177,23 @@ void rms_norm_kernel
         if constexpr (input_fp16) read_half4<true>(x4, ((const half4*) (x + row * dim)) + column);
         if constexpr (input_fp32) read_float4(x4, ((const float4*) (x + row * dim)) + column);
 
-        float4 w4;
-        read_half4<false>(w4, ((const half4*) w) + column);
-        if (constant_bias != 0.0f)
+        if (w)
         {
-            w4.x += constant_bias;
-            w4.y += constant_bias;
-            w4.z += constant_bias;
-            w4.w += constant_bias;
+            float4 w4;
+            read_half4<false>(w4, ((const half4*) w) + column);
+            if (constant_bias != 0.0f)
+            {
+                w4.x += constant_bias;
+                w4.y += constant_bias;
+                w4.z += constant_bias;
+                w4.w += constant_bias;
+            }
+            apply4(x4, w4, rmf);
         }
-
-        apply4(x4, w4, rmf);
+        else
+        {
+            apply4_nw(x4, rmf);
+        }
 
         if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row * dim)) + column);
         if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row * dim)) + column);
@@ -196,7 +210,7 @@ Compute RMSNorm: y = x * w / sqrt(row_mean(x * x) + epsilon)
 void rms_norm
 (
     at::Tensor x,
-    at::Tensor w,
+    c10::optional<at::Tensor> w,
     at::Tensor y,
     float epsilon,
     float constant_bias,
@@ -209,9 +223,11 @@ void rms_norm
         y = y.flatten(-2);
     }
 
-    TORCH_CHECK_DTYPE(w, kHalf);
+    TORCH_CHECK_DTYPE_OPT(w, kHalf);
+    const half* w_ptr = (const half*) OPTPTR(w);
     TORCH_CHECK_DIV(x, -1, 4);
-    TORCH_CHECK_SHAPES(x, -1, w, 0, 1);
+    if (w_ptr)
+        TORCH_CHECK_SHAPES(x, -1, w.value(), 0, 1);
     TORCH_CHECK_SHAPES_FULL(x, y);
 
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -231,7 +247,7 @@ void rms_norm
         rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>
         (
             (const half*) x.data_ptr(),
-            (const half*) w.data_ptr(),
+            (const half*) w_ptr,
             (half*) y.data_ptr(),
             epsilon,
             rows,
@@ -242,7 +258,7 @@ void rms_norm
         rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>
         (
             (const half*) x.data_ptr(),
-            (const half*) w.data_ptr(),
+            (const half*) w_ptr,
             (float*) y.data_ptr(),
             epsilon,
             rows,
@@ -253,7 +269,7 @@ void rms_norm
         rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>
         (
             (const float*) x.data_ptr(),
-            (const half*) w.data_ptr(),
+            (const half*) w_ptr,
             (half*) y.data_ptr(),
             epsilon,
             rows,
@@ -264,7 +280,7 @@ void rms_norm
         rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>
         (
             (const float*) x.data_ptr(),
-            (const half*) w.data_ptr(),
+            (const half*) w_ptr,
             (float*) y.data_ptr(),
             epsilon,
             rows,

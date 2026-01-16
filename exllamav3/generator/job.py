@@ -1096,3 +1096,6 @@ class Job:
             page = seq.allocated_pages[last_page]
             assert page.kv_position == PAGE_SIZE
             cache.stash(page.phash, self.recurrent_state)
+
+    def free_recurrent_state(self):
+        self.recurrent_state = None

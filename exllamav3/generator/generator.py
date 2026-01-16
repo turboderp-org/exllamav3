@@ -572,6 +572,7 @@ class Generator:
         num_jobs = self.num_remaining_jobs()
         for job in completed_jobs + requeuing_jobs:
             job.deallocate_pages()
+            job.free_recurrent_state()
             self.active_jobs.remove(job)
 
         # Requeue jobs

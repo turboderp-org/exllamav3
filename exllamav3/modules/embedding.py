@@ -18,7 +18,8 @@ class Embedding(Module):
         hidden_size: int,
         out_dtype: torch.dtype | None = torch.float,
         qmap: str | None = None,
-        normalize: bool = False
+        normalize: bool = False,
+        multiplier: float = 1.0
     ):
         super().__init__(config, key, None)
         assert qmap is None, "No quant scheme for Embedding"
@@ -30,6 +31,7 @@ class Embedding(Module):
         self.out_dtype = out_dtype
         self._numel = vocab_size * hidden_size
         self.normalize = normalize
+        self.multiplier = multiplier
 
         self.caps.update({
             "prefer_cpu": True,
@@ -130,7 +132,7 @@ class Embedding(Module):
             if deepstack_emb is not None:
                 params["deepstack_emb"] = deepstack_emb
 
-            return combined_emb
+            return combined_emb if self.multiplier == 1.0 else combined_emb * self.multiplier
 
         # No indexed embeddings, or none in current batch
         else:
@@ -138,7 +140,7 @@ class Embedding(Module):
             x = to2(x, out_dtype, self.out_dtype)
             if self.normalize:
                 x *= x.shape[-1] ** 0.5
-            return x
+            return x if self.multiplier == 1.0 else x * self.multiplier
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         return []

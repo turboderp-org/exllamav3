@@ -12,6 +12,7 @@ class RopeStyle(IntEnum):
     NONE = 0
     GPTJ = 1
     NEOX = 2
+    NANOCHAT = 3
 
 @dataclass
 class RopeSettings:
@@ -25,6 +26,7 @@ class RopeSettings:
     rope_style: RopeStyle = RopeStyle.NEOX
     override_max_position_embeddings: int | None = None
     llama_4_scaling_beta: float = 0.0
+    override_type: str | None = None
 
     def print(self):
         print(f" -- RoPE settings")
@@ -100,10 +102,11 @@ class RoPE:
         self.llama_4_scaling_beta = 0.0
         self.llama_4_scaling_original = 1  # Unused when beta=0
 
-        t = None
+        t = rope_settings.override_type
         rs = self.rope_settings
-        if rs.rope_scaling is not None:
-            t = rs.rope_scaling.get("rope_type", rs.rope_scaling.get("type"))
+        if not t:
+            if rs.rope_scaling is not None:
+                t = rs.rope_scaling.get("rope_type", rs.rope_scaling.get("type"))
         match t:
             case None:
                 self._rope_params_default()
@@ -363,7 +366,8 @@ class RoPE:
         k_norm: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
         norm_constant_bias: float = 0.0,
-        inv_freq: torch.Tensor | None = None
+        inv_freq: torch.Tensor | None = None,
+        post_rope_norm: bool = False
     ):
         q = q.contiguous()
         if k is not None: k = k.contiguous()
@@ -399,6 +403,7 @@ class RoPE:
             norm_constant_bias,
             self.llama_4_scaling_beta,
             self.llama_4_scaling_original,
+            post_rope_norm
         )
             
         if squeeze:

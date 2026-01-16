@@ -13,6 +13,9 @@ from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
+from .hcxvisionv2 import HCXVisionV2Model
+from .hyperclovax import HyperClovaxModel
+from .iquestcoder import IQuestCoderModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
 from .minimax_m2 import MiniMaxM2Model
@@ -20,6 +23,8 @@ from .ministral3 import Ministral3Model
 from .mistral import MistralModel
 from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
+from .nanochat import NanoChatModel
+from .olmo3 import Olmo3Model
 from .phi3 import Phi3Model
 from .qwen2 import Qwen2Model
 from .qwen3 import Qwen3Model
@@ -29,6 +34,7 @@ from .qwen3_vl import Qwen3VLModel
 from .qwen3_vl_moe import Qwen3VLMoeModel
 from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
+from .solar_open_moe import SolarOpenMoeModel
 
 ARCHITECTURES = {
     m.config_class.arch_string: {
@@ -52,6 +58,9 @@ ARCHITECTURES = {
         Glm4MoeModel,
         Glm4VModel,
         Glm4VMoeModel,
+        HCXVisionV2Model,
+        HyperClovaxModel,
+        IQuestCoderModel,
         LlamaModel,
         MiMoModel,
         MiniMaxM2Model,
@@ -59,6 +68,8 @@ ARCHITECTURES = {
         MistralModel,
         Mistral3Model,
         MixtralModel,
+        NanoChatModel,
+        Olmo3Model,
         Phi3Model,
         Qwen2Model,
         Qwen3Model,
@@ -68,6 +79,7 @@ ARCHITECTURES = {
         Qwen3VLMoeModel,
         SeedOssModel,
         SmolLM3Model,
+        SolarOpenMoeModel,
     ]
 }
 

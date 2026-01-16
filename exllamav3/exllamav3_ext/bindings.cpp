@@ -29,6 +29,7 @@
 
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
+#include "generator/sampling_extra.cuh"
 #include "generator/gumbel.cuh"
 #include "generator/rep_pen.cuh"
 #include "generator/cache.cuh"
@@ -115,6 +116,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gumbel_noise_log", &gumbel_noise_log, "gumbel_noise_log");
     m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
     m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
+    m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
 
     m.def("cache_rotate", &cache_rotate, "cache_rotate");
 

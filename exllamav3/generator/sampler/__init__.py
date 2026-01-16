@@ -15,6 +15,7 @@ from .custom import (
     SS_NoOp,
     SS_RepP,
     SS_PresFreqP,
+    SS_AdaptiveP,
 )
 from .presets import (
     DefaultSampler,
@@ -25,4 +26,5 @@ from .presets import (
     TopKSampler,
     TopPSampler,
     ComboSampler,
+    AdaptivePSampler,
 )

@@ -95,6 +95,8 @@ class ComboSampler(CustomSampler):
         top_k: int = 0,
         top_p: float = 1.0,
         temp_last: bool = False,
+        adaptive_target: float = 1.0,
+        adaptive_decay: float = 0.9,
     ):
         # Steps with default parameters become no-ops
         stack = [
@@ -113,7 +115,31 @@ class ComboSampler(CustomSampler):
                 SS_TopK(top_k),
                 SS_TopP(top_p),
                 SS_Temperature(temperature if temp_last else 1.0),
+            ]
+
+        if adaptive_target != 1.0:
+            stack += [
+                SS_AdaptiveP(adaptive_target, adaptive_decay)
+            ]
+        else:
+            stack += [
                 SS_Sample()
             ]
 
+        super().__init__(stack)
+
+class AdaptivePSampler(CustomSampler):
+    """
+    Min-P followed by Adaptive-P
+    """
+    def __init__(
+        self,
+        min_p: float = 0.08,
+        target: float = 0.5,
+        decay: float = 0.9,
+    ):
+        stack = [
+            SS_MinP(min_p),
+            SS_AdaptiveP(target, decay)
+        ]
         super().__init__(stack)

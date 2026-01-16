@@ -17,7 +17,8 @@ class RMSNorm(Module):
         out_dtype: torch.dtype | None = None,
         qmap: str | None = None,
         constant_bias: float = 0.0,
-        span_heads: bool = False
+        span_heads: bool = False,
+        unweighted: bool = False
     ):
         super().__init__(config, key, None)
         assert qmap is None, "No quant scheme for RMSNorm"
@@ -29,6 +30,7 @@ class RMSNorm(Module):
         self._numel = None
         self.constant_bias = constant_bias
         self.span_heads = span_heads
+        self.unweighted = unweighted
 
     @override
     def optimizer_targets(self):
@@ -37,9 +39,12 @@ class RMSNorm(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
-        weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, float2half = True)
-        self._numel = weight.numel()
-        self.weight = nn.Parameter(weight, requires_grad = False)
+        if not self.unweighted:
+            weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, float2half = True)
+            self._numel = weight.numel()
+            self.weight = nn.Parameter(weight, requires_grad = False)
+        else:
+            self._numel = 0
 
     @override
     def unload(self):
@@ -48,7 +53,7 @@ class RMSNorm(Module):
 
     @override
     def get_tensors(self):
-        return {
+        return {} if self.unweighted else {
             f"{self.key}.weight": self.weight.data
         }
 
@@ -63,7 +68,8 @@ class RMSNorm(Module):
         var = x.pow(2).mean(dim = -1, keepdim = True) + self.rms_norm_eps
         x = x * torch.rsqrt(var)
         x = x.to(dtype)
-        x = x * self.weight if self.constant_bias == 0.0 else x * (self.weight + self.constant_bias)
+        if not self.unweighted:
+            x = x * self.weight if self.constant_bias == 0.0 else x * (self.weight + self.constant_bias)
         x = x.to(out_dtype or self.out_dtype)
         return x
 
@@ -84,6 +90,8 @@ class RMSNorm(Module):
         return y
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
+        if self.unweighted:
+            return []
         stc = self.config.stc
         storage = sum(stc.get_tensor_sizes(self.key))
         overhead = storage // 2 * (self.out_dtype or torch.half).itemsize
@@ -118,7 +126,7 @@ class RMSNorm(Module):
         )
         module.device = device
         w = consumer.recv(exported["weight"], cuda = True)
-        module.weight = nn.Parameter(w)
+        module.weight = nn.Parameter(w) if w is not None else None
         torch.cuda.synchronize()
         return module
 
@@ -134,8 +142,9 @@ class RMSNorm(Module):
         module.device = device
 
         w = consumer.recv(exported["weight"], cuda = True)
-        if w.dim() == 2:
-            w = w[first : last, :]
-        module.weight = nn.Parameter(w.to(module.device).contiguous())
+        if w is not None:
+            if w.dim() == 2:
+                w = w[first : last, :]
+            module.weight = nn.Parameter(w.to(module.device).contiguous())
 
         return module

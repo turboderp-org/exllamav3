@@ -37,11 +37,15 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Gemma 3** (Gemma3ForCausalLM, Gemma3ForConditionalGeneration) *- multimodal*
 - **GLM 4**, **GLM 4.5**, **GLM 4.5-Air**, **GLM 4.6** (Glm4ForCausalLM, Glm4MoeForCausalLM)
 - **GLM 4.1V**, **GLM 4.5V** (Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration) *- multimodal*
+- **HyperCLOVAX** (HyperCLOVAXForCausalLM, HCXVisionV2ForCausalLM) *- multimodal*
+- **IQuest-Coder** (IQuestCoderForCausalLM)
 - **Llama**, **Llama 2**, **Llama 3**, **Llama 3.1-Nemotron** etc. (LlamaForCausalLM)
 - **MiMo-RL** (MiMoForCausalLM)
 - **MiniMax-M2** (MiniMaxM2ForCausalLM)
-- **Mistral**, **Mistral 3** etc. (MistralForCausalLM, Mistral3ForConditionalGeneration) *- multimodal*
+- **Mistral**, **Ministral 3**, **Devstral 2** etc. (MistralForCausalLM, Mistral3ForConditionalGeneration) *- multimodal*
 - **Mixtral** (MixtralForCausalLM)
+- **NanoChat** (NanoChatForCausalLM)
+- **Olmo 3.1** (Olmo3ForCausalLM)
 - **Phi3**, **Phi4** (Phi3ForCausalLM)
 - **Qwen 2**, **Qwen 2.5** (Qwen2ForCausalLM)
 - **Qwen 3** (Qwen3ForCausalLM, Qwen3MoeForCausalLM)
@@ -50,6 +54,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Qwen 3-VL MoE** (Qwen3VLMoeForConditionalGeneration) *- multimodal*
 - **Seed-OSS** (SeedOssForCausalLM)
 - **SmolLM** (SmolLM3ForCausalLM)
+- **SolarOpen** (SolarOpenForCausalLM)
 
 Always adding more, stay tuned.
 
