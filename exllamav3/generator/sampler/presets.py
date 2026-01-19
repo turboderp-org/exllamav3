@@ -117,14 +117,14 @@ class ComboSampler(CustomSampler):
                 SS_Temperature(temperature if temp_last else 1.0),
             ]
 
-        if adaptive_target != 1.0:
-            stack += [
-                SS_AdaptiveP(adaptive_target, adaptive_decay)
-            ]
-        else:
-            stack += [
-                SS_Sample()
-            ]
+            if adaptive_target != 1.0:
+                stack += [
+                    SS_AdaptiveP(adaptive_target, adaptive_decay)
+                ]
+            else:
+                stack += [
+                    SS_Sample()
+                ]
 
         super().__init__(stack)
 
