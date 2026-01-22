@@ -47,7 +47,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **NanoChat** (NanoChatForCausalLM)
 - **Olmo 3.1** (Olmo3ForCausalLM)
 - **Phi3**, **Phi4** (Phi3ForCausalLM)
-- **Qwen 2**, **Qwen 2.5** (Qwen2ForCausalLM)
+- **Qwen 2**, **Qwen 2.5**, **Qwen 2.5 VL** (Qwen2ForCausalLM, Qwen2_5_VLForConditionalGeneration) *- multimodal*
 - **Qwen 3** (Qwen3ForCausalLM, Qwen3MoeForCausalLM)
 - **Qwen 3-Next** (Qwen3NextForCausalLM)
 - **Qwen 3-VL** (Qwen3VLForConditionalGeneration)  *- multimodal*
