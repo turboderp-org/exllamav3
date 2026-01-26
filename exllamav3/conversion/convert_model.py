@@ -12,8 +12,7 @@ from ..util.tensor import save_tensor_image
 from ..util.measures import cosine_error, sqnr
 from .calibration_data import get_default_calibration
 from .compile import compile_model, dsize
-from safetensors.torch import save_file
-from safetensors import safe_open
+from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
 import threading
