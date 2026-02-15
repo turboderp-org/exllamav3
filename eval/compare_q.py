@@ -317,7 +317,10 @@ def plot(results, args):
         plt.grid(color = 'dimgray', linestyle = '--', linewidth = 0.5)
     else:
         plt.grid(True)
-    plt.show()
+    if args.plot_file:
+        plt.savefig(args.plot_file)
+    else:
+        plt.show()
 
 
 def dict_hash(x: dict) -> str:
@@ -403,6 +406,7 @@ if __name__ == "__main__":
     parser.add_argument("-mask", "--mask", type = str, help = "Semicolon-separated list of strings to match against model labels for inclusion")
     parser.add_argument("-lf", "--logits_file", type = str, help = "Reference logits file for KLD", required = False)
     parser.add_argument("-dark", "--dark", action = "store_true", help = "Dark mode")
+    parser.add_argument("-pf", "--plot_file", type = str, help = "Write the plot to a file")
     _args = parser.parse_args()
     main(_args)
 
