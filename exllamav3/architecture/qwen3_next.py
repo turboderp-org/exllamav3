@@ -28,7 +28,6 @@ class Qwen3NextConfig(Config):
         self.num_q_heads = self.read_cfg(int, "num_attention_heads", no_default)
         self.num_kv_heads = self.read_cfg(int, "num_key_value_heads", self.num_q_heads)
         self.assert_cfg(bool, "use_sliding_window", False, True)
-        self.full_attention_interval = self.read_cfg(int, "full_attention_interval", 4)
 
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
