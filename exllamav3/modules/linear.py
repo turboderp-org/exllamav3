@@ -21,7 +21,7 @@ class Linear(Module):
         in_features: int,
         out_features: int,
         qmap: str | None = None,
-        alt_key: str | None = None,
+        alt_key: str | list | None = None,
         qbits_key: str = "bits",
         qbits_mod_key: str = "",
         fkey : str | None = None,
@@ -117,24 +117,32 @@ class Linear(Module):
         return weight.view(ws).half()
 
 
-    def load_fp16(self, key: str) -> bool:
+    def load_fp16(self, key: str | list[str]) -> bool:
 
         if self.config.stc.has_tensor_group(key, ["weight"]):
 
             self.used_alt_key = key == self.alt_key
-            dev = "cpu" if self.is_sliced else self.device
-            pad1 = (self.out_features,) if not self.is_sliced else None
-            pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
-            scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
-            scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
-            assert scale is None or scale_inv is None
-            no_defer = scale is not None or scale_inv is not None
-            weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
-            bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
-            if scale is not None:
-                weight = self.apply_fp8_scales_(weight, scale)
-            elif scale_inv is not None:
-                weight = self.apply_fp8_scales_inv_(weight, scale_inv)
+            if self.used_alt_key and isinstance(key, list):
+                dev = self.device
+                weight = [self.config.stc.get_tensor(k + ".weight", dev, float2half = True, transpose = self.transposed_load, no_defer = True) for k in key]
+                bias = [self.config.stc.get_tensor(k + ".bias", dev, float2half = True, optional = True, no_defer = True) for k in key]
+                weight = torch.cat(weight, dim = -1)
+                bias = torch.cat(bias, dim = -1) if bias[0] is not None else None
+            else:
+                dev = "cpu" if self.is_sliced else self.device
+                pad1 = (self.out_features,) if not self.is_sliced else None
+                pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
+                scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+                scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+                assert scale is None or scale_inv is None
+                no_defer = scale is not None or scale_inv is not None
+                weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
+                bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
+                if scale is not None:
+                    weight = self.apply_fp8_scales_(weight, scale)
+                elif scale_inv is not None:
+                    weight = self.apply_fp8_scales_inv_(weight, scale_inv)
+
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
