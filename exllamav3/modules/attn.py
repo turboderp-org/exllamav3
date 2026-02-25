@@ -7,11 +7,44 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
-from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
+import flashinfer
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+
+_FLASHINFER_WORKSPACE_BYTES = 64 * 1024 * 1024
+_FLASHINFER_WORKSPACE: dict[tuple[str, int | None], torch.Tensor] = {}
+
+
+def get_flashinfer_workspace(device: torch.device) -> torch.Tensor:
+    key = (device.type, device.index)
+    workspace = _FLASHINFER_WORKSPACE.get(key)
+    if workspace is None or workspace.device != device:
+        workspace = torch.empty(_FLASHINFER_WORKSPACE_BYTES, dtype = torch.uint8, device = device)
+        _FLASHINFER_WORKSPACE[key] = workspace
+    return workspace
+
+
+def make_paged_kv_metadata(
+    block_table: torch.Tensor,
+    kv_lens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    kv_lens = kv_lens.to(dtype = torch.int32)
+    max_pages = block_table.shape[1]
+    num_pages = torch.div(kv_lens + PAGE_SIZE - 1, PAGE_SIZE, rounding_mode = "floor")
+    page_ids = torch.arange(max_pages, dtype = torch.int32, device = block_table.device).view(1, -1)
+    page_mask = page_ids < num_pages.view(-1, 1)
+    indices = block_table.to(dtype = torch.int32)[page_mask]
+    indptr = torch.empty((kv_lens.numel() + 1,), dtype = torch.int32, device = block_table.device)
+    indptr[0] = 0
+    indptr[1:] = torch.cumsum(num_pages, dim = 0)
+    last_page_len = torch.where(
+        kv_lens > 0,
+        torch.remainder(kv_lens - 1, PAGE_SIZE) + 1,
+        torch.ones_like(kv_lens)
+    )
+    return indptr.contiguous(), indices.contiguous(), last_page_len.contiguous()
 
 """
 SDPA:
@@ -25,9 +58,10 @@ SDPA:
     - batch shape is determined by shape of input_ids
     - no logit softcap support (Gemma)
                     
-Flash Attention:
+FlashInfer backend (legacy attn_mode names preserved):
                 
     attn_mode: "flash_attn"
+    attn_mode: "flashinfer"
     batch_shape: tuple of (bsz, max_seq_len)
     cache: Cache with capacity of at least bsz*max_seq_len tokens
     past_len: int, *OR*
@@ -45,6 +79,7 @@ Flash Attention:
     position_ids: shape (bsz, seq_len) (overrides cache_seqlens for position emb)
 
     attn_mode: "flash_attn_nc"
+    attn_mode: "flashinfer_nc"
     position (optional, default = 0): int *OR*
     positions: shape (bsz) *OR*
     position_ids: shape (bsz, seq_len)    
@@ -111,13 +146,13 @@ def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     """
     Add attn parameters to state
     """
-    attn_mode = params.get("attn_mode", "flash_attn_nc")
+    attn_mode = params.get("attn_mode", "flashinfer_nc")
     match attn_mode:
         case "sdpa_nc":
             return prepare_sdpa_nc(input_ids, params)
-        case "flash_attn":
+        case "flash_attn" | "flashinfer":
             return prepare_flash_attn(input_ids, params)
-        case "flash_attn_nc":
+        case "flash_attn_nc" | "flashinfer_nc":
             return prepare_flash_attn_nc(input_ids, params)
         case _:
             raise ValueError(f"Unknown attn_mode: {attn_mode}")
@@ -254,6 +289,7 @@ class Attention(Module):
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
+        self.flashinfer_prefill_wrapper = None
 
         self.has_split_cache = False
 
@@ -321,6 +357,7 @@ class Attention(Module):
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
+        self.flashinfer_prefill_wrapper = None
 
 
     @override
@@ -337,13 +374,13 @@ class Attention(Module):
                 params["backend"].all_reduce(x, False)
         else:
             bsz, seqlen, _ = x.shape
-            attn_mode = params.get("attn_mode", "flash_attn_nc")
+            attn_mode = params.get("attn_mode", "flashinfer_nc")
             match attn_mode:
                 case "sdpa_nc":
                     x = self.decode_sdpa_nc(x, bsz, seqlen, params)
-                case "flash_attn":
+                case "flash_attn" | "flashinfer":
                     x = self.decode_flash_attn(x, bsz, seqlen, params)
-                case "flash_attn_nc":
+                case "flash_attn_nc" | "flashinfer_nc":
                     x = self.decode_flash_attn_nc(x, bsz, seqlen, params)
                 case _:
                     raise ValueError(f"Unknown attn_mode: {attn_mode}")
@@ -398,6 +435,56 @@ class Attention(Module):
         o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         x = self.o_proj.forward(o, params)
         return x
+
+
+    def get_flashinfer_prefill_wrapper(self) -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
+        if self.flashinfer_prefill_wrapper is None:
+            workspace = get_flashinfer_workspace(self.device)
+            self.flashinfer_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                workspace,
+                kv_layout = "NHD",
+            )
+        return self.flashinfer_prefill_wrapper
+
+
+    def append_paged_kv_cache(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, q_len, _, _ = k.shape
+        batch_ids = (
+            torch.arange(bsz, dtype = torch.int32, device = k.device)
+            .view(-1, 1)
+            .expand(-1, q_len)
+            .reshape(-1)
+            .contiguous()
+        )
+        token_offsets = torch.arange(q_len, dtype = torch.int32, device = k.device)
+        token_positions = (
+            cache_seqlens.to(dtype = torch.int32).view(-1, 1)
+            + token_offsets.view(1, -1)
+        ).reshape(-1).contiguous()
+        append_k = k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+        append_v = v.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+        kv_lens = cache_seqlens.to(dtype = torch.int32) + q_len
+        kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_metadata(block_table, kv_lens)
+        flashinfer.append_paged_kv_cache(
+            append_k,
+            append_v,
+            batch_ids,
+            token_positions,
+            (cache_k, cache_v),
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            kv_layout = "NHD",
+        )
+        return kv_indptr, kv_indices, kv_last_page_len
 
 
     def decode_sdpa_nc(
@@ -490,31 +577,46 @@ class Attention(Module):
                 self.post_rope_norm
             )
 
+        window_left = self.sliding_window if self.sliding_window >= 0 else -1
+        logits_soft_cap = self.logit_softcapping if self.logit_softcapping > 0 else None
+
         if self.use_cu_seqlens and (cu_seqlens := get_for_device(params, "cu_seqlens", self.device, None)) is not None:
-            max_seqlen = params["max_seqlen"]
-            o = flash_attn_varlen_func(
-                q = q.squeeze(0),
-                k = k.squeeze(0),
-                v = v.squeeze(0),
-                cu_seqlens_q = cu_seqlens,
-                cu_seqlens_k = cu_seqlens,
-                max_seqlen_q = max_seqlen,
-                max_seqlen_k = max_seqlen,
-                causal = causal,
-                softmax_scale = self.sm_scale,
-                window_size = (self.sliding_window, self.sliding_window),
-                softcap = self.logit_softcapping
-            )
+            q_ = q.squeeze(0)
+            k_ = k.squeeze(0)
+            v_ = v.squeeze(0)
+            out_segs = []
+            for i in range(cu_seqlens.numel() - 1):
+                a = cu_seqlens[i].item()
+                b = cu_seqlens[i + 1].item()
+                out_segs.append(
+                    flashinfer.single_prefill_with_kv_cache(
+                        q_[a:b],
+                        k_[a:b],
+                        v_[a:b],
+                        causal = causal,
+                        kv_layout = "NHD",
+                        pos_encoding_mode = "NONE",
+                        sm_scale = self.sm_scale,
+                        window_left = window_left,
+                        logits_soft_cap = logits_soft_cap,
+                    )
+                )
+            o = torch.cat(out_segs, dim = 0).unsqueeze(0)
         else:
-            o = flash_attn_func(
-                q = q,
-                k = k,
-                v = v,
-                causal = causal,
-                softmax_scale = self.sm_scale,
-                window_size = (self.sliding_window, self.sliding_window),
-                softcap = self.logit_softcapping
-            )
+            o = torch.stack([
+                flashinfer.single_prefill_with_kv_cache(
+                    q[i],
+                    k[i],
+                    v[i],
+                    causal = causal,
+                    kv_layout = "NHD",
+                    pos_encoding_mode = "NONE",
+                    sm_scale = self.sm_scale,
+                    window_left = window_left,
+                    logits_soft_cap = logits_soft_cap,
+                )
+                for i in range(bsz)
+            ], dim = 0)
 
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.interleaved_gate: o *= g.sigmoid()
@@ -569,19 +671,46 @@ class Attention(Module):
         else:
             cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
 
-        o = flash_attn_with_kvcache(
-            q = q,
-            k = k,
-            v = v,
-            k_cache = cache_k,
-            v_cache = cache_v,
-            block_table = block_table,
-            cache_seqlens = cache_seqlens,
-            causal = causal,
-            softmax_scale = self.sm_scale,
-            window_size = (self.sliding_window, self.sliding_window),
-            softcap = self.logit_softcapping
+        kv_indptr, kv_indices, kv_last_page_len = self.append_paged_kv_cache(
+            k,
+            v,
+            cache_k,
+            cache_v,
+            cache_seqlens,
+            block_table,
         )
+        qo_indptr = torch.arange(
+            0,
+            (bsz + 1) * seqlen,
+            seqlen,
+            dtype = torch.int32,
+            device = self.device
+        )
+        window_left = self.sliding_window if self.sliding_window >= 0 else -1
+        logits_soft_cap = self.logit_softcapping if self.logit_softcapping > 0 else None
+        wrapper = self.get_flashinfer_prefill_wrapper()
+        wrapper.plan(
+            qo_indptr = qo_indptr,
+            paged_kv_indptr = kv_indptr,
+            paged_kv_indices = kv_indices,
+            paged_kv_last_page_len = kv_last_page_len,
+            num_qo_heads = self.num_q_heads,
+            num_kv_heads = self.num_kv_heads,
+            head_dim_qk = self.head_dim,
+            page_size = PAGE_SIZE,
+            causal = causal,
+            pos_encoding_mode = "NONE",
+            sm_scale = self.sm_scale,
+            window_left = window_left,
+            logits_soft_cap = logits_soft_cap,
+            q_data_type = q.dtype,
+            kv_data_type = cache_k.dtype,
+            o_data_type = q.dtype,
+        )
+        o = wrapper.run(
+            q.view(-1, self.num_q_heads, self.head_dim).contiguous(),
+            (cache_k, cache_v),
+        ).view(bsz, seqlen, self.num_q_heads, self.head_dim)
 
         if self.has_split_cache:
             self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
@@ -625,7 +754,7 @@ class Attention(Module):
             channels_to_split //= 2
         assert (channel_width * self.head_dim) % 128 == 0, \
             "Model's K/V heads cannot divide into 128-channel tensors"
-        # TODO: Account for flash-attn temp VRAM usage
+        # TODO: Account for flashinfer temp VRAM usage
         tpa = TPAllocation(
             key = self.key,
             channel_width = channel_width,

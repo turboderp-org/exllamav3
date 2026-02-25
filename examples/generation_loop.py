@@ -42,7 +42,7 @@ vocab = tokenizer.get_id_to_piece_list()
 # Prefill the prompt, up to but not including the last token, which will be the first token forwarded in the
 # generation loop. Treat the cache as a rectangular batch.
 params = {
-    "attn_mode": "flash_attn",
+    "attn_mode": "flashinfer",
     "cache": cache,
     "past_len": 0,
     "batch_shape": (1, 2048),
@@ -64,7 +64,7 @@ with Timer() as t:
 
         # Inference params. Recurrent states must carry over from the previous forward pass to support recurrence
         params = {
-            "attn_mode": "flash_attn",
+            "attn_mode": "flashinfer",
             "cache": cache,
             "past_len": context_ids.shape[-1] - 1,
             "batch_shape": (1, 2048),

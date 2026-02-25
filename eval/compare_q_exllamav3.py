@@ -37,6 +37,6 @@ def load_exllamav3(model_dir: str | list):
 
 def fwd_exllamav3(model_instance, input_ids: torch.Tensor):
     input_ids = input_ids.cpu()
-    output = model_instance.forward(input_ids, {"attn_mode": "flash_attn_nc"})
+    output = model_instance.forward(input_ids, {"attn_mode": "flashinfer_nc"})
     output[..., model_instance.config.vocab_size:] = float("-inf")
     return output
