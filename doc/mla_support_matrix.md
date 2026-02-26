@@ -24,8 +24,8 @@ A model is considered "supported" only when all of the following are true:
 | `DeepseekV2ForCausalLM` | Implemented | Previously validated with local DeepSeek-V2-Lite flow | Uses `DeepseekV2MLAAttention` |
 | `DeepseekV3ForCausalLM` | Implemented | Config/model instantiation path available | Alias to DeepSeek V2 path, matching vLLM behavior |
 | `GlmMoeDsaForCausalLM` | Implemented | Config/model instantiation path available | Alias to DeepSeek V2 path, matching vLLM behavior |
-| `Qwen3_5ForConditionalGeneration` | Implemented | Config/model parse + architecture graph validated | Qwen3.5 linear/full attention mix + MM parser path; full E2E pending |
-| `Qwen3_5MoeForConditionalGeneration` | Implemented | Config/model parse + block forward validated | Split GDN projections and split MoE experts mapping handled; quantized E2E pending |
+| `Qwen3_5ForConditionalGeneration` | Implemented | Quantized EN/KO generation smoke validated | Qwen3.5 linear/full attention mix + MM parser path |
+| `Qwen3_5MoeForConditionalGeneration` | Implemented | Quantized EN/KO generation smoke validated | Split GDN projections and split MoE experts mapping handled |
 | `DeepseekV32ForCausalLM` | Not implemented | Not validated | Requires vLLM-specific V3.2 indexer/cache path (`DeepseekV32Indexer*`) not present in exllamav3 |
 | `Glm4MoeLiteForCausalLM` | Not implemented | Not validated | Requires GLM4-MoE-Lite-specific decoder/load-weight path and additional mapping logic |
 | `MiniCPM3ForCausalLM` | Not implemented | Not validated | Separate latent attention implementation and model-specific loader path required |
@@ -51,4 +51,4 @@ A model is considered "supported" only when all of the following are true:
 For very large FP16 checkpoints (e.g., 35B class), full end-to-end generation may be constrained by available VRAM.
 In such cases, support is reported as implemented with block-forward validation until quantized checkpoints are available for full runtime validation.
 
-Current status note (2026-02-26): Qwen3.5 35B A3B quantization is in progress. Full end-to-end quality/performance validation will be added in a follow-up PR update once quantization completes.
+Current status note (2026-02-26): Qwen3.5 35B A3B quantization completed. Split GDN projection handling was corrected and quantized EN/KO generation smoke tests now pass.
