@@ -15,6 +15,10 @@ from ..util import profile_opt
 
 _FLASHINFER_WORKSPACE_BYTES = 64 * 1024 * 1024
 _FLASHINFER_WORKSPACE: dict[tuple[str, int | None], torch.Tensor] = {}
+_FLASHINFER_DECODE_WRAPPERS: dict[
+    tuple[str, int | None, str, bool],
+    flashinfer.BatchDecodeWithPagedKVCacheWrapper
+] = {}
 
 
 def get_flashinfer_workspace(device: torch.device) -> torch.Tensor:
@@ -24,6 +28,25 @@ def get_flashinfer_workspace(device: torch.device) -> torch.Tensor:
         workspace = torch.empty(_FLASHINFER_WORKSPACE_BYTES, dtype = torch.uint8, device = device)
         _FLASHINFER_WORKSPACE[key] = workspace
     return workspace
+
+
+def get_flashinfer_decode_wrapper_shared(
+    device: torch.device,
+    backend: str = "auto",
+    use_tensor_cores: bool = False,
+) -> flashinfer.BatchDecodeWithPagedKVCacheWrapper:
+    key = (device.type, device.index, backend, use_tensor_cores)
+    wrapper = _FLASHINFER_DECODE_WRAPPERS.get(key)
+    if wrapper is None:
+        workspace = get_flashinfer_workspace(device)
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace,
+            kv_layout = "NHD",
+            backend = backend,
+            use_tensor_cores = use_tensor_cores,
+        )
+        _FLASHINFER_DECODE_WRAPPERS[key] = wrapper
+    return wrapper
 
 
 def make_paged_kv_metadata(
@@ -138,6 +161,42 @@ def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         params["cache_seqlens"] = cache_seqlens
         params["positions"] = positions
         params["position_ids"] = position_ids
+
+    # Precompute flashinfer metadata once per forward call and reuse it in
+    # every attention layer to reduce Python-side decode overhead.
+    block_table = params.get("block_table")
+    cache_seqlens = params.get("cache_seqlens")
+    if block_table is not None and cache_seqlens is not None:
+        cache_seqlens = cache_seqlens.to(dtype = torch.int32).contiguous()
+        block_table = block_table.to(dtype = torch.int32).contiguous()
+        token_offsets = torch.arange(seq_len, dtype = torch.int32, device = cache_seqlens.device)
+        batch_ids = (
+            torch.arange(bsz, dtype = torch.int32, device = cache_seqlens.device)
+            .view(-1, 1)
+            .expand(-1, seq_len)
+            .reshape(-1)
+            .contiguous()
+        )
+        token_positions = (
+            cache_seqlens.view(-1, 1)
+            + token_offsets.view(1, -1)
+        ).reshape(-1).contiguous()
+        kv_lens = cache_seqlens + seq_len
+        kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_metadata(block_table, kv_lens)
+        qo_indptr = torch.arange(
+            0,
+            (bsz + 1) * seq_len,
+            seq_len,
+            dtype = torch.int32,
+            device = cache_seqlens.device
+        )
+        params["flashinfer_batch_ids"] = batch_ids
+        params["flashinfer_token_positions"] = token_positions
+        params["flashinfer_kv_indptr"] = kv_indptr
+        params["flashinfer_kv_indices"] = kv_indices
+        params["flashinfer_kv_last_page_len"] = kv_last_page_len
+        params["flashinfer_qo_indptr"] = qo_indptr
+        params["flashinfer_kv_lens"] = kv_lens.contiguous()
 
     return input_ids
 
@@ -290,6 +349,8 @@ class Attention(Module):
         self.q_norm_tensor = None
         self.k_norm_tensor = None
         self.flashinfer_prefill_wrapper = None
+        self.flashinfer_decode_wrapper = None
+        self.flashinfer_decode_wrapper_failed = False
 
         self.has_split_cache = False
 
@@ -358,6 +419,8 @@ class Attention(Module):
         self.q_norm_tensor = None
         self.k_norm_tensor = None
         self.flashinfer_prefill_wrapper = None
+        self.flashinfer_decode_wrapper = None
+        self.flashinfer_decode_wrapper_failed = False
 
 
     @override
@@ -447,6 +510,22 @@ class Attention(Module):
         return self.flashinfer_prefill_wrapper
 
 
+    def get_flashinfer_decode_wrapper(
+        self,
+        backend: str = "auto",
+        use_tensor_cores: bool = False,
+    ) -> flashinfer.BatchDecodeWithPagedKVCacheWrapper | None:
+        if self.flashinfer_decode_wrapper_failed:
+            return None
+        wrapper = get_flashinfer_decode_wrapper_shared(
+            self.device,
+            backend = backend,
+            use_tensor_cores = use_tensor_cores,
+        )
+        self.flashinfer_decode_wrapper = wrapper
+        return self.flashinfer_decode_wrapper
+
+
     def append_paged_kv_cache(
         self,
         k: torch.Tensor,
@@ -455,24 +534,32 @@ class Attention(Module):
         cache_v: torch.Tensor,
         cache_seqlens: torch.Tensor,
         block_table: torch.Tensor,
+        batch_ids: torch.Tensor | None = None,
+        token_positions: torch.Tensor | None = None,
+        kv_indptr: torch.Tensor | None = None,
+        kv_indices: torch.Tensor | None = None,
+        kv_last_page_len: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, q_len, _, _ = k.shape
-        batch_ids = (
-            torch.arange(bsz, dtype = torch.int32, device = k.device)
-            .view(-1, 1)
-            .expand(-1, q_len)
-            .reshape(-1)
-            .contiguous()
-        )
-        token_offsets = torch.arange(q_len, dtype = torch.int32, device = k.device)
-        token_positions = (
-            cache_seqlens.to(dtype = torch.int32).view(-1, 1)
-            + token_offsets.view(1, -1)
-        ).reshape(-1).contiguous()
+        if batch_ids is None:
+            batch_ids = (
+                torch.arange(bsz, dtype = torch.int32, device = k.device)
+                .view(-1, 1)
+                .expand(-1, q_len)
+                .reshape(-1)
+                .contiguous()
+            )
+        if token_positions is None:
+            token_offsets = torch.arange(q_len, dtype = torch.int32, device = k.device)
+            token_positions = (
+                cache_seqlens.to(dtype = torch.int32).view(-1, 1)
+                + token_offsets.view(1, -1)
+            ).reshape(-1).contiguous()
         append_k = k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
         append_v = v.view(-1, self.num_kv_heads, self.head_dim).contiguous()
-        kv_lens = cache_seqlens.to(dtype = torch.int32) + q_len
-        kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_metadata(block_table, kv_lens)
+        if kv_indptr is None or kv_indices is None or kv_last_page_len is None:
+            kv_lens = cache_seqlens.to(dtype = torch.int32) + q_len
+            kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_metadata(block_table, kv_lens)
         flashinfer.append_paged_kv_cache(
             append_k,
             append_v,
@@ -635,6 +722,12 @@ class Attention(Module):
         cache = params.get("cache")
         block_table = get_for_device(params, "block_table", self.device)
         cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
+        batch_ids = get_for_device(params, "flashinfer_batch_ids", self.device, None)
+        token_positions = get_for_device(params, "flashinfer_token_positions", self.device, None)
+        kv_indptr = get_for_device(params, "flashinfer_kv_indptr", self.device, None)
+        kv_indices = get_for_device(params, "flashinfer_kv_indices", self.device, None)
+        kv_last_page_len = get_for_device(params, "flashinfer_kv_last_page_len", self.device, None)
+        qo_indptr = get_for_device(params, "flashinfer_qo_indptr", self.device, None)
         position = params.get("position", 0)
         positions = get_for_device(params, "positions", self.device, None)
         position_ids = get_for_device(params, "position_ids", self.device, None)
@@ -678,39 +771,111 @@ class Attention(Module):
             cache_v,
             cache_seqlens,
             block_table,
+            batch_ids = batch_ids,
+            token_positions = token_positions,
+            kv_indptr = kv_indptr,
+            kv_indices = kv_indices,
+            kv_last_page_len = kv_last_page_len,
         )
-        qo_indptr = torch.arange(
-            0,
-            (bsz + 1) * seqlen,
-            seqlen,
-            dtype = torch.int32,
-            device = self.device
-        )
+        if qo_indptr is None:
+            qo_indptr = torch.arange(
+                0,
+                (bsz + 1) * seqlen,
+                seqlen,
+                dtype = torch.int32,
+                device = self.device
+            )
         window_left = self.sliding_window if self.sliding_window >= 0 else -1
         logits_soft_cap = self.logit_softcapping if self.logit_softcapping > 0 else None
-        wrapper = self.get_flashinfer_prefill_wrapper()
-        wrapper.plan(
-            qo_indptr = qo_indptr,
-            paged_kv_indptr = kv_indptr,
-            paged_kv_indices = kv_indices,
-            paged_kv_last_page_len = kv_last_page_len,
-            num_qo_heads = self.num_q_heads,
-            num_kv_heads = self.num_kv_heads,
-            head_dim_qk = self.head_dim,
-            page_size = PAGE_SIZE,
-            causal = causal,
-            pos_encoding_mode = "NONE",
-            sm_scale = self.sm_scale,
-            window_left = window_left,
-            logits_soft_cap = logits_soft_cap,
-            q_data_type = q.dtype,
-            kv_data_type = cache_k.dtype,
-            o_data_type = q.dtype,
-        )
-        o = wrapper.run(
-            q.view(-1, self.num_q_heads, self.head_dim).contiguous(),
-            (cache_k, cache_v),
-        ).view(bsz, seqlen, self.num_q_heads, self.head_dim)
+        q_flat = q.view(-1, self.num_q_heads, self.head_dim).contiguous()
+        o = None
+
+        # Single-token decode is the hot path for generation. Prefer flashinfer's
+        # decode wrapper here and fall back to the prefill wrapper on any runtime
+        # incompatibility to preserve correctness.
+        use_decode_wrapper = params.get("flashinfer_use_decode_wrapper", True)
+        decode_backend = params.get("flashinfer_decode_backend", "auto")
+        decode_use_tensor_cores = params.get("flashinfer_decode_use_tensor_cores", False)
+        decode_fixed_split_size = params.get("flashinfer_decode_fixed_split_size", None)
+        decode_disable_split_kv = params.get("flashinfer_decode_disable_split_kv", False)
+        if use_decode_wrapper and causal and seqlen == 1:
+            decode_wrapper = self.get_flashinfer_decode_wrapper(
+                backend = decode_backend,
+                use_tensor_cores = decode_use_tensor_cores,
+            )
+            if decode_wrapper is not None:
+                try:
+                    planned = params.get("flashinfer_decode_planned_wrappers")
+                    if planned is None:
+                        planned = {}
+                        params["flashinfer_decode_planned_wrappers"] = planned
+                    plan_marker = (
+                        id(decode_wrapper),
+                        kv_indptr.data_ptr(),
+                        kv_indices.data_ptr(),
+                        kv_last_page_len.data_ptr(),
+                        self.num_q_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        window_left,
+                        logits_soft_cap,
+                        q.dtype,
+                        cache_k.dtype,
+                    )
+                    wrapper_id = id(decode_wrapper)
+                    if planned.get(wrapper_id) != plan_marker:
+                        decode_wrapper.plan(
+                            indptr = kv_indptr,
+                            indices = kv_indices,
+                            last_page_len = kv_last_page_len,
+                            num_qo_heads = self.num_q_heads,
+                            num_kv_heads = self.num_kv_heads,
+                            head_dim = self.head_dim,
+                            page_size = PAGE_SIZE,
+                            pos_encoding_mode = "NONE",
+                            sm_scale = self.sm_scale,
+                            window_left = window_left,
+                            logits_soft_cap = logits_soft_cap,
+                            q_data_type = q.dtype,
+                            kv_data_type = cache_k.dtype,
+                            o_data_type = q.dtype,
+                            fixed_split_size = decode_fixed_split_size,
+                            disable_split_kv = decode_disable_split_kv,
+                        )
+                        planned[wrapper_id] = plan_marker
+                    o = decode_wrapper.run(
+                        q_flat,
+                        (cache_k, cache_v),
+                        q_len_per_req = 1,
+                    ).view(bsz, seqlen, self.num_q_heads, self.head_dim)
+                except (RuntimeError, TypeError, ValueError, AssertionError):
+                    self.flashinfer_decode_wrapper_failed = True
+                    self.flashinfer_decode_wrapper = None
+
+        if o is None:
+            prefill_wrapper = self.get_flashinfer_prefill_wrapper()
+            prefill_wrapper.plan(
+                qo_indptr = qo_indptr,
+                paged_kv_indptr = kv_indptr,
+                paged_kv_indices = kv_indices,
+                paged_kv_last_page_len = kv_last_page_len,
+                num_qo_heads = self.num_q_heads,
+                num_kv_heads = self.num_kv_heads,
+                head_dim_qk = self.head_dim,
+                page_size = PAGE_SIZE,
+                causal = causal,
+                pos_encoding_mode = "NONE",
+                sm_scale = self.sm_scale,
+                window_left = window_left,
+                logits_soft_cap = logits_soft_cap,
+                q_data_type = q.dtype,
+                kv_data_type = cache_k.dtype,
+                o_data_type = q.dtype,
+            )
+            o = prefill_wrapper.run(
+                q_flat,
+                (cache_k, cache_v),
+            ).view(bsz, seqlen, self.num_q_heads, self.head_dim)
 
         if self.has_split_cache:
             self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)

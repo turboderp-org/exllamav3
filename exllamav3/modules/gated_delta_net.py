@@ -285,6 +285,10 @@ class GatedDeltaNet(Module):
         key_conv1d: str | None = None,
         key_fused_ba: str | None = None,
         key_fused_qkvz: str | None = None,
+        key_qkv: str | None = None,
+        key_z: str | None = None,
+        key_b: str | None = None,
+        key_a: str | None = None,
         key_norm: str | None = None,
         key_o: str | None = None,
         qmap: str | None = None,
@@ -311,17 +315,42 @@ class GatedDeltaNet(Module):
         self.fdim_ba = 2 * self.num_v_heads
         self.fdim_qkv = 2 * self.num_k_heads * self.k_head_dim + self.num_v_heads * self.v_head_dim
 
+        if key_qkv or key_z:
+            assert key_qkv and key_z, \
+                "GatedDeltaNet split qkv/z projections require both key_qkv and key_z"
+        if key_b or key_a:
+            assert key_b and key_a, \
+                "GatedDeltaNet split b/a projections require both key_b and key_a"
+
         if key_fused_qkvz:
             self.qkvz_proj = Linear(config, f"{key}.{key_fused_qkvz}", hidden_size, self.fdim_qkvz, qmap = qmap + ".input", out_dtype = torch.float)
             self.register_submodule(self.qkvz_proj)
         else:
             self.qkvz_proj = None
 
+        if key_qkv:
+            self.qkv_proj = Linear(config, f"{key}.{key_qkv}", hidden_size, self.fdim_qkv, qmap = qmap + ".input", out_dtype = torch.float)
+            self.z_proj = Linear(config, f"{key}.{key_z}", hidden_size, self.v_dim, qmap = qmap + ".input", out_dtype = torch.float)
+            self.register_submodule(self.qkv_proj)
+            self.register_submodule(self.z_proj)
+        else:
+            self.qkv_proj = None
+            self.z_proj = None
+
         if key_fused_ba:
             self.ba_proj = Linear(config, f"{key}.{key_fused_ba}", hidden_size, self.fdim_ba, qmap = None, out_dtype = torch.float, pad_to = 1)
             self.register_submodule(self.ba_proj)
         else:
             self.ba_proj = None
+
+        if key_b:
+            self.b_proj = Linear(config, f"{key}.{key_b}", hidden_size, self.num_v_heads, qmap = None, out_dtype = torch.float, pad_to = 1)
+            self.a_proj = Linear(config, f"{key}.{key_a}", hidden_size, self.num_v_heads, qmap = None, out_dtype = torch.float, pad_to = 1)
+            self.register_submodule(self.b_proj)
+            self.register_submodule(self.a_proj)
+        else:
+            self.b_proj = None
+            self.a_proj = None
 
         self.o_proj = Linear(config, f"{key}.{key_o}", 2 * hidden_size, hidden_size, qmap = qmap + ".output", out_dtype = self.out_dtype)
         self.register_submodule(self.o_proj)
@@ -356,8 +385,15 @@ class GatedDeltaNet(Module):
 
     @override
     def optimizer_targets(self):
-        qkvz = self.qkvz_proj.optimizer_targets()
-        return [[qkvz]]
+        if self.qkvz_proj is not None:
+            return [[self.qkvz_proj.optimizer_targets()]]
+
+        targets = []
+        if self.qkv_proj is not None:
+            targets += self.qkv_proj.optimizer_targets()
+        if self.z_proj is not None:
+            targets += self.z_proj.optimizer_targets()
+        return [targets]
 
 
     def load_local(self, device, **kwargs):
@@ -401,9 +437,17 @@ class GatedDeltaNet(Module):
     def load(self, device: torch.Device, **kwargs):
         super().load(device)
         self.a_log = self.config.stc.get_tensor(self.key_a_log, self.device, optional = False, allow_bf16 = True)
+        if self.a_log.dtype != torch.bfloat16:
+            self.a_log = self.a_log.to(torch.bfloat16)
         self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True)
+        if self.dt_bias.dtype != torch.bfloat16:
+            self.dt_bias = self.dt_bias.to(torch.bfloat16)
         self.conv1d_weight = self.config.stc.get_tensor(self.key_conv1d_weight, self.device, optional = False, allow_bf16 = True)
+        if self.conv1d_weight.dtype != torch.bfloat16:
+            self.conv1d_weight = self.conv1d_weight.to(torch.bfloat16)
         self.conv1d_bias = self.config.stc.get_tensor(self.key_conv1d_bias, self.device, optional = True, allow_bf16 = True)
+        if self.conv1d_bias is not None and self.conv1d_bias.dtype != torch.bfloat16:
+            self.conv1d_bias = self.conv1d_bias.to(torch.bfloat16)
         self.norm.load(device, **kwargs)
         self.load_local(device, **kwargs)
 
@@ -509,8 +553,19 @@ class GatedDeltaNet(Module):
         # Torch path
         else:
             # Projections
-            qkvz = self.qkvz_proj.forward(x, params)
-            ba = self.ba_proj.forward(x, params)
+            if self.qkvz_proj is not None:
+                qkvz = self.qkvz_proj.forward(x, params)
+            else:
+                qkv = self.qkv_proj.forward(x, params)
+                z_ = self.z_proj.forward(x, params)
+                qkvz = torch.cat((qkv, z_), dim = -1)
+
+            if self.ba_proj is not None:
+                ba = self.ba_proj.forward(x, params)
+            else:
+                b = self.b_proj.forward(x, params)
+                a = self.a_proj.forward(x, params)
+                ba = torch.cat((b, a), dim = -1)
 
             mixed_qkv = torch.zeros((bsz, self.fdim_qkv, seqlen), dtype = torch.bfloat16, device = self.device)
             z = torch.zeros((bsz, seqlen, self.num_v_heads, self.v_head_dim), dtype = torch.bfloat16, device = self.device)
@@ -546,8 +601,8 @@ class GatedDeltaNet(Module):
                     self.conv1d_bias,
                 )
 
-            # Use chunked rule when advantageous
-            if seqlen >= 32:
+            # Use chunked rule when advantageous and available
+            if seqlen >= 32 and chunk_gated_delta_rule is not None:
                 mixed_qkv = mixed_qkv.transpose(1, 2)
 
                 q, k, v = torch.split(mixed_qkv, [self.k_dim, self.k_dim, self.v_dim], dim = -1)
@@ -577,6 +632,12 @@ class GatedDeltaNet(Module):
                 )
 
                 mixed_qkv = mixed_qkv.transpose(1, 2).contiguous()
+                if recurrent_state is None:
+                    recurrent_state = torch.zeros(
+                        (bsz, self.num_v_heads, self.k_head_dim, self.v_head_dim),
+                        dtype = torch.float,
+                        device = self.device
+                    )
                 ext.cuda_recurrent_gated_delta_rule(
                     mixed_qkv,
                     g,

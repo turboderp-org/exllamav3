@@ -25,6 +25,8 @@ class RoutingCFG:
     routed_scaling_factor: float | None
     n_group: int | None
     topk_group: int | None
+    topk_method: str | None
+    norm_topk_prob: bool
 
 
 def routing_std(bsz, cfg, y, params):
@@ -55,6 +57,49 @@ def routing_std(bsz, cfg, y, params):
                 routing_weights,
             )
         return selected_experts, routing_weights
+
+
+def routing_deepseek_v2(bsz, cfg, y, params):
+    activate_all_experts = params.get("activate_all_experts")
+    router_logits = torch.matmul(y.float(), cfg.gate_tensor.float())
+    probs = torch.softmax(router_logits, dim = -1)
+
+    if activate_all_experts:
+        routing_weights = probs
+        if cfg.routed_scaling_factor is not None:
+            routing_weights = routing_weights * cfg.routed_scaling_factor
+        selected_experts = (
+            torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
+            .repeat((bsz, 1))
+        )
+        return selected_experts, routing_weights.to(torch.half)
+
+    topk_method = cfg.topk_method or "greedy"
+    if topk_method == "group_limited_greedy" and cfg.n_group and cfg.n_group > 1 and cfg.topk_group:
+        ex_per_group = cfg.num_experts // cfg.n_group
+        group_scores = probs.view(-1, cfg.n_group, ex_per_group).max(dim = -1).values
+        group_idx = torch.topk(group_scores, k = cfg.topk_group, dim = -1, sorted = False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1.0)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(-1, cfg.n_group, ex_per_group)
+            .reshape(-1, cfg.num_experts)
+            .bool()
+        )
+        probs = probs.masked_fill(~score_mask, 0.0)
+
+    topk_weights, topk_indices = torch.topk(
+        probs,
+        k = cfg.num_experts_per_tok,
+        dim = -1,
+        sorted = False
+    )
+    if cfg.norm_topk_prob:
+        topk_weights = topk_weights / (topk_weights.sum(dim = -1, keepdim = True) + 1e-20)
+    if cfg.routed_scaling_factor is not None:
+        topk_weights = topk_weights * cfg.routed_scaling_factor
+    return topk_indices, topk_weights.to(torch.half)
 
 
 # TODO: Optimize top_k groups (for DS3)
@@ -162,6 +207,7 @@ class BlockSparseMLP(Module):
         key_routing_gate: str | None = None,
         key_shared_gate: str | None = None,
         key_e_score_bias: str | None = "gate.e_score_correction_bias",
+        experts_transposed_load: bool = True,
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
@@ -172,6 +218,8 @@ class BlockSparseMLP(Module):
         routed_scaling_factor: float | None = None,
         n_group: int | None = None,
         topk_group: int | None = None,
+        topk_method: str | None = "greedy",
+        norm_topk_prob: bool = False,
         shared_experts: MLP | GatedMLP | None = None,
         gates: list[Linear | Module] = None,
         ups: list[Linear | Module] = None,
@@ -200,6 +248,8 @@ class BlockSparseMLP(Module):
         self.routed_scaling_factor = routed_scaling_factor
         self.n_group = n_group
         self.topk_group = topk_group
+        self.topk_method = topk_method
+        self.norm_topk_prob = norm_topk_prob
 
         if routing_gate is None and key_routing_gate is None:
             self.routing_gate = None
@@ -259,7 +309,8 @@ class BlockSparseMLP(Module):
                     in_features = hidden_size,
                     out_features = intermediate_size,
                     qmap = qmap + ".input",
-                    out_dtype = self.interm_dtype
+                    out_dtype = self.interm_dtype,
+                    transposed_load = experts_transposed_load,
                 )
                 up = Linear(
                     config = config,
@@ -270,7 +321,8 @@ class BlockSparseMLP(Module):
                     in_features = hidden_size,
                     out_features = intermediate_size,
                     qmap = qmap + ".input",
-                    out_dtype = self.interm_dtype
+                    out_dtype = self.interm_dtype,
+                    transposed_load = experts_transposed_load,
                 )
                 down = Linear(
                     config = config,
@@ -282,6 +334,7 @@ class BlockSparseMLP(Module):
                     qmap = qmap + f".{idx}.down",
                     out_dtype = self.out_dtype,
                     allow_input_padding = True,
+                    transposed_load = experts_transposed_load,
                 )
 
                 self.ups.append(up)
@@ -313,6 +366,7 @@ class BlockSparseMLP(Module):
 
         match router_type:
             case "std": self.routing_fn = routing_std
+            case "deepseek_v2": self.routing_fn = routing_deepseek_v2
             case "ds3": self.routing_fn = routing_ds3
             case "dots": self.routing_fn = routing_dots
             case _: raise ValueError(f"Unknown router type {router_type}")
@@ -460,6 +514,8 @@ class BlockSparseMLP(Module):
             routed_scaling_factor = self.routed_scaling_factor,
             n_group = self.n_group,
             topk_group = self.topk_group,
+            topk_method = self.topk_method,
+            norm_topk_prob = self.norm_topk_prob,
         )
 
 
@@ -808,6 +864,8 @@ class BlockSparseMLP(Module):
                 "routed_scaling_factor": self.routed_scaling_factor,
                 "n_group": self.n_group,
                 "topk_group": self.topk_group,
+                "topk_method": self.topk_method,
+                "norm_topk_prob": self.norm_topk_prob,
             },
             "routing_gate": _export(self.routing_gate),
             "e_score_correction_bias": producer.send(self.e_score_correction_bias),

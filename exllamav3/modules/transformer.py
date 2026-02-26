@@ -104,9 +104,30 @@ class TransformerBlock(Module):
                 k = self.attn.k_proj
                 v = self.attn.v_proj
                 o = self.attn.o_proj
-            elif isinstance(self.attn, GatedDeltaNet):
-                qkvz = self.attn.qkvz_proj
+            elif all(hasattr(self.attn, name) for name in ("q_proj", "k_proj", "v_proj", "o_proj")):
+                q = self.attn.q_proj
+                k = self.attn.k_proj
+                v = self.attn.v_proj
                 o = self.attn.o_proj
+            elif isinstance(self.attn, GatedDeltaNet):
+                if self.attn.qkvz_proj is not None:
+                    qkvz = self.attn.qkvz_proj
+                    o = self.attn.o_proj
+                elif self.attn.qkv_proj is not None and self.attn.z_proj is not None:
+                    strategy = {}
+                    for linear in (self.attn.qkv_proj, self.attn.z_proj, self.attn.o_proj):
+                        s, surplus_bits = linear.allocate_q(quant_args, surplus_bits)
+                        strategy.update(s)
+                    if u is not None:
+                        s, surplus_bits = allocate_transformer(
+                            quant_args[self.qbits_key],
+                            surplus_bits,
+                            None, None, None, None, g, u, d, None
+                        )
+                        strategy.update(s)
+                    return strategy, surplus_bits
+                else:
+                    o = self.attn.o_proj
 
         return allocate_transformer(
             quant_args[self.qbits_key],
@@ -229,7 +250,7 @@ class ParallelDecoderBlock(Module):
 
 
     def allocate_q(self, quant_args: dict, surplus_bits: int):
-        if self.attn:
+        if self.attn and not all(hasattr(self.attn, name) for name in ("q_proj", "k_proj", "v_proj", "o_proj")):
             assert isinstance(self.attn, Attention)
 
         if not self.attn and not self.mlp:
@@ -238,10 +259,10 @@ class ParallelDecoderBlock(Module):
         return allocate_transformer(
             quant_args[self.qbits_key],
             surplus_bits,
-            self.attn.q_proj if self.attn else None,
-            self.attn.k_proj if self.attn else None,
-            self.attn.v_proj if self.attn else None,
-            self.attn.o_proj if self.attn else None,
+            self.attn.q_proj if self.attn and hasattr(self.attn, "q_proj") else None,
+            self.attn.k_proj if self.attn and hasattr(self.attn, "k_proj") else None,
+            self.attn.v_proj if self.attn and hasattr(self.attn, "v_proj") else None,
+            self.attn.o_proj if self.attn and hasattr(self.attn, "o_proj") else None,
             self.mlp.gates if any(isinstance(self.mlp, x) for x in [GatedMLP, BlockSparseMLP]) else None,
             self.mlp.ups if self.mlp else None,
             self.mlp.downs if self.mlp else None,

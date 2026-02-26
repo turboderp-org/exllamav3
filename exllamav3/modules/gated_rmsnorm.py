@@ -38,6 +38,8 @@ class GatedRMSNorm(Module):
     def load(self, device: torch.device, **kwargs):
         self.device = device
         weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, allow_bf16 = True)
+        if weight.dtype != torch.bfloat16:
+            weight = weight.to(torch.bfloat16)
         self._numel = weight.numel()
         self.weight = nn.Parameter(weight, requires_grad = False)
 

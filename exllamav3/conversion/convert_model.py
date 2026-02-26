@@ -16,6 +16,7 @@ from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
 import threading
+from collections import deque
 
 col_default = "\u001b[0m"
 col_red = "\u001b[31;1m"
@@ -297,6 +298,7 @@ def main(args, job_state):
     last_checkpoint_time = time.time()
     start_time = time.time()
     timed_blocks = 0
+    eta_window = deque(maxlen = 8)
 
     # Get model
     config, model, tokenizer = get_base_model(args)
@@ -611,10 +613,21 @@ def main(args, job_state):
         )
         sys.stdout.flush()
         if idx >= model.first_block_idx:
-            overall_time = time.time() - start_time
             timed_blocks += 1
-            est_remaining = (overall_time / timed_blocks) * (len(model.modules) - idx)
-            print(f" -- Estimated remaining time: {human_time(est_remaining)}")
+            eta_window.append(module_time)
+            remaining_blocks = max(0, len(model.modules) - idx - 1)
+            if timed_blocks < 3:
+                print(
+                    " -- Estimated remaining time: warming up "
+                    f"({timed_blocks}/3 timed blocks)"
+                )
+            else:
+                avg_block_time = sum(eta_window) / len(eta_window)
+                est_remaining = avg_block_time * remaining_blocks
+                print(
+                    f" -- Estimated remaining time: {human_time(est_remaining)} "
+                    f"(avg over last {len(eta_window)} blocks)"
+                )
 
         # Unload current module
         module.unload()
