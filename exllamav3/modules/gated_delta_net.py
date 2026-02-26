@@ -553,35 +553,44 @@ class GatedDeltaNet(Module):
         # Torch path
         else:
             # Projections
-            if self.qkvz_proj is not None:
+            #
+            # NOTE:
+            # Qwen3.5 uses split projections (in_proj_qkv/in_proj_z/in_proj_b/in_proj_a),
+            # while Qwen3-Next uses fused projections. The fused C++ helper expects the
+            # packed layout used by fused projections; applying it to split qkv tensors
+            # causes incorrect head ordering and broken generations.
+            if self.qkvz_proj is not None and self.ba_proj is not None:
                 qkvz = self.qkvz_proj.forward(x, params)
+                ba = self.ba_proj.forward(x, params)
+
+                mixed_qkv = torch.zeros((bsz, self.fdim_qkv, seqlen), dtype = torch.bfloat16, device = self.device)
+                z = torch.zeros((bsz, seqlen, self.num_v_heads, self.v_head_dim), dtype = torch.bfloat16, device = self.device)
+                beta = torch.zeros((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
+                g = torch.zeros((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
+
+                ext.gated_delta_net_fused_op(
+                    qkvz, ba,
+                    self.dt_bias,
+                    self.a_log,
+                    mixed_qkv, z, beta, g,
+                    self.num_k_heads,
+                    self.num_v_heads,
+                    self.k_head_dim,
+                    self.v_head_dim
+                )
             else:
                 qkv = self.qkv_proj.forward(x, params)
-                z_ = self.z_proj.forward(x, params)
-                qkvz = torch.cat((qkv, z_), dim = -1)
+                z = self.z_proj.forward(x, params).view(bsz, seqlen, self.num_v_heads, self.v_head_dim).to(torch.bfloat16)
+                b = self.b_proj.forward(x, params).float()
+                a = self.a_proj.forward(x, params).float()
 
-            if self.ba_proj is not None:
-                ba = self.ba_proj.forward(x, params)
-            else:
-                b = self.b_proj.forward(x, params)
-                a = self.a_proj.forward(x, params)
-                ba = torch.cat((b, a), dim = -1)
+                q, k, v = torch.split(qkv, [self.k_dim, self.k_dim, self.v_dim], dim = -1)
+                mixed_qkv = torch.cat((q, k, v), dim = -1).transpose(1, 2).contiguous().to(torch.bfloat16)
 
-            mixed_qkv = torch.zeros((bsz, self.fdim_qkv, seqlen), dtype = torch.bfloat16, device = self.device)
-            z = torch.zeros((bsz, seqlen, self.num_v_heads, self.v_head_dim), dtype = torch.bfloat16, device = self.device)
-            beta = torch.zeros((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
-            g = torch.zeros((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
-
-            ext.gated_delta_net_fused_op(
-                qkvz, ba,
-                self.dt_bias,
-                self.a_log,
-                mixed_qkv, z, beta, g,
-                self.num_k_heads,
-                self.num_v_heads,
-                self.k_head_dim,
-                self.v_head_dim
-            )
+                dt_bias = self.dt_bias.float().view(1, 1, self.num_v_heads)
+                a_log = self.a_log.float().view(1, 1, self.num_v_heads)
+                beta = torch.sigmoid(b).to(torch.bfloat16)
+                g = (-F.softplus(a + dt_bias) * torch.exp(a_log)).to(torch.float)
 
             # Convolution
             if conv_state is None:
