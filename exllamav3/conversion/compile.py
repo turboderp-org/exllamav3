@@ -3,7 +3,7 @@ import shutil
 import json
 from ..loader.safetensors import SafetensorsCollection
 from ..version import __version__
-from safetensors.torch import save_file
+from ..loader.safetensors_alt import save_file
 from ..util.memory import free_mem
 from ..modules import Module
 from .quant_config import update_config, create_quantization_config_json

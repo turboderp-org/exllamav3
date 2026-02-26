@@ -235,7 +235,7 @@ void add_sigmoid_proj_kernel_f
     int t = threadIdx.x;
     const float* pxb = px + dim * b;
     const half* pyb = py + dim * b;
-    const float* pzb = pz + dim * b;
+    float* pzb = pz + dim * b;
 
     float yw = 0.0f;
     for (size_t idx = t; idx < dim; idx += NUM_THREADS_P)
@@ -251,9 +251,9 @@ void add_sigmoid_proj_kernel_f
 
     for (size_t idx = t; idx < dim; idx += NUM_THREADS_P)
     {
-        float x = px[idx];
-        float z = pz[idx];
+        float x = pxb[idx];
+        float z = pzb[idx];
         z += x * syw;
-        pz[idx] = z;
+        pzb[idx] = z;
     }
 }

@@ -725,7 +725,11 @@ class BlockSparseMLP(Module):
         if self.shared_experts and not bc_sh_exp:
             y = self.shared_experts.forward(x, params)
             if self.shared_gate:
-                ext.add_sigmoid_gate_proj(y, x, final_hidden_states, self.shared_gate.inner.weight)
+                if bsz > 32:
+                    z = self.shared_gate.forward(x, params)
+                    ext.add_sigmoid_gate(y, z, final_hidden_states)
+                else:
+                    ext.add_sigmoid_gate_proj(y, x, final_hidden_states, self.shared_gate.inner.weight)
             else:
                 final_hidden_states += y
 

@@ -165,8 +165,8 @@ class MiniMaxM2Model(Model):
         # Activate all experts during H capture pass in quantization
         self.calibration_all_experts = True
 
-        # TODO: Q/K norms span all heads, so TP requires an additional step to reduce variance across ranks
-        self.caps.update({"supports_tp": False})
+        # Q/K norms span all heads - TP support uses variance all-reduce across ranks
+        self.caps.update({"supports_tp": True})
 
 
     @override

@@ -1,5 +1,9 @@
+from __future__ import annotations
 from typing_extensions import override
 from .llama import LlamaConfig, LlamaModel
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .qwen2_5_vl import Qwen2_5VLConfig
 
 # Qwen2 is identical to Llama except for bias on Q, K and V projections, but Linear module automatically
 # detects *.bias tensor
@@ -24,7 +28,7 @@ class Qwen2Model(LlamaModel):
 
     def __init__(
         self,
-        config: Qwen2Config,
+        config: Qwen2Config | Qwen2_5VLConfig,
         **kwargs
     ):
         super().__init__(config, **kwargs)

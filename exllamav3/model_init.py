@@ -132,7 +132,7 @@ def init(
         Mostly relevant if you know ahead of time that you're going to use a long-context model with a short context.
 
     :param kwargs:
-        Additional parametes to forwart to Model.load()
+        Additional parameters to forwart to Model.load()
 
     :return:
         tuple of (Model, Config, Cache | None, Tokenizer | None)

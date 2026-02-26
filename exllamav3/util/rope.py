@@ -110,7 +110,7 @@ class RoPE:
         match t:
             case None:
                 self._rope_params_default()
-            case "default":
+            case "default" | "mrope":
                 self._rope_params_default()
             case "llama3":
                 self._rope_params_llama3()
