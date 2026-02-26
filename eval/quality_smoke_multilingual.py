@@ -65,24 +65,28 @@ def generate_greedy(
     max_new_tokens: int,
     use_decode_wrapper: bool,
 ):
-    input_ids = tokenizer.encode(prompt, add_bos=True, encode_special_tokens=True)
+    input_ids = tokenizer.hf_chat_template(
+        [{"role": "user", "content": prompt}],
+        add_generation_prompt=True,
+    )
     if input_ids.shape[-1] < 2:
         raise RuntimeError("Prompt is too short after tokenization")
 
+    prefill_params = {
+        "attn_mode": "flashinfer",
+        "cache": cache,
+        "past_len": 0,
+        "batch_shape": (1, cache.max_num_tokens),
+        "flashinfer_use_decode_wrapper": use_decode_wrapper,
+    }
     model.prefill(
         input_ids=input_ids[:, :-1],
-        params={
-            "attn_mode": "flashinfer",
-            "cache": cache,
-            "past_len": 0,
-            "batch_shape": (1, cache.max_num_tokens),
-            "flashinfer_use_decode_wrapper": use_decode_wrapper,
-        },
+        params=prefill_params,
     )
 
     cur = input_ids[:, -1:]
     gen_ids = []
-    recurrent_states = None
+    recurrent_states = prefill_params.get("recurrent_states")
 
     for i in range(max_new_tokens):
         params = {

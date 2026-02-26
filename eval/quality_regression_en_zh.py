@@ -131,32 +131,37 @@ def decode_one(tokenizer, ids: torch.Tensor) -> str:
 
 @torch.inference_mode()
 def generate_greedy(model, cache, tokenizer, prompt: str, max_new_tokens: int):
-    input_ids = tokenizer.encode(prompt, add_bos=True, encode_special_tokens=True)
+    input_ids = tokenizer.hf_chat_template(
+        [{"role": "user", "content": prompt}],
+        add_generation_prompt=True,
+    )
     if input_ids.shape[-1] < 2:
         raise RuntimeError("Prompt is too short after tokenization")
 
+    prefill_params = {
+        "attn_mode": "flashinfer",
+        "cache": cache,
+        "past_len": 0,
+        "batch_shape": (1, cache.max_num_tokens),
+    }
     model.prefill(
         input_ids=input_ids[:, :-1],
-        params={
-            "attn_mode": "flashinfer",
-            "cache": cache,
-            "past_len": 0,
-            "batch_shape": (1, cache.max_num_tokens),
-        },
+        params=prefill_params,
     )
 
     cur = input_ids[:, -1:]
     gen_ids: list[int] = []
+    recurrent_states = prefill_params.get("recurrent_states")
     for i in range(max_new_tokens):
-        logits = model.forward(
-            cur,
-            {
-                "attn_mode": "flashinfer",
-                "cache": cache,
-                "past_len": input_ids.shape[-1] - 1 + i,
-                "batch_shape": (1, cache.max_num_tokens),
-            },
-        )
+        params = {
+            "attn_mode": "flashinfer",
+            "cache": cache,
+            "past_len": input_ids.shape[-1] - 1 + i,
+            "batch_shape": (1, cache.max_num_tokens),
+            "recurrent_states": recurrent_states,
+        }
+        logits = model.forward(cur, params)
+        recurrent_states = params.get("recurrent_states")
         next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
         tid = next_id.item()
         if tokenizer.eos_token_id is not None and tid == tokenizer.eos_token_id:
@@ -176,30 +181,32 @@ def score_continuation_nll(model, cache, prompt_ids: torch.Tensor, continuation_
     if len(continuation_ids) == 0:
         return float("nan")
 
+    prefill_params = {
+        "attn_mode": "flashinfer",
+        "cache": cache,
+        "past_len": 0,
+        "batch_shape": (1, cache.max_num_tokens),
+    }
     model.prefill(
         input_ids=prompt_ids[:, :-1],
-        params={
-            "attn_mode": "flashinfer",
-            "cache": cache,
-            "past_len": 0,
-            "batch_shape": (1, cache.max_num_tokens),
-        },
+        params=prefill_params,
     )
 
     past_len = prompt_ids.shape[-1] - 1
     cur = prompt_ids[:, -1:]
     nll_sum = 0.0
+    recurrent_states = prefill_params.get("recurrent_states")
 
     for tid in continuation_ids:
-        logits = model.forward(
-            cur,
-            {
-                "attn_mode": "flashinfer",
-                "cache": cache,
-                "past_len": past_len,
-                "batch_shape": (1, cache.max_num_tokens),
-            },
-        )
+        params = {
+            "attn_mode": "flashinfer",
+            "cache": cache,
+            "past_len": past_len,
+            "batch_shape": (1, cache.max_num_tokens),
+            "recurrent_states": recurrent_states,
+        }
+        logits = model.forward(cur, params)
+        recurrent_states = params.get("recurrent_states")
         logp = F.log_softmax(logits[:, -1, :], dim=-1)[0, tid]
         nll_sum += float(-logp)
         cur = torch.tensor([[tid]], dtype=torch.long)
@@ -386,4 +393,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
