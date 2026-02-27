@@ -173,7 +173,21 @@ class RoPE:
         else:
             factor = rs.rope_scaling.get("factor")
             original_max_position_embeddings = max_position_embeddings
-        attn_factor = rs.rope_scaling.get("attention_factor", 0.1 * math.log(factor) + 1.0)
+
+        def get_mscale(scale: float, mscale: float = 1.0) -> float:
+            if scale <= 1:
+                return 1.0
+            return 0.1 * mscale * math.log(scale) + 1.0
+
+        attn_factor = rs.rope_scaling.get("attention_factor")
+        if attn_factor is None:
+            mscale = rs.rope_scaling.get("mscale")
+            mscale_all_dim = rs.rope_scaling.get("mscale_all_dim")
+            if mscale is not None and mscale_all_dim is not None:
+                attn_factor = get_mscale(factor, float(mscale)) / get_mscale(factor, float(mscale_all_dim))
+            else:
+                attn_factor = get_mscale(factor)
+
         beta_fast = rs.rope_scaling.get("beta_fast", 32)
         beta_slow = rs.rope_scaling.get("beta_slow", 1)
         self.llama_4_scaling_beta = rs.rope_scaling.get("llama_4_scaling_beta", 0.0)

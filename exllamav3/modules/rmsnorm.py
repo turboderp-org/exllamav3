@@ -84,9 +84,33 @@ class RMSNorm(Module):
         params,
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
+        dtype = out_dtype or self.out_dtype
 
-        y = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
-        ext.rms_norm(x, self.weight, y, self.rms_norm_eps, self.constant_bias, self.span_heads)
+        # ext.rms_norm expects row-major 2D inputs for the standard
+        # per-channel RMSNorm path. Flattening keeps results consistent across
+        # chunk/prefill shapes (e.g. [B, T, C] vs [B*T, C]).
+        if not self.span_heads and x.dim() > 2:
+            x_2d = x.view(-1, x.shape[-1]).contiguous()
+            y_2d = torch.empty_like(x_2d, dtype = dtype)
+            ext.rms_norm(
+                x_2d,
+                self.weight,
+                y_2d,
+                self.rms_norm_eps,
+                self.constant_bias,
+                self.span_heads,
+            )
+            return y_2d.view_as(x)
+
+        y = torch.empty_like(x, dtype = dtype)
+        ext.rms_norm(
+            x,
+            self.weight,
+            y,
+            self.rms_norm_eps,
+            self.constant_bias,
+            self.span_heads,
+        )
         return y
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:

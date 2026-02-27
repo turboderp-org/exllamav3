@@ -3,6 +3,7 @@ from .apertus import ApertusModel
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
+from .deepseek_v2 import DeepseekV2Model, DeepseekModel, DeepseekV3Model, GlmMoeDsaModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
 from .ernie4_5_moe import Ernie4_5MoEModel
@@ -29,6 +30,7 @@ from .phi3 import Phi3Model
 from .qwen2 import Qwen2Model
 from .qwen2_5_vl import Qwen2_5VLModel
 from .qwen3 import Qwen3Model
+from .qwen3_5 import Qwen3_5Model, Qwen3_5MoeModel
 from .qwen3_moe import Qwen3MoeModel
 from .qwen3_next import Qwen3NextModel
 from .qwen3_vl import Qwen3VLModel
@@ -48,6 +50,10 @@ ARCHITECTURES = {
         CohereModel,
         Cohere2Model,
         DeciLMModel,
+        DeepseekV2Model,
+        DeepseekModel,
+        DeepseekV3Model,
+        GlmMoeDsaModel,
         Dots1Model,
         Ernie4_5Model,
         Ernie4_5MoEModel,
@@ -75,6 +81,8 @@ ARCHITECTURES = {
         Qwen2Model,
         Qwen2_5VLModel,
         Qwen3Model,
+        Qwen3_5Model,
+        Qwen3_5MoeModel,
         Qwen3MoeModel,
         Qwen3NextModel,
         Qwen3VLModel,

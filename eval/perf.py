@@ -54,7 +54,7 @@ def measure_prefill(args, model, cache, warmup = False):
                 chunks = [(i, min(i + chunk_size, end)) for i in range(start, end, chunk_size)]
                 for start, end in chunks:
                     params = {
-                        "attn_mode": "flash_attn",
+                        "attn_mode": "flashinfer",
                         "cache": cache,
                         "past_len": start,
                         "batch_shape": (1, max(length, 256)),
@@ -92,7 +92,7 @@ def measure_generate(args, model, cache, warmup = False):
             with Timer() as t:
                 for _ in range(100):
                     params = {
-                        "attn_mode": "flash_attn",
+                        "attn_mode": "flashinfer",
                         "cache": cache,
                         "past_len": length,
                         "batch_shape": (1, max(length, 256)),

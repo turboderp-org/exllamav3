@@ -61,7 +61,7 @@ def main(args):
         for row in range(eval_ids.shape[0]):
             pb.update(row)
             input_ids = eval_ids[row:row + 1, :]
-            logits = model.forward(input_ids, {"attn_mode": "flash_attn_nc"})
+            logits = model.forward(input_ids, {"attn_mode": "flashinfer_nc"})
             logits = logits[:, :-1, :vocab_size].float()
             logits += 1e-10
             log_probs = F.log_softmax(logits, dim = -1)

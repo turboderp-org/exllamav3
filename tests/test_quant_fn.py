@@ -146,7 +146,7 @@ def test_quant_dequant(K, test_key, cb):
     state = torch.randn((1, bsz, linear.in_features), dtype = torch.float16, device = device)
     capture_H = {}
     params = {
-        "attn_mode": "flash_attn_nc",
+        "attn_mode": "flashinfer_nc",
         "capture": capture_H
     }
     rs = linear.prepare_for_device(state, params)
