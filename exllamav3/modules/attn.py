@@ -1,5 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
+import re
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
@@ -13,7 +15,10 @@ from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 
-_FLASHINFER_WORKSPACE_BYTES = 64 * 1024 * 1024
+_FLASHINFER_WORKSPACE_DEFAULT_BYTES = 128 * 1024 * 1024
+_FLASHINFER_WORKSPACE_MIN_BYTES = 16 * 1024 * 1024
+_FLASHINFER_WORKSPACE_ROUND_BYTES = 8 * 1024 * 1024
+_FLASHINFER_WORKSPACE_GROWTH_MARGIN_BYTES = 16 * 1024 * 1024
 _FLASHINFER_WORKSPACE: dict[tuple[str, int | None], torch.Tensor] = {}
 _FLASHINFER_DECODE_WRAPPERS: dict[
     tuple[str, int | None, str, bool],
@@ -21,10 +26,84 @@ _FLASHINFER_DECODE_WRAPPERS: dict[
 ] = {}
 
 
+def _round_up_workspace_size(num_bytes: int) -> int:
+    num_bytes = max(num_bytes, _FLASHINFER_WORKSPACE_MIN_BYTES)
+    round_bytes = _FLASHINFER_WORKSPACE_ROUND_BYTES
+    return ((num_bytes + round_bytes - 1) // round_bytes) * round_bytes
+
+
+def _get_workspace_size_from_env() -> int:
+    raw_bytes = os.getenv("EXLLAMAV3_FLASHINFER_WORKSPACE_BUFFER_SIZE")
+    if raw_bytes is not None:
+        try:
+            return _round_up_workspace_size(int(raw_bytes))
+        except ValueError:
+            pass
+
+    raw_mb = os.getenv("EXLLAMAV3_FLASHINFER_WORKSPACE_MB")
+    if raw_mb is not None:
+        try:
+            return _round_up_workspace_size(int(raw_mb) * 1024 * 1024)
+        except ValueError:
+            pass
+
+    return _round_up_workspace_size(_FLASHINFER_WORKSPACE_DEFAULT_BYTES)
+
+
+_FLASHINFER_WORKSPACE_BYTES = _get_workspace_size_from_env()
+
+
+def _parse_workspace_overflow_message(message: str) -> tuple[int, int] | None:
+    match = re.search(
+        r"with size\s+(\d+)\s+and alignment\s+\d+,\s+but only\s+(\d+)\s+bytes available",
+        message,
+    )
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def grow_flashinfer_workspace_for_exception(
+    device: torch.device | None,
+    exc: BaseException,
+) -> bool:
+    if device is None or not isinstance(exc, RuntimeError):
+        return False
+    parsed = _parse_workspace_overflow_message(str(exc))
+    if parsed is None:
+        return False
+
+    required_bytes, available_bytes = parsed
+    target_bytes = max(
+        int(required_bytes * 1.25),
+        required_bytes + _FLASHINFER_WORKSPACE_GROWTH_MARGIN_BYTES,
+        available_bytes * 2,
+    )
+    target_bytes = _round_up_workspace_size(target_bytes)
+
+    global _FLASHINFER_WORKSPACE_BYTES
+    if target_bytes <= _FLASHINFER_WORKSPACE_BYTES:
+        target_bytes = _round_up_workspace_size(_FLASHINFER_WORKSPACE_BYTES * 2)
+    _FLASHINFER_WORKSPACE_BYTES = target_bytes
+
+    key = (device.type, device.index)
+    _FLASHINFER_WORKSPACE.pop(key, None)
+
+    for wrapper_key in tuple(_FLASHINFER_DECODE_WRAPPERS.keys()):
+        if wrapper_key[0] == device.type and wrapper_key[1] == device.index:
+            _FLASHINFER_DECODE_WRAPPERS.pop(wrapper_key, None)
+
+    return True
+
+
 def get_flashinfer_workspace(device: torch.device) -> torch.Tensor:
     key = (device.type, device.index)
     workspace = _FLASHINFER_WORKSPACE.get(key)
-    if workspace is None or workspace.device != device:
+    if (
+        workspace is None
+        or workspace.device != device
+        or workspace.numel() < _FLASHINFER_WORKSPACE_BYTES
+    ):
         workspace = torch.empty(_FLASHINFER_WORKSPACE_BYTES, dtype = torch.uint8, device = device)
         _FLASHINFER_WORKSPACE[key] = workspace
     return workspace
@@ -853,29 +932,44 @@ class Attention(Module):
                     self.flashinfer_decode_wrapper = None
 
         if o is None:
-            prefill_wrapper = self.get_flashinfer_prefill_wrapper()
-            prefill_wrapper.plan(
-                qo_indptr = qo_indptr,
-                paged_kv_indptr = kv_indptr,
-                paged_kv_indices = kv_indices,
-                paged_kv_last_page_len = kv_last_page_len,
-                num_qo_heads = self.num_q_heads,
-                num_kv_heads = self.num_kv_heads,
-                head_dim_qk = self.head_dim,
-                page_size = PAGE_SIZE,
-                causal = causal,
-                pos_encoding_mode = "NONE",
-                sm_scale = self.sm_scale,
-                window_left = window_left,
-                logits_soft_cap = logits_soft_cap,
-                q_data_type = q.dtype,
-                kv_data_type = cache_k.dtype,
-                o_data_type = q.dtype,
-            )
-            o = prefill_wrapper.run(
-                q_flat,
-                (cache_k, cache_v),
-            ).view(bsz, seqlen, self.num_q_heads, self.head_dim)
+            retried_workspace_growth = False
+            while True:
+                prefill_wrapper = self.get_flashinfer_prefill_wrapper()
+                try:
+                    prefill_wrapper.plan(
+                        qo_indptr = qo_indptr,
+                        paged_kv_indptr = kv_indptr,
+                        paged_kv_indices = kv_indices,
+                        paged_kv_last_page_len = kv_last_page_len,
+                        num_qo_heads = self.num_q_heads,
+                        num_kv_heads = self.num_kv_heads,
+                        head_dim_qk = self.head_dim,
+                        page_size = PAGE_SIZE,
+                        causal = causal,
+                        pos_encoding_mode = "NONE",
+                        sm_scale = self.sm_scale,
+                        window_left = window_left,
+                        logits_soft_cap = logits_soft_cap,
+                        q_data_type = q.dtype,
+                        kv_data_type = cache_k.dtype,
+                        o_data_type = q.dtype,
+                    )
+                    o = prefill_wrapper.run(
+                        q_flat,
+                        (cache_k, cache_v),
+                    ).view(bsz, seqlen, self.num_q_heads, self.head_dim)
+                    break
+                except RuntimeError as ex:
+                    if (
+                        not retried_workspace_growth
+                        and grow_flashinfer_workspace_for_exception(self.device, ex)
+                    ):
+                        retried_workspace_growth = True
+                        self.flashinfer_prefill_wrapper = None
+                        self.flashinfer_decode_wrapper = None
+                        self.flashinfer_decode_wrapper_failed = False
+                        continue
+                    raise
 
         if self.has_split_cache:
             self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)

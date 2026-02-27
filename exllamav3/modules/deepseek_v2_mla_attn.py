@@ -13,6 +13,7 @@ from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm
 from .attn import (
     get_flashinfer_workspace,
+    grow_flashinfer_workspace_for_exception,
     make_paged_kv_metadata,
 )
 
@@ -325,6 +326,7 @@ class DeepseekV2MLAAttention(Module):
     def _plan_mla_wrapper(
         self,
         wrapper: flashinfer.BatchMLAPagedAttentionWrapper,
+        backend: str,
         params: dict,
         qo_indptr: torch.Tensor,
         kv_indptr: torch.Tensor,
@@ -340,37 +342,51 @@ class DeepseekV2MLAAttention(Module):
             planned = {}
             params["flashinfer_mla_planned_wrappers"] = planned
 
-        wrapper_id = id(wrapper)
-        plan_marker = (
-            kv_indptr.data_ptr(),
-            kv_indices.data_ptr(),
-            kv_lens.data_ptr(),
-            self.num_q_heads,
-            self.kv_lora_rank,
-            self.qk_rope_head_dim,
-            q_dtype,
-            kv_dtype,
-            seqlen,
-            causal,
-        )
-        if planned.get(wrapper_id) == plan_marker:
-            return
+        retried_workspace_growth = False
+        while True:
+            wrapper_id = id(wrapper)
+            plan_marker = (
+                kv_indptr.data_ptr(),
+                kv_indices.data_ptr(),
+                kv_lens.data_ptr(),
+                self.num_q_heads,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                q_dtype,
+                kv_dtype,
+                seqlen,
+                causal,
+            )
+            if planned.get(wrapper_id) == plan_marker:
+                return
 
-        wrapper.plan(
-            qo_indptr = qo_indptr,
-            kv_indptr = kv_indptr,
-            kv_indices = kv_indices,
-            kv_len_arr = kv_lens,
-            num_heads = self.num_q_heads,
-            head_dim_ckv = self.kv_lora_rank,
-            head_dim_kpe = self.qk_rope_head_dim,
-            page_size = PAGE_SIZE,
-            causal = causal,
-            sm_scale = self.sm_scale,
-            q_data_type = q_dtype,
-            kv_data_type = kv_dtype,
-        )
-        planned[wrapper_id] = plan_marker
+            try:
+                wrapper.plan(
+                    qo_indptr = qo_indptr,
+                    kv_indptr = kv_indptr,
+                    kv_indices = kv_indices,
+                    kv_len_arr = kv_lens,
+                    num_heads = self.num_q_heads,
+                    head_dim_ckv = self.kv_lora_rank,
+                    head_dim_kpe = self.qk_rope_head_dim,
+                    page_size = PAGE_SIZE,
+                    causal = causal,
+                    sm_scale = self.sm_scale,
+                    q_data_type = q_dtype,
+                    kv_data_type = kv_dtype,
+                )
+                planned[wrapper_id] = plan_marker
+                return
+            except RuntimeError as exc:
+                if (
+                    not retried_workspace_growth
+                    and grow_flashinfer_workspace_for_exception(self.device, exc)
+                ):
+                    retried_workspace_growth = True
+                    self.flashinfer_mla_wrappers.pop(backend, None)
+                    wrapper = self.get_flashinfer_mla_wrapper(backend)
+                    continue
+                raise
 
 
     def _run_mla_torch_fallback(
@@ -595,6 +611,7 @@ class DeepseekV2MLAAttention(Module):
                 wrapper = self.get_flashinfer_mla_wrapper(backend)
                 self._plan_mla_wrapper(
                     wrapper = wrapper,
+                    backend = backend,
                     params = params,
                     qo_indptr = qo_indptr,
                     kv_indptr = kv_indptr,
