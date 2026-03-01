@@ -199,7 +199,7 @@ def main(args):
                 # Print token IDs for last response
                 case "/t":
                     if last_tokens is None:
-                        print_error(f"Unknown command: {c[0]}")
+                        print_error(f"No previous response to tokenize")
                         continue
                     print_tokens(last_tokens, tokenizer.get_id_to_piece_list())
                     continue
