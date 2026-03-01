@@ -40,7 +40,7 @@ class RMSNorm(Module):
     def load(self, device: torch.device, **kwargs):
         self.device = device
         if not self.unweighted:
-            weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, float2half = True)
+            weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, float2half = True, allow_bf16 = True)
             self._numel = weight.numel()
             self.weight = nn.Parameter(weight, requires_grad = False)
         else:

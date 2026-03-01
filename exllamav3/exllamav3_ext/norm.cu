@@ -130,12 +130,12 @@ __device__ __forceinline__ float _silu(float x)
 }
 
 
-template <typename input_t, typename output_t>
+template <typename input_t, typename output_t, typename weight_t>
 __global__ __launch_bounds__(NUM_THREADS)
 void rms_norm_kernel
 (
     const input_t* __restrict__ x,
-    const half* __restrict__ w,
+    const weight_t* __restrict__ w,
     output_t* __restrict__ y,
     const float epsilon,
     const int rows,
@@ -149,6 +149,7 @@ void rms_norm_kernel
     constexpr bool output_fp16 = std::is_same_v<output_t, half>;
     static_assert(input_fp32 || input_fp16, "rms_norm_kernel: input must be float or half type");
     static_assert(output_fp32 || output_fp16, "rms_norm_kernel: output must be float or half type");
+    constexpr bool weight_bf16 = std::is_same_v<weight_t, bfloat16>;
 
     int t = threadIdx.x;
     int warp_id = threadIdx.x / 32;
@@ -181,7 +182,11 @@ void rms_norm_kernel
         if (w)
         {
             float4 w4;
-            read_half4<false>(w4, ((const half4*) w) + column);
+            if constexpr (weight_bf16)
+                read_bfloat164(w4, ((const bfloat164*) w) + column);
+            else
+                read_half4<false>(w4, ((const half4*) w) + column);
+
             if (constant_bias != 0.0f)
             {
                 w4.x += constant_bias;
@@ -224,12 +229,18 @@ void rms_norm
         y = y.flatten(-2);
     }
 
-    TORCH_CHECK_DTYPE_OPT(w, kHalf);
     const half* w_ptr = (const half*) OPTPTR(w);
     TORCH_CHECK_DIV(x, -1, 4);
-    if (w_ptr)
-        TORCH_CHECK_SHAPES(x, -1, w.value(), 0, 1);
     TORCH_CHECK_SHAPES_FULL(x, y);
+
+    bool weight_bf16 = false;
+    bool weight_fp16 = false;
+    if (w_ptr)
+    {
+        TORCH_CHECK_SHAPES(x, -1, w.value(), 0, 1);
+        weight_bf16 = w.value().dtype() == at::kBFloat16;
+        weight_fp16 = w.value().dtype() == at::kHalf;
+    }
 
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -244,7 +255,7 @@ void rms_norm
     dim3 blockDim(NUM_THREADS, 1, 1);
     dim3 gridDim(rows, 1, 1);
 
-    if (input_fp16 && output_fp16)
+    if (input_fp16 && output_fp16 && weight_fp16)
         rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>
         (
             (const half*) x.data_ptr(),
@@ -255,7 +266,7 @@ void rms_norm
             dim,
             constant_bias
         );
-    else if (input_fp16 && output_fp32)
+    else if (input_fp16 && output_fp32 && weight_fp16)
         rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>
         (
             (const half*) x.data_ptr(),
@@ -266,7 +277,7 @@ void rms_norm
             dim,
             constant_bias
         );
-    else if (input_fp32 && output_fp16)
+    else if (input_fp32 && output_fp16 && weight_fp16)
         rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>
         (
             (const float*) x.data_ptr(),
@@ -277,11 +288,55 @@ void rms_norm
             dim,
             constant_bias
         );
-    else if (input_fp32 && output_fp32)
+    else if (input_fp32 && output_fp32 && weight_fp16)
         rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>
         (
             (const float*) x.data_ptr(),
             (const half*) w_ptr,
+            (float*) y.data_ptr(),
+            epsilon,
+            rows,
+            dim,
+            constant_bias
+        );
+    else if (input_fp16 && output_fp16 && weight_bf16)
+        rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>
+        (
+            (const half*) x.data_ptr(),
+            (const bfloat16*) w_ptr,
+            (half*) y.data_ptr(),
+            epsilon,
+            rows,
+            dim,
+            constant_bias
+        );
+    else if (input_fp16 && output_fp32 && weight_bf16)
+        rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>
+        (
+            (const half*) x.data_ptr(),
+            (const bfloat16*) w_ptr,
+            (float*) y.data_ptr(),
+            epsilon,
+            rows,
+            dim,
+            constant_bias
+        );
+    else if (input_fp32 && output_fp16 && weight_bf16)
+        rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>
+        (
+            (const float*) x.data_ptr(),
+            (const bfloat16*) w_ptr,
+            (half*) y.data_ptr(),
+            epsilon,
+            rows,
+            dim,
+            constant_bias
+        );
+    else if (input_fp32 && output_fp32 && weight_bf16)
+        rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>
+        (
+            (const float*) x.data_ptr(),
+            (const bfloat16*) w_ptr,
             (float*) y.data_ptr(),
             epsilon,
             rows,
@@ -289,18 +344,18 @@ void rms_norm
             constant_bias
         );
     else
-        TORCH_CHECK(false, "rms_norm: Invalid datatypes for input/output, must be half or float")
+        TORCH_CHECK(false, "rms_norm: Invalid datatypes for input/output")
 
     cuda_check(cudaPeekAtLastError());
 }
 
 
-template <int num_threads, typename output_t>
+template <int num_threads, typename output_t, typename weight_t>
 __global__ __launch_bounds__(num_threads)
 void gated_rms_norm_kernel
 (
     const bfloat16* __restrict__ x,
-    const bfloat16* __restrict__ w,
+    const weight_t* __restrict__ w,
     output_t* __restrict__ y,
     const bfloat16* __restrict__ g,
     const float epsilon,
@@ -311,6 +366,7 @@ void gated_rms_norm_kernel
 {
     constexpr bool output_fp32 = std::is_same_v<output_t, float>;
     constexpr bool output_fp16 = std::is_same_v<output_t, half>;
+    constexpr bool weight_bf16 = std::is_same_v<weight_t, bfloat16>;
     static_assert(output_fp32 || output_fp16, "gated_rms_norm_kernel: output must be float or half type");
 
     int t = threadIdx.x;
@@ -340,7 +396,12 @@ void gated_rms_norm_kernel
         float4 w4;
         float4 g4;
         read_bfloat164(x4, ((const bfloat164*) (x + row * dim)) + column);
-        read_bfloat164(w4, ((const bfloat164*) w) + column);
+
+        if constexpr (weight_bf16)
+            read_bfloat164(w4, ((const bfloat164*) w) + column);
+        else
+            read_float4(w4, ((const float4*) w) + column);
+
         read_bfloat164(g4, ((const bfloat164*) (g + row * dim)) + column);
 
         if (constant_bias != 0.0f)
@@ -382,7 +443,7 @@ void gated_rms_norm
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(x, kBFloat16);
-    TORCH_CHECK_DTYPE(w, kBFloat16);
+    // TORCH_CHECK_DTYPE(w, kBFloat16);
     TORCH_CHECK_DTYPE(g, kBFloat16);
     TORCH_CHECK_DIV(x, -1, 4);
     TORCH_CHECK_SHAPES(x, -1, w, 0, 1);
@@ -391,6 +452,8 @@ void gated_rms_norm
 
     bool output_fp32 = y.dtype() == at::kFloat;
     bool output_fp16 = y.dtype() == at::kHalf;
+    bool weight_bf16 = w.dtype() == at::kBFloat16;
+    bool weight_fp32 = w.dtype() == at::kFloat;
 
     int rows = 1;
     for (int i = 0; i < x.dim() - 1; ++i) rows *= x.size(i);
@@ -401,7 +464,7 @@ void gated_rms_norm
     dim3 blockDim(small ? 32 : NUM_THREADS, 1, 1);
     dim3 gridDim(rows, 1, 1);
 
-    if (!small && output_fp16)
+    if (!small && output_fp16 && weight_bf16)
         gated_rms_norm_kernel<NUM_THREADS><<<gridDim, blockDim, 0, stream>>>
         (
             (const bfloat16*) x.data_ptr(),
@@ -413,7 +476,7 @@ void gated_rms_norm
             dim,
             constant_bias
         );
-    else if (!small && output_fp32)
+    else if (!small && output_fp32 && weight_bf16)
         gated_rms_norm_kernel<NUM_THREADS><<<gridDim, blockDim, 0, stream>>>
         (
             (const bfloat16*) x.data_ptr(),
@@ -425,7 +488,7 @@ void gated_rms_norm
             dim,
             constant_bias
         );
-    else if (small && output_fp16)
+    else if (small && output_fp16 && weight_bf16)
         gated_rms_norm_kernel<32><<<gridDim, blockDim, 0, stream>>>
         (
             (const bfloat16*) x.data_ptr(),
@@ -437,11 +500,59 @@ void gated_rms_norm
             dim,
             constant_bias
         );
-    else if (small && output_fp32)
+    else if (small && output_fp32 && weight_bf16)
         gated_rms_norm_kernel<32><<<gridDim, blockDim, 0, stream>>>
         (
             (const bfloat16*) x.data_ptr(),
             (const bfloat16*) w.data_ptr(),
+            (float*) y.data_ptr(),
+            (const bfloat16*) g.data_ptr(),
+            epsilon,
+            rows,
+            dim,
+            constant_bias
+        );
+    else if (!small && output_fp16 && weight_fp32)
+        gated_rms_norm_kernel<NUM_THREADS><<<gridDim, blockDim, 0, stream>>>
+        (
+            (const bfloat16*) x.data_ptr(),
+            (const float*) w.data_ptr(),
+            (half*) y.data_ptr(),
+            (const bfloat16*) g.data_ptr(),
+            epsilon,
+            rows,
+            dim,
+            constant_bias
+        );
+    else if (!small && output_fp32 && weight_fp32)
+        gated_rms_norm_kernel<NUM_THREADS><<<gridDim, blockDim, 0, stream>>>
+        (
+            (const bfloat16*) x.data_ptr(),
+            (const float*) w.data_ptr(),
+            (float*) y.data_ptr(),
+            (const bfloat16*) g.data_ptr(),
+            epsilon,
+            rows,
+            dim,
+            constant_bias
+        );
+    else if (small && output_fp16 && weight_fp32)
+        gated_rms_norm_kernel<32><<<gridDim, blockDim, 0, stream>>>
+        (
+            (const bfloat16*) x.data_ptr(),
+            (const float*) w.data_ptr(),
+            (half*) y.data_ptr(),
+            (const bfloat16*) g.data_ptr(),
+            epsilon,
+            rows,
+            dim,
+            constant_bias
+        );
+    else if (small && output_fp32 && weight_fp32)
+        gated_rms_norm_kernel<32><<<gridDim, blockDim, 0, stream>>>
+        (
+            (const bfloat16*) x.data_ptr(),
+            (const float*) w.data_ptr(),
             (float*) y.data_ptr(),
             (const bfloat16*) g.data_ptr(),
             epsilon,
