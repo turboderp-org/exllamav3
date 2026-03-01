@@ -830,6 +830,7 @@ class BlockSparseMLP(Module):
                 "routed_scaling_factor": self.routed_scaling_factor,
                 "n_group": self.n_group,
                 "topk_group": self.topk_group,
+                "act_limit": self.act_limit
             },
             "routing_gate": _export(self.routing_gate),
             "e_score_correction_bias": producer.send(self.e_score_correction_bias),

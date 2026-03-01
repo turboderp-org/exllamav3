@@ -145,7 +145,8 @@ class Step3_5Model(Model):
                             rms_norm_eps = config.rms_norm_eps,
                             constant_bias = 1.0,
                         ),
-                        out_dtype = torch.float
+                        out_dtype = torch.float,
+                        tp_split_norm = False
                     ),
                     mlp_norm = RMSNorm(
                         config = config,

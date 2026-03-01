@@ -718,6 +718,7 @@ class GatedMLP(Module):
                 "out_dtype": self.out_dtype,
                 "interm_dtype": self.interm_dtype,
                 "intermediate_split_size": self.intermediate_split_size,
+                "act_limit": self.act_limit
             },
             "gates": [_export(self.gates[i]) for i in range(self.num_slices)],
             "ups": [_export(self.ups[i]) for i in range(self.num_slices)],
