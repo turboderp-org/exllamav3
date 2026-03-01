@@ -575,6 +575,12 @@ class BlockSparseMLP(Module):
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
 
+        if self.is_quantized and bsz >= self.f_threshold and selected_experts.is_cuda:
+            # routing_fn may fill these tensors via custom CUDA kernels. The large-batch torch fallback
+            # below immediately feeds them into PyTorch indexing ops (one_hot, where, gather), so make
+            # sure the routing outputs are materialized first.
+            torch.cuda.synchronize(selected_experts.device)
+
         # Empty slice
         if self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros_like(x, dtype = self.out_dtype)
@@ -582,22 +588,11 @@ class BlockSparseMLP(Module):
         # Torch path
         elif bsz >= self.f_threshold or not self.is_quantized:
             final_hidden_states = torch.zeros_like(y, dtype = self.out_dtype)
-
-            if self.routing_device is None or self.num_local_experts == self.num_experts:
-                expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
-            else:
-                # TODO: profile, maybe optimize
-                selected_experts -= self.routing_first
-                invalid = (selected_experts < 0) | (selected_experts >= self.num_local_experts)
-                shifted = torch.where(invalid, torch.zeros_like(selected_experts), selected_experts + 1)
-                expert_mask = F.one_hot(shifted, num_classes = self.num_local_experts + 1)[..., 1:]
-                # routing_weights[invalid] = 0.0
+            async_keepalive = self.is_quantized and params.get("indexed_embeddings")
 
             if self.num_local_experts is None or self.num_local_experts > 0:
 
                 num_ex = self.num_local_experts or self.num_experts
-                expert_count = expert_mask.view(-1, num_ex).sum(dim = 0).cpu()
-                expert_mask = expert_mask.permute(2, 1, 0)
 
                 def mlp(exp_i, xc):
                     g = self.gates[exp_i].forward(xc, params)
@@ -606,14 +601,73 @@ class BlockSparseMLP(Module):
                     self.activation_fn_call(g, u, a)
                     return self.downs[exp_i].forward(a, params)
 
-                for expert_idx in range(num_ex):
-                    if expert_count[expert_idx] == 0:
-                        continue
-                    idx, top_x = torch.where(expert_mask[expert_idx])
-                    current_state = y[None, top_x].reshape(-1, self.hidden_size)
-                    current_state = mlp(expert_idx, current_state) * routing_weights[top_x, idx, None]
-                    final_hidden_states.index_add_(0, top_x, current_state)
+                if async_keepalive:
+                    assignments = [[] for _ in range(num_ex)]
+                    selected_experts_cpu = selected_experts.cpu().tolist()
 
+                    if self.routing_device is None or self.num_local_experts == self.num_experts:
+                        for token_idx, row in enumerate(selected_experts_cpu):
+                            for slot_idx, expert_idx in enumerate(row):
+                                if 0 <= expert_idx < num_ex:
+                                    assignments[expert_idx].append((slot_idx, token_idx))
+                    else:
+                        routing_first = self.routing_first
+                        for token_idx, row in enumerate(selected_experts_cpu):
+                            for slot_idx, expert_idx in enumerate(row):
+                                local_expert = expert_idx - routing_first
+                                if 0 <= local_expert < num_ex:
+                                    assignments[local_expert].append((slot_idx, token_idx))
+
+                    for expert_idx, pairs in enumerate(assignments):
+                        if not pairs:
+                            continue
+                        idx = torch.tensor(
+                            [slot_idx for slot_idx, _ in pairs],
+                            dtype = torch.long,
+                            device = self.device,
+                        )
+                        top_x = torch.tensor(
+                            [token_idx for _, token_idx in pairs],
+                            dtype = torch.long,
+                            device = self.device,
+                        )
+                        idx_col = idx.view(-1, 1)
+                        input_state = torch.index_select(y, 0, top_x)
+                        expert_routing = torch.index_select(routing_weights, 0, top_x)
+                        expert_routing = torch.gather(expert_routing, 1, idx_col)
+                        gate_out = self.gates[expert_idx].forward(input_state, params)
+                        up_out = self.ups[expert_idx].forward(input_state, params)
+                        act_out = up_out if self.interm_dtype == torch.half else torch.empty_like(up_out, dtype = torch.half)
+                        self.activation_fn_call(gate_out, up_out, act_out)
+                        down_out = self.downs[expert_idx].forward(act_out, params)
+                        weighted_out = down_out * expert_routing
+                        final_hidden_states.index_add_(0, top_x, weighted_out)
+                        torch.cuda.synchronize(final_hidden_states.device)
+                else:
+                    if self.routing_device is None or self.num_local_experts == self.num_experts:
+                        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
+                    else:
+                        # TODO: profile, maybe optimize
+                        shifted = selected_experts - self.routing_first
+                        invalid = (shifted < 0) | (shifted >= self.num_local_experts)
+                        masked = torch.where(invalid, torch.zeros_like(shifted), shifted + 1)
+                        expert_mask = F.one_hot(masked, num_classes = self.num_local_experts + 1)[..., 1:]
+                        # routing_weights[invalid] = 0.0
+
+                    expert_count = expert_mask.view(-1, num_ex).sum(dim = 0).cpu()
+                    expert_mask = expert_mask.permute(2, 1, 0)
+
+                    for expert_idx in range(num_ex):
+                        if expert_count[expert_idx] == 0:
+                            continue
+                        mask_row = expert_mask[expert_idx]
+                        idx, top_x = torch.where(mask_row)
+                        idx_col = idx.view(-1, 1)
+                        current_state = torch.index_select(y, 0, top_x)
+                        expert_routing = torch.index_select(routing_weights, 0, top_x)
+                        expert_routing = torch.gather(expert_routing, 1, idx_col)
+                        current_state = mlp(expert_idx, current_state) * expert_routing
+                        final_hidden_states.index_add_(0, top_x, current_state)
             final_hidden_states = final_hidden_states.reshape(x.shape)
             final_hidden_states = to2(final_hidden_states, out_dtype, self.out_dtype)
 

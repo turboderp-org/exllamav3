@@ -90,6 +90,7 @@ class Generator:
         self.model = model
         self.cache = cache
         self.tokenizer = tokenizer
+        self._forward_params_keepalive = None
         cfg = self.model.config
         self.padded_vocab_size = ((cfg.vocab_size + 31) // 32) * 32
 
@@ -479,17 +480,19 @@ class Generator:
                     job.filter_futures.append(None)
 
         # Get logit batch from model
+        model_params = {
+            "attn_mode": "flashinfer",
+            "block_table": block_index,
+            "cache": self.cache,
+            "cache_seqlens": cache_seqlens,
+            "recurrent_states": batch_states,
+            "indexed_embeddings": active_embeddings,
+            "positions": positions,
+        }
+        self._forward_params_keepalive = model_params
         batch_logits = self.model.forward(
             input_ids = batch_ids,
-            params = {
-                "attn_mode": "flashinfer",
-                "block_table": block_index,
-                "cache": self.cache,
-                "cache_seqlens": cache_seqlens,
-                "recurrent_states": batch_states,
-                "indexed_embeddings": active_embeddings,
-                "positions": positions,
-            }
+            params = model_params,
         )
 
         # Split batched recurrent states

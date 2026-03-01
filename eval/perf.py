@@ -2,7 +2,7 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.misc import Timer, cuda_sync_active
-from exllamav3 import model_init
+from exllamav3 import model_init, Generator, Job, GreedySampler
 import torch
 import argparse
 from functools import lru_cache
@@ -18,8 +18,8 @@ col_gray = "\u001b[37;1m"
 
 
 @lru_cache
-def cached_ids(length):
-    return torch.ones((1, length), dtype = torch.long)
+def cached_ids(length, value = 1):
+    return torch.full((1, length), value, dtype = torch.long)
 
 
 def get_lengths(max_length):
@@ -29,6 +29,21 @@ def get_lengths(max_length):
         length = min(length * 2, max_length)
         lengths.append(length)
     return lengths
+
+
+def get_generate_lengths(max_length, max_new_tokens, cache_size):
+    return [
+        length for length in [0] + get_lengths(max_length)
+        if length + max_new_tokens <= cache_size
+    ]
+
+
+def get_bench_token_id(tokenizer):
+    for text in (" hello", "a"):
+        ids = tokenizer.encode(text, add_bos = False)
+        if ids.numel():
+            return int(ids[0, 0].item())
+    return 1
 
 
 faux_recurrent_states = None
@@ -79,35 +94,45 @@ def measure_prefill(args, model, cache, warmup = False):
     return results
 
 
-def measure_generate(args, model, cache, warmup = False):
-    global faux_recurrent_states
+def measure_generate(args, model, cache, tokenizer, warmup = False):
     chunk_size = args.chunk_size
-    lengths = [0] + get_lengths(chunk_size if warmup else args.max_length)
+    bench_new_tokens = 100
+    lengths = get_generate_lengths(
+        chunk_size if warmup else args.max_length,
+        bench_new_tokens,
+        cache.max_num_tokens
+    )
+    bench_token_id = get_bench_token_id(tokenizer)
+    generator = Generator(
+        model,
+        cache,
+        tokenizer,
+        max_batch_size = 1,
+        max_chunk_size = chunk_size,
+    )
     progress = 0
     results = {}
     max_progress = len(lengths)
     with (ProgressBar("Warmup" if warmup else "Generate", max_progress) as pb):
         for length in lengths:
-            torch.cuda.synchronize()
-            with Timer() as t:
-                for _ in range(100):
-                    params = {
-                        "attn_mode": "flashinfer",
-                        "cache": cache,
-                        "past_len": length,
-                        "batch_shape": (1, max(length, 256)),
-                    }
-                    if "recurrent_states" in model.caps and length > 0:
-                        for v in faux_recurrent_states.values():
-                            v.position = length
-                        params.update({
-                            "recurrent_states": faux_recurrent_states
-                        })
-                    logits = model.forward(cached_ids(1), params)
-                    sample = torch.argmax(logits)
-                    sample = sample.cpu()  # force sync
-                    del logits
-            results[length] = 100 / t.interval
+            input_ids = cached_ids(length + 1, bench_token_id)
+            job = Job(
+                input_ids = input_ids,
+                max_new_tokens = bench_new_tokens + 1,
+                sampler = GreedySampler(),
+                stop_conditions = [],
+            )
+            generator.enqueue(job)
+
+            last_result = None
+            while generator.num_remaining_jobs():
+                for result in generator.iterate():
+                    if result.get("eos"):
+                        last_result = result
+
+            assert last_result is not None, "Generator produced no terminal benchmark result."
+            time_generate = max(last_result["time_generate"], 1e-9)
+            results[length] = last_result["new_tokens"] / time_generate
             if not warmup:
                 print(f"Context {length: 6}: {col_green}{results[length]:10.2f}{col_default} tokens/s")
             progress += 1
@@ -133,9 +158,9 @@ def main(args):
     print()
 
     # Test generation
-    measure_generate(args, model, cache, warmup = True)
+    measure_generate(args, model, cache, tokenizer, warmup = True)
     print(f"{col_yellow}Generation{col_default}")
-    generate_results = measure_generate(args, model, cache)
+    generate_results = measure_generate(args, model, cache, tokenizer)
     print()
 
 

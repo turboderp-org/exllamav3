@@ -265,6 +265,7 @@ class Job:
         self.embeddings = embeddings or []
         self.alt_rope_freqs = None
         self.alt_rope_offset = 0
+        self._prefill_params_keepalive = None
 
         # Pinned buffer for IDs during sampling
         self.current_pinned_ids = None
@@ -883,7 +884,7 @@ class Job:
             freqs, offset = generator.model.g_rope.get_mrope_freqs(
                 ids,
                 self.embeddings,
-                ids.shape[-1]  # + self.max_new_tokens
+                ids.shape[-1] + self.max_new_tokens
             )
             self.alt_rope_freqs = freqs
             self.alt_rope_offset = offset - ids.shape[-1]
@@ -998,17 +999,19 @@ class Job:
                         }
                     )
 
+                prefill_params = {
+                    "attn_mode": "flashinfer",
+                    "block_table": seq.block_index_tensor,
+                    "cache": self.generator.cache,
+                    "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                    "recurrent_states": self.recurrent_state,
+                    "indexed_embeddings": self.embeddings,
+                    "inv_freq": self.alt_rope_freqs,
+                }
+                self._prefill_params_keepalive = prefill_params
                 self.generator.model.prefill(
                     input_ids = prefill_ids,
-                    params = {
-                        "attn_mode": "flashinfer",
-                        "block_table": seq.block_index_tensor,
-                        "cache": self.generator.cache,
-                        "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                        "recurrent_states": self.recurrent_state,
-                        "indexed_embeddings": self.embeddings,
-                        "inv_freq": self.alt_rope_freqs,
-                    }
+                    params = prefill_params,
                 )
 
                 seq.kv_position = prefill_end

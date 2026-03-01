@@ -133,11 +133,20 @@ def make_paged_kv_metadata(
     kv_lens: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     kv_lens = kv_lens.to(dtype = torch.int32)
-    max_pages = block_table.shape[1]
     num_pages = torch.div(kv_lens + PAGE_SIZE - 1, PAGE_SIZE, rounding_mode = "floor")
-    page_ids = torch.arange(max_pages, dtype = torch.int32, device = block_table.device).view(1, -1)
-    page_mask = page_ids < num_pages.view(-1, 1)
-    indices = block_table.to(dtype = torch.int32)[page_mask]
+    block_table_i32 = block_table.to(dtype = torch.int32)
+    if block_table_i32.shape[0] == 1:
+        indices = block_table_i32[0, :int(num_pages[0].item())].contiguous()
+    else:
+        page_slices = [
+            block_table_i32[row, :count]
+            for row, count in enumerate(num_pages.tolist())
+            if count > 0
+        ]
+        if page_slices:
+            indices = torch.cat(page_slices, dim = 0).contiguous()
+        else:
+            indices = torch.empty((0,), dtype = torch.int32, device = block_table_i32.device)
     indptr = torch.empty((kv_lens.numel() + 1,), dtype = torch.int32, device = block_table.device)
     indptr[0] = 0
     indptr[1:] = torch.cumsum(num_pages, dim = 0)
@@ -743,22 +752,79 @@ class Attention(Module):
                 self.post_rope_norm
             )
 
+        def _sdpa_nc_fallback() -> torch.Tensor:
+            assert self.sliding_window < 0, \
+                "Torch SDPA fallback does not support sliding window attention (SWA)"
+            assert self.logit_softcapping == 0.0, \
+                "Torch SDPA fallback does not support logit softcapping"
+
+            if self.use_cu_seqlens and (cu_seqlens := get_for_device(params, "cu_seqlens", self.device, None)) is not None:
+                q_ = q.squeeze(0)
+                k_ = k.squeeze(0)
+                v_ = v.squeeze(0)
+                out_segs = []
+                for i in range(cu_seqlens.numel() - 1):
+                    a = cu_seqlens[i].item()
+                    b = cu_seqlens[i + 1].item()
+                    out_seg = F.scaled_dot_product_attention(
+                        q_[a:b].transpose(0, 1).unsqueeze(0),
+                        k_[a:b].transpose(0, 1).unsqueeze(0),
+                        v_[a:b].transpose(0, 1).unsqueeze(0),
+                        is_causal = causal,
+                        enable_gqa = self.gqa,
+                        scale = self.sm_scale,
+                    )
+                    out_segs.append(out_seg.squeeze(0).transpose(0, 1))
+                return torch.cat(out_segs, dim = 0).unsqueeze(0)
+
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                is_causal = causal,
+                enable_gqa = self.gqa,
+                scale = self.sm_scale,
+            ).transpose(1, 2)
+
+        if not causal:
+            o = _sdpa_nc_fallback()
+            o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+            if self.interleaved_gate: o *= g.sigmoid()
+            o = self.project_o(o, bsz, seqlen, params)
+            return o
+
         window_left = self.sliding_window if self.sliding_window >= 0 else -1
         logits_soft_cap = self.logit_softcapping if self.logit_softcapping > 0 else None
 
-        if self.use_cu_seqlens and (cu_seqlens := get_for_device(params, "cu_seqlens", self.device, None)) is not None:
-            q_ = q.squeeze(0)
-            k_ = k.squeeze(0)
-            v_ = v.squeeze(0)
-            out_segs = []
-            for i in range(cu_seqlens.numel() - 1):
-                a = cu_seqlens[i].item()
-                b = cu_seqlens[i + 1].item()
-                out_segs.append(
+        try:
+            if self.use_cu_seqlens and (cu_seqlens := get_for_device(params, "cu_seqlens", self.device, None)) is not None:
+                q_ = q.squeeze(0)
+                k_ = k.squeeze(0)
+                v_ = v.squeeze(0)
+                out_segs = []
+                for i in range(cu_seqlens.numel() - 1):
+                    a = cu_seqlens[i].item()
+                    b = cu_seqlens[i + 1].item()
+                    out_segs.append(
+                        flashinfer.single_prefill_with_kv_cache(
+                            q_[a:b],
+                            k_[a:b],
+                            v_[a:b],
+                            causal = causal,
+                            kv_layout = "NHD",
+                            pos_encoding_mode = "NONE",
+                            sm_scale = self.sm_scale,
+                            window_left = window_left,
+                            logits_soft_cap = logits_soft_cap,
+                        )
+                    )
+                o = torch.cat(out_segs, dim = 0).unsqueeze(0)
+            else:
+                o = torch.stack([
                     flashinfer.single_prefill_with_kv_cache(
-                        q_[a:b],
-                        k_[a:b],
-                        v_[a:b],
+                        q[i],
+                        k[i],
+                        v[i],
                         causal = causal,
                         kv_layout = "NHD",
                         pos_encoding_mode = "NONE",
@@ -766,23 +832,12 @@ class Attention(Module):
                         window_left = window_left,
                         logits_soft_cap = logits_soft_cap,
                     )
-                )
-            o = torch.cat(out_segs, dim = 0).unsqueeze(0)
-        else:
-            o = torch.stack([
-                flashinfer.single_prefill_with_kv_cache(
-                    q[i],
-                    k[i],
-                    v[i],
-                    causal = causal,
-                    kv_layout = "NHD",
-                    pos_encoding_mode = "NONE",
-                    sm_scale = self.sm_scale,
-                    window_left = window_left,
-                    logits_soft_cap = logits_soft_cap,
-                )
-                for i in range(bsz)
-            ], dim = 0)
+                    for i in range(bsz)
+                ], dim = 0)
+        except RuntimeError as ex:
+            if "Unsupported head_dim" not in str(ex):
+                raise
+            o = _sdpa_nc_fallback()
 
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.interleaved_gate: o *= g.sigmoid()

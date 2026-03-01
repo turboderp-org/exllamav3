@@ -595,7 +595,13 @@ class GatedDeltaNet(Module):
             # Convolution
             if conv_state is None:
                 if save_state:
-                    conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+                    conv_state = torch.zeros(
+                        (bsz, self.fdim_qkv, self.conv_kernel_size),
+                        dtype = mixed_qkv.dtype,
+                        device = mixed_qkv.device,
+                    )
+                    copy_len = min(self.conv_kernel_size, mixed_qkv.shape[-1])
+                    conv_state[:, :, -copy_len:].copy_(mixed_qkv[:, :, -copy_len:])
                     rs.last_conv_state = conv_state
                 mixed_qkv = causal_conv1d_fwd_function(
                     mixed_qkv,

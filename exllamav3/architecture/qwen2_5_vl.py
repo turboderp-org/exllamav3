@@ -548,7 +548,10 @@ class Qwen2_5VLVisionModel(Model):
         embedding_tensor = self.forward(
             image_tensor,
             params = params,
-        ).cpu()
+        )
+        if embedding_tensor.is_cuda:
+            torch.cuda.synchronize(embedding_tensor.device)
+        embedding_tensor = embedding_tensor.cpu()
 
         # Qwen2.5 wants this, idk
         reverse_indices = torch.argsort(window_index)
