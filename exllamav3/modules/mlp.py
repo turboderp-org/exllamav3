@@ -374,6 +374,7 @@ class GatedMLP(Module):
         activation_fn: str = "silu",
         intermediate_split_size: int | None = MAX_MLP_INTERMEDIATE,
         interm_dtype: torch.dtype = None,
+        act_limit: float = 0.0,
         pad_to = 128,
         gates: list[Linear | Module] = None,
         ups: list[Linear | Module] = None,
@@ -388,6 +389,7 @@ class GatedMLP(Module):
         self.hidden_size = hidden_size
         self.intermediate_split_size = intermediate_split_size
         self.pad_to = pad_to
+        self.act_limit = act_limit
 
         if key_fused_gate_up:
             assert not intermediate_split_size or intermediate_size <= intermediate_split_size, \
@@ -573,6 +575,7 @@ class GatedMLP(Module):
                 self.activation_fn == "gelu",
                 self.activation_fn == "relu2",
                 self.downs[0].inner.bc,
+                self.act_limit,
             )
 
 
@@ -616,7 +619,7 @@ class GatedMLP(Module):
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
-                    self.activation_fn_call(g, u, a)
+                    self.activation_fn_call(g, u, a, self.act_limit)
                     d_ = self.downs[s].forward(a, params)
 
                     if d is None: d = d_
@@ -653,7 +656,7 @@ class GatedMLP(Module):
                     u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)
 
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
-                    self.activation_fn_call(g, u, a)
+                    self.activation_fn_call(g, u, a, self.act_limit)
                     d_ = self.downs[s].forward(a, params)
 
                     if d is None: d = d_

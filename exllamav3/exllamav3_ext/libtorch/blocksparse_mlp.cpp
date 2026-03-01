@@ -113,9 +113,9 @@ void BC_BlockSparseMLP::run_bsz1_gr
     );
 
     if (act_silu)
-        silu_mul_gr(interm_g, interm_u, interm_a, graph);
+        silu_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
     else if (act_gelu)
-        gelu_mul_gr(interm_g, interm_u, interm_a, graph);
+        gelu_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
 
     exl3_mgemm_gr
     (

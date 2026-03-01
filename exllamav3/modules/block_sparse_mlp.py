@@ -169,6 +169,7 @@ class BlockSparseMLP(Module):
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
+        act_limit: float = 0.0,
         interm_dtype: torch.dtype = None,
         router_type: str = "std",
         routing_gate: Linear | None = None,
@@ -197,6 +198,7 @@ class BlockSparseMLP(Module):
         self.num_local_experts = num_local_experts if num_local_experts is not None else num_experts
         self.hidden_size = hidden_size
         self.router_type = router_type
+        self.act_limit = act_limit
 
         self.routing_first = routing_first
         self.routing_last = routing_last
@@ -458,7 +460,8 @@ class BlockSparseMLP(Module):
                 self.activation_fn == "silu",
                 self.activation_fn == "gelu",
                 sh_exp,
-                sh_gate
+                sh_gate,
+                self.act_limit
             )
 
 
@@ -566,7 +569,7 @@ class BlockSparseMLP(Module):
                     g = self.gates[exp_i].forward(xc, params)
                     u = self.ups[exp_i].forward(xc, params)
                     a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
-                    self.activation_fn_call(g, u, a)
+                    self.activation_fn_call(g, u, a, self.act_limit)
                     return self.downs[exp_i].forward(a, params)
 
                 for expert_idx in range(num_ex):
@@ -642,7 +645,7 @@ class BlockSparseMLP(Module):
                 )
 
                 # Activation
-                self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a)
+                self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a, self.act_limit)
 
                 # Down
                 ext.exl3_mgemm(
@@ -717,7 +720,7 @@ class BlockSparseMLP(Module):
             )
 
             # Activation
-            self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a)
+            self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a, self.act_limit)
 
             # Down
             ext.exl3_mgemm(

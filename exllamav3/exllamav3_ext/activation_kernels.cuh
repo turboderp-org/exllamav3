@@ -110,6 +110,7 @@ void act_mul_kernel_h
     const half* __restrict__ x,
     const half* __restrict__ y,
     half* __restrict__ z,
+    const float act_limit,
     const size_t numel
 )
 {
@@ -126,6 +127,13 @@ void act_mul_kernel_h
     else if constexpr (activation_type == ACT_RELU2)
         x2 = _relu2(x2);
 
+    if (act_limit != 0.0f)
+    {
+        x2 = __hmax2(x2, __float2half2_rn(-act_limit));
+        x2 = __hmin2(x2, __float2half2_rn(act_limit));
+        y2 = __hmin2(y2, __float2half2_rn(act_limit));
+    }
+
     ((half2*) z)[idx] = __hmul2(x2, y2);
 }
 
@@ -137,6 +145,7 @@ void act_mul_kernel_f
     const float* __restrict__ x,
     const float* __restrict__ y,
     half* __restrict__ z,
+    const float act_limit,
     const size_t numel
 )
 {
@@ -160,6 +169,16 @@ void act_mul_kernel_f
     {
         x2.x = _relu2(x2.x);
         x2.y = _relu2(x2.y);
+    }
+
+    if (act_limit != 0.0f)
+    {
+        if (x2.x < -act_limit) x2.x = -act_limit;
+        if (x2.y < -act_limit) x2.y = -act_limit;
+        if (x2.x > act_limit) x2.x = act_limit;
+        if (x2.y > act_limit) x2.y = act_limit;
+        if (y2.x > act_limit) y2.x = act_limit;
+        if (y2.y > act_limit) y2.y = act_limit;
     }
 
     x2.x *= y2.x;

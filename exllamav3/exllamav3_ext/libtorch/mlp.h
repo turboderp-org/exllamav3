@@ -23,6 +23,7 @@ struct BC_GatedMLP
     bool act_gelu;
     bool act_relu2;
     std::shared_ptr<BC_LinearEXL3> down;
+    float act_limit;
 
     Graph graph_bsz1;
 
@@ -40,7 +41,8 @@ struct BC_GatedMLP
         bool _act_silu,
         bool _act_gelu,
         bool _act_relu2,
-        std::shared_ptr<BC_LinearEXL3> _down
+        std::shared_ptr<BC_LinearEXL3> _down,
+        float _act_limit
     ) :
         guh                 (std::move(_guh)),
         gu                  (std::move(_gu)),
@@ -54,7 +56,8 @@ struct BC_GatedMLP
         act_silu            (_act_silu),
         act_gelu            (_act_gelu),
         act_relu2           (_act_relu2),
-        down                (_down)
+        down                (_down),
+        act_limit           (_act_limit)
     {}
 
     void run_bsz1_gr

@@ -31,7 +31,8 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
         bool,
         bool,
         std::shared_ptr<BC_GatedMLP>,
-        std::shared_ptr<BC_LinearFP16>
+        std::shared_ptr<BC_LinearFP16>,
+        float
     >(),
     py::arg("yh"),
     py::arg("interm_g"),
@@ -63,6 +64,7 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
     py::arg("act_silu"),
     py::arg("act_gelu"),
     py::arg("shared_experts"),
-    py::arg("shared_gate")
+    py::arg("shared_gate"),
+    py::arg("act_limit")
 )
 .def("run_bsz1", &BC_BlockSparseMLP::run_bsz1);

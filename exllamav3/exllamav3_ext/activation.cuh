@@ -8,6 +8,7 @@ void silu_mul_gr
     const at::Tensor& x,
     const at::Tensor& y,
     at::Tensor& z,
+    const float act_limit,
     Graph* graph
 );
 
@@ -15,7 +16,8 @@ void silu_mul
 (
     const at::Tensor& x,
     const at::Tensor& y,
-    at::Tensor& z
+    at::Tensor& z,
+    const float act_limit
 );
 
 void gelu_mul_gr
@@ -23,6 +25,7 @@ void gelu_mul_gr
     const at::Tensor& x,
     const at::Tensor& y,
     at::Tensor& z,
+    const float act_limit,
     Graph* graph
 );
 
@@ -30,7 +33,8 @@ void gelu_mul
 (
     const at::Tensor& x,
     const at::Tensor& y,
-    at::Tensor& z
+    at::Tensor& z,
+    const float act_limit
 );
 
 void relu2_mul_gr
@@ -38,6 +42,7 @@ void relu2_mul_gr
     const at::Tensor& x,
     const at::Tensor& y,
     at::Tensor& z,
+    const float act_limit,
     Graph* graph
 );
 
@@ -45,7 +50,8 @@ void relu2_mul
 (
     const at::Tensor& x,
     const at::Tensor& y,
-    at::Tensor& z
+    at::Tensor& z,
+    const float act_limit
 );
 
 void xielu_gr
