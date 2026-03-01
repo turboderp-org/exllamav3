@@ -204,6 +204,10 @@ def main(args):
                     print_tokens(last_tokens, tokenizer.get_id_to_piece_list())
                     continue
 
+                # Catbench 1.0
+                case "/cat":
+                    user_prompt = "Write a python script that draws a cute kitten using matplotlib."
+
                 case _:
                     print_error(f"Unknown command: {c[0]}")
                     continue
