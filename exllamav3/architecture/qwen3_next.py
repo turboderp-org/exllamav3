@@ -62,10 +62,6 @@ class Qwen3NextConfig(Config):
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
 
-def conditional(condition, a, b):
-    return a if condition else b
-
-
 class Qwen3NextModel(Model):
     config_class = Qwen3NextConfig
 
@@ -97,8 +93,7 @@ class Qwen3NextModel(Model):
                     rms_norm_eps = config.rms_norm_eps,
                     constant_bias = 1.0,
                 ),
-                attn = conditional(
-                    (idx + 1) % config.full_attention_interval != 0,
+                attn = (
                     GatedDeltaNet(
                         config = config,
                         key = f"model.layers.{idx}.linear_attn",
@@ -119,7 +114,8 @@ class Qwen3NextModel(Model):
                         key_o = "out_proj",
                         qmap = "block.attn",
                         out_dtype = torch.float,
-                    ),
+                    )
+                    if (idx + 1) % config.full_attention_interval != 0 else
                     Attention(
                         config = config,
                         key = f"model.layers.{idx}.self_attn",
