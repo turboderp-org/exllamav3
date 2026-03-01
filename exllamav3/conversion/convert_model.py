@@ -43,9 +43,7 @@ parser.add_argument("-strat", "--strategy", type = str, default = None, help = "
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "When possible, use new parallel mode for small tensors (MoE layers especially)")
 
 group = parser.add_mutually_exclusive_group()
-group.add_argument("--out_scales", dest = "out_scales_", action = "store_true", help = "Always enable out channel scales  (for debug purposes)")
-group.add_argument("--no_out_scales", dest = "out_scales_", action = "store_false", help = "Never enable out channel scales  (for debug purposes)")
-parser.set_defaults(out_scales_ = None)
+group.add_argument("--out_scales", type = str, default = "always", help = "Enable out channel scales (always/never/auto, default: always)")
 
 parser.add_argument("--override_anyway", action = "store_true", help = "Allow resuming even when overriding settings that will break the existing job.")
 
@@ -183,7 +181,7 @@ def prepare(args) -> (dict, dict, bool, str):
     # Momentary args
     in_args["image_dump"] = args.image_dump
     in_args["verbose"] = args.verbose
-    in_args["apply_out_scales"] = args.out_scales_
+    in_args["apply_out_scales"] = {"always": True, "never": False, "auto": None}[args.out_scales]
 
     if args.resume:
         job_state = load_dict("ckpt/job.json", in_args)
