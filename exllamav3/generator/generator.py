@@ -497,7 +497,7 @@ class Generator:
             batch_logits = self.draft_model.forward(
                 input_ids = batch_ids,
                 params = {
-                    "attn_mode": "flashinfer",
+                    "attn_mode": "auto",
                     "block_table": block_index,
                     "cache": self.draft_cache,
                     "cache_seqlens": cache_seqlens,
@@ -511,7 +511,7 @@ class Generator:
         self.draft_model.prefill(
             input_ids = batch_ids,
             params = {
-                "attn_mode": "flashinfer",
+                "attn_mode": "auto",
                 "block_table": block_index,
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens
@@ -608,7 +608,7 @@ class Generator:
 
         # Get logit batch from model
         model_params = {
-            "attn_mode": "flashinfer",
+            "attn_mode": "auto",
             "block_table": block_index,
             "cache": self.cache,
             "cache_seqlens": cache_seqlens,

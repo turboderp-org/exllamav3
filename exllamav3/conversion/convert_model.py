@@ -361,7 +361,7 @@ def main(args, job_state):
                     for i in range(len(state)):
                         progress.update(i)
                         params = {
-                            "attn_mode": "flashinfer_nc",
+                            "attn_mode": "auto_nc",
                             "capture": capture_H,
                             "activate_all_experts": model.calibration_all_experts,
                         }
@@ -372,7 +372,7 @@ def main(args, job_state):
                         if i < num_ref_states:
                             if model.calibration_all_experts:
                                 # Do not activate all experts for reference state, for error measurement
-                                params = { "attn_mode": "flashinfer_nc" }
+                                params = { "attn_mode": "auto_nc" }
                                 if slicing:
                                     params["q_mlp_slice"] = current_slice
                                 rs = module.prepare_for_device(state[i], params)
@@ -585,7 +585,7 @@ def main(args, job_state):
             for i in range(len(state)):
                 progress.update(i)
                 params = {
-                    "attn_mode": "flashinfer_nc",
+                    "attn_mode": "auto_nc",
                 }
                 state[i] = module.prepare_for_device(state[i], params)
                 if i < num_ref_states or idx < len(model.modules) - 1:

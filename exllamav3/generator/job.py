@@ -992,7 +992,7 @@ class Job:
                     self.generator.draft_model.prefill(
                         input_ids = prefill_ids,
                         params = {
-                            "attn_mode": "flashinfer",
+                            "attn_mode": "auto",
                             "block_table": seq.block_index_tensor,
                             "cache": self.generator.draft_cache,
                             "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32)
@@ -1000,7 +1000,7 @@ class Job:
                     )
 
                 prefill_params = {
-                    "attn_mode": "flashinfer",
+                    "attn_mode": "auto",
                     "block_table": seq.block_index_tensor,
                     "cache": self.generator.cache,
                     "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),

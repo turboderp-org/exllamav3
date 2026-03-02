@@ -10,11 +10,22 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
-import flashinfer
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+
+try:
+    from flash_attn import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
+except ImportError:
+    flash_attn_func = None
+    flash_attn_varlen_func = None
+    flash_attn_with_kvcache = None
+
+try:
+    import flashinfer
+except ImportError:
+    flashinfer = None
 
 _FLASHINFER_WORKSPACE_DEFAULT_BYTES = 128 * 1024 * 1024
 _FLASHINFER_WORKSPACE_MIN_BYTES = 16 * 1024 * 1024
@@ -41,6 +52,41 @@ _FLASHINFER_RUNTIME_STATS = {
     "prefill_plan_reuses": 0,
     "workspace_grows": 0,
 }
+
+
+def has_flash_attn_backend() -> bool:
+    return (
+        flash_attn_func is not None
+        and flash_attn_varlen_func is not None
+        and flash_attn_with_kvcache is not None
+    )
+
+
+def has_flashinfer_backend() -> bool:
+    return flashinfer is not None
+
+
+def _resolve_attn_mode(requested_mode: str, params: dict) -> str:
+    if requested_mode in ("flash_attn", "flash_attn_nc") and not has_flash_attn_backend():
+        raise RuntimeError("flash-attn backend requested but flash_attn is not installed")
+    if requested_mode in ("flashinfer", "flashinfer_nc") and not has_flashinfer_backend():
+        raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
+
+    if requested_mode == "auto":
+        if has_flash_attn_backend():
+            return "flash_attn"
+        if has_flashinfer_backend():
+            return "flashinfer"
+        raise RuntimeError("No cache-capable attention backend is installed (need flash-attn or flashinfer)")
+
+    if requested_mode == "auto_nc":
+        if has_flash_attn_backend():
+            return "flash_attn_nc"
+        if has_flashinfer_backend():
+            return "flashinfer_nc"
+        return "sdpa_nc"
+
+    return requested_mode
 
 
 def _flashinfer_runtime_stat(key: str, amount: int = 1):
@@ -159,6 +205,8 @@ def grow_flashinfer_workspace_for_exception(
 
 
 def get_flashinfer_workspace(device: torch.device) -> torch.Tensor:
+    if not has_flashinfer_backend():
+        raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
     key = (device.type, device.index)
     workspace = _FLASHINFER_WORKSPACE.get(key)
     if (
@@ -177,6 +225,8 @@ def get_flashinfer_decode_wrapper_shared(
     use_tensor_cores: bool = False,
     plan_key: tuple | None = None,
 ) -> flashinfer.BatchDecodeWithPagedKVCacheWrapper:
+    if not has_flashinfer_backend():
+        raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
     key = (device.type, device.index, backend, use_tensor_cores)
     if plan_key is not None:
         key = key + tuple(plan_key)
@@ -198,6 +248,8 @@ def get_flashinfer_decode_wrapper_shared(
 def get_flashinfer_prefill_wrapper_shared(
     device: torch.device,
 ) -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
+    if not has_flashinfer_backend():
+        raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
     key = (device.type, device.index)
     wrapper = _FLASHINFER_PREFILL_WRAPPERS.get(key)
     if wrapper is None:
@@ -287,10 +339,11 @@ SDPA:
     - batch shape is determined by shape of input_ids
     - no logit softcap support (Gemma)
                     
-FlashInfer backend (legacy attn_mode names preserved):
+Flash Attention / FlashInfer:
                 
     attn_mode: "flash_attn"
     attn_mode: "flashinfer"
+    attn_mode: "auto"
     batch_shape: tuple of (bsz, max_seq_len)
     cache: Cache with capacity of at least bsz*max_seq_len tokens
     past_len: int, *OR*
@@ -309,6 +362,7 @@ FlashInfer backend (legacy attn_mode names preserved):
 
     attn_mode: "flash_attn_nc"
     attn_mode: "flashinfer_nc"
+    attn_mode: "auto_nc"
     position (optional, default = 0): int *OR*
     positions: shape (bsz) *OR*
     position_ids: shape (bsz, seq_len)    
@@ -329,6 +383,10 @@ def prepare_flash_attn_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor
     return input_ids
 
 
+def prepare_flashinfer_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+    return prepare_flash_attn_nc(input_ids, params)
+
+
 def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     bsz, seq_len = input_ids.shape
 
@@ -343,6 +401,47 @@ def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         assert cache_bsz >= bsz, "batch size too large for cache"
         assert cache_max_seq_len % PAGE_SIZE == 0, f"cache seq len must be a multiple of {PAGE_SIZE}"
         # assert (past_len is not None) ^ (cache_seqlens is not None), "Need either past_len or cache_seqlens"
+        assert bsz * cache_max_seq_len <= cache.max_num_tokens, "Cache too small for batch shape"
+        cache_bsz = min(bsz, cache_bsz)
+        num_pages = cache_bsz * cache_max_seq_len // PAGE_SIZE
+        block_table = torch.arange(num_pages, dtype = torch.int32).view(cache_bsz, cache_max_seq_len // PAGE_SIZE)
+        if past_len is not None:
+            cache_seqlens = torch.tensor([past_len], dtype = torch.int32).repeat(bsz)
+            if position is None: position = past_len
+        else:
+            if positions is None and position_ids is None: positions = cache_seqlens
+        if position is None: position = 0
+        params["block_table"] = block_table
+        params["cache_seqlens"] = cache_seqlens
+        params["position"] = position
+        params["positions"] = positions
+        params["position_ids"] = position_ids
+
+    elif "block_table" in params:
+        positions = params.get("positions")
+        position_ids = params.get("position_ids")
+        cache_seqlens = params.get("cache_seqlens")
+        if positions is None and position_ids is None: positions = cache_seqlens
+        params["cache_seqlens"] = cache_seqlens
+        params["positions"] = positions
+        params["position_ids"] = position_ids
+
+    return input_ids
+
+
+def prepare_flashinfer(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+    bsz, seq_len = input_ids.shape
+
+    if "batch_shape" in params:
+        cache = params["cache"]
+        cache_bsz, cache_max_seq_len = params["batch_shape"]
+        past_len = params.get("past_len")
+        cache_seqlens = params.get("cache_seqlens") if past_len is None else None
+        position = params.get("position") if past_len is None else None
+        positions = params.get("positions") if past_len is None else None
+        position_ids = params.get("position_ids") if past_len is None else None
+        assert cache_bsz >= bsz, "batch size too large for cache"
+        assert cache_max_seq_len % PAGE_SIZE == 0, f"cache seq len must be a multiple of {PAGE_SIZE}"
         assert bsz * cache_max_seq_len <= cache.max_num_tokens, "Cache too small for batch shape"
         cache_bsz = min(bsz, cache_bsz)
         num_pages = cache_bsz * cache_max_seq_len // PAGE_SIZE
@@ -411,14 +510,19 @@ def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     """
     Add attn parameters to state
     """
-    attn_mode = params.get("attn_mode", "flashinfer_nc")
+    attn_mode = _resolve_attn_mode(params.get("attn_mode", "auto_nc"), params)
+    params["_resolved_attn_mode"] = attn_mode
     match attn_mode:
         case "sdpa_nc":
             return prepare_sdpa_nc(input_ids, params)
-        case "flash_attn" | "flashinfer":
+        case "flash_attn":
             return prepare_flash_attn(input_ids, params)
-        case "flash_attn_nc" | "flashinfer_nc":
+        case "flashinfer":
+            return prepare_flashinfer(input_ids, params)
+        case "flash_attn_nc":
             return prepare_flash_attn_nc(input_ids, params)
+        case "flashinfer_nc":
+            return prepare_flashinfer_nc(input_ids, params)
         case _:
             raise ValueError(f"Unknown attn_mode: {attn_mode}")
 
@@ -643,14 +747,21 @@ class Attention(Module):
                 params["backend"].all_reduce(x, False)
         else:
             bsz, seqlen, _ = x.shape
-            attn_mode = params.get("attn_mode", "flashinfer_nc")
+            attn_mode = params.get("_resolved_attn_mode")
+            if attn_mode is None:
+                attn_mode = _resolve_attn_mode(params.get("attn_mode", "auto_nc"), params)
+                params["_resolved_attn_mode"] = attn_mode
             match attn_mode:
                 case "sdpa_nc":
                     x = self.decode_sdpa_nc(x, bsz, seqlen, params)
-                case "flash_attn" | "flashinfer":
+                case "flash_attn":
                     x = self.decode_flash_attn(x, bsz, seqlen, params)
-                case "flash_attn_nc" | "flashinfer_nc":
+                case "flashinfer":
+                    x = self.decode_flashinfer(x, bsz, seqlen, params)
+                case "flash_attn_nc":
                     x = self.decode_flash_attn_nc(x, bsz, seqlen, params)
+                case "flashinfer_nc":
+                    x = self.decode_flashinfer_nc(x, bsz, seqlen, params)
                 case _:
                     raise ValueError(f"Unknown attn_mode: {attn_mode}")
             if self.tp_reduce:
@@ -749,6 +860,8 @@ class Attention(Module):
         kv_indices: torch.Tensor | None = None,
         kv_last_page_len: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not has_flashinfer_backend():
+            raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
         bsz, q_len, _, _ = k.shape
         if batch_ids is None:
             batch_ids = (
@@ -843,6 +956,81 @@ class Attention(Module):
         seqlen: int,
         params: dict,
     ):
+        if not has_flash_attn_backend():
+            raise RuntimeError("flash-attn backend requested but flash_attn is not installed")
+
+        causal = params.get("causal", True)
+        position = params.get("position", 0)
+        positions = get_for_device(params, "positions", self.device, None)
+        position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
+
+        q, k, v, g = self.project_qkv(x, params)
+        q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
+        k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
+
+        if self.rope:
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
+                self.norm_eps,
+                self.norm_constant_bias,
+                inv_freq,
+                self.post_rope_norm
+            )
+
+        if self.use_cu_seqlens and (cu_seqlens := get_for_device(params, "cu_seqlens", self.device, None)) is not None:
+            max_seqlen = params["max_seqlen"]
+            o = flash_attn_varlen_func(
+                q = q.squeeze(0),
+                k = k.squeeze(0),
+                v = v.squeeze(0),
+                cu_seqlens_q = cu_seqlens,
+                cu_seqlens_k = cu_seqlens,
+                max_seqlen_q = max_seqlen,
+                max_seqlen_k = max_seqlen,
+                causal = causal,
+                softmax_scale = self.sm_scale,
+                window_size = (self.sliding_window, self.sliding_window),
+                softcap = self.logit_softcapping
+            )
+        else:
+            o = flash_attn_func(
+                q = q,
+                k = k,
+                v = v,
+                causal = causal,
+                softmax_scale = self.sm_scale,
+                window_size = (self.sliding_window, self.sliding_window),
+                softcap = self.logit_softcapping
+            )
+
+        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.interleaved_gate: o *= g.sigmoid()
+
+        o = self.project_o(o, bsz, seqlen, params)
+        return o
+
+
+    def decode_flashinfer_nc(
+        self,
+        x: torch.Tensor,
+        bsz: int,
+        seqlen: int,
+        params: dict,
+    ):
+        if not has_flashinfer_backend():
+            raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
         causal = params.get("causal", True)
         position = params.get("position", 0)
         positions = get_for_device(params, "positions", self.device, None)
@@ -974,6 +1162,82 @@ class Attention(Module):
         seqlen: int,
         params: dict,
     ):
+        if not has_flash_attn_backend():
+            raise RuntimeError("flash-attn backend requested but flash_attn is not installed")
+
+        cache = params.get("cache")
+        block_table = get_for_device(params, "block_table", self.device)
+        cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
+        position = params.get("position", 0)
+        positions = get_for_device(params, "positions", self.device, None)
+        position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
+        causal = params.get("causal", True)
+
+        q, k, v, g = self.project_qkv(x, params)
+        q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
+        k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
+
+        if self.rope:
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
+                self.norm_eps,
+                self.norm_constant_bias,
+                inv_freq,
+                self.post_rope_norm
+            )
+
+        if self.has_split_cache:
+            cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table)
+        else:
+            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
+
+        o = flash_attn_with_kvcache(
+            q = q,
+            k = k,
+            v = v,
+            k_cache = cache_k,
+            v_cache = cache_v,
+            block_table = block_table,
+            cache_seqlens = cache_seqlens,
+            causal = causal,
+            softmax_scale = self.sm_scale,
+            window_size = (self.sliding_window, self.sliding_window),
+            softcap = self.logit_softcapping
+        )
+
+        if self.has_split_cache:
+            self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
+        else:
+            cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
+
+        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.interleaved_gate: o *= g.sigmoid()
+
+        o = self.project_o(o, bsz, seqlen, params)
+        return o
+
+
+    def decode_flashinfer(
+        self,
+        x: torch.Tensor,
+        bsz: int,
+        seqlen: int,
+        params: dict,
+    ):
+        if not has_flashinfer_backend():
+            raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
         cache = params.get("cache")
         block_table = get_for_device(params, "block_table", self.device)
         cache_seqlens = get_for_device(params, "cache_seqlens", self.device)

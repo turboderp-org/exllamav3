@@ -4,7 +4,10 @@ from typing_extensions import override
 
 import torch
 import torch.nn.functional as F
-import flashinfer
+try:
+    import flashinfer
+except ImportError:
+    flashinfer = None
 
 from ..constants import PAGE_SIZE
 from ..model.config import Config
@@ -37,6 +40,8 @@ class DeepseekV2MLAAttention(Module):
         out_dtype: torch.dtype | None = None,
     ):
         super().__init__(config, key, None)
+        if flashinfer is None:
+            raise RuntimeError("DeepSeek V2 MLA attention requires flashinfer to be installed")
 
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
@@ -674,11 +679,11 @@ class DeepseekV2MLAAttention(Module):
     ) -> torch.Tensor:
         bsz, seqlen, _ = x.shape
 
-        attn_mode = params.get("attn_mode", "flashinfer_nc")
+        attn_mode = params.get("_resolved_attn_mode", params.get("attn_mode", "flashinfer_nc"))
         match attn_mode:
-            case "sdpa_nc":
+            case "sdpa_nc" | "auto_nc":
                 x = self.decode_flashinfer_nc(x, bsz, seqlen, params)
-            case "flash_attn" | "flashinfer":
+            case "flash_attn" | "flashinfer" | "auto":
                 x = self.decode_flashinfer(x, bsz, seqlen, params)
             case "flash_attn_nc" | "flashinfer_nc":
                 x = self.decode_flashinfer_nc(x, bsz, seqlen, params)

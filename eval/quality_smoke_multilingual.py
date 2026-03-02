@@ -73,7 +73,7 @@ def generate_greedy(
         raise RuntimeError("Prompt is too short after tokenization")
 
     prefill_params = {
-        "attn_mode": "flashinfer",
+        "attn_mode": "auto",
         "cache": cache,
         "past_len": 0,
         "batch_shape": (1, cache.max_num_tokens),
@@ -90,7 +90,7 @@ def generate_greedy(
 
     for i in range(max_new_tokens):
         params = {
-            "attn_mode": "flashinfer",
+            "attn_mode": "auto",
             "cache": cache,
             "past_len": input_ids.shape[-1] - 1 + i,
             "batch_shape": (1, cache.max_num_tokens),

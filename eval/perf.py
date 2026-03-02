@@ -69,7 +69,7 @@ def measure_prefill(args, model, cache, warmup = False):
                 chunks = [(i, min(i + chunk_size, end)) for i in range(start, end, chunk_size)]
                 for start, end in chunks:
                     params = {
-                        "attn_mode": "flashinfer",
+                        "attn_mode": "auto",
                         "cache": cache,
                         "past_len": start,
                         "batch_shape": (1, max(length, 256)),

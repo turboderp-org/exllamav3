@@ -139,7 +139,7 @@ def generate_greedy(model, cache, tokenizer, prompt: str, max_new_tokens: int):
         raise RuntimeError("Prompt is too short after tokenization")
 
     prefill_params = {
-        "attn_mode": "flashinfer",
+        "attn_mode": "auto",
         "cache": cache,
         "past_len": 0,
         "batch_shape": (1, cache.max_num_tokens),
@@ -154,7 +154,7 @@ def generate_greedy(model, cache, tokenizer, prompt: str, max_new_tokens: int):
     recurrent_states = prefill_params.get("recurrent_states")
     for i in range(max_new_tokens):
         params = {
-            "attn_mode": "flashinfer",
+            "attn_mode": "auto",
             "cache": cache,
             "past_len": input_ids.shape[-1] - 1 + i,
             "batch_shape": (1, cache.max_num_tokens),
@@ -182,7 +182,7 @@ def score_continuation_nll(model, cache, prompt_ids: torch.Tensor, continuation_
         return float("nan")
 
     prefill_params = {
-        "attn_mode": "flashinfer",
+        "attn_mode": "auto",
         "cache": cache,
         "past_len": 0,
         "batch_shape": (1, cache.max_num_tokens),
@@ -199,7 +199,7 @@ def score_continuation_nll(model, cache, prompt_ids: torch.Tensor, continuation_
 
     for tid in continuation_ids:
         params = {
-            "attn_mode": "flashinfer",
+            "attn_mode": "auto",
             "cache": cache,
             "past_len": past_len,
             "batch_shape": (1, cache.max_num_tokens),
