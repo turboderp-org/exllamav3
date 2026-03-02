@@ -205,8 +205,9 @@ class DeepseekV2MLAAttention(Module):
                 f"got {self.kv_lora_rank}/{self.qk_rope_head_dim}"
             )
 
-        kv_weight = self.kv_b_proj.inner.get_weight_tensor().float()
-        o_weight = self.o_proj.inner.get_weight_tensor().float()
+        compute_dtype = torch.half if self.device.type == "cuda" else torch.float
+        kv_weight = self.kv_b_proj.inner.get_weight_tensor().to(compute_dtype)
+        o_weight = self.o_proj.inner.get_weight_tensor().to(compute_dtype)
 
         kv_head_width = self.qk_nope_head_dim + self.v_head_dim
         kv_width = self.num_q_heads * kv_head_width
@@ -225,11 +226,11 @@ class DeepseekV2MLAAttention(Module):
         w_o = o_weight.view(self.num_q_heads, self.v_head_dim, self.hidden_size).contiguous()
 
         w_o_abs = torch.matmul(w_uv, w_o).contiguous()
-        self.mla_w_uk_t = w_uk.half()
-        self.mla_w_o_abs = w_o_abs.half()
+        self.mla_w_uk_t = w_uk if w_uk.dtype == torch.half else w_uk.half()
+        self.mla_w_o_abs = w_o_abs if w_o_abs.dtype == torch.half else w_o_abs.half()
 
         bias = self.o_proj.inner.get_bias_tensor()
-        self.mla_o_bias = bias.to(torch.half, copy = True) if bias is not None else None
+        self.mla_o_bias = bias.to(compute_dtype, copy = True) if bias is not None else None
 
 
     def _ensure_absorption_ready(self):

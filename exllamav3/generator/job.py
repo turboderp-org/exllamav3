@@ -953,7 +953,12 @@ class Job:
             # since the recurrent checkpoint will always be on a page boundary
             p0 = prefill_start // PAGE_SIZE
             p1 = prefill_end // PAGE_SIZE
-            if prefill_start == p0 * PAGE_SIZE and self.generator.recurrent_cache is None:
+            cache_is_quantized = self.generator.cache.layer_type.__name__ == "CacheLayer_quant"
+            if (
+                prefill_start == p0 * PAGE_SIZE
+                and self.generator.recurrent_cache is None
+                and not cache_is_quantized
+            ):
                 prev_hash = None if p0 == 0 else seq.allocated_pages[p0 - 1].phash
                 best_match = 0
                 best_match_page = None
