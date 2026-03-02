@@ -292,9 +292,9 @@ def can_reuse_flashinfer_decode_plan(
         return False
 
     # flashinfer's non-tensor-core decode plan is tied to the per-request page
-    # layout (`indptr`), not the last-page occupancy. If the page layout is
-    # unchanged we can keep the existing plan and only update the last-page
-    # lengths in-place.
+    # layout (`indptr`). The actual page indices can still change across
+    # requests, so callers must refresh the wrapper's indices buffer even when
+    # the plan itself can be reused.
     return torch.equal(paged_kv_indptr_buf, kv_indptr)
 
 
@@ -1370,6 +1370,13 @@ class Attention(Module):
                             kv_last_page_len,
                         )
                     ):
+                        decode_wrapper._paged_kv_indices_buf.copy_(
+                            kv_indices,
+                            non_blocking = (
+                                kv_indices.device
+                                == decode_wrapper._paged_kv_indices_buf.device
+                            ),
+                        )
                         decode_wrapper._paged_kv_last_page_len_buf.copy_(
                             kv_last_page_len,
                             non_blocking = (
