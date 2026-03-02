@@ -19,6 +19,7 @@ from .attn import (
     grow_flashinfer_workspace_for_exception,
     make_paged_kv_metadata,
 )
+from ..conversion.allocation import allocate_transformer
 
 
 class DeepseekV2MLAAttention(Module):
@@ -59,6 +60,7 @@ class DeepseekV2MLAAttention(Module):
         self.out_dtype = out_dtype
         self.sm_scale = self.qk_head_dim ** -0.5
         qmap_input = qmap + ".input" if qmap else None
+        qmap_q = qmap + ".q" if qmap else None
         qmap_kva = qmap + ".kva" if qmap else None
         qmap_o = qmap + ".o" if qmap else None
 
@@ -94,7 +96,7 @@ class DeepseekV2MLAAttention(Module):
                 f"{key}.q_b_proj",
                 self.q_lora_rank,
                 num_q_heads * self.qk_head_dim,
-                qmap = qmap_input,
+                qmap = qmap_q,
                 qbits_mod_key = "q",
             )
             self.q_proj = self.q_b_proj
@@ -165,6 +167,35 @@ class DeepseekV2MLAAttention(Module):
         v = self.kv_b_proj.optimizer_targets()
         o = self.o_proj.optimizer_targets()
         return [[q, k + v, o]]
+
+    @override
+    def allocate_q(self, quant_args: dict, surplus_bits: int):
+        # MLA with q_lora_rank introduces an additional projection (`q_a_proj`)
+        # that is not representable in the standard q/k/v/o grouping used by
+        # TransformerBlock.allocate_q. Quantize it explicitly first, then apply
+        # the usual grouped allocation to q_b/kv_a/kv_b/o.
+        strategy = {}
+        if self.q_lora_rank is not None:
+            s, surplus_bits = self.q_a_proj.allocate_q(quant_args, surplus_bits)
+            strategy.update(s)
+            q = self.q_b_proj
+        else:
+            q = self.q_proj
+
+        s, surplus_bits = allocate_transformer(
+            quant_args[q.qbits_key],
+            surplus_bits,
+            q,
+            self.kv_a_proj_with_mqa,
+            self.kv_b_proj,
+            self.o_proj,
+            None,
+            None,
+            None,
+            None,
+        )
+        strategy.update(s)
+        return strategy, surplus_bits
 
 
     def _build_absorption_matrices(self):
