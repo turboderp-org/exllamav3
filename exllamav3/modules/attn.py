@@ -83,6 +83,9 @@ def _get_backend_policy_traits(config: object | None) -> dict[str, object]:
     q_heads = _get_int("num_attention_heads")
     kv_heads = _get_int("num_key_value_heads")
     kv_lora_rank = _get_int("kv_lora_rank")
+    qk_nope_head_dim = _get_int("qk_nope_head_dim")
+    qk_rope_head_dim = _get_int("qk_rope_head_dim")
+    v_head_dim = _get_int("v_head_dim")
     sliding_window = _get_int("sliding_window")
     use_sliding_window = bool(
         primary_cfg.get("use_sliding_window", config_dict.get("use_sliding_window", False))
@@ -100,7 +103,12 @@ def _get_backend_policy_traits(config: object | None) -> dict[str, object]:
     return {
         "architecture": architecture,
         "gqa_ratio": gqa_ratio,
-        "mla_required": architecture == "DeepseekV2ForCausalLM" and kv_lora_rank is not None,
+        "mla_required": (
+            kv_lora_rank is not None
+            and qk_nope_head_dim is not None
+            and qk_rope_head_dim is not None
+            and v_head_dim is not None
+        ),
         "has_sliding_window": (
             (sliding_window is not None and sliding_window > 0) or use_sliding_window
         ),

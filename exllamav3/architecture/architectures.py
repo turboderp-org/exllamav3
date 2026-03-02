@@ -13,6 +13,7 @@ from .gemma2 import Gemma2Model
 from .gemma3 import Gemma3Model, Gemma3TextModel
 from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
+from .glm4_moe_lite import Glm4MoeLiteModel
 from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
 from .hcxvisionv2 import HCXVisionV2Model
@@ -65,6 +66,7 @@ ARCHITECTURES = {
         Gemma3TextModel,
         Glm4Model,
         Glm4MoeModel,
+        Glm4MoeLiteModel,
         Glm4VModel,
         Glm4VMoeModel,
         HCXVisionV2Model,
