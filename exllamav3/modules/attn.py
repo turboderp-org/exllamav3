@@ -21,6 +21,10 @@ _FLASHINFER_WORKSPACE_MIN_BYTES = 16 * 1024 * 1024
 _FLASHINFER_WORKSPACE_ROUND_BYTES = 8 * 1024 * 1024
 _FLASHINFER_WORKSPACE_GROWTH_MARGIN_BYTES = 16 * 1024 * 1024
 _FLASHINFER_WORKSPACE: dict[tuple[str, int | None], torch.Tensor] = {}
+_FLASHINFER_PREFILL_WRAPPERS: dict[
+    tuple[str, int | None],
+    flashinfer.BatchPrefillWithPagedKVCacheWrapper
+] = {}
 _FLASHINFER_DECODE_WRAPPERS: dict[
     tuple[str, int | None, str, bool],
     flashinfer.BatchDecodeWithPagedKVCacheWrapper
@@ -34,6 +38,7 @@ _FLASHINFER_RUNTIME_STATS = {
     "decode_plan_calls": 0,
     "decode_plan_reuses": 0,
     "prefill_plan_calls": 0,
+    "prefill_plan_reuses": 0,
     "workspace_grows": 0,
 }
 
@@ -56,14 +61,25 @@ def _flashinfer_runtime_stat(key: str, amount: int = 1):
             _FLASHINFER_RUNTIME_STATS["decode_plan_reuses"] / decode_total
             if decode_total else 0.0
         )
+        prefill_total = (
+            _FLASHINFER_RUNTIME_STATS["prefill_plan_calls"] +
+            _FLASHINFER_RUNTIME_STATS["prefill_plan_reuses"]
+        )
+        prefill_reuse_rate = (
+            _FLASHINFER_RUNTIME_STATS["prefill_plan_reuses"] / prefill_total
+            if prefill_total else 0.0
+        )
         _FLASHINFER_RUNTIME_LOG.info(
             "flashinfer runtime stats: decode_plans=%d decode_reuses=%d "
-            "decode_reuse_rate=%.2f prefill_plans=%d decode_wrappers=%d "
+            "decode_reuse_rate=%.2f prefill_plans=%d prefill_reuses=%d "
+            "prefill_reuse_rate=%.2f decode_wrappers=%d "
             "prefill_wrappers=%d workspace_grows=%d",
             _FLASHINFER_RUNTIME_STATS["decode_plan_calls"],
             _FLASHINFER_RUNTIME_STATS["decode_plan_reuses"],
             decode_reuse_rate,
             _FLASHINFER_RUNTIME_STATS["prefill_plan_calls"],
+            _FLASHINFER_RUNTIME_STATS["prefill_plan_reuses"],
+            prefill_reuse_rate,
             _FLASHINFER_RUNTIME_STATS["decode_wrapper_creates"],
             _FLASHINFER_RUNTIME_STATS["prefill_wrapper_creates"],
             _FLASHINFER_RUNTIME_STATS["workspace_grows"],
@@ -132,6 +148,7 @@ def grow_flashinfer_workspace_for_exception(
 
     key = (device.type, device.index)
     _FLASHINFER_WORKSPACE.pop(key, None)
+    _FLASHINFER_PREFILL_WRAPPERS.pop(key, None)
 
     for wrapper_key in tuple(_FLASHINFER_DECODE_WRAPPERS.keys()):
         if wrapper_key[0] == device.type and wrapper_key[1] == device.index:
@@ -172,6 +189,23 @@ def get_flashinfer_decode_wrapper_shared(
         _FLASHINFER_DECODE_WRAPPERS[key] = wrapper
         if _FLASHINFER_RUNTIME_STATS_ENABLED:
             _flashinfer_runtime_stat("decode_wrapper_creates")
+    return wrapper
+
+
+def get_flashinfer_prefill_wrapper_shared(
+    device: torch.device,
+) -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
+    key = (device.type, device.index)
+    wrapper = _FLASHINFER_PREFILL_WRAPPERS.get(key)
+    if wrapper is None:
+        workspace = get_flashinfer_workspace(device)
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace,
+            kv_layout = "NHD",
+        )
+        _FLASHINFER_PREFILL_WRAPPERS[key] = wrapper
+        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+            _flashinfer_runtime_stat("prefill_wrapper_creates")
     return wrapper
 
 
@@ -637,13 +671,7 @@ class Attention(Module):
 
     def get_flashinfer_prefill_wrapper(self) -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
         if self.flashinfer_prefill_wrapper is None:
-            workspace = get_flashinfer_workspace(self.device)
-            self.flashinfer_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                workspace,
-                kv_layout = "NHD",
-            )
-            if _FLASHINFER_RUNTIME_STATS_ENABLED:
-                _flashinfer_runtime_stat("prefill_wrapper_creates")
+            self.flashinfer_prefill_wrapper = get_flashinfer_prefill_wrapper_shared(self.device)
         return self.flashinfer_prefill_wrapper
 
 
@@ -1045,26 +1073,50 @@ class Attention(Module):
             while True:
                 prefill_wrapper = self.get_flashinfer_prefill_wrapper()
                 try:
-                    if _FLASHINFER_RUNTIME_STATS_ENABLED:
-                        _flashinfer_runtime_stat("prefill_plan_calls")
-                    prefill_wrapper.plan(
-                        qo_indptr = qo_indptr,
-                        paged_kv_indptr = kv_indptr,
-                        paged_kv_indices = kv_indices,
-                        paged_kv_last_page_len = kv_last_page_len,
-                        num_qo_heads = self.num_q_heads,
-                        num_kv_heads = self.num_kv_heads,
-                        head_dim_qk = self.head_dim,
-                        page_size = PAGE_SIZE,
-                        causal = causal,
-                        pos_encoding_mode = "NONE",
-                        sm_scale = self.sm_scale,
-                        window_left = window_left,
-                        logits_soft_cap = logits_soft_cap,
-                        q_data_type = q.dtype,
-                        kv_data_type = cache_k.dtype,
-                        o_data_type = q.dtype,
+                    planned = params.get("flashinfer_prefill_planned_wrappers")
+                    if planned is None:
+                        planned = {}
+                        params["flashinfer_prefill_planned_wrappers"] = planned
+                    plan_marker = (
+                        qo_indptr.data_ptr(),
+                        kv_indptr.data_ptr(),
+                        kv_indices.data_ptr(),
+                        kv_last_page_len.data_ptr(),
+                        self.num_q_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        causal,
+                        window_left,
+                        logits_soft_cap,
+                        q.dtype,
+                        cache_k.dtype,
                     )
+                    wrapper_id = id(prefill_wrapper)
+                    if planned.get(wrapper_id) != plan_marker:
+                        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+                            _flashinfer_runtime_stat("prefill_plan_calls")
+                        prefill_wrapper.plan(
+                            qo_indptr = qo_indptr,
+                            paged_kv_indptr = kv_indptr,
+                            paged_kv_indices = kv_indices,
+                            paged_kv_last_page_len = kv_last_page_len,
+                            num_qo_heads = self.num_q_heads,
+                            num_kv_heads = self.num_kv_heads,
+                            head_dim_qk = self.head_dim,
+                            page_size = PAGE_SIZE,
+                            causal = causal,
+                            pos_encoding_mode = "NONE",
+                            sm_scale = self.sm_scale,
+                            window_left = window_left,
+                            logits_soft_cap = logits_soft_cap,
+                            q_data_type = q.dtype,
+                            kv_data_type = cache_k.dtype,
+                            o_data_type = q.dtype,
+                        )
+                        planned[wrapper_id] = plan_marker
+                    else:
+                        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+                            _flashinfer_runtime_stat("prefill_plan_reuses")
                     o = prefill_wrapper.run(
                         q_flat,
                         (cache_k, cache_v),
