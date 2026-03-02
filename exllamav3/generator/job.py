@@ -1008,7 +1008,9 @@ class Job:
                     "indexed_embeddings": self.embeddings,
                     "inv_freq": self.alt_rope_freqs,
                 }
-                self._prefill_params_keepalive = prefill_params
+                self._prefill_params_keepalive = (
+                    prefill_params if self.generator.use_flashinfer_optimizations else None
+                )
                 self.generator.model.prefill(
                     input_ids = prefill_ids,
                     params = prefill_params,

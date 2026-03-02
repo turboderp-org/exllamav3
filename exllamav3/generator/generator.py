@@ -63,6 +63,23 @@ def _generator_runtime_stat(key: str, amount: int = 1):
             _GENERATOR_RUNTIME_STATS["draft_cache_seqlens_allocs"],
         )
 
+
+def _resolve_generator_attn_backend(requested_mode: str) -> str:
+    if requested_mode != "auto":
+        return requested_mode
+
+    # Keep generator-side optimizations aligned with the actual cache-capable
+    # backend that will be used at runtime. This preserves the legacy
+    # flash-attn path while enabling flashinfer-specific batching tweaks only
+    # when flashinfer is the effective backend.
+    from ..modules.attn import has_flash_attn_backend, has_flashinfer_backend
+
+    if has_flash_attn_backend():
+        return "flash_attn"
+    if has_flashinfer_backend():
+        return "flashinfer"
+    raise RuntimeError("No cache-capable attention backend is installed (need flash-attn or flashinfer)")
+
 class Generator:
 
     def __init__(
@@ -143,10 +160,11 @@ class Generator:
                 "Unsupported generator attn_mode "
                 f"'{requested_attn_mode}'. Expected one of: auto, flash_attn, flashinfer."
             )
-        self.attn_mode = requested_attn_mode
-        self.attn_mode_nc = (
-            "auto_nc" if requested_attn_mode == "auto" else f"{requested_attn_mode}_nc"
-        )
+        self.attn_mode_policy = requested_attn_mode
+        self.resolved_attn_backend = _resolve_generator_attn_backend(requested_attn_mode)
+        self.attn_mode = self.resolved_attn_backend
+        self.attn_mode_nc = f"{self.resolved_attn_backend}_nc"
+        self.use_flashinfer_optimizations = self.attn_mode == "flashinfer"
         cfg = self.model.config
         self.padded_vocab_size = ((cfg.vocab_size + 31) // 32) * 32
 
@@ -253,6 +271,9 @@ class Generator:
 
 
     def _collect_batch_input_ids(self, input_ids_list: list[torch.Tensor]) -> torch.Tensor:
+        if not self.use_flashinfer_optimizations:
+            return torch.cat(input_ids_list, dim = 0)
+
         if len(input_ids_list) == 1:
             if _GENERATOR_RUNTIME_STATS_ENABLED:
                 _generator_runtime_stat("gen_input_ids_direct_reuses")
@@ -464,17 +485,21 @@ class Generator:
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = self._ensure_block_index_buffer(
-            "_draft_block_index_buffer",
-            batch_size,
-            max_pages_batch,
-            "draft_block_index_allocs",
-        )
-        cache_seqlens = self._ensure_vector_buffer(
-            "_draft_cache_seqlens_buffer",
-            batch_size,
-            "draft_cache_seqlens_allocs",
-        )
+        if self.use_flashinfer_optimizations:
+            block_index = self._ensure_block_index_buffer(
+                "_draft_block_index_buffer",
+                batch_size,
+                max_pages_batch,
+                "draft_block_index_allocs",
+            )
+            cache_seqlens = self._ensure_vector_buffer(
+                "_draft_cache_seqlens_buffer",
+                batch_size,
+                "draft_cache_seqlens_allocs",
+            )
+        else:
+            block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
+            cache_seqlens = torch.empty((batch_size,), dtype = torch.int32)
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
@@ -549,24 +574,34 @@ class Generator:
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = self._ensure_block_index_buffer(
-            "_gen_block_index_buffer",
-            batch_size,
-            max_pages_batch,
-            "gen_block_index_allocs",
-        )
-        cache_seqlens = self._ensure_vector_buffer(
-            "_gen_cache_seqlens_buffer",
-            batch_size,
-            "gen_cache_seqlens_allocs",
-        )
+        if self.use_flashinfer_optimizations:
+            block_index = self._ensure_block_index_buffer(
+                "_gen_block_index_buffer",
+                batch_size,
+                max_pages_batch,
+                "gen_block_index_allocs",
+            )
+            cache_seqlens = self._ensure_vector_buffer(
+                "_gen_cache_seqlens_buffer",
+                batch_size,
+                "gen_cache_seqlens_allocs",
+            )
+        else:
+            block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
+            cache_seqlens = torch.empty((batch_size,), dtype = torch.int32)
         batch = 0
         use_offsets = "mrope" in self.model.caps
-        positions = self._ensure_vector_buffer(
-            "_gen_positions_buffer",
-            batch_size,
-            "gen_positions_allocs",
-        ) if use_offsets else None
+        if use_offsets:
+            if self.use_flashinfer_optimizations:
+                positions = self._ensure_vector_buffer(
+                    "_gen_positions_buffer",
+                    batch_size,
+                    "gen_positions_allocs",
+                )
+            else:
+                positions = torch.empty((batch_size,), dtype = torch.int32)
+        else:
+            positions = None
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
             for seq in job.sequences:
@@ -626,7 +661,7 @@ class Generator:
             "indexed_embeddings": active_embeddings,
             "positions": positions,
         }
-        self._forward_params_keepalive = model_params
+        self._forward_params_keepalive = model_params if self.use_flashinfer_optimizations else None
         batch_logits = self.model.forward(
             input_ids = batch_ids,
             params = model_params,
