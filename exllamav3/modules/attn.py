@@ -66,6 +66,84 @@ def has_flashinfer_backend() -> bool:
     return flashinfer is not None
 
 
+def _get_backend_policy_traits(config: object | None) -> dict[str, object]:
+    config_dict = getattr(config, "config_dict", {}) or {}
+    primary_cfg = config_dict
+    for key in ("text_config", "language_config"):
+        candidate = config_dict.get(key)
+        if isinstance(candidate, dict):
+            primary_cfg = candidate
+            break
+
+    def _get_int(key: str) -> int | None:
+        value = primary_cfg.get(key, config_dict.get(key))
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    architecture = getattr(config, "architecture", None)
+    q_heads = _get_int("num_attention_heads")
+    kv_heads = _get_int("num_key_value_heads")
+    kv_lora_rank = _get_int("kv_lora_rank")
+    sliding_window = _get_int("sliding_window")
+    use_sliding_window = bool(
+        primary_cfg.get("use_sliding_window", config_dict.get("use_sliding_window", False))
+    )
+
+    gqa_ratio = None
+    if (
+        q_heads is not None
+        and kv_heads is not None
+        and kv_heads > 0
+        and q_heads % kv_heads == 0
+    ):
+        gqa_ratio = q_heads // kv_heads
+
+    return {
+        "architecture": architecture,
+        "gqa_ratio": gqa_ratio,
+        "mla_required": architecture == "DeepseekV2ForCausalLM" and kv_lora_rank is not None,
+        "has_sliding_window": (
+            (sliding_window is not None and sliding_window > 0) or use_sliding_window
+        ),
+    }
+
+
+def resolve_auto_attention_backend(
+    config: object | None,
+    flash_attn_available: bool,
+    flashinfer_available: bool,
+) -> str:
+    traits = _get_backend_policy_traits(config)
+    architecture = traits["architecture"]
+    gqa_ratio = traits["gqa_ratio"]
+    mla_required = traits["mla_required"]
+    has_sliding_window = traits["has_sliding_window"]
+
+    # MLA support is a hard flashinfer requirement.
+    if mla_required:
+        if flashinfer_available:
+            return "flashinfer"
+        raise RuntimeError(
+            "This model requires flashinfer backend for MLA support."
+        )
+
+    # Exaone4 with SWA is more reliable on SDPA than forcing flash-attn.
+    if architecture == "Exaone4ForCausalLM" and has_sliding_window:
+        return "sdpa"
+
+    # Known flashinfer native non-tc decode gaps. Prefer flash-attn if present,
+    # otherwise fall back to SDPA instead of forcing a slower/brittle path.
+    if gqa_ratio in (5, 12):
+        if flash_attn_available:
+            return "flash_attn"
+        return "sdpa"
+
+    if flash_attn_available:
+        return "flash_attn"
+    if flashinfer_available:
+        return "flashinfer"
+    return "sdpa"
+
+
 def _resolve_attn_mode(requested_mode: str, params: dict) -> str:
     if requested_mode in ("flash_attn", "flash_attn_nc") and not has_flash_attn_backend():
         raise RuntimeError("flash-attn backend requested but flash_attn is not installed")

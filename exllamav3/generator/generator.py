@@ -64,7 +64,7 @@ def _generator_runtime_stat(key: str, amount: int = 1):
         )
 
 
-def _resolve_generator_attn_backend(requested_mode: str) -> str:
+def _resolve_generator_attn_backend(requested_mode: str, config: object | None) -> str:
     if requested_mode != "auto":
         return requested_mode
 
@@ -72,13 +72,17 @@ def _resolve_generator_attn_backend(requested_mode: str) -> str:
     # backend that will be used at runtime. This preserves the legacy
     # flash-attn path while enabling flashinfer-specific batching tweaks only
     # when flashinfer is the effective backend.
-    from ..modules.attn import has_flash_attn_backend, has_flashinfer_backend
+    from ..modules.attn import (
+        has_flash_attn_backend,
+        has_flashinfer_backend,
+        resolve_auto_attention_backend,
+    )
 
-    if has_flash_attn_backend():
-        return "flash_attn"
-    if has_flashinfer_backend():
-        return "flashinfer"
-    raise RuntimeError("No cache-capable attention backend is installed (need flash-attn or flashinfer)")
+    return resolve_auto_attention_backend(
+        config,
+        has_flash_attn_backend(),
+        has_flashinfer_backend(),
+    )
 
 class Generator:
 
@@ -155,13 +159,16 @@ class Generator:
         self.tokenizer = tokenizer
         self._forward_params_keepalive = None
         requested_attn_mode = kwargs.get("attn_mode", "auto")
-        if requested_attn_mode not in ("auto", "flash_attn", "flashinfer"):
+        if requested_attn_mode not in ("auto", "flash_attn", "flashinfer", "sdpa"):
             raise ValueError(
                 "Unsupported generator attn_mode "
-                f"'{requested_attn_mode}'. Expected one of: auto, flash_attn, flashinfer."
+                f"'{requested_attn_mode}'. Expected one of: auto, flash_attn, flashinfer, sdpa."
             )
         self.attn_mode_policy = requested_attn_mode
-        self.resolved_attn_backend = _resolve_generator_attn_backend(requested_attn_mode)
+        self.resolved_attn_backend = _resolve_generator_attn_backend(
+            requested_attn_mode,
+            model.config,
+        )
         self.attn_mode = self.resolved_attn_backend
         self.attn_mode_nc = f"{self.resolved_attn_backend}_nc"
         self.use_flashinfer_optimizations = self.attn_mode == "flashinfer"
