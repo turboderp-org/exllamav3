@@ -105,8 +105,24 @@ class TransformerBlock(Module):
                 v = self.attn.v_proj
                 o = self.attn.o_proj
             elif isinstance(self.attn, GatedDeltaNet):
-                qkvz = self.attn.qkvz_proj
-                o = self.attn.o_proj
+                if self.attn.qkvz_proj is not None:
+                    qkvz = self.attn.qkvz_proj
+                    o = self.attn.o_proj
+                elif self.attn.qkv_proj is not None and self.attn.z_proj is not None:
+                    strategy = {}
+                    for linear in (self.attn.qkv_proj, self.attn.z_proj, self.attn.o_proj):
+                        s, surplus_bits = linear.allocate_q(quant_args, surplus_bits)
+                        strategy.update(s)
+                    if u is not None:
+                        s, surplus_bits = allocate_transformer(
+                            quant_args[self.qbits_key],
+                            surplus_bits,
+                            None, None, None, None, g, u, d, None
+                        )
+                        strategy.update(s)
+                    return strategy, surplus_bits
+                else:
+                    o = self.attn.o_proj
 
         return allocate_transformer(
             quant_args[self.qbits_key],
