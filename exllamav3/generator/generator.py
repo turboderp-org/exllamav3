@@ -137,6 +137,16 @@ class Generator:
         self.cache = cache
         self.tokenizer = tokenizer
         self._forward_params_keepalive = None
+        requested_attn_mode = kwargs.get("attn_mode", "auto")
+        if requested_attn_mode not in ("auto", "flash_attn", "flashinfer"):
+            raise ValueError(
+                "Unsupported generator attn_mode "
+                f"'{requested_attn_mode}'. Expected one of: auto, flash_attn, flashinfer."
+            )
+        self.attn_mode = requested_attn_mode
+        self.attn_mode_nc = (
+            "auto_nc" if requested_attn_mode == "auto" else f"{requested_attn_mode}_nc"
+        )
         cfg = self.model.config
         self.padded_vocab_size = ((cfg.vocab_size + 31) // 32) * 32
 
@@ -497,7 +507,7 @@ class Generator:
             batch_logits = self.draft_model.forward(
                 input_ids = batch_ids,
                 params = {
-                    "attn_mode": "auto",
+                    "attn_mode": self.attn_mode,
                     "block_table": block_index,
                     "cache": self.draft_cache,
                     "cache_seqlens": cache_seqlens,
@@ -511,7 +521,7 @@ class Generator:
         self.draft_model.prefill(
             input_ids = batch_ids,
             params = {
-                "attn_mode": "auto",
+                "attn_mode": self.attn_mode,
                 "block_table": block_index,
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens
@@ -608,7 +618,7 @@ class Generator:
 
         # Get logit batch from model
         model_params = {
-            "attn_mode": "auto",
+            "attn_mode": self.attn_mode,
             "block_table": block_index,
             "cache": self.cache,
             "cache_seqlens": cache_seqlens,
