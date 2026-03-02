@@ -28,6 +28,9 @@ _GENERATOR_RUNTIME_STATS = {
     "gen_block_index_allocs": 0,
     "gen_cache_seqlens_allocs": 0,
     "gen_positions_allocs": 0,
+    "gen_input_ids_buffer_allocs": 0,
+    "gen_input_ids_buffer_reuses": 0,
+    "gen_input_ids_direct_reuses": 0,
     "draft_block_index_allocs": 0,
     "draft_cache_seqlens_allocs": 0,
 }
@@ -45,12 +48,17 @@ def _generator_runtime_stat(key: str, amount: int = 1):
         _GENERATOR_RUNTIME_LOG.info(
             "generator runtime stats: iterate_gen=%d iterate_draft=%d "
             "gen_block_index_allocs=%d gen_cache_seqlens_allocs=%d gen_positions_allocs=%d "
+            "gen_input_ids_buffer_allocs=%d gen_input_ids_buffer_reuses=%d "
+            "gen_input_ids_direct_reuses=%d "
             "draft_block_index_allocs=%d draft_cache_seqlens_allocs=%d",
             _GENERATOR_RUNTIME_STATS["iterate_gen_calls"],
             _GENERATOR_RUNTIME_STATS["iterate_draft_calls"],
             _GENERATOR_RUNTIME_STATS["gen_block_index_allocs"],
             _GENERATOR_RUNTIME_STATS["gen_cache_seqlens_allocs"],
             _GENERATOR_RUNTIME_STATS["gen_positions_allocs"],
+            _GENERATOR_RUNTIME_STATS["gen_input_ids_buffer_allocs"],
+            _GENERATOR_RUNTIME_STATS["gen_input_ids_buffer_reuses"],
+            _GENERATOR_RUNTIME_STATS["gen_input_ids_direct_reuses"],
             _GENERATOR_RUNTIME_STATS["draft_block_index_allocs"],
             _GENERATOR_RUNTIME_STATS["draft_cache_seqlens_allocs"],
         )
@@ -186,6 +194,10 @@ class Generator:
         self._gen_block_index_buffer = None
         self._gen_cache_seqlens_buffer = None
         self._gen_positions_buffer = None
+        self._gen_single_token_input_ids_buffer = torch.empty(
+            (max_batch_size, 1),
+            dtype = torch.long,
+        )
 
         # Visualizer
         if show_visualizer:
@@ -228,6 +240,25 @@ class Generator:
             if _GENERATOR_RUNTIME_STATS_ENABLED:
                 _generator_runtime_stat(stat_key)
         return buf[:length]
+
+
+    def _collect_batch_input_ids(self, input_ids_list: list[torch.Tensor]) -> torch.Tensor:
+        if len(input_ids_list) == 1:
+            if _GENERATOR_RUNTIME_STATS_ENABLED:
+                _generator_runtime_stat("gen_input_ids_direct_reuses")
+            return input_ids_list[0]
+
+        if input_ids_list and all(ids.shape[-1] == 1 for ids in input_ids_list):
+            batch_size = len(input_ids_list)
+            batch_ids = self._gen_single_token_input_ids_buffer[:batch_size, :]
+            torch.cat(input_ids_list, dim = 0, out = batch_ids)
+            if _GENERATOR_RUNTIME_STATS_ENABLED:
+                _generator_runtime_stat("gen_input_ids_buffer_reuses")
+            return batch_ids
+
+        if _GENERATOR_RUNTIME_STATS_ENABLED:
+            _generator_runtime_stat("gen_input_ids_buffer_allocs")
+        return torch.cat(input_ids_list, dim = 0)
 
 
     def num_remaining_jobs(self):
@@ -552,7 +583,7 @@ class Generator:
             batch_jobs.append(job)
             active_embeddings += job.embeddings
         logit_mapping.append(len(input_ids_list))
-        batch_ids = torch.cat(input_ids_list, dim = 0)
+        batch_ids = self._collect_batch_input_ids(input_ids_list)
 
         # Collect recurrent states for batch
         # TODO: Figure out a way to minimize redundant batching and unbatching
