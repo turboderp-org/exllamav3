@@ -1094,7 +1094,7 @@ class Job:
 
     def maybe_stash_recurrent(self, cache, interval):
         seq = self.sequences[0]
-        if seq.kv_position % interval == 0:
+        if seq.kv_position > 0 and seq.kv_position % interval == 0:
             last_page = (seq.kv_position - 1) // PAGE_SIZE
             page = seq.allocated_pages[last_page]
             assert page.kv_position == PAGE_SIZE
