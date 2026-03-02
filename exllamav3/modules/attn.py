@@ -175,8 +175,11 @@ def get_flashinfer_decode_wrapper_shared(
     device: torch.device,
     backend: str = "auto",
     use_tensor_cores: bool = False,
+    plan_key: tuple | None = None,
 ) -> flashinfer.BatchDecodeWithPagedKVCacheWrapper:
     key = (device.type, device.index, backend, use_tensor_cores)
+    if plan_key is not None:
+        key = key + tuple(plan_key)
     wrapper = _FLASHINFER_DECODE_WRAPPERS.get(key)
     if wrapper is None:
         workspace = get_flashinfer_workspace(device)
@@ -207,6 +210,40 @@ def get_flashinfer_prefill_wrapper_shared(
         if _FLASHINFER_RUNTIME_STATS_ENABLED:
             _flashinfer_runtime_stat("prefill_wrapper_creates")
     return wrapper
+
+
+def can_reuse_flashinfer_decode_plan(
+    decode_wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+) -> bool:
+    if decode_wrapper.use_tensor_cores:
+        return False
+
+    paged_kv_indptr_buf = getattr(decode_wrapper, "_paged_kv_indptr_buf", None)
+    paged_kv_indices_buf = getattr(decode_wrapper, "_paged_kv_indices_buf", None)
+    paged_kv_last_page_len_buf = getattr(decode_wrapper, "_paged_kv_last_page_len_buf", None)
+    plan_info = getattr(decode_wrapper, "_plan_info", None)
+    if (
+        plan_info is None
+        or paged_kv_indptr_buf is None
+        or paged_kv_indices_buf is None
+        or paged_kv_last_page_len_buf is None
+    ):
+        return False
+    if (
+        paged_kv_indptr_buf.numel() != kv_indptr.numel()
+        or paged_kv_indices_buf.numel() != kv_indices.numel()
+        or paged_kv_last_page_len_buf.numel() != kv_last_page_len.numel()
+    ):
+        return False
+
+    # flashinfer's non-tensor-core decode plan is tied to the per-request page
+    # layout (`indptr`), not the last-page occupancy. If the page layout is
+    # unchanged we can keep the existing plan and only update the last-page
+    # lengths in-place.
+    return torch.equal(paged_kv_indptr_buf, kv_indptr)
 
 
 def make_paged_kv_metadata(
@@ -686,6 +723,13 @@ class Attention(Module):
             self.device,
             backend = backend,
             use_tensor_cores = use_tensor_cores,
+            plan_key = (
+                self.num_q_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.sliding_window,
+                self.logit_softcapping,
+            ),
         )
         self.flashinfer_decode_wrapper = wrapper
         return self.flashinfer_decode_wrapper
@@ -1016,25 +1060,62 @@ class Attention(Module):
             )
             if decode_wrapper is not None:
                 try:
-                    planned = params.get("flashinfer_decode_planned_wrappers")
-                    if planned is None:
-                        planned = {}
-                        params["flashinfer_decode_planned_wrappers"] = planned
-                    plan_marker = (
-                        id(decode_wrapper),
-                        kv_indptr.data_ptr(),
-                        kv_indices.data_ptr(),
-                        kv_last_page_len.data_ptr(),
-                        self.num_q_heads,
-                        self.num_kv_heads,
-                        self.head_dim,
-                        window_left,
-                        logits_soft_cap,
-                        q.dtype,
-                        cache_k.dtype,
-                    )
                     wrapper_id = id(decode_wrapper)
-                    if planned.get(wrapper_id) != plan_marker:
+                    if decode_wrapper.use_tensor_cores:
+                        plan_marker = (
+                            id(decode_wrapper),
+                            kv_indptr.data_ptr(),
+                            kv_indices.data_ptr(),
+                            kv_last_page_len.data_ptr(),
+                            self.num_q_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            window_left,
+                            logits_soft_cap,
+                            q.dtype,
+                            cache_k.dtype,
+                        )
+                        planned = params.get("flashinfer_decode_planned_wrappers")
+                        if planned is None:
+                            planned = {}
+                            params["flashinfer_decode_planned_wrappers"] = planned
+                        should_replan = planned.get(wrapper_id) != plan_marker
+                    else:
+                        plan_marker = (
+                            kv_indptr.numel(),
+                            kv_indices.numel(),
+                            kv_last_page_len.numel(),
+                            self.num_q_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            window_left,
+                            logits_soft_cap,
+                            q.dtype,
+                            cache_k.dtype,
+                        )
+                        should_replan = (
+                            getattr(decode_wrapper, "_exllamav3_decode_plan_marker", None)
+                            != plan_marker
+                        )
+                    if (
+                        not should_replan
+                        and can_reuse_flashinfer_decode_plan(
+                            decode_wrapper,
+                            kv_indptr,
+                            kv_indices,
+                            kv_last_page_len,
+                        )
+                    ):
+                        decode_wrapper._paged_kv_last_page_len_buf.copy_(
+                            kv_last_page_len,
+                            non_blocking = (
+                                kv_last_page_len.device
+                                == decode_wrapper._paged_kv_last_page_len_buf.device
+                            ),
+                        )
+                        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+                            _flashinfer_runtime_stat("decode_plan_reuses")
+                    else:
                         if _FLASHINFER_RUNTIME_STATS_ENABLED:
                             _flashinfer_runtime_stat("decode_plan_calls")
                         decode_wrapper.plan(
@@ -1055,10 +1136,10 @@ class Attention(Module):
                             fixed_split_size = decode_fixed_split_size,
                             disable_split_kv = decode_disable_split_kv,
                         )
-                        planned[wrapper_id] = plan_marker
-                    else:
-                        if _FLASHINFER_RUNTIME_STATS_ENABLED:
-                            _flashinfer_runtime_stat("decode_plan_reuses")
+                        if decode_wrapper.use_tensor_cores:
+                            planned[wrapper_id] = plan_marker
+                        else:
+                            decode_wrapper._exllamav3_decode_plan_marker = plan_marker
                     o = decode_wrapper.run(
                         q_flat,
                         (cache_k, cache_v),
