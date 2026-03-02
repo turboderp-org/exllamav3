@@ -1,4 +1,6 @@
 from __future__ import annotations
+import logging
+import os
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -16,6 +18,42 @@ import time
 import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
+
+_GENERATOR_RUNTIME_STATS_ENABLED = os.getenv("EXLLAMAV3_RUNTIME_STATS", "").lower() in ("1", "true", "yes", "on")
+_GENERATOR_RUNTIME_STATS_INTERVAL = max(int(os.getenv("EXLLAMAV3_RUNTIME_STATS_INTERVAL", "128")), 1)
+_GENERATOR_RUNTIME_LOG = logging.getLogger("exllamav3.runtime.generator")
+_GENERATOR_RUNTIME_STATS = {
+    "iterate_gen_calls": 0,
+    "iterate_draft_calls": 0,
+    "gen_block_index_allocs": 0,
+    "gen_cache_seqlens_allocs": 0,
+    "gen_positions_allocs": 0,
+    "draft_block_index_allocs": 0,
+    "draft_cache_seqlens_allocs": 0,
+}
+
+
+def _generator_runtime_stat(key: str, amount: int = 1):
+    if not _GENERATOR_RUNTIME_STATS_ENABLED:
+        return
+    _GENERATOR_RUNTIME_STATS[key] += amount
+    total_calls = (
+        _GENERATOR_RUNTIME_STATS["iterate_gen_calls"] +
+        _GENERATOR_RUNTIME_STATS["iterate_draft_calls"]
+    )
+    if total_calls and total_calls % _GENERATOR_RUNTIME_STATS_INTERVAL == 0:
+        _GENERATOR_RUNTIME_LOG.info(
+            "generator runtime stats: iterate_gen=%d iterate_draft=%d "
+            "gen_block_index_allocs=%d gen_cache_seqlens_allocs=%d gen_positions_allocs=%d "
+            "draft_block_index_allocs=%d draft_cache_seqlens_allocs=%d",
+            _GENERATOR_RUNTIME_STATS["iterate_gen_calls"],
+            _GENERATOR_RUNTIME_STATS["iterate_draft_calls"],
+            _GENERATOR_RUNTIME_STATS["gen_block_index_allocs"],
+            _GENERATOR_RUNTIME_STATS["gen_cache_seqlens_allocs"],
+            _GENERATOR_RUNTIME_STATS["gen_positions_allocs"],
+            _GENERATOR_RUNTIME_STATS["draft_block_index_allocs"],
+            _GENERATOR_RUNTIME_STATS["draft_cache_seqlens_allocs"],
+        )
 
 class Generator:
 
@@ -348,10 +386,16 @@ class Generator:
             batch_size += 1
         if batch_size == 0:
             return None
+        if _GENERATOR_RUNTIME_STATS_ENABLED:
+            _generator_runtime_stat("iterate_draft_calls")
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+        if _GENERATOR_RUNTIME_STATS_ENABLED:
+            _generator_runtime_stat("draft_block_index_allocs")
         block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
+        if _GENERATOR_RUNTIME_STATS_ENABLED:
+            _generator_runtime_stat("draft_cache_seqlens_allocs")
         cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
         batch = 0
         for job in self.active_jobs:
@@ -422,13 +466,22 @@ class Generator:
             return
         if draft_tokens is not None:
             max_seq_len += draft_tokens.shape[-1]
+        if _GENERATOR_RUNTIME_STATS_ENABLED:
+            _generator_runtime_stat("iterate_gen_calls")
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+        if _GENERATOR_RUNTIME_STATS_ENABLED:
+            _generator_runtime_stat("gen_block_index_allocs")
         block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
+        if _GENERATOR_RUNTIME_STATS_ENABLED:
+            _generator_runtime_stat("gen_cache_seqlens_allocs")
         cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
         batch = 0
         use_offsets = "mrope" in self.model.caps
+        if use_offsets:
+            if _GENERATOR_RUNTIME_STATS_ENABLED:
+                _generator_runtime_stat("gen_positions_allocs")
         positions = torch.zeros_like(cache_seqlens) if use_offsets else None
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue

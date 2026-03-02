@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import logging
 import os
 import re
 import torch
@@ -24,6 +25,49 @@ _FLASHINFER_DECODE_WRAPPERS: dict[
     tuple[str, int | None, str, bool],
     flashinfer.BatchDecodeWithPagedKVCacheWrapper
 ] = {}
+_FLASHINFER_RUNTIME_STATS_ENABLED = os.getenv("EXLLAMAV3_RUNTIME_STATS", "").lower() in ("1", "true", "yes", "on")
+_FLASHINFER_RUNTIME_STATS_INTERVAL = max(int(os.getenv("EXLLAMAV3_RUNTIME_STATS_INTERVAL", "256")), 1)
+_FLASHINFER_RUNTIME_LOG = logging.getLogger("exllamav3.runtime.flashinfer")
+_FLASHINFER_RUNTIME_STATS = {
+    "decode_wrapper_creates": 0,
+    "prefill_wrapper_creates": 0,
+    "decode_plan_calls": 0,
+    "decode_plan_reuses": 0,
+    "prefill_plan_calls": 0,
+    "workspace_grows": 0,
+}
+
+
+def _flashinfer_runtime_stat(key: str, amount: int = 1):
+    if not _FLASHINFER_RUNTIME_STATS_ENABLED:
+        return
+    _FLASHINFER_RUNTIME_STATS[key] += amount
+    total_plan_events = (
+        _FLASHINFER_RUNTIME_STATS["decode_plan_calls"] +
+        _FLASHINFER_RUNTIME_STATS["decode_plan_reuses"] +
+        _FLASHINFER_RUNTIME_STATS["prefill_plan_calls"]
+    )
+    if total_plan_events and total_plan_events % _FLASHINFER_RUNTIME_STATS_INTERVAL == 0:
+        decode_total = (
+            _FLASHINFER_RUNTIME_STATS["decode_plan_calls"] +
+            _FLASHINFER_RUNTIME_STATS["decode_plan_reuses"]
+        )
+        decode_reuse_rate = (
+            _FLASHINFER_RUNTIME_STATS["decode_plan_reuses"] / decode_total
+            if decode_total else 0.0
+        )
+        _FLASHINFER_RUNTIME_LOG.info(
+            "flashinfer runtime stats: decode_plans=%d decode_reuses=%d "
+            "decode_reuse_rate=%.2f prefill_plans=%d decode_wrappers=%d "
+            "prefill_wrappers=%d workspace_grows=%d",
+            _FLASHINFER_RUNTIME_STATS["decode_plan_calls"],
+            _FLASHINFER_RUNTIME_STATS["decode_plan_reuses"],
+            decode_reuse_rate,
+            _FLASHINFER_RUNTIME_STATS["prefill_plan_calls"],
+            _FLASHINFER_RUNTIME_STATS["decode_wrapper_creates"],
+            _FLASHINFER_RUNTIME_STATS["prefill_wrapper_creates"],
+            _FLASHINFER_RUNTIME_STATS["workspace_grows"],
+        )
 
 
 def _round_up_workspace_size(num_bytes: int) -> int:
@@ -93,6 +137,7 @@ def grow_flashinfer_workspace_for_exception(
         if wrapper_key[0] == device.type and wrapper_key[1] == device.index:
             _FLASHINFER_DECODE_WRAPPERS.pop(wrapper_key, None)
 
+    _flashinfer_runtime_stat("workspace_grows")
     return True
 
 
@@ -125,6 +170,8 @@ def get_flashinfer_decode_wrapper_shared(
             use_tensor_cores = use_tensor_cores,
         )
         _FLASHINFER_DECODE_WRAPPERS[key] = wrapper
+        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+            _flashinfer_runtime_stat("decode_wrapper_creates")
     return wrapper
 
 
@@ -595,6 +642,8 @@ class Attention(Module):
                 workspace,
                 kv_layout = "NHD",
             )
+            if _FLASHINFER_RUNTIME_STATS_ENABLED:
+                _flashinfer_runtime_stat("prefill_wrapper_creates")
         return self.flashinfer_prefill_wrapper
 
 
@@ -958,6 +1007,8 @@ class Attention(Module):
                     )
                     wrapper_id = id(decode_wrapper)
                     if planned.get(wrapper_id) != plan_marker:
+                        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+                            _flashinfer_runtime_stat("decode_plan_calls")
                         decode_wrapper.plan(
                             indptr = kv_indptr,
                             indices = kv_indices,
@@ -977,6 +1028,9 @@ class Attention(Module):
                             disable_split_kv = decode_disable_split_kv,
                         )
                         planned[wrapper_id] = plan_marker
+                    else:
+                        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+                            _flashinfer_runtime_stat("decode_plan_reuses")
                     o = decode_wrapper.run(
                         q_flat,
                         (cache_k, cache_v),
@@ -991,6 +1045,8 @@ class Attention(Module):
             while True:
                 prefill_wrapper = self.get_flashinfer_prefill_wrapper()
                 try:
+                    if _FLASHINFER_RUNTIME_STATS_ENABLED:
+                        _flashinfer_runtime_stat("prefill_plan_calls")
                     prefill_wrapper.plan(
                         qo_indptr = qo_indptr,
                         paged_kv_indptr = kv_indptr,
