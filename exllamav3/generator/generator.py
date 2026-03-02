@@ -177,6 +177,15 @@ class Generator:
                 dtype = torch.long,
                 pin_memory = False
             )
+            self._draft_block_index_buffer = None
+            self._draft_cache_seqlens_buffer = None
+        else:
+            self._draft_block_index_buffer = None
+            self._draft_cache_seqlens_buffer = None
+
+        self._gen_block_index_buffer = None
+        self._gen_cache_seqlens_buffer = None
+        self._gen_positions_buffer = None
 
         # Visualizer
         if show_visualizer:
@@ -196,6 +205,29 @@ class Generator:
         assert recurrent_checkpoint_interval % PAGE_SIZE == 0, \
             "recurrent_checkpoint_interval must be a multiple of the page size (256)"
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
+
+
+    def _ensure_block_index_buffer(self, attr: str, batch_size: int, max_pages_batch: int, stat_key: str):
+        total_elems = batch_size * max_pages_batch
+        buf = getattr(self, attr)
+        if buf is None or buf.numel() < total_elems:
+            buf = torch.empty((total_elems,), dtype = torch.int32)
+            setattr(self, attr, buf)
+            if _GENERATOR_RUNTIME_STATS_ENABLED:
+                _generator_runtime_stat(stat_key)
+        view = buf[:total_elems].view(batch_size, max_pages_batch)
+        view.zero_()
+        return view
+
+
+    def _ensure_vector_buffer(self, attr: str, length: int, stat_key: str):
+        buf = getattr(self, attr)
+        if buf is None or buf.numel() < length:
+            buf = torch.empty((length,), dtype = torch.int32)
+            setattr(self, attr, buf)
+            if _GENERATOR_RUNTIME_STATS_ENABLED:
+                _generator_runtime_stat(stat_key)
+        return buf[:length]
 
 
     def num_remaining_jobs(self):
@@ -391,12 +423,17 @@ class Generator:
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        if _GENERATOR_RUNTIME_STATS_ENABLED:
-            _generator_runtime_stat("draft_block_index_allocs")
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        if _GENERATOR_RUNTIME_STATS_ENABLED:
-            _generator_runtime_stat("draft_cache_seqlens_allocs")
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        block_index = self._ensure_block_index_buffer(
+            "_draft_block_index_buffer",
+            batch_size,
+            max_pages_batch,
+            "draft_block_index_allocs",
+        )
+        cache_seqlens = self._ensure_vector_buffer(
+            "_draft_cache_seqlens_buffer",
+            batch_size,
+            "draft_cache_seqlens_allocs",
+        )
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
@@ -471,18 +508,24 @@ class Generator:
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        if _GENERATOR_RUNTIME_STATS_ENABLED:
-            _generator_runtime_stat("gen_block_index_allocs")
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        if _GENERATOR_RUNTIME_STATS_ENABLED:
-            _generator_runtime_stat("gen_cache_seqlens_allocs")
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        block_index = self._ensure_block_index_buffer(
+            "_gen_block_index_buffer",
+            batch_size,
+            max_pages_batch,
+            "gen_block_index_allocs",
+        )
+        cache_seqlens = self._ensure_vector_buffer(
+            "_gen_cache_seqlens_buffer",
+            batch_size,
+            "gen_cache_seqlens_allocs",
+        )
         batch = 0
         use_offsets = "mrope" in self.model.caps
-        if use_offsets:
-            if _GENERATOR_RUNTIME_STATS_ENABLED:
-                _generator_runtime_stat("gen_positions_allocs")
-        positions = torch.zeros_like(cache_seqlens) if use_offsets else None
+        positions = self._ensure_vector_buffer(
+            "_gen_positions_buffer",
+            batch_size,
+            "gen_positions_allocs",
+        ) if use_offsets else None
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
             for seq in job.sequences:
