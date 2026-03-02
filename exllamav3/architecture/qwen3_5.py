@@ -6,7 +6,7 @@ import json
 
 from ..model.config import Config, no_default
 from ..model.model import Model
-from ..util.rope import RopeStyle
+from ..util.rope import RopeStyle, RoPE
 from ..modules import (
     RMSNorm,
     Embedding,
@@ -362,6 +362,10 @@ class Qwen3_5BaseModel(Model):
 
         # TP for this architecture is not implemented yet
         self.caps.update({"supports_tp": False})
+
+        # Generator needs MRoPE freqs when using MMEmbeddings
+        self.caps.update({"mrope": True})
+        self.g_rope = RoPE("cpu", config.rope_settings)
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
