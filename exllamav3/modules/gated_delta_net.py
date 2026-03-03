@@ -352,14 +352,7 @@ class GatedDeltaNet(Module):
             self.b_proj = None
             self.a_proj = None
 
-        self.o_proj = Linear(
-            config,
-            f"{key}.{key_o}",
-            self.v_head_dim * self.num_v_heads,
-            hidden_size,
-            qmap = qmap + ".output",
-            out_dtype = self.out_dtype
-        )
+        self.o_proj = Linear(config, f"{key}.{key_o}", 2 * hidden_size, hidden_size, qmap = qmap + ".output", out_dtype = self.out_dtype)
         self.register_submodule(self.o_proj)
 
         self.norm = GatedRMSNorm(config, f"{key}.{key_norm}", self.rms_norm_eps, out_dtype = torch.half)
@@ -444,9 +437,17 @@ class GatedDeltaNet(Module):
     def load(self, device: torch.Device, **kwargs):
         super().load(device)
         self.a_log = self.config.stc.get_tensor(self.key_a_log, self.device, optional = False, allow_bf16 = True)
+        if self.a_log.dtype != torch.bfloat16:
+            self.a_log = self.a_log.to(torch.bfloat16)
         self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True)
+        if self.dt_bias.dtype != torch.bfloat16:
+            self.dt_bias = self.dt_bias.to(torch.bfloat16)
         self.conv1d_weight = self.config.stc.get_tensor(self.key_conv1d_weight, self.device, optional = False, allow_bf16 = True)
+        if self.conv1d_weight.dtype != torch.bfloat16:
+            self.conv1d_weight = self.conv1d_weight.to(torch.bfloat16)
         self.conv1d_bias = self.config.stc.get_tensor(self.key_conv1d_bias, self.device, optional = True, allow_bf16 = True)
+        if self.conv1d_bias is not None and self.conv1d_bias.dtype != torch.bfloat16:
+            self.conv1d_bias = self.conv1d_bias.to(torch.bfloat16)
         self.norm.load(device, **kwargs)
         self.load_local(device, **kwargs)
 
@@ -594,7 +595,13 @@ class GatedDeltaNet(Module):
             # Convolution
             if conv_state is None:
                 if save_state:
-                    conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+                    conv_state = torch.zeros(
+                        (bsz, self.fdim_qkv, self.conv_kernel_size),
+                        dtype = mixed_qkv.dtype,
+                        device = mixed_qkv.device,
+                    )
+                    copy_len = min(self.conv_kernel_size, mixed_qkv.shape[-1])
+                    conv_state[:, :, -copy_len:].copy_(mixed_qkv[:, :, -copy_len:])
                     rs.last_conv_state = conv_state
                 mixed_qkv = causal_conv1d_fwd_function(
                     mixed_qkv,
@@ -610,8 +617,6 @@ class GatedDeltaNet(Module):
                 )
 
             # Use chunked rule when advantageous and available
-            # TODO: At least warn if chunked rule (i.e. flash-linear-attention) is not available
-            #       since performance will tank on prompt ingestion
             if seqlen >= 32 and chunk_gated_delta_rule is not None:
                 mixed_qkv = mixed_qkv.transpose(1, 2)
 
