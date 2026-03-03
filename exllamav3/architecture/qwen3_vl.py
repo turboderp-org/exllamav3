@@ -105,8 +105,8 @@ def read_qwen3_vl_vision_config(config_dict: dict):
     v.head_dim = v.hidden_size // v.num_heads
     v.rope_theta = 10000.0
     v.layernorm_eps = 1e-6
-    assert v.model_type in ["qwen3_vl", "qwen3_vl_moe"], \
-        "Expected vision_config->model_type to be 'qwen3_vl' or 'qwen3_vl_moe'"
+    assert v.model_type in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"], \
+        "Expected vision_config->model_type to be one of 'qwen3_vl', 'qwen3_vl_moe', 'qwen3_5', 'qwen3_5_moe'"
     return v
 
 
@@ -234,7 +234,7 @@ class Qwen3VLVisionPatchMerger(Module):
         if self.extract is not None:
             if "deepstack" not in params:
                 params["deepstack"] = []
-            params["deepstack"].append(y.cpu())
+            params["deepstack"].append(y)
             return x
         else:
             return y
@@ -485,20 +485,39 @@ class Qwen3VLVisionModel(Model):
         embedding_tensor = self.forward(
             image_tensor,
             params = params,
-        ).cpu()
+        )
+        deepstack_levels = len(params.get("deepstack", []))
+        if deepstack_levels:
+            packed_tensor = torch.cat([embedding_tensor] + params["deepstack"], dim = -1)
+        else:
+            packed_tensor = embedding_tensor
+        if packed_tensor.is_cuda:
+            torch.cuda.synchronize(packed_tensor.device)
+        packed_tensor = packed_tensor.cpu()
 
-        num_emb_tokens = embedding_tensor.shape[1]
+        num_emb_tokens = packed_tensor.shape[1]
         mmes = []
         for i in range(embedding_tensor.shape[0]):
             id_start = self.config.vision_start_token_id
             id_end = self.config.vision_end_token_id
             token_string = torch.tensor([[id_start] + [-1] * num_emb_tokens + [id_end]], dtype = torch.long)
 
+            sample_tensor = packed_tensor[i]
+            embeddings = sample_tensor[:, :v.out_hidden_size]
+            if deepstack_levels:
+                deepstack_slice = sample_tensor[:, v.out_hidden_size:]
+                deepstack_embeddings = [
+                    deepstack_slice[:, j * v.out_hidden_size:(j + 1) * v.out_hidden_size]
+                    for j in range(deepstack_levels)
+                ]
+            else:
+                deepstack_embeddings = None
+
             mme = MMEmbedding(
-                embeddings = embedding_tensor[i],
+                embeddings = embeddings,
                 text_alias = text_alias,
                 token_string = token_string,
-                deepstack_embeddings = [de.squeeze(0) for de in params["deepstack"]] if "deepstack" in params else None,
+                deepstack_embeddings = deepstack_embeddings,
                 grid_thw = grid_thw,
                 mrope_merge_size = v.spatial_merge_size
             )

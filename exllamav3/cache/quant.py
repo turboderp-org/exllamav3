@@ -10,6 +10,20 @@ if TYPE_CHECKING:
     from ..modules import Attention
 import numpy as np
 
+_QCACHE_SCRATCH: dict[tuple[str, int | None, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_qcache_scratch(device: torch.device, shape: tuple[int, ...]) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (device.type, device.index, shape)
+    kv = _QCACHE_SCRATCH.get(key)
+    if kv is None or kv[0].device != device:
+        k = torch.empty(shape, dtype = torch.half, device = device)
+        v = torch.empty(shape, dtype = torch.half, device = device)
+        kv = (k, v)
+        _QCACHE_SCRATCH[key] = kv
+    return kv
+
+
 class CacheLayer_quant(CacheLayer):
 
     def __init__(
@@ -66,17 +80,14 @@ class CacheLayer_quant(CacheLayer):
 
     @override
     def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor):
-        k = torch.empty(self.shape, dtype = torch.half, device = self.device)
-        v = torch.empty(self.shape, dtype = torch.half, device = self.device)
+        k, v = _get_qcache_scratch(self.device, self.shape)
         ext.dequant_cache_paged(self.qk, self.sk, k, self.qv, self.sv, v, cache_seqlens, block_table, PAGE_SIZE)
         return k, v
 
 
     @override
     def get_kv_alloc_placeholder(self):
-        k = torch.empty(self.shape, dtype = torch.half, device = self.device)
-        v = torch.empty(self.shape, dtype = torch.half, device = self.device)
-        return k, v
+        return _get_qcache_scratch(self.device, self.shape)
 
 
     @override

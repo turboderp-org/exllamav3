@@ -25,6 +25,8 @@ class RoutingCFG:
     routed_scaling_factor: float | None
     n_group: int | None
     topk_group: int | None
+    topk_method: str | None
+    norm_topk_prob: bool
 
 
 def routing_std(bsz, cfg, y, params):
@@ -55,6 +57,49 @@ def routing_std(bsz, cfg, y, params):
                 routing_weights,
             )
         return selected_experts, routing_weights
+
+
+def routing_deepseek_v2(bsz, cfg, y, params):
+    activate_all_experts = params.get("activate_all_experts")
+    router_logits = torch.matmul(y.float(), cfg.gate_tensor.float())
+    probs = torch.softmax(router_logits, dim = -1)
+
+    if activate_all_experts:
+        routing_weights = probs
+        if cfg.routed_scaling_factor is not None:
+            routing_weights = routing_weights * cfg.routed_scaling_factor
+        selected_experts = (
+            torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
+            .repeat((bsz, 1))
+        )
+        return selected_experts, routing_weights.to(torch.half)
+
+    topk_method = cfg.topk_method or "greedy"
+    if topk_method == "group_limited_greedy" and cfg.n_group and cfg.n_group > 1 and cfg.topk_group:
+        ex_per_group = cfg.num_experts // cfg.n_group
+        group_scores = probs.view(-1, cfg.n_group, ex_per_group).max(dim = -1).values
+        group_idx = torch.topk(group_scores, k = cfg.topk_group, dim = -1, sorted = False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1.0)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(-1, cfg.n_group, ex_per_group)
+            .reshape(-1, cfg.num_experts)
+            .bool()
+        )
+        probs = probs.masked_fill(~score_mask, 0.0)
+
+    topk_weights, topk_indices = torch.topk(
+        probs,
+        k = cfg.num_experts_per_tok,
+        dim = -1,
+        sorted = False
+    )
+    if cfg.norm_topk_prob:
+        topk_weights = topk_weights / (topk_weights.sum(dim = -1, keepdim = True) + 1e-20)
+    if cfg.routed_scaling_factor is not None:
+        topk_weights = topk_weights * cfg.routed_scaling_factor
+    return topk_indices, topk_weights.to(torch.half)
 
 
 # TODO: Optimize top_k groups (for DS3)
@@ -162,6 +207,7 @@ class BlockSparseMLP(Module):
         key_routing_gate: str | None = None,
         key_shared_gate: str | None = None,
         key_e_score_bias: str | None = "gate.e_score_correction_bias",
+        experts_transposed_load: bool = True,
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
@@ -172,6 +218,8 @@ class BlockSparseMLP(Module):
         routed_scaling_factor: float | None = None,
         n_group: int | None = None,
         topk_group: int | None = None,
+        topk_method: str | None = "greedy",
+        norm_topk_prob: bool = False,
         shared_experts: MLP | GatedMLP | None = None,
         gates: list[Linear | Module] = None,
         ups: list[Linear | Module] = None,
@@ -200,6 +248,8 @@ class BlockSparseMLP(Module):
         self.routed_scaling_factor = routed_scaling_factor
         self.n_group = n_group
         self.topk_group = topk_group
+        self.topk_method = topk_method
+        self.norm_topk_prob = norm_topk_prob
 
         if routing_gate is None and key_routing_gate is None:
             self.routing_gate = None
@@ -259,7 +309,8 @@ class BlockSparseMLP(Module):
                     in_features = hidden_size,
                     out_features = intermediate_size,
                     qmap = qmap + ".input",
-                    out_dtype = self.interm_dtype
+                    out_dtype = self.interm_dtype,
+                    transposed_load = experts_transposed_load,
                 )
                 up = Linear(
                     config = config,
@@ -270,7 +321,8 @@ class BlockSparseMLP(Module):
                     in_features = hidden_size,
                     out_features = intermediate_size,
                     qmap = qmap + ".input",
-                    out_dtype = self.interm_dtype
+                    out_dtype = self.interm_dtype,
+                    transposed_load = experts_transposed_load,
                 )
                 down = Linear(
                     config = config,
@@ -282,6 +334,7 @@ class BlockSparseMLP(Module):
                     qmap = qmap + f".{idx}.down",
                     out_dtype = self.out_dtype,
                     allow_input_padding = True,
+                    transposed_load = experts_transposed_load,
                 )
 
                 self.ups.append(up)
@@ -313,6 +366,7 @@ class BlockSparseMLP(Module):
 
         match router_type:
             case "std": self.routing_fn = routing_std
+            case "deepseek_v2": self.routing_fn = routing_deepseek_v2
             case "ds3": self.routing_fn = routing_ds3
             case "dots": self.routing_fn = routing_dots
             case _: raise ValueError(f"Unknown router type {router_type}")
@@ -460,6 +514,8 @@ class BlockSparseMLP(Module):
             routed_scaling_factor = self.routed_scaling_factor,
             n_group = self.n_group,
             topk_group = self.topk_group,
+            topk_method = self.topk_method,
+            norm_topk_prob = self.norm_topk_prob,
         )
 
 
@@ -519,6 +575,12 @@ class BlockSparseMLP(Module):
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
 
+        if self.is_quantized and bsz >= self.f_threshold and selected_experts.is_cuda:
+            # routing_fn may fill these tensors via custom CUDA kernels. The large-batch torch fallback
+            # below immediately feeds them into PyTorch indexing ops (one_hot, where, gather), so make
+            # sure the routing outputs are materialized first.
+            torch.cuda.synchronize(selected_experts.device)
+
         # Empty slice
         if self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros_like(x, dtype = self.out_dtype)
@@ -526,22 +588,11 @@ class BlockSparseMLP(Module):
         # Torch path
         elif bsz >= self.f_threshold or not self.is_quantized:
             final_hidden_states = torch.zeros_like(y, dtype = self.out_dtype)
-
-            if self.routing_device is None or self.num_local_experts == self.num_experts:
-                expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
-            else:
-                # TODO: profile, maybe optimize
-                selected_experts -= self.routing_first
-                invalid = (selected_experts < 0) | (selected_experts >= self.num_local_experts)
-                shifted = torch.where(invalid, torch.zeros_like(selected_experts), selected_experts + 1)
-                expert_mask = F.one_hot(shifted, num_classes = self.num_local_experts + 1)[..., 1:]
-                # routing_weights[invalid] = 0.0
+            async_keepalive = self.is_quantized and params.get("indexed_embeddings")
 
             if self.num_local_experts is None or self.num_local_experts > 0:
 
                 num_ex = self.num_local_experts or self.num_experts
-                expert_count = expert_mask.view(-1, num_ex).sum(dim = 0).cpu()
-                expert_mask = expert_mask.permute(2, 1, 0)
 
                 def mlp(exp_i, xc):
                     g = self.gates[exp_i].forward(xc, params)
@@ -550,14 +601,73 @@ class BlockSparseMLP(Module):
                     self.activation_fn_call(g, u, a)
                     return self.downs[exp_i].forward(a, params)
 
-                for expert_idx in range(num_ex):
-                    if expert_count[expert_idx] == 0:
-                        continue
-                    idx, top_x = torch.where(expert_mask[expert_idx])
-                    current_state = y[None, top_x].reshape(-1, self.hidden_size)
-                    current_state = mlp(expert_idx, current_state) * routing_weights[top_x, idx, None]
-                    final_hidden_states.index_add_(0, top_x, current_state)
+                if async_keepalive:
+                    assignments = [[] for _ in range(num_ex)]
+                    selected_experts_cpu = selected_experts.cpu().tolist()
 
+                    if self.routing_device is None or self.num_local_experts == self.num_experts:
+                        for token_idx, row in enumerate(selected_experts_cpu):
+                            for slot_idx, expert_idx in enumerate(row):
+                                if 0 <= expert_idx < num_ex:
+                                    assignments[expert_idx].append((slot_idx, token_idx))
+                    else:
+                        routing_first = self.routing_first
+                        for token_idx, row in enumerate(selected_experts_cpu):
+                            for slot_idx, expert_idx in enumerate(row):
+                                local_expert = expert_idx - routing_first
+                                if 0 <= local_expert < num_ex:
+                                    assignments[local_expert].append((slot_idx, token_idx))
+
+                    for expert_idx, pairs in enumerate(assignments):
+                        if not pairs:
+                            continue
+                        idx = torch.tensor(
+                            [slot_idx for slot_idx, _ in pairs],
+                            dtype = torch.long,
+                            device = self.device,
+                        )
+                        top_x = torch.tensor(
+                            [token_idx for _, token_idx in pairs],
+                            dtype = torch.long,
+                            device = self.device,
+                        )
+                        idx_col = idx.view(-1, 1)
+                        input_state = torch.index_select(y, 0, top_x)
+                        expert_routing = torch.index_select(routing_weights, 0, top_x)
+                        expert_routing = torch.gather(expert_routing, 1, idx_col)
+                        gate_out = self.gates[expert_idx].forward(input_state, params)
+                        up_out = self.ups[expert_idx].forward(input_state, params)
+                        act_out = up_out if self.interm_dtype == torch.half else torch.empty_like(up_out, dtype = torch.half)
+                        self.activation_fn_call(gate_out, up_out, act_out)
+                        down_out = self.downs[expert_idx].forward(act_out, params)
+                        weighted_out = down_out * expert_routing
+                        final_hidden_states.index_add_(0, top_x, weighted_out)
+                        torch.cuda.synchronize(final_hidden_states.device)
+                else:
+                    if self.routing_device is None or self.num_local_experts == self.num_experts:
+                        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
+                    else:
+                        # TODO: profile, maybe optimize
+                        shifted = selected_experts - self.routing_first
+                        invalid = (shifted < 0) | (shifted >= self.num_local_experts)
+                        masked = torch.where(invalid, torch.zeros_like(shifted), shifted + 1)
+                        expert_mask = F.one_hot(masked, num_classes = self.num_local_experts + 1)[..., 1:]
+                        # routing_weights[invalid] = 0.0
+
+                    expert_count = expert_mask.view(-1, num_ex).sum(dim = 0).cpu()
+                    expert_mask = expert_mask.permute(2, 1, 0)
+
+                    for expert_idx in range(num_ex):
+                        if expert_count[expert_idx] == 0:
+                            continue
+                        mask_row = expert_mask[expert_idx]
+                        idx, top_x = torch.where(mask_row)
+                        idx_col = idx.view(-1, 1)
+                        current_state = torch.index_select(y, 0, top_x)
+                        expert_routing = torch.index_select(routing_weights, 0, top_x)
+                        expert_routing = torch.gather(expert_routing, 1, idx_col)
+                        current_state = mlp(expert_idx, current_state) * expert_routing
+                        final_hidden_states.index_add_(0, top_x, current_state)
             final_hidden_states = final_hidden_states.reshape(x.shape)
             final_hidden_states = to2(final_hidden_states, out_dtype, self.out_dtype)
 
@@ -808,6 +918,8 @@ class BlockSparseMLP(Module):
                 "routed_scaling_factor": self.routed_scaling_factor,
                 "n_group": self.n_group,
                 "topk_group": self.topk_group,
+                "topk_method": self.topk_method,
+                "norm_topk_prob": self.norm_topk_prob,
             },
             "routing_gate": _export(self.routing_gate),
             "e_score_correction_bias": producer.send(self.e_score_correction_bias),

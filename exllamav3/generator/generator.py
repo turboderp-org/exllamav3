@@ -1,4 +1,6 @@
 from __future__ import annotations
+import logging
+import os
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -16,6 +18,71 @@ import time
 import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
+
+_GENERATOR_RUNTIME_STATS_ENABLED = os.getenv("EXLLAMAV3_RUNTIME_STATS", "").lower() in ("1", "true", "yes", "on")
+_GENERATOR_RUNTIME_STATS_INTERVAL = max(int(os.getenv("EXLLAMAV3_RUNTIME_STATS_INTERVAL", "128")), 1)
+_GENERATOR_RUNTIME_LOG = logging.getLogger("exllamav3.runtime.generator")
+_GENERATOR_RUNTIME_STATS = {
+    "iterate_gen_calls": 0,
+    "iterate_draft_calls": 0,
+    "gen_block_index_allocs": 0,
+    "gen_cache_seqlens_allocs": 0,
+    "gen_positions_allocs": 0,
+    "gen_input_ids_buffer_allocs": 0,
+    "gen_input_ids_buffer_reuses": 0,
+    "gen_input_ids_direct_reuses": 0,
+    "draft_block_index_allocs": 0,
+    "draft_cache_seqlens_allocs": 0,
+}
+
+
+def _generator_runtime_stat(key: str, amount: int = 1):
+    if not _GENERATOR_RUNTIME_STATS_ENABLED:
+        return
+    _GENERATOR_RUNTIME_STATS[key] += amount
+    total_calls = (
+        _GENERATOR_RUNTIME_STATS["iterate_gen_calls"] +
+        _GENERATOR_RUNTIME_STATS["iterate_draft_calls"]
+    )
+    if total_calls and total_calls % _GENERATOR_RUNTIME_STATS_INTERVAL == 0:
+        _GENERATOR_RUNTIME_LOG.info(
+            "generator runtime stats: iterate_gen=%d iterate_draft=%d "
+            "gen_block_index_allocs=%d gen_cache_seqlens_allocs=%d gen_positions_allocs=%d "
+            "gen_input_ids_buffer_allocs=%d gen_input_ids_buffer_reuses=%d "
+            "gen_input_ids_direct_reuses=%d "
+            "draft_block_index_allocs=%d draft_cache_seqlens_allocs=%d",
+            _GENERATOR_RUNTIME_STATS["iterate_gen_calls"],
+            _GENERATOR_RUNTIME_STATS["iterate_draft_calls"],
+            _GENERATOR_RUNTIME_STATS["gen_block_index_allocs"],
+            _GENERATOR_RUNTIME_STATS["gen_cache_seqlens_allocs"],
+            _GENERATOR_RUNTIME_STATS["gen_positions_allocs"],
+            _GENERATOR_RUNTIME_STATS["gen_input_ids_buffer_allocs"],
+            _GENERATOR_RUNTIME_STATS["gen_input_ids_buffer_reuses"],
+            _GENERATOR_RUNTIME_STATS["gen_input_ids_direct_reuses"],
+            _GENERATOR_RUNTIME_STATS["draft_block_index_allocs"],
+            _GENERATOR_RUNTIME_STATS["draft_cache_seqlens_allocs"],
+        )
+
+
+def _resolve_generator_attn_backend(requested_mode: str, config: object | None) -> str:
+    if requested_mode != "auto":
+        return requested_mode
+
+    # Keep generator-side optimizations aligned with the actual cache-capable
+    # backend that will be used at runtime. This preserves the legacy
+    # flash-attn path while enabling flashinfer-specific batching tweaks only
+    # when flashinfer is the effective backend.
+    from ..modules.attn import (
+        has_flash_attn_backend,
+        has_flashinfer_backend,
+        resolve_auto_attention_backend,
+    )
+
+    return resolve_auto_attention_backend(
+        config,
+        has_flash_attn_backend(),
+        has_flashinfer_backend(),
+    )
 
 class Generator:
 
@@ -90,6 +157,21 @@ class Generator:
         self.model = model
         self.cache = cache
         self.tokenizer = tokenizer
+        self._forward_params_keepalive = None
+        requested_attn_mode = kwargs.get("attn_mode", "auto")
+        if requested_attn_mode not in ("auto", "flash_attn", "flashinfer", "sdpa"):
+            raise ValueError(
+                "Unsupported generator attn_mode "
+                f"'{requested_attn_mode}'. Expected one of: auto, flash_attn, flashinfer, sdpa."
+            )
+        self.attn_mode_policy = requested_attn_mode
+        self.resolved_attn_backend = _resolve_generator_attn_backend(
+            requested_attn_mode,
+            model.config,
+        )
+        self.attn_mode = self.resolved_attn_backend
+        self.attn_mode_nc = f"{self.resolved_attn_backend}_nc"
+        self.use_flashinfer_optimizations = self.attn_mode == "flashinfer"
         cfg = self.model.config
         self.padded_vocab_size = ((cfg.vocab_size + 31) // 32) * 32
 
@@ -138,6 +220,19 @@ class Generator:
                 dtype = torch.long,
                 pin_memory = False
             )
+            self._draft_block_index_buffer = None
+            self._draft_cache_seqlens_buffer = None
+        else:
+            self._draft_block_index_buffer = None
+            self._draft_cache_seqlens_buffer = None
+
+        self._gen_block_index_buffer = None
+        self._gen_cache_seqlens_buffer = None
+        self._gen_positions_buffer = None
+        self._gen_single_token_input_ids_buffer = torch.empty(
+            (max_batch_size, 1),
+            dtype = torch.long,
+        )
 
         # Visualizer
         if show_visualizer:
@@ -157,6 +252,51 @@ class Generator:
         assert recurrent_checkpoint_interval % PAGE_SIZE == 0, \
             "recurrent_checkpoint_interval must be a multiple of the page size (256)"
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
+
+
+    def _ensure_block_index_buffer(self, attr: str, batch_size: int, max_pages_batch: int, stat_key: str):
+        total_elems = batch_size * max_pages_batch
+        buf = getattr(self, attr)
+        if buf is None or buf.numel() < total_elems:
+            buf = torch.empty((total_elems,), dtype = torch.int32)
+            setattr(self, attr, buf)
+            if _GENERATOR_RUNTIME_STATS_ENABLED:
+                _generator_runtime_stat(stat_key)
+        view = buf[:total_elems].view(batch_size, max_pages_batch)
+        view.zero_()
+        return view
+
+
+    def _ensure_vector_buffer(self, attr: str, length: int, stat_key: str):
+        buf = getattr(self, attr)
+        if buf is None or buf.numel() < length:
+            buf = torch.empty((length,), dtype = torch.int32)
+            setattr(self, attr, buf)
+            if _GENERATOR_RUNTIME_STATS_ENABLED:
+                _generator_runtime_stat(stat_key)
+        return buf[:length]
+
+
+    def _collect_batch_input_ids(self, input_ids_list: list[torch.Tensor]) -> torch.Tensor:
+        if not self.use_flashinfer_optimizations:
+            return torch.cat(input_ids_list, dim = 0)
+
+        if len(input_ids_list) == 1:
+            if _GENERATOR_RUNTIME_STATS_ENABLED:
+                _generator_runtime_stat("gen_input_ids_direct_reuses")
+            return input_ids_list[0]
+
+        if input_ids_list and all(ids.shape[-1] == 1 for ids in input_ids_list):
+            batch_size = len(input_ids_list)
+            batch_ids = self._gen_single_token_input_ids_buffer[:batch_size, :]
+            torch.cat(input_ids_list, dim = 0, out = batch_ids)
+            if _GENERATOR_RUNTIME_STATS_ENABLED:
+                _generator_runtime_stat("gen_input_ids_buffer_reuses")
+            return batch_ids
+
+        if _GENERATOR_RUNTIME_STATS_ENABLED:
+            _generator_runtime_stat("gen_input_ids_buffer_allocs")
+        return torch.cat(input_ids_list, dim = 0)
 
 
     def num_remaining_jobs(self):
@@ -347,11 +487,26 @@ class Generator:
             batch_size += 1
         if batch_size == 0:
             return None
+        if _GENERATOR_RUNTIME_STATS_ENABLED:
+            _generator_runtime_stat("iterate_draft_calls")
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        if self.use_flashinfer_optimizations:
+            block_index = self._ensure_block_index_buffer(
+                "_draft_block_index_buffer",
+                batch_size,
+                max_pages_batch,
+                "draft_block_index_allocs",
+            )
+            cache_seqlens = self._ensure_vector_buffer(
+                "_draft_cache_seqlens_buffer",
+                batch_size,
+                "draft_cache_seqlens_allocs",
+            )
+        else:
+            block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
+            cache_seqlens = torch.empty((batch_size,), dtype = torch.int32)
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
@@ -384,7 +539,7 @@ class Generator:
             batch_logits = self.draft_model.forward(
                 input_ids = batch_ids,
                 params = {
-                    "attn_mode": "flash_attn",
+                    "attn_mode": self.attn_mode,
                     "block_table": block_index,
                     "cache": self.draft_cache,
                     "cache_seqlens": cache_seqlens,
@@ -398,7 +553,7 @@ class Generator:
         self.draft_model.prefill(
             input_ids = batch_ids,
             params = {
-                "attn_mode": "flash_attn",
+                "attn_mode": self.attn_mode,
                 "block_table": block_index,
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens
@@ -421,14 +576,39 @@ class Generator:
             return
         if draft_tokens is not None:
             max_seq_len += draft_tokens.shape[-1]
+        if _GENERATOR_RUNTIME_STATS_ENABLED:
+            _generator_runtime_stat("iterate_gen_calls")
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        if self.use_flashinfer_optimizations:
+            block_index = self._ensure_block_index_buffer(
+                "_gen_block_index_buffer",
+                batch_size,
+                max_pages_batch,
+                "gen_block_index_allocs",
+            )
+            cache_seqlens = self._ensure_vector_buffer(
+                "_gen_cache_seqlens_buffer",
+                batch_size,
+                "gen_cache_seqlens_allocs",
+            )
+        else:
+            block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
+            cache_seqlens = torch.empty((batch_size,), dtype = torch.int32)
         batch = 0
         use_offsets = "mrope" in self.model.caps
-        positions = torch.zeros_like(cache_seqlens) if use_offsets else None
+        if use_offsets:
+            if self.use_flashinfer_optimizations:
+                positions = self._ensure_vector_buffer(
+                    "_gen_positions_buffer",
+                    batch_size,
+                    "gen_positions_allocs",
+                )
+            else:
+                positions = torch.empty((batch_size,), dtype = torch.int32)
+        else:
+            positions = None
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
             for seq in job.sequences:
@@ -455,7 +635,7 @@ class Generator:
             batch_jobs.append(job)
             active_embeddings += job.embeddings
         logit_mapping.append(len(input_ids_list))
-        batch_ids = torch.cat(input_ids_list, dim = 0)
+        batch_ids = self._collect_batch_input_ids(input_ids_list)
 
         # Collect recurrent states for batch
         # TODO: Figure out a way to minimize redundant batching and unbatching
@@ -479,17 +659,19 @@ class Generator:
                     job.filter_futures.append(None)
 
         # Get logit batch from model
+        model_params = {
+            "attn_mode": self.attn_mode,
+            "block_table": block_index,
+            "cache": self.cache,
+            "cache_seqlens": cache_seqlens,
+            "recurrent_states": batch_states,
+            "indexed_embeddings": active_embeddings,
+            "positions": positions,
+        }
+        self._forward_params_keepalive = model_params if self.use_flashinfer_optimizations else None
         batch_logits = self.model.forward(
             input_ids = batch_ids,
-            params = {
-                "attn_mode": "flash_attn",
-                "block_table": block_index,
-                "cache": self.cache,
-                "cache_seqlens": cache_seqlens,
-                "recurrent_states": batch_states,
-                "indexed_embeddings": active_embeddings,
-                "positions": positions,
-            }
+            params = model_params,
         )
 
         # Split batched recurrent states

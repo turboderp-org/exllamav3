@@ -100,7 +100,7 @@ setup(
     author="turboderp",
     install_requires=[
         "torch>=2.6.0",
-        "flash_attn>=2.7.4.post1",
+        "flashinfer-python>=0.6.3",
         "tokenizers>=0.21.1",
         "numpy>=2.1.0",
         "rich",

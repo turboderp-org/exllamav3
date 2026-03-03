@@ -6,6 +6,28 @@ from ..loader import SafetensorsCollection
 from ..util.file import read_dict, no_value, no_default
 import uuid
 
+
+def _normalize_architecture_config(config_dict: dict) -> dict:
+    """
+    Normalize top-level Hugging Face config quirks before architecture dispatch.
+
+    Some multimodal configs (notably DeepSeek-VL2) omit a usable top-level
+    "architectures" field and keep the language backbone under "language_config".
+    ExLlama expects a single concrete architecture string plus a "text_config"
+    alias for generic token metadata reads.
+    """
+
+    model_type = config_dict.get("model_type")
+    architectures = config_dict.get("architectures")
+
+    if model_type == "deepseek_vl_v2":
+        if not architectures:
+            config_dict["architectures"] = ["DeepseekVLV2ForCausalLM"]
+        if "text_config" not in config_dict and "language_config" in config_dict:
+            config_dict["text_config"] = config_dict["language_config"]
+
+    return config_dict
+
 class Config(ABC):
     arch_string = None
     load_isq: bool
@@ -33,7 +55,7 @@ class Config(ABC):
         # Verify architecture
         self.config_filename = os.path.join(directory, "config.json")
         with open(self.config_filename, encoding = "utf8") as f:
-            self.config_dict = json.load(f)
+            self.config_dict = _normalize_architecture_config(json.load(f))
 
         assert len(self.config_dict["architectures"]) == 1, \
             f"Multiple architectures defined in {self.config_filename}"
@@ -132,7 +154,7 @@ class Config(ABC):
 
         config_filename = os.path.join(directory, "config.json")
         with open(config_filename, encoding = "utf8") as f:
-            config_dict = json.load(f)
+            config_dict = _normalize_architecture_config(json.load(f))
 
         assert "architectures" in config_dict, f"No architecture defined in {config_filename}"
         archs = config_dict["architectures"]

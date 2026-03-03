@@ -16,6 +16,7 @@ from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
 import threading
+from collections import deque
 
 col_default = "\u001b[0m"
 col_red = "\u001b[31;1m"
@@ -297,6 +298,7 @@ def main(args, job_state):
     last_checkpoint_time = time.time()
     start_time = time.time()
     timed_blocks = 0
+    eta_window = deque(maxlen = 8)
 
     # Get model
     config, model, tokenizer = get_base_model(args)
@@ -359,7 +361,7 @@ def main(args, job_state):
                     for i in range(len(state)):
                         progress.update(i)
                         params = {
-                            "attn_mode": "flash_attn_nc",
+                            "attn_mode": "auto_nc",
                             "capture": capture_H,
                             "activate_all_experts": model.calibration_all_experts,
                         }
@@ -370,7 +372,7 @@ def main(args, job_state):
                         if i < num_ref_states:
                             if model.calibration_all_experts:
                                 # Do not activate all experts for reference state, for error measurement
-                                params = { "attn_mode": "flash_attn_nc" }
+                                params = { "attn_mode": "auto_nc" }
                                 if slicing:
                                     params["q_mlp_slice"] = current_slice
                                 rs = module.prepare_for_device(state[i], params)
@@ -443,41 +445,48 @@ def main(args, job_state):
                     curr_progress = 0
                     max_progress = len(linears)
 
+                worker_errors = []
+                worker_error_lock = threading.Lock()
+
                 # Worker thread
                 def work_thread(device_idx, dev_linears):
                     global curr_progress
+                    try:
+                        torch.cuda.set_device(device_idx)
+                        for linear in dev_linears:
+                            quant_args_local = {
+                                "seed": idx,
+                                "K": strategy[linear.key],
+                                "devices": [device_idx],
+                                "apply_out_scales": args["apply_out_scales"],
+                            }
+                            if args["codebook"] == "mcg": quant_args_local.update({ "mcg": True })
+                            elif args["codebook"] == "mul1": quant_args_local.update({ "mul1": True })
 
-                    for linear in dev_linears:
-                        quant_args_local = {
-                            "seed": idx,
-                            "K": strategy[linear.key],
-                            "devices": [device_idx],
-                            "apply_out_scales": args["apply_out_scales"],
-                        }
-                        if args["codebook"] == "mcg": quant_args_local.update({ "mcg": True })
-                        elif args["codebook"] == "mul1": quant_args_local.update({ "mul1": True })
+                            proxy_err = linear.convert_exl3(
+                                capture_H[linear.qmap],
+                                quant_args = quant_args_local,
+                                verbose = args["verbose"],
+                                save_reg = False,
+                                override_swap_device = torch.device(device_idx)
+                            )
+                            assert isinstance(linear.inner, LinearEXL3)
+                            linear.inner.swap_cpu()
 
-                        proxy_err = linear.convert_exl3(
-                            capture_H[linear.qmap],
-                            quant_args = quant_args_local,
-                            verbose = args["verbose"],
-                            save_reg = False,
-                            override_swap_device = device_idx
-                        )
-                        assert isinstance(linear.inner, LinearEXL3)
-                        linear.inner.swap_cpu()
-
-                        flags = "o" if quant_args_local["apply_out_scales"] else "."
-                        proxy_err_str = f"{proxy_err:8.6f}" if proxy_err >= 0.0 else "(OoM)   "
-                        print(
-                            f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
-                            f"  bpw: {quant_args_local['K']:5.2f}"
-                            f"  proxy_err: {proxy_err_str}"
-                            f"  {flags}"
-                            f"  g_sc: {quant_args_local['g_scale']:.6f}"
-                        )
-                        with progress_lock:
-                            curr_progress += 1
+                            flags = "o" if quant_args_local["apply_out_scales"] else "."
+                            proxy_err_str = f"{proxy_err:8.6f}" if proxy_err >= 0.0 else "(OoM)   "
+                            print(
+                                f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
+                                f"  bpw: {quant_args_local['K']:5.2f}"
+                                f"  proxy_err: {proxy_err_str}"
+                                f"  {flags}"
+                                f"  g_sc: {quant_args_local['g_scale']:.6f}"
+                            )
+                            with progress_lock:
+                                curr_progress += 1
+                    except BaseException as e:
+                        with worker_error_lock:
+                            worker_errors.append(e)
 
                 # Launch
                 threads = []
@@ -505,6 +514,9 @@ def main(args, job_state):
 
                 for t in threads:
                     t.join(timeout = 0.1)
+
+                if worker_errors:
+                    raise worker_errors[0]
 
             # Quantize module, single GPU or tensor split
             else:
@@ -583,7 +595,7 @@ def main(args, job_state):
             for i in range(len(state)):
                 progress.update(i)
                 params = {
-                    "attn_mode": "flash_attn_nc",
+                    "attn_mode": "auto_nc",
                 }
                 state[i] = module.prepare_for_device(state[i], params)
                 if i < num_ref_states or idx < len(model.modules) - 1:
@@ -611,10 +623,21 @@ def main(args, job_state):
         )
         sys.stdout.flush()
         if idx >= model.first_block_idx:
-            overall_time = time.time() - start_time
             timed_blocks += 1
-            est_remaining = (overall_time / timed_blocks) * (len(model.modules) - idx)
-            print(f" -- Estimated remaining time: {human_time(est_remaining)}")
+            eta_window.append(module_time)
+            remaining_blocks = max(0, len(model.modules) - idx - 1)
+            if timed_blocks < 3:
+                print(
+                    " -- Estimated remaining time: warming up "
+                    f"({timed_blocks}/3 timed blocks)"
+                )
+            else:
+                avg_block_time = sum(eta_window) / len(eta_window)
+                est_remaining = avg_block_time * remaining_blocks
+                print(
+                    f" -- Estimated remaining time: {human_time(est_remaining)} "
+                    f"(avg over last {len(eta_window)} blocks)"
+                )
 
         # Unload current module
         module.unload()
