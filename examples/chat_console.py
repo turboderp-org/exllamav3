@@ -19,10 +19,12 @@ col_info = "\u001b[32;1m"  # Green
 col_sysprompt = "\u001b[37;1m"  # Grey
 
 def print_error(text):
-    print(col_error + "\nError: " + col_default + text)
+    ftext = text.replace("\n", "\n       ")
+    print(col_error + "\nError: " + col_default + ftext)
 
 def print_info(text):
-    print(col_info + "\nInfo: " + col_default + text)
+    ftext = text.replace("\n", "\n      ")
+    print(col_info + "\nInfo: " + col_default + ftext)
 
 def read_input_console(args, user_name, multiline: bool):
     print("\n" + col_user + user_name + ": " + col_default, end = '', flush = True)
@@ -47,12 +49,10 @@ def read_input_ptk(args, user_name, multiline: bool, prefix: str = None):
 
 class Streamer_basic:
 
-    def __init__(self, args, bot_name, think_tag, end_think_tag, updates_per_second):
+    def __init__(self, args, bot_name, think_tag, end_think_tag, updates_per_second, think):
         self.all_text = ""
         self.args = args
         self.bot_name = bot_name
-        self.updates_per_second = updates_per_second
-
 
     def __enter__(self):
         print()
@@ -127,7 +127,7 @@ class MarkdownConsoleStream:
         return i
 
 class Streamer_rich:
-    def __init__(self, args, bot_name, think_tag, end_think_tag, updates_per_second):
+    def __init__(self, args, bot_name, think_tag, end_think_tag, updates_per_second, think):
         self.all_text = ""
         self.think_text = ""
         self.bot_name = bot_name
@@ -139,6 +139,7 @@ class Streamer_rich:
         self.end_think_tag = end_think_tag
         self.updates_per_second = updates_per_second
         self.last_update = time.time()
+        self.think = think
 
     def begin(self):
         self.live = MarkdownConsoleStream()
@@ -147,7 +148,7 @@ class Streamer_rich:
         self.is_live = True
 
     def __enter__(self):
-        if self.args.think and self.think_tag is not None:
+        if self.think and self.think_tag is not None:
             print()
             print(col_think1 + "Thinking" + col_default + ": " + col_think2, end = "")
         else:
@@ -161,7 +162,7 @@ class Streamer_rich:
             self.live.__exit__(exc_type, exc_value, traceback)
 
     def stream(self, text: str, force: bool = False):
-        if self.args.think and self.think_tag is not None and not self.is_live:
+        if self.think and self.think_tag is not None and not self.is_live:
             print_text = text
             if not self.think_text:
                 print_text = print_text.lstrip()
