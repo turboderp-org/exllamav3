@@ -417,9 +417,7 @@ def main(args, job_state):
             # Decide mode
             # TODO: Might be useful to compare no. h-tiles per tensor, no. layers and no. SMs across GPUs
             use_parallel_mode = False
-            if args["parallel_mode"] and len(devices) > 1:
-                print(" -- parallel_mode requested with multiple GPUs; using stable multi-GPU quantization path instead")
-            elif args["parallel_mode"] and len(linears) >= len(devices) and all(b <= 8 for _, b in strategy.items()):
+            if args["parallel_mode"] and len(linears) >= len(devices) and all(b <= 8 for _, b in strategy.items()):
                 use_parallel_mode = True
 
             # Quantize module, layer parallel
