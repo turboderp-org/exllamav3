@@ -287,8 +287,8 @@ def main(args, job_state):
 
     torch.set_grad_enabled(False)
 
-    devices = [torch.device(f"cuda:{int(d)}") for d in args["devices"].split(",")]
-    device = devices[0]
+    devices = [int(d) for d in args["devices"].split(",")]
+    device = torch.device(devices[0])
     if args.get("device_ratios"):
         device_ratios = [int(d) for d in args["device_ratios"].split(",")]
         assert len(devices) == len(device_ratios), "--devices and --device_ratios must be same length"
@@ -452,6 +452,7 @@ def main(args, job_state):
                 def work_thread(device_idx, dev_linears):
                     global curr_progress
                     try:
+                        torch.cuda.set_device(device_idx)
                         for linear in dev_linears:
                             quant_args_local = {
                                 "seed": idx,
@@ -467,7 +468,7 @@ def main(args, job_state):
                                 quant_args = quant_args_local,
                                 verbose = args["verbose"],
                                 save_reg = False,
-                                override_swap_device = device_idx
+                                override_swap_device = torch.device(device_idx)
                             )
                             assert isinstance(linear.inner, LinearEXL3)
                             linear.inner.swap_cpu()

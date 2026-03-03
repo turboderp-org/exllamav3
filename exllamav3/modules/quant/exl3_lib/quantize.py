@@ -133,7 +133,7 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
     for i, device in enumerate(devices):
 
         stream = get_quant_stream(device)
-        with torch.cuda.stream(stream):
+        with torch.cuda.device(device), torch.cuda.stream(stream):
 
             # Wait for input in host memory
             if i > 0:
@@ -175,7 +175,7 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
             evt.record(stream)
 
     # Copy pinned buffers to original device
-    with torch.cuda.stream(main_stream):
+    with torch.cuda.device(devices[0]), torch.cuda.stream(main_stream):
         for evt in slice_done_events:
             main_stream.wait_event(evt)
         q_tiles = torch.empty_like(tiles, device = devices[0])
@@ -202,7 +202,7 @@ def quantize_tiles_multigpu_sync(tiles, quant_args: dict):
     q_tiles_per_device = []
     q_idx_per_device = []
     for dev_tiles, device in zip(tiles_per_device, devices):
-        with torch.cuda.stream(get_quant_stream(device)):
+        with torch.cuda.device(device), torch.cuda.stream(get_quant_stream(device)):
             dev_q_tiles, dev_q_idx = quantize_tiles(dev_tiles, quant_args)
             q_tiles_per_device.append(dev_q_tiles)
             q_idx_per_device.append(dev_q_idx)
