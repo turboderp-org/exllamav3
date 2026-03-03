@@ -47,10 +47,12 @@ def read_input_ptk(args, user_name, multiline: bool, prefix: str = None):
 
 class Streamer_basic:
 
-    def __init__(self, args, bot_name, think_tag, end_think_tag):
+    def __init__(self, args, bot_name, think_tag, end_think_tag, updates_per_second):
         self.all_text = ""
         self.args = args
         self.bot_name = bot_name
+        self.updates_per_second = updates_per_second
+
 
     def __enter__(self):
         print()
@@ -125,7 +127,7 @@ class MarkdownConsoleStream:
         return i
 
 class Streamer_rich:
-    def __init__(self, args, bot_name, think_tag, end_think_tag):
+    def __init__(self, args, bot_name, think_tag, end_think_tag, updates_per_second):
         self.all_text = ""
         self.think_text = ""
         self.bot_name = bot_name
@@ -135,6 +137,8 @@ class Streamer_rich:
         self.is_live = False
         self.think_tag = think_tag
         self.end_think_tag = end_think_tag
+        self.updates_per_second = updates_per_second
+        self.last_update = time.time()
 
     def begin(self):
         self.live = MarkdownConsoleStream()
@@ -152,10 +156,11 @@ class Streamer_rich:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        self.stream("", True)
         if self.is_live:
             self.live.__exit__(exc_type, exc_value, traceback)
 
-    def stream(self, text: str):
+    def stream(self, text: str, force: bool = False):
         if self.args.think and self.think_tag is not None and not self.is_live:
             print_text = text
             if not self.think_text:
@@ -180,7 +185,11 @@ class Streamer_rich:
             if self.think_tag is not None:
                 formatted_text = formatted_text.replace(self.think_tag, f"`{self.think_tag}`")
                 formatted_text = formatted_text.replace(self.end_think_tag, f"`{self.end_think_tag}`")
-            self.live.update(formatted_text)
+
+            now = time.time()
+            if now - self.last_update > 1.0 / self.updates_per_second or force:
+                self.last_update = now
+                self.live.update(formatted_text)
 
 class KeyReader:
     """

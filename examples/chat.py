@@ -246,7 +246,7 @@ def main(args):
         ctx_exceeded = False
         with (
             KeyReader() as keyreader,
-            streamer_cm(args, bot_name, tt[0], tt[1]) as s
+            streamer_cm(args, bot_name, tt[0], tt[1], args.updates_per_second) as s
         ):
             if prefix:
                 s.stream(prefix)
@@ -334,5 +334,6 @@ if __name__ == "__main__":
     parser.add_argument("-save", "--save", type = str, help = "Save output to file (use with --prompt)")
     parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")
     parser.add_argument("-dbg", "--debug", action = "store_true", help = "Print extra debug stuff")
+    parser.add_argument("-ups", "--updates-per-second", type = int, help = "Max number of console updates per second (markdown console), default: 30", default = 30)
     _args = parser.parse_args()
     main(_args)
