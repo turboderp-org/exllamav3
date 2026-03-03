@@ -578,6 +578,7 @@ class GatedDeltaNet(Module):
                     self.v_head_dim
                 )
             else:
+                # TODO: Bound class and/or graph for this part
                 qkv = self.qkv_proj.forward(x, params)
                 z = self.z_proj.forward(x, params).view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
                 b = self.b_proj.forward(x, params)
@@ -585,12 +586,18 @@ class GatedDeltaNet(Module):
 
                 mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
 
-                dt_bias = self.dt_bias.float().view(1, 1, self.num_v_heads)
-                a_log = self.a_log.view(1, 1, self.num_v_heads)
-                beta = torch.sigmoid(b).to(torch.bfloat16)
-                g = (-F.softplus(a + dt_bias) * torch.exp(a_log)).to(torch.float)
+                beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
+                g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
+
+                ext.gated_delta_net_fused_op_2(
+                    b, a,
+                    self.dt_bias,
+                    self.a_log,
+                    beta, g
+                )
 
             # Convolution
+            # TODO: Figure out an alternative or write a new kernel that won't require transposing qkv back and forth
             if conv_state is None:
                 if save_state:
                     conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
