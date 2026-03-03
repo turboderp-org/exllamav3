@@ -287,8 +287,8 @@ def main(args, job_state):
 
     torch.set_grad_enabled(False)
 
-    devices = [int(d) for d in args["devices"].split(",")]
-    device = torch.device(devices[0])
+    devices = [torch.device(f"cuda:{int(d)}") for d in args["devices"].split(",")]
+    device = devices[0]
     if args.get("device_ratios"):
         device_ratios = [int(d) for d in args["device_ratios"].split(",")]
         assert len(devices) == len(device_ratios), "--devices and --device_ratios must be same length"
@@ -445,41 +445,47 @@ def main(args, job_state):
                     curr_progress = 0
                     max_progress = len(linears)
 
+                worker_errors = []
+                worker_error_lock = threading.Lock()
+
                 # Worker thread
                 def work_thread(device_idx, dev_linears):
                     global curr_progress
+                    try:
+                        for linear in dev_linears:
+                            quant_args_local = {
+                                "seed": idx,
+                                "K": strategy[linear.key],
+                                "devices": [device_idx],
+                                "apply_out_scales": args["apply_out_scales"],
+                            }
+                            if args["codebook"] == "mcg": quant_args_local.update({ "mcg": True })
+                            elif args["codebook"] == "mul1": quant_args_local.update({ "mul1": True })
 
-                    for linear in dev_linears:
-                        quant_args_local = {
-                            "seed": idx,
-                            "K": strategy[linear.key],
-                            "devices": [device_idx],
-                            "apply_out_scales": args["apply_out_scales"],
-                        }
-                        if args["codebook"] == "mcg": quant_args_local.update({ "mcg": True })
-                        elif args["codebook"] == "mul1": quant_args_local.update({ "mul1": True })
+                            proxy_err = linear.convert_exl3(
+                                capture_H[linear.qmap],
+                                quant_args = quant_args_local,
+                                verbose = args["verbose"],
+                                save_reg = False,
+                                override_swap_device = device_idx
+                            )
+                            assert isinstance(linear.inner, LinearEXL3)
+                            linear.inner.swap_cpu()
 
-                        proxy_err = linear.convert_exl3(
-                            capture_H[linear.qmap],
-                            quant_args = quant_args_local,
-                            verbose = args["verbose"],
-                            save_reg = False,
-                            override_swap_device = device_idx
-                        )
-                        assert isinstance(linear.inner, LinearEXL3)
-                        linear.inner.swap_cpu()
-
-                        flags = "o" if quant_args_local["apply_out_scales"] else "."
-                        proxy_err_str = f"{proxy_err:8.6f}" if proxy_err >= 0.0 else "(OoM)   "
-                        print(
-                            f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
-                            f"  bpw: {quant_args_local['K']:5.2f}"
-                            f"  proxy_err: {proxy_err_str}"
-                            f"  {flags}"
-                            f"  g_sc: {quant_args_local['g_scale']:.6f}"
-                        )
-                        with progress_lock:
-                            curr_progress += 1
+                            flags = "o" if quant_args_local["apply_out_scales"] else "."
+                            proxy_err_str = f"{proxy_err:8.6f}" if proxy_err >= 0.0 else "(OoM)   "
+                            print(
+                                f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
+                                f"  bpw: {quant_args_local['K']:5.2f}"
+                                f"  proxy_err: {proxy_err_str}"
+                                f"  {flags}"
+                                f"  g_sc: {quant_args_local['g_scale']:.6f}"
+                            )
+                            with progress_lock:
+                                curr_progress += 1
+                    except BaseException as e:
+                        with worker_error_lock:
+                            worker_errors.append(e)
 
                 # Launch
                 threads = []
@@ -507,6 +513,9 @@ def main(args, job_state):
 
                 for t in threads:
                     t.join(timeout = 0.1)
+
+                if worker_errors:
+                    raise worker_errors[0]
 
             # Quantize module, single GPU or tensor split
             else:
