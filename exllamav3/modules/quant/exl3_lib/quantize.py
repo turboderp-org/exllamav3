@@ -80,6 +80,13 @@ def get_quant_stream(device):
     return torch.cuda.Stream(device = device)
 
 
+def synchronize_devices(devices, all_devices: bool = True):
+    sync_devices = devices if all_devices else devices[:1]
+    for device in sync_devices:
+        with torch.cuda.device(device):
+            torch.cuda.synchronize()
+
+
 pinned_tiles: torch.Tensor | None = None
 pinned_q_tiles: torch.Tensor | None = None
 pinned_q_idx: torch.Tensor | None = None
@@ -353,8 +360,9 @@ def ldlq(
     """
 
     devices = quant_args["devices"]
-    for device in devices:
-        torch.cuda.synchronize(device)
+    # At this point only the primary device is guaranteed to have pending work.
+    # Secondary devices are first used inside quantize_tiles_multigpu().
+    synchronize_devices(devices, all_devices = False)
     main_stream = get_quant_stream(devices[0])
     with torch.cuda.stream(main_stream):
 
@@ -437,8 +445,7 @@ def ldlq(
             b_err = b_weight - b_weight_q
             prod_cache.addmm_(b_L.T, b_err, alpha = 1.0, beta = 1.0)
 
-        for device in devices:
-            torch.cuda.synchronize(device)
+        synchronize_devices(devices)
 
     return weight_q, encoded
 
@@ -545,8 +552,11 @@ def g_scale_gss(
     tiles = torch.stack(tiles)
 
     devices = quant_args["devices"]
-    for device in devices:
-        torch.cuda.synchronize(device)
+    # g_scale_gss() enters here before any secondary-device work has been
+    # launched for the current test batch. Only the primary device needs a
+    # pre-sync here; secondary devices are synchronized after test_scale() has
+    # actually used them.
+    synchronize_devices(devices, all_devices = False)
 
     main_stream = get_quant_stream(devices[0])
     # TODO: Figure out why Torch always initializes cuda:0 when exiting this CM, even when it's not used
@@ -593,8 +603,7 @@ def g_scale_gss(
             print(f"     - gss: min = {best_scale:.6f}, mse: {(f1 + f2) / 2:.6f}")
 
     devices = quant_args["devices"]
-    for device in devices:
-        torch.cuda.synchronize(device)
+    synchronize_devices(devices)
 
     return best_scale, (f1 + f2) / 2
 
