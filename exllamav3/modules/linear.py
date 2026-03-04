@@ -37,7 +37,7 @@ class Linear(Module):
         out_dtype: torch.dtype | None = None,
         allow_input_padding: bool = False,
         post_scale: float = 1.0,
-        transposed_load: bool = True
+        transposed_load: bool = True,
     ):
         super().__init__(config, key, qmap)
 
@@ -348,6 +348,9 @@ class Linear(Module):
             self.out_dtype,
             key = self.key
         )
+
+        if quant_args["q_fallback"]:
+            proxy_err = 0.0
 
         if return_weight_q:
             return proxy_err, weight_q

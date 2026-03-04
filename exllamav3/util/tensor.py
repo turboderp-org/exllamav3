@@ -170,13 +170,13 @@ def save_tensor_image(
     t = t.detach().to("cpu", copy = True).float()
 
     k = 3
-    mu, sigma = t.mean(), t.std()
-    lo, hi = mu - k * sigma, mu + k * sigma
+    _, sigma = t.mean(), t.std()
+    lo, hi = -k * sigma, k * sigma
     t.clamp_(lo, hi)
     t -= lo
     t /= (hi - lo + 1e-8)
 
-    rgba = cm.get_cmap("gnuplot2")(t.numpy())
+    rgba = cm.get_cmap("berlin")(t.numpy())
     rgb8 = (rgba[..., :3] * 255).astype("uint8")
     im = Image.fromarray(rgb8)
     im.save(path)
