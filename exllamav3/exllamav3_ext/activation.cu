@@ -24,6 +24,7 @@ void silu_mul_gr
     const at::Tensor& x,
     const at::Tensor& y,
     at::Tensor& z,
+    const float act_limit,
     Graph* graph
 )
 {
@@ -52,6 +53,7 @@ void silu_mul_gr
             (const float*) x.data_ptr(),
             (const float*) y.data_ptr(),
             (half*) z.data_ptr(),
+            act_limit,
             numel
         );
 
@@ -69,6 +71,7 @@ void silu_mul_gr
             (const half*) x.data_ptr(),
             (const half*) y.data_ptr(),
             (half*) z.data_ptr(),
+            act_limit,
             numel
         );
 
@@ -85,10 +88,11 @@ void silu_mul
 (
     const at::Tensor& x,
     const at::Tensor& y,
-    at::Tensor& z
+    at::Tensor& z,
+    const float act_limit
 )
 {
-    silu_mul_gr(x, y, z, nullptr);
+    silu_mul_gr(x, y, z, act_limit, nullptr);
 }
 
 // silu(x) * y -> z, in-place if z == x or z == y
@@ -98,6 +102,7 @@ void gelu_mul_gr
     const at::Tensor& x,
     const at::Tensor& y,
     at::Tensor& z,
+    const float act_limit,
     Graph* graph
 )
 {
@@ -126,6 +131,7 @@ void gelu_mul_gr
             (const float*) x.data_ptr(),
             (const float*) y.data_ptr(),
             (half*) z.data_ptr(),
+            act_limit,
             numel
         );
 
@@ -143,6 +149,7 @@ void gelu_mul_gr
             (const half*) x.data_ptr(),
             (const half*) y.data_ptr(),
             (half*) z.data_ptr(),
+            act_limit,
             numel
         );
 
@@ -159,10 +166,11 @@ void gelu_mul
 (
     const at::Tensor& x,
     const at::Tensor& y,
-    at::Tensor& z
+    at::Tensor& z,
+    const float act_limit
 )
 {
-    gelu_mul_gr(x, y, z, nullptr);
+    gelu_mul_gr(x, y, z, act_limit, nullptr);
 }
 
 // relu^2(x) * y -> z
@@ -172,6 +180,7 @@ void relu2_mul_gr
     const at::Tensor& x,
     const at::Tensor& y,
     at::Tensor& z,
+    const float act_limit,
     Graph* graph
 )
 {
@@ -200,6 +209,7 @@ void relu2_mul_gr
             (const float*) x.data_ptr(),
             (const float*) y.data_ptr(),
             (half*) z.data_ptr(),
+            act_limit,
             numel
         );
 
@@ -217,6 +227,7 @@ void relu2_mul_gr
             (const half*) x.data_ptr(),
             (const half*) y.data_ptr(),
             (half*) z.data_ptr(),
+            act_limit,
             numel
         );
 
@@ -233,10 +244,11 @@ void relu2_mul
 (
     const at::Tensor& x,
     const at::Tensor& y,
-    at::Tensor& z
+    at::Tensor& z,
+    const float act_limit
 )
 {
-    relu2_mul_gr(x, y, z, nullptr);
+    relu2_mul_gr(x, y, z, act_limit, nullptr);
 }
 
 // xielu(x, alpha_p, alpha_n) -> z

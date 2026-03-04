@@ -41,11 +41,11 @@ void BC_GatedMLP::run_bsz1_gr
     at::Tensor u = gu.select(0, 1).unsqueeze(0);
 
     if (act_silu)
-        silu_mul_gr(g, u, a, graph);
+        silu_mul_gr(g, u, a, act_limit, graph);
     else if (act_gelu)
-        gelu_mul_gr(g, u, a, graph);
+        gelu_mul_gr(g, u, a, act_limit, graph);
     else if (act_relu2)
-        relu2_mul_gr(g, u, a, graph);
+        relu2_mul_gr(g, u, a, act_limit, graph);
 
     down->run_gr(a, d, graph);
 }

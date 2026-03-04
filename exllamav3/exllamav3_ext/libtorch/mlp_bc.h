@@ -13,7 +13,8 @@ py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
         bool,
         bool,
         bool,
-        std::shared_ptr<BC_LinearEXL3>
+        std::shared_ptr<BC_LinearEXL3>,
+        float
     >(),
     py::arg("guh"),
     py::arg("gu"),
@@ -27,6 +28,7 @@ py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
     py::arg("act_silu"),
     py::arg("act_gelu"),
     py::arg("act_relu2"),
-    py::arg("down")
+    py::arg("down"),
+    py::arg("act_limit")
 )
 .def("run_bsz1", &BC_GatedMLP::run_bsz1);

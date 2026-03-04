@@ -140,9 +140,12 @@ class SafetensorsCollection:
 
     def has_tensor_group(
         self,
-        key: str,
+        key: str | list,
         subkeys: list,
     ):
+        if isinstance(key, list):
+            return all(self.has_tensor_group(k, subkeys) for k in key)
+
         sources = [self.tensor_file_map]
         if self.new_tensors:
             sources += [self.new_tensors]

@@ -49,6 +49,7 @@ struct BC_BlockSparseMLP
     bool act_gelu;
     std::shared_ptr<BC_GatedMLP> shared_experts;
     std::shared_ptr<BC_LinearFP16> shared_gate;
+    float act_limit;
 
     Graph graph_bsz1;
 
@@ -84,7 +85,8 @@ struct BC_BlockSparseMLP
         bool _act_silu,
         bool _act_gelu,
         std::shared_ptr<BC_GatedMLP> _shared_experts,
-        std::shared_ptr<BC_LinearFP16> _shared_gate
+        std::shared_ptr<BC_LinearFP16> _shared_gate,
+        float _act_limit
     ) :
         yh                  (std::move(_yh)),
         interm_g            (std::move(_interm_g)),
@@ -116,7 +118,8 @@ struct BC_BlockSparseMLP
         act_silu            (_act_silu),
         act_gelu            (_act_gelu),
         shared_experts      (_shared_experts),
-        shared_gate         (_shared_gate)
+        shared_gate         (_shared_gate),
+        act_limit           (_act_limit)
     {}
 
     void run_bsz1_gr

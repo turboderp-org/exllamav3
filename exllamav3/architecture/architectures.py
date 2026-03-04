@@ -29,6 +29,7 @@ from .phi3 import Phi3Model
 from .qwen2 import Qwen2Model
 from .qwen2_5_vl import Qwen2_5VLModel
 from .qwen3 import Qwen3Model
+from .qwen3_5 import Qwen3_5Model, Qwen3_5MoeModel
 from .qwen3_moe import Qwen3MoeModel
 from .qwen3_next import Qwen3NextModel
 from .qwen3_vl import Qwen3VLModel
@@ -36,6 +37,7 @@ from .qwen3_vl_moe import Qwen3VLMoeModel
 from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
 from .solar_open_moe import SolarOpenMoeModel
+from .step3_5 import Step3_5Model
 
 ARCHITECTURES = {
     m.config_class.arch_string: {
@@ -75,6 +77,8 @@ ARCHITECTURES = {
         Qwen2Model,
         Qwen2_5VLModel,
         Qwen3Model,
+        Qwen3_5Model,
+        Qwen3_5MoeModel,
         Qwen3MoeModel,
         Qwen3NextModel,
         Qwen3VLModel,
@@ -82,6 +86,7 @@ ARCHITECTURES = {
         SeedOssModel,
         SmolLM3Model,
         SolarOpenMoeModel,
+        Step3_5Model,
     ]
 }
 

@@ -105,8 +105,14 @@ def read_qwen3_vl_vision_config(config_dict: dict):
     v.head_dim = v.hidden_size // v.num_heads
     v.rope_theta = 10000.0
     v.layernorm_eps = 1e-6
-    assert v.model_type in ["qwen3_vl", "qwen3_vl_moe"], \
-        "Expected vision_config->model_type to be 'qwen3_vl' or 'qwen3_vl_moe'"
+    model_types = [
+        "qwen3_vl",
+        "qwen3_vl_moe",
+        "qwen3_5",
+        "qwen3_5_moe"
+    ]
+    assert v.model_type in model_types, \
+        f"Expected vision_config->model_type to be one of {model_types}"
     return v
 
 

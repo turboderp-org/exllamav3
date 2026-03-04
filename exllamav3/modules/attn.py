@@ -140,10 +140,11 @@ class Attention(Module):
         key_k: str | None = None,
         key_v: str | None = None,
         key_o: str | None = None,
+        key_g: str | None = None,
         key_fused_qkv: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
-        sliding_window: int  = -1,
+        sliding_window: int = -1,
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
@@ -152,9 +153,11 @@ class Attention(Module):
         v_proj: Linear | Module | None = None,
         kv_proj: Linear | Module | None = None,
         o_proj: Linear | Module | None = None,
+        g_proj: Linear | Module | None = None,
         interleaved_gate: bool = False,
         use_cu_seqlens: bool = False,
-        post_rope_norm: bool = False
+        post_rope_norm: bool = False,
+        tp_split_norm: bool = True
     ):
         super().__init__(config, key, None)
 
@@ -173,6 +176,7 @@ class Attention(Module):
         self.interleaved_gate = interleaved_gate
         self.use_cu_seqlens = use_cu_seqlens
         self.post_rope_norm = post_rope_norm
+        self.tp_split_norm = tp_split_norm
 
         if post_rope_norm:
             assert q_norm is None and k_norm is None, \
@@ -181,6 +185,7 @@ class Attention(Module):
         if self.num_kv_heads == 0:
             return
 
+        # Create q, k, v projections
         if key_fused_qkv:
             assert not interleaved_gate, "Attn: interleaved_gate not implemented for fused QKV tensor"
             fkey = f"{key}.{key_fused_qkv}"
@@ -216,6 +221,7 @@ class Attention(Module):
                 self.register_submodule(self.k_proj)
                 self.register_submodule(self.v_proj)
 
+        # Create o proj
         if key_o:
             self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o", out_dtype = out_dtype, qbits_mod_key = "o")
             self.register_submodule(self.o_proj)
@@ -224,6 +230,7 @@ class Attention(Module):
             self.o_proj = o_proj
             self.register_submodule(self.o_proj)
 
+        # Register q/k norms
         if q_norm:
             assert k_norm, "Must have both Q and K norms, or neither"
             self.q_norm = q_norm
@@ -242,6 +249,22 @@ class Attention(Module):
             self.k_norm = None
             self.norm_eps = 1e-6
             self.norm_constant_bias = 0.0
+
+        # Register headwise gate
+        if key_g:
+            assert not interleaved_gate, \
+                "Cannot apply both interleaved and headwise gate"
+            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, num_q_heads, qmap = None, out_dtype = torch.half, pad_to = 1)
+            self.headwise_gate = True
+            self.register_submodule(self.g_proj)
+        else:
+            if g_proj:
+                self.g_proj = g_proj
+                self.headwise_gate = True
+                self.register_submodule(self.g_proj)
+            else:
+                self.g_proj = None
+                self.headwise_gate = False
 
         self.caps.update({
             "kv_cache": True
@@ -365,6 +388,8 @@ class Attention(Module):
         if self.interleaved_gate:
             q, g = torch.chunk(q.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
             g = g.reshape(bsz, q_len, -1)
+        elif self.g_proj:
+            g = self.g_proj.forward(x, params)
         else:
             g = None
 
@@ -518,6 +543,9 @@ class Attention(Module):
         v = v.transpose(1, 2)
         o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa, scale = self.sm_scale)
         o = o.transpose(1, 2)
+
+        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -591,6 +619,7 @@ class Attention(Module):
                 softcap = self.logit_softcapping
             )
 
+        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.interleaved_gate: o *= g.sigmoid()
 
@@ -667,6 +696,7 @@ class Attention(Module):
         else:
             cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
 
+        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.interleaved_gate: o *= g.sigmoid()
 
@@ -747,6 +777,7 @@ class Attention(Module):
                 "sliding_window": self.sliding_window,
                 "logit_softcapping": self.logit_softcapping,
                 "post_rope_norm": self.post_rope_norm,
+                "tp_split_norm": self.tp_split_norm,
             },
             "num_kv_heads": self.num_kv_heads,
             **{name: _export(getattr(self, name, None)) for name in (
@@ -757,6 +788,7 @@ class Attention(Module):
                 "v_proj",
                 "kv_proj",
                 "o_proj",
+                "g_proj",
             )},
             "device": self.device,
             "cache_layers": [
@@ -776,12 +808,15 @@ class Attention(Module):
         head_dim = exported["kwargs"]["head_dim"]
         n_gqa = exported["n_gqa"]
         device = local_context["device"]
+        tp_split_norm = exported["kwargs"]["tp_split_norm"]
         first, last, unit = plan[key]
         assert unit == "heads"
         num_kv_heads = last - first
         num_q_heads = num_kv_heads * n_gqa
 
         q_split = (True, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+            if num_kv_heads else None
+        qh_split = (True, first * n_gqa, last * n_gqa) \
             if num_kv_heads else None
         kv_split = (True, first * head_dim, last * head_dim) \
             if num_kv_heads else None
@@ -803,10 +838,10 @@ class Attention(Module):
             norm_k_split = (first, last) \
                 if num_kv_heads else None
 
-        # def _import(name):
-        #     nonlocal exported, plan
-        #     return exported[name]["cls"].tp_import(local_context, exported[name], plan) \
-        #         if exported.get(name) else None
+        def _import(name):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import(local_context, exported[name], plan) \
+                if exported.get(name) else None
 
         def _import_split(name, split):
             nonlocal exported, plan
@@ -818,13 +853,14 @@ class Attention(Module):
             **exported["kwargs"],
             num_q_heads = num_q_heads,
             num_kv_heads = num_kv_heads,
-            q_norm = _import_split("q_norm", norm_q_split),
-            k_norm = _import_split("k_norm", norm_k_split),
+            q_norm = _import_split("q_norm", norm_q_split) if tp_split_norm else _import("q_norm"),
+            k_norm = _import_split("k_norm", norm_k_split) if tp_split_norm else _import("k_norm"),
             q_proj = _import_split("q_proj", q_split),
             k_proj = _import_split("k_proj", kv_split),
             v_proj = _import_split("v_proj", kv_split),
             kv_proj = _import_split("kv_proj", kv_split),
             o_proj = _import_split("o_proj", o_split),
+            g_proj = _import_split("g_proj", qh_split),
         )
 
         if num_kv_heads:

@@ -13,7 +13,10 @@
 #define ROPESTYLE_NANOCHAT 3
 #define MAX_NUM_THREADS 1024
 
-template <int rope_mode>
+using bfloat16 = __nv_bfloat16;
+using bfloat162 = __nv_bfloat162;
+
+template <int rope_mode, bool norm_bf16>
 __global__
 void rope_kernel
 (
@@ -32,8 +35,8 @@ void rope_kernel
     const uint32_t* __restrict__ positions,
     const uint32_t* __restrict__ position_ids,
     float attn_factor,
-    const half* __restrict__ q_norm,
-    const half* __restrict__ k_norm,
+    const void* __restrict__ q_norm,
+    const void* __restrict__ k_norm,
     const float norm_eps,
     const float norm_constant_bias,
     const bool inv_freq_table,
@@ -84,7 +87,6 @@ void rope_kernel
     __shared__ float sums[MAX_NUM_THREADS / 32];
 
     // Prep
-    half2 norm_constant_bias_h2 = __float2half2_rn(norm_constant_bias);
     int head_dim_pad = (head_dim + 63) / 64 * 64;
 
     // Loop over heads
@@ -92,7 +94,7 @@ void rope_kernel
     {
         const half* g_head_in_ptr;
         half* g_head_out_ptr;
-        const half* norm_weight;
+        const void* norm_weight;
         if (head_idx < num_heads_q)
         {
             g_head_in_ptr = q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * head_dim;
@@ -165,7 +167,6 @@ void rope_kernel
         auto apply_norm = [&] ()
         {
             half2 *tptr = (half2*)(sh_head + t * 2);
-            half2 *wptr = (half2*)(norm_weight + t * 2);
             // int lane_id = threadIdx.x % 32;
             int warp_id = threadIdx.x / 32;
             int warps = blockDim.x / 32;
@@ -185,11 +186,27 @@ void rope_kernel
             float rmf = rsqrtf(sum / (float) head_dim + norm_eps);
             v1 *= rmf;
             v2 *= rmf;
-            v = __floats2half2_rn(v1, v2);
 
-            // Apply weight and store
-            half2 w = __hadd2(*wptr, norm_constant_bias_h2);
-            v = __hmul2(w, v);
+            // Downcast, apply weight and store
+            if constexpr (norm_bf16)
+            {
+                bfloat162 *wptr = (bfloat162*)(((bfloat16*)norm_weight) + t * 2);
+                float2 w = __bfloat1622float2(*wptr);
+                w.x += norm_constant_bias;
+                w.y += norm_constant_bias;
+                v1 *= w.x;
+                v2 *= w.y;
+                v = __floats2half2_rn(v1, v2);
+            }
+            else
+            {
+                half2 norm_constant_bias_h2 = __float2half2_rn(norm_constant_bias);
+                half2 *wptr = (half2*)(((half*)norm_weight) + t * 2);
+                half2 w = __hadd2(*wptr, norm_constant_bias_h2);
+                v = __floats2half2_rn(v1, v2);
+                v = __hmul2(w, v);
+            }
+
             *tptr = v;
             __syncthreads();
         };
@@ -334,14 +351,17 @@ void rope
         TORCH_CHECK(position_ids.value().size(1) == seq_len, "position_ids is incorrect shape");
     }
 
-    half* q_norm_ptr = (half*) OPTPTR(q_norm);
-    half* k_norm_ptr = (half*) OPTPTR(k_norm);
-    TORCH_CHECK_DTYPE_OPT(q_norm, kHalf);
-    TORCH_CHECK_DTYPE_OPT(k_norm, kHalf);
+    void* q_norm_ptr = (void*) OPTPTR(q_norm);
+    void* k_norm_ptr = (void*) OPTPTR(k_norm);
+    bool norm_fp16 = true;
+    bool norm_bf16 = false;
     if (q_norm_ptr)
     {
         TORCH_CHECK_DIM(q_norm.value(), 1);
         TORCH_CHECK(q_norm.value().size(0) == head_dim, "q_norm is incorrect size");
+        norm_bf16 = q_norm.value().dtype() == at::kBFloat16;
+        norm_fp16 = q_norm.value().dtype() == at::kHalf;
+        TORCH_CHECK(k_norm.value().dtype() == q_norm.value().dtype(), "q_norm and k_norm must be same dtype");
     }
 
     dim3 blocks(seq_len, bsz);
@@ -355,9 +375,19 @@ void rope
                  q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table, inv_freq_stride, \
                  llama_4_scaling_beta, llama_4_scaling_original, post_rope_norm
 
-    if      (rope_mode == ROPESTYLE_GPTJ)       rope_kernel<ROPESTYLE_GPTJ><<<blocks, threads, 0, stream>>>(ARGS);
-    else if (rope_mode == ROPESTYLE_NEOX)       rope_kernel<ROPESTYLE_NEOX><<<blocks, threads, 0, stream>>>(ARGS);
-    else if (rope_mode == ROPESTYLE_NANOCHAT)   rope_kernel<ROPESTYLE_NANOCHAT><<<blocks, threads, 0, stream>>>(ARGS);
+    if (norm_fp16)
+    {
+        if      (rope_mode == ROPESTYLE_GPTJ)       rope_kernel<ROPESTYLE_GPTJ, false><<<blocks, threads, 0, stream>>>(ARGS);
+        else if (rope_mode == ROPESTYLE_NEOX)       rope_kernel<ROPESTYLE_NEOX, false><<<blocks, threads, 0, stream>>>(ARGS);
+        else if (rope_mode == ROPESTYLE_NANOCHAT)   rope_kernel<ROPESTYLE_NANOCHAT, false><<<blocks, threads, 0, stream>>>(ARGS);
+    }
+    else if (norm_bf16)
+    {
+        if      (rope_mode == ROPESTYLE_GPTJ)       rope_kernel<ROPESTYLE_GPTJ, true><<<blocks, threads, 0, stream>>>(ARGS);
+        else if (rope_mode == ROPESTYLE_NEOX)       rope_kernel<ROPESTYLE_NEOX, true><<<blocks, threads, 0, stream>>>(ARGS);
+        else if (rope_mode == ROPESTYLE_NANOCHAT)   rope_kernel<ROPESTYLE_NANOCHAT, true><<<blocks, threads, 0, stream>>>(ARGS);
+    }
+    else TORCH_CHECK(false, "rope: incorrect norm dtype");
 
     cuda_check(cudaPeekAtLastError());
 }

@@ -54,6 +54,7 @@ def read_dict(
         expected_types: type | list[type],
         keys: str | list[str],
         default = no_default,
+        wrong_type_as_missing: bool = False,
 ) -> T:
     """
     Utility function to read typed value from (nested) dictionary
@@ -73,6 +74,9 @@ def read_dict(
     :param default:
         Default value to return if the key isn't found, e.g. None. If this is the special value no_default
         and no keys are matched, raise an exception instead.
+
+    :param wrong_type_as_missing:
+         Treat an existing key of the wrong type as a missing key and apply default value if possible
 
     :return:
         Requested value if key found, otherwise default value
@@ -110,7 +114,8 @@ def read_dict(
                         x = int(x)
                     if isinstance(x, t):
                         return cast(T, x)
-            raise TypeError(f"Value for {key} is not of expected type: {expected_types}")
+            if not wrong_type_as_missing:
+                raise TypeError(f"Value for {key} is not of expected type: {expected_types}")
 
     if default != no_default:
         return default

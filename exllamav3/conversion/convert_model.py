@@ -16,6 +16,7 @@ from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
 import threading
+from collections import deque
 
 col_default = "\u001b[0m"
 col_red = "\u001b[31;1m"
@@ -43,9 +44,7 @@ parser.add_argument("-strat", "--strategy", type = str, default = None, help = "
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "When possible, use new parallel mode for small tensors (MoE layers especially)")
 
 group = parser.add_mutually_exclusive_group()
-group.add_argument("--out_scales", dest = "out_scales_", action = "store_true", help = "Always enable out channel scales  (for debug purposes)")
-group.add_argument("--no_out_scales", dest = "out_scales_", action = "store_false", help = "Never enable out channel scales  (for debug purposes)")
-parser.set_defaults(out_scales_ = None)
+group.add_argument("--out_scales", type = str, default = "always", help = "Enable out channel scales (always/never/auto, default: always)")
 
 parser.add_argument("--override_anyway", action = "store_true", help = "Allow resuming even when overriding settings that will break the existing job.")
 
@@ -183,7 +182,7 @@ def prepare(args) -> (dict, dict, bool, str):
     # Momentary args
     in_args["image_dump"] = args.image_dump
     in_args["verbose"] = args.verbose
-    in_args["apply_out_scales"] = args.out_scales_
+    in_args["apply_out_scales"] = {"always": True, "never": False, "auto": None}[args.out_scales]
 
     if args.resume:
         job_state = load_dict("ckpt/job.json", in_args)
@@ -297,6 +296,7 @@ def main(args, job_state):
     last_checkpoint_time = time.time()
     start_time = time.time()
     timed_blocks = 0
+    eta_window = deque(maxlen = 8)
 
     # Get model
     config, model, tokenizer = get_base_model(args)
@@ -611,10 +611,21 @@ def main(args, job_state):
         )
         sys.stdout.flush()
         if idx >= model.first_block_idx:
-            overall_time = time.time() - start_time
             timed_blocks += 1
-            est_remaining = (overall_time / timed_blocks) * (len(model.modules) - idx)
-            print(f" -- Estimated remaining time: {human_time(est_remaining)}")
+            eta_window.append(module_time)
+            remaining_blocks = max(0, len(model.modules) - idx - 1)
+            if timed_blocks < 3:
+                print(
+                    " -- Estimated remaining time: warming up "
+                    f"({timed_blocks}/3 timed blocks)"
+                )
+            else:
+                avg_block_time = sum(eta_window) / len(eta_window)
+                est_remaining = avg_block_time * remaining_blocks
+                print(
+                    f" -- Estimated remaining time: {human_time(est_remaining)} "
+                    f"(avg over last {len(eta_window)} blocks)"
+                )
 
         # Unload current module
         module.unload()

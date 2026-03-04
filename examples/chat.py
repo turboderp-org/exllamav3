@@ -24,6 +24,8 @@ def main(args):
     max_response_tokens = args.max_response_tokens
     multiline = args.multiline
     show_tps = args.show_tps
+    think = args.think
+    assert not (args.think and args.no_think), "Cannot enable think and no_think modes at the same time"
 
     if args.basic_console:
         read_input_fn = read_input_ptk
@@ -38,7 +40,7 @@ def main(args):
     if args.think_budget is not None:
         spc["thinking_budget"] = args.think_budget
     prompt_format.set_special(spc)
-    system_prompt = prompt_format.default_system_prompt(args.think) if not args.system_prompt else args.system_prompt
+    system_prompt = prompt_format.default_system_prompt(think) if not args.system_prompt else args.system_prompt
     add_bos = prompt_format.add_bos()
 
     # Load model
@@ -90,9 +92,33 @@ def main(args):
                 user_prompt = "/x"
 
         # Intercept commands
+        en_dis = { True: "Enabled", False: "Disabled" }
         if user_prompt.startswith("/"):
             c = user_prompt.strip().split(" ")
             match c[0]:
+
+                # List commands
+                case "/h":
+                    print_info("\n".join([
+                        "/ban               Edit banned strings list",
+                        "/cat               Run Catbench 1.0",
+                        "/cc                Copy last code block to clipboard",
+                        "/cc <n>            Copy nth-last code block to clipboard",
+                        "/clear             Clear context",
+                        "/e                 Edit and resume last model response",
+                        "/load              Load stored session from ~/chat_py_session.json",
+                        "/load <filename>   Load stored session from file",
+                        "/mli               Toggle multiline input",
+                        "/r                 Rewind and repeat last prompt",
+                        "/save              Save current session to ~/chat_py_session.json",
+                        "/save <filename>   Save current session to file",
+                        "/sp                Edit system prompt",
+                        "/t                 Tokenize context",
+                        "/think             Toggle reasoning mode",
+                        "/tps               Toggle tokens/second output",
+                        "/x                 Exit",
+                    ]))
+                    continue
 
                 # Exit app
                 case "/x":
@@ -116,10 +142,7 @@ def main(args):
                 # Toggle multiline mode
                 case "/mli":
                     multiline = not multiline
-                    if multiline:
-                        print_info("Enabled multiline mode")
-                    else:
-                        print_info("Disabled multiline mode")
+                    print_info(f"{en_dis[multiline]} multiline mode")
                     continue
 
                 # Clear context
@@ -130,11 +153,14 @@ def main(args):
 
                 # Toggle TPS
                 case "/tps":
-                    multiline = not multiline
-                    if multiline:
-                        print_info("Enabled tokens/second output")
-                    else:
-                        print_info("Disabled tokens/second output")
+                    show_tps = not show_tps
+                    print_info(f"{en_dis[show_tps]} tokens/second output")
+                    continue
+
+                # Toggle reasoning
+                case "/think":
+                    think = not think
+                    print_info(f"{en_dis[think]} reasoning mode")
                     continue
 
                 # Retry last response
@@ -199,10 +225,14 @@ def main(args):
                 # Print token IDs for last response
                 case "/t":
                     if last_tokens is None:
-                        print_error(f"Unknown command: {c[0]}")
+                        print_error(f"No previous response to tokenize")
                         continue
                     print_tokens(last_tokens, tokenizer.get_id_to_piece_list())
                     continue
+
+                # Catbench 1.0
+                case "/cat":
+                    user_prompt = "Write a python script that draws a cute kitten using matplotlib."
 
                 case _:
                     print_error(f"Unknown command: {c[0]}")
@@ -213,10 +243,10 @@ def main(args):
 
         # Tokenize context and trim from head if too long
         def get_input_ids(_prefix):
-            frm_context = prompt_format.format(system_prompt, context, args.think)
+            frm_context = prompt_format.format(system_prompt, context, think)
             if _prefix:
                 frm_context += prefix
-            elif args.think and prompt_format.thinktag()[0] is not None:
+            elif think and prompt_format.thinktag()[0] is not None:
                 frm_context += prompt_format.thinktag()[0]
             ids_ = tokenizer.encode(frm_context, add_bos = add_bos, encode_special_tokens = True)
             exp_len_ = ids_.shape[-1] + max_response_tokens + 1
@@ -242,7 +272,7 @@ def main(args):
         ctx_exceeded = False
         with (
             KeyReader() as keyreader,
-            streamer_cm(args, bot_name, tt[0], tt[1]) as s
+            streamer_cm(args, bot_name, tt[0], tt[1], args.updates_per_second, think) as s
         ):
             if prefix:
                 s.stream(prefix)
@@ -330,5 +360,6 @@ if __name__ == "__main__":
     parser.add_argument("-save", "--save", type = str, help = "Save output to file (use with --prompt)")
     parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")
     parser.add_argument("-dbg", "--debug", action = "store_true", help = "Print extra debug stuff")
+    parser.add_argument("-ups", "--updates-per-second", type = int, help = "Max number of console updates per second (markdown console), default: 30", default = 30)
     _args = parser.parse_args()
     main(_args)

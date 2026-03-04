@@ -113,6 +113,8 @@ def routing_dots(bsz, cfg, y, params):
         activate_all_experts = params.get("activate_all_experts")
         if activate_all_experts:
             routing_weights = router_logits.sigmoid()
+            if cfg.e_score_correction_bias is not None:
+                routing_weights += cfg.e_score_correction_bias.unsqueeze(0)
             factor = cfg.routed_scaling_factor / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
             routing_weights *= factor
             selected_experts = (
@@ -157,6 +159,8 @@ class BlockSparseMLP(Module):
         key_up: str | None = None,
         key_gate: str | None = None,
         key_down: str | None = None,
+        key_gate_split: str | None = None,
+        key_up_split: str | None = None,
         key_gate_up_split: str | None = None,
         key_down_split: str | None = None,
         key_routing_gate: str | None = None,
@@ -165,6 +169,7 @@ class BlockSparseMLP(Module):
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
+        act_limit: float = 0.0,
         interm_dtype: torch.dtype = None,
         router_type: str = "std",
         routing_gate: Linear | None = None,
@@ -179,6 +184,7 @@ class BlockSparseMLP(Module):
         routing_first: int | None = None,
         routing_last: int | None = None,
         routing_device: int | None = None,
+        transposed_load: bool = True,
     ):
         super().__init__(config, key, None)
 
@@ -192,6 +198,7 @@ class BlockSparseMLP(Module):
         self.num_local_experts = num_local_experts if num_local_experts is not None else num_experts
         self.hidden_size = hidden_size
         self.router_type = router_type
+        self.act_limit = act_limit
 
         self.routing_first = routing_first
         self.routing_last = routing_last
@@ -250,38 +257,52 @@ class BlockSparseMLP(Module):
 
             for idx in range(self.num_local_experts):
 
+                fkey_gate, fkey_up, fkey_down = (
+                    f"{key}.{key_gate_up_split}" if key_gate_up_split else
+                    f"{key}.{key_gate_split}" if key_gate_split else
+                    None,
+                    f"{key}.{key_gate_up_split}" if key_gate_up_split else
+                    f"{key}.{key_up_split}" if key_up_split else
+                    None,
+                    f"{key}.{key_down_split}" if key_down_split else
+                    None
+                )
+
                 gate = Linear(
                     config = config,
                     key = f"{key}.{key_gate}".replace("{expert_idx}", str(idx)),
-                    fkey = f"{key}.{key_gate_up_split}",
+                    fkey = fkey_gate,
                     fidx = idx,
-                    frange = (0, intermediate_size),
+                    frange = (0, intermediate_size) if key_gate_up_split else None,
                     in_features = hidden_size,
                     out_features = intermediate_size,
                     qmap = qmap + ".input",
-                    out_dtype = self.interm_dtype
+                    out_dtype = self.interm_dtype,
+                    transposed_load = transposed_load,
                 )
                 up = Linear(
                     config = config,
                     key = f"{key}.{key_up}".replace("{expert_idx}", str(idx)),
-                    fkey = f"{key}.{key_gate_up_split}",
+                    fkey = fkey_up,
                     fidx = idx,
-                    frange = (intermediate_size, intermediate_size * 2),
+                    frange = (intermediate_size, intermediate_size * 2) if key_gate_up_split else None,
                     in_features = hidden_size,
                     out_features = intermediate_size,
                     qmap = qmap + ".input",
-                    out_dtype = self.interm_dtype
+                    out_dtype = self.interm_dtype,
+                    transposed_load = transposed_load,
                 )
                 down = Linear(
                     config = config,
                     key = f"{key}.{key_down}".replace("{expert_idx}", str(idx)),
-                    fkey = f"{key}.{key_down_split}",
+                    fkey = fkey_down,
                     fidx = idx,
                     in_features = intermediate_size,
                     out_features = hidden_size,
                     qmap = qmap + f".{idx}.down",
                     out_dtype = self.out_dtype,
                     allow_input_padding = True,
+                    transposed_load = transposed_load,
                 )
 
                 self.ups.append(up)
@@ -439,7 +460,8 @@ class BlockSparseMLP(Module):
                 self.activation_fn == "silu",
                 self.activation_fn == "gelu",
                 sh_exp,
-                sh_gate
+                sh_gate,
+                self.act_limit
             )
 
 
@@ -547,7 +569,7 @@ class BlockSparseMLP(Module):
                     g = self.gates[exp_i].forward(xc, params)
                     u = self.ups[exp_i].forward(xc, params)
                     a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
-                    self.activation_fn_call(g, u, a)
+                    self.activation_fn_call(g, u, a, self.act_limit)
                     return self.downs[exp_i].forward(a, params)
 
                 for expert_idx in range(num_ex):
@@ -623,7 +645,7 @@ class BlockSparseMLP(Module):
                 )
 
                 # Activation
-                self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a)
+                self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a, self.act_limit)
 
                 # Down
                 ext.exl3_mgemm(
@@ -698,7 +720,7 @@ class BlockSparseMLP(Module):
             )
 
             # Activation
-            self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a)
+            self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a, self.act_limit)
 
             # Down
             ext.exl3_mgemm(
@@ -808,6 +830,7 @@ class BlockSparseMLP(Module):
                 "routed_scaling_factor": self.routed_scaling_factor,
                 "n_group": self.n_group,
                 "topk_group": self.topk_group,
+                "act_limit": self.act_limit,
             },
             "routing_gate": _export(self.routing_gate),
             "e_score_correction_bias": producer.send(self.e_score_correction_bias),
