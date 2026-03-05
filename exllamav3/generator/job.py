@@ -652,8 +652,9 @@ class Job:
         if filter_eos_condition:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "end_filter")
 
-        # Hold text if it contains an incomplete character
-        if 1 <= self.held_text.count("�") < 5:
+        # Hold text if it contains an incomplete character. Always attempt
+        # reconstruction when replacement characters are present.
+        if "�" in self.held_text:
             test_decode = self.generator.tokenizer.decode(
                 self.held_tokens.torch(),
                 decode_special_tokens = self.decode_special_tokens
