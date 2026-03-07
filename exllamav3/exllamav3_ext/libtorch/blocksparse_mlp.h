@@ -10,6 +10,7 @@ namespace py = pybind11;
 #include "../graph.cuh"
 
 #define MAX_EXPERTS 512
+#define TEMP_ROWS 32
 
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     int bsz,
@@ -75,6 +76,7 @@ struct BC_BlockSparseMLP
     bool use_mgemm;
 
     Graph graph_bsz1;
+    Graph graph_single[TEMP_ROWS];
 
     BC_BlockSparseMLP
     (
@@ -137,6 +139,13 @@ struct BC_BlockSparseMLP
         const at::Tensor& y,
         at::Tensor& selected_experts,
         at::Tensor& routing_weights
+    );
+
+    void run_single_expert_gr
+    (
+        const at::Tensor& y,
+        const int expert_idx,
+        Graph* graph
     );
 
     void run_single_expert

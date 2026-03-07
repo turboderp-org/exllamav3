@@ -156,7 +156,11 @@ int exl3_gemm_gr
     );
 
     if (graph) graph->record_param((void*) kernel, GP_gemm_A, 0);
+    if (graph) graph->record_param((void*) kernel, GP_gemm_B_trellis, 1);
     if (graph) graph->record_param((void*) kernel, GP_gemm_C, 2);
+    if (graph) graph->record_param((void*) kernel, GP_gemm_B_suh, 7);
+    if (graph) graph->record_param((void*) kernel, GP_gemm_A_had, 8);
+    if (graph) graph->record_param((void*) kernel, GP_gemm_B_svh, 9);
     if (graph) graph->record_param((void*) kernel, GP_end, 0);
 
     cuda_check(cudaPeekAtLastError());
