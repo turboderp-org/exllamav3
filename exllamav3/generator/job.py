@@ -944,7 +944,7 @@ class Job:
             if prefill_end <= prefill_start:
                 continue
 
-            assert prefill_start % 256 == 0
+            assert prefill_start % PAGE_SIZE == 0
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
@@ -983,8 +983,16 @@ class Job:
                     self.cached_tokens += best_match
                     progress += best_match
 
-            # Inference
+            # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
+            recurrent_last_page = False
+            if self.generator.recurrent_cache is not None:
+                seqlen = len(seq.sequence_ids) - 1
+                last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
+                if prefill_start < last_page_b < prefill_end:
+                    prefill_end = last_page_b
+                    recurrent_last_page = True
 
+            # Inference
             if prefill_end > prefill_start:
 
                 if self.generator.draft_model:
@@ -1029,8 +1037,12 @@ class Job:
                     page.can_revert = False
 
                 progress += prefill_end - prefill_start
-                if progress >= len(seq.sequence_ids) - 1:
+                if self.sequences[0].kv_position >= len(seq.sequence_ids) - 1:
                     seq.prefill_complete = True
+
+                if recurrent_last_page:
+                    self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
+
 
         if progress:
             r = {
