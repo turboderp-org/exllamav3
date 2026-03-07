@@ -6,6 +6,8 @@
 #include "../util.h"
 #include "../hgemm.cuh"
 #include "../quant/exl3_gemm.cuh"
+#include "../quant/hadamard.cuh"
+#include "../quant/reconstruct.cuh"
 #include "../activation.cuh"
 #include "../add.cuh"
 
@@ -69,7 +71,7 @@ void BC_BlockSparseMLP::run_bsz1_gr
     Graph* graph
 )
 {
-    py::gil_scoped_release _;
+    //py::gil_scoped_release _;
     const at::Tensor& yi = y.unsqueeze(0);
 
     exl3_mgemm_gr
@@ -213,4 +215,258 @@ void BC_BlockSparseMLP::run_bsz1
         graph_bsz1.launch(args, stream);
 
     #endif
+    #undef USE_GRAPH
+}
+
+BC_BlockSparseMLP::BC_BlockSparseMLP
+(
+    at::Tensor _yh2,
+    at::Tensor _yh,
+    at::Tensor _interm_gu,
+    at::Tensor _interm_g,
+    at::Tensor _interm_u,
+    at::Tensor _interm_a,
+    at::Tensor _out_d,
+    at::Tensor _out_d2,
+    c10::optional<at::Tensor> _out_d_sh,
+    c10::optional<at::Tensor> _z,
+    at::Tensor _dq_temp_up,
+    at::Tensor _dq_temp_down,
+    int _min_expert,
+    int _max_expert,
+    at::Tensor _gate_ptrs_trellis,
+    at::Tensor _gate_ptrs_suh,
+    at::Tensor _gate_ptrs_svh,
+    int _gate_K,
+    bool _gate_mcg,
+    bool _gate_mul1,
+    at::Tensor _up_ptrs_trellis,
+    at::Tensor _up_ptrs_suh,
+    at::Tensor _up_ptrs_svh,
+    int _up_K,
+    bool _up_mcg,
+    bool _up_mul1,
+    at::Tensor _down_ptrs_trellis,
+    at::Tensor _down_ptrs_suh,
+    at::Tensor _down_ptrs_svh,
+    int _down_K,
+    bool _down_mcg,
+    bool _down_mul1,
+    bool _act_silu,
+    bool _act_gelu,
+    std::shared_ptr<BC_GatedMLP> _shared_experts,
+    std::shared_ptr<BC_LinearFP16> _shared_gate,
+    float _act_limit,
+    std::vector<std::shared_ptr<BC_LinearEXL3>> _gates,
+    std::vector<std::shared_ptr<BC_LinearEXL3>> _ups,
+    std::vector<std::shared_ptr<BC_LinearEXL3>> _downs,
+    at::Tensor _gu_trellis_ptr,
+    at::Tensor _gu_suh_ptr,
+    at::Tensor _gu_svh_ptr
+) :
+        yh2                 (std::move(_yh2)),
+        yh                  (std::move(_yh)),
+        interm_gu           (std::move(_interm_gu)),
+        interm_g            (std::move(_interm_g)),
+        interm_u            (std::move(_interm_u)),
+        interm_a            (std::move(_interm_a)),
+        out_d               (std::move(_out_d)),
+        out_d2              (std::move(_out_d2)),
+        out_d_sh            (std::move(_out_d_sh)),
+        z                   (std::move(_z)),
+        dq_temp_up          (std::move(_dq_temp_up)),
+        dq_temp_down        (std::move(_dq_temp_down)),
+        min_expert          (_min_expert),
+        max_expert          (_max_expert),
+        gate_ptrs_trellis   (std::move(_gate_ptrs_trellis)),
+        gate_ptrs_suh       (std::move(_gate_ptrs_suh)),
+        gate_ptrs_svh       (std::move(_gate_ptrs_svh)),
+        gate_K              (_gate_K),
+        gate_mcg            (_gate_mcg),
+        gate_mul1           (_gate_mul1),
+        up_ptrs_trellis     (std::move(_up_ptrs_trellis)),
+        up_ptrs_suh         (std::move(_up_ptrs_suh)),
+        up_ptrs_svh         (std::move(_up_ptrs_svh)),
+        up_K                (_up_K),
+        up_mcg              (_up_mcg),
+        up_mul1             (_up_mul1),
+        down_ptrs_trellis   (std::move(_down_ptrs_trellis)),
+        down_ptrs_suh       (std::move(_down_ptrs_suh)),
+        down_ptrs_svh       (std::move(_down_ptrs_svh)),
+        down_K              (_down_K),
+        down_mcg            (_down_mcg),
+        down_mul1           (_down_mul1),
+        act_silu            (_act_silu),
+        act_gelu            (_act_gelu),
+        shared_experts      (_shared_experts),
+        shared_gate         (_shared_gate),
+        act_limit           (_act_limit),
+        gates               (_gates),
+        ups                 (_ups),
+        downs               (_downs),
+        gu_trellis_ptr      (_gu_trellis_ptr),
+        gu_suh_ptr          (_gu_suh_ptr),
+        gu_svh_ptr          (_gu_svh_ptr)
+{
+    gate_ptrs_trellis_cpu   = gate_ptrs_trellis.cpu();
+    gate_ptrs_suh_cpu       = gate_ptrs_suh.cpu();
+    gate_ptrs_svh_cpu       = gate_ptrs_svh.cpu();
+    up_ptrs_trellis_cpu     = up_ptrs_trellis.cpu();
+    up_ptrs_suh_cpu         = up_ptrs_suh.cpu();
+    up_ptrs_svh_cpu         = up_ptrs_svh.cpu();
+    down_ptrs_trellis_cpu   = down_ptrs_trellis.cpu();
+    down_ptrs_suh_cpu       = down_ptrs_suh.cpu();
+    down_ptrs_svh_cpu       = down_ptrs_svh.cpu();
+
+    max_experts_per_token = interm_g.size(0);
+    max_tokens_per_expert = max_experts_per_token;
+
+    for (int i = 0; i < max_tokens_per_expert; ++i)
+    {
+        interm_g_single.push_back(interm_g.squeeze(1).slice(0, 0, i + 1));
+        interm_u_single.push_back(interm_u.squeeze(1).slice(0, 0, i + 1));
+        interm_a_single.push_back(interm_a.squeeze(1).slice(0, 0, i + 1));
+        out_d_single.push_back(out_d.squeeze(1).slice(0, 0, i + 1));
+    }
+
+    TORCH_CHECK(max_expert <= MAX_EXPERTS, "BC_BlockSparseMLP: Too many experts");
+
+    use_mgemm = gate_K == up_K;
+}
+
+void BC_BlockSparseMLP::run_single_expert
+(
+    const at::Tensor& y,
+    const int expert_idx
+)
+{
+    int bsz = y.size(0);
+
+    at::Tensor ai = interm_a.slice(0, 0, bsz);
+    at::Tensor oi = out_d2.slice(0, 0, bsz);
+
+    if (use_mgemm)
+    {
+        at::Tensor yb = y.unsqueeze(0);
+        at::Tensor gui = interm_gu.slice(0, 0, bsz * 2).view({2, bsz, interm_gu.size(1)});
+        at::Tensor yh2i = yh2.slice(0, 0, 2).view({2, 1, yh2.size(1)});
+
+        exl3_mgemm
+        (
+            yb,
+            gu_trellis_ptr[expert_idx],
+            gui,
+            gu_suh_ptr[expert_idx],
+            yh2,
+            gu_svh_ptr[expert_idx],
+            c10::nullopt,
+            c10::nullopt,
+            gate_K,
+            -1,
+            gate_mcg,
+            gate_mul1,
+            -1,
+            -1,
+            0
+        );
+
+        at::Tensor gi = gui[0];
+        at::Tensor ui = gui[1];
+
+        if (act_silu)
+            silu_mul(gi, ui, ai, act_limit);
+        else if (act_gelu)
+            gelu_mul(gi, ui, ai, act_limit);
+    }
+    else
+    {
+        at::Tensor gi = interm_gu.slice(0, 0, bsz);
+        at::Tensor ui = interm_gu.slice(0, bsz, bsz * 2);
+
+        exl3_gemm
+        (
+            y,
+            gates[expert_idx]->trellis,
+            gi,
+            gates[expert_idx]->suh,
+            yh,
+            gates[expert_idx]->svh,
+            -1,
+            gate_mcg,
+            gate_mul1,
+            0
+        );
+
+        exl3_gemm
+        (
+            y,
+            ups[expert_idx]->trellis,
+            ui,
+            ups[expert_idx]->suh,
+            yh,
+            ups[expert_idx]->svh,
+            -1,
+            up_mcg,
+            up_mul1,
+            0
+        );
+
+        if (act_silu)
+            silu_mul(gi, ui, ai, act_limit);
+        else if (act_gelu)
+            gelu_mul(gi, ui, ai, act_limit);
+    }
+
+    exl3_gemm
+    (
+        ai,
+        downs[expert_idx]->trellis,
+        oi,
+        downs[expert_idx]->suh,
+        ai,
+        downs[expert_idx]->svh,
+        -1,
+        down_mcg,
+        down_mul1,
+        0
+    );
+}
+
+void BC_BlockSparseMLP::run_single_expert_dq
+(
+    const at::Tensor& y,
+    const int expert_idx,
+    at::Tensor& yh,
+    at::Tensor& interm,
+    at::Tensor& interm_a,
+    at::Tensor& out
+)
+{
+    int bsz = y.size(0);
+
+    at::Tensor yh1 = yh[0];
+    at::Tensor yh2 = yh[0];
+    at::Tensor interm1 = interm[0];
+    at::Tensor interm2 = interm[1];
+
+    had_r_128_dual(y, yh1, gates[expert_idx]->suh, c10::nullopt,
+                   y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
+
+    reconstruct(dq_temp_up, gates[expert_idx]->trellis, gate_K, gate_mcg, gate_mul1);
+    hgemm(yh1, dq_temp_up, interm1);
+    reconstruct(dq_temp_up, ups[expert_idx]->trellis, up_K, up_mcg, up_mul1);
+    hgemm(yh2, dq_temp_up, interm2);
+
+    had_r_128_dual(interm1, interm1, c10::nullopt, gates[expert_idx]->svh,
+                   interm2, interm2, c10::nullopt, ups[expert_idx]->svh, 1.0);
+
+    if (act_silu)
+        silu_mul(interm1, interm2, interm_a, act_limit);
+    else if (act_gelu)
+        gelu_mul(interm1, interm2, interm_a, act_limit);
+
+    had_r_128(interm_a, interm_a, downs[expert_idx]->suh, c10::nullopt, 1.0);
+    reconstruct(dq_temp_down, downs[expert_idx]->trellis, down_K, down_mcg, down_mul1);
+    hgemm(interm_a, dq_temp_down, out);
+    had_r_128(out, out, c10::nullopt, downs[expert_idx]->svh, 1.0);
 }
