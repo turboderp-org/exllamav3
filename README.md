@@ -17,11 +17,10 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 
 ### ⚠️ Important
 
-- **Qwen3-Next** support is currently experimental and still requires some optimization, so don't expect
-  optimal performance just yet. [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) is required
-  and this in turn requires Triton. [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) is supported and 
-  recommended but not required.
-- **Qwen3-Next** currently does not support tensor/expert parallelism.
+- **Qwen3-Next** and **Qwen3.5** can take advantage of [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention), though this requires
+  Triton, and performance can be shaky due to the sporadic JIT compilation it imposes. [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) is
+  supported and recommended but not required.
+- **Qwen3-Next** and **Qwen3.5** currently do not support tensor/expert parallelism.
 
 ## Architecture support
 
