@@ -400,6 +400,7 @@ class BlockSparseMLP(Module):
         interm_a = temp_activa[:numex].view(numex, 1, I)
         yh2 = temp_hidden
         interm_gu = temp_interm
+        interm_a2 = temp_activa
         out_d = temp_output[:numex].view(numex, 1, H)
         out_d2 = temp_output
 
@@ -457,6 +458,7 @@ class BlockSparseMLP(Module):
                 cfg.interm_g,
                 cfg.interm_u,
                 cfg.interm_a,
+                interm_a2,
                 cfg.out_d,
                 cfg.out_d2,
                 sh_exp_t,
@@ -636,7 +638,7 @@ class BlockSparseMLP(Module):
 
                     current_state = y.index_select(0, top_x)
 
-                    if self.bc is not None:
+                    if self.bc is not None and False:
                         if count <= TEMP_ROWS:
                             self.bc.run_single_expert(current_state, expert_idx)
                             current_state = self.experts_cfg.out_d2[:count]
@@ -647,12 +649,13 @@ class BlockSparseMLP(Module):
                                 device = self.device
                             )
                             interm = torch.empty(
-                                (2, count, self.intermediate_size),
+                                (count * 2, self.intermediate_size),
                                 dtype = self.interm_dtype,
                                 device = self.device
                             )
-                            interm_a = interm[0] if self.interm_dtype == torch.half else torch.empty_like(interm[0], dtype = torch.half)
-                            yh = torch.empty((2, count, self.hidden_size), dtype = torch.half, device = self.device)
+                            interm_a = interm[:count] if self.interm_dtype == torch.half else \
+                                torch.empty_like(interm[:count], dtype = torch.half)
+                            yh = torch.empty((count * 2, self.hidden_size), dtype = torch.half, device = self.device)
                             self.bc.run_single_expert_dq(current_state, expert_idx, yh, interm, interm_a, out_state)
                             current_state = out_state
                     else:

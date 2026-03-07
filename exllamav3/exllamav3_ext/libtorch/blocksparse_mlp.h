@@ -26,6 +26,7 @@ struct BC_BlockSparseMLP
     at::Tensor interm_g;
     at::Tensor interm_u;
     at::Tensor interm_a;
+    at::Tensor interm_a2;
     at::Tensor out_d;
     at::Tensor out_d2;
     c10::optional<at::Tensor> out_d_sh;
@@ -83,6 +84,7 @@ struct BC_BlockSparseMLP
         at::Tensor _interm_g,
         at::Tensor _interm_u,
         at::Tensor _interm_a,
+        at::Tensor _interm_a2,
         at::Tensor _out_d,
         at::Tensor _out_d2,
         c10::optional<at::Tensor> _out_d_sh,

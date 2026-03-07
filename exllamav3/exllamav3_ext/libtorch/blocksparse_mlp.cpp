@@ -226,6 +226,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     at::Tensor _interm_g,
     at::Tensor _interm_u,
     at::Tensor _interm_a,
+    at::Tensor _interm_a2,
     at::Tensor _out_d,
     at::Tensor _out_d2,
     c10::optional<at::Tensor> _out_d_sh,
@@ -270,6 +271,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         interm_g            (std::move(_interm_g)),
         interm_u            (std::move(_interm_u)),
         interm_a            (std::move(_interm_a)),
+        interm_a2           (std::move(_interm_a2)),
         out_d               (std::move(_out_d)),
         out_d2              (std::move(_out_d2)),
         out_d_sh            (std::move(_out_d_sh)),
@@ -342,7 +344,7 @@ void BC_BlockSparseMLP::run_single_expert
 {
     int bsz = y.size(0);
 
-    at::Tensor ai = interm_a.slice(0, 0, bsz);
+    at::Tensor ai = interm_a2.slice(0, 0, bsz);
     at::Tensor oi = out_d2.slice(0, 0, bsz);
 
     if (use_mgemm)
@@ -444,10 +446,10 @@ void BC_BlockSparseMLP::run_single_expert_dq
 {
     int bsz = y.size(0);
 
-    at::Tensor yh1 = yh[0];
-    at::Tensor yh2 = yh[0];
-    at::Tensor interm1 = interm[0];
-    at::Tensor interm2 = interm[1];
+    at::Tensor yh1 = yh.slice(0, 0, bsz);
+    at::Tensor yh2 = yh.slice(0, bsz, bsz * 2);
+    at::Tensor interm1 = interm.slice(0, 0, bsz);
+    at::Tensor interm2 = interm.slice(0, bsz, bsz * 2);
 
     had_r_128_dual(y, yh1, gates[expert_idx]->suh, c10::nullopt,
                    y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
