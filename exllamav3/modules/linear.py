@@ -136,7 +136,15 @@ class Linear(Module):
                 scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                 assert scale is None or scale_inv is None
                 no_defer = scale is not None or scale_inv is not None
-                weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
+                weight = self.config.stc.get_tensor(
+                    key + ".weight",
+                    dev,
+                    float2half = True,
+                    transpose = self.transposed_load,
+                    pad_to = pad2,
+                    no_defer = no_defer,
+                    auto_transpose_to_pad = True,
+                )
                 bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
                 if scale is not None:
                     weight = self.apply_fp8_scales_(weight, scale)
