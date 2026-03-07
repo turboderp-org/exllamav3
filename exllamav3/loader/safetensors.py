@@ -252,6 +252,7 @@ class SafetensorsCollection:
         optional: bool = False,
         allow_bf16: bool = False,
         float2half: bool = False,
+        cast_dtype: torch.dtype | None = None,
         no_defer: bool = False,
         transpose: bool = False,
         pad_to: tuple = None,
@@ -268,6 +269,8 @@ class SafetensorsCollection:
             tensor = self.new_tensors[key].to(device)
             if transpose:
                 tensor = tensor.T.contiguous()
+            if cast_dtype is not None and tensor.dtype != cast_dtype:
+                tensor = tensor.to(cast_dtype)
             return tensor
 
         if not key in self.tensor_file_map:
@@ -296,6 +299,11 @@ class SafetensorsCollection:
             beg += esize * numel * fidx
             end = beg + esize * numel
             bytesize = end - beg
+
+        if cast_dtype is not None:
+            # Dtype casts happen after the tensor is materialized, so keep these small compatibility
+            # loads out of the deferred path rather than expanding deferred bookkeeping.
+            no_defer = True
 
         load_method = self.load_method
         if load_method == "mt_fread" and self.deferred_mode and not no_defer:
@@ -375,6 +383,8 @@ class SafetensorsCollection:
                         padded = torch.zeros(pad_to, dtype = tensor.dtype, device = tensor.device)
                         padded[tuple(slice(0, s) for s in tensor.shape)].copy_(tensor)
                         tensor = padded
+                    if cast_dtype is not None and tensor.dtype != cast_dtype:
+                        tensor = tensor.to(cast_dtype)
                     tensor = tensor.contiguous()
                     self.metrics.direct_tensors += 1
 
@@ -393,6 +403,8 @@ class SafetensorsCollection:
                             padded = torch.zeros(pad_to, dtype = tensor.dtype, device = tensor.device)
                             padded[tuple(slice(0, s) for s in tensor.shape)].copy_(tensor)
                             tensor = padded
+                        if cast_dtype is not None and tensor.dtype != cast_dtype:
+                            tensor = tensor.to(cast_dtype)
                         tensor = tensor.to(device).contiguous()
                     self.metrics.direct_tensors += 1
 
