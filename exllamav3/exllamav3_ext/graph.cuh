@@ -14,7 +14,11 @@ enum GraphedParams
     GP_end,
 
     GP_gemm_A,
+    GP_gemm_B_trellis,
     GP_gemm_C,
+    GP_gemm_B_suh,
+    GP_gemm_A_had,
+    GP_gemm_B_svh,
 
     GP_mgemm,
     GP_mgemm_A,

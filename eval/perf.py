@@ -19,7 +19,7 @@ col_gray = "\u001b[37;1m"
 
 @lru_cache
 def cached_ids(length):
-    return torch.ones((1, length), dtype = torch.long)
+    return torch.arange(length, dtype = torch.long).unsqueeze(0)
 
 
 def get_lengths(max_length):

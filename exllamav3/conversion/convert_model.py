@@ -467,13 +467,19 @@ def main(args, job_state):
                         assert isinstance(linear.inner, LinearEXL3)
                         linear.inner.swap_cpu()
 
-                        flags = "o" if quant_args_local["apply_out_scales"] else "."
-                        proxy_err_str = f"{proxy_err:8.6f}" if proxy_err >= 0.0 else "(OoM)   "
+                        flags_local = "o" if quant_args_local["apply_out_scales"] else "."
+                        flags_local += "f" if quant_args_local["q_fallback"] else "."
+                        proxy_err_str_local = (
+                            "(zero)  " if quant_args_local["zeros"] else
+                            "(big)   " if proxy_err >= 9.9 else
+                            f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
+                            "(OoM)   "
+                        )
                         print(
                             f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
                             f"  bpw: {quant_args_local['K']:5.2f}"
-                            f"  proxy_err: {proxy_err_str}"
-                            f"  {flags}"
+                            f"  proxy_err: {proxy_err_str_local}"
+                            f"  {flags_local}"
                             f"  g_sc: {quant_args_local['g_scale']:.6f}"
                         )
                         with progress_lock:
@@ -539,7 +545,13 @@ def main(args, job_state):
                             assert isinstance(linear.inner, LinearEXL3)
                             linear.inner.swap_cpu()
                         flags = "o" if quant_args["apply_out_scales"] else "."
-                        proxy_err_str = f"{proxy_err:8.6f}" if proxy_err >= 0.0 else "(OoM)   "
+                        flags += "f" if quant_args["q_fallback"] else "."
+                        proxy_err_str = (
+                            "(zero)  " if quant_args["zeros"] else
+                            "(big)   " if proxy_err >= 9.9 else
+                            f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
+                            "(OoM)   "
+                        )
                         print(
                             f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
                             f"  bpw: {quant_args['K']:5.2f}"

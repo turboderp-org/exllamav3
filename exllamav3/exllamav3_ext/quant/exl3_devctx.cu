@@ -77,3 +77,10 @@ int g_get_num_sms(int device)
 {
     return DevCtx::instance().get_num_sms(device);
 }
+
+void prepare_ctx(int device)
+{
+    DevCtx::instance().get_num_sms(device);
+    DevCtx::instance().get_cc(device);
+    DevCtx::instance().get_locks(device);
+}

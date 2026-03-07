@@ -172,7 +172,7 @@ class RMSNorm(Module):
         if w is not None:
             if w.dim() == 2:
                 w = w[first : last, :]
-            elif w.dim() == 1:
+            elif w.dim() == 1 and module.span_heads:
                 # 1D weight tensor (e.g., span_heads=True norms)
                 # split contains element indices
                 w = w[first : last]
