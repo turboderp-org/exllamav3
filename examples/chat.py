@@ -8,6 +8,7 @@ from chat_util import *
 from chat_io import *
 import torch
 from chat_console import *
+from safetensors.torch import save_file
 
 @torch.inference_mode()
 def main(args):
@@ -25,6 +26,7 @@ def main(args):
     multiline = args.multiline
     show_tps = args.show_tps
     think = args.think
+    last_input_ids = None
     assert not (args.think and args.no_think), "Cannot enable think and no_think modes at the same time"
 
     if args.basic_console:
@@ -78,6 +80,7 @@ def main(args):
             context = []
 
         # Get user prompt
+        enable_healing = False
         if single_prompt is not None:
             # This round, use provided prompt from cmdline
             user_prompt = single_prompt
@@ -112,6 +115,7 @@ def main(args):
                         "/r                 Rewind and repeat last prompt",
                         "/save              Save current session to ~/chat_py_session.json",
                         "/save <filename>   Save current session to file",
+                        "/save_ids          Save last input IDs to last_ids.safetensors",
                         "/sp                Edit system prompt",
                         "/t                 Tokenize context",
                         "/think             Toggle reasoning mode",
@@ -165,8 +169,12 @@ def main(args):
 
                 # Retry last response
                 case "/r":
-                    user_prompt = context[-1][0]
-                    context = context[:-1]
+                    if len(context) == 0:
+                        print_error(f"No last prompt to replay")
+                        continue
+                    else:
+                        user_prompt = context[-1][0]
+                        context = context[:-1]
 
                 # Edit last response
                 case "/e":
@@ -175,6 +183,7 @@ def main(args):
                     last_reply = context[-1][-1]
                     prefix = read_input_fn(args, bot_name, True, last_reply)
                     context = context[:-1]
+                    enable_healing = True
 
                 # Edit system prompt
                 case "/sp":
@@ -205,6 +214,16 @@ def main(args):
                         c.append("~/chat_py_session.json")
                     save_session(c[1], system_prompt, banned_strings, context)
                     print_info(f"Saved session to: {c[1]}")
+                    continue
+
+                # Save IDs
+                case "/save_ids":
+                    if last_input_ids is None:
+                        print_error(f"No IDs to save")
+                    else:
+                        d = {"ids": last_input_ids}
+                    save_file(d, "last_ids.safetensors")
+                    print_info(f"Saved IDs to last_ids.safetensors")
                     continue
 
                 # Load conversation
@@ -258,13 +277,16 @@ def main(args):
                 context = context[1:]
                 ids, exp_len = get_input_ids(prefix)
 
+        last_input_ids = ids.clone()
+
         # Inference
         job = Job(
             input_ids = ids,
             max_new_tokens =  max_response_tokens,
             stop_conditions = stop_conditions,
             sampler = sampler,
-            banned_strings = banned_strings
+            banned_strings = banned_strings,
+            token_healing = enable_healing,
         )
         generator.enqueue(job)
 

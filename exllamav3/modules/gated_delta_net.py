@@ -616,8 +616,7 @@ class GatedDeltaNet(Module):
                 )
 
             # Use chunked rule when advantageous and available
-            # TODO: At least warn if chunked rule (i.e. flash-linear-attention) is not available
-            #       since performance will tank on prompt ingestion
+            # TODO: Replace chunked fn with non-Triton implementation
             if seqlen >= self.num_v_heads and chunk_gated_delta_rule is not None:
                 mixed_qkv = mixed_qkv.transpose(1, 2)
 
