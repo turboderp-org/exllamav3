@@ -2,6 +2,7 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.misc import Timer, cuda_sync_active
+from exllamav3.constants import PAGE_SIZE
 from exllamav3 import model_init
 import torch
 import argparse
@@ -19,7 +20,7 @@ col_gray = "\u001b[37;1m"
 
 @lru_cache
 def cached_ids(length):
-    return torch.arange(length, dtype = torch.long).unsqueeze(0)
+    return torch.ones((1, length), dtype = torch.long)
 
 
 def get_lengths(max_length):
@@ -31,13 +32,35 @@ def get_lengths(max_length):
     return lengths
 
 
+def cache_seq_len(length: int) -> int:
+    return max(((length + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE, PAGE_SIZE)
+
+
 faux_recurrent_states = None
 
 
-def measure_prefill(args, model, cache, warmup = False):
+def resolve_benchmark_attn_backend(config) -> str:
+    from exllamav3.modules.attn import (
+        has_flash_attn_backend,
+        has_flashinfer_backend,
+        resolve_auto_attention_backend,
+    )
+
+    return resolve_auto_attention_backend(
+        config,
+        has_flash_attn_backend(),
+        has_flashinfer_backend(),
+    )
+
+
+def measure_prefill(args, model, cache, attn_mode: str, warmup = False):
     global faux_recurrent_states
     chunk_size = args.chunk_size
-    lengths = get_lengths(chunk_size if warmup else args.max_length)
+    lengths = [
+        length
+        for length in get_lengths(chunk_size if warmup else args.max_length)
+        if cache_seq_len(length) <= cache.max_num_tokens
+    ]
 
     progress = 0
     results = {}
@@ -54,10 +77,10 @@ def measure_prefill(args, model, cache, warmup = False):
                 chunks = [(i, min(i + chunk_size, end)) for i in range(start, end, chunk_size)]
                 for start, end in chunks:
                     params = {
-                        "attn_mode": "flash_attn",
+                        "attn_mode": attn_mode,
                         "cache": cache,
                         "past_len": start,
-                        "batch_shape": (1, max(length, 256)),
+                        "batch_shape": (1, cache_seq_len(length)),
                     }
                     if "recurrent_states" in model.caps and start > 0:
                         for v in faux_recurrent_states.values():
@@ -79,10 +102,14 @@ def measure_prefill(args, model, cache, warmup = False):
     return results
 
 
-def measure_generate(args, model, cache, warmup = False):
+def measure_generate(args, model, cache, attn_mode: str, warmup = False):
     global faux_recurrent_states
     chunk_size = args.chunk_size
-    lengths = [0] + get_lengths(chunk_size if warmup else args.max_length)
+    lengths = [
+        length
+        for length in [0] + get_lengths(chunk_size if warmup else args.max_length)
+        if cache_seq_len(length + 1) <= cache.max_num_tokens
+    ]
     progress = 0
     results = {}
     max_progress = len(lengths)
@@ -92,10 +119,10 @@ def measure_generate(args, model, cache, warmup = False):
             with Timer() as t:
                 for _ in range(100):
                     params = {
-                        "attn_mode": "flash_attn",
+                        "attn_mode": attn_mode,
                         "cache": cache,
                         "past_len": length,
-                        "batch_shape": (1, max(length, 256)),
+                        "batch_shape": (1, cache_seq_len(length + 1)),
                     }
                     if "recurrent_states" in model.caps and length > 0:
                         for v in faux_recurrent_states.values():
@@ -124,21 +151,23 @@ def main(args):
 
     model, config, cache, tokenizer = model_init.init(args, max_chunk_size = args.chunk_size)
     bpw_layer, bpw_head, vram_bits = model.get_storage_info()
+    attn_mode = resolve_benchmark_attn_backend(config)
 
     print(f" -- Bitrate: {bpw_layer:.2f} bpw / {bpw_head:.2f} bpw (head)")
     print(f" -- Chunk size: {args.chunk_size}")
+    print(f" -- Attention backend: {attn_mode}")
     print()
 
     # Test prefill
-    measure_prefill(args, model, cache, warmup = True)
+    measure_prefill(args, model, cache, attn_mode, warmup = True)
     print(f"{col_yellow}Prefill:{col_default}")
-    prefill_results = measure_prefill(args, model, cache)
+    prefill_results = measure_prefill(args, model, cache, attn_mode)
     print()
 
     # Test generation
-    measure_generate(args, model, cache, warmup = True)
+    measure_generate(args, model, cache, attn_mode, warmup = True)
     print(f"{col_yellow}Generation{col_default}")
-    generate_results = measure_generate(args, model, cache)
+    generate_results = measure_generate(args, model, cache, attn_mode)
     print()
 
 
