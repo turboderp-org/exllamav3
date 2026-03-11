@@ -17,6 +17,23 @@ import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 
+def _resolve_generator_attn_backend(requested_mode: str, config: object | None) -> str:
+    if requested_mode != "auto":
+        return requested_mode
+
+    from ..modules.attn import (
+        has_flash_attn_backend,
+        has_flashinfer_backend,
+        resolve_auto_attention_backend,
+    )
+
+    return resolve_auto_attention_backend(
+        config,
+        has_flash_attn_backend(),
+        has_flashinfer_backend(),
+    )
+
+
 class Generator:
 
     def __init__(
@@ -90,6 +107,19 @@ class Generator:
         self.model = model
         self.cache = cache
         self.tokenizer = tokenizer
+        requested_attn_mode = kwargs.get("attn_mode", "auto")
+        if requested_attn_mode not in ("auto", "flash_attn", "flashinfer", "sdpa"):
+            raise ValueError(
+                "Unsupported generator attn_mode "
+                f"'{requested_attn_mode}'. Expected one of: auto, flash_attn, flashinfer, sdpa."
+            )
+        self.attn_mode_policy = requested_attn_mode
+        self.resolved_attn_backend = _resolve_generator_attn_backend(
+            requested_attn_mode,
+            model.config,
+        )
+        self.attn_mode = self.resolved_attn_backend
+        self.attn_mode_nc = f"{self.resolved_attn_backend}_nc"
         cfg = self.model.config
         self.padded_vocab_size = ((cfg.vocab_size + 31) // 32) * 32
 
@@ -482,7 +512,7 @@ class Generator:
         batch_logits = self.model.forward(
             input_ids = batch_ids,
             params = {
-                "attn_mode": "flash_attn",
+                "attn_mode": self.attn_mode,
                 "block_table": block_index,
                 "cache": self.cache,
                 "cache_seqlens": cache_seqlens,
