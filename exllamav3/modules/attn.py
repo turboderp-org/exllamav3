@@ -1,5 +1,8 @@
 from __future__ import annotations
 from typing_extensions import override
+import logging
+import os
+import re
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
@@ -7,11 +10,424 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
-from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+
+try:
+    from flash_attn import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
+except ImportError:
+    flash_attn_func = None
+    flash_attn_varlen_func = None
+    flash_attn_with_kvcache = None
+
+try:
+    import flashinfer
+except ImportError:
+    flashinfer = None
+
+_FLASHINFER_WORKSPACE_DEFAULT_BYTES = 128 * 1024 * 1024
+_FLASHINFER_WORKSPACE_MIN_BYTES = 16 * 1024 * 1024
+_FLASHINFER_WORKSPACE_ROUND_BYTES = 8 * 1024 * 1024
+_FLASHINFER_WORKSPACE_GROWTH_MARGIN_BYTES = 16 * 1024 * 1024
+_FLASHINFER_WORKSPACE: dict[tuple[str, int | None], torch.Tensor] = {}
+_FLASHINFER_PREFILL_WRAPPERS: dict[
+    tuple[str, int | None],
+    flashinfer.BatchPrefillWithPagedKVCacheWrapper
+] = {}
+_FLASHINFER_DECODE_WRAPPERS: dict[
+    tuple[str, int | None, str, bool],
+    flashinfer.BatchDecodeWithPagedKVCacheWrapper
+] = {}
+_FLASHINFER_RUNTIME_STATS_ENABLED = os.getenv("EXLLAMAV3_RUNTIME_STATS", "").lower() in ("1", "true", "yes", "on")
+_FLASHINFER_RUNTIME_STATS_INTERVAL = max(int(os.getenv("EXLLAMAV3_RUNTIME_STATS_INTERVAL", "256")), 1)
+_FLASHINFER_RUNTIME_LOG = logging.getLogger("exllamav3.runtime.flashinfer")
+_FLASHINFER_RUNTIME_STATS = {
+    "decode_wrapper_creates": 0,
+    "prefill_wrapper_creates": 0,
+    "decode_plan_calls": 0,
+    "decode_plan_reuses": 0,
+    "prefill_plan_calls": 0,
+    "prefill_plan_reuses": 0,
+    "workspace_grows": 0,
+}
+
+
+def has_flash_attn_backend() -> bool:
+    return (
+        flash_attn_func is not None
+        and flash_attn_varlen_func is not None
+        and flash_attn_with_kvcache is not None
+    )
+
+
+def has_flashinfer_backend() -> bool:
+    return flashinfer is not None
+
+
+def _get_backend_policy_traits(config: object | None) -> dict[str, object]:
+    config_dict = getattr(config, "config_dict", {}) or {}
+    primary_cfg = config_dict
+    for key in ("text_config", "language_config"):
+        candidate = config_dict.get(key)
+        if isinstance(candidate, dict):
+            primary_cfg = candidate
+            break
+
+    def _get_int(key: str) -> int | None:
+        value = primary_cfg.get(key, config_dict.get(key))
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    architecture = getattr(config, "architecture", None)
+    q_heads = _get_int("num_attention_heads")
+    kv_heads = _get_int("num_key_value_heads")
+    kv_lora_rank = _get_int("kv_lora_rank")
+    qk_nope_head_dim = _get_int("qk_nope_head_dim")
+    qk_rope_head_dim = _get_int("qk_rope_head_dim")
+    v_head_dim = _get_int("v_head_dim")
+    sliding_window = _get_int("sliding_window")
+    use_sliding_window = bool(
+        primary_cfg.get("use_sliding_window", config_dict.get("use_sliding_window", False))
+    )
+
+    gqa_ratio = None
+    if (
+        q_heads is not None
+        and kv_heads is not None
+        and kv_heads > 0
+        and q_heads % kv_heads == 0
+    ):
+        gqa_ratio = q_heads // kv_heads
+
+    return {
+        "architecture": architecture,
+        "gqa_ratio": gqa_ratio,
+        "mla_required": (
+            kv_lora_rank is not None
+            and qk_nope_head_dim is not None
+            and qk_rope_head_dim is not None
+            and v_head_dim is not None
+        ),
+        "has_sliding_window": (
+            (sliding_window is not None and sliding_window > 0) or use_sliding_window
+        ),
+    }
+
+
+def resolve_auto_attention_backend(
+    config: object | None,
+    flash_attn_available: bool,
+    flashinfer_available: bool,
+) -> str:
+    traits = _get_backend_policy_traits(config)
+    architecture = traits["architecture"]
+    gqa_ratio = traits["gqa_ratio"]
+    mla_required = traits["mla_required"]
+    has_sliding_window = traits["has_sliding_window"]
+
+    # MLA support is a hard flashinfer requirement.
+    if mla_required:
+        if flashinfer_available:
+            return "flashinfer"
+        raise RuntimeError(
+            "This model requires flashinfer backend for MLA support."
+        )
+
+    # Exaone4 with SWA is not a good fit for flash-attn at long context, but this
+    # branch does not yet implement a cached causal SDPA attention path. Do not
+    # auto-select an unsupported backend; prefer flash-attn when available and
+    # otherwise fall back to flashinfer.
+    if architecture == "Exaone4ForCausalLM" and has_sliding_window:
+        if flash_attn_available:
+            return "flash_attn"
+        if flashinfer_available:
+            return "flashinfer"
+        raise RuntimeError(
+            "No cache-capable attention backend is installed (need flash-attn or flashinfer)."
+        )
+
+    # Known flashinfer native non-tc decode gaps. Prefer flash-attn if present,
+    # otherwise fall back to flashinfer rather than auto-selecting an unsupported
+    # causal SDPA path.
+    if gqa_ratio in (5, 12):
+        if flash_attn_available:
+            return "flash_attn"
+        if flashinfer_available:
+            return "flashinfer"
+        raise RuntimeError(
+            "No cache-capable attention backend is installed (need flash-attn or flashinfer)."
+        )
+
+    if flash_attn_available:
+        return "flash_attn"
+    if flashinfer_available:
+        return "flashinfer"
+    raise RuntimeError(
+        "No cache-capable attention backend is installed (need flash-attn or flashinfer)."
+    )
+
+
+def _resolve_attn_mode(requested_mode: str, params: dict) -> str:
+    if requested_mode in ("flash_attn", "flash_attn_nc") and not has_flash_attn_backend():
+        raise RuntimeError("flash-attn backend requested but flash_attn is not installed")
+    if requested_mode in ("flashinfer", "flashinfer_nc") and not has_flashinfer_backend():
+        raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
+
+    if requested_mode == "auto":
+        if has_flash_attn_backend():
+            return "flash_attn"
+        if has_flashinfer_backend():
+            return "flashinfer"
+        raise RuntimeError("No cache-capable attention backend is installed (need flash-attn or flashinfer)")
+
+    if requested_mode == "auto_nc":
+        if has_flash_attn_backend():
+            return "flash_attn_nc"
+        if has_flashinfer_backend():
+            return "flashinfer_nc"
+        return "sdpa_nc"
+
+    return requested_mode
+
+
+def _flashinfer_runtime_stat(key: str, amount: int = 1):
+    if not _FLASHINFER_RUNTIME_STATS_ENABLED:
+        return
+    _FLASHINFER_RUNTIME_STATS[key] += amount
+    total_plan_events = (
+        _FLASHINFER_RUNTIME_STATS["decode_plan_calls"] +
+        _FLASHINFER_RUNTIME_STATS["decode_plan_reuses"] +
+        _FLASHINFER_RUNTIME_STATS["prefill_plan_calls"]
+    )
+    if total_plan_events and total_plan_events % _FLASHINFER_RUNTIME_STATS_INTERVAL == 0:
+        decode_total = (
+            _FLASHINFER_RUNTIME_STATS["decode_plan_calls"] +
+            _FLASHINFER_RUNTIME_STATS["decode_plan_reuses"]
+        )
+        decode_reuse_rate = (
+            _FLASHINFER_RUNTIME_STATS["decode_plan_reuses"] / decode_total
+            if decode_total else 0.0
+        )
+        prefill_total = (
+            _FLASHINFER_RUNTIME_STATS["prefill_plan_calls"] +
+            _FLASHINFER_RUNTIME_STATS["prefill_plan_reuses"]
+        )
+        prefill_reuse_rate = (
+            _FLASHINFER_RUNTIME_STATS["prefill_plan_reuses"] / prefill_total
+            if prefill_total else 0.0
+        )
+        _FLASHINFER_RUNTIME_LOG.info(
+            "flashinfer runtime stats: decode_plans=%d decode_reuses=%d "
+            "decode_reuse_rate=%.2f prefill_plans=%d prefill_reuses=%d "
+            "prefill_reuse_rate=%.2f decode_wrappers=%d "
+            "prefill_wrappers=%d workspace_grows=%d",
+            _FLASHINFER_RUNTIME_STATS["decode_plan_calls"],
+            _FLASHINFER_RUNTIME_STATS["decode_plan_reuses"],
+            decode_reuse_rate,
+            _FLASHINFER_RUNTIME_STATS["prefill_plan_calls"],
+            _FLASHINFER_RUNTIME_STATS["prefill_plan_reuses"],
+            prefill_reuse_rate,
+            _FLASHINFER_RUNTIME_STATS["decode_wrapper_creates"],
+            _FLASHINFER_RUNTIME_STATS["prefill_wrapper_creates"],
+            _FLASHINFER_RUNTIME_STATS["workspace_grows"],
+        )
+
+
+def _round_up_workspace_size(num_bytes: int) -> int:
+    num_bytes = max(num_bytes, _FLASHINFER_WORKSPACE_MIN_BYTES)
+    round_bytes = _FLASHINFER_WORKSPACE_ROUND_BYTES
+    return ((num_bytes + round_bytes - 1) // round_bytes) * round_bytes
+
+
+def _get_workspace_size_from_env() -> int:
+    raw_bytes = os.getenv("EXLLAMAV3_FLASHINFER_WORKSPACE_BUFFER_SIZE")
+    if raw_bytes is not None:
+        try:
+            return _round_up_workspace_size(int(raw_bytes))
+        except ValueError:
+            pass
+
+    raw_mb = os.getenv("EXLLAMAV3_FLASHINFER_WORKSPACE_MB")
+    if raw_mb is not None:
+        try:
+            return _round_up_workspace_size(int(raw_mb) * 1024 * 1024)
+        except ValueError:
+            pass
+
+    return _round_up_workspace_size(_FLASHINFER_WORKSPACE_DEFAULT_BYTES)
+
+
+_FLASHINFER_WORKSPACE_BYTES = _get_workspace_size_from_env()
+
+
+def _parse_workspace_overflow_message(message: str) -> tuple[int, int] | None:
+    match = re.search(
+        r"with size\s+(\d+)\s+and alignment\s+\d+,\s+but only\s+(\d+)\s+bytes available",
+        message,
+    )
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def grow_flashinfer_workspace_for_exception(
+    device: torch.device | None,
+    exc: BaseException,
+) -> bool:
+    if device is None or not isinstance(exc, RuntimeError):
+        return False
+    parsed = _parse_workspace_overflow_message(str(exc))
+    if parsed is None:
+        return False
+
+    required_bytes, available_bytes = parsed
+    target_bytes = max(
+        int(required_bytes * 1.25),
+        required_bytes + _FLASHINFER_WORKSPACE_GROWTH_MARGIN_BYTES,
+        available_bytes * 2,
+    )
+    target_bytes = _round_up_workspace_size(target_bytes)
+
+    global _FLASHINFER_WORKSPACE_BYTES
+    if target_bytes <= _FLASHINFER_WORKSPACE_BYTES:
+        target_bytes = _round_up_workspace_size(_FLASHINFER_WORKSPACE_BYTES * 2)
+    _FLASHINFER_WORKSPACE_BYTES = target_bytes
+
+    key = (device.type, device.index)
+    _FLASHINFER_WORKSPACE.pop(key, None)
+    _FLASHINFER_PREFILL_WRAPPERS.pop(key, None)
+
+    for wrapper_key in tuple(_FLASHINFER_DECODE_WRAPPERS.keys()):
+        if wrapper_key[0] == device.type and wrapper_key[1] == device.index:
+            _FLASHINFER_DECODE_WRAPPERS.pop(wrapper_key, None)
+
+    _flashinfer_runtime_stat("workspace_grows")
+    return True
+
+
+def get_flashinfer_workspace(device: torch.device) -> torch.Tensor:
+    if not has_flashinfer_backend():
+        raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
+    key = (device.type, device.index)
+    workspace = _FLASHINFER_WORKSPACE.get(key)
+    if (
+        workspace is None
+        or workspace.device != device
+        or workspace.numel() < _FLASHINFER_WORKSPACE_BYTES
+    ):
+        workspace = torch.empty(_FLASHINFER_WORKSPACE_BYTES, dtype = torch.uint8, device = device)
+        _FLASHINFER_WORKSPACE[key] = workspace
+    return workspace
+
+
+def get_flashinfer_decode_wrapper_shared(
+    device: torch.device,
+    backend: str = "auto",
+    use_tensor_cores: bool = False,
+    plan_key: tuple | None = None,
+) -> flashinfer.BatchDecodeWithPagedKVCacheWrapper:
+    if not has_flashinfer_backend():
+        raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
+    key = (device.type, device.index, backend, use_tensor_cores)
+    if plan_key is not None:
+        key = key + tuple(plan_key)
+    wrapper = _FLASHINFER_DECODE_WRAPPERS.get(key)
+    if wrapper is None:
+        workspace = get_flashinfer_workspace(device)
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace,
+            kv_layout = "NHD",
+            backend = backend,
+            use_tensor_cores = use_tensor_cores,
+        )
+        _FLASHINFER_DECODE_WRAPPERS[key] = wrapper
+        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+            _flashinfer_runtime_stat("decode_wrapper_creates")
+    return wrapper
+
+
+def get_flashinfer_prefill_wrapper_shared(
+    device: torch.device,
+) -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
+    if not has_flashinfer_backend():
+        raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
+    key = (device.type, device.index)
+    wrapper = _FLASHINFER_PREFILL_WRAPPERS.get(key)
+    if wrapper is None:
+        workspace = get_flashinfer_workspace(device)
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace,
+            kv_layout = "NHD",
+        )
+        _FLASHINFER_PREFILL_WRAPPERS[key] = wrapper
+        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+            _flashinfer_runtime_stat("prefill_wrapper_creates")
+    return wrapper
+
+
+def can_reuse_flashinfer_decode_plan(
+    decode_wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+) -> bool:
+    if decode_wrapper.use_tensor_cores:
+        return False
+
+    paged_kv_indptr_buf = getattr(decode_wrapper, "_paged_kv_indptr_buf", None)
+    paged_kv_indices_buf = getattr(decode_wrapper, "_paged_kv_indices_buf", None)
+    paged_kv_last_page_len_buf = getattr(decode_wrapper, "_paged_kv_last_page_len_buf", None)
+    plan_info = getattr(decode_wrapper, "_plan_info", None)
+    if (
+        plan_info is None
+        or paged_kv_indptr_buf is None
+        or paged_kv_indices_buf is None
+        or paged_kv_last_page_len_buf is None
+    ):
+        return False
+    if (
+        paged_kv_indptr_buf.numel() != kv_indptr.numel()
+        or paged_kv_indices_buf.numel() != kv_indices.numel()
+        or paged_kv_last_page_len_buf.numel() != kv_last_page_len.numel()
+    ):
+        return False
+
+    # flashinfer's non-tensor-core decode plan is tied to the per-request page
+    # layout (`indptr`). The actual page indices can still change across
+    # requests, so callers must refresh the wrapper's indices buffer even when
+    # the plan itself can be reused.
+    return torch.equal(paged_kv_indptr_buf, kv_indptr)
+
+
+def make_paged_kv_metadata(
+    block_table: torch.Tensor,
+    kv_lens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    kv_lens = kv_lens.to(dtype = torch.int32)
+    num_pages = torch.div(kv_lens + PAGE_SIZE - 1, PAGE_SIZE, rounding_mode = "floor")
+    block_table_i32 = block_table.to(dtype = torch.int32)
+    if block_table_i32.shape[0] == 1:
+        indices = block_table_i32[0, :int(num_pages[0].item())].contiguous()
+    else:
+        page_slices = [
+            block_table_i32[row, :count]
+            for row, count in enumerate(num_pages.tolist())
+            if count > 0
+        ]
+        if page_slices:
+            indices = torch.cat(page_slices, dim = 0).contiguous()
+        else:
+            indices = torch.empty((0,), dtype = torch.int32, device = block_table_i32.device)
+    indptr = torch.empty((kv_lens.numel() + 1,), dtype = torch.int32, device = block_table.device)
+    indptr[0] = 0
+    indptr[1:] = torch.cumsum(num_pages, dim = 0)
+    last_page_len = torch.where(
+        kv_lens > 0,
+        torch.remainder(kv_lens - 1, PAGE_SIZE) + 1,
+        torch.ones_like(kv_lens)
+    )
+    return indptr.contiguous(), indices.contiguous(), last_page_len.contiguous()
 
 """
 SDPA:
@@ -25,9 +441,11 @@ SDPA:
     - batch shape is determined by shape of input_ids
     - no logit softcap support (Gemma)
                     
-Flash Attention:
+Flash Attention / FlashInfer:
                 
     attn_mode: "flash_attn"
+    attn_mode: "flashinfer"
+    attn_mode: "auto"
     batch_shape: tuple of (bsz, max_seq_len)
     cache: Cache with capacity of at least bsz*max_seq_len tokens
     past_len: int, *OR*
@@ -45,6 +463,8 @@ Flash Attention:
     position_ids: shape (bsz, seq_len) (overrides cache_seqlens for position emb)
 
     attn_mode: "flash_attn_nc"
+    attn_mode: "flashinfer_nc"
+    attn_mode: "auto_nc"
     position (optional, default = 0): int *OR*
     positions: shape (bsz) *OR*
     position_ids: shape (bsz, seq_len)    
@@ -63,6 +483,10 @@ def prepare_flash_attn_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor
     assert "cache" not in params, \
         f"Cache provided for attn_mode: sdpa_nc"
     return input_ids
+
+
+def prepare_flashinfer_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+    return prepare_flash_attn_nc(input_ids, params)
 
 
 def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
@@ -107,18 +531,100 @@ def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     return input_ids
 
 
+def prepare_flashinfer(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+    bsz, seq_len = input_ids.shape
+
+    if "batch_shape" in params:
+        cache = params["cache"]
+        cache_bsz, cache_max_seq_len = params["batch_shape"]
+        past_len = params.get("past_len")
+        cache_seqlens = params.get("cache_seqlens") if past_len is None else None
+        position = params.get("position") if past_len is None else None
+        positions = params.get("positions") if past_len is None else None
+        position_ids = params.get("position_ids") if past_len is None else None
+        assert cache_bsz >= bsz, "batch size too large for cache"
+        assert cache_max_seq_len % PAGE_SIZE == 0, f"cache seq len must be a multiple of {PAGE_SIZE}"
+        assert bsz * cache_max_seq_len <= cache.max_num_tokens, "Cache too small for batch shape"
+        cache_bsz = min(bsz, cache_bsz)
+        num_pages = cache_bsz * cache_max_seq_len // PAGE_SIZE
+        block_table = torch.arange(num_pages, dtype = torch.int32).view(cache_bsz, cache_max_seq_len // PAGE_SIZE)
+        if past_len is not None:
+            cache_seqlens = torch.tensor([past_len], dtype = torch.int32).repeat(bsz)
+            if position is None: position = past_len
+        else:
+            if positions is None and position_ids is None: positions = cache_seqlens
+        if position is None: position = 0
+        params["block_table"] = block_table
+        params["cache_seqlens"] = cache_seqlens
+        params["position"] = position
+        params["positions"] = positions
+        params["position_ids"] = position_ids
+
+    elif "block_table" in params:
+        positions = params.get("positions")
+        position_ids = params.get("position_ids")
+        cache_seqlens = params.get("cache_seqlens")
+        if positions is None and position_ids is None: positions = cache_seqlens
+        params["cache_seqlens"] = cache_seqlens
+        params["positions"] = positions
+        params["position_ids"] = position_ids
+
+    # Precompute flashinfer metadata once per forward call and reuse it in
+    # every attention layer to reduce Python-side decode overhead.
+    block_table = params.get("block_table")
+    cache_seqlens = params.get("cache_seqlens")
+    if block_table is not None and cache_seqlens is not None:
+        cache_seqlens = cache_seqlens.to(dtype = torch.int32).contiguous()
+        block_table = block_table.to(dtype = torch.int32).contiguous()
+        token_offsets = torch.arange(seq_len, dtype = torch.int32, device = cache_seqlens.device)
+        batch_ids = (
+            torch.arange(bsz, dtype = torch.int32, device = cache_seqlens.device)
+            .view(-1, 1)
+            .expand(-1, seq_len)
+            .reshape(-1)
+            .contiguous()
+        )
+        token_positions = (
+            cache_seqlens.view(-1, 1)
+            + token_offsets.view(1, -1)
+        ).reshape(-1).contiguous()
+        kv_lens = cache_seqlens + seq_len
+        kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_metadata(block_table, kv_lens)
+        qo_indptr = torch.arange(
+            0,
+            (bsz + 1) * seq_len,
+            seq_len,
+            dtype = torch.int32,
+            device = cache_seqlens.device
+        )
+        params["flashinfer_batch_ids"] = batch_ids
+        params["flashinfer_token_positions"] = token_positions
+        params["flashinfer_kv_indptr"] = kv_indptr
+        params["flashinfer_kv_indices"] = kv_indices
+        params["flashinfer_kv_last_page_len"] = kv_last_page_len
+        params["flashinfer_qo_indptr"] = qo_indptr
+        params["flashinfer_kv_lens"] = kv_lens.contiguous()
+
+    return input_ids
+
+
 def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     """
     Add attn parameters to state
     """
-    attn_mode = params.get("attn_mode", "flash_attn_nc")
+    attn_mode = _resolve_attn_mode(params.get("attn_mode", "auto_nc"), params)
+    params["_resolved_attn_mode"] = attn_mode
     match attn_mode:
         case "sdpa_nc":
             return prepare_sdpa_nc(input_ids, params)
         case "flash_attn":
             return prepare_flash_attn(input_ids, params)
+        case "flashinfer":
+            return prepare_flashinfer(input_ids, params)
         case "flash_attn_nc":
             return prepare_flash_attn_nc(input_ids, params)
+        case "flashinfer_nc":
+            return prepare_flashinfer_nc(input_ids, params)
         case _:
             raise ValueError(f"Unknown attn_mode: {attn_mode}")
 
@@ -144,7 +650,7 @@ class Attention(Module):
         key_fused_qkv: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
-        sliding_window: int = -1,
+        sliding_window: int  = -1,
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
@@ -177,6 +683,8 @@ class Attention(Module):
         self.use_cu_seqlens = use_cu_seqlens
         self.post_rope_norm = post_rope_norm
         self.tp_split_norm = tp_split_norm
+        self.g_proj = None
+        self.headwise_gate = False
 
         if post_rope_norm:
             assert q_norm is None and k_norm is None, \
@@ -185,7 +693,6 @@ class Attention(Module):
         if self.num_kv_heads == 0:
             return
 
-        # Create q, k, v projections
         if key_fused_qkv:
             assert not interleaved_gate, "Attn: interleaved_gate not implemented for fused QKV tensor"
             fkey = f"{key}.{key_fused_qkv}"
@@ -221,7 +728,6 @@ class Attention(Module):
                 self.register_submodule(self.k_proj)
                 self.register_submodule(self.v_proj)
 
-        # Create o proj
         if key_o:
             self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o", out_dtype = out_dtype, qbits_mod_key = "o")
             self.register_submodule(self.o_proj)
@@ -230,7 +736,6 @@ class Attention(Module):
             self.o_proj = o_proj
             self.register_submodule(self.o_proj)
 
-        # Register q/k norms
         if q_norm:
             assert k_norm, "Must have both Q and K norms, or neither"
             self.q_norm = q_norm
@@ -250,21 +755,24 @@ class Attention(Module):
             self.norm_eps = 1e-6
             self.norm_constant_bias = 0.0
 
-        # Register headwise gate
         if key_g:
             assert not interleaved_gate, \
                 "Cannot apply both interleaved and headwise gate"
-            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, num_q_heads, qmap = None, out_dtype = torch.half, pad_to = 1)
+            self.g_proj = Linear(
+                config,
+                f"{key}.{key_g}",
+                hidden_size,
+                num_q_heads,
+                qmap = None,
+                out_dtype = torch.half,
+                pad_to = 1,
+            )
             self.headwise_gate = True
             self.register_submodule(self.g_proj)
-        else:
-            if g_proj:
-                self.g_proj = g_proj
-                self.headwise_gate = True
-                self.register_submodule(self.g_proj)
-            else:
-                self.g_proj = None
-                self.headwise_gate = False
+        elif g_proj:
+            self.g_proj = g_proj
+            self.headwise_gate = True
+            self.register_submodule(self.g_proj)
 
         self.caps.update({
             "kv_cache": True
@@ -277,13 +785,11 @@ class Attention(Module):
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
+        self.flashinfer_prefill_wrapper = None
+        self.flashinfer_decode_wrapper = None
+        self.flashinfer_decode_wrapper_failed = False
 
         self.has_split_cache = False
-
-        # TP-aware span_heads norm support
-        self.tp_span_heads_norm = False
-        self.q_global_dim = 0
-        self.k_global_dim = 0
 
 
     @override
@@ -349,6 +855,9 @@ class Attention(Module):
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
+        self.flashinfer_prefill_wrapper = None
+        self.flashinfer_decode_wrapper = None
+        self.flashinfer_decode_wrapper_failed = False
 
 
     @override
@@ -365,14 +874,21 @@ class Attention(Module):
                 params["backend"].all_reduce(x, False)
         else:
             bsz, seqlen, _ = x.shape
-            attn_mode = params.get("attn_mode", "flash_attn_nc")
+            attn_mode = params.get("_resolved_attn_mode")
+            if attn_mode is None:
+                attn_mode = _resolve_attn_mode(params.get("attn_mode", "auto_nc"), params)
+                params["_resolved_attn_mode"] = attn_mode
             match attn_mode:
                 case "sdpa_nc":
                     x = self.decode_sdpa_nc(x, bsz, seqlen, params)
                 case "flash_attn":
                     x = self.decode_flash_attn(x, bsz, seqlen, params)
+                case "flashinfer":
+                    x = self.decode_flashinfer(x, bsz, seqlen, params)
                 case "flash_attn_nc":
                     x = self.decode_flash_attn_nc(x, bsz, seqlen, params)
+                case "flashinfer_nc":
+                    x = self.decode_flashinfer_nc(x, bsz, seqlen, params)
                 case _:
                     raise ValueError(f"Unknown attn_mode: {attn_mode}")
             if self.tp_reduce:
@@ -430,66 +946,83 @@ class Attention(Module):
         return x
 
 
-    def apply_qk_norms_tp(
+    def get_flashinfer_prefill_wrapper(self) -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
+        if self.flashinfer_prefill_wrapper is None:
+            self.flashinfer_prefill_wrapper = get_flashinfer_prefill_wrapper_shared(self.device)
+        return self.flashinfer_prefill_wrapper
+
+
+    def get_flashinfer_decode_wrapper(
         self,
-        q: torch.Tensor,
+        backend: str = "auto",
+        use_tensor_cores: bool = False,
+    ) -> flashinfer.BatchDecodeWithPagedKVCacheWrapper | None:
+        if self.flashinfer_decode_wrapper_failed:
+            return None
+        wrapper = get_flashinfer_decode_wrapper_shared(
+            self.device,
+            backend = backend,
+            use_tensor_cores = use_tensor_cores,
+            plan_key = (
+                self.num_q_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.sliding_window,
+                self.logit_softcapping,
+            ),
+        )
+        self.flashinfer_decode_wrapper = wrapper
+        return self.flashinfer_decode_wrapper
+
+
+    def append_paged_kv_cache(
+        self,
         k: torch.Tensor,
-        params: dict,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply Q/K RMSNorm with TP-aware variance reduction.
-        Used when span_heads=True and tp_reduce=True.
-
-        The variance is computed locally, then all-reduced across TP ranks
-        to get the true global variance.
-        """
-        backend = params["backend"]
-        orig_q_shape = q.shape
-        orig_k_shape = k.shape
-        bsz, seq_len = q.shape[0], q.shape[1]
-
-        # Flatten head dimension for norm computation: (bsz, seq, num_heads*head_dim)
-        q_flat = q.view(bsz, seq_len, -1).float()
-        k_flat = k.view(bsz, seq_len, -1).float()
-
-        # Compute local sum of squares
-        q_sq_sum = q_flat.pow(2).sum(dim=-1, keepdim=True)
-        k_sq_sum = k_flat.pow(2).sum(dim=-1, keepdim=True)
-
-        # Native TP backend requires data_size (numel * 2 bytes) to be multiple of 16.
-        # So numel must be multiple of 8. We have 2 values (q, k) per position.
-        # Flatten to 1D and pad to multiple of 8 elements.
-        qk_sq_sum = torch.cat([q_sq_sum.view(-1), k_sq_sum.view(-1)])  # (bsz*seq_len*2,)
-        numel = qk_sq_sum.numel()
-        pad_to = (numel + 7) // 8 * 8
-        if pad_to > numel:
-            qk_sq_sum = torch.nn.functional.pad(qk_sq_sum, (0, pad_to - numel))
-        backend.all_reduce(qk_sq_sum)
-        # Extract back (first half is q, second half is k)
-        half = bsz * seq_len
-        q_sq_sum = qk_sq_sum[:half].view(bsz, seq_len, 1)
-        k_sq_sum = qk_sq_sum[half:half*2].view(bsz, seq_len, 1)
-
-        # Compute global variance (sum / global_dim)
-        q_var = q_sq_sum / self.q_global_dim
-        k_var = k_sq_sum / self.k_global_dim
-
-        # Compute normalization factors
-        q_rmf = torch.rsqrt(q_var + self.norm_eps)
-        k_rmf = torch.rsqrt(k_var + self.norm_eps)
-
-        # Get weights (handle constant_bias if needed)
-        q_w = self.q_norm.weight
-        k_w = self.k_norm.weight
-        if self.norm_constant_bias != 0.0:
-            q_w = q_w + self.norm_constant_bias
-            k_w = k_w + self.norm_constant_bias
-
-        # Apply normalization and reshape back
-        q = (q_flat * q_rmf * q_w).half().view(orig_q_shape)
-        k = (k_flat * k_rmf * k_w).half().view(orig_k_shape)
-
-        return q, k
+        v: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        batch_ids: torch.Tensor | None = None,
+        token_positions: torch.Tensor | None = None,
+        kv_indptr: torch.Tensor | None = None,
+        kv_indices: torch.Tensor | None = None,
+        kv_last_page_len: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not has_flashinfer_backend():
+            raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
+        bsz, q_len, _, _ = k.shape
+        if batch_ids is None:
+            batch_ids = (
+                torch.arange(bsz, dtype = torch.int32, device = k.device)
+                .view(-1, 1)
+                .expand(-1, q_len)
+                .reshape(-1)
+                .contiguous()
+            )
+        if token_positions is None:
+            token_offsets = torch.arange(q_len, dtype = torch.int32, device = k.device)
+            token_positions = (
+                cache_seqlens.to(dtype = torch.int32).view(-1, 1)
+                + token_offsets.view(1, -1)
+            ).reshape(-1).contiguous()
+        append_k = k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+        append_v = v.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+        if kv_indptr is None or kv_indices is None or kv_last_page_len is None:
+            kv_lens = cache_seqlens.to(dtype = torch.int32) + q_len
+            kv_indptr, kv_indices, kv_last_page_len = make_paged_kv_metadata(block_table, kv_lens)
+        flashinfer.append_paged_kv_cache(
+            append_k,
+            append_v,
+            batch_ids,
+            token_positions,
+            (cache_k, cache_v),
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            kv_layout = "NHD",
+        )
+        return kv_indptr, kv_indices, kv_last_page_len
 
 
     def decode_sdpa_nc(
@@ -515,13 +1048,9 @@ class Attention(Module):
         assert self.logit_softcapping == 0.0, \
             "Torch SDPA does not support logit softcapping"
 
-        if self.q_norm:
-            if self.tp_span_heads_norm:
-                # TP-aware path for span_heads=True
-                q, k = self.apply_qk_norms_tp(q, k, params)
-            elif not self.rope or self.q_norm_tensor is None:
-                q = self.q_norm.forward(q, params, out_dtype = torch.half)
-                k = self.k_norm.forward(k, params, out_dtype = torch.half)
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
             q, k = self.rope.apply(
@@ -530,8 +1059,8 @@ class Attention(Module):
                 positions,
                 position_ids,
                 True,
-                self.q_norm_tensor if not self.tp_span_heads_norm else None,
-                self.k_norm_tensor if not self.tp_span_heads_norm else None,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
                 self.norm_eps,
                 self.norm_constant_bias,
                 inv_freq,
@@ -543,9 +1072,7 @@ class Attention(Module):
         v = v.transpose(1, 2)
         o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa, scale = self.sm_scale)
         o = o.transpose(1, 2)
-
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -559,6 +1086,9 @@ class Attention(Module):
         seqlen: int,
         params: dict,
     ):
+        if not has_flash_attn_backend():
+            raise RuntimeError("flash-attn backend requested but flash_attn is not installed")
+
         causal = params.get("causal", True)
         position = params.get("position", 0)
         positions = get_for_device(params, "positions", self.device, None)
@@ -570,13 +1100,9 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        if self.q_norm:
-            if self.tp_span_heads_norm:
-                # TP-aware path for span_heads=True
-                q, k = self.apply_qk_norms_tp(q, k, params)
-            elif not self.rope or self.q_norm_tensor is None:
-                q = self.q_norm.forward(q, params, out_dtype = torch.half)
-                k = self.k_norm.forward(k, params, out_dtype = torch.half)
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
             q, k = self.rope.apply(
@@ -585,8 +1111,8 @@ class Attention(Module):
                 positions,
                 position_ids,
                 True,
-                self.q_norm_tensor if not self.tp_span_heads_norm else None,
-                self.k_norm_tensor if not self.tp_span_heads_norm else None,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
                 self.norm_eps,
                 self.norm_constant_bias,
                 inv_freq,
@@ -627,6 +1153,141 @@ class Attention(Module):
         return o
 
 
+    def decode_flashinfer_nc(
+        self,
+        x: torch.Tensor,
+        bsz: int,
+        seqlen: int,
+        params: dict,
+    ):
+        if not has_flashinfer_backend():
+            raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
+        causal = params.get("causal", True)
+        position = params.get("position", 0)
+        positions = get_for_device(params, "positions", self.device, None)
+        position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
+
+        q, k, v, g = self.project_qkv(x, params)
+        q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
+        k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
+
+        if self.rope:
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
+                self.norm_eps,
+                self.norm_constant_bias,
+                inv_freq,
+                self.post_rope_norm
+            )
+
+        def _sdpa_nc_fallback() -> torch.Tensor:
+            assert self.sliding_window < 0, \
+                "Torch SDPA fallback does not support sliding window attention (SWA)"
+            assert self.logit_softcapping == 0.0, \
+                "Torch SDPA fallback does not support logit softcapping"
+
+            if self.use_cu_seqlens and (cu_seqlens := get_for_device(params, "cu_seqlens", self.device, None)) is not None:
+                q_ = q.squeeze(0)
+                k_ = k.squeeze(0)
+                v_ = v.squeeze(0)
+                out_segs = []
+                for i in range(cu_seqlens.numel() - 1):
+                    a = cu_seqlens[i].item()
+                    b = cu_seqlens[i + 1].item()
+                    out_seg = F.scaled_dot_product_attention(
+                        q_[a:b].transpose(0, 1).unsqueeze(0),
+                        k_[a:b].transpose(0, 1).unsqueeze(0),
+                        v_[a:b].transpose(0, 1).unsqueeze(0),
+                        is_causal = causal,
+                        enable_gqa = self.gqa,
+                        scale = self.sm_scale,
+                    )
+                    out_segs.append(out_seg.squeeze(0).transpose(0, 1))
+                return torch.cat(out_segs, dim = 0).unsqueeze(0)
+
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                is_causal = causal,
+                enable_gqa = self.gqa,
+                scale = self.sm_scale,
+            ).transpose(1, 2)
+
+        if not causal:
+            o = _sdpa_nc_fallback()
+            if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+            o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+            if self.interleaved_gate: o *= g.sigmoid()
+            o = self.project_o(o, bsz, seqlen, params)
+            return o
+
+        window_left = self.sliding_window if self.sliding_window >= 0 else -1
+        logits_soft_cap = self.logit_softcapping if self.logit_softcapping > 0 else None
+
+        try:
+            if self.use_cu_seqlens and (cu_seqlens := get_for_device(params, "cu_seqlens", self.device, None)) is not None:
+                q_ = q.squeeze(0)
+                k_ = k.squeeze(0)
+                v_ = v.squeeze(0)
+                out_segs = []
+                for i in range(cu_seqlens.numel() - 1):
+                    a = cu_seqlens[i].item()
+                    b = cu_seqlens[i + 1].item()
+                    out_segs.append(
+                        flashinfer.single_prefill_with_kv_cache(
+                            q_[a:b],
+                            k_[a:b],
+                            v_[a:b],
+                            causal = causal,
+                            kv_layout = "NHD",
+                            pos_encoding_mode = "NONE",
+                            sm_scale = self.sm_scale,
+                            window_left = window_left,
+                            logits_soft_cap = logits_soft_cap,
+                        )
+                    )
+                o = torch.cat(out_segs, dim = 0).unsqueeze(0)
+            else:
+                o = torch.stack([
+                    flashinfer.single_prefill_with_kv_cache(
+                        q[i],
+                        k[i],
+                        v[i],
+                        causal = causal,
+                        kv_layout = "NHD",
+                        pos_encoding_mode = "NONE",
+                        sm_scale = self.sm_scale,
+                        window_left = window_left,
+                        logits_soft_cap = logits_soft_cap,
+                    )
+                    for i in range(bsz)
+                ], dim = 0)
+        except RuntimeError as ex:
+            if "Unsupported head_dim" not in str(ex):
+                raise
+            o = _sdpa_nc_fallback()
+
+        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.interleaved_gate: o *= g.sigmoid()
+
+        o = self.project_o(o, bsz, seqlen, params)
+        return o
+
+
     def decode_flash_attn(
         self,
         x: torch.Tensor,
@@ -634,6 +1295,9 @@ class Attention(Module):
         seqlen: int,
         params: dict,
     ):
+        if not has_flash_attn_backend():
+            raise RuntimeError("flash-attn backend requested but flash_attn is not installed")
+
         cache = params.get("cache")
         block_table = get_for_device(params, "block_table", self.device)
         cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
@@ -648,14 +1312,9 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        # TODO: Add LayerNorm option to fused norm/RoPE kernel
-        if self.q_norm:
-            if self.tp_span_heads_norm:
-                # TP-aware path for span_heads=True
-                q, k = self.apply_qk_norms_tp(q, k, params)
-            elif not self.rope or self.q_norm_tensor is None:
-                q = self.q_norm.forward(q, params, out_dtype = torch.half)
-                k = self.k_norm.forward(k, params, out_dtype = torch.half)
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
             q, k = self.rope.apply(
@@ -664,8 +1323,8 @@ class Attention(Module):
                 positions,
                 position_ids,
                 True,
-                self.q_norm_tensor if not self.tp_span_heads_norm else None,
-                self.k_norm_tensor if not self.tp_span_heads_norm else None,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
                 self.norm_eps,
                 self.norm_constant_bias,
                 inv_freq,
@@ -690,6 +1349,276 @@ class Attention(Module):
             window_size = (self.sliding_window, self.sliding_window),
             softcap = self.logit_softcapping
         )
+
+        if self.has_split_cache:
+            self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
+        else:
+            cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
+
+        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.interleaved_gate: o *= g.sigmoid()
+
+        o = self.project_o(o, bsz, seqlen, params)
+        return o
+
+
+    def decode_flashinfer(
+        self,
+        x: torch.Tensor,
+        bsz: int,
+        seqlen: int,
+        params: dict,
+    ):
+        if not has_flashinfer_backend():
+            raise RuntimeError("flashinfer backend requested but flashinfer is not installed")
+        cache = params.get("cache")
+        block_table = get_for_device(params, "block_table", self.device)
+        cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
+        batch_ids = get_for_device(params, "flashinfer_batch_ids", self.device, None)
+        token_positions = get_for_device(params, "flashinfer_token_positions", self.device, None)
+        kv_indptr = get_for_device(params, "flashinfer_kv_indptr", self.device, None)
+        kv_indices = get_for_device(params, "flashinfer_kv_indices", self.device, None)
+        kv_last_page_len = get_for_device(params, "flashinfer_kv_last_page_len", self.device, None)
+        qo_indptr = get_for_device(params, "flashinfer_qo_indptr", self.device, None)
+        position = params.get("position", 0)
+        positions = get_for_device(params, "positions", self.device, None)
+        position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
+        causal = params.get("causal", True)
+
+        q, k, v, g = self.project_qkv(x, params)
+        q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
+        k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+
+        # TODO: Add LayerNorm option to fused norm/RoPE kernel
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
+            q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            k = self.k_norm.forward(k, params, out_dtype = torch.half)
+
+        if self.rope:
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
+                self.norm_eps,
+                self.norm_constant_bias,
+                inv_freq,
+                self.post_rope_norm
+            )
+
+        if self.has_split_cache:
+            cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table)
+        else:
+            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
+
+        kv_indptr, kv_indices, kv_last_page_len = self.append_paged_kv_cache(
+            k,
+            v,
+            cache_k,
+            cache_v,
+            cache_seqlens,
+            block_table,
+            batch_ids = batch_ids,
+            token_positions = token_positions,
+            kv_indptr = kv_indptr,
+            kv_indices = kv_indices,
+            kv_last_page_len = kv_last_page_len,
+        )
+        if qo_indptr is None:
+            qo_indptr = torch.arange(
+                0,
+                (bsz + 1) * seqlen,
+                seqlen,
+                dtype = torch.int32,
+                device = self.device
+            )
+        window_left = self.sliding_window if self.sliding_window >= 0 else -1
+        logits_soft_cap = self.logit_softcapping if self.logit_softcapping > 0 else None
+        q_flat = q.view(-1, self.num_q_heads, self.head_dim).contiguous()
+        o = None
+
+        # Single-token decode is the hot path for generation. Prefer flashinfer's
+        # decode wrapper here and fall back to the prefill wrapper on any runtime
+        # incompatibility to preserve correctness.
+        use_decode_wrapper = params.get("flashinfer_use_decode_wrapper", True)
+        decode_backend = params.get("flashinfer_decode_backend", "auto")
+        decode_use_tensor_cores = params.get("flashinfer_decode_use_tensor_cores", False)
+        decode_fixed_split_size = params.get("flashinfer_decode_fixed_split_size", None)
+        decode_disable_split_kv = params.get("flashinfer_decode_disable_split_kv", False)
+        if use_decode_wrapper and causal and seqlen == 1:
+            decode_wrapper = self.get_flashinfer_decode_wrapper(
+                backend = decode_backend,
+                use_tensor_cores = decode_use_tensor_cores,
+            )
+            if decode_wrapper is not None:
+                try:
+                    wrapper_id = id(decode_wrapper)
+                    if decode_wrapper.use_tensor_cores:
+                        plan_marker = (
+                            id(decode_wrapper),
+                            kv_indptr.data_ptr(),
+                            kv_indices.data_ptr(),
+                            kv_last_page_len.data_ptr(),
+                            self.num_q_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            window_left,
+                            logits_soft_cap,
+                            q.dtype,
+                            cache_k.dtype,
+                        )
+                        planned = params.get("flashinfer_decode_planned_wrappers")
+                        if planned is None:
+                            planned = {}
+                            params["flashinfer_decode_planned_wrappers"] = planned
+                        should_replan = planned.get(wrapper_id) != plan_marker
+                    else:
+                        plan_marker = (
+                            kv_indptr.numel(),
+                            kv_indices.numel(),
+                            kv_last_page_len.numel(),
+                            self.num_q_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            window_left,
+                            logits_soft_cap,
+                            q.dtype,
+                            cache_k.dtype,
+                        )
+                        should_replan = (
+                            getattr(decode_wrapper, "_exllamav3_decode_plan_marker", None)
+                            != plan_marker
+                        )
+                    if (
+                        not should_replan
+                        and can_reuse_flashinfer_decode_plan(
+                            decode_wrapper,
+                            kv_indptr,
+                            kv_indices,
+                            kv_last_page_len,
+                        )
+                    ):
+                        decode_wrapper._paged_kv_indices_buf.copy_(
+                            kv_indices,
+                            non_blocking = (
+                                kv_indices.device
+                                == decode_wrapper._paged_kv_indices_buf.device
+                            ),
+                        )
+                        decode_wrapper._paged_kv_last_page_len_buf.copy_(
+                            kv_last_page_len,
+                            non_blocking = (
+                                kv_last_page_len.device
+                                == decode_wrapper._paged_kv_last_page_len_buf.device
+                            ),
+                        )
+                        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+                            _flashinfer_runtime_stat("decode_plan_reuses")
+                    else:
+                        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+                            _flashinfer_runtime_stat("decode_plan_calls")
+                        decode_wrapper.plan(
+                            indptr = kv_indptr,
+                            indices = kv_indices,
+                            last_page_len = kv_last_page_len,
+                            num_qo_heads = self.num_q_heads,
+                            num_kv_heads = self.num_kv_heads,
+                            head_dim = self.head_dim,
+                            page_size = PAGE_SIZE,
+                            pos_encoding_mode = "NONE",
+                            sm_scale = self.sm_scale,
+                            window_left = window_left,
+                            logits_soft_cap = logits_soft_cap,
+                            q_data_type = q.dtype,
+                            kv_data_type = cache_k.dtype,
+                            o_data_type = q.dtype,
+                            fixed_split_size = decode_fixed_split_size,
+                            disable_split_kv = decode_disable_split_kv,
+                        )
+                        if decode_wrapper.use_tensor_cores:
+                            planned[wrapper_id] = plan_marker
+                        else:
+                            decode_wrapper._exllamav3_decode_plan_marker = plan_marker
+                    o = decode_wrapper.run(
+                        q_flat,
+                        (cache_k, cache_v),
+                        q_len_per_req = 1,
+                    ).view(bsz, seqlen, self.num_q_heads, self.head_dim)
+                except (RuntimeError, TypeError, ValueError, AssertionError):
+                    self.flashinfer_decode_wrapper_failed = True
+                    self.flashinfer_decode_wrapper = None
+
+        if o is None:
+            retried_workspace_growth = False
+            while True:
+                prefill_wrapper = self.get_flashinfer_prefill_wrapper()
+                try:
+                    planned = params.get("flashinfer_prefill_planned_wrappers")
+                    if planned is None:
+                        planned = {}
+                        params["flashinfer_prefill_planned_wrappers"] = planned
+                    plan_marker = (
+                        qo_indptr.data_ptr(),
+                        kv_indptr.data_ptr(),
+                        kv_indices.data_ptr(),
+                        kv_last_page_len.data_ptr(),
+                        self.num_q_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        causal,
+                        window_left,
+                        logits_soft_cap,
+                        q.dtype,
+                        cache_k.dtype,
+                    )
+                    wrapper_id = id(prefill_wrapper)
+                    if planned.get(wrapper_id) != plan_marker:
+                        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+                            _flashinfer_runtime_stat("prefill_plan_calls")
+                        prefill_wrapper.plan(
+                            qo_indptr = qo_indptr,
+                            paged_kv_indptr = kv_indptr,
+                            paged_kv_indices = kv_indices,
+                            paged_kv_last_page_len = kv_last_page_len,
+                            num_qo_heads = self.num_q_heads,
+                            num_kv_heads = self.num_kv_heads,
+                            head_dim_qk = self.head_dim,
+                            page_size = PAGE_SIZE,
+                            causal = causal,
+                            pos_encoding_mode = "NONE",
+                            sm_scale = self.sm_scale,
+                            window_left = window_left,
+                            logits_soft_cap = logits_soft_cap,
+                            q_data_type = q.dtype,
+                            kv_data_type = cache_k.dtype,
+                            o_data_type = q.dtype,
+                        )
+                        planned[wrapper_id] = plan_marker
+                    else:
+                        if _FLASHINFER_RUNTIME_STATS_ENABLED:
+                            _flashinfer_runtime_stat("prefill_plan_reuses")
+                    o = prefill_wrapper.run(
+                        q_flat,
+                        (cache_k, cache_v),
+                    ).view(bsz, seqlen, self.num_q_heads, self.head_dim)
+                    break
+                except RuntimeError as ex:
+                    if (
+                        not retried_workspace_growth
+                        and grow_flashinfer_workspace_for_exception(self.device, ex)
+                    ):
+                        retried_workspace_growth = True
+                        self.flashinfer_prefill_wrapper = None
+                        self.flashinfer_decode_wrapper = None
+                        self.flashinfer_decode_wrapper_failed = False
+                        continue
+                    raise
 
         if self.has_split_cache:
             self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
@@ -734,7 +1663,7 @@ class Attention(Module):
             channels_to_split //= 2
         assert (channel_width * self.head_dim) % 128 == 0, \
             "Model's K/V heads cannot divide into 128-channel tensors"
-        # TODO: Account for flash-attn temp VRAM usage
+        # TODO: Account for flashinfer temp VRAM usage
         tpa = TPAllocation(
             key = self.key,
             channel_width = channel_width,
@@ -756,13 +1685,6 @@ class Attention(Module):
         def _export(child):
             nonlocal producer
             return child.tp_export(plan, producer) if child is not None else None
-
-        # Check if q_norm uses span_heads
-        q_norm_span_heads = (
-            self.q_norm is not None and
-            isinstance(self.q_norm, RMSNorm) and
-            self.q_norm.span_heads
-        )
 
         return {
             "cls": Attention,
@@ -794,11 +1716,7 @@ class Attention(Module):
             "cache_layers": [
                 cl.tp_export(plan) for cl in self.cache_layers
             ],
-            "n_gqa": self.num_q_heads // self.num_kv_heads,
-            # For TP-aware span_heads norm
-            "q_norm_span_heads": q_norm_span_heads,
-            "q_global_dim": self.num_q_heads * self.head_dim if self.q_norm else 0,
-            "k_global_dim": self.num_kv_heads * self.head_dim if self.k_norm else 0,
+            "n_gqa": self.num_q_heads // self.num_kv_heads
         }
 
 
@@ -822,21 +1740,10 @@ class Attention(Module):
             if num_kv_heads else None
         o_split = (False, first * head_dim * n_gqa, last * head_dim * n_gqa) \
             if num_kv_heads else None
-        # For span_heads norms, we need element indices (head_idx * head_dim)
-        # For regular norms, we use head indices
-        q_norm_span_heads = exported.get("q_norm_span_heads", False)
-        if q_norm_span_heads:
-            # span_heads=True: norm weight is 1D with shape (num_heads * head_dim,)
-            norm_q_split = (first * head_dim * n_gqa, last * head_dim * n_gqa) \
-                if num_kv_heads else None
-            norm_k_split = (first * head_dim, last * head_dim) \
-                if num_kv_heads else None
-        else:
-            # span_heads=False: norm weight is 2D with shape (num_heads, head_dim)
-            norm_q_split = (first * n_gqa, last * n_gqa) \
-                if num_kv_heads else None
-            norm_k_split = (first, last) \
-                if num_kv_heads else None
+        norm_q_split = (first * n_gqa, last * n_gqa) \
+            if num_kv_heads else None
+        norm_k_split = (first, last) \
+            if num_kv_heads else None
 
         def _import(name):
             nonlocal exported, plan
@@ -875,13 +1782,6 @@ class Attention(Module):
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
-
-        # Set up TP-aware span_heads norm if needed
-        if exported.get("q_norm_span_heads", False):
-            module.tp_span_heads_norm = True
-            module.q_global_dim = exported.get("q_global_dim", 0)
-            module.k_global_dim = exported.get("k_global_dim", 0)
-
         module.load_local(device)
         torch.cuda.synchronize()
         return module

@@ -6,6 +6,7 @@ from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .embedding import Embedding
 from .attn import Attention
+from .deepseek_v2_mla_attn import DeepseekV2MLAAttention
 from .gated_delta_net import GatedDeltaNet
 from .gated_rmsnorm import GatedRMSNorm
 from .transformer import TransformerBlock, ParallelDecoderBlock
