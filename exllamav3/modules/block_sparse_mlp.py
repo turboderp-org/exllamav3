@@ -188,6 +188,7 @@ class BlockSparseMLP(Module):
         routing_last: int | None = None,
         routing_device: int | None = None,
         transposed_load: bool = True,
+        transpose_fused_weights: bool = True,
     ):
         super().__init__(config, key, None)
 
@@ -285,6 +286,7 @@ class BlockSparseMLP(Module):
                     qmap = qmap + ".input",
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
+                    transpose_fused_weights = transpose_fused_weights,
                 )
                 up = Linear(
                     config = config,
@@ -297,6 +299,7 @@ class BlockSparseMLP(Module):
                     qmap = qmap + ".input",
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
+                    transpose_fused_weights = transpose_fused_weights,
                 )
                 down = Linear(
                     config = config,
@@ -309,6 +312,7 @@ class BlockSparseMLP(Module):
                     out_dtype = self.out_dtype,
                     allow_input_padding = True,
                     transposed_load = transposed_load,
+                    transpose_fused_weights = transpose_fused_weights,
                 )
 
                 self.ups.append(up)

@@ -381,7 +381,7 @@ class Qwen3_5BaseModel(Model):
                             key_down_split = "experts.down_proj",
                             key_routing_gate = "gate",
                             key_shared_gate = "shared_expert_gate",
-                            transposed_load = False,
+                            transpose_fused_weights = False,
                             qmap = "block.mlp",
                             interm_dtype = torch.half,
                             out_dtype = torch.float,
