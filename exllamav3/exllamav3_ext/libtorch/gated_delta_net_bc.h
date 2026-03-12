@@ -22,7 +22,8 @@ py::class_<BC_GatedDeltaNet, std::shared_ptr<BC_GatedDeltaNet>>(m, "BC_GatedDelt
         at::Tensor,
         c10::optional<at::Tensor>,
         std::shared_ptr<BC_GatedRMSNorm>,
-        std::shared_ptr<BC_LinearEXL3>
+        std::shared_ptr<BC_LinearEXL3>,
+        float
     >(),
     py::arg("mixed_qkv"),
     py::arg("z"),
@@ -45,7 +46,8 @@ py::class_<BC_GatedDeltaNet, std::shared_ptr<BC_GatedDeltaNet>>(m, "BC_GatedDelt
     py::arg("conv1d_weight"),
     py::arg("conv1d_bias"),
     py::arg("norm"),
-    py::arg("o_proj")
+    py::arg("o_proj"),
+    py::arg("beta_scale")
 )
 .def("run_bsz1_a", &BC_GatedDeltaNet::run_bsz1_a)
 .def("run_bsz1_b", &BC_GatedDeltaNet::run_bsz1_b);

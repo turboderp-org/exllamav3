@@ -31,6 +31,7 @@ struct BC_GatedDeltaNet
     c10::optional<at::Tensor> conv1d_bias;
     std::shared_ptr<BC_GatedRMSNorm> norm;
     std::shared_ptr<BC_LinearEXL3> o_proj;
+    const float beta_scale;
 
     BC_GatedDeltaNet
     (
@@ -55,7 +56,8 @@ struct BC_GatedDeltaNet
         at::Tensor _conv1d_weight,
         c10::optional<at::Tensor> _conv1d_bias,
         std::shared_ptr<BC_GatedRMSNorm> _norm,
-        std::shared_ptr<BC_LinearEXL3> _o_proj
+        std::shared_ptr<BC_LinearEXL3> _o_proj,
+        const float _beta_scale
     ) :
         mixed_qkv       (std::move(_mixed_qkv)),
         z               (std::move(_z)),
@@ -78,7 +80,8 @@ struct BC_GatedDeltaNet
         conv1d_weight   (std::move(_conv1d_weight)),
         conv1d_bias     (std::move(_conv1d_bias)),
         norm            (_norm),
-        o_proj          (_o_proj)
+        o_proj          (_o_proj),
+        beta_scale      (_beta_scale)
     {}
 
     at::Tensor run_bsz1_a

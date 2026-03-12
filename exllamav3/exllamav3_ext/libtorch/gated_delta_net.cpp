@@ -28,7 +28,8 @@ at::Tensor BC_GatedDeltaNet::run_bsz1_a
         num_k_heads,
         num_v_heads,
         k_head_dim,
-        v_head_dim
+        v_head_dim,
+        beta_scale
     );
 
     return mixed_qkv;

@@ -280,6 +280,7 @@ class GatedDeltaNet(Module):
         num_v_heads: int,
         rms_norm_eps: float,
         conv_kernel_size: int,
+        beta_scale: float = 1.0,
         key_a_log: str | None = None,
         key_dt_bias: str | None = None,
         key_conv1d: str | None = None,
@@ -308,6 +309,7 @@ class GatedDeltaNet(Module):
         self.conv_kernel_size = conv_kernel_size
         self.k_dim = self.k_head_dim * self.num_k_heads
         self.v_dim = self.v_head_dim * self.num_v_heads
+        self.beta_scale = beta_scale
 
         self.out_dtype = out_dtype
 
@@ -437,7 +439,8 @@ class GatedDeltaNet(Module):
                 self.conv1d_weight,
                 self.conv1d_bias,
                 self.norm.bc,
-                self.o_proj.inner.bc
+                self.o_proj.inner.bc,
+                self.beta_scale
             )
 
     @override
@@ -575,7 +578,8 @@ class GatedDeltaNet(Module):
                     self.num_k_heads,
                     self.num_v_heads,
                     self.k_head_dim,
-                    self.v_head_dim
+                    self.v_head_dim,
+                    self.beta_scale
                 )
             else:
                 # TODO: Bound class and/or graph for this part
@@ -593,7 +597,8 @@ class GatedDeltaNet(Module):
                     b, a,
                     self.dt_bias,
                     self.a_log,
-                    beta, g
+                    beta, g,
+                    self.beta_scale
                 )
 
             # Convolution
