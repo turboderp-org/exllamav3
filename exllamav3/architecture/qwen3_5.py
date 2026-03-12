@@ -274,7 +274,7 @@ class Qwen3_5BaseModel(Model):
 
     def __init__(
         self,
-        config: Qwen3_5VLConfig | Qwen3_5VLMoeConfig | Qwen3_5Config | Qwen3_5MoeConfig,
+        config: Qwen3_5VLBaseConfig | Qwen3_5VLMoeBaseConfig,
         key_prefix: str,
         use_moe: bool,
         **kwargs
@@ -462,8 +462,9 @@ class Qwen3_5BaseModel(Model):
         self.caps.update({"supports_tp": False})
 
         # Generator needs MRoPE freqs when using MMEmbeddings
-        self.caps.update({"mrope": True})
-        self.g_rope = RoPE("cpu", config.rope_settings)
+        if config.vision:
+            self.caps.update({"mrope": True})
+            self.g_rope = RoPE("cpu", config.rope_settings)
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
