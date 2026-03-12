@@ -347,6 +347,7 @@ class Model(Model_TPMixin, Model_LSMixin):
 
     def get_layout_tree(self, pre_indent: int) -> str:
         def get_branch(module, b_indent) -> str:
+            nonlocal pre_indent
             lines = [get_branch(m, b_indent + 4) for m in module.modules]
             dedup_lines = []
             count = 1
@@ -362,7 +363,50 @@ class Model(Model_TPMixin, Model_LSMixin):
             r = " " * (pre_indent + b_indent) + " - []" + module.get_name() + "\n"
             r += "".join(dedup_lines)
             return r
-        return get_branch(self, 0).replace("[]", "").rstrip()
+
+        def compact_rle(s: list[str]) -> list[tuple[int, list[str]]]:
+            n = len(s)
+            if n == 0:
+                return []
+            dp = [(0, None)] + [(float('inf'), None)] * n
+            for i in range(1, n + 1):
+                for j in range(i - 1, -1, -1):
+                    seg = s[j:i]
+                    seg_len = len(seg)
+                    p = _smallest_period(seg)
+                    if p is not None:
+                        k = seg_len // p
+                        cost = dp[j][0] + p
+                        if cost < dp[i][0]:
+                            dp[i] = (cost, (j, k, s[j:j + p]))
+            result = []
+            pos = n
+            while pos > 0:
+                _, (j, k, pattern) = dp[pos]
+                result.append((k, pattern))
+                pos = j
+            result.reverse()
+            return result
+
+        def _smallest_period(seg: list[str]) -> int | None:
+            n = len(seg)
+            for p in range(1, n + 1):
+                if n % p == 0 and all(seg[i] == seg[i % p] for i in range(p, n)):
+                    return p
+            return None
+
+        br = get_branch(self, 0).replace("[]", "").rstrip()
+        br = br.split("\n")
+        cbr = compact_rle(br)
+        br = []
+        for num, span in cbr:
+            if num == 1:
+                br += span
+            else:
+                br += [" " * span[0].index("- ") + f"- [{num}x]"]
+                br += ["    " + s for s in span]
+
+        return "\n".join(br)
 
 
     def get_storage_info(self):
