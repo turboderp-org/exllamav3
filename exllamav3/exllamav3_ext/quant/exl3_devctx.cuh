@@ -5,6 +5,8 @@
 
 // Max allowable output size, in tiles. Used to allocate global lock buffer per device for sync across threadblocks
 #define MAX_TILES_C (1024 * 1024)
+#define MAX_BARRIERS 1024
+#define BARRIER_LOCKS_OFFSET MAX_TILES_C
 
 // Workspace size
 #define WORKSPACE_SIZE (4*1024*1024)

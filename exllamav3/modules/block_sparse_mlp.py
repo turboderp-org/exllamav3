@@ -13,7 +13,8 @@ from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache
 
-TEMP_ROWS = 32
+TEMP_ROWS_FUSED = 128
+TEMP_ROWS_GRAPH = 32
 
 @dataclass
 class RoutingCFG:
@@ -27,6 +28,13 @@ class RoutingCFG:
     routed_scaling_factor: float | None
     n_group: int | None
     topk_group: int | None
+
+@dataclass
+class FusedBuffers:
+    temp_state_g: torch.Tensor
+    temp_state_u: torch.Tensor
+    temp_intermediate_g: torch.Tensor
+    temp_intermediate_u: torch.Tensor
 
 
 def routing_std(bsz, cfg, y, params):
@@ -192,7 +200,6 @@ class BlockSparseMLP(Module):
     ):
         super().__init__(config, key, None)
 
-        self.out_dtype = out_dtype
         self.interm_dtype = interm_dtype
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
@@ -212,8 +219,14 @@ class BlockSparseMLP(Module):
         self.n_group = n_group
         self.topk_group = topk_group
 
-        assert num_experts_per_tok <= TEMP_ROWS, \
-            f"Too many experts per token, max supported is {TEMP_ROWS}"
+        assert out_dtype in (torch.float, None), \
+            f"BlockSparseMLP output dtype must be float"
+
+        assert shared_experts is None or shared_experts.out_dtype in (torch.float, None), \
+            f"Shared experts output dtype must be float"
+
+        assert num_experts_per_tok <= TEMP_ROWS_GRAPH, \
+            f"Too many experts per token, max supported is {TEMP_ROWS_GRAPH}"
 
         if routing_gate is None and key_routing_gate is None:
             self.routing_gate = None
@@ -309,7 +322,7 @@ class BlockSparseMLP(Module):
                     in_features = intermediate_size,
                     out_features = hidden_size,
                     qmap = qmap + f".{idx}.down",
-                    out_dtype = self.out_dtype,
+                    out_dtype = torch.float,
                     allow_input_padding = True,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
@@ -328,6 +341,7 @@ class BlockSparseMLP(Module):
             case "gelu": self.activation_fn_call = ext.gelu_mul
 
         self.is_quantized = False
+        self.support_fused = False
         self.multi_gate = None
         self.multi_up = None
         self.multi_down = None
@@ -352,6 +366,7 @@ class BlockSparseMLP(Module):
 
         self.bc = None
         self.bc_sh_exp = False
+        self.fused_mode_buffers = None
 
 
     @override
@@ -387,16 +402,23 @@ class BlockSparseMLP(Module):
             self.multi_up = MultiLinear(self.device, self.ups)
             self.multi_down = MultiLinear(self.device, self.downs)
 
-        # Temp buffers
+            # Enable fully fused kernel if possible
+            self.support_fused = (
+                self.multi_gate.q_signature() ==
+                self.multi_up.q_signature() ==
+                self.multi_down.q_signature()
+            ) and self.multi_gate.mcg and not self.multi_gate.mul1
+
+        # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok
         H = self.hidden_size
         I = self.intermediate_size
         device = self.device
 
-        temp_hidden = g_tensor_cache.get(device, (TEMP_ROWS * 2, H), torch.half, "temp_hidden")
-        temp_interm = g_tensor_cache.get(device, (TEMP_ROWS * 2, I), self.interm_dtype, "temp_interm")
-        temp_activa = g_tensor_cache.get(device, (TEMP_ROWS, I), torch.half, "temp_activa")
-        temp_output = g_tensor_cache.get(device, (TEMP_ROWS, H), self.out_dtype or torch.half, "temp_output")
+        temp_hidden = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH * 2, H), torch.half, "moe1_temp_hidden")
+        temp_interm = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH * 2, I), self.interm_dtype, "moe1_temp_interm")
+        temp_activa = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH, I), torch.half, "moe1_temp_activa")
+        temp_output = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH, H), torch.float, "moe1_temp_output")
 
         yh = temp_hidden[:numex].view(numex, 1, H)
         interm_g = temp_interm[:numex].view(numex, 1, I)
@@ -436,12 +458,13 @@ class BlockSparseMLP(Module):
             if self.shared_experts and isinstance(self.shared_experts, GatedMLP) and self.shared_experts.bc is not None:
                 self.bc_sh_exp = True
                 sh_exp_bc = self.shared_experts.bc
-                sh_exp_t = torch.empty((1, 1, H), dtype = self.out_dtype or torch.half, device = self.device)
+                sh_exp_t = torch.empty((1, 1, H), dtype = torch.float, device = self.device)
                 if self.shared_gate:
                     assert self.shared_gate.quant_type == "fp16"
                     sh_gate_bc = self.shared_gate.inner.bc
                     sh_gate_t = torch.empty((1, 1, 1), dtype = self.shared_gate.out_dtype, device = self.device)
 
+            # Pointer lists for fused modes
             g_trellis_ptr = torch.tensor([l.inner.trellis.data_ptr() for l in self.gates])
             u_trellis_ptr = torch.tensor([l.inner.trellis.data_ptr() for l in self.ups])
             g_suh_ptr = torch.tensor([l.inner.suh.data_ptr() for l in self.gates])
@@ -455,6 +478,7 @@ class BlockSparseMLP(Module):
             dq_temp_up = g_tensor_cache.get(device, (H, I), torch.half, "dq_temp")
             dq_temp_down = dq_temp_up.view(I, H)
 
+            # Bound class for graph, dq and fused-bsz1 paths
             self.bc = ext.BC_BlockSparseMLP(
                 yh2,
                 cfg.yh,
@@ -502,6 +526,18 @@ class BlockSparseMLP(Module):
                 gu_svh_ptr
             )
 
+            # Larger buffers for fused path, if supported
+            if self.support_fused:
+                C = ext.exl3_moe_max_concurrency(torch.device(device).index)
+                self.fused_mode_buffers = FusedBuffers(
+                    temp_state_g = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, H), torch.half, "moe2_temp_state_g"),
+                    temp_state_u = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, H), torch.half, "moe2_temp_state_u"),
+                    temp_intermediate_g = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, I), torch.half, "moe2_temp_intermediate_g"),
+                    temp_intermediate_u = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, I), torch.half, "moe2_temp_intermediate_u"),
+                )
+                self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 4)
+
+
 
     def load_routing(self, **kwargs):
 
@@ -533,13 +569,15 @@ class BlockSparseMLP(Module):
             optional = True,
             float2half = True,
         )
-        self.load_local(**kwargs)
-        self.load_routing(**kwargs)
+        if device is not None and device.type == "cuda":
+            self.load_local(**kwargs)
+            self.load_routing(**kwargs)
 
 
     @override
     def unload(self):
         self.bc = None
+        self.fused_mode_buffers = None
         if self.multi_gate is not None:
             self.multi_gate.unload()
             self.multi_gate = None
@@ -581,11 +619,11 @@ class BlockSparseMLP(Module):
 
         # Empty slice
         if self.intermediate_size == 0 or self.num_local_experts == 0:
-            final_hidden_states = torch.zeros_like(x, dtype = self.out_dtype)
+            final_hidden_states = torch.zeros_like(x, dtype = torch.float)
 
-        # Torch/C++ path
+        # Torch/C++/fused path
         elif bsz >= self.f_threshold or not self.is_quantized:
-            final_hidden_states = torch.zeros_like(y, dtype = self.out_dtype)
+            final_hidden_states = torch.zeros_like(y, dtype = torch.float)
 
             # if self.routing_device is None or self.num_local_experts == self.num_experts:
             #     expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
@@ -619,7 +657,6 @@ class BlockSparseMLP(Module):
 
                 # Group once by local expert id (including sentinel for expert-P mode)
                 order = flat_expert_local.argsort()
-                # local_sorted = flat_expert_local[order]
                 token_sorted = flat_token[order]
                 weight_sorted = flat_weight[order]
 
@@ -630,6 +667,43 @@ class BlockSparseMLP(Module):
                 expert_ptr[1:] = expert_count.cumsum(0)
                 expert_ptr = expert_ptr.tolist()
 
+                # Run fused path if possible, skips experts with more than TEMP_ROWS_FUSED tokens
+                if self.fused_mode_buffers is not None:
+                    ext.exl3_moe(
+                        y,
+                        final_hidden_states,
+                        expert_count,
+                        token_sorted,
+                        weight_sorted,
+                        self.fused_mode_buffers.temp_state_g,
+                        self.fused_mode_buffers.temp_state_u,
+                        self.fused_mode_buffers.temp_intermediate_g,
+                        self.fused_mode_buffers.temp_intermediate_u,
+                        0,  # SiLU
+                        self.multi_gate.K,
+                        self.multi_up.K,
+                        self.multi_down.K,
+                        self.multi_gate.ptrs_trellis,
+                        self.multi_gate.ptrs_suh,
+                        self.multi_gate.ptrs_svh,
+                        self.multi_up.ptrs_trellis,
+                        self.multi_up.ptrs_suh,
+                        self.multi_up.ptrs_svh,
+                        self.multi_down.ptrs_trellis,
+                        self.multi_down.ptrs_suh,
+                        self.multi_down.ptrs_svh,
+                        self.multi_gate.mcg,
+                        self.multi_gate.mul1,
+                        self.multi_up.mcg,
+                        self.multi_up.mul1,
+                        self.multi_down.mcg,
+                        self.multi_down.mul1,
+                        self.act_limit
+                    )
+                    min_rows = TEMP_ROWS_FUSED
+                else:
+                    min_rows = 0
+
                 out_state = None
                 interm = None
                 interm_a = None
@@ -639,7 +713,7 @@ class BlockSparseMLP(Module):
                     start = expert_ptr[expert_idx]
                     end = expert_ptr[expert_idx + 1]
                     count = end - start
-                    if count == 0:
+                    if count <= min_rows:
                         continue
 
                     top_x = token_sorted[start:end]
@@ -648,21 +722,16 @@ class BlockSparseMLP(Module):
                     current_state = y.index_select(0, top_x)
 
                     if self.bc is not None:
-                        if count <= TEMP_ROWS:
+                        # Graph path
+                        if count <= TEMP_ROWS_GRAPH:
                             self.bc.run_single_expert(current_state, expert_idx)
                             current_state = self.experts_cfg.out_d2[:count]
+
+                        # DQ path
                         else:
                             if count > max_count:
-                                out_state = torch.empty(
-                                    (count, self.hidden_size),
-                                    dtype = self.out_dtype or torch.half,
-                                    device = self.device
-                                )
-                                interm = torch.empty(
-                                    (count * 2, self.intermediate_size),
-                                    dtype = self.interm_dtype,
-                                    device = self.device
-                                )
+                                out_state = torch.empty((count, self.hidden_size), dtype = torch.float, device = self.device)
+                                interm = torch.empty((count * 2, self.intermediate_size), dtype = self.interm_dtype, device = self.device)
                                 interm_a = interm[:count] if self.interm_dtype == torch.half else \
                                     torch.empty_like(interm[:count], dtype = torch.half)
                                 out_state_ = out_state
@@ -682,6 +751,8 @@ class BlockSparseMLP(Module):
                             self.bc.run_single_expert_dq(current_state, expert_idx, yh, interm_, interm_a_, out_state)
                             current_state = out_state_
                     else:
+
+                        # Torch path
                         def mlp(exp_i, xc):
                             g = self.gates[exp_i].forward(xc, params)
                             u = self.ups[exp_i].forward(xc, params)
@@ -695,12 +766,11 @@ class BlockSparseMLP(Module):
                     final_hidden_states.index_add_(0, top_x, current_state)
 
             final_hidden_states = final_hidden_states.reshape(x.shape)
-            final_hidden_states = to2(final_hidden_states, out_dtype, self.out_dtype)
 
         # Fused path, few tokens
         elif bsz > 1:
 
-            final_hidden_states = torch.empty_like(y, dtype = self.out_dtype)
+            final_hidden_states = torch.empty_like(y, dtype = torch.float)
 
             y = y.unsqueeze(1).unsqueeze(1)
             selected_experts = selected_experts.unsqueeze(1)
@@ -870,6 +940,8 @@ class BlockSparseMLP(Module):
                 (self.intermediate_size > 0 and self.num_local_experts > 0) or bool(self.shared_experts)
             )
 
+        if out_dtype is not None:
+            final_hidden_states = final_hidden_states.to(out_dtype)
         return final_hidden_states
 
 
@@ -888,7 +960,7 @@ class BlockSparseMLP(Module):
         for u in self.ups: storage += u.storage_size()
         for d in self.downs: storage += d.storage_size()
         # TODO: More precise overhead estimate accounting for gate etc.
-        overhead_d = self.hidden_size * (self.out_dtype or torch.half).itemsize
+        overhead_d = self.hidden_size * torch.float.itemsize
         overhead_s = 4 * self.intermediate_size * (self.interm_dtype or torch.half).itemsize
         if self.interm_dtype != torch.half:
             overhead_s += self.intermediate_size * torch.half.itemsize
@@ -932,7 +1004,6 @@ class BlockSparseMLP(Module):
                 "activation_fn": self.activation_fn,
                 "num_experts": self.num_experts,
                 "num_experts_per_tok": self.num_experts_per_tok,
-                "out_dtype": self.out_dtype,
                 "interm_dtype": self.interm_dtype,
                 "router_type": self.router_type,
                 "routed_scaling_factor": self.routed_scaling_factor,

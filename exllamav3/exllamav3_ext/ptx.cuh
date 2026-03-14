@@ -1,4 +1,5 @@
 #pragma once
+#include <cuda/atomic>
 
 // Tensor core fragments
 
@@ -312,3 +313,36 @@ static __forceinline__ __device__ uint32_t bfe64(uint32_t lo, uint32_t hi, int o
 
 #define FSHF_IMM(dst, lo, hi, imm) asm("shf.r.wrap.b32 %0, %1, %2, " #imm ";" : "=r"(dst) : "r"(lo), "r"(hi))
 #define BFE16_IMM(dst, src, imm) asm("bfe.u32 %0, %1, " #imm ", 16;" : "=r"(dst) : "r"(src))
+
+// Inter-block barrier
+
+__device__ inline void group_barrier
+(
+    int group_id,
+    int group_size,
+    int* barrier_counters_sense  // length 2*max(group_id). odd positions are flipped after sync (sense)
+)
+{
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        cuda::atomic_ref<int, cuda::thread_scope_device> counter(barrier_counters_sense[group_id * 2]);
+        cuda::atomic_ref<int, cuda::thread_scope_device> sense(barrier_counters_sense[group_id * 2 + 1]);
+
+        int old_sense = sense.load(cuda::memory_order_relaxed);
+        int old = counter.fetch_add(1, cuda::memory_order_acq_rel);
+
+        if (old == group_size - 1)
+        {
+            counter.store(0, cuda::memory_order_relaxed);
+            sense.store(1 - old_sense, cuda::memory_order_release);
+        }
+        else
+        {
+            while (sense.load(cuda::memory_order_acquire) == old_sense) __nanosleep(32);
+        }
+    }
+
+    __syncthreads();
+}

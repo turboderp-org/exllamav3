@@ -446,7 +446,7 @@ void BC_BlockSparseMLP::run_single_expert
 )
 {
     int bsz = y.size(0);
-    TORCH_CHECK(bsz <= TEMP_ROWS);
+    TORCH_CHECK(bsz <= TEMP_ROWS_GRAPH);
     int graphidx = bsz - 1;
 
     c10::cuda::CUDAGuard device_guard(y.device());

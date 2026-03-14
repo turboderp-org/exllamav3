@@ -10,7 +10,7 @@ namespace py = pybind11;
 #include "../graph.cuh"
 
 #define MAX_EXPERTS 512
-#define TEMP_ROWS 32
+#define TEMP_ROWS_GRAPH 32  // must match TEMP_ROWS_GRAPH in BlockSparseMLP.py
 
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     int bsz,
@@ -76,7 +76,7 @@ struct BC_BlockSparseMLP
     bool use_mgemm;
 
     Graph graph_bsz1;
-    Graph graph_single[TEMP_ROWS];
+    Graph graph_single[TEMP_ROWS_GRAPH];
 
     BC_BlockSparseMLP
     (
