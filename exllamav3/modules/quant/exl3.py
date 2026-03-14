@@ -76,7 +76,8 @@ class LinearEXL3:
 
 
     def unload(self):
-        g_tensor_cache.drop(*self.bsz1_xh_args)
+        # g_tensor_cache.drop(*self.bsz1_xh_args)
+        pass
 
 
     def get_tensors(self, key: str):

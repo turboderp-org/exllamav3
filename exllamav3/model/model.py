@@ -6,6 +6,7 @@ from .config import Config
 from ..util.memory import free_mem
 from .model_tp import Model_TPMixin
 from .model_ls import Model_LSMixin
+from ..util.tensor import g_tensor_cache
 
 class Model(Model_TPMixin, Model_LSMixin):
 
@@ -328,6 +329,9 @@ class Model(Model_TPMixin, Model_LSMixin):
                 self.output_device = tp_output_device
 
         free_mem()
+
+        # Release all global shared tensors (refs still held by modules until model is unloaded)
+        g_tensor_cache.drop_all()
 
 
     @torch.inference_mode

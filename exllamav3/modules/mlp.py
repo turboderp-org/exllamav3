@@ -584,8 +584,8 @@ class GatedMLP(Module):
         super().unload()
 
         if self.bc is not None:
-            for arg in self.bsz1_pa_args:
-                g_tensor_cache.drop(*arg)
+            # for arg in self.bsz1_pa_args:
+            #     g_tensor_cache.drop(*arg)
             self.bc = None
             self.bsz1_pa_args = []
 
