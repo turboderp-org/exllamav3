@@ -23,8 +23,9 @@ typedef void (*fp_exl3_moe_kernel) (EXL3_MOE_KERNEL_ARGS);
 
 fp_exl3_moe_kernel exl3_moe_kernel_instances[] =
 {
-    exl3_moe_kernel<1>,
-    exl3_moe_kernel<2>,
+    exl3_moe_kernel<0>,  // Switch Kg, Ku and Kd at runtime
+    exl3_moe_kernel<1>,  // Compile-time Kg = Ku = Kd
+    exl3_moe_kernel<2>,  // ...
     exl3_moe_kernel<3>,
     exl3_moe_kernel<4>,
     exl3_moe_kernel<5>,
@@ -176,8 +177,8 @@ void exl3_moe
 
     TORCH_CHECK(act_function == MOE_ACT_SILU, "MoE kernel: Only SiLU is currently supported");
 
-    TORCH_CHECK(K_gate == K_up && K_gate == K_down, "MoE kernel requires gate, up and down tensors to be the same bitrate");
-    int K = K_gate;
+    int K = 0;
+    if (K_gate == K_up && K_up == K_down) K = K_gate;
 
     TORCH_CHECK_DIM(gate_ptrs_trellis, 1);
     TORCH_CHECK(gate_ptrs_trellis.size(0) == num_experts, "Number of gate tensors doesn't match num_experts");
@@ -201,7 +202,7 @@ void exl3_moe
     int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
     TORCH_CHECK(concurrency * MOE_SMS_PER_EXPERT <= num_sms, "Concurrency too high for device num_sms");
     dim3 grid_dim(MOE_SMS_PER_EXPERT, 1, concurrency);
-    fp_exl3_moe_kernel kernel = exl3_moe_kernel_instances[K - 1];
+    fp_exl3_moe_kernel kernel = exl3_moe_kernel_instances[K];
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
     {
@@ -258,6 +259,9 @@ void exl3_moe
         (void*) &max_tokens_per_expert,
         (void*) &concurrency,
         (void*) &act_limit,
+        (void*) &K_gate,
+        (void*) &K_up,
+        (void*) &K_down,
         (void*) &locks
     };
 

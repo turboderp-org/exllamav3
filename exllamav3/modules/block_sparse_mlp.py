@@ -403,11 +403,7 @@ class BlockSparseMLP(Module):
             self.multi_down = MultiLinear(self.device, self.downs)
 
             # Enable fully fused kernel if possible
-            self.support_fused = (
-                self.multi_gate.q_signature() ==
-                self.multi_up.q_signature() ==
-                self.multi_down.q_signature()
-            ) and self.multi_gate.mcg and not self.multi_gate.mul1
+            self.support_fused = ((True, False) == self.multi_gate.q_cb() == self.multi_up.q_cb() == self.multi_down.q_cb())
 
         # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok

@@ -33,8 +33,8 @@ class MultiLinear:
         self.mul1 = linears[0].inner.mul1
         assert all(l.inner.mul1 == self.mul1 for l in linears[1:])
 
-    def q_signature(self):
-        return self.K, self.mcg, self.mul1
+    def q_cb(self):
+        return self.mcg, self.mul1
 
     def unload(self):
         pass

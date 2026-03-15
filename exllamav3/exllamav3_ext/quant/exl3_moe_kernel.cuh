@@ -45,10 +45,13 @@
     const int max_tokens_per_expert,            \
     const int concurrency,                      \
     const float act_limit,                      \
+    const int K_gate,                           \
+    const int K_up,                             \
+    const int K_down,                           \
                                                 \
     int* __restrict__ locks
 
-template<int bits>
+template<int t_bits>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 {
@@ -137,22 +140,41 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         had_gather_gu_in();
 
         // g, u GEMM
-        auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis)
+        auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
         {
             int size_m = token_count;
             while (size_m > 0)
             {
-                exl3_gemm_kernel_inner
-                <bits, false, 1, MOE_TILESIZE_M, MOE_TILESIZE_K, MOE_TILESIZE_N, MOE_SH_STAGES, MOE_FRAG_STAGES>
-                (
-                    in_addr,
-                    trellis,
-                    out_addr,
-                    size_m,
-                    hidden_dim,
-                    intermediate_dim,
+                #define ARGS            \
+                    in_addr,            \
+                    trellis,            \
+                    out_addr,           \
+                    size_m,             \
+                    hidden_dim,         \
+                    intermediate_dim,   \
                     locks
-                );
+                #define SHAPE_ARGS      \
+                    MOE_TILESIZE_M,     \
+                    MOE_TILESIZE_K,     \
+                    MOE_TILESIZE_N,     \
+                    MOE_SH_STAGES,      \
+                    MOE_FRAG_STAGES
+                if constexpr (t_bits)
+                    exl3_gemm_kernel_inner<t_bits, false, 1, SHAPE_ARGS>(ARGS);
+                else switch(K)
+                {
+                    case 1: exl3_gemm_kernel_inner<1, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 2: exl3_gemm_kernel_inner<2, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 3: exl3_gemm_kernel_inner<3, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 4: exl3_gemm_kernel_inner<4, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 5: exl3_gemm_kernel_inner<5, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 6: exl3_gemm_kernel_inner<6, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 7: exl3_gemm_kernel_inner<7, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 8: exl3_gemm_kernel_inner<8, false, 1, SHAPE_ARGS>(ARGS); break;
+                }
+                #undef ARGS
+                #undef SHAPE_ARGS
+
                 in_addr += 16 * hidden_dim;
                 out_addr += 16 * intermediate_dim;
                 size_m -= 16;
@@ -160,8 +182,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             }
         };
 
-        gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis);
-        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis);
+        gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
+        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
 
         // Output hadamard for g, u + activation+gate + input hadamard for d
         auto had_guad = [&]()
@@ -189,22 +211,41 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         had_guad();
 
         // d GEMM
-        auto gemm_down = [&](const half* in_addr, half* out_addr, const uint16_t* trellis)
+        auto gemm_down = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
         {
             int size_m = token_count;
             while (size_m > 0)
             {
-                exl3_gemm_kernel_inner
-                <bits, false, 1, MOE_TILESIZE_M, MOE_TILESIZE_K, MOE_TILESIZE_N, MOE_SH_STAGES, MOE_FRAG_STAGES>
-                (
-                    in_addr,
-                    trellis,
-                    out_addr,
-                    size_m,
-                    intermediate_dim,
-                    hidden_dim,
+                #define ARGS            \
+                    in_addr,            \
+                    trellis,            \
+                    out_addr,           \
+                    size_m,             \
+                    intermediate_dim,   \
+                    hidden_dim,         \
                     locks
-                );
+                #define SHAPE_ARGS      \
+                    MOE_TILESIZE_M,     \
+                    MOE_TILESIZE_K,     \
+                    MOE_TILESIZE_N,     \
+                    MOE_SH_STAGES,      \
+                    MOE_FRAG_STAGES
+                if constexpr (t_bits)
+                    exl3_gemm_kernel_inner<t_bits, false, 1, SHAPE_ARGS>(ARGS);
+                else switch(K)
+                {
+                    case 1: exl3_gemm_kernel_inner<1, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 2: exl3_gemm_kernel_inner<2, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 3: exl3_gemm_kernel_inner<3, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 4: exl3_gemm_kernel_inner<4, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 5: exl3_gemm_kernel_inner<5, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 6: exl3_gemm_kernel_inner<6, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 7: exl3_gemm_kernel_inner<7, false, 1, SHAPE_ARGS>(ARGS); break;
+                    case 8: exl3_gemm_kernel_inner<8, false, 1, SHAPE_ARGS>(ARGS); break;
+                }
+                #undef ARGS
+                #undef SHAPE_ARGS
+
                 in_addr += 16 * intermediate_dim;
                 out_addr += 16 * hidden_dim;
                 size_m -= 16;
@@ -212,7 +253,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             }
         };
 
-        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis);
+        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
 
         // Output hadamard for d + scatter add
         auto had_d_out = [&]()
