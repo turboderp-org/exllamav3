@@ -569,7 +569,7 @@ class BlockSparseMLP(Module):
             optional = True,
             float2half = True,
         )
-        if device is not None and device.type == "cuda":
+        if device is not None and torch.device(device).type == "cuda":
             self.load_local(**kwargs)
             self.load_routing(**kwargs)
 
