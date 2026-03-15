@@ -171,7 +171,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     case 6: exl3_gemm_kernel_inner<6, false, 1, SHAPE_ARGS>(ARGS); break;
                     case 7: exl3_gemm_kernel_inner<7, false, 1, SHAPE_ARGS>(ARGS); break;
                     case 8: exl3_gemm_kernel_inner<8, false, 1, SHAPE_ARGS>(ARGS); break;
-                }
+                };
                 #undef ARGS
                 #undef SHAPE_ARGS
 
@@ -242,7 +242,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     case 6: exl3_gemm_kernel_inner<6, false, 1, SHAPE_ARGS>(ARGS); break;
                     case 7: exl3_gemm_kernel_inner<7, false, 1, SHAPE_ARGS>(ARGS); break;
                     case 8: exl3_gemm_kernel_inner<8, false, 1, SHAPE_ARGS>(ARGS); break;
-                }
+                };
                 #undef ARGS
                 #undef SHAPE_ARGS
 
