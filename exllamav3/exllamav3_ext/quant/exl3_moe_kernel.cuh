@@ -10,9 +10,9 @@
 #define MOE_ACT_GELU 1  // TODO
 
 #define MOE_SMS_PER_EXPERT 12
-#define MOE_TILESIZE_K 16
+#define MOE_TILESIZE_K 32
 #define MOE_TILESIZE_M 16
-#define MOE_TILESIZE_N 128
+#define MOE_TILESIZE_N 256
 #define MOE_SH_STAGES 4
 #define MOE_FRAG_STAGES 3
 
