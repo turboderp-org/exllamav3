@@ -28,6 +28,7 @@ def main(args):
     think = args.think
     last_input_ids = None
     assert not (args.think and args.no_think), "Cannot enable think and no_think modes at the same time"
+    save_probs = args.probs
 
     if args.basic_console:
         read_input_fn = read_input_ptk
@@ -103,6 +104,7 @@ def main(args):
                 # List commands
                 case "/h":
                     print_info("\n".join([
+                        "/b <source>        Random benchmark question",
                         "/ban               Edit banned strings list",
                         "/cat               Run Catbench 1.0",
                         "/cc                Copy last code block to clipboard",
@@ -112,6 +114,7 @@ def main(args):
                         "/load              Load stored session from ~/chat_py_session.json",
                         "/load <filename>   Load stored session from file",
                         "/mli               Toggle multiline input",
+                        "/probs             Set number of probs recorded (0 to disable), adds overhead",
                         "/r                 Rewind and repeat last prompt",
                         "/save              Save current session to ~/chat_py_session.json",
                         "/save <filename>   Save current session to file",
@@ -121,7 +124,6 @@ def main(args):
                         "/think             Toggle reasoning mode",
                         "/tps               Toggle tokens/second output",
                         "/x                 Exit",
-                        "/b <source>        Random benchmark question",
                     ]))
                     continue
 
@@ -287,6 +289,19 @@ def main(args):
                 case "/cat":
                     user_prompt = "Write a python script that draws a cute kitten using matplotlib."
 
+                # Enable/disable
+                case "/probs":
+                    n = c[1] if len(c) > 1 else "0"
+                    if n.isnumeric():
+                        save_probs = int(n)
+                        if save_probs:
+                            print_info(f"Saving top-{save_probs} probs per token.")
+                        else:
+                            print_info(f"Disabled probs")
+                    else:
+                        print_error("Invalid argument")
+                    continue
+
                 case _:
                     print_error(f"Unknown command: {c[0]}")
                     continue
@@ -321,8 +336,12 @@ def main(args):
             sampler = sampler,
             banned_strings = banned_strings,
             token_healing = enable_healing,
+            return_logits = save_probs > 0,
         )
         generator.enqueue(job)
+        saved_topk = []
+        saved_probs = []
+        saved_samples = []
 
         # Stream response
         ctx_exceeded = False
@@ -337,6 +356,14 @@ def main(args):
                     chunk = r.get("text", "")
                     s.stream(chunk)
                     token_ids = r.get("token_ids")
+                    if save_probs and "logits" in r:
+                        logits = r["logits"]
+                        probs = logits.softmax(dim = -1)
+                        topk = probs.topk(k = save_probs)
+                        saved_probs += list(x.flatten().tolist() for x in topk[0].split(1, 1))
+                        saved_topk += list(x.flatten().tolist() for x in topk[1].split(1, 1))
+                    if save_probs and token_ids is not None:
+                        saved_samples += list(x.flatten().tolist() for x in token_ids.split(1, 1))
                     if token_ids is not None:
                         ids = torch.cat((ids, token_ids), dim = -1)
                     if r["eos"] and r["eos_reason"] == "max_new_tokens":
@@ -369,6 +396,9 @@ def main(args):
                 f"{col_info}{cached_tokens:,}{col_default} tokens cached - "
                 f"Generate: {col_info}{new_tokens:,}{col_default} tokens at {col_info}{tps:.3f}{col_default} t/s"
             )
+
+        if save_probs:
+            print_probs(saved_topk, saved_probs, saved_samples, tokenizer.get_id_to_piece_list())
 
         if args.debug:
             from pprint import pprint
@@ -412,6 +442,7 @@ if __name__ == "__main__":
     parser.add_argument("-think_budget", "--think_budget", type = int, help = "Thinking budget for supported models", default = None)
     parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context with every new prompt")
     parser.add_argument("-tps", "--show_tps", action = "store_true", help = "Show tokens/second after every reply")
+    parser.add_argument("-probs", "--probs", type = int, help = "Sample top-K raw probabilities per token, adds overhead", default = 0)
     parser.add_argument("-prompt", "--prompt", type = str, help = "Run single prompt, then exit")
     parser.add_argument("-save", "--save", type = str, help = "Save output to file (use with --prompt)")
     parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")
