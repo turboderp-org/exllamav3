@@ -9,11 +9,9 @@
 #include <cmath>
 
 using bfloat16 = __nv_bfloat16;
-#define MAX_HEAD_DIM 128
 #define MAX_K_HEADS 32
 #define MAX_V_HEADS 64
 
-#define R_THREADS MAX_HEAD_DIM
 #define SUBK 4
 
 #define FUSED_OP_2_THREADS 512
@@ -33,12 +31,23 @@ __device__ __forceinline__ float untrunc_bf16(bfloat16 x)
     return __bfloat162float(x);
 }
 
+__device__ __forceinline__ float as_float(bfloat16 x)
+{
+    return __bfloat162float(x);
+}
+
+__device__ __forceinline__ float as_float(float x)
+{
+    return x;
+}
+
 __device__ __forceinline__ float softplus(float x)  // beta=1.0, linear threshold=20.0
 {
     if (x > 20.0f) return x;
     return log1pf(__expf(x));
 }
 
+template<int MAX_HEAD_DIM>
 __global__ __launch_bounds__(MAX_HEAD_DIM)
 void gated_delta_net_fused_op_kernel
 (
@@ -55,7 +64,8 @@ void gated_delta_net_fused_op_kernel
     const size_t Nk,
     const size_t Ng,
     const size_t Hk,
-    const size_t Hv
+    const size_t Hv,
+    const float beta_scale
 )
 {
     const size_t Nv   = Nk * Ng;
@@ -133,7 +143,7 @@ void gated_delta_net_fused_op_kernel
 
             // beta = sigmoid(b).bfloat16()
             float b = in_ba[base_ba + t];
-            out_beta[out_va_off] = trunc_bf16(_sigmoid_fast_exp(b));
+            out_beta[out_va_off] = trunc_bf16(_sigmoid_fast_exp(b) * beta_scale);
 
             // g = -self.a_log.float().exp() * F.softplus(a + self.dt_bias.float())
             float g = in_ba[base_ba + Ng + t];
@@ -162,7 +172,8 @@ void gated_delta_net_fused_op
     size_t num_k_heads,
     size_t num_v_heads,
     size_t k_head_dim,
-    size_t v_head_dim
+    size_t v_head_dim,
+    const float beta_scale
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(mixed_qkvz.device());
@@ -196,37 +207,44 @@ void gated_delta_net_fused_op
 
     const int blocks = B * S * Nk;
     const int threads = MAX(Hk, Hv);
-    TORCH_CHECK(threads <= MAX_HEAD_DIM, "Max head dim exceeded");
 
-    gated_delta_net_fused_op_kernel<<<blocks, threads, 0, stream>>>
-    (
-        (const float*) mixed_qkvz.data_ptr(),
-        (const float*) mixed_ba.data_ptr(),
-        (const bfloat16*) dt_bias.data_ptr(),
-        (const bfloat16*) a_log.data_ptr(),
-        (bfloat16*) mixed_qkv.data_ptr(),
-        (bfloat16*) z.data_ptr(),
-        (bfloat16*) beta.data_ptr(),
-        (float*) g.data_ptr(),
-        B, S, Nk, Ng, Hk, Hv
-    );
+    #define KERNEL_ARGS                         \
+        (const float*) mixed_qkvz.data_ptr(),   \
+        (const float*) mixed_ba.data_ptr(),     \
+        (const bfloat16*) dt_bias.data_ptr(),   \
+        (const bfloat16*) a_log.data_ptr(),     \
+        (bfloat16*) mixed_qkv.data_ptr(),       \
+        (bfloat16*) z.data_ptr(),               \
+        (bfloat16*) beta.data_ptr(),            \
+        (float*) g.data_ptr(),                  \
+        B, S, Nk, Ng, Hk, Hv,                   \
+        beta_scale
+
+    if (threads <= 128)
+        gated_delta_net_fused_op_kernel<128><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+    else if (threads <= 256)
+        gated_delta_net_fused_op_kernel<256><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+    else TORCH_CHECK(false, "Max head dim exceeded");
+
+    #undef KERNEL_ARGS
 
     cuda_check(cudaPeekAtLastError());
 }
 
-
+template <typename a_log_T>
 __global__ void gated_delta_net_fused_op_2_kernel
 (
     const float* __restrict__ in_b,             // [B,S,H]
     const float* __restrict__ in_a,             // [B,S,H]
     const bfloat16* __restrict__ in_dt_bias,    // [H]
-    const float* __restrict__ in_a_log,         // [H]
+    const a_log_T* __restrict__ in_a_log,       // [H]
     bfloat16* __restrict__ out_beta,            // [B,S,H]
     float* __restrict__ out_g,                  // [B,S,H]
     int B,
     int S,
     int H,
-    int rows_per_block
+    int rows_per_block,
+    const float beta_scale
 )
 {
     int t = threadIdx.x % H;
@@ -240,9 +258,9 @@ __global__ void gated_delta_net_fused_op_2_kernel
     out_beta += row * H + t;
     out_g += row * H + t;
 
-    float beta = _sigmoid_fast_exp(*in_b);
-    float dt_bias = untrunc_bf16(*in_dt_bias);
-    float g = -softplus(*in_a + dt_bias) * __expf(*in_a_log);
+    float beta = _sigmoid_fast_exp(*in_b) * beta_scale;
+    float dt_bias = as_float(*in_dt_bias);
+    float g = -softplus(*in_a + dt_bias) * __expf(as_float(*in_a_log));
 
     *out_beta = trunc_bf16(beta);
     *out_g = g;
@@ -260,7 +278,8 @@ void gated_delta_net_fused_op_2
     const at::Tensor& dt_bias,      // [H] bfloat16
     const at::Tensor& a_log,        // [H] float
     at::Tensor& beta,               // out [B,S,H] bfloat16
-    at::Tensor& g                   // out [B,S,H] float
+    at::Tensor& g,                  // out [B,S,H] float
+    const float beta_scale
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(b.device());
@@ -269,9 +288,11 @@ void gated_delta_net_fused_op_2
     TORCH_CHECK_DTYPE(b, kFloat);
     TORCH_CHECK_DTYPE(a, kFloat);
     TORCH_CHECK_DTYPE(dt_bias, kBFloat16);
-    TORCH_CHECK_DTYPE(a_log, kFloat);
     TORCH_CHECK_DTYPE(beta, kBFloat16);
     TORCH_CHECK_DTYPE(g, kFloat);
+
+    bool a_log_fp32 = a_log.dtype() == at::kFloat;
+    bool a_log_bf16 = a_log.dtype() == at::kBFloat16;
 
     TORCH_CHECK_SHAPES_FULL(b, a);
     TORCH_CHECK_SHAPES(b, 2, dt_bias, 0, 1);
@@ -287,25 +308,33 @@ void gated_delta_net_fused_op_2
     int threads = rows_per_block * H;
     int blocks = CEIL_DIVIDE(B * S, rows_per_block);
 
-    gated_delta_net_fused_op_2_kernel<<<blocks, threads, 0, stream>>>
-    (
-        (const float*) b.data_ptr(),
-        (const float*) a.data_ptr(),
-        (const bfloat16*) dt_bias.data_ptr(),
-        (const float*) a_log.data_ptr(),
-        (bfloat16*) beta.data_ptr(),
-        (float*) g.data_ptr(),
-        B,
-        S,
-        H,
-        rows_per_block
-    );
+    #define ARGS(a_log_T)                       \
+        (const float*) b.data_ptr(),            \
+        (const float*) a.data_ptr(),            \
+        (const bfloat16*) dt_bias.data_ptr(),   \
+        (const a_log_T*) a_log.data_ptr(),      \
+        (bfloat16*) beta.data_ptr(),            \
+        (float*) g.data_ptr(),                  \
+        B,                                      \
+        S,                                      \
+        H,                                      \
+        rows_per_block,                         \
+        beta_scale
+
+    if (a_log_fp32)
+        gated_delta_net_fused_op_2_kernel<<<blocks, threads, 0, stream>>>(ARGS(float));
+    else if (a_log_bf16)
+        gated_delta_net_fused_op_2_kernel<<<blocks, threads, 0, stream>>>(ARGS(bfloat16));
+    else TORCH_CHECK(false, "gated_delta_net_fused_op_2: unsupported dtype");
+
+    #undef ARGS
 
     cuda_check(cudaPeekAtLastError());
 }
 
 
-__global__ __launch_bounds__(R_THREADS * SUBK)
+template <int MAX_HEAD_DIM>
+__global__ __launch_bounds__(MAX_HEAD_DIM * SUBK)
 void cuda_recurrent_gated_delta_rule_kernel
 (
     // k_dim = num_k_heads * k_head_dim
@@ -417,10 +446,10 @@ void cuda_recurrent_gated_delta_rule_kernel
             float* rs_rd = gl_rs + t + bt * bts * v_head_dim;
 
             // TODO: Could use tensor cores
-            for (int i = 0; i < k_head_dim / 16 / SUBK; ++i)
+            for (int i = 0; i < k_head_dim / 8 / SUBK; ++i)
             {
                 #pragma unroll
-                for (int j = 0; j < 16; ++j, rs_rd += v_head_dim, sh_k_rd++)
+                for (int j = 0; j < 8; ++j, rs_rd += v_head_dim, sh_k_rd++)
                     sum = sum + *sh_k_rd * *rs_rd;
             }
             atomicAdd(sh_dot1 + t, sum);
@@ -444,10 +473,10 @@ void cuda_recurrent_gated_delta_rule_kernel
             float* rs_rw = gl_rs + t + bt * bts * v_head_dim;
 
             // TODO: Could use tensor cores
-            for (int i = 0; i < k_head_dim / 16 / SUBK; ++i)
+            for (int i = 0; i < k_head_dim / 8 / SUBK; ++i)
             {
                 #pragma unroll
-                for (int j = 0; j < 16; ++j, rs_rw += v_head_dim, sh_k_rd++, sh_q_rd++)
+                for (int j = 0; j < 8; ++j, rs_rw += v_head_dim, sh_k_rd++, sh_q_rd++)
                 {
                     // State update step, k x v
                     float state = *rs_rw;
@@ -500,11 +529,6 @@ void cuda_recurrent_gated_delta_rule
     int seqlen = mixed_qkv.size(1);
     int qkv_dim = mixed_qkv.size(2);
 
-    TORCH_CHECK(num_k_heads <= MAX_K_HEADS, "num_k_heads > MAX_K_HEADS");
-    TORCH_CHECK(num_v_heads <= MAX_V_HEADS, "num_v_heads > MAX_V_HEADS");
-    TORCH_CHECK(k_head_dim <= MAX_HEAD_DIM, "k_head_dim > MAX_HEAD_DIM");
-    TORCH_CHECK(v_head_dim <= MAX_HEAD_DIM, "v_head_dim > MAX_HEAD_DIM");
-
     TORCH_CHECK_DTYPE(mixed_qkv, kBFloat16);
     TORCH_CHECK_DTYPE(g, kFloat);
     TORCH_CHECK_DTYPE(beta, kBFloat16);
@@ -516,19 +540,25 @@ void cuda_recurrent_gated_delta_rule
 
     float scale = 1.0f / sqrtf(k_head_dim);
 
-    cuda_recurrent_gated_delta_rule_kernel<<<blocks, threads, 0, stream>>>
-    (
-        (const bfloat16*) mixed_qkv.data_ptr(),
-        (const float*) g.data_ptr(),
-        (const bfloat16*) beta.data_ptr(),
-        (float*) recurrent_state.data_ptr(),
-        (bfloat16*) core_attn_out.data_ptr(),
-        bsz,
-        seqlen,
-        num_k_heads,
-        num_v_heads,
-        k_head_dim,
-        v_head_dim,
+    #define KERNEL_ARGS                         \
+        (const bfloat16*) mixed_qkv.data_ptr(), \
+        (const float*) g.data_ptr(),            \
+        (const bfloat16*) beta.data_ptr(),      \
+        (float*) recurrent_state.data_ptr(),    \
+        (bfloat16*) core_attn_out.data_ptr(),   \
+        bsz,                                    \
+        seqlen,                                 \
+        num_k_heads,                            \
+        num_v_heads,                            \
+        k_head_dim,                             \
+        v_head_dim,                             \
         scale
-    );
+
+    if (threads.x <= 128)
+        cuda_recurrent_gated_delta_rule_kernel<128><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+    else if (threads.x <= 256)
+        cuda_recurrent_gated_delta_rule_kernel<256><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+    else TORCH_CHECK(false, "Max head dim exceeded");
+
+    #undef KERNEL_ARGS
 }

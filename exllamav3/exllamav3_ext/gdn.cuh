@@ -11,7 +11,8 @@ void gated_delta_net_fused_op
     size_t num_k_heads,
     size_t num_v_heads,
     size_t k_head_dim,
-    size_t v_head_dim
+    size_t v_head_dim,
+    const float beta_scale
 );
 
 void gated_delta_net_fused_op_2
@@ -21,7 +22,8 @@ void gated_delta_net_fused_op_2
     const at::Tensor& dt_bias,
     const at::Tensor& a_log,
     at::Tensor& beta,
-    at::Tensor& g
+    at::Tensor& g,
+    const float beta_scale
 );
 
 void cuda_recurrent_gated_delta_rule

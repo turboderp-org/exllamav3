@@ -38,6 +38,7 @@ class Linear(Module):
         allow_input_padding: bool = False,
         post_scale: float = 1.0,
         transposed_load: bool = True,
+        transpose_fused_weights: bool = True,
     ):
         super().__init__(config, key, qmap)
 
@@ -62,6 +63,7 @@ class Linear(Module):
         self.out_dtype = out_dtype
         self.post_scale = post_scale
         self.transposed_load = transposed_load
+        self.transpose_fused_weights = transpose_fused_weights
 
         assert self.in_features_unpadded == self.in_features or allow_input_padding, \
             f"Input padding is not allowed for {self.key}, in_dim: {self.in_features_unpadded}, pad_to: {pad_to}"
@@ -168,7 +170,7 @@ class Linear(Module):
             weight = self.config.stc.get_tensor(
                 self.fkey,
                 self.device,
-                transpose = self.transposed_load,
+                transpose = self.transpose_fused_weights,
                 no_defer = True,
                 fidx = self.fidx
             )

@@ -134,10 +134,12 @@ def allocate_linear(
 
     numel = l.weights_numel()
     budget = int(bpw * numel) + surplus_bits + 1
-    bpw = budget / numel
-    bpw = max(int(math.floor(bpw)), 1)
-    used_budget = bpw * numel
+    base_bpw = int(math.floor(bpw))
+    new_bpw = int(math.floor(budget / numel))
+    new_bpw = max(new_bpw, 1)
+    new_bpw = min(new_bpw, base_bpw + 2, 8)
+    used_budget = new_bpw * numel
 
-    strategy = {l.key: bpw}
+    strategy = {l.key: new_bpw}
     surplus = budget - used_budget
     return strategy, surplus

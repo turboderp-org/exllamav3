@@ -211,7 +211,7 @@ Compute RMSNorm: y = x * w / sqrt(row_mean(x * x) + epsilon)
 - Can operate in-place if y == x
 - x can be either float or half dtype
 - y can be either float or half dtype
-- w must be half dtype
+- w can be either bfloat16 or half dtype
 */
 void rms_norm
 (
@@ -236,7 +236,7 @@ void rms_norm
     TORCH_CHECK_SHAPES_FULL(x, y);
 
     auto tx = x.dtype();
-    auto tw = x.dtype();  // intentional, type is if w is None
+    auto tw = x.dtype();  // intentional, type is irrelevant if w is None
     auto ty = y.dtype();
 
     const half* w_ptr = (const half*) OPTPTR(w);
@@ -382,7 +382,7 @@ void gated_rms_norm
     for (int i = 0; i < x.dim() - 1; ++i) rows *= x.size(i);
     int dim = x.size(-1);
 
-    bool small = (dim <= 128);
+    bool small = (dim <= 256);
 
     dim3 blockDim(small ? 32 : NUM_THREADS, 1, 1);
     dim3 gridDim(rows, 1, 1);

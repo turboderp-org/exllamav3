@@ -199,12 +199,15 @@ class GTensorCache:
         self.cache[key] = (refc + 1, v)
         return v
 
-    def drop(self, device, shape, dtype, x = ""):
-        key = self.make_key(device, shape, dtype, x)
-        refc, v = self.cache[key]
-        if refc == 1:
-            del self.cache[key]
-        else:
-            self.cache[key] = (refc - 1, v)
+    # def drop(self, device, shape, dtype, x = ""):
+    #     key = self.make_key(device, shape, dtype, x)
+    #     refc, v = self.cache[key]
+    #     if refc == 1:
+    #         del self.cache[key]
+    #     else:
+    #         self.cache[key] = (refc - 1, v)
+
+    def drop_all(self):
+        self.cache.clear()
 
 g_tensor_cache = GTensorCache()

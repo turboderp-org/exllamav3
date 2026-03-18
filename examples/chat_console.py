@@ -6,6 +6,7 @@ from rich.console import Console
 from prompt_toolkit import prompt as ptk_prompt
 from prompt_toolkit.formatted_text import ANSI
 import time, os
+import unicodedata
 
 # ANSI codes
 ESC = "\u001b"
@@ -17,6 +18,10 @@ col_think2 = "\u001b[35m"  # Magenta
 col_error = "\u001b[31;1m"  # Bright red
 col_info = "\u001b[32;1m"  # Green
 col_sysprompt = "\u001b[37;1m"  # Grey
+col_dark = "\u001b[0;90m"  # White
+col_b = "\u001b[100m"
+LRO = '\u202D'  # Left-to-Right Override
+PDF = '\u202C'  # Pop Directional Formatting
 
 def print_error(text):
     ftext = text.replace("\n", "\n       ")
@@ -270,6 +275,30 @@ class KeyReader:
                 return (ch or "").lower() or None
             return None
 
+
+def display_width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in ('F', 'W') else 1 for c in s)
+
+def char_width(c):
+    return 2 if unicodedata.east_asian_width(c) in ('F', 'W') else 1
+
+def ljust_truncate(s, width):
+    dw = display_width(s)
+    if dw <= width:
+        return s + ' ' * (width - dw)
+    max_content = width - 1  # reserve 1 column for '…'
+    cols = 0
+    truncated = []
+    for c in s:
+        cw = char_width(c)
+        if cols + cw > max_content:
+            break
+        truncated.append(c)
+        cols += cw
+    padding = width - cols - 1  # 1 for the ellipsis
+    t = ''.join(truncated) + '…' + ' ' * padding
+    return t
+
 def print_tokens(
     ids: list,
     vocab: list,
@@ -281,9 +310,39 @@ def print_tokens(
         t = ids[pos]
         p = repr(vocab[t])[1:-1].replace(" ", "␣")
         line += f"{col_user}{t:6}{col_default} "
-        line += f"{p:10} " if len(p) <= 10 else f"{p[:9]}… "
+        line += f"{ljust_truncate(p, 10)} "
         if (pos + 1) % ids_per_line == 0 or pos == len(ids) - 1:
             line = line.replace("␣", f"{col_bot}␣{col_default}").replace("…", f"{col_error}…{col_default}")
             ppos = pos // ids_per_line * ids_per_line
             print(f"{col_info}{ppos:6} {col_default}: {line}")
             line = ""
+
+def print_probs(
+    saved_topk: list,
+    saved_probs: list,
+    saved_samples: list,
+    vocab: list,
+    ids_per_line = 5,
+):
+    if len(saved_topk) == 0:
+        return
+    num = len(saved_topk[0])
+    lines = ["    "] * (num + 2)
+    ids_this_line = 0
+    for ids, probs, sample in zip(saved_topk, saved_probs, saved_samples):
+        tss = repr(vocab[sample[0]])[1:-1].replace(" ", "␣")
+        lines[0] += f"{col_sysprompt}" + ljust_truncate(tss, 26) + f"{col_default}  "
+        lines[1] += f"{col_dark}" + "─" * 26 + f"{col_default}  "
+        for i, (t, p) in enumerate(zip(ids, probs)):
+            hl = col_b if sample[0] == t else ""
+            ts = repr(vocab[t])[1:-1].replace(" ", "␣")
+            lines[i + 2] += f"{col_user}{hl}  {t:6}{col_default}{hl} "
+            lines[i + 2] += f"{ljust_truncate(ts, 10)} "
+            lines[i + 2] += f"{col_think1}{hl}{p:6.4f}{col_default}  "
+        ids_this_line += 1
+        if ids_this_line == ids_per_line:
+            print(f"\n{LRO}" + "\n".join(lines) + f"{PDF}")
+            lines = ["    "] * (num + 2)
+            ids_this_line = 0
+    if ids_this_line > 0:
+        print(f"\n{LRO}" + "\n".join(lines) + f"{PDF}")

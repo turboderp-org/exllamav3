@@ -280,12 +280,17 @@ class GatedDeltaNet(Module):
         num_v_heads: int,
         rms_norm_eps: float,
         conv_kernel_size: int,
+        beta_scale: float = 1.0,
         key_a_log: str | None = None,
         key_dt_bias: str | None = None,
         key_conv1d: str | None = None,
+        key_conv1d_q: str | None = None,
+        key_conv1d_k: str | None = None,
+        key_conv1d_v: str | None = None,
         key_fused_ba: str | None = None,
         key_fused_qkvz: str | None = None,
         key_qkv: str | None = None,
+        key_qkv_alt: list | None = None,
         key_z: str | None = None,
         key_b: str | None = None,
         key_a: str | None = None,
@@ -308,6 +313,7 @@ class GatedDeltaNet(Module):
         self.conv_kernel_size = conv_kernel_size
         self.k_dim = self.k_head_dim * self.num_k_heads
         self.v_dim = self.v_head_dim * self.num_v_heads
+        self.beta_scale = beta_scale
 
         self.out_dtype = out_dtype
 
@@ -329,7 +335,15 @@ class GatedDeltaNet(Module):
             self.qkvz_proj = None
 
         if key_qkv:
-            self.qkv_proj = Linear(config, f"{key}.{key_qkv}", hidden_size, self.fdim_qkv, qmap = qmap + ".input", out_dtype = torch.float)
+            self.qkv_proj = Linear(
+                config,
+                f"{key}.{key_qkv}",
+                hidden_size,
+                self.fdim_qkv,
+                qmap = qmap + ".input",
+                out_dtype = torch.float,
+                alt_key = None if not key_qkv_alt else [f"{key}.{x}" for x in key_qkv_alt],
+            )
             self.z_proj = Linear(config, f"{key}.{key_z}", hidden_size, self.v_dim, qmap = qmap + ".input", out_dtype = torch.float)
             self.register_submodule(self.qkv_proj)
             self.register_submodule(self.z_proj)
@@ -369,10 +383,16 @@ class GatedDeltaNet(Module):
         self.dt_bias = None
         self.conv1d_weight = None
         self.conv1d_bias = None
+        self.conv1d_q_weight = None
+        self.conv1d_k_weight = None
+        self.conv1d_v_weight = None
         self.key_a_log = f"{key}.{key_a_log}"
         self.key_dt_bias = f"{key}.{key_dt_bias}"
         self.key_conv1d_weight = f"{key}.{key_conv1d}.weight"
         self.key_conv1d_bias = f"{key}.{key_conv1d}.bias"
+        self.key_conv1d_q_weight = f"{key}.{key_conv1d_q}.weight" if key_conv1d_q else None
+        self.key_conv1d_k_weight = f"{key}.{key_conv1d_k}.weight" if key_conv1d_k else None
+        self.key_conv1d_v_weight = f"{key}.{key_conv1d_v}.weight" if key_conv1d_v else None
 
         self.conv_dim = self.k_head_dim * self.num_k_heads
 
@@ -437,7 +457,8 @@ class GatedDeltaNet(Module):
                 self.conv1d_weight,
                 self.conv1d_bias,
                 self.norm.bc,
-                self.o_proj.inner.bc
+                self.o_proj.inner.bc,
+                self.beta_scale
             )
 
     @override
@@ -445,22 +466,29 @@ class GatedDeltaNet(Module):
         super().load(device)
         self.a_log = self.config.stc.get_tensor(self.key_a_log, self.device, optional = False, allow_bf16 = True)
         self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True)
-        self.conv1d_weight = self.config.stc.get_tensor(self.key_conv1d_weight, self.device, optional = False, allow_bf16 = True)
+        self.conv1d_weight = self.config.stc.get_tensor(self.key_conv1d_weight, self.device, optional = True, allow_bf16 = True)
         self.conv1d_bias = self.config.stc.get_tensor(self.key_conv1d_bias, self.device, optional = True, allow_bf16 = True)
+        if self.conv1d_weight is None:
+            self.conv1d_q_weight = self.config.stc.get_tensor(self.key_conv1d_q_weight, self.device, optional = False, allow_bf16 = True)
+            self.conv1d_k_weight = self.config.stc.get_tensor(self.key_conv1d_k_weight, self.device, optional = False, allow_bf16 = True)
+            self.conv1d_v_weight = self.config.stc.get_tensor(self.key_conv1d_v_weight, self.device, optional = False, allow_bf16 = True)
         self.norm.load(device, **kwargs)
         self.load_local(device, **kwargs)
 
     @override
     def unload(self):
         if self.bc is not None:
-            for arg in self.bsz1_pa_args:
-                g_tensor_cache.drop(*arg)
+            # for arg in self.bsz1_pa_args:
+            #     g_tensor_cache.drop(*arg)
             self.bc = None
             self.bsz1_pa_args = []
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
         self.conv1d_bias = None
+        self.conv1d_q_weight = None
+        self.conv1d_k_weight = None
+        self.conv1d_v_weight = None
         self.norm.unload()
         super().unload()
 
@@ -516,6 +544,17 @@ class GatedDeltaNet(Module):
     ) -> torch.Tensor:
 
         bsz, seqlen, _ = x.shape
+
+        # Post load, fuse conv1d weights if needed
+        if self.conv1d_weight is None:
+            self.conv1d_weight = torch.cat([
+                self.conv1d_q_weight,
+                self.conv1d_k_weight,
+                self.conv1d_v_weight,
+            ], dim = 0)
+            self.conv1d_q_weight = None
+            self.conv1d_k_weight = None
+            self.conv1d_v_weight = None
 
         # Previous state
         rs = params.get("recurrent_states")
@@ -575,7 +614,8 @@ class GatedDeltaNet(Module):
                     self.num_k_heads,
                     self.num_v_heads,
                     self.k_head_dim,
-                    self.v_head_dim
+                    self.v_head_dim,
+                    self.beta_scale
                 )
             else:
                 # TODO: Bound class and/or graph for this part
@@ -593,7 +633,8 @@ class GatedDeltaNet(Module):
                     b, a,
                     self.dt_bias,
                     self.a_log,
-                    beta, g
+                    beta, g,
+                    self.beta_scale
                 )
 
             # Convolution

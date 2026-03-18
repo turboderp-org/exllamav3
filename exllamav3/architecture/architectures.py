@@ -25,11 +25,12 @@ from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
 from .nanochat import NanoChatModel
 from .olmo3 import Olmo3Model
+from .olmohybrid import OlmoHybridModel
 from .phi3 import Phi3Model
 from .qwen2 import Qwen2Model
 from .qwen2_5_vl import Qwen2_5VLModel
 from .qwen3 import Qwen3Model
-from .qwen3_5 import Qwen3_5Model, Qwen3_5MoeModel
+from .qwen3_5 import Qwen3_5Model, Qwen3_5MoeModel, Qwen3_5VLModel, Qwen3_5VLMoeModel
 from .qwen3_moe import Qwen3MoeModel
 from .qwen3_next import Qwen3NextModel
 from .qwen3_vl import Qwen3VLModel
@@ -73,12 +74,15 @@ ARCHITECTURES = {
         MixtralModel,
         NanoChatModel,
         Olmo3Model,
+        OlmoHybridModel,
         Phi3Model,
         Qwen2Model,
         Qwen2_5VLModel,
         Qwen3Model,
         Qwen3_5Model,
         Qwen3_5MoeModel,
+        Qwen3_5VLModel,
+        Qwen3_5VLMoeModel,
         Qwen3MoeModel,
         Qwen3NextModel,
         Qwen3VLModel,

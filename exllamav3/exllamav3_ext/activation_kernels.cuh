@@ -129,9 +129,9 @@ void act_mul_kernel_h
 
     if (act_limit != 0.0f)
     {
-        x2 = __hmax2(x2, __float2half2_rn(-act_limit));
-        x2 = __hmin2(x2, __float2half2_rn(act_limit));
+        y2 = __hmax2(y2, __float2half2_rn(-act_limit));
         y2 = __hmin2(y2, __float2half2_rn(act_limit));
+        x2 = __hmin2(x2, __float2half2_rn(act_limit));
     }
 
     ((half2*) z)[idx] = __hmul2(x2, y2);
@@ -173,12 +173,12 @@ void act_mul_kernel_f
 
     if (act_limit != 0.0f)
     {
-        if (x2.x < -act_limit) x2.x = -act_limit;
-        if (x2.y < -act_limit) x2.y = -act_limit;
-        if (x2.x > act_limit) x2.x = act_limit;
-        if (x2.y > act_limit) x2.y = act_limit;
+        if (y2.x < -act_limit) y2.x = -act_limit;
+        if (y2.y < -act_limit) y2.y = -act_limit;
         if (y2.x > act_limit) y2.x = act_limit;
         if (y2.y > act_limit) y2.y = act_limit;
+        if (x2.x > act_limit) x2.x = act_limit;
+        if (x2.y > act_limit) x2.y = act_limit;
     }
 
     x2.x *= y2.x;

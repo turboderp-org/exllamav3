@@ -28,6 +28,7 @@ def main(args):
     think = args.think
     last_input_ids = None
     assert not (args.think and args.no_think), "Cannot enable think and no_think modes at the same time"
+    save_probs = args.probs
 
     if args.basic_console:
         read_input_fn = read_input_ptk
@@ -103,6 +104,7 @@ def main(args):
                 # List commands
                 case "/h":
                     print_info("\n".join([
+                        "/b <source>        Random benchmark question",
                         "/ban               Edit banned strings list",
                         "/cat               Run Catbench 1.0",
                         "/cc                Copy last code block to clipboard",
@@ -112,6 +114,7 @@ def main(args):
                         "/load              Load stored session from ~/chat_py_session.json",
                         "/load <filename>   Load stored session from file",
                         "/mli               Toggle multiline input",
+                        "/probs             Set number of probs recorded (0 to disable), adds overhead",
                         "/r                 Rewind and repeat last prompt",
                         "/save              Save current session to ~/chat_py_session.json",
                         "/save <filename>   Save current session to file",
@@ -128,6 +131,27 @@ def main(args):
                 case "/x":
                     print_info("Exiting")
                     break
+
+                # Random benchmark question
+                case "/b":
+                    source = c[1] if len(c) > 1 else None
+                    sources = get_sample_sources()
+                    if source and source.isnumeric():
+                        i = int(source)
+                        source = list(sources)[i - 1] if 1 <= i <= len(sources) else None
+                    if source not in sources:
+                        print_info(
+                            "Available sample sources:\n\n" +
+                            "\n".join([f"{i + 1}. {t}" for i, t in enumerate(get_sample_sources())])
+                        )
+                        continue
+                    question = sample_question(source)
+                    print_info(f"Question from {source}; multi-line mode, press Alt-Enter to submit or Ctrl-C to abort")
+                    try:
+                        user_prompt = read_input_fn(args, "Prompt", True, question)
+                    except KeyboardInterrupt:
+                        print_info("Aborted")
+                        continue
 
                 # Copy codeblock to clipboard
                 case "/cc":
@@ -178,35 +202,47 @@ def main(args):
 
                 # Edit last response
                 case "/e":
-                    print_info("Press Alt+Enter to submit")
+                    print_info("Press Alt-Enter to submit")
                     user_prompt = context[-1][0]
                     last_reply = context[-1][-1]
-                    prefix = read_input_fn(args, bot_name, True, last_reply)
-                    context = context[:-1]
-                    enable_healing = True
+                    try:
+                        prefix = read_input_fn(args, bot_name, True, last_reply)
+                        context = context[:-1]
+                        enable_healing = True
+                    except KeyboardInterrupt:
+                        print_info("Exiting")
+                        break
 
                 # Edit system prompt
                 case "/sp":
-                    print_info("Press Alt+Enter to submit")
-                    system_prompt = read_input_fn(args, "System prompt", True, system_prompt)
-                    continue
+                    print_info("Press Alt-Enter to submit")
+                    try:
+                        system_prompt = read_input_fn(args, "System prompt", True, system_prompt)
+                        continue
+                    except KeyboardInterrupt:
+                        print_info("Exiting")
+                        break
 
                 # Edit banned strings
                 case "/ban":
-                    print_info("Write each string on a new line and enclose in \"double quotes\", press Alt+Enter to submit")
+                    print_info("Write each string on a new line and enclose in \"double quotes\", press Alt-Enter to submit")
                     bans = "\n".join(f"\"{b}\"" for b in banned_strings)
-                    bans = read_input_fn(args, "Banned strings", True, bans)
-                    bans = [b.strip() for b in bans.split("\n")]
-                    bans = [b[1:-1] for b in bans if b.startswith("\"") and b.endswith("\"")]
-                    d = len(bans) - len(banned_strings)
-                    banned_strings = bans
-                    if d < 0:
-                        print_info(f"{-d} string(s) removed")
-                    elif d > 0:
-                        print_info(f"{d} string(s) added")
-                    else:
-                        print_info("Strings updated")
-                    continue
+                    try:
+                        bans = read_input_fn(args, "Banned strings", True, bans)
+                        bans = [b.strip() for b in bans.split("\n")]
+                        bans = [b[1:-1] for b in bans if b.startswith("\"") and b.endswith("\"")]
+                        d = len(bans) - len(banned_strings)
+                        banned_strings = bans
+                        if d < 0:
+                            print_info(f"{-d} string(s) removed")
+                        elif d > 0:
+                            print_info(f"{d} string(s) added")
+                        else:
+                            print_info("Strings updated")
+                        continue
+                    except KeyboardInterrupt:
+                        print_info("Exiting")
+                        break
 
                 # Save conversation
                 case "/save":
@@ -253,6 +289,19 @@ def main(args):
                 case "/cat":
                     user_prompt = "Write a python script that draws a cute kitten using matplotlib."
 
+                # Enable/disable
+                case "/probs":
+                    n = c[1] if len(c) > 1 else "0"
+                    if n.isnumeric():
+                        save_probs = int(n)
+                        if save_probs:
+                            print_info(f"Saving top-{save_probs} probs per token.")
+                        else:
+                            print_info(f"Disabled probs")
+                    else:
+                        print_error("Invalid argument")
+                    continue
+
                 case _:
                     print_error(f"Unknown command: {c[0]}")
                     continue
@@ -287,8 +336,12 @@ def main(args):
             sampler = sampler,
             banned_strings = banned_strings,
             token_healing = enable_healing,
+            return_logits = save_probs > 0,
         )
         generator.enqueue(job)
+        saved_topk = []
+        saved_probs = []
+        saved_samples = []
 
         # Stream response
         ctx_exceeded = False
@@ -303,6 +356,14 @@ def main(args):
                     chunk = r.get("text", "")
                     s.stream(chunk)
                     token_ids = r.get("token_ids")
+                    if save_probs and "logits" in r:
+                        logits = r["logits"]
+                        probs = logits.softmax(dim = -1)
+                        topk = probs.topk(k = save_probs)
+                        saved_probs += list(x.flatten().tolist() for x in topk[0].split(1, 1))
+                        saved_topk += list(x.flatten().tolist() for x in topk[1].split(1, 1))
+                    if save_probs and token_ids is not None:
+                        saved_samples += list(x.flatten().tolist() for x in token_ids.split(1, 1))
                     if token_ids is not None:
                         ids = torch.cat((ids, token_ids), dim = -1)
                     if r["eos"] and r["eos_reason"] == "max_new_tokens":
@@ -335,6 +396,9 @@ def main(args):
                 f"{col_info}{cached_tokens:,}{col_default} tokens cached - "
                 f"Generate: {col_info}{new_tokens:,}{col_default} tokens at {col_info}{tps:.3f}{col_default} t/s"
             )
+
+        if save_probs:
+            print_probs(saved_topk, saved_probs, saved_samples, tokenizer.get_id_to_piece_list())
 
         if args.debug:
             from pprint import pprint
@@ -369,7 +433,7 @@ if __name__ == "__main__":
     parser.add_argument("-modes", "--modes", action = "store_true", help = "List available prompt modes and exit")
     parser.add_argument("-un", "--user_name", type = str, default = "User", help = "User name (raw mode only)")
     parser.add_argument("-bn", "--bot_name", type = str, default = "Assistant", help = "Bot name (raw mode only)")
-    parser.add_argument("-mli", "--multiline", action = "store_true", help = "Enable multi line input (use Alt+Enter to submit input)")
+    parser.add_argument("-mli", "--multiline", action = "store_true", help = "Enable multi line input (use Alt-Enter to submit input)")
     parser.add_argument("-sp", "--system_prompt", type = str, help = "Use custom system prompt")
     parser.add_argument("-maxr", "--max_response_tokens", type = int, default = 1000, help = "Max tokens per response, default = 1000")
     parser.add_argument("-basic", "--basic_console", action = "store_true", help = "Use basic console output (no markdown and fancy prompt input")
@@ -378,6 +442,7 @@ if __name__ == "__main__":
     parser.add_argument("-think_budget", "--think_budget", type = int, help = "Thinking budget for supported models", default = None)
     parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context with every new prompt")
     parser.add_argument("-tps", "--show_tps", action = "store_true", help = "Show tokens/second after every reply")
+    parser.add_argument("-probs", "--probs", type = int, help = "Sample top-K raw probabilities per token, adds overhead", default = 0)
     parser.add_argument("-prompt", "--prompt", type = str, help = "Run single prompt, then exit")
     parser.add_argument("-save", "--save", type = str, help = "Save output to file (use with --prompt)")
     parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")

@@ -112,7 +112,7 @@ class MixtralModel(Model):
                     key_routing_gate = "gate",
                     qmap = "block.mlp",
                     interm_dtype = torch.half,
-                    out_dtype = torch.half,
+                    out_dtype = torch.float,
                 ),
             )
             for idx in range(config.num_hidden_layers)
