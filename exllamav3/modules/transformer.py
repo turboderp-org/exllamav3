@@ -99,7 +99,22 @@ class TransformerBlock(Module):
         q, k, v, o = None, None, None, None
         qkvz = None
         if self.attn:
-            if isinstance(self.attn, Attention):
+            if type(self.attn).allocate_q is not Module.allocate_q and not isinstance(self.attn, GatedDeltaNet):
+                strategy, surplus_bits = self.attn.allocate_q(quant_args, surplus_bits)
+                if u is not None:
+                    s, surplus_bits = allocate_transformer(
+                        quant_args[self.qbits_key],
+                        surplus_bits,
+                        None, None, None, None, g, u, d, None
+                    )
+                    strategy.update(s)
+                return strategy, surplus_bits
+            elif isinstance(self.attn, Attention):
+                q = self.attn.q_proj
+                k = self.attn.k_proj
+                v = self.attn.v_proj
+                o = self.attn.o_proj
+            elif all(hasattr(self.attn, name) for name in ("q_proj", "k_proj", "v_proj", "o_proj")):
                 q = self.attn.q_proj
                 k = self.attn.k_proj
                 v = self.attn.v_proj
@@ -245,7 +260,7 @@ class ParallelDecoderBlock(Module):
 
 
     def allocate_q(self, quant_args: dict, surplus_bits: int):
-        if self.attn:
+        if self.attn and not all(hasattr(self.attn, name) for name in ("q_proj", "k_proj", "v_proj", "o_proj")):
             assert isinstance(self.attn, Attention)
 
         if not self.attn and not self.mlp:
@@ -254,10 +269,10 @@ class ParallelDecoderBlock(Module):
         return allocate_transformer(
             quant_args[self.qbits_key],
             surplus_bits,
-            self.attn.q_proj if self.attn else None,
-            self.attn.k_proj if self.attn else None,
-            self.attn.v_proj if self.attn else None,
-            self.attn.o_proj if self.attn else None,
+            self.attn.q_proj if self.attn and hasattr(self.attn, "q_proj") else None,
+            self.attn.k_proj if self.attn and hasattr(self.attn, "k_proj") else None,
+            self.attn.v_proj if self.attn and hasattr(self.attn, "v_proj") else None,
+            self.attn.o_proj if self.attn and hasattr(self.attn, "o_proj") else None,
             self.mlp.gates if any(isinstance(self.mlp, x) for x in [GatedMLP, BlockSparseMLP]) else None,
             self.mlp.ups if self.mlp else None,
             self.mlp.downs if self.mlp else None,
