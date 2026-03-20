@@ -3,6 +3,8 @@ from .apertus import ApertusModel
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
+from .deepseek_v2 import DeepseekV2Model, DeepseekModel, DeepseekV3Model, GlmMoeDsaModel
+from .deepseek_vl2 import DeepseekVLV2TextModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
 from .ernie4_5_moe import Ernie4_5MoEModel
@@ -51,6 +53,11 @@ ARCHITECTURES = {
         CohereModel,
         Cohere2Model,
         DeciLMModel,
+        DeepseekV2Model,
+        DeepseekModel,
+        DeepseekV3Model,
+        DeepseekVLV2TextModel,
+        GlmMoeDsaModel,
         Dots1Model,
         Ernie4_5Model,
         Ernie4_5MoEModel,

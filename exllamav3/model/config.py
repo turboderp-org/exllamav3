@@ -8,6 +8,7 @@ import uuid
 
 class Config(ABC):
     arch_string = None
+    model_type_string = None
     load_isq: bool
 
     def __init__(
@@ -35,10 +36,19 @@ class Config(ABC):
         with open(self.config_filename, encoding = "utf8") as f:
             self.config_dict = json.load(f)
 
-        assert len(self.config_dict["architectures"]) == 1, \
-            f"Multiple architectures defined in {self.config_filename}"
+        arch = None
+        archs = self.config_dict.get("architectures")
+        if archs is not None:
+            assert len(archs) == 1, \
+                f"Multiple architectures defined in {self.config_filename}"
+            arch = archs[0]
+        else:
+            model_type = self.config_dict.get("model_type")
+            if self.model_type_string is not None and model_type == self.model_type_string:
+                arch = self.arch_string
+            else:
+                raise AssertionError(f"No architecture defined in {self.config_filename}")
 
-        arch = self.config_dict["architectures"][0]
         assert arch == self.arch_string, \
             f"Unexpected architecture {arch} in {self.config_filename}, should be {self.arch_string}."
         self.architecture = arch
@@ -47,10 +57,26 @@ class Config(ABC):
         self.stc = SafetensorsCollection(directory, load_method = kwargs.get("load_method"))
 
         # Standard params, vocab
-        self.bos_token_id = self.read_cfg(int, ["bos_token_id", "text_config->bos_token_id"], None)
-        self.eos_token_id = self.read_cfg([int, list], ["eos_token_id", "text_config->eos_token_id"], None)
-        self.pad_token_id = self.read_cfg(int, ["pad_token_id", "text_config->pad_token_id"], None)
-        self.vocab_size = self.read_cfg(int, ["vocab_size", "text_config->vocab_size"], None)
+        self.bos_token_id = self.read_cfg(
+            int,
+            ["bos_token_id", "text_config->bos_token_id", "language_config->bos_token_id"],
+            None,
+        )
+        self.eos_token_id = self.read_cfg(
+            [int, list],
+            ["eos_token_id", "text_config->eos_token_id", "language_config->eos_token_id"],
+            None,
+        )
+        self.pad_token_id = self.read_cfg(
+            int,
+            ["pad_token_id", "text_config->pad_token_id", "language_config->pad_token_id"],
+            None,
+        )
+        self.vocab_size = self.read_cfg(
+            int,
+            ["vocab_size", "text_config->vocab_size", "language_config->vocab_size"],
+            None,
+        )
         if isinstance(self.eos_token_id, list):
             self.eos_token_id_list = self.eos_token_id
             self.eos_token_id = self.eos_token_id[0]
@@ -134,10 +160,22 @@ class Config(ABC):
         with open(config_filename, encoding = "utf8") as f:
             config_dict = json.load(f)
 
-        assert "architectures" in config_dict, f"No architecture defined in {config_filename}"
-        archs = config_dict["architectures"]
-        assert len(archs) == 1, f"Multiple architectures defined in {config_filename}"
-        arch = archs[0]
+        arch = None
+        archs = config_dict.get("architectures")
+        if archs is not None:
+            assert len(archs) == 1, f"Multiple architectures defined in {config_filename}"
+            arch = archs[0]
+        else:
+            model_type = config_dict.get("model_type")
+            candidates = [
+                arch_name
+                for arch_name, arch_def in architectures.items()
+                if getattr(arch_def["config_class"], "model_type_string", None) == model_type
+            ]
+            assert candidates, f"No architecture defined in {config_filename}"
+            assert len(candidates) == 1, f"Multiple architectures match model_type {model_type} in {config_filename}"
+            arch = candidates[0]
+
         assert arch in architectures, f"Unknown architecture {arch} in {config_filename}"
 
         arch_def = architectures[arch]
