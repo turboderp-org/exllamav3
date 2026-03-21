@@ -222,6 +222,7 @@ class Job:
 
         self.stop_tokens_list = list(self.stop_tokens)
         self.stop_strings_list = list(self.stop_strings)
+        self.stop_string_max_length = max([0] + [len(x) for x in self.stop_strings_list])
 
         # Banned strings
         if banned_strings:
@@ -653,7 +654,7 @@ class Job:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "end_filter")
 
         # Hold text if it contains an incomplete character
-        if 1 <= self.held_text.count("�") < 5:
+        if self.held_text.endswith("�") and self.held_text.count("�") < 5:
             test_decode = self.generator.tokenizer.decode(
                 self.held_tokens.torch(),
                 decode_special_tokens = self.decode_special_tokens
@@ -663,7 +664,7 @@ class Job:
             else:
                 # Don't hold forever if a broken generation yields a replacement character but never completes
                 # the Unicode symbol
-                return emit(results, emit_held = (len(test_decode) > 20))
+                return emit(results, emit_held = (len(test_decode) > self.stop_string_max_length + 20))
 
         # Hold text as long as it contains part of a banned string
 
