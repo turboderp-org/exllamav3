@@ -992,6 +992,7 @@ class Job:
                 if prefill_start < last_page_b < prefill_end:
                     prefill_end = last_page_b
                     recurrent_last_page = True
+                    prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Inference
             if prefill_end > prefill_start:
