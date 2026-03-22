@@ -18,7 +18,7 @@ col_green = "\u001b[32;1m"
 col_red = "\u001b[31;1m"
 col_gray = "\u001b[37;1m"
 
-model_dir = "/mnt/str/models/qwen3.5-9b/exl3/4.00bpw"
+model_dir = "/mnt/str/models/qwen3.5-35b-a3b/exl3/4.09bpw"
 cache_size = 16384
 draft_model_dir = None
 prompt_len = (50, 4096)
@@ -105,7 +105,10 @@ def iterate():
             )
 
             full = result["identifier"] + result["full_completion"]
-            full = full[full.find(": ") + 2:]
+            pr = result["identifier"]
+            i = full.find(": ") + 2
+            full = full[i:]
+            pr = pr[i:]
             full = full[:full.rfind(",")]
             try:
                 ok = is_consecutive_integers(full)
@@ -117,7 +120,6 @@ def iterate():
             else:
                 print("Sus!")
                 print("--------")
-                pr = result["identifier"]
                 print(col_green + pr + col_red + full[len(pr):] + col_default)
                 print("--------")
 
