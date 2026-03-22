@@ -35,10 +35,12 @@ class MLP(Module):
         pad_to = 128,
         ups: list[Linear | Module] = None,
         downs: list[Linear | Module] = None,
-        interm_scale: float | None = None
+        interm_scale: float | None = None,
+        select_hq_bits: int = 0,
     ):
         super().__init__(config, key, None)
 
+        self.q_priority = 1 + select_hq_bits
         self.hidden_size = hidden_size
         self.pad_to = pad_to
         self.out_dtype = out_dtype
@@ -101,8 +103,9 @@ class MLP(Module):
                     frange = frange_up,
                     alt_key = a_key_u,
                     out_dtype = self.interm_dtype,
-                    qbits_mod_key = "u",
-                    pad_to = pad_to
+                    pad_to = pad_to,
+                    select_hq_bits = select_hq_bits,
+                    qgroup = key + ".u",
                 )
                 down = Linear(
                     config = config,
@@ -117,8 +120,9 @@ class MLP(Module):
                     alt_key = a_key_d,
                     out_dtype = self.out_dtype,
                     allow_input_padding = True,
-                    qbits_mod_key = "d",
-                    pad_to = pad_to
+                    pad_to = pad_to,
+                    select_hq_bits = select_hq_bits,
+                    qgroup = key + ".d",
                 )
 
                 self.ups.append(up)
@@ -379,6 +383,7 @@ class GatedMLP(Module):
         gates: list[Linear | Module] = None,
         ups: list[Linear | Module] = None,
         downs: list[Linear | Module] = None,
+        select_hq_bits: int = 0,
     ):
         super().__init__(config, key, None)
 
@@ -456,8 +461,9 @@ class GatedMLP(Module):
                     frange = frange_gate,
                     alt_key = a_key_g,
                     out_dtype = self.interm_dtype,
-                    qbits_mod_key = "g",
-                    pad_to = pad_to
+                    pad_to = pad_to,
+                    select_hq_bits = select_hq_bits,
+                    qgroup = key + ".gu",
                 )
                 up = Linear(
                     config = config,
@@ -473,8 +479,9 @@ class GatedMLP(Module):
                     frange = frange_up,
                     alt_key = a_key_u,
                     out_dtype = self.interm_dtype,
-                    qbits_mod_key = "u",
-                    pad_to = pad_to
+                    pad_to = pad_to,
+                    select_hq_bits = select_hq_bits,
+                    qgroup = key + ".gu",
                 )
                 down = Linear(
                     config = config,
@@ -489,8 +496,9 @@ class GatedMLP(Module):
                     alt_key = a_key_d,
                     out_dtype = self.out_dtype,
                     allow_input_padding = True,
-                    qbits_mod_key = "d",
-                    pad_to = pad_to
+                    pad_to = pad_to,
+                    select_hq_bits = select_hq_bits,
+                    qgroup = key + ".d",
                 )
 
                 self.ups.append(up)

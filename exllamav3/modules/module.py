@@ -40,7 +40,8 @@ class Module(ABC):
         self.caps = {}
         self.qmap = qmap
         self.num_slices = 1
-        self.qbits_mod_key = ""
+        self.select_hq_bits = 0
+        self.q_priority = 0
 
     def __iter__(self):
         yield self
@@ -97,9 +98,6 @@ class Module(ABC):
         out_dtype: torch.dtype = torch.half
     ) -> torch.Tensor:
         pass
-
-    def allocate_q(self, quant_args: dict, surplus_bits: int):
-        return {}, surplus_bits
 
     def register_submodule(self, module: Module | None):
         if module is not None:

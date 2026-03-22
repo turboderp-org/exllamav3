@@ -146,7 +146,8 @@ class Step3_5Model(Model):
                             constant_bias = 1.0,
                         ),
                         out_dtype = torch.float,
-                        tp_split_norm = False
+                        tp_split_norm = False,
+                        select_hq_bits = 2,
                     ),
                     mlp_norm = RMSNorm(
                         config = config,
@@ -167,6 +168,7 @@ class Step3_5Model(Model):
                             act_limit = act_limit,
                             interm_dtype = torch.half,
                             out_dtype = torch.float,
+                            select_hq_bits = 1,
                         )
                         if not is_moe else
                         BlockSparseMLP(
@@ -202,6 +204,7 @@ class Step3_5Model(Model):
                                 act_limit = act_limit_shared,
                                 interm_dtype = torch.half,
                                 out_dtype = torch.float,
+                                select_hq_bits = 2,
                             ),
                             transposed_load = False,
                         )

@@ -147,7 +147,7 @@ def compile_model(args, model, config, tokenizer):
     qcfg = {
         "quant_method": "exl3",
         "version": __version__,
-        "bits": args["bits"],
+        "bits": args["final_bits"],
         "head_bits": args["head_bits"],
     }
     if "cal_rows" in args:
@@ -171,7 +171,7 @@ def compile_model(args, model, config, tokenizer):
         if orig_qcfg.get("quant_method") == "exl3":
             qcfg = orig_qcfg
             qcfg.update({
-                "bits": args["bits"],
+                "bits": args["final_bits"],
                 "head_bits": args["head_bits"],
             })
             if "codebook" in args:

@@ -92,7 +92,8 @@ class MixtralModel(Model):
                     key_v = "v_proj",
                     key_o = "o_proj",
                     qmap = "block.attn",
-                    out_dtype = torch.float
+                    out_dtype = torch.float,
+                    select_hq_bits = 2,
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
