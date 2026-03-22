@@ -95,20 +95,3 @@ python convert.py -i /mnt/models/qwen3.5-35b-a3b \
 ```
  
 For dialing in the optimal ratio, monitor GPU usage while quantizing. Usage should periodically jump to 100% for at least one device, and ideally you want the other devices close to that as well, while they are active. Increasing the relative split for a device should increase the relative usage as well.
-
-### Expected duration
-
-Some rough estimates of the expected overall time to convert various sizes of models, as of v0.0.1. Quantization kernel is tuned for Ada GPUs at the moment, and especially Ampere performance is likely to improve with more optimization.
-
-| Model size | bpw | 3090   | 4090   | 5090   | 5090 + 2x4090 |
-|------------|-----|--------|--------|--------|---------------|
-| 1B         | 2.0 | 11m    | 4m     | 3m     | 2m            |
-| 1B         | 4.0 | 6m     | 3m     | 2m     | 1m            |
-| 1B         | 8.0 | 5m     | 3m     | 2m     | 1m            |
-| 8B         | 2.0 | 1h 08m | 21m    | 16m    | 10m           |
-| 8B         | 4.0 | 34m    | 14m    | 12m    | 8m            |
-| 8B         | 8.0 | 31m    | 14m    | 11m    | 8m            |
-| 70B        | 2.0 | 9h 04m | 3h 7m  | 2h 19m | 1h 24m        |
-| 70B        | 4.0 | 4h 32m | 2h 0m  | 1h 50m | 1h 5m         |
-| 70B        | 8.0 | 4h 20m | 1h 58m | 1h 41  | 1h 3m         |
-
