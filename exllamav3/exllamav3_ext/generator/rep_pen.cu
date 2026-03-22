@@ -8,13 +8,18 @@
 
 #define BLOCK_VOCAB_SPAN 4096
 #define NUM_THREADS 1024
+#define CLAMP(x, min, max) ((x) < (min) ? (min) : ((x) > (max) ? (max) : (x)))
 
 __device__ __forceinline__
-float shmemAtomicMaxF(float* addr, float val)  // val > 0
+float shmemAtomicMaxF(float* addr, float val)
 {
-    auto uaddr = reinterpret_cast<unsigned int*>(addr);
-    unsigned int old = atomicMax(uaddr, __float_as_uint(val));
-    return __uint_as_float(old);
+    if (val >= 0.0f) {
+        unsigned int old = atomicMax(reinterpret_cast<unsigned int*>(addr), __float_as_uint(val));
+        return __uint_as_float(old);
+    } else {
+        unsigned int old = atomicMin(reinterpret_cast<unsigned int*>(addr), __float_as_uint(val));
+        return __uint_as_float(old);
+    }
 }
 
 template <bool input_fp16>
@@ -40,10 +45,10 @@ void apply_rep_pens_kernel
         factors[i] = 0.0f;
     __syncthreads();
 
-    // Record which tokens from the range appear in past_ids and
+    // Record which tokens from the range appear in past_ids
     for (int i = threadIdx.x; i < past_len; i += NUM_THREADS)
     {
-        if (i < past_len - sustain_range - decay_range)
+        if (i <= past_len - sustain_range - decay_range)
             continue;
 
         int tid = (int) past_ids[i];
@@ -55,8 +60,12 @@ void apply_rep_pens_kernel
             factors[tid - range_min] = 1.0f;
         else
         {
-            float f = MAX(0.0f, 1.0f - ((float)dist - (float)sustain_range) / (float)decay_range);
-            shmemAtomicMaxF(factors + tid - range_min, f);
+            float distf = (float)(past_len - i);
+            float sustain_rangef = (float)sustain_range;
+            float decay_rangef = (float)decay_range;
+            float factor = decay_range > 0 ? 1.0f - (distf - sustain_rangef) / decay_rangef : 1.0f;
+            factor = CLAMP(factor, 0.0f, 1.0f);
+            shmemAtomicMaxF(factors + tid - range_min, factor);
         }
     }
     __syncthreads();
@@ -153,20 +162,23 @@ void apply_pres_freq_pens_kernel
     }
     __syncthreads();
 
-    // Record which tokens from the range appear in past_ids and
+    // Record which tokens from the range appear in past_ids
     for (int i = threadIdx.x; i < past_len; i += NUM_THREADS)
     {
-        if (i < past_len - sustain_range - decay_range)
+        if (i <= past_len - sustain_range - decay_range)
             continue;
 
         int tid = (int) past_ids[i];
         if (tid < range_min || tid >= range_max)
             continue;
 
-        int dist = past_len - i;
-        float pen = MIN(1.0f, MAX(0.0f, 1.0f - ((float)dist - (float)sustain_range) / (float)decay_range));
-        atomicAdd(frequency + tid - range_min, pen * freq_p);
-        shmemAtomicMaxF(presence + tid - range_min, pen * pres_p);
+        float distf = (float)(past_len - i);
+        float sustain_rangef = (float)sustain_range;
+        float decay_rangef = (float)decay_range;
+        float factor = decay_range > 0 ? 1.0f - (distf - sustain_rangef) / decay_rangef : 1.0f;
+        factor = CLAMP(factor, 0.0f, 1.0f);
+        atomicAdd(frequency + tid - range_min, factor * freq_p);
+        shmemAtomicMaxF(presence + tid - range_min, factor * pres_p);
     }
     __syncthreads();
 

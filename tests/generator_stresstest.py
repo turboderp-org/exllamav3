@@ -18,7 +18,7 @@ col_green = "\u001b[32;1m"
 col_red = "\u001b[31;1m"
 col_gray = "\u001b[37;1m"
 
-model_dir = "/mnt/str/models/llama3.2-1b-instruct/exl3/5.0bpw/"
+model_dir = "/mnt/str/models/qwen3.5-9b/exl3/4.00bpw"
 cache_size = 16384
 draft_model_dir = None
 prompt_len = (50, 4096)
@@ -58,7 +58,7 @@ generator = Generator(
     draft_model = draft_model,
     draft_cache = draft_cache,
     tokenizer = tokenizer,
-    show_visualizer = True,  # Slows down the test but makes it less boring
+    # show_visualizer = True,  # Slows down the test but makes it less boring
 )
 
 def start_new_job():
@@ -99,8 +99,8 @@ def iterate():
             cached_tokens = result["cached_tokens"]
             cached_pages = result["cached_pages"]
             print(
-                f"{str(result['job'])}  pending: {num_pending}  active: {num_active}  "
-                f"cached_p: {cached_pages}  cached_t: {cached_tokens}  -  ",
+                f"{str(result['job']):20}  pending: {num_pending:3}  active: {num_active:3}  "
+                f"cached_p: {cached_pages:3}  cached_t: {cached_tokens:5}  -  ",
                 end = ""
             )
 
@@ -124,6 +124,7 @@ def iterate():
 # Main loop
 next_target_q_depth = 0
 depth_0_interval = force_depth_0_interval
+last_defrag_serial = generator.pagetable.last_defrag_serial
 while True:
 
     # Iterate until target q depth is reached
@@ -131,6 +132,9 @@ while True:
         print(f" - Generating, target depth {next_target_q_depth}")
     while generator.num_remaining_jobs() > next_target_q_depth:
         iterate()
+        if last_defrag_serial != generator.pagetable.last_defrag_serial:
+            print(" !! DEFRAG")
+            last_defrag_serial = generator.pagetable.last_defrag_serial
 
     next_target_q_depth = random.randint(target_q_depth[0] + 1, target_q_depth[1])
 
