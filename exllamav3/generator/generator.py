@@ -156,6 +156,7 @@ class Generator:
             self.recurrent_cache = None
         assert recurrent_checkpoint_interval % PAGE_SIZE == 0, \
             "recurrent_checkpoint_interval must be a multiple of the page size (256)"
+        recurrent_checkpoint_interval = min(recurrent_checkpoint_interval, self.max_chunk_size)
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
 
 
