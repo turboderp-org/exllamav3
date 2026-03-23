@@ -510,6 +510,11 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
+        # Optional addend to V tensor (e.g. value embeddings)
+        v_addend = params.pop("attn_v_addend", None)
+        if v_addend is not None:
+            v = v + v_addend.to(v.dtype).view_as(v)
+
         assert self.sliding_window < 0, \
             "Torch SDPA does not support sliding window attention (SWA)"
         assert self.logit_softcapping == 0.0, \
@@ -569,6 +574,11 @@ class Attention(Module):
         q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+
+        # Optional addend to V tensor (e.g. value embeddings)
+        v_addend = params.pop("attn_v_addend", None)
+        if v_addend is not None:
+            v = v + v_addend.to(v.dtype).view_as(v)
 
         if self.q_norm:
             if self.tp_span_heads_norm:
@@ -647,6 +657,11 @@ class Attention(Module):
         q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+
+        # Optional addend to V tensor (e.g. value embeddings)
+        v_addend = params.pop("attn_v_addend", None)
+        if v_addend is not None:
+            v = v + v_addend.to(v.dtype).view_as(v)
 
         # TODO: Add LayerNorm option to fused norm/RoPE kernel
         if self.q_norm:
