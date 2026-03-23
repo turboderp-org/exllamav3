@@ -273,6 +273,7 @@ class Job:
 
         # Recurrent state
         self.recurrent_state = None
+        self.last_recurrent_checkpoint_pos = None
 
 
     def get_pinned_logit_mask(self):
@@ -989,7 +990,7 @@ class Job:
             if self.generator.recurrent_cache is not None:
                 seqlen = len(seq.sequence_ids) - 1
                 last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
-                if prefill_start < last_page_b < prefill_end:
+                if prefill_start < last_page_b <= prefill_end:
                     prefill_end = last_page_b
                     recurrent_last_page = True
                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
@@ -1105,11 +1106,15 @@ class Job:
 
     def maybe_stash_recurrent(self, cache, interval):
         seq = self.sequences[0]
-        if seq.kv_position % interval == 0:
+        if seq.kv_position % interval == 0 and \
+            self.last_recurrent_checkpoint_pos != seq.kv_position:
+            self.last_recurrent_checkpoint_pos = seq.kv_position
             last_page = (seq.kv_position - 1) // PAGE_SIZE
             page = seq.allocated_pages[last_page]
             assert page.kv_position == PAGE_SIZE
             cache.stash(page.phash, self.recurrent_state)
+            # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk
+            self.last_recurrent_checkpoint_pos = seq.kv_position
 
     def free_recurrent_state(self):
         self.recurrent_state = None
