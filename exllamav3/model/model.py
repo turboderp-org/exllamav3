@@ -29,6 +29,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.last_kv_module_idx = None
         self.logit_layer_idx = None
         self.first_block_idx = None
+        self.layer_map = None
 
         # Calibration options
         self.calibration_all_experts = False
