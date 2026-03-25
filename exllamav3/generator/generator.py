@@ -579,7 +579,7 @@ class Generator:
         # Requeue jobs
         for job in requeuing_jobs:
             rq_job = job.prepare_for_requeue()
-            self.pending_jobs.append(rq_job)
+            self.pending_jobs.insert(0, rq_job)
 
         # Defrag
         if num_jobs and not self.num_remaining_jobs():
