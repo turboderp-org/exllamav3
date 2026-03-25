@@ -113,6 +113,42 @@ class PromptFormat_chatml(PromptFormat):
         ]
 
 
+class PromptFormat_qwen35(PromptFormat):
+    description = "Qwen3.5 format, reasoning-aware ChatML"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        for (u, a) in messages:
+            context += f"<|im_start|>user\n{u}<|im_end|>\n"
+            context += f"<|im_start|>assistant\n"
+            if a is not None:
+                context += f"{a}<|im_end|>\n"
+            elif not think:
+                context += f"<think>\n\n</think>\n\n"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|im_end|>"),
+            """<|im_end|>"""
+        ]
+
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
+
 class PromptFormat_phi(PromptFormat):
     description = "Phi3/Phi4 instruct models (note, some Phi4 models use ChatML)"
 
@@ -729,6 +765,7 @@ prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
     "chatml": PromptFormat_chatml,
+    "qwen35": PromptFormat_qwen35,
     "phi": PromptFormat_phi,
     "mistral": PromptFormat_mistral,
     "mistral3": PromptFormat_mistral3,

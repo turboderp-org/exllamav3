@@ -468,7 +468,7 @@ class PageTable:
             return
 
         # Defragment once job queue is empty and all pages have been touched at least once
-        if self.access_serial < self.last_defrag_serial + self.max_pages:
+        if self.access_serial < self.last_defrag_serial + self.max_pages * 8:
             return
         self.last_defrag_serial = self.access_serial
 

@@ -327,6 +327,7 @@ class Qwen3_5BaseModel(Model):
                             key_o = "out_proj",
                             qmap = "block.attn",
                             out_dtype = torch.float,
+                            select_hq_bits = 2 if use_moe else 0,
                         )
                         if config.layer_types[idx] == "linear_attention" else
                         Attention(
@@ -358,6 +359,7 @@ class Qwen3_5BaseModel(Model):
                             ),
                             out_dtype = torch.float,
                             interleaved_gate = True,
+                            select_hq_bits = 2 if use_moe else 0,
                         )
                     ),
                     mlp_norm = RMSNorm(
@@ -396,6 +398,7 @@ class Qwen3_5BaseModel(Model):
                                 qmap = "block.mlp",
                                 interm_dtype = torch.half,
                                 out_dtype = torch.float,
+                                select_hq_bits = 2,
                             )
                         ) if use_moe else
                         GatedMLP(

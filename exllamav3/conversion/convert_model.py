@@ -12,6 +12,7 @@ from ..util.tensor import save_tensor_image
 from ..util.measures import cosine_error, sqnr
 from .calibration_data import get_default_calibration
 from .compile import compile_model, dsize
+from .allocation import create_q_strategy, print_strategy
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
@@ -30,6 +31,7 @@ parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Outpu
 parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in MB, default: 8192")
 parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
 parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bits per weight, output (head) layer, default: 6")
+parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
 parser.add_argument("-resume", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
 parser.add_argument("-cc", "--cal_cols", type = int, help = "Calibration data size, columns, default: 2048")
@@ -40,7 +42,6 @@ parser.add_argument("-d", "--devices", type = str, default = "0", help = "List o
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
 parser.add_argument("-cb", "--codebook", type = str, default = "mcg", help = "Codebook: mcg (default), mul1 or 3inst")
-parser.add_argument("-strat", "--strategy", type = str, default = None, help = "Modifiers for quantization strategy - EXPERIMENTAL")
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "When possible, use new parallel mode for small tensors (MoE layers especially)")
 
 group = parser.add_mutually_exclusive_group()
@@ -167,6 +168,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("shard_size", True, 8192),
         ("bits", False, None),
         ("head_bits", False, 6),
+        ("hq", False, False),
         ("cal_rows", False, 250),
         ("cal_cols", False, 2048),
         ("checkpoint_interval", True, None),
@@ -174,7 +176,6 @@ def prepare(args) -> (dict, dict, bool, str):
         ("devices", True, None),
         ("device_ratios", True, None),
         ("codebook", True, "mcg"),
-        ("strategy", False, ""),
         ("parallel_mode", True, False),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
@@ -191,7 +192,7 @@ def prepare(args) -> (dict, dict, bool, str):
         print(f" -- Creating new job")
         job_state = {
             "next_module_idx": 0,
-            "surplus_bits": 0,
+            "q_strategy": None,
         }
         save_dict("args.json", in_args, in_args)
         save_dict("ckpt/job.json", job_state, in_args)
@@ -252,31 +253,6 @@ def get_state_error(x, ref):
      return err.item(), cos, sq
 
 
-def mod_strategy(args, module, strategy, idx):
-    mod_arg = args.get("strategy")
-    if not mod_arg:
-        return strategy
-
-    s_layers = [""] + mod_arg.split(";")
-    if idx >= len(s_layers):
-        return strategy
-
-    s = s_layers[idx]
-    mod = {}
-    while s:
-        l, m = s[0], s[1]
-        s = s[2:]
-        mod[l] = int(m)
-
-    new_strategy = {}
-    for key, bits in strategy.items():
-        submodule = module.find_module(key)
-        modifier = mod.get(submodule.qbits_mod_key, 0)
-        new_strategy[key] = min(bits + modifier, 8)
-
-    return new_strategy
-
-
 @torch.inference_mode()
 def main(args, job_state):
     global max_progress, curr_progress
@@ -320,6 +296,15 @@ def main(args, job_state):
     def put_preserve(si, params_):
         quant_preserves[si] = params_["quant_preserve"]
 
+    # Get quantization strategy for model @bitrate
+    print(" -- Deciding quantization strategy")
+    hq = args["hq"]
+    strategy, final_bpw = create_q_strategy(model, config, args["bits"], args["head_bits"], hq)
+    args["final_bits"] = round(final_bpw, 2)
+    print(" -- Quantization strategy, summary:")
+    print(print_strategy(strategy))
+    print(f" -- Final bitrate (excluding head): {final_bpw:4.2f}" + (" (--hq enabled)" if hq else ""))
+
     # Iterate over modules
     for idx, module in enumerate(model.modules):
 
@@ -333,17 +318,6 @@ def main(args, job_state):
 
         # Collect output tensors
         q_tensors = {}
-
-        # Quantization strategy
-        strategy, surplus = module.allocate_q(
-            {
-                "bits": args["bits"],
-                "head_bits": args["head_bits"],
-            },
-            job_state["surplus_bits"],
-        )
-        strategy = mod_strategy(args, module, strategy, idx)
-        job_state["surplus_bits"] = surplus
 
         # Slice module if necessary
         slicing = module.num_slices > 1

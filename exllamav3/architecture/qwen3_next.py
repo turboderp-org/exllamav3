@@ -114,6 +114,7 @@ class Qwen3NextModel(Model):
                         key_o = "out_proj",
                         qmap = "block.attn",
                         out_dtype = torch.float,
+                        select_hq_bits = 2,
                     )
                     if (idx + 1) % config.full_attention_interval != 0 else
                     Attention(
@@ -145,6 +146,7 @@ class Qwen3NextModel(Model):
                         ),
                         out_dtype = torch.float,
                         interleaved_gate = True,
+                        select_hq_bits = 2,
                     )
                 ),
                 mlp_norm = RMSNorm(
@@ -179,6 +181,7 @@ class Qwen3NextModel(Model):
                         qmap = "block.mlp",
                         interm_dtype = torch.half,
                         out_dtype = torch.float,
+                        select_hq_bits = 2,
                     )
                 ),
             )

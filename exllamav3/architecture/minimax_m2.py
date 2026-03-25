@@ -106,7 +106,8 @@ class MiniMaxM2Model(Model):
                         rms_norm_eps = config.rms_norm_eps,
                         span_heads = True,
                     ),
-                    out_dtype = torch.float
+                    out_dtype = torch.float,
+                    select_hq_bits = 2,
                 ),
                 mlp_norm = RMSNorm(
                     config = config,

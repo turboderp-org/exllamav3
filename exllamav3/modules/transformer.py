@@ -4,7 +4,6 @@ import torch
 from ..util.tensor import to2, get_for_device
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
-from ..conversion.allocation import allocate_transformer
 from ..util import profile_opt
 
 class TransformerBlock(Module):
@@ -143,52 +142,52 @@ class TransformerBlock(Module):
         return to2(x, out_dtype, self.out_dtype)
 
 
-    def allocate_q(self, quant_args: dict, surplus_bits: int):
-
-        if not self.attn and not self.mlp:
-            return {}, surplus_bits
-
-        g = self.mlp.gates if any(isinstance(self.mlp, x) for x in [GatedMLP, BlockSparseMLP]) else None
-        u = self.mlp.ups if self.mlp else None
-        d = self.mlp.downs if self.mlp else None
-        if self.mlp and isinstance(self.mlp, BlockSparseMLP) and self.mlp.shared_experts:
-            g = g + self.mlp.shared_experts.gates
-            u = u + self.mlp.shared_experts.ups
-            d = d + self.mlp.shared_experts.downs
-
-        q, k, v, o = None, None, None, None
-        qkvz = None
-        if self.attn:
-            if isinstance(self.attn, Attention):
-                q = self.attn.q_proj
-                k = self.attn.k_proj
-                v = self.attn.v_proj
-                o = self.attn.o_proj
-            elif isinstance(self.attn, GatedDeltaNet):
-                if self.attn.qkvz_proj is not None:
-                    qkvz = self.attn.qkvz_proj
-                    o = self.attn.o_proj
-                elif self.attn.qkv_proj is not None and self.attn.z_proj is not None:
-                    strategy = {}
-                    for linear in (self.attn.qkv_proj, self.attn.z_proj, self.attn.o_proj):
-                        s, surplus_bits = linear.allocate_q(quant_args, surplus_bits)
-                        strategy.update(s)
-                    if u is not None:
-                        s, surplus_bits = allocate_transformer(
-                            quant_args[self.qbits_key],
-                            surplus_bits,
-                            None, None, None, None, g, u, d, None
-                        )
-                        strategy.update(s)
-                    return strategy, surplus_bits
-                else:
-                    o = self.attn.o_proj
-
-        return allocate_transformer(
-            quant_args[self.qbits_key],
-            surplus_bits,
-            q, k, v, o, g, u, d, qkvz
-        )
+    # def allocate_q(self, quant_args: dict, surplus_bits: int):
+    #
+    #     if not self.attn and not self.mlp:
+    #         return {}, surplus_bits
+    #
+    #     g = self.mlp.gates if any(isinstance(self.mlp, x) for x in [GatedMLP, BlockSparseMLP]) else None
+    #     u = self.mlp.ups if self.mlp else None
+    #     d = self.mlp.downs if self.mlp else None
+    #     if self.mlp and isinstance(self.mlp, BlockSparseMLP) and self.mlp.shared_experts:
+    #         g = g + self.mlp.shared_experts.gates
+    #         u = u + self.mlp.shared_experts.ups
+    #         d = d + self.mlp.shared_experts.downs
+    #
+    #     q, k, v, o = None, None, None, None
+    #     qkvz = None
+    #     if self.attn:
+    #         if isinstance(self.attn, Attention):
+    #             q = self.attn.q_proj
+    #             k = self.attn.k_proj
+    #             v = self.attn.v_proj
+    #             o = self.attn.o_proj
+    #         elif isinstance(self.attn, GatedDeltaNet):
+    #             if self.attn.qkvz_proj is not None:
+    #                 qkvz = self.attn.qkvz_proj
+    #                 o = self.attn.o_proj
+    #             elif self.attn.qkv_proj is not None and self.attn.z_proj is not None:
+    #                 strategy = {}
+    #                 for linear in (self.attn.qkv_proj, self.attn.z_proj, self.attn.o_proj):
+    #                     s, surplus_bits = linear.allocate_q(quant_args, surplus_bits)
+    #                     strategy.update(s)
+    #                 if u is not None:
+    #                     s, surplus_bits = allocate_transformer(
+    #                         quant_args[self.qbits_key],
+    #                         surplus_bits,
+    #                         None, None, None, None, g, u, d, None
+    #                     )
+    #                     strategy.update(s)
+    #                 return strategy, surplus_bits
+    #             else:
+    #                 o = self.attn.o_proj
+    #
+    #     return allocate_transformer(
+    #         quant_args[self.qbits_key],
+    #         surplus_bits,
+    #         q, k, v, o, g, u, d, qkvz
+    #     )
 
     def get_name(self):
         name = super().get_name()
@@ -303,26 +302,6 @@ class ParallelDecoderBlock(Module):
 
         return to2(x, out_dtype, self.out_dtype)
 
-
-    def allocate_q(self, quant_args: dict, surplus_bits: int):
-        if self.attn:
-            assert isinstance(self.attn, Attention)
-
-        if not self.attn and not self.mlp:
-            return {}, surplus_bits
-
-        return allocate_transformer(
-            quant_args[self.qbits_key],
-            surplus_bits,
-            self.attn.q_proj if self.attn else None,
-            self.attn.k_proj if self.attn else None,
-            self.attn.v_proj if self.attn else None,
-            self.attn.o_proj if self.attn else None,
-            self.mlp.gates if any(isinstance(self.mlp, x) for x in [GatedMLP, BlockSparseMLP]) else None,
-            self.mlp.ups if self.mlp else None,
-            self.mlp.downs if self.mlp else None,
-            None
-        )
 
 
     def get_name(self):

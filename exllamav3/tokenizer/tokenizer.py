@@ -651,6 +651,7 @@ class Tokenizer:
         """
 
         from transformers import AutoTokenizer
+        from transformers.tokenization_utils_base import BatchEncoding
         if self.hf_tokenizer is None:
             self.hf_tokenizer = AutoTokenizer.from_pretrained(self.config.directory)
 
@@ -673,10 +674,11 @@ class Tokenizer:
             )
 
         # HF tokenizer versions/models vary:
+        # - BatchEncoding
         # - dict with "input_ids"
         # - plain token list
         # - tensor
-        if isinstance(rendered, dict):
+        if isinstance(rendered, dict) or isinstance(rendered, BatchEncoding):
             ids = rendered.get("input_ids")
         else:
             ids = rendered

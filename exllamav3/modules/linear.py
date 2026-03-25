@@ -8,7 +8,6 @@ from . import Module
 from .quant import LinearFP16, LinearEXL3
 from .quant.exl3_lib import quantize_exl3
 from ..ext import exllamav3_ext as ext
-from ..conversion.allocation import allocate_linear
 from ..model.model_tp_alloc import TPAllocation
 
 
@@ -23,7 +22,6 @@ class Linear(Module):
         qmap: str | None = None,
         alt_key: str | list | None = None,
         qbits_key: str = "bits",
-        qbits_mod_key: str = "",
         fkey : str | None = None,
         frange: tuple[int, int] | None = None,
         fidx: int | None = None,
@@ -39,6 +37,8 @@ class Linear(Module):
         post_scale: float = 1.0,
         transposed_load: bool = True,
         transpose_fused_weights: bool = True,
+        select_hq_bits: int = 0,
+        qgroup: str = None
     ):
         super().__init__(config, key, qmap)
 
@@ -53,7 +53,6 @@ class Linear(Module):
         self.first_out_feature = first_out_feature if first_out_feature is not None else 0
         self.inner = None
         self.qbits_key = qbits_key
-        self.qbits_mod_key = qbits_mod_key
         self.fkey = fkey
         self.frange = frange
         self.fidx = fidx
@@ -64,6 +63,8 @@ class Linear(Module):
         self.post_scale = post_scale
         self.transposed_load = transposed_load
         self.transpose_fused_weights = transpose_fused_weights
+        self.select_hq_bits = select_hq_bits
+        self.qgroup = qgroup or key
 
         assert self.in_features_unpadded == self.in_features or allow_input_padding, \
             f"Input padding is not allowed for {self.key}, in_dim: {self.in_features_unpadded}, pad_to: {pad_to}"
@@ -405,14 +406,6 @@ class Linear(Module):
         if self.post_scale != 1.0:
             x *= self.post_scale
         return x
-
-
-    def allocate_q(self, quant_args: dict, surplus_bits: int):
-        return allocate_linear(
-            quant_args[self.qbits_key],
-            surplus_bits,
-            self
-        )
 
 
     def quant_format_id(self):

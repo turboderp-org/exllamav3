@@ -98,6 +98,7 @@ class Ernie4_5MoEModel(Model):
                     key_o = "o_proj",
                     qmap = "block.attn",
                     out_dtype = torch.float,
+                    select_hq_bits = 2,
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
@@ -116,6 +117,7 @@ class Ernie4_5MoEModel(Model):
                         qmap = "block.mlp",
                         interm_dtype = torch.half,
                         out_dtype = torch.float,
+                        select_hq_bits = 1,
                     )
                     if idx < config.first_k_dense_replace else
                     BlockSparseMLP(
@@ -148,6 +150,7 @@ class Ernie4_5MoEModel(Model):
                                 qmap = "block.mlp",
                                 interm_dtype = torch.half,
                                 out_dtype = torch.float,
+                                select_hq_bits = 2,
                             )
                             if config.num_shared_experts > 0 else
                             None
