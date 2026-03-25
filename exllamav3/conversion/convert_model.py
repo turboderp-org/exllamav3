@@ -294,22 +294,37 @@ def main(args, job_state):
         device_ratios = None
 
     last_checkpoint_time = time.time()
-    start_time = time.time()
     timed_blocks = 0
     eta_window = deque(maxlen = 8)
 
     # Get model
     config, model, tokenizer = get_base_model(args)
 
+    # Check caps
+    can_resume_quant = model.caps.get("can_resume_quant", True)
+    if not can_resume_quant:
+        print(" !! Warning, resuming an interrupted quant is not possible for this architecture.")
+        print(" !! Checkpoints will not be saved because they are redundant.")
+        assert job_state["next_module_idx"] == 0, \
+            "Current implementation of this architecture does not support resuming an interrupted quant job."
+
     # Get initial state or resume state
     state = prepare_state(args, job_state, config, model, tokenizer)
+    original_input_ids = state.copy()
+    quant_preserves = [{} for _ in range(len(state))]
+
+    def get_preserve(si, params_):
+        params_.update(quant_preserves[si])
+        params_["quant_preserve"] = quant_preserves[si]
+
+    def put_preserve(si, params_):
+        quant_preserves[si] = params_["quant_preserve"]
 
     # Iterate over modules
     for idx, module in enumerate(model.modules):
 
         start_module_time = time.time()
         if idx == model.first_block_idx:
-            start_time = time.time()
             timed_blocks = 0
 
         # If resuming, skip along to checkpoint index
@@ -362,19 +377,29 @@ def main(args, job_state):
                             "attn_mode": "flash_attn_nc",
                             "capture": capture_H,
                             "activate_all_experts": model.calibration_all_experts,
+                            "input_ids": original_input_ids[i],
                         }
                         if slicing:
                              params["q_mlp_slice"] = current_slice
+                        get_preserve(i, params)
+                        model.per_layer_quant_preamble(params)
                         rs = module.prepare_for_device(state[i], params)
                         rs = module.forward(rs, params)
+                        put_preserve(i, params)
                         if i < num_ref_states:
                             if model.calibration_all_experts:
                                 # Do not activate all experts for reference state, for error measurement
-                                params = { "attn_mode": "flash_attn_nc" }
+                                params = {
+                                    "attn_mode": "flash_attn_nc",
+                                    "input_ids": original_input_ids[i],
+                                }
                                 if slicing:
                                     params["q_mlp_slice"] = current_slice
+                                get_preserve(i, params)
+                                model.per_layer_quant_preamble(params)
                                 rs = module.prepare_for_device(state[i], params)
                                 rs = module.forward(rs, params)
+                                put_preserve(i, params)
                             ref_states.append(rs.cpu())
                         rs = None
                 print(f" -- Captured: {module.key}" + slice_str)
@@ -567,7 +592,8 @@ def main(args, job_state):
                 q_tensors.update(m.get_tensors())
 
             # Unload module
-            module.unload()
+            if not module.caps.get("retain_during_quant"):
+                module.unload()
             config.stc.close()
 
         # Save layer tensors to working directory
@@ -596,10 +622,14 @@ def main(args, job_state):
                 progress.update(i)
                 params = {
                     "attn_mode": "flash_attn_nc",
+                    "input_ids": original_input_ids[i],
                 }
                 state[i] = module.prepare_for_device(state[i], params)
                 if i < num_ref_states or idx < len(model.modules) - 1:
+                    get_preserve(i, params)
+                    model.per_layer_quant_preamble(params)
                     state[i] = module.forward(state[i], params).cpu()
+                    put_preserve(i, params)
                 if i < num_ref_states and len(linears):
                     ref_states[i] = ref_states[i].to(state[i].device)
                     rfn, cos, sq = get_state_error(state[i], ref_states[i])
@@ -640,12 +670,14 @@ def main(args, job_state):
                 )
 
         # Unload current module
-        module.unload()
+        if not module.caps.get("retain_during_quant"):
+            module.unload()
         # free_mem()
 
         # Checkpoint
         job_state["next_module_idx"] = idx + 1
-        if time.time() > last_checkpoint_time + args["checkpoint_interval"] and \
+        if can_resume_quant and \
+            time.time() > last_checkpoint_time + args["checkpoint_interval"] and \
             (args.get("last_checkpoint_index", -1) < 0 or idx <= args["last_checkpoint_index"]):
             print(f" -- Saving checkpoint")
             ckpt_dir = os.path.join(args["work_dir"], "ckpt")

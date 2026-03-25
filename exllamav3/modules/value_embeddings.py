@@ -28,32 +28,30 @@ class ValueEmbeddings(Module):
         self.vocab_size = vocab_size
         self.kv_head_dim = kv_head_dim
         self.num_kv_heads = num_kv_heads
-        self.ve_layers = []
         self.weight = {}
         self.forward_ref = {}
 
         self.caps.update({
             "prefer_cpu": True,
+            "retain_during_quant": True,
         })
 
     @override
     def load(self, device, **kwargs):
         self.device = device
-        self.ve_layers = []
         self.weight = {}
         for layer_idx in self.target_layers:
             self.weight[layer_idx] = self.config.stc.get_tensor(f"{self.key}.{layer_idx}.weight", self.device, float2half = True)
 
     @override
     def unload(self):
-        self.ve_layers = []
         self.weight = {}
 
     @override
     def get_tensors(self):
         return {
             f"{self.key}.{layer_idx}.weight": self.weight[layer_idx].contiguous()
-            for layer_idx in self.ve_layers
+            for layer_idx in self.target_layers
         }
 
     @override
@@ -72,4 +70,4 @@ class ValueEmbeddings(Module):
         return []
 
     def weights_numel(self):
-        return len(self.ve_layers) * self.vocab_size * self.kv_dim
+        return len(self.target_layers) * self.vocab_size * self.num_kv_heads * self.kv_head_dim

@@ -129,7 +129,7 @@ class NanoChatModel(Model):
         # Value embeddings: single CPU module, all lookups at once
         if config.has_ve:
             ve_layers = [2*i + 1 for i in range(config.num_hidden_layers // 2)]
-            ve_module = ValueEmbeddings(
+            self.ve_module = ValueEmbeddings(
                 config = config,
                 key = "value_embeds",
                 target_layers = ve_layers,
@@ -137,10 +137,10 @@ class NanoChatModel(Model):
                 kv_head_dim = config.head_dim,
                 num_kv_heads = config.num_kv_heads,
             )
-            self.modules += [ve_module]
+            self.modules += [self.ve_module]
         else:
             ve_layers = []
-            ve_module = None
+            self.ve_module = None
 
         self.first_block_idx = len(self.modules)
 
@@ -215,8 +215,8 @@ class NanoChatModel(Model):
             self.modules += [block]
 
             # Give ValueEmbeddings a reference to the current attn layer so device can be known at inference time
-            if ve_module and idx in ve_layers:
-                ve_module.forward_ref[idx] = block.ve_gate
+            if self.ve_module and idx in ve_layers:
+                self.ve_module.forward_ref[idx] = block.ve_gate
 
         self.last_kv_module_idx = len(self.modules) - 1
 
@@ -250,13 +250,17 @@ class NanoChatModel(Model):
         # TP for this architecture is not implemented yet
         self.caps.update({"supports_tp": False})
 
+        # Interrupted quantization cannot resume because this model uses Spaghetti Attention
+        self.caps.update({"can_resume_quant": False})
+
+
     @staticmethod
     @override
     def get_additional_compiled_tensors(config: NanoChatConfig) -> dict:
         extra = {}
         for k in ["resid_lambdas", "x0_lambdas", "backout_lambda"]:
             e = config.stc.get_tensor_meta(k)
-            if e: extra[k] = e
+            if e: extra.update(e)
         return extra
 
     @override
@@ -264,6 +268,10 @@ class NanoChatModel(Model):
         input_ids = prepare_for_attn(input_ids, params)
         params["input_ids"] = input_ids
         return input_ids
+
+    def per_layer_quant_preamble(self, params: dict):
+        if self.ve_module and self.ve_module.device is not None:
+            self.ve_module.forward(None, params)
 
     @override
     def default_chat_prompt(self, prompt, system_prompt = None):

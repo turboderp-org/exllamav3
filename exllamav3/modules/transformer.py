@@ -68,6 +68,8 @@ class TransformerBlock(Module):
         if self.layer_idx == 0:
             x0 = x.clone()
             params["_nc_x0"] = x0
+            if "quant_preserve" in params:
+                params["quant_preserve"]["_nc_x0"] = x0
         else:
             x0 = get_for_device(params, "_nc_x0", self.device)
         return self.resid_lambda * x + self.x0_lambda * x0
@@ -75,11 +77,15 @@ class TransformerBlock(Module):
 
     def _extract_backout(self, x: torch.Tensor, params: dict):
         params["_nc_x_backout"] = x.clone()
+        if "quant_preserve" in params:
+            params["quant_preserve"]["_nc_x_backout"] = params["_nc_x_backout"]
         return x
 
 
     def _apply_backout(self, x: torch.Tensor, params: dict):
         xmid = get_for_device(params, "_nc_x_backout", self.device)
+        if xmid is None:
+            return x
         return x - self.backout_lambda * xmid
 
 
