@@ -155,6 +155,7 @@ class Attention(Module):
         o_proj: Linear | Module | None = None,
         g_proj: Linear | Module | None = None,
         interleaved_gate: bool = False,
+        ve_gate: bool = False,
         use_cu_seqlens: bool = False,
         post_rope_norm: bool = False,
         tp_split_norm: bool = True
@@ -174,6 +175,7 @@ class Attention(Module):
         self.sliding_window = sliding_window
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
+        self.ve_gate = ve_gate
         self.use_cu_seqlens = use_cu_seqlens
         self.post_rope_norm = post_rope_norm
         self.tp_split_norm = tp_split_norm
@@ -511,9 +513,9 @@ class Attention(Module):
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
         # Optional addend to V tensor (e.g. value embeddings)
-        v_addend = params.pop("attn_v_addend", None)
-        if v_addend is not None:
-            v = v + v_addend.to(v.dtype).view_as(v)
+        if self.ve_gate:
+            v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
+            v.add_(v_addend)
 
         assert self.sliding_window < 0, \
             "Torch SDPA does not support sliding window attention (SWA)"
@@ -576,9 +578,9 @@ class Attention(Module):
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
         # Optional addend to V tensor (e.g. value embeddings)
-        v_addend = params.pop("attn_v_addend", None)
-        if v_addend is not None:
-            v = v + v_addend.to(v.dtype).view_as(v)
+        if self.ve_gate:
+            v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
+            v.add_(v_addend)
 
         if self.q_norm:
             if self.tp_span_heads_norm:
@@ -659,9 +661,9 @@ class Attention(Module):
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
         # Optional addend to V tensor (e.g. value embeddings)
-        v_addend = params.pop("attn_v_addend", None)
-        if v_addend is not None:
-            v = v + v_addend.to(v.dtype).view_as(v)
+        if self.ve_gate:
+            v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
+            v.add_(v_addend)
 
         # TODO: Add LayerNorm option to fused norm/RoPE kernel
         if self.q_norm:

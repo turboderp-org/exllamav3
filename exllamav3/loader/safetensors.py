@@ -230,6 +230,27 @@ class SafetensorsCollection:
         return results
 
 
+    def get_tensor_meta(
+        self,
+        key: str,
+        optional: bool = True
+    ) -> dict | None:
+        filename = self.tensor_file_map.get(key)
+        if optional and key is None:
+            return None
+        header = self.file_headers[filename]
+        h = header[key]
+        dtype, np_dtype, esize = convert_dtype(h["dtype"])
+        beg, end = h["data_offsets"]
+        return {
+            key: {
+                "shape": h["shape"],
+                "n_bytes": end - beg,
+                "dtype": str(dtype)
+            }
+        }
+
+
     def get_tensors(
         self,
         prefix: str,

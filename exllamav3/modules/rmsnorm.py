@@ -86,11 +86,6 @@ class RMSNorm(Module):
     ) -> torch.Tensor:
         dtype = out_dtype or self.out_dtype
 
-        # Unweighted RMSNorm (e.g. nanochat) has no weight tensor,
-        # fall back to PyTorch path since CUDA kernel requires weight
-        if self.unweighted:
-            return self.forward_torch(x, params, out_dtype)
-
         # ext.rms_norm expects row-major 2D inputs for the standard
         # per-channel RMSNorm path. Flattening keeps results consistent across
         # chunk/prefill shapes (e.g. [B, T, C] vs [B*T, C]).

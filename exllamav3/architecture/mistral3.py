@@ -468,7 +468,7 @@ class Mistral3VisionModel(Model):
         )
 
 
-    def default_load_params(self):
+    def default_load_params(self, max_chunk_size):
         return {
             "features_size": (
                 self.config.vision_pp.size["longest_edge"] // self.config.vision_pp.patch_size,

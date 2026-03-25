@@ -1,9 +1,9 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from ..util.tensor import to2
+from ..util.tensor import to2, get_for_device
 from ..model.config import Config
-from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP
+from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
 from ..conversion.allocation import allocate_transformer
 from ..util import profile_opt
 
@@ -13,27 +13,40 @@ class TransformerBlock(Module):
         self,
         config: Config | None,
         key: str,
+        layer_idx: int | None = None,
+        ve_gate: Linear | None = None,
+        resid_lambda: float | None = None,
+        x0_lambda: float | None = None,
         attn_norm: RMSNorm | LayerNorm | None = None,
         attn: Attention | GatedDeltaNet | None = None,
         attn_post_norm: RMSNorm | LayerNorm | None = None,
         mlp_norm: RMSNorm | LayerNorm | None = None,
         mlp: MLP | GatedMLP | BlockSparseMLP | None = None,
         mlp_post_norm: RMSNorm | LayerNorm | None = None,
+        backout_extract: bool = False,
+        backout_lambda: float | None = None,
         qmap: str | None = None,
         qbits_key: str = "bits",
         out_dtype: torch.dtype = None
     ):
         super().__init__(config, key, None)
 
+        self.layer_idx = layer_idx
+        self.ve_gate = ve_gate
+        self.resid_lambda = resid_lambda
+        self.x0_lambda = x0_lambda
         self.attn_norm = attn_norm
         self.attn = attn
         self.attn_post_norm = attn_post_norm
         self.mlp_norm = mlp_norm
         self.mlp = mlp
         self.mlp_post_norm = mlp_post_norm
+        self.backout_extract = backout_extract
+        self.backout_lambda = backout_lambda
         self.qbits_key = qbits_key
         self.out_dtype = out_dtype
 
+        self.register_submodule(self.ve_gate)
         self.register_submodule(self.attn_norm)
         self.register_submodule(self.attn)
         self.register_submodule(self.attn_post_norm)
@@ -51,6 +64,35 @@ class TransformerBlock(Module):
         return [a, m]
 
 
+    def _apply_resid_lambda(self, x: torch.Tensor, params: dict):
+        if self.layer_idx == 0:
+            x0 = x.clone()
+            params["_nc_x0"] = x0
+        else:
+            x0 = get_for_device(params, "_nc_x0", self.device)
+        return self.resid_lambda * x + self.x0_lambda * x0
+
+
+    def _extract_backout(self, x: torch.Tensor, params: dict):
+        params["_nc_x_backout"] = x.clone()
+        return x
+
+
+    def _apply_backout(self, x: torch.Tensor, params: dict):
+        xmid = get_for_device(params, "_nc_x_backout", self.device)
+        return x - self.backout_lambda * xmid
+
+
+    def _compute_ve_addend(self, x: torch.Tensor, params: dict):
+        ve = params[f"_nc_ve.{self.layer_idx}"].to(self.device)  # already on device, except while loading model
+        y = x[..., :self.ve_gate.in_features].half()
+        g = self.ve_gate.forward(y, params)
+        g.sigmoid_()
+        g *= 3
+        params[f"_nc_ve.{self.layer_idx}"] = g.unsqueeze(-1) * ve
+        return x
+
+
     @override
     def forward(
         self,
@@ -58,6 +100,15 @@ class TransformerBlock(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+
+        if self.resid_lambda is not None:
+            x = self._apply_resid_lambda(x, params)
+
+        if self.backout_extract:
+            x = self._extract_backout(x, params)
+
+        if self.ve_gate:
+            x = self._compute_ve_addend(x, params)
 
         if self.attn:
             if self.attn_norm:
@@ -79,6 +130,9 @@ class TransformerBlock(Module):
             if self.mlp_post_norm:
                 y = self.mlp_post_norm.forward(y, params)
             x += y
+
+        if self.backout_lambda is not None:
+            x = self._apply_backout(x, params)
 
         return to2(x, out_dtype, self.out_dtype)
 

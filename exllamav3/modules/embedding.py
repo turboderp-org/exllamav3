@@ -60,7 +60,7 @@ class Embedding(Module):
 
     @override
     def get_tensors(self):
-       return {
+        return {
             f"{self.key}.weight": self.embedding.weight.data.contiguous()
         }
 
