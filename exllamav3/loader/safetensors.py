@@ -277,6 +277,7 @@ class SafetensorsCollection:
         transpose: bool = False,
         pad_to: tuple = None,
         fidx: int = None,
+        auto_transpose_to_pad: bool = False,
     ) -> torch.Tensor | None:
 
         if device is None:
@@ -317,6 +318,16 @@ class SafetensorsCollection:
             beg += esize * numel * fidx
             end = beg + esize * numel
             bytesize = end - beg
+
+        if auto_transpose_to_pad and pad_to is not None and len(shape) == len(pad_to) == 2:
+            # Some resaved checkpoints preserve the same architecture but store 2D linear weights
+            # in the opposite orientation. Only flip when the configured orientation does not fit.
+            shape_current = tuple(shape) if not transpose else (shape[1], shape[0])
+            shape_alt = (shape[1], shape[0]) if not transpose else tuple(shape)
+            current_fits = all(a <= b for a, b in zip(shape_current, pad_to))
+            alt_fits = all(a <= b for a, b in zip(shape_alt, pad_to))
+            if not current_fits and alt_fits:
+                transpose = not transpose
 
         load_method = self.load_method
         if load_method == "mt_fread" and self.deferred_mode and not no_defer:
