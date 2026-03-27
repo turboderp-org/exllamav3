@@ -109,7 +109,7 @@ setup(
         "safetensors>=0.3.2",
         "pyyaml",
         "marisa_trie",
-        "kbnf>=0.4.2",
+        "kbnf>=0.4.2",  # >=0.5.7 fixes mask/accept inconsistency on GPT-2 BPE tokenizers; see https://github.com/lesj0610/kbnf/releases/tag/v0.5.7
         "formatron>=0.5.0",
         "pydantic==2.11.0"
     ],

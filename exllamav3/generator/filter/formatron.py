@@ -22,6 +22,27 @@ def create_engine_vocabulary(
 ) -> kbnf.Vocabulary:
     vocab = tokenizer.get_vocab_dict()
     new_vocab = get_original_characters(vocab, vocab_processors)
+
+    # Some tokenizers (e.g. EXAONE BPE) have duplicate token strings: multiple
+    # token IDs share the same piece text.  _get_vocab_dict() builds a
+    # {str: int} dict comprehension where the last ID wins, so earlier IDs that
+    # share a string are dropped from `vocab` and consequently from `new_vocab`.
+    # When the model outputs one of these "lost" IDs, kbnf rejects it with
+    # "The input token id is rejected", crashing generation.
+    #
+    # Fix: build a str->bytes lookup from new_vocab, then back-fill any token
+    # ID absent from new_vocab by reusing the bytes of its duplicate string.
+    id_to_str = {v: k for k, v in vocab.items()}  # {token_id: token_str}
+    str_to_bytes = {
+        id_to_str[id_]: b for id_, b in new_vocab.items() if id_ in id_to_str
+    }
+    full_size = tokenizer.tokenizer.get_vocab_size()
+    for i in range(full_size):
+        if i not in new_vocab:
+            token_str = tokenizer.tokenizer.id_to_token(i)
+            if token_str in str_to_bytes:
+                new_vocab[i] = str_to_bytes[token_str]
+
     return kbnf.Vocabulary(
         {k: kbnf.Token(v) for k, v in new_vocab.items()},
         {v: k for k, v in vocab.items()}
@@ -60,7 +81,30 @@ class FormatronFilter(Filter):
     def accept_token(self, token: int):
         if self._formatter.is_completed():
             return
-        self._formatter.accept_token(token)
+        try:
+            self._formatter.accept_token(token)
+        except ValueError as e:
+            # kbnf (Rust) raises ValueError when a token that passed the logit
+            # mask is nonetheless rejected by the grammar engine's internal state
+            # machine.  This indicates a mask/accept inconsistency inside kbnf —
+            # compute_allowed_tokens() reported the token as valid, but
+            # try_accept_new_token() disagrees.
+            #
+            # Known trigger: GPT2-style byte-level BPE tokenizers (e.g. EXAONE
+            # 4.x) whose special tokens (e.g. [PAD], id=0) have literal-string
+            # byte representations (b'[PAD]') that incidentally match valid
+            # grammar byte sequences in certain states (e.g. inside a JSON string
+            # value), causing the mask to permit them while kbnf's state machine
+            # rejects them on accept.
+            #
+            # Re-raising propagates the error up through the exllamav3 generator
+            # loop, which causes the in-flight job to be aborted cleanly instead
+            # of crashing the calling process.
+            #
+            # This fallback remains safe and beneficial even after a kbnf-side fix:
+            # it turns any future unforeseen mask/accept inconsistency into a
+            # recoverable per-request error rather than a process crash.
+            raise
 
     def get_next_logit_mask(self) -> torch.Tensor:
         self._formatter.compute_allowed_tokens()
