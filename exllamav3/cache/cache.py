@@ -79,6 +79,7 @@ class Cache:
         model: Model,
         max_num_tokens: int,
         layer_type: Type[CacheLayer] | None = None,
+        layer_map: list[int] | None = None,
         **kwargs
     ):
         """
@@ -113,11 +114,35 @@ class Cache:
         # self.recurrent_layer_type = recurrent_layer_type or RecurrentLayer_fp16
 
         cl = self.model.get_cache_layers()
-        self.num_layers = len(cl)
-        self.layers = {
-            attn.layer_idx: self.layer_type(self.config, attn, id(self), self.max_num_tokens, **kwargs)
-            for attn in cl
-        }
+        if layer_map is None:
+            layer_map = getattr(model, "layer_map", None)
+
+        self.layer_map = None
+        if layer_map is None:
+            self.num_layers = len(cl)
+            self.layers = {
+                attn.layer_idx: self.layer_type(self.config, attn, id(self), self.max_num_tokens, **kwargs)
+                for attn in cl
+            }
+        else:
+            layer_map = list(layer_map)
+            if not layer_map:
+                raise ValueError("layer_map must contain at least one entry.")
+            layer_idx_to_pos = {attn.layer_idx: pos for pos, attn in enumerate(cl)}
+            mapped = []
+            for idx in layer_map:
+                if 0 <= idx < len(cl):
+                    mapped.append(idx)
+                elif idx in layer_idx_to_pos:
+                    mapped.append(layer_idx_to_pos[idx])
+                else:
+                    raise ValueError(f"layer_map index {idx} is invalid for cache layers.")
+            self.layer_map = mapped
+            self.num_layers = len(mapped)
+            self.layers = {
+                v_idx: self.layer_type(self.config, cl[p_idx], id(self), self.max_num_tokens, **kwargs)
+                for v_idx, p_idx in enumerate(mapped)
+            }
 
         self.attach_to_model()
 
@@ -132,10 +157,17 @@ class Cache:
             model = self.model
 
         cl = model.get_cache_layers()
-        for module in cl:
-            layer = self.layers[module.layer_idx]
-            assert layer not in module.cache_layers, "Cannot attach cache twice to the same model."
-            module.cache_layers.append(layer)
+        if self.layer_map is None:
+            for module in cl:
+                layer = self.layers[module.layer_idx]
+                assert layer not in module.cache_layers, "Cannot attach cache twice to the same model."
+                module.cache_layers.append(layer)
+        else:
+            for v_idx, p_idx in enumerate(self.layer_map):
+                module = cl[p_idx]
+                layer = self.layers[v_idx]
+                assert layer not in module.cache_layers, "Cannot attach cache twice to the same model."
+                module.cache_layers.append(layer)
 
 
     def detach_from_model(self, model: Model | None = None):
@@ -146,9 +178,15 @@ class Cache:
             model = self.model
 
         cl = model.get_cache_layers()
-        for module in cl:
-            layer = self.layers[module.layer_idx]
-            module.cache_layers.remove(layer)
+        if self.layer_map is None:
+            for module in cl:
+                layer = self.layers[module.layer_idx]
+                module.cache_layers.remove(layer)
+        else:
+            for v_idx, p_idx in enumerate(self.layer_map):
+                module = cl[p_idx]
+                layer = self.layers[v_idx]
+                module.cache_layers.remove(layer)
 
 
     def get_layer(self, idx: int, cache_seqlens: torch.Tensor, block_table: torch.Tensor) -> tuple:

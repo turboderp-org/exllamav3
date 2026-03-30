@@ -733,7 +733,8 @@ class Attention(Module):
         if self.has_split_cache:
             cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table)
         else:
-            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
+            layer_idx = params.get("layer_idx_override", self.layer_idx)
+            cache_k, cache_v = cache.get_layer(layer_idx, cache_seqlens, block_table)
 
         o = flash_attn_with_kvcache(
             q = q,
@@ -752,7 +753,8 @@ class Attention(Module):
         if self.has_split_cache:
             self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
         else:
-            cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
+            layer_idx = params.get("layer_idx_override", self.layer_idx)
+            cache.update_layer(layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
