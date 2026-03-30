@@ -12,7 +12,6 @@
 #define MOE_SMS_PER_EXPERT 12
 #define MOE_TILESIZE_K 32
 #define MOE_TILESIZE_M 16
-#define MOE_TILESIZE_N 256
 #define MOE_SH_STAGES 4
 #define MOE_FRAG_STAGES 3
 
@@ -51,7 +50,7 @@
                                                 \
     int* __restrict__ locks
 
-template<int t_bits>
+template<int t_bits, int MOE_TILESIZE_N>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 {
