@@ -90,10 +90,10 @@ class SS_Argmax(SS_Base):
                 state.sample = torch.argmax(state.probs, dim = -1)
             case SS.LOGITS_S:
                 temp = torch.argmax(state.logits, dim = -1)
-                state.state = state.indices[temp]
+                state.sample = state.indices[temp]
             case SS.PROBS_S | SS.PROBS_N_S:
                 temp = torch.argmax(state.probs, dim = -1)
-                state.state = state.indices[temp]
+                state.sample = state.indices[temp]
         state.state = SS.DONE
 
 
@@ -111,11 +111,7 @@ class SS_Sample(SS_Base):
             case SS.LOGITS:
                 ext.gumbel_noise_f32(state.logits, state.logits, state.rand_u32)
                 state.sample = torch.argmax(state.logits, dim = -1)
-            case SS.PROBS:
-                state.probs /= state.probs.sum(dim = -1, keepdim = True)
-                ext.gumbel_noise_log(state.probs, state.probs, state.rand_u32)
-                state.sample = torch.argmax(state.probs, dim = -1)
-            case SS.PROBS_N:
+            case SS.PROBS | SS.PROBS_N:
                 ext.gumbel_noise_log(state.probs, state.probs, state.rand_u32)
                 state.sample = torch.argmax(state.probs, dim = -1)
             case SS.LOGITS_S:
