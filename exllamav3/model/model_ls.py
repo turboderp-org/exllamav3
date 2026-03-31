@@ -185,12 +185,20 @@ class Model_LSMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
+        tq3 = params.get("tq3_activations", False)
         for idx, module in enumerate(modules):
             params["prefill"] = (idx == last_kv_module_idx)
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
             if idx == last_kv_module_idx:
                 break
+            # Compress/decompress inter-layer activations to reduce peak memory
+            if tq3:
+                from ..modules.tq3_activation import TQ3ActivationCompressor
+                compressed = TQ3ActivationCompressor.compress(x)
+                del x
+                x = TQ3ActivationCompressor.decompress(compressed)
+                del compressed
         del params["prefill"]
         return None
 
@@ -202,10 +210,19 @@ class Model_LSMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
+        tq3 = params.get("tq3_activations", False)
+        num_modules = len(modules)
         for idx, module in enumerate(modules):
             if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
                 x = x[..., -num:, :].contiguous()
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
+            # Compress/decompress inter-layer activations to reduce peak memory
+            if tq3 and idx < num_modules - 1:
+                from ..modules.tq3_activation import TQ3ActivationCompressor
+                compressed = TQ3ActivationCompressor.compress(x)
+                del x
+                x = TQ3ActivationCompressor.decompress(compressed)
+                del compressed
         return x
 

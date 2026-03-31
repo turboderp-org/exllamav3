@@ -10,6 +10,8 @@ from ..model.model_tp_alloc import TPAllocation
 
 class Embedding(Module):
 
+    tq3_compress: bool = False
+
     def __init__(
         self,
         config: Config | None,
@@ -26,6 +28,7 @@ class Embedding(Module):
 
         self.key = key
         self.embedding = None
+        self.tq3_emb = None
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.out_dtype = out_dtype
@@ -46,17 +49,30 @@ class Embedding(Module):
         self.device = device
         weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True)
         self._numel = weight.numel()
-        self.embedding = nn.Embedding(
-            self.vocab_size,
-            self.hidden_size,
-            device = "meta"
-        )
-        self.embedding.weight = nn.Parameter(weight)
+
+        if self.tq3_compress and weight is not None:
+            from .tq3_embedding import TQ3Embedding
+            # Pad vocab to multiple of 32 if needed
+            vocab_size = weight.shape[0]
+            if vocab_size % 32 != 0:
+                pad_rows = 32 - (vocab_size % 32)
+                weight = torch.nn.functional.pad(weight, (0, 0, 0, pad_rows))
+            self.tq3_emb = TQ3Embedding.from_weight(weight)
+            self.embedding = None
+            weight = None
+        else:
+            self.embedding = nn.Embedding(
+                self.vocab_size,
+                self.hidden_size,
+                device = "meta"
+            )
+            self.embedding.weight = nn.Parameter(weight)
 
     @override
     def unload(self):
         self.device = None
         self.embedding = None
+        self.tq3_emb = None
 
     @override
     def get_tensors(self):
@@ -108,7 +124,10 @@ class Embedding(Module):
             if standard_mask.any():
                 for i in range(bsz):
                     standard_ids_row = input_ids[i][standard_mask[i]]
-                    standard_emb_row = self.embedding(standard_ids_row)
+                    if self.tq3_emb is not None:
+                        standard_emb_row = self.tq3_emb.forward(standard_ids_row)
+                    else:
+                        standard_emb_row = self.embedding(standard_ids_row)
                     combined_emb[i][standard_mask[i]] = standard_emb_row.to(out_dtype)
 
             # Only normalize standard embeddings
@@ -136,7 +155,10 @@ class Embedding(Module):
 
         # No indexed embeddings, or none in current batch
         else:
-            x = self.embedding.forward(x)
+            if self.tq3_emb is not None:
+                x = self.tq3_emb.forward(x)
+            else:
+                x = self.embedding.forward(x)
             x = to2(x, out_dtype, self.out_dtype)
             if self.normalize:
                 x *= x.shape[-1] ** 0.5

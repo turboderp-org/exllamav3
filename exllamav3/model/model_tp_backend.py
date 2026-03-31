@@ -27,6 +27,8 @@ class TPBackend:
 
 class TPBackendNCCL:
 
+    tq3_compress: bool = False  # Set to True to enable TQ3 communication compression
+
     def __init__(
         self,
         device: int,
@@ -99,6 +101,10 @@ class TPBackendNCCL:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        if self.tq3_compress:
+            from .tq3_tp_compress import TQ3AllReduce
+            TQ3AllReduce.compressed_all_reduce(tensor)
+            return
         if tensor.dtype == torch.float32:
             temp = tensor.to(torch.bfloat16)
             dist.all_reduce(temp, async_op = False)
@@ -151,6 +157,8 @@ class TPBackendNCCL:
 
 
 class TPBackendNative:
+
+    tq3_compress: bool = False  # Set to True to enable TQ3 communication compression
 
     def __init__(
         self,
@@ -329,6 +337,10 @@ class TPBackendNative:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        if self.tq3_compress:
+            from .tq3_tp_compress import TQ3AllReduce
+            TQ3AllReduce.compressed_all_reduce(tensor)
+            return
         # if tensor.numel() * 2 < MAX_CPU_REDUCE:
         ext.pg_all_reduce_cpu(
             self.ptr_g,

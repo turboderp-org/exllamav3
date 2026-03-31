@@ -16,3 +16,4 @@ from .qwen3_vl_pos_embedding import Qwen3VLPosEmbedding
 from .glm4v_pos_embedding import Glm4VPosEmbedding
 from .deepstack import DeepstackEmbed
 from .value_embeddings import ValueEmbeddings
+from .tq3_activation import TQ3ActivationCompressor
