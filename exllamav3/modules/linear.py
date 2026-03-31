@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from ..model.config import Config
 from . import Module
-from .quant import LinearFP16, LinearEXL3
+from .quant import LinearFP16, LinearEXL3, LinearTQ3
 from .quant.exl3_lib import quantize_exl3
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
@@ -235,6 +235,12 @@ class Linear(Module):
             [["sv", "svh"], ["su", "suh"], "trellis"]
         )
 
+    def is_tq3_storage(self, key: str):
+        return self.config.stc.has_tensor_group(
+            key,
+            ["tq3_packed", "tq3_scale"]
+        )
+
     def load_exl3(self, key: str) -> bool:
         if not self.is_exl3_storage(key):
             return False
@@ -269,6 +275,31 @@ class Linear(Module):
         return True
 
 
+    def load_tq3(self, key: str) -> bool:
+        if not self.is_tq3_storage(key):
+            return False
+        self.used_alt_key = key == self.alt_key
+        tq3_packed = self.config.stc.get_tensor(key + ".tq3_packed", self.device)
+        tq3_scale = self.config.stc.get_tensor(key + ".tq3_scale", self.device)
+        suh = self.config.stc.get_tensor(key + ".suh", self.device, optional=True)
+        svh = self.config.stc.get_tensor(key + ".svh", self.device, optional=True)
+        bias = self.config.stc.get_tensor(key + ".bias", self.device, optional=True)
+        self.inner = LinearTQ3(
+            self.config,
+            self.in_features,
+            self.out_features,
+            tq3_packed,
+            tq3_scale,
+            suh,
+            svh,
+            bias,
+            self.out_dtype,
+            key=self.key
+        )
+        self.quant_type = "tq3"
+        return True
+
+
     @override
     def can_defer_load(self):
         if self.is_sliced: return False
@@ -282,6 +313,7 @@ class Linear(Module):
         if self.alt_key:
             keys += [self.alt_key]
         if any(self.load_exl3(k) for k in keys): return
+        if any(self.load_tq3(k) for k in keys): return
         if any(self.load_fp16(k) for k in keys): return
         raise ValueError(f"No tensors found for {self.key} matching supported quantization format.")
 
@@ -412,6 +444,8 @@ class Linear(Module):
         # alt_key is only used when loading unquantized model
         if self.is_exl3_storage(self.key):
             return "exl3"
+        elif self.is_tq3_storage(self.key):
+            return "tq3"
         else:
             return None
 
@@ -420,6 +454,8 @@ class Linear(Module):
     def _storage_size(self):
         # alt_key is only used when loading unquantized model
         if self.is_exl3_storage(self.key):
+            return sum(self.config.stc.get_tensor_sizes(prefix = self.key))
+        elif self.is_tq3_storage(self.key):
             return sum(self.config.stc.get_tensor_sizes(prefix = self.key))
         else:
             return 2 * self.in_features * self.out_features
