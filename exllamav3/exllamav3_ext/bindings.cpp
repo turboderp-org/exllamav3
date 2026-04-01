@@ -36,6 +36,7 @@
 #include "generator/cache.cuh"
 
 #include "cache/q_cache.cuh"
+#include "cache/lm_cache.cuh"
 
 #include "histogram.cuh"
 
@@ -129,6 +130,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dequant_cache_cont", &dequant_cache_cont, "dequant_cache_cont");
     m.def("quant_cache_paged", &quant_cache_paged, "quant_cache_paged");
     m.def("dequant_cache_paged", &dequant_cache_paged, "dequant_cache_paged");
+
+    m.def("quant_lm_cache_cont", &quant_lm_cache_cont, "quant_lm_cache_cont");
+    m.def("dequant_lm_cache_cont", &dequant_lm_cache_cont, "dequant_lm_cache_cont");
+    m.def("quant_lm_cache_paged", &quant_lm_cache_paged, "quant_lm_cache_paged");
+    m.def("dequant_lm_cache_paged", &dequant_lm_cache_paged, "dequant_lm_cache_paged");
 
     m.def("count_inf_nan", &count_inf_nan, "count_inf_nan");
     m.def("histogram", &histogram, "histogram");
