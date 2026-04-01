@@ -36,6 +36,7 @@ class TPBackendNCCL:
         master: bool,
         uuid: str,
         shbuf_size: int = SHBUF_SIZE,
+        tq3_compress: bool = False,
     ):
         self.device = device
         if device < 0:
