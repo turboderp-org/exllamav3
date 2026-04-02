@@ -713,14 +713,19 @@ __device__ __forceinline__ void dequant_block_lm_sub_asym
     }
 
     // Step 3: Asymmetric dequantize
-    //   v_wht_scaled = q / (levels-1) * scale + zero
-    // scale and zero are already in the 1/sqrt(32)-scaled WHT domain,
-    // so no additional factor is needed before the inverse WHT.
+    //   v_wht = q / (levels-1) * scale + zero
+    // scale and zero are in the 1/sqrt(32)-scaled WHT domain.
+    // shuffle_had_fx32 is the UNNORMALIZED WHT (H*H = N*I, not I).
+    // To get the correct inverse: multiply by 1/sqrt(32) first, then WHT.
+    // This gives: WHT(v/sqrt(32)) = WHT(WHT(x)/32) = x (since WHT(WHT(x))=32*x).
     constexpr int num_levels = (1 << num_bits);
     int sub_id = lane / sub_size;
     float scale = __half2float(in_scales[sub_id]);
     float zero  = __half2float(in_zeros[sub_id]);
     float v = ((float)q / (float)(num_levels - 1)) * scale + zero;
+
+    // Apply 1/sqrt(32) normalization before inverse WHT
+    v *= 0.17677669529663688110f;
 
     // Step 4: Inverse WHT
     v = shuffle_had_fx32(v, lane);
