@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from ..model.config import Config
 from . import Module
-from .quant import LinearFP16, LinearEXL3
+from .quant import LinearFP16, LinearEXL3, LinearTQInstant
 from .quant.exl3_lib import quantize_exl3
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
@@ -361,6 +361,25 @@ class Linear(Module):
             return proxy_err
 
 
+    def convert_tq_instant(self, bits: int = 4, sub_scale_size: int = 8):
+        """Convert FP16 weights to TQ instant quantization. No calibration needed."""
+        assert isinstance(self.inner, LinearFP16), "Must be FP16 to convert to TQ"
+        weight = self.inner.get_weight_tensor()
+        bias = self.inner.get_bias_tensor()
+        self.inner = LinearTQInstant(
+            self.config,
+            self.in_features,
+            self.out_features,
+            weight,
+            bits=bits,
+            sub_scale_size=sub_scale_size,
+            bias=bias,
+            out_dtype=self.out_dtype,
+            key=self.key,
+        )
+        self.quant_type = "tq_instant"
+
+
     def capture_H(self, x: torch.Tensor, params: dict):
         if self.qmap not in params["capture"]:
             params["capture"][self.qmap] = {
@@ -412,6 +431,8 @@ class Linear(Module):
         # alt_key is only used when loading unquantized model
         if self.is_exl3_storage(self.key):
             return "exl3"
+        elif hasattr(self, 'inner') and self.inner is not None and getattr(self.inner, 'quant_type', None) == 'tq_instant':
+            return "tq_instant"
         else:
             return None
 
