@@ -177,6 +177,8 @@ def mp_model_forward(
     params: dict,
     last_kv_module_idx: int,
     prefill: bool,
+    module_start: int = 0,
+    module_end: int | None = None,
 ):
     """
     Forward pass for parallel slice of a model
@@ -184,7 +186,8 @@ def mp_model_forward(
     backend = local_context["backend"]
     backend.fwd_barrier()
 
-    modules = local_context["modules"]
+    all_modules = local_context["modules"]
+    modules = all_modules[module_start:module_end]
     consumer = local_context["inf_consumer"]
 
     for tensor_param in [
