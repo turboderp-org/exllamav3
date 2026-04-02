@@ -29,12 +29,14 @@ class CacheLayer_lloyd_max(CacheLayer):
         max_num_tokens: int,
         k_bits: int,
         v_bits: int,
+        sub_scale_size: int = 32,
     ):
         super().__init__(config, attention, cache_id, max_num_tokens)
 
         assert max_num_tokens % PAGE_SIZE == 0, \
             f"max_num_tokens must be a multiple of {PAGE_SIZE}."
         assert (2 <= k_bits <= 8) and (2 <= v_bits <= 8), "quantized cache must be from 2 to 8 bits"
+        assert sub_scale_size in (8, 32), "sub_scale_size must be 8 (sub-block) or 32 (standard)"
 
         self.shape = (
             (max_num_tokens // PAGE_SIZE, PAGE_SIZE, attention.num_kv_heads, attention.head_dim)
@@ -43,10 +45,11 @@ class CacheLayer_lloyd_max(CacheLayer):
 
         self.k_bits = k_bits
         self.v_bits = v_bits
+        self.sub_scale_size = sub_scale_size
         self.token_dim = attention.num_kv_heads * attention.head_dim
         self.qshape_k = ((max_num_tokens // PAGE_SIZE, PAGE_SIZE, self.token_dim // 32 * k_bits) if attention else None)
         self.qshape_v = ((max_num_tokens // PAGE_SIZE, PAGE_SIZE, self.token_dim // 32 * v_bits) if attention else None)
-        self.qshape_s = ((max_num_tokens // PAGE_SIZE, PAGE_SIZE, self.token_dim // 32) if attention else None)
+        self.qshape_s = ((max_num_tokens // PAGE_SIZE, PAGE_SIZE, self.token_dim // sub_scale_size) if attention else None)
 
         self.qk = None
         self.qv = None
@@ -77,7 +80,10 @@ class CacheLayer_lloyd_max(CacheLayer):
     def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor):
         k = torch.empty(self.shape, dtype = torch.half, device = self.device)
         v = torch.empty(self.shape, dtype = torch.half, device = self.device)
-        ext.dequant_lm_cache_paged(self.qk, self.sk, k, self.qv, self.sv, v, cache_seqlens, block_table, PAGE_SIZE)
+        if self.sub_scale_size == 8:
+            ext.dequant_lm_cache_paged_sub(self.qk, self.sk, k, self.qv, self.sv, v, cache_seqlens, block_table, PAGE_SIZE)
+        else:
+            ext.dequant_lm_cache_paged(self.qk, self.sk, k, self.qv, self.sv, v, cache_seqlens, block_table, PAGE_SIZE)
         return k, v
 
 
@@ -97,13 +103,22 @@ class CacheLayer_lloyd_max(CacheLayer):
         v: torch.Tensor,
         length: int
     ):
-        ext.quant_lm_cache_paged(
-            k, self.qk, self.sk,
-            v, self.qv, self.sv,
-            cache_seqlens, block_table,
-            PAGE_SIZE,
-            length
-        )
+        if self.sub_scale_size == 8:
+            ext.quant_lm_cache_paged_sub(
+                k, self.qk, self.sk,
+                v, self.qv, self.sv,
+                cache_seqlens, block_table,
+                PAGE_SIZE,
+                length
+            )
+        else:
+            ext.quant_lm_cache_paged(
+                k, self.qk, self.sk,
+                v, self.qv, self.sv,
+                cache_seqlens, block_table,
+                PAGE_SIZE,
+                length
+            )
 
 
     @override
@@ -144,5 +159,6 @@ class CacheLayer_lloyd_max(CacheLayer):
                 "max_num_tokens": self.max_num_tokens,
                 "k_bits": self.k_bits,
                 "v_bits": self.v_bits,
+                "sub_scale_size": self.sub_scale_size,
             }
         }

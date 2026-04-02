@@ -127,6 +127,129 @@ __device__ __forceinline__ void dequant_block_lm
 }
 
 // ---------------------------------------------------------------------------
+// shuffle_max_sub
+//
+// Reduce-max within a sub-group of lanes.  sub_size must be a power of 2
+// and <= 32.  The XOR shuffle with offsets strictly less than sub_size only
+// communicates between lanes that share the same sub_size-aligned bucket, so
+// this is a correct intra-sub-group reduction even with a full-warp mask.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float shuffle_max_sub(float v, int sub_size)
+{
+    for (int i = 1; i < sub_size; i <<= 1)
+    {
+        float other = __shfl_xor_sync(0xffffffff, v, i);
+        v = fmaxf(v, other);
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// quant_block_lm_sub
+//
+// Variant of quant_block_lm that computes one scale per sub-group of
+// sub_size lanes (instead of one scale for the full 32-lane block).
+//
+// Steps:
+//   1. Load and full-warp WHT (unchanged — must be 32-wide).
+//   2. Apply 1/sqrt(32) normalisation.
+//   3. Compute per-sub-group max and normalise within each sub-group.
+//   4. Lloyd-Max quantize (unchanged).
+//   5. Bitplane-pack (unchanged).
+//   6. Write sub-group scales: thread 0 of each sub-group writes its scale.
+//
+// Memory written:
+//   out[0..num_bits-1]              : bitplanes  (same layout as quant_block_lm)
+//   out_scales[0..num_subs-1]       : num_subs = 32 / sub_size half-precision scales
+// ---------------------------------------------------------------------------
+
+template <int num_bits, int sub_size>
+__device__ __forceinline__ void quant_block_lm_sub
+(
+    const half* __restrict__ in,
+    uint32_t* __restrict__ out,
+    half* __restrict__ out_scales
+)
+{
+    constexpr int num_subs = 32 / sub_size;
+    int t = threadIdx.x & 31;
+
+    // Step 1+2: Load, full-warp WHT, 1/sqrt(32) scale
+    float v = __half2float(in[t]);
+    v = shuffle_had_fx32(v, t);
+    v *= 0.17677669529663688110f;  // 1/sqrt(32)
+
+    // Step 3: Sub-group normalisation
+    float s = shuffle_max_sub(fabsf(v) + 1e-10f, sub_size);
+    v /= s;
+
+    // Step 4: Lloyd-Max boundary search
+    int q = lm_quantize(v, num_bits);
+
+    // Step 5: Bitplane pack
+    register uint32_t bitplanes[num_bits];
+    #pragma unroll
+    for (int i = 0, mask = 1; i < num_bits; ++i, mask <<= 1)
+        bitplanes[i] = __ballot_sync(0xffffffff, q & mask);
+
+    // Step 5b: Write bitplanes
+    if (t < num_bits)
+        out[t] = bitplanes[t];
+
+    // Step 6: Write sub-group scales (one write per sub-group, by lane 0 of each)
+    int sub_id   = t / sub_size;
+    int sub_lane = t % sub_size;
+    if (sub_lane == 0 && sub_id < num_subs)
+        out_scales[sub_id] = __float2half_rn(s);
+}
+
+// ---------------------------------------------------------------------------
+// dequant_block_lm_sub
+//
+// Inverse of quant_block_lm_sub.  Reads the same bitplane layout, then
+// applies per-sub-group scales before the inverse WHT.
+// ---------------------------------------------------------------------------
+
+template <int num_bits, int sub_size>
+__device__ __forceinline__ void dequant_block_lm_sub
+(
+    const uint32_t* __restrict__ in,
+    const half* __restrict__ in_scales,
+    half* __restrict__ out
+)
+{
+    int lane = threadIdx.x & 31;
+
+    // Step 1: Load bitplane words (same as dequant_block_lm)
+    uint32_t word = (lane < num_bits) ? in[lane] : 0u;
+
+    // Step 2: Reconstruct integer code
+    int q = 0;
+    #pragma unroll
+    for (int i = 0; i < num_bits; ++i)
+    {
+        uint32_t wi = __shfl_sync(0xffffffff, word, i);
+        q |= (int)(((wi >> lane) & 1u) << i);
+    }
+
+    // Step 3: Centroid lookup
+    float v = lm_dequantize(q, num_bits);
+
+    // Step 4: Apply 1/sqrt(32) factor (matches quant path)
+    v *= 0.17677669529663688110f;
+
+    // Step 5: Apply per-sub-group scale
+    int sub_id = lane / sub_size;
+    v *= __half2float(in_scales[sub_id]);
+
+    // Step 6: Inverse WHT
+    v = shuffle_had_fx32(v, lane);
+
+    out[lane] = __float2half(v);
+}
+
+// ---------------------------------------------------------------------------
 // Continuous-layout kernel wrappers (one block per 32-element group)
 // ---------------------------------------------------------------------------
 
@@ -263,6 +386,180 @@ void dequant_lm_cache_paged_kernel
 
 #define __(i, j) dequant_lm_cache_paged_kernel<i, j>
 constexpr auto dequant_lm_cache_paged_kernel_instances = std::array
+{
+    std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
+    std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },
+    std::array{ __(4, 2), __(4, 3), __(4, 4), __(4, 5), __(4, 6), __(4, 7), __(4, 8) },
+    std::array{ __(5, 2), __(5, 3), __(5, 4), __(5, 5), __(5, 6), __(5, 7), __(5, 8) },
+    std::array{ __(6, 2), __(6, 3), __(6, 4), __(6, 5), __(6, 6), __(6, 7), __(6, 8) },
+    std::array{ __(7, 2), __(7, 3), __(7, 4), __(7, 5), __(7, 6), __(7, 7), __(7, 8) },
+    std::array{ __(8, 2), __(8, 3), __(8, 4), __(8, 5), __(8, 6), __(8, 7), __(8, 8) }
+};
+#undef __
+
+// ---------------------------------------------------------------------------
+// Sub-block continuous-layout kernel wrappers (sub_size = 8, 4 scales/block)
+// ---------------------------------------------------------------------------
+
+template <int bits>
+__global__ __launch_bounds__(MAX_WARPS * 32)
+void quant_lm_cache_cont_sub_kernel
+(
+    const half* __restrict__ in,
+    uint32_t* __restrict__ out,
+    half* __restrict__ out_scales
+)
+{
+    constexpr int sub_size = 8;
+    constexpr int num_subs = 32 / sub_size;  // 4
+    in         += 32       * blockIdx.x;
+    out        += bits     * blockIdx.x;
+    out_scales += num_subs * blockIdx.x;
+    quant_block_lm_sub<bits, sub_size>(in, out, out_scales);
+}
+
+#define __(i) quant_lm_cache_cont_sub_kernel<i>
+constexpr auto quant_lm_cache_cont_sub_kernel_instances = std::array
+{
+    __(2), __(3), __(4), __(5), __(6), __(7), __(8)
+};
+#undef __
+
+
+template <int bits>
+__global__ __launch_bounds__(MAX_WARPS * 32)
+void dequant_lm_cache_cont_sub_kernel
+(
+    const uint32_t* __restrict__ in,
+    const half* __restrict__ in_scales,
+    half* __restrict__ out
+)
+{
+    constexpr int sub_size = 8;
+    constexpr int num_subs = 32 / sub_size;  // 4
+    in        += bits     * blockIdx.x;
+    in_scales += num_subs * blockIdx.x;
+    out       += 32       * blockIdx.x;
+    dequant_block_lm_sub<bits, sub_size>(in, in_scales, out);
+}
+
+#define __(i) dequant_lm_cache_cont_sub_kernel<i>
+constexpr auto dequant_lm_cache_cont_sub_kernel_instances = std::array
+{
+    __(2), __(3), __(4), __(5), __(6), __(7), __(8)
+};
+#undef __
+
+// ---------------------------------------------------------------------------
+// Sub-block paged-layout kernel wrappers (sub_size = 8, 4 scales/block)
+// ---------------------------------------------------------------------------
+
+template <int k_bits, int v_bits>
+__global__ __launch_bounds__(MAX_WARPS * 32)
+void quant_lm_cache_paged_sub_kernel
+(
+    const half* __restrict__ k_in,
+    uint32_t* __restrict__ k_out,
+    half* __restrict__ k_out_scales,
+    const half* __restrict__ v_in,
+    uint32_t* __restrict__ v_out,
+    half* __restrict__ v_out_scales,
+    const uint32_t* __restrict__ cache_seqlens,
+    const uint32_t* __restrict__ block_table,
+    const int blocks_per_seq,
+    const int token_dim
+)
+{
+    constexpr int sub_size = 8;
+    constexpr int num_subs = 32 / sub_size;  // 4
+
+    int batch_idx  = blockIdx.z;
+    int token_idx  = blockIdx.y + cache_seqlens[batch_idx];
+    int page_idx   = token_idx / CQ_PAGE_SIZE;
+    int token_pos  = block_table[blocks_per_seq * batch_idx + page_idx] * CQ_PAGE_SIZE
+                     + (token_idx % CQ_PAGE_SIZE);
+    int sub_pos    = (token_pos * token_dim + blockDim.x * blockIdx.x + threadIdx.x) / 32;
+
+    quant_block_lm_sub<k_bits, sub_size>(
+        k_in  + sub_pos * 32,
+        k_out + sub_pos * k_bits,
+        k_out_scales + sub_pos * num_subs
+    );
+    quant_block_lm_sub<v_bits, sub_size>(
+        v_in  + sub_pos * 32,
+        v_out + sub_pos * v_bits,
+        v_out_scales + sub_pos * num_subs
+    );
+}
+
+#define __(i, j) quant_lm_cache_paged_sub_kernel<i, j>
+constexpr auto quant_lm_cache_paged_sub_kernel_instances = std::array
+{
+    std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
+    std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },
+    std::array{ __(4, 2), __(4, 3), __(4, 4), __(4, 5), __(4, 6), __(4, 7), __(4, 8) },
+    std::array{ __(5, 2), __(5, 3), __(5, 4), __(5, 5), __(5, 6), __(5, 7), __(5, 8) },
+    std::array{ __(6, 2), __(6, 3), __(6, 4), __(6, 5), __(6, 6), __(6, 7), __(6, 8) },
+    std::array{ __(7, 2), __(7, 3), __(7, 4), __(7, 5), __(7, 6), __(7, 7), __(7, 8) },
+    std::array{ __(8, 2), __(8, 3), __(8, 4), __(8, 5), __(8, 6), __(8, 7), __(8, 8) }
+};
+#undef __
+
+
+template <int k_bits, int v_bits>
+__global__ __launch_bounds__(MAX_WARPS * 32)
+void dequant_lm_cache_paged_sub_kernel
+(
+    const uint32_t* __restrict__ k_in,
+    const half* __restrict__ k_in_scales,
+    half* __restrict__ k_out,
+    const uint32_t* __restrict__ v_in,
+    const half* __restrict__ v_in_scales,
+    half* __restrict__ v_out,
+    const uint32_t* __restrict__ cache_seqlens,
+    const uint32_t* __restrict__ block_table,
+    const int pages_per_seq,
+    const int warps_per_token,
+    const int num_blocks
+)
+{
+    constexpr int sub_size = 8;
+    constexpr int num_subs = 32 / sub_size;  // 4
+
+    int batch_idx       = blockIdx.y;
+    int block_id        = blockDim.x * (blockIdx.x * ITER_PER_TB);
+    int t_warp_id       = (block_id + threadIdx.x) / 32;
+    int d_warp_id       = blockDim.x / 32;
+    int max_token_idx   = cache_seqlens[batch_idx];
+    const uint32_t* b_block_table = block_table + batch_idx * pages_per_seq;
+
+    #pragma unroll 4
+    for (int iter = 0; iter < ITER_PER_TB; ++iter)
+    {
+        int token_idx = t_warp_id / warps_per_token;
+        if (token_idx >= max_token_idx) break;
+        int page_idx  = token_idx / CQ_PAGE_SIZE;
+        int page_sub  = t_warp_id - page_idx * CQ_PAGE_SIZE * warps_per_token;
+        int mapped_page = b_block_table[page_idx];
+        int addr      = mapped_page * CQ_PAGE_SIZE * warps_per_token + page_sub;
+
+        dequant_block_lm_sub<k_bits, sub_size>(
+            k_in  + addr * k_bits,
+            k_in_scales + addr * num_subs,
+            k_out + addr * 32
+        );
+        dequant_block_lm_sub<v_bits, sub_size>(
+            v_in  + addr * v_bits,
+            v_in_scales + addr * num_subs,
+            v_out + addr * 32
+        );
+
+        t_warp_id += d_warp_id;
+    }
+}
+
+#define __(i, j) dequant_lm_cache_paged_sub_kernel<i, j>
+constexpr auto dequant_lm_cache_paged_sub_kernel_instances = std::array
 {
     std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
     std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },
