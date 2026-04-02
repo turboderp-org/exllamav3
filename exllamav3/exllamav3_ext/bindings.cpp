@@ -139,6 +139,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dequant_lm_cache_cont_sub", &dequant_lm_cache_cont_sub, "dequant_lm_cache_cont_sub");
     m.def("quant_lm_cache_paged_sub", &quant_lm_cache_paged_sub, "quant_lm_cache_paged_sub");
     m.def("dequant_lm_cache_paged_sub", &dequant_lm_cache_paged_sub, "dequant_lm_cache_paged_sub");
+    m.def("quant_lm_cache_cont_asym", &quant_lm_cache_cont_asym, "quant_lm_cache_cont_asym");
+    m.def("dequant_lm_cache_cont_asym", &dequant_lm_cache_cont_asym, "dequant_lm_cache_cont_asym");
+    m.def("quant_lm_cache_paged_asym", &quant_lm_cache_paged_asym, "quant_lm_cache_paged_asym");
+    m.def("dequant_lm_cache_paged_asym", &dequant_lm_cache_paged_asym, "dequant_lm_cache_paged_asym");
 
     m.def("count_inf_nan", &count_inf_nan, "count_inf_nan");
     m.def("histogram", &histogram, "histogram");
