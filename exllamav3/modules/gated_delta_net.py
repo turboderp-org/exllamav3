@@ -75,13 +75,13 @@ try:
     import causal_conv1d_cuda
     causal_conv1d_update_function = causal_conv1d_update_function_cu
     causal_conv1d_fwd_function = causal_conv1d_fwd_function_cu
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError, RuntimeError):
     causal_conv1d_update_function = causal_conv1d_update_function_torch
     causal_conv1d_fwd_function = causal_conv1d_fwd_function_torch
 
 try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError, RuntimeError):
     chunk_gated_delta_rule = None
 
 """
