@@ -18,6 +18,7 @@ from .deepstack import DeepstackEmbed
 from .value_embeddings import ValueEmbeddings
 from .gemma4 import (
     Gemma4Attention,
+    Gemma4QuantCacheLayer,
     Gemma4Experts,
     Gemma4MoEFeedForward,
     Gemma4MoETransformerBlock,

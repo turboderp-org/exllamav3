@@ -21,6 +21,7 @@ from ..modules import (
     Gemma4Attention,
     Gemma4MoEFeedForward,
     Gemma4MoETransformerBlock,
+    Gemma4QuantCacheLayer,
     Gemma4TransformerBlock,
     Gemma4VisionAttention,
     Gemma4VisionPatchEmbedder,
@@ -281,6 +282,7 @@ class Gemma4TextModel(Model):
         self.caps.update({
             "supports_tp": False,
             "atomic_mm_prefill": True,
+            "quantized_kv_cache_layer": Gemma4QuantCacheLayer,
         })
 
         self.modules += [

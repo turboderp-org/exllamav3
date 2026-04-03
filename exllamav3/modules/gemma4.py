@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 from typing_extensions import override
 
+from ..cache.quant import CacheLayer_quant
 from ..model.config import Config
 from ..model.model_tp_alloc import TPAllocation
 from ..util.rope import RoPE
@@ -55,6 +56,119 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+class Gemma4QuantCacheLayer(CacheLayer_quant):
+
+    def __init__(
+        self,
+        config: Config | None,
+        attention: Attention,
+        cache_id: int,
+        max_num_tokens: int,
+        k_bits: int,
+        v_bits: int,
+    ):
+        super().__init__(config, attention, cache_id, max_num_tokens, k_bits, v_bits)
+        self.shadow_k_pages: dict[int, torch.Tensor] | None = None
+        self.shadow_v_pages: dict[int, torch.Tensor] | None = None
+
+
+    @override
+    def alloc(self, device: torch.device):
+        super().alloc(device)
+        self.shadow_k_pages = {}
+        self.shadow_v_pages = {}
+
+
+    @override
+    def free(self):
+        super().free()
+        self.shadow_k_pages = None
+        self.shadow_v_pages = None
+
+
+    def _ensure_shadow_page(self, page_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.device is not None
+        assert self.shadow_k_pages is not None and self.shadow_v_pages is not None
+        sk = self.shadow_k_pages.get(page_idx)
+        sv = self.shadow_v_pages.get(page_idx)
+        if sk is None or sv is None:
+            shape = self.shape[1:]
+            sk = torch.zeros(shape, dtype = torch.half, device = self.device)
+            sv = torch.zeros(shape, dtype = torch.half, device = self.device)
+            self.shadow_k_pages[page_idx] = sk
+            self.shadow_v_pages[page_idx] = sv
+        return sk, sv
+
+
+    def write_shadow_pages(
+        self,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        bsz, seqlen, _, _ = k.shape
+        for b in range(bsz):
+            start = int(cache_seqlens[b])
+            for t in range(seqlen):
+                pos = start + t
+                page_idx = int(block_table[b, pos // PAGE_SIZE])
+                page_pos = pos % PAGE_SIZE
+                sk, sv = self._ensure_shadow_page(page_idx)
+                sk[page_pos].copy_(k[b, t], non_blocking = True)
+                sv[page_pos].copy_(v[b, t], non_blocking = True)
+
+
+    def gather_shadow_pages(
+        self,
+        block_table: torch.Tensor,
+        total_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.device is not None
+        assert self.shadow_k_pages is not None and self.shadow_v_pages is not None
+        bsz = block_table.shape[0]
+        max_total = int(total_lens.max())
+        gathered_k = torch.zeros(
+            (bsz, max_total, self.attention.num_kv_heads, self.attention.head_dim),
+            dtype = torch.half,
+            device = self.device,
+        )
+        gathered_v = torch.zeros_like(gathered_k)
+        for b in range(bsz):
+            total = int(total_lens[b])
+            if total == 0:
+                continue
+            num_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+            cursor = 0
+            for local_page in range(num_pages):
+                page_idx = int(block_table[b, local_page])
+                sk, sv = self._ensure_shadow_page(page_idx)
+                count = min(PAGE_SIZE, total - cursor)
+                gathered_k[b, cursor : cursor + count].copy_(sk[:count], non_blocking = True)
+                gathered_v[b, cursor : cursor + count].copy_(sv[:count], non_blocking = True)
+                cursor += count
+        return gathered_k, gathered_v
+
+
+    @override
+    def copy_page(self, source: "Gemma4QuantCacheLayer", from_page: int, to_page: int, num_tokens: int):
+        super().copy_page(source, from_page, to_page, num_tokens)
+        if (
+            source.shadow_k_pages is None or
+            source.shadow_v_pages is None or
+            self.shadow_k_pages is None or
+            self.shadow_v_pages is None
+        ):
+            return
+        src_k = source.shadow_k_pages.get(from_page)
+        src_v = source.shadow_v_pages.get(from_page)
+        if src_k is None or src_v is None:
+            return
+        dst_k, dst_v = self._ensure_shadow_page(to_page)
+        dst_k[:num_tokens].copy_(src_k[:num_tokens], non_blocking = True)
+        dst_v[:num_tokens].copy_(src_v[:num_tokens], non_blocking = True)
 
 
 class Gemma4VisionRoPE:
@@ -320,6 +434,7 @@ class Gemma4Attention(Attention):
         position_ids = get_for_device(params, "position_ids", self.device, None)
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
         causal = params.get("causal", True)
+        has_mm_embeddings = bool(params.get("indexed_embeddings"))
         vision_group_ids = self._get_vision_group_ids(params)
         if self.sliding_window < 0:
             vision_group_ids = None
@@ -351,13 +466,25 @@ class Gemma4Attention(Attention):
                 self.post_rope_norm
             )
 
-        cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
-        self._write_cache_pages(cache_k, block_table, cache_seqlens, k)
-        self._write_cache_pages(cache_v, block_table, cache_seqlens, v)
-
         total_lens = cache_seqlens + seqlen
-        all_k = self._gather_cache_pages(cache_k, block_table, total_lens).transpose(1, 2)
-        all_v = self._gather_cache_pages(cache_v, block_table, total_lens).transpose(1, 2)
+        cache_layer = cache.layers[self.layer_idx]
+        use_shadow_cache = isinstance(cache_layer, Gemma4QuantCacheLayer) and (
+            self.sliding_window < 0 or has_mm_embeddings
+        )
+
+        if use_shadow_cache:
+            cache_layer.write_shadow_pages(block_table, cache_seqlens, k, v)
+            all_k, all_v = cache_layer.gather_shadow_pages(block_table, total_lens)
+            all_k = all_k.transpose(1, 2)
+            all_v = all_v.transpose(1, 2)
+            cache.update_layer(self.layer_idx, cache_seqlens, block_table, k, v, seqlen)
+        else:
+            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
+            self._write_cache_pages(cache_k, block_table, cache_seqlens, k)
+            self._write_cache_pages(cache_v, block_table, cache_seqlens, v)
+            all_k = self._gather_cache_pages(cache_k, block_table, total_lens).transpose(1, 2)
+            all_v = self._gather_cache_pages(cache_v, block_table, total_lens).transpose(1, 2)
+
         q = q.transpose(1, 2)
         mask = self._build_mm_mask(
             bsz,
@@ -371,8 +498,7 @@ class Gemma4Attention(Attention):
         )
         o = self._mm_attention(q, all_k, all_v, mask)
 
-        cache_layer = cache.layers[self.layer_idx]
-        if hasattr(cache_layer, "qk"):
+        if not use_shadow_cache and hasattr(cache_layer, "qk"):
             cache.update_layer(self.layer_idx, cache_seqlens, block_table, k, v, seqlen)
 
         if self.headwise_gate:
@@ -475,11 +601,12 @@ class Gemma4Attention(Attention):
 
         bsz, seqlen, _ = x.shape
         attn_mode = params.get("attn_mode", "flash_attn_nc")
+        has_mm_embeddings = bool(params.get("indexed_embeddings"))
         vision_group_ids = self._get_vision_group_ids(params)
         if self.sliding_window < 0:
             vision_group_ids = None
 
-        if self.head_dim > 256 or vision_group_ids is not None:
+        if self.head_dim > 256 or vision_group_ids is not None or has_mm_embeddings:
             match attn_mode:
                 case "flash_attn_nc":
                     x = self.decode_sdpa_nc(x, bsz, seqlen, params)
