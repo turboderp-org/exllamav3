@@ -286,10 +286,17 @@ class Gemma4TextModel(Model):
             config.num_kv_heads == 16 and
             config.num_global_kv_heads == 4
         )
+        is_26b_a4b_moe = (
+            config.num_hidden_layers == 30 and
+            config.enable_moe_block and
+            config.num_kv_heads == 8 and
+            config.num_global_kv_heads == 2
+        )
+        use_single_quant_kv_cache = is_31b_dense or is_26b_a4b_moe
         self.caps.update({
             "supports_tp": False,
             "atomic_mm_prefill": True,
-            "quantized_kv_cache_layer": Gemma4SingleQuantCacheLayer if is_31b_dense else Gemma4QuantCacheLayer,
+            "quantized_kv_cache_layer": Gemma4SingleQuantCacheLayer if use_single_quant_kv_cache else Gemma4QuantCacheLayer,
         })
 
         self.modules += [
