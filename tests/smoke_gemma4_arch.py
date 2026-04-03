@@ -4,20 +4,24 @@ Lightweight smoke checks for Gemma4 text architecture integration.
 
 Checks:
 1) Config/architecture resolution
-2) Model graph construction
+2) Text and vision model graph construction
 3) One sliding-attn block forward
 4) One full-attn block forward
 5) One MoE block forward when enabled
+6) One image embedding extraction through the vision tower
 
 Optional:
-6) Attempt full model load
+7) Attempt full text model load
 """
 
 import argparse
+import os
 import sys
 import torch
+from PIL import Image
 
-from exllamav3 import Config, Model
+from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
+from exllamav3.generator.sampler import GreedySampler
 
 
 def fail(msg: str) -> None:
@@ -31,6 +35,8 @@ def main() -> None:
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--full_load", action="store_true")
     ap.add_argument("--reserve_per_device", default=None, help="e.g. 0.25,0.25")
+    ap.add_argument("--multimodal_generation", action="store_true")
+    ap.add_argument("--multimodal_image", default=None)
     args = ap.parse_args()
 
     cfg = Config.from_directory(args.model_dir)
@@ -39,7 +45,10 @@ def main() -> None:
         fail(f"Unexpected architecture: {cfg.architecture}")
 
     model = Model.from_config(cfg)
+    vision_model = Model.from_config(cfg, component = "vision")
+    tokenizer = Tokenizer.from_config(cfg)
     print("[INFO] model graph ok")
+    print("[INFO] vision graph ok")
 
     if not torch.cuda.is_available():
         fail("CUDA is required for this smoke check")
@@ -79,6 +88,14 @@ def main() -> None:
         print("[INFO] moe block forward:", blk_moe.key, tuple(y.shape))
         blk_moe.unload()
 
+    vision_model.load(device)
+    image = Image.new("RGB", (640, 480), (255, 0, 0))
+    image_embedding = vision_model.get_image_embeddings(tokenizer, image)
+    print("[INFO] image embeddings:", image_embedding.mm_length)
+    if image_embedding.mm_length <= 0:
+        fail("Vision tower produced no image embeddings")
+    vision_model.unload()
+
     if args.full_load:
         reserve = None
         if args.reserve_per_device:
@@ -90,6 +107,62 @@ def main() -> None:
             model.unload()
         except Exception as e:
             print("[WARN] full model load failed:", repr(e))
+
+    if args.multimodal_generation:
+        image_path = args.multimodal_image
+        if image_path is None:
+            image_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "examples",
+                "media",
+                "cat.png",
+            )
+        if not os.path.exists(image_path):
+            fail(f"Multimodal test image not found: {image_path}")
+
+        reserve = None
+        if args.reserve_per_device:
+            reserve = [float(x) for x in args.reserve_per_device.split(",")]
+
+        cache = Cache(model, max_num_tokens = 4096)
+        vision_model.load(device)
+        image_embedding = vision_model.get_image_embeddings(tokenizer, Image.open(image_path).convert("RGB"))
+        prompt_ids = tokenizer.hf_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": "What animal is shown? Answer with one word."},
+                    ],
+                }
+            ],
+            add_generation_prompt = True,
+            enable_thinking = False,
+            embeddings = [image_embedding],
+        )
+        vision_model.unload()
+
+        model.load(reserve_per_device = reserve)
+        generator = Generator(model, cache, tokenizer)
+        job = Job(
+            input_ids = prompt_ids.cpu(),
+            max_new_tokens = 8,
+            stop_conditions = [tokenizer.eos_token_id, "<turn|>"],
+            decode_special_tokens = True,
+            embeddings = [image_embedding],
+            sampler = GreedySampler(),
+        )
+        generator.enqueue(job)
+        output_text = ""
+        while generator.num_remaining_jobs():
+            for result in generator.iterate():
+                if result.get("stage") == "streaming":
+                    output_text += result.get("text", "")
+        print("[INFO] multimodal generation:", repr(output_text))
+        if "cat" not in output_text.lower():
+            fail(f"Unexpected multimodal generation output: {output_text!r}")
+        model.unload()
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

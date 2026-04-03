@@ -23,4 +23,9 @@ from .gemma4 import (
     Gemma4MoETransformerBlock,
     Gemma4Router,
     Gemma4TransformerBlock,
+    Gemma4VisionAttention,
+    Gemma4VisionPatchEmbedder,
+    Gemma4VisionPooler,
+    Gemma4VisionProjector,
+    Gemma4VisionStandardize,
 )

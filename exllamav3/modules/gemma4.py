@@ -14,6 +14,85 @@ from ..util.tensor import to2
 from . import Attention, GatedMLP, Linear, Module, RMSNorm, TransformerBlock
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim = -1)
+
+
+def _apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    cos = cos.unsqueeze(2)
+    sin = sin.unsqueeze(2)
+    return (x * cos) + (_rotate_half(x) * sin)
+
+
+def _apply_multidimensional_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    ndim = 2
+    channels_per_dim = 2 * (x.shape[-1] // (2 * ndim))
+    if channels_per_dim <= 0:
+        raise ValueError(f"Invalid multidimensional RoPE channel count: {x.shape[-1]}")
+
+    split_sizes = [channels_per_dim] * ndim
+    remainder = x.shape[-1] - channels_per_dim * ndim
+    if remainder > 0:
+        split_sizes.append(remainder)
+
+    x_parts = torch.split(x, split_sizes, dim = -1)
+    cos_parts = torch.split(cos, channels_per_dim, dim = -1)
+    sin_parts = torch.split(sin, channels_per_dim, dim = -1)
+    out_parts = [
+        _apply_rotary_pos_emb(x_part, cos_part, sin_part)
+        for x_part, cos_part, sin_part in zip(x_parts[:ndim], cos_parts, sin_parts)
+    ]
+    if remainder > 0:
+        out_parts.append(x_parts[-1])
+    return torch.cat(out_parts, dim = -1)
+
+
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+class Gemma4VisionRoPE:
+
+    def __init__(
+        self,
+        device: torch.device,
+        head_dim: int,
+        rope_theta: float,
+    ):
+        spatial_dim = head_dim // 2
+        self.device = device
+        self.inv_freq = 1.0 / (
+            rope_theta ** (
+                torch.arange(0, spatial_dim, 2, dtype = torch.int64, device = device).float() / spatial_dim
+            )
+        )
+
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        all_cos = []
+        all_sin = []
+        for i in range(2):
+            dim_position_ids = position_ids[:, :, i][:, None, :].float()
+            freqs = (inv_freq_expanded @ dim_position_ids).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim = -1)
+            all_cos.append(emb.cos())
+            all_sin.append(emb.sin())
+        cos = torch.cat(all_cos, dim = -1).to(dtype = x.dtype, device = x.device)
+        sin = torch.cat(all_sin, dim = -1).to(dtype = x.dtype, device = x.device)
+        return cos, sin
+
+
 class Gemma4Attention(Attention):
 
     def __init__(
@@ -49,6 +128,91 @@ class Gemma4Attention(Attention):
 
         self.v_norm = v_norm
         self.register_submodule(self.v_norm)
+
+
+    def _get_vision_group_ids(self, params: dict) -> torch.Tensor | None:
+        group_ids = get_for_device(params, "vision_group_ids", self.device, None)
+        if group_ids is None:
+            return None
+        if group_ids.numel() == 0 or not (group_ids >= 0).any():
+            return None
+        return group_ids
+
+
+    def _build_mm_mask(
+        self,
+        bsz: int,
+        seqlen: int,
+        total_lens: torch.Tensor,
+        cache_seqlens: torch.Tensor | None,
+        vision_group_ids: torch.Tensor | None,
+        q_dtype: torch.dtype,
+        device: torch.device,
+        causal: bool,
+    ) -> torch.Tensor:
+        max_total = int(total_lens.max())
+        mask = torch.full(
+            (bsz, 1, seqlen, max_total),
+            torch.finfo(q_dtype).min,
+            dtype = q_dtype,
+            device = device,
+        )
+        for b in range(bsz):
+            total = int(total_lens[b])
+            if total == 0:
+                continue
+            past = int(cache_seqlens[b]) if cache_seqlens is not None else 0
+            full_groups = None
+            if vision_group_ids is not None:
+                full_groups = torch.full((total,), -1, dtype = torch.int32, device = device)
+                full_groups[past : past + seqlen] = vision_group_ids[b]
+            for qi in range(seqlen):
+                q_abs = past + qi
+                if not causal:
+                    start = 0 if self.sliding_window < 0 else max(0, q_abs - self.sliding_window)
+                    end = total if self.sliding_window < 0 else min(total, q_abs + self.sliding_window + 1)
+                    mask[b, 0, qi, start:end] = 0
+                else:
+                    end = min(total, q_abs + 1)
+                    start = 0 if self.sliding_window < 0 else max(0, q_abs - self.sliding_window)
+                    if end > start:
+                        mask[b, 0, qi, start:end] = 0
+                if full_groups is not None:
+                    q_group = int(full_groups[q_abs])
+                    if q_group >= 0:
+                        same_group = full_groups[:total] == q_group
+                        mask[b, 0, qi, same_group] = 0
+        return mask
+
+
+    def _mm_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        scale = self.sm_scale if self.sm_scale is not None else self.head_dim ** -0.5
+        if self.logit_softcapping:
+            if self.gqa and k.shape[1] != q.shape[1]:
+                repeat = q.shape[1] // k.shape[1]
+                k = k.repeat_interleave(repeat, dim = 1)
+                v = v.repeat_interleave(repeat, dim = 1)
+            scores = torch.matmul(q.float(), k.transpose(-1, -2).float()) * scale
+            scores = torch.tanh(scores / self.logit_softcapping) * self.logit_softcapping
+            scores = scores + mask.float()
+            probs = torch.softmax(scores, dim = -1, dtype = torch.float32)
+            return torch.matmul(probs, v.float()).to(q.dtype)
+
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask = mask,
+            is_causal = False,
+            enable_gqa = self.gqa,
+            scale = scale,
+        )
 
 
     def optimizer_targets(self):
@@ -156,6 +320,9 @@ class Gemma4Attention(Attention):
         position_ids = get_for_device(params, "position_ids", self.device, None)
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
         causal = params.get("causal", True)
+        vision_group_ids = self._get_vision_group_ids(params)
+        if self.sliding_window < 0:
+            vision_group_ids = None
 
         q, k, v, g = self.project_qkv(x, params)
         q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
@@ -192,34 +359,17 @@ class Gemma4Attention(Attention):
         all_k = self._gather_cache_pages(cache_k, block_table, total_lens).transpose(1, 2)
         all_v = self._gather_cache_pages(cache_v, block_table, total_lens).transpose(1, 2)
         q = q.transpose(1, 2)
-
-        max_total = all_k.shape[2]
-        mask = torch.full(
-            (bsz, 1, seqlen, max_total),
-            torch.finfo(q.dtype).min,
-            dtype = q.dtype,
-            device = q.device,
+        mask = self._build_mm_mask(
+            bsz,
+            seqlen,
+            total_lens,
+            cache_seqlens,
+            vision_group_ids,
+            q.dtype,
+            q.device,
+            causal,
         )
-        for b in range(bsz):
-            total = int(total_lens[b])
-            if total == 0:
-                continue
-            if not causal:
-                mask[b, 0, :, :total] = 0
-                continue
-            past = int(cache_seqlens[b])
-            for qi in range(seqlen):
-                upto = min(total, past + qi + 1)
-                mask[b, 0, qi, :upto] = 0
-
-        o = F.scaled_dot_product_attention(
-            q,
-            all_k,
-            all_v,
-            attn_mask = mask,
-            enable_gqa = self.gqa,
-            scale = self.sm_scale,
-        )
+        o = self._mm_attention(q, all_k, all_v, mask)
 
         cache_layer = cache.layers[self.layer_idx]
         if hasattr(cache_layer, "qk"):
@@ -227,7 +377,7 @@ class Gemma4Attention(Attention):
 
         if self.headwise_gate:
             o *= g.sigmoid().unsqueeze(-1)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.transpose(1, 2).contiguous().reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.interleaved_gate:
             o *= g.sigmoid()
 
@@ -246,6 +396,9 @@ class Gemma4Attention(Attention):
         positions = get_for_device(params, "positions", self.device, None)
         position_ids = get_for_device(params, "position_ids", self.device, None)
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
+        vision_group_ids = self._get_vision_group_ids(params)
+        if self.sliding_window < 0:
+            vision_group_ids = None
 
         q, k, v, g = self.project_qkv(x, params)
         q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
@@ -277,7 +430,29 @@ class Gemma4Attention(Attention):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa, scale = self.sm_scale)
+
+        if vision_group_ids is not None:
+            total_lens = torch.full((bsz,), seqlen, dtype = torch.int32, device = q.device)
+            mask = self._build_mm_mask(
+                bsz,
+                seqlen,
+                total_lens,
+                None,
+                vision_group_ids,
+                q.dtype,
+                q.device,
+                causal,
+            )
+            o = self._mm_attention(q, k, v, mask)
+        else:
+            o = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal = causal,
+                enable_gqa = self.gqa,
+                scale = self.sm_scale,
+            )
 
         if self.headwise_gate:
             o *= g.sigmoid().unsqueeze(-1)
@@ -300,8 +475,11 @@ class Gemma4Attention(Attention):
 
         bsz, seqlen, _ = x.shape
         attn_mode = params.get("attn_mode", "flash_attn_nc")
+        vision_group_ids = self._get_vision_group_ids(params)
+        if self.sliding_window < 0:
+            vision_group_ids = None
 
-        if self.head_dim > 256:
+        if self.head_dim > 256 or vision_group_ids is not None:
             match attn_mode:
                 case "flash_attn_nc":
                     x = self.decode_sdpa_nc(x, bsz, seqlen, params)
@@ -805,3 +983,380 @@ class Gemma4MoETransformerBlock(Gemma4TransformerBlock):
             x = x * self.layer_scalar.to(dtype = x.dtype)
 
         return to2(x, out_dtype, self.out_dtype)
+
+
+class Gemma4VisionPatchEmbedder(Module):
+
+    def __init__(
+        self,
+        config: Config,
+        key: str,
+        hidden_size: int,
+        patch_dim: int,
+    ):
+        super().__init__(config, key, None)
+        self.hidden_size = hidden_size
+        self.position_embedding_size = config.vision.position_embedding_size
+        self.position_embedding_key = f"{key}.position_embedding_table"
+        self.position_embedding_table = None
+        self.position_embedding_numel = 0
+
+        self.input_proj = Linear(
+            config = config,
+            key = f"{key}.input_proj",
+            in_features = patch_dim,
+            out_features = hidden_size,
+            qmap = None,
+            out_dtype = torch.half,
+            pad_to = 1,
+        )
+        self.register_submodule(self.input_proj)
+
+
+    @override
+    def optimizer_targets(self):
+        return []
+
+
+    @override
+    def load(self, device: torch.device, **kwargs):
+        super().load(device, **kwargs)
+        self.position_embedding_table = self.config.stc.get_tensor(
+            self.position_embedding_key,
+            device,
+            float2half = True,
+            allow_bf16 = True,
+            no_defer = True,
+        )
+        self.position_embedding_numel = self.position_embedding_table.numel()
+
+
+    @override
+    def unload(self):
+        super().unload()
+        self.position_embedding_table = None
+        self.position_embedding_numel = 0
+
+
+    @override
+    def get_tensors(self):
+        if self.position_embedding_table is None:
+            return {}
+        return {
+            self.position_embedding_key: self.position_embedding_table.contiguous(),
+        }
+
+
+    @override
+    def weights_numel(self):
+        return super().weights_numel() + self.position_embedding_numel
+
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        position_ids = get_for_device(params, "image_position_ids", self.device)
+        padding_positions = (position_ids == -1).all(dim = -1)
+        clamped_positions = position_ids.clamp(min = 0)
+        x = 2.0 * (x - 0.5)
+        hidden_states = self.input_proj.forward(x, params, out_dtype = torch.half)
+
+        pos_x = clamped_positions[..., 0].reshape(-1)
+        pos_y = clamped_positions[..., 1].reshape(-1)
+        table = self.position_embedding_table
+        pos_emb = table[0].index_select(0, pos_x) + table[1].index_select(0, pos_y)
+        pos_emb = pos_emb.view(position_ids.shape[0], position_ids.shape[1], self.hidden_size).to(hidden_states.dtype)
+        pos_emb = torch.where(padding_positions.unsqueeze(-1), torch.zeros_like(pos_emb), pos_emb)
+        hidden_states = hidden_states + pos_emb
+        return to2(hidden_states, out_dtype, torch.half)
+
+
+class Gemma4VisionAttention(Module):
+
+    def __init__(
+        self,
+        config: Config,
+        key: str,
+        layer_idx: int,
+        hidden_size: int,
+        head_dim: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        rope_theta: float,
+        rms_norm_eps: float,
+    ):
+        super().__init__(config, key, None)
+        self.layer_idx = layer_idx
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
+        self.gqa = (num_q_heads != num_kv_heads)
+        self.rope_theta = rope_theta
+        self.rope = None
+
+        self.q_proj = Linear(config, f"{key}.q_proj.linear", hidden_size, num_q_heads * head_dim, qmap = None)
+        self.k_proj = Linear(config, f"{key}.k_proj.linear", hidden_size, num_kv_heads * head_dim, qmap = None)
+        self.v_proj = Linear(config, f"{key}.v_proj.linear", hidden_size, num_kv_heads * head_dim, qmap = None)
+        self.o_proj = Linear(config, f"{key}.o_proj.linear", num_q_heads * head_dim, hidden_size, qmap = None)
+        self.q_norm = RMSNorm(config, f"{key}.q_norm", rms_norm_eps = rms_norm_eps)
+        self.k_norm = RMSNorm(config, f"{key}.k_norm", rms_norm_eps = rms_norm_eps)
+        self.v_norm = RMSNorm(config, f"{key}.v_norm", rms_norm_eps = rms_norm_eps, unweighted = True)
+
+        self.register_submodule(self.q_proj)
+        self.register_submodule(self.k_proj)
+        self.register_submodule(self.v_proj)
+        self.register_submodule(self.o_proj)
+        self.register_submodule(self.q_norm)
+        self.register_submodule(self.k_norm)
+        self.register_submodule(self.v_norm)
+
+
+    @override
+    def optimizer_targets(self):
+        q = self.q_proj.optimizer_targets()
+        k = self.k_proj.optimizer_targets()
+        v = self.v_proj.optimizer_targets()
+        o = self.o_proj.optimizer_targets()
+        return [[q, k + v, o]]
+
+
+    @override
+    def load(self, device: torch.device, **kwargs):
+        super().load(device, **kwargs)
+        self.rope = Gemma4VisionRoPE(device, self.head_dim, self.rope_theta)
+
+
+    @override
+    def unload(self):
+        super().unload()
+        self.rope = None
+
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        position_ids = get_for_device(params, "image_position_ids", self.device)
+        padding_positions = (position_ids == -1).all(dim = -1)
+        bsz, seqlen, _ = x.shape
+
+        q = self.q_proj.forward(x, params).view(bsz, seqlen, self.num_q_heads, self.head_dim)
+        k = self.k_proj.forward(x, params).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = self.v_proj.forward(x, params).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+
+        q = self.q_norm.forward(q, params, out_dtype = torch.half)
+        k = self.k_norm.forward(k, params, out_dtype = torch.half)
+        v = self.v_norm.forward(v, params, out_dtype = torch.half)
+
+        cos, sin = self.rope.forward(q, position_ids)
+        q = _apply_multidimensional_rope(q, cos, sin).transpose(1, 2)
+        k = _apply_multidimensional_rope(k, cos, sin).transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        if self.gqa:
+            repeat = self.num_q_heads // self.num_kv_heads
+            k = _repeat_kv(k, repeat)
+            v = _repeat_kv(v, repeat)
+
+        attn_mask = torch.zeros((bsz, 1, 1, seqlen), dtype = q.dtype, device = q.device)
+        attn_mask.masked_fill_(padding_positions.unsqueeze(1).unsqueeze(1), torch.finfo(q.dtype).min)
+
+        attn_weights = torch.matmul(q, k.transpose(2, 3)) * 1.0
+        attn_weights = attn_weights + attn_mask
+        attn_weights = torch.softmax(attn_weights, dim = -1, dtype = torch.float32).to(q.dtype)
+        y = torch.matmul(attn_weights, v)
+        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.num_q_heads * self.head_dim)
+        y = self.o_proj.forward(y, params)
+        return to2(y, out_dtype, torch.half)
+
+
+class Gemma4VisionPooler(Module):
+
+    def __init__(
+        self,
+        config: Config,
+        key: str,
+        hidden_size: int,
+    ):
+        super().__init__(config, key, None)
+        self.root_hidden_size = hidden_size ** 0.5
+
+
+    @override
+    def optimizer_targets(self):
+        return []
+
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        position_ids = get_for_device(params, "image_position_ids", self.device)
+        output_length = int(params["image_output_length"])
+        if output_length > x.shape[1]:
+            raise ValueError(f"Cannot pool {x.shape[1]} patches to {output_length} soft tokens.")
+
+        padding_positions = (position_ids == -1).all(dim = -1)
+        x = x.masked_fill(padding_positions.unsqueeze(-1), 0.0)
+
+        if x.shape[1] != output_length:
+            input_seq_len = x.shape[1]
+            k = int((input_seq_len // output_length) ** 0.5)
+            k_squared = k ** 2
+            if k_squared * output_length != input_seq_len:
+                raise ValueError(f"Cannot pool {x.shape} to {output_length}: {k=}^2 mismatch")
+            clamped_positions = position_ids.clamp(min = 0)
+            max_x = clamped_positions[..., 0].max(dim = -1, keepdim = True)[0] + 1
+            kernel_idxs = torch.div(clamped_positions, k, rounding_mode = "floor")
+            kernel_idxs = kernel_idxs[..., 0] + (max_x // k) * kernel_idxs[..., 1]
+            weights = F.one_hot(kernel_idxs.long(), output_length).float() / k_squared
+            x = weights.transpose(1, 2) @ x.float()
+            params["image_pooler_mask"] = torch.logical_not((weights == 0).all(dim = 1))
+        else:
+            x = x.float()
+            params["image_pooler_mask"] = ~padding_positions
+
+        x = x * self.root_hidden_size
+        return to2(x, out_dtype, torch.float)
+
+
+class Gemma4VisionStandardize(Module):
+
+    def __init__(
+        self,
+        config: Config,
+        key: str,
+    ):
+        super().__init__(config, key, None)
+        self.bias_key = f"{key}.std_bias"
+        self.scale_key = f"{key}.std_scale"
+        self.std_bias = None
+        self.std_scale = None
+        self.extra_numel = 0
+
+
+    @override
+    def optimizer_targets(self):
+        return []
+
+
+    @override
+    def load(self, device: torch.device, **kwargs):
+        super().load(device, **kwargs)
+        self.std_bias = self.config.stc.get_tensor(self.bias_key, device, float2half = True, allow_bf16 = True, no_defer = True)
+        self.std_scale = self.config.stc.get_tensor(self.scale_key, device, float2half = True, allow_bf16 = True, no_defer = True)
+        self.extra_numel = self.std_bias.numel() + self.std_scale.numel()
+
+
+    @override
+    def unload(self):
+        super().unload()
+        self.std_bias = None
+        self.std_scale = None
+        self.extra_numel = 0
+
+
+    @override
+    def get_tensors(self):
+        if self.std_bias is None or self.std_scale is None:
+            return {}
+        return {
+            self.bias_key: self.std_bias.contiguous(),
+            self.scale_key: self.std_scale.contiguous(),
+        }
+
+
+    @override
+    def weights_numel(self):
+        return self.extra_numel
+
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        y = (x.float() - self.std_bias.float()) * self.std_scale.float()
+        return to2(y, out_dtype, torch.float)
+
+
+class Gemma4VisionProjector(Module):
+
+    def __init__(
+        self,
+        config: Config,
+        key: str,
+        in_features: int,
+        out_features: int,
+        rms_norm_eps: float,
+    ):
+        super().__init__(config, key, None)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rms_norm_eps = rms_norm_eps
+        self.weight = None
+        self._numel = 0
+
+
+    @override
+    def optimizer_targets(self):
+        return []
+
+
+    @override
+    def load(self, device: torch.device, **kwargs):
+        super().load(device, **kwargs)
+        self.weight = self.config.stc.get_tensor(
+            f"{self.key}.weight",
+            device,
+            transpose = True,
+            allow_bf16 = True,
+            no_defer = True,
+        )
+        self._numel = self.weight.numel()
+
+
+    @override
+    def unload(self):
+        super().unload()
+        self.weight = None
+        self._numel = 0
+
+
+    @override
+    def get_tensors(self):
+        if self.weight is None:
+            return {}
+        return {
+            f"{self.key}.weight": self.weight.T.contiguous(),
+        }
+
+
+    @override
+    def weights_numel(self):
+        return self._numel
+
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        y = torch.matmul(x.float(), self.weight.float())
+        y = y * torch.rsqrt(y.pow(2).mean(dim = -1, keepdim = True) + self.rms_norm_eps)
+        return to2(y, out_dtype, torch.float)
