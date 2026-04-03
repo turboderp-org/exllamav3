@@ -6,6 +6,7 @@ from torch import nn
 from typing_extensions import override
 
 from ..cache.quant import CacheLayer_quant
+from ..ext import exllamav3_ext as ext
 from ..model.config import Config
 from ..model.model_tp_alloc import TPAllocation
 from ..util.rope import RoPE
@@ -171,6 +172,78 @@ class Gemma4QuantCacheLayer(CacheLayer_quant):
         dst_v[:num_tokens].copy_(src_v[:num_tokens], non_blocking = True)
 
 
+class Gemma4SingleQuantCacheLayer(Gemma4QuantCacheLayer):
+
+    @override
+    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor):
+        k = torch.empty(self.shape, dtype = torch.half, device = self.device)
+        v = torch.empty(self.shape, dtype = torch.half, device = self.device)
+        ext.dequant_cache_paged_single(self.qk, self.sk, k, cache_seqlens, block_table, PAGE_SIZE)
+        ext.dequant_cache_paged_single(self.qv, self.sv, v, cache_seqlens, block_table, PAGE_SIZE)
+        return k, v
+
+
+    def get_kv_compact(
+        self,
+        total_lens: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bsz = block_table.shape[0]
+        max_total = int(total_lens.max())
+        compact_shape = (bsz, max_total, self.token_dim)
+        k = torch.empty(compact_shape, dtype = torch.half, device = self.device)
+        v = torch.empty_like(k)
+        ext.dequant_cache_paged_compact_single(self.qk, self.sk, k, cache_seqlens, block_table, PAGE_SIZE)
+        ext.dequant_cache_paged_compact_single(self.qv, self.sv, v, cache_seqlens, block_table, PAGE_SIZE)
+        view_shape = (bsz, max_total, self.attention.num_kv_heads, self.attention.head_dim)
+        return k.view(view_shape), v.view(view_shape)
+
+
+    @override
+    def update_kv(
+        self,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int
+    ):
+        ext.quant_cache_paged_single(k, self.qk, self.sk, cache_seqlens, block_table, PAGE_SIZE, length)
+        ext.quant_cache_paged_single(v, self.qv, self.sv, cache_seqlens, block_table, PAGE_SIZE, length)
+
+
+    def update_kv_compact(
+        self,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int,
+    ) -> None:
+        bsz = k.shape[0]
+        k_compact = k.contiguous().view(bsz, length, self.token_dim)
+        v_compact = v.contiguous().view(bsz, length, self.token_dim)
+        ext.quant_cache_paged_compact_single(
+            k_compact,
+            self.qk,
+            self.sk,
+            cache_seqlens,
+            block_table,
+            PAGE_SIZE,
+            length,
+        )
+        ext.quant_cache_paged_compact_single(
+            v_compact,
+            self.qv,
+            self.sv,
+            cache_seqlens,
+            block_table,
+            PAGE_SIZE,
+            length,
+        )
+
+
 class Gemma4VisionRoPE:
 
     def __init__(
@@ -220,6 +293,7 @@ class Gemma4Attention(Attention):
         num_kv_heads: int,
         use_k_as_v: bool,
         v_norm: RMSNorm | None,
+        force_quantized_fallback: bool = False,
         **kwargs,
     ):
         key_v = kwargs.get("key_v")
@@ -236,6 +310,7 @@ class Gemma4Attention(Attention):
         )
 
         self.use_k_as_v = use_k_as_v
+        self.force_quantized_fallback = force_quantized_fallback
         if use_k_as_v:
             self.modules.remove(self.v_proj)
             self.v_proj = None
@@ -471,13 +546,30 @@ class Gemma4Attention(Attention):
         use_shadow_cache = isinstance(cache_layer, Gemma4QuantCacheLayer) and (
             self.sliding_window < 0 or has_mm_embeddings
         )
+        use_compact_cache = (
+            self.force_quantized_fallback and
+            isinstance(cache_layer, Gemma4SingleQuantCacheLayer) and
+            not use_shadow_cache
+        )
 
         if use_shadow_cache:
             cache_layer.write_shadow_pages(block_table, cache_seqlens, k, v)
             all_k, all_v = cache_layer.gather_shadow_pages(block_table, total_lens)
             all_k = all_k.transpose(1, 2)
             all_v = all_v.transpose(1, 2)
-            cache.update_layer(self.layer_idx, cache_seqlens, block_table, k, v, seqlen)
+            if isinstance(cache_layer, Gemma4SingleQuantCacheLayer):
+                cache_layer.update_kv_compact(cache_seqlens, block_table, k, v, seqlen)
+            else:
+                cache.update_layer(self.layer_idx, cache_seqlens, block_table, k, v, seqlen)
+        elif use_compact_cache:
+            compact_k, compact_v = cache_layer.get_kv_compact(total_lens, cache_seqlens, block_table)
+            for b in range(bsz):
+                start = int(cache_seqlens[b])
+                compact_k[b, start : start + seqlen].copy_(k[b], non_blocking = True)
+                compact_v[b, start : start + seqlen].copy_(v[b], non_blocking = True)
+            all_k = compact_k.transpose(1, 2)
+            all_v = compact_v.transpose(1, 2)
+            cache_layer.update_kv_compact(cache_seqlens, block_table, k, v, seqlen)
         else:
             cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
             self._write_cache_pages(cache_k, block_table, cache_seqlens, k)
@@ -498,7 +590,7 @@ class Gemma4Attention(Attention):
         )
         o = self._mm_attention(q, all_k, all_v, mask)
 
-        if not use_shadow_cache and hasattr(cache_layer, "qk"):
+        if not use_shadow_cache and not use_compact_cache and hasattr(cache_layer, "qk"):
             cache.update_layer(self.layer_idx, cache_seqlens, block_table, k, v, seqlen)
 
         if self.headwise_gate:
@@ -603,10 +695,17 @@ class Gemma4Attention(Attention):
         attn_mode = params.get("attn_mode", "flash_attn_nc")
         has_mm_embeddings = bool(params.get("indexed_embeddings"))
         vision_group_ids = self._get_vision_group_ids(params)
+        cache = params.get("cache")
         if self.sliding_window < 0:
             vision_group_ids = None
+        force_quantized_fallback = (
+            self.force_quantized_fallback and
+            attn_mode == "flash_attn" and
+            cache is not None and
+            isinstance(cache.layers[self.layer_idx], Gemma4QuantCacheLayer)
+        )
 
-        if self.head_dim > 256 or vision_group_ids is not None or has_mm_embeddings:
+        if self.head_dim > 256 or vision_group_ids is not None or has_mm_embeddings or force_quantized_fallback:
             match attn_mode:
                 case "flash_attn_nc":
                     x = self.decode_sdpa_nc(x, bsz, seqlen, params)

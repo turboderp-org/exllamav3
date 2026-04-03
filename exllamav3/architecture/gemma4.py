@@ -22,6 +22,7 @@ from ..modules import (
     Gemma4MoEFeedForward,
     Gemma4MoETransformerBlock,
     Gemma4QuantCacheLayer,
+    Gemma4SingleQuantCacheLayer,
     Gemma4TransformerBlock,
     Gemma4VisionAttention,
     Gemma4VisionPatchEmbedder,
@@ -279,10 +280,16 @@ class Gemma4TextModel(Model):
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        is_31b_dense = (
+            config.num_hidden_layers == 60 and
+            not config.enable_moe_block and
+            config.num_kv_heads == 16 and
+            config.num_global_kv_heads == 4
+        )
         self.caps.update({
             "supports_tp": False,
             "atomic_mm_prefill": True,
-            "quantized_kv_cache_layer": Gemma4QuantCacheLayer,
+            "quantized_kv_cache_layer": Gemma4SingleQuantCacheLayer if is_31b_dense else Gemma4QuantCacheLayer,
         })
 
         self.modules += [
@@ -320,6 +327,7 @@ class Gemma4TextModel(Model):
                     rms_norm_eps = config.rms_norm_eps,
                     unweighted = True,
                 ),
+                force_quantized_fallback = is_31b_dense and not layer_is_full,
                 rope_settings = config.rope_settings_full if layer_is_full else config.rope_settings_local,
                 sm_scale = 1.0,
                 sliding_window = config.swa_pattern[idx],
