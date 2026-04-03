@@ -16,3 +16,11 @@ from .qwen3_vl_pos_embedding import Qwen3VLPosEmbedding
 from .glm4v_pos_embedding import Glm4VPosEmbedding
 from .deepstack import DeepstackEmbed
 from .value_embeddings import ValueEmbeddings
+from .gemma4 import (
+    Gemma4Attention,
+    Gemma4Experts,
+    Gemma4MoEFeedForward,
+    Gemma4MoETransformerBlock,
+    Gemma4Router,
+    Gemma4TransformerBlock,
+)

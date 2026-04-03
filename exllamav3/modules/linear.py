@@ -24,6 +24,7 @@ class Linear(Module):
         qbits_key: str = "bits",
         fkey : str | None = None,
         frange: tuple[int, int] | None = None,
+        frange_dim: int = 0,
         fidx: int | None = None,
         caps: dict = None,
         softcap: float = 0.0,
@@ -37,6 +38,7 @@ class Linear(Module):
         post_scale: float = 1.0,
         transposed_load: bool = True,
         transpose_fused_weights: bool = True,
+        ftranspose_after_load: bool = True,
         select_hq_bits: int = 0,
         qgroup: str = None
     ):
@@ -55,6 +57,7 @@ class Linear(Module):
         self.qbits_key = qbits_key
         self.fkey = fkey
         self.frange = frange
+        self.frange_dim = frange_dim
         self.fidx = fidx
         self.quant_type = None
         self.softcap = softcap
@@ -63,6 +66,7 @@ class Linear(Module):
         self.post_scale = post_scale
         self.transposed_load = transposed_load
         self.transpose_fused_weights = transpose_fused_weights
+        self.ftranspose_after_load = ftranspose_after_load
         self.select_hq_bits = select_hq_bits
         self.qgroup = qgroup or key
 
@@ -176,12 +180,19 @@ class Linear(Module):
                 fidx = self.fidx
             )
             if self.frange is not None:
-                weight = weight[self.frange[0] : self.frange[1]].contiguous()
+                if self.frange_dim == 0:
+                    weight = weight[self.frange[0] : self.frange[1]].contiguous()
+                elif self.frange_dim == 1:
+                    weight = weight[:, self.frange[0] : self.frange[1]].contiguous()
+                else:
+                    raise ValueError(f"Unsupported frange_dim={self.frange_dim} for {self.key}")
             weight = self.pad_out(weight)
+            if self.ftranspose_after_load:
+                weight = weight.T.contiguous()
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
-                weight.T.contiguous(),
+                weight,
                 None,
                 self.full_in_features,
                 self.full_out_features,
@@ -462,6 +473,11 @@ class Linear(Module):
                 "out_features": self.out_features,
                 "out_dtype": self.out_dtype,
                 "alt_key": self.alt_key,
+                "fkey": self.fkey,
+                "frange": self.frange,
+                "frange_dim": self.frange_dim,
+                "fidx": self.fidx,
+                "ftranspose_after_load": self.ftranspose_after_load,
                 "caps": self.caps,
                 "softcap": self.softcap,
                 "full_in_features": self.full_in_features,
