@@ -180,7 +180,7 @@ def main(args):
     total_correct = 0
     eval_string = "(evaluating)"
 
-    with ProgressBar("Generating samples", total_jobs, transient = False) as progress:
+    with (ProgressBar("Generating samples", total_jobs, transient = False) as progress):
 
         while generator.num_remaining_jobs():
             results = generator.iterate()
@@ -229,8 +229,11 @@ def main(args):
                     if correct:
                         total_correct += 1
                     score = total_correct / total_answered
-                    interval = 1.96 * math.sqrt(score * (1 - score) / total_answered * (total_jobs - total_answered) / (total_jobs - 1))
-                    eval_string = f"{total_correct: 4}/{total_answered: 4} = {score * 100:6.2f}% +/- {interval * 100: 6.2f}%"
+                    if total_answered == total_jobs:
+                        eval_string = f"{total_correct: 4}/{total_answered: 4} = {score * 100:6.2f}%"
+                    else:
+                        interval = 1.96 * math.sqrt(score * (1 - score) / total_answered * (total_jobs - total_answered) / (total_jobs - 1))
+                        eval_string = f"{total_correct: 4}/{total_answered: 4} = {score * 100:6.2f}% +/- {interval * 100: 6.2f}%"
 
                     # Save answer
                     all_results[idx]["full_completion"] = completion
