@@ -488,7 +488,13 @@ class GatedDeltaNet(Module):
     @override
     def load(self, device: torch.Device, **kwargs):
         super().load(device)
-        self.a_log = self.config.stc.get_tensor(self.key_a_log, self.device, optional = False, allow_bf16 = True)
+        self.a_log = self.config.stc.get_tensor(
+            self.key_a_log,
+            self.device,
+            optional = False,
+            allow_bf16 = True,
+            cast_dtype = torch.float,
+        )
         self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True)
         self.conv1d_weight = self.config.stc.get_tensor(self.key_conv1d_weight, self.device, optional = True, allow_bf16 = True)
         self.conv1d_bias = self.config.stc.get_tensor(self.key_conv1d_bias, self.device, optional = True, allow_bf16 = True)
