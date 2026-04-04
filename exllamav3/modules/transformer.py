@@ -1,10 +1,9 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from ..util.tensor import to2
+from ..util.tensor import to2, get_for_device
 from ..model.config import Config
-from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP
-from ..conversion.allocation import allocate_transformer
+from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
 from ..util import profile_opt
 
 class TransformerBlock(Module):
@@ -13,27 +12,40 @@ class TransformerBlock(Module):
         self,
         config: Config | None,
         key: str,
+        layer_idx: int | None = None,
+        ve_gate: Linear | None = None,
+        resid_lambda: float | None = None,
+        x0_lambda: float | None = None,
         attn_norm: RMSNorm | LayerNorm | None = None,
         attn: Attention | GatedDeltaNet | None = None,
         attn_post_norm: RMSNorm | LayerNorm | None = None,
         mlp_norm: RMSNorm | LayerNorm | None = None,
         mlp: MLP | GatedMLP | BlockSparseMLP | None = None,
         mlp_post_norm: RMSNorm | LayerNorm | None = None,
+        backout_extract: bool = False,
+        backout_lambda: float | None = None,
         qmap: str | None = None,
         qbits_key: str = "bits",
         out_dtype: torch.dtype = None
     ):
         super().__init__(config, key, None)
 
+        self.layer_idx = layer_idx
+        self.ve_gate = ve_gate
+        self.resid_lambda = resid_lambda
+        self.x0_lambda = x0_lambda
         self.attn_norm = attn_norm
         self.attn = attn
         self.attn_post_norm = attn_post_norm
         self.mlp_norm = mlp_norm
         self.mlp = mlp
         self.mlp_post_norm = mlp_post_norm
+        self.backout_extract = backout_extract
+        self.backout_lambda = backout_lambda
         self.qbits_key = qbits_key
         self.out_dtype = out_dtype
 
+        self.register_submodule(self.ve_gate)
         self.register_submodule(self.attn_norm)
         self.register_submodule(self.attn)
         self.register_submodule(self.attn_post_norm)
@@ -51,6 +63,41 @@ class TransformerBlock(Module):
         return [a, m]
 
 
+    def _apply_resid_lambda(self, x: torch.Tensor, params: dict):
+        if self.layer_idx == 0:
+            x0 = x.clone()
+            params["_nc_x0"] = x0
+            if "quant_preserve" in params:
+                params["quant_preserve"]["_nc_x0"] = x0
+        else:
+            x0 = get_for_device(params, "_nc_x0", self.device)
+        return self.resid_lambda * x + self.x0_lambda * x0
+
+
+    def _extract_backout(self, x: torch.Tensor, params: dict):
+        params["_nc_x_backout"] = x.clone()
+        if "quant_preserve" in params:
+            params["quant_preserve"]["_nc_x_backout"] = params["_nc_x_backout"]
+        return x
+
+
+    def _apply_backout(self, x: torch.Tensor, params: dict):
+        xmid = get_for_device(params, "_nc_x_backout", self.device)
+        if xmid is None:
+            return x
+        return x - self.backout_lambda * xmid
+
+
+    def _compute_ve_addend(self, x: torch.Tensor, params: dict):
+        ve = params[f"_nc_ve.{self.layer_idx}"].to(self.device)  # already on device, except while loading model
+        y = x[..., :self.ve_gate.in_features].half()
+        g = self.ve_gate.forward(y, params)
+        g.sigmoid_()
+        g *= 3
+        params[f"_nc_ve.{self.layer_idx}"] = g.unsqueeze(-1) * ve
+        return x
+
+
     @override
     def forward(
         self,
@@ -58,6 +105,15 @@ class TransformerBlock(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+
+        if self.resid_lambda is not None:
+            x = self._apply_resid_lambda(x, params)
+
+        if self.backout_extract:
+            x = self._extract_backout(x, params)
+
+        if self.ve_gate:
+            x = self._compute_ve_addend(x, params)
 
         if self.attn:
             if self.attn_norm:
@@ -80,55 +136,11 @@ class TransformerBlock(Module):
                 y = self.mlp_post_norm.forward(y, params)
             x += y
 
+        if self.backout_lambda is not None:
+            x = self._apply_backout(x, params)
+
         return to2(x, out_dtype, self.out_dtype)
 
-
-    def allocate_q(self, quant_args: dict, surplus_bits: int):
-
-        if not self.attn and not self.mlp:
-            return {}, surplus_bits
-
-        g = self.mlp.gates if any(isinstance(self.mlp, x) for x in [GatedMLP, BlockSparseMLP]) else None
-        u = self.mlp.ups if self.mlp else None
-        d = self.mlp.downs if self.mlp else None
-        if self.mlp and isinstance(self.mlp, BlockSparseMLP) and self.mlp.shared_experts:
-            g = g + self.mlp.shared_experts.gates
-            u = u + self.mlp.shared_experts.ups
-            d = d + self.mlp.shared_experts.downs
-
-        q, k, v, o = None, None, None, None
-        qkvz = None
-        if self.attn:
-            if isinstance(self.attn, Attention):
-                q = self.attn.q_proj
-                k = self.attn.k_proj
-                v = self.attn.v_proj
-                o = self.attn.o_proj
-            elif isinstance(self.attn, GatedDeltaNet):
-                if self.attn.qkvz_proj is not None:
-                    qkvz = self.attn.qkvz_proj
-                    o = self.attn.o_proj
-                elif self.attn.qkv_proj is not None and self.attn.z_proj is not None:
-                    strategy = {}
-                    for linear in (self.attn.qkv_proj, self.attn.z_proj, self.attn.o_proj):
-                        s, surplus_bits = linear.allocate_q(quant_args, surplus_bits)
-                        strategy.update(s)
-                    if u is not None:
-                        s, surplus_bits = allocate_transformer(
-                            quant_args[self.qbits_key],
-                            surplus_bits,
-                            None, None, None, None, g, u, d, None
-                        )
-                        strategy.update(s)
-                    return strategy, surplus_bits
-                else:
-                    o = self.attn.o_proj
-
-        return allocate_transformer(
-            quant_args[self.qbits_key],
-            surplus_bits,
-            q, k, v, o, g, u, d, qkvz
-        )
 
     def get_name(self):
         name = super().get_name()
@@ -243,26 +255,6 @@ class ParallelDecoderBlock(Module):
 
         return to2(x, out_dtype, self.out_dtype)
 
-
-    def allocate_q(self, quant_args: dict, surplus_bits: int):
-        if self.attn:
-            assert isinstance(self.attn, Attention)
-
-        if not self.attn and not self.mlp:
-            return {}, surplus_bits
-
-        return allocate_transformer(
-            quant_args[self.qbits_key],
-            surplus_bits,
-            self.attn.q_proj if self.attn else None,
-            self.attn.k_proj if self.attn else None,
-            self.attn.v_proj if self.attn else None,
-            self.attn.o_proj if self.attn else None,
-            self.mlp.gates if any(isinstance(self.mlp, x) for x in [GatedMLP, BlockSparseMLP]) else None,
-            self.mlp.ups if self.mlp else None,
-            self.mlp.downs if self.mlp else None,
-            None
-        )
 
 
     def get_name(self):

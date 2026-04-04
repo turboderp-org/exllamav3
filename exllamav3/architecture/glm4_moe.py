@@ -113,7 +113,8 @@ class Glm4MoeModel(Model):
                         key = f"{key_prefix}.layers.{idx}.self_attn.k_norm",
                         rms_norm_eps = config.rms_norm_eps,
                     ) if config.use_qk_norm else None,
-                    out_dtype = torch.float
+                    out_dtype = torch.float,
+                    select_hq_bits = 2,
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
@@ -132,6 +133,7 @@ class Glm4MoeModel(Model):
                         qmap = "block.mlp",
                         interm_dtype = torch.half,
                         out_dtype = torch.float,
+                        select_hq_bits = 1,
                     )
                     if idx < config.first_k_dense_replace else
                     BlockSparseMLP(
@@ -164,6 +166,7 @@ class Glm4MoeModel(Model):
                             qmap = "block.mlp",
                             interm_dtype = torch.half,
                             out_dtype = torch.float,
+                            select_hq_bits = 2,
                         ),
                     )
                 )

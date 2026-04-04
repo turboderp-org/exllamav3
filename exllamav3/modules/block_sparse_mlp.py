@@ -300,6 +300,7 @@ class BlockSparseMLP(Module):
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
+                    qgroup = key + ".block_gud",
                 )
                 up = Linear(
                     config = config,
@@ -313,6 +314,7 @@ class BlockSparseMLP(Module):
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
+                    qgroup = key + ".block_gud",
                 )
                 down = Linear(
                     config = config,
@@ -326,6 +328,7 @@ class BlockSparseMLP(Module):
                     allow_input_padding = True,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
+                    qgroup = key + ".block_gud",
                 )
 
                 self.ups.append(up)

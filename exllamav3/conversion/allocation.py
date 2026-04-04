@@ -1,145 +1,137 @@
 from __future__ import annotations
 import math
 import bisect
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
+import re
 if TYPE_CHECKING:
+    from ..model import Model, Config
+
+@dataclass
+class QTarget:
+    numel: int
+    target_bpw: int
+    min_bpw: int
+    priority: int
+
+    def total_bits(self):
+        return self.numel * self.target_bpw
+
+    def delta_1(self):
+        delta = (min(8, self.target_bpw + 1) - self.target_bpw) * self.numel
+        return delta
+
+    def increase_1(self):
+        self.target_bpw = min(8, self.target_bpw + 1)
+
+    def clamp_min(self):
+        self.target_bpw = max(self.target_bpw, self.min_bpw)
+
+
+def create_q_strategy(
+    model: Model,
+    config: Config,
+    bpw: float,
+    head_bpw: int,
+    hq: bool,
+) -> (dict, float):
+    from ..modules.module import Module
     from ..modules.linear import Linear
 
-def allocate_transformer(
-    bpw: float,
-    surplus_bits: int,
-    q: Linear | None,
-    k: Linear | None,
-    v: Linear | None,
-    o: Linear | None,
-    g: Linear | list[Linear] | None,
-    u: Linear | list[Linear] | None,
-    d: Linear | list[Linear] | None,
-    qkvz: Linear | None,
-) -> (dict, int):
-
-    # Submodules
-    keys = []
-    out_keys = {}
-    numels = []
-    perms_qkvo = []
-    perms_gud = []
-
-    if q is not None:
-        assert k and v and o
-        keys += [m.key for m in (q, k, v, o)]
-        numels += [m.weights_numel() for m in (q, k, v, o)]
-        for m in (q, k, v, o):
-            out_keys[m.key] = m.key
-        perms_qkvo = [
-            [0, 0, 0, 0],
-            [0, 1, 1, 0],
-            [0, 2, 2, 0],
-            [0, 1, 1, 1],
-            [0, 1, 2, 1],
-            [1, 2, 2, 1],
-        ]
-
-    if qkvz is not None:
-        assert o
-        keys += [m.key for m in (qkvz, o)]
-        numels += [m.weights_numel() for m in (qkvz, o)]
-        for m in (qkvz, o):
-            out_keys[m.key] = m.key
-        perms_qkvo = [
-            [0, 0],
-            [1, 1],
-            [2, 2],
-        ]
-
-    if g is not None and u is not None:
-        assert d
-        if isinstance(g, list):
-            for m in (g, u, d):
-                key_ = m[0].key.replace(".slice.0", ".slice.*").replace(".experts.0.", ".experts.*.")
-                keys += [key_]
-                numels += [sum(mm.weights_numel() for mm in m)]
-                for mm in m:
-                    out_keys[mm.key] = key_
-        else:
-            keys += [m.key for m in (g, u, d)]
-            numels += [m.weights_numel() for m in (g, u, d)]
-            for m in (g, u, d):
-                out_keys[m.key] = m.key
-        perms_gud = [
-            [0, 0, 0],
-            [0, 0, 1],
-            [0, 1, 1],
-            [1, 1, 1],
-        ]
-
-    elif g is None and u is not None:
-        assert d
-        if isinstance(u, list):
-            for m in (u, d):
-                key_ = m[0].key.replace(".slice.0", ".slice.*").replace(".experts.0.", ".experts.*.")
-                keys += [key_]
-                numels += [sum(mm.weights_numel() for mm in m)]
-                for mm in m:
-                    out_keys[mm.key] = key_
-        else:
-            keys += [m.key for m in (u, d)]
-            numels += [m.weights_numel() for m in (u, d)]
-            for m in (u, d):
-                out_keys[m.key] = m.key
-        perms_gud = [
-            [0, 0],
-            [0, 1],
-            [1, 1],
-        ]
-
-    # Bits per weight from budget
-    numel = sum(numels)
-    budget = int(bpw * numel) + surplus_bits + 1
-    bpw = budget / numel
-
-    # Permutations to consider
-    base_bpw = max(int(math.floor(bpw)), 1)
-    if perms_qkvo and perms_gud:
-        perms = [qkvo + gud for qkvo in perms_qkvo for gud in perms_gud]
-        perms = [[min(8, p1 + base_bpw) for p1 in p2] for p2 in perms]
-    elif perms_qkvo:
-        perms = perms_qkvo
-        perms = [[min(8, p1 + base_bpw) for p1 in p2] for p2 in perms]
-    elif perms_gud:
-        perms = perms_gud
-        perms = [[min(8, p1 + base_bpw) for p1 in p2] for p2 in perms]
-    else:
-        assert False, "Logic error"
-
-    # Find largest option within budget
-    options = [(sum(a * b for a, b in zip(p, numels)), p) for p in perms]
-    options.sort()
-    idx = bisect.bisect_right(options, (budget,))
-    idx = max(0, idx - 1)
-    used_budget, selected = options[idx]
-
-    # Output
-    strategy = {k: v for k, v in zip(keys, selected)}
-    strategy = {k: strategy[v] for k, v in out_keys.items()}
-    surplus = budget - used_budget
-    return strategy, surplus
-
-
-def allocate_linear(
-    bpw: float,
-    surplus_bits: int,
-    l: Linear,
-) -> (dict, int):
-
-    numel = l.weights_numel()
-    budget = int(bpw * numel) + surplus_bits + 1
     base_bpw = int(math.floor(bpw))
-    new_bpw = int(math.floor(budget / numel))
-    new_bpw = max(new_bpw, 1)
-    new_bpw = min(new_bpw, base_bpw + 2, 8)
-    used_budget = new_bpw * numel
+    sum_numel = 0
+    sum_bits = 0
+    targets = {}
+    aux_targets = {}
+    target_groups = {}
 
-    strategy = {l.key: new_bpw}
-    surplus = budget - used_budget
-    return strategy, surplus
+    # Collect and initialize targets
+    def _add(module: Module, priority: int):
+        priority = max(priority, module.q_priority)
+        nonlocal sum_numel, sum_bits, targets, aux_targets
+        if isinstance(module, Linear) and module.qmap is not None:
+            if module.qbits_key == "bits":
+                numel = module.weights_numel()
+                sum_numel += numel
+                sum_bits += numel * base_bpw
+                qt = QTarget(
+                    numel = numel,
+                    target_bpw = base_bpw,
+                    min_bpw = min(base_bpw + module.select_hq_bits, 8),
+                    priority = priority
+                )
+                targets[module.key] = qt
+                if module.qgroup not in target_groups:
+                    target_groups[module.qgroup] = []
+                target_groups[module.qgroup].append(qt)
+
+            elif module.qbits_key == "head_bits":
+                numel = module.weights_numel()
+                aux_targets[module.key] = QTarget(
+                    numel = numel,
+                    target_bpw = head_bpw,
+                    min_bpw = head_bpw,
+                    priority = priority
+                )
+            else:
+                raise ValueError("Logic error in create_q_strategy")
+        for sm in module.modules:
+            _add(sm, priority)
+
+    for m in model.modules:
+        _add(m, 0)
+
+    # Target
+    max_bits = int(bpw * float(sum_numel))
+    order = sorted(target_groups.values(), key = lambda x: max(y.priority for y in x), reverse = True)
+
+    # Bump with priorities target met
+    while sum_bits < max_bits:
+        updates = False
+        for target_list in order:
+            cost = sum(t.delta_1() for t in target_list)
+            if cost > 0 and sum_bits + cost <= max_bits:
+                for t in target_list:
+                    t.increase_1()
+                updates = True
+                sum_bits += cost
+        if not updates:
+            break
+
+    # Apply constraint from --hq:
+    final_bits = 0
+    for t in targets.values():
+        if hq:
+            t.clamp_min()
+        final_bits += t.total_bits()
+
+    # Combined with head layer
+    targets.update(aux_targets)
+
+    # Keep only bitrate
+    f_targets = {k: v.target_bpw for k, v in targets.items()}
+
+    return f_targets, float(final_bits) / sum_numel
+
+
+def print_strategy(
+    strategy: dict
+) -> str:
+    pattern = re.compile(r'(?<=\.)\d+(?=\.)')
+    output = {}
+    max_length = 0
+    for target_key, target_bpw in strategy.items():
+        if target_bpw not in output:
+            output[target_bpw] = {}
+        mkey = pattern.sub("*", target_key)
+        max_length = max(len(mkey), max_length)
+        if mkey not in output[target_bpw]:
+            output[target_bpw][mkey] = 0
+        output[target_bpw][mkey] += 1
+
+    r = ""
+    for bpw, tensors in sorted(output.items()):
+        r += f"     - {bpw} bpw:\n"
+        for key, count in sorted(tensors.items()):
+            r += f"        {key:{max_length}}   {count:8,} " + ("tensors\n" if count > 1 else "tensor\n")
+    return r.rstrip()

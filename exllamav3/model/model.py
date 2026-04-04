@@ -93,6 +93,10 @@ class Model(Model_TPMixin, Model_LSMixin):
         raise NotImplementedError()
 
 
+    def per_layer_quant_preamble(self, params: dict):
+        pass
+
+
     @torch.inference_mode
     def prefill(self, input_ids: torch.Tensor, params: dict | None = None):
         if params is None:

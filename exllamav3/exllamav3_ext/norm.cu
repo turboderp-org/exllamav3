@@ -235,15 +235,15 @@ void rms_norm
     TORCH_CHECK_DIV(x, -1, 4);
     TORCH_CHECK_SHAPES_FULL(x, y);
 
-    auto tx = x.dtype();
-    auto tw = x.dtype();  // intentional, type is irrelevant if w is None
-    auto ty = y.dtype();
+    auto tx = x.scalar_type();
+    auto tw = at::kHalf;  // intentional, type is irrelevant if w is None
+    auto ty = y.scalar_type();
 
     const half* w_ptr = (const half*) OPTPTR(w);
     if (w_ptr)
     {
         TORCH_CHECK_SHAPES(x, -1, w.value(), 0, 1);
-        tw = w.value().dtype();
+        tw = w.value().scalar_type();
     }
 
     int rows = 1;

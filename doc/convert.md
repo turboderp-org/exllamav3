@@ -17,9 +17,11 @@ does.
   
 - **-hb / --head_bits *int***: Number of bits per weight for the lm_head (output) layer of the model. Must be an integer from 1 to 8, default is 6.
 
+- **-hq / --hq**: Increase the bitrate of select layers, such as attention and shared-expert layers. Final model bitrate may be somewhat higher than requested by `--bits`, but for MoE models this is typically a very small increase in size (0.05 - 0.10 bpw) for a disproportionately large increase in model fidelity. 
+
 #### Advanced (generally disregard these options)
 
-- **--out_scales | --no_out_scales**: Force enable or disable output channel scales. By default, whether to apply this setting is autodetected during quantization, so don't set either of these flags unless there's a good reason to. Mostly they're for debug purposes. 
+- **--out_scales *str***: Force enable or disable output channel scales. Options are "always" (default), "never" and "auto". Mostly for debug purposes. 
 
 #### Checkpoints
 
@@ -80,32 +82,16 @@ python convert.py -i /mnt/models/llama3.1-70b-instruct \
                   -d 0,1,2
 ```
 
-Convert a model on the first three devices, using CUDA:2 as the primary device and distributing 3/12, 4/12 and 5/12 of the workload to CUDA:2, CUDA:0 and CUDA:1, respectively:
+Convert a model on the first three devices, using CUDA:2 as the primary device and distributing 3/12, 4/12 and 5/12 of the workload to CUDA:2, CUDA:0 and CUDA:1, respectively. Also keep attention etc. in higher precision with `-eb`. Final model size will be slightly larger than the 4.00 bpw requested in this example, but since this is an MoE model, the increase will be on the order of 0.05 - 0.1 bpw:
 
 ```sh
-python convert.py -i /mnt/models/llama3.1-70b-instruct \
-                  -o /mnt/models/llama3.1-70b-instruct-exl3-3.75bpw \
+python convert.py -i /mnt/models/qwen3.5-35b-a3b \
+                  -o /mnt/models/qwen3.5-35b-a3b-4.00bpw-plus \
                   -w /mnt/temp/exl3 \
-                  -b 3.75 \
+                  -b 4.00 \
+                  -eb \
                   -d 2,0,1 \
                   -dr 3,4,5
 ```
  
 For dialing in the optimal ratio, monitor GPU usage while quantizing. Usage should periodically jump to 100% for at least one device, and ideally you want the other devices close to that as well, while they are active. Increasing the relative split for a device should increase the relative usage as well.
-
-### Expected duration
-
-Some rough estimates of the expected overall time to convert various sizes of models, as of v0.0.1. Quantization kernel is tuned for Ada GPUs at the moment, and especially Ampere performance is likely to improve with more optimization.
-
-| Model size | bpw | 3090   | 4090   | 5090   | 5090 + 2x4090 |
-|------------|-----|--------|--------|--------|---------------|
-| 1B         | 2.0 | 11m    | 4m     | 3m     | 2m            |
-| 1B         | 4.0 | 6m     | 3m     | 2m     | 1m            |
-| 1B         | 8.0 | 5m     | 3m     | 2m     | 1m            |
-| 8B         | 2.0 | 1h 08m | 21m    | 16m    | 10m           |
-| 8B         | 4.0 | 34m    | 14m    | 12m    | 8m            |
-| 8B         | 8.0 | 31m    | 14m    | 11m    | 8m            |
-| 70B        | 2.0 | 9h 04m | 3h 7m  | 2h 19m | 1h 24m        |
-| 70B        | 4.0 | 4h 32m | 2h 0m  | 1h 50m | 1h 5m         |
-| 70B        | 8.0 | 4h 20m | 1h 58m | 1h 41  | 1h 3m         |
-

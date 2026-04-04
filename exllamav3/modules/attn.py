@@ -155,12 +155,15 @@ class Attention(Module):
         o_proj: Linear | Module | None = None,
         g_proj: Linear | Module | None = None,
         interleaved_gate: bool = False,
+        ve_gate: bool = False,
         use_cu_seqlens: bool = False,
         post_rope_norm: bool = False,
-        tp_split_norm: bool = True
+        tp_split_norm: bool = True,
+        select_hq_bits: int = 0,
     ):
         super().__init__(config, key, None)
 
+        self.q_priority = 2 + select_hq_bits
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.head_dim = head_dim
@@ -174,6 +177,7 @@ class Attention(Module):
         self.sliding_window = sliding_window
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
+        self.ve_gate = ve_gate
         self.use_cu_seqlens = use_cu_seqlens
         self.post_rope_norm = post_rope_norm
         self.tp_split_norm = tp_split_norm
@@ -197,7 +201,17 @@ class Attention(Module):
 
         if key_q or frange_q:
             f = 2 if interleaved_gate else 1
-            self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim * f, qmap = qmap + ".input", fkey = fkey, frange = frange_q, qbits_mod_key = "q")
+            self.q_proj = Linear(
+                config,
+                f"{key}.{key_q}",
+                hidden_size,
+                num_q_heads * head_dim * f,
+                qmap = qmap + ".input",
+                fkey = fkey,
+                frange = frange_q,
+                select_hq_bits = select_hq_bits,
+                qgroup = key + ".qkv",
+            )
             self.register_submodule(self.q_proj)
         else:
             assert q_proj
@@ -206,8 +220,28 @@ class Attention(Module):
 
         if key_k or frange_k:
             assert key_v or frange_v
-            self.k_proj = Linear(config, f"{key}.{key_k}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_k, qbits_mod_key = "k")
-            self.v_proj = Linear(config, f"{key}.{key_v}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_v, qbits_mod_key = "v")
+            self.k_proj = Linear(
+                config,
+                f"{key}.{key_k}",
+                hidden_size,
+                num_kv_heads * head_dim,
+                qmap =  qmap + ".input",
+                fkey = fkey,
+                frange = frange_k,
+                select_hq_bits = select_hq_bits,
+                qgroup = key + ".qkv",
+            )
+            self.v_proj = Linear(
+                config,
+                f"{key}.{key_v}",
+                hidden_size,
+                num_kv_heads * head_dim,
+                qmap =  qmap + ".input",
+                fkey = fkey,
+                frange = frange_v,
+                select_hq_bits = select_hq_bits,
+                qgroup = key + ".qkv",
+            )
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
         else:
@@ -223,7 +257,16 @@ class Attention(Module):
 
         # Create o proj
         if key_o:
-            self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o", out_dtype = out_dtype, qbits_mod_key = "o")
+            self.o_proj = Linear(
+                config,
+                f"{key}.{key_o}",
+                num_q_heads * head_dim,
+                hidden_size,
+                qmap =  qmap + ".o",
+                out_dtype = out_dtype,
+                select_hq_bits = select_hq_bits,
+                qgroup = key + ".o",
+            )
             self.register_submodule(self.o_proj)
         else:
             assert o_proj
@@ -510,6 +553,11 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
+        # Optional addend to V tensor (e.g. value embeddings)
+        if self.ve_gate:
+            v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
+            v.add_(v_addend)
+
         assert self.sliding_window < 0, \
             "Torch SDPA does not support sliding window attention (SWA)"
         assert self.logit_softcapping == 0.0, \
@@ -569,6 +617,11 @@ class Attention(Module):
         q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+
+        # Optional addend to V tensor (e.g. value embeddings)
+        if self.ve_gate:
+            v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
+            v.add_(v_addend)
 
         if self.q_norm:
             if self.tp_span_heads_norm:
@@ -647,6 +700,11 @@ class Attention(Module):
         q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+
+        # Optional addend to V tensor (e.g. value embeddings)
+        if self.ve_gate:
+            v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
+            v.add_(v_addend)
 
         # TODO: Add LayerNorm option to fused norm/RoPE kernel
         if self.q_norm:

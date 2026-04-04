@@ -230,6 +230,27 @@ class SafetensorsCollection:
         return results
 
 
+    def get_tensor_meta(
+        self,
+        key: str,
+        optional: bool = True
+    ) -> dict | None:
+        filename = self.tensor_file_map.get(key)
+        if optional and key is None:
+            return None
+        header = self.file_headers[filename]
+        h = header[key]
+        dtype, np_dtype, esize = convert_dtype(h["dtype"])
+        beg, end = h["data_offsets"]
+        return {
+            key: {
+                "shape": h["shape"],
+                "n_bytes": end - beg,
+                "dtype": str(dtype)
+            }
+        }
+
+
     def get_tensors(
         self,
         prefix: str,
@@ -620,10 +641,19 @@ class VariantSafetensorsCollection(SafetensorsCollection):
         prefix: str,
         only_serializable: bool = False
     ) -> dict:
-        keys = [self.main.tensor_file_map.get(prefix)] or []
-        if keys[0] is None:
-            keys = []
+        keys = [self.main.tensor_file_map.get(prefix)]
+        if keys[0] is None: keys = []
         keys += self.main.get_tensor_file_map_trie().keys(prefix + ".")
+
+        if len(self.stcs):
+            keys = set(keys)
+            for _, _, s in self.stcs:
+                keys_ = [s.tensor_file_map.get(prefix)]
+                if keys_[0] is None: keys_ = []
+                keys_ += s.get_tensor_file_map_trie().keys(prefix + ".")
+                keys |= set(keys_)
+            keys = list(keys)
+
         results = {}
         for key in keys:
             stc = self.find_stc(key)

@@ -455,7 +455,7 @@ class Qwen3VLVisionModel(Model):
         )
 
 
-    def default_load_params(self):
+    def default_load_params(self, max_chunk_size):
         return { "grid_thw": torch.tensor([[1, 86, 128]]) }
 
 

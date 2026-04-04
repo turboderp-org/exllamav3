@@ -298,10 +298,12 @@ class GatedDeltaNet(Module):
         key_o: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
+        select_hq_bits: int = 0,
     ):
         super().__init__(config, key, None)
         self.module_name = "GatedDeltaNet"
 
+        self.q_priority = 1 + select_hq_bits
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.k_head_dim = k_head_dim
@@ -329,7 +331,16 @@ class GatedDeltaNet(Module):
                 "GatedDeltaNet split b/a projections require both key_b and key_a"
 
         if key_fused_qkvz:
-            self.qkvz_proj = Linear(config, f"{key}.{key_fused_qkvz}", hidden_size, self.fdim_qkvz, qmap = qmap + ".input", out_dtype = torch.float)
+            self.qkvz_proj = Linear(
+                config,
+                f"{key}.{key_fused_qkvz}",
+                hidden_size,
+                self.fdim_qkvz,
+                qmap = qmap + ".input",
+                out_dtype = torch.float,
+                select_hq_bits = select_hq_bits,
+                qgroup = key + ".qkvz",
+            )
             self.register_submodule(self.qkvz_proj)
         else:
             self.qkvz_proj = None
@@ -343,8 +354,19 @@ class GatedDeltaNet(Module):
                 qmap = qmap + ".input",
                 out_dtype = torch.float,
                 alt_key = None if not key_qkv_alt else [f"{key}.{x}" for x in key_qkv_alt],
+                select_hq_bits = select_hq_bits,
+                qgroup = key + ".qkvz",
             )
-            self.z_proj = Linear(config, f"{key}.{key_z}", hidden_size, self.v_dim, qmap = qmap + ".input", out_dtype = torch.float)
+            self.z_proj = Linear(
+                config,
+                f"{key}.{key_z}",
+                hidden_size,
+                self.v_dim,
+                qmap = qmap + ".input",
+                out_dtype = torch.float,
+                select_hq_bits = select_hq_bits,
+                qgroup = key + ".qkvz",
+            )
             self.register_submodule(self.qkv_proj)
             self.register_submodule(self.z_proj)
         else:
@@ -372,7 +394,9 @@ class GatedDeltaNet(Module):
             self.v_head_dim * self.num_v_heads,
             hidden_size,
             qmap = qmap + ".output",
-            out_dtype = self.out_dtype
+            out_dtype = self.out_dtype,
+            select_hq_bits = select_hq_bits,
+            qgroup = key + ".o",
         )
         self.register_submodule(self.o_proj)
 

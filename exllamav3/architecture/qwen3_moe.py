@@ -112,7 +112,8 @@ class Qwen3MoeModel(Model):
                             key = f"{key_prefix}.layers.{idx}.self_attn.k_norm",
                             rms_norm_eps = config.rms_norm_eps,
                         ),
-                        out_dtype = torch.float
+                        out_dtype = torch.float,
+                        select_hq_bits = 2,
                     ),
                     mlp_norm = RMSNorm(
                         config = config,

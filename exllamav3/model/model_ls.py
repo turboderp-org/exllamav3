@@ -40,8 +40,8 @@ class Model_LSMixin:
         return (1, chunk_size), torch.long
 
 
-    def default_load_params(self):
-        return {}
+    def default_load_params(self, chunk_size):
+        return {"input_ids": torch.zeros((1, chunk_size), dtype = torch.long)}
 
 
     def _load_autosplit(
@@ -64,7 +64,7 @@ class Model_LSMixin:
         dummy_state = None
         prev_load_device = None
         touched_devices = []
-        params = self.default_load_params()
+        params = self.default_load_params(max_chunk_size)
 
         with ProgressBar(f"Loading (LS)" if progressbar else None, len(modules)) as progress:
 

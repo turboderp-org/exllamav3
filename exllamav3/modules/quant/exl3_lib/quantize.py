@@ -265,7 +265,7 @@ def blockwise_preapply_had_r_(x: torch.Tensor, had_dim):
         x[:, start:end] = block_transformed
 
 
-def block_ldl(H: torch.Tensor, b: int, verbose: bool):
+def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool):
 
     n, _ = H.shape
     assert (n % b == 0)
@@ -273,22 +273,36 @@ def block_ldl(H: torch.Tensor, b: int, verbose: bool):
 
     # Cholesky factorization: H = L @ L.T
     # Try on GPU first
-    try:
-        retry_cpu = False
-        L = torch.linalg.cholesky(H)
-        # H is not needed after this, move to CPU. Then overwrite H's GPU storage with L, since we can't otherwise
-        # free up that VRAM as the tensor is referenced by the parent frame
-        H_cpu = H.cpu()
-        H.copy_(L)  # VRAM copy, tiny overhead
-        L = H
-        H = H_cpu
+    num_cholesky_retries = 0
+    retry_cpu = False
+    while True:
+        try:
+            L = torch.linalg.cholesky(H)
+            # H is not needed after this, move to CPU. Then overwrite H's GPU storage with L, since we can't otherwise
+            # free up that VRAM as the tensor is referenced by the parent frame
+            H_cpu = H.cpu()
+            H.copy_(L)  # VRAM copy, tiny overhead
+            L = H
+            H = H_cpu
+            break
 
-    # Fall back on CPU factorization
-    except Exception as e:
-        if e.__class__.__name__ == "OutOfMemoryError" or "CUDA out of memory" in str(e) or "HIP out of memory" in str(e):
-            retry_cpu = True
-        else:
-            raise e
+        except torch._C._LinAlgError as e:
+            num_cholesky_retries += 1
+            if num_cholesky_retries > 10:
+                print(" ## Cholesky decomp. failed, number of retries exceeded")
+                raise e
+            print(f" !! Cholesky decomp. failed, increasing diagonal damping, attempt {num_cholesky_retries}/10")
+            H.diagonal().add_(2.0 * quant_args.get("sigma_reg", 0.025) * H.diagonal().mean())
+            continue
+
+        # Fall back on CPU factorization
+        except Exception as e:
+            if e.__class__.__name__ == "OutOfMemoryError" or "CUDA out of memory" in str(e) or "HIP out of memory" in str(e):
+                retry_cpu = True
+                break
+            else:
+                raise e
+
     if retry_cpu:
         print(f" !! Out of memory on {str(H.device)}, trying CPU fallback")
         free_mem()
@@ -567,17 +581,17 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         count = H_data["count"]
         if count == 0:
             q_fallback = True
+            diag_mean = 0.0
         else:
             H /= count
             diag_mean = torch.diag(H).mean()
             q_fallback = diag_mean.item() < 1e-20
 
         # Regularize diagonal
-        idx = torch.arange(H.shape[0])
-        H[idx, idx] += quant_args.get("sigma_reg", 0.025) * diag_mean
+        H.diagonal().add_(quant_args.get("sigma_reg", 0.025) * diag_mean)
 
         # Some tests
-        diag = H[idx, idx].clone()
+        diag = H.diagonal().clone()
 
         if verbose:
             print(f"     - H min/max: {H.min().item():.6f}   {H.max().item():.6f}")
@@ -599,7 +613,7 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         if q_fallback:
             L = None
         else:
-            L, H = block_ldl(H, 16, verbose)
+            L, H = block_ldl(H, 16, quant_args, verbose)
             dr = torch.arange(k)
             L[dr, dr] = 0
 

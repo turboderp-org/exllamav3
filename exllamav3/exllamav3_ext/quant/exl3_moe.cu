@@ -23,15 +23,15 @@ typedef void (*fp_exl3_moe_kernel) (EXL3_MOE_KERNEL_ARGS);
 
 fp_exl3_moe_kernel exl3_moe_kernel_instances[] =
 {
-    exl3_moe_kernel<0>,  // Switch Kg, Ku and Kd at runtime
-    exl3_moe_kernel<1>,  // Compile-time Kg = Ku = Kd
-    exl3_moe_kernel<2>,  // ...
-    exl3_moe_kernel<3>,
-    exl3_moe_kernel<4>,
-    exl3_moe_kernel<5>,
-    exl3_moe_kernel<6>,
-    exl3_moe_kernel<7>,
-    exl3_moe_kernel<8>
+    exl3_moe_kernel<0, 128>, exl3_moe_kernel<0, 256>, // Switch Kg, Ku and Kd at runtime
+    exl3_moe_kernel<1, 128>, exl3_moe_kernel<1, 256>, // Compile-time Kg = Ku = Kd
+    exl3_moe_kernel<2, 128>, exl3_moe_kernel<2, 256>, // ...
+    exl3_moe_kernel<3, 128>, exl3_moe_kernel<3, 256>,
+    exl3_moe_kernel<4, 128>, exl3_moe_kernel<4, 256>,
+    exl3_moe_kernel<5, 128>, exl3_moe_kernel<5, 256>,
+    exl3_moe_kernel<6, 128>, exl3_moe_kernel<6, 256>,
+    exl3_moe_kernel<7, 128>, exl3_moe_kernel<7, 256>,
+    exl3_moe_kernel<8, 128>, exl3_moe_kernel<8, 256>
 };
 
 /*
@@ -202,7 +202,10 @@ void exl3_moe
     int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
     TORCH_CHECK(concurrency * MOE_SMS_PER_EXPERT <= num_sms, "Concurrency too high for device num_sms");
     dim3 grid_dim(MOE_SMS_PER_EXPERT, 1, concurrency);
-    fp_exl3_moe_kernel kernel = exl3_moe_kernel_instances[K];
+
+    int N_off = 0;
+    if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0) N_off = 1;
+    fp_exl3_moe_kernel kernel = exl3_moe_kernel_instances[2 * K + N_off];
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
     {
