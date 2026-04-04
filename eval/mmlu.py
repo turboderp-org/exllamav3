@@ -142,7 +142,7 @@ def main(args):
         conf = confidence_sum / total
         if n_sample:
             p_subject = f"all subjects, {total} random samples"
-            interval = math.sqrt(score * (1 - score) / total * (full_len - total) / (full_len - 1))
+            interval = 1.96 * math.sqrt(score * (1 - score) / total * (full_len - total) / (full_len - 1))
             print(
                 f"{p_subject:40}: {correct: 5}/{total: 5} = {score * 100:6.2f}% +/- {interval * 100: 6.2f}%"
                 + (" (95% CI)" if total == n_sample else "")
