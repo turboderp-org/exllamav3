@@ -268,6 +268,7 @@ class Generator:
                         "stop_string"  (stop string was completed)
                         "max_new_tokens"  (max_new_tokens reached)
                         "end_filter"  (filter reached end state with eos_after_completed = True)
+                        "loop_detected"  (loop detection triggered)
                     optional, if "eos_reason" == "stop_token":
                         "eos_triggering_token_id": int
                         "eos_triggering_token_str": str
@@ -651,6 +652,7 @@ class Generator:
         return_last_results: bool = False,
         embeddings: list[MMEmbedding] | list[list[MMEmbedding]] | None = None,
         max_rq_tokens: int | None = None,
+        stop_on_loop: tuple[int, int] = None,
         **kwargs
     ):
         """
@@ -715,6 +717,10 @@ class Generator:
             Maximum number of tokens before job is requeued. Rounded to nearest page boundary. This limits how
             many new pages are allocated in the cache for the job in any one round and allows a single job to use
             the full cache size without limiting concurrency for other jobs.
+
+        :param stop_on_loop:
+            Tuple of (window_size: int, min_reps: int), or None. If enabled, generation will end if the last
+            window_size tokens sampled make up >= min_reps consecutive instances of a looping string.
 
         :return:
             Completion(s): (str or list[str] depending on the type of the input prompt argument)
@@ -781,7 +787,8 @@ class Generator:
                 token_healing = token_healing,
                 decode_special_tokens = decode_special_tokens,
                 embeddings = embeddings[idx] or [],
-                max_rq_tokens = max_rq_tokens
+                max_rq_tokens = max_rq_tokens,
+                stop_on_loop = stop_on_loop,
             )
 
             if seed is not None: seed += 1

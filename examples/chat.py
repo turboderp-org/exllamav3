@@ -337,6 +337,7 @@ def main(args):
             banned_strings = banned_strings,
             token_healing = enable_healing,
             return_logits = save_probs > 0,
+            stop_on_loop = (args.loop_window, args.loop_min_reps),
         )
         generator.enqueue(job)
         saved_topk = []
@@ -344,7 +345,7 @@ def main(args):
         saved_samples = []
 
         # Stream response
-        ctx_exceeded = False
+        stop_reason = None
         with (
             KeyReader() as keyreader,
             streamer_cm(args, bot_name, tt[0], tt[1], args.updates_per_second, think) as s
@@ -366,8 +367,9 @@ def main(args):
                         saved_samples += list(x.flatten().tolist() for x in token_ids.split(1, 1))
                     if token_ids is not None:
                         ids = torch.cat((ids, token_ids), dim = -1)
-                    if r["eos"] and r["eos_reason"] == "max_new_tokens":
-                        ctx_exceeded = True
+                    if r["eos"]:
+                        stop_reason = r["eos_reason"]
+
 
                 # Check for keypress while streaming
                 keypress = keyreader.getkey()
@@ -380,8 +382,11 @@ def main(args):
 
         last_tokens = ids[0].tolist()
 
-        if ctx_exceeded:
+        if stop_reason == "max_new_tokens":
             print(f"\n{col_error} !! Response exceeded {max_response_tokens} tokens and was cut short.{col_default}")
+
+        if stop_reason == "loop_detected":
+            print(f"\n{col_error} !! Loop detected, generation stopped.")
 
         if show_tps and r:
             prompt_tokens = r["prompt_tokens"]
@@ -448,5 +453,7 @@ if __name__ == "__main__":
     parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")
     parser.add_argument("-dbg", "--debug", action = "store_true", help = "Print extra debug stuff")
     parser.add_argument("-ups", "--updates-per-second", type = int, help = "Max number of console updates per second (markdown console), default: 30", default = 30)
+    parser.add_argument("-lw", "--loop_window", type = int, help = "Loop detection window in tokens, default = 150", default = 150)
+    parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
     _args = parser.parse_args()
     main(_args)
