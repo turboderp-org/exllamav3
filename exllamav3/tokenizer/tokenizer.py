@@ -128,6 +128,14 @@ class Tokenizer:
         self.bos_token_id = get_default_token_id("bos_token", self.bos_token_id, 1)
         self.eos_token_id = get_default_token_id("eos_token", self.eos_token_id, 2)
 
+        # Update EOS token ID in config if tokenizer_config.json disagrees with config.json
+        e = get_default_token_id("eos_token", None, 2)
+        if e:
+            if config.eos_token_id != e:
+                config.eos_token_id = e
+            if e not in config.eos_token_id_list:
+                config.eos_token_id_list.append(e)
+
         # Get control token strings
         self.unk_token = self.tokenizer.model.unk_token
         self.bos_token = None if self.bos_token_id is None else \
