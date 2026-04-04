@@ -112,6 +112,8 @@ class RoPE:
                 self._rope_params_default()
             case "default" | "mrope":
                 self._rope_params_default()
+            case "proportional":
+                self._rope_params_proportional()
             case "llama3":
                 self._rope_params_llama3()
             case "linear":
@@ -158,6 +160,33 @@ class RoPE:
         self._rope_params_default()
         factor = rs.rope_scaling.get("factor", 1.0)
         self.inv_freq /= factor
+
+
+    def _rope_params_proportional(self):
+        rs = self.rope_settings
+        head_dim = rs.head_dim
+        base = rs.rope_theta
+        factor = rs.rope_scaling.get("factor", 1.0) if rs.rope_scaling else 1.0
+        rope_proportion = rs.partial_rotary_factor
+
+        rope_angles = int(rope_proportion * head_dim // 2)
+        inv_freq_rotated = 1.0 / (
+            base ** (
+                torch.arange(0, 2 * rope_angles, 2, dtype = torch.int64, device = self.device).float() / head_dim
+            )
+        )
+        nope_angles = head_dim // 2 - rope_angles
+        if nope_angles > 0:
+            inv_freq = torch.cat(
+                (
+                    inv_freq_rotated,
+                    torch.zeros(nope_angles, dtype = torch.float32, device = self.device),
+                ),
+                dim = 0,
+            )
+        else:
+            inv_freq = inv_freq_rotated
+        self.inv_freq, self.attn_factor = inv_freq / factor, 1.0
 
 
     def _rope_params_yarn(self):

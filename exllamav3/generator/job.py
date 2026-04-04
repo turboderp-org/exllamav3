@@ -929,6 +929,7 @@ class Job:
             self.time_first_prefill = time.time()
 
         progress = 0
+        atomic_mm_prefill = bool(self.embeddings) and self.generator.model.caps.get("atomic_mm_prefill", False)
         for seq in self.sequences:
             if seq.prefill_complete:
                 continue
@@ -942,26 +943,45 @@ class Job:
 
             p0 = prefill_start // PAGE_SIZE
             p1 = (prefill_end + PAGE_SIZE - 1) // PAGE_SIZE
-            for local_idx in range(p0, p1):
-                if 0 <= cp_pos <= seq.kv_position:
-                    break
-                page = seq.allocated_pages[local_idx]
-                if page.kv_position == PAGE_SIZE:
-                    prefill_start = (local_idx + 1) * PAGE_SIZE
-                    seq.kv_position = prefill_start
-                    self.cached_pages += 1
-                    page.can_revert = False
-                else:
-                    break
+            if not atomic_mm_prefill:
+                for local_idx in range(p0, p1):
+                    if 0 <= cp_pos <= seq.kv_position:
+                        break
+                    page = seq.allocated_pages[local_idx]
+                    if page.kv_position == PAGE_SIZE:
+                        prefill_start = (local_idx + 1) * PAGE_SIZE
+                        seq.kv_position = prefill_start
+                        self.cached_pages += 1
+                        page.can_revert = False
+                    else:
+                        break
 
-            p0 = prefill_start // PAGE_SIZE
-            for local_idx in range(p0, p1):
-                if 0 <= cp_pos <= seq.kv_position:
-                    break
-                page = seq.allocated_pages[local_idx]
-                if page.kv_position == PAGE_SIZE:
-                    prefill_end = local_idx * PAGE_SIZE
-                    break
+                p0 = prefill_start // PAGE_SIZE
+                for local_idx in range(p0, p1):
+                    if 0 <= cp_pos <= seq.kv_position:
+                        break
+                    page = seq.allocated_pages[local_idx]
+                    if page.kv_position == PAGE_SIZE:
+                        prefill_end = local_idx * PAGE_SIZE
+                        break
+
+            if atomic_mm_prefill:
+                seq_limit = len(seq.sequence_ids) - 1
+                seq_tokens = seq.sequence_ids.torch().view(-1)
+                while True:
+                    extended = False
+                    for embedding in self.embeddings:
+                        mask = (seq_tokens >= embedding.first_index) & (seq_tokens < embedding.last_index)
+                        if not mask.any():
+                            continue
+                        mm_positions = torch.nonzero(mask, as_tuple = False).flatten()
+                        mm_start = int(mm_positions[0])
+                        mm_end = int(mm_positions[-1]) + 1
+                        if prefill_start < mm_end and mm_start < prefill_end < mm_end:
+                            prefill_end = min(seq_limit, mm_end)
+                            extended = True
+                    if not extended:
+                        break
 
             if prefill_end <= prefill_start:
                 continue
@@ -974,7 +994,7 @@ class Job:
             # since the recurrent checkpoint will always be on a page boundary
             p0 = prefill_start // PAGE_SIZE
             p1 = prefill_end // PAGE_SIZE
-            if prefill_start == p0 * PAGE_SIZE and self.generator.recurrent_cache is None:
+            if prefill_start == p0 * PAGE_SIZE and self.generator.recurrent_cache is None and not atomic_mm_prefill:
                 prev_hash = None if p0 == 0 else seq.allocated_pages[p0 - 1].phash
                 best_match = 0
                 best_match_page = None
