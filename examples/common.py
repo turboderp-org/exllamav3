@@ -12,13 +12,13 @@ def format_prompt(prompt_format, sp, p):
 
         case "llama3":
             return (
-            f"<|begin_of_text|>"
-            f"<|start_header_id|>system<|end_header_id|>\n\n"
-            f"{sp}<|eot_id|>"
-            f"<|start_header_id|>user<|end_header_id|>\n\n"
-            f"{p}<|eot_id|>"
-            f"<|start_header_id|>assistant<|end_header_id|>\n\n"
-        )
+                f"<|begin_of_text|>"
+                f"<|start_header_id|>system<|end_header_id|>\n\n"
+                f"{sp}<|eot_id|>"
+                f"<|start_header_id|>user<|end_header_id|>\n\n"
+                f"{p}<|eot_id|>"
+                f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+            )
 
         case "mistral":
             return f"<s>[INST] {sp}\n\n{p}[/INST]"
@@ -48,6 +48,18 @@ def format_prompt(prompt_format, sp, p):
                 f"<start_of_turn>model\n"
             )
 
+        case "gemma4":
+            s = "<bos>"
+            if sp:
+                s += f"<|turn>system\n{sp}<turn|>\n"
+            return (
+                s + f"<|turn>user\n"
+                f"{p}<turn|>\n"
+                f"<|turn>model\n"
+                f"<|channel>thought\n"
+                f"<channel|>\n"
+            )
+
         case "glmv":
             return (
                 f"[gMASK]<sop><|system|>\n{sp}"
@@ -70,6 +82,8 @@ def get_stop_conditions(prompt_format, tokenizer):
             return [tokenizer.eos_token_id, "\n\nQuestion:"]
         case "gemma":
             return [tokenizer.eos_token_id, "<end_of_turn>"]
+        case "gemma4":
+            return [tokenizer.eos_token_id, "<turn|>"]
         case "chatml":
             return [tokenizer.eos_token_id, "<|im_end|>"]
         case "mistral":
