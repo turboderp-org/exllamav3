@@ -296,6 +296,44 @@ class PromptFormat_gemma(PromptFormat):
             tokenizer.single_id("<start_of_turn>"),
         ]
 
+class PromptFormat_gemma4(PromptFormat):
+    description = "Gemma4"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            """You are a helpful AI assistant."""
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context = "<|turn>system\n"
+            if think:
+                context += "<|think|>"
+            context += system_prompt + "<turn|>\n"
+        for (u, a) in messages:
+            context += f"<|turn>user\n"
+            context += f"{u}<turn|>\n"
+            context += f"<|turn>model\n"
+            if a is not None: context += f"{a}<turn|>\n"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<eos>"),
+            tokenizer.single_id("<turn|>"),
+        ]
+
+    def thinktag(self):
+        return "<|channel>thought", "<channel|>"
+
 class PromptFormat_reka(PromptFormat):
     description = "Reka Flash 3"
 
@@ -770,6 +808,7 @@ prompt_formats = {
     "mistral": PromptFormat_mistral,
     "mistral3": PromptFormat_mistral3,
     "gemma": PromptFormat_gemma,
+    "gemma4": PromptFormat_gemma4,
     "glm": PromptFormat_glm,
     "reka": PromptFormat_reka,
     "cohere": PromptFormat_cohere,

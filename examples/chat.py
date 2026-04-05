@@ -370,7 +370,6 @@ def main(args):
                     if r["eos"]:
                         stop_reason = r["eos_reason"]
 
-
                 # Check for keypress while streaming
                 keypress = keyreader.getkey()
                 match keypress:
@@ -453,7 +452,7 @@ if __name__ == "__main__":
     parser.add_argument("-save_svg", "--save_svg", action = "store_true", help = "Extract SVG from response (use with --save)")
     parser.add_argument("-dbg", "--debug", action = "store_true", help = "Print extra debug stuff")
     parser.add_argument("-ups", "--updates-per-second", type = int, help = "Max number of console updates per second (markdown console), default: 30", default = 30)
-    parser.add_argument("-lw", "--loop_window", type = int, help = "Loop detection window in tokens, default = 150", default = 150)
+    parser.add_argument("-lw", "--loop_window", type = int, help = "Loop detection window in tokens, default = 300", default = 300)
     parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
     _args = parser.parse_args()
     main(_args)
