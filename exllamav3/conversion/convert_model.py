@@ -287,7 +287,11 @@ def main(args, job_state):
 
     # Get initial state or resume state
     state = prepare_state(args, job_state, config, model, tokenizer)
-    original_input_ids = state.copy()
+    original_input_ids = (
+        state.copy()
+        if job_state["next_module_idx"] == 0 else
+        [{} for _ in range(len(state))]
+    )
     quant_preserves = [{} for _ in range(len(state))]
 
     def get_preserve(si, params_):
@@ -576,6 +580,7 @@ def main(args, job_state):
             # Unload module
             if not module.caps.get("retain_during_quant"):
                 module.unload()
+            capture_H = None
             config.stc.close()
 
         # Save layer tensors to working directory
