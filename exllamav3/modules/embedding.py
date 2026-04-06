@@ -44,7 +44,7 @@ class Embedding(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
-        weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True)
+        weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True, allow_bf16 = True)
         self._numel = weight.numel()
         self.embedding = nn.Embedding(
             self.vocab_size,
@@ -132,15 +132,19 @@ class Embedding(Module):
             if deepstack_emb is not None:
                 params["deepstack_emb"] = deepstack_emb
 
-            return combined_emb if self.multiplier == 1.0 else combined_emb * self.multiplier
+            if self.multiplier != 1.0:
+                combined_emb *= self.multiplier
+            return combined_emb
 
         # No indexed embeddings, or none in current batch
         else:
             x = self.embedding.forward(x)
+            if self.multiplier != 1.0:
+                x *= self.multiplier
             x = to2(x, out_dtype, self.out_dtype)
             if self.normalize:
                 x *= x.shape[-1] ** 0.5
-            return x if self.multiplier == 1.0 else x * self.multiplier
+            return x
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         return []
