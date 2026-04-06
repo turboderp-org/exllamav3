@@ -112,7 +112,8 @@ setup(
         "marisa_trie",
         "kbnf>=0.4.2",
         "formatron>=0.5.0",
-        "pydantic==2.11.0"
+        "pydantic==2.11.0",
+        "xformers"
     ],
     include_package_data=True,
     package_data = {

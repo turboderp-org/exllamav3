@@ -12,6 +12,24 @@ from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+from torch.nn.attention.bias import causal_lower_right
+
+try:
+    import xformers.ops as xops
+    from xformers.ops.fmha.attn_bias import (
+        BlockDiagonalCausalWithOffsetPaddedKeysMask,
+        BlockDiagonalPaddedKeysMask,
+        LowerTriangularFromBottomRightMask,
+    )
+    # Monkey-patch xformers for sm_120 support, what could go wrong
+    from xformers.ops.fmha import cutlass as xf_cutlass
+    xf_cutlass.FwOp.CUDA_MAXIMUM_COMPUTE_CAPABILITY = (12, 0)
+    xf_cutlass.BwOp.CUDA_MAXIMUM_COMPUTE_CAPABILITY = (12, 0)
+    has_xformers = True
+except ModuleNotFoundError:
+    has_xformers = False
+
+has_warned_sdpa_fallback = False
 
 """
 SDPA:
@@ -181,6 +199,13 @@ class Attention(Module):
         self.use_cu_seqlens = use_cu_seqlens
         self.post_rope_norm = post_rope_norm
         self.tp_split_norm = tp_split_norm
+
+        # Use SDPA fallback when head_dim exceeds 256 (max supported by flash-attn
+        self.use_sdpa_fallback = self.head_dim > 256 or self.use_k_as_v
+        if self.use_sdpa_fallback:
+            assert sliding_window == -1 and logit_softcapping == 0.0, \
+                "head_dim > 512 requires SDPA fallback path, which doesn't support sliding " \
+                "window attn or logit softcapping"
 
         if post_rope_norm:
             assert q_norm is None and k_norm is None, \
@@ -464,6 +489,10 @@ class Attention(Module):
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
 
+        q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
+        k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim)
+        v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim)
+
         return q, k, v, g
 
 
@@ -549,9 +578,6 @@ class Attention(Module):
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
 
         q, k, v, g = self.project_qkv(x, params)
-        q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
-        k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
         # Optional addend to V tensor (e.g. value embeddings)
         if self.ve_gate:
@@ -593,7 +619,7 @@ class Attention(Module):
         o = o.transpose(1, 2)
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -607,6 +633,9 @@ class Attention(Module):
         seqlen: int,
         params: dict,
     ):
+        if self.use_sdpa_fallback:
+            return self.decode_sdpa_nc(x, bsz, seqlen, params)
+
         causal = params.get("causal", True)
         position = params.get("position", 0)
         positions = get_for_device(params, "positions", self.device, None)
@@ -614,9 +643,6 @@ class Attention(Module):
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
 
         q, k, v, g = self.project_qkv(x, params)
-        q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
-        k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
         # Optional addend to V tensor (e.g. value embeddings)
         if self.ve_gate:
@@ -697,9 +723,6 @@ class Attention(Module):
         causal = params.get("causal", True)
 
         q, k, v, g = self.project_qkv(x, params)
-        q = q.view(bsz, seqlen, self.num_q_heads, self.head_dim)
-        k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
         # Optional addend to V tensor (e.g. value embeddings)
         if self.ve_gate:
@@ -735,7 +758,15 @@ class Attention(Module):
         else:
             cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
 
-        o = flash_attn_with_kvcache(
+        if self.use_sdpa_fallback:
+            if has_xformers:
+                fn = self.flash_attn_with_kvcache_xformers_fallback
+            else:
+                fn = self.flash_attn_with_kvcache_sdpa_fallback
+        else:
+            fn = flash_attn_with_kvcache
+
+        o = fn(
             q = q,
             k = k,
             v = v,
@@ -760,6 +791,179 @@ class Attention(Module):
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
+
+    @staticmethod
+    def flash_attn_with_kvcache_xformers_fallback(
+        q, k, v,
+        k_cache, v_cache,
+        block_table, cache_seqlens,
+        causal = False,
+        softmax_scale = None,
+        window_size = None,
+        softcap = None,
+        chunk_size = 1024,
+    ):
+        batch, seqlen_q, nheads, headdim = q.shape
+        _, seqlen_new, nheads_k, _ = k.shape
+        block_size = k_cache.shape[1]
+        ngroups = nheads // nheads_k
+
+        outputs = []
+        for b in range(batch):
+            seq_len = cache_seqlens[b].item()
+            total_len = seq_len + seqlen_new
+
+            # Gather pages into contiguous buffer
+            num_blocks_needed = (total_len + block_size - 1) // block_size
+            phys_blocks = block_table[b, :num_blocks_needed]
+            k_buf = k_cache[phys_blocks].view(-1, nheads_k, headdim)
+            v_buf = v_cache[phys_blocks].view(-1, nheads_k, headdim)
+
+            # Write new tokens into buffer
+            k_buf[seq_len:total_len] = k[b]
+            v_buf[seq_len:total_len] = v[b]
+
+            # Prepare for xformers: (1, seq, nheads_k, ngroups, headdim) for GQA
+            k_xf = k_buf[:total_len].unsqueeze(0)  # (1, total_len, nheads_k, headdim)
+            v_xf = v_buf[:total_len].unsqueeze(0)
+
+            if ngroups > 1:
+                q_xf = q[b].unsqueeze(0).view(1, seqlen_q, nheads_k, ngroups, headdim)
+                k_xf = k_xf.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
+                v_xf = v_xf.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
+            else:
+                q_xf = q[b].unsqueeze(0)
+
+            if causal:
+                attn_bias = LowerTriangularFromBottomRightMask()
+            else:
+                attn_bias = None
+
+            o = xops.memory_efficient_attention(
+                q_xf, k_xf, v_xf,
+                attn_bias = attn_bias,
+                scale = softmax_scale,
+            )
+
+            if ngroups > 1:
+                o = o.reshape(1, seqlen_q, nheads, headdim)
+            outputs.append(o.squeeze(0))
+
+            # Write back affected pages
+            first_block = seq_len // block_size
+            last_block = (total_len - 1) // block_size
+            for block_idx in range(first_block, last_block + 1):
+                phys = phys_blocks[block_idx]
+                blk_start = block_idx * block_size
+                write_start = max(blk_start, seq_len)
+                write_end = min(blk_start + block_size, total_len)
+                off_start = write_start - blk_start
+                off_end = write_end - blk_start
+                src_start = write_start - seq_len
+                src_end = write_end - seq_len
+                k_cache[phys, off_start:off_end] = k[b, src_start:src_end]
+                v_cache[phys, off_start:off_end] = v[b, src_start:src_end]
+
+        return torch.stack(outputs)
+
+
+    @staticmethod
+    def flash_attn_with_kvcache_sdpa_fallback(
+        q, k, v,
+        k_cache, v_cache,
+        block_table, cache_seqlens,
+        causal = False, softmax_scale = None,
+        window_size = None,
+        softcap = None,
+        chunk_size = 512,
+    ):
+        batch, seqlen_q, nheads, headdim = q.shape
+        _, seqlen_new, nheads_k, _ = k.shape
+        block_size = k_cache.shape[1]
+
+        global has_warned_sdpa_fallback
+        if not has_warned_sdpa_fallback:
+            col_default = "\u001b[0m"
+            col_red = "\u001b[31;1m"
+            print(
+                f"{col_red} !! Warning, using SDPA fallback for large head size. VRAM usage will be high "
+                f"and inference on long sequences will be slow. Consider installing `xformers` to improve "
+                f"performance.{col_default}"
+            )
+            has_warned_sdpa_fallback = True
+
+        outputs = []
+        for b in range(batch):
+            seq_len = cache_seqlens[b].item()
+            total_len = seq_len + seqlen_new
+
+            # Gather this sequence's blocks into a contiguous page-aligned buffer
+            num_blocks_needed = (total_len + block_size - 1) // block_size
+            phys_blocks = block_table[b, :num_blocks_needed]
+            k_buf = k_cache[phys_blocks].reshape(-1, nheads_k, headdim)
+            v_buf = v_cache[phys_blocks].reshape(-1, nheads_k, headdim)
+
+            # In-place copy new tokens into the buffer
+            k_buf[seq_len:total_len] = k[b]
+            v_buf[seq_len:total_len] = v[b]
+
+            # Transpose kv once for all chunks: (1, nheads_k, buf_len, headdim)
+            k_sdpa_full = k_buf.transpose(0, 1).unsqueeze(0)
+            v_sdpa_full = v_buf.transpose(0, 1).unsqueeze(0)
+
+            # Process q in chunks
+            chunk_outputs = []
+            for chunk_start in range(0, seqlen_q, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, seqlen_q)
+                q_chunk = q[b, chunk_start:chunk_end]  # (chunk_len, nheads, headdim)
+                q_sdpa = q_chunk.transpose(0, 1).unsqueeze(0)
+                chunk_len = chunk_end - chunk_start
+
+                if causal:
+                    # This chunk's last query sits at absolute position: (total_len - seqlen_q) + chunk_end - 1
+                    # So it only needs kv up to that position (inclusive)
+                    kv_end = total_len - seqlen_q + chunk_end
+                    k_sdpa = k_sdpa_full[:, :, :kv_end]
+                    v_sdpa = v_sdpa_full[:, :, :kv_end]
+                    attn_mask = causal_lower_right(chunk_len, kv_end)
+                else:
+                    k_sdpa = k_sdpa_full[:, :, :total_len]
+                    v_sdpa = v_sdpa_full[:, :, :total_len]
+                    attn_mask = None
+
+                o = F.scaled_dot_product_attention(
+                    q_sdpa, k_sdpa, v_sdpa,
+                    attn_mask = attn_mask,
+                    scale = softmax_scale,
+                    enable_gqa = True,
+                )
+                chunk_outputs.append(o.squeeze(0).transpose(0, 1))
+
+            outputs.append(torch.cat(chunk_outputs, dim = 0))
+
+            # Write back only the new tokens to the paged cache
+            first_block = seq_len // block_size
+            last_block = (total_len - 1) // block_size
+
+            for block_idx in range(first_block, last_block + 1):
+                phys = phys_blocks[block_idx]
+                blk_start = block_idx * block_size
+                blk_end = blk_start + block_size
+
+                write_start = max(blk_start, seq_len)
+                write_end = min(blk_end, total_len)
+
+                off_start = write_start - blk_start
+                off_end = write_end - blk_start
+
+                src_start = write_start - seq_len
+                src_end = write_end - seq_len
+
+                k_cache[phys, off_start:off_end] = k[b, src_start:src_end]
+                v_cache[phys, off_start:off_end] = v[b, src_start:src_end]
+
+        return torch.stack(outputs)
 
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
