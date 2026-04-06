@@ -166,6 +166,7 @@ class Attention(Module):
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
+        v_norm: RMSNorm | LayerNorm | None = None,
         q_proj: Linear | Module | None = None,
         k_proj: Linear | Module | None = None,
         v_proj: Linear | Module | None = None,
@@ -174,6 +175,7 @@ class Attention(Module):
         g_proj: Linear | Module | None = None,
         interleaved_gate: bool = False,
         ve_gate: bool = False,
+        use_k_as_v: bool = False,
         use_cu_seqlens: bool = False,
         post_rope_norm: bool = False,
         tp_split_norm: bool = True,
@@ -199,6 +201,7 @@ class Attention(Module):
         self.use_cu_seqlens = use_cu_seqlens
         self.post_rope_norm = post_rope_norm
         self.tp_split_norm = tp_split_norm
+        self.use_k_as_v = use_k_as_v
 
         # Use SDPA fallback when head_dim exceeds 256 (max supported by flash-attn
         self.use_sdpa_fallback = self.head_dim > 256 or self.use_k_as_v
@@ -244,7 +247,7 @@ class Attention(Module):
             self.register_submodule(self.q_proj)
 
         if key_k or frange_k:
-            assert key_v or frange_v
+            assert key_v or frange_v or use_k_as_v
             self.k_proj = Linear(
                 config,
                 f"{key}.{key_k}",
@@ -266,7 +269,7 @@ class Attention(Module):
                 frange = frange_v,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
-            )
+            ) if not use_k_as_v else None
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
         else:
@@ -317,6 +320,13 @@ class Attention(Module):
             self.k_norm = None
             self.norm_eps = 1e-6
             self.norm_constant_bias = 0.0
+
+        # Register v norm
+        if v_norm:
+            self.v_norm = v_norm
+            self.register_submodule(self.v_norm)
+        else:
+            self.v_norm = None
 
         # Register headwise gate
         if key_g:
@@ -380,6 +390,7 @@ class Attention(Module):
 
         # Test if K and V proj can be fused
         if (
+            not self.use_k_as_v and
             device != torch.device("cpu") and
             self.k_proj.quant_type == "exl3" and
             self.v_proj.quant_type == "exl3" and
@@ -463,7 +474,7 @@ class Attention(Module):
 
         if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
-            v = self.v_proj.forward(x, params)
+            v = self.v_proj.forward(x, params) if not self.use_k_as_v else k
 
         else:
             x = x.view(1, bsz * q_len, dim)
@@ -492,6 +503,9 @@ class Attention(Module):
         q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
         k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim)
+
+        if self.v_norm is not None:
+            v = self.v_norm.forward(v, params, out_dtype = torch.half)
 
         return q, k, v, g
 
