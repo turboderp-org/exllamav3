@@ -211,6 +211,7 @@ class BlockSparseMLP(Module):
         self.interm_dtype = interm_dtype
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
+        self.intermediate_size_padded = (intermediate_size + 127) // 128 * 128
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 32)
@@ -425,7 +426,7 @@ class BlockSparseMLP(Module):
         # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok
         H = self.hidden_size
-        I = self.intermediate_size
+        I = self.intermediate_size_padded
         device = self.device
 
         temp_hidden = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH * 2, H), torch.half, "moe1_temp_hidden")
@@ -754,7 +755,7 @@ class BlockSparseMLP(Module):
                         else:
                             if count > max_count:
                                 out_state = torch.empty((count, self.hidden_size), dtype = torch.float, device = self.device)
-                                interm = torch.empty((count * 2, self.intermediate_size), dtype = self.interm_dtype, device = self.device)
+                                interm = torch.empty((count * 2, self.intermediate_size_padded), dtype = self.interm_dtype, device = self.device)
                                 interm_a = interm[:count] if self.interm_dtype == torch.half else \
                                     torch.empty_like(interm[:count], dtype = torch.half)
                                 out_state_ = out_state
