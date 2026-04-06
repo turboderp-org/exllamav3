@@ -2,22 +2,19 @@ from __future__ import annotations
 from typing_extensions import override
 import numpy as np
 import torch
-import torch.nn.functional as F
 from ..model.config import Config
 from ..model.model import Model
 from ..util.rope import RopeStyle, position_embedding_grid_2d, RopeSettings
 from ..util.vision import convert_to_rgb, normalize_image, smart_resize
 from ..util.file import read_dict,  no_default
 from ..modules import (
-    Module,
     TransformerBlock,
     Attention,
-    Linear,
     Conv,
     MLP,
     LayerNorm,
-    Qwen3VLPosEmbedding
 )
+from ..modules.arch_specific.qwen3_vl import Qwen3VLPosEmbedding, Qwen3VLVisionPatchMerger
 from .qwen3 import Qwen3Model
 from ..tokenizer import Tokenizer, MMEmbedding
 from types import SimpleNamespace
@@ -147,103 +144,6 @@ class Qwen3VLModel(Qwen3Model):
         **kwargs
     ):
         super().__init__(config, key_prefix = "model.language_model", **kwargs)
-
-
-class Qwen3VLVisionPatchMerger(Module):
-
-    def __init__(
-        self,
-        config: Config,
-        key: str,
-        key_up: str,
-        key_down: str,
-        key_norm: str,
-        hidden_size: int,
-        merge_size: int,
-        out_hidden_size: int,
-        use_postshuffle_norm: bool = False,
-        extract: int | None = None,
-        out_dtype: torch.dtype | None = None,
-        qmap: str | None = None,
-    ):
-        super().__init__(config, key, None)
-        self.in_size = hidden_size * merge_size
-        self.interm_size = hidden_size * merge_size
-        self.out_size = out_hidden_size
-        self.out_dtype = out_dtype
-        self.use_postshuffle_norm = use_postshuffle_norm
-        self.extract = extract
-
-        self.up = Linear(
-            config = config,
-            key = f"{key}.{key_up}",
-            in_features = self.in_size,
-            out_features = self.interm_size,
-            qmap = qmap + ".input",
-            out_dtype = torch.half,
-            pad_to = 1
-        )
-        self.down = Linear(
-            config = config,
-            key = f"{key}.{key_down}",
-            in_features = self.interm_size,
-            out_features = self.out_size,
-            qmap = qmap + ".down",
-            out_dtype = self.out_dtype,
-            allow_input_padding = True,
-            pad_to = 1
-        )
-
-        self.register_submodule(self.up)
-        self.register_submodule(self.down)
-
-        if key_norm:
-            self.norm = LayerNorm(
-                config = config,
-                key = f"{key}.{key_norm}",
-                layernorm_eps = 1e-6,
-                out_dtype = torch.half,
-            )
-            self.register_submodule(self.norm)
-
-    def optimizer_targets(self):
-        raise NotImplementedError()
-
-    @override
-    def weights_numel(self):
-        numel = self.up.weights_numel() + self.down.weights_numel()
-        if self.norm: numel += self.norm.weights_numel()
-        return numel
-
-    @override
-    def forward(
-        self,
-        x: torch.Tensor,
-        params,
-        out_dtype: torch.dtype | None = None,
-    ) -> torch.Tensor:
-
-        bsz, seqlen, dim = x.shape
-        y = x
-        if self.use_postshuffle_norm:
-            y = y.view(-1, self.in_size)
-            y = self.norm.forward(y, params).to(torch.half)
-        else:
-            y = self.norm.forward(y, params).to(torch.half)
-            y = y.view(-1, self.in_size)
-
-        y = self.up.forward(y, params)
-        y = F.gelu(y, approximate = "tanh")
-        y = self.down.forward(y, params)
-        y = y.view(bsz, -1, self.out_size)
-
-        if self.extract is not None:
-            if "deepstack" not in params:
-                params["deepstack"] = []
-            params["deepstack"].append(y.cpu())
-            return x
-        else:
-            return y
 
 
 class Qwen3VLVisionModel(Model):

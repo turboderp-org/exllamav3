@@ -2,23 +2,19 @@ from __future__ import annotations
 from typing_extensions import override
 import numpy as np
 import torch
-import torch.nn.functional as F
 from ..model.config import Config
 from ..model.model import Model
 from ..util.rope import RopeStyle, position_embedding_grid_2d, RopeSettings
 from ..util.file import read_dict, no_default
 from ..util.vision import convert_to_rgb, normalize_image, smart_resize
 from ..modules import (
-    Module,
     RMSNorm,
     TransformerBlock,
     Attention,
     GatedMLP,
-    Linear,
     Conv,
-    LayerNorm,
-    Glm4VPosEmbedding,
 )
+from ..modules.arch_specific.glm4v import Glm4VPosEmbedding, Glm4VVisionPatchMerger
 from .glm4 import Glm4Model
 from types import SimpleNamespace
 from ..tokenizer import Tokenizer, MMEmbedding
@@ -143,116 +139,6 @@ class Glm4VModel(Glm4Model):
         **kwargs
     ):
         super().__init__(config, key_prefix = "model.language_model", **kwargs)
-
-
-class Glm4VVisionPatchMerger(Module):
-
-    def __init__(
-        self,
-        config: Config,
-        key: str,
-        key_gate: str,
-        key_up: str,
-        key_down: str,
-        key_proj: str,
-        key_norm: str,
-        hidden_size: int,
-        interm_size: int,
-        use_postshuffle_norm: bool = False,
-        out_dtype: torch.dtype | None = None,
-        qmap: str | None = None,
-    ):
-        super().__init__(config, key, None)
-        self.hidden_size = hidden_size
-        self.interm_size = interm_size
-        self.out_dtype = out_dtype
-        self.use_postshuffle_norm = use_postshuffle_norm
-
-        self.proj = Linear(
-            config = config,
-            key = f"{key}.{key_proj}",
-            in_features = self.hidden_size,
-            out_features = self.hidden_size,
-            qmap = qmap + ".input",
-            out_dtype = torch.half,
-            pad_to = 1
-        )
-        self.gate = Linear(
-            config = config,
-            key = f"{key}.{key_gate}",
-            in_features = self.hidden_size,
-            out_features = self.interm_size,
-            qmap = qmap + ".post_norm",
-            out_dtype = torch.half,
-            pad_to = 1
-        )
-        self.up = Linear(
-            config = config,
-            key = f"{key}.{key_up}",
-            in_features = self.hidden_size,
-            out_features = self.interm_size,
-            qmap = qmap + ".post_norm",
-            out_dtype = torch.half,
-            pad_to = 1
-        )
-        self.down = Linear(
-            config = config,
-            key = f"{key}.{key_down}",
-            in_features = self.interm_size,
-            out_features = self.hidden_size,
-            qmap = qmap + ".down",
-            out_dtype = self.out_dtype,
-            allow_input_padding = True,
-            pad_to = 1
-        )
-
-        self.register_submodule(self.proj)
-        self.register_submodule(self.gate)
-        self.register_submodule(self.up)
-        self.register_submodule(self.down)
-
-        self.norm = LayerNorm(
-            config = config,
-            key = f"{key}.{key_norm}",
-            layernorm_eps = 1e-6,
-            out_dtype = torch.half,
-        )
-        self.register_submodule(self.norm)
-
-    def optimizer_targets(self):
-        raise NotImplementedError()
-
-    @override
-    def weights_numel(self):
-        numel = (
-            self.gate.weights_numel() +
-            self.up.weights_numel() +
-            self.down.weights_numel() +
-            self.proj.weights_numel() +
-            self.norm.weights_numel()
-        )
-        return numel
-
-    @override
-    def forward(
-        self,
-        x: torch.Tensor,
-        params,
-        out_dtype: torch.dtype | None = None,
-    ) -> torch.Tensor:
-
-        seqlen, _, dim = x.shape
-        x = x.view(-1, self.hidden_size)
-        y = self.proj.forward(x.half(), params)
-        y = self.norm.forward(y, params).half()
-        y = F.gelu(y, approximate = "tanh")
-        g = self.gate.forward(y, params)
-        g = F.silu(g)
-        y = self.up.forward(y, params)
-        y *= g
-        y = self.down.forward(y, params)
-        y = y.view(1, -1, self.hidden_size)
-        return y
 
 
 class Glm4VVisionModel(Model):
