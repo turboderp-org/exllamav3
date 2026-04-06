@@ -28,6 +28,7 @@ class RoutingCFG:
     routed_scaling_factor: float | None
     n_group: int | None
     topk_group: int | None
+    per_expert_scale: torch.Tensor | None
 
 @dataclass
 class FusedBuffers:
@@ -44,6 +45,7 @@ def routing_std(bsz, cfg, y, params):
             cfg.router_logits_bsz1,
             cfg.selected_experts_bsz1,
             cfg.routing_weights_bsz1,
+            cfg.per_expert_scale,
         )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
     else:
@@ -55,6 +57,8 @@ def routing_std(bsz, cfg, y, params):
                 torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
                 .repeat((bsz, 1))
             )
+            if cfg.per_expert_scale is not None:
+                routing_weights *= cfg.per_expert_scale.unsqueeze(0)
             return selected_experts, routing_weights
         else:
             routing_weights = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device)
@@ -63,6 +67,7 @@ def routing_std(bsz, cfg, y, params):
                 router_logits,
                 selected_experts,
                 routing_weights,
+                cfg.per_expert_scale,
             )
         return selected_experts, routing_weights
 
@@ -177,6 +182,7 @@ class BlockSparseMLP(Module):
         key_routing_gate: str | None = None,
         key_shared_gate: str | None = None,
         key_e_score_bias: str | None = "gate.e_score_correction_bias",
+        key_per_expert_scale: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
@@ -340,8 +346,12 @@ class BlockSparseMLP(Module):
                 self.register_submodule(down)
 
         match activation_fn:
-            case "silu": self.activation_fn_call = ext.silu_mul
-            case "gelu": self.activation_fn_call = ext.gelu_mul
+            case "silu":
+                self.activation_fn_call = ext.silu_mul
+                self.activation_fn_idx = 0
+            case "gelu":
+                self.activation_fn_call = ext.gelu_mul
+                self.activation_fn_idx = 1
 
         self.is_quantized = False
         self.support_fused = False
@@ -354,6 +364,8 @@ class BlockSparseMLP(Module):
 
         self.e_score_correction_bias = None
         self.e_score_correction_bias_key = key_e_score_bias
+        self.per_expert_scale = None
+        self.per_expert_scale_key = key_per_expert_scale
 
         self.shared_experts = shared_experts
         if shared_experts is not None:
@@ -555,6 +567,7 @@ class BlockSparseMLP(Module):
             routed_scaling_factor = self.routed_scaling_factor,
             n_group = self.n_group,
             topk_group = self.topk_group,
+            per_expert_scale = self.per_expert_scale,
         )
 
 
@@ -562,12 +575,20 @@ class BlockSparseMLP(Module):
     def load(self, device: torch.Device, **kwargs):
         super().load(device, **kwargs)
 
-        self.e_score_correction_bias = self.config.stc.get_tensor(
-            f"{self.key}.{self.e_score_correction_bias_key}",
-            self.device,
-            optional = True,
-            float2half = True,
-        )
+        if self.e_score_correction_bias_key:
+            self.e_score_correction_bias = self.config.stc.get_tensor(
+                f"{self.key}.{self.e_score_correction_bias_key}",
+                self.device,
+                optional = True,
+                float2half = True,
+            )
+        if self.per_expert_scale_key:
+            self.per_expert_scale = self.config.stc.get_tensor(
+                f"{self.key}.{self.per_expert_scale_key}",
+                self.device,
+                optional = True,
+                allow_bf16 = True,
+            )
         if device is not None and torch.device(device).type == "cuda":
             self.load_local(**kwargs)
             self.load_routing(**kwargs)
@@ -589,6 +610,7 @@ class BlockSparseMLP(Module):
         self.routing_cfg = None
         self.experts_cfg = None
         self.e_score_correction_bias = None
+        self.per_expert_scale = None
         super().unload()
 
 
@@ -949,6 +971,8 @@ class BlockSparseMLP(Module):
         t = super().get_tensors()
         if self.e_score_correction_bias is not None:
             t[f"{self.key}.gate.e_score_correction_bias"] = self.e_score_correction_bias.contiguous()
+        if self.per_expert_scale is not None:
+            t[f"{self.key}.{self.per_expert_scale_key}"] = self.per_expert_scale.contiguous()
         return t
 
 

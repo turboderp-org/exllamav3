@@ -15,5 +15,6 @@ void routing_std
 (
     const at::Tensor& scores,
     at::Tensor topk_indices,
-    at::Tensor topk_weights
+    at::Tensor topk_weights,
+    const c10::optional<at::Tensor>& per_expert_scale
 );

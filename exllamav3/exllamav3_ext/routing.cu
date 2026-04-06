@@ -9,6 +9,7 @@
 #define MAX_NUM_EXPERTS 512
 #define MAX_K 16
 
+using bfloat16 = __nv_bfloat16;
 
 __device__ __forceinline__
 float sigmoid_stable_hf(float xf)
@@ -211,6 +212,7 @@ __global__ void routing_std_kernel
     const half* __restrict__ scores,
     int64_t* __restrict__ topk_indices,
     half* __restrict__ topk_weights,
+    const bfloat16* __restrict__ per_expert_scale,
     int num_experts,
     int K,
     int bsz
@@ -297,6 +299,9 @@ __global__ void routing_std_kernel
         float sum = warp_reduce_sum_first_k(e, K) + 1e-20;
         e /= sum;
 
+        if (per_expert_scale)
+            e *= __bfloat162float(per_expert_scale[idx]);
+
         if (lane_id < K)
         {
             int kpos = lane_id;
@@ -352,7 +357,6 @@ void routing_ds3_nogroup
                  + num_threads * sizeof(int)
                  + num_warps * sizeof(float);
 
-    //int num_blocks = bsz;
     routing_ds3_nogroup_kernel<<<bsz, num_threads, shmem, stream>>>
     (
         (const half*) scores.data_ptr(),
@@ -379,7 +383,8 @@ void routing_std
 (
     const at::Tensor& scores,
     at::Tensor topk_indices,
-    at::Tensor topk_weights
+    at::Tensor topk_weights,
+    const c10::optional<at::Tensor>& per_expert_scale
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
@@ -388,9 +393,11 @@ void routing_std
     TORCH_CHECK_SHAPES(scores, 0, topk_indices, 0, 1);
     TORCH_CHECK_SHAPES(scores, 0, topk_weights, 0, 1);
     TORCH_CHECK_SHAPES(topk_indices, 1, topk_weights, 1, 1);
+    TORCH_CHECK_SHAPES_OPT(per_expert_scale, 0, scores, 1, 1);
     TORCH_CHECK_DTYPE(scores, kHalf);
     TORCH_CHECK_DTYPE(topk_indices, kLong);
     TORCH_CHECK_DTYPE(topk_weights, kHalf);
+    TORCH_CHECK_DTYPE_OPT(per_expert_scale, kBFloat16);
 
     int bsz = scores.size(0);
     int num_experts = scores.size(1);
@@ -412,6 +419,7 @@ void routing_std
         (const half*) scores.data_ptr(),
         (int64_t*) topk_indices.data_ptr(),
         (half*) topk_weights.data_ptr(),
+        (const bfloat16*) OPTPTR(per_expert_scale),
         num_experts,
         K,
         bsz
