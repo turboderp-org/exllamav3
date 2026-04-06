@@ -14,6 +14,7 @@ class RMSNorm(Module):
         config: Config | None,
         key: str,
         rms_norm_eps: float,
+        tensor_weight_suffix: bool = True,
         out_dtype: torch.dtype | None = None,
         qmap: str | None = None,
         constant_bias: float = 0.0,
@@ -34,6 +35,8 @@ class RMSNorm(Module):
         self.span_heads = span_heads
         self.unweighted = unweighted
 
+        self.tensor_key = f"{self.key}.weight" if tensor_weight_suffix else f"{self.key}"
+
     @override
     def optimizer_targets(self):
         return []
@@ -42,7 +45,7 @@ class RMSNorm(Module):
     def load(self, device: torch.device, **kwargs):
         self.device = device
         if not self.unweighted:
-            weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, float2half = True, allow_bf16 = True)
+            weight = self.config.stc.get_tensor(self.tensor_key, self.device, float2half = True, allow_bf16 = True)
             self._numel = weight.numel()
             self.weight = nn.Parameter(weight, requires_grad = False)
         else:
@@ -56,7 +59,7 @@ class RMSNorm(Module):
     @override
     def get_tensors(self):
         return {} if self.unweighted else {
-            f"{self.key}.weight": self.weight.data
+            self.tensor_key: self.weight.data
         }
 
     def forward_torch(
