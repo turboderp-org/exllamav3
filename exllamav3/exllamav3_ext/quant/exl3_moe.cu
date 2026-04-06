@@ -175,7 +175,7 @@ void exl3_moe
     TORCH_CHECK(up_mcg && !up_mul1, "MoE kernel: Only mcg codebook is currently supported");
     TORCH_CHECK(down_mcg && !down_mul1, "MoE kernel: Only mcg codebook is currently supported");
 
-    TORCH_CHECK(act_function == MOE_ACT_SILU, "MoE kernel: Only SiLU is currently supported");
+    // TORCH_CHECK(act_function == MOE_ACT_SILU, "MoE kernel: Only SiLU is currently supported");
 
     int K = 0;
     if (K_gate == K_up && K_up == K_down) K = K_gate;
@@ -262,6 +262,7 @@ void exl3_moe
         (void*) &max_tokens_per_expert,
         (void*) &concurrency,
         (void*) &act_limit,
+        (void*) &act_function,
         (void*) &K_gate,
         (void*) &K_up,
         (void*) &K_down,
