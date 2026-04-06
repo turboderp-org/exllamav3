@@ -9,6 +9,8 @@ from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
+from .rmsnorm import RMSNorm
+from .layernorm import LayerNorm
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache
@@ -700,7 +702,7 @@ class BlockSparseMLP(Module):
                         self.fused_mode_buffers.temp_state_u,
                         self.fused_mode_buffers.temp_intermediate_g,
                         self.fused_mode_buffers.temp_intermediate_u,
-                        0,  # SiLU
+                        self.activation_fn_idx,
                         self.multi_gate.K,
                         self.multi_up.K,
                         self.multi_down.K,
