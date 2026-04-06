@@ -164,8 +164,9 @@ class SafetensorsCollection:
         prefix: str,
     ):
         assert self.new_tensors is None
-        keys = [self.tensor_file_map.get(prefix)]
-        if keys[0] is None:
+        if prefix in self.tensor_file_map:
+            keys = [prefix]
+        else:
             keys = []
         keys += self.get_tensor_file_map_trie().keys(prefix + ".")
         sizes = [self.get_tensor_size(key) for key in keys]
@@ -209,8 +210,9 @@ class SafetensorsCollection:
         only_serializable: bool = False
     ) -> dict:
         assert self.new_tensors is None
-        keys = [self.tensor_file_map.get(prefix)]
-        if keys[0] is None:
+        if prefix in self.tensor_file_map:
+            keys = [prefix]
+        else:
             keys = []
         keys += self.get_tensor_file_map_trie().keys(prefix + ".")
         results = {}
@@ -258,8 +260,9 @@ class SafetensorsCollection:
         allow_bf16: bool = False,
     ) -> dict:
         assert self.new_tensors is None
-        keys = [self.tensor_file_map.get(prefix)]
-        if keys[0] is None:
+        if prefix in self.tensor_file_map:
+            keys = [prefix]
+        else:
             keys = []
         keys += self.get_tensor_file_map_trie().keys(prefix + ".")
         result = {key: self.get_tensor(key, device, allow_bf16 = allow_bf16) for key in keys}
@@ -641,15 +644,19 @@ class VariantSafetensorsCollection(SafetensorsCollection):
         prefix: str,
         only_serializable: bool = False
     ) -> dict:
-        keys = [self.main.tensor_file_map.get(prefix)]
-        if keys[0] is None: keys = []
+        if prefix in self.main.tensor_file_map:
+            keys = [prefix]
+        else:
+            keys = []
         keys += self.main.get_tensor_file_map_trie().keys(prefix + ".")
 
         if len(self.stcs):
             keys = set(keys)
             for _, _, s in self.stcs:
-                keys_ = [s.tensor_file_map.get(prefix)]
-                if keys_[0] is None: keys_ = []
+                if prefix in s.tensor_file_map:
+                    keys_ = [prefix]
+                else:
+                    keys_ = []
                 keys_ += s.get_tensor_file_map_trie().keys(prefix + ".")
                 keys |= set(keys_)
             keys = list(keys)
