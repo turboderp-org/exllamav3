@@ -16,6 +16,7 @@ from torch.nn.attention.bias import causal_lower_right
 
 try:
     import xformers.ops as xops
+    from xformers.ops.fmha import ck, cutlass, flash
     from xformers.ops.fmha.attn_bias import (
         BlockDiagonalCausalWithOffsetPaddedKeysMask,
         BlockDiagonalPaddedKeysMask,
@@ -24,7 +25,6 @@ try:
     # Monkey-patch xformers for sm_120 support, what could go wrong
     from xformers.ops.fmha import cutlass as xf_cutlass
     xf_cutlass.FwOp.CUDA_MAXIMUM_COMPUTE_CAPABILITY = (12, 0)
-    xf_cutlass.BwOp.CUDA_MAXIMUM_COMPUTE_CAPABILITY = (12, 0)
     has_xformers = True
 except ModuleNotFoundError:
     has_xformers = False
@@ -854,11 +854,34 @@ class Attention(Module):
             else:
                 attn_bias = None
 
-            o = xops.memory_efficient_attention(
+            def stable_gqa_via_4d(q5, k5, v5, attn_bias = None, scale = None):
+                B, Mq, G, H, K = q5.shape
+                out = torch.empty(B, Mq, G * H, K, device = q5.device, dtype = q5.dtype)
+                for g in range(G):
+                    qg = q5[:, :, g]
+                    kg = k5[:, :, g, :1, :].expand(-1, -1, H, -1)
+                    vg = v5[:, :, g, :1, :].expand(-1, -1, H, -1)
+                    og = xops.memory_efficient_attention(
+                        qg, kg, vg,
+                        attn_bias = attn_bias,
+                        scale = scale,
+                        op = (cutlass.FwOp, None),
+                    )
+                    out[:, :, g * H:(g + 1) * H, :] = og
+                return out
+
+            # Hack required for xformers currently since GQA is broken
+            # https://github.com/facebookresearch/xformers/issues/1392
+            o = stable_gqa_via_4d(
                 q_xf, k_xf, v_xf,
                 attn_bias = attn_bias,
                 scale = softmax_scale,
             )
+            # o = xops.memory_efficient_attention(
+            #     q_xf, k_xf, v_xf,
+            #     attn_bias = attn_bias,
+            #     scale = softmax_scale,
+            # )
 
             if ngroups > 1:
                 o = o.reshape(1, seqlen_q, nheads, headdim)
