@@ -161,6 +161,7 @@ def main(args, job_state):
     # Recompile model
     compile_args = {
         "bits": bpw_layer,
+        "final_bits": bpw_layer,
         "head_bits": bpw_head,
         "in_dir": dir_base,
         "out_dir": args["out_dir"],
