@@ -399,6 +399,12 @@ class PageTable:
             "cache_seqlens": cache_seqlens,
         }
 
+    def advance_draft_decode_params(self, params: dict, step: int = 1) -> None:
+        # Default pagetable still advances the original single cache-seqlens
+        # tensor only. Custom pagetables can extend this when they expose
+        # additional role-aware seqlens tensors.
+        params["cache_seqlens"] += step
+
     def build_decode_params(self, active_jobs: list, max_seq_len: int, use_offsets: bool = False) -> dict:
         # Non-Gemma models stay on this original single-cache path. Custom
         # pagetables can extend it with extra role-aware tables while keeping the

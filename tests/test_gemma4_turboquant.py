@@ -19,6 +19,7 @@ from exllamav3.cache.gemma4 import (
 )
 from exllamav3.cache.quant import CacheLayer_quant
 from exllamav3.constants import PAGE_SIZE
+from exllamav3.generator.generator import Generator
 from exllamav3.generator.gemma4_pagetable import Gemma4PageTable
 from exllamav3.generator.job import Job
 from exllamav3.generator.pagetable import PageTable, Sequence, tensor_hash_checksum
@@ -240,6 +241,191 @@ def test_select_gemma4_cache_layer_applies_auto_swa_default_only_when_unspecifie
         },
     )
     assert explicit_swa["max_num_tokens"] == 1536
+
+
+def test_pagetable_advance_draft_decode_params_keeps_default_path_and_extends_gemma_roles():
+    default_pagetable = PageTable(
+        SimpleNamespace(),
+        SimpleNamespace(max_num_tokens = PAGE_SIZE * 4),
+    )
+    default_params = {
+        "cache_seqlens": torch.tensor([3, 7], dtype = torch.int32),
+    }
+    default_pagetable.advance_draft_decode_params(default_params, step = 2)
+    assert default_params["cache_seqlens"].tolist() == [5, 9]
+
+    gemma4_pagetable = _make_gemma4_pagetable()
+    gemma4_params = {
+        "cache_seqlens": torch.tensor([1], dtype = torch.int32),
+        "cache_seqlens_full": torch.tensor([4], dtype = torch.int32),
+        "cache_seqlens_swa": torch.tensor([6], dtype = torch.int32),
+    }
+    gemma4_pagetable.advance_draft_decode_params(gemma4_params, step = 2)
+    assert gemma4_params["cache_seqlens"].tolist() == [3]
+    assert gemma4_params["cache_seqlens_full"].tolist() == [6]
+    assert gemma4_params["cache_seqlens_swa"].tolist() == [8]
+
+
+def test_generator_iterate_draftmodel_gen_advances_custom_draft_cache_seqlens():
+    observed_forward = []
+    observed_prefill = []
+
+    class _FakePageTable:
+
+        def __init__(self):
+            self.advance_calls = 0
+
+        def build_draft_decode_params(self, active_jobs, max_seq_len):
+            return {
+                "block_table": torch.zeros((1, 1), dtype = torch.int32),
+                "cache_seqlens": torch.tensor([3], dtype = torch.int32),
+                "block_table_full": torch.zeros((1, 1), dtype = torch.int32),
+                "cache_seqlens_full": torch.tensor([5], dtype = torch.int32),
+                "block_table_swa": torch.zeros((1, 1), dtype = torch.int32),
+                "cache_seqlens_swa": torch.tensor([7], dtype = torch.int32),
+            }
+
+        def advance_draft_decode_params(self, params, step = 1):
+            self.advance_calls += 1
+            params["cache_seqlens"] += step
+            params["cache_seqlens_full"] += step
+            params["cache_seqlens_swa"] += step
+
+    class _FakeDraftModel:
+
+        def forward(self, input_ids, params):
+            observed_forward.append({
+                "cache_seqlens": params["cache_seqlens"].clone(),
+                "cache_seqlens_full": params["cache_seqlens_full"].clone(),
+                "cache_seqlens_swa": params["cache_seqlens_swa"].clone(),
+            })
+            logits = torch.zeros((1, 1, 4), dtype = torch.float32)
+            logits[:, :, 1] = 1.0
+            return logits
+
+        def prefill(self, input_ids, params):
+            observed_prefill.append({
+                "cache_seqlens": params["cache_seqlens"].clone(),
+                "cache_seqlens_full": params["cache_seqlens_full"].clone(),
+                "cache_seqlens_swa": params["cache_seqlens_swa"].clone(),
+            })
+
+    fake_job = SimpleNamespace(
+        embeddings = [],
+        time_first_token = 0.0,
+        is_prefill_done = lambda: True,
+        get_max_seq_len = lambda: 1,
+        get_input_ids_list = lambda: [torch.tensor([[11]], dtype = torch.long)],
+    )
+    fake_self = SimpleNamespace(
+        active_jobs = [fake_job],
+        num_draft_tokens = 2,
+        pagetable = _FakePageTable(),
+        draft_model = _FakeDraftModel(),
+        draft_cache = object(),
+        draft_input_ids_pinned = torch.zeros((1, 1), dtype = torch.long),
+        draft_ids_pinned = torch.zeros((1, 2), dtype = torch.long),
+    )
+
+    Generator.iterate_draftmodel_gen(fake_self, results = [])
+
+    assert fake_self.pagetable.advance_calls == 2
+    assert [entry["cache_seqlens"].item() for entry in observed_forward] == [3, 4]
+    assert [entry["cache_seqlens_full"].item() for entry in observed_forward] == [5, 6]
+    assert [entry["cache_seqlens_swa"].item() for entry in observed_forward] == [7, 8]
+    assert observed_prefill[-1]["cache_seqlens"].item() == 5
+    assert observed_prefill[-1]["cache_seqlens_full"].item() == 7
+    assert observed_prefill[-1]["cache_seqlens_swa"].item() == 9
+
+
+def test_generator_iterate_gen_rolls_back_rejected_draft_tokens_for_each_sequence():
+    page_a = SimpleNamespace(kv_position = 1)
+    page_b = SimpleNamespace(kv_position = 1)
+    seq_a = SimpleNamespace(kv_position = 1, allocated_pages = [page_a])
+    seq_b = SimpleNamespace(kv_position = 1, allocated_pages = [page_b])
+    sync_calls = []
+
+    class _FakeModel:
+        caps = {}
+
+        def forward(self, input_ids, params):
+            return torch.zeros((2, 2, 4), dtype = torch.float32)
+
+    class _FakePageTable:
+
+        def build_decode_params(self, active_jobs, max_seq_len, use_offsets = False):
+            return {
+                "block_table": torch.zeros((2, 1), dtype = torch.int32),
+                "cache_seqlens": torch.tensor([1, 1], dtype = torch.int32),
+            }
+
+        def sync_sequence_views(self, seq):
+            sync_calls.append(seq)
+
+        def defrag(self):
+            return None
+
+    class _FakeJob:
+
+        def __init__(self):
+            self.sequences = [seq_a, seq_b]
+            self.embeddings = []
+            self.time_first_token = 0.0
+            self.new_tokens = 0
+            self.filters = []
+            self.filter_futures = []
+            self.logit_masks = []
+            self.accepted_draft_tokens = 0
+            self.rejected_draft_tokens = 0
+
+        def is_prefill_done(self):
+            return True
+
+        def get_max_seq_len(self):
+            return 1
+
+        def get_input_ids_list(self, draft_tokens = None, batch_offset = 0, add_to_cache = False):
+            return [
+                torch.tensor([[1]], dtype = torch.long),
+                torch.tensor([[2]], dtype = torch.long),
+            ]
+
+        def prepare_logit_mask(self):
+            return None
+
+        def prepare_sampling_past_ids(self):
+            return None
+
+        def receive_logits(self, token_logits):
+            return torch.tensor(0), None, None, 1.0
+
+        def receive_sample(self, token_logits, next_token, next_k_tokens, next_k_probs, next_prob, results):
+            return False, torch.tensor(1), False
+
+        def deallocate_pages(self):
+            return None
+
+        def free_recurrent_state(self):
+            return None
+
+    fake_job = _FakeJob()
+    fake_self = SimpleNamespace(
+        active_jobs = [fake_job],
+        num_draft_tokens = 0,
+        model = _FakeModel(),
+        pagetable = _FakePageTable(),
+        recurrent_cache = None,
+        filter_pool = None,
+        cache = object(),
+        num_remaining_jobs = lambda: 1,
+    )
+
+    Generator.iterate_gen(fake_self, results = [], draft_tokens = torch.zeros((1, 1), dtype = torch.long))
+
+    assert fake_job.rejected_draft_tokens == 1
+    assert page_a.kv_position == 0
+    assert page_b.kv_position == 0
+    assert sync_calls == [seq_a, seq_b]
 
 
 def test_gemma4_pagetable_reports_min_safe_swa_window_and_atomic_prefill_guard():

@@ -379,7 +379,7 @@ class Generator:
             new_ids = torch.argmax(batch_logits, dim = -1)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
-            cache_params["cache_seqlens"] += 1
+            self.pagetable.advance_draft_decode_params(cache_params)
 
         self.draft_model.prefill(
             input_ids = batch_ids,
@@ -529,12 +529,12 @@ class Generator:
                         job.rejected_draft_tokens += rejected
                         for seq in job.sequences:
                             r = rejected
-                        while r:
-                            pos = seq.kv_position + r
-                            page = seq.allocated_pages[(pos - 1) // PAGE_SIZE]
-                            rp = min(page.kv_position, r)
-                            page.kv_position -= rp
-                            r -= rp
+                            while r:
+                                pos = seq.kv_position + r
+                                page = seq.allocated_pages[(pos - 1) // PAGE_SIZE]
+                                rp = min(page.kv_position, r)
+                                page.kv_position -= rp
+                                r -= rp
                             self.pagetable.sync_sequence_views(seq)
                         break
                     else:

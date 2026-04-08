@@ -844,6 +844,11 @@ class Gemma4PageTable(PageTable):
         )
         return params
 
+    def advance_draft_decode_params(self, params: dict, step: int = 1) -> None:
+        super().advance_draft_decode_params(params, step = step)
+        params["cache_seqlens_full"] += step
+        params["cache_seqlens_swa"] += step
+
     def build_decode_params(self, active_jobs: list, max_seq_len: int, use_offsets: bool = False) -> dict:
         params = super().build_decode_params(active_jobs, max_seq_len, use_offsets = use_offsets)
         for job in active_jobs:
