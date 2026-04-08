@@ -24,6 +24,7 @@ class TransformerBlock(Module):
         mlp_post_norm: RMSNorm | LayerNorm | None = None,
         backout_extract: bool = False,
         backout_lambda: float | None = None,
+        key_layer_scalar: str | None = None,
         qmap: str | None = None,
         qbits_key: str = "bits",
         out_dtype: torch.dtype = None
@@ -45,6 +46,10 @@ class TransformerBlock(Module):
         self.qbits_key = qbits_key
         self.out_dtype = out_dtype
 
+        self.key_layer_scalar = key_layer_scalar
+        self.layer_scalar_t = None
+        self.layer_scalar_f = None
+
         self.register_submodule(self.ve_gate)
         self.register_submodule(self.attn_norm)
         self.register_submodule(self.attn)
@@ -62,6 +67,31 @@ class TransformerBlock(Module):
         m = self.mlp.optimizer_targets() if self.mlp else []
         return [a, m]
 
+    def load(self, device: torch.device, **kwargs):
+        super().load(device, **kwargs)
+        if self.key_layer_scalar:
+            self.layer_scalar_t = self.config.stc.get_tensor(
+                self.key + "." + self.key_layer_scalar,
+                None,
+                allow_bf16 = True,
+                no_defer = True,
+            )
+            assert self.layer_scalar_t.numel() == 1
+            self.layer_scalar_f = self.layer_scalar_t.float().item()
+
+    def unload(self):
+        super().unload()
+        self.layer_scalar_t = None
+
+    def get_tensors(self):
+        if self.key_layer_scalar is None:
+            return {}
+        return {
+            self.key + "." + self.key_layer_scalar: self.layer_scalar_t.data.contiguous()
+        }
+
+    def weights_numel(self):
+        return super().weights_numel() + (1 if self.key_layer_scalar is not None else 0)
 
     def _apply_resid_lambda(self, x: torch.Tensor, params: dict):
         if self.layer_idx == 0:
@@ -127,6 +157,7 @@ class TransformerBlock(Module):
             x += y
 
         if self.mlp:
+            params["residual"] = x
             if self.mlp_norm:
                 y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
             else:
@@ -138,6 +169,9 @@ class TransformerBlock(Module):
 
         if self.backout_lambda is not None:
             x = self._apply_backout(x, params)
+
+        if self.layer_scalar_f is not None:
+            x *= self.layer_scalar_f
 
         return to2(x, out_dtype, self.out_dtype)
 

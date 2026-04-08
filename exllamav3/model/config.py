@@ -154,6 +154,7 @@ class Config(ABC):
         config_dict: dict | None = None,
         theta_key: str | list = None,
         override_type: str = None,
+        override_head_dim: int | None = None
     ):
         if config_dict is None:
             config_dict = self.config_dict
@@ -162,7 +163,7 @@ class Config(ABC):
             theta_key = ["rope_theta", "rope_parameters->rope_theta"]
 
         return RopeSettings(
-            head_dim = self.head_dim,
+            head_dim = override_head_dim or self.head_dim,
             rope_theta = read_dict(
                 config_dict,
                 float,

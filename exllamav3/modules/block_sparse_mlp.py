@@ -197,6 +197,10 @@ class BlockSparseMLP(Module):
         n_group: int | None = None,
         topk_group: int | None = None,
         shared_experts: MLP | GatedMLP | None = None,
+        shared_experts_post_norm: RMSNorm | LayerNorm | None = None,
+        router_pre_norm: RMSNorm | LayerNorm | None = None,
+        routed_pre_norm: RMSNorm | LayerNorm | None = None,
+        routed_post_norm: RMSNorm | LayerNorm | None = None,
         gates: list[Linear | Module] = None,
         ups: list[Linear | Module] = None,
         downs: list[Linear | Module] = None,
@@ -205,6 +209,9 @@ class BlockSparseMLP(Module):
         routing_device: int | None = None,
         transposed_load: bool = True,
         transpose_fused_weights: bool = True,
+        ftranspose_after_load: bool = True,
+        frange_dim: int = 0,
+        alt_residual_channel: bool = False
     ):
         super().__init__(config, key, None)
 
@@ -219,6 +226,7 @@ class BlockSparseMLP(Module):
         self.hidden_size = hidden_size
         self.router_type = router_type
         self.act_limit = act_limit
+        self.alt_residual_channel = alt_residual_channel
 
         self.routing_first = routing_first
         self.routing_last = routing_last
@@ -309,6 +317,8 @@ class BlockSparseMLP(Module):
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
+                    ftranspose_after_load = ftranspose_after_load,
+                    frange_dim = frange_dim,
                     qgroup = key + ".block_gud",
                 )
                 up = Linear(
@@ -323,6 +333,8 @@ class BlockSparseMLP(Module):
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
+                    ftranspose_after_load = ftranspose_after_load,
+                    frange_dim = frange_dim,
                     qgroup = key + ".block_gud",
                 )
                 down = Linear(
@@ -337,6 +349,7 @@ class BlockSparseMLP(Module):
                     allow_input_padding = True,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
+                    ftranspose_after_load = ftranspose_after_load,
                     qgroup = key + ".block_gud",
                 )
 
@@ -381,6 +394,15 @@ class BlockSparseMLP(Module):
             case _: raise ValueError(f"Unknown router type {router_type}")
 
         self.tp_reduce = False
+
+        self.shared_experts_post_norm = shared_experts_post_norm
+        self.router_pre_norm = router_pre_norm
+        self.routed_pre_norm = routed_pre_norm
+        self.routed_post_norm = routed_post_norm
+        self.register_submodule(self.shared_experts_post_norm)
+        self.register_submodule(self.router_pre_norm)
+        self.register_submodule(self.routed_pre_norm)
+        self.register_submodule(self.routed_post_norm)
 
         self.bc = None
         self.bc_sh_exp = False
@@ -469,7 +491,13 @@ class BlockSparseMLP(Module):
             sh_gate_bc = None
             sh_gate_t = None
             self.bc_sh_exp = False
-            if self.shared_experts and isinstance(self.shared_experts, GatedMLP) and self.shared_experts.bc is not None:
+            if (
+                self.shared_experts
+                and isinstance(self.shared_experts, GatedMLP)
+                and self.shared_experts.bc is not None
+                and self.shared_experts_post_norm is None   # TODO: embed post_norm in BC
+                and not self.alt_residual_channel  # TODO: allow residual channel switching in BC (Gemma4)
+            ):
                 self.bc_sh_exp = True
                 sh_exp_bc = self.shared_experts.bc
                 sh_exp_t = torch.empty((1, 1, H), dtype = torch.float, device = self.device)
@@ -552,7 +580,6 @@ class BlockSparseMLP(Module):
                 self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 4)
 
 
-
     def load_routing(self, **kwargs):
 
         router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
@@ -625,16 +652,28 @@ class BlockSparseMLP(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        y = x.view(-1, self.hidden_size)
+        if self.alt_residual_channel:
+            y = params["residual"].view(-1, self.hidden_size)
+        else:
+            y = x.view(-1, self.hidden_size)
         bsz = y.shape[0]
         bc_sh_exp = False
 
         # Routing
+        if self.router_pre_norm:
+            z = self.router_pre_norm.forward(y, params, out_dtype = torch.half)
+        else:
+            z = y
+
         if self.routing_gate is not None:
-            selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, y, params)
+            selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, z, params)
         else:
             selected_experts = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.long, device = self.device)
             routing_weights = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.half, device = self.device)
+
+        # Extra norm (Gemma4)
+        if self.routed_pre_norm:
+            y = self.routed_pre_norm.forward(y, params, out_dtype = torch.half)
 
         # Broadcast routing indices and weights
         if self.routing_device is not None:
@@ -945,9 +984,15 @@ class BlockSparseMLP(Module):
 
             final_hidden_states = cfg.out_d[:1, ...].view(x.shape)
 
+        # Extra norm (Gemma4)
+        if self.routed_post_norm:
+            final_hidden_states = self.routed_post_norm.forward(final_hidden_states, params)
+
         # Shared experts
         if self.shared_experts and not bc_sh_exp:
             y = self.shared_experts.forward(x, params)
+            if self.shared_experts_post_norm:
+                y = self.shared_experts_post_norm.forward(y, params)
             if self.shared_gate:
                 if bsz > 32:
                     z = self.shared_gate.forward(x, params)

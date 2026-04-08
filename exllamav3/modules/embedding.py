@@ -115,6 +115,10 @@ class Embedding(Module):
             if self.normalize:
                 combined_emb *= combined_emb.shape[-1] ** 0.5
 
+            # Also only scale standard embeddings
+            if self.multiplier != 1.0:
+                combined_emb *= self.multiplier
+
             # Insert indexed embeddings
             for im, ie, act in zip(indexed_masks, indexed_emb, indexed_act):
                 if not act:
@@ -132,8 +136,6 @@ class Embedding(Module):
             if deepstack_emb is not None:
                 params["deepstack_emb"] = deepstack_emb
 
-            if self.multiplier != 1.0:
-                combined_emb *= self.multiplier
             return combined_emb
 
         # No indexed embeddings, or none in current batch

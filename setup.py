@@ -86,6 +86,7 @@ setup(
         "exllamav3.conversion.standard_cal_data",
         "exllamav3.integration",
         "exllamav3.architecture",
+        "exllamav3.architecture.mm_processing",
         "exllamav3.model",
         "exllamav3.modules",
         "exllamav3.modules.arch_specific",

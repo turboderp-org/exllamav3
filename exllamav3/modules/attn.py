@@ -234,7 +234,7 @@ class Attention(Module):
                 f"{key}.{key_q}",
                 hidden_size,
                 num_q_heads * head_dim * f,
-                qmap = qmap + ".input",
+                qmap = qmap + ".input" if qmap is not None else None,
                 fkey = fkey,
                 frange = frange_q,
                 select_hq_bits = select_hq_bits,
@@ -253,7 +253,7 @@ class Attention(Module):
                 f"{key}.{key_k}",
                 hidden_size,
                 num_kv_heads * head_dim,
-                qmap =  qmap + ".input",
+                qmap =  qmap + ".input" if qmap is not None else None,
                 fkey = fkey,
                 frange = frange_k,
                 select_hq_bits = select_hq_bits,
@@ -264,7 +264,7 @@ class Attention(Module):
                 f"{key}.{key_v}",
                 hidden_size,
                 num_kv_heads * head_dim,
-                qmap =  qmap + ".input",
+                qmap =  qmap + ".input" if qmap is not None else None,
                 fkey = fkey,
                 frange = frange_v,
                 select_hq_bits = select_hq_bits,
@@ -290,10 +290,10 @@ class Attention(Module):
                 f"{key}.{key_o}",
                 num_q_heads * head_dim,
                 hidden_size,
-                qmap =  qmap + ".o",
+                qmap =  qmap + ".o" if qmap is not None else None,
                 out_dtype = out_dtype,
                 select_hq_bits = select_hq_bits,
-                qgroup = key + ".o",
+                qgroup = key + ".o" if qmap is not None else None,
             )
             self.register_submodule(self.o_proj)
         else:
@@ -735,6 +735,7 @@ class Attention(Module):
         position_ids = get_for_device(params, "position_ids", self.device, None)
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
         causal = params.get("causal", True)
+        non_causal_spans = params.get("non_causal_spans")
 
         q, k, v, g = self.project_qkv(x, params)
 
@@ -780,19 +781,38 @@ class Attention(Module):
         else:
             fn = flash_attn_with_kvcache
 
-        o = fn(
-            q = q,
-            k = k,
-            v = v,
-            k_cache = cache_k,
-            v_cache = cache_v,
-            block_table = block_table,
-            cache_seqlens = cache_seqlens,
-            causal = causal,
-            softmax_scale = self.sm_scale,
-            window_size = (self.sliding_window, self.sliding_window),
-            softcap = self.logit_softcapping
-        )
+        if not non_causal_spans:
+            o = fn(
+                q = q,
+                k = k,
+                v = v,
+                k_cache = cache_k,
+                v_cache = cache_v,
+                block_table = block_table,
+                cache_seqlens = cache_seqlens,
+                causal = causal,
+                softmax_scale = self.sm_scale,
+                window_size = (self.sliding_window, self.sliding_window),
+                softcap = self.logit_softcapping
+            )
+        else:
+            o = []
+            for a, b, c in non_causal_spans:
+                o_ = fn(
+                    q = q[:, a : b],
+                    k = k[:, a : b],
+                    v = v[:, a : b],
+                    k_cache = cache_k,
+                    v_cache = cache_v,
+                    block_table = block_table,
+                    cache_seqlens = cache_seqlens + a,
+                    causal = not c,
+                    softmax_scale = self.sm_scale,
+                    window_size = (self.sliding_window, self.sliding_window),
+                    softcap = self.logit_softcapping
+                )
+                o.append(o_)
+            o = torch.cat(o, dim = 1)
 
         if self.has_split_cache:
             self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
