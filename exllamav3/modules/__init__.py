@@ -18,14 +18,15 @@ from .deepstack import DeepstackEmbed
 from .value_embeddings import ValueEmbeddings
 from .gemma4 import (
     Gemma4Attention,
-    Gemma4Experts,
-    Gemma4MoEFeedForward,
-    Gemma4MoETransformerBlock,
-    Gemma4Router,
-    Gemma4TransformerBlock,
+    Gemma4GatedMLP,
     Gemma4VisionAttention,
     Gemma4VisionPatchEmbedder,
     Gemma4VisionPooler,
     Gemma4VisionProjector,
     Gemma4VisionStandardize,
+    Gemma4Experts,
+    Gemma4MoEFeedForward,
+    Gemma4MoETransformerBlock,
+    Gemma4Router,
+    Gemma4TransformerBlock,
 )

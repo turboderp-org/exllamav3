@@ -178,18 +178,22 @@ def init(
                 k_bits, v_bits = tuple(split)
             else:
                 raise ValueError("Specify either one or two bitrates for cache quantization")
+            # Most models continue to instantiate the default quantized cache
+            # layer. Gemma4 opts in through model caps so model_init can keep
+            # the public cache_quant interface unchanged for non-Gemma models.
+            layer_type = model.caps.get("quantized_kv_cache_layer", CacheLayer_quant)
             cache = Cache(
                 model,
                 max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_quant,
+                layer_type = layer_type,
                 k_bits = k_bits,
-                v_bits = v_bits
+                v_bits = v_bits,
             )
         else:
             cache = Cache(
                 model,
                 max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_fp16
+                layer_type = CacheLayer_fp16,
             )
     else:
         cache = None

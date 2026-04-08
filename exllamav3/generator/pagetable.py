@@ -37,7 +37,7 @@ random_hash = _randomhash
 @dataclass
 class CachePage:
 
-    pagetable: PageTable
+    arena: PageArena
     page_index: int
 
     # Hash of this page if kv_position == PAGE_SIZE, else random hash. Also used to index (un)referenced_pages
@@ -95,9 +95,9 @@ class CachePage:
     # Increase reference count
     def add_ref(self, serial):
         if self.ref_count == 0:
-            del self.pagetable.unreferenced_pages[self.phash]
-            assert self.phash not in self.pagetable.referenced_pages
-            self.pagetable.referenced_pages[self.phash] = self
+            del self.arena.unreferenced_pages[self.phash]
+            assert self.phash not in self.arena.referenced_pages
+            self.arena.referenced_pages[self.phash] = self
         self.ref_count += 1
         self.access_serial = max(serial, self.access_serial)
         self.can_revert = False
@@ -105,10 +105,10 @@ class CachePage:
     # Increase reference count and clear page
     def add_ref_clear(self, serial, newhash):
         assert self.ref_count == 0
-        del self.pagetable.unreferenced_pages[self.phash]
+        del self.arena.unreferenced_pages[self.phash]
         self.phash = newhash
-        assert self.phash not in self.pagetable.referenced_pages
-        self.pagetable.referenced_pages[self.phash] = self
+        assert self.phash not in self.arena.referenced_pages
+        self.arena.referenced_pages[self.phash] = self
         self.ref_count += 1
         self.access_serial = serial
         self.prev_hash = None
@@ -119,10 +119,10 @@ class CachePage:
     def add_ref_unique(self, serial):
         self.backup()
         assert self.ref_count == 0
-        del self.pagetable.unreferenced_pages[self.phash]
+        del self.arena.unreferenced_pages[self.phash]
         self.phash = _randomhash()
-        assert self.phash not in self.pagetable.referenced_pages
-        self.pagetable.referenced_pages[self.phash] = self
+        assert self.phash not in self.arena.referenced_pages
+        self.arena.referenced_pages[self.phash] = self
         self.ref_count += 1
         self.access_serial = serial
         self.prev_hash = None
@@ -132,26 +132,26 @@ class CachePage:
     def sub_ref(self):
         self.ref_count -= 1
         if self.ref_count == 0:
-            del self.pagetable.referenced_pages[self.phash]
+            del self.arena.referenced_pages[self.phash]
             if self.can_revert:
                 self.revert()
-            if self.phash in self.pagetable.referenced_pages or self.phash in self.pagetable.unreferenced_pages:
+            if self.phash in self.arena.referenced_pages or self.phash in self.arena.unreferenced_pages:
                 self.phash = _randomhash()
                 self.prev_hash = None
-            assert self.phash not in self.pagetable.unreferenced_pages
-            self.pagetable.unreferenced_pages[self.phash] = self
+            assert self.phash not in self.arena.unreferenced_pages
+            self.arena.unreferenced_pages[self.phash] = self
 
     # Clear page
     def clear(self):
         assert self.ref_count == 0
-        del self.pagetable.unreferenced_pages[self.phash]
+        del self.arena.unreferenced_pages[self.phash]
         self.phash = _randomhash()
         self.prev_hash = None
         self.kv_position = 0
         self.can_revert = False
         self.sequence[:, :] = 0
-        assert self.phash not in self.pagetable.unreferenced_pages
-        self.pagetable.unreferenced_pages[self.phash] = self
+        assert self.phash not in self.arena.unreferenced_pages
+        self.arena.unreferenced_pages[self.phash] = self
 
     # Update hash
     def update_hash(self, newhash = None):
@@ -159,21 +159,64 @@ class CachePage:
             newhash = tensor_hash_checksum(self.sequence, self.prev_hash)
         assert self.ref_count > 0
         assert self.kv_position == PAGE_SIZE
-        del self.pagetable.referenced_pages[self.phash]
+        del self.arena.referenced_pages[self.phash]
         self.phash = newhash
         self.can_revert = False
-        assert self.phash not in self.pagetable.referenced_pages
-        self.pagetable.referenced_pages[self.phash] = self
+        assert self.phash not in self.arena.referenced_pages
+        self.arena.referenced_pages[self.phash] = self
 
     # Clear allocated page to repeat prefill
     def make_unique(self):
         assert self.ref_count > 0
-        del self.pagetable.referenced_pages[self.phash]
+        del self.arena.referenced_pages[self.phash]
         self.phash = _randomhash()
-        assert self.phash not in self.pagetable.referenced_pages
-        self.pagetable.referenced_pages[self.phash] = self
+        assert self.phash not in self.arena.referenced_pages
+        self.arena.referenced_pages[self.phash] = self
         self.prev_hash = None
         self.kv_position = 0
+
+
+class PageArena:
+
+    def __init__(self, pagetable: PageTable, max_pages: int, role: str = "default"):
+        self.pagetable = pagetable
+        self.role = role
+        self.max_pages = max_pages
+        self.access_serial = max_pages
+        self.referenced_pages = {}
+        self.unreferenced_pages = {}
+        self.all_pages = []
+        self.last_defrag_serial = max_pages
+        self.reset()
+
+    def reset(self):
+        self.referenced_pages = {}
+        self.unreferenced_pages = {}
+        self.all_pages = []
+        for idx in range(self.max_pages):
+            h = _randomhash()
+            cp = CachePage(
+                arena = self,
+                page_index = idx,
+                phash = h,
+                phash_revert = h,
+                prev_hash = None,
+                prev_hash_revert = None,
+                sequence = torch.empty((1, PAGE_SIZE), dtype = torch.long),
+                ref_count = 0,
+                access_serial = idx,
+                access_serial_revert = idx,
+                kv_position = 0,
+                kv_position_revert = 0,
+                can_revert = False,
+                new_page_index = 0,
+                children = [],
+                longest_chain = 1,
+            )
+            self.all_pages.append(cp)
+            self.unreferenced_pages[h] = cp
+        self.access_serial = self.max_pages
+        self.last_defrag_serial = self.access_serial
 
 
 class Sequence:
@@ -190,7 +233,7 @@ class Sequence:
         self.prefill_complete = False
 
 
-    def prepare(self, has_prefix_token: bool, max_new_tokens: int):
+    def prepare(self, has_prefix_token: bool, max_new_tokens: int, allow_page_reuse: bool = True):
         self.page_hashes = []
         unique_hashes = set()
 
@@ -202,9 +245,12 @@ class Sequence:
         r_hash = None
         for i in range(context_pages):
             # TODO: profile/optimize hash function
-            page_ids = self.sequence_ids.torch_slice(i * PAGE_SIZE, (i + 1) * PAGE_SIZE)
-            assert page_ids.shape[-1] == PAGE_SIZE
-            r_hash = tensor_hash_checksum(page_ids, r_hash)
+            if allow_page_reuse:
+                page_ids = self.sequence_ids.torch_slice(i * PAGE_SIZE, (i + 1) * PAGE_SIZE)
+                assert page_ids.shape[-1] == PAGE_SIZE
+                r_hash = tensor_hash_checksum(page_ids, r_hash)
+            else:
+                r_hash = _randomhash()
             self.page_hashes.append(r_hash)
             unique_hashes.add(r_hash)
 
@@ -212,10 +258,14 @@ class Sequence:
         return unique_hashes, self.new_unique_pages
 
     def build_block_index_tensor(self):
-        self.block_index_tensor = torch.tensor(
-            [[page.page_index for page in self.allocated_pages]],
-            dtype = torch.int32,
-        )
+        if self.allocated_pages is None:
+            self.block_index_tensor = None
+        else:
+            self.block_index_tensor = torch.tensor(
+                [[page.page_index for page in self.allocated_pages]],
+                dtype = torch.int32,
+            )
+        return self.block_index_tensor
 
     def allocate_pages(self, pagetable: PageTable, recurrent_cache: None | RecurrentCache):
         # If recurrent model, find logest recurrent prefix
@@ -253,55 +303,262 @@ class PageTable:
     ):
         self.generator = generator
         self.cache = cache
-        self.max_pages = cache.max_num_tokens // PAGE_SIZE
+        self.default_arena = PageArena(self, cache.max_num_tokens // PAGE_SIZE, role = "default")
 
-        self.access_serial = self.max_pages
-        self.referenced_pages = {}
-        self.unreferenced_pages = {}
-        self.all_pages = []
-        self.reset_page_table()
-        self.last_defrag_serial = self.max_pages
+    @property
+    def max_pages(self):
+        return self.default_arena.max_pages
+
+    @property
+    def access_serial(self):
+        return self.default_arena.access_serial
+
+    @access_serial.setter
+    def access_serial(self, value):
+        self.default_arena.access_serial = value
+
+    @property
+    def referenced_pages(self):
+        return self.default_arena.referenced_pages
+
+    @referenced_pages.setter
+    def referenced_pages(self, value):
+        self.default_arena.referenced_pages = value
+
+    @property
+    def unreferenced_pages(self):
+        return self.default_arena.unreferenced_pages
+
+    @unreferenced_pages.setter
+    def unreferenced_pages(self, value):
+        self.default_arena.unreferenced_pages = value
+
+    @property
+    def all_pages(self):
+        return self.default_arena.all_pages
+
+    @all_pages.setter
+    def all_pages(self, value):
+        self.default_arena.all_pages = value
+
+    @property
+    def last_defrag_serial(self):
+        return self.default_arena.last_defrag_serial
+
+    @last_defrag_serial.setter
+    def last_defrag_serial(self, value):
+        self.default_arena.last_defrag_serial = value
+
+    def build_batch_block_index(
+        self,
+        active_jobs: list,
+        max_seq_len: int,
+        role: str = "default",
+        single_sequence_per_job: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if role != "default":
+            raise KeyError(f"Unknown page arena role: {role}")
+        batch_size = 0
+        for job in active_jobs:
+            if not job.is_prefill_done():
+                continue
+            batch_size += 1 if single_sequence_per_job else len(job.sequences)
+
+        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
+        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+
+        batch = 0
+        for job in active_jobs:
+            if not job.is_prefill_done():
+                continue
+            for seq in job.sequences:
+                seq_block_index = seq.block_index_tensor
+                if seq_block_index is None:
+                    continue
+                seq_block_index = seq_block_index[:, :max_pages_batch]
+                block_index[batch : batch + 1, :seq_block_index.shape[-1]].copy_(seq_block_index)
+                cache_seqlens[batch] = seq.kv_position
+                batch += 1
+                if single_sequence_per_job:
+                    break
+
+        return block_index, cache_seqlens
+
+    def build_draft_decode_params(self, active_jobs: list, max_seq_len: int) -> dict:
+        # The default pagetable exposes the same single-cache decode metadata the
+        # generator used inline before custom pagetables were introduced.
+        block_index, cache_seqlens = self.build_batch_block_index(
+            active_jobs,
+            max_seq_len,
+            role = "default",
+            single_sequence_per_job = True,
+        )
+        return {
+            "block_table": block_index,
+            "cache_seqlens": cache_seqlens,
+        }
+
+    def build_decode_params(self, active_jobs: list, max_seq_len: int, use_offsets: bool = False) -> dict:
+        # Non-Gemma models stay on this original single-cache path. Custom
+        # pagetables can extend it with extra role-aware tables while keeping the
+        # default contract intact for every other architecture.
+        block_index, cache_seqlens = self.build_batch_block_index(
+            active_jobs,
+            max_seq_len,
+            role = "default",
+            single_sequence_per_job = False,
+        )
+        positions = torch.zeros_like(cache_seqlens) if use_offsets else None
+
+        batch = 0
+        for job in active_jobs:
+            if not job.is_prefill_done():
+                continue
+            for seq in job.sequences:
+                if positions is not None:
+                    positions[batch] = seq.kv_position + job.alt_rope_offset
+                batch += 1
+
+        params = {
+            "block_table": block_index,
+            "cache_seqlens": cache_seqlens,
+        }
+        if positions is not None:
+            params["positions"] = positions
+        return params
+
+    def build_prefill_params(self, seq: Sequence, prefill_start: int) -> dict:
+        # Default prefill still uses one block table and one cache_seqlens tensor.
+        return {
+            "block_table": seq.block_index_tensor,
+            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+        }
+
+    def build_cache_copy_plan(
+        self,
+        source_page: CachePage,
+        target_page: CachePage,
+        num_tokens: int,
+        seq: Sequence | None = None,
+    ) -> dict[str, tuple[int, int]] | bool | None:
+        # The default pagetable keeps the original single-cache copy behavior. Custom
+        # pagetables can return a role-aware plan when they need extra copy targets.
+        return False
+
+    def get_arena(self, role: str = "default") -> PageArena:
+        if role != "default":
+            raise KeyError(f"Unknown page arena role: {role}")
+        return self.default_arena
+
+    def num_unreferenced_pages_by_role(self) -> dict[str, int]:
+        return { "default": self.num_unreferenced_pages() }
+
+    def current_new_pages_required_by_role(self, job) -> dict[str, int]:
+        return { "default": self.current_new_pages_required(job) }
+
+    def can_admit_job(self, job, current_batch_size: int, max_batch_size: int) -> bool:
+        if len(job.sequences) + current_batch_size > max_batch_size:
+            return False
+        required = self.current_new_pages_required_by_role(job)
+        available = self.num_unreferenced_pages_by_role()
+        for role, pages in required.items():
+            if pages > available.get(role, 0):
+                return False
+        return True
+
+    def get_visualizer_num_pages(self) -> int:
+        return self.get_arena("default").max_pages
+
+    def get_visualizer_state(self, active_jobs: list) -> tuple[list[tuple[int, list[int]]], list[float]]:
+        chains = []
+        for job in active_jobs:
+            for seq in job.sequences:
+                idx = job.serial_number
+                pages = seq.allocated_pages or []
+                chain = [page.page_index for page in pages]
+                chains.append((idx, chain))
+        usage = [0.0] * self.get_visualizer_num_pages()
+        for page in self.all_pages:
+            usage[page.page_index] = page.kv_position / PAGE_SIZE
+        return chains, usage
+
+    def get_max_pages_for_job(self, job) -> int:
+        return self.get_arena("default").max_pages
+
+    def find_referenced_page(self, page_hash: bytes, role: str = "default"):
+        return self.get_arena(role).referenced_pages.get(page_hash)
+
+    def find_unreferenced_page(self, page_hash: bytes, role: str = "default"):
+        return self.get_arena(role).unreferenced_pages.get(page_hash)
+
+    def iter_pages(self, role: str = "default"):
+        return iter(self.get_arena(role).all_pages)
+
+    def prepare_sequence(
+        self,
+        seq: Sequence,
+        has_prefix_token: bool,
+        max_new_tokens: int,
+        allow_page_reuse: bool = True,
+    ):
+        return seq.prepare(has_prefix_token, max_new_tokens, allow_page_reuse = allow_page_reuse)
+
+    def clamp_prefill_end(
+        self,
+        seq: Sequence,
+        prefill_start: int,
+        prefill_end: int,
+        embeddings = None,
+        atomic_mm_prefill: bool = False,
+    ) -> int:
+        return prefill_end
+
+    def sync_sequence_views(self, seq: Sequence):
+        # Default pagetable has only one logical cache view, so there is nothing to
+        # synchronize after page mutations.
+        pass
+
+    def cache_prefill_copy_source(self, seq: Sequence):
+        # Default pagetable does not snapshot role-specific local pages after prefill.
+        pass
+
+    def clear_page(self, page: CachePage, role: str = "default"):
+        page.clear()
+
+    def allocate_sequence(self, seq: Sequence, recurrent_cache: None | RecurrentCache):
+        return seq.allocate_pages(self, recurrent_cache)
+
+    def deallocate_sequence(self, seq: Sequence):
+        if seq.allocated_pages is not None:
+            self.deallocate_pages(seq.allocated_pages)
+            seq.allocated_pages = []
+
+    def current_new_pages_required(self, job) -> int:
+        arena = self.get_arena("default")
+        new_pages = 0
+        for h in job.all_unique_hashes:
+            if h not in arena.referenced_pages:
+                new_pages += 1
+        for s in job.sequences:
+            new_pages += s.new_unique_pages
+        return new_pages
 
 
     def reset_page_table(self):
         """
         Reset the page table.
         """
-        self.referenced_pages = {}
-        self.unreferenced_pages = {}
-        self.all_pages = []
-        for idx in range(self.max_pages):
-            h = _randomhash()
-            cp = CachePage(
-                pagetable = self,
-                page_index = idx,
-                phash = h,
-                phash_revert = h,
-                prev_hash = None,
-                prev_hash_revert = None,
-                sequence = torch.empty((1, PAGE_SIZE), dtype = torch.long),
-                ref_count = 0,
-                access_serial = idx,
-                access_serial_revert = idx,
-                kv_position = 0,
-                kv_position_revert = 0,
-                can_revert = False,
-                new_page_index = 0,
-                children = [],
-                longest_chain = 1,
-            )
-            self.all_pages.append(cp)
-            self.unreferenced_pages[h] = cp
-        self.access_serial = self.max_pages
-        self.last_defrag_serial = self.access_serial
+        self.default_arena.reset()
 
 
     def print_page_list(self, short: bool = True):
-        for cp in self.all_pages:
-            if cp.phash in self.referenced_pages:
+        arena = self.get_arena("default")
+        for cp in arena.all_pages:
+            if cp.phash in arena.referenced_pages:
                 assert cp.ref_count > 0
                 ref = str(cp.ref_count) if cp.ref_count < 10 else "+"
-            elif cp.phash in self.unreferenced_pages:
+            elif cp.phash in arena.unreferenced_pages:
                 assert cp.ref_count == 0
                 ref = "."
             else:
@@ -315,26 +572,28 @@ class PageTable:
         self,
         page_hashes: list,
         new_unique_pages: int,
-        recurrent_pages: list[int] | None
+        recurrent_pages: list[int] | None,
+        role: str = "default",
     ):
+        arena = self.get_arena(role)
         allocated_pages = []
         available_pages = None
 
         # Allocate whole pages
         for lp, h in enumerate(page_hashes):
-            self.access_serial += 1
+            arena.access_serial += 1
 
             # Find matching referenced page
-            rp = self.referenced_pages.get(h)
+            rp = arena.referenced_pages.get(h)
             if rp:
-                rp.add_ref(self.access_serial)
+                rp.add_ref(arena.access_serial)
                 allocated_pages.append(rp)
 
             # If possible, reuse an unreferenced page with matching hash
             else:
-                up = self.unreferenced_pages.get(h)
+                up = arena.unreferenced_pages.get(h)
                 if up:
-                    up.add_ref(self.access_serial)
+                    up.add_ref(arena.access_serial)
                     allocated_pages.append(up)
 
                 # No matching pages
@@ -342,7 +601,7 @@ class PageTable:
 
                     # Get list of unreferenced pages in order of oldest to newest
                     if available_pages is None:
-                        available_pages = list(self.unreferenced_pages.values())
+                        available_pages = list(arena.unreferenced_pages.values())
                         available_pages.sort(key = lambda x: x.access_serial)
                         available_pages = deque(available_pages)
                     else:
@@ -351,16 +610,16 @@ class PageTable:
 
                     # Allocate oldest unreferenced page
                     op = available_pages.popleft()
-                    op.add_ref_clear(self.access_serial, h)
+                    op.add_ref_clear(arena.access_serial, h)
                     allocated_pages.append(op)
 
         # Allocate unique pages
         for npi in range(new_unique_pages):
-            self.access_serial += 1
+            arena.access_serial += 1
 
             # Get list of unreferenced pages in order of oldest to newest
             if available_pages is None:
-                available_pages = list(self.unreferenced_pages.values())
+                available_pages = list(arena.unreferenced_pages.values())
                 available_pages.sort(key = lambda x: x.access_serial)
                 available_pages = deque(available_pages)
             else:
@@ -368,7 +627,7 @@ class PageTable:
                     available_pages.popleft()
 
             op = available_pages.popleft()
-            op.add_ref_unique(self.access_serial)
+            op.add_ref_unique(arena.access_serial)
             allocated_pages.append(op)
 
         # List prefilled pages
@@ -406,10 +665,11 @@ class PageTable:
 
 
     def num_unreferenced_pages(self):
-        return len(self.unreferenced_pages)
+        return len(self.get_arena("default").unreferenced_pages)
 
 
     def validate_pagetable(self, active_jobs):
+        arena = self.get_arena("default")
 
         def p_assert(exp):
             # assert exp
@@ -418,34 +678,34 @@ class PageTable:
 
         # Check page collections
         ids = set()
-        for p in self.referenced_pages.values():
+        for p in arena.referenced_pages.values():
             p_assert(p.ref_count > 0)
             ids.add(id(p))
-        for p in self.unreferenced_pages.values():
+        for p in arena.unreferenced_pages.values():
             p_assert(p.ref_count == 0)
             ids.add(id(p))
-        p_assert(len(ids) == self.max_pages)
-        p_assert(len(self.all_pages) == self.max_pages)
+        p_assert(len(ids) == arena.max_pages)
+        p_assert(len(arena.all_pages) == arena.max_pages)
 
         # Check job reference counts
-        refcounts = [0] * self.max_pages
+        refcounts = [0] * arena.max_pages
         for job in active_jobs:
             for seq in job.sequences:
                 for page in seq.allocated_pages:
                     refcounts[page.page_index] += 1
 
-        for page in self.all_pages:
+        for page in arena.all_pages:
             p_assert(page.ref_count == refcounts[page.page_index])
 
         # Check that all hashes are unique
         hashes = set()
-        for page in self.all_pages:
+        for page in arena.all_pages:
             p_assert(page.phash not in hashes)
             hashes.add(page.phash)
-        p_assert(len(hashes) == self.max_pages)
+        p_assert(len(hashes) == arena.max_pages)
 
         # Check individual hashes
-        for page in self.all_pages:
+        for page in arena.all_pages:
             if page.kv_position == PAGE_SIZE and page.phash[:8] != b'\x00\x00\x00\x00\x00\x00\x00\x00':
                 h = tensor_hash_checksum(page.sequence, page.prev_hash)
                 p_assert(page.phash == h)
@@ -463,16 +723,17 @@ class PageTable:
 
 
     def defrag(self, debug = False):
+        arena = self.get_arena("default")
 
         if not self.generator.enable_defrag:
             return
 
         # Defragment once job queue is empty and all pages have been touched at least once
-        if self.access_serial < self.last_defrag_serial + self.max_pages * 8:
+        if arena.access_serial < arena.last_defrag_serial + arena.max_pages * 8:
             return
-        self.last_defrag_serial = self.access_serial
+        arena.last_defrag_serial = arena.access_serial
 
-        assert not self.referenced_pages
+        assert not arena.referenced_pages
 
         if debug:
             torch.cuda.synchronize()
@@ -483,7 +744,7 @@ class PageTable:
         def build_page_index():
             nonlocal page_index
             page_index = {}
-            for page in self.all_pages:
+            for page in arena.all_pages:
                 page_index[page.phash] = page
                 page.children = []
                 page.longest_chain = 1
@@ -494,7 +755,7 @@ class PageTable:
         def build_root_pages():
             nonlocal root_pages
             root_pages = []
-            for page in self.all_pages:
+            for page in arena.all_pages:
                 if page.prev_hash is None:
                     root_pages.append(page)
                 else:
@@ -589,7 +850,7 @@ class PageTable:
                 shift_counts[shift] += 1
                 new_page_index += 1
 
-        assert new_page_index == self.max_pages
+        assert new_page_index == arena.max_pages
 
         # Adjust overall shift to minimize page copies
         shift_adjust = max(shift_counts, key = shift_counts.get)
@@ -599,15 +860,15 @@ class PageTable:
             print("Page shifts")
 
         defrag_map = {}
-        for page in self.all_pages:
-            page.new_page_index = (page.new_page_index - shift_adjust + self.max_pages) % self.max_pages
+        for page in arena.all_pages:
+            page.new_page_index = (page.new_page_index - shift_adjust + arena.max_pages) % arena.max_pages
             if page.page_index != page.new_page_index:
                 defrag_map[page.new_page_index] = page.page_index
                 if debug:
                     print(f"{page.new_page_index:2} ← {page.page_index:2}")
 
         # Don't bother if less than 10% of cache is fragmented
-        if len(defrag_map) <= max(self.max_pages // 10, 2):
+        if len(defrag_map) <= max(arena.max_pages // 10, 2):
             return
 
         # Find page rotations
@@ -658,7 +919,7 @@ class PageTable:
                 ext.cache_rotate(cache, all_rotations, buffer)
 
         # Write new page indices
-        for page in self.all_pages:
+        for page in arena.all_pages:
             page.page_index = page.new_page_index
 
         # Debug stuff

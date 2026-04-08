@@ -199,6 +199,51 @@ constexpr auto quant_cache_paged_kernel_instances = std::array
 
 template <int k_bits, int v_bits>
 __global__ __launch_bounds__(MAX_WARPS * 32)
+void quant_cache_paged_delta_kernel
+(
+    const half* __restrict__ k_in,
+    uint32_t* __restrict__ k_out,
+    half* __restrict__ k_out_scales,
+    const half* __restrict__ v_in,
+    uint32_t* __restrict__ v_out,
+    half* __restrict__ v_out_scales,
+    const uint32_t* __restrict__ cache_seqlens,
+    const uint32_t* __restrict__ block_table,
+    const int blocks_per_seq,
+    const int token_dim,
+    const int seq_len
+)
+{
+    int batch_idx = blockIdx.z;
+    int delta_token_idx = blockIdx.y;
+    int token_idx = delta_token_idx + cache_seqlens[batch_idx];
+    int page_idx = token_idx / CQ_PAGE_SIZE;
+    int token_pos = block_table[blocks_per_seq * batch_idx + page_idx] * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
+    int input_pos = (batch_idx * seq_len + delta_token_idx) * token_dim + blockDim.x * blockIdx.x + threadIdx.x;
+    int output_pos = token_pos * token_dim + blockDim.x * blockIdx.x + threadIdx.x;
+    int sub_pos_in = input_pos / 32;
+    int sub_pos_out = output_pos / 32;
+
+    quant_block<k_bits>(k_in + sub_pos_in * 32, k_out + sub_pos_out * k_bits, k_out_scales + sub_pos_out);
+    quant_block<v_bits>(v_in + sub_pos_in * 32, v_out + sub_pos_out * v_bits, v_out_scales + sub_pos_out);
+}
+
+#define __(i, j) quant_cache_paged_delta_kernel<i, j>
+constexpr auto quant_cache_paged_delta_kernel_instances = std::array
+{
+    std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
+    std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },
+    std::array{ __(4, 2), __(4, 3), __(4, 4), __(4, 5), __(4, 6), __(4, 7), __(4, 8) },
+    std::array{ __(5, 2), __(5, 3), __(5, 4), __(5, 5), __(5, 6), __(5, 7), __(5, 8) },
+    std::array{ __(6, 2), __(6, 3), __(6, 4), __(6, 5), __(6, 6), __(6, 7), __(6, 8) },
+    std::array{ __(7, 2), __(7, 3), __(7, 4), __(7, 5), __(7, 6), __(7, 7), __(7, 8) },
+    std::array{ __(8, 2), __(8, 3), __(8, 4), __(8, 5), __(8, 6), __(8, 7), __(8, 8) }
+};
+#undef __
+
+
+template <int k_bits, int v_bits>
+__global__ __launch_bounds__(MAX_WARPS * 32)
 void dequant_cache_paged_kernel
 (
     const uint32_t* __restrict__ k_in,
@@ -241,6 +286,301 @@ void dequant_cache_paged_kernel
 
 #define __(i, j) dequant_cache_paged_kernel<i, j>
 constexpr auto dequant_cache_paged_kernel_instances = std::array
+{
+    std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
+    std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },
+    std::array{ __(4, 2), __(4, 3), __(4, 4), __(4, 5), __(4, 6), __(4, 7), __(4, 8) },
+    std::array{ __(5, 2), __(5, 3), __(5, 4), __(5, 5), __(5, 6), __(5, 7), __(5, 8) },
+    std::array{ __(6, 2), __(6, 3), __(6, 4), __(6, 5), __(6, 6), __(6, 7), __(6, 8) },
+    std::array{ __(7, 2), __(7, 3), __(7, 4), __(7, 5), __(7, 6), __(7, 7), __(7, 8) },
+    std::array{ __(8, 2), __(8, 3), __(8, 4), __(8, 5), __(8, 6), __(8, 7), __(8, 8) }
+};
+#undef __
+
+
+template <int k_bits, int v_bits>
+__global__ __launch_bounds__(MAX_WARPS * 32)
+void dequant_cache_paged_gather_kernel
+(
+    const uint32_t* __restrict__ k_in,
+    const half* __restrict__ k_in_scales,
+    half* __restrict__ k_out,
+    const uint32_t* __restrict__ v_in,
+    const half* __restrict__ v_in_scales,
+    half* __restrict__ v_out,
+    const uint32_t* __restrict__ cache_seqlens,
+    const uint32_t* __restrict__ block_table,
+    const int blocks_per_seq,
+    const int token_dim,
+    const int seq_len
+)
+{
+    int batch_idx = blockIdx.z;
+    int token_idx = blockIdx.y;
+    int max_token_idx = cache_seqlens[batch_idx];
+    if (token_idx >= max_token_idx) return;
+
+    int page_idx = token_idx / CQ_PAGE_SIZE;
+    int token_pos = block_table[blocks_per_seq * batch_idx + page_idx] * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
+    int input_pos = token_pos * token_dim + blockDim.x * blockIdx.x + threadIdx.x;
+    int output_pos = (batch_idx * seq_len + token_idx) * token_dim + blockDim.x * blockIdx.x + threadIdx.x;
+    int sub_pos_in = input_pos / 32;
+    int sub_pos_out = output_pos / 32;
+
+    dequant_block<k_bits>(k_in + sub_pos_in * k_bits, k_in_scales + sub_pos_in, k_out + sub_pos_out * 32);
+    dequant_block<v_bits>(v_in + sub_pos_in * v_bits, v_in_scales + sub_pos_in, v_out + sub_pos_out * 32);
+}
+
+#define __(i, j) dequant_cache_paged_gather_kernel<i, j>
+constexpr auto dequant_cache_paged_gather_kernel_instances = std::array
+{
+    std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
+    std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },
+    std::array{ __(4, 2), __(4, 3), __(4, 4), __(4, 5), __(4, 6), __(4, 7), __(4, 8) },
+    std::array{ __(5, 2), __(5, 3), __(5, 4), __(5, 5), __(5, 6), __(5, 7), __(5, 8) },
+    std::array{ __(6, 2), __(6, 3), __(6, 4), __(6, 5), __(6, 6), __(6, 7), __(6, 8) },
+    std::array{ __(7, 2), __(7, 3), __(7, 4), __(7, 5), __(7, 6), __(7, 7), __(7, 8) },
+    std::array{ __(8, 2), __(8, 3), __(8, 4), __(8, 5), __(8, 6), __(8, 7), __(8, 8) }
+};
+#undef __
+
+template <int k_bits, int v_bits>
+__global__ __launch_bounds__(MAX_WARPS * 32)
+void dequant_cache_paged_gather_heads_kernel
+(
+    const uint32_t* __restrict__ k_in,
+    const half* __restrict__ k_in_scales,
+    half* __restrict__ k_out,
+    const uint32_t* __restrict__ v_in,
+    const half* __restrict__ v_in_scales,
+    half* __restrict__ v_out,
+    const uint32_t* __restrict__ cache_seqlens,
+    const uint32_t* __restrict__ block_table,
+    const int blocks_per_seq,
+    const int token_dim,
+    const int seq_len,
+    const int num_kv_heads,
+    const int head_dim
+)
+{
+    int batch_idx = blockIdx.z;
+    int token_idx = blockIdx.y;
+    int max_token_idx = cache_seqlens[batch_idx];
+    if (token_idx >= max_token_idx) return;
+
+    int page_idx = token_idx / CQ_PAGE_SIZE;
+    int token_pos = block_table[blocks_per_seq * batch_idx + page_idx] * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
+    int channel = blockDim.x * blockIdx.x + threadIdx.x;
+    int input_pos = token_pos * token_dim + channel;
+    int head_idx = channel / head_dim;
+    int head_offset = channel - head_idx * head_dim;
+    int output_pos = ((batch_idx * num_kv_heads + head_idx) * seq_len + token_idx) * head_dim + head_offset;
+    int sub_pos_in = input_pos / 32;
+    int sub_pos_out = output_pos / 32;
+
+    dequant_block<k_bits>(k_in + sub_pos_in * k_bits, k_in_scales + sub_pos_in, k_out + sub_pos_out * 32);
+    dequant_block<v_bits>(v_in + sub_pos_in * v_bits, v_in_scales + sub_pos_in, v_out + sub_pos_out * 32);
+}
+
+#define __(i, j) dequant_cache_paged_gather_heads_kernel<i, j>
+constexpr auto dequant_cache_paged_gather_heads_kernel_instances = std::array
+{
+    std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
+    std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },
+    std::array{ __(4, 2), __(4, 3), __(4, 4), __(4, 5), __(4, 6), __(4, 7), __(4, 8) },
+    std::array{ __(5, 2), __(5, 3), __(5, 4), __(5, 5), __(5, 6), __(5, 7), __(5, 8) },
+    std::array{ __(6, 2), __(6, 3), __(6, 4), __(6, 5), __(6, 6), __(6, 7), __(6, 8) },
+    std::array{ __(7, 2), __(7, 3), __(7, 4), __(7, 5), __(7, 6), __(7, 7), __(7, 8) },
+    std::array{ __(8, 2), __(8, 3), __(8, 4), __(8, 5), __(8, 6), __(8, 7), __(8, 8) }
+};
+#undef __
+
+
+template <int k_bits, int v_bits>
+__global__ __launch_bounds__(MAX_WARPS * 32)
+void dequant_cache_paged_gather_delta_kernel
+(
+    const uint32_t* __restrict__ k_in,
+    const half* __restrict__ k_in_scales,
+    const half* __restrict__ k_delta,
+    half* __restrict__ k_out,
+    const uint32_t* __restrict__ v_in,
+    const half* __restrict__ v_in_scales,
+    const half* __restrict__ v_delta,
+    half* __restrict__ v_out,
+    const uint32_t* __restrict__ cache_seqlens,
+    const uint32_t* __restrict__ block_table,
+    const int blocks_per_seq,
+    const int token_dim,
+    const int seq_len,
+    const int delta_len
+)
+{
+    int batch_idx = blockIdx.z;
+    int token_idx = blockIdx.y;
+    int cache_len = cache_seqlens[batch_idx];
+    int total_len = cache_len + delta_len;
+    if (token_idx >= total_len) return;
+
+    if (token_idx < cache_len)
+    {
+        int page_idx = token_idx / CQ_PAGE_SIZE;
+        int token_pos = block_table[blocks_per_seq * batch_idx + page_idx] * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
+        int input_pos = token_pos * token_dim + blockDim.x * blockIdx.x + threadIdx.x;
+        int output_pos = (batch_idx * seq_len + token_idx) * token_dim + blockDim.x * blockIdx.x + threadIdx.x;
+        int sub_pos_in = input_pos / 32;
+        int sub_pos_out = output_pos / 32;
+
+        dequant_block<k_bits>(k_in + sub_pos_in * k_bits, k_in_scales + sub_pos_in, k_out + sub_pos_out * 32);
+        dequant_block<v_bits>(v_in + sub_pos_in * v_bits, v_in_scales + sub_pos_in, v_out + sub_pos_out * 32);
+        return;
+    }
+
+    int delta_token_idx = token_idx - cache_len;
+    int input_pos = (batch_idx * delta_len + delta_token_idx) * token_dim + blockDim.x * blockIdx.x + threadIdx.x;
+    int output_pos = (batch_idx * seq_len + token_idx) * token_dim + blockDim.x * blockIdx.x + threadIdx.x;
+    k_out[output_pos] = k_delta[input_pos];
+    v_out[output_pos] = v_delta[input_pos];
+}
+
+#define __(i, j) dequant_cache_paged_gather_delta_kernel<i, j>
+constexpr auto dequant_cache_paged_gather_delta_kernel_instances = std::array
+{
+    std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
+    std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },
+    std::array{ __(4, 2), __(4, 3), __(4, 4), __(4, 5), __(4, 6), __(4, 7), __(4, 8) },
+    std::array{ __(5, 2), __(5, 3), __(5, 4), __(5, 5), __(5, 6), __(5, 7), __(5, 8) },
+    std::array{ __(6, 2), __(6, 3), __(6, 4), __(6, 5), __(6, 6), __(6, 7), __(6, 8) },
+    std::array{ __(7, 2), __(7, 3), __(7, 4), __(7, 5), __(7, 6), __(7, 7), __(7, 8) },
+    std::array{ __(8, 2), __(8, 3), __(8, 4), __(8, 5), __(8, 6), __(8, 7), __(8, 8) }
+};
+#undef __
+
+template <int k_bits, int v_bits>
+__global__ __launch_bounds__(MAX_WARPS * 32)
+void dequant_cache_paged_gather_delta_heads_kernel
+(
+    const uint32_t* __restrict__ k_in,
+    const half* __restrict__ k_in_scales,
+    const half* __restrict__ k_delta,
+    half* __restrict__ k_out,
+    const uint32_t* __restrict__ v_in,
+    const half* __restrict__ v_in_scales,
+    const half* __restrict__ v_delta,
+    half* __restrict__ v_out,
+    const uint32_t* __restrict__ cache_seqlens,
+    const uint32_t* __restrict__ block_table,
+    const int blocks_per_seq,
+    const int token_dim,
+    const int seq_len,
+    const int delta_len,
+    const int num_kv_heads,
+    const int head_dim
+)
+{
+    int batch_idx = blockIdx.z;
+    int token_idx = blockIdx.y;
+    int cache_len = cache_seqlens[batch_idx];
+    int total_len = cache_len + delta_len;
+    if (token_idx >= total_len) return;
+
+    int channel = blockDim.x * blockIdx.x + threadIdx.x;
+    int head_idx = channel / head_dim;
+    int head_offset = channel - head_idx * head_dim;
+    int output_pos = ((batch_idx * num_kv_heads + head_idx) * seq_len + token_idx) * head_dim + head_offset;
+
+    if (token_idx < cache_len)
+    {
+        int page_idx = token_idx / CQ_PAGE_SIZE;
+        int token_pos = block_table[blocks_per_seq * batch_idx + page_idx] * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
+        int input_pos = token_pos * token_dim + channel;
+        int sub_pos_in = input_pos / 32;
+        int sub_pos_out = output_pos / 32;
+
+        dequant_block<k_bits>(k_in + sub_pos_in * k_bits, k_in_scales + sub_pos_in, k_out + sub_pos_out * 32);
+        dequant_block<v_bits>(v_in + sub_pos_in * v_bits, v_in_scales + sub_pos_in, v_out + sub_pos_out * 32);
+        return;
+    }
+
+    int delta_token_idx = token_idx - cache_len;
+    int input_pos = (batch_idx * delta_len + delta_token_idx) * token_dim + channel;
+    k_out[output_pos] = k_delta[input_pos];
+    v_out[output_pos] = v_delta[input_pos];
+}
+
+#define __(i, j) dequant_cache_paged_gather_delta_heads_kernel<i, j>
+constexpr auto dequant_cache_paged_gather_delta_heads_kernel_instances = std::array
+{
+    std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
+    std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },
+    std::array{ __(4, 2), __(4, 3), __(4, 4), __(4, 5), __(4, 6), __(4, 7), __(4, 8) },
+    std::array{ __(5, 2), __(5, 3), __(5, 4), __(5, 5), __(5, 6), __(5, 7), __(5, 8) },
+    std::array{ __(6, 2), __(6, 3), __(6, 4), __(6, 5), __(6, 6), __(6, 7), __(6, 8) },
+    std::array{ __(7, 2), __(7, 3), __(7, 4), __(7, 5), __(7, 6), __(7, 7), __(7, 8) },
+    std::array{ __(8, 2), __(8, 3), __(8, 4), __(8, 5), __(8, 6), __(8, 7), __(8, 8) }
+};
+#undef __
+
+
+template <int k_bits, int v_bits>
+__global__ __launch_bounds__(MAX_WARPS * 32)
+void dequant_cache_paged_select_delta_heads_kernel
+(
+    const uint32_t* __restrict__ k_in,
+    const half* __restrict__ k_in_scales,
+    const half* __restrict__ k_delta,
+    half* __restrict__ k_out,
+    const uint32_t* __restrict__ v_in,
+    const half* __restrict__ v_in_scales,
+    const half* __restrict__ v_delta,
+    half* __restrict__ v_out,
+    const uint32_t* __restrict__ cache_seqlens,
+    const uint32_t* __restrict__ block_table,
+    const uint32_t* __restrict__ selected_positions,
+    const uint32_t* __restrict__ selected_counts,
+    const int blocks_per_seq,
+    const int token_dim,
+    const int seq_len,
+    const int delta_len,
+    const int max_selected,
+    const int num_kv_heads,
+    const int head_dim
+)
+{
+    int batch_idx = blockIdx.z;
+    int selected_idx = blockIdx.y;
+    int selected_total = selected_counts[batch_idx];
+    if (selected_idx >= selected_total) return;
+
+    int token_idx = selected_positions[batch_idx * max_selected + selected_idx];
+    int cache_len = cache_seqlens[batch_idx];
+    int channel = blockDim.x * blockIdx.x + threadIdx.x;
+    int head_idx = channel / head_dim;
+    int head_offset = channel - head_idx * head_dim;
+    int output_pos = ((batch_idx * num_kv_heads + head_idx) * seq_len + selected_idx) * head_dim + head_offset;
+
+    if (token_idx < cache_len)
+    {
+        int page_idx = token_idx / CQ_PAGE_SIZE;
+        int token_pos = block_table[blocks_per_seq * batch_idx + page_idx] * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
+        int input_pos = token_pos * token_dim + channel;
+        int sub_pos_in = input_pos / 32;
+        int sub_pos_out = output_pos / 32;
+
+        dequant_block<k_bits>(k_in + sub_pos_in * k_bits, k_in_scales + sub_pos_in, k_out + sub_pos_out * 32);
+        dequant_block<v_bits>(v_in + sub_pos_in * v_bits, v_in_scales + sub_pos_in, v_out + sub_pos_out * 32);
+        return;
+    }
+
+    int delta_token_idx = token_idx - cache_len;
+    if (delta_token_idx >= delta_len) return;
+    int input_pos = (batch_idx * delta_len + delta_token_idx) * token_dim + channel;
+    k_out[output_pos] = k_delta[input_pos];
+    v_out[output_pos] = v_delta[input_pos];
+}
+
+#define __(i, j) dequant_cache_paged_select_delta_heads_kernel<i, j>
+constexpr auto dequant_cache_paged_select_delta_heads_kernel_instances = std::array
 {
     std::array{ __(2, 2), __(2, 3), __(2, 4), __(2, 5), __(2, 6), __(2, 7), __(2, 8) },
     std::array{ __(3, 2), __(3, 3), __(3, 4), __(3, 5), __(3, 6), __(3, 7), __(3, 8) },

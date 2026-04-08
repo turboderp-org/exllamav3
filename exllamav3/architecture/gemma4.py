@@ -7,15 +7,21 @@ from types import SimpleNamespace
 import torch
 from typing_extensions import override
 
+from ..cache.gemma4 import (
+    Gemma4QuantCacheLayer,
+    Gemma4SingleQuantCacheLayer,
+    select_gemma4_cache_layer,
+)
+from ..generator.gemma4_pagetable import Gemma4PageTable
 from ..model.config import Config
 from ..model.model import Model
 from ..modules import (
     Embedding,
-    GatedMLP,
     Linear,
     RMSNorm,
     TransformerBlock,
     Gemma4Attention,
+    Gemma4GatedMLP,
     Gemma4MoEFeedForward,
     Gemma4MoETransformerBlock,
     Gemma4TransformerBlock,
@@ -80,6 +86,10 @@ def _update_gemma4_reconstruct_mode(
         return
 
     if has_mm_request:
+        # Keep the full 26B MM request on the conservative EXL3 reconstruct
+        # route. The multimodal prompt itself only contains image placeholders
+        # during prefill, but the generated decode tokens belong to the same MM
+        # request and must not fall back to the shared fast path mid-stream.
         if "reconstruct" not in params:
             params["reconstruct"] = True
             params[temp_flag] = True
@@ -226,10 +236,16 @@ class Gemma4TextModel(Model):
         super().__init__(config, **kwargs)
         profile = _detect_gemma4_profile(config)
         is_31b_dense = profile == "31b_dense"
+        is_26b_a4b_moe = profile == "26b_a4b_moe"
+        use_single_quant_kv_cache = is_31b_dense or is_26b_a4b_moe
         self.caps.update({
             "supports_tp": is_31b_dense,
             "atomic_mm_prefill": True,
             "gemma4_profile": profile,
+            "cache_contract": "gemma4_iswa",
+            "cache_layer_selector": self.select_cache_layer,
+            "quantized_kv_cache_layer": Gemma4SingleQuantCacheLayer if use_single_quant_kv_cache else Gemma4QuantCacheLayer,
+            "page_table_cls": Gemma4PageTable,
         })
 
         self.modules += [
@@ -267,6 +283,7 @@ class Gemma4TextModel(Model):
                     rms_norm_eps = config.rms_norm_eps,
                     unweighted = True,
                 ),
+                force_quantized_fallback = is_31b_dense and not layer_is_full,
                 rope_settings = config.rope_settings_full if layer_is_full else config.rope_settings_local,
                 sm_scale = 1.0,
                 sliding_window = config.swa_pattern[idx],
@@ -334,7 +351,7 @@ class Gemma4TextModel(Model):
                 )
             else:
                 block = Gemma4TransformerBlock(
-                    mlp = GatedMLP(
+                    mlp = Gemma4GatedMLP(
                         config = config,
                         key = f"{key}.mlp",
                         hidden_size = config.hidden_size,
@@ -399,3 +416,11 @@ class Gemma4TextModel(Model):
         p += f"<|turn>user\n{prompt}<turn|>\n"
         p += "<|turn>model\n"
         return p
+
+    def select_cache_layer(self, default_layer_type, attention, cache_kwargs):
+        return select_gemma4_cache_layer(
+            default_layer_type,
+            attention,
+            self.config.layer_types,
+            cache_kwargs = cache_kwargs,
+        )

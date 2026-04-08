@@ -169,6 +169,75 @@ void quant_cache_paged
     cuda_check(cudaPeekAtLastError());
 }
 
+void quant_cache_paged_delta
+(
+    const at::Tensor& k_in,
+    const at::Tensor& k_out,
+    const at::Tensor& k_out_scales,
+    const at::Tensor& v_in,
+    const at::Tensor& v_out,
+    const at::Tensor& v_out_scales,
+    const at::Tensor& cache_seqlens,
+    const at::Tensor& block_table,
+    int page_size,
+    int seq_len
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(k_in.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(k_in, kHalf);
+    TORCH_CHECK_DTYPE(k_out, kInt);
+    TORCH_CHECK_DTYPE(k_out_scales, kHalf);
+    TORCH_CHECK_DTYPE(v_in, kHalf);
+    TORCH_CHECK_DTYPE(v_out, kInt);
+    TORCH_CHECK_DTYPE(v_out_scales, kHalf);
+    TORCH_CHECK_SHAPES_FULL(k_in, v_in);
+    TORCH_CHECK_SHAPES_FULL(k_out_scales, v_out_scales);
+    TORCH_CHECK(page_size == CQ_PAGE_SIZE, "Page size mismatch");
+
+    int dim;
+    if (k_in.dim() == 4)
+        dim = k_in.size(2) * k_in.size(3);
+    else if (k_in.dim() == 3)
+        dim = k_in.size(2);
+    else
+        TORCH_CHECK(false, "paged cache must be 3D or 4D");
+
+    int warps_per_token = dim / 32;
+    TORCH_CHECK(dim == 32 * warps_per_token, "dim must be a multiple of 32");
+    int tb_per_token = CEIL_DIVIDE(warps_per_token, MAX_WARPS);
+    int tb_usage = CEIL_DIVIDE(warps_per_token, tb_per_token);
+
+    TORCH_CHECK(k_out.dim() == 3 && v_out.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)");
+    int k_bits = k_out.size(2) / warps_per_token;
+    int v_bits = v_out.size(2) / warps_per_token;
+
+    int bsz = block_table.size(0);
+    int blocks_per_seq = block_table.size(1);
+
+    dim3 blocks(tb_per_token, seq_len, bsz);
+    dim3 threads(32 * tb_usage);
+
+    TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
+
+    quant_cache_paged_delta_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    (
+        (const half*) k_in.data_ptr(),
+        (uint32_t*) k_out.data_ptr(),
+        (half*) k_out_scales.data_ptr(),
+        (const half*) v_in.data_ptr(),
+        (uint32_t*) v_out.data_ptr(),
+        (half*) v_out_scales.data_ptr(),
+        (const uint32_t*) cache_seqlens.data_ptr(),
+        (const uint32_t*) block_table.data_ptr(),
+        blocks_per_seq,
+        dim,
+        seq_len
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
 /*
 Dequantize paged tensor
 
@@ -248,6 +317,427 @@ void dequant_cache_paged
         pages_per_seq,
         warps_per_token,
         num_blocks
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+void dequant_cache_paged_gather
+(
+    const at::Tensor& k_in,
+    const at::Tensor& k_in_scales,
+    const at::Tensor& k_out,
+    const at::Tensor& v_in,
+    const at::Tensor& v_in_scales,
+    const at::Tensor& v_out,
+    const at::Tensor& cache_seqlens,
+    const at::Tensor& block_table,
+    int page_size,
+    int seq_len
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(k_in.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(k_in, kInt);
+    TORCH_CHECK_DTYPE(k_in_scales, kHalf);
+    TORCH_CHECK_DTYPE(k_out, kHalf);
+    TORCH_CHECK_DTYPE(v_in, kInt);
+    TORCH_CHECK_DTYPE(v_in_scales, kHalf);
+    TORCH_CHECK_DTYPE(v_out, kHalf);
+    TORCH_CHECK_SHAPES_FULL(k_in_scales, v_in_scales);
+    TORCH_CHECK_SHAPES_FULL(k_out, v_out);
+    TORCH_CHECK(page_size == CQ_PAGE_SIZE, "Page size mismatch");
+
+    int dim;
+    if (k_out.dim() == 4)
+        dim = k_out.size(2) * k_out.size(3);
+    else if (k_out.dim() == 3)
+        dim = k_out.size(2);
+    else
+        TORCH_CHECK(false, "paged cache output must be 3D or 4D");
+
+    int warps_per_token = dim / 32;
+    TORCH_CHECK(dim == 32 * warps_per_token, "dim must be a multiple of 32");
+    int tb_per_token = CEIL_DIVIDE(warps_per_token, MAX_WARPS);
+    int tb_usage = CEIL_DIVIDE(warps_per_token, tb_per_token);
+
+    TORCH_CHECK(k_in.dim() == 3 && v_in.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)");
+    int k_bits = k_in.size(2) / warps_per_token;
+    int v_bits = v_in.size(2) / warps_per_token;
+
+    int bsz = block_table.size(0);
+    int blocks_per_seq = block_table.size(1);
+
+    dim3 blocks(tb_per_token, seq_len, bsz);
+    dim3 threads(32 * tb_usage);
+
+    TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
+
+    dequant_cache_paged_gather_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    (
+        (const uint32_t*) k_in.data_ptr(),
+        (const half*) k_in_scales.data_ptr(),
+        (half*) k_out.data_ptr(),
+        (const uint32_t*) v_in.data_ptr(),
+        (const half*) v_in_scales.data_ptr(),
+        (half*) v_out.data_ptr(),
+        (const uint32_t*) cache_seqlens.data_ptr(),
+        (const uint32_t*) block_table.data_ptr(),
+        blocks_per_seq,
+        dim,
+        seq_len
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+void dequant_cache_paged_gather_heads
+(
+    const at::Tensor& k_in,
+    const at::Tensor& k_in_scales,
+    const at::Tensor& k_out,
+    const at::Tensor& v_in,
+    const at::Tensor& v_in_scales,
+    const at::Tensor& v_out,
+    const at::Tensor& cache_seqlens,
+    const at::Tensor& block_table,
+    int page_size,
+    int seq_len
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(k_in.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(k_in, kInt);
+    TORCH_CHECK_DTYPE(k_in_scales, kHalf);
+    TORCH_CHECK_DTYPE(k_out, kHalf);
+    TORCH_CHECK_DTYPE(v_in, kInt);
+    TORCH_CHECK_DTYPE(v_in_scales, kHalf);
+    TORCH_CHECK_DTYPE(v_out, kHalf);
+    TORCH_CHECK_SHAPES_FULL(k_in_scales, v_in_scales);
+    TORCH_CHECK_SHAPES_FULL(k_out, v_out);
+    TORCH_CHECK(page_size == CQ_PAGE_SIZE, "Page size mismatch");
+
+    TORCH_CHECK(k_out.dim() == 4, "heads-first paged cache output must be 4D");
+    TORCH_CHECK(k_out.size(2) == seq_len, "heads-first output seq_len mismatch");
+
+    int num_kv_heads = k_out.size(1);
+    int head_dim = k_out.size(3);
+    int dim = num_kv_heads * head_dim;
+    int warps_per_token = dim / 32;
+    TORCH_CHECK(dim == 32 * warps_per_token, "dim must be a multiple of 32");
+    TORCH_CHECK(head_dim % 32 == 0, "head_dim must be a multiple of 32");
+    int tb_per_token = CEIL_DIVIDE(warps_per_token, MAX_WARPS);
+    int tb_usage = CEIL_DIVIDE(warps_per_token, tb_per_token);
+
+    TORCH_CHECK(k_in.dim() == 3 && v_in.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)");
+    int k_bits = k_in.size(2) / warps_per_token;
+    int v_bits = v_in.size(2) / warps_per_token;
+
+    int bsz = block_table.size(0);
+    int blocks_per_seq = block_table.size(1);
+
+    dim3 blocks(tb_per_token, seq_len, bsz);
+    dim3 threads(32 * tb_usage);
+
+    TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
+
+    dequant_cache_paged_gather_heads_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    (
+        (const uint32_t*) k_in.data_ptr(),
+        (const half*) k_in_scales.data_ptr(),
+        (half*) k_out.data_ptr(),
+        (const uint32_t*) v_in.data_ptr(),
+        (const half*) v_in_scales.data_ptr(),
+        (half*) v_out.data_ptr(),
+        (const uint32_t*) cache_seqlens.data_ptr(),
+        (const uint32_t*) block_table.data_ptr(),
+        blocks_per_seq,
+        dim,
+        seq_len,
+        num_kv_heads,
+        head_dim
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+void dequant_cache_paged_gather_delta
+(
+    const at::Tensor& k_in,
+    const at::Tensor& k_in_scales,
+    const at::Tensor& k_delta,
+    const at::Tensor& k_out,
+    const at::Tensor& v_in,
+    const at::Tensor& v_in_scales,
+    const at::Tensor& v_delta,
+    const at::Tensor& v_out,
+    const at::Tensor& cache_seqlens,
+    const at::Tensor& block_table,
+    int page_size,
+    int seq_len,
+    int delta_len
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(k_in.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(k_in, kInt);
+    TORCH_CHECK_DTYPE(k_in_scales, kHalf);
+    TORCH_CHECK_DTYPE(k_delta, kHalf);
+    TORCH_CHECK_DTYPE(k_out, kHalf);
+    TORCH_CHECK_DTYPE(v_in, kInt);
+    TORCH_CHECK_DTYPE(v_in_scales, kHalf);
+    TORCH_CHECK_DTYPE(v_delta, kHalf);
+    TORCH_CHECK_DTYPE(v_out, kHalf);
+    TORCH_CHECK_SHAPES_FULL(k_in_scales, v_in_scales);
+    TORCH_CHECK_SHAPES_FULL(k_delta, v_delta);
+    TORCH_CHECK_SHAPES_FULL(k_out, v_out);
+    TORCH_CHECK(page_size == CQ_PAGE_SIZE, "Page size mismatch");
+
+    int dim;
+    if (k_out.dim() == 4)
+        dim = k_out.size(2) * k_out.size(3);
+    else if (k_out.dim() == 3)
+        dim = k_out.size(2);
+    else
+        TORCH_CHECK(false, "paged cache output must be 3D or 4D");
+
+    int delta_dim;
+    if (k_delta.dim() == 4)
+        delta_dim = k_delta.size(2) * k_delta.size(3);
+    else if (k_delta.dim() == 3)
+        delta_dim = k_delta.size(2);
+    else
+        TORCH_CHECK(false, "delta cache input must be 3D or 4D");
+
+    TORCH_CHECK(delta_dim == dim, "delta dim must match output dim");
+
+    int warps_per_token = dim / 32;
+    TORCH_CHECK(dim == 32 * warps_per_token, "dim must be a multiple of 32");
+    int tb_per_token = CEIL_DIVIDE(warps_per_token, MAX_WARPS);
+    int tb_usage = CEIL_DIVIDE(warps_per_token, tb_per_token);
+
+    TORCH_CHECK(k_in.dim() == 3 && v_in.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)");
+    int k_bits = k_in.size(2) / warps_per_token;
+    int v_bits = v_in.size(2) / warps_per_token;
+
+    int bsz = block_table.size(0);
+    int blocks_per_seq = block_table.size(1);
+
+    dim3 blocks(tb_per_token, seq_len, bsz);
+    dim3 threads(32 * tb_usage);
+
+    TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
+
+    dequant_cache_paged_gather_delta_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    (
+        (const uint32_t*) k_in.data_ptr(),
+        (const half*) k_in_scales.data_ptr(),
+        (const half*) k_delta.data_ptr(),
+        (half*) k_out.data_ptr(),
+        (const uint32_t*) v_in.data_ptr(),
+        (const half*) v_in_scales.data_ptr(),
+        (const half*) v_delta.data_ptr(),
+        (half*) v_out.data_ptr(),
+        (const uint32_t*) cache_seqlens.data_ptr(),
+        (const uint32_t*) block_table.data_ptr(),
+        blocks_per_seq,
+        dim,
+        seq_len,
+        delta_len
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+void dequant_cache_paged_gather_delta_heads
+(
+    const at::Tensor& k_in,
+    const at::Tensor& k_in_scales,
+    const at::Tensor& k_delta,
+    const at::Tensor& k_out,
+    const at::Tensor& v_in,
+    const at::Tensor& v_in_scales,
+    const at::Tensor& v_delta,
+    const at::Tensor& v_out,
+    const at::Tensor& cache_seqlens,
+    const at::Tensor& block_table,
+    int page_size,
+    int seq_len,
+    int delta_len
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(k_in.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(k_in, kInt);
+    TORCH_CHECK_DTYPE(k_in_scales, kHalf);
+    TORCH_CHECK_DTYPE(k_delta, kHalf);
+    TORCH_CHECK_DTYPE(k_out, kHalf);
+    TORCH_CHECK_DTYPE(v_in, kInt);
+    TORCH_CHECK_DTYPE(v_in_scales, kHalf);
+    TORCH_CHECK_DTYPE(v_delta, kHalf);
+    TORCH_CHECK_DTYPE(v_out, kHalf);
+    TORCH_CHECK_SHAPES_FULL(k_in_scales, v_in_scales);
+    TORCH_CHECK_SHAPES_FULL(k_delta, v_delta);
+    TORCH_CHECK_SHAPES_FULL(k_out, v_out);
+    TORCH_CHECK(page_size == CQ_PAGE_SIZE, "Page size mismatch");
+
+    TORCH_CHECK(k_out.dim() == 4, "heads-first paged cache output must be 4D");
+    TORCH_CHECK(k_out.size(2) == seq_len, "heads-first output seq_len mismatch");
+
+    int num_kv_heads = k_out.size(1);
+    int head_dim = k_out.size(3);
+    int dim = num_kv_heads * head_dim;
+    int delta_dim;
+    if (k_delta.dim() == 4)
+        delta_dim = k_delta.size(2) * k_delta.size(3);
+    else if (k_delta.dim() == 3)
+        delta_dim = k_delta.size(2);
+    else
+        TORCH_CHECK(false, "delta cache input must be 3D or 4D");
+
+    TORCH_CHECK(delta_dim == dim, "delta dim must match output dim");
+    TORCH_CHECK(head_dim % 32 == 0, "head_dim must be a multiple of 32");
+
+    int warps_per_token = dim / 32;
+    TORCH_CHECK(dim == 32 * warps_per_token, "dim must be a multiple of 32");
+    int tb_per_token = CEIL_DIVIDE(warps_per_token, MAX_WARPS);
+    int tb_usage = CEIL_DIVIDE(warps_per_token, tb_per_token);
+
+    TORCH_CHECK(k_in.dim() == 3 && v_in.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)");
+    int k_bits = k_in.size(2) / warps_per_token;
+    int v_bits = v_in.size(2) / warps_per_token;
+
+    int bsz = block_table.size(0);
+    int blocks_per_seq = block_table.size(1);
+
+    dim3 blocks(tb_per_token, seq_len, bsz);
+    dim3 threads(32 * tb_usage);
+
+    TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
+
+    dequant_cache_paged_gather_delta_heads_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    (
+        (const uint32_t*) k_in.data_ptr(),
+        (const half*) k_in_scales.data_ptr(),
+        (const half*) k_delta.data_ptr(),
+        (half*) k_out.data_ptr(),
+        (const uint32_t*) v_in.data_ptr(),
+        (const half*) v_in_scales.data_ptr(),
+        (const half*) v_delta.data_ptr(),
+        (half*) v_out.data_ptr(),
+        (const uint32_t*) cache_seqlens.data_ptr(),
+        (const uint32_t*) block_table.data_ptr(),
+        blocks_per_seq,
+        dim,
+        seq_len,
+        delta_len,
+        num_kv_heads,
+        head_dim
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+void dequant_cache_paged_select_delta_heads
+(
+    const at::Tensor& k_in,
+    const at::Tensor& k_in_scales,
+    const at::Tensor& k_delta,
+    const at::Tensor& k_out,
+    const at::Tensor& v_in,
+    const at::Tensor& v_in_scales,
+    const at::Tensor& v_delta,
+    const at::Tensor& v_out,
+    const at::Tensor& cache_seqlens,
+    const at::Tensor& block_table,
+    const at::Tensor& selected_positions,
+    const at::Tensor& selected_counts,
+    int page_size,
+    int seq_len,
+    int delta_len
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(k_in.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(k_in, kInt);
+    TORCH_CHECK_DTYPE(k_in_scales, kHalf);
+    TORCH_CHECK_DTYPE(k_delta, kHalf);
+    TORCH_CHECK_DTYPE(k_out, kHalf);
+    TORCH_CHECK_DTYPE(v_in, kInt);
+    TORCH_CHECK_DTYPE(v_in_scales, kHalf);
+    TORCH_CHECK_DTYPE(v_delta, kHalf);
+    TORCH_CHECK_DTYPE(v_out, kHalf);
+    TORCH_CHECK_DTYPE(cache_seqlens, kInt);
+    TORCH_CHECK_DTYPE(block_table, kInt);
+    TORCH_CHECK_DTYPE(selected_positions, kInt);
+    TORCH_CHECK_DTYPE(selected_counts, kInt);
+    TORCH_CHECK_SHAPES_FULL(k_in_scales, v_in_scales);
+    TORCH_CHECK_SHAPES_FULL(k_delta, v_delta);
+    TORCH_CHECK_SHAPES_FULL(k_out, v_out);
+    TORCH_CHECK(page_size == CQ_PAGE_SIZE, "Page size mismatch");
+
+    TORCH_CHECK(k_out.dim() == 4, "heads-first paged cache output must be 4D");
+    TORCH_CHECK(k_out.size(2) == seq_len, "heads-first output seq_len mismatch");
+    TORCH_CHECK(selected_positions.dim() == 2, "selected_positions must have shape (bsz, max_selected)");
+    TORCH_CHECK(selected_counts.dim() == 1, "selected_counts must have shape (bsz)");
+
+    int bsz = block_table.size(0);
+    TORCH_CHECK(selected_positions.size(0) == bsz, "selected_positions batch mismatch");
+    TORCH_CHECK(selected_counts.size(0) == bsz, "selected_counts batch mismatch");
+
+    int max_selected = selected_positions.size(1);
+    TORCH_CHECK(seq_len == max_selected, "selected gather seq_len mismatch");
+
+    int num_kv_heads = k_out.size(1);
+    int head_dim = k_out.size(3);
+    int dim = num_kv_heads * head_dim;
+    int delta_dim;
+    if (k_delta.dim() == 4)
+        delta_dim = k_delta.size(2) * k_delta.size(3);
+    else if (k_delta.dim() == 3)
+        delta_dim = k_delta.size(2);
+    else
+        TORCH_CHECK(false, "delta cache input must be 3D or 4D");
+
+    TORCH_CHECK(delta_dim == dim, "delta dim must match output dim");
+    TORCH_CHECK(head_dim % 32 == 0, "head_dim must be a multiple of 32");
+
+    int warps_per_token = dim / 32;
+    TORCH_CHECK(dim == 32 * warps_per_token, "dim must be a multiple of 32");
+    int tb_per_token = CEIL_DIVIDE(warps_per_token, MAX_WARPS);
+    int tb_usage = CEIL_DIVIDE(warps_per_token, tb_per_token);
+
+    TORCH_CHECK(k_in.dim() == 3 && v_in.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)");
+    int k_bits = k_in.size(2) / warps_per_token;
+    int v_bits = v_in.size(2) / warps_per_token;
+    int blocks_per_seq = block_table.size(1);
+
+    dim3 blocks(tb_per_token, max_selected, bsz);
+    dim3 threads(32 * tb_usage);
+
+    TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
+
+    dequant_cache_paged_select_delta_heads_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    (
+        (const uint32_t*) k_in.data_ptr(),
+        (const half*) k_in_scales.data_ptr(),
+        (const half*) k_delta.data_ptr(),
+        (half*) k_out.data_ptr(),
+        (const uint32_t*) v_in.data_ptr(),
+        (const half*) v_in_scales.data_ptr(),
+        (const half*) v_delta.data_ptr(),
+        (half*) v_out.data_ptr(),
+        (const uint32_t*) cache_seqlens.data_ptr(),
+        (const uint32_t*) block_table.data_ptr(),
+        (const uint32_t*) selected_positions.data_ptr(),
+        (const uint32_t*) selected_counts.data_ptr(),
+        blocks_per_seq,
+        dim,
+        seq_len,
+        delta_len,
+        max_selected,
+        num_kv_heads,
+        head_dim
     );
     cuda_check(cudaPeekAtLastError());
 }

@@ -333,6 +333,7 @@ class Job:
                     ids = ids[:, tokens_page:]
                     tokens_to_add -= tokens_page
                     page.can_revert = False
+                self.pagetable.sync_sequence_views(seq)
         return input_ids_list
 
 
@@ -483,33 +484,40 @@ class Job:
                 else:
                     last_hash = None
 
-                page_ids = seq.sequence_ids.torch_slice(page_before * PAGE_SIZE, page_after * PAGE_SIZE)
-                new_hash = tensor_hash_checksum(page_ids, last_hash)
-
-                # If another referenced page has the same hash, switch to referencing that instead
-                if new_hash in self.pagetable.referenced_pages:
-                    new_serial = page.access_serial
-                    page.sub_ref()
-                    page = self.pagetable.referenced_pages[new_hash]
-                    assert page.kv_position == PAGE_SIZE
-                    seq.allocated_pages[page_before] = page
-                    seq.build_block_index_tensor()
-                    page.add_ref(new_serial)
-
-                else:
-                    # If an unreferenced page has the same hash, clear that page
-                    if new_hash in self.pagetable.unreferenced_pages:
-                        up = self.pagetable.unreferenced_pages[new_hash]
-                        up.clear()
-
-                    # Update the hash
+                if self.embeddings:
+                    new_hash = random_hash()
                     page.update_hash(new_hash)
+                else:
+                    page_ids = seq.sequence_ids.torch_slice(page_before * PAGE_SIZE, page_after * PAGE_SIZE)
+                    new_hash = tensor_hash_checksum(page_ids, last_hash)
+
+                    # If another referenced page has the same hash, switch to referencing that instead
+                    referenced_page = self.pagetable.find_referenced_page(new_hash)
+                    if referenced_page is not None:
+                        new_serial = page.access_serial
+                        page.sub_ref()
+                        page = referenced_page
+                        assert page.kv_position == PAGE_SIZE
+                        seq.allocated_pages[page_before] = page
+                        seq.build_block_index_tensor()
+                        page.add_ref(new_serial)
+                        self.pagetable.sync_sequence_views(seq)
+
+                    else:
+                        # If an unreferenced page has the same hash, clear that page
+                        up = self.pagetable.find_unreferenced_page(new_hash)
+                        if up is not None:
+                            self.pagetable.clear_page(up)
+
+                        # Update the hash
+                        page.update_hash(new_hash)
 
                 # Allow completing the final page without starting a new one (for requeue)
                 if page_after < len(seq.allocated_pages):
                     page = seq.allocated_pages[page_after]
                     page.prev_hash = new_hash
                     page.can_revert = False
+            self.pagetable.sync_sequence_views(seq)
 
         # Stream output
 
@@ -707,6 +715,7 @@ class Job:
                         page.kv_position = seq.kv_position - pi * PAGE_SIZE
                     else:
                         page.kv_position = 0
+                self.pagetable.sync_sequence_views(seq)
             off_tokens = self.held_tokens.slice(len(self.checkpoint["held_tokens"]), None)
             off_text = self.held_text[len(self.checkpoint["held_text"]):]
             self.held_text = self.checkpoint["held_text"]
@@ -850,15 +859,24 @@ class Job:
         # Hash full pages of input IDs
         all_unique_hashes = set()
         all_unique_pages = 0
+        allow_page_reuse = not bool(self.embeddings)
         for seq in self.sequences:
-            unique_hashes, unique_pages = seq.prepare(self.prefix_token is not None, self.max_rq_tokens)
+            # Default PageTable forwards to the original Sequence.prepare()
+            # behavior. Custom pagetables can tighten reuse rules without
+            # changing how non-Gemma jobs are hashed and queued.
+            unique_hashes, unique_pages = self.pagetable.prepare_sequence(
+                seq,
+                self.prefix_token is not None,
+                self.max_rq_tokens,
+                allow_page_reuse = allow_page_reuse,
+            )
             all_unique_hashes |= unique_hashes
             all_unique_pages += unique_pages
         self.all_unique_hashes = list(all_unique_hashes)
 
         # Make sure the request can potentially fit
         total_pages = len(self.all_unique_hashes) + seq.new_unique_pages
-        max_pages = self.pagetable.max_pages
+        max_pages = self.pagetable.get_max_pages_for_job(self)
         assert total_pages <= max_pages, \
             f"Job requires {total_pages} pages (only {max_pages} available) and cannot " + \
             f"be enqueued. Total cache allocated is {max_pages} * {PAGE_SIZE} = " + \
@@ -895,13 +913,7 @@ class Job:
 
 
     def current_new_pages_required(self):
-        new_pages = 0
-        for h in self.all_unique_hashes:
-            if h not in self.pagetable.referenced_pages:
-                new_pages += 1
-        for s in self.sequences:
-            new_pages += s.new_unique_pages
-        return new_pages
+        return self.pagetable.current_new_pages_required(self)
 
 
     def prefill(self, results: list):
@@ -963,10 +975,20 @@ class Job:
                     if not extended:
                         break
 
+            # The default pagetable leaves the prefill span unchanged. Custom
+            # pagetables can clamp it when an architecture needs stricter local
+            # cache invariants, while non-Gemma models keep the original path.
+            prefill_end = self.pagetable.clamp_prefill_end(
+                seq,
+                prefill_start,
+                prefill_end,
+                embeddings = self.embeddings,
+                atomic_mm_prefill = atomic_mm_prefill,
+            )
+
             if prefill_end <= prefill_start:
                 continue
 
-            assert prefill_start % PAGE_SIZE == 0
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
@@ -978,7 +1000,7 @@ class Job:
                 prev_hash = None if p0 == 0 else seq.allocated_pages[p0 - 1].phash
                 best_match = 0
                 best_match_page = None
-                for page in self.pagetable.all_pages:
+                for page in self.pagetable.iter_pages():
                     if page.prev_hash != prev_hash or id(page) == id(seq.allocated_pages[p0]):
                         continue
                     match = ext.count_match_tensor(page.sequence, prefill_ids, page.kv_position)
@@ -987,23 +1009,54 @@ class Job:
                         best_match_page = page
                 if best_match_page and best_match > 1:
                     page = seq.allocated_pages[p0]
-                    for c in [self.generator.cache] if not self.generator.draft_model else \
-                            [self.generator.cache, self.generator.draft_cache]:
-                        c.copy_page(
-                            c,
-                            best_match_page.page_index,
-                            page.page_index,
-                            best_match,
-                        )
-                    page.prev_hash = best_match_page.prev_hash
-                    page.sequence[:, :best_match].copy_(prefill_ids[:, :best_match])
-                    prefill_ids = prefill_ids[:, best_match:]
-                    prefill_start += best_match
-                    seq.kv_position += best_match
-                    page.kv_position = best_match
-                    page.can_revert = False
-                    self.cached_tokens += best_match
-                    progress += best_match
+                    copy_plan = self.pagetable.build_cache_copy_plan(
+                        best_match_page,
+                        page,
+                        best_match,
+                        seq = seq,
+                    )
+                    did_copy = False
+                    if copy_plan is False:
+                        # The default pagetable keeps the original whole-cache page
+                        # copy path. Custom pagetables return either a role-aware
+                        # plan dict or None to skip the optimization entirely.
+                        for c in [self.generator.cache] if not self.generator.draft_model else \
+                                [self.generator.cache, self.generator.draft_cache]:
+                            c.copy_page(
+                                c,
+                                best_match_page.page_index,
+                                page.page_index,
+                                best_match,
+                            )
+                        did_copy = True
+                    elif copy_plan is not None:
+                        for c in [self.generator.cache] if not self.generator.draft_model else \
+                                [self.generator.cache, self.generator.draft_cache]:
+                            c.copy_page(
+                                c,
+                                best_match_page.page_index,
+                                page.page_index,
+                                best_match,
+                                page_plan = copy_plan,
+                            )
+                        did_copy = True
+                    else:
+                        # A custom pagetable can decline the partial-copy optimization
+                        # for a specific source/target pair. In that case, keep the
+                        # original prefill path and ingest the remaining tokens
+                        # normally instead of stalling the sequence on this page.
+                        did_copy = False
+                    if did_copy:
+                        page.prev_hash = best_match_page.prev_hash
+                        page.sequence[:, :best_match].copy_(prefill_ids[:, :best_match])
+                        prefill_ids = prefill_ids[:, best_match:]
+                        prefill_start += best_match
+                        seq.kv_position += best_match
+                        page.kv_position = best_match
+                        page.can_revert = False
+                        self.cached_tokens += best_match
+                        progress += best_match
+                        self.pagetable.sync_sequence_views(seq)
 
             # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
             recurrent_last_page = False
@@ -1019,26 +1072,26 @@ class Job:
             if prefill_end > prefill_start:
 
                 if self.generator.draft_model:
+                    cache_params = self.pagetable.build_prefill_params(seq, prefill_start)
                     self.generator.draft_model.prefill(
                         input_ids = prefill_ids,
                         params = {
                             "attn_mode": "flash_attn",
-                            "block_table": seq.block_index_tensor,
                             "cache": self.generator.draft_cache,
-                            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32)
+                            **cache_params,
                         }
                     )
 
+                cache_params = self.pagetable.build_prefill_params(seq, prefill_start)
                 self.generator.model.prefill(
                     input_ids = prefill_ids,
                     params = {
                         "attn_mode": "flash_attn",
-                        "block_table": seq.block_index_tensor,
                         "cache": self.generator.cache,
-                        "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
                         "recurrent_states": self.recurrent_state,
                         "indexed_embeddings": self.embeddings,
                         "inv_freq": self.alt_rope_freqs,
+                        **cache_params,
                     }
                 )
 
@@ -1058,10 +1111,12 @@ class Job:
                     pfp_b = pf_b - local_idx * PAGE_SIZE
                     page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
                     page.can_revert = False
+                self.pagetable.sync_sequence_views(seq)
 
                 progress += prefill_end - prefill_start
                 if self.sequences[0].kv_position >= len(seq.sequence_ids) - 1:
                     seq.prefill_complete = True
+                    self.pagetable.cache_prefill_copy_source(seq)
 
                 if recurrent_last_page:
                     self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
@@ -1084,7 +1139,7 @@ class Job:
     def allocate_pages(self):
         for seq in self.sequences:
             allocated_pages, cached_pages, non_sequential_pages, recurrent_state = \
-                seq.allocate_pages(self.pagetable, self.generator.recurrent_cache)
+                self.pagetable.allocate_sequence(seq, self.generator.recurrent_cache)
 
             self.recurrent_state = None
             if self.generator.recurrent_cache is not None:
@@ -1101,9 +1156,7 @@ class Job:
 
     def deallocate_pages(self):
         for seq in self.sequences:
-            if seq.allocated_pages is not None:
-                self.pagetable.deallocate_pages(seq.allocated_pages)
-                seq.allocated_pages = []
+            self.pagetable.deallocate_sequence(seq)
 
 
     def prepare_sampling_past_ids(self):

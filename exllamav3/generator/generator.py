@@ -14,7 +14,6 @@ from .sampler import Sampler
 from .visualizer import CacheVisualizer
 import time
 import threading
-from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 
 class Generator:
@@ -93,10 +92,6 @@ class Generator:
         cfg = self.model.config
         self.padded_vocab_size = ((cfg.vocab_size + 31) // 32) * 32
 
-        # Paging
-        self.pagetable = PageTable(self, cache)
-        self.max_total_tokens = PAGE_SIZE * self.pagetable.max_pages
-
         # Draft model
         self.draft_model = draft_model
         self.draft_cache = draft_cache
@@ -116,6 +111,14 @@ class Generator:
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
         self.max_chunk_size = max_chunk_size
+
+        # Paging
+        # Most models keep the default PageTable. Architectures such as Gemma4 can
+        # opt into a custom pagetable class through model caps without changing the
+        # public Generator API for existing models.
+        pagetable_cls = self.model.caps.get("page_table_cls", PageTable)
+        self.pagetable = pagetable_cls(self, cache)
+        self.max_total_tokens = PAGE_SIZE * self.pagetable.max_pages
 
         # Job queues
         self.job_serial = 0
@@ -141,7 +144,7 @@ class Generator:
 
         # Visualizer
         if show_visualizer:
-            self.visualizer = CacheVisualizer(self.pagetable.max_pages)
+            self.visualizer = CacheVisualizer(self.pagetable.get_visualizer_num_pages())
         else:
             self.visualizer = None
 
@@ -325,15 +328,7 @@ class Generator:
 
 
     def update_visualizer(self):
-        chains = []
-        for job in self.active_jobs:
-            for seq in job.sequences:
-                idx = job.serial_number
-                chain = [page.page_index for page in seq.allocated_pages]
-                chains.append((idx, chain))
-        usage = [0] * self.pagetable.max_pages
-        for page in self.pagetable.all_pages:
-            usage[page.page_index] = page.kv_position / PAGE_SIZE
+        chains, usage = self.pagetable.get_visualizer_state(self.active_jobs)
         self.visualizer.update(chains, usage)
 
 
@@ -349,18 +344,9 @@ class Generator:
         if batch_size == 0:
             return None
 
-        # Create block index table for batch
-        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
-        batch = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
-                batch += 1
+        # Default PageTable returns the original single-cache draft metadata.
+        # Custom pagetables can extend this without changing non-Gemma callers.
+        cache_params = self.pagetable.build_draft_decode_params(self.active_jobs, max_seq_len)
 
         # Indexed embeddings not supported when drafting
         # TODO: Allow multimodal draft model, perhaps with dummy embeddings?
@@ -386,23 +372,21 @@ class Generator:
                 input_ids = batch_ids,
                 params = {
                     "attn_mode": "flash_attn",
-                    "block_table": block_index,
                     "cache": self.draft_cache,
-                    "cache_seqlens": cache_seqlens,
+                    **cache_params,
                 }
             )
             new_ids = torch.argmax(batch_logits, dim = -1)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
-            cache_seqlens += 1
+            cache_params["cache_seqlens"] += 1
 
         self.draft_model.prefill(
             input_ids = batch_ids,
             params = {
                 "attn_mode": "flash_attn",
-                "block_table": block_index,
                 "cache": self.draft_cache,
-                "cache_seqlens": cache_seqlens
+                **cache_params,
             }
         )
 
@@ -423,22 +407,11 @@ class Generator:
         if draft_tokens is not None:
             max_seq_len += draft_tokens.shape[-1]
 
-        # Create block index table for batch
-        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
-        batch = 0
         use_offsets = "mrope" in self.model.caps
-        positions = torch.zeros_like(cache_seqlens) if use_offsets else None
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
-                cache_seqlens[batch] = seq.kv_position
-                if use_offsets:
-                    positions[batch] = seq.kv_position + job.alt_rope_offset
-                batch += 1
+        # Non-Gemma models keep the original one-block-table decode contract
+        # through the default PageTable implementation. Custom pagetables can
+        # add role-aware tables while preserving that contract for other models.
+        cache_params = self.pagetable.build_decode_params(self.active_jobs, max_seq_len, use_offsets = use_offsets)
 
         # Collect input IDs and indexed embeddings
         input_ids_list = []
@@ -484,12 +457,10 @@ class Generator:
             input_ids = batch_ids,
             params = {
                 "attn_mode": "flash_attn",
-                "block_table": block_index,
                 "cache": self.cache,
-                "cache_seqlens": cache_seqlens,
                 "recurrent_states": batch_states,
-                "indexed_embeddings": active_embeddings,
-                "positions": positions,
+                **({"indexed_embeddings": active_embeddings} if active_embeddings else {}),
+                **cache_params,
             }
         )
 
@@ -558,12 +529,13 @@ class Generator:
                         job.rejected_draft_tokens += rejected
                         for seq in job.sequences:
                             r = rejected
-                            while r:
-                                pos = seq.kv_position + r
-                                page = seq.allocated_pages[(pos - 1) // PAGE_SIZE]
-                                rp = min(page.kv_position, r)
-                                page.kv_position -= rp
-                                r -= rp
+                        while r:
+                            pos = seq.kv_position + r
+                            page = seq.allocated_pages[(pos - 1) // PAGE_SIZE]
+                            rp = min(page.kv_position, r)
+                            page.kv_position -= rp
+                            r -= rp
+                            self.pagetable.sync_sequence_views(seq)
                         break
                     else:
                         job.accepted_draft_tokens += 1
@@ -594,15 +566,12 @@ class Generator:
             current_max_batch += len(job.sequences)
 
         # Start new jobs if possible
-        if (self.pagetable.num_unreferenced_pages() and
-            len(self.pending_jobs) and
-            current_max_batch < self.max_batch_size):
+        if len(self.pending_jobs) and current_max_batch < self.max_batch_size:
 
             skipped_jobs = []
             for job in self.pending_jobs.copy():
 
-                if (len(job.sequences) + current_max_batch > self.max_batch_size or
-                        job.current_new_pages_required() > self.pagetable.num_unreferenced_pages()):
+                if not self.pagetable.can_admit_job(job, current_max_batch, self.max_batch_size):
                     skipped_jobs.append(job)
                     continue
 

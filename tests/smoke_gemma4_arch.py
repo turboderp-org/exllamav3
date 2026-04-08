@@ -35,6 +35,7 @@ def main() -> None:
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--full_load", action="store_true")
     ap.add_argument("--reserve_per_device", default=None, help="e.g. 0.25,0.25")
+    ap.add_argument("--swa_cache_size", type=int, default=None)
     ap.add_argument("--multimodal_generation", action="store_true")
     ap.add_argument("--multimodal_image", default=None)
     args = ap.parse_args()
@@ -124,7 +125,10 @@ def main() -> None:
         if args.reserve_per_device:
             reserve = [float(x) for x in args.reserve_per_device.split(",")]
 
-        cache = Cache(model, max_num_tokens = 4096)
+        cache_kwargs = {}
+        if args.swa_cache_size is not None:
+            cache_kwargs["swa_max_num_tokens"] = args.swa_cache_size
+        cache = Cache(model, max_num_tokens = 4096, **cache_kwargs)
         vision_model.load(device)
         image_embedding = vision_model.get_image_embeddings(tokenizer, Image.open(image_path).convert("RGB"))
         prompt_ids = tokenizer.hf_chat_template(
