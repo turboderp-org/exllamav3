@@ -9,6 +9,7 @@ from .ernie4_5_moe import Ernie4_5MoEModel
 from .exaone4 import Exaone4Model
 from .gemma2 import Gemma2Model
 from .gemma3 import Gemma3Model, Gemma3TextModel
+from .gemma4 import Gemma4TextModel
 from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
@@ -58,6 +59,7 @@ ARCHITECTURES = {
         Gemma2Model,
         Gemma3Model,
         Gemma3TextModel,
+        Gemma4TextModel,
         Glm4Model,
         Glm4MoeModel,
         Glm4VModel,

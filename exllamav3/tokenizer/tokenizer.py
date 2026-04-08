@@ -627,6 +627,7 @@ class Tokenizer:
         self,
         messages: list,
         add_generation_prompt: bool = True,
+        embeddings: list[MMEmbedding] | None = None,
         **template_kwargs
     ):
         """
@@ -642,6 +643,10 @@ class Tokenizer:
         :param add_generation_prompt:
             bool, add generation prompt
 
+        :param embeddings:
+            Optional list of MMEmbeddings. When present, HF chat template output is first rendered to text and
+            occurrences of the model's image placeholder token are replaced with embedding aliases before tokenizing.
+
         :param template_kwargs:
             Additional kwargs forwarded to `transformers` chat template rendering,
             e.g. `tools`, `chat_template_kwargs`, `enable_thinking`, etc.
@@ -649,6 +654,32 @@ class Tokenizer:
         :return:
             Token IDs tensor, shape (1, num_tokens)
         """
+
+        if embeddings:
+            if self.config.image_token_id is None:
+                raise ValueError("hf_chat_template(..., embeddings=...) requires config.image_token_id")
+            if not (0 <= self.config.image_token_id < len(self.id_to_piece)):
+                raise ValueError("config.image_token_id is out of tokenizer vocabulary range")
+
+            image_placeholder = self.id_to_piece[self.config.image_token_id]
+            rendered = self.hf_render_chat_template(
+                messages,
+                add_generation_prompt = add_generation_prompt,
+                **template_kwargs,
+            )
+            placeholder_count = rendered.count(image_placeholder)
+            if placeholder_count != len(embeddings):
+                raise ValueError(
+                    f"HF chat template rendered {placeholder_count} image placeholders but got "
+                    f"{len(embeddings)} embedding(s)"
+                )
+            for embedding in embeddings:
+                rendered = rendered.replace(image_placeholder, embedding.text_alias, 1)
+            return self.encode(
+                rendered,
+                encode_special_tokens = True,
+                embeddings = embeddings,
+            )
 
         from transformers import AutoTokenizer
         from transformers.tokenization_utils_base import BatchEncoding
