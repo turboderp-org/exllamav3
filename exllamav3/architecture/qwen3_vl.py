@@ -4,8 +4,9 @@ import numpy as np
 import torch
 from ..model.config import Config
 from ..model.model import Model
-from ..util.rope import RopeStyle, position_embedding_grid_2d, RopeSettings
-from ..util.vision import convert_to_rgb, normalize_image, smart_resize
+from ..util.rope import RopeStyle, RopeSettings
+from .mm_processing.common import convert_to_rgb, normalize_image
+from .mm_processing.qwen2 import qwen2_smart_resize, qwen2_position_embedding_grid_2d
 from ..util.file import read_dict,  no_default
 from ..modules import (
     TransformerBlock,
@@ -296,7 +297,7 @@ class Qwen3VLVisionModel(Model):
         assert all(old_size == frame.size for frame in images), \
             "All frames in video must have same dimensions"
 
-        new_size = smart_resize(
+        new_size = qwen2_smart_resize(
             old_size,
             pp.patch_size * v.spatial_merge_size,
             pp.min_pixels,
@@ -381,7 +382,7 @@ class Qwen3VLVisionModel(Model):
             image_tensor = image_tensor.unsqueeze(0)
             return_batch = False
 
-        inv_freq = position_embedding_grid_2d(grid_thw, v.head_dim, v.spatial_merge_size, v.rope_theta)
+        inv_freq = qwen2_position_embedding_grid_2d(grid_thw, v.head_dim, v.spatial_merge_size, v.rope_theta)
         params = {
             "causal": False,
             "grid_thw": torch.tensor([grid_thw], dtype = torch.int),

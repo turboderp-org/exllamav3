@@ -26,7 +26,7 @@ from ..tokenizer import MMEmbedding, Tokenizer
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..util.file import no_default
 from ..util.rope import RopeStyle, RopeSettings
-from ..util.vision import convert_to_rgb
+from .mm_processing.common import convert_to_rgb
 from .mm_processing.gemma4 import (
     get_aspect_ratio_preserving_size,
     convert_image_to_patches,

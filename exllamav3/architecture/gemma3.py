@@ -7,7 +7,7 @@ from ..model.config import Config
 from ..model.model import Model
 from ..util.rope import RopeStyle
 from ..util.file import read_dict, no_default
-from ..util.vision import convert_to_rgb, normalize_image
+from .mm_processing.common import convert_to_rgb, normalize_image
 from ..modules import (
     RMSNorm,
     Embedding,

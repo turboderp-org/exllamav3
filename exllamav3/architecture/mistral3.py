@@ -7,7 +7,7 @@ from ..model.config import Config
 from ..model.model import Model
 from ..util.rope import RopeSettings, RopeStyle
 from ..util.file import read_dict, no_default
-from ..util.vision import size_to_longest_edge_and_patch_size, convert_to_rgb, normalize_image
+from .mm_processing.common import convert_to_rgb, normalize_image, size_to_longest_edge_and_patch_size
 from ..modules import (
     RMSNorm,
     Embedding,
