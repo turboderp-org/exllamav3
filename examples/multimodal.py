@@ -8,7 +8,7 @@ import requests
 import torch
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth=200)
 
-mode = "qwen35"
+mode = "gemma4"
 cache_size = 8192
 streaming = True
 
@@ -16,6 +16,9 @@ match mode:
     case "gemma3":
         prompt_format = "gemma"
         model_dir = "/mnt/str/models/gemma3-4b-it/exl3/5.0bpw/"
+    case "gemma4":
+        prompt_format = "gemma4"
+        model_dir = "/mnt/str/models/gemma4-26b-a4b-it/exl3/4.00bpw/"
     case "mistral3":
         prompt_format = "mistral"
         model_dir = "/mnt/str/models/mistral-small-3.1-24b-instruct-2503/exl3/4.0bpw/"
@@ -46,10 +49,10 @@ images = [
     # {"url": "https://picsum.photos/800/600"},
 
     # Unrandom photo from picsum
-    # {"url": "https://fastly.picsum.photos/id/451/800/600.jpg?hmac=B0-st7nsgJ0F8ufKM5HjVwP-1y_vIL60R-PpNFLITiQ"}
+    # {"url": "https://fastly.picsum.photos/id/451/800/600.jpg?hmac=B0-st7nsgJ0F8ufKM5HjVwP-1y_vIL60R-PpNFLITiQ"},
 
     # Qwen3 demo image
-    # {"url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"}
+    # {"url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"},
 ]
 
 system_prompt = "You are a very nice language model."

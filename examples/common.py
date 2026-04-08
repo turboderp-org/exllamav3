@@ -57,7 +57,7 @@ def format_prompt(prompt_format, sp, p):
                 f"{p}<turn|>\n"
                 f"<|turn>model\n"
                 f"<|channel>thought\n"
-                f"<channel|>\n"
+                f"<channel|>"
             )
 
         case "glmv":
