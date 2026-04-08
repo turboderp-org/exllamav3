@@ -43,7 +43,8 @@ void rope_kernel
     const int inv_freq_stride,
     const float llama_4_scaling_beta,
     const int llama_4_scaling_original,
-    bool post_rope_norm
+    bool post_rope_norm,
+    int position_ids_stride
 )
 {
     // Get position
@@ -53,7 +54,7 @@ void rope_kernel
     if (positions)
         pos = token_pos + positions[batch];
     else if (position_ids)
-        pos = position_ids[batch * seq_len + token_pos];
+        pos = position_ids[batch * seq_len + token_pos * position_ids_stride];
 
     // Apply Llama 4 scaling
     if (llama_4_scaling_beta > 0.0f)
@@ -290,7 +291,8 @@ void rope
     float norm_constant_bias,
     float llama_4_scaling_beta,
     int llama_4_scaling_original,
-    bool post_rope_norm
+    bool post_rope_norm,
+    int rotate_dims
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(q.device());
@@ -346,7 +348,9 @@ void rope
 
     if (position_ids_ptr)
     {
-        TORCH_CHECK_DIM(position_ids.value(), 2)
+        TORCH_CHECK(position_ids.value().is_contiguous(), "position_ids must be contiguous");
+        int rd = position_ids.value().dim();
+        TORCH_CHECK(rd == 2 || (rd == 3 && position_ids.value().size(-1) == rotate_dims), "position_ids wrong number of dims")
         TORCH_CHECK(position_ids.value().size(0) == bsz, "position_ids is incorrect shape");
         TORCH_CHECK(position_ids.value().size(1) == seq_len, "position_ids is incorrect shape");
     }
@@ -370,24 +374,34 @@ void rope
     int parallel_heads = MIN((MAX_NUM_THREADS / thr), num_heads_q + num_heads_k);
     dim3 threads(thr, parallel_heads);
 
-    #define ARGS q_ptr, out_q_ptr, k_ptr, out_k_ptr, inv_freq_ptr, bsz, seq_len, num_heads_q, num_heads_k, \
-                 head_dim, partial_head_dim, position, positions_ptr, position_ids_ptr, attn_factor, \
-                 q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table, inv_freq_stride, \
-                 llama_4_scaling_beta, llama_4_scaling_original, post_rope_norm
+    for (int rdim = rotate_dims - 1; rdim >= 0; --rdim)
+    {
+        bool last_dim = rdim == 0;
+        int offset = partial_head_dim * rdim;
+        const uint32_t* position_ids_ptr_ = position_ids_ptr;
+        if (rotate_dims > 1) position_ids_ptr_ += rdim;
 
-    if (norm_fp16)
-    {
-        if      (rope_mode == ROPESTYLE_GPTJ)       rope_kernel<ROPESTYLE_GPTJ, false><<<blocks, threads, 0, stream>>>(ARGS);
-        else if (rope_mode == ROPESTYLE_NEOX)       rope_kernel<ROPESTYLE_NEOX, false><<<blocks, threads, 0, stream>>>(ARGS);
-        else if (rope_mode == ROPESTYLE_NANOCHAT)   rope_kernel<ROPESTYLE_NANOCHAT, false><<<blocks, threads, 0, stream>>>(ARGS);
+        #define ARGS q_ptr + offset, out_q_ptr + offset, k_ptr + offset, out_k_ptr + offset, inv_freq_ptr, bsz, \
+                     seq_len, num_heads_q, num_heads_k, head_dim, partial_head_dim, position, positions_ptr, \
+                     position_ids_ptr_, attn_factor, last_dim ? q_norm_ptr : nullptr, \
+                     last_dim ? k_norm_ptr : nullptr, norm_eps, norm_constant_bias, inv_freq_table, \
+                     inv_freq_stride, llama_4_scaling_beta, llama_4_scaling_original, \
+                     post_rope_norm && last_dim, rotate_dims
+
+        if (norm_fp16)
+        {
+            if      (rope_mode == ROPESTYLE_GPTJ)       rope_kernel<ROPESTYLE_GPTJ, false><<<blocks, threads, 0, stream>>>(ARGS);
+            else if (rope_mode == ROPESTYLE_NEOX)       rope_kernel<ROPESTYLE_NEOX, false><<<blocks, threads, 0, stream>>>(ARGS);
+            else if (rope_mode == ROPESTYLE_NANOCHAT)   rope_kernel<ROPESTYLE_NANOCHAT, false><<<blocks, threads, 0, stream>>>(ARGS);
+        }
+        else if (norm_bf16)
+        {
+            if      (rope_mode == ROPESTYLE_GPTJ)       rope_kernel<ROPESTYLE_GPTJ, true><<<blocks, threads, 0, stream>>>(ARGS);
+            else if (rope_mode == ROPESTYLE_NEOX)       rope_kernel<ROPESTYLE_NEOX, true><<<blocks, threads, 0, stream>>>(ARGS);
+            else if (rope_mode == ROPESTYLE_NANOCHAT)   rope_kernel<ROPESTYLE_NANOCHAT, true><<<blocks, threads, 0, stream>>>(ARGS);
+        }
+        else TORCH_CHECK(false, "rope: incorrect norm dtype");
     }
-    else if (norm_bf16)
-    {
-        if      (rope_mode == ROPESTYLE_GPTJ)       rope_kernel<ROPESTYLE_GPTJ, true><<<blocks, threads, 0, stream>>>(ARGS);
-        else if (rope_mode == ROPESTYLE_NEOX)       rope_kernel<ROPESTYLE_NEOX, true><<<blocks, threads, 0, stream>>>(ARGS);
-        else if (rope_mode == ROPESTYLE_NANOCHAT)   rope_kernel<ROPESTYLE_NANOCHAT, true><<<blocks, threads, 0, stream>>>(ARGS);
-    }
-    else TORCH_CHECK(false, "rope: incorrect norm dtype");
 
     cuda_check(cudaPeekAtLastError());
 }

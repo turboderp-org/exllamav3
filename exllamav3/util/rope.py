@@ -27,6 +27,7 @@ class RopeSettings:
     override_max_position_embeddings: int | None = None
     llama_4_scaling_beta: float = 0.0
     override_type: str | None = None
+    rotate_dims: int = 1
 
     def print(self):
         print(f" -- RoPE settings")
@@ -432,7 +433,8 @@ class RoPE:
             norm_constant_bias,
             self.llama_4_scaling_beta,
             self.llama_4_scaling_original,
-            post_rope_norm
+            post_rope_norm,
+            self.rope_settings.rotate_dims
         )
             
         if squeeze:
