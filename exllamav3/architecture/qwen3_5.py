@@ -16,8 +16,8 @@ from ..modules import (
     Linear,
     GatedDeltaNet,
     GatedMLP,
-    DeepstackEmbed
 )
+from ..modules.arch_specific.qwen3_vl import DeepstackEmbed
 from ..modules.attn import prepare_for_attn
 from ..modules.gated_delta_net import prepare_for_recurrence
 from .qwen3_vl import read_qwen3_vl_vision_config, read_qwen3_vl_pp_config, Qwen3VLVisionModel

@@ -128,6 +128,14 @@ class Tokenizer:
         self.bos_token_id = get_default_token_id("bos_token", self.bos_token_id, 1)
         self.eos_token_id = get_default_token_id("eos_token", self.eos_token_id, 2)
 
+        # Update EOS token ID in config if tokenizer_config.json disagrees with config.json
+        e = get_default_token_id("eos_token", None, 2)
+        if e:
+            if config.eos_token_id != e:
+                config.eos_token_id = e
+            if e not in config.eos_token_id_list:
+                config.eos_token_id_list.append(e)
+
         # Get control token strings
         self.unk_token = self.tokenizer.model.unk_token
         self.bos_token = None if self.bos_token_id is None else \
@@ -627,6 +635,7 @@ class Tokenizer:
         self,
         messages: list,
         add_generation_prompt: bool = True,
+        embeddings: list[MMEmbedding] | None = None,
         **template_kwargs
     ):
         """
@@ -642,6 +651,10 @@ class Tokenizer:
         :param add_generation_prompt:
             bool, add generation prompt
 
+        :param embeddings:
+            Optional list of MMEmbeddings. When present, HF chat template output is first rendered to text and
+            occurrences of the model's image placeholder token are replaced with embedding aliases before tokenizing.
+
         :param template_kwargs:
             Additional kwargs forwarded to `transformers` chat template rendering,
             e.g. `tools`, `chat_template_kwargs`, `enable_thinking`, etc.
@@ -649,6 +662,32 @@ class Tokenizer:
         :return:
             Token IDs tensor, shape (1, num_tokens)
         """
+
+        if embeddings:
+            if self.config.image_token_id is None:
+                raise ValueError("hf_chat_template(..., embeddings=...) requires config.image_token_id")
+            if not (0 <= self.config.image_token_id < len(self.id_to_piece)):
+                raise ValueError("config.image_token_id is out of tokenizer vocabulary range")
+
+            image_placeholder = self.id_to_piece[self.config.image_token_id]
+            rendered = self.hf_render_chat_template(
+                messages,
+                add_generation_prompt = add_generation_prompt,
+                **template_kwargs,
+            )
+            placeholder_count = rendered.count(image_placeholder)
+            if placeholder_count != len(embeddings):
+                raise ValueError(
+                    f"HF chat template rendered {placeholder_count} image placeholders but got "
+                    f"{len(embeddings)} embedding(s)"
+                )
+            for embedding in embeddings:
+                rendered = rendered.replace(image_placeholder, embedding.text_alias, 1)
+            return self.encode(
+                rendered,
+                encode_special_tokens = True,
+                embeddings = embeddings,
+            )
 
         from transformers import AutoTokenizer
         from transformers.tokenization_utils_base import BatchEncoding

@@ -10,6 +10,7 @@ from .filter import Filter
 import random
 import time
 from ..ext import exllamav3_ext as ext
+from .loop_detect import LoopDetector
 from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
 from ..tokenizer import MMEmbedding
@@ -57,6 +58,7 @@ class Job:
         banned_strings: list[str] | None = None,
         embeddings: list[MMEmbedding] | None = None,
         max_rq_tokens: int | None = None,
+        stop_on_loop: tuple[int, int] = None,
         rq_state: dict | None = None,
         **kwargs
     ):
@@ -125,6 +127,10 @@ class Job:
             Maximum number of tokens before job is requeued. Rounded to nearest page boundary. This limits how
             many new pages are allocated in the cache for the job in any one round and allows a single job to use
             the full cache size without limiting concurrency for other jobs.
+
+        :param stop_on_loop:
+            Tuple of (window_size: int, min_reps: int), or None. If enabled, generation will end if the last
+            window_size tokens sampled make up >= min_reps consecutive instances of a looping string.
 
         :param rq_state:
             Internal, passed when job requeues itself
@@ -274,6 +280,15 @@ class Job:
         # Recurrent state
         self.recurrent_state = None
         self.last_recurrent_checkpoint_pos = None
+
+        # Loop detector
+        self.loop_detector = None
+        self.stop_on_loop = stop_on_loop
+        if stop_on_loop:
+            window_size, min_reps = stop_on_loop
+            assert window_size > 1, "Loop detector window size cannot be less than 1"
+            assert 1 < min_reps < window_size, "Number of reps must be > 1, < window_size"
+            self.loop_detector = LoopDetector(window_size, window_size // min_reps)
 
 
     def get_pinned_logit_mask(self):
@@ -642,9 +657,11 @@ class Job:
         if self.return_logits:
             self.held_logits.append(logits[:1, :, :])
 
+        token = next_token.item()
+
         # End on stop tokens
-        if next_token.item() in self.stop_tokens:
-            return emit(results, emit_eos = True, eos_reason = "stop_token", stop_token = next_token.item())
+        if token in self.stop_tokens:
+            return emit(results, emit_eos = True, eos_reason = "stop_token", stop_token = token)
 
         # Stop if we reach max_new_tokens
         if self.new_tokens >= self.max_new_tokens - self.generator.num_draft_tokens:
@@ -668,7 +685,6 @@ class Job:
                 return emit(results, emit_held = (len(test_decode) > self.stop_string_max_length + 20))
 
         # Hold text as long as it contains part of a banned string
-
         def unset_checkpoint():
             self.checkpoint = None
 
@@ -743,7 +759,6 @@ class Job:
                 unset_checkpoint()
 
         # End on stop strings
-
         if self.stop_strings_utf32_offsets is not None:
             match = ext.partial_strings_match(
                 np.frombuffer(self.held_text.encode("utf-32-le"), dtype = np.uint8),
@@ -767,8 +782,12 @@ class Job:
             if match == -2:
                 return emit(results)
 
-        # Stream output
+        # Stop if loop is detected
+        if self.loop_detector:
+            if self.loop_detector.feed_many(self.held_tokens.torch()):
+                return emit(results, emit_eos = True, emit_held = True, eos_reason = "loop_detected")
 
+        # Stream output
         return emit(results, emit_held = True)
 
 
@@ -817,6 +836,7 @@ class Job:
             banned_strings = self.banned_strings,
             embeddings = self.embeddings,
             max_rq_tokens = self.orig_max_rq_tokens,
+            stop_on_loop = self.stop_on_loop,
             rq_state = rq_state,
         )
 
@@ -909,6 +929,7 @@ class Job:
             self.time_first_prefill = time.time()
 
         progress = 0
+
         for seq in self.sequences:
             if seq.prefill_complete:
                 continue
@@ -919,6 +940,10 @@ class Job:
             prefill_end = seq.kv_position + self.generator.max_chunk_size
             prefill_end = (prefill_end // PAGE_SIZE) * PAGE_SIZE
             prefill_end = min(prefill_end, len(seq.sequence_ids) - 1)
+
+            atomic_mm_prefill = bool(self.embeddings) and self.generator.model.caps.get("atomic_mm_prefill")
+            assert not atomic_mm_prefill or not self.recurrent_state, \
+                "Atomic prefill is not supported for recurrent models"
 
             p0 = prefill_start // PAGE_SIZE
             p1 = (prefill_end + PAGE_SIZE - 1) // PAGE_SIZE
@@ -997,6 +1022,21 @@ class Job:
 
             # Inference
             if prefill_end > prefill_start:
+
+                # For atomic MM prefills, if the current chunk ends on a MM token, expand to cover the entire MM
+                # span. Cache pages are already allocated for the full span, so this will process part of the next
+                # chunk redundantly but won't write out-of-bounds since cache pages are already allocated for the
+                # whole input sequence including MM tokens. (This is for Gemma4 specifically, which has image token
+                # spans of at most 280 tokens.)
+                if atomic_mm_prefill:
+                    ext_prefill_end = prefill_end
+                    while (
+                        ext_prefill_end < len(seq.sequence_ids) - 1 and
+                        seq.multimodal_mask[ext_prefill_end - 1] and
+                        seq.multimodal_mask[ext_prefill_end]
+                    ):
+                        ext_prefill_end += 1
+                    prefill_ids = seq.sequence_ids.torch_slice(prefill_start, ext_prefill_end)
 
                 if self.generator.draft_model:
                     self.generator.draft_model.prefill(

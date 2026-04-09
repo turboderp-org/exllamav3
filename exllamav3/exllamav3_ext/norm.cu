@@ -140,7 +140,8 @@ void rms_norm_kernel
     const float epsilon,
     const int rows,
     const int dim,
-    const float constant_bias
+    const float constant_bias,
+    const float constant_scale
 )
 {
     constexpr bool input_fp32 = std::is_same_v<input_t, float>;
@@ -170,7 +171,7 @@ void rms_norm_kernel
     sum = reduce<NUM_THREADS>(sum, warp_id, lane_id);
 
     // Get norm
-    float rmf = rsqrtf(sum / (float)dim + epsilon);
+    float rmf = rsqrtf(sum / (float)dim + epsilon) * constant_scale;
 
     // Normalize x, scaling by w
     for (int column = t; column < columns; column += NUM_THREADS)
@@ -220,6 +221,7 @@ void rms_norm
     at::Tensor y,
     float epsilon,
     float constant_bias,
+    float constant_scale,
     bool span_heads
 )
 {
@@ -264,7 +266,8 @@ void rms_norm
             epsilon,                                        \
             rows,                                           \
             dim,                                            \
-            constant_bias                                   \
+            constant_bias,                                  \
+            constant_scale                                  \
         );
 
     //      x_type________ w_type_____________  y_type_______

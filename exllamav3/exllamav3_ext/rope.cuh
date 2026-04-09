@@ -20,7 +20,8 @@ void rope
     float norm_constant_bias,
     float llama_4_scaling_beta,
     int llama_4_scaling_original,
-    bool post_rope_norm
+    bool post_rope_norm,
+    int rotate_dims
 );
 
 int64_t gen_mrope_pos_ids

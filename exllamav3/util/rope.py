@@ -27,6 +27,7 @@ class RopeSettings:
     override_max_position_embeddings: int | None = None
     llama_4_scaling_beta: float = 0.0
     override_type: str | None = None
+    rotate_dims: int = 1
 
     def print(self):
         print(f" -- RoPE settings")
@@ -112,6 +113,8 @@ class RoPE:
                 self._rope_params_default()
             case "default" | "mrope":
                 self._rope_params_default()
+            case "proportional":
+                self._rope_params_proportional()
             case "llama3":
                 self._rope_params_llama3()
             case "linear":
@@ -158,6 +161,33 @@ class RoPE:
         self._rope_params_default()
         factor = rs.rope_scaling.get("factor", 1.0)
         self.inv_freq /= factor
+
+
+    def _rope_params_proportional(self):
+        rs = self.rope_settings
+        head_dim = rs.head_dim
+        base = rs.rope_theta
+        factor = rs.rope_scaling.get("factor", 1.0) if rs.rope_scaling else 1.0
+        rope_proportion = rs.partial_rotary_factor
+
+        rope_angles = int(rope_proportion * head_dim // 2)
+        inv_freq_rotated = 1.0 / (
+            base ** (
+                torch.arange(0, 2 * rope_angles, 2, dtype = torch.int64, device = self.device).float() / head_dim
+            )
+        )
+        nope_angles = head_dim // 2 - rope_angles
+        if nope_angles > 0:
+            inv_freq = torch.cat(
+                (
+                    inv_freq_rotated,
+                    torch.zeros(nope_angles, dtype = torch.float32, device = self.device),
+                ),
+                dim = 0,
+            )
+        else:
+            inv_freq = inv_freq_rotated
+        self.inv_freq, self.attn_factor = inv_freq / factor, 1.0
 
 
     def _rope_params_yarn(self):
@@ -403,7 +433,8 @@ class RoPE:
             norm_constant_bias,
             self.llama_4_scaling_beta,
             self.llama_4_scaling_original,
-            post_rope_norm
+            post_rope_norm,
+            self.rope_settings.rotate_dims
         )
             
         if squeeze:
@@ -411,36 +442,3 @@ class RoPE:
             out_k = out_k.squeeze(0) if out_k is not None else None
 
         return out_q, out_k
-
-
-def position_embedding_grid_2d(
-    grid_thw: tuple,
-    head_dim: int,
-    spatial_merge_size: int,
-    theta: float,
-):
-    """
-    Position IDs for Qwen2/3 grid
-    """
-
-    t, h, w = grid_thw
-    spm = spatial_merge_size
-
-    # Position IDs
-    hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-    hpos_ids = hpos_ids.reshape(h // spm, spm, w // spm, spm)
-    hpos_ids = hpos_ids.permute(0, 2, 1, 3)
-    hpos_ids = hpos_ids.flatten()
-    wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
-    wpos_ids = wpos_ids.reshape(h // spm, spm, w // spm, spm)
-    wpos_ids = wpos_ids.permute(0, 2, 1, 3)
-    wpos_ids = wpos_ids.flatten()
-    ids = torch.stack([hpos_ids, wpos_ids], dim = -1).repeat(t, 1)
-
-    # Frequencies
-    dim = head_dim // 2
-    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype = torch.float) / dim))
-    seq = torch.arange(max(h, w), dtype = torch.float)
-    freqs = torch.outer(seq, inv_freq)
-    emb = freqs[ids].flatten(1)
-    return emb

@@ -14,9 +14,11 @@ class RMSNorm(Module):
         config: Config | None,
         key: str,
         rms_norm_eps: float,
+        tensor_weight_suffix: bool = True,
         out_dtype: torch.dtype | None = None,
         qmap: str | None = None,
         constant_bias: float = 0.0,
+        constant_scale: float = 1.0,
         span_heads: bool = False,
         unweighted: bool = False
     ):
@@ -29,8 +31,11 @@ class RMSNorm(Module):
         self.out_dtype = out_dtype
         self._numel = None
         self.constant_bias = constant_bias
+        self.constant_scale = constant_scale
         self.span_heads = span_heads
         self.unweighted = unweighted
+
+        self.tensor_key = f"{self.key}.weight" if tensor_weight_suffix else f"{self.key}"
 
     @override
     def optimizer_targets(self):
@@ -40,7 +45,7 @@ class RMSNorm(Module):
     def load(self, device: torch.device, **kwargs):
         self.device = device
         if not self.unweighted:
-            weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, float2half = True, allow_bf16 = True)
+            weight = self.config.stc.get_tensor(self.tensor_key, self.device, float2half = True, allow_bf16 = True)
             self._numel = weight.numel()
             self.weight = nn.Parameter(weight, requires_grad = False)
         else:
@@ -54,7 +59,7 @@ class RMSNorm(Module):
     @override
     def get_tensors(self):
         return {} if self.unweighted else {
-            f"{self.key}.weight": self.weight.data
+            self.tensor_key: self.weight.data
         }
 
     def forward_torch(
@@ -66,7 +71,7 @@ class RMSNorm(Module):
         dtype = x.dtype
         x = x.float()
         var = x.pow(2).mean(dim = -1, keepdim = True) + self.rms_norm_eps
-        x = x * torch.rsqrt(var)
+        x = x * torch.rsqrt(var) * self.constant_scale
         x = x.to(dtype)
         if not self.unweighted:
             x = x * self.weight if self.constant_bias == 0.0 else x * (self.weight + self.constant_bias)
@@ -99,6 +104,7 @@ class RMSNorm(Module):
                 y_2d,
                 self.rms_norm_eps,
                 self.constant_bias,
+                self.constant_scale,
                 self.span_heads,
             )
             return y_2d.view_as(x)
@@ -110,6 +116,7 @@ class RMSNorm(Module):
             y,
             self.rms_norm_eps,
             self.constant_bias,
+            self.constant_scale,
             self.span_heads,
         )
         return y

@@ -9,6 +9,7 @@ void rms_norm
     at::Tensor y,
     float epsilon,
     float constant_bias,
+    float constant_scale,
     bool span_heads
 );
 

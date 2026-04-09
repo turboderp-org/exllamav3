@@ -7,7 +7,7 @@
 #include "../ptx.cuh"
 
 #define MOE_ACT_SILU 0
-#define MOE_ACT_GELU 1  // TODO
+#define MOE_ACT_GELU 1
 
 #define MOE_SMS_PER_EXPERT 12
 #define MOE_TILESIZE_K 32
@@ -44,6 +44,7 @@
     const int max_tokens_per_expert,            \
     const int concurrency,                      \
     const float act_limit,                      \
+    const int act_function,                     \
     const int K_gate,                           \
     const int K_up,                             \
     const int K_down,                           \
@@ -201,7 +202,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     exp_up_svh + 128 * token_off,
                     exp_down_suh + 128 * token_off,
                     0.088388347648f,
-                    act_limit
+                    act_limit,
+                    act_function
                 );
             }
             group_barrier(group_idx, MOE_SMS_PER_EXPERT, barrier_counters_sense);

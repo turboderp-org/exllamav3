@@ -149,7 +149,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description = "Run HumanEval evaluation")
+    parser = argparse.ArgumentParser(description = "Run IFBench evaluation")
     model_init.add_args(
         parser,
         add_sampling_args = True,

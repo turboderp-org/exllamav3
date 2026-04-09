@@ -44,15 +44,18 @@ void stloader_read
         stream = at::cuda::getCurrentCUDAStream(device.index()).stream();
     }
 
-    // Synchronization
+    TORCH_CHECK(target.is_contiguous(), "target must be contiguous");
+    TORCH_CHECK(target.nbytes() >= size, "target too small for requested read");
 
-    Py_BEGIN_ALLOW_THREADS
+    // Synchronization
 
     volatile bool load_failed = false;
     volatile int load_errnum = 0;
     std::mutex mtx;
     std::deque<std::pair<size_t, size_t>> dq;
     std::condition_variable cv;
+
+    Py_BEGIN_ALLOW_THREADS
 
     // Load chunks
 
@@ -152,6 +155,8 @@ void stloader_read
     for (auto& thread : threads)
         thread.join();
 
+    Py_END_ALLOW_THREADS
+
     if (load_failed)
         TORCH_CHECK
         (
@@ -164,8 +169,6 @@ void stloader_read
         cudaDeviceSynchronize();
         free(load_buffer);
     }
-
-    Py_END_ALLOW_THREADS
 }
 
 std::vector<uintptr_t> stloader_open_file(const char* filename)

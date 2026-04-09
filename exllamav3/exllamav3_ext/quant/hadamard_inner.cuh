@@ -1,4 +1,8 @@
 #pragma once
+#include "../compat.cuh"
+
+#define ACT_SILU 0
+#define ACT_GELU 1
 
 // Hadamard transform 128-element vector across one warp, with optional pre and post scales
 
@@ -216,7 +220,8 @@ void had_hf_r_128_guad_inner
     const half* __restrict__ post_scale_u,
     const half* __restrict__ pre_scale_d,
     const float r_scale,
-    const float act_limit
+    const float act_limit,
+    const int act_function
 )
 {
     int t = threadIdx.x & 31;
@@ -256,6 +261,15 @@ void had_hf_r_128_guad_inner
         return result;
     };
 
+    auto _gelu = [&](const half2& x)
+    {
+        float2 xf = __half22float2(x);
+        const float c = 0.797884560803f;  // sqrt(2/Pi)
+        xf.x = 0.5f * xf.x * (1.0f + tanh_opt(c * (xf.x + 0.044715f * xf.x * xf.x * xf.x)));
+        xf.y = 0.5f * xf.y * (1.0f + tanh_opt(c * (xf.y + 0.044715f * xf.y * xf.y * xf.y)));
+        return __float22half2_rn(xf);
+    };
+
     // Load
     half4 vg = ((half4*) input_ptr_g)[t];
     half4 vu = ((half4*) input_ptr_u)[t];
@@ -264,7 +278,7 @@ void had_hf_r_128_guad_inner
     vg = had(vg);
     vu = had(vu);
 
-    // Post scale
+    // Post scale  TODO: should maybe do this in float32
     int i = blockIdx.y * 32 + t;
     half4 scales_g = ((half4*) post_scale_g)[i];
     half4 scales_u = ((half4*) post_scale_u)[i];
@@ -274,8 +288,20 @@ void had_hf_r_128_guad_inner
     vu.y = __hmul2(vu.y, scales_u.y);
 
     // Activation
-    vg.x = _silu(vg.x);
-    vg.y = _silu(vg.y);
+    switch (act_function)
+    {
+        case ACT_SILU:
+            vg.x = _silu(vg.x);
+            vg.y = _silu(vg.y);
+            break;
+
+        case ACT_GELU:
+            vg.x = _gelu(vg.x);
+            vg.y = _gelu(vg.y);
+            break;
+
+        default:
+    }
 
     // Optional activation limits
     if (act_limit != 0.0f)

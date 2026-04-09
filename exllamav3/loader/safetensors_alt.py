@@ -46,7 +46,7 @@ def _tensor_bytes_view(t: torch.Tensor) -> memoryview:
         mv = memoryview(us).cast("B")
         byte_off = int(t.storage_offset() * t.element_size())
         nbytes = _tensor_nbytes(t)
-        return mv[byte_off: byte_off + nbytes]
+        return mv[byte_off : byte_off + nbytes]
     except TypeError:
         if t.dtype is torch.bfloat16:
             arr_u8 = t.view(torch.uint8).numpy()  # zero-copy
@@ -81,16 +81,20 @@ def _stream_readinto(f: io.BufferedReader, mv: memoryview, nbytes: int, chunk: i
         remaining -= got
 
 
-def _stream_write(f: io.BufferedWriter, mv: memoryview, chunk: int = 8 << 20) -> None:
+def _stream_write(f, mv: memoryview, chunk: int = 8 << 20) -> None:
     """
     Write the full memoryview mv to f in chunks.
     """
+    mv = memoryview(mv).cast("B")
     off = 0
+    assert len(mv.shape) == 1, "memoryview should be 1D"
     n = len(mv)
     while off < n:
-        step = chunk if (n - off) > chunk else (n - off)
-        f.write(mv[off : off + step])
-        off += step
+        end = min(off + chunk, n)
+        written = f.write(mv[off:end])
+        if written is None or written <= 0:
+            raise OSError(f"short write at offset {off} / {n}: {written}")
+        off += written
 
 
 @dataclass(frozen=True)
@@ -268,6 +272,6 @@ def save_file(
 
         # stream tensors in the same order we built offsets
         for name, t in tensors.items():
-            t = t.contiguous().cpu()
+            t = t.contiguous().cpu().view(-1)
             mv = _tensor_bytes_view(t)
             _stream_write(f, mv)

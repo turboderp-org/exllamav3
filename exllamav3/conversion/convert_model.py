@@ -18,6 +18,7 @@ import os, shutil
 import json
 import threading
 from collections import deque
+import re
 
 col_default = "\u001b[0m"
 col_red = "\u001b[31;1m"
@@ -286,7 +287,11 @@ def main(args, job_state):
 
     # Get initial state or resume state
     state = prepare_state(args, job_state, config, model, tokenizer)
-    original_input_ids = state.copy()
+    original_input_ids = (
+        state.copy()
+        if job_state["next_module_idx"] == 0 else
+        [{} for _ in range(len(state))]
+    )
     quant_preserves = [{} for _ in range(len(state))]
 
     def get_preserve(si, params_):
@@ -376,8 +381,15 @@ def main(args, job_state):
                                 put_preserve(i, params)
                             ref_states.append(rs.cpu())
                         rs = None
-                print(f" -- Captured: {module.key}" + slice_str)
-                sys.stdout.flush()
+                print(f" -- Captured: {module.key}" + slice_str, flush = True)
+
+                # More feedback
+                if len(capture_H):
+                    hfb_keys = [re.sub(r'\d+', '*', k) for k in capture_H.keys()]
+                    hfb_keys = sorted(list(set(hfb_keys)))
+                    print(f" -- Hessians: " + ", ".join(hfb_keys))
+                else:
+                    print(f" !! Hessians: None")
 
                 # Check for infs or NaNs in H
                 for k, v in capture_H.items():
@@ -517,9 +529,9 @@ def main(args, job_state):
                     if strategy[linear.key] == 16:
                         print(
                             f" -- Unquantized: {linear.key:{config.stc.max_key_len() + 6}}"
-                            f"  bpw: {16:5.2f}"
+                            f"  bpw: {16:5.2f}",
+                            flush = True
                         )
-                        sys.stdout.flush()
                     else:
                         quant_args = {
                             "seed": idx,
@@ -557,9 +569,9 @@ def main(args, job_state):
                             f"  proxy_err: {proxy_err_str}"
                             f"  {flags}"
                             f"  g_sc: {quant_args['g_scale']:.6f}"
-                            f"  [{t.interval:4.2f} s]"
+                            f"  [{t.interval:4.2f} s]",
+                            flush = True
                         )
-                        sys.stdout.flush()
 
             # Collect converted module tensors
             for m in module:
@@ -568,6 +580,7 @@ def main(args, job_state):
             # Unload module
             if not module.caps.get("retain_during_quant"):
                 module.unload()
+            capture_H = None
             config.stc.close()
 
         # Save layer tensors to working directory
@@ -623,9 +636,9 @@ def main(args, job_state):
             (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
             f"  cos: {cos_error:.6f}"
             f"  sqnr: {sqnr_:.6f}"
-            f"  [{module_time:.2f} s]"
+            f"  [{module_time:.2f} s]",
+            flush = True
         )
-        sys.stdout.flush()
         if idx >= model.first_block_idx:
             timed_blocks += 1
             eta_window.append(module_time)

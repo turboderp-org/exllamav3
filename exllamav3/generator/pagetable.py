@@ -14,6 +14,7 @@ from ..util.tensor import SeqTensor
 from exllamav3.ext import exllamav3_ext as ext
 import time
 from ..cache import RecurrentCache
+from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..util import profile_opt
 
 
@@ -188,6 +189,9 @@ class Sequence:
         self.block_index_tensor = None
         self.live = True
         self.prefill_complete = False
+
+        # Multimodal token spans
+        self.multimodal_mask = ids[0] >= FIRST_MM_EMBEDDING_INDEX
 
 
     def prepare(self, has_prefix_token: bool, max_new_tokens: int):

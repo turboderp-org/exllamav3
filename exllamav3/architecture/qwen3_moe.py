@@ -4,7 +4,8 @@ import torch
 from ..model.config import Config, no_default
 from ..model.model import Model
 from ..util.rope import RopeStyle, RoPE
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, BlockSparseMLP, Linear, DeepstackEmbed
+from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, BlockSparseMLP, Linear
+from ..modules.arch_specific.qwen3_vl import DeepstackEmbed
 from ..modules.attn import prepare_for_attn
 
 from typing import TYPE_CHECKING

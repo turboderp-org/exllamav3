@@ -86,8 +86,10 @@ setup(
         "exllamav3.conversion.standard_cal_data",
         "exllamav3.integration",
         "exllamav3.architecture",
+        "exllamav3.architecture.mm_processing",
         "exllamav3.model",
         "exllamav3.modules",
+        "exllamav3.modules.arch_specific",
         "exllamav3.modules.quant",
         "exllamav3.modules.quant.exl3_lib",
         "exllamav3.tokenizer",
@@ -111,7 +113,8 @@ setup(
         "marisa_trie",
         "kbnf>=0.4.2",
         "formatron>=0.5.0",
-        "pydantic==2.11.0"
+        "pydantic==2.11.0",
+        "xformers"
     ],
     include_package_data=True,
     package_data = {
