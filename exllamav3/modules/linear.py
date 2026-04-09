@@ -65,6 +65,8 @@ class Linear(Module):
         self.transpose_fused_weights = transpose_fused_weights
         self.select_hq_bits = select_hq_bits
         self.qgroup = qgroup or key
+        self.lora_a_tensors = {}
+        self.lora_b_tensors = {}
 
         assert self.in_features_unpadded == self.in_features or allow_input_padding, \
             f"Input padding is not allowed for {self.key}, in_dim: {self.in_features_unpadded}, pad_to: {pad_to}"
@@ -292,6 +294,8 @@ class Linear(Module):
             self.inner.unload()
         self.device = None
         self.inner = None
+        self.lora_a_tensors.clear()
+        self.lora_b_tensors.clear()
 
 
     @override
@@ -400,12 +404,29 @@ class Linear(Module):
         if "capture" in params and self.qmap:
             self.capture_H(x, params)
 
+        lora_input = x if self.lora_a_tensors else None
+
         x = self.inner.forward(x, params, out_dtype)
+
+        if lora_input is not None:
+            self.apply_lora(lora_input, x)
+
         if self.softcap != 0.0:
             ext.softcap(x, x, self.softcap)
         if self.post_scale != 1.0:
             x *= self.post_scale
         return x
+
+
+    def apply_lora(self, lora_input: torch.Tensor, x: torch.Tensor):
+        orig_shape = lora_input.shape
+        flat = lora_input.view(-1, orig_shape[-1])
+        for lora, a in self.lora_a_tensors.items():
+            b = self.lora_b_tensors.get(lora)
+            if b is not None:
+                lora_in = flat if flat.dtype == a.dtype else flat.to(a.dtype)
+                delta = lora_in @ a @ b
+                x += delta.view(*orig_shape[:-1], -1).to(x.dtype)
 
 
     def quant_format_id(self):
