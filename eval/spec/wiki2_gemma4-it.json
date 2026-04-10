@@ -1,0 +1,10 @@
+{
+    "tokenize_fn": "transformers",
+    "tokenizer_dir": "/mnt/str/models/gemma4-26b-a4b-it/hf",
+    "dataset": "wiki2",
+    "eval_stride": 2048,
+    "eval_len": 2048,
+    "max_rows": 30,
+    "chat_template": true,
+    "warmup_tokens": 128
+}

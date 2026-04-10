@@ -31,7 +31,7 @@ def load_exllamav3(model_dir: str | list):
     else:
         config = Config.from_directory(model_dir)
     model = Model.from_config(config)
-    model.load(max_output_size = 2048, max_output_factor = 7)
+    model.load(max_output_size = 2048, max_output_factor = 7, progressbar = True)
     bpw_layer, bpw_head, vram_bits = get_storage_info(model)
     return model, bpw_layer, bpw_head, vram_bits
 
