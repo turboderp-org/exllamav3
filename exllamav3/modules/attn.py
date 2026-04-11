@@ -203,9 +203,9 @@ class Attention(Module):
         self.tp_split_norm = tp_split_norm
         self.use_k_as_v = use_k_as_v
 
-        # Use SDPA fallback when head_dim exceeds 256 (max supported by flash-attn
-        self.use_sdpa_fallback = self.head_dim > 256 or self.use_k_as_v
-        if self.use_sdpa_fallback:
+        # Use fallback when head_dim exceeds 256 (max supported by flash-attn
+        self.use_bighead_fallback = self.head_dim > 256 or self.use_k_as_v
+        if self.use_bighead_fallback:
             assert sliding_window == -1 and logit_softcapping == 0.0, \
                 "head_dim > 512 requires SDPA fallback path, which doesn't support sliding " \
                 "window attn or logit softcapping"
@@ -647,7 +647,7 @@ class Attention(Module):
         seqlen: int,
         params: dict,
     ):
-        if self.use_sdpa_fallback:
+        if self.use_bighead_fallback:
             return self.decode_sdpa_nc(x, bsz, seqlen, params)
 
         causal = params.get("causal", True)
@@ -773,8 +773,10 @@ class Attention(Module):
         else:
             cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
 
-        if self.use_sdpa_fallback:
-            if has_xformers:
+        if self.use_bighead_fallback:
+            if q.shape[1] <= 8:
+                fn = self.bighead_attn_paged_fallback
+            elif has_xformers:
                 fn = self.flash_attn_with_kvcache_xformers_fallback
             else:
                 fn = self.flash_attn_with_kvcache_sdpa_fallback
@@ -923,6 +925,29 @@ class Attention(Module):
                 v_cache[phys, off_start:off_end] = v[b, src_start:src_end]
 
         return torch.stack(outputs)
+
+
+    @staticmethod
+    def bighead_attn_paged_fallback(
+        q, k, v,
+        k_cache, v_cache,
+        block_table, cache_seqlens,
+        causal = False, softmax_scale = None,
+        window_size = None,
+        softcap = None,
+        kv_chunk_size = 128,
+    ):
+        o = torch.empty_like(q)
+        ext.bighead_attn_paged(
+            q, k, v,
+            k_cache, v_cache,
+            block_table, cache_seqlens,
+            o,
+            kv_chunk_size,
+            causal,
+            softmax_scale
+        )
+        return o
 
 
     @staticmethod
