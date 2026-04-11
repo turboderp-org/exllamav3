@@ -64,7 +64,7 @@ void exl3_gemv_kernel
     int t = threadIdx.x + (threadIdx.y + threadIdx.z * blockDim.y) * blockDim.x;
     int lane_id = threadIdx.x; // & 31;
 
-    int k_slice = blockIdx.z;
+    //int k_slice = blockIdx.z;
 
     const int blocks_n = TILESIZE_N / 16;
     const int blocks_k = TILESIZE_K / 16;
@@ -177,7 +177,7 @@ void exl3_gemv_kernel
     auto reduce_fr_c = [&]()
     {
         int frag_row = lane_id >> 2;
-        int frag_col = lane_id & 3;
+        //int frag_col = lane_id & 3;
 
         #pragma unroll
         for (int r_k = blocks_k / 2; r_k > 0; r_k >>= 1)
@@ -323,8 +323,8 @@ void exl3_gemv_kernel
             __syncthreads();
 
             // Load B frag
-            #pragma unroll
             B_sh_block = B_sh_tile[tile_k % num_stages] + str_B_sh_block_k * block_k;
+            #pragma unroll
             for (int block_n = 0; block_n < blocks_n; ++block_n)
             {
                 load_sh2fr_b(block_n);
