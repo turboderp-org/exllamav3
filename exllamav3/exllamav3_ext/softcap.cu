@@ -16,7 +16,7 @@ __global__ void softcap_kernel
     const float scale
 )
 {
-    uint64_t idx = (uint64_t)blockIdx.x * NUM_THREADS + (uint64_t)threadIdx.x;
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + (uint64_t)threadIdx.x;
     if (idx >= numel) return;
 
     float v = x[idx];
