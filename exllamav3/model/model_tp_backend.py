@@ -9,9 +9,9 @@ from ..util import log_tp
 
 GLOBALS_SIZE = 128*1024
 SHBUF_SIZE = 16 * 1024 ** 2
-SHBUF_SIZE_R = 17 * 128 * 1024
+SHBUF_SIZE_R = 17 * 4 * 128 * 1024
 SHBUF_SIZE_S = 16 * 1024
-MAX_CPU_REDUCE = SHBUF_SIZE_R // 17 // 256 * 256
+# MAX_CPU_REDUCE = SHBUF_SIZE_R // 17 // 256 * 256
 
 class TPBackend:
 

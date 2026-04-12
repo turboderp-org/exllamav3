@@ -3,11 +3,21 @@
 #include "context.cuh"
 
 #define NUM_THREADS 1024
-#define CPUREDUCE_CHUNK_SIZE (NUM_THREADS * 16)
+#define CPUREDUCE_CHUNK_SIZE (NUM_THREADS * 64)
 
 void enable_fast_fp();
+void enable_fast_fp_avx2();
 
 void perform_cpu_reduce
+(
+    PGContext* ctx,
+    size_t data_size,
+    uint32_t device_mask,
+    uint8_t* shbuf_ptr,
+    size_t shbuf_size
+);
+
+void perform_cpu_reduce_avx2
 (
     PGContext* ctx,
     size_t data_size,
