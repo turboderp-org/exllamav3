@@ -21,6 +21,7 @@ try:
         BlockDiagonalCausalWithOffsetPaddedKeysMask,
         BlockDiagonalPaddedKeysMask,
         LowerTriangularFromBottomRightMask,
+        LowerTriangularMask,
     )
     # Monkey-patch xformers for sm_120 support, what could go wrong
     from xformers.ops.fmha import cutlass as xf_cutlass
@@ -30,6 +31,36 @@ except ModuleNotFoundError:
     has_xformers = False
 
 has_warned_sdpa_fallback = False
+def _warn_sdpa_fallback():
+    global has_warned_sdpa_fallback
+    if has_warned_sdpa_fallback:
+        return
+    col_default = "\u001b[0m"
+    col_red = "\u001b[31;1m"
+    print(
+        f"{col_red} !! Warning, using SDPA fallback for large head size. VRAM usage will be high "
+        f"and inference on long sequences will be slow. Consider installing `xformers` to improve "
+        f"performance.{col_default}"
+    )
+    has_warned_sdpa_fallback = True
+
+# Hack required for xformers currently since GQA is broken
+# https://github.com/facebookresearch/xformers/issues/1392
+def _stable_xformers_gqa_via_4d(q5, k5, v5, attn_bias = None, scale = None):
+    B, Mq, G, H, K = q5.shape
+    out = torch.empty(B, Mq, G * H, K, device = q5.device, dtype = q5.dtype)
+    for g in range(G):
+        qg = q5[:, :, g]
+        kg = k5[:, :, g, :1, :].expand(-1, -1, H, -1)
+        vg = v5[:, :, g, :1, :].expand(-1, -1, H, -1)
+        og = xops.memory_efficient_attention(
+            qg, kg, vg,
+            attn_bias = attn_bias,
+            scale = scale,
+            op = (cutlass.FwOp, None),
+        )
+        out[:, :, g * H:(g + 1) * H, :] = og
+    return out
 
 """
 SDPA:
@@ -626,11 +657,36 @@ class Attention(Module):
                 self.post_rope_norm
             )
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa, scale = self.sm_scale)
-        o = o.transpose(1, 2)
+        if self.use_bighead_fallback and has_xformers:
+            _, _, nheads, headdim = q.shape
+            _, _, nheads_k, _ = k.shape
+            ngroups = nheads // nheads_k
+            if ngroups > 1:
+                q_ = q.view(1, seqlen, nheads_k, ngroups, headdim)
+                k_ = k.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
+                v_ = v.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
+
+                o = _stable_xformers_gqa_via_4d(
+                    q_, k_, v_,
+                    attn_bias = LowerTriangularMask() if causal else None,
+                    scale = self.sm_scale,
+                )
+                o = o.reshape(1, seqlen, nheads, headdim)
+            else:
+                o = xops.memory_efficient_attention(
+                    q, k, v,
+                    attn_bias = LowerTriangularMask() if causal else None,
+                    scale = self.sm_scale,
+                    op = (cutlass.FwOp, None),
+                )
+        else:
+            if self.use_bighead_fallback:
+                _warn_sdpa_fallback()
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa, scale = self.sm_scale)
+            o = o.transpose(1, 2)
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
@@ -864,49 +920,27 @@ class Attention(Module):
             k_xf = k_buf[:total_len].unsqueeze(0)  # (1, total_len, nheads_k, headdim)
             v_xf = v_buf[:total_len].unsqueeze(0)
 
+            attn_bias = LowerTriangularFromBottomRightMask() if causal else None
+
             if ngroups > 1:
                 q_xf = q[b].unsqueeze(0).view(1, seqlen_q, nheads_k, ngroups, headdim)
                 k_xf = k_xf.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
                 v_xf = v_xf.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
+                o = _stable_xformers_gqa_via_4d(
+                    q_xf, k_xf, v_xf,
+                    attn_bias = attn_bias,
+                    scale = softmax_scale,
+                )
+                o = o.reshape(1, seqlen_q, nheads, headdim)
             else:
                 q_xf = q[b].unsqueeze(0)
+                o = xops.memory_efficient_attention(
+                    q_xf, k_xf, v_xf,
+                    attn_bias = attn_bias,
+                    scale = softmax_scale,
+                    op = (cutlass.FwOp, None),
+                )
 
-            if causal:
-                attn_bias = LowerTriangularFromBottomRightMask()
-            else:
-                attn_bias = None
-
-            def stable_gqa_via_4d(q5, k5, v5, attn_bias = None, scale = None):
-                B, Mq, G, H, K = q5.shape
-                out = torch.empty(B, Mq, G * H, K, device = q5.device, dtype = q5.dtype)
-                for g in range(G):
-                    qg = q5[:, :, g]
-                    kg = k5[:, :, g, :1, :].expand(-1, -1, H, -1)
-                    vg = v5[:, :, g, :1, :].expand(-1, -1, H, -1)
-                    og = xops.memory_efficient_attention(
-                        qg, kg, vg,
-                        attn_bias = attn_bias,
-                        scale = scale,
-                        op = (cutlass.FwOp, None),
-                    )
-                    out[:, :, g * H:(g + 1) * H, :] = og
-                return out
-
-            # Hack required for xformers currently since GQA is broken
-            # https://github.com/facebookresearch/xformers/issues/1392
-            o = stable_gqa_via_4d(
-                q_xf, k_xf, v_xf,
-                attn_bias = attn_bias,
-                scale = softmax_scale,
-            )
-            # o = xops.memory_efficient_attention(
-            #     q_xf, k_xf, v_xf,
-            #     attn_bias = attn_bias,
-            #     scale = softmax_scale,
-            # )
-
-            if ngroups > 1:
-                o = o.reshape(1, seqlen_q, nheads, headdim)
             outputs.append(o.squeeze(0))
 
             # Write back affected pages
@@ -964,17 +998,7 @@ class Attention(Module):
         _, seqlen_new, nheads_k, _ = k.shape
         block_size = k_cache.shape[1]
 
-        global has_warned_sdpa_fallback
-        if not has_warned_sdpa_fallback:
-            col_default = "\u001b[0m"
-            col_red = "\u001b[31;1m"
-            print(
-                f"{col_red} !! Warning, using SDPA fallback for large head size. VRAM usage will be high "
-                f"and inference on long sequences will be slow. Consider installing `xformers` to improve "
-                f"performance.{col_default}"
-            )
-            has_warned_sdpa_fallback = True
-
+        _warn_sdpa_fallback()
         outputs = []
         for b in range(batch):
             seq_len = cache_seqlens[b].item()
