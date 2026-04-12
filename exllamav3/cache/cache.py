@@ -31,7 +31,7 @@ class CacheLayer(ABC):
         pass
 
     @abstractmethod
-    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor) -> tuple:
+    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor, sliding_window: int = -1) -> tuple:
         pass
 
     @abstractmethod
@@ -151,8 +151,8 @@ class Cache:
             module.cache_layers.remove(layer)
 
 
-    def get_layer(self, idx: int, cache_seqlens: torch.Tensor, block_table: torch.Tensor) -> tuple:
-        return self.layers[idx].get_kv(cache_seqlens, block_table)
+    def get_layer(self, idx: int, cache_seqlens: torch.Tensor, block_table: torch.Tensor, sliding_window: int = -1) -> tuple:
+        return self.layers[idx].get_kv(cache_seqlens, block_table, sliding_window)
 
 
     def update_layer(

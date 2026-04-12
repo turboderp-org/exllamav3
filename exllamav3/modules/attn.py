@@ -825,9 +825,9 @@ class Attention(Module):
             )
 
         if self.has_split_cache:
-            cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table)
+            cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table, self.sliding_window)
         else:
-            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
+            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table, self.sliding_window)
 
         if self.use_bighead_fallback:
             if q.shape[1] <= 8:

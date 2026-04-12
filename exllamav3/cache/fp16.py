@@ -47,7 +47,7 @@ class CacheLayer_fp16(CacheLayer):
 
 
     @override
-    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor) -> tuple:
+    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor, sliding_window: int = -1) -> tuple:
         return self.k, self.v
 
 

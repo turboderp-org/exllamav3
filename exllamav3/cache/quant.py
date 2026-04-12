@@ -65,10 +65,10 @@ class CacheLayer_quant(CacheLayer):
 
 
     @override
-    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor):
+    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor, sliding_window: int = -1):
         k = torch.empty(self.shape, dtype = torch.half, device = self.device)
         v = torch.empty(self.shape, dtype = torch.half, device = self.device)
-        ext.dequant_cache_paged(self.qk, self.sk, k, self.qv, self.sv, v, cache_seqlens, block_table, PAGE_SIZE)
+        ext.dequant_cache_paged(self.qk, self.sk, k, self.qv, self.sv, v, cache_seqlens, block_table, PAGE_SIZE, sliding_window)
         return k, v
 
 

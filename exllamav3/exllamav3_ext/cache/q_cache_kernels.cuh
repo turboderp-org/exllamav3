@@ -212,7 +212,8 @@ void dequant_cache_paged_kernel
     // int page_size,
     const int pages_per_seq,
     const int warps_per_token,
-    const int num_blocks
+    const int num_blocks,
+    const int sliding_window
 )
 {
     int batch_idx = blockIdx.y;
@@ -221,6 +222,16 @@ void dequant_cache_paged_kernel
     int d_warp_id = blockDim.x / 32;
     int max_token_idx = cache_seqlens[batch_idx];
     const uint32_t* b_block_table = block_table + batch_idx * pages_per_seq;
+
+    // Skip all whole blocks prior to the sliding window
+    if (sliding_window > 0)
+    {
+        int nb_block_id = block_id + blockDim.x * ITER_PER_TB;
+        int nb_t_warp_id = nb_block_id / 32;
+        int nb_token_idx = nb_t_warp_id / warps_per_token;
+        if (nb_token_idx <= max_token_idx - sliding_window)
+            return;
+    }
 
     #pragma unroll 4
     for (int iter = 0; iter < ITER_PER_TB; ++iter)

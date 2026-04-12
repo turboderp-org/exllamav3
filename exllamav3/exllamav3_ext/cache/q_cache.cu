@@ -190,7 +190,8 @@ void dequant_cache_paged
     const at::Tensor& v_out,
     const at::Tensor& cache_seqlens,
     const at::Tensor& block_table,
-    int page_size
+    int page_size,
+    int sliding_window
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(k_in.device());
@@ -247,7 +248,8 @@ void dequant_cache_paged
         // page_size,
         pages_per_seq,
         warps_per_token,
-        num_blocks
+        num_blocks,
+        sliding_window
     );
     cuda_check(cudaPeekAtLastError());
 }

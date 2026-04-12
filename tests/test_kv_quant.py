@@ -72,7 +72,8 @@ def test_kv_quant(device, block_table_size, head_dim, num_kv_heads, cache_size, 
             cache_v_tensor_out,
             cache_seqlens,
             block_table,
-            page_size
+            page_size,
+            -1
         )
 
     def tq():
