@@ -1,3 +1,24 @@
+#if !defined(__x86_64__) && !defined(_M_X64) && !defined(__i386__) && !defined(_M_IX86)
+#include "all_reduce_cpu_avx2.h"
+#include <stdexcept>
+
+void enable_fast_fp()
+{
+    throw std::runtime_error("AVX2 is not supported on this architecture.");
+}
+
+void perform_cpu_reduce
+(
+    PGContext*,
+    size_t,
+    uint32_t,
+    uint8_t*,
+    size_t
+)
+{
+    throw std::runtime_error("AVX2 is not supported on this architecture.");
+}
+#else
 #include <immintrin.h>
 #include "all_reduce_cpu_avx2.h"
 #include "../avx2_target.h"
@@ -219,3 +240,4 @@ void perform_cpu_reduce
         num_chunks--;
     }
 }
+#endif

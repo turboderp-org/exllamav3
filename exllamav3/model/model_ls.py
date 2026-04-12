@@ -43,6 +43,24 @@ class Model_LSMixin:
     def default_load_params(self, chunk_size):
         return {"input_ids": torch.zeros((1, chunk_size), dtype = torch.long)}
 
+    def _resolve_layer_map(self, params: dict):
+        layer_map = params.get("layer_map")
+        if layer_map is None:
+            layer_map = getattr(self, "layer_map", None)
+        return layer_map
+
+    def _split_block_modules(self, modules: list, last_kv_module_idx: int):
+        first_block_idx = getattr(self, "first_block_idx", None)
+        if first_block_idx is None or last_kv_module_idx is None:
+            return None
+        if first_block_idx > last_kv_module_idx:
+            return None
+        return (
+            modules[:first_block_idx],
+            modules[first_block_idx:last_kv_module_idx + 1],
+            modules[last_kv_module_idx + 1:],
+        )
+
 
     def _load_autosplit(
         self,
@@ -185,13 +203,49 @@ class Model_LSMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
-        for idx, module in enumerate(modules):
-            params["prefill"] = (idx == last_kv_module_idx)
+        layer_map = self._resolve_layer_map(params)
+        if not layer_map:
+            for idx, module in enumerate(modules):
+                params["prefill"] = (idx == last_kv_module_idx)
+                x = module.prepare_for_device(x, params)
+                x = module.forward(x, params)
+                if idx == last_kv_module_idx:
+                    break
+            del params["prefill"]
+            return None
+
+        split = self._split_block_modules(modules, last_kv_module_idx)
+        if split is None:
+            raise ValueError("layer_map requires first_block_idx and last_kv_module_idx to be set.")
+
+        prefix, blocks, _ = split
+        layer_map = list(layer_map)
+        num_blocks = len(blocks)
+        if not layer_map:
+            raise ValueError("layer_map must contain at least one block index.")
+        if any(idx < 0 or idx >= num_blocks for idx in layer_map):
+            raise ValueError("layer_map indices out of range for block list.")
+
+        for module in prefix:
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
-            if idx == last_kv_module_idx:
+
+        prev_override = params.get("layer_idx_override", None)
+        last_virtual_idx = len(layer_map) - 1
+        for virtual_idx, physical_idx in enumerate(layer_map):
+            params["prefill"] = (virtual_idx == last_virtual_idx)
+            params["layer_idx_override"] = virtual_idx
+            module = blocks[physical_idx]
+            x = module.prepare_for_device(x, params)
+            x = module.forward(x, params)
+            if virtual_idx == last_virtual_idx:
                 break
+
         del params["prefill"]
+        if prev_override is None:
+            params.pop("layer_idx_override", None)
+        else:
+            params["layer_idx_override"] = prev_override
         return None
 
 
@@ -202,10 +256,49 @@ class Model_LSMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
-        for idx, module in enumerate(modules):
+        layer_map = self._resolve_layer_map(params)
+        if not layer_map:
+            for idx, module in enumerate(modules):
+                if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
+                    x = x[..., -num:, :].contiguous()
+                x = module.prepare_for_device(x, params)
+                x = module.forward(x, params)
+            return x
+
+        split = self._split_block_modules(modules, last_kv_module_idx)
+        if split is None:
+            raise ValueError("layer_map requires first_block_idx and last_kv_module_idx to be set.")
+
+        prefix, blocks, suffix = split
+        layer_map = list(layer_map)
+        num_blocks = len(blocks)
+        if not layer_map:
+            raise ValueError("layer_map must contain at least one block index.")
+        if any(idx < 0 or idx >= num_blocks for idx in layer_map):
+            raise ValueError("layer_map indices out of range for block list.")
+
+        for module in prefix:
+            if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
+                x = x[..., -num:, :].contiguous()
+            x = module.prepare_for_device(x, params)
+            x = module.forward(x, params)
+
+        prev_override = params.get("layer_idx_override", None)
+        for virtual_idx, physical_idx in enumerate(layer_map):
+            params["layer_idx_override"] = virtual_idx
+            module = blocks[physical_idx]
+            if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
+                x = x[..., -num:, :].contiguous()
+            x = module.prepare_for_device(x, params)
+            x = module.forward(x, params)
+        if prev_override is None:
+            params.pop("layer_idx_override", None)
+        else:
+            params["layer_idx_override"] = prev_override
+
+        for module in suffix:
             if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
                 x = x[..., -num:, :].contiguous()
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
         return x
-

@@ -2,6 +2,7 @@
 
 bool is_avx2_supported()
 {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     static bool avx2_check = false;
     static bool avx2_supported = false;
     if (avx2_check) return avx2_supported;
@@ -16,4 +17,7 @@ bool is_avx2_supported()
     // if (avx2_supported) printf("AVX2 supported\n");
     // else printf("AVX2 not supported\n");
     return avx2_supported;
+#else
+    return false;
+#endif
 }
