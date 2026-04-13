@@ -360,23 +360,23 @@ class Tokenizer:
 
     # Decode sequence with added, unspecial tokens
 
-    def decode_unspecial(self, seq):
+    def decode_unspecial(self, seq, decode_special_tokens = False):
 
         if not self.unspecial_id_to_piece:
-            return self.tokenizer.decode(seq)
+            return self.tokenizer.decode(seq, skip_special_tokens = not decode_special_tokens)
 
         text = ""
         start = 0
         end = 0
         while end < len(seq):
             if seq[end] in self.unspecial_id_to_piece:
-                if end > start: text += self.tokenizer.decode(seq[start: end])
+                if end > start: text += self.tokenizer.decode(seq[start: end], skip_special_tokens = not decode_special_tokens)
                 text += self.unspecial_id_to_piece[seq[end]]
                 end += 1
                 start = end
             else:
                 end += 1
-        if end > start: text += self.tokenizer.decode(seq[start: end])
+        if end > start: text += self.tokenizer.decode(seq[start: end], skip_special_tokens = not decode_special_tokens)
         return text
 
     # Decode sequence with or without special tokens
@@ -399,13 +399,13 @@ class Tokenizer:
             end = 0
             while end < len(seq):
                 if seq[end] in self.extended_id_to_piece:
-                    if end > start: text += self.tokenizer.decode(seq[start: end])
+                    if end > start: text += self.tokenizer.decode(seq[start: end], decode_special_tokens)
                     text += self.extended_id_to_piece[seq[end]]
                     end += 1
                     start = end
                 else:
                     end += 1
-            if end > start: text += self.decode_unspecial(seq[start: end])
+            if end > start: text += self.decode_unspecial(seq[start: end], decode_special_tokens)
 
         return text
 
