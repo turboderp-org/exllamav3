@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Branch Decoder Demo</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --bg-2: #141821;
+    --bg-3: #1d232e;
+    --border: #2a313d;
+    --border-hi: #3a4250;
+    --text: #e6edf3;
+    --text-dim: #8b95a7;
+    --text-dimmer: #565e6d;
+    --accent: #7ee787;
+    --accent-2: #79b8ff;
+    --prompt: #ffcb6b;
+    --danger: #ff7b72;
+    --shadow: 0 8px 24px rgba(0,0,0,0.35);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: radial-gradient(ellipse at top, #11141c 0%, #0b0d12 60%);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    min-height: 100vh;
+  }
+  body { display: flex; flex-direction: column; }
+
+  header {
+    padding: 14px 28px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 20px;
+    align-items: center;
+    background: rgba(20, 24, 33, 0.8);
+    backdrop-filter: blur(12px);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header .logo {
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    background: linear-gradient(135deg, var(--accent-2), var(--accent));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  header .spacer { flex: 1; }
+  .param {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .param input {
+    width: 90px;
+    background: var(--bg-3);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 12px;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    transition: border-color 0.15s ease;
+  }
+  .param input:focus {
+    outline: none;
+    border-color: var(--accent-2);
+  }
+
+  main {
+    flex: 1;
+    width: 100%;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 32px 28px 80px;
+  }
+
+  .section-label {
+    color: var(--text-dimmer);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+
+  #prompt-section textarea {
+    width: 100%;
+    min-height: 180px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    color: var(--text);
+    padding: 14px 16px;
+    font-size: 13px;
+    line-height: 1.6;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    resize: vertical;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  #prompt-section textarea:focus {
+    outline: none;
+    border-color: var(--accent-2);
+    box-shadow: 0 0 0 3px rgba(121, 184, 255, 0.1);
+  }
+
+  .toolbar { display: flex; gap: 10px; margin-top: 14px; align-items: center; }
+  button {
+    background: linear-gradient(135deg, var(--accent-2), #4e8fd8);
+    color: #06080c;
+    border: none;
+    border-radius: 8px;
+    padding: 9px 18px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+    transition: transform 0.08s ease, filter 0.15s ease, box-shadow 0.15s ease;
+    box-shadow: 0 2px 6px rgba(121, 184, 255, 0.25);
+  }
+  button:hover { filter: brightness(1.1); box-shadow: 0 4px 12px rgba(121, 184, 255, 0.35); }
+  button:active { transform: translateY(1px); }
+  button.ghost {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    box-shadow: none;
+  }
+  button.ghost:hover { color: var(--text); border-color: var(--border-hi); }
+
+  #blocks-section {
+    margin-top: 28px;
+    padding: 22px 24px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13.5px;
+    line-height: 1.8;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    box-shadow: var(--shadow);
+    animation: fadeIn 0.3s ease;
+  }
+  .block {
+    display: inline;
+    padding: 1px 2px;
+    margin: -1px 0;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+    position: relative;
+  }
+  .block.prompt { color: var(--prompt); }
+  .block.model { color: var(--text); }
+  .block:hover { background: rgba(121, 184, 255, 0.14); }
+  .block.latest {
+    background: var(--bg-2);
+    box-shadow: inset 0 -1px 0 rgba(126, 231, 135, 0.4);
+  }
+  .block.latest:hover { background: rgba(121, 184, 255, 0.14); }
+  .block.flash {
+    animation: flash 0.6s ease-out;
+  }
+  @keyframes flash {
+    0%   { background: rgba(210, 255, 215, 0.55); box-shadow: inset 0 -1px 0 rgba(126, 231, 135, 0.9); }
+    100% { background: var(--bg-2); box-shadow: inset 0 -1px 0 rgba(126, 231, 135, 0.4); }
+  }
+
+  #branches-section {
+    margin-top: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .branch {
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    transition: border-color 0.12s ease, transform 0.08s ease, background 0.12s ease;
+    animation: slideIn 0.25s ease backwards;
+    animation-delay: calc(var(--i, 0) * 0.02s);
+  }
+  .branch:hover {
+    border-color: var(--accent);
+    background: var(--bg-3);
+    transform: translateX(2px);
+  }
+  .branch:active { transform: translateX(2px) translateY(1px); }
+  .branch .idx {
+    flex: 0 0 18px;
+    font-size: 10px;
+    color: var(--text-dimmer);
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    text-align: center;
+  }
+  .branch .text {
+    flex: 1;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    min-width: 0;
+  }
+  .branch .bar {
+    flex: 0 0 72px;
+    height: 4px;
+    background: var(--bg-3);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .branch .bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent-2), var(--accent));
+    transition: width 0.4s cubic-bezier(.2,.7,.2,1);
+  }
+  .branch .prob {
+    flex: 0 0 52px;
+    text-align: right;
+    font-size: 12px;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  .hint {
+    color: var(--text-dimmer);
+    font-size: 11px;
+    margin-top: 14px;
+    line-height: 1.6;
+  }
+  .hint kbd {
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 10px;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    color: var(--text-dim);
+  }
+
+  .empty {
+    color: var(--text-dimmer);
+    font-size: 12px;
+    font-style: italic;
+    padding: 8px 0;
+  }
+
+  body.loading main { pointer-events: none; }
+  body.loading main::after {
+    content: "";
+    position: fixed;
+    top: 0; left: 0;
+    height: 2px;
+    width: 100%;
+    background: linear-gradient(90deg, transparent, var(--accent-2), transparent);
+    animation: progress 1s linear infinite;
+    z-index: 20;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateX(60px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+  @keyframes progress {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(100%); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">◆ BRANCH DECODER DEMO</div>
+  <div class="spacer"></div>
+  <div class="param"><label>top-p</label><input id="top_p" type="number" step="0.01" min="0" max="0.99" value="0.95"></div>
+  <div class="param"><label>top-k</label><input id="top_k" type="number" step="1" min="1" max="100" value="10"></div>
+  <div class="param"><label>max-span</label><input id="max_span" type="number" step="1" min="1" max="100" value="24"></div>
+</header>
+<main>
+  <section id="prompt-section">
+    <div class="section-label">Initial prompt</div>
+    <textarea id="prompt" placeholder="Enter your raw prompt here (including any chat template / control tokens)..."></textarea>
+    <div class="toolbar">
+      <button id="start-btn">Initialize →</button>
+      <button id="default-btn" class="ghost">Default</button>
+      <button id="reset-btn" class="ghost">Clear</button>
+    </div>
+    <div class="hint">
+      Click any chunk above to rewind. Click a branch below to extend.
+    </div>
+  </section>
+  <section id="blocks-section" style="display:none;"></section>
+  <section id="branches-section" style="display:none;"></section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
