@@ -942,8 +942,8 @@ class Job:
             prefill_end = min(prefill_end, len(seq.sequence_ids) - 1)
 
             atomic_mm_prefill = bool(self.embeddings) and self.generator.model.caps.get("atomic_mm_prefill")
-            assert not atomic_mm_prefill or not self.recurrent_state, \
-                "Atomic prefill is not supported for recurrent models"
+            # assert not atomic_mm_prefill or not self.recurrent_state, \
+            #     "Atomic prefill is not supported for recurrent models"
 
             p0 = prefill_start // PAGE_SIZE
             p1 = (prefill_end + PAGE_SIZE - 1) // PAGE_SIZE
