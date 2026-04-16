@@ -45,6 +45,8 @@ def add_args(
     parser.add_argument("-tp_linear", "--tp_max_parallelism_linear", type = int, help = "(TP) Maximum parallelism for linear (output) layers", default = None)
     parser.add_argument("-tp_moe_ts", "--tp_moe_tensor_split", action = "store_true", help = "(TP) Use tensor split for MoE layers rather than expert parallelism")
 
+    parser.add_argument("-swa_full", "--swa_full", action = "store_true", help = f"Use full cache for SWA layers. Default is recurrent mode with snapshots")
+
     parser.add_argument("-lv", "--load_verbose", action = "store_true", help = "Verbose output while loading")
 
     if add_sampling_args:
@@ -166,7 +168,7 @@ def init(
             config.stc = vstc
 
     # Model instance
-    model = Model.from_config(config)
+    model = Model.from_config(config, swa_full = args.swa_full)
 
     # Cache
     if "cache_size" in vars(args):
