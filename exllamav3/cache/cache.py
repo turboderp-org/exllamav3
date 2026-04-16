@@ -2,9 +2,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Type
 import torch
-from ..model import Model, Config
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
+    from ..model import Model, Config
     from ..modules import Attention
 
 class CacheLayer(ABC):

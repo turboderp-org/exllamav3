@@ -166,7 +166,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             # reserve 1 GB on cuda:0 and cuda:2, exclude cuda:1
             model.load(reserve_per_device = [1, -1, 1])
 
-            The default reserve per device is 0.25 GB. This applies to devices not included in reserve_per_device
+            The default reserve per device is 0.5 GB. This applies to devices not included in reserve_per_device
             as well.
 
         :param use_per_device:

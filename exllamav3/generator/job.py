@@ -814,7 +814,7 @@ class Job:
             "time_enqueued": self.time_enqueued,
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
-            "rq_new_tokens": self.new_tokens - 1
+            "rq_new_tokens": self.new_tokens - 1,
         }
 
         serial_number = self.serial_number
@@ -1143,6 +1143,7 @@ class Job:
                 f.attach(self)
                 f.reset()
                 f.is_active = f.trigger_token is None
+
 
     def maybe_stash_recurrent(self, cache, interval):
         seq = self.sequences[0]

@@ -2,11 +2,11 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 from ..constants import PAGE_SIZE
-from ..model import Model, Config
 from .cache import CacheLayer
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..modules import Attention
+    from ..model import Model, Config
 import numpy as np
 
 class CacheLayer_fp16(CacheLayer):

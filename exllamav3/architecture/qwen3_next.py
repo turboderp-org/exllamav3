@@ -6,7 +6,7 @@ from ..model.model import Model
 from ..util.rope import RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, BlockSparseMLP, Linear, GatedDeltaNet, GatedMLP
 from ..modules.attn import prepare_for_attn
-from ..modules.gated_delta_net import prepare_for_recurrence
+from ..cache.recurrent_util import prepare_for_recurrence
 
 class Qwen3NextConfig(Config):
     arch_string = "Qwen3NextForCausalLM"

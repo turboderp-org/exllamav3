@@ -110,7 +110,7 @@ def prepare_sdpa_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
 
 def prepare_flash_attn_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     assert "cache" not in params, \
-        f"Cache provided for attn_mode: sdpa_nc"
+        f"Cache provided for attn_mode: flash_attn_nc"
     return input_ids
 
 
@@ -440,7 +440,7 @@ class Attention(Module):
 
     @override
     def load(self, device: torch.Device, **kwargs):
-        super().load(device)
+        super().load(device, **kwargs)
         self.load_local(device, **kwargs)
 
 

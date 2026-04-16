@@ -16,7 +16,7 @@ from ..modules import (
     GatedMLP,
 )
 from ..modules.attn import prepare_for_attn
-from ..modules.gated_delta_net import prepare_for_recurrence
+from ..cache.recurrent_util import prepare_for_recurrence
 
 class OlmoHybridConfig(Config):
     arch_string = "OlmoHybridForCausalLM"

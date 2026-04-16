@@ -161,6 +161,9 @@ class LinearEXL3:
 
 
     def get_inner_weight_tensor(self):
+        # baseline = torch.cuda.memory_allocated(self.trellis.device)
+        # free, total = torch.cuda.mem_get_info(self .trellis.device)
+        # print(f"{self.key:50} {baseline:15,} {free:15,}")
         w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
         ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
         return w

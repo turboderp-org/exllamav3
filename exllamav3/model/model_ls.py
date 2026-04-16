@@ -1,6 +1,9 @@
 from __future__ import annotations
 from typing import Callable
 import torch
+
+from ..modules.attn import prepare_for_attn
+from ..cache.recurrent_util import prepare_for_recurrence
 from ..util.memory import (
     set_memory_fraction_reserve,
     set_memory_fraction_use,
