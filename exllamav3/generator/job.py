@@ -1111,7 +1111,8 @@ class Job:
                 if recurrent_state is None:
                     self.recurrent_state = self.generator.recurrent_cache.get_empty_state()
                 else:
-                    self.recurrent_state = self.generator.recurrent_cache.get_unstashed(recurrent_state)
+                    self.recurrent_state = self.generator.recurrent_cache.get_unstashed(recurrent_state, cached_pages * PAGE_SIZE)
+                    self.last_recurrent_checkpoint_pos = self.recurrent_state[0].position
 
             # Metrics
             self.cached_pages += cached_pages
@@ -1149,13 +1150,28 @@ class Job:
         seq = self.sequences[0]
         if seq.kv_position % interval == 0 and \
             self.last_recurrent_checkpoint_pos != seq.kv_position:
+            assert seq.kv_position % PAGE_SIZE == 0
+
             self.last_recurrent_checkpoint_pos = seq.kv_position
             last_page = (seq.kv_position - 1) // PAGE_SIZE
-            page = seq.allocated_pages[last_page]
-            assert page.kv_position == PAGE_SIZE
-            cache.stash(page.phash, self.recurrent_state)
+
+            # Collect valid checkpoint positions
+            max_offset = self.recurrent_state[0].get_cachable_interval()
+            hashes = []
+            for page_offset, offset in enumerate(range(0, max_offset + 1, PAGE_SIZE)):
+                if last_page - page_offset < 0:
+                    break
+                page = seq.allocated_pages[last_page - page_offset]
+                assert page.kv_position == PAGE_SIZE
+                hashes.append((offset, page.phash))
+
+            # Insert oldest hash first
+            hashes.sort(reverse = True)
+            cache.stash(hashes, self.recurrent_state)
+
             # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk
             self.last_recurrent_checkpoint_pos = seq.kv_position
+
 
     def free_recurrent_state(self):
         self.recurrent_state = None

@@ -198,7 +198,8 @@ class GDN_RecurrentState(CacheableState):
         )
 
     @override
-    def unstash(self, device):
+    def unstash(self, device, trim_position):
+        assert self.position == trim_position
         return GDN_RecurrentState(
             self.position,
             self.positions,
@@ -214,6 +215,11 @@ class GDN_RecurrentState(CacheableState):
             self.last_conv_state.element_size() * self.last_conv_state.numel() +
             self.last_recurrent_state.element_size() * self.last_recurrent_state.numel()
         )
+
+    @override
+    def get_cachable_interval(self):
+        # Recurrent state tracks only one token
+        return 0
 
     def collect_batch(self, batch: list[GDN_RecurrentState]):
         lcs = torch.cat([b.last_conv_state for b in batch], dim = 0)
