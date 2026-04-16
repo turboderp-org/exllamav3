@@ -15,6 +15,7 @@ from ..modules import (
     RMSNorm,
     TransformerBlock,
     Attention,
+    SlidingAttention,
     BlockSparseMLP,
 )
 from ..modules.arch_specific.gemma4 import (
@@ -31,7 +32,7 @@ from .mm_processing.gemma4 import (
     get_aspect_ratio_preserving_size,
     convert_image_to_patches,
 )
-
+from ..cache.recurrent_util import prepare_for_recurrence
 
 class Gemma4Config(Config):
     arch_string = "Gemma4ForConditionalGeneration"
@@ -172,9 +173,11 @@ class Gemma4TextModel(Model):
         self,
         config: Gemma4Config,
         key_prefix: str = "model.language_model",
+        swa_full: bool = False,
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        self.swa_full = swa_full
 
         use_moe = config.enable_moe_block
 
@@ -184,7 +187,7 @@ class Gemma4TextModel(Model):
                 key = f"{key_prefix}.embed_tokens",
                 vocab_size = config.vocab_size,
                 hidden_size = config.hidden_size,
-                multiplier = torch.tensor(config.hidden_size ** 0.5, dtype=torch.bfloat16).float().item()
+                multiplier = torch.tensor(config.hidden_size ** 0.5, dtype = torch.bfloat16).float().item()
             )
         ]
 
@@ -193,42 +196,79 @@ class Gemma4TextModel(Model):
         for idx in range(config.num_hidden_layers):
             layer_is_full = config.layer_types[idx] == "full_attention"
 
-            attn = Attention(
-                config = config,
-                key = f"{key_prefix}.layers.{idx}.self_attn",
-                layer_idx = idx,
-                hidden_size = config.hidden_size,
-                head_dim = config.global_head_dim if layer_is_full else config.head_dim,
-                num_q_heads = config.num_q_heads,
-                num_kv_heads = config.num_global_kv_heads if layer_is_full else config.num_kv_heads,
-                rope_settings = config.rope_settings_global if layer_is_full else config.rope_settings_local,
-                logit_softcapping = config.attn_logit_softcapping,
-                sliding_window = config.swa_pattern[idx],
-                use_k_as_v = layer_is_full and config.attention_k_eq_v,
-                key_q = "q_proj",
-                key_k = "k_proj",
-                key_v = "v_proj",
-                key_o = "o_proj",
-                qmap = "block.attn",
-                sm_scale = 1.0,
-                q_norm = RMSNorm(
+            if swa_full or config.swa_pattern[idx] <= 0:
+                attn = Attention(
                     config = config,
-                    key = f"{key_prefix}.layers.{idx}.self_attn.q_norm",
-                    rms_norm_eps = config.rms_norm_eps,
-                ),
-                k_norm = RMSNorm(
+                    key = f"{key_prefix}.layers.{idx}.self_attn",
+                    layer_idx = idx,
+                    hidden_size = config.hidden_size,
+                    head_dim = config.global_head_dim if layer_is_full else config.head_dim,
+                    num_q_heads = config.num_q_heads,
+                    num_kv_heads = config.num_global_kv_heads if layer_is_full else config.num_kv_heads,
+                    rope_settings = config.rope_settings_global if layer_is_full else config.rope_settings_local,
+                    logit_softcapping = config.attn_logit_softcapping,
+                    sliding_window = config.swa_pattern[idx],
+                    use_k_as_v = layer_is_full and config.attention_k_eq_v,
+                    key_q = "q_proj",
+                    key_k = "k_proj",
+                    key_v = "v_proj",
+                    key_o = "o_proj",
+                    qmap = "block.attn",
+                    sm_scale = 1.0,
+                    q_norm = RMSNorm(
+                        config = config,
+                        key = f"{key_prefix}.layers.{idx}.self_attn.q_norm",
+                        rms_norm_eps = config.rms_norm_eps,
+                    ),
+                    k_norm = RMSNorm(
+                        config = config,
+                        key = f"{key_prefix}.layers.{idx}.self_attn.k_norm",
+                        rms_norm_eps = config.rms_norm_eps,
+                    ),
+                    v_norm = RMSNorm(
+                        config = config,
+                        key = f"{key_prefix}.layers.{idx}.self_attn.v_norm",
+                        rms_norm_eps = config.rms_norm_eps,
+                        unweighted = True,
+                    ),
+                    select_hq_bits = 2 if use_moe else 0,
+                )
+            else:
+                attn = SlidingAttention(
                     config = config,
-                    key = f"{key_prefix}.layers.{idx}.self_attn.k_norm",
-                    rms_norm_eps = config.rms_norm_eps,
-                ),
-                v_norm = RMSNorm(
-                    config = config,
-                    key = f"{key_prefix}.layers.{idx}.self_attn.v_norm",
-                    rms_norm_eps = config.rms_norm_eps,
-                    unweighted = True,
-                ),
-                select_hq_bits = 2 if use_moe else 0,
-            )
+                    key = f"{key_prefix}.layers.{idx}.self_attn",
+                    layer_idx = idx,
+                    hidden_size = config.hidden_size,
+                    head_dim = config.head_dim,
+                    num_q_heads = config.num_q_heads,
+                    num_kv_heads = config.num_kv_heads,
+                    rope_settings = config.rope_settings_local,
+                    logit_softcapping = config.attn_logit_softcapping,
+                    sliding_window = config.swa_pattern[idx],
+                    key_q = "q_proj",
+                    key_k = "k_proj",
+                    key_v = "v_proj",
+                    key_o = "o_proj",
+                    qmap = "block.attn",
+                    sm_scale = 1.0,
+                    q_norm = RMSNorm(
+                        config = config,
+                        key = f"{key_prefix}.layers.{idx}.self_attn.q_norm",
+                        rms_norm_eps = config.rms_norm_eps,
+                    ),
+                    k_norm = RMSNorm(
+                        config = config,
+                        key = f"{key_prefix}.layers.{idx}.self_attn.k_norm",
+                        rms_norm_eps = config.rms_norm_eps,
+                    ),
+                    v_norm = RMSNorm(
+                        config = config,
+                        key = f"{key_prefix}.layers.{idx}.self_attn.v_norm",
+                        rms_norm_eps = config.rms_norm_eps,
+                        unweighted = True,
+                    ),
+                    select_hq_bits = 2 if use_moe else 0,
+                )
 
             mlp = GatedMLP(
                 config = config,
@@ -361,10 +401,19 @@ class Gemma4TextModel(Model):
             "atomic_mm_prefill": config.use_bidirectional_attention == "vision",
         })
 
+        # SWA layers are recurrent, optionally. Checkpoints are expensive so default to a longer interval
+        if not self.swa_full:
+            self.caps.update({
+                "recurrent_states": True,
+                "default_recurrent_checkpoint_interval": 6144,
+            })
+
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         _prepare_noncausal_mm_spans(input_ids, params)
+        if not self.swa_full:
+            prepare_for_recurrence(input_ids, params, self)
         return prepare_for_attn(input_ids, params)
 
 
