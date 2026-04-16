@@ -26,6 +26,12 @@ class CacheableState(ABC):
         """
         pass
 
+    @abstractmethod
+    def reset(self):
+        """
+        Clear this recurrent state (used during autosplit load)
+        """
+
 
 class RecurrentCache(OrderedDict):
     def __init__(

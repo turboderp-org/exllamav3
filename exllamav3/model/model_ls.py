@@ -60,7 +60,8 @@ class Model_LSMixin:
         generator: bool,
         config: Config,
         modules: list,
-        verbose: bool
+        verbose: bool,
+        cache_weakrefs: dict
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
@@ -68,6 +69,23 @@ class Model_LSMixin:
         prev_load_device = None
         touched_devices = []
         params = self.default_load_params(max_chunk_size)
+
+        # Simulate cached/recurrent path while loading with cache
+        cl = [m for m in self if m.caps.get("kv_cache")]
+        if cl:
+            c0 = cl[0].cache_layers[0] if len(cl[0].cache_layers) else None
+            if c0:
+                cache = cache_weakrefs[c0.cache_id]()
+                params.update({
+                    "attn_mode": "flash_attn",
+                    "cache": cache,
+                    "past_len": 0,
+                    "batch_shape": (1, max_chunk_size),
+                })
+                prepare_for_attn(torch.zeros((1, max_chunk_size), dtype = torch.long), params)
+                rl = [m for m in self if m.caps.get("recurrent_cache")]
+                if rl:
+                    prepare_for_recurrence(None, params, self)
 
         with ProgressBar(f"Loading (LS)" if progressbar else None, len(modules)) as progress:
 
@@ -94,13 +112,14 @@ class Model_LSMixin:
                         if load_device != torch.device("cpu") and load_device != prev_load_device:
                             prev_load_device = load_device
                             i = active_devices[current_device_i]
+                            touched_devices.append(i)
+                            i = active_devices[current_device_i]
                             if reserve_per_device is not None:
                                 set_memory_fraction_reserve(reserve_per_device[i], i)
                             elif use_per_device is not None:
-                                 set_memory_fraction_use(use_per_device[i], i)
+                                set_memory_fraction_use(use_per_device[i], i)
                             else:
                                 raise RuntimeError("Logic error")
-                            touched_devices.append(i)
 
                         # (Re)create or backup hidden state (metadata)
                         if dummy_state is None:
@@ -113,7 +132,7 @@ class Model_LSMixin:
                         defer = module.can_defer_load()
                         if defer:
                             config.stc.begin_deferred_load()
-                        module.load(load_device)
+                        module.load(load_device, max_chunk_size = max_chunk_size)
                         if defer:
                             config.stc.end_deferred_load()
 
@@ -158,6 +177,13 @@ class Model_LSMixin:
                     if fail:
                         module.unload()
                         dummy_state = None
+                        if "recurrent_states" in params:
+                            rls = [m for m in module if m.caps.get("recurrent_cache")]
+                            for rl in rls:
+                                s = params["recurrent_states"].get(rl.layer_idx)
+                                if s:
+                                    s.reset()
+
                         free_mem()
                         current_device_i += 1
                         if current_device_i >= len(active_devices):

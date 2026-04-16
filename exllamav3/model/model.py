@@ -24,6 +24,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         }
         self.active_devices = []
         self.output_device = None
+        self.cache_weakrefs = {}
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
@@ -295,6 +296,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     self.config,
                     self.modules,
                     verbose,
+                    self.cache_weakrefs
                 )
                 self.output_device = self.modules[-1].device
 

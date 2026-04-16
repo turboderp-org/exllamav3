@@ -41,9 +41,8 @@ def set_memory_fraction_use(
     device: int
 ):
     touch_device(device)
-    free, total = torch.cuda.mem_get_info(device)
-    baseline = torch.cuda.memory_allocated(device)
-    fraction = min((baseline + use) / total, 1.0)
+    total = torch.cuda.get_device_properties(device).total_memory
+    fraction = min(use / total, 1.0)
     torch.cuda.set_per_process_memory_fraction(fraction, device = device)
 
 

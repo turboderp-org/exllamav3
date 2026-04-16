@@ -227,6 +227,10 @@ class GDN_RecurrentState(CacheableState):
             b.last_recurrent_state.copy_(self.last_recurrent_state[i:i+1, ...])
             b.position = self.positions[i]
 
+    @override
+    def reset(self):
+        self.last_conv_state = None
+        self.last_recurrent_state = None
 
 
 class GatedDeltaNet(Module):
@@ -450,7 +454,7 @@ class GatedDeltaNet(Module):
 
     @override
     def load(self, device: torch.Device, **kwargs):
-        super().load(device)
+        super().load(device, **kwargs)
         self.a_log = self.config.stc.get_tensor(self.key_a_log, self.device, optional = False, allow_bf16 = True)
         self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True)
         self.conv1d_weight = self.config.stc.get_tensor(self.key_conv1d_weight, self.device, optional = True, allow_bf16 = True)

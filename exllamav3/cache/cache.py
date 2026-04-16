@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..model import Model, Config
     from ..modules import Attention
+import weakref
 
 class CacheLayer(ABC):
 
@@ -131,6 +132,8 @@ class Cache:
         if model is None:
             model = self.model
 
+        model.cache_weakrefs[id(self)] = weakref.ref(self)
+
         cl = model.get_cache_layers()
         for module in cl:
             layer = self.layers[module.layer_idx]
@@ -144,6 +147,8 @@ class Cache:
         """
         if model is None:
             model = self.model
+
+        del model.cache_weakrefs[id(self)]
 
         cl = model.get_cache_layers()
         for module in cl:
