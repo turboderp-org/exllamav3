@@ -55,6 +55,7 @@ def main(args):
     # Recompile model
     compile_args = {
         "bits": bpw_layer,
+        "final_bits": bpw_layer,
         "head_bits": bpw_head,
         "in_dir": args.in_dir,
         "out_dir": args.out_dir,
