@@ -33,7 +33,7 @@ class Generator:
         show_visualizer: bool = False,
         enable_defrag: bool = True,
         recurrent_cache_size: int = 4 * 1024**3,
-        recurrent_checkpoint_interval: int = 2048,
+        recurrent_checkpoint_interval: int = None,
         **kwargs
     ):
         """
@@ -82,7 +82,8 @@ class Generator:
             Ignored if model doesn't use recurrent states
 
         :param recurrent_checkpoint_interval:
-            Minimum number of tokens between recurrent checkpoints. Must be a multiple of the page size
+            Minimum number of tokens between recurrent checkpoints. Must be a multiple of the page size.
+            Model architecture determines default
 
         :param kwargs:
         """
@@ -154,6 +155,9 @@ class Generator:
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
         else:
             self.recurrent_cache = None
+        if recurrent_checkpoint_interval is None:
+            recurrent_checkpoint_interval = model.caps.get("default_recurrent_checkpoint_interval", 2048)
+
         assert recurrent_checkpoint_interval % PAGE_SIZE == 0, \
             "recurrent_checkpoint_interval must be a multiple of the page size (256)"
         recurrent_checkpoint_interval = min(recurrent_checkpoint_interval, self.max_chunk_size)

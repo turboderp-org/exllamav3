@@ -220,7 +220,10 @@ class Qwen3NextModel(Model):
         self.calibration_all_experts = True
 
         # Mark that we need recurrent cache for generation
-        self.caps.update({"recurrent_states": True})
+        self.caps.update({
+            "recurrent_states": True,
+            "default_recurrent_checkpoint_interval": 2048,
+        })
 
         # TODO: Enable TP for linear attn
         self.caps.update({"supports_tp": False})
