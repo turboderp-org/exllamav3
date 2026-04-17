@@ -477,6 +477,8 @@ class Model(Model_TPMixin, Model_LSMixin):
             numel = module.weights_numel()
 
             # Throw exception if module type has no trainable weights
+            # and was not filtered out via TRAINABLE_LEAF_TYPES
+            # This only affects new modules that we forgot to config
             if numel is None or numel == 0:
                 raise ValueError(
                     f"Layer type '{module.__class__.__name__}' at '{module.key}' has no trainable weights"
