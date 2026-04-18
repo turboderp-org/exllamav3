@@ -25,8 +25,9 @@ class SWA_RecurrentState(CacheableState):
         v_state: torch.Tensor | None = None,
         batched = False,
         batch: list[SWA_RecurrentState] | None = None,
-        attn_window_size = None,
-        kept_window_size = None,
+        window_beg: int = 0,
+        attn_window_size: int = None,
+        kept_window_size: int = None,
     ):
         super().__init__()
         self.position = position
@@ -35,6 +36,7 @@ class SWA_RecurrentState(CacheableState):
         self.v_state = v_state
         self.batched = batched
         self.batch = batch
+        self.window_beg = window_beg
         self.attn_window_size = attn_window_size
         self.kept_window_size = kept_window_size
 
@@ -47,6 +49,7 @@ class SWA_RecurrentState(CacheableState):
             self.positions,
             self.k_state.cpu(),
             self.v_state.cpu(),
+            window_beg = self.window_beg,
             attn_window_size = self.attn_window_size,
             kept_window_size = self.kept_window_size,
         )
@@ -55,14 +58,15 @@ class SWA_RecurrentState(CacheableState):
     def unstash(self, device, trim_position):
         trim = self.position - trim_position
         assert 0 <= trim <= self.get_cachable_interval()
-        k = self.k_state if trim == 0 else self.k_state[:, :-trim, :, :]
-        v = self.v_state if trim == 0 else self.v_state[:, :-trim, :, :]
+        k = self.k_state
+        v = self.v_state
         assert self.positions is None
         return SWA_RecurrentState(
             trim_position,
             self.positions,
             k.to(device, non_blocking = True),
             v.to(device, non_blocking = True),
+            window_beg = self.window_beg,
             attn_window_size = self.attn_window_size,
             kept_window_size = self.kept_window_size,
         )
@@ -105,6 +109,27 @@ class SWA_RecurrentState(CacheableState):
     def reset(self):
         self.k_state = None
         self.v_state = None
+        self.window_beg = 0
+
+    @override
+    def force_position(self, position: int):
+        self.position = position
+        self.window_beg = (position + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE - self.attn_window_size
+        self.window_beg = max(self.window_beg, 0)
+
+    @override
+    def clone(self):
+        return SWA_RecurrentState(
+            self.position,
+            self.positions,
+            self.k_state.clone() if self.k_state is not None else None,
+            self.v_state.clone() if self.v_state is not None else None,
+            self.batched,
+            self.batch,
+            self.window_beg,
+            self.attn_window_size,
+            self.kept_window_size,
+        )
 
 
 class SlidingAttention(Module):
@@ -527,78 +552,127 @@ class SlidingAttention(Module):
 
         ro = []
         for i, rs in enumerate(rsb):
+            q_ = q[i:i+1]
+            k_ = k[i:i+1]
+            v_ = v[i:i+1]
 
-            # Limit window at the start of a new context
-            l_pad = max(self.kv_state_size - rs.position, 0)
-
+            # Create empty state if unitialized
             if rs.k_state is None:
-                # Create empty state from unitialized state
                 rs.k_state = torch.empty((1, self.kv_state_size, self.num_kv_heads, self.head_dim), dtype = torch.half, device = x.device)
                 rs.v_state = torch.empty((1, self.kv_state_size, self.num_kv_heads, self.head_dim), dtype = torch.half, device = x.device)
 
             k_state = rs.k_state
             v_state = rs.v_state
 
-            # If seqlen fits in extended state, update KV state inplace
-            if max(self.sliding_window - l_pad, 0) + seqlen < self.kv_state_size:
-                # TODO: this is a bottleneck, rework to use ring buffer with paged mode instead
-                k_state[:, :-seqlen, :, :].copy_(k_state[:, seqlen:, :, :].clone())
-                v_state[:, :-seqlen, :, :].copy_(v_state[:, seqlen:, :, :].clone())
-                k_state[:, -seqlen:, :, :].copy_(k[i : i + 1])
-                v_state[:, -seqlen:, :, :].copy_(v[i : i + 1])
-                truncate = False
-                l_pad = max(l_pad - seqlen, 0)
+            # Physical cache state
+            cache_beg = rs.window_beg
+            cache_pos = rs.position - cache_beg
+            cache_wpos = max(cache_pos - self.sliding_window, 0) // PAGE_SIZE * PAGE_SIZE
+            cache_hot = cache_pos - cache_wpos
 
-            # Otherwise create temp states
+            def pad(z):
+                return (z + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+            seqlen_pad = pad(seqlen)
+
+            # Case 1: new KV fits in cache without shifting
+            if cache_pos + seqlen <= self.kv_state_size:
+                shift = 0
+                wshift = 0
+                cache_seqlens = cache_pos
+                cache_seqlens_nc = cache_pos
+                temp_cache = False
+
+            # Case 2: new KV fits in cache if we shift
+            elif seqlen_pad <= self.sliding_window_overp - PAGE_SIZE:
+                shift = seqlen_pad
+                wshift = seqlen_pad
+                k_state[:, :-shift, :, :].copy_(k_state[:, shift:, :, :].clone())
+                v_state[:, :-shift, :, :].copy_(v_state[:, shift:, :, :].clone())
+                cache_seqlens = cache_pos - shift
+                cache_seqlens_nc = cache_pos - shift
+                temp_cache = False
+
+            # Case 3: temporary cache+kv fits in preallocated buffer
+            elif cache_hot + seqlen_pad <= self.stage_k.shape[1]:
+                if cache_hot:
+                    self.stage_k[:, :cache_hot].copy_(k_state[:, cache_wpos : cache_pos])
+                    self.stage_v[:, :cache_hot].copy_(v_state[:, cache_wpos : cache_pos])
+                self.stage_k[:, cache_hot : cache_hot + seqlen].copy_(k_)
+                self.stage_v[:, cache_hot : cache_hot + seqlen].copy_(v_)
+                k_state = self.stage_k
+                v_state = self.stage_v
+                k_ = None
+                v_ = None
+                cache_seqlens = cache_hot + seqlen
+                cache_seqlens_nc = cache_hot
+                shift = pad(cache_seqlens) - self.kv_state_size
+                wshift = shift + cache_wpos
+                temp_cache = True
+                # assert shift > 0
+
+            # Case 4: create new temp tensors
             else:
-                if self.kv_state_size + seqlen <= self.stage_k.shape[1]:
-                    self.stage_k[:, : self.kv_state_size].copy_(k_state)
-                    self.stage_v[:, : self.kv_state_size].copy_(v_state)
-                    self.stage_k[:, self.kv_state_size : self.kv_state_size + seqlen].copy_(k[i: i + 1])
-                    self.stage_v[:, self.kv_state_size : self.kv_state_size + seqlen].copy_(v[i: i + 1])
-                    k_state = self.stage_k[:, : self.kv_state_size + seqlen]
-                    v_state = self.stage_v[:, : self.kv_state_size + seqlen]
-                else:
-                    k_state = torch.cat((k_state[:, :], k[i: i + 1]), dim = 1)
-                    v_state = torch.cat((v_state[:, :], v[i: i + 1]), dim = 1)
-                truncate = True
+                k_state = torch.cat((k_state[:, cache_wpos : cache_pos], k_), dim = 1)
+                v_state = torch.cat((v_state[:, cache_wpos : cache_pos], v_), dim = 1)
+                k_ = None
+                v_ = None
+                cache_seqlens = cache_hot + seqlen
+                cache_seqlens_nc = cache_hot
+                shift = pad(cache_seqlens) - self.kv_state_size
+                wshift = shift + cache_wpos
+                temp_cache = True
+                assert shift > 0
 
-            q_ = q[i:i+1]
             if not non_causal_spans:
-                # Faster than flash_attn_func
                 o = flash_attn_with_kvcache(
                     q = q_,
-                    k_cache = k_state[:, l_pad :],
-                    v_cache = v_state[:, l_pad :],
+                    k = k_,
+                    v = v_,
+                    k_cache = k_state,
+                    v_cache = v_state,
                     causal = causal,
+                    cache_seqlens = cache_seqlens,
                     softmax_scale = self.sm_scale,
-                    window_size = (self.sliding_window, self.sliding_window),
+                    window_size = (self.sliding_window, 0),
                     softcap = self.logit_softcapping
                 )
             else:
                 o = []
                 for a, b, c in non_causal_spans:
+                    l = b - a
+                    if k_ is None:
+                        cache_seqlens_nc += l
                     o_ = flash_attn_with_kvcache(
                         q = q_[:, a : b],
-                        k_cache = k_state[:, l_pad + a : l_pad + b],
-                        v_cache = v_state[:, l_pad + a : l_pad + b],
+                        k = k_[:, a : b] if k_ is not None else None,
+                        v = v_[:, a : b] if v_ is not None else None,
+                        k_cache = k_state,
+                        v_cache = v_state,
                         causal = not c,
+                        cache_seqlens = cache_seqlens_nc,
                         softmax_scale = self.sm_scale,
-                        window_size = (self.sliding_window, self.sliding_window),
+                        window_size = (
+                            (max(self.sliding_window, l), l - 1)
+                            if c else
+                            (self.sliding_window, 0)
+                        ),
                         softcap = self.logit_softcapping
                     )
+                    if k_ is not None:
+                        cache_seqlens_nc += l
                     o.append(o_)
                 o = torch.cat(o, dim = 1)
             ro.append(o)
 
             # If KV not updated inplace, copy tail of extended temp tensors back into state
             # Copy inplace to keep tensors contiguous and to avoid fragmentation
-            if truncate:
-                rs.k_state.copy_(k_state[:, -self.kv_state_size:, :, :])
-                rs.v_state.copy_(v_state[:, -self.kv_state_size:, :, :])
+            if temp_cache:
+                rs.k_state.copy_(k_state[:, shift : shift + self.kv_state_size, :, :])
+                rs.v_state.copy_(v_state[:, shift : shift + self.kv_state_size, :, :])
 
             # Advance state
             rs.position += seqlen
+            rs.window_beg += wshift
 
             assert rs.k_state.shape[1] == self.kv_state_size
 
