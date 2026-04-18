@@ -97,7 +97,7 @@ setup(
         "exllamav3.loader",
         "exllamav3.util",
     ],
-    url="https://github.com/turboderp/exllamav3",
+    url="https://github.com/turboderp-org/exllamav3",
     license="MIT",
     author="turboderp",
     install_requires=[
