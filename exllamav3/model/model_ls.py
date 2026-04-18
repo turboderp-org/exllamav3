@@ -61,6 +61,7 @@ class Model_LSMixin:
         config: Config,
         modules: list,
         verbose: bool,
+        max_batch_size: int,
         cache_weakrefs: dict
     ):
         current_device_i = 0
@@ -146,16 +147,25 @@ class Model_LSMixin:
                         dummy_state = module.prepare_for_device(dummy_state, params)
                         dummy_state = module.forward(dummy_state, params)
 
+                        # Create extra dummy recurrent states to account for max_batch_size
+                        recurrent = params.get("recurrent_states")
+                        if recurrent:
+                            dummy_recurrent_states = []
+                            for _ in range(1, max_batch_size):
+                                s = {k: v.clone() for k, v in recurrent.items()}
+                                dummy_recurrent_states.append(s)
+                            del dummy_recurrent_states
+
                         # Account for max_output_factor after last layer,
-                        extra_dummy_states = None
+                        extra_dummy_out_states = None
                         if is_logits_layer:
-                            extra_dummy_states = [
+                            extra_dummy_out_states = [
                                 torch.empty_like(dummy_state)
                                 for _ in range(max_output_factor - 1)
                             ]
 
                         # Dereference extra dummy tensors
-                        extra_dummy_states = None
+                        extra_dummy_out_states = None
                         qcache_overhead = None
 
                         # We're good

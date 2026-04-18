@@ -38,6 +38,19 @@ class CacheableState(ABC):
         Clear this recurrent state (used during autosplit load)
         """
 
+    @abstractmethod
+    def force_position(self, position: int):
+        """
+        For testing/benchmark purposes, modify the state to mapping to a specific position. Actual state
+        value will be incorrect but state will be valid.
+        """
+
+    @abstractmethod
+    def clone(self):
+        """
+        Return a fully materialized clone of this state
+        """
+
 
 class RecurrentCache(OrderedDict):
     def __init__(
@@ -51,6 +64,7 @@ class RecurrentCache(OrderedDict):
         self.model = model
 
         # Get device map needed for unstashing
+        self.model = model
         self.rl = model.get_recurrent_layers()
         self.device_map = {m.layer_idx: m.device for m in self.rl}
 
@@ -123,5 +137,4 @@ class RecurrentCache(OrderedDict):
         """
         Create an empty recurrent state compatible with the associated model
         """
-        new_state = {m.layer_idx: m.new_recurrent_state() for m in self.rl}
-        return new_state
+        return self.model.get_empty_state()

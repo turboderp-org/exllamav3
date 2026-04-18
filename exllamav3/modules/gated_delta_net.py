@@ -238,6 +238,20 @@ class GDN_RecurrentState(CacheableState):
         self.last_conv_state = None
         self.last_recurrent_state = None
 
+    @override
+    def force_position(self, position: int):
+        self.position = position
+
+    @override
+    def clone(self):
+        return GDN_RecurrentState(
+            self.position,
+            self.positions,
+            self.last_conv_state.clone() if self.last_conv_state is not None else None,
+            self.last_recurrent_state.clone() if self.last_recurrent_state is not None else None,
+            self.batched,
+        )
+
 
 class GatedDeltaNet(Module):
 

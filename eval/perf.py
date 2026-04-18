@@ -31,11 +31,7 @@ def get_lengths(max_length):
     return lengths
 
 
-faux_recurrent_states = None
-
-
 def measure_prefill(args, model, cache, warmup = False):
-    global faux_recurrent_states
     chunk_size = args.chunk_size
     lengths = get_lengths(chunk_size if warmup else args.max_length)
 
@@ -52,22 +48,17 @@ def measure_prefill(args, model, cache, warmup = False):
                     pre_time = (length // 2) / results[length // 2]
                     start = length // 2
                 chunks = [(i, min(i + chunk_size, end)) for i in range(start, end, chunk_size)]
+                recurrent = model.get_empty_state(start)
                 for start, end in chunks:
                     params = {
                         "attn_mode": "flash_attn",
                         "cache": cache,
                         "past_len": start,
                         "batch_shape": (1, max(length, 256)),
+                        "recurrent_states": recurrent,
                     }
-                    if "recurrent_states" in model.caps and start > 0:
-                        for v in faux_recurrent_states.values():
-                            v.position = start
-                        params.update({
-                            "recurrent_states": faux_recurrent_states
-                        })
                     model.prefill(cached_ids(end - start), params)
-                    if "recurrent_states" in params and faux_recurrent_states is None:
-                        faux_recurrent_states = params["recurrent_states"]
+                    recurrent = params.get("recurrent_states")
                 cuda_sync_active()
 
             results[length] = length / (pre_time + t.interval)
@@ -80,7 +71,6 @@ def measure_prefill(args, model, cache, warmup = False):
 
 
 def measure_generate(args, model, cache, warmup = False):
-    global faux_recurrent_states
     chunk_size = args.chunk_size
     lengths = [0] + get_lengths(chunk_size if warmup else args.max_length - 256)
     progress = 0
@@ -88,25 +78,22 @@ def measure_generate(args, model, cache, warmup = False):
     max_progress = len(lengths)
     with (ProgressBar("Warmup" if warmup else "Generate", max_progress) as pb):
         for length in lengths:
+            recurrent = model.get_empty_state(length)
             torch.cuda.synchronize()
             with Timer() as t:
-                for _ in range(100):
+                for i in range(100):
                     params = {
                         "attn_mode": "flash_attn",
                         "cache": cache,
-                        "past_len": length,
+                        "past_len": length + i,
                         "batch_shape": (1, max(length + 256, 256)),
+                        "recurrent_states": recurrent
                     }
-                    if "recurrent_states" in model.caps and length > 0:
-                        for v in faux_recurrent_states.values():
-                            v.position = length
-                        params.update({
-                            "recurrent_states": faux_recurrent_states
-                        })
                     logits = model.forward(cached_ids(1), params)
                     sample = torch.argmax(logits)
                     sample = sample.cpu()  # force sync
                     del logits
+                    recurrent = params.get("recurrent_states")
             results[length] = 100 / t.interval
             if not warmup:
                 print(f"Context {length: 6}: {col_green}{results[length]:10.2f}{col_default} tokens/s")
