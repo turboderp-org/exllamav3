@@ -226,6 +226,7 @@ class Attention(Module):
         self.rope = None
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
+        self.sliding_window_0 = min(sliding_window, 0)
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
         self.ve_gate = ve_gate
@@ -754,7 +755,7 @@ class Attention(Module):
                 max_seqlen_k = max_seqlen,
                 causal = causal,
                 softmax_scale = self.sm_scale,
-                window_size = (self.sliding_window, self.sliding_window),
+                window_size = (self.sliding_window, self.sliding_window_0),
                 softcap = self.logit_softcapping
             )
         else:
@@ -764,7 +765,7 @@ class Attention(Module):
                 v = v,
                 causal = causal,
                 softmax_scale = self.sm_scale,
-                window_size = (self.sliding_window, self.sliding_window),
+                window_size = (self.sliding_window, self.sliding_window_0),
                 softcap = self.logit_softcapping
             )
 
@@ -850,12 +851,13 @@ class Attention(Module):
                 cache_seqlens = cache_seqlens,
                 causal = causal,
                 softmax_scale = self.sm_scale,
-                window_size = (self.sliding_window, self.sliding_window),
+                window_size = (self.sliding_window, self.sliding_window_0),
                 softcap = self.logit_softcapping
             )
         else:
             o = []
-            for a, b, c in non_causal_spans:
+            for a, b, nc in non_causal_spans:
+                l = b - a
                 o_ = fn(
                     q = q[:, a : b],
                     k = k[:, a : b],
@@ -864,9 +866,13 @@ class Attention(Module):
                     v_cache = cache_v,
                     block_table = block_table,
                     cache_seqlens = cache_seqlens + a,
-                    causal = not c,
+                    causal = not nc,
                     softmax_scale = self.sm_scale,
-                    window_size = (self.sliding_window, self.sliding_window),
+                    window_size = (
+                        (max(self.sliding_window, l), l - 1 if nc else 0)
+                        if self.sliding_window > 0 and nc else
+                        (self.sliding_window, self.sliding_window_0)
+                    ),
                     softcap = self.logit_softcapping
                 )
                 o.append(o_)
