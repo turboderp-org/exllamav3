@@ -110,6 +110,7 @@ class SWA_RecurrentState(CacheableState):
         self.k_state = None
         self.v_state = None
         self.window_beg = 0
+        self.position = 0
 
     @override
     def force_position(self, position: int):
