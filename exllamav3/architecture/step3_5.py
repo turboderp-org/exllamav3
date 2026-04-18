@@ -1,10 +1,21 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+
+from ..cache.recurrent_util import prepare_for_recurrence
 from ..model.config import Config, no_default
 from ..model.model import Model
 from ..util.rope import RopeStyle, RoPE
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, BlockSparseMLP, Linear, GatedMLP
+from ..modules import (
+    RMSNorm,
+    Embedding,
+    TransformerBlock,
+    Attention,
+    BlockSparseMLP,
+    Linear,
+    GatedMLP,
+    SlidingAttention
+)
 from ..modules.attn import prepare_for_attn
 
 class Step3_5Config(Config):
@@ -85,9 +96,11 @@ class Step3_5Model(Model):
         self,
         config: Step3_5Config,
         key_prefix: str = "model",
+        swa_full: bool = False,
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        self.swa_full = swa_full
 
         self.modules += [
             Embedding(
@@ -147,6 +160,39 @@ class Step3_5Model(Model):
                         ),
                         out_dtype = torch.float,
                         tp_split_norm = False,
+                        select_hq_bits = 2,
+                    )
+                    if swa_full or not is_swa else
+                    SlidingAttention(
+                        config = config,
+                        key = f"{key_prefix}.layers.{idx}.self_attn",
+                        layer_idx = idx,
+                        hidden_size = config.hidden_size,
+                        head_dim = config.head_dim,
+                        num_q_heads = config.num_q_heads if not is_swa else config.alt_num_q_heads,
+                        num_kv_heads = config.num_kv_heads if not is_swa else config.alt_num_kv_heads,
+                        rope_settings = config.rope_settings_list[idx],
+                        sm_scale = None,
+                        sliding_window = config.sliding_window if is_swa else -1,
+                        key_q = "q_proj",
+                        key_k = "k_proj",
+                        key_v = "v_proj",
+                        key_o = "o_proj",
+                        key_g = "g_proj",
+                        qmap = "block.attn",
+                        q_norm = RMSNorm(
+                            config = config,
+                            key = f"{key_prefix}.layers.{idx}.self_attn.q_norm",
+                            rms_norm_eps = config.rms_norm_eps,
+                            constant_bias = 1.0,
+                        ),
+                        k_norm = RMSNorm(
+                            config = config,
+                            key = f"{key_prefix}.layers.{idx}.self_attn.k_norm",
+                            rms_norm_eps = config.rms_norm_eps,
+                            constant_bias = 1.0,
+                        ),
+                        out_dtype = torch.float,
                         select_hq_bits = 2,
                     ),
                     mlp_norm = RMSNorm(
@@ -243,9 +289,19 @@ class Step3_5Model(Model):
         # Activate all experts during H capture pass in quantization
         self.calibration_all_experts = True
 
+        # SWA layers are recurrent, optionally. Checkpoints are expensive so default to a longer interval
+        if not self.swa_full:
+            self.caps.update({
+                "supports_tp": False,
+                "recurrent_states": True,
+                "default_recurrent_checkpoint_interval": 6144,
+            })
+
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        if not self.swa_full:
+            prepare_for_recurrence(input_ids, params, self)
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 

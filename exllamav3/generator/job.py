@@ -1112,7 +1112,8 @@ class Job:
                     self.recurrent_state = self.generator.recurrent_cache.get_empty_state()
                 else:
                     self.recurrent_state = self.generator.recurrent_cache.get_unstashed(recurrent_state, cached_pages * PAGE_SIZE)
-                    self.last_recurrent_checkpoint_pos = self.recurrent_state[0].position
+                    first_rec_layer_state = next(iter(self.recurrent_state.values()))
+                    self.last_recurrent_checkpoint_pos = first_rec_layer_state.position
 
             # Metrics
             self.cached_pages += cached_pages
@@ -1156,7 +1157,9 @@ class Job:
             last_page = (seq.kv_position - 1) // PAGE_SIZE
 
             # Collect valid checkpoint positions
-            max_offset = self.recurrent_state[0].get_cachable_interval()
+
+            first_rec_layer_state = next(iter(self.recurrent_state.values()))
+            max_offset = first_rec_layer_state.get_cachable_interval()
             hashes = []
             for page_offset, offset in enumerate(range(0, max_offset + 1, PAGE_SIZE)):
                 if last_page - page_offset < 0:

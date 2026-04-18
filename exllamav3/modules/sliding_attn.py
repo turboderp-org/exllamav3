@@ -149,6 +149,7 @@ class SlidingAttention(Module):
         key_k: str | None = None,
         key_v: str | None = None,
         key_o: str | None = None,
+        key_g: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
@@ -161,6 +162,7 @@ class SlidingAttention(Module):
         k_proj: Linear | Module | None = None,
         v_proj: Linear | Module | None = None,
         o_proj: Linear | Module | None = None,
+        g_proj: Linear | Module | None = None,
         post_rope_norm: bool = False,
         select_hq_bits: int = 0,
     ):
@@ -292,6 +294,20 @@ class SlidingAttention(Module):
         else:
             self.v_norm = None
 
+        # Register headwise gate
+        if key_g:
+            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, num_q_heads, qmap = None, out_dtype = torch.half, pad_to = 1)
+            self.headwise_gate = True
+            self.register_submodule(self.g_proj)
+        else:
+            if g_proj:
+                self.g_proj = g_proj
+                self.headwise_gate = True
+                self.register_submodule(self.g_proj)
+            else:
+                self.g_proj = None
+                self.headwise_gate = False
+
         self.caps.update({
             "recurrent_cache": True,
             "sliding_window_overp": sliding_window_overp
@@ -408,6 +424,11 @@ class SlidingAttention(Module):
         bsz, q_len, dim = x.shape
         q = self.q_proj.forward(x, params)
 
+        if self.g_proj:
+            g = self.g_proj.forward(x, params)
+        else:
+            g = None
+
         if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
             v = self.v_proj.forward(x, params)
@@ -443,7 +464,7 @@ class SlidingAttention(Module):
         if self.v_norm is not None:
             v = self.v_norm.forward(v, params, out_dtype = torch.half)
 
-        return q, k, v
+        return q, k, v, g
 
 
     def project_o(self, o: torch.Tensor, bsz: int, seqlen: int, params: dict) -> torch.Tensor:
@@ -465,7 +486,7 @@ class SlidingAttention(Module):
         position_ids = get_for_device(params, "position_ids", self.device, None)
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
 
-        q, k, v = self.project_qkv(x, params)
+        q, k, v, g = self.project_qkv(x, params)
 
         if self.q_norm:
             if not self.rope or self.q_norm_tensor is None:
@@ -497,6 +518,7 @@ class SlidingAttention(Module):
             softcap = self.logit_softcapping
         )
 
+        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -516,7 +538,7 @@ class SlidingAttention(Module):
         causal = params.get("causal", True)
         non_causal_spans = params.get("non_causal_spans")
 
-        q, k, v = self.project_qkv(x, params)
+        q, k, v, g = self.project_qkv(x, params)
 
         if self.q_norm:
             if not self.rope or self.q_norm_tensor is None:
@@ -680,6 +702,7 @@ class SlidingAttention(Module):
         o = torch.cat(ro, dim = 0) if len(ro) > 1 else o
         assert o.shape[1] == seqlen
 
+        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         o = self.project_o(o, bsz, seqlen, params)
         return o
