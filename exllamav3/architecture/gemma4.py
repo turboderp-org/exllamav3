@@ -441,7 +441,7 @@ def _prepare_noncausal_mm_spans(input_ids, params):
         (int(start), int(end), bool(val))
         for start, end, val in zip(boundaries[:-1], boundaries[1:], values)
     ]
-    if spans and spans[0][2]:
+    if (len(spans) > 0 and spans[0][2]) or len(spans) > 1:
         assert input_ids.shape[0] == 1, "Gemma4 does not support batched multimodal prefill"
         params["non_causal_spans"] = spans
 
