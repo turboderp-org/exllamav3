@@ -13,7 +13,8 @@ def add_args(
     default_cache_size = 8192,
     add_sampling_args: bool = False,
     default_sampling_args: dict = None,
-    default_autosplit_max_batch_size: int = 1
+    default_autosplit_max_batch_size: int = 1,
+    add_draft_model_args: bool = False,
 ):
     """
     Add standard model loading arguments to command line parser
@@ -35,6 +36,9 @@ def add_args(
 
     :param default_sampling_args:
         dict of default values
+
+    :param add_draft_model_args:
+        bool, add draft model args. If True, init() will return draft_model and draft_config as well
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
@@ -82,6 +86,10 @@ def add_args(
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
+
+    if add_draft_model_args:
+        parser.add_argument("-dm", "--draft_model_dir", type = str, help = "Path to draft model directory", default = None)
+        parser.add_argument("-ndt", "--num_draft_tokens", type = int, help = "Number of draft tokens (default: 4)", default = 4)
 
 
 def get_arg_sampler(args):
@@ -142,18 +150,24 @@ def init(
         Additional parameters to forwart to Model.load()
 
     :return:
-        tuple of (Model, Config, Cache | None, Tokenizer | None)
+        tuple of (Model, Config, Cache | None, Tokenizer | None)  or
+        tuple of (Model, Config, Cache | None, Tokenizer | None, Model, Config, Cache | None) if draft model args enabled
     """
 
     def printp(p: bool, s: str):
         if p: print(s)
 
+    return_draft = "draft_model_dir" in args
+    draft_model_dir = args.draft_model_dir if return_draft else None
+
     # Config
     config = Config.from_directory(args.model_dir)
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
+    draft_config = Config.from_directory(draft_model_dir) if draft_model_dir else None
 
     # Override tensors
     if args.override:
+        assert not draft_model_dir, "Tensor overrides not supported when loading with draft model"
         with open(args.override, "r") as f:
             comp = yaml.safe_load(f)
         sources = {s["id"]: s["model_dir"] for s in comp["sources"]}
@@ -174,6 +188,7 @@ def init(
 
     # Model instance
     model = Model.from_config(config, swa_full = args.swa_full)
+    draft_model = Model.from_config(draft_config, swa_full = args.swa_full) if draft_model_dir else None
 
     # Cache
     if "cache_size" in vars(args):
@@ -192,14 +207,27 @@ def init(
                 k_bits = k_bits,
                 v_bits = v_bits
             )
+            draft_cache = Cache(
+                draft_model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_quant,
+                k_bits = k_bits,
+                v_bits = v_bits
+            ) if draft_model_dir else None
         else:
             cache = Cache(
                 model,
                 max_num_tokens = args.cache_size,
                 layer_type = CacheLayer_fp16
             )
+            draft_cache = Cache(
+                draft_model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_fp16
+            ) if draft_model_dir else None
     else:
         cache = None
+        draft_cache = None
 
     # Split
     if args.gpu_split is None or args.gpu_split == "auto":
@@ -226,6 +254,17 @@ def init(
     if len(tp_dev_limits) and not args.tensor_parallel:
         printp(not quiet, " !! Warning, parallelism are do not applied to layer-split model")
 
+    # Load draft model
+    if draft_model_dir:
+        printp(not quiet, f" -- Loading {draft_model_dir}")
+        draft_model.load(
+            use_per_device = split,
+            progressbar = progress,
+            verbose = args.load_verbose,
+            max_batch_size = args.autosplit_max_batch_size,
+            **kwargs
+        )
+
     # Load model
     printp(not quiet, f" -- Loading {args.model_dir}")
     model.load(
@@ -251,4 +290,7 @@ def init(
     if args.load_metrics:
         config.stc.metrics.print()
 
-    return model, config, cache, tokenizer
+    if return_draft:
+        return model, config, cache, tokenizer, draft_model, draft_config, draft_cache
+    else:
+        return model, config, cache, tokenizer

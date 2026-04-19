@@ -47,7 +47,7 @@ def main(args):
     add_bos = prompt_format.add_bos()
 
     # Load model
-    model, config, cache, tokenizer = model_init.init(args)
+    model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
     context_length = cache.max_num_tokens
 
     # Generator
@@ -55,6 +55,9 @@ def main(args):
         model = model,
         cache = cache,
         tokenizer = tokenizer,
+        draft_model = draft_model,
+        draft_cache = draft_cache,
+        num_draft_tokens = args.num_draft_tokens,
     )
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
     if config.eos_token_id_list and all(config.eos_token_id_list):
@@ -432,7 +435,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    model_init.add_args(parser, cache = True, add_sampling_args = True)
+    model_init.add_args(parser, cache = True, add_sampling_args = True, add_draft_model_args = True)
     parser.add_argument("-mode", "--mode", type = str, help = "Prompt mode", default = None)
     parser.add_argument("-modes", "--modes", action = "store_true", help = "List available prompt modes and exit")
     parser.add_argument("-un", "--user_name", type = str, default = "User", help = "User name (raw mode only)")
