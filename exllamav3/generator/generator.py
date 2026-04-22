@@ -34,6 +34,7 @@ class Generator:
         enable_defrag: bool = True,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
+        ngram_match_min: int = 0,
         **kwargs
     ):
         """
@@ -71,6 +72,9 @@ class Generator:
         :param num_draft_tokens:
             Number of future tokens to draft.
 
+        :param ngram_match_min:
+            Minimum number of tokens to match for n-gram draft (0 = disabled).
+
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
 
@@ -102,17 +106,23 @@ class Generator:
         self.draft_model = draft_model
         self.draft_cache = draft_cache
         if draft_model:
+            assert not ngram_match_min, \
+                "Cannot use both draft model and n-gram draft."
             assert num_draft_tokens <= max_q_size, \
                 "num_draft_tokens cannot be larger than max_q_size."
             assert draft_cache is not None, \
                 "Must supply cache for draft model"
             assert draft_cache.max_num_tokens == cache.max_num_tokens, \
                 "Cache and draft cache must be same size"
-            assert not model.caps.get("recurrent_states"), \
-                "Speculative decoding with draft model not supported for recurrent model."
+            assert not draft_model.caps.get("recurrent_states"), \
+                "Speculative decoding with recurrent draft model not supported."
+            self.num_draft_tokens = num_draft_tokens
+        elif ngram_match_min:
             self.num_draft_tokens = num_draft_tokens
         else:
             self.num_draft_tokens = 0
+
+        self.ngram_match_min = ngram_match_min
 
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
@@ -128,7 +138,7 @@ class Generator:
         self.filter_queue = []
 
         # Buffers
-        if draft_model:
+        if draft_model or ngram_match_min:
             self.draft_input_ids_pinned = torch.empty(
                 (max_batch_size, 1),
                 dtype = torch.long,
@@ -312,6 +322,11 @@ class Generator:
             draft_tokens = self.iterate_draftmodel_gen(results)
             self.iterate_gen(results, draft_tokens)
 
+        # Generation with n-gram draft
+        if self.ngram_match_min:
+            draft_tokens = self.iterate_ngram_gen(results)
+            self.iterate_gen(results, draft_tokens)
+
         # Regular generation
         else:
             self.iterate_gen(results)
@@ -414,6 +429,34 @@ class Generator:
         return self.draft_ids_pinned
 
 
+    def iterate_ngram_gen(self, results: list):
+
+         # Get shape of active batch
+        batch_size = 0
+        max_seq_len = 0
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
+            batch_size += 1
+        if batch_size == 0:
+            return None
+
+        # Generate draft
+        draft_ids = []
+        min_len = self.num_draft_tokens
+        for job in self.active_jobs:
+            d = job.get_ngram_draft(self.num_draft_tokens)
+            min_len = min(min_len, d.shape[-1])
+            draft_ids.append(d)
+
+        if min_len == 0:
+            return None
+
+        # Trim to minimum length in batch
+        draft_ids = torch.cat([d[:, :min_len] for d in draft_ids], dim = 0)
+        return draft_ids
+
+
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
 
         # Get shape of active batch
@@ -495,16 +538,9 @@ class Generator:
                 "recurrent_states": batch_states,
                 "indexed_embeddings": active_embeddings,
                 "positions": positions,
+                "recurrent_history": draft_tokens is not None,
             }
         )
-
-        # Split batched recurrent states
-        if self.recurrent_cache is not None:
-            if batch_size > 1:
-                for key, v in batch_states.items():
-                    v.distribute_batch([s[key] for s in states])
-                del batch_states
-                del states
 
         # Run foreground filters here, while GPU workload is queued up and running
         for job in batch_jobs:
@@ -528,7 +564,7 @@ class Generator:
         completed_jobs = []
         requeuing_jobs = []
         j = 0
-        for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+        for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
             if a == b: continue
             job_logits = batch_logits[a:b, :, :]
 

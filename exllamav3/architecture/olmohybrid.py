@@ -235,7 +235,10 @@ class OlmoHybridModel(Model):
         self.logit_layer_idx = len(self.modules) - 1
 
         # Mark that we need recurrent cache for generation
-        self.caps.update({"recurrent_states": True})
+        self.caps.update({
+            "recurrent_states": True,
+            "linear_attn": True,
+        })
 
         # TP for this architecture is not implemented yet
         self.caps.update({"supports_tp": False})

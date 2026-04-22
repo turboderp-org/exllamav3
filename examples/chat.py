@@ -58,6 +58,7 @@ def main(args):
         draft_model = draft_model,
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
+        ngram_match_min = args.ngram_match_min,
     )
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
     if config.eos_token_id_list and all(config.eos_token_id_list):
@@ -397,12 +398,18 @@ def main(args):
             prompt_tps = new_ctx_tokens / r["time_prefill"]
             new_tokens = r["new_tokens"]
             tps = new_tokens / r["time_generate"]
-            print(
-                "\n"
-                f"Context: {col_info}{new_ctx_tokens:,}{col_default} new tokens at {col_info}{prompt_tps:.3f}{col_default} t/s - "
-                f"{col_info}{cached_tokens:,}{col_default} tokens cached - "
-                f"Generate: {col_info}{new_tokens:,}{col_default} tokens at {col_info}{tps:.3f}{col_default} t/s"
-            )
+            rstr = f"\nContext: {col_info}{new_ctx_tokens:,}{col_default} new tokens at {col_info}{prompt_tps:.2f}{col_default} t/s"
+            rstr += f" - {col_info}{cached_tokens:,}{col_default} tokens cached"
+            rstr += f" - Generate: {col_info}{new_tokens:,}{col_default} tokens at {col_info}{tps:.2f}{col_default} t/s"
+            if "accepted_draft_tokens" in r:
+                dacc = r["accepted_draft_tokens"]
+                drej = r["rejected_draft_tokens"]
+                dtot = dacc + drej
+                rstr += f" - Draft: {col_info}{dacc:,}{col_default} / {col_info}{dtot:,}{col_default} accepted"
+                if dtot > 0:
+                    rstr += f" ({col_info}{dacc/dtot*100.0:.2f}{col_default}%)"
+            print(rstr)
+
 
         if save_probs:
             print_probs(saved_topk, saved_probs, saved_samples, tokenizer.get_id_to_piece_list())
@@ -457,5 +464,6 @@ if __name__ == "__main__":
     parser.add_argument("-ups", "--updates-per-second", type = int, help = "Max number of console updates per second (markdown console), default: 30", default = 30)
     parser.add_argument("-lw", "--loop_window", type = int, help = "Loop detection window in tokens, default = 300", default = 300)
     parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
+    parser.add_argument("-ngram_min", "--ngram_match_min", type = int, help = "N-gram draft minimum match length, default = 0 (disabled)", default = 0)
     _args = parser.parse_args()
     main(_args)

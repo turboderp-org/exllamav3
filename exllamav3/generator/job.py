@@ -290,6 +290,9 @@ class Job:
             assert 1 < min_reps < window_size, "Number of reps must be > 1, < window_size"
             self.loop_detector = LoopDetector(window_size, window_size // min_reps)
 
+        # N-gram automaton
+        self.sam = rq_state.get("sam", None)
+
 
     def get_pinned_logit_mask(self):
         if self.pinned_logit_mask is None:
@@ -611,7 +614,7 @@ class Job:
                     "cached_pages": self.cached_pages // len(self.sequences),
                     "cached_tokens": (self.cached_pages * PAGE_SIZE + self.cached_tokens) // len(self.sequences),
                 })
-                if self.generator.draft_model:
+                if self.generator.draft_model or self.generator.ngram_match_min:
                     r.update({
                         "accepted_draft_tokens": self.accepted_draft_tokens,
                         "rejected_draft_tokens": self.rejected_draft_tokens
@@ -815,6 +818,7 @@ class Job:
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
             "rq_new_tokens": self.new_tokens - 1,
+            "sam": self.sam
         }
 
         serial_number = self.serial_number
@@ -896,6 +900,7 @@ class Job:
             self.held_probs = SeqTensor((1, 0), dtype = torch.float, seq_dim = -1)
             self.held_logits = SeqTensor((1, 0, self.generator.padded_vocab_size), dtype = torch.float, seq_dim = 1)
             self.full_completion = ""
+            self.sam = None if not generator.ngram_match_min else ext.BC_SAM()
 
         self.time_enqueue = time.time()
 
@@ -1178,3 +1183,19 @@ class Job:
 
     def free_recurrent_state(self):
         self.recurrent_state = None
+
+
+    def get_ngram_draft(self, draft_length: int):
+        assert self.sam
+
+        # Update SAM with current history and find longest suffix
+        seq = self.sequences[0].sequence_ids.torch()
+        beg, end = self.sam.accept_tensor(seq)
+
+        # Grab continuation after longest match or return empty seq
+        if end - beg >= self.generator.ngram_match_min:
+            draft = seq[:, end : end + self.generator.num_draft_tokens]
+        else:
+            draft = torch.empty((1, 0), dtype = torch.long)
+
+        return draft

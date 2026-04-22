@@ -223,6 +223,7 @@ class Qwen3NextModel(Model):
         self.caps.update({
             "recurrent_states": True,
             "default_recurrent_checkpoint_interval": 2048,
+            "linear_attn": True,
         })
 
         # TODO: Enable TP for linear attn

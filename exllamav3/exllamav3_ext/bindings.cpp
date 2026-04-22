@@ -14,7 +14,6 @@
 #include "softcap.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
-#include "causal_conv1d.cuh"
 #include "add.cuh"
 
 #include "quant/quantize.cuh"
@@ -52,6 +51,8 @@
 #include "libtorch/blocksparse_mlp.h"
 
 #include "attention.cuh"
+
+#include "sam.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -148,4 +149,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
+    #include "sam_bc.h"
 }
