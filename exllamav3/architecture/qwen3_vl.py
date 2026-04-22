@@ -194,6 +194,7 @@ class Qwen3VLVisionModel(Model):
                 TransformerBlock(
                     config = config,
                     key = f"{key_prefix}.blocks.{idx}",
+                    layer_idx = idx,
                     attn_norm = LayerNorm(
                         config = config,
                         key = f"{key_prefix}.blocks.{idx}.norm1",

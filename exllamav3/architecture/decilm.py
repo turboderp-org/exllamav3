@@ -138,6 +138,7 @@ class DeciLMModel(Model):
                 TransformerBlock(
                     config = config,
                     key = f"model.layers.{idx}",
+                    layer_idx = idx,
                     attn_norm = attn_norm,
                     attn = attn,
                     mlp_norm = mlp_norm,

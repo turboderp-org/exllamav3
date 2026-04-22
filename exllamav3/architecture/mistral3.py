@@ -148,6 +148,7 @@ class Mistral3Model(Model):
             TransformerBlock(
                 config = config,
                 key = key_prefix + f"model.layers.{idx}",
+                layer_idx = idx,
                 attn_norm = RMSNorm(
                     config = config,
                     key = key_prefix + f"model.layers.{idx}.input_layernorm",
@@ -272,6 +273,7 @@ class Mistral3VisionModel(Model):
             TransformerBlock(
                 config = config,
                 key = key_prefix + f"transformer.layers.{idx}",
+                layer_idx = idx,
                 attn_norm = RMSNorm(
                     config = config,
                     key = key_prefix + f"transformer.layers.{idx}.attention_norm",

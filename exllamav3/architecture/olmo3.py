@@ -88,6 +88,7 @@ class Olmo3Model(Model):
                 TransformerBlock(
                     config = config,
                     key = f"{key_prefix}.layers.{idx}",
+                    layer_idx = idx,
                     attn = Attention(
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.self_attn",

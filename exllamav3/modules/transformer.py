@@ -194,6 +194,7 @@ class TransformerBlock(Module):
             "cls": TransformerBlock,
             "kwargs": {
                 "key": self.key,
+                "layer_idx": self.layer_idx,
                 "out_dtype": self.out_dtype,
             },
             **{name: _export(getattr(self, name, None)) for name in (
@@ -237,6 +238,7 @@ class ParallelDecoderBlock(Module):
         self,
         config: Config | None,
         key: str,
+        layer_idx: int | None = None,
         input_norm: RMSNorm | LayerNorm | None = None,
         attn: Attention | None = None,
         mlp: MLP | GatedMLP | None = None,
@@ -246,6 +248,7 @@ class ParallelDecoderBlock(Module):
     ):
         super().__init__(config, key, None)
 
+        self.layer_idx = layer_idx
         self.input_norm = input_norm
         self.attn = attn
         self.mlp = mlp
@@ -309,6 +312,7 @@ class ParallelDecoderBlock(Module):
             "cls": ParallelDecoderBlock,
             "kwargs": {
                 "key": self.key,
+                "layer_idx": self.layer_idx,
                 "out_dtype": self.out_dtype,
             },
             **{name: _export(getattr(self, name, None)) for name in (

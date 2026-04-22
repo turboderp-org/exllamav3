@@ -75,6 +75,7 @@ class CohereModel(Model):
             ParallelDecoderBlock(
                 config = config,
                 key = f"model.layers.{idx}",
+                layer_idx = idx,
                 out_dtype = torch.float,
                 input_norm = LayerNorm(
                     config = config,

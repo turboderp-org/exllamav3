@@ -83,6 +83,7 @@ class Glm4MoeModel(Model):
             TransformerBlock(
                 config = config,
                 key = f"{key_prefix}.layers.{idx}",
+                layer_idx = idx,
                 attn_norm = RMSNorm(
                     config = config,
                     key = f"{key_prefix}.layers.{idx}.input_layernorm",
