@@ -132,6 +132,12 @@ class SWA_RecurrentState(CacheableState):
             self.kept_window_size,
         )
 
+    @override
+    def rewind(self, count: int):
+        assert not self.batched
+        assert count <= self.position - self.window_beg
+        self.position -= count
+
 
 class SlidingAttention(Module):
 

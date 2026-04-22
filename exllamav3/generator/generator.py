@@ -595,8 +595,18 @@ class Generator:
                 # Continue sampling from logit batch as long as result matches draft
                 if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                     if draft_tokens[j, i].item() != sampled_token.item():
+
+                        # Count rejected draft tokens
                         rejected = batch_logits.shape[1] - 1 - i
                         job.rejected_draft_tokens += rejected
+
+                        # Rewind recurrent states
+                        if rejected:
+                            for layer, bs in batch_states.items() if batch_states is not None else {}.items():
+                                assert len(job.sequences) == 1
+                                (bs[idx] if batch_size > 1 else bs).rewind(rejected)
+
+                        # Rewind cache position (draft model cache layout is always the same as target)
                         for seq in job.sequences:
                             r = rejected
                             while r:
@@ -606,9 +616,19 @@ class Generator:
                                 page.kv_position -= rp
                                 r -= rp
                         break
+
+                    # Accept draft token
                     else:
                         job.accepted_draft_tokens += 1
             j += 1
+
+        # Split batched recurrent states
+        if self.recurrent_cache is not None:
+            if batch_size > 1:
+                for key, v in batch_states.items():
+                    v.distribute_batch([s[key] for s in states])
+                del batch_states
+                del states
 
         # Release pages for completed jobs
         num_jobs = self.num_remaining_jobs()

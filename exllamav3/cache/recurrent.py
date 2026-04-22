@@ -51,6 +51,10 @@ class CacheableState(ABC):
         Return a fully materialized clone of this state
         """
 
+    @abstractmethod
+    def rewind(self, count: int):
+        pass
+
 
 class RecurrentCache(OrderedDict):
     def __init__(

@@ -50,6 +50,25 @@ def causal_conv1d_fwd_function_torch(
     return y
 
 
+def causal_conv1d_update_with_history(
+    x,
+    conv_state,
+    weight,
+    bias,
+):
+    # TODO: Could use static buffer and skip the concat, investigate if causal_conv1d_cu can return longer state
+    bsz, dim, seq_len = x.shape
+    state_len = conv_state.shape[-1]
+
+    y = torch.cat([conv_state, x], dim = -1).to(weight.dtype)
+    conv_state.copy_(y[:, :, -state_len:])
+    conv_state_history = y
+    y = F.conv1d(y, weight.unsqueeze(1), bias, padding = 0, groups = dim)
+    y = F.silu(y[:, :, -seq_len:])
+    y = y.to(x.dtype)
+    return y, conv_state_history
+
+
 def causal_conv1d_update_function_cu(
     x,
     conv_state,
@@ -186,6 +205,9 @@ class GDN_RecurrentState(CacheableState):
         self.last_conv_state = last_conv_state
         self.last_recurrent_state = last_recurrent_state
         self.batched = batched
+        self.batch = None
+        self.history = None
+        self.conv_history = None
 
     @override
     def stash(self):
@@ -222,6 +244,7 @@ class GDN_RecurrentState(CacheableState):
         return 0
 
     def collect_batch(self, batch: list[GDN_RecurrentState]):
+        self.batch = batch
         lcs = torch.cat([b.last_conv_state for b in batch], dim = 0)
         lrs = torch.cat([b.last_recurrent_state for b in batch], dim = 0)
         positions = [b.position for b in batch]
@@ -251,6 +274,15 @@ class GDN_RecurrentState(CacheableState):
             self.last_recurrent_state.clone() if self.last_recurrent_state is not None else None,
             self.batched,
         )
+
+    @override
+    def rewind(self, count: int):
+        assert self.history is not None
+        assert not self.batched and self.batch is None
+        if count == 0: return
+        self.last_recurrent_state[0].copy_(self.history[0, -count])
+        cdim = self.last_conv_state.shape[-1]
+        self.last_conv_state[0].copy_(self.conv_history[0, :, -count - cdim : -count])
 
 
 class GatedDeltaNet(Module):
@@ -555,6 +587,7 @@ class GatedDeltaNet(Module):
     ) -> torch.Tensor:
 
         bsz, seqlen, _ = x.shape
+        save_history = params.get("recurrent_history", False)
 
         # Post load, fuse conv1d weights if needed
         if self.conv1d_weight is None:
@@ -585,9 +618,10 @@ class GatedDeltaNet(Module):
             conv_state = None
             recurrent_state = None
             save_state = False
+            save_history = False  # no SD without prior state, for simplicity
 
         # C++ path
-        if self.bc is not None and bsz == 1 and seqlen == 1 and save_state:
+        if self.bc is not None and bsz == 1 and seqlen == 1 and save_state and not save_history:
             y = torch.empty_like(x)
             mixed_qkv = self.bc.run_bsz1_a(x)
             mixed_qkv = causal_conv1d_update_function(
@@ -660,12 +694,20 @@ class GatedDeltaNet(Module):
                     self.conv1d_bias,
                 )
             else:
-                mixed_qkv = causal_conv1d_update_function(
-                    mixed_qkv,
-                    conv_state,  # Updated inplace
-                    self.conv1d_weight.squeeze(1),
-                    self.conv1d_bias,
-                )
+                if save_history:
+                    mixed_qkv, conv_state_history = causal_conv1d_update_with_history(
+                        mixed_qkv,
+                        conv_state,  # Updated inplace
+                        self.conv1d_weight.squeeze(1),
+                        self.conv1d_bias,
+                    )
+                else:
+                    mixed_qkv = causal_conv1d_update_function(
+                        mixed_qkv,
+                        conv_state,  # Updated inplace
+                        self.conv1d_weight.squeeze(1),
+                        self.conv1d_bias,
+                    )
 
             # Use chunked rule when advantageous and available
             # TODO: Replace chunked fn with non-Triton implementation
@@ -705,6 +747,13 @@ class GatedDeltaNet(Module):
                         dtype = torch.float,
                         device = self.device
                     )
+
+                history = torch.empty(
+                    (bsz, seqlen - 1, self.num_v_heads, self.k_head_dim, self.v_head_dim),
+                    dtype = torch.float,
+                    device = self.device
+                ) if save_history else None
+
                 ext.cuda_recurrent_gated_delta_rule(
                     mixed_qkv,
                     g,
@@ -714,7 +763,8 @@ class GatedDeltaNet(Module):
                     self.num_k_heads,
                     self.num_v_heads,
                     self.k_head_dim,
-                    self.v_head_dim
+                    self.v_head_dim,
+                    history,
                 )
 
             # Norm
@@ -730,8 +780,15 @@ class GatedDeltaNet(Module):
             rs.last_conv_state = conv_state
             if not rs.batched:
                 rs.position += seqlen
+                if save_history:
+                    rs.history = history
+                    rs.conv_history = conv_state_history
             else:
                 rs.positions = [r + seqlen for r in rs.positions]
+                if save_history:
+                    for i, b in enumerate(rs.batch):
+                        b.history = history[i:i+1]
+                        b.conv_history = conv_state_history[i:i+1]
 
         return to2(x, out_dtype, self.out_dtype)
 

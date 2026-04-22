@@ -36,5 +36,6 @@ void cuda_recurrent_gated_delta_rule
     int num_k_heads,
     int num_v_heads,
     int k_head_dim,
-    int v_head_dim
+    int v_head_dim,
+    const c10::optional<at::Tensor>& history
 );
