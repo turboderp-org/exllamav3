@@ -209,6 +209,7 @@ class Attention(Module):
         use_k_as_v: bool = False,
         use_cu_seqlens: bool = False,
         post_rope_norm: bool = False,
+        full_gate: bool = False,
         tp_split_norm: bool = True,
         select_hq_bits: int = 0,
     ):
@@ -234,6 +235,7 @@ class Attention(Module):
         self.post_rope_norm = post_rope_norm
         self.tp_split_norm = tp_split_norm
         self.use_k_as_v = use_k_as_v
+        self.full_gate = full_gate
 
         # Use fallback when head_dim exceeds 256 (max supported by flash-attn
         self.use_bighead_fallback = self.head_dim > 256 or self.use_k_as_v
@@ -364,13 +366,14 @@ class Attention(Module):
         if key_g:
             assert not interleaved_gate, \
                 "Cannot apply both interleaved and headwise gate"
-            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, num_q_heads, qmap = None, out_dtype = torch.half, pad_to = 1)
-            self.headwise_gate = True
+            gate_features = num_q_heads * head_dim if full_gate else num_q_heads
+            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, gate_features, qmap = None, out_dtype = torch.half, pad_to = 1)
+            self.headwise_gate = not full_gate
             self.register_submodule(self.g_proj)
         else:
             if g_proj:
                 self.g_proj = g_proj
-                self.headwise_gate = True
+                self.headwise_gate = not full_gate
                 self.register_submodule(self.g_proj)
             else:
                 self.g_proj = None
@@ -691,6 +694,7 @@ class Attention(Module):
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.full_gate: o *= g.sigmoid()
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -771,6 +775,7 @@ class Attention(Module):
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.full_gate: o *= g.sigmoid()
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -885,6 +890,7 @@ class Attention(Module):
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.full_gate: o *= g.sigmoid()
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)

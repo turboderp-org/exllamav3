@@ -1,4 +1,5 @@
 from .arcee import ArceeModel
+from .afmoe import AfmoeModel
 from .apertus import ApertusModel
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
@@ -48,6 +49,7 @@ ARCHITECTURES = {
         "model_class": m,
     } for m in [
         ArceeModel,
+        AfmoeModel,
         ApertusModel,
         CohereModel,
         Cohere2Model,
