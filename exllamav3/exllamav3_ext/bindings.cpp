@@ -124,6 +124,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
 
     m.def("cache_rotate", &cache_rotate, "cache_rotate");
+    m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
 
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
     m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
