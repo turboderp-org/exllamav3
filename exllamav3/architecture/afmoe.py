@@ -53,6 +53,10 @@ class AfmoeConfig(Config):
 
         # MLP/MoE params
         self.assert_cfg(str, "hidden_act", "silu", True)
+        self.assert_cfg(str, "score_func", "sigmoid", True)
+        self.assert_cfg(int, "topk_group", 1, True)
+        self.assert_cfg(int, "n_group", 1, True)
+
         self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
         self.moe_intermediate_size = self.read_cfg(int, "moe_intermediate_size", no_default)
         self.num_experts = self.read_cfg(int, "num_experts", no_default)
@@ -60,9 +64,6 @@ class AfmoeConfig(Config):
         self.num_shared_experts = self.read_cfg(int, "num_shared_experts", 0)
         self.route_norm = self.read_cfg(bool, "route_norm", True)
         self.route_scale = self.read_cfg(float, "route_scale", 1.0)
-        self.score_func = self.read_cfg(str, "score_func", "sigmoid")
-        self.n_group = self.read_cfg(int, "n_group", 1)
-        self.topk_group = self.read_cfg(int, "topk_group", 1)
         self.mup_enabled = self.read_cfg(bool, "mup_enabled", False)
 
         # Norms/RoPE
@@ -167,10 +168,8 @@ class AfmoeModel(Model):
                             key_routing_gate="router.gate",
                             key_e_score_bias="expert_bias",
                             qmap="block.mlp",
-                            router_type="ds3" if config.score_func == "sigmoid" else "std",
+                            router_type="dots",
                             routed_scaling_factor=config.route_scale,
-                            n_group=config.n_group,
-                            topk_group=config.topk_group,
                             interm_dtype=torch.half,
                             out_dtype=torch.float,
                             shared_experts=(

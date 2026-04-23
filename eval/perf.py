@@ -116,14 +116,17 @@ def main(args):
     print(f" -- Chunk size: {args.chunk_size}")
     print()
 
-    # Test prefill
-    measure_prefill(args, model, cache, warmup = True)
-    print(f"{col_yellow}Prefill:{col_default}")
-    prefill_results = measure_prefill(args, model, cache)
-    print()
+    if not args.skip_prefill:
+        # Test prefill
+        if not args.skip_warmup:
+            measure_prefill(args, model, cache, warmup = True)
+        print(f"{col_yellow}Prefill:{col_default}")
+        prefill_results = measure_prefill(args, model, cache)
+        print()
 
     # Test generation
-    measure_generate(args, model, cache, warmup = True)
+    if not args.skip_warmup:
+        measure_generate(args, model, cache, warmup = True)
     print(f"{col_yellow}Generation{col_default}")
     generate_results = measure_generate(args, model, cache)
     print()
@@ -137,5 +140,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("-max_length", "--max_length", type = int, help = "Max context length to measure (default: 32768)", default = 32768)
     parser.add_argument("-chunk_size", "--chunk_size", type = int, help = "Max chunk size (default: 4096)", default = 4096)
+    parser.add_argument("-spf", "--skip_prefill", action = "store_true", help = "Skip measuring prefill speed")
+    parser.add_argument("-swu", "--skip_warmup", action = "store_true", help = "Skip warmup passes")
     _args = parser.parse_args()
     main(_args)
