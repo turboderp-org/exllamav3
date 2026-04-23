@@ -244,7 +244,6 @@ class GDN_RecurrentState(CacheableState):
         return 0
 
     def collect_batch(self, batch: list[GDN_RecurrentState]):
-        self.batch = batch
         lcs = torch.cat([b.last_conv_state for b in batch], dim = 0)
         lrs = torch.cat([b.last_recurrent_state for b in batch], dim = 0)
         positions = [b.position for b in batch]
@@ -254,6 +253,9 @@ class GDN_RecurrentState(CacheableState):
         for i, b in enumerate(batch):
             b.last_conv_state.copy_(self.last_conv_state[i:i+1, ...])
             b.last_recurrent_state.copy_(self.last_recurrent_state[i:i+1, ...])
+            if self.history is not None:
+                b.history = self.history[i:i+1]
+                b.conv_history = self.conv_history[i:i+1]
             b.position = self.positions[i]
 
     @override
@@ -786,9 +788,8 @@ class GatedDeltaNet(Module):
             else:
                 rs.positions = [r + seqlen for r in rs.positions]
                 if save_history:
-                    for i, b in enumerate(rs.batch):
-                        b.history = history[i:i+1]
-                        b.conv_history = conv_state_history[i:i+1]
+                    rs.history = history
+                    rs.conv_history = conv_state_history
 
         return to2(x, out_dtype, self.out_dtype)
 

@@ -59,6 +59,7 @@ class TransformerBlock(Module):
         self.register_submodule(self.mlp_post_norm)
 
         self.num_slices = mlp.num_slices if mlp else 1
+        self.export_state = False
 
 
     @override
@@ -166,6 +167,12 @@ class TransformerBlock(Module):
             if self.mlp_post_norm:
                 y = self.mlp_post_norm.forward(y, params)
             x += y
+
+        if self.export_state:
+            s = params.get("export_states")
+            if not s:
+                s = params["export_states"] = []
+            s.append(x.half())
 
         if self.backout_lambda is not None:
             x = self._apply_backout(x, params)

@@ -108,6 +108,8 @@ class Model_LSMixin:
                         # Select device
                         load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else \
                             torch.device(active_devices[current_device_i])
+                        x_device = torch.device("cpu") if module.caps.get("prefer_cpu") or module.caps.get("x_cpu") else \
+                            torch.device(active_devices[current_device_i])
 
                         # Set VRAM limit if new device
                         if load_device != torch.device("cpu") and load_device != prev_load_device:
@@ -124,7 +126,7 @@ class Model_LSMixin:
 
                         # (Re)create or backup hidden state (metadata)
                         if dummy_state is None:
-                            dummy_state = torch.zeros(backup_shape, dtype = backup_dtype, device = load_device)
+                            dummy_state = torch.zeros(backup_shape, dtype = backup_dtype, device = x_device)
                         else:
                             backup_shape = dummy_state.shape
                             backup_dtype = dummy_state.dtype
@@ -144,8 +146,9 @@ class Model_LSMixin:
                                 qcache_overhead.append(cl.get_kv_alloc_placeholder())
 
                         # Forward dummy state through module
-                        dummy_state = module.prepare_for_device(dummy_state, params)
-                        dummy_state = module.forward(dummy_state, params)
+                        if self.caps.get("autosplit_load_fwd", True):
+                            dummy_state = module.prepare_for_device(dummy_state, params)
+                            dummy_state = module.forward(dummy_state, params)
 
                         # Create extra dummy recurrent states to account for max_batch_size
                         recurrent = params.get("recurrent_states")

@@ -89,7 +89,7 @@ def add_args(
 
     if add_draft_model_args:
         parser.add_argument("-dm", "--draft_model_dir", type = str, help = "Path to draft model directory", default = None)
-        parser.add_argument("-ndt", "--num_draft_tokens", type = int, help = "Number of draft tokens (default: 4)", default = 4)
+        parser.add_argument("-ndt", "--num_draft_tokens", type = int, help = "Number of draft tokens (default: draft model default, else 4)", default = None)
 
 
 def get_arg_sampler(args):

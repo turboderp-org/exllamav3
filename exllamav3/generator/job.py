@@ -1043,29 +1043,39 @@ class Job:
                         ext_prefill_end += 1
                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, ext_prefill_end)
 
-                if self.generator.draft_model:
+                params = {
+                    "attn_mode": "flash_attn",
+                    "block_table": seq.block_index_tensor,
+                    "cache": self.generator.cache,
+                    "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                    "recurrent_states": self.recurrent_state,
+                    "indexed_embeddings": self.embeddings,
+                    "inv_freq": self.alt_rope_freqs,
+                }
+                self.generator.model.prefill(
+                    input_ids = prefill_ids,
+                    params = params,
+                )
+
+                if self.generator.dflash_draft:
+                    self.generator.draft_model.update_kv_from_target(
+                        target_hidden = params.get("export_states"),
+                        cache = self.generator.draft_cache,
+                        params = {
+                            "block_table": seq.block_index_tensor,
+                            "cache_seqlens": params["cache_seqlens"],
+                        }
+                    )
+                elif self.generator.draft_model:
                     self.generator.draft_model.prefill(
                         input_ids = prefill_ids,
                         params = {
                             "attn_mode": "flash_attn",
                             "block_table": seq.block_index_tensor,
                             "cache": self.generator.draft_cache,
-                            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32)
+                            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
                         }
                     )
-
-                self.generator.model.prefill(
-                    input_ids = prefill_ids,
-                    params = {
-                        "attn_mode": "flash_attn",
-                        "block_table": seq.block_index_tensor,
-                        "cache": self.generator.cache,
-                        "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                        "recurrent_states": self.recurrent_state,
-                        "indexed_embeddings": self.embeddings,
-                        "inv_freq": self.alt_rope_freqs,
-                    }
-                )
 
                 seq.kv_position = prefill_end
 

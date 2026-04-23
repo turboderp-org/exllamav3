@@ -4,6 +4,7 @@ from .apertus import ApertusModel
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
+from .dflash import DFlashModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
 from .ernie4_5_moe import Ernie4_5MoEModel
@@ -54,6 +55,7 @@ ARCHITECTURES = {
         CohereModel,
         Cohere2Model,
         DeciLMModel,
+        DFlashModel,
         Dots1Model,
         Ernie4_5Model,
         Ernie4_5MoEModel,
