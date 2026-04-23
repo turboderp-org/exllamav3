@@ -806,7 +806,6 @@ class Attention(Module):
             v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
             v.add_(v_addend)
 
-        # TODO: Add LayerNorm option to fused norm/RoPE kernel
         if self.q_norm:
             if self.tp_span_heads_norm:
                 # TP-aware path for span_heads=True
