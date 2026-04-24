@@ -285,6 +285,7 @@ class GDN_RecurrentState(CacheableState):
         self.last_recurrent_state[0].copy_(self.history[0, -count])
         cdim = self.last_conv_state.shape[-1]
         self.last_conv_state[0].copy_(self.conv_history[0, :, -count - cdim : -count])
+        self.position -= count
 
 
 class GatedDeltaNet(Module):
