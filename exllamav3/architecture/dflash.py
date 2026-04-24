@@ -51,11 +51,8 @@ class DFlashConfig(Config):
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
         # self.num_target_layers = self.read_cfg(int, "num_target_layers", no_default)
-
-        self.layer_types = self.read_cfg(list, "layer_types", None)
-        if self.layer_types:
-            assert all(t == "full_attention" for t in self.layer_types), \
-                "Only full_attention layer type is implemented for this model."
+        self.layer_types = self.read_cfg(list, "layer_types", ["full_attention"] * self.num_hidden_layers)
+        self.sliding_window = self.read_cfg(int, "sliding_window", 2048)
 
         # DFlash
         self.mask_token_id = self.read_cfg(int, "dflash_config->mask_token_id", no_default)
@@ -97,6 +94,8 @@ class DFlashModel(Model):
         self.attn_modules = []
 
         for idx in range(config.num_hidden_layers):
+            is_swa = config.layer_types[idx] == "sliding_attention"
+
             attn = DFlashAttention(
                 config = config,
                 key = f"layers.{idx}.self_attn",
@@ -111,6 +110,7 @@ class DFlashModel(Model):
                 key_v = "v_proj",
                 key_o = "o_proj",
                 qmap = "block.attn",
+                sliding_window = config.sliding_window if is_swa else -1,
                 q_norm = RMSNorm(
                     config = config,
                     key = f"layers.{idx}.self_attn.q_norm",

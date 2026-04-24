@@ -105,6 +105,7 @@ class DFlashAttention(Module):
         key_fused_qkv: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
+        sliding_window: int = -1,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
         q_proj: Linear | Module | None = None,
@@ -125,6 +126,8 @@ class DFlashAttention(Module):
         self.rope_settings = rope_settings
         self.rope = None
         self.out_dtype = out_dtype
+        self.sliding_window = sliding_window
+        self.sliding_window_0 = min(sliding_window, 0)
 
         # Create q, k, v projections
         if key_fused_qkv:
@@ -335,6 +338,7 @@ class DFlashAttention(Module):
             v_cache = cache_v,
             block_table = block_table,
             cache_seqlens = cache_seqlens,
+            window_size = (self.sliding_window, self.sliding_window_0),
             causal = False,
         )
 
