@@ -287,7 +287,7 @@ def main(args):
     global session
     model, config, cache, tokenizer = model_init.init(args)
     assert not model.caps.get("recurrent_states"), \
-        "Recurrent models not currently supported in this demo."
+        "Recurrent models not currently supported in this demo. SWA models are supported if loaded with -swa_full."
     session = Session(model, config, cache, tokenizer)
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)
