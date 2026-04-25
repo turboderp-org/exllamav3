@@ -74,20 +74,21 @@ class Mistral3Config(Config):
             assert isinstance(patch_temp, int), "Unexpected type for patch_size"
             return patch_temp
 
-        self.vision = SimpleNamespace()
-        self.vision.head_dim = self.read_cfg(int, ["vision_config->head_dim"], no_default)
-        self.vision.num_q_heads = self.read_cfg(int, ["vision_config->num_attention_heads"], no_default)
+        self.vision = SimpleNamespace(
+            head_dim = self.read_cfg(int, ["vision_config->head_dim"], no_default),
+            num_q_heads = self.read_cfg(int, ["vision_config->num_attention_heads"], no_default),
+            multimodal_projector_bias = self.read_cfg(bool, ["multimodal_projector_bias"], False),
+            hidden_size = self.read_cfg(int, ["vision_config->hidden_size"], no_default),
+            patch_size = unpack_patch_size(self.read_cfg(object, ["vision_config->patch_size"], int(14))),
+            num_hidden_layers = self.read_cfg(int, ["vision_config->num_hidden_layers"], 24),
+            intermediate_size = self.read_cfg(int, ["vision_config->intermediate_size"], no_default),
+            rms_norm_eps = self.rms_norm_eps,
+            image_size = self.read_cfg(int, ["vision_config->image_size"], 1540),
+            spatial_merge_size = self.read_cfg(int, ["spatial_merge_size"], 1),
+            rope_theta = self.read_cfg(int, ["vision_config->rope_theta"], 10000.0),
+        )
         self.vision.num_kv_heads = self.read_cfg(int, ["vision_config->num_key_value_heads"], self.vision.num_q_heads)
-        self.vision.multimodal_projector_bias = self.read_cfg(bool, ["multimodal_projector_bias"], False)
-        self.vision.hidden_size = self.read_cfg(int, ["vision_config->hidden_size"], no_default)
-        self.vision.patch_size = unpack_patch_size(self.read_cfg(object, ["vision_config->patch_size"], int(14)))
-        self.vision.num_hidden_layers = self.read_cfg(int, ["vision_config->num_hidden_layers"], 24)
-        self.vision.intermediate_size = self.read_cfg(int, ["vision_config->intermediate_size"], no_default)
         self.vision.merger_intermediate_size = self.vision.intermediate_size
-        self.vision.rms_norm_eps = self.rms_norm_eps
-        self.vision.image_size = self.read_cfg(int, ["vision_config->image_size"], 1540)
-        self.vision.spatial_merge_size = self.read_cfg(int, ["spatial_merge_size"], 1)
-        self.vision.rope_theta = self.read_cfg(int, ["vision_config->rope_theta"], 10000.0)
 
         vision_cfg = self.read_cfg(dict, "vision_config", no_default)
         self.vision.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX, config_dict = vision_cfg)
@@ -110,13 +111,14 @@ class Mistral3Config(Config):
         image_processor_type = read_dict(read_prep_config, str, ["image_processor_type"], no_default)
         assert image_processor_type in ["PixtralImageProcessor", "PixtralImageProcessorFast"], \
             f"Wrong image processor type: {image_processor_type}"
-        self.vision_pp = SimpleNamespace()
-        self.vision_pp.image_mean = read_dict(read_prep_config, list, ["image_mean"], no_default)
-        self.vision_pp.image_std = read_dict(read_prep_config, list, ["image_std"], no_default)
-        self.vision_pp.resample = read_dict(read_prep_config, int, ["resample"], no_default)
-        self.vision_pp.rescale_factor = read_dict(read_prep_config, float, ["rescale_factor"], no_default)
-        self.vision_pp.size = read_dict(read_prep_config, dict, ["size"], no_default)
-        self.vision_pp.patch_size = unpack_patch_size(read_dict(read_prep_config, object, ["patch_size"], no_default))
+        self.vision_pp = SimpleNamespace(
+            image_mean = read_dict(read_prep_config, list, ["image_mean"], no_default),
+            image_std = read_dict(read_prep_config, list, ["image_std"], no_default),
+            resample = read_dict(read_prep_config, int, ["resample"], no_default),
+            rescale_factor = read_dict(read_prep_config, float, ["rescale_factor"], no_default),
+            size = read_dict(read_prep_config, dict, ["size"], no_default),
+            patch_size = unpack_patch_size(read_dict(read_prep_config, object, ["patch_size"], no_default)),
+        )
 
         assert self.vision.patch_size == self.vision_pp.patch_size, \
             "Vision model and vision preprocessor patch sizes do not match"

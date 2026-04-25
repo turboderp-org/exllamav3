@@ -107,20 +107,20 @@ class Gemma3Config(Config):
         self.final_logit_softcapping = self.read_cfg(float, "text_config->final_logit_softcapping", 0.0)
 
         # Vision model settings
-        self.vision = SimpleNamespace()
-        self.vision.num_q_heads = self.read_cfg(int, ["vision_config->num_attention_heads"], no_default)
+        self.vision = SimpleNamespace(
+            num_q_heads = self.read_cfg(int, ["vision_config->num_attention_heads"], no_default),
+            hidden_size = self.read_cfg(int, ["vision_config->hidden_size"], no_default),
+            multimodal_projector_bias = self.read_cfg(bool, ["multimodal_projector_bias"], False),
+            patch_size = self.read_cfg(int, ["vision_config->patch_size"], no_default),
+            num_hidden_layers = self.read_cfg(int, ["vision_config->num_hidden_layers"], 24),
+            mm_tokens_per_image = self.read_cfg(int, "mm_tokens_per_image", no_default),
+            num_channels = 3,
+            layernorm_eps = 1e-6,  # Siglip default
+            image_size = self.read_cfg(int, ["vision_config->image_size"], 896),
+        )
+        self.vision.head_dim = self.read_cfg(int, ["vision_config->head_dim"], self.vision.hidden_size // self.vision.num_q_heads)
         self.vision.num_kv_heads = self.read_cfg(int, ["vision_config->num_key_value_heads"], self.vision.num_q_heads)
-        self.vision.hidden_size = self.read_cfg(int, ["vision_config->hidden_size"], no_default)
-        def_head_dim = self.vision.hidden_size // self.vision.num_q_heads
-        self.vision.head_dim = self.read_cfg(int, ["vision_config->head_dim"], def_head_dim)
-        self.vision.multimodal_projector_bias = self.read_cfg(bool, ["multimodal_projector_bias"], False)
-        self.vision.patch_size = self.read_cfg(int, ["vision_config->patch_size"], no_default)
-        self.vision.num_hidden_layers = self.read_cfg(int, ["vision_config->num_hidden_layers"], 24)
         self.vision.intermediate_size = self.read_cfg(int, ["vision_config->intermediate_size"], self.vision.hidden_size)
-        self.vision.mm_tokens_per_image = self.read_cfg(int, "mm_tokens_per_image", no_default)
-        self.vision.num_channels = 3
-        self.vision.layernorm_eps = 1e-6  # Siglip default
-        self.vision.image_size = self.read_cfg(int, ["vision_config->image_size"], 896)
 
         # Vision preprocessor
         prep_path = os.path.join(self.directory, "preprocessor_config.json")
@@ -129,13 +129,13 @@ class Gemma3Config(Config):
         image_processor_type = read_dict(read_prep_config, str, ["image_processor_type"], no_default)
         assert image_processor_type == "Gemma3ImageProcessor", \
             f"Wrong image processor type: {image_processor_type}"
-        self.vision_pp = SimpleNamespace()
-        self.vision_pp.image_mean = read_dict(read_prep_config, list, ["image_mean"], no_default)
-        self.vision_pp.image_std = read_dict(read_prep_config, list, ["image_std"], no_default)
-        self.vision_pp.resample = read_dict(read_prep_config, int, ["resample"], no_default)
-        self.vision_pp.rescale_factor = read_dict(read_prep_config, float, ["rescale_factor"], no_default)
-        self.vision_pp.size = read_dict(read_prep_config, dict, ["size"], no_default)
-
+        self.vision_pp = SimpleNamespace(
+            image_mean = read_dict(read_prep_config, list, ["image_mean"], no_default),
+            image_std = read_dict(read_prep_config, list, ["image_std"], no_default),
+            resample = read_dict(read_prep_config, int, ["resample"], no_default),
+            rescale_factor = read_dict(read_prep_config, float, ["rescale_factor"], no_default),
+            size = read_dict(read_prep_config, dict, ["size"], no_default),
+        )
 
     def default_max_position_embeddings(self):
         # Fixed for Gemma3, usually not present in config.json
