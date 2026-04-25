@@ -1,0 +1,16 @@
+{
+    "model": "/mnt/str/models/qwen3.5-27b/exl3/4.00bpw",
+    "stream": true,
+    "messages": [
+        {
+            "role": "system",
+            "content": "Given the following conversation, relevant context, and a follow up question, reply with an answer to the current question the user is asking. Return only your response to the question given the above information following the users instructions as needed."
+        },
+        {
+            "role": "user",
+            "content": "Write a Python script that draws a picture of a cute kitten using matplotlib."
+        }
+    ],
+    "temperature": 0.7,
+    "max_tokens": 4096
+}
