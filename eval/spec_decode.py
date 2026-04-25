@@ -153,6 +153,7 @@ def main(args):
             draft_model = draft_model,
             draft_cache = draft_cache,
             tokenizer = tokenizer,
+            num_draft_tokens = args.num_draft_tokens,
             max_chunk_size = 4096,
         )
         result_draft = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens)
