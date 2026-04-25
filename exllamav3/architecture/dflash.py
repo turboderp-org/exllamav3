@@ -57,8 +57,6 @@ class DFlashConfig(Config):
         # DFlash
         self.mask_token_id = self.read_cfg(int, "dflash_config->mask_token_id", no_default)
         self.target_layer_ids = self.read_cfg(list, "dflash_config->target_layer_ids", no_default)
-        assert len(self.target_layer_ids) == self.num_hidden_layers, \
-            "Length of target layer list doesn't match num_hidden_layers"
         self.block_size = self.read_cfg(int, "block_size", no_default)
 
         # RoPE
@@ -83,7 +81,7 @@ class DFlashModel(Model):
             key = "fc",
             key_norm = "hidden_norm",
             hidden_size = config.hidden_size,
-            target_state_size = config.hidden_size * config.num_hidden_layers,
+            target_state_size = config.hidden_size * len(config.target_layer_ids),
             mask_token_id = config.mask_token_id,
             rms_norm_eps = config.rms_norm_eps,
             native_draft_len = config.block_size,
