@@ -20,7 +20,7 @@ def main(args):
 
     # Load model
     model, config, cache, tokenizer = model_init.init(args)
-    generator = Generator(model, cache, tokenizer, show_visualizer = args.visualize_cache)
+    generator = Generator(model, cache, tokenizer, show_visualizer = args.visualize_cache, max_chunk_size = 2048)
     bpw_layer, bpw_head, vram_bits = model.get_storage_info()
 
     print(f" -- Model: {args.model_dir}")
@@ -178,7 +178,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    model_init.add_args(parser, default_cache_size = 65536)
+    model_init.add_args(parser, default_cache_size = 65536, default_autosplit_max_batch_size = 9)
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     _args = parser.parse_args()
     main(_args)

@@ -19,7 +19,7 @@ from ..modules import (
 )
 from ..modules.arch_specific.qwen3_vl import DeepstackEmbed
 from ..modules.attn import prepare_for_attn
-from ..modules.gated_delta_net import prepare_for_recurrence
+from ..cache.recurrent_util import prepare_for_recurrence
 from .qwen3_vl import read_qwen3_vl_vision_config, read_qwen3_vl_pp_config, Qwen3VLVisionModel
 
 
@@ -298,6 +298,7 @@ class Qwen3_5BaseModel(Model):
                 TransformerBlock(
                     config = config,
                     key = f"{key_prefix}.layers.{idx}",
+                    layer_idx = idx,
                     attn_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.input_layernorm",
@@ -459,7 +460,11 @@ class Qwen3_5BaseModel(Model):
             self.calibration_all_experts = True
 
         # Mark that we need recurrent cache for generation
-        self.caps.update({"recurrent_states": True})
+        self.caps.update({
+            "recurrent_states": True,
+            "default_recurrent_checkpoint_interval": 2048,
+            "linear_attn": True,
+        })
 
         # TP for this architecture is not implemented yet
         self.caps.update({"supports_tp": False})

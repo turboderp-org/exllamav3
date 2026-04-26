@@ -365,7 +365,8 @@ void rope
         TORCH_CHECK(q_norm.value().size(0) == head_dim, "q_norm is incorrect size");
         norm_bf16 = q_norm.value().dtype() == at::kBFloat16;
         norm_fp16 = q_norm.value().dtype() == at::kHalf;
-        TORCH_CHECK(k_norm.value().dtype() == q_norm.value().dtype(), "q_norm and k_norm must be same dtype");
+        if (k_norm_ptr)
+            TORCH_CHECK(k_norm.value().dtype() == q_norm.value().dtype(), "q_norm and k_norm must be same dtype");
     }
 
     dim3 blocks(seq_len, bsz);

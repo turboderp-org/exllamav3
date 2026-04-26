@@ -1,12 +1,13 @@
 #include <immintrin.h>
 #include "all_reduce_cpu_avx2.h"
+#include "all_reduce_cpu_avx512.h"
 #include "../avx2_target.h"
+#include "../avx512_target.h"
 #include "../util.h"
 
 #ifndef __linux__
 #include <intrin.h>
 #endif
-#include <immintrin.h>
 
 AVX2_TARGET
 inline void do16(uint16_t* __restrict ap, const uint16_t* __restrict bp)
@@ -63,36 +64,22 @@ inline void bf16_add_inplace_avx2
     }
 }
 
-AVX2_TARGET
 void enable_fast_fp()
+{
+    if (is_avx512_supported())
+        enable_fast_fp_avx512();
+    else
+        enable_fast_fp_avx2();
+}
+
+AVX2_TARGET
+void enable_fast_fp_avx2()
 {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 }
 
-// A += B (BF16), in-place, round-toward-zero. Assumes count % 32 == 0. Not optimized, little-endian only
-static inline void bf16_add_inplace_ref
-(
-    uint16_t* __restrict a,
-    const uint16_t* __restrict b,
-    size_t count
-)
-{
-    for (int i = 0; i < count; ++i)
-    {
-        uint16_t s[2] = {0, 0};
-        uint16_t d[2] = {0, 0};
-        s[1] = *b++;
-        d[1] = *a;
-        float* fs = (float*) s;
-        float* fd = (float*) d;
-        *fd += *fs;
-        *a++ = d[1];
-    }
-}
-
-// Perform reduction on current job
-AVX2_TARGET
+// Dispatch for the right target - prioritizes AVX-512 if available
 void perform_cpu_reduce
 (
     PGContext* ctx,
@@ -102,9 +89,31 @@ void perform_cpu_reduce
     size_t shbuf_size
 )
 {
-    // Indexing
-    const uint32_t buf_slot_size = (shbuf_size / (MAX_DEVICES + 1)) / 1024 * 1024;
+    if (is_avx512_supported())
+    {
+        perform_cpu_reduce_avx512(ctx, data_size, device_mask, shbuf_ptr, shbuf_size);
+    }
+    else
+    {
+        perform_cpu_reduce_avx2(ctx, data_size, device_mask, shbuf_ptr, shbuf_size);
+    }
+}
+
+// Perform reduction on current job using AVX2
+AVX2_TARGET
+void perform_cpu_reduce_avx2
+(
+    PGContext* ctx,
+    size_t data_size,
+    uint32_t device_mask,
+    uint8_t* shbuf_ptr,
+    size_t shbuf_size
+)
+{
+    // Indexing - original MAX_DEVICES-based layout
+    const uint32_t buf_slot_size = (shbuf_size / (MAX_DEVICES + 1) / 1024) * 1024;
     const uint32_t max_buf_stages = buf_slot_size / CPUREDUCE_CHUNK_SIZE;
+    TORCH_CHECK(max_buf_stages >= 2, "Shared buffer too small for chunk size (need at least 2 stages)");
     auto host_ptr = [&] (int device, uint32_t stage_idx)
     {
         return shbuf_ptr + buf_slot_size * device + (stage_idx % max_buf_stages) * CPUREDUCE_CHUNK_SIZE;

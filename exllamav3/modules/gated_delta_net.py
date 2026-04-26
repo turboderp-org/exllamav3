@@ -50,6 +50,25 @@ def causal_conv1d_fwd_function_torch(
     return y
 
 
+def causal_conv1d_update_with_history(
+    x,
+    conv_state,
+    weight,
+    bias,
+):
+    # TODO: Could use static buffer and skip the concat, investigate if causal_conv1d_cu can return longer state
+    bsz, dim, seq_len = x.shape
+    state_len = conv_state.shape[-1]
+
+    y = torch.cat([conv_state, x], dim = -1).to(weight.dtype)
+    conv_state.copy_(y[:, :, -state_len:])
+    conv_state_history = y
+    y = F.conv1d(y, weight.unsqueeze(1), bias, padding = 0, groups = dim)
+    y = F.silu(y[:, :, -seq_len:])
+    y = y.to(x.dtype)
+    return y, conv_state_history
+
+
 def causal_conv1d_update_function_cu(
     x,
     conv_state,
@@ -186,6 +205,9 @@ class GDN_RecurrentState(CacheableState):
         self.last_conv_state = last_conv_state
         self.last_recurrent_state = last_recurrent_state
         self.batched = batched
+        self.batch = None
+        self.history = None
+        self.conv_history = None
 
     @override
     def stash(self):
@@ -198,7 +220,8 @@ class GDN_RecurrentState(CacheableState):
         )
 
     @override
-    def unstash(self, device):
+    def unstash(self, device, trim_position):
+        assert self.position == trim_position
         return GDN_RecurrentState(
             self.position,
             self.positions,
@@ -215,6 +238,11 @@ class GDN_RecurrentState(CacheableState):
             self.last_recurrent_state.element_size() * self.last_recurrent_state.numel()
         )
 
+    @override
+    def get_cachable_interval(self):
+        # Recurrent state tracks only one token
+        return 0
+
     def collect_batch(self, batch: list[GDN_RecurrentState]):
         lcs = torch.cat([b.last_conv_state for b in batch], dim = 0)
         lrs = torch.cat([b.last_recurrent_state for b in batch], dim = 0)
@@ -225,45 +253,39 @@ class GDN_RecurrentState(CacheableState):
         for i, b in enumerate(batch):
             b.last_conv_state.copy_(self.last_conv_state[i:i+1, ...])
             b.last_recurrent_state.copy_(self.last_recurrent_state[i:i+1, ...])
+            if self.history is not None:
+                b.history = self.history[i:i+1]
+                b.conv_history = self.conv_history[i:i+1]
             b.position = self.positions[i]
 
+    @override
+    def reset(self):
+        self.last_conv_state = None
+        self.last_recurrent_state = None
 
-def prepare_for_recurrence(input_ids: torch.Tensor, params: dict, model) -> torch.Tensor:
-    """
-    Add linear attn parameters to state
+    @override
+    def force_position(self, position: int):
+        self.position = position
 
-    batch_shape: tuple of (bsz, _)
-    past_len: int (default: 0)
+    @override
+    def clone(self):
+        return GDN_RecurrentState(
+            self.position,
+            self.positions,
+            self.last_conv_state.clone() if self.last_conv_state is not None else None,
+            self.last_recurrent_state.clone() if self.last_recurrent_state is not None else None,
+            self.batched,
+        )
 
-    *OR*
-
-    cache_seqlens: shape (bsz)
-    """
-    batch_shape = params.get("batch_shape")
-    cache_seqlens = params.get("cache_seqlens")
-
-    if batch_shape is not None:
-        bsz, _ = batch_shape
-        past_len = params.get("past_len", 0)
-        if past_len > 0:
-            rs = params.get("recurrent_states")
-            if rs is None:
-                raise ValueError(f"Past length given, but no previous state for linear attn in params")
-            for k, v in rs.items():
-                if not v.batched and v.position != past_len:
-                    raise ValueError(f"recurrent states don't match input past_len")
-        else:
-            rl = model.get_recurrent_layers()
-            rs = {attn.layer_idx: GDN_RecurrentState() for attn in rl}
-            params["recurrent_states"] = rs
-
-    elif cache_seqlens is not None:
-        # (Empty) states must be provided with cache_seqlens
-        pass
-
-    else:
-        if "recurrent_states" in params:
-            raise ValueError(f"recurrent_states given without bsz and seqlens")
+    @override
+    def rewind(self, count: int):
+        assert self.history is not None
+        assert not self.batched and self.batch is None
+        if count == 0: return
+        self.last_recurrent_state[0].copy_(self.history[0, -count])
+        cdim = self.last_conv_state.shape[-1]
+        self.last_conv_state[0].copy_(self.conv_history[0, :, -count - cdim : -count])
+        self.position -= count
 
 
 class GatedDeltaNet(Module):
@@ -487,7 +509,7 @@ class GatedDeltaNet(Module):
 
     @override
     def load(self, device: torch.Device, **kwargs):
-        super().load(device)
+        super().load(device, **kwargs)
         self.a_log = self.config.stc.get_tensor(self.key_a_log, self.device, optional = False, allow_bf16 = True)
         self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True)
         self.conv1d_weight = self.config.stc.get_tensor(self.key_conv1d_weight, self.device, optional = True, allow_bf16 = True)
@@ -568,6 +590,7 @@ class GatedDeltaNet(Module):
     ) -> torch.Tensor:
 
         bsz, seqlen, _ = x.shape
+        save_history = params.get("recurrent_history", False)
 
         # Post load, fuse conv1d weights if needed
         if self.conv1d_weight is None:
@@ -598,9 +621,10 @@ class GatedDeltaNet(Module):
             conv_state = None
             recurrent_state = None
             save_state = False
+            save_history = False  # no SD without prior state, for simplicity
 
         # C++ path
-        if self.bc is not None and bsz == 1 and seqlen == 1 and save_state:
+        if self.bc is not None and bsz == 1 and seqlen == 1 and save_state and not save_history:
             y = torch.empty_like(x)
             mixed_qkv = self.bc.run_bsz1_a(x)
             mixed_qkv = causal_conv1d_update_function(
@@ -673,12 +697,20 @@ class GatedDeltaNet(Module):
                     self.conv1d_bias,
                 )
             else:
-                mixed_qkv = causal_conv1d_update_function(
-                    mixed_qkv,
-                    conv_state,  # Updated inplace
-                    self.conv1d_weight.squeeze(1),
-                    self.conv1d_bias,
-                )
+                if save_history:
+                    mixed_qkv, conv_state_history = causal_conv1d_update_with_history(
+                        mixed_qkv,
+                        conv_state,  # Updated inplace
+                        self.conv1d_weight.squeeze(1),
+                        self.conv1d_bias,
+                    )
+                else:
+                    mixed_qkv = causal_conv1d_update_function(
+                        mixed_qkv,
+                        conv_state,  # Updated inplace
+                        self.conv1d_weight.squeeze(1),
+                        self.conv1d_bias,
+                    )
 
             # Use chunked rule when advantageous and available
             # TODO: Replace chunked fn with non-Triton implementation
@@ -718,6 +750,13 @@ class GatedDeltaNet(Module):
                         dtype = torch.float,
                         device = self.device
                     )
+
+                history = torch.empty(
+                    (bsz, seqlen - 1, self.num_v_heads, self.k_head_dim, self.v_head_dim),
+                    dtype = torch.float,
+                    device = self.device
+                ) if save_history else None
+
                 ext.cuda_recurrent_gated_delta_rule(
                     mixed_qkv,
                     g,
@@ -727,7 +766,8 @@ class GatedDeltaNet(Module):
                     self.num_k_heads,
                     self.num_v_heads,
                     self.k_head_dim,
-                    self.v_head_dim
+                    self.v_head_dim,
+                    history,
                 )
 
             # Norm
@@ -743,8 +783,14 @@ class GatedDeltaNet(Module):
             rs.last_conv_state = conv_state
             if not rs.batched:
                 rs.position += seqlen
+                if save_history:
+                    rs.history = history
+                    rs.conv_history = conv_state_history
             else:
                 rs.positions = [r + seqlen for r in rs.positions]
+                if save_history:
+                    rs.history = history
+                    rs.conv_history = conv_state_history
 
         return to2(x, out_dtype, self.out_dtype)
 

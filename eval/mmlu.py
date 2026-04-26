@@ -16,6 +16,24 @@ def get_dataset_mmlu(split):
     rows = [example for example in dataset]
     return rows
 
+@disk_lru_cache("get_dataset_mmlu_redux")
+def get_dataset_mmlu_redux(redux_version):
+    from datasets import get_dataset_config_names
+    dataset_name = {
+        1: "edinburgh-dawg/mmlu-redux",
+        2: "edinburgh-dawg/mmlu-redux-2.0",
+    }[redux_version]
+    print(f" -- Loading MMLU-Redux dataset ({dataset_name})")
+    config_names = get_dataset_config_names(dataset_name)
+    rows = []
+    for config_name in config_names:
+        dataset = load_dataset(dataset_name, config_name, split = "test")
+        for example in dataset:
+            example["subject"] = config_name
+            rows.append(example)
+    print(f" -- Loaded {len(rows)} questions across {len(config_names)} subjects")
+    return rows
+
 def main(args):
 
     # Initialize
@@ -35,11 +53,44 @@ def main(args):
 
     # Get dataset
     dataset_dev = get_dataset_mmlu("dev")
-    dataset_all = get_dataset_mmlu("test")
     dataset_dev = sorted(dataset_dev, key = lambda q: q["subject"])
-    dataset_all = sorted(dataset_all, key = lambda q: q["subject"])
 
-    all_subjects = set([q["subject"] for q in dataset_dev])
+    if args.redux:
+        dataset_all = get_dataset_mmlu_redux(args.redux)
+        dataset_all = sorted(dataset_all, key = lambda q: q["subject"])
+
+        # Filter and optionally fix ground truth based on error annotations
+        filtered = []
+        redux_stats = {"total": 0, "ok": 0, "fixed": 0, "dropped": 0}
+        for q in dataset_all:
+            redux_stats["total"] += 1
+            error_type = q.get("error_type", "ok")
+            if error_type == "ok":
+                redux_stats["ok"] += 1
+                filtered.append(q)
+            elif error_type == "wrong_groundtruth" and q.get("correct_answer"):
+                # Use the corrected answer
+                answer_map = {"A": 0, "B": 1, "C": 2, "D": 3}
+                corrected = q["correct_answer"].strip().upper()
+                if corrected in answer_map:
+                    q["answer"] = answer_map[corrected]
+                    redux_stats["fixed"] += 1
+                    filtered.append(q)
+                else:
+                    redux_stats["dropped"] += 1
+            else:
+                redux_stats["dropped"] += 1
+
+        dataset_all = filtered
+        print(f" -- MMLU-Redux: {redux_stats['total']} total, "
+              f"{redux_stats['ok']} ok, "
+              f"{redux_stats['fixed']} fixed ground truth, "
+              f"{redux_stats['dropped']} dropped (erroneous)")
+    else:
+        dataset_all = get_dataset_mmlu("test")
+        dataset_all = sorted(dataset_all, key = lambda q: q["subject"])
+
+    all_subjects = set([q["subject"] for q in dataset_all])
     if args.subjects != "all":
         sel_subjects = args.subjects.split(",")
         for s in sel_subjects:
@@ -80,7 +131,7 @@ def main(args):
             f += " " + c_options[answer] + "\n\n"
         return f
 
-    # Fewshot preprompts
+    # Fewshot preprompts (always from original MMLU dev set)
     preprompt_ids = {}
     with ProgressBar("Preprompts", len(all_subjects), transient = False) as progress:
         for idx, subject in enumerate(all_subjects):
@@ -91,6 +142,7 @@ def main(args):
                 if fewshots == args.fewshot_examples: break
                 if pq["subject"] != subject: continue
                 preprompt += format_question(pq["question"], pq["choices"], pq["answer"])
+                fewshots += 1
             preprompt_ids[subject] = tokenizer.encode(preprompt, add_bos = False)
             progress.update(idx + 1)
 
@@ -190,5 +242,6 @@ if __name__ == "__main__":
     parser.add_argument("-skip", "--skip_subjects", type = int, default = 0, help = "Skip number of categories")
     parser.add_argument("-mqps", "--max_q_per_subject", type = int, default = None, help = "Max questions per subject (default: unlimited)")
     parser.add_argument("-r", "--random_sample", type = int, default = None, help = "Randomly sample number of questions across subjects")
+    parser.add_argument("-redux", "--redux", type = int, default = None, choices = [1, 2], help = "Use MMLU-Redux instead of MMLU (1 = v1, 2 = v2.0)")
     _args = parser.parse_args()
     main(_args)

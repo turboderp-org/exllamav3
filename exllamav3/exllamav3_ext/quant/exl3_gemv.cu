@@ -72,9 +72,9 @@ void exl3_gemv
     dim3 blocks(1, size_n / TILESIZE_N, 1);
     dim3 threads(32, 1, TILESIZE_K / 16);
 
-    int cb = 0;
-    if (mcg) cb = 1;
-    if (mul1) cb = 2;
+//    int cb = 0;
+//    if (mcg) cb = 1;
+//    if (mul1) cb = 2;
 
     const half* A_ptr = (const half*) A.data_ptr();
 //    const half* A_ptr = (const half*) OPTPTR(A_had);

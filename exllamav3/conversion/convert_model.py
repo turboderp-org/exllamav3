@@ -221,6 +221,7 @@ def get_base_model(args):
     print(f" -- Loaded model config")
     print(f"    Architecture: {config.architecture}")
     model = Model.from_config(config)
+    assert model.caps.get("can_quantize", True), "Cannot quantize this model type."
     print(f" -- Created model instance:")
     print(model.get_layout_tree(4))
     tokenizer = Tokenizer.from_config(config)

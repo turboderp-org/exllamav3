@@ -21,6 +21,7 @@ try:
         BlockDiagonalCausalWithOffsetPaddedKeysMask,
         BlockDiagonalPaddedKeysMask,
         LowerTriangularFromBottomRightMask,
+        LowerTriangularMask,
     )
     # Monkey-patch xformers for sm_120 support, what could go wrong
     from xformers.ops.fmha import cutlass as xf_cutlass
@@ -30,6 +31,36 @@ except ModuleNotFoundError:
     has_xformers = False
 
 has_warned_sdpa_fallback = False
+def _warn_sdpa_fallback():
+    global has_warned_sdpa_fallback
+    if has_warned_sdpa_fallback:
+        return
+    col_default = "\u001b[0m"
+    col_red = "\u001b[31;1m"
+    print(
+        f"{col_red} !! Warning, using SDPA fallback for large head size. VRAM usage will be high "
+        f"and inference on long sequences will be slow. Consider installing `xformers` to improve "
+        f"performance.{col_default}"
+    )
+    has_warned_sdpa_fallback = True
+
+# Hack required for xformers currently since GQA is broken
+# https://github.com/facebookresearch/xformers/issues/1392
+def _stable_xformers_gqa_via_4d(q5, k5, v5, attn_bias = None, scale = None):
+    B, Mq, G, H, K = q5.shape
+    out = torch.empty(B, Mq, G * H, K, device = q5.device, dtype = q5.dtype)
+    for g in range(G):
+        qg = q5[:, :, g]
+        kg = k5[:, :, g, :1, :].expand(-1, -1, H, -1)
+        vg = v5[:, :, g, :1, :].expand(-1, -1, H, -1)
+        og = xops.memory_efficient_attention(
+            qg, kg, vg,
+            attn_bias = attn_bias,
+            scale = scale,
+            op = (cutlass.FwOp, None),
+        )
+        out[:, :, g * H:(g + 1) * H, :] = og
+    return out
 
 """
 SDPA:
@@ -79,7 +110,7 @@ def prepare_sdpa_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
 
 def prepare_flash_attn_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     assert "cache" not in params, \
-        f"Cache provided for attn_mode: sdpa_nc"
+        f"Cache provided for attn_mode: flash_attn_nc"
     return input_ids
 
 
@@ -178,6 +209,7 @@ class Attention(Module):
         use_k_as_v: bool = False,
         use_cu_seqlens: bool = False,
         post_rope_norm: bool = False,
+        full_gate: bool = False,
         tp_split_norm: bool = True,
         select_hq_bits: int = 0,
     ):
@@ -195,6 +227,7 @@ class Attention(Module):
         self.rope = None
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
+        self.sliding_window_0 = min(sliding_window, 0)
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
         self.ve_gate = ve_gate
@@ -202,10 +235,11 @@ class Attention(Module):
         self.post_rope_norm = post_rope_norm
         self.tp_split_norm = tp_split_norm
         self.use_k_as_v = use_k_as_v
+        self.full_gate = full_gate
 
-        # Use SDPA fallback when head_dim exceeds 256 (max supported by flash-attn
-        self.use_sdpa_fallback = self.head_dim > 256 or self.use_k_as_v
-        if self.use_sdpa_fallback:
+        # Use fallback when head_dim exceeds 256 (max supported by flash-attn
+        self.use_bighead_fallback = self.head_dim > 256 or self.use_k_as_v
+        if self.use_bighead_fallback:
             assert sliding_window == -1 and logit_softcapping == 0.0, \
                 "head_dim > 512 requires SDPA fallback path, which doesn't support sliding " \
                 "window attn or logit softcapping"
@@ -332,13 +366,14 @@ class Attention(Module):
         if key_g:
             assert not interleaved_gate, \
                 "Cannot apply both interleaved and headwise gate"
-            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, num_q_heads, qmap = None, out_dtype = torch.half, pad_to = 1)
-            self.headwise_gate = True
+            gate_features = num_q_heads * head_dim if full_gate else num_q_heads
+            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, gate_features, qmap = None, out_dtype = torch.half, pad_to = 1)
+            self.headwise_gate = not full_gate
             self.register_submodule(self.g_proj)
         else:
             if g_proj:
                 self.g_proj = g_proj
-                self.headwise_gate = True
+                self.headwise_gate = not full_gate
                 self.register_submodule(self.g_proj)
             else:
                 self.g_proj = None
@@ -409,7 +444,7 @@ class Attention(Module):
 
     @override
     def load(self, device: torch.Device, **kwargs):
-        super().load(device)
+        super().load(device, **kwargs)
         self.load_local(device, **kwargs)
 
 
@@ -626,14 +661,40 @@ class Attention(Module):
                 self.post_rope_norm
             )
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa, scale = self.sm_scale)
-        o = o.transpose(1, 2)
+        if self.use_bighead_fallback and has_xformers:
+            _, _, nheads, headdim = q.shape
+            _, _, nheads_k, _ = k.shape
+            ngroups = nheads // nheads_k
+            if ngroups > 1:
+                q_ = q.view(1, seqlen, nheads_k, ngroups, headdim)
+                k_ = k.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
+                v_ = v.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
+
+                o = _stable_xformers_gqa_via_4d(
+                    q_, k_, v_,
+                    attn_bias = LowerTriangularMask() if causal else None,
+                    scale = self.sm_scale,
+                )
+                o = o.reshape(1, seqlen, nheads, headdim)
+            else:
+                o = xops.memory_efficient_attention(
+                    q, k, v,
+                    attn_bias = LowerTriangularMask() if causal else None,
+                    scale = self.sm_scale,
+                    op = (cutlass.FwOp, None),
+                )
+        else:
+            if self.use_bighead_fallback:
+                _warn_sdpa_fallback()
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa, scale = self.sm_scale)
+            o = o.transpose(1, 2)
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.full_gate: o *= g.sigmoid()
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -647,7 +708,7 @@ class Attention(Module):
         seqlen: int,
         params: dict,
     ):
-        if self.use_sdpa_fallback:
+        if self.use_bighead_fallback:
             return self.decode_sdpa_nc(x, bsz, seqlen, params)
 
         causal = params.get("causal", True)
@@ -698,7 +759,7 @@ class Attention(Module):
                 max_seqlen_k = max_seqlen,
                 causal = causal,
                 softmax_scale = self.sm_scale,
-                window_size = (self.sliding_window, self.sliding_window),
+                window_size = (self.sliding_window, self.sliding_window_0),
                 softcap = self.logit_softcapping
             )
         else:
@@ -708,12 +769,13 @@ class Attention(Module):
                 v = v,
                 causal = causal,
                 softmax_scale = self.sm_scale,
-                window_size = (self.sliding_window, self.sliding_window),
+                window_size = (self.sliding_window, self.sliding_window_0),
                 softcap = self.logit_softcapping
             )
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.full_gate: o *= g.sigmoid()
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -744,7 +806,6 @@ class Attention(Module):
             v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
             v.add_(v_addend)
 
-        # TODO: Add LayerNorm option to fused norm/RoPE kernel
         if self.q_norm:
             if self.tp_span_heads_norm:
                 # TP-aware path for span_heads=True
@@ -769,12 +830,14 @@ class Attention(Module):
             )
 
         if self.has_split_cache:
-            cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table)
+            cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table, self.sliding_window)
         else:
-            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
+            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table, self.sliding_window)
 
-        if self.use_sdpa_fallback:
-            if has_xformers:
+        if self.use_bighead_fallback:
+            if q.shape[1] <= 8:
+                fn = self.bighead_attn_paged_fallback
+            elif has_xformers:
                 fn = self.flash_attn_with_kvcache_xformers_fallback
             else:
                 fn = self.flash_attn_with_kvcache_sdpa_fallback
@@ -792,12 +855,13 @@ class Attention(Module):
                 cache_seqlens = cache_seqlens,
                 causal = causal,
                 softmax_scale = self.sm_scale,
-                window_size = (self.sliding_window, self.sliding_window),
+                window_size = (self.sliding_window, self.sliding_window_0),
                 softcap = self.logit_softcapping
             )
         else:
             o = []
-            for a, b, c in non_causal_spans:
+            for a, b, nc in non_causal_spans:
+                l = b - a
                 o_ = fn(
                     q = q[:, a : b],
                     k = k[:, a : b],
@@ -806,9 +870,13 @@ class Attention(Module):
                     v_cache = cache_v,
                     block_table = block_table,
                     cache_seqlens = cache_seqlens + a,
-                    causal = not c,
+                    causal = not nc,
                     softmax_scale = self.sm_scale,
-                    window_size = (self.sliding_window, self.sliding_window),
+                    window_size = (
+                        (max(self.sliding_window, l), l - 1 if nc else 0)
+                        if self.sliding_window > 0 and nc else
+                        (self.sliding_window, self.sliding_window_0)
+                    ),
                     softcap = self.logit_softcapping
                 )
                 o.append(o_)
@@ -821,6 +889,7 @@ class Attention(Module):
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.full_gate: o *= g.sigmoid()
         if self.interleaved_gate: o *= g.sigmoid()
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -862,49 +931,27 @@ class Attention(Module):
             k_xf = k_buf[:total_len].unsqueeze(0)  # (1, total_len, nheads_k, headdim)
             v_xf = v_buf[:total_len].unsqueeze(0)
 
+            attn_bias = LowerTriangularFromBottomRightMask() if causal else None
+
             if ngroups > 1:
                 q_xf = q[b].unsqueeze(0).view(1, seqlen_q, nheads_k, ngroups, headdim)
                 k_xf = k_xf.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
                 v_xf = v_xf.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
+                o = _stable_xformers_gqa_via_4d(
+                    q_xf, k_xf, v_xf,
+                    attn_bias = attn_bias,
+                    scale = softmax_scale,
+                )
+                o = o.reshape(1, seqlen_q, nheads, headdim)
             else:
                 q_xf = q[b].unsqueeze(0)
+                o = xops.memory_efficient_attention(
+                    q_xf, k_xf, v_xf,
+                    attn_bias = attn_bias,
+                    scale = softmax_scale,
+                    op = (cutlass.FwOp, None),
+                )
 
-            if causal:
-                attn_bias = LowerTriangularFromBottomRightMask()
-            else:
-                attn_bias = None
-
-            def stable_gqa_via_4d(q5, k5, v5, attn_bias = None, scale = None):
-                B, Mq, G, H, K = q5.shape
-                out = torch.empty(B, Mq, G * H, K, device = q5.device, dtype = q5.dtype)
-                for g in range(G):
-                    qg = q5[:, :, g]
-                    kg = k5[:, :, g, :1, :].expand(-1, -1, H, -1)
-                    vg = v5[:, :, g, :1, :].expand(-1, -1, H, -1)
-                    og = xops.memory_efficient_attention(
-                        qg, kg, vg,
-                        attn_bias = attn_bias,
-                        scale = scale,
-                        op = (cutlass.FwOp, None),
-                    )
-                    out[:, :, g * H:(g + 1) * H, :] = og
-                return out
-
-            # Hack required for xformers currently since GQA is broken
-            # https://github.com/facebookresearch/xformers/issues/1392
-            o = stable_gqa_via_4d(
-                q_xf, k_xf, v_xf,
-                attn_bias = attn_bias,
-                scale = softmax_scale,
-            )
-            # o = xops.memory_efficient_attention(
-            #     q_xf, k_xf, v_xf,
-            #     attn_bias = attn_bias,
-            #     scale = softmax_scale,
-            # )
-
-            if ngroups > 1:
-                o = o.reshape(1, seqlen_q, nheads, headdim)
             outputs.append(o.squeeze(0))
 
             # Write back affected pages
@@ -926,6 +973,29 @@ class Attention(Module):
 
 
     @staticmethod
+    def bighead_attn_paged_fallback(
+        q, k, v,
+        k_cache, v_cache,
+        block_table, cache_seqlens,
+        causal = False, softmax_scale = None,
+        window_size = None,
+        softcap = None,
+        kv_chunk_size = 128,
+    ):
+        o = torch.empty_like(q)
+        ext.bighead_attn_paged(
+            q, k, v,
+            k_cache, v_cache,
+            block_table, cache_seqlens,
+            o,
+            kv_chunk_size,
+            causal,
+            softmax_scale
+        )
+        return o
+
+
+    @staticmethod
     def flash_attn_with_kvcache_sdpa_fallback(
         q, k, v,
         k_cache, v_cache,
@@ -939,17 +1009,7 @@ class Attention(Module):
         _, seqlen_new, nheads_k, _ = k.shape
         block_size = k_cache.shape[1]
 
-        global has_warned_sdpa_fallback
-        if not has_warned_sdpa_fallback:
-            col_default = "\u001b[0m"
-            col_red = "\u001b[31;1m"
-            print(
-                f"{col_red} !! Warning, using SDPA fallback for large head size. VRAM usage will be high "
-                f"and inference on long sequences will be slow. Consider installing `xformers` to improve "
-                f"performance.{col_default}"
-            )
-            has_warned_sdpa_fallback = True
-
+        _warn_sdpa_fallback()
         outputs = []
         for b in range(batch):
             seq_len = cache_seqlens[b].item()

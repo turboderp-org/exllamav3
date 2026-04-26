@@ -207,6 +207,7 @@ class Qwen2_5VLVisionModel(Model):
                 TransformerBlock(
                     config = config,
                     key = f"{key_prefix}.blocks.{idx}",
+                    layer_idx = idx,
                     attn_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.blocks.{idx}.norm1",

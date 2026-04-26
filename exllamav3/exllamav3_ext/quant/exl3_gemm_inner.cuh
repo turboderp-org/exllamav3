@@ -31,6 +31,12 @@ void exl3_gemm_kernel_inner
     const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;   // in uint16s
     const int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS;                            // in floats
 
+    // XOR-swizzle constants for bank-conflict-free A fragment loads
+    // col_swizzled = col ^ ((row >> SHIFT) & MASK)
+    const int A_COLS = TILESIZE_K / 8;                                            // int4 columns per row
+    const int A_SWIZZLE_MASK = A_COLS - 1;
+    const int A_SWIZZLE_SHIFT = (A_COLS <= 2) ? 2 : 1;
+
     // Sanity checks
     static_assert(EXL3_GEMM_BASE_THREADS == 256);
     static_assert(TILESIZE_M % 16 == 0, "Invalid kernel params");
@@ -91,11 +97,13 @@ void exl3_gemm_kernel_inner
     const int load_a_iters = CEIL_DIVIDE(sh0_a_stride_m / 8, EXL3_GEMM_BASE_THREADS);
     bool pred_a_gl[load_a_iters];
     int load_a_gl[load_a_iters];
+    int load_a_sh[load_a_iters];
     for (int i = 0; i < load_a_iters; ++i)
     {
         int k = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_a_stride_k / 8);
         int m = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_a_stride_k / 8);
         load_a_gl[i] = m * size_k / 8 + k;
+        load_a_sh[i] = m * A_COLS + (k ^ ((m >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK));
         pred_a_gl[i] = m < max_m;
     }
 
@@ -112,7 +120,7 @@ void exl3_gemm_kernel_inner
     {
         int n = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_b_stride_n / 8);
         int k = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_b_stride_n / 8);
-        load_b_gl[i] = k * blocks_n * 256 / 16 * bits / 8 * k + n;
+        load_b_gl[i] = k * (blocks_n * 256 / 16 * bits / 8) + n;
         pred_b_gl[i] = i * EXL3_GEMM_BASE_THREADS + t < sh0_b_stride_k / 8;
     }
 
@@ -207,16 +215,14 @@ void exl3_gemm_kernel_inner
 
         if (slice0_iters)
         {
-            // Copy tile from row-major A matrix
+            // Copy tile from row-major A matrix (XOR-swizzled for bank-conflict-free ldmatrix)
             {
                 const int4* gl = (const int4*) gl_a_ptr;
                 int4* sh = (int4*) sh0_a_ptr;
                 #pragma unroll
                 for (int i = 0; i < load_a_iters; ++i)
                 {
-                    // TODO: Rearrange into ldmatrix friendly layout while loading?
-                    // cp_async_pred(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_a_gl[i], pred_a_gl[i]);
-                    if (pred_a_gl[i]) cp_async(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_a_gl[i]);
+                    if (pred_a_gl[i]) cp_async(sh + load_a_sh[i], gl + load_a_gl[i]);
                 }
             }
 
@@ -245,15 +251,17 @@ void exl3_gemm_kernel_inner
     {
         if (!slice1_iters) return;
 
-        // A fragments
+        // A fragments (XOR-swizzled shared memory layout)
         {
-            // TODO: Resolve bank conflicts
             int r = (lane_id % 8) + 8 * ((lane_id / 8) % 2);
-            int c = lane_id / 16;
-            int4* sha = (int4*) sh1_a_ptr + r * TILESIZE_K / 8 + c;
+            int base_c = lane_id / 16 + sub_k * 2;
             #pragma unroll
             for (int m = 0; m < TILEBLOCKS_M; ++m)
-                ldsm4(frag_a[buf][m], sha + (m * 16) * TILESIZE_K / 8 + sub_k * 16 / 8);
+            {
+                int R = r + m * 16;
+                int c_swizzled = base_c ^ ((R >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
+                ldsm4(frag_a[buf][m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
+            }
         }
 
         // B fragments

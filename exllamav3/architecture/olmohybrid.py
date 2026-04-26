@@ -16,7 +16,7 @@ from ..modules import (
     GatedMLP,
 )
 from ..modules.attn import prepare_for_attn
-from ..modules.gated_delta_net import prepare_for_recurrence
+from ..cache.recurrent_util import prepare_for_recurrence
 
 class OlmoHybridConfig(Config):
     arch_string = "OlmoHybridForCausalLM"
@@ -108,6 +108,7 @@ class OlmoHybridModel(Model):
                 TransformerBlock(
                     config = config,
                     key = f"{key_prefix}.layers.{idx}",
+                    layer_idx = idx,
                     attn_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.input_layernorm",
@@ -235,7 +236,10 @@ class OlmoHybridModel(Model):
         self.logit_layer_idx = len(self.modules) - 1
 
         # Mark that we need recurrent cache for generation
-        self.caps.update({"recurrent_states": True})
+        self.caps.update({
+            "recurrent_states": True,
+            "linear_attn": True,
+        })
 
         # TP for this architecture is not implemented yet
         self.caps.update({"supports_tp": False})

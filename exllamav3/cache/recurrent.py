@@ -13,7 +13,7 @@ class CacheableState(ABC):
         pass
 
     @abstractmethod
-    def unstash(self, device):
+    def unstash(self, device, trim_position):
         """
         Return GPU copy of state
         """
@@ -24,6 +24,35 @@ class CacheableState(ABC):
         """
         Return size of state in bytes (in system memory after stashing)
         """
+        pass
+
+    @abstractmethod
+    def get_cachable_interval(self):
+        """
+        Return number of past positions from which state can be trivially reconstructed
+        """
+
+    @abstractmethod
+    def reset(self):
+        """
+        Clear this recurrent state (used during autosplit load)
+        """
+
+    @abstractmethod
+    def force_position(self, position: int):
+        """
+        For testing/benchmark purposes, modify the state to mapping to a specific position. Actual state
+        value will be incorrect but state will be valid.
+        """
+
+    @abstractmethod
+    def clone(self):
+        """
+        Return a fully materialized clone of this state
+        """
+
+    @abstractmethod
+    def rewind(self, count: int):
         pass
 
 
@@ -39,6 +68,7 @@ class RecurrentCache(OrderedDict):
         self.model = model
 
         # Get device map needed for unstashing
+        self.model = model
         self.rl = model.get_recurrent_layers()
         self.device_map = {m.layer_idx: m.device for m in self.rl}
 
@@ -56,44 +86,59 @@ class RecurrentCache(OrderedDict):
         Add state to cache
         """
         if key in self:
-            old_state_size = self.get_size(self[key])
             del self[key]
-            self.current_size -= old_state_size
-        state_size = self.get_size(state)
-        while self.current_size + state_size > self.max_size:
-            assert self.current_size > 0, "Not enough space in cache for single state"
-            _, oldest_state = self.popitem(last = False)
-            oldest_state_size = self.get_size(oldest_state)
-            self.current_size -= oldest_state_size
+        if state not in self.values():
+            state_size = self.get_size(state)
+            while self.update_total_size() + state_size > self.max_size:
+                assert self.current_size > 0, "Not enough space in cache for single state"
+                _, oldest_state = self.popitem(last = False)
         self[key] = state
-        self.current_size += state_size
+        self.update_total_size()
+
+    def update_total_size(self):
+        seen = set()
+        total = 0
+        for v in self.values():
+            if id(v) in seen:
+                continue
+            seen.add(id(v))
+            total += self.get_size(v)
+        self.current_size = total
+        return total
 
     def get_size(self, state):
         elems = state if isinstance(state, list) else state.values()
         total = sum(e.get_size() for e in elems)
         return total
 
-    def stash(self, key, state):
+    def stash(self, keys, state):
         """
         Save state checkpoint to system memory
         """
-        if key in self:
-            self.move_to_end(key)
-        else:
-            stashed_state = {k: v.stash() for k, v in state.items()}
-            self.put(key, stashed_state)
+        stashed_state = None
+        for offset, key in keys:
+            if key in self:
+                self.move_to_end(key)
+            else:
+                stashed_state = stashed_state or self.get_stashed(state)
+                self.put(key, stashed_state)
 
-    def get_unstashed(self, stashed_state):
+    def get_stashed(self, state):
+        """
+        Move checkpoint to system RAM and prepare to store in cache
+        """
+        return {k: v.stash() for k, v in state.items()}
+
+    def get_unstashed(self, stashed_state, trim_position):
         """
         Retrieve state checkpoint from system memory to device memory, device-mapped according to
         loaded model.
         """
-        unstashed_state = {k: v.unstash(self.device_map[k]) for k, v in stashed_state.items()}
+        unstashed_state = {k: v.unstash(self.device_map[k], trim_position) for k, v in stashed_state.items()}
         return unstashed_state
 
     def get_empty_state(self):
         """
         Create an empty recurrent state compatible with the associated model
         """
-        new_state = {m.layer_idx: m.new_recurrent_state() for m in self.rl}
-        return new_state
+        return self.model.get_empty_state()

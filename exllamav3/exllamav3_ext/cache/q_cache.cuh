@@ -40,5 +40,6 @@ void dequant_cache_paged
     const at::Tensor& v_out,
     const at::Tensor& cache_seqlens,
     const at::Tensor& block_table,
-    int page_size
+    int page_size,
+    int sliding_window
 );

@@ -1,0 +1,57 @@
+[
+    {
+        "load_fn": "transformers_auto_bf16",
+        "fwd_fn": "transformers",
+        "label": "HF BF16",
+        "model_dir": "/mnt/str/models/gemma4-26b-a4b-it/hf/",
+        "out_logits": "/mnt/str/models/gemma4-26b-a4b-it/ref_logits"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 2.10bpw H6 ",
+        "model_dir": "/mnt/str/models/gemma4-26b-a4b-it/exl3/2.10bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 2.54bpw H6 ",
+        "model_dir": "/mnt/str/models/gemma4-26b-a4b-it/exl3/2.54bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 3.10bpw H6 ",
+        "model_dir": "/mnt/str/models/gemma4-26b-a4b-it/exl3/3.10bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 3.54bpw H6 ",
+        "model_dir": "/mnt/str/models/gemma4-26b-a4b-it/exl3/3.54bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 4.10bpw H6 ",
+        "model_dir": "/mnt/str/models/gemma4-26b-a4b-it/exl3/4.10bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 5.10bpw H6 ",
+        "model_dir": "/mnt/str/models/gemma4-26b-a4b-it/exl3/5.10bpw/"
+    },
+    {
+        "load_fn": "exllamav3",
+        "fwd_fn": "exllamav3",
+        "label": "EXL3 6.10bpw H6 ",
+        "model_dir": "/mnt/str/models/gemma4-26b-a4b-it/exl3/6.10bpw/"
+    },
+    {
+        "model_dir": "/mnt/str/models/gemma4-26b-a4b-it/gguf/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+        "load_fn": "llamacpp",
+        "fwd_fn": "llamacpp",
+        "label": "GGUF UD-Q4_K_M"
+    }
+]

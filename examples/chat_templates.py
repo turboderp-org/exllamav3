@@ -95,7 +95,9 @@ class PromptFormat_chatml(PromptFormat):
         )
 
     def format(self, system_prompt, messages, think):
-        context = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        context = ""
+        if system_prompt:
+            context += f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
         for (u, a) in messages:
             context += f"<|im_start|>user\n{u}<|im_end|>\n"
             context += f"<|im_start|>assistant\n"

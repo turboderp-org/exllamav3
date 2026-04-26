@@ -14,7 +14,6 @@
 #include "softcap.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
-#include "causal_conv1d.cuh"
 #include "add.cuh"
 
 #include "quant/quantize.cuh"
@@ -50,6 +49,10 @@
 #include "libtorch/gated_rmsnorm.h"
 #include "libtorch/mlp.h"
 #include "libtorch/blocksparse_mlp.h"
+
+#include "attention.cuh"
+
+#include "sam.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -121,6 +124,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
 
     m.def("cache_rotate", &cache_rotate, "cache_rotate");
+    m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
 
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
     m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
@@ -137,9 +141,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
 
+    m.def("bighead_attn", &bighead_attn, "bighead_attn");
+    m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");
+    m.def("bighead_attn_workspace_size", &bighead_attn_workspace_size, "bighead_attn_workspace_size");
+
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
+    #include "sam_bc.h"
 }

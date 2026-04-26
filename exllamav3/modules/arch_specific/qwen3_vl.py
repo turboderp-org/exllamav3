@@ -1,11 +1,11 @@
 from __future__ import annotations
 import torch
 from torch import nn
-from exllamav3.model.config import Config
-from exllamav3.modules import Module, Linear, LayerNorm
-from exllamav3.util.tensor import to2
+from ...model.config import Config
+from ...modules import Module, Linear, LayerNorm
+from ...util.tensor import to2
 from typing_extensions import override
-from exllamav3.model.model_tp_alloc import TPAllocation
+from ...model.model_tp_alloc import TPAllocation
 import torch.nn.functional as F
 
 

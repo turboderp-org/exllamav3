@@ -18,7 +18,7 @@ col_green = "\u001b[32;1m"
 col_red = "\u001b[31;1m"
 col_gray = "\u001b[37;1m"
 
-model_dir = "/mnt/str/models/qwen3.5-35b-a3b/exl3/4.09bpw"
+model_dir = "/mnt/str/models/gemma4-31b/exl3/4.00bpw/"
 cache_size = 16384
 draft_model_dir = None
 prompt_len = (50, 4096)

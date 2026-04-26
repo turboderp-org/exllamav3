@@ -301,6 +301,7 @@ void had_hf_r_128_guad_inner
             break;
 
         default:
+            break;
     }
 
     // Optional activation limits

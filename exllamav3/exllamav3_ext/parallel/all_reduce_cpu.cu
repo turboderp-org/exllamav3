@@ -156,10 +156,12 @@ void pg_all_reduce_cpu_kernel
     // Indexing
     const uint32_t buf_slot_size = (shbuf_size / (MAX_DEVICES + 1) / 1024) * 1024;
     const uint32_t max_buf_stages = buf_slot_size / CPUREDUCE_CHUNK_SIZE;
+
     auto host_ptr = [&] (int device, uint32_t stage_idx)
     {
         return shbuf_ptr + buf_slot_size * device + (stage_idx % max_buf_stages) * CPUREDUCE_CHUNK_SIZE;
     };
+
     auto dev_ptr = [&] (uint32_t chunk_idx)
     {
         if constexpr (dtype == PARCK_MODE_FLOAT)
@@ -168,6 +170,14 @@ void pg_all_reduce_cpu_kernel
             return data_ptr + chunk_idx * CPUREDUCE_CHUNK_SIZE;
     };
     uint8_t* data_end = data_ptr + data_size;
+
+    auto dev_ptr_end = [&] (uint32_t chunk_idx)
+    {
+        if constexpr (dtype == PARCK_MODE_FLOAT)
+            return MIN(data_ptr + (chunk_idx + 1) * CPUREDUCE_CHUNK_SIZE * 2, data_end);
+        if constexpr (dtype == PARCK_MODE_HALF || dtype == PARCK_MODE_BF16)
+            return MIN(data_ptr + (chunk_idx + 1) * CPUREDUCE_CHUNK_SIZE, data_end);
+    };
 
     int t = threadIdx.x;
     int dir = blockIdx.x;
@@ -203,8 +213,9 @@ void pg_all_reduce_cpu_kernel
                 if constexpr (dtype == PARCK_MODE_FLOAT)
                 {
                     uint4* src = (uint4*) dev_ptr(send_idx);
+                    uint4* src_end = (uint4*) dev_ptr_end(send_idx);
                     uint2* dst = (uint2*) host_ptr(this_device, stage);
-                    for (int i = 0; i < 2 && src + t < (uint4*) data_end; ++i)
+                    for (int i = 0; src + t < src_end; ++i)
                     {
                         // Truncate FP32 -> BF16
                         uint4 v = src[t];
@@ -219,8 +230,9 @@ void pg_all_reduce_cpu_kernel
                 if constexpr (dtype == PARCK_MODE_BF16)
                 {
                     uint2* src = (uint2*) dev_ptr(send_idx);
+                    uint2* src_end = (uint2*) dev_ptr_end(send_idx);
                     uint2* dst = (uint2*) host_ptr(this_device, stage);
-                    for (int i = 0; i < 2 && src + t < (uint2*) data_end; ++i)
+                    for (int i = 0; src + t < src_end; ++i)
                     {
                         // Copy BF16 -> BF16
                         uint2 pack = src[t];
@@ -234,8 +246,9 @@ void pg_all_reduce_cpu_kernel
                 if constexpr (dtype == PARCK_MODE_HALF)
                 {
                     half4* src = (half4*) dev_ptr(send_idx);
+                    half4* src_end = (half4*) dev_ptr_end(send_idx);
                     uint2* dst = (uint2*) host_ptr(this_device, stage);
-                    for (int i = 0; i < 2 && src + t < (half4*) data_end; ++i)
+                    for (int i = 0; src + t < src_end; ++i)
                     {
                         half4 h = src[t];
                         float4 f{ __half2float(h.x.x), __half2float(h.x.y), __half2float(h.y.x), __half2float(h.y.y) };
@@ -298,8 +311,9 @@ void pg_all_reduce_cpu_kernel
             if constexpr (dtype == PARCK_MODE_FLOAT)
             {
                 uint4* dst = (uint4*) dev_ptr(recv_idx);
+                uint4* dst_end = (uint4*) dev_ptr_end(recv_idx);
                 uint2* src = (uint2*) host_ptr(MAX_DEVICES, stage);
-                for (int i = 0; i < 2 && dst + t < (uint4*) data_end; ++i)
+                for (int i = 0; dst + t < dst_end; ++i)
                 {
                     uint2 pack = src[t];
                     uint4 v{ pack.x << 16, pack.x & 0xffff0000, pack.y << 16, pack.y & 0xffff0000 };
@@ -313,8 +327,9 @@ void pg_all_reduce_cpu_kernel
             if constexpr (dtype == PARCK_MODE_BF16)
             {
                 uint2* dst = (uint2*) dev_ptr(recv_idx);
+                uint2* dst_end = (uint2*) dev_ptr_end(recv_idx);
                 uint2* src = (uint2*) host_ptr(MAX_DEVICES, stage);
-                for (int i = 0; i < 2 && dst + t < (uint2*) data_end; ++i)
+                for (int i = 0; dst + t < dst_end; ++i)
                 {
                     uint2 pack = src[t];
                     dst[t] = pack;
@@ -327,8 +342,9 @@ void pg_all_reduce_cpu_kernel
             if constexpr (dtype == PARCK_MODE_HALF)
             {
                 half4* dst = (half4*) dev_ptr(recv_idx);
+                half4* dst_end = (half4*) dev_ptr_end(recv_idx);
                 uint2* src = (uint2*) host_ptr(MAX_DEVICES, stage);
-                for (int i = 0; i < 2 && dst + t < (half4*) data_end; ++i)
+                for (int i = 0; dst + t < dst_end; ++i)
                 {
                     uint2 pack = src[t];
                     uint4 v{ pack.x << 16, pack.x & 0xffff0000, pack.y << 16, pack.y & 0xffff0000 };

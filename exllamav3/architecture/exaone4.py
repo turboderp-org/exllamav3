@@ -108,6 +108,7 @@ class Exaone4Model(Model):
             TransformerBlock(
                 config = config,
                 key = f"model.layers.{idx}",
+                layer_idx = idx,
                 attn = Attention(
                     config = config,
                     key = f"model.layers.{idx}.self_attn",

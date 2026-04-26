@@ -7,8 +7,9 @@ from common import format_prompt, get_stop_conditions
 A couple of examples showing uses of the generator
 """
 
-prompt_format = "llama3"  # see common.py
-model_dir = "/mnt/str/eval_models/llama3.1-8b-instruct/exl3/4.0bpw/"
+prompt_format = "chatml"  # see common.py
+model_dir = "/mnt/str/models/qwen3.5-27b/exl3/4.00bpw/"
+draft_model_dir = None  # "/mnt/str/models/qwen3.5-27b-dflash/hf/"
 cache_size = 16384
 
 system_prompt = "You are a very nice language model."
@@ -159,6 +160,17 @@ def generate_temperature(generator, tokenizer):
 
 def main():
 
+    # Load draft model
+    if draft_model_dir:
+        draft_config = Config.from_directory(draft_model_dir)
+        draft_model = Model.from_config(draft_config)
+        draft_cache = Cache(draft_model, max_num_tokens = cache_size)
+        draft_model.load(progressbar = True)
+    else:
+        draft_config = None
+        draft_model = None
+        draft_cache = None
+
     # Load a model with cache
     config = Config.from_directory(model_dir)
     model = Model.from_config(config)
@@ -171,6 +183,8 @@ def main():
         model = model,
         cache = cache,
         tokenizer = tokenizer,
+        draft_model = draft_model,
+        draft_cache = draft_cache,
     )
 
     # Do some things

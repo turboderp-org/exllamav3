@@ -24,6 +24,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         }
         self.active_devices = []
         self.output_device = None
+        self.cache_weakrefs = {}
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
@@ -143,6 +144,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         tp_dev_limits: dict | None = None,
         tp_backend: str = "native",
         verbose: bool = False,
+        max_batch_size: int = 1,
         tp_options: dict | None = None,
     ):
         """
@@ -166,7 +168,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             # reserve 1 GB on cuda:0 and cuda:2, exclude cuda:1
             model.load(reserve_per_device = [1, -1, 1])
 
-            The default reserve per device is 0.25 GB. This applies to devices not included in reserve_per_device
+            The default reserve per device is 0.5 GB. This applies to devices not included in reserve_per_device
             as well.
 
         :param use_per_device:
@@ -223,6 +225,9 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         :param verbose:
             bool, more info while loading including full TP split
+
+        :param max_batch_size:
+            Max batch size to account for when loading in autosplit mode (default: 1)
 
         :param tp_options:
             dict of optional values:
@@ -295,6 +300,8 @@ class Model(Model_TPMixin, Model_LSMixin):
                     self.config,
                     self.modules,
                     verbose,
+                    max_batch_size,
+                    self.cache_weakrefs
                 )
                 self.output_device = self.modules[-1].device
 
@@ -468,3 +475,17 @@ class Model(Model_TPMixin, Model_LSMixin):
         Decide if any model-specific requirements are met when creating Model
         """
         pass
+
+    def get_empty_state(self, initial_length: int = 0):
+        """
+        Create an empty recurrent state. initial_length > 0 is for testing/benchmark purposes
+        """
+        if "recurrent_states" not in self.caps:
+            return None
+        new_state = {}
+        for m in self.get_recurrent_layers():
+            s = m.new_recurrent_state()
+            if initial_length:
+                s.force_position(initial_length)
+            new_state[m.layer_idx] = s
+        return new_state

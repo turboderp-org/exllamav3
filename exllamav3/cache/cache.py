@@ -2,10 +2,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Type
 import torch
-from ..model import Model, Config
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
+    from ..model import Model, Config
     from ..modules import Attention
+import weakref
 
 class CacheLayer(ABC):
 
@@ -31,7 +32,7 @@ class CacheLayer(ABC):
         pass
 
     @abstractmethod
-    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor) -> tuple:
+    def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor, sliding_window: int = -1) -> tuple:
         pass
 
     @abstractmethod
@@ -131,6 +132,8 @@ class Cache:
         if model is None:
             model = self.model
 
+        model.cache_weakrefs[id(self)] = weakref.ref(self)
+
         cl = model.get_cache_layers()
         for module in cl:
             layer = self.layers[module.layer_idx]
@@ -145,14 +148,16 @@ class Cache:
         if model is None:
             model = self.model
 
+        del model.cache_weakrefs[id(self)]
+
         cl = model.get_cache_layers()
         for module in cl:
             layer = self.layers[module.layer_idx]
             module.cache_layers.remove(layer)
 
 
-    def get_layer(self, idx: int, cache_seqlens: torch.Tensor, block_table: torch.Tensor) -> tuple:
-        return self.layers[idx].get_kv(cache_seqlens, block_table)
+    def get_layer(self, idx: int, cache_seqlens: torch.Tensor, block_table: torch.Tensor, sliding_window: int = -1) -> tuple:
+        return self.layers[idx].get_kv(cache_seqlens, block_table, sliding_window)
 
 
     def update_layer(

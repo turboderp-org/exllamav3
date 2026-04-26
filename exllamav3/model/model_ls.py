@@ -1,6 +1,9 @@
 from __future__ import annotations
 from typing import Callable
 import torch
+
+from ..modules.attn import prepare_for_attn
+from ..cache.recurrent_util import prepare_for_recurrence
 from ..util.memory import (
     set_memory_fraction_reserve,
     set_memory_fraction_use,
@@ -57,7 +60,9 @@ class Model_LSMixin:
         generator: bool,
         config: Config,
         modules: list,
-        verbose: bool
+        verbose: bool,
+        max_batch_size: int,
+        cache_weakrefs: dict
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
@@ -65,6 +70,23 @@ class Model_LSMixin:
         prev_load_device = None
         touched_devices = []
         params = self.default_load_params(max_chunk_size)
+
+        # Simulate cached/recurrent path while loading with cache
+        cl = [m for m in self if m.caps.get("kv_cache")]
+        if cl:
+            c0 = cl[0].cache_layers[0] if len(cl[0].cache_layers) else None
+            if c0:
+                cache = cache_weakrefs[c0.cache_id]()
+                params.update({
+                    "attn_mode": "flash_attn",
+                    "cache": cache,
+                    "past_len": 0,
+                    "batch_shape": (1, max_chunk_size),
+                })
+                prepare_for_attn(torch.zeros((1, max_chunk_size), dtype = torch.long), params)
+                rl = [m for m in self if m.caps.get("recurrent_cache")]
+                if rl:
+                    prepare_for_recurrence(None, params, self)
 
         with ProgressBar(f"Loading (LS)" if progressbar else None, len(modules)) as progress:
 
@@ -86,22 +108,25 @@ class Model_LSMixin:
                         # Select device
                         load_device = torch.device("cpu") if module.caps.get("prefer_cpu") else \
                             torch.device(active_devices[current_device_i])
+                        x_device = torch.device("cpu") if module.caps.get("prefer_cpu") or module.caps.get("x_cpu") else \
+                            torch.device(active_devices[current_device_i])
 
                         # Set VRAM limit if new device
                         if load_device != torch.device("cpu") and load_device != prev_load_device:
                             prev_load_device = load_device
                             i = active_devices[current_device_i]
+                            touched_devices.append(i)
+                            i = active_devices[current_device_i]
                             if reserve_per_device is not None:
                                 set_memory_fraction_reserve(reserve_per_device[i], i)
                             elif use_per_device is not None:
-                                 set_memory_fraction_use(use_per_device[i], i)
+                                set_memory_fraction_use(use_per_device[i], i)
                             else:
                                 raise RuntimeError("Logic error")
-                            touched_devices.append(i)
 
                         # (Re)create or backup hidden state (metadata)
                         if dummy_state is None:
-                            dummy_state = torch.zeros(backup_shape, dtype = backup_dtype, device = load_device)
+                            dummy_state = torch.zeros(backup_shape, dtype = backup_dtype, device = x_device)
                         else:
                             backup_shape = dummy_state.shape
                             backup_dtype = dummy_state.dtype
@@ -110,7 +135,7 @@ class Model_LSMixin:
                         defer = module.can_defer_load()
                         if defer:
                             config.stc.begin_deferred_load()
-                        module.load(load_device)
+                        module.load(load_device, max_chunk_size = max_chunk_size)
                         if defer:
                             config.stc.end_deferred_load()
 
@@ -121,19 +146,29 @@ class Model_LSMixin:
                                 qcache_overhead.append(cl.get_kv_alloc_placeholder())
 
                         # Forward dummy state through module
-                        dummy_state = module.prepare_for_device(dummy_state, params)
-                        dummy_state = module.forward(dummy_state, params)
+                        if self.caps.get("autosplit_load_fwd", True):
+                            dummy_state = module.prepare_for_device(dummy_state, params)
+                            dummy_state = module.forward(dummy_state, params)
+
+                        # Create extra dummy recurrent states to account for max_batch_size
+                        recurrent = params.get("recurrent_states")
+                        if recurrent:
+                            dummy_recurrent_states = []
+                            for _ in range(1, max_batch_size):
+                                s = {k: v.clone() for k, v in recurrent.items()}
+                                dummy_recurrent_states.append(s)
+                            del dummy_recurrent_states
 
                         # Account for max_output_factor after last layer,
-                        extra_dummy_states = None
+                        extra_dummy_out_states = None
                         if is_logits_layer:
-                            extra_dummy_states = [
+                            extra_dummy_out_states = [
                                 torch.empty_like(dummy_state)
                                 for _ in range(max_output_factor - 1)
                             ]
 
                         # Dereference extra dummy tensors
-                        extra_dummy_states = None
+                        extra_dummy_out_states = None
                         qcache_overhead = None
 
                         # We're good
@@ -155,6 +190,13 @@ class Model_LSMixin:
                     if fail:
                         module.unload()
                         dummy_state = None
+                        if "recurrent_states" in params:
+                            rls = [m for m in module if m.caps.get("recurrent_cache")]
+                            for rl in rls:
+                                s = params["recurrent_states"].get(rl.layer_idx)
+                                if s:
+                                    s.reset()
+
                         free_mem()
                         current_device_i += 1
                         if current_device_i >= len(active_devices):

@@ -6,7 +6,7 @@ from ..model.model import Model
 from ..util.rope import RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, BlockSparseMLP, Linear, GatedDeltaNet, GatedMLP
 from ..modules.attn import prepare_for_attn
-from ..modules.gated_delta_net import prepare_for_recurrence
+from ..cache.recurrent_util import prepare_for_recurrence
 
 class Qwen3NextConfig(Config):
     arch_string = "Qwen3NextForCausalLM"
@@ -87,6 +87,7 @@ class Qwen3NextModel(Model):
             TransformerBlock(
                 config = config,
                 key = f"model.layers.{idx}",
+                layer_idx = idx,
                 attn_norm = RMSNorm(
                     config = config,
                     key = f"model.layers.{idx}.input_layernorm",
@@ -220,7 +221,11 @@ class Qwen3NextModel(Model):
         self.calibration_all_experts = True
 
         # Mark that we need recurrent cache for generation
-        self.caps.update({"recurrent_states": True})
+        self.caps.update({
+            "recurrent_states": True,
+            "default_recurrent_checkpoint_interval": 2048,
+            "linear_attn": True,
+        })
 
         # TODO: Enable TP for linear attn
         self.caps.update({"supports_tp": False})

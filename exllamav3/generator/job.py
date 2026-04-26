@@ -290,6 +290,9 @@ class Job:
             assert 1 < min_reps < window_size, "Number of reps must be > 1, < window_size"
             self.loop_detector = LoopDetector(window_size, window_size // min_reps)
 
+        # N-gram automaton
+        self.sam = rq_state.get("sam", None)
+
 
     def get_pinned_logit_mask(self):
         if self.pinned_logit_mask is None:
@@ -611,7 +614,7 @@ class Job:
                     "cached_pages": self.cached_pages // len(self.sequences),
                     "cached_tokens": (self.cached_pages * PAGE_SIZE + self.cached_tokens) // len(self.sequences),
                 })
-                if self.generator.draft_model:
+                if self.generator.draft_model or self.generator.ngram_match_min:
                     r.update({
                         "accepted_draft_tokens": self.accepted_draft_tokens,
                         "rejected_draft_tokens": self.rejected_draft_tokens
@@ -814,7 +817,8 @@ class Job:
             "time_enqueued": self.time_enqueued,
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
-            "rq_new_tokens": self.new_tokens - 1
+            "rq_new_tokens": self.new_tokens - 1,
+            "sam": self.sam
         }
 
         serial_number = self.serial_number
@@ -896,6 +900,7 @@ class Job:
             self.held_probs = SeqTensor((1, 0), dtype = torch.float, seq_dim = -1)
             self.held_logits = SeqTensor((1, 0, self.generator.padded_vocab_size), dtype = torch.float, seq_dim = 1)
             self.full_completion = ""
+            self.sam = None if not generator.ngram_match_min else ext.BC_SAM()
 
         self.time_enqueue = time.time()
 
@@ -942,8 +947,8 @@ class Job:
             prefill_end = min(prefill_end, len(seq.sequence_ids) - 1)
 
             atomic_mm_prefill = bool(self.embeddings) and self.generator.model.caps.get("atomic_mm_prefill")
-            assert not atomic_mm_prefill or not self.recurrent_state, \
-                "Atomic prefill is not supported for recurrent models"
+            # assert not atomic_mm_prefill or not self.recurrent_state, \
+            #     "Atomic prefill is not supported for recurrent models"
 
             p0 = prefill_start // PAGE_SIZE
             p1 = (prefill_end + PAGE_SIZE - 1) // PAGE_SIZE
@@ -1038,29 +1043,39 @@ class Job:
                         ext_prefill_end += 1
                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, ext_prefill_end)
 
-                if self.generator.draft_model:
+                params = {
+                    "attn_mode": "flash_attn",
+                    "block_table": seq.block_index_tensor,
+                    "cache": self.generator.cache,
+                    "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                    "recurrent_states": self.recurrent_state,
+                    "indexed_embeddings": self.embeddings,
+                    "inv_freq": self.alt_rope_freqs,
+                }
+                self.generator.model.prefill(
+                    input_ids = prefill_ids,
+                    params = params,
+                )
+
+                if self.generator.dflash_draft:
+                    self.generator.draft_model.update_kv_from_target(
+                        target_hidden = params.get("export_states"),
+                        cache = self.generator.draft_cache,
+                        params = {
+                            "block_table": seq.block_index_tensor,
+                            "cache_seqlens": params["cache_seqlens"],
+                        }
+                    )
+                elif self.generator.draft_model:
                     self.generator.draft_model.prefill(
                         input_ids = prefill_ids,
                         params = {
                             "attn_mode": "flash_attn",
                             "block_table": seq.block_index_tensor,
                             "cache": self.generator.draft_cache,
-                            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32)
+                            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
                         }
                     )
-
-                self.generator.model.prefill(
-                    input_ids = prefill_ids,
-                    params = {
-                        "attn_mode": "flash_attn",
-                        "block_table": seq.block_index_tensor,
-                        "cache": self.generator.cache,
-                        "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                        "recurrent_states": self.recurrent_state,
-                        "indexed_embeddings": self.embeddings,
-                        "inv_freq": self.alt_rope_freqs,
-                    }
-                )
 
                 seq.kv_position = prefill_end
 
@@ -1111,7 +1126,9 @@ class Job:
                 if recurrent_state is None:
                     self.recurrent_state = self.generator.recurrent_cache.get_empty_state()
                 else:
-                    self.recurrent_state = self.generator.recurrent_cache.get_unstashed(recurrent_state)
+                    self.recurrent_state = self.generator.recurrent_cache.get_unstashed(recurrent_state, cached_pages * PAGE_SIZE)
+                    first_rec_layer_state = next(iter(self.recurrent_state.values()))
+                    self.last_recurrent_checkpoint_pos = first_rec_layer_state.position
 
             # Metrics
             self.cached_pages += cached_pages
@@ -1144,17 +1161,51 @@ class Job:
                 f.reset()
                 f.is_active = f.trigger_token is None
 
+
     def maybe_stash_recurrent(self, cache, interval):
         seq = self.sequences[0]
         if seq.kv_position % interval == 0 and \
             self.last_recurrent_checkpoint_pos != seq.kv_position:
+            assert seq.kv_position % PAGE_SIZE == 0
+
             self.last_recurrent_checkpoint_pos = seq.kv_position
             last_page = (seq.kv_position - 1) // PAGE_SIZE
-            page = seq.allocated_pages[last_page]
-            assert page.kv_position == PAGE_SIZE
-            cache.stash(page.phash, self.recurrent_state)
+
+            # Collect valid checkpoint positions
+
+            first_rec_layer_state = next(iter(self.recurrent_state.values()))
+            max_offset = first_rec_layer_state.get_cachable_interval()
+            hashes = []
+            for page_offset, offset in enumerate(range(0, max_offset + 1, PAGE_SIZE)):
+                if last_page - page_offset < 0:
+                    break
+                page = seq.allocated_pages[last_page - page_offset]
+                assert page.kv_position == PAGE_SIZE
+                hashes.append((offset, page.phash))
+
+            # Insert oldest hash first
+            hashes.sort(reverse = True)
+            cache.stash(hashes, self.recurrent_state)
+
             # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk
             self.last_recurrent_checkpoint_pos = seq.kv_position
 
+
     def free_recurrent_state(self):
         self.recurrent_state = None
+
+
+    def get_ngram_draft(self, draft_length: int):
+        assert self.sam
+
+        # Update SAM with current history and find longest suffix
+        seq = self.sequences[0].sequence_ids.torch()
+        beg, end = self.sam.accept_tensor(seq)
+
+        # Grab continuation after longest match or return empty seq
+        if end - beg >= self.generator.ngram_match_min:
+            draft = seq[:, end : end + self.generator.num_draft_tokens]
+        else:
+            draft = torch.empty((1, 0), dtype = torch.long)
+
+        return draft

@@ -25,7 +25,8 @@ from compare_q_transformers import (
     load_transformers_auto,
     load_transformers,
     fwd_transformers,
-    tokenize_transformers
+    tokenize_transformers,
+    chat_template_transformers
 )
 from compare_q_exllamav2 import (
     load_exllamav2,
@@ -72,6 +73,10 @@ tokenize_fns = {
     "transformers": tokenize_transformers,
 }
 
+template_fns = {
+    "transformers": chat_template_transformers,
+}
+
 # Util fn
 
 def load_tensor(filename):
@@ -99,6 +104,7 @@ def save_tensor(tensor, filename: str):
 @disk_lru_cache("get_dataset")
 def get_test_data(spec: dict):
     tokenize_fn = tokenize_fns[spec["tokenize_fn"]]
+    template_fn = template_fns[spec["tokenize_fn"]] if spec.get("chat_template") else None
     assert spec["dataset"] == "wiki2", "Only wiki2 implemented atm"
     eval_stride = spec["eval_stride"]
     eval_len = spec["eval_len"]
@@ -114,7 +120,10 @@ def get_test_data(spec: dict):
     seqs = []
     for a in range(0, num_tokens - eval_len, eval_stride):
         b = a + eval_len
-        seqs.append(eval_tokens[:, a:b])
+        tokens = eval_tokens[:, a:b]
+        if template_fn:
+            tokens = template_fn(spec["tokenizer_dir"], tokens)
+        seqs.append(tokens)
         if max_rows and len(seqs) >= max_rows:
             break
     eval_tokens = torch.cat(seqs, dim = 0)[:, :]
@@ -141,6 +150,8 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
     kl_div_sum_ab = 0.0
     kl_div_count = 0.0
 
+    eval_len = data_spec["eval_len"] - data_spec.get("warmup_tokens", 0)
+
     print(f"Testing: {model_dir} ({spec['label']})")
 
     collect_logits = False
@@ -159,7 +170,7 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
             pb.update(row)
             input_ids = eval_ids[row:row + 1, :]
             logits = fwd_fn(model_instance, input_ids)
-            logits = logits.float()
+            logits = logits.float()[..., -eval_len:, :]
 
             # kld
             if logits_file and row < 10:
@@ -185,7 +196,7 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
             logits += 1e-10
             log_probs = F.log_softmax(logits, dim = -1)
             del logits
-            target_ids = input_ids[:, 1:].to(log_probs.device)
+            target_ids = input_ids[:, -eval_len:][:, 1:].to(log_probs.device)
             del input_ids
             target_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
             del log_probs

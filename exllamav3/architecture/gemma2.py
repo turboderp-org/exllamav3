@@ -78,6 +78,7 @@ class Gemma2Model(Model):
             TransformerBlock(
                 config = config,
                 key = f"model.layers.{idx}",
+                layer_idx = idx,
                 attn_norm = RMSNorm(
                     config = config,
                     key = f"model.layers.{idx}.input_layernorm",

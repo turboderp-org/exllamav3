@@ -323,6 +323,7 @@ def print_probs(
     saved_samples: list,
     vocab: list,
     ids_per_line = 5,
+    minimum_p = 1e-6,
 ):
     if len(saved_topk) == 0:
         return
@@ -331,14 +332,17 @@ def print_probs(
     ids_this_line = 0
     for ids, probs, sample in zip(saved_topk, saved_probs, saved_samples):
         tss = repr(vocab[sample[0]])[1:-1].replace(" ", "␣")
-        lines[0] += f"{col_sysprompt}" + ljust_truncate(tss, 26) + f"{col_default}  "
-        lines[1] += f"{col_dark}" + "─" * 26 + f"{col_default}  "
+        lines[0] += f"{col_sysprompt}" + ljust_truncate(tss, 27) + f"{col_default}  "
+        lines[1] += f"{col_dark}" + "─" * 27 + f"{col_default}  "
         for i, (t, p) in enumerate(zip(ids, probs)):
-            hl = col_b if sample[0] == t else ""
-            ts = repr(vocab[t])[1:-1].replace(" ", "␣")
-            lines[i + 2] += f"{col_user}{hl}  {t:6}{col_default}{hl} "
-            lines[i + 2] += f"{ljust_truncate(ts, 10)} "
-            lines[i + 2] += f"{col_think1}{hl}{p:6.4f}{col_default}  "
+            if p < minimum_p:
+                lines[i + 2] += " " * 29
+            else:
+                hl = col_b if sample[0] == t else ""
+                ts = repr(vocab[t])[1:-1].replace(" ", "␣")
+                lines[i + 2] += f"{col_user}{hl}  {t:6}{col_default}{hl} "
+                lines[i + 2] += f"{ljust_truncate(ts, 10)} "
+                lines[i + 2] += f"{col_think1}{hl}{p:7.5f}{col_default}  "
         ids_this_line += 1
         if ids_this_line == ids_per_line:
             print(f"\n{LRO}" + "\n".join(lines) + f"{PDF}")

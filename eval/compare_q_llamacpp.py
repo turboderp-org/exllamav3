@@ -39,7 +39,7 @@ def load_llamacpp(model_dir: str):
         model_path = model_dir,
         logits_all = True,
         verbose = False,
-        n_ctx = 2048,
+        n_ctx = 3072,
         n_gpu_layers = 999
     )
     return model, bpw_layer, bpw_head, vram_bits

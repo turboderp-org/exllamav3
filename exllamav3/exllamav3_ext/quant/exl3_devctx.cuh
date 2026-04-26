@@ -9,7 +9,7 @@
 #define BARRIER_LOCKS_OFFSET MAX_TILES_C
 
 // Workspace size
-#define WORKSPACE_SIZE (4*1024*1024)
+#define WORKSPACE_SIZE (16*1024*1024)
 
 // Treat hopper and blackwell as same arch for now
 #define MAX_DEVICES 16
