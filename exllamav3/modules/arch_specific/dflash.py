@@ -302,7 +302,7 @@ class DFlashAttention(Module):
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
 
         bsz, seqlen, dim = x.shape
-        cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table, -1)
+        cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table, -1, 0)
 
         q = self.q_proj.forward(x, params)
         k = self.k_proj.forward(x, params)
@@ -345,5 +345,5 @@ class DFlashAttention(Module):
         o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         o = self.o_proj.forward(o, params)
 
-        cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
+        cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen, 0)
         return o

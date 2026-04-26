@@ -42,6 +42,7 @@ class Module(ABC):
         self.num_slices = 1
         self.select_hq_bits = 0
         self.q_priority = 0
+        self.layer_idx = None
 
     def __iter__(self):
         yield self

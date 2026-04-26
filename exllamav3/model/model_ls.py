@@ -12,12 +12,18 @@ from ..util.memory import (
 )
 from ..util.progress import ProgressBar
 from .config import Config
+from abc import ABC, abstractmethod
 
 
-class Model_LSMixin:
+class Model_LSMixin(ABC):
 
     def __init__(self):
         pass
+
+
+    @abstractmethod
+    def get_layer_instances(self, layer_idx) -> tuple:
+        ...
 
 
     def _load_single(
@@ -193,9 +199,10 @@ class Model_LSMixin:
                         if "recurrent_states" in params:
                             rls = [m for m in module if m.caps.get("recurrent_cache")]
                             for rl in rls:
-                                s = params["recurrent_states"].get(rl.layer_idx)
-                                if s:
-                                    s.reset()
+                                for instance in self.get_layer_instances(rl.layer_idx):
+                                    s = params["recurrent_states"].get(instance)
+                                    if s:
+                                        s.reset()
 
                         free_mem()
                         current_device_i += 1
@@ -224,14 +231,13 @@ class Model_LSMixin:
         self,
         x: torch.Tensor,
         params: dict,
-        last_kv_module_idx: int,
-        modules: list,
     ):
-        for idx, module in enumerate(modules):
-            params["prefill"] = (idx == last_kv_module_idx)
+        for module, instance, idx in self.fwd_modules:
+            params["layer_instance"] = instance
+            params["prefill"] = (instance == self.last_kv_module_instance)
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
-            if idx == last_kv_module_idx:
+            if instance == self.last_kv_module_instance:
                 break
         del params["prefill"]
         return None
@@ -241,10 +247,9 @@ class Model_LSMixin:
         self,
         x: torch.Tensor,
         params: dict,
-        last_kv_module_idx: int,
-        modules: list,
     ):
-        for idx, module in enumerate(modules):
+        for module, instance, idx in self.fwd_modules:
+            params["layer_instance"] = instance
             if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
                 x = x[..., -num:, :].contiguous()
             x = module.prepare_for_device(x, params)

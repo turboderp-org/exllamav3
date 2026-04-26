@@ -830,9 +830,9 @@ class Attention(Module):
             )
 
         if self.has_split_cache:
-            cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table, self.sliding_window)
+            cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table, self.sliding_window, params.get("layer_instance"))
         else:
-            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table, self.sliding_window)
+            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table, self.sliding_window, params.get("layer_instance"))
 
         if self.use_bighead_fallback:
             if q.shape[1] <= 8:
@@ -883,9 +883,9 @@ class Attention(Module):
             o = torch.cat(o, dim = 1)
 
         if self.has_split_cache:
-            self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
+            self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen, params.get("layer_instance"))
         else:
-            cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
+            cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen, params.get("layer_instance"))
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))

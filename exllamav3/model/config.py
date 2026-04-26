@@ -14,16 +14,25 @@ class Config(ABC):
         self,
         directory: str,
         model_classes: dict,
+        layer_map: list[int] | str | None = None,
         **kwargs,
     ):
         """
-        Read a HF model config and prepare it for instantiation and loading
+        Read HF model config and prepare it for instantiation and loading
 
         :param directory:
             Directory containg the model config.json, weights, etc.
 
-        :param expect_arch:
-            Expected achitecture string
+        :param layer_map:
+            List of layer indices for RYS relayering. Forward passes will traverse the model in this order.
+            If layers repeat, attached cache will allocate individual key/value tensors for each instance of
+            each layer. Model weights are still loaded in the original layer order.
+
+            Alternatively, can be a string spec, e.g.:
+                "0,1,2,3,4,5,6,4,5,6"   list of ints to parse
+                "0..6,4..6"             inclusive intervals
+                "0..6,4,5,6"            mixed ints and intervals
+                "..,4.."                open-ended intervals (limited by model)
         """
 
         self.directory = directory
@@ -73,6 +82,18 @@ class Config(ABC):
 
         # Load parameters
         self.load_isq = False
+
+        # Layer map
+        if layer_map is None:
+            self.layer_map = None
+            self.layer_map_str = None
+        elif isinstance(layer_map, str):
+            self.layer_map = None
+            self.layer_map_str = layer_map
+        else:
+            assert isinstance(layer_map, list), "layer_map must be string or list of ints"
+            self.layer_map = layer_map
+            self.layer_map_str = None
 
 
     def default_max_position_embeddings(self):

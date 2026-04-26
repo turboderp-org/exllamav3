@@ -26,7 +26,10 @@ def prepare_for_recurrence(input_ids: torch.Tensor, params: dict, model) -> torc
                     raise ValueError(f"recurrent states don't match input past_len")
         else:
             rl = model.get_recurrent_layers()
-            rs = {attn.layer_idx: attn.new_recurrent_state() for attn in rl}
+            rs = {}
+            for attn in rl:
+                for instance in model.get_layer_instances(attn.layer_idx):
+                    rs[instance] = attn.new_recurrent_state()
             params["recurrent_states"] = rs
 
     elif cache_seqlens is not None:

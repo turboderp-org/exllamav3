@@ -58,6 +58,8 @@ def add_args(
 
     parser.add_argument("-lv", "--load_verbose", action = "store_true", help = "Verbose output while loading")
 
+    parser.add_argument("-layer_map", "--layer_map", type = str, help = "RYS layer map as a list of ints or (inclusive) ranges, example: 0..15,11..31 (repeats layers 11 through 15 once)", default = None)
+
     if add_sampling_args:
         defs = default_sampling_args if default_sampling_args is not None else {}
         d = SimpleNamespace()
@@ -161,7 +163,7 @@ def init(
     draft_model_dir = args.draft_model_dir if return_draft else None
 
     # Config
-    config = Config.from_directory(args.model_dir)
+    config = Config.from_directory(args.model_dir, layer_map = args.layer_map)
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
     draft_config = Config.from_directory(draft_model_dir) if draft_model_dir else None
 

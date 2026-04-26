@@ -229,7 +229,7 @@ class DFlashModel(Model):
             cache_seqlens = get_for_device(params, "cache_seqlens", layer.device)
             target_hidden = get_for_device(params, "target_hidden_cc", layer.device)
 
-            cache_k, cache_v = cache.get_layer(layer.layer_idx, cache_seqlens, block_table, -1)
+            cache_k, cache_v = cache.get_layer(layer.layer_idx, cache_seqlens, block_table, -1, 0)
 
             # k/v project
             k = layer.k_proj.forward(target_hidden, params)
@@ -260,7 +260,7 @@ class DFlashModel(Model):
                 cache_seqlens,
             )
 
-            cache.update_layer(layer.layer_idx, cache_seqlens, block_table, cache_k, cache_v, target_seqlen)
+            cache.update_layer(layer.layer_idx, cache_seqlens, block_table, cache_k, cache_v, target_seqlen, 0)
 
 
     def sample_from_state(

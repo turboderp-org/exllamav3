@@ -576,7 +576,7 @@ class SlidingAttention(Module):
         #       temporary batch tensors causes excessive fragmentation and unpredictable VRAM usage
         rsb = params.get("recurrent_states")
         assert rsb is not None
-        rsb = rsb[self.layer_idx]
+        rsb = rsb[self.layer_idx, params.get("layer_instance", 0)]
         if rsb.batched:
             rsb = rsb.batch
         else:
