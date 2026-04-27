@@ -1,4 +1,4 @@
-name: Build Wheels & Release (Windows only)
+name: Build Wheels & Release
 
 on:
   workflow_dispatch:
@@ -28,18 +28,33 @@ jobs:
 #        # Python 3.10
 #          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 #          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 #
 #        # Python 3.11
 #          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 #          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 #
 #        # Python 3.12
 #          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 #          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.11.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 #
 #        # Python 3.13
 #          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 #          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.11.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#
+#        # Python 3.14
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.14', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.14', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.14', cuda: '12.8.1', rocm:    '', torch: '2.11.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Windows 2022 CUDA
 
@@ -47,26 +62,39 @@ jobs:
           - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
           - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
           - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.11
           - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
           - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
           - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.12
           - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
           - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
           - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.11.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # Python 3.13
           - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
           - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
           - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.11.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+
+        # Python 3.14
+          - { artname: 'wheel', os: windows-2022, pyver: '3.14', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.14', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.14', cuda: '12.8.1', rocm:    '', torch: '2.11.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
 
         # sdist
-          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.7.0', cudaarch: ''                              }
-          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.8.0', cudaarch: ''                              }
-          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.9.0', cudaarch: ''                              }
+#          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.7.0', cudaarch: ''                              }
+#          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.8.0', cudaarch: ''                              }
+#          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.9.0', cudaarch: ''                              }
+#          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.10.0', cudaarch: ''                              }
+#          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.11.0', cudaarch: ''                              }
 
       fail-fast: false
 
@@ -120,22 +148,59 @@ jobs:
       - name: Install Windows CUDA 12.8
         if: runner.os == 'Windows' && contains(matrix.cuda, '12.8')
         run: |
+          $ErrorActionPreference = "Stop"
+
+          function Download-WithRetry {
+            param(
+              [Parameter(Mandatory=$true)][string]$Url,
+              [Parameter(Mandatory=$true)][string]$OutFile,
+              [int]$MaxAttempts = 5
+            )
+
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+              try {
+                Write-Host "Downloading $Url (attempt $attempt/$MaxAttempts)"
+                curl.exe -fL --retry 5 --retry-delay 5 --retry-all-errors -o $OutFile $Url
+
+                if (-not (Test-Path $OutFile)) {
+                  throw "File was not created: $OutFile"
+                }
+
+                $size = (Get-Item $OutFile).Length
+                if ($size -le 0) {
+                  throw "Downloaded file is empty: $OutFile"
+                }
+
+                Write-Host "Downloaded $OutFile ($size bytes)"
+                return
+              }
+              catch {
+                Write-Warning "Download failed for $Url : $_"
+                if ($attempt -eq $MaxAttempts) { throw }
+                Start-Sleep -Seconds ([Math]::Min(60, 5 * $attempt))
+              }
+            }
+          }
+
           mkdir -p "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
           choco install unzip -y
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.8.57-archive.zip"
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.8.61-archive.zip"
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-12.8.61-archive.zip"
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.8.3.14-archive.zip"
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-12.8.55-archive.zip"
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-12.8.55-archive.zip"
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-12.8.55-archive.zip"
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvprof/windows-x86_64/cuda_nvprof-windows-x86_64-12.8.57-archive.zip"
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-12.8.55-archive.zip"
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/libcusparse/windows-x86_64/libcusparse-windows-x86_64-12.5.7.53-archive.zip"
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/libcusolver/windows-x86_64/libcusolver-windows-x86_64-11.7.2.55-archive.zip"
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/libcurand/windows-x86_64/libcurand-windows-x86_64-10.3.9.55-archive.zip"
-          curl -fL -O "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/windows-x86_64/libcufft-windows-x86_64-11.3.3.41-archive.zip"
+
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.8.57-archive.zip" "cuda_cudart.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.8.61-archive.zip" "cuda_nvcc.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-12.8.61-archive.zip" "cuda_nvrtc.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.8.3.14-archive.zip" "libcublas.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-12.8.55-archive.zip" "cuda_nvtx.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-12.8.55-archive.zip" "cuda_profiler_api.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-12.8.55-archive.zip" "visual_studio_integration.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvprof/windows-x86_64/cuda_nvprof-windows-x86_64-12.8.57-archive.zip" "cuda_nvprof.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-12.8.55-archive.zip" "cuda_cccl.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcusparse/windows-x86_64/libcusparse-windows-x86_64-12.5.7.53-archive.zip" "libcusparse.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcusolver/windows-x86_64/libcusolver-windows-x86_64-11.7.2.55-archive.zip" "libcusolver.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcurand/windows-x86_64/libcurand-windows-x86_64-10.3.9.55-archive.zip" "libcurand.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/windows-x86_64/libcufft-windows-x86_64-11.3.3.41-archive.zip" "libcufft.zip"
+
           unzip '*.zip' -d "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+
           xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_cudart-windows-x86_64-12.8.57-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
           xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_nvcc-windows-x86_64-12.8.61-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
           xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_nvrtc-windows-x86_64-12.8.61-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
@@ -153,6 +218,18 @@ jobs:
           echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           echo "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $required = @(
+            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvcc.exe",
+            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvrtc64_*.dll",
+            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\lib\x64\cublas.lib"
+          )
+          
+          foreach ($pattern in $required) {
+            if (-not (Get-ChildItem $pattern -ErrorAction SilentlyContinue)) {
+              throw "Missing required CUDA file: $pattern"
+            }
+          }
 
       # "network" method is currently broken due to an NVIDIA driver dependency issue
       # https://forums.developer.nvidia.com/t/nvidia-driver-570-installation-is-broken-again/335219

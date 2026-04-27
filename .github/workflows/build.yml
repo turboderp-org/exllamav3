@@ -229,6 +229,7 @@ jobs:
             if (-not (Get-ChildItem $pattern -ErrorAction SilentlyContinue)) {
               throw "Missing required CUDA file: $pattern"
             }
+          }
 
       # "network" method is currently broken due to an NVIDIA driver dependency issue
       # https://forums.developer.nvidia.com/t/nvidia-driver-570-installation-is-broken-again/335219
