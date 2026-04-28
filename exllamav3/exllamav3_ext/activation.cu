@@ -367,6 +367,72 @@ void add_sigmoid_gate
     add_sigmoid_gate_gr(x, y, z, nullptr);
 }
 
+// x *= sigmoid(y)
+
+void mul_sigmoid_
+(
+    at::Tensor& x,
+    const at::Tensor& y
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK_DTYPE(y, kHalf);
+    TORCH_CHECK_SHAPES_FULL(x, y);
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(y.is_contiguous(), "y must be contiguous");
+    TORCH_CHECK(x.numel() % 2 == 0, "x.numel() must be even");
+
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    mul_sigmoid_kernel_h<<<blocks, NUM_THREADS, 0, stream>>>
+    (
+        (half*) x.data_ptr(),
+        (const half*) y.data_ptr(),
+        numel
+    );
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+// x *= sigmoid(y), where x is [B, S, H, D] and y is [B, S, H]
+
+void mul_sigmoid_broadcast_
+(
+    at::Tensor& x,
+    const at::Tensor& y
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK_DTYPE(y, kHalf);
+    TORCH_CHECK(x.dim() == 4, "x must be [B, S, H, D]");
+    TORCH_CHECK(y.dim() == 3, "y must be [B, S, H]");
+    TORCH_CHECK(x.size(0) == y.size(0), "x and y have incompatible shapes");
+    TORCH_CHECK(x.size(1) == y.size(1), "x and y have incompatible shapes");
+    TORCH_CHECK(x.size(2) == y.size(2), "x and y have incompatible shapes");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(y.is_contiguous(), "y must be contiguous");
+    TORCH_CHECK(x.size(3) % 2 == 0, "x.size(3) must be even");
+
+    size_t numel = x.numel();
+    size_t dim = x.size(3);
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    mul_sigmoid_broadcast_kernel_h<<<blocks, NUM_THREADS, 0, stream>>>
+    (
+        (half*) x.data_ptr(),
+        (const half*) y.data_ptr(),
+        numel,
+        dim
+    );
+
+    cuda_check(cudaPeekAtLastError());
+}
+
 // x * sigmoid(y @ w) + z -> z
 
 void add_sigmoid_gate_proj_gr

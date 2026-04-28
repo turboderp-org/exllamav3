@@ -546,7 +546,7 @@ class Attention(Module):
 
 
     def project_o(self, o: torch.Tensor, bsz: int, seqlen: int, params: dict) -> torch.Tensor:
-        o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
+        # o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         x = self.o_proj.forward(o, params)
         return x
 
@@ -692,10 +692,9 @@ class Attention(Module):
             o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa, scale = self.sm_scale)
             o = o.transpose(1, 2)
 
-        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate: o *= g.sigmoid()
-        if self.interleaved_gate: o *= g.sigmoid()
+        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -773,10 +772,9 @@ class Attention(Module):
                 softcap = self.logit_softcapping
             )
 
-        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate: o *= g.sigmoid()
-        if self.interleaved_gate: o *= g.sigmoid()
+        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -887,10 +885,9 @@ class Attention(Module):
         else:
             cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen, params.get("layer_instance"))
 
-        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate: o *= g.sigmoid()
-        if self.interleaved_gate: o *= g.sigmoid()
+        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o

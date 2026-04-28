@@ -107,6 +107,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("relu2_mul", &relu2_mul, "relu2_mul");
     m.def("xielu", &xielu, "xielu");
     m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
+    m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
+    m.def("mul_sigmoid_broadcast_", &mul_sigmoid_broadcast_, "mul_sigmoid_broadcast_");
     m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
 

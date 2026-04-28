@@ -86,6 +86,18 @@ void add_sigmoid_gate
     at::Tensor& z
 );
 
+void mul_sigmoid_
+(
+    at::Tensor& x,
+    const at::Tensor& y
+);
+
+void mul_sigmoid_broadcast_
+(
+    at::Tensor& x,
+    const at::Tensor& y
+);
+
 void add_sigmoid_gate_proj_gr
 (
     const at::Tensor& x,
