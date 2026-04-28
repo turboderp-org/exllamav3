@@ -530,6 +530,74 @@ class Model(Model_TPMixin, Model_LSMixin):
         vram_bits = head_numel * head_bpw + sum_bits
         return sum_bits / sum_numel, head_bpw, vram_bits
 
+    def get_detailed_weights_info(self):
+        """
+        Get detailed weights information per layer type.
+        This focuses only on layers with trainable weights.
+
+        Returns:
+            dict: {layer_name: {"count": int, "size_bytes": int, "numel": int, "bits": float}}
+
+            layer_name has numeric indices replaced with '*' for aggregation.
+            Example: "model.language_model.layers.0.mlp.experts.0.up_proj"
+                     -> "model.language_model.layers.*.mlp.experts.*.up_proj"
+        """
+        from ..modules import Linear, Embedding, Conv
+
+        # Trainable leaf modules - modules that always have trainable weights
+        # Exclude normalization layers which may be unweighted (RMSNorm, LayerNorm, etc.)
+        TRAINABLE_LEAF_TYPES = (Linear, Embedding, Conv)
+
+        def normalize_key(key):
+            """Replace numeric indices with '*' for aggregation."""
+            parts = key.split(".")
+            return ".".join("*" if p.isdigit() else p for p in parts)
+
+        def get_tensor_size_bytes(tensors):
+            return sum(t.element_size() * t.numel() for t in tensors.values())
+
+        stats = {}
+
+        for module in self:
+            if not isinstance(module, TRAINABLE_LEAF_TYPES):
+                continue
+
+            layer_name = normalize_key(module.key)
+            numel = module.weights_numel()
+
+            # Throw exception if module type has no trainable weights
+            # and was not filtered out via TRAINABLE_LEAF_TYPES
+            # This only affects new modules that we forgot to config
+            if numel is None or numel == 0:
+                raise ValueError(
+                    f"Layer type '{module.__class__.__name__}' at '{module.key}' has no trainable weights"
+                )
+
+            if module.device is not None:
+                size_bytes = get_tensor_size_bytes(module.get_tensors())
+            else:
+                # Metadata only
+                if isinstance(module, Linear):
+                    size_bytes = module.storage_size()
+                else:
+                    size_bytes = sum(self.config.stc.get_tensor_sizes(module.key))
+
+            if layer_name not in stats:
+                stats[layer_name] = {
+                    "count": 0,
+                    "size_bytes": 0,
+                    "numel": 0,
+                    "bits": 0.0,
+                    "leaf_module": module.__class__.__name__,
+                }
+
+            stats[layer_name]["count"] += 1
+            stats[layer_name]["size_bytes"] += size_bytes
+            stats[layer_name]["numel"] += numel
+            stats[layer_name]["bits"] += 8 * size_bytes
+
+        return stats
+
 
     def get_name(self):
         return self.__class__.__name__

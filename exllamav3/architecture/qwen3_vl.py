@@ -213,8 +213,11 @@ class Qwen3VLVisionModel(Model):
                             head_dim = v.head_dim,
                             rope_style = RopeStyle.NEOX,
                         ),
-                        key_fused_qkv = "qkv",
-                        key_o = "proj",
+                        key_fused_qkv = "qkv_proj",
+                        key_q="q_proj",
+                        key_k="k_proj",
+                        key_v="v_proj",
+                        key_o = "o_proj",
                         qmap = "block.attn",
                     ),
                     mlp_norm = LayerNorm(
