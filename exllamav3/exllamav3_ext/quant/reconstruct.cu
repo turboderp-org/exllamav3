@@ -7,8 +7,6 @@
 #include "../ptx.cuh"
 #include "exl3_dq.cuh"
 
-// TODO: Benchmark, profile, unit test
-
 template <int K, int cb>
 __global__ __launch_bounds__(256)
 void reconstruct_kernel
@@ -30,7 +28,7 @@ void reconstruct_kernel
     // Load packed 16*128 tile
     __shared__ uint32_t s_packed[8][packed_size / 2];
     g_packed += (k * blocks_n + n) * packed_size;
-    for (int s = t; s < packed_size * 8 / 8; s += 256)
+    if (t < packed_size)
         ((int4*) s_packed)[t] = ((int4*) g_packed)[t];
     __syncthreads();
 
@@ -46,7 +44,6 @@ void reconstruct_kernel
     half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
     half2 n2 = __shfl_down_sync(0xFFFFFFFF, frag[1][0], 4, 32);
     half2 n3 = __shfl_down_sync(0xFFFFFFFF, frag[1][1], 4, 32);
-    __syncwarp();
 
     if (!(lane_id & 4))
     {
