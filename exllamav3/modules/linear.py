@@ -411,10 +411,13 @@ class Linear(Module):
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
 
-        if "capture" in params and self.qmap:
+        if self.qmap and "capture" in params:
             self.capture_H(x, params)
 
-        lora_input = x if self.lora_a_tensors else None
+        if self.lora_a_tensors:
+            lora_input = x
+        else:
+            lora_input = None
 
         x = self.inner.forward(x, params, out_dtype)
 

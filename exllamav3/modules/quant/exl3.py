@@ -56,6 +56,7 @@ class LinearEXL3:
         self.bias = bias
         self.swap_device = None
         self.out_dtype = out_dtype
+        self.default_out_dtype = out_dtype or torch.half
 
         self.mcg_tensor = mcg
         self.mul1_tensor = mul1
@@ -108,26 +109,29 @@ class LinearEXL3:
             if self.key in ovr and ovr[self.key].inner is not self:
                 return ovr[self.key].forward(x, params, out_dtype)
 
-        bsz = x.numel() // x.shape[-1]
-        torch_mode = params.get("reconstruct", bsz > 32)
+        reconstruct = params.get("reconstruct")
+        if not reconstruct:
+            rows = x.numel() // x.shape[-1]
+            if rows <= 32:
+                dtype = out_dtype or self.default_out_dtype
+                return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
-        out_shape = x.shape[:-1] + (self.out_features,)
-        x = x.view(-1, self.in_features)
-        y = torch.empty(out_shape, dtype = out_dtype or self.out_dtype or torch.half, device = x.device)
+        shape = x.shape
+        rows = x.numel() // shape[-1]
+        out_features = self.out_features
+        out_shape = shape[:-1] + (out_features,)
+        x = x.view(rows, self.in_features)
+        y = torch.empty(out_shape, dtype = out_dtype or self.default_out_dtype, device = x.device)
 
-        if torch_mode:
-            y_ = y.view(x.shape[0], self.out_features)
-            xh = torch.empty_like(x)
-            ext.had_r_128(x, xh, self.suh, None, 1.0)
-            w = self.get_inner_weight_tensor()
-            ext.hgemm(xh, w, y_)
-            ext.had_r_128(y_, y_, None, self.svh, 1.0)
-            if self.bias is not None:
-                y += self.bias
-            y = y.view(out_shape)
-
-        else:
-            self.bc.run(x, y)
+        y_ = y.view(rows, out_features)
+        xh = torch.empty_like(x)
+        ext.had_r_128(x, xh, self.suh, None, 1.0)
+        w = self.get_inner_weight_tensor()
+        ext.hgemm(xh, w, y_)
+        ext.had_r_128(y_, y_, None, self.svh, 1.0)
+        if self.bias is not None:
+            y += self.bias
+        y = y.view(out_shape)
 
         return y
 

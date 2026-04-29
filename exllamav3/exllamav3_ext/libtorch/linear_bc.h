@@ -31,4 +31,5 @@ py::class_<BC_LinearEXL3, std::shared_ptr<BC_LinearEXL3>>(m, "BC_LinearEXL3").de
     py::arg("mul1"),
     py::arg("xh")
 )
-.def("run", &BC_LinearEXL3::run);
+.def("run", &BC_LinearEXL3::run)
+.def("run_alloc", &BC_LinearEXL3::run_alloc);
