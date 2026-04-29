@@ -13,6 +13,7 @@ from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from torch.nn.attention.bias import causal_lower_right
+from ..util.tensor import g_tensor_cache
 
 try:
     import xformers.ops as xops
@@ -409,6 +410,10 @@ class Attention(Module):
         self.q_global_dim = 0
         self.k_global_dim = 0
 
+        self.prealloc_qgh_1 = None
+        self.prealloc_qg_1 = None
+        self.prealloc_kvh_1 = None
+        self.prealloc_kv_1 = None
 
     @override
     def optimizer_targets(self):
@@ -446,6 +451,8 @@ class Attention(Module):
             self.v_proj.inner.bias is None
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
+            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "kvh_1")
+            self.prealloc_kv_1 = g_tensor_cache.get(device, (2, 1, self.num_kv_heads * self.head_dim), torch.half, "kv_1")
 
         # Test if Q and G proj can be fused
         if (
@@ -459,6 +466,8 @@ class Attention(Module):
             self.g_proj.inner.bias is None
         ):
             self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
+            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "qgh_1")
+            self.prealloc_qg_1 = g_tensor_cache.get(device, (2, 1, self.num_q_heads * self.head_dim), torch.half, "qg_1")
 
         # Head norm
         if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
@@ -491,6 +500,11 @@ class Attention(Module):
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
+
+        self.prealloc_qgh_1 = None
+        self.prealloc_qg_1 = None
+        self.prealloc_kvh_1 = None
+        self.prealloc_kv_1 = None
 
 
     @override
@@ -538,8 +552,12 @@ class Attention(Module):
 
         else:
             x = x.view(1, bsz * q_len, dim)
-            qgh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
-            qg = torch.empty((2, bsz * q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = x.device)
+            if bsz * q_len == 1:
+                qgh = self.prealloc_qgh_1
+                qg = self.prealloc_qg_1
+            else:
+                qgh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                qg = torch.empty((2, bsz * q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
                 self.multi_qg.ptrs_trellis,
@@ -566,8 +584,12 @@ class Attention(Module):
 
         else:
             x = x.view(1, bsz * q_len, dim)
-            kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
-            kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
+            if bsz * q_len == 1:
+                kvh = self.prealloc_kvh_1
+                kv = self.prealloc_kv_1
+            else:
+                kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
                 self.multi_kv.ptrs_trellis,

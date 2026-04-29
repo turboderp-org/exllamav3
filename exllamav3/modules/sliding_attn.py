@@ -342,6 +342,10 @@ class SlidingAttention(Module):
 
         self.has_split_cache = False
 
+        self.prealloc_qgh_1 = None
+        self.prealloc_qg_1 = None
+        self.prealloc_kvh_1 = None
+        self.prealloc_kv_1 = None
 
     @override
     def optimizer_targets(self):
@@ -374,6 +378,8 @@ class SlidingAttention(Module):
             self.v_proj.inner.bias is None
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
+            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "kvh_1")
+            self.prealloc_kv_1 = g_tensor_cache.get(device, (2, 1, self.num_kv_heads * self.head_dim), torch.half, "kv_1")
 
         # Test if Q and G proj can be fused
         if (
@@ -387,6 +393,8 @@ class SlidingAttention(Module):
             self.g_proj.inner.bias is None
         ):
             self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
+            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "qgh_1")
+            self.prealloc_qg_1 = g_tensor_cache.get(device, (2, 1, self.num_q_heads * self.head_dim), torch.half, "qg_1")
 
         # Head norm
         if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
@@ -421,6 +429,11 @@ class SlidingAttention(Module):
         self.k_norm_tensor = None
         self.stage_k = None
         self.stage_v = None
+
+        self.prealloc_qgh_1 = None
+        self.prealloc_qg_1 = None
+        self.prealloc_kvh_1 = None
+        self.prealloc_kv_1 = None
 
 
     def new_recurrent_state(self):
@@ -469,8 +482,12 @@ class SlidingAttention(Module):
                 g = None
         else:
             x = x.view(1, bsz * q_len, dim)
-            qgh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
-            qg = torch.empty((2, bsz * q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = x.device)
+            if bsz * q_len == 1:
+                qgh = self.prealloc_qgh_1
+                qg = self.prealloc_qg_1
+            else:
+                qgh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                qg = torch.empty((2, bsz * q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
                 self.multi_qg.ptrs_trellis,
@@ -497,8 +514,12 @@ class SlidingAttention(Module):
 
         else:
             x = x.view(1, bsz * q_len, dim)
-            kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
-            kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
+            if bsz * q_len == 1:
+                kvh = self.prealloc_kvh_1
+                kv = self.prealloc_kv_1
+            else:
+                kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
                 self.multi_kv.ptrs_trellis,
