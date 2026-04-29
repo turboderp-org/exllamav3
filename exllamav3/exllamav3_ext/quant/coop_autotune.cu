@@ -463,7 +463,7 @@ CoopAutotuneLaunch tune
         }
 
         if (base.max_num_sms > 1)
-    {
+        {
             int concurrency = MAX(MIN(total_sms / base.max_num_sms, max_concurrency), 1);
             candidates.push_back({ base.kernel, base.block_dim, base.max_num_sms, concurrency, base.tag, 0.0f, {} });
         }
@@ -479,12 +479,14 @@ CoopAutotuneLaunch tune
     if (numel_B > 1e6) repeats = 10;
     if (numel_B > 1e7) repeats = 5;
     if (numel_B > 1e8) repeats = 3;
+    if (numel_B > 2e8) repeats = 2;
     int max_rounds = 64;
     if (numel_B > 1e7) max_rounds = 20;
-    if (numel_B > 1e8) max_rounds = 10;
+    if (numel_B > 1e8) max_rounds = 8;
+    if (numel_B > 2e8) max_rounds = 3;
 
-    measure_stage(candidates, kernel_args, smem, stream, MIN(8, max_rounds), repeats, 16, start, end);
-    measure_stage(candidates, kernel_args, smem, stream, MIN(40, max_rounds), repeats, 8, start, end);
+    measure_stage(candidates, kernel_args, smem, stream, MIN(8, max_rounds), repeats, 8, start, end);
+    measure_stage(candidates, kernel_args, smem, stream, MIN(40, max_rounds), repeats, 4, start, end);
     measure_stage(candidates, kernel_args, smem, stream, MIN(64, max_rounds), repeats, 1, start, end);
 
     cuda_check(cudaEventDestroy(start));
