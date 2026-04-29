@@ -138,7 +138,7 @@ class LinearEXL3:
         if self.transformers_fix:
             bitfield = bitfield.cpu()
 
-        # TODO: Maybe custom kernel for this. Only used for full reconstruct and loading old models, not during inference
+        # (Only used for full reconstruct and loading old models, not during inference)
         bitfield = bitfield.view(torch.uint16).to(torch.int)
         masks = (1 << torch.arange(16)).to(bitfield.device)
         expanded = (bitfield.unsqueeze(-1) & masks) > 0

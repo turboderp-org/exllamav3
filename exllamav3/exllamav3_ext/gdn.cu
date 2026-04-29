@@ -470,7 +470,6 @@ void cuda_recurrent_gated_delta_rule_kernel
             float* sh_k_rd = sh_k + bt * bts;
             float* rs_rd = gl_rs_r + v_start + t + bt * bts * v_head_dim;
 
-            // TODO: Could use tensor cores
             for (int i = 0; i < k_head_dim / 8 / SUBK; ++i)
             {
                 #pragma unroll
@@ -498,7 +497,6 @@ void cuda_recurrent_gated_delta_rule_kernel
             float* rs_r = gl_rs_r + v_start + t + bt * bts * v_head_dim;
             float* rs_w = gl_rs_w + v_start + t + bt * bts * v_head_dim;
 
-            // TODO: Could use tensor cores
             for (int i = 0; i < k_head_dim / 8 / SUBK; ++i)
             {
                 #pragma unroll
