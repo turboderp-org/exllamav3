@@ -147,6 +147,11 @@ def buffered_arange(r: int, device: torch.device):
         buffered_aranges[r] = torch.arange(r)
     return get_for_device(buffered_aranges, r, device)
 
+def buffered_interleaved_arange(r: int, k: int, device: torch.device):
+    if (r, k) not in buffered_aranges:
+        buffered_aranges[(r, k)] = torch.arange(r).repeat_interleave(k)
+    return get_for_device(buffered_aranges, (r, k), device)
+
 
 def to2(
     x: torch.Tensor,

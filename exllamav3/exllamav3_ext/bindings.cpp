@@ -69,7 +69,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("softcap", &softcap, "softcap");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
+    m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
     m.def("routing_std", &routing_std, "routing_std");
+    m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
     m.def("had_paley", &had_paley, "had_paley");
     m.def("had_paley2", &had_paley2, "had_paley2");
