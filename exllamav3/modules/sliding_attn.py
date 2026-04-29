@@ -12,6 +12,8 @@ from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..util import profile_opt
 
+MAX_PRE_SEQ = 8192
+
 """
 Dedicated attention layer for SWA layers. Maintains recurrent state instead of KV cache
 """
@@ -346,6 +348,8 @@ class SlidingAttention(Module):
         self.prealloc_qg_1 = None
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
+        self.pre_seqs = None
+
 
     @override
     def optimizer_targets(self):
@@ -401,6 +405,9 @@ class SlidingAttention(Module):
             self.q_norm_tensor = self.q_norm.weight.data
             self.k_norm_tensor = self.k_norm.weight.data
 
+        # Create seqlens for flash_attn_with_kvcache to avoid extra torch.full on launch
+        self.pre_seqs = torch.arange(MAX_PRE_SEQ, dtype = torch.int, device = device)
+
 
     @override
     def load(self, device: torch.Device, **kwargs):
@@ -434,6 +441,7 @@ class SlidingAttention(Module):
         self.prealloc_qg_1 = None
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
+        self.pre_seqs = None
 
 
     def new_recurrent_state(self):
@@ -730,6 +738,9 @@ class SlidingAttention(Module):
                 assert shift > 0
 
             if not non_causal_spans:
+                if cache_seqlens < MAX_PRE_SEQ:
+                    cache_seqlens = self.pre_seqs[cache_seqlens : cache_seqlens + 1]
+
                 o = flash_attn_with_kvcache(
                     q = q_,
                     k = k_,
