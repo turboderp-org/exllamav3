@@ -59,13 +59,13 @@ void BC_GatedMLP::run_bsz1
     c10::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    #define USE_GRAPH
-    #ifndef USE_GRAPH
-
+    if (graph_bsz1.disabled || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
+    {
         run_bsz1_gr(x, d, nullptr);
-
-    #else
-
+        graph_bsz1.ready_to_record = true;
+    }
+    else
+    {
         if (!graph_bsz1.ready)
         {
             graph_bsz1.capture_begin();
@@ -80,6 +80,5 @@ void BC_GatedMLP::run_bsz1
         };
 
         graph_bsz1.launch(args, stream);
-
-    #endif
+    }
 }
