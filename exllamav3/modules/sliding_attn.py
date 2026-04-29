@@ -184,7 +184,7 @@ class SlidingAttention(Module):
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.gqa = (num_q_heads != num_kv_heads)
-        self.sm_scale = sm_scale
+        self.sm_scale = sm_scale or self.head_dim ** (-0.5)
         self.rope_settings = rope_settings
         self.rope = None
         self.out_dtype = out_dtype
