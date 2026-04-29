@@ -797,8 +797,9 @@ class SlidingAttention(Module):
         o = torch.cat(ro, dim = 0) if len(ro) > 1 else o
         assert o.shape[1] == seqlen
 
-        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate: o *= g.sigmoid()
+        if self.full_gate: ext.mul_sigmoid_(o, g)
+
         o = self.project_o(o, bsz, seqlen, params)
         return o
