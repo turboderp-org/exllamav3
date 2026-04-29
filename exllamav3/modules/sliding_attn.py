@@ -334,6 +334,7 @@ class SlidingAttention(Module):
         })
 
         self.multi_kv = None
+        self.multi_qg = None
         self.tp_reduce = False
 
         self.q_norm_tensor = None
@@ -374,6 +375,19 @@ class SlidingAttention(Module):
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
 
+        # Test if Q and G proj can be fused
+        if (
+            self.g_proj is not None and
+            device != torch.device("cpu") and
+            self.q_proj.quant_type == "exl3" and
+            self.g_proj.quant_type == "exl3" and
+            self.q_proj.out_features == self.g_proj.out_features and
+            self.q_proj.inner.K == self.g_proj.inner.K and
+            self.q_proj.inner.bias is None and
+            self.g_proj.inner.bias is None
+        ):
+            self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
+
         # Head norm
         if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
             self.q_norm_tensor = self.q_norm.weight.data
@@ -398,6 +412,10 @@ class SlidingAttention(Module):
         if self.multi_kv is not None:
             self.multi_kv.unload()
             self.multi_kv = None
+
+        if self.multi_qg is not None:
+            self.multi_qg.unload()
+            self.multi_qg = None
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
@@ -442,12 +460,36 @@ class SlidingAttention(Module):
 
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
-        q = self.q_proj.forward(x, params)
 
-        if self.g_proj:
-            g = self.g_proj.forward(x, params)
+        if self.multi_qg is None or bsz * q_len > 32:
+            q = self.q_proj.forward(x, params)
+            if self.g_proj:
+                g = self.g_proj.forward(x, params)
+            else:
+                g = None
         else:
-            g = None
+            x = x.view(1, bsz * q_len, dim)
+            qgh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+            qg = torch.empty((2, bsz * q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = x.device)
+            ext.exl3_mgemm(
+                x,
+                self.multi_qg.ptrs_trellis,
+                qg,
+                self.multi_qg.ptrs_suh,
+                qgh,
+                self.multi_qg.ptrs_svh,
+                None,
+                None,
+                self.multi_qg.K,
+                -1,
+                self.multi_qg.mcg,
+                self.multi_qg.mul1,
+                -1,
+                -1,
+                0
+            )
+            q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
+            g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
         if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
