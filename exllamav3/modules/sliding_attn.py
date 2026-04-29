@@ -306,7 +306,17 @@ class SlidingAttention(Module):
         # Register headwise gate
         if key_g:
             gate_features = num_q_heads * head_dim if full_gate else num_q_heads
-            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, gate_features, qmap = None, out_dtype = torch.half, pad_to = 1)
+            _qmap = ".input" if full_gate else None
+            self.g_proj = Linear(
+                config,
+                f"{key}.{key_g}",
+                hidden_size,
+                gate_features,
+                qmap = _qmap,
+                out_dtype = torch.half,
+                pad_to = 1,
+                select_hq_bits = select_hq_bits,
+            )
             self.headwise_gate = not full_gate
             self.register_submodule(self.g_proj)
         else:
