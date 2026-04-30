@@ -267,7 +267,7 @@ void exl3_moe
         (void*) &locks
     };
 
-    cudaLaunchCooperativeKernel
+    cudaLaunchKernel
     (
         (void*) kernel,
         grid_dim,
