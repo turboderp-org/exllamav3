@@ -3,6 +3,7 @@
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
 #include "exl3_gemm_inner.cuh"
+#include "exl3_devctx.cuh"
 
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
@@ -92,6 +93,10 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     int bszm = MAX(bszm_in, bszm_out);
     auto grid = cg::this_grid();
 
+    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+        int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
+    #endif
+
     // Pack indices within min_index <= idx < max_index
 
     if (min_index >= 0)
@@ -159,7 +164,12 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                     0.088388347648f  // 1/sqrt(128)
                 );
         }
-        grid.sync();
+
+        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+            group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
+        #else
+            grid.sync();
+        #endif
 
         // Matmul
 
@@ -184,7 +194,12 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
             else                  C_ = (void*) (((half*) C_) + 16 * size_n);
             size_m_ -= 16;
-            grid.sync();
+
+            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+                group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
+            #else
+                grid.sync();
+            #endif
         }
 
         // Had and output scales
