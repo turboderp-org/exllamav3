@@ -557,7 +557,7 @@ void exl3_gemm_kernel_inner
     // dequantization overhead, but we need two different iterations of the main loop to avoid confusing the compiler
     // and making it (sometimes) place the fragment arrays in local memory
 
-    #define FSTAGE(_load, _mul) \
+    #define FSTAGE_OLD(_load, _mul) \
         async_load_gl(); \
         wait_stage(); \
         load_frags(_load); \
@@ -566,11 +566,20 @@ void exl3_gemm_kernel_inner
         advance2(); \
         if (!slice2_iters) break; \
 
+    #define FSTAGE(_load, _mul) \
+        async_load_gl(); \
+        wait_stage(); \
+        matmul(_mul); \
+        if (slice2_k == tiles_k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; } \
+        advance2(); \
+        if (!slice2_iters) break; \
+        load_frags(_load); \
+
     if constexpr (FRAG_STAGES == 1)
     {
         while (true)
         {
-            FSTAGE(0, 0);
+            FSTAGE_OLD(0, 0);
         }
     }
 
