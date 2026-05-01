@@ -511,7 +511,7 @@ class Gemma4VisionModel(Model):
                         ),
                         k_norm = RMSNorm(
                             config = config,
-                            key = f"{key}.self_attn.q_norm",
+                            key = f"{key}.self_attn.k_norm",
                             rms_norm_eps = v.rms_norm_eps,
                         ),
                         v_norm = RMSNorm(
