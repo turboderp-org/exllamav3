@@ -18,12 +18,11 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
         int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
 
         for(; this_warp < total_warps; this_warp += warps_grid)
-            had_hf_r_128_inner
+            had_hf_r_128_inner<true, false>
             (
                 A + this_warp * 128,
                 A_had + this_warp * 128,
                 suh + (this_warp * 128) % size_k,
-                nullptr,
                 0.088388347648f  // 1/sqrt(128)
             );
 
@@ -59,20 +58,18 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
         for(; this_warp < total_warps; this_warp += warps_grid)
         {
             if constexpr (c_fp32)
-                had_ff_r_128_inner
+                had_ff_r_128_inner<false, true>
                 (
                     ((const float*) C) + this_warp * 128,
                     ((float*) C) + this_warp * 128,
-                    nullptr,
                     svh + (this_warp * 128) % size_n,
                     0.088388347648f  // 1/sqrt(128)
                 );
             else
-                had_hf_r_128_inner
+                had_hf_r_128_inner<false, true>
                 (
                     ((const half*) C) + this_warp * 128,
                     ((half*) C) + this_warp * 128,
-                    nullptr,
                     svh + (this_warp * 128) % size_n,
                     0.088388347648f  // 1/sqrt(128)
                 );
@@ -155,12 +152,11 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             half* A_had_ = A_had + j * size_m * size_k;
 
             for(; this_warp < total_warps; this_warp += warps_grid)
-                had_hf_r_128_inner
+                had_hf_r_128_inner<true, false>
                 (
                     A_ + this_warp * 128,
                     A_had_ + this_warp * 128,
                     suh + (this_warp * 128) % size_k,
-                    nullptr,
                     0.088388347648f  // 1/sqrt(128)
                 );
         }
@@ -220,20 +216,18 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             for(; this_warp < total_warps; this_warp += warps_grid)
             {
                 if constexpr (c_fp32)
-                    had_ff_r_128_inner
+                    had_ff_r_128_inner<false, true>
                     (
                         ((const float*) C_) + this_warp * 128,
                         ((float*) C_) + this_warp * 128,
-                        nullptr,
                         svh + (this_warp * 128) % size_n,
                         scale
                     );
                 else
-                    had_hf_r_128_inner
+                    had_hf_r_128_inner<false, true>
                     (
                         ((const half*) C_) + this_warp * 128,
                         ((half*) C_) + this_warp * 128,
-                        nullptr,
                         svh + (this_warp * 128) % size_n,
                         scale
                     );

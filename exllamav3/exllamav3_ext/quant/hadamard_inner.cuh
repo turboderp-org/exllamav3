@@ -87,13 +87,13 @@ __device__ inline half2 shuffle_had_h2x32(half2 v, int lane_id)
 
 // Half vector, half scales
 
+template <bool pre_scale, bool post_scale>
 inline __device__
 void had_hf_r_128_inner
 (
     const half* __restrict__ input_ptr,
     half* __restrict__ output_ptr,
-    const half* __restrict__ pre_scale,
-    const half* __restrict__ post_scale,
+    const half* __restrict__ scale,
     const float r_scale
 )
 {
@@ -103,10 +103,10 @@ void had_hf_r_128_inner
     half4 v = ((half4*) input_ptr)[t];
 
     // Pre scale
-    if (pre_scale)
+    if constexpr (pre_scale)
     {
         int i = blockIdx.y * 32 + t;
-        half4 scales = ((half4*) pre_scale)[i];
+        half4 scales = ((half4*) scale)[i];
         v.x = __hmul2(v.x, scales.x);
         v.y = __hmul2(v.y, scales.y);
     }
@@ -131,10 +131,10 @@ void had_hf_r_128_inner
     v.y = __floats2half2_rn(h2 * r_scale, h3 * r_scale);
 
     // Post scale
-    if (post_scale)
+    if constexpr (post_scale)
     {
         int i = blockIdx.y * 32 + t;
-        half4 scales = ((half4*) post_scale)[i];
+        half4 scales = ((half4*) scale)[i];
         v.x = __hmul2(v.x, scales.x);
         v.y = __hmul2(v.y, scales.y);
     }
@@ -145,13 +145,13 @@ void had_hf_r_128_inner
 
 // Float vector, half scales
 
+template <bool pre_scale, bool post_scale>
 inline __device__
 void had_ff_r_128_inner
 (
     const float* __restrict__ input_ptr,
     float* __restrict__ output_ptr,
-    const half* __restrict__ pre_scale,
-    const half* __restrict__ post_scale,
+    const half* __restrict__ scale,
     const float r_scale
 )
 {
@@ -161,10 +161,10 @@ void had_ff_r_128_inner
     float4 v = ((float4*) input_ptr)[t];
 
     // Pre scale
-    if (pre_scale)
+    if constexpr (pre_scale)
     {
         int i = blockIdx.y * 32 + t;
-        half4 scales = ((half4*) pre_scale)[i];
+        half4 scales = ((half4*) scale)[i];
         v.x *= __low2float(scales.x);
         v.y *= __high2float(scales.x);
         v.z *= __low2float(scales.y);
@@ -194,10 +194,10 @@ void had_ff_r_128_inner
     v.w *= r_scale;
 
     // Post scale
-    if (post_scale)
+    if constexpr (post_scale)
     {
         int i = blockIdx.y * 32 + t;
-        half4 scales = ((half4*) post_scale)[i];
+        half4 scales = ((half4*) scale)[i];
         v.x *= __low2float(scales.x);
         v.y *= __high2float(scales.x);
         v.z *= __low2float(scales.y);

@@ -80,20 +80,18 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                 int token_idx = top_x[warp_idx / warps_per_token];
                 int token_off = warp_idx % warps_per_token;
                 const half* in_ptr = hidden_state + token_idx * hidden_dim + token_off * 128;
-                had_hf_r_128_inner
+                had_hf_r_128_inner<true, false>
                 (
                     in_ptr,
                     temp_state_g + 128 * warp_idx,
                     exp_gate_suh + 128 * token_off,
-                    nullptr,
                     0.088388347648f
                 );
-                had_hf_r_128_inner
+                had_hf_r_128_inner<true, false>
                 (
                     in_ptr,
                     temp_state_u + 128 * warp_idx,
                     exp_up_suh + 128 * token_off,
-                    nullptr,
                     0.088388347648f
                 );
             }
