@@ -1,7 +1,9 @@
+#include <cuda_fp16.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
+
 #include "coop_autotune.cuh"
 
-#include <cublas_v2.h>
-#include <torch/extension.h>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
