@@ -268,49 +268,52 @@ jobs:
           $wheel = Get-ChildItem dist/*.whl | Select-Object -First 1
           if (-not $wheel) { throw "No wheel found in dist/" }
 
+          # Compare parsed requirements instead of raw strings because setuptools/packaging
+          # may canonicalize equivalent specifiers, e.g.:
+          #   xformers>=0.0.34,<0.0.36
+          # becomes:
+          #   xformers<0.0.36,>=0.0.34
           $verifyScript = @'
           from pathlib import Path
           from zipfile import ZipFile
           import os
-          import re
+          from packaging.requirements import Requirement
+          from packaging.utils import canonicalize_name
 
           wheel = next(Path("dist").glob("*.whl"))
-          expected_torch = f"Requires-Dist: torch{os.environ['TORCH_SPEC']}"
-          expected_xformers = f"Requires-Dist: xformers{os.environ['XFORMERS_SPEC']}"
+          expected = {
+              "torch": Requirement(f"torch{os.environ['TORCH_SPEC']}"),
+              "xformers": Requirement(f"xformers{os.environ['XFORMERS_SPEC']}"),
+          }
 
           with ZipFile(wheel) as zf:
               metadata_name = next(n for n in zf.namelist() if n.endswith(".dist-info/METADATA"))
               metadata = zf.read(metadata_name).decode("utf-8", errors="replace")
 
+          actual = {}
           print(f"Wheel: {wheel}")
-          print(expected_torch)
-          print(expected_xformers)
+          print("--- METADATA Requires-Dist lines ---")
+          for line in metadata.splitlines():
+              if not line.startswith("Requires-Dist:"):
+                  continue
+              print(line)
+              req_text = line.removeprefix("Requires-Dist:").strip()
+              req = Requirement(req_text)
+              actual[canonicalize_name(req.name)] = req
 
-          # setuptools/pkg_resources may normalize names by replacing _ with -.
-          # It may also insert a space before a parenthesized version specifier,
-          # depending on metadata generation path. Accept the common normalized forms.
-          torch_patterns = [
-              re.escape(expected_torch),
-              re.escape(expected_torch).replace(re.escape("=="), r" ?=="),
-          ]
-          xformers_patterns = [
-              re.escape(expected_xformers),
-              re.escape(expected_xformers).replace(re.escape(">="), r" ?>=").replace(re.escape("<"), r" ?<"),
-          ]
+          for name, expected_req in expected.items():
+              key = canonicalize_name(name)
+              if key not in actual:
+                  raise SystemExit(f"Missing dependency metadata for {name}")
 
-          if not any(re.search(p, metadata) for p in torch_patterns):
-              print("--- METADATA Requires-Dist lines ---")
-              for line in metadata.splitlines():
-                  if line.startswith("Requires-Dist:"):
-                      print(line)
-              raise SystemExit(f"Missing expected metadata line: {expected_torch}")
+              actual_req = actual[key]
+              if str(actual_req.specifier) != str(expected_req.specifier):
+                  raise SystemExit(
+                      f"Dependency mismatch for {name}: expected {expected_req.specifier}, "
+                      f"got {actual_req.specifier}"
+                  )
 
-          if not any(re.search(p, metadata) for p in xformers_patterns):
-              print("--- METADATA Requires-Dist lines ---")
-              for line in metadata.splitlines():
-                  if line.startswith("Requires-Dist:"):
-                      print(line)
-              raise SystemExit(f"Missing expected metadata line: {expected_xformers}")
+          print("Dependency metadata verified.")
           '@
 
           Set-Content -Path verify_wheel_metadata.py -Value $verifyScript -Encoding UTF8
