@@ -704,6 +704,20 @@ class Generator:
                     else:
                         job.accepted_draft_tokens += 1
                         accepted_length += 1
+
+                        # Advance filters
+                        for f in job.filters:
+                            if not f.is_active: continue
+                            if f.use_background_worker():
+                                job.filter_futures.append(self.filter_pool.submit(f.get_next_logit_mask))
+                            else:
+                                job.logit_masks.append(f.get_next_logit_mask())
+                                job.filter_futures.append(None)
+
+                        # Update masks and past IDs
+                        job.prepare_logit_mask()
+                        job.prepare_sampling_past_ids()
+
             j += 1
             accepted_lengths.append(accepted_length)
 

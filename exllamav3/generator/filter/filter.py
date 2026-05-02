@@ -54,7 +54,7 @@ class Filter:
     def get_next_logit_mask(self) -> torch.Tensor:
         """
         Return boolean mask of valid tokens for the current state as CPU tensor. Assume self.is_completed() is
-        False and self.compute_constraint() has been called
+        False
         """
         raise NotImplementedError()
 
