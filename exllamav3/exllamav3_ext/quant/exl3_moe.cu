@@ -7,7 +7,7 @@
 namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
-#include "exl3_moe_kernel.cuh"
+#include "comp_units/exl3_moe_instances.cuh"
 #include "exl3_devctx.cuh"
 #include <set>
 
@@ -19,19 +19,17 @@ int exl3_moe_max_concurrency(int device)
 
 std::set<void*> moe_kernel_attr_set[MAX_DEVICES] = {};
 
-typedef void (*fp_exl3_moe_kernel) (EXL3_MOE_KERNEL_ARGS);
-
 fp_exl3_moe_kernel exl3_moe_kernel_instances[] =
 {
-    exl3_moe_kernel<0, 128>, exl3_moe_kernel<0, 256>, // Switch Kg, Ku and Kd at runtime
-    exl3_moe_kernel<1, 128>, exl3_moe_kernel<1, 256>, // Compile-time Kg = Ku = Kd
-    exl3_moe_kernel<2, 128>, exl3_moe_kernel<2, 256>, // ...
-    exl3_moe_kernel<3, 128>, exl3_moe_kernel<3, 256>,
-    exl3_moe_kernel<4, 128>, exl3_moe_kernel<4, 256>,
-    exl3_moe_kernel<5, 128>, exl3_moe_kernel<5, 256>,
-    exl3_moe_kernel<6, 128>, exl3_moe_kernel<6, 256>,
-    exl3_moe_kernel<7, 128>, exl3_moe_kernel<7, 256>,
-    exl3_moe_kernel<8, 128>, exl3_moe_kernel<8, 256>
+    exl3_moe_kernel_k0_n128(), exl3_moe_kernel_k0_n256(), // Switch Kg, Ku and Kd at runtime
+    exl3_moe_kernel_k1_n128(), exl3_moe_kernel_k1_n256(), // Compile-time Kg = Ku = Kd
+    exl3_moe_kernel_k2_n128(), exl3_moe_kernel_k2_n256(), // ...
+    exl3_moe_kernel_k3_n128(), exl3_moe_kernel_k3_n256(),
+    exl3_moe_kernel_k4_n128(), exl3_moe_kernel_k4_n256(),
+    exl3_moe_kernel_k5_n128(), exl3_moe_kernel_k5_n256(),
+    exl3_moe_kernel_k6_n128(), exl3_moe_kernel_k6_n256(),
+    exl3_moe_kernel_k7_n128(), exl3_moe_kernel_k7_n256(),
+    exl3_moe_kernel_k8_n128(), exl3_moe_kernel_k8_n256()
 };
 
 /*
@@ -65,7 +63,7 @@ inputs:
         temp intermediate storage - shape (concurrency, max_tokens_per_expert, intermediate_dim), fp16
 
     act_function:
-        int, see exl3_moe.h
+        int, see exl3_moe.cuh
 
     K_gate
     K_up
@@ -269,7 +267,7 @@ void exl3_moe
         (void*) &locks
     };
 
-    cudaLaunchCooperativeKernel
+    cudaLaunchKernel
     (
         (void*) kernel,
         grid_dim,

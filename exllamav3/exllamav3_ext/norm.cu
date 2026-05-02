@@ -130,7 +130,7 @@ __device__ __forceinline__ float _silu(float x)
 }
 
 
-template <typename input_t, typename output_t, typename weight_t>
+template <bool add_residual, typename input_t, typename output_t, typename weight_t>
 __global__ __launch_bounds__(NUM_THREADS)
 void rms_norm_kernel
 (
@@ -202,6 +202,17 @@ void rms_norm_kernel
             apply4_nw(x4, rmf);
         }
 
+        if constexpr (add_residual)
+        {
+            float4 r4;
+            if constexpr (output_fp16) read_half4<false>(r4, ((half4*) (y + row * dim)) + column);
+            if constexpr (output_fp32) read_float4(r4, ((float4*) (y + row * dim)) + column);
+            x4.x += r4.x;
+            x4.y += r4.y;
+            x4.z += r4.z;
+            x4.w += r4.w;
+        }
+
         if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row * dim)) + column);
         if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row * dim)) + column);
     }
@@ -222,7 +233,8 @@ void rms_norm
     float epsilon,
     float constant_bias,
     float constant_scale,
-    bool span_heads
+    bool span_heads,
+    bool add_residual
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -256,29 +268,37 @@ void rms_norm
     dim3 gridDim(rows, 1, 1);
 
     // Launch macro
-    #define __(_tx, __tx, _tw, __tw, _ty, __ty)             \
-    if (tx == at::_tx && tw == at::_tw && ty == at::_ty)    \
-        rms_norm_kernel<<<gridDim, blockDim, 0, stream>>>   \
-        (                                                   \
-            (const __tx*) x.data_ptr(),                     \
-            (const __tw*) w_ptr,                            \
-            (__ty*) y.data_ptr(),                           \
-            epsilon,                                        \
-            rows,                                           \
-            dim,                                            \
-            constant_bias,                                  \
-            constant_scale                                  \
+    #define __(_tx, __tx, _tw, __tw, _ty, __ty, _res)                               \
+    if (tx == at::_tx && tw == at::_tw && ty == at::_ty && add_residual == _res)    \
+        rms_norm_kernel<_res><<<gridDim, blockDim, 0, stream>>>                     \
+        (                                                                           \
+            (const __tx*) x.data_ptr(),                                             \
+            (const __tw*) w_ptr,                                                    \
+            (__ty*) y.data_ptr(),                                                   \
+            epsilon,                                                                \
+            rows,                                                                   \
+            dim,                                                                    \
+            constant_bias,                                                          \
+            constant_scale                                                          \
         );
 
     //      x_type________ w_type_____________  y_type_______
-         __(kHalf,  half,  kHalf,     half,     kHalf,  half )
-    else __(kHalf,  half,  kHalf,     half,     kFloat, float)
-    else __(kFloat, float, kHalf,     half,     kHalf,  half )
-    else __(kFloat, float, kHalf,     half,     kFloat, float)
-    else __(kHalf,  half,  kBFloat16, bfloat16, kHalf,  half )
-    else __(kHalf,  half,  kBFloat16, bfloat16, kFloat, float)
-    else __(kFloat, float, kBFloat16, bfloat16, kHalf,  half )
-    else __(kFloat, float, kBFloat16, bfloat16, kFloat, float)
+         __(kHalf,  half,  kHalf,     half,     kHalf,  half,  false)
+    else __(kHalf,  half,  kHalf,     half,     kFloat, float, false)
+    else __(kFloat, float, kHalf,     half,     kHalf,  half,  false)
+    else __(kFloat, float, kHalf,     half,     kFloat, float, false)
+    else __(kHalf,  half,  kBFloat16, bfloat16, kHalf,  half,  false)
+    else __(kHalf,  half,  kBFloat16, bfloat16, kFloat, float, false)
+    else __(kFloat, float, kBFloat16, bfloat16, kHalf,  half,  false)
+    else __(kFloat, float, kBFloat16, bfloat16, kFloat, float, false)
+    else __(kHalf,  half,  kHalf,     half,     kHalf,  half,  true)
+    else __(kHalf,  half,  kHalf,     half,     kFloat, float, true)
+    else __(kFloat, float, kHalf,     half,     kHalf,  half,  true)
+    else __(kFloat, float, kHalf,     half,     kFloat, float, true)
+    else __(kHalf,  half,  kBFloat16, bfloat16, kHalf,  half,  true)
+    else __(kHalf,  half,  kBFloat16, bfloat16, kFloat, float, true)
+    else __(kFloat, float, kBFloat16, bfloat16, kHalf,  half,  true)
+    else __(kFloat, float, kBFloat16, bfloat16, kFloat, float, true)
 
     else TORCH_CHECK(false, "rms_norm: Invalid datatypes for input/output");
     #undef __

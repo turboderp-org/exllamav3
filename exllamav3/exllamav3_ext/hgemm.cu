@@ -15,16 +15,15 @@ Row-major matmul using cuBLAS, a @ b -> c
 
 using bfloat16 = __nv_bfloat16;
 
-void hgemm_gr
+static void hgemm_gemmex_impl
 (
     at::Tensor a,
     at::Tensor b,
     at::Tensor c,
-    Graph* graph
+    cudaStream_t stream
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
-    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     bool output_fp32 = c.dtype() == at::kFloat;
     bool output_fp16 = c.dtype() == at::kHalf;
@@ -54,45 +53,34 @@ void hgemm_gr
     void* ws = DevCtx::instance().get_ws(device);
     cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
 
-    if (output_fp16)
-    {
-        half alpha_ = __float2half(1.0f);
-        half beta_ = __float2half(0.0f);
+    float alpha_ = 1.0f;
+    float beta_ = 0.0f;
+    cudaDataType_t c_type = output_fp32 ? CUDA_R_32F : CUDA_R_16F;
+    auto r = cublasGemmEx
+    (
+        cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        size_n, size_m, size_k,
+        &alpha_, b_ptr, CUDA_R_16F, size_n,
+                 a_ptr, CUDA_R_16F, size_k,
+        &beta_,  c.data_ptr(), c_type, size_n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+    cublas_check(r);
+    cuda_check(cudaPeekAtLastError());
+}
 
-        half* c_ptr = (half*) c.data_ptr();
-        auto r = cublasHgemm
-        (
-            cublas_handle,
-            CUBLAS_OP_N,
-            CUBLAS_OP_N,
-            size_n, size_m, size_k,
-            &alpha_, b_ptr, size_n,
-                     a_ptr, size_k,
-            &beta_,  c_ptr, size_n
-        );
-        cublas_check(r);
-        cuda_check(cudaPeekAtLastError());
-    }
-    if (output_fp32)
-    {
-        float alpha_ = 1.0f;
-        float beta_ = 0.0f;
-
-        float* c_ptr = (float*) c.data_ptr();
-        auto r = cublasGemmEx
-        (
-            cublas_handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            size_n, size_m, size_k,
-            &alpha_, b_ptr, CUDA_R_16F, size_n,
-                     a_ptr, CUDA_R_16F, size_k,
-            &beta_,  c_ptr, CUDA_R_32F, size_n,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP
-        );
-        cublas_check(r);
-        cuda_check(cudaPeekAtLastError());
-    }
+void hgemm_gr
+(
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor c,
+    Graph* graph
+)
+{
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+    hgemm_gemmex_impl(a, b, c, stream);
 
     if (graph) graph->need_cublas = true;
 }

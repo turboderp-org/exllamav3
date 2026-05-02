@@ -69,7 +69,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("softcap", &softcap, "softcap");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
+    m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
     m.def("routing_std", &routing_std, "routing_std");
+    m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
     m.def("had_paley", &had_paley, "had_paley");
     m.def("had_paley2", &had_paley2, "had_paley2");
@@ -107,6 +109,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("relu2_mul", &relu2_mul, "relu2_mul");
     m.def("xielu", &xielu, "xielu");
     m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
+    m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
+    m.def("mul_sigmoid_broadcast_", &mul_sigmoid_broadcast_, "mul_sigmoid_broadcast_");
     m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
 

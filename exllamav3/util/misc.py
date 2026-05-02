@@ -4,6 +4,7 @@ import time
 import torch
 import socket, contextlib
 import weakref
+import re
 
 lock = threading.RLock()
 
@@ -135,3 +136,79 @@ def set_process_priority_and_affinity():
         pass
     except Exception as e:
         pass
+
+
+def parse_int_list(
+    spec: str,
+    *,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> list[int]:
+    """
+    Parse a command-line integer list specification.
+
+    Supported forms:
+        "1,2,3"                 -> [1, 2, 3]
+        "1..4"                  -> [1, 2, 3, 4]
+        "4..1"                  -> [4, 3, 2, 1]
+        "..4"                   -> [min_value..4]
+        "4.."                   -> [4..max_value]
+        "..,.."                 -> [min_value..max_value, min_value..max_value]
+        "..15,11..15,11.."      -> [min_value..15, 11..15, 11..max_value]
+
+    Ranges are inclusive.
+    Whitespace is ignored around items.
+
+    Open-ended ranges require min_value or max_value.
+    """
+
+    if not spec.strip():
+        return []
+
+    result: list[int] = []
+    int_pattern = r"[+-]?\d+"
+
+    for part in spec.split(","):
+        part = part.strip()
+
+        if not part:
+            raise ValueError(f"Empty item in integer list: {spec!r}")
+
+        if re.fullmatch(int_pattern, part):
+            result.append(int(part))
+            continue
+
+        match = re.fullmatch(
+            rf"({int_pattern})?\s*\.\.\s*({int_pattern})?",
+            part,
+        )
+
+        if not match:
+            raise ValueError(f"Invalid integer list item: {part!r}")
+
+        start_text, end_text = match.groups()
+
+        if start_text is None and end_text is None:
+            if min_value is None or max_value is None:
+                raise ValueError(f"Range {part!r} requires both min_value and max_value")
+            start = min_value
+            end = max_value
+        else:
+            if start_text is None:
+                if min_value is None:
+                    raise ValueError(f"Open-ended range {part!r} requires min_value")
+                start = min_value
+            else:
+                start = int(start_text)
+
+            if end_text is None:
+                if max_value is None:
+                    raise ValueError(f"Open-ended range {part!r} requires max_value")
+                end = max_value
+            else:
+                end = int(end_text)
+
+        step = 1 if end >= start else -1
+        result.extend(range(start, end + step, step))
+
+    return result

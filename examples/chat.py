@@ -389,7 +389,7 @@ def main(args):
             print(f"\n{col_error} !! Response exceeded {max_response_tokens} tokens and was cut short.{col_default}")
 
         if stop_reason == "loop_detected":
-            print(f"\n{col_error} !! Loop detected, generation stopped.")
+            print(f"\n{col_error} !! Loop detected, generation stopped.{col_default}")
 
         if show_tps and r:
             prompt_tokens = r["prompt_tokens"]
@@ -409,7 +409,6 @@ def main(args):
                 if dtot > 0:
                     rstr += f" ({col_info}{dacc/dtot*100.0:.2f}{col_default}%)"
             print(rstr)
-
 
         if save_probs:
             print_probs(saved_topk, saved_probs, saved_samples, tokenizer.get_id_to_piece_list())

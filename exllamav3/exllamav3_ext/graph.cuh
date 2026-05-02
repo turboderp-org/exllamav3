@@ -73,6 +73,8 @@ public:
 
     bool need_cublas;
     bool ready;
+    bool ready_to_record;
+    bool disabled;
 
     Graph();
     ~Graph();

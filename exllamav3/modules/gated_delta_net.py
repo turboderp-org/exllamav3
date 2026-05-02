@@ -606,7 +606,7 @@ class GatedDeltaNet(Module):
         # Previous state
         rs = params.get("recurrent_states")
         if rs is not None:
-            rs = rs[self.layer_idx]
+            rs = rs[self.layer_idx, params.get("layer_instance", 0)]
             conv_state = rs.last_conv_state if rs.last_conv_state is not None else \
                 torch.zeros((bsz, self.fdim_qkv, self.conv_kernel_size), dtype = torch.bfloat16, device = x.device)
             recurrent_state = rs.last_recurrent_state if rs.last_recurrent_state is not None else \

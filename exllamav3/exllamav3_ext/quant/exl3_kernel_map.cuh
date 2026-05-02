@@ -138,46 +138,5 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
     const int bszm_out
 );
 
-struct TSample {
-    int cc;
-    int K;
-    int m;
-    int k;
-    int n;
-    int shape_idx;
-    int num_sms;
-};
-
-struct TMSample {
-    int cc;
-    int K;
-    int m;
-    int k;
-    int n;
-    int shape_idx;
-    int num_sms;
-    int bszm_in;
-    int bszm_out;
-};
-
-struct TResult
-{
-    fp_exl3_gemm_kernel kernel;
-    fp_exl3_mgemm_kernel mkernel;
-    int shape_idx;
-    int num_sms;
-    int block_dim;
-};
-
-TResult* select_exl3_gemm_mgemm_kernel_new
-(
-    const int cc,
-    const int size_m,
-    const int size_k,
-    const int size_n,
-    const int K,
-    const bool c_fp32,
-    const int force_shape_idx,
-    const int force_num_sms,
-    const int cb
-);
+fp_exl3_gemm_kernel get_gemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb);
+fp_exl3_mgemm_kernel get_mgemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb);

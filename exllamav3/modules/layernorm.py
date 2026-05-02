@@ -92,6 +92,7 @@ class LayerNorm(Module):
         x: torch.Tensor,
         params: dict,
         out_dtype: torch.dtype | None = None,
+        residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         w, b = (self._weight_f(), self._bias_f()) if x.dtype == torch.float else (self.weight, self.bias)
         d = w.dim()
@@ -102,7 +103,11 @@ class LayerNorm(Module):
             x *= w
             if b is not None:
                 x += b
-        return x.to(out_dtype or self.out_dtype)
+        x = x.to(out_dtype or self.out_dtype)
+        if residual is not None:
+            residual += x
+            return residual
+        return x
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         stc = self.config.stc

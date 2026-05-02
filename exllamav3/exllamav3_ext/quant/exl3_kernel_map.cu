@@ -20,9 +20,6 @@ namespace cg = cooperative_groups;
 #include "comp_units/exl3_comp_unit_7.cuh"
 #include "comp_units/exl3_comp_unit_8.cuh"
 
-#include "exl3_kernel_map_samples.cuh"
-std::map<uint64_t, TResult> _tuning_cache = {};
-
 int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool multi, int bszm_in, int bszm_out)
 {
     bool mod_256 = (size_n % 256 == 0);
@@ -294,86 +291,4 @@ fp_exl3_mgemm_kernel get_mgemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int
             default: TORCH_CHECK(false, "No kernel for GEMM shape");
         }
     }
-}
-
-
-TResult f_tr;
-
-TResult* select_exl3_gemm_mgemm_kernel_new
-(
-    int cc,
-    int size_m,
-    int size_k,
-    int size_n,
-    int K,
-    bool c_fp32,
-    int force_shape_idx,
-    int force_num_sms,
-    int cb
-)
-{
-    // Force parameters for tuning/benchmarking
-    if (force_shape_idx > 0)
-    {
-        TORCH_CHECK(force_num_sms, "Must supply force_shape_idx and force_num_sms together");
-        f_tr.kernel = get_gemm_kernel_ptr(K, force_shape_idx, c_fp32, cb);
-        f_tr.mkernel = get_mgemm_kernel_ptr(K, force_shape_idx, c_fp32, cb);
-        f_tr.shape_idx = force_shape_idx;
-        f_tr.num_sms = force_num_sms;
-        f_tr.block_dim = exl3_gemm_blockdim[force_shape_idx];
-        return &f_tr;
-    };
-    TORCH_CHECK(!force_num_sms, "Must supply force_shape_idx and force_num_sms together.");
-
-    // Cache parameters
-    uint64_t key = (((uint64_t) size_k) << 40) |
-                   (((uint64_t) size_n) << 16) |
-                   (((uint64_t) cc)     <<  8) |
-                   (((uint64_t) K)      <<  4) |
-                   (c_fp32 ? 0x01ull : 0x00ull);
-
-    auto lookup = _tuning_cache.find(key);
-    if (lookup == _tuning_cache.end())
-    {
-        // Find closest kernel in map
-        bool mod512 = (size_n % 512 == 0);
-        bool mod256 = (size_n % 256 == 0);
-        bool mod128 = (size_n % 128 == 0);
-        TORCH_CHECK(mod128, "size_n must be a multiple of 128");
-        TSample* cand = mod512 ? samples_512 : (mod256 ? samples_256 : samples_128);
-        TSample* best = nullptr;
-        int64_t best_dist = 1ll<<62;
-
-        for (; cand->K; cand++)
-        {
-            if (cand->K != K) continue;
-            if (cand->cc != cc) continue;
-
-            int64_t distk = (int64_t) (size_k - cand->k);
-            int64_t distn = (int64_t) (size_n - cand->n);
-            int64_t dist = distk * distk + distn * distn;
-            if (dist < best_dist) { best_dist = dist; best = cand; }
-        }
-        TORCH_CHECK(best, "Failed to find valid kernel for shape");
-
-        // Avoid empty blocks
-        int tilesize_k = exl3_gemm_tilesize_k[best->shape_idx];
-        int tilesize_n = exl3_gemm_tilesize_n[best->shape_idx];
-        int max_slices = size_k / tilesize_k * size_n / tilesize_n;
-        int num_sms = MAX(MIN(max_slices, best->num_sms), 1);
-
-        // Results
-        TResult tr = {
-            get_gemm_kernel_ptr(K, best->shape_idx, c_fp32, cb),
-            get_mgemm_kernel_ptr(K, best->shape_idx, c_fp32, cb),
-            best->shape_idx,
-            num_sms,
-            exl3_gemm_blockdim[best->shape_idx]
-        };
-
-        _tuning_cache[key] = tr;
-    }
-
-    lookup = _tuning_cache.find(key);
-    return &(lookup->second);
 }

@@ -154,8 +154,9 @@ class TransformerBlock(Module):
             y = self.attn.forward(y, params)
             if params.get("prefill"): return x
             if self.attn_post_norm:
-                y = self.attn_post_norm.forward(y, params)
-            x += y
+                self.attn_post_norm.forward(y, params, residual = x)
+            else:
+                x += y
 
         if self.mlp:
             params["residual"] = x
@@ -165,14 +166,16 @@ class TransformerBlock(Module):
                 y = x.half()
             y = self.mlp.forward(y, params)
             if self.mlp_post_norm:
-                y = self.mlp_post_norm.forward(y, params)
-            x += y
+                self.mlp_post_norm.forward(y, params, residual = x)
+            else:
+                x += y
 
         if self.export_state:
-            s = params.get("export_states")
-            if not s:
-                s = params["export_states"] = []
-            s.append(x.half())
+            if params.get("layer_instance", 0) == 0:
+                s = params.get("export_states")
+                if not s:
+                    s = params["export_states"] = []
+                s.append(x.half())
 
         if self.backout_lambda is not None:
             x = self._apply_backout(x, params)

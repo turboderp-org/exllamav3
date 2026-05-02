@@ -3,6 +3,7 @@ from functools import cached_property
 from typing import Callable
 import torch
 from .config import Config
+from ..util import parse_int_list
 from ..util.memory import free_mem
 from .model_tp import Model_TPMixin
 from .model_ls import Model_LSMixin
@@ -19,6 +20,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.config = config
 
         self.modules = []
+        self.fwd_modules = []
         self.caps = {
             "supports_tp": True
         }
@@ -28,6 +30,7 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
+        self.last_kv_module_instance = None
         self.logit_layer_idx = None
         self.first_block_idx = None
 
@@ -66,6 +69,80 @@ class Model(Model_TPMixin, Model_LSMixin):
         return self._get_recurrent_layers
 
 
+    def get_layer_instances(self, layer_idx):
+        if not self.config.layer_map:
+            return [(layer_idx, 0)]
+        return [
+            (layer_idx, instance)
+            for instance in range(self.config.layer_map.count(layer_idx))
+        ]
+
+
+    def num_unmapped_layers(self):
+        indices = set()
+        for m in self.modules:
+            if m.layer_idx is not None:
+                assert m.layer_idx not in indices
+                indices.add(m.layer_idx)
+        assert len(indices) == max(indices) + 1
+        return len(indices)
+
+
+    def prepare_layer_map(self):
+        """
+        Prepare list of (module, instance_num, original_idx) for mapped layers
+        """
+
+        # Parse layer map string
+        if self.config.layer_map is None and self.config.layer_map_str:
+            self.config.layer_map = parse_int_list(
+                self.config.layer_map_str,
+                min_value = 0,
+                max_value = self.num_unmapped_layers() - 1
+            )
+
+        # No layer map
+        if not self.config.layer_map:
+            self.fwd_modules = [(m, 0, idx) for idx, m in enumerate(self.modules)]
+            return
+
+        # Isolate and enumerate indexed layers
+        prolog = []
+        inner = []
+        epilog = []
+        for m in self.modules:
+            if m.layer_idx is None:
+                if not inner:
+                    prolog.append(m)
+                else:
+                    epilog.append(m)
+            else:
+                assert len(inner) == m.layer_idx, "Inner layers are not in order"
+                assert not epilog, "Inner layers are not consecutive"
+                inner.append(m)
+
+        # Compile relayered list
+        relayered = []
+        inner_count = [0] * len(inner)
+        offset = 0
+        for idx, m in enumerate(prolog):
+            relayered.append((m, 0, idx + offset))
+        offset = len(prolog)
+        for idx in self.config.layer_map:
+            relayered.append((inner[idx], inner_count[idx], idx + offset))
+            inner_count[idx] += 1
+        offset = len(prolog) + len(inner)
+        for idx, m in enumerate(epilog):
+            relayered.append((m, 0, idx + offset))
+
+        self.fwd_modules = relayered
+        if self.last_kv_module_idx is not None:
+            self.last_kv_module_instance = (
+                self.last_kv_module_idx,
+                inner_count[self.last_kv_module_idx - len(prolog)] - 1
+            )
+
+
     @staticmethod
     def from_config(
         config: Config,
@@ -86,6 +163,9 @@ class Model(Model_TPMixin, Model_LSMixin):
             f"{config.architecture} does not define a '{component}' component model"
 
         model = config.model_classes[component](config, **kwargs)
+
+        # Compile layer map after model is constructed (before any caches are attached)
+        model.prepare_layer_map()
         return model
 
 
@@ -106,7 +186,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         if self.loaded_tp:
             return self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
         else:
-            return self.prefill_ls(x, params, self.last_kv_module_idx, self.modules)
+            return self.prefill_ls(x, params)
 
 
     @torch.inference_mode
@@ -117,7 +197,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         if self.loaded_tp:
             return self.forward_tp(x, params, self.last_kv_module_idx, self.modules)
         else:
-            return self.forward_ls(x, params, self.last_kv_module_idx, self.modules)
+            return self.forward_ls(x, params)
 
 
     def unload(self):
@@ -309,6 +389,8 @@ class Model(Model_TPMixin, Model_LSMixin):
             else:
                 if not self.caps.get("supports_tp"):
                     raise NotImplementedError(f"Tensor-parallel is not currently implemented for {self.config.architecture}")
+                if self.config.layer_map:
+                    raise NotImplementedError(f"Tensor-parallel is not currently implemented for relayered models.")
 
                 if tp_output_device is None:
                     tp_output_device = active_devices[0]
@@ -484,8 +566,9 @@ class Model(Model_TPMixin, Model_LSMixin):
             return None
         new_state = {}
         for m in self.get_recurrent_layers():
-            s = m.new_recurrent_state()
-            if initial_length:
-                s.force_position(initial_length)
-            new_state[m.layer_idx] = s
+            for i in self.get_layer_instances(m.layer_idx):
+                s = m.new_recurrent_state()
+                if initial_length:
+                    s.force_position(initial_length)
+                new_state[i] = s
         return new_state

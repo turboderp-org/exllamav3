@@ -88,6 +88,7 @@ class RMSNorm(Module):
         x: torch.Tensor,
         params,
         out_dtype: torch.dtype | None = None,
+        residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         dtype = out_dtype or self.out_dtype
 
@@ -97,7 +98,7 @@ class RMSNorm(Module):
         # TODO: Weight tensor is always contiguous, so this could be handled more efficiently in the extension
         if not self.span_heads and x.dim() > 2:
             x_2d = x.view(-1, x.shape[-1]).contiguous()
-            y_2d = torch.empty_like(x_2d, dtype = dtype)
+            y_2d = torch.empty_like(x_2d, dtype = dtype) if residual is None else residual.view_as(x_2d)
             ext.rms_norm(
                 x_2d,
                 self.weight,
@@ -106,10 +107,11 @@ class RMSNorm(Module):
                 self.constant_bias,
                 self.constant_scale,
                 self.span_heads,
+                residual is not None,
             )
             return y_2d.view_as(x)
 
-        y = torch.empty_like(x, dtype = dtype)
+        y = torch.empty_like(x, dtype = dtype) if residual is None else residual.view_as(x)
         ext.rms_norm(
             x,
             self.weight,
@@ -118,6 +120,7 @@ class RMSNorm(Module):
             self.constant_bias,
             self.constant_scale,
             self.span_heads,
+            residual is not None,
         )
         return y
 

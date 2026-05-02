@@ -115,10 +115,11 @@ class Cache:
 
         cl = self.model.get_cache_layers()
         self.num_layers = len(cl)
-        self.layers = {
-            attn.layer_idx: self.layer_type(self.config, attn, id(self), self.max_num_tokens, **kwargs)
-            for attn in cl
-        }
+        self.layers = {}
+        for attn in cl:
+            for instance in self.model.get_layer_instances(attn.layer_idx):
+                self.layers[instance] = \
+                    self.layer_type(self.config, attn, id(self), self.max_num_tokens, **kwargs)
 
         self.attach_to_model()
 
@@ -136,9 +137,10 @@ class Cache:
 
         cl = model.get_cache_layers()
         for module in cl:
-            layer = self.layers[module.layer_idx]
-            assert layer not in module.cache_layers, "Cannot attach cache twice to the same model."
-            module.cache_layers.append(layer)
+            for instance in self.model.get_layer_instances(module.layer_idx):
+                layer = self.layers[instance]
+                assert layer not in module.cache_layers, "Cannot attach cache twice to the same model."
+                module.cache_layers.append(layer)
 
 
     def detach_from_model(self, model: Model | None = None):
@@ -152,12 +154,22 @@ class Cache:
 
         cl = model.get_cache_layers()
         for module in cl:
-            layer = self.layers[module.layer_idx]
-            module.cache_layers.remove(layer)
+            for instance in self.model.get_layer_instances(module.layer_idx):
+                layer = self.layers[instance]
+                module.cache_layers.remove(layer)
 
 
-    def get_layer(self, idx: int, cache_seqlens: torch.Tensor, block_table: torch.Tensor, sliding_window: int = -1) -> tuple:
-        return self.layers[idx].get_kv(cache_seqlens, block_table, sliding_window)
+    def get_layer(
+        self,
+        idx: int,
+        cache_seqlens:
+        torch.Tensor,
+        block_table: torch.Tensor,
+        sliding_window: int = -1,
+        instance = None,
+    ) -> tuple:
+        instance = instance or 0
+        return self.layers[idx, instance].get_kv(cache_seqlens, block_table, sliding_window)
 
 
     def update_layer(
@@ -167,9 +179,11 @@ class Cache:
         block_table: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        length: int
+        length: int,
+        instance: None,
     ):
-        return self.layers[idx].update_kv(cache_seqlens, block_table, k, v, length)
+        instance = instance or 0
+        return self.layers[idx, instance].update_kv(cache_seqlens, block_table, k, v, length)
 
 
     def copy_page(
@@ -183,8 +197,8 @@ class Cache:
             "Cannot copy pages between TP and non-TP caches, or between distinct TP caches."
         assert target.num_layers == self.num_layers
         if not self.model.loaded_tp:
-            for idx, src in self.layers.items():
-                dst = target.layers[idx]
+            for instance, src in self.layers.items():
+                dst = target.layers[instance]
                 assert type(src) is type(dst)
                 dst.copy_page(src, from_page, to_page, num_tokens)
         else:
@@ -200,8 +214,8 @@ class Cache:
 
     def new_recurrent_state(self):
         rl = self.model.get_recurrent_layers()
-        state = {
-            attn.layer_idx: attn.new_recurrent_state()
-            for attn in rl
-        }
+        state = {}
+        for attn in rl:
+            for instance in self.model.get_layer_instances(attn.layer_idx):
+                state[instance]: attn.new_recurrent_state()
         return state

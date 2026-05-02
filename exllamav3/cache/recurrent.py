@@ -70,7 +70,11 @@ class RecurrentCache(OrderedDict):
         # Get device map needed for unstashing
         self.model = model
         self.rl = model.get_recurrent_layers()
-        self.device_map = {m.layer_idx: m.device for m in self.rl}
+        self.device_map = {}
+        for m in self.rl:
+            for instance in self.model.get_layer_instances(m.layer_idx):
+                self.device_map[instance] =  m.device
+
 
     def get(self, key, default = None):
         """
