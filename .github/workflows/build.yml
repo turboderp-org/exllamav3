@@ -268,11 +268,11 @@ jobs:
           $wheel = Get-ChildItem dist/*.whl | Select-Object -First 1
           if (-not $wheel) { throw "No wheel found in dist/" }
 
-          python -m pip install --upgrade wheel
-          python - <<'PY'
+          $verifyScript = @'
           from pathlib import Path
           from zipfile import ZipFile
           import os
+          import re
 
           wheel = next(Path("dist").glob("*.whl"))
           expected_torch = f"Requires-Dist: torch{os.environ['TORCH_SPEC']}"
@@ -282,14 +282,39 @@ jobs:
               metadata_name = next(n for n in zf.namelist() if n.endswith(".dist-info/METADATA"))
               metadata = zf.read(metadata_name).decode("utf-8", errors="replace")
 
+          print(f"Wheel: {wheel}")
           print(expected_torch)
           print(expected_xformers)
 
-          if expected_torch not in metadata:
+          # setuptools/pkg_resources may normalize names by replacing _ with -.
+          # It may also insert a space before a parenthesized version specifier,
+          # depending on metadata generation path. Accept the common normalized forms.
+          torch_patterns = [
+              re.escape(expected_torch),
+              re.escape(expected_torch).replace(re.escape("=="), r" ?=="),
+          ]
+          xformers_patterns = [
+              re.escape(expected_xformers),
+              re.escape(expected_xformers).replace(re.escape(">="), r" ?>=").replace(re.escape("<"), r" ?<"),
+          ]
+
+          if not any(re.search(p, metadata) for p in torch_patterns):
+              print("--- METADATA Requires-Dist lines ---")
+              for line in metadata.splitlines():
+                  if line.startswith("Requires-Dist:"):
+                      print(line)
               raise SystemExit(f"Missing expected metadata line: {expected_torch}")
-          if expected_xformers not in metadata:
+
+          if not any(re.search(p, metadata) for p in xformers_patterns):
+              print("--- METADATA Requires-Dist lines ---")
+              for line in metadata.splitlines():
+                  if line.startswith("Requires-Dist:"):
+                      print(line)
               raise SystemExit(f"Missing expected metadata line: {expected_xformers}")
-          PY
+          '@
+
+          Set-Content -Path verify_wheel_metadata.py -Value $verifyScript -Encoding UTF8
+          python verify_wheel_metadata.py
 
       - name: Upload wheel files to GitHub release
         if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
