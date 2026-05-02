@@ -1,4 +1,4 @@
-name: Build Wheels & Release
+name: Build Wheels & Release (Windows only)
 
 on:
   workflow_dispatch:
@@ -299,51 +299,6 @@ jobs:
         uses: svenstaro/upload-release-action@2.6.1
         with:
           file: ./dist/*.whl
-          tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
-          file_glob: true
-          overwrite: true
-          release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}
-
-  build_sdist:
-    name: sdist
-    runs-on: ubuntu-22.04
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Get version string
-        id: package_version
-        run: |
-          $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
-          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') {
-            Write-Output $('::notice file=build.yml,title=Package Version::Detected package version is: {0}' -f $Matches[1])
-            Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
-          }
-          else {
-            Write-Output '::error file=build.yml::Could not parse version from exllamav3/version.py! You must upload files manually!'
-            Write-Output "PACKAGE_VERSION=None" >> "$env:GITHUB_OUTPUT"
-          }
-
-      - name: Install the latest version of uv and set the python version
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: '3.11'
-
-      - name: Build sdist
-        run: |
-          uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
-          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
-    
-          $env:EXLLAMA_NOCOMPILE=1
-          python -m build -n --sdist
-
-      - name: Upload sdist to GitHub release
-        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
-        uses: svenstaro/upload-release-action@2.6.1
-        with:
-          file: ./dist/*.tar.gz
           tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
           file_glob: true
           overwrite: true

@@ -328,20 +328,24 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Build sdist
-        if: matrix.cuda == ''
+      - name: Build sdist and py3-none-any JIT wheel
         run: |
           uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
           uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
-    
-          $env:EXLLAMA_NOCOMPILE=1
-          python -m build -n --sdist
 
-      - name: Upload sdist to GitHub release
+          # Build both:
+          #   - exllamav3-<version>.tar.gz
+          #   - exllamav3-<version>-py3-none-any.whl
+          # The EXLLAMA_NOCOMPILE flag prevents the extension from being compiled
+          # into the wheel, leaving it to JIT/load at runtime.
+          $env:EXLLAMA_NOCOMPILE=1
+          python -m build -n
+
+      - name: Upload sdist and py3-none-any JIT wheel to GitHub release
         if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
         uses: svenstaro/upload-release-action@2.6.1
         with:
-          file: ./dist/*.tar.gz
+          file: ./dist/*
           tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
           file_glob: true
           overwrite: true
