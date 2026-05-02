@@ -12,6 +12,8 @@ from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..util import profile_opt
 
+MAX_PRE_SEQ = 8192
+
 """
 Dedicated attention layer for SWA layers. Maintains recurrent state instead of KV cache
 """
@@ -184,7 +186,7 @@ class SlidingAttention(Module):
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.gqa = (num_q_heads != num_kv_heads)
-        self.sm_scale = sm_scale
+        self.sm_scale = sm_scale or self.head_dim ** (-0.5)
         self.rope_settings = rope_settings
         self.rope = None
         self.out_dtype = out_dtype
@@ -306,7 +308,17 @@ class SlidingAttention(Module):
         # Register headwise gate
         if key_g:
             gate_features = num_q_heads * head_dim if full_gate else num_q_heads
-            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, gate_features, qmap = None, out_dtype = torch.half, pad_to = 1)
+            _qmap = ".input" if full_gate else None
+            self.g_proj = Linear(
+                config,
+                f"{key}.{key_g}",
+                hidden_size,
+                gate_features,
+                qmap = _qmap,
+                out_dtype = torch.half,
+                pad_to = 1,
+                select_hq_bits = select_hq_bits,
+            )
             self.headwise_gate = not full_gate
             self.register_submodule(self.g_proj)
         else:
@@ -324,12 +336,19 @@ class SlidingAttention(Module):
         })
 
         self.multi_kv = None
+        self.multi_qg = None
         self.tp_reduce = False
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
 
         self.has_split_cache = False
+
+        self.prealloc_qgh_1 = None
+        self.prealloc_qg_1 = None
+        self.prealloc_kvh_1 = None
+        self.prealloc_kv_1 = None
+        self.pre_seqs = None
 
 
     @override
@@ -363,11 +382,31 @@ class SlidingAttention(Module):
             self.v_proj.inner.bias is None
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
+            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "kvh_1")
+            self.prealloc_kv_1 = g_tensor_cache.get(device, (2, 1, self.num_kv_heads * self.head_dim), torch.half, "kv_1")
+
+        # Test if Q and G proj can be fused
+        if (
+            self.g_proj is not None and
+            device != torch.device("cpu") and
+            self.q_proj.quant_type == "exl3" and
+            self.g_proj.quant_type == "exl3" and
+            self.q_proj.out_features == self.g_proj.out_features and
+            self.q_proj.inner.K == self.g_proj.inner.K and
+            self.q_proj.inner.bias is None and
+            self.g_proj.inner.bias is None
+        ):
+            self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
+            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "qgh_1")
+            self.prealloc_qg_1 = g_tensor_cache.get(device, (2, 1, self.num_q_heads * self.head_dim), torch.half, "qg_1")
 
         # Head norm
         if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
             self.q_norm_tensor = self.q_norm.weight.data
             self.k_norm_tensor = self.k_norm.weight.data
+
+        # Create seqlens for flash_attn_with_kvcache to avoid extra torch.full on launch
+        self.pre_seqs = torch.arange(MAX_PRE_SEQ, dtype = torch.int, device = device)
 
 
     @override
@@ -389,10 +428,20 @@ class SlidingAttention(Module):
             self.multi_kv.unload()
             self.multi_kv = None
 
+        if self.multi_qg is not None:
+            self.multi_qg.unload()
+            self.multi_qg = None
+
         self.q_norm_tensor = None
         self.k_norm_tensor = None
         self.stage_k = None
         self.stage_v = None
+
+        self.prealloc_qgh_1 = None
+        self.prealloc_qg_1 = None
+        self.prealloc_kvh_1 = None
+        self.prealloc_kv_1 = None
+        self.pre_seqs = None
 
 
     def new_recurrent_state(self):
@@ -432,12 +481,40 @@ class SlidingAttention(Module):
 
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
-        q = self.q_proj.forward(x, params)
 
-        if self.g_proj:
-            g = self.g_proj.forward(x, params)
+        if self.multi_qg is None or bsz * q_len > 32:
+            q = self.q_proj.forward(x, params)
+            if self.g_proj:
+                g = self.g_proj.forward(x, params)
+            else:
+                g = None
         else:
-            g = None
+            x = x.view(1, bsz * q_len, dim)
+            if bsz * q_len == 1:
+                qgh = self.prealloc_qgh_1
+                qg = self.prealloc_qg_1
+            else:
+                qgh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                qg = torch.empty((2, bsz * q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = x.device)
+            ext.exl3_mgemm(
+                x,
+                self.multi_qg.ptrs_trellis,
+                qg,
+                self.multi_qg.ptrs_suh,
+                qgh,
+                self.multi_qg.ptrs_svh,
+                None,
+                None,
+                self.multi_qg.K,
+                -1,
+                self.multi_qg.mcg,
+                self.multi_qg.mul1,
+                -1,
+                -1,
+                0
+            )
+            q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
+            g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
         if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
@@ -445,8 +522,12 @@ class SlidingAttention(Module):
 
         else:
             x = x.view(1, bsz * q_len, dim)
-            kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
-            kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
+            if bsz * q_len == 1:
+                kvh = self.prealloc_kvh_1
+                kv = self.prealloc_kv_1
+            else:
+                kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
                 self.multi_kv.ptrs_trellis,
@@ -657,6 +738,9 @@ class SlidingAttention(Module):
                 assert shift > 0
 
             if not non_causal_spans:
+                if cache_seqlens < MAX_PRE_SEQ:
+                    cache_seqlens = self.pre_seqs[cache_seqlens : cache_seqlens + 1]
+
                 o = flash_attn_with_kvcache(
                     q = q_,
                     k = k_,
@@ -713,8 +797,9 @@ class SlidingAttention(Module):
         o = torch.cat(ro, dim = 0) if len(ro) > 1 else o
         assert o.shape[1] == seqlen
 
-        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate: o *= g.sigmoid()
+        if self.full_gate: ext.mul_sigmoid_(o, g)
+
         o = self.project_o(o, bsz, seqlen, params)
         return o

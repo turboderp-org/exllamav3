@@ -13,7 +13,7 @@ from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
-from ..util.tensor import g_tensor_cache
+from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 
 TEMP_ROWS_FUSED = 128
 TEMP_ROWS_GRAPH = 32
@@ -42,8 +42,9 @@ class FusedBuffers:
 
 def routing_std(bsz, cfg, y, params):
     if bsz == 1:
-        torch.matmul(y, cfg.gate_tensor, out = cfg.router_logits_bsz1)
         ext.routing_std(
+            y,
+            cfg.gate_tensor,
             cfg.router_logits_bsz1,
             cfg.selected_experts_bsz1,
             cfg.routing_weights_bsz1,
@@ -51,9 +52,9 @@ def routing_std(bsz, cfg, y, params):
         )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
     else:
-        router_logits = torch.matmul(y, cfg.gate_tensor)
         activate_all_experts = params.get("activate_all_experts")
         if activate_all_experts:
+            router_logits = torch.matmul(y, cfg.gate_tensor)
             routing_weights = torch.softmax(router_logits, dim = -1)
             selected_experts = (
                 torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
@@ -63,9 +64,12 @@ def routing_std(bsz, cfg, y, params):
                 routing_weights *= cfg.per_expert_scale.unsqueeze(0)
             return selected_experts, routing_weights
         else:
+            router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
             routing_weights = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device)
             selected_experts = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.long, device = y.device)
             ext.routing_std(
+                y,
+                cfg.gate_tensor,
                 router_logits,
                 selected_experts,
                 routing_weights,
@@ -115,8 +119,9 @@ def routing_ds3(bsz, cfg, y, params):
 def routing_dots(bsz, cfg, y, params):
 
     if bsz == 1:
-        torch.matmul(y, cfg.gate_tensor, out = cfg.router_logits_bsz1)
         ext.routing_ds3_nogroup(
+            y,
+            cfg.gate_tensor,
             cfg.router_logits_bsz1,
             cfg.e_score_correction_bias,
             cfg.selected_experts_bsz1,
@@ -126,9 +131,9 @@ def routing_dots(bsz, cfg, y, params):
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
 
     else:
-        router_logits = torch.matmul(y, cfg.gate_tensor)
         activate_all_experts = params.get("activate_all_experts")
         if activate_all_experts:
+            router_logits = torch.matmul(y, cfg.gate_tensor)
             routing_weights = router_logits.sigmoid()
             if cfg.e_score_correction_bias is not None:
                 routing_weights += cfg.e_score_correction_bias.unsqueeze(0)
@@ -139,9 +144,12 @@ def routing_dots(bsz, cfg, y, params):
                 .repeat((bsz, 1))
             )
         else:
+            router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
             routing_weights = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device)
             selected_experts = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.long, device = y.device)
             ext.routing_ds3_nogroup(
+                y,
+                cfg.gate_tensor,
                 router_logits,
                 cfg.e_score_correction_bias,
                 selected_experts,
@@ -221,7 +229,7 @@ class BlockSparseMLP(Module):
         self.intermediate_size_padded = (intermediate_size + 127) // 128 * 128
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
-        self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 32)
+        self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 4)
         self.num_local_experts = num_local_experts if num_local_experts is not None else num_experts
         self.hidden_size = hidden_size
         self.router_type = router_type
@@ -708,8 +716,7 @@ class BlockSparseMLP(Module):
                 flat_weight = routing_weights.reshape(-1)                       # [num_tokens * top_k]
 
                 # Token indices corresponding to each flattened assignment
-                flat_token = torch.arange(num_tokens, device = y.device)
-                flat_token = flat_token.repeat_interleave(top_k)  # [num_tokens * top_k]
+                flat_token = buffered_interleaved_arange(num_tokens, top_k, device = y.device)
 
                 if self.routing_device is None or self.num_local_experts == self.num_experts:
                     flat_expert_local = flat_expert_global
@@ -725,10 +732,7 @@ class BlockSparseMLP(Module):
 
                 # Count how many assignments per expert
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                expert_ptr = torch.empty(E + 2, device = y.device, dtype = torch.long)
-                expert_ptr[0] = 0
-                expert_ptr[1:] = expert_count.cumsum(0)
-                expert_ptr = expert_ptr.tolist()
+                expert_count_list = expert_count.tolist()
 
                 # Run fused path if possible, skips experts with more than TEMP_ROWS_FUSED tokens
                 if self.fused_mode_buffers is not None:
@@ -771,12 +775,13 @@ class BlockSparseMLP(Module):
                 interm = None
                 interm_a = None
                 max_count = 0
+                start = 0
 
                 for expert_idx in range(num_ex):
-                    start = expert_ptr[expert_idx]
-                    end = expert_ptr[expert_idx + 1]
-                    count = end - start
+                    count = expert_count_list[expert_idx]
+                    end = start + count
                     if count <= min_rows:
+                        start = end
                         continue
 
                     top_x = token_sorted[start:end]
@@ -827,6 +832,7 @@ class BlockSparseMLP(Module):
 
                     current_state.mul_(w)
                     final_hidden_states.index_add_(0, top_x, current_state)
+                    start = end
 
             final_hidden_states = final_hidden_states.reshape(x.shape)
 

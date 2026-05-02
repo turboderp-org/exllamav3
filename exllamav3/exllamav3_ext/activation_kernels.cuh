@@ -103,6 +103,16 @@ __device__ __forceinline__ float _sigmoid_fast_exp(float x)
 }
 
 
+__device__ __forceinline__ half2 _sigmoid(half2 x)
+{
+    half2 one = __float2half2_rn(1.0f);
+    half2 neg_x = __hneg2(x);
+    half2 e = h2exp(neg_x);
+    half2 sum = __hadd2(one, e);
+    return h2rcp(sum);
+}
+
+
 template <int activation_type>
 __global__ __launch_bounds__(NUM_THREADS)
 void act_mul_kernel_h
@@ -231,6 +241,45 @@ void add_sigmoid_kernel_f
     float z = pz[idx];
     z += x * _sigmoid_fast_exp(y);
     pz[idx] = z;
+}
+
+
+__global__ __launch_bounds__(NUM_THREADS)
+void mul_sigmoid_kernel_h
+(
+    half* __restrict__ x,
+    const half* __restrict__ y,
+    const size_t numel
+)
+{
+    size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
+    if (idx >= numel / 2) return;
+
+    half2 x2 = ((half2*) x)[idx];
+    half2 y2 = ((const half2*) y)[idx];
+    x2 = __hmul2(x2, _sigmoid(y2));
+    ((half2*) x)[idx] = x2;
+}
+
+
+__global__ __launch_bounds__(NUM_THREADS)
+void mul_sigmoid_broadcast_kernel_h
+(
+    half* __restrict__ x,
+    const half* __restrict__ y,
+    const size_t numel,
+    const size_t dim
+)
+{
+    size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
+    if (idx >= numel / 2) return;
+
+    size_t x_idx = idx * 2;
+    size_t y_idx = x_idx / dim;
+    half2 x2 = ((half2*) x)[idx];
+    half2 y2 = __half2half2(y[y_idx]);
+    x2 = __hmul2(x2, _sigmoid(y2));
+    ((half2*) x)[idx] = x2;
 }
 
 // x * sigmoid(y @ w) + z -> z,

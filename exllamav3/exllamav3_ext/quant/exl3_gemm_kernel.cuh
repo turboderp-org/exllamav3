@@ -3,6 +3,7 @@
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
 #include "exl3_gemm_inner.cuh"
+#include "exl3_devctx.cuh"
 
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
@@ -10,19 +11,18 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
 {
     auto grid = cg::this_grid();
 
-    if (suh)
+    // if (suh)
     {
         int total_warps = size_m * size_k / 128;
         int warps_grid = gridDim.x * blockDim.x / 32;
         int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
 
         for(; this_warp < total_warps; this_warp += warps_grid)
-            had_hf_r_128_inner
+            had_hf_r_128_inner<true, false>
             (
                 A + this_warp * 128,
                 A_had + this_warp * 128,
                 suh + (this_warp * 128) % size_k,
-                nullptr,
                 0.088388347648f  // 1/sqrt(128)
             );
 
@@ -37,8 +37,8 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     while (size_m_ > 0)
     {
         exl3_gemm_kernel_inner
-        <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
-        (A_, B, C_, size_m_, size_k, size_n, locks);
+        <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
+        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks, svh);
 
         A_ += 16 * size_k;
         if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
@@ -49,7 +49,8 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
             grid.sync();
     }
 
-    if (svh)
+    // if (svh)
+    /*
     {
         int total_warps = size_m * size_n / 128;
         int warps_grid = gridDim.x * blockDim.x / 32;
@@ -58,25 +59,24 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
         for(; this_warp < total_warps; this_warp += warps_grid)
         {
             if constexpr (c_fp32)
-                had_ff_r_128_inner
+                had_ff_r_128_inner<false, true>
                 (
                     ((const float*) C) + this_warp * 128,
                     ((float*) C) + this_warp * 128,
-                    nullptr,
                     svh + (this_warp * 128) % size_n,
                     0.088388347648f  // 1/sqrt(128)
                 );
             else
-                had_hf_r_128_inner
+                had_hf_r_128_inner<false, true>
                 (
                     ((const half*) C) + this_warp * 128,
                     ((half*) C) + this_warp * 128,
-                    nullptr,
                     svh + (this_warp * 128) % size_n,
                     0.088388347648f  // 1/sqrt(128)
                 );
         }
     }
+     */
 }
 
 #define MAX_INDICES 128
@@ -91,6 +91,10 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 {
     int bszm = MAX(bszm_in, bszm_out);
     auto grid = cg::this_grid();
+
+    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+        int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
+    #endif
 
     // Pack indices within min_index <= idx < max_index
 
@@ -150,16 +154,20 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             half* A_had_ = A_had + j * size_m * size_k;
 
             for(; this_warp < total_warps; this_warp += warps_grid)
-                had_hf_r_128_inner
+                had_hf_r_128_inner<true, false>
                 (
                     A_ + this_warp * 128,
                     A_had_ + this_warp * 128,
                     suh + (this_warp * 128) % size_k,
-                    nullptr,
                     0.088388347648f  // 1/sqrt(128)
                 );
         }
-        grid.sync();
+
+        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+            group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
+        #else
+            grid.sync();
+        #endif
 
         // Matmul
 
@@ -176,15 +184,20 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 int lock_offs = blockIdx.z * size_n / 128;
 
                 exl3_gemm_kernel_inner
-                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
-                (A_, B, C_, size_m_, size_k, size_n, locks + lock_offs);
-             }
+                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
+                (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks + lock_offs, nullptr);
+            }
 
             A_ += 16 * size_k;
             if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
             else                  C_ = (void*) (((half*) C_) + 16 * size_n);
             size_m_ -= 16;
-            grid.sync();
+
+            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+                group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
+            #else
+                grid.sync();
+            #endif
         }
 
         // Had and output scales
@@ -205,20 +218,18 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             for(; this_warp < total_warps; this_warp += warps_grid)
             {
                 if constexpr (c_fp32)
-                    had_ff_r_128_inner
+                    had_ff_r_128_inner<false, true>
                     (
                         ((const float*) C_) + this_warp * 128,
                         ((float*) C_) + this_warp * 128,
-                        nullptr,
                         svh + (this_warp * 128) % size_n,
                         scale
                     );
                 else
-                    had_hf_r_128_inner
+                    had_hf_r_128_inner<false, true>
                     (
                         ((const half*) C_) + this_warp * 128,
                         ((half*) C_) + this_warp * 128,
-                        nullptr,
                         svh + (this_warp * 128) % size_n,
                         scale
                     );

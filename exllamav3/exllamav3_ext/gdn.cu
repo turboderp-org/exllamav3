@@ -333,7 +333,7 @@ void gated_delta_net_fused_op_2
 }
 
 
-template <int MAX_HEAD_DIM, bool save_history>
+template <int MAX_HEAD_DIM, bool save_history, int V_SPLIT>
 __global__ __launch_bounds__(MAX_HEAD_DIM * SUBK)
 void cuda_recurrent_gated_delta_rule_kernel
 (
@@ -376,6 +376,9 @@ void cuda_recurrent_gated_delta_rule_kernel
     int warp = t / 32;
     int head = blockIdx.y;
     int k_head = head / group;
+    int v_chunk = blockIdx.z;
+    int v_chunk_dim = v_head_dim / V_SPLIT;
+    int v_start = v_chunk * v_chunk_dim;
 
     // Shared buffers
     __shared__ float sh_red[2][MAX_HEAD_DIM / 32];
@@ -390,8 +393,8 @@ void cuda_recurrent_gated_delta_rule_kernel
         // Advance to q/k head
         const bfloat16* gl_q = mixed_qkv + k_head * k_head_dim;
         const bfloat16* gl_k = mixed_qkv + (num_k_heads + k_head) * k_head_dim;
-        const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * k_head_dim) + head * v_head_dim;
-        bfloat16* out = core_attn_out + head * v_head_dim;
+        const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * k_head_dim) + head * v_head_dim + v_start;
+        bfloat16* out = core_attn_out + head * v_head_dim + v_start;
 
         float* gl_rs_r;
         float* gl_rs_w;
@@ -453,21 +456,20 @@ void cuda_recurrent_gated_delta_rule_kernel
             sh_q[t] = q;
         }
 
-        if (t < v_head_dim && bt == 0)
+        if (t < v_chunk_dim && bt == 0)
         {
             sh_dot1[t] = 0.0f;
             sh_dot2[t] = 0.0f;
         }
         __syncthreads();
 
-        if (t < v_head_dim)
+        if (t < v_chunk_dim)
         {
             // Dot products with last state
             float sum = 0.0f;
             float* sh_k_rd = sh_k + bt * bts;
-            float* rs_rd = gl_rs_r + t + bt * bts * v_head_dim;
+            float* rs_rd = gl_rs_r + v_start + t + bt * bts * v_head_dim;
 
-            // TODO: Could use tensor cores
             for (int i = 0; i < k_head_dim / 8 / SUBK; ++i)
             {
                 #pragma unroll
@@ -478,7 +480,7 @@ void cuda_recurrent_gated_delta_rule_kernel
         }
         __syncthreads();
 
-        if (t < v_head_dim)
+        if (t < v_chunk_dim)
         {
             float g_h = __expf(g[head]);
             float beta_h = __bfloat162float(beta[head]);
@@ -492,10 +494,9 @@ void cuda_recurrent_gated_delta_rule_kernel
             float v_out = 0.0f;
             float* sh_k_rd = sh_k + bt * bts;
             float* sh_q_rd = sh_q + bt * bts;
-            float* rs_r = gl_rs_r + t + bt * bts * v_head_dim;
-            float* rs_w = gl_rs_w + t + bt * bts * v_head_dim;
+            float* rs_r = gl_rs_r + v_start + t + bt * bts * v_head_dim;
+            float* rs_w = gl_rs_w + v_start + t + bt * bts * v_head_dim;
 
-            // TODO: Could use tensor cores
             for (int i = 0; i < k_head_dim / 8 / SUBK; ++i)
             {
                 #pragma unroll
@@ -514,13 +515,12 @@ void cuda_recurrent_gated_delta_rule_kernel
         }
         __syncthreads();
 
-        if (t < v_head_dim && bt == 0)
+        if (t < v_chunk_dim && bt == 0)
         {
             float v_out = sh_dot2[t];
 
             // Store attn output
-            if (bt == 0)
-                out[t] = __float2bfloat16_rz(v_out * scale);
+            out[t] = __float2bfloat16_rz(v_out * scale);
         }
 
         // Next seq index
@@ -531,6 +531,175 @@ void cuda_recurrent_gated_delta_rule_kernel
     }
 }
 
+template <bool save_history, int V_SPLIT>
+__global__ __launch_bounds__(128 * SUBK)
+void cuda_recurrent_gated_delta_rule_kernel_128
+(
+                                                // k_head_dim = v_head_dim = 128
+    const bfloat16* __restrict__ mixed_qkv,     // [bsz, seqlen, (k_dim + k_dim + v_dim)]
+    const float* __restrict__ g,                // [bsz, seqlen, (group * num_k_heads)]
+    const bfloat16* __restrict__ beta,          // [bsz, seqlen, (group * num_k_heads)]
+    float* __restrict__ recurrent_state,        // [bsz, (group * num_k_heads), 128, 128]
+    bfloat16* __restrict__ core_attn_out,       // [bsz, seqlen, num_v_heads, 128]
+    const int bsz,
+    const int seqlen,
+    const int num_k_heads,
+    const int num_v_heads,
+    const int k_head_dim,
+    const int v_head_dim,
+    const float scale,
+    float* __restrict__ history                 // [bsz, seqlen - 1, (group * num_k_heads), 128, 128]
+)
+{
+    constexpr int HEAD_DIM = 128;
+    constexpr int V_CHUNK_DIM = HEAD_DIM / V_SPLIT;
+    constexpr int BTS = HEAD_DIM / SUBK;
+
+    int group = num_v_heads / num_k_heads;
+
+    int bi = blockIdx.x;
+    mixed_qkv +=        bi * seqlen * (3 * HEAD_DIM * num_k_heads + HEAD_DIM * (num_v_heads - num_k_heads));
+    g +=                bi * seqlen * (group * num_k_heads);
+    beta +=             bi * seqlen * (group * num_k_heads);
+    recurrent_state +=  bi * (group * num_k_heads) * HEAD_DIM * HEAD_DIM;
+    core_attn_out +=    bi * seqlen * num_v_heads * HEAD_DIM;
+
+    constexpr size_t HEAD_STATE_SIZE = HEAD_DIM * HEAD_DIM;
+    const size_t state_size = group * num_k_heads * HEAD_STATE_SIZE;
+    if constexpr (save_history)
+        history +=      bi * (seqlen - 1) * group * num_k_heads * HEAD_STATE_SIZE;
+
+    int t = threadIdx.x;
+    int bt = threadIdx.y;
+    int lane = t % 32;
+    int warp = t / 32;
+    int head = blockIdx.y;
+    int k_head = head / group;
+    int v_chunk = blockIdx.z;
+    int v_start = v_chunk * V_CHUNK_DIM;
+
+    __shared__ float sh_red[2][HEAD_DIM / 32];
+    __shared__ float sh_k[HEAD_DIM];
+    __shared__ float sh_q[HEAD_DIM];
+    __shared__ float sh_dot1[HEAD_DIM];
+    __shared__ float sh_dot2[HEAD_DIM];
+
+    for (int s = 0; s < seqlen; ++s)
+    {
+        const bfloat16* gl_q = mixed_qkv + k_head * HEAD_DIM;
+        const bfloat16* gl_k = mixed_qkv + (num_k_heads + k_head) * HEAD_DIM;
+        const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * HEAD_DIM) + head * HEAD_DIM + v_start;
+        bfloat16* out = core_attn_out + head * HEAD_DIM + v_start;
+
+        float* gl_rs_r;
+        float* gl_rs_w;
+        if constexpr (save_history)
+        {
+            bool first = (s == 0);
+            bool last = (s == seqlen - 1);
+            gl_rs_r = first ? recurrent_state + head * HEAD_STATE_SIZE
+                            : history         + head * HEAD_STATE_SIZE + (s - 1) * state_size;
+            gl_rs_w = last  ? recurrent_state + head * HEAD_STATE_SIZE
+                            : history         + head * HEAD_STATE_SIZE + (s ) * state_size;
+        }
+        else
+        {
+            gl_rs_r = recurrent_state + head * HEAD_STATE_SIZE;
+            gl_rs_w = gl_rs_r;
+        }
+
+        float q = __bfloat162float(gl_q[t]);
+        float k = __bfloat162float(gl_k[t]);
+
+        float sumq = q * q;
+        float sumk = k * k;
+        #pragma unroll
+        for(int offset = 16; offset > 0; offset /= 2)
+        {
+            sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
+            sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+        }
+        if (lane == 0)
+        {
+            sh_red[0][warp] = sumq;
+            sh_red[1][warp] = sumk;
+        }
+        __syncthreads();
+
+        sumq = lane < HEAD_DIM / 32 ? sh_red[0][lane] : 0.0f;
+        sumk = lane < HEAD_DIM / 32 ? sh_red[1][lane] : 0.0f;
+        #pragma unroll
+        for(int offset = 16; offset > 0; offset /= 2)
+        {
+            sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
+            sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+        }
+
+        q = q * rsqrtf(sumq + 1e-6f);
+        k = k * rsqrtf(sumk + 1e-6f);
+        sh_k[t] = k;
+        sh_q[t] = q;
+
+        if (t < V_CHUNK_DIM && bt == 0)
+        {
+            sh_dot1[t] = 0.0f;
+            sh_dot2[t] = 0.0f;
+        }
+        __syncthreads();
+
+        if (t < V_CHUNK_DIM)
+        {
+            float sum = 0.0f;
+            float* sh_k_rd = sh_k + bt * BTS;
+            float* rs_rd = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
+
+            #pragma unroll
+            for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
+            {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j, rs_rd += HEAD_DIM, sh_k_rd++)
+                    sum = sum + *sh_k_rd * *rs_rd;
+            }
+            atomicAdd(sh_dot1 + t, sum);
+        }
+        __syncthreads();
+
+        if (t < V_CHUNK_DIM)
+        {
+            float g_h = __expf(g[head]);
+            float beta_h = __bfloat162float(beta[head]);
+            float v = __bfloat162float(gl_v[t]) - sh_dot1[t] * g_h;
+            float v_out = 0.0f;
+            float* sh_k_rd = sh_k + bt * BTS;
+            float* sh_q_rd = sh_q + bt * BTS;
+            float* rs_r = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
+            float* rs_w = gl_rs_w + v_start + t + bt * BTS * HEAD_DIM;
+
+            #pragma unroll
+            for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
+            {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j, rs_r += HEAD_DIM, rs_w += HEAD_DIM, sh_k_rd++, sh_q_rd++)
+                {
+                    float state = *rs_r;
+                    state = state * g_h + *sh_k_rd * v * beta_h;
+                    *rs_w = state;
+                    v_out = v_out + *sh_q_rd * state;
+                }
+            }
+            atomicAdd(sh_dot2 + t, v_out);
+        }
+        __syncthreads();
+
+        if (t < V_CHUNK_DIM && bt == 0)
+            out[t] = __float2bfloat16_rz(sh_dot2[t] * scale);
+
+        mixed_qkv +=        2 * HEAD_DIM * num_k_heads + HEAD_DIM * num_v_heads;
+        g +=                num_v_heads;
+        beta +=             num_v_heads;
+        core_attn_out +=    num_v_heads * HEAD_DIM;
+    }
+}
 
 void cuda_recurrent_gated_delta_rule
 (
@@ -553,20 +722,52 @@ void cuda_recurrent_gated_delta_rule
     int seqlen = mixed_qkv.size(1);
     int qkv_dim = mixed_qkv.size(2);
 
+    TORCH_CHECK(num_v_heads % num_k_heads == 0, "num_v_heads must be divisible by num_k_heads");
+    TORCH_CHECK(k_head_dim >= 32 && k_head_dim % (8 * SUBK) == 0, "k_head_dim must be a multiple of 32");
+    TORCH_CHECK(MAX(k_head_dim, v_head_dim) <= 256, "Max head dim exceeded");
+
+    TORCH_CHECK(qkv_dim == 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim,
+                "mixed_qkv must be [bsz, seqlen, 2*num_k_heads*k_head_dim + num_v_heads*v_head_dim]");
+    TORCH_CHECK(g.dim() == 3 && g.size(0) == bsz && g.size(1) == seqlen && g.size(2) == num_v_heads,
+                "g must be [bsz, seqlen, num_v_heads]");
+    TORCH_CHECK(beta.dim() == 3 && beta.size(0) == bsz && beta.size(1) == seqlen && beta.size(2) == num_v_heads,
+                "beta must be [bsz, seqlen, num_v_heads]");
+    TORCH_CHECK(recurrent_state.dim() == 4 &&
+                recurrent_state.size(0) == bsz &&
+                recurrent_state.size(1) == num_v_heads &&
+                recurrent_state.size(2) == k_head_dim &&
+                recurrent_state.size(3) == v_head_dim,
+                "recurrent_state must be [bsz, num_v_heads, k_head_dim, v_head_dim]");
+    TORCH_CHECK(core_attn_out.dim() == 4 &&
+                core_attn_out.size(0) == bsz &&
+                core_attn_out.size(1) == seqlen &&
+                core_attn_out.size(2) == num_v_heads &&
+                core_attn_out.size(3) == v_head_dim,
+                "core_attn_out must be [bsz, seqlen, num_v_heads, v_head_dim]");
+
     TORCH_CHECK_DTYPE(mixed_qkv, kBFloat16);
     TORCH_CHECK_DTYPE(g, kFloat);
     TORCH_CHECK_DTYPE(beta, kBFloat16);
     TORCH_CHECK_DTYPE(recurrent_state, kFloat);
     TORCH_CHECK_DTYPE(core_attn_out, kBFloat16);
 
-    dim3 blocks(bsz, num_v_heads);  // group * num_k_heads
-    dim3 threads(MAX(k_head_dim, v_head_dim), SUBK);
+    int v_split = (bsz == 1 && k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64) ? 4 : 1;
+    TORCH_CHECK(v_head_dim % v_split == 0, "v_head_dim must be divisible by v_split");
+
+    dim3 blocks(bsz, num_v_heads, v_split);  // group * num_k_heads
+    dim3 threads(MAX(k_head_dim, v_head_dim / v_split), SUBK);
 
     float* history_ptr = (float*) OPTPTR(history);
     if (history_ptr)
     {
         TORCH_CHECK_DTYPE_OPT(history, kFloat);
-        TORCH_CHECK(history.value().size(1) == seqlen - 1, "history tensor is wrong size");
+        TORCH_CHECK(history.value().dim() == 5 &&
+                    history.value().size(0) == bsz &&
+                    history.value().size(1) == seqlen - 1 &&
+                    history.value().size(2) == num_v_heads &&
+                    history.value().size(3) == k_head_dim &&
+                    history.value().size(4) == v_head_dim,
+                    "history must be [bsz, seqlen - 1, num_v_heads, k_head_dim, v_head_dim]");
     }
 
     float scale = 1.0f / sqrtf(k_head_dim);
@@ -588,19 +789,45 @@ void cuda_recurrent_gated_delta_rule
 
     if (!history_ptr)
     {
-        if (threads.x <= 128)
-            cuda_recurrent_gated_delta_rule_kernel<128, false><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+        if (k_head_dim == 128 && v_head_dim == 128)
+        {
+            if (v_split == 4)
+                cuda_recurrent_gated_delta_rule_kernel_128<false, 4><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+            else
+                cuda_recurrent_gated_delta_rule_kernel_128<false, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+        }
+        else if (threads.x <= 128)
+        {
+            if (v_split == 4)
+                cuda_recurrent_gated_delta_rule_kernel<128, false, 4><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+            else
+                cuda_recurrent_gated_delta_rule_kernel<128, false, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+        }
         else if (threads.x <= 256)
-            cuda_recurrent_gated_delta_rule_kernel<256, false><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+            cuda_recurrent_gated_delta_rule_kernel<256, false, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
         else TORCH_CHECK(false, "Max head dim exceeded");
     }
     else
     {
-        if (threads.x <= 128)
-            cuda_recurrent_gated_delta_rule_kernel<128, true><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+        if (k_head_dim == 128 && v_head_dim == 128)
+        {
+            if (v_split == 4)
+                cuda_recurrent_gated_delta_rule_kernel_128<true, 4><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+            else
+                cuda_recurrent_gated_delta_rule_kernel_128<true, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+        }
+        else if (threads.x <= 128)
+        {
+            if (v_split == 4)
+                cuda_recurrent_gated_delta_rule_kernel<128, true, 4><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+            else
+                cuda_recurrent_gated_delta_rule_kernel<128, true, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+        }
         else if (threads.x <= 256)
-            cuda_recurrent_gated_delta_rule_kernel<256, true><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+            cuda_recurrent_gated_delta_rule_kernel<256, true, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
         else TORCH_CHECK(false, "Max head dim exceeded");
     }
     #undef KERNEL_ARGS
+
+    cuda_check(cudaPeekAtLastError());
 }

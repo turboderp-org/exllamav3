@@ -13,6 +13,7 @@ from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from torch.nn.attention.bias import causal_lower_right
+from ..util.tensor import g_tensor_cache
 
 try:
     import xformers.ops as xops
@@ -222,7 +223,7 @@ class Attention(Module):
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.gqa = (num_q_heads != num_kv_heads)
-        self.sm_scale = sm_scale
+        self.sm_scale = sm_scale or self.head_dim ** (-0.5)
         self.rope_settings = rope_settings
         self.rope = None
         self.out_dtype = out_dtype
@@ -367,7 +368,17 @@ class Attention(Module):
             assert not interleaved_gate, \
                 "Cannot apply both interleaved and headwise gate"
             gate_features = num_q_heads * head_dim if full_gate else num_q_heads
-            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, gate_features, qmap = None, out_dtype = torch.half, pad_to = 1)
+            _qmap = ".input" if full_gate else None
+            self.g_proj = Linear(
+                config,
+                f"{key}.{key_g}",
+                hidden_size,
+                gate_features,
+                qmap = _qmap,
+                out_dtype = torch.half,
+                pad_to = 1,
+                select_hq_bits = select_hq_bits,
+            )
             self.headwise_gate = not full_gate
             self.register_submodule(self.g_proj)
         else:
@@ -386,6 +397,7 @@ class Attention(Module):
         self.cache_layers = []
         self.tp_cache_lookup = {}
         self.multi_kv = None
+        self.multi_qg = None
         self.tp_reduce = False
 
         self.q_norm_tensor = None
@@ -398,6 +410,10 @@ class Attention(Module):
         self.q_global_dim = 0
         self.k_global_dim = 0
 
+        self.prealloc_qgh_1 = None
+        self.prealloc_qg_1 = None
+        self.prealloc_kvh_1 = None
+        self.prealloc_kv_1 = None
 
     @override
     def optimizer_targets(self):
@@ -435,6 +451,23 @@ class Attention(Module):
             self.v_proj.inner.bias is None
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
+            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "kvh_1")
+            self.prealloc_kv_1 = g_tensor_cache.get(device, (2, 1, self.num_kv_heads * self.head_dim), torch.half, "kv_1")
+
+        # Test if Q and G proj can be fused
+        if (
+            self.g_proj is not None and
+            device != torch.device("cpu") and
+            self.q_proj.quant_type == "exl3" and
+            self.g_proj.quant_type == "exl3" and
+            self.q_proj.out_features == self.g_proj.out_features and
+            self.q_proj.inner.K == self.g_proj.inner.K and
+            self.q_proj.inner.bias is None and
+            self.g_proj.inner.bias is None
+        ):
+            self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
+            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "qgh_1")
+            self.prealloc_qg_1 = g_tensor_cache.get(device, (2, 1, self.num_q_heads * self.head_dim), torch.half, "qg_1")
 
         # Head norm
         if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
@@ -461,8 +494,17 @@ class Attention(Module):
             self.multi_kv.unload()
             self.multi_kv = None
 
+        if self.multi_qg is not None:
+            self.multi_qg.unload()
+            self.multi_qg = None
+
         self.q_norm_tensor = None
         self.k_norm_tensor = None
+
+        self.prealloc_qgh_1 = None
+        self.prealloc_qg_1 = None
+        self.prealloc_kvh_1 = None
+        self.prealloc_kv_1 = None
 
 
     @override
@@ -497,15 +539,44 @@ class Attention(Module):
 
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
-        q = self.q_proj.forward(x, params)
 
-        if self.interleaved_gate:
-            q, g = torch.chunk(q.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
-            g = g.reshape(bsz, q_len, -1)
-        elif self.g_proj:
-            g = self.g_proj.forward(x, params)
+        if self.multi_qg is None or bsz * q_len > 32:
+            q = self.q_proj.forward(x, params)
+            if self.interleaved_gate:
+                q, g = torch.chunk(q.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
+                g = g.reshape(bsz, q_len, -1)
+            elif self.g_proj:
+                g = self.g_proj.forward(x, params)
+            else:
+                g = None
+
         else:
-            g = None
+            x = x.view(1, bsz * q_len, dim)
+            if bsz * q_len == 1:
+                qgh = self.prealloc_qgh_1
+                qg = self.prealloc_qg_1
+            else:
+                qgh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                qg = torch.empty((2, bsz * q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = x.device)
+            ext.exl3_mgemm(
+                x,
+                self.multi_qg.ptrs_trellis,
+                qg,
+                self.multi_qg.ptrs_suh,
+                qgh,
+                self.multi_qg.ptrs_svh,
+                None,
+                None,
+                self.multi_qg.K,
+                -1,
+                self.multi_qg.mcg,
+                self.multi_qg.mul1,
+                -1,
+                -1,
+                0
+            )
+            q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
+            g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
         if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
@@ -513,8 +584,12 @@ class Attention(Module):
 
         else:
             x = x.view(1, bsz * q_len, dim)
-            kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
-            kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
+            if bsz * q_len == 1:
+                kvh = self.prealloc_kvh_1
+                kv = self.prealloc_kv_1
+            else:
+                kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
                 self.multi_kv.ptrs_trellis,
@@ -546,7 +621,7 @@ class Attention(Module):
 
 
     def project_o(self, o: torch.Tensor, bsz: int, seqlen: int, params: dict) -> torch.Tensor:
-        o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
+        # o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         x = self.o_proj.forward(o, params)
         return x
 
@@ -692,10 +767,9 @@ class Attention(Module):
             o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa, scale = self.sm_scale)
             o = o.transpose(1, 2)
 
-        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate: o *= g.sigmoid()
-        if self.interleaved_gate: o *= g.sigmoid()
+        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -773,10 +847,9 @@ class Attention(Module):
                 softcap = self.logit_softcapping
             )
 
-        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate: o *= g.sigmoid()
-        if self.interleaved_gate: o *= g.sigmoid()
+        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -887,10 +960,9 @@ class Attention(Module):
         else:
             cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen, params.get("layer_instance"))
 
-        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate: o *= g.sigmoid()
-        if self.interleaved_gate: o *= g.sigmoid()
+        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o

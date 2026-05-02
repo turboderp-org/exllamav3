@@ -729,7 +729,7 @@ class Job:
             off_tokens = self.held_tokens.slice(len(self.checkpoint["held_tokens"]), None)
             off_text = self.held_text[len(self.checkpoint["held_text"]):]
             self.held_text = self.checkpoint["held_text"]
-            self.held_token = self.checkpoint["held_tokens"]
+            self.held_tokens = self.checkpoint["held_tokens"]
             self.held_probs = self.checkpoint["held_probs"]
             self.held_k_tokens = self.checkpoint["held_k_tokens"]
             self.held_k_probs = self.checkpoint["held_k_probs"]

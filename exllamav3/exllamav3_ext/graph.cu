@@ -7,9 +7,13 @@
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
 
+//#define GRAPHDEBUG 1
+
 Graph::Graph()
 {
     ready = false;
+    ready_to_record = false;
+    disabled = false;
     graph = NULL;
     graph_exec = NULL;
     need_cublas = false;
@@ -23,6 +27,10 @@ Graph::~Graph()
 
 cudaStream_t Graph::capture_begin()
 {
+    #ifdef GRAPHDEBUG
+        printf("Begin graph capture\n");
+    #endif
+
     // Make sure nothing is pending
     cudaDeviceSynchronize();
 
@@ -88,6 +96,10 @@ void Graph::capture_end()
 
     // Graph is ready
     ready = true;
+
+    #ifdef GRAPHDEBUG
+        printf("End graph capture, num_nodes=%d, graph_sites.size()=%d\n", num_nodes, graph_sites.size());
+    #endif
 }
 
 void Graph::record_param(void* kernel, int param_id, int param_offset)

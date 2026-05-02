@@ -10,7 +10,8 @@ void rms_norm
     float epsilon,
     float constant_bias,
     float constant_scale,
-    bool span_heads
+    bool span_heads,
+    bool add_residual
 );
 
 void gated_rms_norm

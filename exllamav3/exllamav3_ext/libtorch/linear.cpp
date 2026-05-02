@@ -52,3 +52,19 @@ void BC_LinearEXL3::run(const at::Tensor& x, at::Tensor& y)
 {
     run_gr(x, y, nullptr);
 }
+
+at::Tensor BC_LinearEXL3::run_alloc(const at::Tensor& x, int64_t out_features, bool output_fp32)
+{
+    std::vector<int64_t> out_shape = x.sizes().vec();
+    out_shape.back() = out_features;
+
+    at::Tensor y = at::empty(
+        out_shape,
+        x.options().dtype(output_fp32 ? at::kFloat : at::kHalf)
+    );
+
+    at::Tensor x_flat = x.view({-1, x.size(-1)});
+    at::Tensor y_flat = y.view({-1, out_features});
+    run(x_flat, y_flat);
+    return y;
+}

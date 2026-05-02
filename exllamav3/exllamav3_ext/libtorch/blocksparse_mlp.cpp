@@ -164,13 +164,13 @@ void BC_BlockSparseMLP::run_bsz1
     c10::cuda::CUDAGuard device_guard(y.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    #define USE_GRAPH
-    #ifndef USE_GRAPH
-
+    if (graph_bsz1.disabled || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
+    {
         run_bsz1_gr(y, selected_experts, routing_weights, nullptr);
-
-    #else
-
+        graph_bsz1.ready_to_record = true;
+    }
+    else
+    {
         if (!graph_bsz1.ready)
         {
             graph_bsz1.capture_begin();
@@ -214,9 +214,7 @@ void BC_BlockSparseMLP::run_bsz1
         }
 
         graph_bsz1.launch(args, stream);
-
-    #endif
-    #undef USE_GRAPH
+    }
 }
 
 BC_BlockSparseMLP::BC_BlockSparseMLP
@@ -452,13 +450,13 @@ void BC_BlockSparseMLP::run_single_expert
     c10::cuda::CUDAGuard device_guard(y.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    #define USE_GRAPH
-    #ifndef USE_GRAPH
-
+    if (graph_single[graphidx].disabled || (!graph_single[graphidx].ready && !graph_single[graphidx].ready_to_record))
+    {
         run_single_expert_gr(y, expert_idx, nullptr);
-
-    #else
-
+        graph_single[graphidx].ready_to_record = true;
+    }
+    else
+    {
         if (!graph_single[graphidx].ready)
         {
             prepare_ctx(y.get_device());
@@ -486,9 +484,7 @@ void BC_BlockSparseMLP::run_single_expert
         };
 
         graph_single[graphidx].launch(args, stream);
-
-    #endif
-    #undef USE_GRAPH
+    }
 }
 
 
