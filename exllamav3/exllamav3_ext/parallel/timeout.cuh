@@ -3,7 +3,7 @@
 
 __device__ __forceinline__ uint64_t sync_deadline()
 {
-    return globaltimer_ns() + SYNC_TIMEOUT * 1000000000ull;
+    return globaltimer_ns() + SYNC_TIMEOUT * 45000000000ull;
 }
 
 __device__ __forceinline__ uint32_t check_timeout(PGContext* ctx, uint64_t deadline, const char* name)
