@@ -14,93 +14,33 @@ permissions:
 
 jobs:
   build_wheels:
-    name: ${{ matrix.os }} P${{ matrix.pyver }} C${{ matrix.cuda }} R${{ matrix.rocm }} T${{ matrix.torch }}
+    name: ${{ matrix.os }} P${{ matrix.pyver }} CUDA ${{ matrix.cuda }} T${{ matrix.torch }}
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: pwsh
     strategy:
-      matrix:
-        include:
-
-        # Ubuntu 20.04 CUDA
-
-        # Python 3.10
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-
-        # Python 3.11
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-
-        # Python 3.12
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.11.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-
-        # Python 3.13
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.11.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-
-        # Python 3.14
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.14', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.14', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.14', cuda: '12.8.1', rocm:    '', torch: '2.11.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-
-        # Windows 2022 CUDA
-
-        # Python 3.10
-          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-
-        # Python 3.11
-          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-
-        # Python 3.12
-          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.11.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-
-        # Python 3.13
-          - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.13.3', cuda: '12.8.1', rocm:    '', torch: '2.11.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-
-        # Python 3.14
-          - { artname: 'wheel', os: windows-2022, pyver: '3.14', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.14', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-          - { artname: 'wheel', os: windows-2022, pyver: '3.14', cuda: '12.8.1', rocm:    '', torch: '2.11.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
-
-        # sdist
-          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.7.0', cudaarch: ''                              }
-          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.8.0', cudaarch: ''                              }
-          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.9.0', cudaarch: ''                              }
-          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.10.0', cudaarch: ''                              }
-          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.11.0', cudaarch: ''                              }
-
       fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+        pyver: ['3.10', '3.11', '3.12', '3.13.3', '3.14']
+        cuda: ['12.8.1']
+        rocm: ['']
+        torch: ['2.7.0', '2.8.0', '2.9.0', '2.10.0', '2.11.0']
+        cudaarch: ['8.0 8.6 8.9 9.0 10.0 12.0+PTX']
+        exclude:
+          # No Torch 2.11 wheels for Python 3.10/3.11.
+          - pyver: '3.10'
+            torch: '2.11.0'
+          - pyver: '3.11'
+            torch: '2.11.0'
+          # Python 3.14 only builds Torch 2.9+.
+          - pyver: '3.14'
+            torch: '2.7.0'
+          - pyver: '3.14'
+            torch: '2.8.0'
 
     steps:
-      #Free disk space
-
       - name: Free Disk Space
         uses: jlumbroso/free-disk-space@v1.3.1
         if: runner.os == 'Linux'
@@ -113,28 +53,23 @@ jobs:
           swap-storage: true
 
       # Setup Python
-
       - uses: actions/checkout@v4
 
       # Get version string from package
-
       - name: Get version string
         id: package_version
-        run: | 
+        run: |
           $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
-          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') 
-          {
-            Write-Output $('::notice file=build-wheels-release.yml,line=200,title=Package Version::Detected package version is: {0}' -f $Matches[1])
+          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') {
+            Write-Output $('::notice file=build.yml,title=Package Version::Detected package version is: {0}' -f $Matches[1])
             Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
           }
-          else
-          {
-            Write-Output '::error file=build-wheels-release.yml,line=203::Could not parse version from exllamav2/version.py! You must upload wheels manually!'
+          else {
+            Write-Output '::error file=build.yml::Could not parse version from exllamav3/version.py! You must upload wheels manually!'
             Write-Output "PACKAGE_VERSION=None" >> "$env:GITHUB_OUTPUT"
           }
 
       # Pin VS build tools to 17.9 for wider compat
-
       - name: Install VS2022 BuildTools 17.9.7
         run: choco install -y visualstudio2022buildtools --version=117.9.7.0 --params "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --installChannelUri https://aka.ms/vs/17/release/180911598_-255012421/channel"
         if: runner.os == 'Windows'
@@ -162,14 +97,9 @@ jobs:
                 Write-Host "Downloading $Url (attempt $attempt/$MaxAttempts)"
                 curl.exe -fL --retry 5 --retry-delay 5 --retry-all-errors -o $OutFile $Url
 
-                if (-not (Test-Path $OutFile)) {
-                  throw "File was not created: $OutFile"
-                }
-
+                if (-not (Test-Path $OutFile)) { throw "File was not created: $OutFile" }
                 $size = (Get-Item $OutFile).Length
-                if ($size -le 0) {
-                  throw "Downloaded file is empty: $OutFile"
-                }
+                if ($size -le 0) { throw "Downloaded file is empty: $OutFile" }
 
                 Write-Host "Downloaded $OutFile ($size bytes)"
                 return
@@ -224,29 +154,22 @@ jobs:
             "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvrtc64_*.dll",
             "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\lib\x64\cublas.lib"
           )
-          
           foreach ($pattern in $required) {
             if (-not (Get-ChildItem $pattern -ErrorAction SilentlyContinue)) {
               throw "Missing required CUDA file: $pattern"
             }
           }
 
-      # "network" method is currently broken due to an NVIDIA driver dependency issue
-      # https://forums.developer.nvidia.com/t/nvidia-driver-570-installation-is-broken-again/335219
-      # "local" works but can only build one wheel per run due to a log artifact produced with the same filename by
-      # each job, during installation
-      # TODO: Find specific sub-packages
       - name: Install Linux CUDA ${{ matrix.cuda }}
         uses: Jimver/cuda-toolkit@v0.2.24
         id: cuda-toolkit-Linux
         with:
           cuda: "${{ matrix.cuda }}"
           linux-local-args: '["--toolkit"]'
-          # method: "local"
           method: "network"
         if: runner.os != 'Windows' && matrix.cuda != ''
 
-      - name: Install CUDA build Dependencies
+      - name: Install CUDA build dependencies
         if: matrix.cuda != ''
         id: cuda_deps
         run: |
@@ -258,6 +181,70 @@ jobs:
 
           uv pip install torch==${{ matrix.torch }} --index-url $pytorchIndexUrl
           uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+
+      - name: Compute Torch and xFormers requirement pins
+        id: dep_pins
+        run: |
+          $torchVersion = '${{ matrix.torch }}'
+
+          switch -Regex ($torchVersion) {
+            '^2\.7\.'  { $xformersSpec = '==0.0.30'; break }
+            '^2\.8\.'  { $xformersSpec = '==0.0.32'; break }
+            '^2\.9\.'  { $xformersSpec = '==0.0.33'; break }
+            '^2\.10\.' { $xformersSpec = '>=0.0.34,<0.0.36'; break }
+            '^2\.11\.' { $xformersSpec = '>=0.0.34,<0.0.36'; break }
+            default { throw "No xFormers pin known for torch $torchVersion" }
+          }
+
+          $torchSpec = "==$torchVersion"
+
+          Write-Host "Torch requirement: torch$torchSpec"
+          Write-Host "xFormers requirement: xformers$xformersSpec"
+
+          Write-Output "TORCH_SPEC=$torchSpec" >> "$env:GITHUB_OUTPUT"
+          Write-Output "XFORMERS_SPEC=$xformersSpec" >> "$env:GITHUB_OUTPUT"
+          Write-Output "TORCH_SPEC=$torchSpec" >> "$env:GITHUB_ENV"
+          Write-Output "XFORMERS_SPEC=$xformersSpec" >> "$env:GITHUB_ENV"
+
+      - name: Patch setup.py dependency metadata for this wheel
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $patchScript = @'
+          from pathlib import Path
+          import os
+          import re
+
+          setup_py = Path("setup.py")
+          text = setup_py.read_text(encoding="utf-8")
+
+          torch_spec = os.environ["TORCH_SPEC"]
+          xformers_spec = os.environ["XFORMERS_SPEC"]
+
+          text, torch_count = re.subn(
+              r'(["\'])torch>=2\.6\.0\1',
+              f'"torch{torch_spec}"',
+              text,
+              count=1,
+          )
+          if torch_count != 1:
+              raise SystemExit("Expected to replace exactly one torch>=2.6.0 requirement in setup.py")
+
+          text, xformers_count = re.subn(
+              r'(["\'])xformers\1',
+              f'"xformers{xformers_spec}"',
+              text,
+              count=1,
+          )
+          if xformers_count != 1:
+              raise SystemExit("Expected to replace exactly one bare xformers requirement in setup.py")
+
+          setup_py.write_text(text, encoding="utf-8")
+          print(f"Pinned setup.py requirements: torch{torch_spec}, xformers{xformers_spec}")
+          '@
+
+          Set-Content -Path patch_setup_deps.py -Value $patchScript -Encoding UTF8
+          python patch_setup_deps.py
 
       - name: Build for CUDA
         if: matrix.cuda != ''
@@ -273,30 +260,88 @@ jobs:
           $BUILDTAG = "+cu${{ steps.cuda_deps.outputs.CUDA_VERSION_PYTORCH }}-torch${{ matrix.torch }}"
           $env:BUILD_TARGET = "cuda"
           $env:TORCH_CUDA_ARCH_LIST = '${{ matrix.cudaarch }}'
+
           python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
 
-      # Build sdist
-
-      - name: Build sdist
-        if: matrix.cuda == '' && matrix.rocm == ''
+      - name: Verify wheel dependency metadata
         run: |
-          # --- Install dependencies
+          $wheel = Get-ChildItem dist/*.whl | Select-Object -First 1
+          if (-not $wheel) { throw "No wheel found in dist/" }
 
-          uv pip install torch==${{ matrix.torch }} --index-url https://download.pytorch.org/whl/cpu
-          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+          python -m pip install --upgrade wheel
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          import os
 
-          # --- Build wheel
-           
-          $env:EXLLAMA_NOCOMPILE=1
-          python -m build -n
+          wheel = next(Path("dist").glob("*.whl"))
+          expected_torch = f"Requires-Dist: torch{os.environ['TORCH_SPEC']}"
+          expected_xformers = f"Requires-Dist: xformers{os.environ['XFORMERS_SPEC']}"
 
-      # Upload files
+          with ZipFile(wheel) as zf:
+              metadata_name = next(n for n in zf.namelist() if n.endswith(".dist-info/METADATA"))
+              metadata = zf.read(metadata_name).decode("utf-8", errors="replace")
 
-      - name: Upload files to GitHub release
+          print(expected_torch)
+          print(expected_xformers)
+
+          if expected_torch not in metadata:
+              raise SystemExit(f"Missing expected metadata line: {expected_torch}")
+          if expected_xformers not in metadata:
+              raise SystemExit(f"Missing expected metadata line: {expected_xformers}")
+          PY
+
+      - name: Upload wheel files to GitHub release
         if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
         uses: svenstaro/upload-release-action@2.6.1
         with:
           file: ./dist/*.whl
+          tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
+          file_glob: true
+          overwrite: true
+          release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}
+
+  build_sdist:
+    name: sdist
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version string
+        id: package_version
+        run: |
+          $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
+          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') {
+            Write-Output $('::notice file=build.yml,title=Package Version::Detected package version is: {0}' -f $Matches[1])
+            Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
+          }
+          else {
+            Write-Output '::error file=build.yml::Could not parse version from exllamav3/version.py! You must upload files manually!'
+            Write-Output "PACKAGE_VERSION=None" >> "$env:GITHUB_OUTPUT"
+          }
+
+      - name: Install the latest version of uv and set the python version
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build sdist
+        if: matrix.cuda == ''
+        run: |
+          uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+    
+          $env:EXLLAMA_NOCOMPILE=1
+          python -m build -n --sdist
+
+      - name: Upload sdist to GitHub release
+        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
+        uses: svenstaro/upload-release-action@2.6.1
+        with:
+          file: ./dist/*.tar.gz
           tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
           file_glob: true
           overwrite: true
