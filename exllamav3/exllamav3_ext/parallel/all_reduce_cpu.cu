@@ -86,7 +86,7 @@ void run_cpu_reduce_jobs
     uint8_t* shbuf_ptr = (uint8_t*) shbuf;
     ReduceJob current_job;
 
-    uint32_t max_wait = 8000; // ms
+    uint32_t max_wait = 50000; // ms
     while (true)
     {
         // Wait for next job. Should never pause for more than one millisecond, since jobs are
