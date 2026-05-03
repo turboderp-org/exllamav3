@@ -482,12 +482,18 @@ CoopAutotuneLaunch tune
     if (numel_B > 2e8) repeats = 2;
     int max_rounds = 64;
     if (numel_B > 1e7) max_rounds = 20;
-    if (numel_B > 1e8) max_rounds = 8;
-    if (numel_B > 2e8) max_rounds = 3;
+    if (numel_B > 1e8) max_rounds = 5;
+    if (numel_B > 2e8) max_rounds = 2;
+    int max_cands = 8;
+    if (numel_B > 1e8) max_cands = 4;
+    if (numel_B > 2e8) max_cands = 2;
 
-    measure_stage(candidates, kernel_args, smem, stream, MIN(8, max_rounds), repeats, 8, start, end);
-    measure_stage(candidates, kernel_args, smem, stream, MIN(40, max_rounds), repeats, 4, start, end);
-    measure_stage(candidates, kernel_args, smem, stream, MIN(64, max_rounds), repeats, 1, start, end);
+    if (candidates.size() > 1 and max_cands > 4)
+        measure_stage(candidates, kernel_args, smem, stream, MIN(8, max_rounds), repeats, MIN(8, max_cands), start, end);
+    if (candidates.size() > 1 and max_cands > 1)
+        measure_stage(candidates, kernel_args, smem, stream, MIN(40, max_rounds), repeats, MIN(4, max_cands), start, end);
+    if (candidates.size() > 1)
+        measure_stage(candidates, kernel_args, smem, stream, MIN(64, max_rounds), repeats, 1, start, end);
 
     cuda_check(cudaEventDestroy(start));
     cuda_check(cudaEventDestroy(end));

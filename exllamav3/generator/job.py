@@ -213,6 +213,8 @@ class Job:
         self.stop_strings = rq_state.get("stop_strings", set())
         self.stop_tokens = rq_state.get("stop_tokens", set())
         if stop_conditions is not None:
+            if isinstance(stop_conditions, str) or isinstance(stop_conditions, int):
+                stop_conditions = [stop_conditions]
             for t in stop_conditions:
                 if isinstance(t, int):
                     self.stop_tokens.add(t)
