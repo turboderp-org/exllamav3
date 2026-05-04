@@ -1,0 +1,65 @@
+name: Build Wheels & Release (sdist only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release? 1 = yes, 0 = no'
+        default: '0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+
+  build_sdist:
+    name: sdist
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version string
+        id: package_version
+        run: |
+          $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
+          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') {
+            Write-Output $('::notice file=build.yml,title=Package Version::Detected package version is: {0}' -f $Matches[1])
+            Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
+          }
+          else {
+            Write-Output '::error file=build.yml::Could not parse version from exllamav3/version.py! You must upload files manually!'
+            Write-Output "PACKAGE_VERSION=None" >> "$env:GITHUB_OUTPUT"
+          }
+
+      - name: Install the latest version of uv and set the python version
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build sdist and py3-none-any JIT wheel
+        run: |
+          uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+
+          # Build both:
+          #   - exllamav3-<version>.tar.gz
+          #   - exllamav3-<version>-py3-none-any.whl
+          # The EXLLAMA_NOCOMPILE flag prevents the extension from being compiled
+          # into the wheel, leaving it to JIT/load at runtime.
+          $env:EXLLAMA_NOCOMPILE=1
+          python -m build -n
+
+      - name: Upload sdist and py3-none-any JIT wheel to GitHub release
+        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
+        uses: svenstaro/upload-release-action@2.6.1
+        with:
+          file: ./dist/*
+          tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
+          file_glob: true
+          overwrite: true
+          release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}

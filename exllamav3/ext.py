@@ -81,7 +81,11 @@ if build_jit:
     # compiler flags
 
     extra_cflags = []
-    extra_cuda_cflags = ["-lineinfo", "-O3"]
+    extra_cuda_cflags = [
+        "-lineinfo", "-O3", "--use_fast_math",
+        "-Xcudafe", "--diag_suppress=177",
+        "-Xcudafe", "--diag_suppress=20012",
+    ]
 
     if windows:
         extra_cflags += ["/Ox"]

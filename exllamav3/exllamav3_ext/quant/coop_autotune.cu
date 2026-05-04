@@ -1,7 +1,9 @@
+#include <cuda_fp16.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
+
 #include "coop_autotune.cuh"
 
-#include <cublas_v2.h>
-#include <torch/extension.h>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -488,9 +490,9 @@ CoopAutotuneLaunch tune
     if (numel_B > 1e8) max_cands = 4;
     if (numel_B > 2e8) max_cands = 2;
 
-    if (candidates.size() > 1 and max_cands > 4)
+    if (candidates.size() > 1 && max_cands > 4)
         measure_stage(candidates, kernel_args, smem, stream, MIN(8, max_rounds), repeats, MIN(8, max_cands), start, end);
-    if (candidates.size() > 1 and max_cands > 1)
+    if (candidates.size() > 1 && max_cands > 1)
         measure_stage(candidates, kernel_args, smem, stream, MIN(40, max_rounds), repeats, MIN(4, max_cands), start, end);
     if (candidates.size() > 1)
         measure_stage(candidates, kernel_args, smem, stream, MIN(64, max_rounds), repeats, 1, start, end);
