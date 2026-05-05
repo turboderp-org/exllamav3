@@ -208,7 +208,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    model_init.add_args(parser, default_cache_size = 65536, cache = True, add_draft_model_args = True, )
+    model_init.add_args(parser, default_cache_size = 49152, cache = True, add_draft_model_args = True, )
     parser.add_argument("-nbl", "--no_baseline", action = "store_true", help = "Skip baseline measurement")
     parser.add_argument("-ngram_min", "--ngram_match_min", type = int, help = "N-gram minimum match length, default = 0 (disabled)", default = 0)
     parser.add_argument("-ngram_len", "--ngram_draft_length", type = int, help = "N-gram draft length, default = 4", default = 4)
