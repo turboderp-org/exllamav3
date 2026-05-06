@@ -229,15 +229,19 @@ def get_base_model(args):
     print(f" -- Loaded model config")
     print(f"    Architecture: {config.architecture}")
     model = Model.from_config(config)
+    use_reference_state = not model.caps.get("uncalibrated_quantize", False)
     assert model.caps.get("can_quantize", True), "Cannot quantize this model type."
     print(f" -- Created model instance:")
     print(model.get_layout_tree(4))
-    tokenizer = Tokenizer.from_config(config)
-    print(f" -- Loaded tokenizer")
-    print(f"    Vocab size: {tokenizer.actual_vocab_size}")
+    if use_reference_state:
+        tokenizer = Tokenizer.from_config(config)
+        print(f" -- Loaded tokenizer")
+        print(f"    Vocab size: {tokenizer.actual_vocab_size}")
+    else:
+        tokenizer = None
     if hasattr(config, "rope_settings"):
         config.rope_settings.print()
-    return config, model, tokenizer
+    return config, model, tokenizer, use_reference_state
 
 
 def prepare_state(args, job_state, config, model, tokenizer):
@@ -284,10 +288,10 @@ def main(args, job_state):
     eta_window = deque(maxlen = 8)
 
     # Get model
-    config, model, tokenizer = get_base_model(args)
+    config, model, tokenizer, use_reference_state = get_base_model(args)
 
     # Check caps
-    can_resume_quant = model.caps.get("can_resume_quant", True)
+    can_resume_quant = model.caps.get("can_resume_quant", use_reference_state)
     if not can_resume_quant:
         print(" !! Warning, resuming an interrupted quant is not possible for this architecture.")
         print(" !! Checkpoints will not be saved because they are redundant.")
@@ -295,13 +299,17 @@ def main(args, job_state):
             "Current implementation of this architecture does not support resuming an interrupted quant job."
 
     # Get initial state or resume state
-    state = prepare_state(args, job_state, config, model, tokenizer)
-    original_input_ids = (
-        state.copy()
-        if job_state["next_module_idx"] == 0 else
-        [{} for _ in range(len(state))]
-    )
-    quant_preserves = [{} for _ in range(len(state))]
+    if use_reference_state:
+        state = prepare_state(args, job_state, config, model, tokenizer)
+        original_input_ids = (
+            state.copy()
+            if job_state["next_module_idx"] == 0 else
+            [{} for _ in range(len(state))]
+        )
+        quant_preserves = [{} for _ in range(len(state))]
+    else:
+        print(" -- Performing uncalibrated quantization")
+        state = None
 
     def get_preserve(si, params_):
         params_.update(quant_preserves[si])
@@ -356,61 +364,62 @@ def main(args, job_state):
                 # Capture calibration input states during forward pass. For block-sparse models, all expert layers
                 # are activated to ensure all down projections capture at least some calibration data. When the
                 # state is advanced later, only selected experts will be used.
-                with ProgressBar(f" -- Capturing: {module.key}" + slice_str, len(state)) as progress:
-                    capture_H = {}
-                    ref_states = []
-                    for i in range(len(state)):
-                        progress.update(i)
-                        params = {
-                            "attn_mode": "flash_attn_nc",
-                            "capture": capture_H,
-                            "activate_all_experts": model.calibration_all_experts,
-                            "input_ids": original_input_ids[i],
-                        }
-                        if slicing:
-                             params["q_mlp_slice"] = current_slice
-                        get_preserve(i, params)
-                        model.per_layer_quant_preamble(params)
-                        rs = module.prepare_for_device(state[i], params)
-                        rs = module.forward(rs, params)
-                        put_preserve(i, params)
-                        if i < num_ref_states:
-                            if model.calibration_all_experts:
-                                # Do not activate all experts for reference state, for error measurement
-                                params = {
-                                    "attn_mode": "flash_attn_nc",
-                                    "input_ids": original_input_ids[i],
-                                }
-                                if slicing:
-                                    params["q_mlp_slice"] = current_slice
-                                get_preserve(i, params)
-                                model.per_layer_quant_preamble(params)
-                                rs = module.prepare_for_device(state[i], params)
-                                rs = module.forward(rs, params)
-                                put_preserve(i, params)
-                            ref_states.append(rs.cpu())
-                        rs = None
-                print(f" -- Captured: {module.key}" + slice_str, flush = True)
+                if state is not None:
+                    with ProgressBar(f" -- Capturing: {module.key}" + slice_str, len(state)) as progress:
+                        capture_H = {}
+                        ref_states = []
+                        for i in range(len(state)):
+                            progress.update(i)
+                            params = {
+                                "attn_mode": "flash_attn_nc",
+                                "capture": capture_H,
+                                "activate_all_experts": model.calibration_all_experts,
+                                "input_ids": original_input_ids[i],
+                            }
+                            if slicing:
+                                 params["q_mlp_slice"] = current_slice
+                            get_preserve(i, params)
+                            model.per_layer_quant_preamble(params)
+                            rs = module.prepare_for_device(state[i], params)
+                            rs = module.forward(rs, params)
+                            put_preserve(i, params)
+                            if i < num_ref_states:
+                                if model.calibration_all_experts:
+                                    # Do not activate all experts for reference state, for error measurement
+                                    params = {
+                                        "attn_mode": "flash_attn_nc",
+                                        "input_ids": original_input_ids[i],
+                                    }
+                                    if slicing:
+                                        params["q_mlp_slice"] = current_slice
+                                    get_preserve(i, params)
+                                    model.per_layer_quant_preamble(params)
+                                    rs = module.prepare_for_device(state[i], params)
+                                    rs = module.forward(rs, params)
+                                    put_preserve(i, params)
+                                ref_states.append(rs.cpu())
+                            rs = None
+                    print(f" -- Captured: {module.key}" + slice_str, flush = True)
 
-                # More feedback
-                if len(capture_H):
-                    hfb_keys = [re.sub(r'\d+', '*', k) for k in capture_H.keys()]
-                    hfb_keys = sorted(list(set(hfb_keys)))
-                    print(f" -- Hessians: " + ", ".join(hfb_keys))
-                else:
-                    print(f" !! Hessians: None")
+                    # More feedback
+                    if len(capture_H):
+                        hfb_keys = [re.sub(r'\d+', '*', k) for k in capture_H.keys()]
+                        hfb_keys = sorted(list(set(hfb_keys)))
+                        print(f" -- Hessians: " + ", ".join(hfb_keys))
+                    else:
+                        print(f" !! Hessians: None")
 
-                # Check for infs or NaNs in H
-                for k, v in capture_H.items():
-                    infs, nans = v["inf_nan"][0].item(), v["inf_nan"][1].item()
-                    if infs or nans:
-                        numel = v["num_total"]
-                        print(f" !! Warning: {k} state has {infs:,} inf values and {nans:,} NaN values (out of {numel:,})")
+                    # Check for infs or NaNs in H
+                    for k, v in capture_H.items():
+                        infs, nans = v["inf_nan"][0].item(), v["inf_nan"][1].item()
+                        if infs or nans:
+                            numel = v["num_total"]
+                            print(f" !! Warning: {k} state has {infs:,} inf values and {nans:,} NaN values (out of {numel:,})")
 
-                # Swap captured H to system RAM
-                for k, v in capture_H.items():
-                    v["H_swap_device"] = v["H"].device
-                    v["H"] = v["H"].cpu()
+                    # Swap captured H to system RAM
+                    for k, v in capture_H.items():
+                        v["H_swap_device"] = v["H"].device
+                        v["H"] = v["H"].cpu()
 
             # Get submodules to quantize
             linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]
@@ -478,7 +487,7 @@ def main(args, job_state):
                         elif args["codebook"] == "mul1": quant_args_local.update({ "mul1": True })
 
                         proxy_err = linear.convert_exl3(
-                            capture_H[linear.qmap],
+                            capture_H[linear.qmap] if state else linear.init_H_data(False),
                             quant_args = quant_args_local,
                             verbose = args["verbose"],
                             save_reg = False,
@@ -495,10 +504,11 @@ def main(args, job_state):
                             f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
                             "(OoM)   "
                         )
+                        proxy_err_label_local = "proxy_err" if not quant_args["q_fallback"] else "rmse"
                         print(
                             f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
                             f"  bpw: {quant_args_local['K']:5.2f}"
-                            f"  proxy_err: {proxy_err_str_local}"
+                            f"  {proxy_err_label_local}: {proxy_err_str_local}"
                             f"  {flags_local}"
                             f"  g_sc: {quant_args_local['g_scale']:.6f}"
                         )
@@ -556,7 +566,7 @@ def main(args, job_state):
                             sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
                                 if args["image_dump"] else None
                             proxy_err = linear.convert_exl3(
-                                capture_H[linear.qmap],
+                                capture_H[linear.qmap] if state else linear.init_H_data(False),
                                 quant_args = quant_args,
                                 progress_str = f" -- <step>: {linear.key}",
                                 verbose = args["verbose"],
@@ -572,10 +582,11 @@ def main(args, job_state):
                             f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
                             "(OoM)   "
                         )
+                        proxy_err_label = "proxy_err" if not quant_args["q_fallback"] else "rmse"
                         print(
                             f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
                             f"  bpw: {quant_args['K']:5.2f}"
-                            f"  proxy_err: {proxy_err_str}"
+                            f"  {proxy_err_label}: {proxy_err_str}"
                             f"  {flags}"
                             f"  g_sc: {quant_args['g_scale']:.6f}"
                             f"  [{t.interval:4.2f} s]",
@@ -615,44 +626,53 @@ def main(args, job_state):
         del q_tensors
 
         # Advance state
-        error = 0
-        cos_error = 0
-        sqnr_ = 0
-        with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
-            for i in range(len(state)):
-                progress.update(i)
-                params = {
-                    "attn_mode": "flash_attn_nc",
-                    "input_ids": original_input_ids[i],
-                }
-                state[i] = module.prepare_for_device(state[i], params)
-                if i < num_ref_states or idx < len(model.modules) - 1:
-                    get_preserve(i, params)
-                    model.per_layer_quant_preamble(params)
-                    state[i] = module.forward(state[i], params).cpu()
-                    put_preserve(i, params)
-                if i < num_ref_states and len(linears):
-                    ref_states[i] = ref_states[i].to(state[i].device)
-                    rfn, cos, sq = get_state_error(state[i], ref_states[i])
-                    error += rfn
-                    cos_error += cos
-                    sqnr_ += sq
-                    ref_states[i] = None
-        error /= num_ref_states
-        cos_error /= num_ref_states
-        sqnr_ /= num_ref_states
+        if state is not None:
+            error = 0
+            cos_error = 0
+            sqnr_ = 0
+            with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
+                for i in range(len(state)):
+                    progress.update(i)
+                    params = {
+                        "attn_mode": "flash_attn_nc",
+                        "input_ids": original_input_ids[i],
+                    }
+                    state[i] = module.prepare_for_device(state[i], params)
+                    if i < num_ref_states or idx < len(model.modules) - 1:
+                        get_preserve(i, params)
+                        model.per_layer_quant_preamble(params)
+                        state[i] = module.forward(state[i], params).cpu()
+                        put_preserve(i, params)
+                    if i < num_ref_states and len(linears):
+                        ref_states[i] = ref_states[i].to(state[i].device)
+                        rfn, cos, sq = get_state_error(state[i], ref_states[i])
+                        error += rfn
+                        cos_error += cos
+                        sqnr_ += sq
+                        ref_states[i] = None
+            error /= num_ref_states
+            cos_error /= num_ref_states
+            sqnr_ /= num_ref_states
 
         # Feedback after module
         module_time = time.time() - start_module_time
-        print(
-            f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
-            (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"  no_weights") +
-            (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
-            f"  cos: {cos_error:.6f}"
-            f"  sqnr: {sqnr_:.6f}"
-            f"  [{module_time:.2f} s]",
-            flush = True
-        )
+        if state:
+            print(
+                f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
+                (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"  no_weights") +
+                (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
+                f"  cos: {cos_error:.6f}"
+                f"  sqnr: {sqnr_:.6f}"
+                f"  [{module_time:.2f} s]",
+                flush = True
+            )
+        else:
+            print(
+                f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
+                (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"  no_weights") +
+                f"  [{module_time:.2f} s]",
+                flush = True
+            )
         if idx >= model.first_block_idx:
             timed_blocks += 1
             eta_window.append(module_time)

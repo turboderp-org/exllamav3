@@ -366,25 +366,27 @@ class Linear(Module):
             key = self.key
         )
 
-        if quant_args["q_fallback"]:
-            proxy_err = 0.0
-
         if return_weight_q:
             return proxy_err, weight_q
         else:
             return proxy_err
 
 
+    def init_H_data(self, init_tensor: bool):
+        return {
+            "H": torch.zeros(self.in_features, self.in_features, dtype = torch.float32, device = self.device if init_tensor else "meta"),
+            "first_key": self.key,
+            "count": 0,
+            "finalized": False,
+            "num_total": 0,
+            "inf_nan": torch.zeros(2, dtype = torch.long, device = self.device),
+            "device": self.device,
+        }
+
+
     def capture_H(self, x: torch.Tensor, params: dict):
         if self.qmap not in params["capture"]:
-            params["capture"][self.qmap] = {
-                "H": torch.zeros(self.in_features, self.in_features, dtype = torch.float32, device = self.device),
-                "first_key": self.key,
-                "count": 0,
-                "finalized": False,
-                "num_total": 0,
-                "inf_nan": torch.zeros(2, dtype = torch.long, device = self.device),
-            }
+            params["capture"][self.qmap] = self.init_H_data(True)
 
         params["capture"][self.qmap]["num_total"] += x.numel()
         ext.count_inf_nan(x, params["capture"][self.qmap]["inf_nan"])
