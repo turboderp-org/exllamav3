@@ -446,6 +446,9 @@ CoopAutotuneLaunch tune
     std::vector<ExpandedCandidate> candidates;
     for (const CoopAutotuneCandidate& base : base_candidates)
     {
+        int total_tiles = numel_B / base.block_dim / 16;
+        int min_num_sms = MAX(2, MIN(total_tiles / 32, base.max_num_sms) / base.max_concurrency / 2 * 2);
+
         TORCH_CHECK(base.kernel, "CoopKernelAutotuner: null kernel candidate");
         TORCH_CHECK(base.block_dim > 0, "CoopKernelAutotuner: invalid block_dim");
         TORCH_CHECK(base.max_num_sms > 0, "CoopKernelAutotuner: invalid max_num_sms");
@@ -458,7 +461,7 @@ CoopAutotuneLaunch tune
             candidates.push_back({ base.kernel, base.block_dim, 1, concurrency, base.tag, 0.0f, {} });
         }
 
-        for (int num_sms = 2; num_sms <= base.max_num_sms * 85 / 100; num_sms += 2)
+        for (int num_sms = min_num_sms; num_sms <= base.max_num_sms * 85 / 100; num_sms += 2)
         {
             int concurrency = MAX(MIN(total_sms / num_sms, max_concurrency), 1);
             candidates.push_back({ base.kernel, base.block_dim, num_sms, concurrency, base.tag, 0.0f, {} });
