@@ -86,6 +86,7 @@ class DFlashModel(Model):
             mask_token_id = config.mask_token_id,
             rms_norm_eps = config.rms_norm_eps,
             native_draft_len = config.block_size,
+            qmap = "target_hidden",
         )
         self.modules += [self.input_layer]
 
@@ -168,7 +169,7 @@ class DFlashModel(Model):
 
         self.logit_layer_idx = None
         self.caps.update({
-            "can_quantize": False,
+            "uncalibrated_quantize": True,
             "supports_tp": False,
             "attach_target": True,
             "dflash_draft": True,
@@ -291,3 +292,11 @@ class DFlashModel(Model):
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
         raise NotImplementedError()
+
+
+    @staticmethod
+    @override
+    def get_additional_compiled_tensors(config: DFlashConfig) -> dict:
+        # "hidden_norm" is stored in DFlashInputLayer but doesn't match the "fc" prefix
+        norm_weight = config.stc.list_tensors(prefix = "hidden_norm")
+        return norm_weight
