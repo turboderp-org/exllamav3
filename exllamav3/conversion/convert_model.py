@@ -17,6 +17,7 @@ from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
 import threading
+from pathlib import Path
 from collections import deque
 import re
 
@@ -212,6 +213,13 @@ def prepare(args) -> (dict, dict, bool, str):
             f" !! {col_red}WARNING, experimental options are selected. The quantized model may not work in future "
             f"versions of ExLlamaV3 {col_default}"
         )
+
+    if not args.resume:
+        qt_dir = os.path.join(in_args["work_dir"], "qtensors")
+        clear = [p for p in Path(qt_dir).glob("*.safetensors") if p.is_file()]
+        if len(clear):
+            print(f" !! Deleting {len(clear)} safetensors file(s) from {qt_dir}")
+        in_args["clear_files"] = clear
 
     return in_args, job_state, True, None
 
@@ -585,6 +593,11 @@ def main(args, job_state):
             config.stc.close()
 
         # Save layer tensors to working directory
+        clear_files = args.get("clear_files")
+        if clear_files:
+            for p in clear_files:
+                p.unlink()
+            del args["clear_files"]
         save_tensor(q_tensors, f"qtensors/{module.key}.safetensors", args)
 
         # Output final bpw for layer
