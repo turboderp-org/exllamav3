@@ -741,7 +741,7 @@ class Attention(Module):
             _, _, nheads_k, _ = k.shape
             ngroups = nheads // nheads_k
             if ngroups > 1:
-                q_ = q.view(1, seqlen, nheads_k, ngroups, headdim)
+                q_ = q.view(bsz, seqlen, nheads_k, ngroups, headdim)
                 k_ = k.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
                 v_ = v.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
 
@@ -750,7 +750,7 @@ class Attention(Module):
                     attn_bias = LowerTriangularMask() if causal else None,
                     scale = self.sm_scale,
                 )
-                o = o.reshape(1, seqlen, nheads, headdim)
+                o = o.reshape(bsz, seqlen, nheads, headdim)
             else:
                 o = xops.memory_efficient_attention(
                     q, k, v,
