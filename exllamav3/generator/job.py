@@ -1068,6 +1068,49 @@ class Job:
                             "cache_seqlens": params["cache_seqlens"],
                         }
                     )
+                elif self.generator.mtp_draft:
+                    # MTP convention: cache slot p stores K/V from (token@(p+1), hidden@p).
+                    # For chunk covering positions [a, a+n-1] with target_hidden = [hidden@a, ..., hidden@(a+n-1)]
+                    # and prefill_ids = [token@a, ..., token@(a+n-1)], we can fill:
+                    #   - slot a-1 from (token@a, carry=hidden@(a-1))    -- only if a>=1 and carry is available
+                    #   - slots [a, a+n-2] from (token@(a+1+k), hidden@(a+k)) for k in [0, n-2]
+                    # The last slot in the chunk (a+n-1) stays empty until the NEXT chunk arrives
+                    # (or until job.prefill's iter-1 path picks up the held-back last prompt token).
+                    exports = params.get("export_states") or []
+                    if exports:
+                        target_hidden_seq = exports[-1]
+                        if target_hidden_seq.dim() == 2:
+                            target_hidden_seq = target_hidden_seq.unsqueeze(0)
+                        bsz, n, _ = target_hidden_seq.shape
+
+                        a = prefill_start  # absolute position of chunk start
+
+                        # Carry-fill at slot a-1
+                        if a >= 1 and seq.mtp_carry_hidden is not None:
+                            self.generator.draft_model.update_kv_from_target(
+                                shifted_tokens = prefill_ids[:, 0:1],
+                                shifted_hiddens = seq.mtp_carry_hidden,
+                                cache = self.generator.draft_cache,
+                                params = {
+                                    "block_table": seq.block_index_tensor,
+                                    "cache_seqlens": torch.tensor([a - 1] * bsz, dtype = torch.int32),
+                                },
+                            )
+
+                        # Chunk-local: write n-1 entries at slots [a, a+n-2]
+                        if n >= 2:
+                            self.generator.draft_model.update_kv_from_target(
+                                shifted_tokens = prefill_ids[:, 1:n],
+                                shifted_hiddens = target_hidden_seq[:, 0:n-1, :],
+                                cache = self.generator.draft_cache,
+                                params = {
+                                    "block_table": seq.block_index_tensor,
+                                    "cache_seqlens": torch.tensor([a] * bsz, dtype = torch.int32),
+                                },
+                            )
+
+                        # Update carry = last hidden of this chunk (for next chunk's slot (a+n-1))
+                        seq.mtp_carry_hidden = target_hidden_seq[:, -1:, :].clone().half()
                 elif self.generator.draft_model:
                     self.generator.draft_model.prefill(
                         input_ids = prefill_ids,

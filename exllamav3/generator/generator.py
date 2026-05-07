@@ -180,6 +180,8 @@ class Generator:
         if draft_model is not None and draft_model.caps.get("attach_target"):
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
+        self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("qwen3_5_mtp_draft", False)
+        self.mtp_last_hidden = None  # per-job last_hidden dict, lazily created when mtp_draft
 
 
     def num_remaining_jobs(self):
@@ -330,6 +332,9 @@ class Generator:
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
                 self.iterate_gen(results, draft_tokens)
+            elif self.mtp_draft:
+                draft_tokens = self.iterate_draftmodel_mtp_gen(results)
+                self.iterate_gen(results, draft_tokens)
             else:
                 draft_tokens = self.iterate_draftmodel_gen(results)
                 self.iterate_gen(results, draft_tokens)
@@ -437,6 +442,104 @@ class Generator:
                 "cache_seqlens": cache_seqlens
             }
         )
+
+        return self.draft_ids_pinned
+
+
+    def iterate_draftmodel_mtp_gen(self, results: list):
+        """
+        Recurrent MTP-1 drafting (Qwen3.5/3.6 NEXTN-style). Each step embeds the previous token,
+        concats with previous hidden state, runs the MTP block + lm_head, samples greedy.
+        Requires that the previous iterate_gen has populated self.mtp_last_hidden[job.serial_number].
+        """
+
+        # Get shape of active batch
+        batch_size = 0
+        max_seq_len = 0
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
+            batch_size += 1
+        if batch_size == 0:
+            return None
+
+        # Lazy-init per-job hidden state dict
+        if self.mtp_last_hidden is None:
+            self.mtp_last_hidden = {}
+
+        # Seed mtp_last_hidden from prefill carry on the very first round (before iterate_gen has populated it)
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            if self.mtp_last_hidden.get(job.serial_number) is None:
+                seq0 = job.sequences[0]
+                if getattr(seq0, "mtp_carry_hidden", None) is not None:
+                    self.mtp_last_hidden[job.serial_number] = seq0.mtp_carry_hidden
+
+        # Skip drafting on jobs that still have no target_hidden (no prefill carry, no iterate yet)
+        all_have_hidden = all(
+            self.mtp_last_hidden.get(job.serial_number) is not None
+            for job in self.active_jobs if job.is_prefill_done()
+        )
+        if not all_have_hidden:
+            return None
+
+        # Block table + cache_seqlens for batch
+        # MTP convention: K/V at MTP slot p = (token@(p+1), hidden@p). To predict token@(K+1) where K
+        # = seq.kv_position, MTP step writes slot K-1. So cache_seqlens for the FIRST step = K-1.
+        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
+        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        batch = 0
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            for seq in job.sequences:
+                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
+                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
+                cache_seqlens[batch] = seq.kv_position - 1
+                batch += 1
+
+        # MM embeddings not supported with MTP draft; multi-sequence jobs (CFG) also unsupported
+        # because mtp_last_hidden is tracked per-job, not per-sequence
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            assert not job.embeddings, "MM embeddings not supported with MTP draft model."
+            assert len(job.sequences) == 1, "Multi-sequence jobs (e.g. CFG) not supported with MTP draft."
+
+        # Collect last id and last_hidden for each batch element
+        input_ids_list = []
+        hidden_list = []
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            ids = job.get_input_ids_list()
+            input_ids_list += ids
+            hidden_list.append(self.mtp_last_hidden[job.serial_number])
+
+        batch_ids = self.draft_input_ids_pinned[:batch_size, :]
+        batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
+        target_hidden = torch.cat(hidden_list, dim = 0)  # (bsz, 1, H)
+
+        # Drafting loop — one MTP step per draft token. Step k writes K/V at slot (kv_position - 1 + k)
+        # from input pair (last_id, last_hidden). Output predicts the (k+1)-th draft token.
+        last_ids = batch_ids
+        last_hidden = target_hidden
+        for idx in range(self.num_draft_tokens):
+            params = {
+                "attn_mode": "flash_attn",
+                "block_table": block_index,
+                "cache": self.draft_cache,
+                "cache_seqlens": cache_seqlens,
+            }
+            new_hidden, logits = self.draft_model.step(
+                last_token_ids = last_ids,
+                last_hidden = last_hidden,
+                params = params,
+                layer_step = idx,
+            )
+            new_ids = torch.argmax(logits, dim = -1)
+            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
+            last_ids = new_ids
+            last_hidden = new_hidden
+            cache_seqlens.add_(1)
 
         return self.draft_ids_pinned
 
@@ -685,7 +788,7 @@ class Generator:
 
                         # Rewind recurrent states
                         if rejected and states:
-                            for layer, state in states[idx].items():
+                            for layer, state in states[j].items():
                                 assert len(job.sequences) == 1
                                 state.rewind(rejected)
 
@@ -732,6 +835,63 @@ class Generator:
                     "cache_seqlens": params["cache_seqlens"],
                 }
             )
+
+        # Capture target's last-position post-norm hidden state per job, for next MTP draft round.
+        # Also backfill MTP K/V cache for the just-verified positions, replacing step's drafter-K/V
+        # with target's actual K/V (MTP convention: slot p stores (token@(p+1), main_hidden@p)).
+        if self.mtp_draft:
+            export_states = params.get("export_states")
+            if export_states:
+                target_hidden_full = export_states[-1]  # (batch_size, num_tokens_per_batch, H)
+                done_jobs = set(id(j) for j in completed_jobs) | set(id(j) for j in requeuing_jobs)
+                jb = 0
+                for idx, (job, a_idx, b_idx) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
+                    if a_idx == b_idx: continue
+                    if id(job) in done_jobs:
+                        jb += 1
+                        continue  # job is finishing this iter; no point seeding next-round state
+                    accepted_length = accepted_lengths[jb] if jb < len(accepted_lengths) else 1
+                    pos_idx = accepted_length - 1  # last accepted position relative to this iter's input span
+                    if target_hidden_full.dim() == 3:
+                        h = target_hidden_full[a_idx:a_idx+1, pos_idx:pos_idx+1, :].clone()
+                    else:
+                        flat_pos = a_idx * target_hidden_full.shape[0] // max(1, batch_size) + pos_idx
+                        h = target_hidden_full[flat_pos:flat_pos+1, :].unsqueeze(0).clone()
+                    self.mtp_last_hidden[job.serial_number] = h
+
+                    # Per-job MTP K/V backfill for accepted positions.
+                    # For acc >= 2: write (acc-1) entries at slots [K, K+acc-2] from
+                    #   shifted_tokens[k]  = sequence_ids[K+1+k]   (committed, drafted-and-accepted)
+                    #   shifted_hiddens[k] = main_hidden@(K+k)     (= target_hidden_full[a_idx, k])
+                    # for k in [0, acc-2].
+                    if accepted_length >= 2:
+                        seq0 = job.sequences[0]
+                        K = seq0.kv_position - accepted_length  # kv_position_pre for this iter
+                        n_back = accepted_length - 1
+                        if target_hidden_full.dim() == 3:
+                            shifted_hiddens = target_hidden_full[a_idx:a_idx+1, 0:n_back, :].clone()
+                        else:
+                            flat_a = a_idx * target_hidden_full.shape[0] // max(1, batch_size)
+                            shifted_hiddens = target_hidden_full[flat_a:flat_a+n_back, :].unsqueeze(0).clone()
+                        # Pull just-committed token ids from sequence_ids
+                        shifted_tokens = seq0.sequence_ids.torch_slice(K + 1, K + accepted_length)
+                        self.draft_model.update_kv_from_target(
+                            shifted_tokens = shifted_tokens,
+                            shifted_hiddens = shifted_hiddens,
+                            cache = self.draft_cache,
+                            params = {
+                                "block_table": seq0.block_index_tensor,
+                                "cache_seqlens": torch.tensor([K], dtype = torch.int32),
+                            },
+                        )
+                    jb += 1
+
+        # Drop MTP hidden state for completed/requeuing jobs
+        if self.mtp_draft and self.mtp_last_hidden is not None:
+            for job in completed_jobs + requeuing_jobs:
+                self.mtp_last_hidden.pop(job.serial_number, None)
+            if not self.mtp_last_hidden:
+                self.mtp_last_hidden = None
 
         # Release pages for completed jobs
         num_jobs = self.num_remaining_jobs()

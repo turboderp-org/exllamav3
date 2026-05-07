@@ -15,6 +15,7 @@ class Config(ABC):
         directory: str,
         model_classes: dict,
         layer_map: list[int] | str | None = None,
+        arch_override: str | None = None,
         **kwargs,
     ):
         """
@@ -44,13 +45,18 @@ class Config(ABC):
         with open(self.config_filename, encoding = "utf8") as f:
             self.config_dict = json.load(f)
 
-        assert len(self.config_dict["architectures"]) == 1, \
-            f"Multiple architectures defined in {self.config_filename}"
+        if arch_override is None:
+            assert len(self.config_dict["architectures"]) == 1, \
+                f"Multiple architectures defined in {self.config_filename}"
 
-        arch = self.config_dict["architectures"][0]
-        assert arch == self.arch_string, \
-            f"Unexpected architecture {arch} in {self.config_filename}, should be {self.arch_string}."
-        self.architecture = arch
+            arch = self.config_dict["architectures"][0]
+            assert arch == self.arch_string, \
+                f"Unexpected architecture {arch} in {self.config_filename}, should be {self.arch_string}."
+            self.architecture = arch
+        else:
+            assert arch_override == self.arch_string, \
+                f"arch_override {arch_override} does not match config class arch_string {self.arch_string}"
+            self.architecture = arch_override
 
         # Collect all .safetensors files in directory
         self.stc = SafetensorsCollection(directory, load_method = kwargs.get("load_method"))
@@ -133,12 +139,16 @@ class Config(ABC):
 
 
     @staticmethod
-    def from_directory(directory: str, **kwargs) -> Config:
+    def from_directory(directory: str, arch_override: str | None = None, **kwargs) -> Config:
         """
         Create config from the specified directory if it contains a HF model of a supported architecture
 
         :param directory:
             Directory containing model files
+
+        :param arch_override:
+            If set, ignore the config.json's "architectures" entry and load this architecture instead.
+            Used e.g. to load a Qwen3.6 BF16 directory as a MTP-only draft model.
 
         :param kwargs:
             load_method:
@@ -155,15 +165,19 @@ class Config(ABC):
         with open(config_filename, encoding = "utf8") as f:
             config_dict = json.load(f)
 
-        assert "architectures" in config_dict, f"No architecture defined in {config_filename}"
-        archs = config_dict["architectures"]
-        assert len(archs) == 1, f"Multiple architectures defined in {config_filename}"
-        arch = archs[0]
-        assert arch in architectures, f"Unknown architecture {arch} in {config_filename}"
+        if arch_override is not None:
+            assert arch_override in architectures, f"Unknown arch_override {arch_override}"
+            arch = arch_override
+        else:
+            assert "architectures" in config_dict, f"No architecture defined in {config_filename}"
+            archs = config_dict["architectures"]
+            assert len(archs) == 1, f"Multiple architectures defined in {config_filename}"
+            arch = archs[0]
+            assert arch in architectures, f"Unknown architecture {arch} in {config_filename}"
 
         arch_def = architectures[arch]
         config_class = arch_def["config_class"]
-        config = config_class(directory, **kwargs)
+        config = config_class(directory, arch_override = arch_override, **kwargs)
         return config
 
 
