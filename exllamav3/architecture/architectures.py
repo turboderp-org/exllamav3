@@ -35,6 +35,7 @@ from .qwen2 import Qwen2Model
 from .qwen2_5_vl import Qwen2_5VLModel
 from .qwen3 import Qwen3Model
 from .qwen3_5 import Qwen3_5Model, Qwen3_5MoeModel, Qwen3_5VLModel, Qwen3_5VLMoeModel
+from .qwen3_5_mtp import Qwen3_5MTPDraftModel
 from .qwen3_moe import Qwen3MoeModel
 from .qwen3_next import Qwen3NextModel
 from .qwen3_vl import Qwen3VLModel
@@ -91,6 +92,7 @@ ARCHITECTURES = {
         Qwen3_5MoeModel,
         Qwen3_5VLModel,
         Qwen3_5VLMoeModel,
+        Qwen3_5MTPDraftModel,
         Qwen3MoeModel,
         Qwen3NextModel,
         Qwen3VLModel,

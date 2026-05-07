@@ -96,6 +96,10 @@ class Qwen3_5VLBaseConfig(Config):
             self.full_attention_interval,
         )
 
+        # MTP (multi-token prediction) head — informational; head loaded as separate draft model
+        self.mtp_num_hidden_layers = self.read_cfg(int, pfx("mtp_num_hidden_layers"), 0)
+        self.mtp_use_dedicated_embeddings = self.read_cfg(bool, pfx("mtp_use_dedicated_embeddings"), False)
+
         # RoPE
         self.rope_settings = self.read_rope_settings_default(
             RopeStyle.NEOX,
@@ -212,6 +216,10 @@ class Qwen3_5VLMoeBaseConfig(Config):
             self.num_hidden_layers,
             self.full_attention_interval,
         )
+
+        # MTP (multi-token prediction) head — informational; head loaded as separate draft model
+        self.mtp_num_hidden_layers = self.read_cfg(int, pfx("mtp_num_hidden_layers"), 0)
+        self.mtp_use_dedicated_embeddings = self.read_cfg(bool, pfx("mtp_use_dedicated_embeddings"), False)
 
         # RoPE
         self.rope_settings = self.read_rope_settings_default(

@@ -193,6 +193,10 @@ class Sequence:
         # Multimodal token spans
         self.multimodal_mask = ids[0] >= FIRST_MM_EMBEDDING_INDEX
 
+        # MTP carry hidden — last hidden state of the previous prefill chunk, used to seed
+        # the prev_hidden shift in update_kv_from_target. None until first prefill chunk runs.
+        self.mtp_carry_hidden = None
+
 
     def prepare(self, has_prefix_token: bool, max_new_tokens: int):
         self.page_hashes = []
