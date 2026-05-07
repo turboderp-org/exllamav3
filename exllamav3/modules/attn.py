@@ -908,7 +908,7 @@ class Attention(Module):
             cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table, self.sliding_window, params.get("layer_instance"))
 
         if self.use_bighead_fallback:
-            if q.shape[1] <= 8:
+            if q.shape[1] <= 16:
                 fn = self.bighead_attn_paged_fallback
             elif has_xformers:
                 fn = self.flash_attn_with_kvcache_xformers_fallback
