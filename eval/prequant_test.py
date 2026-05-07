@@ -5,6 +5,7 @@ import argparse
 from exllamav3.util.file import disk_lru_cache
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.memory import free_mem
+from exllamav3.util.misc import prepend_hf_chat_context
 from exllamav3 import Config, Model, Tokenizer
 from exllamav3.ext import exllamav3_ext as ext
 from datasets import load_dataset
@@ -277,6 +278,8 @@ def main(args):
     # Input state
     bos = None if not args.bos else torch.tensor([[config.bos_token_id]], dtype = torch.long)
     eval_ids = get_test_tokens(tokenizer, args.rows, bos)
+    if args.gen_prompt:
+        eval_ids = prepend_hf_chat_context(tokenizer, eval_ids)
     state = eval_ids
 
     # Streaming forward pass
@@ -350,6 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("-fl", "--from_layer", type = int, help = "From layer", default = None)
     parser.add_argument("-tl", "--to_layer", type = int, help = "To layer", default = None)
     parser.add_argument("-nim", "--no_inspect_modules", action = "store_true", help = "Skip module inspection")
+    parser.add_argument("-gp", "--gen_prompt", action = "store_true", help = "Prepend chat template generation prompt to every row")
     # parser.add_argument("-rb", "--regularize_bits", type = int, help = "Target bitrate for regularization test", default = 4)
     _args = parser.parse_args()
     main(_args)

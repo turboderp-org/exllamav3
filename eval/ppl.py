@@ -4,6 +4,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 from exllamav3.util.file import disk_lru_cache
 from exllamav3.util.progress import ProgressBar
+from exllamav3.util.misc import prepend_hf_chat_context
 from exllamav3 import model_init, Tokenizer, Config
 from datasets import load_dataset
 from exllamav3.util.memory import free_mem
@@ -150,6 +151,8 @@ def eval_default(model, config, tokenizer, args, forward_fn):
     # Dataset
     eval_ids = get_test_tokens(tokenizer, args.rows, eval_len = args.length)
     vocab_size = tokenizer.actual_vocab_size
+    if args.gen_prompt:
+        eval_ids = prepend_hf_chat_context(tokenizer, eval_ids)
 
     # Test
     logprob_sum = 0.0
@@ -239,6 +242,7 @@ if __name__ == "__main__":
     parser.add_argument("-hf", "--hf", action = "store_true", help = "Use Transformers as backend (-m must be HF model)")
     parser.add_argument("-hf_t", "--hf_tight", action = "store_true", help = "For Transformers: Force FP16 dtype to save memory")
     parser.add_argument("-hf_fp32", "--hf_fp32", action = "store_true", help = "For Transformers: Force FP32 dtype")
+    parser.add_argument("-gp", "--gen_prompt", action = "store_true", help = "Prepend chat template generation prompt to every row (doesn't apply to GGUF mode)")
 
     _args = parser.parse_args()
     main(_args)

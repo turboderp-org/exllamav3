@@ -6,6 +6,7 @@ from exllamav3.util.file import disk_lru_cache
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.memory import free_mem
 from exllamav3.util.measures import cosine_error, sqnr
+from exllamav3.util.misc import prepend_hf_chat_context
 from exllamav3 import Config, Model, Tokenizer
 from exllamav3.loader import SafetensorsCollection, VariantSafetensorsCollection
 from datasets import load_dataset
@@ -108,6 +109,8 @@ def main(args):
 
     # Dataset
     all_eval_ids = get_test_tokens(tokenizer, args.rows)
+    if args.gen_prompt:
+        all_eval_ids = prepend_hf_chat_context(tokenizer, all_eval_ids)
 
     # Inputs
     states_a = list(all_eval_ids.split(args.batch_size))
@@ -317,5 +320,6 @@ if __name__ == "__main__":
     parser.add_argument("-sla", "--save_logits_a", type = str, help = "Save model A logits (filename)", default = None)
     parser.add_argument("-slb", "--save_logits_b", type = str, help = "Save model B logits (filename)", default = None)
     parser.add_argument("-bsz", "--batch_size", type = int, help = "Batch size", default = 1)
+    parser.add_argument("-gp", "--gen_prompt", action = "store_true", help = "Prepend chat template generation prompt to every row")
     _args = parser.parse_args()
     main(_args)
