@@ -57,7 +57,8 @@ class AsyncGenerator:
             pass
 
     async def cancel(self, job: AsyncJob):
-        assert job.job in self.jobs
+        if job.job not in self.jobs:
+            return
         self.generator.cancel(job.job)
         del self.jobs[job.job]
 
@@ -90,5 +91,5 @@ class AsyncJob:
                 break
 
     async def cancel(self):
-        await self.generator.cancel(self)
         self.cancelled = True
+        await self.generator.cancel(self)
