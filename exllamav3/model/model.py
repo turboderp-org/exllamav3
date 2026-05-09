@@ -30,7 +30,7 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
-        self.last_kv_module_instance = None
+        self.last_kv_module_idx_instance = None
         self.logit_layer_idx = None
         self.first_block_idx = None
 
@@ -104,6 +104,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         # No layer map
         if not self.config.layer_map:
             self.fwd_modules = [(m, 0, idx) for idx, m in enumerate(self.modules)]
+            self.last_kv_module_idx_instance = (self.last_kv_module_idx, 0)
             return
 
         # Isolate and enumerate indexed layers
@@ -137,7 +138,7 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         self.fwd_modules = relayered
         if self.last_kv_module_idx is not None:
-            self.last_kv_module_instance = (
+            self.last_kv_module_idx_instance = (
                 self.last_kv_module_idx,
                 inner_count[self.last_kv_module_idx - len(prolog)] - 1
             )

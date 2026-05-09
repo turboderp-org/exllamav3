@@ -234,10 +234,11 @@ class Model_LSMixin(ABC):
     ):
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
-            params["prefill"] = (instance == self.last_kv_module_instance)
+            pf = (idx, instance) == self.last_kv_module_idx_instance
+            params["prefill"] = pf
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
-            if instance == self.last_kv_module_instance:
+            if pf:
                 break
         del params["prefill"]
         return None
