@@ -236,11 +236,11 @@ class Attention(Module):
                 self.kv_proj = kv_proj
                 self.register_submodule(self.kv_proj)
             else:
-                assert k_proj and v_proj
                 self.k_proj = k_proj
                 self.v_proj = v_proj
                 self.register_submodule(self.k_proj)
-                self.register_submodule(self.v_proj)
+                if self.v_proj:
+                    self.register_submodule(self.v_proj)
 
         # Create o proj
         if key_o:
@@ -368,6 +368,7 @@ class Attention(Module):
             not self.use_k_as_v and
             device != torch.device("cpu") and
             self.k_proj.quant_type == "exl3" and
+            self.v_proj is not None and
             self.v_proj.quant_type == "exl3" and
             self.k_proj.out_features == self.v_proj.out_features and
             self.k_proj.inner.K == self.v_proj.inner.K and
@@ -753,7 +754,7 @@ class Attention(Module):
         storage = 0
         storage += self.q_proj.storage_size()
         storage += self.k_proj.storage_size()
-        storage += self.v_proj.storage_size()
+        storage += self.v_proj.storage_size() if self.v_proj else 0
         storage += self.o_proj.storage_size()
         for cl in self.cache_layers:
             storage += cl.storage_size()
@@ -767,7 +768,7 @@ class Attention(Module):
         recons = max(
             self.q_proj.recons_size(),
             self.k_proj.recons_size(),
-            self.v_proj.recons_size(),
+            self.v_proj.recons_size() if self.v_proj else 0,
             self.o_proj.recons_size(),
         )
         channel_width = 1
@@ -823,6 +824,7 @@ class Attention(Module):
                 "logit_softcapping": self.logit_softcapping,
                 "post_rope_norm": self.post_rope_norm,
                 "tp_split_norm": self.tp_split_norm,
+                "use_k_as_v": self.use_k_as_v
             },
             "num_kv_heads": self.num_kv_heads,
             **{name: _export(getattr(self, name, None)) for name in (
