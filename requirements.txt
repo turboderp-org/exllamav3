@@ -10,6 +10,6 @@ pillow
 pyyaml
 marisa_trie
 kbnf>=0.4.2
-pydantic==2.11.0
+pydantic
 formatron>=0.5.0
 xformers
