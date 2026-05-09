@@ -138,6 +138,7 @@ def main():
         # d=512 (the motivating case)
         (1, 1, 32768, 16, 2, 512, 128, True),
         (1, 4, 32768, 16, 2, 512, 128, True),
+        (1, 16, 32768, 16, 2, 512, 128, True),
         # About as large as we can test with SDPA
         (1, 1, 1024*128, 16, 2, 512, 64, True),
         (1, 1, 1024*128, 16, 2, 512, 128, True),
