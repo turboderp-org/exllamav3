@@ -93,6 +93,7 @@ setup(
         "exllamav3.architecture.mm_processing",
         "exllamav3.model",
         "exllamav3.modules",
+        "exllamav3.modules.attention",
         "exllamav3.modules.arch_specific",
         "exllamav3.modules.quant",
         "exllamav3.modules.quant.exl3_lib",
