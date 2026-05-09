@@ -12,8 +12,8 @@ def _warn_sdpa_fallback():
     col_red = "\u001b[31;1m"
     print(
         f"{col_red} !! Warning, using SDPA fallback for large head size. VRAM usage will be high "
-        f"and inference on long sequences will be slow. Consider installing `xformers` to improve "
-        f"performance.{col_default}"
+        f"and inference on long sequences will be slow. Consider installing `triton` / `triton-windows`"
+        f"or `xformers` to improve performance.{col_default}"
     )
     has_warned_sdpa_fallback = True
 
