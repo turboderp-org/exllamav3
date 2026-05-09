@@ -21,7 +21,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
   Triton, and performance can be shaky due to the sporadic JIT compilation it imposes. [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) is
   supported and recommended but not required.
 - **Qwen3-Next** and **Qwen3.5** currently do not support tensor/expert parallelism.
-- The **Gemma4** implementaion benefits greatly from [xformers](https://github.com/facebookresearch/xformers)
+- The **Gemma4** implementation benefits greatly from [xformers](https://github.com/facebookresearch/xformers)
   (`pip install xformers`) which will be autodetected and used when available. Performance is likely to 
   improve further with a better head_dim > 256 attention implementation soon. 
 - **Gemma4** does not currently support tensor/expert parallelism.
@@ -41,7 +41,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **EXAONE 4.0** (Exaone4ForCausalLM)
 - **Gemma 2** (Gemma2ForCausalLM)
 - **Gemma 3** (Gemma3ForCausalLM, Gemma3ForConditionalGeneration) *- multimodal*
-- **Gemma 4** (Gemma4ForConditionalGeneration) *- multimodal*
+- **Gemma 4** (Gemma4ForConditionalGeneration) *- multimodal* (E2B/E4B currently not supported)
 - **GLM 4**, **GLM 4.5**, **GLM 4.5-Air**, **GLM 4.6** (Glm4ForCausalLM, Glm4MoeForCausalLM)
 - **GLM 4.1V**, **GLM 4.5V** (Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration) *- multimodal*
 - **HyperCLOVAX** (HyperCLOVAXForCausalLM, HCXVisionV2ForCausalLM) *- multimodal*
