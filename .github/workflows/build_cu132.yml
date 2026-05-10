@@ -1,0 +1,488 @@
+name: Build Wheels & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release? 1 = yes, 0 = no'
+        default: '0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build_wheels:
+    name: ${{ matrix.os }} P${{ matrix.pyver }} CUDA ${{ matrix.cuda }} T${{ matrix.torch }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: pwsh
+    strategy:
+      fail-fast: false
+      matrix:
+#        os: [ubuntu-22.04, windows-2022]
+#        pyver: ['3.10', '3.11', '3.12', '3.13.3', '3.14']
+#        cuda: ['12.8.1']
+#        rocm: ['']
+#        torch: ['2.7.0', '2.8.0', '2.9.0', '2.10.0', '2.11.0']
+#        cudaarch: ['8.0 8.6 8.9 9.0 10.0 12.0+PTX']
+        include:
+          # CUDA 13.2 wheels are only built for Python 3.13/3.14 with Torch 2.11.
+          - os: ubuntu-22.04
+            pyver: '3.13.3'
+            cuda: '13.2.1'
+            rocm: ''
+            torch: '2.11.0'
+            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+          - os: windows-2022
+            pyver: '3.13.3'
+            cuda: '13.2.1'
+            rocm: ''
+            torch: '2.11.0'
+            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+          - os: ubuntu-22.04
+            pyver: '3.14'
+            cuda: '13.2.1'
+            rocm: ''
+            torch: '2.11.0'
+            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+          - os: windows-2022
+            pyver: '3.14'
+            cuda: '13.2.1'
+            rocm: ''
+            torch: '2.11.0'
+            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+#        exclude:
+#          # No Torch 2.11 wheels for Python 3.10/3.11.
+#          - pyver: '3.10'
+#            torch: '2.11.0'
+#          - pyver: '3.11'
+#            torch: '2.11.0'
+#          # Python 3.14 only builds Torch 2.9+.
+#          - pyver: '3.14'
+#            torch: '2.7.0'
+#          - pyver: '3.14'
+#            torch: '2.8.0'
+
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        if: runner.os == 'Linux'
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      # Setup Python
+      - uses: actions/checkout@v4
+
+      # Get version string from package
+      - name: Get version string
+        id: package_version
+        run: |
+          $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
+          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') {
+            Write-Output $('::notice file=build.yml,title=Package Version::Detected package version is: {0}' -f $Matches[1])
+            Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
+          }
+          else {
+            Write-Output '::error file=build.yml::Could not parse version from exllamav3/version.py! You must upload wheels manually!'
+            Write-Output "PACKAGE_VERSION=None" >> "$env:GITHUB_OUTPUT"
+          }
+
+      # Pin VS build tools to 17.9 for wider compat
+      - name: Install VS2022 BuildTools 17.9.7
+        run: choco install -y visualstudio2022buildtools --version=117.9.7.0 --params "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --installChannelUri https://aka.ms/vs/17/release/180911598_-255012421/channel"
+        if: runner.os == 'Windows'
+
+      # Install uv for easier python setup
+      - name: Install the latest version of uv and set the python version
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.pyver }}
+
+      - name: Install Windows CUDA 12.8
+        if: runner.os == 'Windows' && contains(matrix.cuda, '12.8')
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Download-WithRetry {
+            param(
+              [Parameter(Mandatory=$true)][string]$Url,
+              [Parameter(Mandatory=$true)][string]$OutFile,
+              [int]$MaxAttempts = 5
+            )
+
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+              try {
+                Write-Host "Downloading $Url (attempt $attempt/$MaxAttempts)"
+                curl.exe -fL --retry 5 --retry-delay 5 --retry-all-errors -o $OutFile $Url
+
+                if (-not (Test-Path $OutFile)) { throw "File was not created: $OutFile" }
+                $size = (Get-Item $OutFile).Length
+                if ($size -le 0) { throw "Downloaded file is empty: $OutFile" }
+
+                Write-Host "Downloaded $OutFile ($size bytes)"
+                return
+              }
+              catch {
+                Write-Warning "Download failed for $Url : $_"
+                if ($attempt -eq $MaxAttempts) { throw }
+                Start-Sleep -Seconds ([Math]::Min(60, 5 * $attempt))
+              }
+            }
+          }
+
+          mkdir -p "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          choco install unzip -y
+
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.8.57-archive.zip" "cuda_cudart.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.8.61-archive.zip" "cuda_nvcc.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-12.8.61-archive.zip" "cuda_nvrtc.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.8.3.14-archive.zip" "libcublas.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-12.8.55-archive.zip" "cuda_nvtx.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-12.8.55-archive.zip" "cuda_profiler_api.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-12.8.55-archive.zip" "visual_studio_integration.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvprof/windows-x86_64/cuda_nvprof-windows-x86_64-12.8.57-archive.zip" "cuda_nvprof.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-12.8.55-archive.zip" "cuda_cccl.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcusparse/windows-x86_64/libcusparse-windows-x86_64-12.5.7.53-archive.zip" "libcusparse.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcusolver/windows-x86_64/libcusolver-windows-x86_64-11.7.2.55-archive.zip" "libcusolver.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcurand/windows-x86_64/libcurand-windows-x86_64-10.3.9.55-archive.zip" "libcurand.zip"
+          Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/windows-x86_64/libcufft-windows-x86_64-11.3.3.41-archive.zip" "libcufft.zip"
+
+          unzip '*.zip' -d "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_cudart-windows-x86_64-12.8.57-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_nvcc-windows-x86_64-12.8.61-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_nvrtc-windows-x86_64-12.8.61-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libcublas-windows-x86_64-12.8.3.14-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_nvtx-windows-x86_64-12.8.55-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_profiler_api-windows-x86_64-12.8.55-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\visual_studio_integration-windows-x86_64-12.8.55-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_nvprof-windows-x86_64-12.8.57-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_cccl-windows-x86_64-12.8.55-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libcusparse-windows-x86_64-12.5.7.53-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libcusolver-windows-x86_64-11.7.2.55-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libcurand-windows-x86_64-10.3.9.55-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libcufft-windows-x86_64-11.3.3.41-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
+          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $required = @(
+            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvcc.exe",
+            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvrtc64_*.dll",
+            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\lib\x64\cublas.lib"
+          )
+          foreach ($pattern in $required) {
+            if (-not (Get-ChildItem $pattern -ErrorAction SilentlyContinue)) {
+              throw "Missing required CUDA file: $pattern"
+            }
+          }
+
+      - name: Install Windows CUDA 13.2
+        if: runner.os == 'Windows' && contains(matrix.cuda, '13.2')
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Download-WithRetry {
+            param(
+              [Parameter(Mandatory=$true)][string]$Url,
+              [Parameter(Mandatory=$true)][string]$OutFile,
+              [int]$MaxAttempts = 5
+            )
+
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+              try {
+                Write-Host "Downloading $Url (attempt $attempt/$MaxAttempts)"
+                curl.exe -fL --retry 5 --retry-delay 5 --retry-all-errors -o $OutFile $Url
+
+                if (-not (Test-Path $OutFile)) { throw "File was not created: $OutFile" }
+                $size = (Get-Item $OutFile).Length
+                if ($size -le 0) { throw "Downloaded file is empty: $OutFile" }
+
+                Write-Host "Downloaded $OutFile ($size bytes)"
+                return
+              }
+              catch {
+                Write-Warning "Download failed for $Url : $_"
+                if ($attempt -eq $MaxAttempts) { throw }
+                Start-Sleep -Seconds ([Math]::Min(60, 5 * $attempt))
+              }
+            }
+          }
+
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"
+          mkdir -p $cudaRoot
+          choco install unzip -y
+
+          $baseUrl = "https://developer.download.nvidia.com/compute/cuda/redist"
+          $packages = @(
+            "cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.2.75-archive.zip",
+            "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.2.78-archive.zip",
+            "cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.2.78-archive.zip",
+            "libcublas/windows-x86_64/libcublas-windows-x86_64-13.4.0.1-archive.zip",
+            "cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.2.75-archive.zip",
+            "cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.2.75-archive.zip",
+            "visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.2.75-archive.zip",
+            "cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-13.2.75-archive.zip",
+            "libcusparse/windows-x86_64/libcusparse-windows-x86_64-12.7.10.1-archive.zip",
+            "libcusolver/windows-x86_64/libcusolver-windows-x86_64-12.2.0.1-archive.zip",
+            "libcurand/windows-x86_64/libcurand-windows-x86_64-10.4.2.55-archive.zip",
+            "libcufft/windows-x86_64/libcufft-windows-x86_64-12.2.0.46-archive.zip"
+          )
+
+          foreach ($package in $packages) {
+            $fileName = Split-Path $package -Leaf
+            Download-WithRetry "$baseUrl/$package" $fileName
+          }
+
+          unzip '*.zip' -d $cudaRoot
+
+          foreach ($archiveDir in Get-ChildItem $cudaRoot -Directory -Filter '*-archive') {
+            xcopy "$($archiveDir.FullName)\*" "$cudaRoot" /E /I /H /Y
+          }
+
+          echo "$cudaRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "$cudaRoot\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "CUDA_PATH_V13_2=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $required = @(
+            "$cudaRoot\bin\nvcc.exe",
+            "$cudaRoot\bin\nvrtc64_*.dll",
+            "$cudaRoot\lib\x64\cublas.lib"
+          )
+          foreach ($pattern in $required) {
+            if (-not (Get-ChildItem $pattern -ErrorAction SilentlyContinue)) {
+              throw "Missing required CUDA file: $pattern"
+            }
+          }
+
+      - name: Install Linux CUDA ${{ matrix.cuda }}
+        uses: Jimver/cuda-toolkit@v0.2.24
+        id: cuda-toolkit-Linux
+        with:
+          cuda: "${{ matrix.cuda }}"
+          linux-local-args: '["--toolkit"]'
+          method: "network"
+        if: runner.os != 'Windows' && matrix.cuda != ''
+
+      - name: Install CUDA build dependencies
+        if: matrix.cuda != ''
+        id: cuda_deps
+        run: |
+          git config --system core.longpaths true
+          $cudaVersion = '${{ matrix.cuda }}'
+          $cudaVersionPytorch = '${{ matrix.cuda }}'.Remove('${{ matrix.cuda }}'.LastIndexOf('.')).Replace('.','')
+          if ($cudaVersion.StartsWith('13.')) {
+            $cudaVersionPytorch = '130'
+          }
+          Write-Output "CUDA_VERSION_PYTORCH=$cudaVersionPytorch" >> "$env:GITHUB_OUTPUT"
+          $pytorchIndexUrl = "https://download.pytorch.org/whl/cu$cudaVersionPytorch"
+
+          uv pip install torch==${{ matrix.torch }} --index-url $pytorchIndexUrl
+          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+
+      - name: Compute Torch and xFormers requirement pins
+        id: dep_pins
+        run: |
+          $torchVersion = '${{ matrix.torch }}'
+
+          switch -Regex ($torchVersion) {
+            '^2\.7\.'  { $xformersSpec = '==0.0.30'; break }
+            '^2\.8\.'  { $xformersSpec = '==0.0.32'; break }
+            '^2\.9\.'  { $xformersSpec = '==0.0.33'; break }
+            '^2\.10\.' { $xformersSpec = '>=0.0.34,<0.0.36'; break }
+            '^2\.11\.' { $xformersSpec = '>=0.0.34,<0.0.36'; break }
+            default { throw "No xFormers pin known for torch $torchVersion" }
+          }
+
+          $torchSpec = "==$torchVersion"
+
+          Write-Host "Torch requirement: torch$torchSpec"
+          Write-Host "xFormers requirement: xformers$xformersSpec"
+
+          Write-Output "TORCH_SPEC=$torchSpec" >> "$env:GITHUB_OUTPUT"
+          Write-Output "XFORMERS_SPEC=$xformersSpec" >> "$env:GITHUB_OUTPUT"
+          Write-Output "TORCH_SPEC=$torchSpec" >> "$env:GITHUB_ENV"
+          Write-Output "XFORMERS_SPEC=$xformersSpec" >> "$env:GITHUB_ENV"
+
+      - name: Patch setup.py dependency metadata for this wheel
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $patchScript = @'
+          from pathlib import Path
+          import os
+          import re
+
+          setup_py = Path("setup.py")
+          text = setup_py.read_text(encoding="utf-8")
+
+          torch_spec = os.environ["TORCH_SPEC"]
+          xformers_spec = os.environ["XFORMERS_SPEC"]
+
+          text, torch_count = re.subn(
+              r'(["\'])torch>=2\.6\.0\1',
+              f'"torch{torch_spec}"',
+              text,
+              count=1,
+          )
+          if torch_count != 1:
+              raise SystemExit("Expected to replace exactly one torch>=2.6.0 requirement in setup.py")
+
+          text, xformers_count = re.subn(
+              r'(["\'])xformers\1',
+              f'"xformers{xformers_spec}"',
+              text,
+              count=1,
+          )
+          if xformers_count != 1:
+              raise SystemExit("Expected to replace exactly one bare xformers requirement in setup.py")
+
+          setup_py.write_text(text, encoding="utf-8")
+          print(f"Pinned setup.py requirements: torch{torch_spec}, xformers{xformers_spec}")
+          '@
+
+          Set-Content -Path patch_setup_deps.py -Value $patchScript -Encoding UTF8
+          python patch_setup_deps.py
+
+      - name: Build for CUDA
+        if: matrix.cuda != ''
+        run: |
+          # --- Spawn the VS shell
+          if ($IsWindows) {
+            Import-Module 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+            Enter-VsDevShell -VsInstallPath 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools' -DevCmdArguments '-arch=x64 -host_arch=x64'
+            $env:DISTUTILS_USE_SDK=1
+          }
+
+          # --- Build wheel
+          $BUILDTAG = "+cu${{ steps.cuda_deps.outputs.CUDA_VERSION_PYTORCH }}-torch${{ matrix.torch }}"
+          $env:BUILD_TARGET = "cuda"
+          $env:TORCH_CUDA_ARCH_LIST = '${{ matrix.cudaarch }}'
+
+          python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+
+      - name: Verify wheel dependency metadata
+        run: |
+          $wheel = Get-ChildItem dist/*.whl | Select-Object -First 1
+          if (-not $wheel) { throw "No wheel found in dist/" }
+
+          # Compare parsed requirements instead of raw strings because setuptools/packaging
+          # may canonicalize equivalent specifiers, e.g.:
+          #   xformers>=0.0.34,<0.0.36
+          # becomes:
+          #   xformers<0.0.36,>=0.0.34
+          $verifyScript = @'
+          from pathlib import Path
+          from zipfile import ZipFile
+          import os
+          from packaging.requirements import Requirement
+          from packaging.utils import canonicalize_name
+
+          wheel = next(Path("dist").glob("*.whl"))
+          expected = {
+              "torch": Requirement(f"torch{os.environ['TORCH_SPEC']}"),
+              "xformers": Requirement(f"xformers{os.environ['XFORMERS_SPEC']}"),
+          }
+
+          with ZipFile(wheel) as zf:
+              metadata_name = next(n for n in zf.namelist() if n.endswith(".dist-info/METADATA"))
+              metadata = zf.read(metadata_name).decode("utf-8", errors="replace")
+
+          actual = {}
+          print(f"Wheel: {wheel}")
+          print("--- METADATA Requires-Dist lines ---")
+          for line in metadata.splitlines():
+              if not line.startswith("Requires-Dist:"):
+                  continue
+              print(line)
+              req_text = line.removeprefix("Requires-Dist:").strip()
+              req = Requirement(req_text)
+              actual[canonicalize_name(req.name)] = req
+
+          for name, expected_req in expected.items():
+              key = canonicalize_name(name)
+              if key not in actual:
+                  raise SystemExit(f"Missing dependency metadata for {name}")
+
+              actual_req = actual[key]
+              if str(actual_req.specifier) != str(expected_req.specifier):
+                  raise SystemExit(
+                      f"Dependency mismatch for {name}: expected {expected_req.specifier}, "
+                      f"got {actual_req.specifier}"
+                  )
+
+          print("Dependency metadata verified.")
+          '@
+
+          Set-Content -Path verify_wheel_metadata.py -Value $verifyScript -Encoding UTF8
+          python verify_wheel_metadata.py
+
+      - name: Upload wheel files to GitHub release
+        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
+        uses: svenstaro/upload-release-action@2.6.1
+        with:
+          file: ./dist/*.whl
+          tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
+          file_glob: true
+          overwrite: true
+          release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}
+
+  build_sdist:
+    name: sdist
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version string
+        id: package_version
+        run: |
+          $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
+          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') {
+            Write-Output $('::notice file=build.yml,title=Package Version::Detected package version is: {0}' -f $Matches[1])
+            Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
+          }
+          else {
+            Write-Output '::error file=build.yml::Could not parse version from exllamav3/version.py! You must upload files manually!'
+            Write-Output "PACKAGE_VERSION=None" >> "$env:GITHUB_OUTPUT"
+          }
+
+      - name: Install the latest version of uv and set the python version
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build sdist and py3-none-any JIT wheel
+        run: |
+          uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+
+          # Build both:
+          #   - exllamav3-<version>.tar.gz
+          #   - exllamav3-<version>-py3-none-any.whl
+          # The EXLLAMA_NOCOMPILE flag prevents the extension from being compiled
+          # into the wheel, leaving it to JIT/load at runtime.
+          $env:EXLLAMA_NOCOMPILE=1
+          python -m build -n
+
+      - name: Upload sdist and py3-none-any JIT wheel to GitHub release
+        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
+        uses: svenstaro/upload-release-action@2.6.1
+        with:
+          file: ./dist/*
+          tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
+          file_glob: true
+          overwrite: true
+          release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}
