@@ -28,7 +28,8 @@ from compare_q_transformers import (
     load_transformers,
     fwd_transformers,
     tokenize_transformers,
-    chat_template_transformers
+    chat_template_transformers,
+    load_transformers_mm
 )
 from compare_q_exllamav2 import (
     load_exllamav2,
@@ -54,6 +55,7 @@ from compare_q_qtip import (
 load_fns = {
     "transformers_auto_bf16": load_transformers_auto_bf16,
     "transformers_auto": load_transformers_auto,
+    "transformers_mm": load_transformers_mm,
     "transformers": load_transformers,
     "exllamav2": load_exllamav2,
     "exllamav3": load_exllamav3,

@@ -1,17 +1,24 @@
 from functools import lru_cache
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForImageTextToText
+
 
 class dummy:
     pass
+
+try:
+    import paroquant.inference.backends.transformers.quantizer
+    from paroquant.inference.backends.transformers.modules import RotateQuantizedLinear
+except (ModuleNotFoundError, ImportError, ValueError):
+    RotateQuantizedLinear = dummy
 
 try:
     from gptqmodel.nn_modules.qlinear.marlin_awq import AwqMarlinLinear
     from gptqmodel.nn_modules.qlinear.tritonv2 import TritonV2Linear
     from gptqmodel.nn_modules.qlinear.exllamav2 import ExllamaV2Linear
 except (ModuleNotFoundError, ImportError):
-    MarlinQuantLinear = dummy
+    AwqMarlinLinear = dummy
     TritonV2Linear = dummy
     ExllamaV2Linear = dummy
 
@@ -34,12 +41,6 @@ try:
     from bitsandbytes.nn import Linear4bit
 except (ModuleNotFoundError, ImportError):
     Linear4bit = dummy
-
-try:
-    import paroquant.inference.backends.transformers.quantizer
-    from paroquant.inference.backends.transformers.modules import RotateQuantizedLinear
-except (ModuleNotFoundError, ImportError, ValueError):
-    RotateQuantizedLinear = dummy
 
 def get_tensors_size(tensors):
     return 8 * sum(t.element_size() * t.numel() for t in tensors.values() if t is not None)
@@ -84,6 +85,12 @@ def get_storage_info(model):
     sum_numel = 0
     head_bpw = 0
     head_numel = 0
+    h_modules = [(name, module) for name, module in model.named_modules() if "lm_head" in name]
+    if hasattr(model, "model"):
+        model = model.model
+    if hasattr(model, "language_model"):
+        model = model.language_model
+    assert model.input_modalities in ["text", ["text"]]
     if hasattr(model, "vocab_size"):
         vocab_size = model.vocab_size
     elif hasattr(model, "model") and hasattr(model.model, "vocab_size"):
@@ -91,7 +98,10 @@ def get_storage_info(model):
         vocab_size = model.vocab_size
     else:
         vocab_size = 128000
-    for name, module in model.named_modules():
+    m_modules = [(name, module) for name, module in model.named_modules() if "lm_head" not in name]
+    m_modules += h_modules
+
+    for name, module in m_modules:
         if any(isinstance(module, x) for x in [Linear4bit]):
             if module.out_features >= vocab_size * 0.9:  # this is foolproof
                 head_numel = module.in_features * module.out_features
@@ -102,12 +112,22 @@ def get_storage_info(model):
                 sum_bits += scan_gpu_tensors(module.quant_state) * 8
                 sum_numel += module.in_features * module.out_features
         elif any(isinstance(module, x) for x in [torch.nn.Linear]):
-            if module.out_features >= vocab_size * 0.9:
-                head_bpw = module.weight.element_size() * 8
-                head_numel = module.weight.numel()
+            if hasattr(module, "weight"):
+                if module.out_features >= vocab_size * 0.9:
+                    head_bpw = module.weight.element_size() * 8
+                    head_numel = module.weight.numel()
+                else:
+                    sum_bits += get_tensor_size(module.weight)
+                    sum_numel +=  module.weight.numel()
+            elif hasattr(module, "weight_packed"):
+                if module.out_features >= vocab_size * 0.9:
+                    head_numel = module.in_features * module.out_features
+                    head_bpw = (scan_gpu_tensors(module) * 8) / head_numel
+                else:
+                    sum_bits += scan_gpu_tensors(module) * 8
+                    sum_numel += module.in_features * module.out_features
             else:
-                sum_bits += get_tensor_size(module.weight)
-                sum_numel +=  module.weight.numel()
+                raise ValueError("I can't even")
         elif any(isinstance(module, x) for x in [RotateQuantizedLinear]):
             sum_bits += get_tensors_size({
                 "pairs": module.pairs,
@@ -157,6 +177,16 @@ def get_storage_info(model):
 @torch.inference_mode
 def load_transformers(model_dir: str, auto = False, bf16 = False):
     model = AutoModelForCausalLM.from_pretrained(
+        model_dir,
+        device_map = "auto" if auto else "cuda:0",
+        torch_dtype = torch.bfloat16 if bf16 else torch.half
+    )
+    bpw_layer, bpw_head, vram_bits = get_storage_info(model)
+    return model, bpw_layer, bpw_head, vram_bits
+
+@torch.inference_mode
+def load_transformers_mm(model_dir: str, auto = False, bf16 = False):
+    model = AutoModelForImageTextToText.from_pretrained(
         model_dir,
         device_map = "auto" if auto else "cuda:0",
         torch_dtype = torch.bfloat16 if bf16 else torch.half
