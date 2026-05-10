@@ -28,7 +28,7 @@ if windows:
     # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break
     #       older cu128 builds
     extra_cflags += ["/Ox", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN"]
-    extra_cuda_cflags += ["-DWIN32_LEAN_AND_MEAN", "-Xcompiler", "/Zc:preprocessor"]
+    extra_cuda_cflags += ["-DWIN32_LEAN_AND_MEAN", "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING"]
     if ext_debug:
         extra_cflags += ["/Zi"]
         extra_cuda_cflags += []
