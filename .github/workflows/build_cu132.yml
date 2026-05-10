@@ -240,6 +240,8 @@ jobs:
             "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.2.51-archive.zip",
             "cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.2.51-archive.zip",
             "cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.2.51-archive.zip",
+            "libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.2.51-archive.zip",
+            "libnvptxcompiler/windows-x86_64/libnvptxcompiler-windows-x86_64-13.2.51-archive.zip",
             "libcublas/windows-x86_64/libcublas-windows-x86_64-13.3.0.5-archive.zip",
             "cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.2.20-archive.zip",
             "cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.2.20-archive.zip",
@@ -272,6 +274,9 @@ jobs:
             "$cudaRoot\bin\nvcc.exe",
             "$cudaRoot\bin\x64\nvrtc64_*.dll",
             "$cudaRoot\include\crt\host_defines.h",
+            "$cudaRoot\nvvm\bin\cicc.exe",
+            "$cudaRoot\nvvm\bin\x64\nvvm64_*.dll",
+            "$cudaRoot\nvvm\libdevice\libdevice.10.bc",
             "$cudaRoot\lib\x64\cublas.lib"
           )
           foreach ($pattern in $required) {
