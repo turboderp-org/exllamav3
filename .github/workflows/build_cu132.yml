@@ -366,7 +366,7 @@ jobs:
             Enter-VsDevShell -VsInstallPath 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools' -DevCmdArguments '-arch=x64 -host_arch=x64'
             $env:DISTUTILS_USE_SDK=1
             if ('${{ matrix.cuda }}'.StartsWith('13.2')) {
-              $env:CL = "/Zc:preprocessor $env:CL"
+              $env:CL = "/Zc:preprocessor /DWIN32_LEAN_AND_MEAN $env:CL"
             }
           }
 
