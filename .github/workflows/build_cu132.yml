@@ -32,25 +32,25 @@ jobs:
           # CUDA 13.2 wheels are only built for Python 3.13/3.14 with Torch 2.11.
           - os: ubuntu-22.04
             pyver: '3.13.3'
-            cuda: '13.2.1'
+            cuda: '13.2.0'
             rocm: ''
             torch: '2.11.0'
             cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
           - os: windows-2022
             pyver: '3.13.3'
-            cuda: '13.2.1'
+            cuda: '13.2.0'
             rocm: ''
             torch: '2.11.0'
             cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
           - os: ubuntu-22.04
             pyver: '3.14'
-            cuda: '13.2.1'
+            cuda: '13.2.0'
             rocm: ''
             torch: '2.11.0'
             cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
           - os: windows-2022
             pyver: '3.14'
-            cuda: '13.2.1'
+            cuda: '13.2.0'
             rocm: ''
             torch: '2.11.0'
             cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
@@ -224,18 +224,19 @@ jobs:
 
           $baseUrl = "https://developer.download.nvidia.com/compute/cuda/redist"
           $packages = @(
-            "cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.2.75-archive.zip",
-            "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.2.78-archive.zip",
-            "cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.2.78-archive.zip",
-            "libcublas/windows-x86_64/libcublas-windows-x86_64-13.4.0.1-archive.zip",
-            "cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.2.75-archive.zip",
-            "cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.2.75-archive.zip",
-            "visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.2.75-archive.zip",
-            "cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-13.2.75-archive.zip",
-            "libcusparse/windows-x86_64/libcusparse-windows-x86_64-12.7.10.1-archive.zip",
-            "libcusolver/windows-x86_64/libcusolver-windows-x86_64-12.2.0.1-archive.zip",
-            "libcurand/windows-x86_64/libcurand-windows-x86_64-10.4.2.55-archive.zip",
-            "libcufft/windows-x86_64/libcufft-windows-x86_64-12.2.0.46-archive.zip"
+            "cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.2.51-archive.zip",
+            "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.2.51-archive.zip",
+            "cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.2.51-archive.zip",
+            "cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.2.51-archive.zip",
+            "libcublas/windows-x86_64/libcublas-windows-x86_64-13.3.0.5-archive.zip",
+            "cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.2.20-archive.zip",
+            "cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.2.20-archive.zip",
+            "visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.2.20-archive.zip",
+            "cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-13.2.27-archive.zip",
+            "libcusparse/windows-x86_64/libcusparse-windows-x86_64-12.7.9.17-archive.zip",
+            "libcusolver/windows-x86_64/libcusolver-windows-x86_64-12.1.0.51-archive.zip",
+            "libcurand/windows-x86_64/libcurand-windows-x86_64-10.4.2.51-archive.zip",
+            "libcufft/windows-x86_64/libcufft-windows-x86_64-12.2.0.37-archive.zip"
           )
 
           foreach ($package in $packages) {
@@ -258,6 +259,7 @@ jobs:
           $required = @(
             "$cudaRoot\bin\nvcc.exe",
             "$cudaRoot\bin\x64\nvrtc64_*.dll",
+            "$cudaRoot\include\crt\host_defines.h",
             "$cudaRoot\lib\x64\cublas.lib"
           )
           foreach ($pattern in $required) {
@@ -266,94 +268,14 @@ jobs:
             }
           }
 
-      - name: Install Linux CUDA 13.2
-        if: runner.os != 'Windows' && contains(matrix.cuda, '13.2')
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          function Download-WithRetry {
-            param(
-              [Parameter(Mandatory=$true)][string]$Url,
-              [Parameter(Mandatory=$true)][string]$OutFile,
-              [int]$MaxAttempts = 5
-            )
-
-            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-              try {
-                Write-Host "Downloading $Url (attempt $attempt/$MaxAttempts)"
-                /usr/bin/curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o $OutFile $Url
-
-                if (-not (Test-Path $OutFile)) { throw "File was not created: $OutFile" }
-                $size = (Get-Item $OutFile).Length
-                if ($size -le 0) { throw "Downloaded file is empty: $OutFile" }
-
-                Write-Host "Downloaded $OutFile ($size bytes)"
-                return
-              }
-              catch {
-                Write-Warning "Download failed for $Url : $_"
-                if ($attempt -eq $MaxAttempts) { throw }
-                Start-Sleep -Seconds ([Math]::Min(60, 5 * $attempt))
-              }
-            }
-          }
-
-          $cudaRoot = Join-Path $env:RUNNER_TEMP 'cuda-13.2'
-          New-Item -ItemType Directory -Force -Path $cudaRoot | Out-Null
-
-          $baseUrl = "https://developer.download.nvidia.com/compute/cuda/redist"
-          $packages = @(
-            "cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-13.2.75-archive.tar.xz",
-            "cuda_nvcc/linux-x86_64/cuda_nvcc-linux-x86_64-13.2.78-archive.tar.xz",
-            "cuda_nvrtc/linux-x86_64/cuda_nvrtc-linux-x86_64-13.2.78-archive.tar.xz",
-            "libcublas/linux-x86_64/libcublas-linux-x86_64-13.4.0.1-archive.tar.xz",
-            "cuda_nvtx/linux-x86_64/cuda_nvtx-linux-x86_64-13.2.75-archive.tar.xz",
-            "cuda_profiler_api/linux-x86_64/cuda_profiler_api-linux-x86_64-13.2.75-archive.tar.xz",
-            "cuda_cccl/linux-x86_64/cuda_cccl-linux-x86_64-13.2.75-archive.tar.xz",
-            "libcusparse/linux-x86_64/libcusparse-linux-x86_64-12.7.10.1-archive.tar.xz",
-            "libcusolver/linux-x86_64/libcusolver-linux-x86_64-12.2.0.1-archive.tar.xz",
-            "libcurand/linux-x86_64/libcurand-linux-x86_64-10.4.2.55-archive.tar.xz",
-            "libcufft/linux-x86_64/libcufft-linux-x86_64-12.2.0.46-archive.tar.xz"
-          )
-
-          foreach ($package in $packages) {
-            $fileName = Split-Path $package -Leaf
-            Download-WithRetry "$baseUrl/$package" $fileName
-            /usr/bin/tar -xJf $fileName -C $cudaRoot
-          }
-
-          foreach ($archiveDir in Get-ChildItem $cudaRoot -Directory -Filter '*-archive') {
-            /bin/cp -a "$($archiveDir.FullName)/." "$cudaRoot/"
-          }
-          if (-not (Test-Path "$cudaRoot/lib64")) {
-            /bin/ln -s "$cudaRoot/lib" "$cudaRoot/lib64"
-          }
-
-          echo "$cudaRoot/bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "CUDA_HOME=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          echo "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          echo "CUDACXX=$cudaRoot/bin/nvcc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          echo "LD_LIBRARY_PATH=$cudaRoot/lib:$env:LD_LIBRARY_PATH" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-          $required = @(
-            "$cudaRoot/bin/nvcc",
-            "$cudaRoot/lib/libnvrtc.so",
-            "$cudaRoot/lib/libcublas.so"
-          )
-          foreach ($pattern in $required) {
-            if (-not (Test-Path $pattern)) {
-              throw "Missing required CUDA file: $pattern"
-            }
-          }
-
       - name: Install Linux CUDA ${{ matrix.cuda }}
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit-Linux
         with:
           cuda: "${{ matrix.cuda }}"
           linux-local-args: '["--toolkit"]'
           method: "network"
-        if: runner.os != 'Windows' && matrix.cuda != '' && !contains(matrix.cuda, '13.2')
+        if: runner.os != 'Windows'
 
       - name: Install CUDA build dependencies
         if: matrix.cuda != ''
@@ -518,52 +440,52 @@ jobs:
           overwrite: true
           release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}
 
-  build_sdist:
-    name: sdist
-    runs-on: ubuntu-22.04
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Get version string
-        id: package_version
-        run: |
-          $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
-          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') {
-            Write-Output $('::notice file=build.yml,title=Package Version::Detected package version is: {0}' -f $Matches[1])
-            Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
-          }
-          else {
-            Write-Output '::error file=build.yml::Could not parse version from exllamav3/version.py! You must upload files manually!'
-            Write-Output "PACKAGE_VERSION=None" >> "$env:GITHUB_OUTPUT"
-          }
-
-      - name: Install the latest version of uv and set the python version
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: '3.11'
-
-      - name: Build sdist and py3-none-any JIT wheel
-        run: |
-          uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
-          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
-
-          # Build both:
-          #   - exllamav3-<version>.tar.gz
-          #   - exllamav3-<version>-py3-none-any.whl
-          # The EXLLAMA_NOCOMPILE flag prevents the extension from being compiled
-          # into the wheel, leaving it to JIT/load at runtime.
-          $env:EXLLAMA_NOCOMPILE=1
-          python -m build -n
-
-      - name: Upload sdist and py3-none-any JIT wheel to GitHub release
-        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
-        uses: svenstaro/upload-release-action@2.6.1
-        with:
-          file: ./dist/*
-          tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
-          file_glob: true
-          overwrite: true
-          release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}
+#  build_sdist:
+#    name: sdist
+#    runs-on: ubuntu-22.04
+#    defaults:
+#      run:
+#        shell: pwsh
+#    steps:
+#      - uses: actions/checkout@v4
+#
+#      - name: Get version string
+#        id: package_version
+#        run: |
+#          $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
+#          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') {
+#            Write-Output $('::notice file=build.yml,title=Package Version::Detected package version is: {0}' -f $Matches[1])
+#            Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
+#          }
+#          else {
+#            Write-Output '::error file=build.yml::Could not parse version from exllamav3/version.py! You must upload files manually!'
+#            Write-Output "PACKAGE_VERSION=None" >> "$env:GITHUB_OUTPUT"
+#          }
+#
+#      - name: Install the latest version of uv and set the python version
+#        uses: astral-sh/setup-uv@v5
+#        with:
+#          python-version: '3.11'
+#
+#      - name: Build sdist and py3-none-any JIT wheel
+#        run: |
+#          uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+#          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+#
+#          # Build both:
+#          #   - exllamav3-<version>.tar.gz
+#          #   - exllamav3-<version>-py3-none-any.whl
+#          # The EXLLAMA_NOCOMPILE flag prevents the extension from being compiled
+#          # into the wheel, leaving it to JIT/load at runtime.
+#          $env:EXLLAMA_NOCOMPILE=1
+#          python -m build -n
+#
+#      - name: Upload sdist and py3-none-any JIT wheel to GitHub release
+#        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
+#        uses: svenstaro/upload-release-action@2.6.1
+#        with:
+#          file: ./dist/*
+#          tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
+#          file_glob: true
+#          overwrite: true
+#          release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}
