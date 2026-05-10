@@ -9,12 +9,14 @@ from datasets import load_dataset
 import math
 import argparse
 import json
-import matplotlib.pyplot as plt
-from adjustText import adjust_text
 import glob
 from safetensors.torch import save_file
 from safetensors import safe_open
 import gc
+try:
+    from compare_q_plot import plot
+except ImportError:
+    from eval.compare_q_plot import plot
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
@@ -238,102 +240,6 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
     return res
 
 
-def plot(results, args):
-
-    def col(light, dark):
-        return dark if args.dark else light
-
-    if args.dark:
-        plt.style.use('dark_background')
-
-    def get_color(s):
-        d = {
-            "EXL2": col("green", "greenyellow"),
-            "EXL3": col("purple", "palevioletred"),
-            "AWQ": col("olive", "tan"),
-            "imat": col("brown", "darkorange"),
-            "GGUF": col("red", "lightseagreen"),
-            "VPTQ": col("blue", "cornflowerblue"),
-            "QTIP": col("teal", "tomato"),
-            "****": col("black", "silver"),
-        }
-        for k, v in d.items():
-            if f"[{v}]" in s:
-                return v
-        for k, v in d.items():
-            if k in s:
-                return v
-        return col("black", "silver")
-
-    plt.rcParams["figure.figsize"] = (14, 11)
-    plt.subplots_adjust(left = 0.05, right = 0.95, top = 0.95, bottom = 0.05)
-
-    lpoints = {}
-    x = []
-    y = []
-    labels = []
-    colors = []
-    for r in results:
-        x_ = r["vram_gb"] if args.vram else r["layer_bpw"]
-        y_ = r["ppl"] if not args.kld else r["kld"]
-        if x_ > args.max_x or y_ > args.max_y:
-            continue
-        x.append(x_)
-        y.append(y_)
-        labels.append(r["label"].split("[")[0].strip() + f"\n{y_:.3f}")
-        color = get_color(r["label"])
-        colors.append(color)
-        if color != col("black", "silver"):
-            if color not in lpoints:
-                lpoints[color] = []
-            lpoints[color].append((x_, y_))
-
-    plt.scatter(x, y, c = colors, marker = "o")
-
-    texts = []
-    for i, label in enumerate(labels):
-        texts.append(
-            plt.text(
-                x[i],
-                y[i],
-                label,
-                fontsize = 8.5,
-                ha = "left",
-                va = "bottom",
-                color = colors[i],
-            )
-        )
-    adjust_text(
-        texts,
-        x = x,
-        y = y,
-        arrowprops = {"arrowstyle": "->", "color": col("lightgray", "dimgray")},
-        expand = (1.35, 2.35),
-        ensure_inside_axes = True,
-        min_arrow_len = 0.10,
-        prevent_crossings = False,
-        pull_threshold = 0.20,
-        force_explode = (0.1, 0.2),
-        max_move = 100
-    )
-
-    for col, lines in lpoints.items():
-        x, y = zip(*sorted(lines))
-        plt.plot(x, y, color = col, linestyle=':')
-
-    plt.xlabel("VRAM // GB (decoder + head)" if args.vram else "bits per weight (decoder only)")
-    plt.ylabel("Perplexity" if not args.kld else "KL divergence")
-    plt.title(args.title)
-    if args.dark:
-        plt.grid(color = 'dimgray', linestyle = '--', linewidth = 0.5)
-    else:
-        plt.grid(True)
-    if args.plot_file:
-        plt.savefig(args.plot_file)
-    else:
-        plt.show()
-
-
 def dict_hash(x: dict) -> str:
     import hashlib
     key = str(json.dumps(x, sort_keys = True))
@@ -420,5 +326,3 @@ if __name__ == "__main__":
     parser.add_argument("-pf", "--plot_file", type = str, help = "Write the plot to a file")
     _args = parser.parse_args()
     main(_args)
-
-
