@@ -28,6 +28,44 @@ jobs:
         rocm: ['']
         torch: ['2.7.0', '2.8.0', '2.9.0', '2.10.0', '2.11.0']
         cudaarch: ['8.0 8.6 8.9 9.0 10.0 12.0+PTX']
+        include:
+          # CUDA 13.2 wheels are only built for Python 3.13/3.14 with Torch 2.11.
+          - os: ubuntu-22.04
+            pyver: '3.12'
+            cuda: '13.2.0'
+            rocm: ''
+            torch: '2.11.0'
+            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+          - os: windows-2022
+            pyver: '3.12'
+            cuda: '13.2.0'
+            rocm: ''
+            torch: '2.11.0'
+            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+          - os: ubuntu-22.04
+            pyver: '3.13.3'
+            cuda: '13.2.0'
+            rocm: ''
+            torch: '2.11.0'
+            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+          - os: windows-2022
+            pyver: '3.13.3'
+            cuda: '13.2.0'
+            rocm: ''
+            torch: '2.11.0'
+            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+          - os: ubuntu-22.04
+            pyver: '3.14'
+            cuda: '13.2.0'
+            rocm: ''
+            torch: '2.11.0'
+            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+          - os: windows-2022
+            pyver: '3.14'
+            cuda: '13.2.0'
+            rocm: ''
+            torch: '2.11.0'
+            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
         exclude:
           # No Torch 2.11 wheels for Python 3.10/3.11.
           - pyver: '3.10'
@@ -160,14 +198,101 @@ jobs:
             }
           }
 
+      - name: Install Windows CUDA 13.2
+        if: runner.os == 'Windows' && contains(matrix.cuda, '13.2')
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Download-WithRetry {
+            param(
+              [Parameter(Mandatory=$true)][string]$Url,
+              [Parameter(Mandatory=$true)][string]$OutFile,
+              [int]$MaxAttempts = 5
+            )
+
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+              try {
+                Write-Host "Downloading $Url (attempt $attempt/$MaxAttempts)"
+                curl.exe -fL --retry 5 --retry-delay 5 --retry-all-errors -o $OutFile $Url
+
+                if (-not (Test-Path $OutFile)) { throw "File was not created: $OutFile" }
+                $size = (Get-Item $OutFile).Length
+                if ($size -le 0) { throw "Downloaded file is empty: $OutFile" }
+
+                Write-Host "Downloaded $OutFile ($size bytes)"
+                return
+              }
+              catch {
+                Write-Warning "Download failed for $Url : $_"
+                if ($attempt -eq $MaxAttempts) { throw }
+                Start-Sleep -Seconds ([Math]::Min(60, 5 * $attempt))
+              }
+            }
+          }
+
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"
+          mkdir -p $cudaRoot
+          choco install unzip -y
+
+          $baseUrl = "https://developer.download.nvidia.com/compute/cuda/redist"
+          $packages = @(
+            "cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.2.51-archive.zip",
+            "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.2.51-archive.zip",
+            "cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.2.51-archive.zip",
+            "cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.2.51-archive.zip",
+            "libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.2.51-archive.zip",
+            "libnvptxcompiler/windows-x86_64/libnvptxcompiler-windows-x86_64-13.2.51-archive.zip",
+            "libcublas/windows-x86_64/libcublas-windows-x86_64-13.3.0.5-archive.zip",
+            "cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.2.20-archive.zip",
+            "cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.2.20-archive.zip",
+            "visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.2.20-archive.zip",
+            "cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-13.2.27-archive.zip",
+            "libcusparse/windows-x86_64/libcusparse-windows-x86_64-12.7.9.17-archive.zip",
+            "libcusolver/windows-x86_64/libcusolver-windows-x86_64-12.1.0.51-archive.zip",
+            "libcurand/windows-x86_64/libcurand-windows-x86_64-10.4.2.51-archive.zip",
+            "libcufft/windows-x86_64/libcufft-windows-x86_64-12.2.0.37-archive.zip"
+          )
+
+          foreach ($package in $packages) {
+            $fileName = Split-Path $package -Leaf
+            Download-WithRetry "$baseUrl/$package" $fileName
+          }
+
+          unzip '*.zip' -d $cudaRoot
+
+          foreach ($archiveDir in Get-ChildItem $cudaRoot -Directory -Filter '*-archive') {
+            xcopy "$($archiveDir.FullName)\*" "$cudaRoot" /E /I /H /Y
+          }
+
+          echo "$cudaRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "$cudaRoot\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "$cudaRoot\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "CUDA_PATH_V13_2=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $required = @(
+            "$cudaRoot\bin\nvcc.exe",
+            "$cudaRoot\bin\x64\nvrtc64_*.dll",
+            "$cudaRoot\include\crt\host_defines.h",
+            "$cudaRoot\nvvm\bin\cicc.exe",
+            "$cudaRoot\nvvm\bin\x64\nvvm64_*.dll",
+            "$cudaRoot\nvvm\libdevice\libdevice.10.bc",
+            "$cudaRoot\lib\x64\cublas.lib"
+          )
+          foreach ($pattern in $required) {
+            if (-not (Get-ChildItem $pattern -ErrorAction SilentlyContinue)) {
+              throw "Missing required CUDA file: $pattern"
+            }
+          }
+
       - name: Install Linux CUDA ${{ matrix.cuda }}
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit-Linux
         with:
           cuda: "${{ matrix.cuda }}"
           linux-local-args: '["--toolkit"]'
           method: "network"
-        if: runner.os != 'Windows' && matrix.cuda != ''
+        if: runner.os != 'Windows'
 
       - name: Install CUDA build dependencies
         if: matrix.cuda != ''
@@ -176,6 +301,9 @@ jobs:
           git config --system core.longpaths true
           $cudaVersion = '${{ matrix.cuda }}'
           $cudaVersionPytorch = '${{ matrix.cuda }}'.Remove('${{ matrix.cuda }}'.LastIndexOf('.')).Replace('.','')
+          if ($cudaVersion.StartsWith('13.')) {
+            $cudaVersionPytorch = '130'
+          }
           Write-Output "CUDA_VERSION_PYTORCH=$cudaVersionPytorch" >> "$env:GITHUB_OUTPUT"
           $pytorchIndexUrl = "https://download.pytorch.org/whl/cu$cudaVersionPytorch"
 
