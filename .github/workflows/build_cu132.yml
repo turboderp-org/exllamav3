@@ -31,6 +31,18 @@ jobs:
         include:
           # CUDA 13.2 wheels are only built for Python 3.13/3.14 with Torch 2.11.
           - os: ubuntu-22.04
+            pyver: '3.12'
+            cuda: '13.2.0'
+            rocm: ''
+            torch: '2.11.0'
+            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+          - os: windows-2022
+            pyver: '3.12'
+            cuda: '13.2.0'
+            rocm: ''
+            torch: '2.11.0'
+            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+          - os: ubuntu-22.04
             pyver: '3.13.3'
             cuda: '13.2.0'
             rocm: ''
