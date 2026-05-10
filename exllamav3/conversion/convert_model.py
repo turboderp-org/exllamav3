@@ -504,7 +504,7 @@ def main(args, job_state):
                             f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
                             "(OoM)   "
                         )
-                        proxy_err_label_local = "proxy_err" if not quant_args["q_fallback"] else "rmse"
+                        proxy_err_label_local = "proxy_err" if not quant_args_local["q_fallback"] else "rmse"
                         print(
                             f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
                             f"  bpw: {quant_args_local['K']:5.2f}"
