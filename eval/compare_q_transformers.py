@@ -7,17 +7,17 @@ class dummy:
     pass
 
 try:
-    from gptqmodel.nn_modules.qlinear.marlin import MarlinQuantLinear
-    from gptqmodel.nn_modules.qlinear.tritonv2 import TritonV2QuantLinear
-    from gptqmodel.nn_modules.qlinear.exllamav2 import ExllamaV2QuantLinear
-except ModuleNotFoundError:
+    from gptqmodel.nn_modules.qlinear.marlin_awq import AwqMarlinLinear
+    from gptqmodel.nn_modules.qlinear.tritonv2 import TritonV2Linear
+    from gptqmodel.nn_modules.qlinear.exllamav2 import ExllamaV2Linear
+except (ModuleNotFoundError, ImportError):
     MarlinQuantLinear = dummy
-    TritonV2QuantLinear = dummy
-    ExllamaV2QuantLinear = dummy
+    TritonV2Linear = dummy
+    ExllamaV2Linear = dummy
 
 try:
     from aqlm import QuantizedLinear
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     QuantizedLinear = dummy
 
 try:
@@ -32,8 +32,14 @@ except (ModuleNotFoundError, ImportError):
 
 try:
     from bitsandbytes.nn import Linear4bit
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     Linear4bit = dummy
+
+try:
+    import paroquant.inference.backends.transformers.quantizer
+    from paroquant.inference.backends.transformers.modules import RotateQuantizedLinear
+except (ModuleNotFoundError, ImportError, ValueError):
+    RotateQuantizedLinear = dummy
 
 def get_tensors_size(tensors):
     return 8 * sum(t.element_size() * t.numel() for t in tensors.values() if t is not None)
@@ -102,6 +108,15 @@ def get_storage_info(model):
             else:
                 sum_bits += get_tensor_size(module.weight)
                 sum_numel +=  module.weight.numel()
+        elif any(isinstance(module, x) for x in [RotateQuantizedLinear]):
+            sum_bits += get_tensors_size({
+                "pairs": module.pairs,
+                "qweight": module.qweight,
+                "qzeros": module.qzeros,
+                "scales": module.scales,
+                "theta": module.theta,
+            })
+            sum_numel += module.in_features * module.out_features
         elif any(isinstance(module, x) for x in [QuantizedLinear, VQuantLinear]):
             sum_bits += get_tensors_size(dict(module.named_parameters()))
             sum_numel += module.in_features * module.out_features
@@ -112,7 +127,7 @@ def get_storage_info(model):
                 "scales": module.scales,
             })
             sum_numel += module.in_features * module.out_features
-        elif any(isinstance(module, x) for x in [MarlinQuantLinear]):
+        elif any(isinstance(module, x) for x in [AwqMarlinLinear]):
             sum_bits += get_tensors_size({
                 "g_idx": module.g_idx,
                 "g_idx_sort_indices": module.g_idx_sort_indices,
@@ -121,7 +136,7 @@ def get_storage_info(model):
                 "scales": module.scales,
             })
             sum_numel += module.in_features * module.out_features
-        elif any(isinstance(module, x) for x in [TritonV2QuantLinear]):
+        elif any(isinstance(module, x) for x in [TritonV2Linear]):
             sum_bits += get_tensors_size({
                 "g_idx": module.g_idx,
                 "qweight": module.qweight,
@@ -129,7 +144,7 @@ def get_storage_info(model):
                 "scales": module.scales,
             })
             sum_numel += module.in_features * module.out_features
-        elif any(isinstance(module, x) for x in [ExllamaV2QuantLinear]):
+        elif any(isinstance(module, x) for x in [ExllamaV2Linear]):
             sum_bits += get_tensors_size(module.q_tensors)
             sum_numel += module.in_features * module.out_features
         elif module.__class__.__name__ == "Gemma4TextExperts":

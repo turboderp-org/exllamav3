@@ -40,7 +40,9 @@ def load_llamacpp(model_dir: str):
         logits_all = True,
         verbose = False,
         n_ctx = 3072,
-        n_gpu_layers = 999
+        n_gpu_layers = 999,
+        split_mode = llama_cpp.LLAMA_SPLIT_MODE_NONE,
+        main_gpu = 0,
     )
     return model, bpw_layer, bpw_head, vram_bits
 
@@ -49,4 +51,5 @@ def fwd_llamacpp(model_instance, input_ids: torch.Tensor):
     model_instance.reset()
     model_instance.eval(input_ids_list)
     logits = torch.from_numpy(model_instance.scores).unsqueeze(0).cuda()
+    logits = logits[:, :input_ids.shape[1]]
     return logits

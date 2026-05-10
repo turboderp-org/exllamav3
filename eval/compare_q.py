@@ -252,9 +252,9 @@ def plot(results, args):
             "EXL3": col("purple", "palevioletred"),
             "AWQ": col("olive", "tan"),
             "imat": col("brown", "darkorange"),
-            "GGUF": col("red", "tomato"),
+            "GGUF": col("red", "lightseagreen"),
             "VPTQ": col("blue", "cornflowerblue"),
-            "QTIP": col("teal", "lightseagreen"),
+            "QTIP": col("teal", "tomato"),
             "****": col("black", "silver"),
         }
         for k, v in d.items():
@@ -308,12 +308,12 @@ def plot(results, args):
         x = x,
         y = y,
         arrowprops = {"arrowstyle": "->", "color": col("lightgray", "dimgray")},
-        expand = (1.35, 2.3),
+        expand = (1.35, 2.35),
         ensure_inside_axes = True,
         min_arrow_len = 0.10,
         prevent_crossings = False,
         pull_threshold = 0.20,
-        # force_explode = (0.2, 0.6),
+        force_explode = (0.1, 0.2),
         max_move = 100
     )
 
