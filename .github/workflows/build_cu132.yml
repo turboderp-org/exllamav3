@@ -301,10 +301,13 @@ jobs:
           git config --system core.longpaths true
           $cudaVersion = '${{ matrix.cuda }}'
           $cudaVersionPytorch = '${{ matrix.cuda }}'.Remove('${{ matrix.cuda }}'.LastIndexOf('.')).Replace('.','')
+          $cudaVersionBuild = $cudaVersionPytorch
           if ($cudaVersion.StartsWith('13.')) {
             $cudaVersionPytorch = '130'
+            $cudaVersionBuild = $cudaVersion.Remove($cudaVersion.LastIndexOf('.')).Replace('.','')
           }
           Write-Output "CUDA_VERSION_PYTORCH=$cudaVersionPytorch" >> "$env:GITHUB_OUTPUT"
+          Write-Output "CUDA_VERSION_BUILD=$cudaVersionBuild" >> "$env:GITHUB_OUTPUT"
           $pytorchIndexUrl = "https://download.pytorch.org/whl/cu$cudaVersionPytorch"
 
           uv pip install torch==${{ matrix.torch }} --index-url $pytorchIndexUrl
@@ -385,7 +388,7 @@ jobs:
           }
 
           # --- Build wheel
-          $BUILDTAG = "+cu${{ steps.cuda_deps.outputs.CUDA_VERSION_PYTORCH }}-torch${{ matrix.torch }}"
+          $BUILDTAG = "+cu${{ steps.cuda_deps.outputs.CUDA_VERSION_BUILD }}-torch${{ matrix.torch }}"
           $env:BUILD_TARGET = "cuda"
           $env:TORCH_CUDA_ARCH_LIST = '${{ matrix.cudaarch }}'
 
