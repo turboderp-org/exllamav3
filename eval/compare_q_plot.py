@@ -533,7 +533,26 @@ def plot(results, args):
 
     df = pd.DataFrame(rows)
     groups = sorted(df["group"].unique())
-    palette = dict(zip(groups, sns.color_palette("tab10", n_colors = len(groups))))
+
+    # Reserve colors for some types
+    fixed_cols = {
+        "AWQ": 0,
+        "EXL3": 1,
+        "GGUF": 2,
+    }
+    cols = sns.color_palette("tab10", n_colors = 10)
+    unused = list(range(len(cols)))
+    palette = {}
+    for g in groups:
+        i = fixed_cols.get(g)
+        if i is not None:
+            palette[g] = cols[i]
+            unused.remove(i)
+    for g in groups:
+        if g not in fixed_cols:
+            i = unused.pop(0)
+            palette[g] = cols[i]
+
     group_counts = df["group"].value_counts()
     line_df = df[df["group"].map(group_counts) > 1].sort_values(["group", "x", "y", "point_label"])
 
