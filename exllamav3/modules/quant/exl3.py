@@ -111,8 +111,10 @@ class LinearEXL3:
 
         reconstruct = params.get("reconstruct")
         if not reconstruct:
-            dtype = out_dtype or self.default_out_dtype
-            return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
+            rows = x.numel() // x.shape[-1]
+            if rows <= 32:
+                dtype = out_dtype or self.default_out_dtype
+                return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
         shape = x.shape
         rows = x.numel() // shape[-1]
