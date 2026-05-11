@@ -23,6 +23,11 @@ except (ModuleNotFoundError, ImportError):
     ExllamaV2Linear = dummy
 
 try:
+    from auto_round_extension.cuda.gptqmodel_marlin import MarlinQuantLinear
+except (ModuleNotFoundError, ImportError):
+    MarlinQuantLinear = dummy
+
+try:
     from aqlm import QuantizedLinear
 except (ModuleNotFoundError, ImportError):
     QuantizedLinear = dummy
@@ -102,6 +107,7 @@ def get_storage_info(model):
     m_modules += h_modules
 
     for name, module in m_modules:
+        cls = type(module).__name__
         if any(isinstance(module, x) for x in [Linear4bit]):
             if module.out_features >= vocab_size * 0.9:  # this is foolproof
                 head_numel = module.in_features * module.out_features
@@ -171,6 +177,14 @@ def get_storage_info(model):
             num = sum(x.numel() for x in module.parameters())
             sum_numel += num
             sum_bits += num * 16
+        elif cls == "MarlinQuantLinear":
+            sum_bits += get_tensors_size({
+                "qweight": module.qweight,
+                "qzeros": module.qzeros,
+                "scales": module.scales,
+            })
+            sum_numel += module.in_features * module.out_features
+
     vram_bits = head_numel * head_bpw + sum_bits
     return sum_bits / sum_numel, head_bpw, vram_bits
 
