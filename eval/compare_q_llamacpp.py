@@ -32,14 +32,14 @@ def get_storage_info(model_dir):
     vram_bits = head_numel * head_bpw + sum_bits
     return sum_bits / sum_numel, head_bpw, vram_bits
 
-def load_llamacpp(model_dir: str):
+def load_llamacpp(model_dir: str, size: int = 2048):
     init_backend()
     bpw_layer, bpw_head, vram_bits = get_storage_info(model_dir)
     model = Llama(
         model_path = model_dir,
         logits_all = True,
         verbose = False,
-        n_ctx = 3072,
+        n_ctx = size,
         n_gpu_layers = 999,
         split_mode = llama_cpp.LLAMA_SPLIT_MODE_NONE,
         main_gpu = 0,

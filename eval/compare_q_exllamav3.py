@@ -23,7 +23,7 @@ def get_storage_info(model):
     vram_bits = head_numel * head_bpw + sum_bits
     return sum_bits / sum_numel, head_bpw, vram_bits
 
-def load_exllamav3(model_dir: str | list):
+def load_exllamav3(model_dir: str | list, size: int = 2048):
     if isinstance(model_dir, list):
         model_dir, override_tensors = model_dir
         config = Config.from_directory(model_dir)
@@ -31,7 +31,7 @@ def load_exllamav3(model_dir: str | list):
     else:
         config = Config.from_directory(model_dir)
     model = Model.from_config(config)
-    model.load(max_output_size = 2048, max_output_factor = 7, progressbar = True)
+    model.load(max_output_size = size, max_output_factor = 7, progressbar = True)
     bpw_layer, bpw_head, vram_bits = get_storage_info(model)
     return model, bpw_layer, bpw_head, vram_bits
 

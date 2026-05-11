@@ -144,9 +144,10 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
     print(f"Loading dataset: {data_spec['dataset']}")
     eval_ids = get_test_data(data_spec)
     rows = eval_ids.shape[0]
+    length = eval_ids.shape[1]
 
     print(f"Loading: {model_dir}")
-    model_instance, bpw_layer, bpw_head, vram_bits = load_fn(model_dir)
+    model_instance, bpw_layer, bpw_head, vram_bits = load_fn(model_dir, size = length + 512)
     vram_gb = vram_bits / 8 / 1024**3
 
     logprob_sum = 0.0

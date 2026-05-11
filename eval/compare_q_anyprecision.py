@@ -83,7 +83,7 @@ def get_storage_info(model):
     return sum_bits / sum_numel, head_bpw, vram_bits
 
 @torch.inference_mode
-def load_anyprecision(model_dir: str, auto = False, bf16 = False):
+def load_anyprecision(model_dir: str, auto = False, bf16 = False, size: int = 2048):
     model = AnyPrecisionForCausalLM.from_quantized(
         model_dir,
     )
