@@ -233,7 +233,7 @@ class Gemma3Model(Model):
     def __init__(
         self,
         config: Gemma3Config | Gemma3TextConfig,
-        key_prefix = "language_model.",
+        key_prefix = "language_model",
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -241,7 +241,7 @@ class Gemma3Model(Model):
         self.modules += [
             Embedding(
                 config = config,
-                key = key_prefix + "model.embed_tokens",
+                key = f"{key_prefix}.model.embed_tokens",
                 vocab_size = config.vocab_size,
                 hidden_size = config.hidden_size,
                 normalize = True,
@@ -253,17 +253,17 @@ class Gemma3Model(Model):
         self.modules += [
             TransformerBlock(
                 config = config,
-                key = key_prefix + f"model.layers.{idx}",
+                key = f"{key_prefix}.model.layers.{idx}",
                 layer_idx = idx,
                 attn_norm = RMSNorm(
                     config = config,
-                    key = key_prefix + f"model.layers.{idx}.input_layernorm",
+                    key = f"{key_prefix}.model.layers.{idx}.input_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                     constant_bias = 1.0,
                 ),
                 attn = Attention(
                     config = config,
-                    key = key_prefix + f"model.layers.{idx}.self_attn",
+                    key = f"{key_prefix}.model.layers.{idx}.self_attn",
                     layer_idx = idx,
                     hidden_size = config.hidden_size,
                     head_dim = config.head_dim,
@@ -280,33 +280,33 @@ class Gemma3Model(Model):
                     qmap = "block.attn",
                     q_norm = RMSNorm(
                         config = config,
-                        key = key_prefix + f"model.layers.{idx}.self_attn.q_norm",
+                        key = f"{key_prefix}.model.layers.{idx}.self_attn.q_norm",
                         rms_norm_eps = config.rms_norm_eps,
                         constant_bias = 1.0,
                     ),
                     k_norm = RMSNorm(
                         config = config,
-                        key = key_prefix + f"model.layers.{idx}.self_attn.k_norm",
+                        key = f"{key_prefix}.model.layers.{idx}.self_attn.k_norm",
                         rms_norm_eps = config.rms_norm_eps,
                         constant_bias = 1.0,
                     ),
                 ),
                 attn_post_norm = RMSNorm(
                     config = config,
-                    key = key_prefix + f"model.layers.{idx}.post_attention_layernorm",
+                    key = f"{key_prefix}.model.layers.{idx}.post_attention_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                     constant_bias = 1.0,
                     out_dtype = torch.float,
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
-                    key = key_prefix + f"model.layers.{idx}.pre_feedforward_layernorm",
+                    key = f"{key_prefix}.model.layers.{idx}.pre_feedforward_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                     constant_bias = 1.0,
                 ),
                 mlp = GatedMLP(
                     config = config,
-                    key = key_prefix + f"model.layers.{idx}.mlp",
+                    key = f"{key_prefix}.model.layers.{idx}.mlp",
                     hidden_size = config.hidden_size,
                     intermediate_size = config.intermediate_size,
                     key_up = "up_proj",
@@ -317,7 +317,7 @@ class Gemma3Model(Model):
                 ),
                 mlp_post_norm = RMSNorm(
                     config = config,
-                    key = key_prefix + f"model.layers.{idx}.post_feedforward_layernorm",
+                    key = f"{key_prefix}.model.layers.{idx}.post_feedforward_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                     constant_bias = 1.0,
                     out_dtype = torch.float,
@@ -331,16 +331,16 @@ class Gemma3Model(Model):
         self.modules += [
             RMSNorm(
                 config = config,
-                key = key_prefix + "model.norm",
+                key = f"{key_prefix}.model.norm",
                 rms_norm_eps = config.rms_norm_eps,
                 out_dtype = torch.half,
                 constant_bias = 1.0,
             ),
             Linear(
                 config = config,
-                key = key_prefix + "lm_head",
+                key = f"{key_prefix}.lm_head",
                 qbits_key = "head_bits",
-                alt_key = key_prefix + "model.embed_tokens",
+                alt_key = f"{key_prefix}.model.embed_tokens",
                 in_features = config.hidden_size,
                 out_features = config.vocab_size,
                 qmap = "block",
@@ -391,7 +391,7 @@ class Gemma3VisionModel(Model):
     def __init__(
         self,
         config: Gemma3Config,
-        key_prefix = "vision_tower.",
+        key_prefix = "vision_tower",
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -404,14 +404,14 @@ class Gemma3VisionModel(Model):
         self.modules += [
             Conv(
                 config = config,
-                key = key_prefix + "vision_model.embeddings.patch_embedding",
+                key = f"{key_prefix}.vision_model.embeddings.patch_embedding",
                 in_channels = config.vision.num_channels,
                 out_channels = config.vision.hidden_size,
                 kernel_size = (config.vision.patch_size, config.vision.patch_size),
             ),
             PosEmbedding(
                 config = config,
-                key = key_prefix + "vision_model.embeddings.position_embedding",
+                key = f"{key_prefix}.vision_model.embeddings.position_embedding",
                 hidden_size = config.vision.hidden_size,
             )
         ]
@@ -419,16 +419,16 @@ class Gemma3VisionModel(Model):
         self.modules += [
             TransformerBlock(
                 config = config,
-                key = key_prefix + f"vision_model.encoder.layers.{idx}",
+                key = f"{key_prefix}.vision_model.encoder.layers.{idx}",
                 layer_idx = idx,
                 attn_norm = LayerNorm(
                     config = config,
-                    key = key_prefix + f"vision_model.encoder.layers.{idx}.layer_norm1",
+                    key = f"{key_prefix}.vision_model.encoder.layers.{idx}.layer_norm1",
                     layernorm_eps = config.vision.layernorm_eps
                 ),
                 attn = Attention(
                     config = config,
-                    key = key_prefix + f"vision_model.encoder.layers.{idx}.self_attn",
+                    key = f"{key_prefix}.vision_model.encoder.layers.{idx}.self_attn",
                     layer_idx = idx,
                     hidden_size = config.vision.hidden_size,
                     head_dim = config.vision.head_dim,
@@ -443,12 +443,12 @@ class Gemma3VisionModel(Model):
                 ),
                 mlp_norm = LayerNorm(
                     config = config,
-                    key = key_prefix + f"vision_model.encoder.layers.{idx}.layer_norm2",
+                    key = f"{key_prefix}.vision_model.encoder.layers.{idx}.layer_norm2",
                     layernorm_eps = config.vision.layernorm_eps
                 ),
                 mlp = MLP(
                     config = config,
-                    key = key_prefix + f"vision_model.encoder.layers.{idx}.mlp",
+                    key = f"{key_prefix}.vision_model.encoder.layers.{idx}.mlp",
                     hidden_size = config.vision.hidden_size,
                     intermediate_size = config.vision.intermediate_size,
                     key_up = "fc1",
@@ -464,12 +464,12 @@ class Gemma3VisionModel(Model):
         self.modules += [
             LayerNorm(
                 config = config,
-                key = key_prefix + f"vision_model.post_layernorm",
+                key = f"{key_prefix}.vision_model.post_layernorm",
                 layernorm_eps = config.vision.layernorm_eps
             ),
             Gemma3MMPool(
                 config = config,
-                key = key_prefix + f"vision_model.mm_pool",
+                key = f"{key_prefix}.vision_model.mm_pool",
                 patches_per_image = int(config.vision.image_size // config.vision.patch_size),
                 tokens_per_side = int(config.vision.mm_tokens_per_image ** 0.5)
             ),

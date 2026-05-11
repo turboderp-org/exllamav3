@@ -120,9 +120,13 @@ class Mistral3Config(Config):
             patch_size = unpack_patch_size(read_dict(read_prep_config, object, ["patch_size"], no_default)),
         )
 
+
         assert self.vision.patch_size == self.vision_pp.patch_size, \
             "Vision model and vision preprocessor patch sizes do not match"
 
+        # New style:  model.language_model.embed_tokens.weight
+        # Old style:  language_model.model.embed_tokens.weight
+        self.new_key_style = self.stc.has_tensor("model.language_model.embed_tokens.weight")
 
 class Mistral3Model(Model):
     config_class = Mistral3Config
@@ -135,30 +139,39 @@ class Mistral3Model(Model):
     ):
         super().__init__(config, **kwargs)
 
+        # Auto-detect key naming convention
+        if config.new_key_style:
+            # New keys: model.language_model.{name}
+            lm = "model.language_model."
+            head = "lm_head"
+        else:
+            # Original keys: language_model.model.{name}
+            lm = key_prefix + "model."
+            head = key_prefix + "lm_head"
+
         self.modules += [
             Embedding(
                 config = config,
-                key = key_prefix + "model.embed_tokens",
+                key = f"{lm}.embed_tokens",
                 vocab_size = config.vocab_size,
                 hidden_size = config.hidden_size,
             )
         ]
 
         self.first_block_idx = len(self.modules)
-
         self.modules += [
             TransformerBlock(
                 config = config,
-                key = key_prefix + f"model.layers.{idx}",
+                key = f"{lm}.layers.{idx}",
                 layer_idx = idx,
                 attn_norm = RMSNorm(
                     config = config,
-                    key = key_prefix + f"model.layers.{idx}.input_layernorm",
+                    key = f"{lm}.layers.{idx}.input_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                 ),
                 attn = Attention(
                     config = config,
-                    key = key_prefix + f"model.layers.{idx}.self_attn",
+                    key = f"{lm}.layers.{idx}.self_attn",
                     layer_idx = idx,
                     hidden_size = config.hidden_size,
                     head_dim = config.head_dim,
@@ -175,12 +188,12 @@ class Mistral3Model(Model):
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
-                    key = key_prefix + f"model.layers.{idx}.post_attention_layernorm",
+                    key = f"{lm}.layers.{idx}.post_attention_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                 ),
                 mlp = GatedMLP(
                     config = config,
-                    key = key_prefix + f"model.layers.{idx}.mlp",
+                    key = f"{lm}.layers.{idx}.mlp",
                     hidden_size = config.hidden_size,
                     intermediate_size = config.intermediate_size,
                     key_up = "up_proj",
@@ -197,19 +210,19 @@ class Mistral3Model(Model):
         self.last_kv_module_idx = len(self.modules) - 1
 
         head_alt_key = None
-        if config.tie_word_embeddings and not self.config.stc.has_tensor(key_prefix + "lm_head"):
-            head_alt_key = key_prefix + "model.embed_tokens"
+        if config.tie_word_embeddings and not self.config.stc.has_tensor(head):
+            head_alt_key = f"{lm}.embed_tokens"
 
         self.modules += [
             RMSNorm(
                 config = config,
-                key = key_prefix + "model.norm",
+                key = f"{lm}.norm",
                 rms_norm_eps = config.rms_norm_eps,
                 out_dtype = torch.half,
             ),
             Linear(
                 config = config,
-                key = key_prefix + "lm_head",
+                key = head,
                 qbits_key = "head_bits",
                 alt_key = head_alt_key,
                 in_features = config.hidden_size,
@@ -218,9 +231,7 @@ class Mistral3Model(Model):
                 caps = {"logits_output": True}
             )
         ]
-
         self.logit_layer_idx = len(self.modules) - 1
-
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
@@ -237,36 +248,50 @@ class Mistral3Model(Model):
         return p
 
 
-class Mistral3VisionModel(Model):
 
+class Mistral3VisionModel(Model):
     @staticmethod
     @override
     def get_additional_compiled_tensors(config: Mistral3Config) -> dict:
+        # Try both prefixes
         vlm_tensors = config.stc.list_tensors(prefix = "vision_tower")
+        if not vlm_tensors:
+            vlm_tensors = config.stc.list_tensors(prefix = "model.vision_tower")
         mmp_tensors = config.stc.list_tensors(prefix = "multi_modal_projector")
+        if not mmp_tensors:
+            mmp_tensors = config.stc.list_tensors(prefix = "model.multi_modal_projector")
         return vlm_tensors | mmp_tensors
 
     def __init__(
         self,
         config: Mistral3Config,
-        key_prefix = "vision_tower.",
+        key_prefix = "vision_tower",
         **kwargs
     ):
         super().__init__(config, **kwargs)
         self.config = config
+
+        # Auto-detect key naming convention
+        if config.new_key_style:
+            vt = "model.vision_tower"
+            mmp = "model.multi_modal_projector"
+        else:
+            vt = key_prefix
+            mmp = "multi_modal_projector"
+
         self.caps.update({"image_input": True})
 
         self.modules += [
             Conv(
                 config = config,
-                key = key_prefix + "patch_conv",
+                key = f"{vt}.patch_conv",
                 in_channels = config.vision.num_channels,
                 out_channels = config.vision.hidden_size,
                 kernel_size = (config.vision.patch_size, config.vision.patch_size),
             ),
-             RMSNorm(
+            RMSNorm(
                 config = config,
-                key = key_prefix + f"ln_pre",
+                key = f"{vt}.ln_pre",
                 rms_norm_eps = config.rms_norm_eps,
             )
         ]
@@ -274,16 +299,16 @@ class Mistral3VisionModel(Model):
         self.modules += [
             TransformerBlock(
                 config = config,
-                key = key_prefix + f"transformer.layers.{idx}",
+                key = f"{vt}.transformer.layers.{idx}",
                 layer_idx = idx,
                 attn_norm = RMSNorm(
                     config = config,
-                    key = key_prefix + f"transformer.layers.{idx}.attention_norm",
+                    key = f"{vt}.transformer.layers.{idx}.attention_norm",
                     rms_norm_eps = config.vision.rms_norm_eps
                 ),
                 attn = Attention(
                     config = config,
-                    key = key_prefix + f"transformer.layers.{idx}.attention",
+                    key = f"{vt}.transformer.layers.{idx}.attention",
                     layer_idx = idx,
                     hidden_size = config.vision.hidden_size,
                     head_dim = config.vision.head_dim,
@@ -301,12 +326,12 @@ class Mistral3VisionModel(Model):
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
-                    key = key_prefix + f"transformer.layers.{idx}.ffn_norm",
+                    key = f"{vt}.transformer.layers.{idx}.ffn_norm",
                     rms_norm_eps = config.vision.rms_norm_eps
                 ),
                 mlp = GatedMLP(
                     config = config,
-                    key = key_prefix + f"transformer.layers.{idx}.feed_forward",
+                    key = f"{vt}.transformer.layers.{idx}.feed_forward",
                     hidden_size = config.vision.hidden_size,
                     intermediate_size = config.vision.intermediate_size,
                     key_gate = "gate_proj",
@@ -323,20 +348,20 @@ class Mistral3VisionModel(Model):
         self.modules += [
             RMSNorm(
                 config = config,
-                key = f"multi_modal_projector.norm",
+                key = f"{mmp}.norm",
                 rms_norm_eps = config.vision.rms_norm_eps,
                 out_dtype = torch.half,
             ),
             Mistral3PatchMerger(
                 config = config,
-                key = "multi_modal_projector.patch_merger",
+                key = f"{mmp}.patch_merger",
                 hidden_size = config.vision.hidden_size,
                 merge = config.vision.spatial_merge_size,
                 out_dtype = torch.half,
             ),
             MLP(
                 config = config,
-                key = "multi_modal_projector",
+                key = mmp,
                 key_up = "linear_1",
                 key_down = "linear_2",
                 hidden_size = config.vision.hidden_size,

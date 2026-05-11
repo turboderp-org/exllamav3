@@ -41,6 +41,9 @@ class Ministral3Config(Config):
         # RoPE
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
+        # For Mistral3
+        self.new_key_style = False
+
 
 class Ministral3Model(Mistral3Model):
     config_class = Ministral3Config
