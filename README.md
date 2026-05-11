@@ -74,7 +74,6 @@ Always adding more, stay tuned.
 
 Currently on the to-do list:
 
-- LoRA support
 - ROCm support
 
 As for what is implemented, expect that some things may be a little broken at first. Please be patient, raise issues and/or contribute. 👉👈 
