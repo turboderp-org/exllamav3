@@ -105,20 +105,122 @@ def save_tensor(tensor, filename: str):
 
 # Tokenize ppl test data
 
+DATASET_ALIASES = {
+    "wiki2": {
+        "path": "wikitext",
+        "name": "wikitext-2-raw-v1",
+        "split": "test",
+        "text_column": "text",
+    },
+    "wikitext2": {
+        "path": "wikitext",
+        "name": "wikitext-2-raw-v1",
+        "split": "test",
+        "text_column": "text",
+    },
+    "wiki103": {
+        "path": "wikitext",
+        "name": "wikitext-103-raw-v1",
+        "split": "test",
+        "text_column": "text",
+    },
+    "wikitext103": {
+        "path": "wikitext",
+        "name": "wikitext-103-raw-v1",
+        "split": "test",
+        "text_column": "text",
+    },
+    "ptb": {
+        "path": "ptb_text_only",
+        "name": "penn_treebank",
+        "split": "test",
+        "text_column": "sentence",
+    },
+    "lambada": {
+        "path": "EleutherAI/lambada_openai",
+        "name": None,
+        "split": "test",
+        "text_column": "text",
+    },
+    "tinystories": {
+        "path": "roneneldan/TinyStories",
+        "name": None,
+        "split": "validation",
+        "text_column": "text",
+    },
+    "c4": {
+        "path": "allenai/c4",
+        "name": "en",
+        "split": "validation",
+        "text_column": "text",
+    },
+    "openwebtext10k": {
+        "path": "stas/openwebtext-10k",
+        "name": None,
+        "split": "val",
+        "text_column": "text",
+    },
+    "openwebtext": {
+        "path": "Skylion007/openwebtext",
+        "name": None,
+        "split": "train[:1000]",
+        "text_column": "text",
+    },
+    "fineweb": {
+        "path": "HuggingFaceFW/fineweb",
+        "name": "sample-10BT",
+        "split": "train[:1000]",
+        "text_column": "text",
+    },
+    "fineweb-edu": {
+        "path": "HuggingFaceFW/fineweb-edu",
+        "name": "sample-10BT",
+        "split": "train[:1000]",
+        "text_column": "text",
+    },
+}
+
+
+def get_dataset_text(spec: dict) -> str:
+    dataset = spec["dataset"]
+    dataset_spec = DATASET_ALIASES.get(dataset.lower(), {})
+    path = spec.get("dataset_path", dataset_spec.get("path", dataset))
+    name = spec.get("dataset_name", dataset_spec.get("name"))
+    split = spec.get("dataset_split", spec.get("split", dataset_spec.get("split", "test")))
+    text_column = spec.get("text_column", dataset_spec.get("text_column", "text"))
+    max_text_rows = spec.get("max_text_rows", spec.get("max_dataset_rows", 0))
+
+    print(f"Loading text dataset: {path}" + (f"/{name}" if name else "") + f" ({split})")
+    if name is None:
+        ds = load_dataset(path, split = split)
+    else:
+        ds = load_dataset(path, name, split = split)
+
+    if text_column not in ds.column_names:
+        raise ValueError(
+            f"Dataset '{dataset}' does not have text column '{text_column}'. "
+            f"Available columns: {', '.join(ds.column_names)}"
+        )
+
+    texts = ds[text_column]
+    if max_text_rows:
+        texts = texts[:max_text_rows]
+    texts = [t for t in texts if isinstance(t, str) and t.strip()]
+    if not texts:
+        raise ValueError(f"Dataset '{dataset}' produced no non-empty text rows")
+    return "\n\n".join(texts)
+
+
 @disk_lru_cache("get_dataset")
 def get_test_data(spec: dict):
     tokenize_fn = tokenize_fns[spec["tokenize_fn"]]
     template_fn = template_fns[spec["tokenize_fn"]] if spec.get("chat_template") else None
-    assert spec["dataset"] == "wiki2", "Only wiki2 implemented atm"
     eval_stride = spec["eval_stride"]
     eval_len = spec["eval_len"]
     max_rows = spec.get("max_rows", 0)
     eval_tokens = tokenize_fn(
         spec["tokenizer_dir"],
-        "\n\n".join(
-            load_dataset("wikitext", "wikitext-2-raw-v1", split = "test")
-            ["text"]
-        )
+        get_dataset_text(spec)
     )
     num_tokens = eval_tokens.shape[-1]
     seqs = []
