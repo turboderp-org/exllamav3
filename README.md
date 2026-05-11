@@ -12,6 +12,7 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
 - Speculative decoding
 - 2-8 bit cache quantization
 - Multimodal support
+- LoRA support
 
 The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://github.com/theroyallab/tabbyAPI/), which provides an OpenAI-compatible API for local or remote inference, with extended features like HF model downloading, embedding model support and support for HF Jinja2 chat templates.
 
