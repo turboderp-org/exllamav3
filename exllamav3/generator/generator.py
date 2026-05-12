@@ -685,7 +685,7 @@ class Generator:
 
                         # Rewind recurrent states
                         if rejected and states:
-                            for layer, state in states[idx].items():
+                            for layer, state in states[j].items():
                                 assert len(job.sequences) == 1
                                 state.rewind(rejected)
 
