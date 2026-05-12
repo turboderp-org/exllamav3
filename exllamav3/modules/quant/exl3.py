@@ -6,6 +6,8 @@ from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
 from ...util import profile_opt
 
+AUTO_RECONSTRUCT_THRESHOLD = 144
+
 class LinearEXL3:
 
     quant_type: str = "exl3"
@@ -112,7 +114,7 @@ class LinearEXL3:
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
-            if rows <= 32:
+            if rows <= AUTO_RECONSTRUCT_THRESHOLD:
                 dtype = out_dtype or self.default_out_dtype
                 return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 

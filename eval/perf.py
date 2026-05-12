@@ -34,6 +34,8 @@ def get_lengths(max_length):
 def measure_prefill(args, model, cache, warmup = False):
     chunk_size = args.chunk_size
     lengths = get_lengths(chunk_size if warmup else args.max_length)
+    if args.short_prefill:
+        lengths = list(range(lengths[0])) + lengths
 
     progress = 0
     results = {}
@@ -142,5 +144,6 @@ if __name__ == "__main__":
     parser.add_argument("-chunk_size", "--chunk_size", type = int, help = "Max chunk size (default: 4096)", default = 4096)
     parser.add_argument("-spf", "--skip_prefill", action = "store_true", help = "Skip measuring prefill speed")
     parser.add_argument("-swu", "--skip_warmup", action = "store_true", help = "Skip warmup passes")
+    parser.add_argument("-short", "--short_prefill", action = "store_true", help = "Test short-prefill/batch throughput")
     _args = parser.parse_args()
     main(_args)
