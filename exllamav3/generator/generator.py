@@ -617,6 +617,11 @@ class Generator:
             params = params,
         )
 
+        # Don't keep recurrent states in params longer than needed
+        p_export_states = params.get("export_states")
+        p_cache_seqlens = params.get("cache_seqlens")
+        params = None
+
         # Split batched recurrent states
         if self.recurrent_cache is not None:
             if batch_size > 1:
@@ -718,18 +723,25 @@ class Generator:
                         job.prepare_logit_mask()
                         job.prepare_sampling_past_ids()
 
-            j += 1
             accepted_lengths.append(accepted_length)
+
+            # Drop recurrent state histories
+            if states:
+                for layer, state in states[j].items():
+                    state.drop_history()
+
+            j += 1
+
 
         # Accept new target_hidden if DFlash
         if self.dflash_draft:
             self.draft_model.update_kv_from_target(
-                target_hidden = params.get("export_states"),
+                target_hidden = p_export_states,
                 cache = self.draft_cache,
                 lengths = accepted_lengths,
                 params = {
                     "block_table": block_index,
-                    "cache_seqlens": params["cache_seqlens"],
+                    "cache_seqlens": p_cache_seqlens,
                 }
             )
 

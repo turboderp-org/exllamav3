@@ -55,6 +55,10 @@ class CacheableState(ABC):
     def rewind(self, count: int):
         pass
 
+    @abstractmethod
+    def drop_history(self):
+        pass
+
 
 class RecurrentCache(OrderedDict):
     def __init__(
