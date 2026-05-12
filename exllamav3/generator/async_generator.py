@@ -23,7 +23,9 @@ class AsyncGenerator:
                 results = self.generator.iterate()
                 for result in results:
                     job = result["job"]
-                    async_job = self.jobs[job]
+                    async_job = self.jobs.get(job)
+                    if not async_job:
+                        continue
                     await async_job.put_result(result)
                     if result["eos"]:
                         del self.jobs[job]
