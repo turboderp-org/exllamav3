@@ -287,6 +287,10 @@ class GDN_RecurrentState(CacheableState):
         self.last_conv_state[0].copy_(self.conv_history[0, :, -count - cdim : -count])
         self.position -= count
 
+    @override
+    def drop_history(self):
+        self.history = None
+        self.conv_history = None
 
 class GatedDeltaNet(Module):
 

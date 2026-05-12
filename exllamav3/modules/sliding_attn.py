@@ -140,6 +140,10 @@ class SWA_RecurrentState(CacheableState):
         assert count <= self.position - self.window_beg
         self.position -= count
 
+    @override
+    def drop_history(self):
+        pass
+
 
 class SlidingAttention(Module):
 
