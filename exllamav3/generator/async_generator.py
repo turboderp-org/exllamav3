@@ -69,7 +69,7 @@ class AsyncJob:
     def __init__(self, generator: AsyncGenerator, *args: object, **kwargs: object):
         self.generator = generator
         self.job = Job(*args, **kwargs)
-        self.queue = asyncio.Queue()
+        self.queue = asyncio.Queue(maxsize=16)
         self.generator.enqueue(self)
         self.cancelled = False
 
