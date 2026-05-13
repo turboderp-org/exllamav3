@@ -66,7 +66,7 @@ def _set_theme(dark):
                 "axes.edgecolor": "#4b515c",
                 "axes.labelcolor": "#e6e8eb",
                 "axes.titlecolor": "#f1f3f5",
-                "grid.color": "#3a3f47",
+                "grid.color": "#303238",
                 "text.color": "#e6e8eb",
                 "xtick.color": "#c8ccd2",
                 "ytick.color": "#c8ccd2",
@@ -500,8 +500,14 @@ def _add_point_labels(fig, ax, rows, line_df, dark, palette):
 def plot(results, args):
     x_key = "vram_gb" if args.vram else "layer_bpw"
     y_key = "kld" if args.kld else "ppl"
-    x_label = "VRAM // GB (decoder + head)" if args.vram else "bits per weight (decoder only)"
-    y_label = "KL divergence" if args.kld else "Perplexity"
+    x_label = (
+        r"Quantized weight size $|W_q|$ / GiB (excl. embeddings, incl. output head)" if args.vram else
+        r"Bits per weight (excl. embeddings and output head)"
+    )
+    y_label = (
+        r"KL divergence, $D_{\mathrm{KL}}(p_{\mathrm{FP}} \parallel p_{\mathrm{quant}})$" if args.kld else
+        r"Perplexity"
+    )
 
     rows = []
     for r in results:
@@ -614,11 +620,13 @@ def plot(results, args):
     ax.set_ylabel(y_label)
     ax.xaxis.label.set_size(14)
     ax.yaxis.label.set_size(14)
+    if args.kld:
+        ax.yaxis.label.set_verticalalignment("center")
     tick_color = "#8e949d" if args.dark else "#5f6670"
     ax.tick_params(axis = "both", which = "major", labelsize = 13, colors = tick_color)
     ax.set_title(args.title, pad = 22)
     ax.margins(x = 0.08, y = 0.12)
-    sns.despine(ax = ax)
+    sns.despine(ax = ax, left = True, bottom = True)
 
     _add_point_labels(fig, ax, rows, line_df, args.dark, palette)
 
