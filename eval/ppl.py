@@ -8,8 +8,8 @@ from exllamav3.util.misc import prepend_hf_chat_context
 from exllamav3 import model_init, Tokenizer, Config
 from datasets import load_dataset
 from exllamav3.util.memory import free_mem
+from exllamav3.util.measures import compute_target_log_probs
 import torch
-import torch.nn.functional as F
 import math
 
 
@@ -109,15 +109,13 @@ def eval_gguf(model, config, tokenizer, args, forward_fn):
 
         input_ids = torch.tensor([chunk_tokens], dtype=torch.long)
         logits = forward_fn(model, input_ids)
-        logits = logits[0, :, :tokenizer.actual_vocab_size].float()
 
-        score_logits = logits[first : n_ctx - 1]  # [n_ctx - 1 - first, vocab]
+        score_logits = logits[0, first : n_ctx - 1]  # [n_ctx - 1 - first, vocab]
         score_tokens = tokens[start + first + 1 : start + n_ctx]
         score_tokens = torch.tensor(score_tokens, dtype = torch.long, device = score_logits.device)
 
-        # Compute per-token NLL via log-softmax (matches llama.cpp's log_softmax function: logit[tok] - max - log(sum_exp))
-        log_probs = F.log_softmax(score_logits, dim=-1)
-        token_nlls = -log_probs[torch.arange(len(score_tokens), device=logits.device), score_tokens]
+        # Matches llama.cpp's log_softmax function: logit[tok] - max - log(sum_exp)
+        token_nlls = -compute_target_log_probs(score_logits, score_tokens, tokenizer.actual_vocab_size)
 
         nll_sum = token_nlls.sum().item()
         nll2_sum = (token_nlls * token_nlls).sum().item()
@@ -162,16 +160,13 @@ def eval_default(model, config, tokenizer, args, forward_fn):
             pb.update(row)
             input_ids = eval_ids[row:row + 1, :]
             logits = forward_fn(model, input_ids)
-            logits = logits[:, :-1, :vocab_size].float()
-            logits += 1e-10
-            log_probs = F.log_softmax(logits, dim = -1)
-            del logits
-            target_ids = input_ids[:, 1:].to(log_probs.device)
+            logits = logits[:, :-1, :]
+            target_ids = input_ids[:, 1:].to(logits.device)
             del input_ids
-            target_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+            target_log_probs = compute_target_log_probs(logits, target_ids, vocab_size)
             logprob_sum += target_log_probs.sum().item()
             logprob_count += target_ids.numel()
-            del log_probs
+            del logits
             del target_log_probs
             del target_ids
             torch.cuda.empty_cache()

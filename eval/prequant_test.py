@@ -6,13 +6,13 @@ from exllamav3.util.file import disk_lru_cache
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.memory import free_mem
 from exllamav3.util.misc import prepend_hf_chat_context
+from exllamav3.util.measures import compute_target_log_probs
 from exllamav3 import Config, Model, Tokenizer
 from exllamav3.ext import exllamav3_ext as ext
 from datasets import load_dataset
 from exllamav3.modules import Linear
 from exllamav3.modules.quant.exl3_lib.quantize import regularize
 import torch
-import torch.nn.functional as F
 import math
 
 # ANSI codes
@@ -321,15 +321,13 @@ def main(args):
             pb.update(row)
             input_ids = eval_ids[row:row + 1, :]
             logits = state[row:row+1, ...]
-            logits = logits[:, :-1, :vocab_size].float()
-            log_probs = F.log_softmax(logits, dim = -1)
-            del logits
-            target_ids = input_ids[:, 1:].to(log_probs.device)
+            logits = logits[:, :-1, :]
+            target_ids = input_ids[:, 1:].to(logits.device)
             del input_ids
-            target_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+            target_log_probs = compute_target_log_probs(logits, target_ids, vocab_size)
             logprob_sum += target_log_probs.sum().item()
             logprob_count += target_ids.numel()
-            del log_probs
+            del logits
             del target_log_probs
             del target_ids
             torch.cuda.empty_cache()

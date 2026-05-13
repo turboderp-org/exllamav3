@@ -1,7 +1,7 @@
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
-import torch.nn.functional as F
+from exllamav3.util.measures import compute_kl_div, compute_target_log_probs
 from exllamav3.util.file import disk_lru_cache, disk_lru_cache_clear
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.memory import free_mem
@@ -277,38 +277,29 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
             pb.update(row)
             input_ids = eval_ids[row:row + 1, :]
             logits = fwd_fn(model_instance, input_ids)
-            logits = logits.float()[..., -eval_len:, :]
+            logits = logits[..., -eval_len:, :]
 
             # kld
             if logits_file and row < 10:
-                probs_a = torch.softmax(logits, dim = -1)
                 if collect_logits:
-                    ref_logits.append(logits.cpu())
+                    ref_logits.append(logits.float().cpu())
                     kl_div_count += 1
                 else:
-                    probs_b = torch.softmax(ref_logits[row].to(logits.device), dim = -1)
-                    vs = min(probs_a.shape[-1], probs_b.shape[-1])
-                    probs_a = probs_a[..., :vs]
-                    probs_b = probs_b[..., :vs]
-                    for r in range(probs_a.shape[1]):
-                        kl_div = F.kl_div(torch.log(probs_a[:, r:r+1, :] + 1e-10), probs_b[:, r:r+1, :], reduction = 'sum')
-                        kl_div_sum_ab += kl_div.item()
-                        kl_div_count += 1
+                    ref = ref_logits[row].to(logits.device)
+                    vs = min(logits.shape[-1], ref.shape[-1])
+                    kl_div = compute_kl_div(logits, ref, vs)
+                    kl_div_sum_ab += kl_div.sum().item()
+                    kl_div_count += kl_div.numel()
                     del kl_div
-                    del probs_b
-                del probs_a
 
             # ppl
             logits = logits[:, :-1, :]
-            logits += 1e-10
-            log_probs = F.log_softmax(logits, dim = -1)
-            del logits
-            target_ids = input_ids[:, -eval_len:][:, 1:].to(log_probs.device)
+            target_ids = input_ids[:, -eval_len:][:, 1:].to(logits.device)
             del input_ids
-            target_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-            del log_probs
+            target_log_probs = compute_target_log_probs(logits, target_ids, logits.shape[-1])
             logprob_sum += target_log_probs.sum().item()
             logprob_count += target_ids.numel()
+            del logits
             del target_log_probs
             del target_ids
             torch.cuda.empty_cache()

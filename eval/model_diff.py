@@ -5,13 +5,12 @@ import argparse
 from exllamav3.util.file import disk_lru_cache
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.memory import free_mem
-from exllamav3.util.measures import cosine_error, sqnr
+from exllamav3.util.measures import compute_kl_div, compute_target_log_probs, cosine_error, sqnr
 from exllamav3.util.misc import prepend_hf_chat_context
 from exllamav3 import Config, Model, Tokenizer
 from exllamav3.loader import SafetensorsCollection, VariantSafetensorsCollection
 from datasets import load_dataset
 import torch
-import torch.nn.functional as F
 import math
 import yaml
 from safetensors.torch import save_file
@@ -41,7 +40,7 @@ def get_dataset_text(spec: dict):
     return dataset_text
 
 
-def get_test_tokens(tokenizer, rows, eval_len = 2048, eval_stride = 512):
+def get_test_tokens(tokenizer, rows, eval_len = 2048, eval_stride = 2048):
     with ProgressBar("Tokenizing", rows) as pb:
         dataset_spec = { "dataset": "wiki2" }
         eval_tokens = tokenizer.encode(get_dataset_text(dataset_spec))
@@ -56,18 +55,17 @@ def get_test_tokens(tokenizer, rows, eval_len = 2048, eval_stride = 512):
     return torch.cat(seqs, dim = 0)[:, :]
 
 
-def ppl(input_ids_, logits_):
+def ppl(input_ids_, logits_, vocab_size_):
     logprob_sum_ = 0.0
     logprob_count_ = 0
-    chunksize = logits_.shape[1] * 10240 // logits_.shape[1]
+    chunksize = 10240
     b_ = 0
-    while b_ < logits_.shape[1]:
+    while b_ < logits_.shape[0]:
         a_ = b_
-        b_ = min(b_ + chunksize, logits_.shape[1])
-        logits_f = logits_[a_:b_, :].float() + 1e-10
+        b_ = min(b_ + chunksize, logits_.shape[0])
+        logits_f = logits_[a_:b_, :]
         target_ids = input_ids_[a_ + 1:b_ + 1].to(logits_.device)
-        log_probs = F.log_softmax(logits_f, dim = -1)
-        token_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+        token_log_probs = compute_target_log_probs(logits_f, target_ids, vocab_size_)
         logprob_sum_ += token_log_probs.sum().item()
         logprob_count_ += target_ids.numel()
     return logprob_sum_, logprob_count_
@@ -86,6 +84,7 @@ def main(args):
     config_b = Config.from_directory(args.model_b)
     config_b.override_dynamic_seq_len(2048)
     model_b = Model.from_config(config_b)
+    vocab_size = tokenizer.actual_vocab_size
 
     # Override tensors
     if args.override:
@@ -213,7 +212,7 @@ def main(args):
 
                     for i in [0, 1]:
                         logits = x[i][:-1, :]
-                        logprob_sum__, logprob_count__ = ppl(input_ids, logits)
+                        logprob_sum__, logprob_count__ = ppl(input_ids, logits, vocab_size)
                         logprob_sum[i] += logprob_sum__
                         logprob_count[i] += logprob_count__
 
@@ -237,13 +236,9 @@ def main(args):
                         topk_agreement_sum[t] += row_hits.sum().item()
                         topk_agreement_count[t] += top_slice_a.shape[0]
 
-                    epsilon = 1e-10
-                    probs_a = torch.softmax(x[0].float(), dim = -1)
-                    probs_b = torch.softmax(x[1].float(), dim = -1)
-                    kl_div = F.kl_div(torch.log(probs_a + epsilon), probs_b, reduction = 'none')
-                    kl_div_sum_ab += kl_div.sum(dim = -1).mean().item()
-                    kl_div = F.kl_div(torch.log(probs_b + epsilon), probs_a, reduction = 'none')
-                    kl_div_sum_ba += kl_div.sum(dim = -1).mean().item()
+                    kl_vocab_size = min(vocab_size, x[0].shape[-1], x[1].shape[-1])
+                    kl_div_sum_ab += compute_kl_div(x[0], x[1], kl_vocab_size).mean().item()
+                    kl_div_sum_ba += compute_kl_div(x[1], x[0], kl_vocab_size).mean().item()
 
         # Print error
         if not logits_layer:
