@@ -7,6 +7,8 @@ from ...util.tensor import g_tensor_cache
 from ...util import profile_opt
 
 AUTO_RECONSTRUCT_THRESHOLD = 144
+MAX_RECONSTRUCT_SLICE_N = 32768
+RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
 class LinearEXL3:
 
@@ -118,24 +120,7 @@ class LinearEXL3:
                 dtype = out_dtype or self.default_out_dtype
                 return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
-        shape = x.shape
-        rows = x.numel() // shape[-1]
-        out_features = self.out_features
-        out_shape = shape[:-1] + (out_features,)
-        x = x.view(rows, self.in_features)
-        y = torch.empty(out_shape, dtype = out_dtype or self.default_out_dtype, device = x.device)
-
-        y_ = y.view(rows, out_features)
-        xh = torch.empty_like(x)
-        ext.had_r_128(x, xh, self.suh, None, 1.0)
-        w = self.get_inner_weight_tensor()
-        ext.hgemm(xh, w, y_)
-        ext.had_r_128(y_, y_, None, self.svh, 1.0)
-        if self.bias is not None:
-            y += self.bias
-        y = y.view(out_shape)
-
-        return y
+        return self.reconstruct_hgemm(x, out_dtype)
 
 
     def unpack_bf(self, bitfield: torch.Tensor):
@@ -153,6 +138,45 @@ class LinearEXL3:
         return expanded.contiguous().to(device)
 
 
+    def reconstruct_hgemm(self, x: torch.Tensor, out_dtype):
+
+        shape = x.shape
+        rows = x.numel() // shape[-1]
+        out_shape = shape[:-1] + (self.out_features,)
+        x = x.view(rows, self.in_features)
+        y = torch.empty(out_shape, dtype = out_dtype or self.default_out_dtype, device = x.device)
+
+        y_ = y.view(rows, self.out_features)
+        xh = torch.empty_like(x)
+        ext.had_r_128(x, xh, self.suh, None, 1.0)
+
+        if self.out_features <= MAX_RECONSTRUCT_SLICE_N:
+            w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
+            ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
+            ext.hgemm(xh, w, y_)
+        else:
+            numel_ = self.in_features * MAX_RECONSTRUCT_SLICE_N
+            w_ = torch.empty((numel_,), dtype = torch.half, device = self.trellis.device)
+            for n_start in range(0, self.out_features, MAX_RECONSTRUCT_SLICE_N):
+                n_end = min(n_start + MAX_RECONSTRUCT_SLICE_N, self.out_features)
+                numel = self.in_features * (n_end - n_start)
+                w = w_[:numel].view(self.in_features, n_end - n_start)
+                ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
+                ext.hgemm(xh, w, y_[:, n_start:n_end])
+
+        ext.had_r_128(y_, y_, None, self.svh, 1.0)
+
+        if self.bias is not None:
+            y += self.bias
+        return y
+
+
+    def get_inner_weight_tensor(self, n_offset: int = 0, n_features: int | None = None):
+        w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
+        ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
+        return w
+
+
     def get_weight_tensor(self):
         # suh = self.unpack_bf(self.su).unsqueeze(1)
         suh = self.unpack_bf(self.su).unsqueeze(1) if self.su else self.suh.unsqueeze(1)
@@ -163,15 +187,6 @@ class LinearEXL3:
         w = preapply_had_r(w, had_n)
         w *= svh
         # w *= self.scale
-        return w
-
-
-    def get_inner_weight_tensor(self):
-        # baseline = torch.cuda.memory_allocated(self.trellis.device)
-        # free, total = torch.cuda.mem_get_info(self .trellis.device)
-        # print(f"{self.key:50} {baseline:15,} {free:15,}")
-        w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
-        ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
         return w
 
 
