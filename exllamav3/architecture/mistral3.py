@@ -134,7 +134,7 @@ class Mistral3Model(Model):
     def __init__(
         self,
         config: Mistral3Config | Ministral3Config,
-        key_prefix = "language_model.",
+        key_prefix = "language_model",
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -142,12 +142,12 @@ class Mistral3Model(Model):
         # Auto-detect key naming convention
         if config.new_key_style:
             # New keys: model.language_model.{name}
-            lm = "model.language_model."
+            lm = f"model.{key_prefix}"
             head = "lm_head"
         else:
             # Original keys: language_model.model.{name}
-            lm = key_prefix + "model."
-            head = key_prefix + "lm_head"
+            lm = f"{key_prefix}.model" if key_prefix else "model"
+            head = f"{key_prefix}.lm_head" if key_prefix else "lm_head"
 
         self.modules += [
             Embedding(
