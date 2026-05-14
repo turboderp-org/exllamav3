@@ -530,6 +530,20 @@ class Linear(Module):
         return module
 
     @staticmethod
+    def tp_import_split_3(local_context, exported, plan, split_0, split_1, split_2):
+        device = local_context["device"]
+        module = Linear(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+        module.inner = exported["inner"]["cls"].tp_import_split_3(local_context, exported["inner"], plan, split_0, split_1, split_2)
+        module.quant_type = module.inner.quant_type
+        module.out_features = module.inner.out_features
+        return module
+
+
+    @staticmethod
     def tp_import(local_context, exported, plan):
         key = exported["kwargs"]["key"]
         first, last, unit = plan[key] if key in plan else (None, None, "channels")

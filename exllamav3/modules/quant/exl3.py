@@ -261,9 +261,63 @@ class LinearEXL3:
             suh = consumer.recv(id_suh, cuda = True, slice_dim = 0, first = first, last = last)
             svh = consumer.recv(id_svh, cuda = True)
             trellis = consumer.recv(id_trellis, cuda = True, slice_dim = 0, first = first // 16, last = last // 16)
-            bias = consumer.recv(id_bias, cuda = True)
+            bias = consumer.recv(id_bias, cuda = True) if first == 0 else None
             in_features = last - first
             out_features = exported["out_features"]
+
+        module = LinearEXL3(
+            config = None,
+            in_features = in_features,
+            out_features = out_features,
+            scale = None,
+            su = None,
+            sv = None,
+            suh = suh,
+            svh = svh,
+            trellis = trellis,
+            mcg = mcg,
+            mul1 = mul1,
+            bias = bias,
+            out_dtype = exported["out_dtype"],
+        )
+        return module
+
+
+    @staticmethod
+    def tp_import_split_3(local_context, exported, plan, split_0, split_1, split_2, dbg = False):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        id_suh = exported["suh"]
+        id_svh = exported["svh"]
+        id_trellis = exported["trellis"]
+        id_bias = exported["bias"]
+        mcg = consumer.recv(exported["mcg"], cuda = True)
+        mul1 = consumer.recv(exported["mul1"], cuda = True)
+
+        svh_ = []
+        trellis_ = []
+        bias_ = []
+        in_features = 0
+        out_features = 0
+
+        for split in [split_0, split_1, split_2]:
+            assert split is not None
+            split_out, first, last = split
+            assert split_out
+
+            suh = consumer.recv(id_suh, cuda = True)
+            svh = consumer.recv(id_svh, cuda = True, slice_dim = 0, first = first, last = last)
+            trellis = consumer.recv(id_trellis, cuda = True, slice_dim = 1, first = first // 16, last = last // 16)
+            bias = consumer.recv(id_bias, cuda = True, slice_dim = 0, first = first, last = last)
+            in_features = exported["in_features"]
+            out_features += last - first
+            svh_.append(svh)
+            trellis_.append(trellis)
+            bias_.append(bias)
+
+        svh = torch.cat(svh_, dim = 0)
+        trellis = torch.cat(trellis_, dim = 1)
+        bias = torch.cat(bias_, dim = 0) if bias_[0] is not None else None
 
         module = LinearEXL3(
             config = None,

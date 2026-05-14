@@ -161,6 +161,46 @@ class LinearFP16:
         return module
 
 
+    @staticmethod
+    def tp_import_split_3(local_context, exported, plan, split_0, split_1, split_2, dbg = False):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        id_w = exported["suh"]
+        id_b = exported["bias"]
+
+        w_ = []
+        b_ = []
+        in_features = 0
+        out_features = 0
+
+        for split in [split_0, split_1, split_2]:
+            assert split is not None
+            split_out, first, last = split
+            assert split_out
+            w = consumer.recv(id_w, cuda = True, slice_dim = 1, first = first, last = last)
+            b = consumer.recv(id_b, cuda = True, slice_dim = 0, first = first, last = last)
+            in_features = exported["in_features"]
+            out_features += last - first
+            w_.append(w)
+            b_.append(b)
+
+        w = torch.cat(w_, dim = 1)
+        b = torch.cat(b_, dim = 0) if b_[0] is not None else None
+
+        module = LinearFP16(
+            in_features = in_features,
+            out_features = out_features,
+            weight = w,
+            bias = b,
+            full_in_features = in_features,
+            full_out_features = out_features,
+            first_in_feature = 0,
+            first_out_feature = 0,
+            out_dtype = exported["out_dtype"],
+        )
+        return module
+
+
 class LinearFP16_torch:
 
     in_features: int
