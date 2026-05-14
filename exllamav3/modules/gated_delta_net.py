@@ -11,6 +11,7 @@ from .gated_rmsnorm import GatedRMSNorm
 from ..cache import CacheableState
 from ..util.tensor import g_tensor_cache
 from ..util import profile_opt
+from ..model.model_tp_shared import TPTensorWrapper
 
 """
 causal_conv1d wrappers and fallback functions 
@@ -322,6 +323,15 @@ class GatedDeltaNet(Module):
         key_a: str | None = None,
         key_norm: str | None = None,
         key_o: str | None = None,
+        a_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        conv1d_weight: torch.Tensor | None = None,
+        qkv_proj: Linear | None = None,
+        z_proj: Linear | None = None,
+        b_proj: Linear | None = None,
+        a_proj: Linear | None = None,
+        norm: GatedRMSNorm | None = None,
+        o_proj: Linear | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         select_hq_bits: int = 0,
@@ -367,11 +377,21 @@ class GatedDeltaNet(Module):
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkvz",
             )
+            self.qkv_proj = None
+            self.z_proj = None
             self.register_submodule(self.qkvz_proj)
         else:
             self.qkvz_proj = None
+            self.qkv_proj = None
+            self.z_proj = None
 
-        if key_qkv:
+        if qkv_proj:
+            self.qkv_proj = qkv_proj
+            self.z_proj = z_proj
+            self.qkvz_proj = None
+            self.register_submodule(self.qkv_proj)
+            self.register_submodule(self.z_proj)
+        elif key_qkv:
             self.qkv_proj = Linear(
                 config,
                 f"{key}.{key_qkv}",
@@ -393,41 +413,63 @@ class GatedDeltaNet(Module):
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkvz",
             )
+            self.qkvz_proj = None
             self.register_submodule(self.qkv_proj)
             self.register_submodule(self.z_proj)
         else:
+            self.qkvz_proj = None
             self.qkv_proj = None
             self.z_proj = None
 
         if key_fused_ba:
             self.ba_proj = Linear(config, f"{key}.{key_fused_ba}", hidden_size, self.fdim_ba, qmap = None, out_dtype = torch.float, pad_to = 1)
+            self.b_proj = None
+            self.a_proj = None
             self.register_submodule(self.ba_proj)
         else:
+            self.b_proj = None
+            self.a_proj = None
             self.ba_proj = None
 
-        if key_b:
+        if b_proj:
+            self.b_proj = b_proj
+            self.a_proj = a_proj
+            self.ba_proj = None
+            self.register_submodule(self.b_proj)
+            self.register_submodule(self.a_proj)
+        elif key_b:
             self.b_proj = Linear(config, f"{key}.{key_b}", hidden_size, self.num_v_heads, qmap = None, out_dtype = torch.float, pad_to = 1)
             self.a_proj = Linear(config, f"{key}.{key_a}", hidden_size, self.num_v_heads, qmap = None, out_dtype = torch.float, pad_to = 1)
+            self.ba_proj = None
             self.register_submodule(self.b_proj)
             self.register_submodule(self.a_proj)
         else:
             self.b_proj = None
             self.a_proj = None
+            self.ba_proj = None
 
-        self.o_proj = Linear(
-            config,
-            f"{key}.{key_o}",
-            self.v_head_dim * self.num_v_heads,
-            hidden_size,
-            qmap = qmap + ".output",
-            out_dtype = self.out_dtype,
-            select_hq_bits = select_hq_bits,
-            qgroup = key + ".o",
-        )
-        self.register_submodule(self.o_proj)
+        if o_proj:
+            self.o_proj = o_proj
+            self.register_submodule(self.o_proj)
+        else:
+            self.o_proj = Linear(
+                config,
+                f"{key}.{key_o}",
+                self.v_head_dim * self.num_v_heads,
+                hidden_size,
+                qmap = qmap + ".output",
+                out_dtype = self.out_dtype,
+                select_hq_bits = select_hq_bits,
+                qgroup = key + ".o",
+            )
+            self.register_submodule(self.o_proj)
 
-        self.norm = GatedRMSNorm(config, f"{key}.{key_norm}", self.rms_norm_eps, out_dtype = torch.half)
-        self.register_submodule(self.norm)
+        if norm is not None:
+            self.norm = norm
+            self.register_submodule(self.norm)
+        else:
+            self.norm = GatedRMSNorm(config, f"{key}.{key_norm}", self.rms_norm_eps, out_dtype = torch.half)
+            self.register_submodule(self.norm)
 
         self.a_log = None
         self.dt_bias = None
@@ -436,13 +478,28 @@ class GatedDeltaNet(Module):
         self.conv1d_q_weight = None
         self.conv1d_k_weight = None
         self.conv1d_v_weight = None
-        self.key_a_log = f"{key}.{key_a_log}"
-        self.key_dt_bias = f"{key}.{key_dt_bias}"
-        self.key_conv1d_weight = f"{key}.{key_conv1d}.weight"
-        self.key_conv1d_bias = f"{key}.{key_conv1d}.bias"
-        self.key_conv1d_q_weight = f"{key}.{key_conv1d_q}.weight" if key_conv1d_q else None
-        self.key_conv1d_k_weight = f"{key}.{key_conv1d_k}.weight" if key_conv1d_k else None
-        self.key_conv1d_v_weight = f"{key}.{key_conv1d_v}.weight" if key_conv1d_v else None
+
+        if dt_bias is not None:
+            self.a_log = a_log
+            self.dt_bias = dt_bias
+            self.key_a_log = None
+            self.key_dt_bias = None
+        else:
+            self.key_a_log = f"{key}.{key_a_log}"
+            self.key_dt_bias = f"{key}.{key_dt_bias}"
+        if conv1d_weight is not None:
+            self.conv1d_weight = conv1d_weight
+            self.key_conv1d_weight = None,
+            self.key_conv1d_bias = None,
+            self.key_conv1d_q_weight = None,
+            self.key_conv1d_k_weight = None,
+            self.key_conv1d_v_weight = None,
+        else:
+            self.key_conv1d_weight = f"{key}.{key_conv1d}.weight"
+            self.key_conv1d_bias = f"{key}.{key_conv1d}.bias"
+            self.key_conv1d_q_weight = f"{key}.{key_conv1d_q}.weight" if key_conv1d_q else None
+            self.key_conv1d_k_weight = f"{key}.{key_conv1d_k}.weight" if key_conv1d_k else None
+            self.key_conv1d_v_weight = f"{key}.{key_conv1d_v}.weight" if key_conv1d_v else None
 
         self.conv_dim = self.k_head_dim * self.num_k_heads
 
@@ -453,11 +510,7 @@ class GatedDeltaNet(Module):
         self.bc = None
         self.bsz1_pa_args = []
 
-        # self.cache_layers = []
-        # self.tp_cache_lookup = {}
-        # self.multi_kv = None
-        # self.tp_reduce = False
-        # self.has_split_cache = False
+        self.tp_reduce = False
 
 
     @override
@@ -514,14 +567,16 @@ class GatedDeltaNet(Module):
     @override
     def load(self, device: torch.Device, **kwargs):
         super().load(device, **kwargs)
-        self.a_log = self.config.stc.get_tensor(self.key_a_log, self.device, optional = False, allow_bf16 = True)
-        self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True)
-        self.conv1d_weight = self.config.stc.get_tensor(self.key_conv1d_weight, self.device, optional = True, allow_bf16 = True)
-        self.conv1d_bias = self.config.stc.get_tensor(self.key_conv1d_bias, self.device, optional = True, allow_bf16 = True)
-        if self.conv1d_weight is None:
-            self.conv1d_q_weight = self.config.stc.get_tensor(self.key_conv1d_q_weight, self.device, optional = False, allow_bf16 = True)
-            self.conv1d_k_weight = self.config.stc.get_tensor(self.key_conv1d_k_weight, self.device, optional = False, allow_bf16 = True)
-            self.conv1d_v_weight = self.config.stc.get_tensor(self.key_conv1d_v_weight, self.device, optional = False, allow_bf16 = True)
+        if self.key_a_log is not None:
+            self.a_log = self.config.stc.get_tensor(self.key_a_log, self.device, optional = False, allow_bf16 = True)
+            self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True)
+        if self.key_conv1d_weight is not None:
+            self.conv1d_weight = self.config.stc.get_tensor(self.key_conv1d_weight, self.device, optional = True, allow_bf16 = True)
+            self.conv1d_bias = self.config.stc.get_tensor(self.key_conv1d_bias, self.device, optional = True, allow_bf16 = True)
+            if self.conv1d_weight is None:
+                self.conv1d_q_weight = self.config.stc.get_tensor(self.key_conv1d_q_weight, self.device, optional = False, allow_bf16 = True)
+                self.conv1d_k_weight = self.config.stc.get_tensor(self.key_conv1d_k_weight, self.device, optional = False, allow_bf16 = True)
+                self.conv1d_v_weight = self.config.stc.get_tensor(self.key_conv1d_v_weight, self.device, optional = False, allow_bf16 = True)
         self.norm.load(device, **kwargs)
         self.load_local(device, **kwargs)
 
@@ -592,6 +647,12 @@ class GatedDeltaNet(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+
+        if self.num_k_heads == 0:
+            x = torch.zeros_like(x, dtype = self.out_dtype)
+            if self.tp_reduce:
+                params["backend"].all_reduce(x, False)
+            return to2(x, out_dtype, self.out_dtype)
 
         bsz, seqlen, _ = x.shape
         save_history = params.get("recurrent_history", False)
@@ -796,6 +857,10 @@ class GatedDeltaNet(Module):
                     rs.history = history
                     rs.conv_history = conv_state_history
 
+        # TP reduction
+        if self.tp_reduce:
+            params["backend"].all_reduce(x)
+
         return to2(x, out_dtype, self.out_dtype)
 
 
@@ -818,13 +883,157 @@ class GatedDeltaNet(Module):
 
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
-        raise NotImplementedError()
+        assert self.qkv_proj is not None
+        assert self.z_proj is not None
+        assert self.b_proj is not None
+        assert self.a_proj is not None
+        storage = 0
+        storage += self.qkv_proj.storage_size()
+        storage += self.z_proj.storage_size()
+        storage += self.b_proj.storage_size()
+        storage += self.a_proj.storage_size()
+        overhead_d = 0
+        overhead_d += self.hidden_size * (self.out_dtype or torch.half).itemsize
+        overhead_s = 0
+        overhead_s += 2 * self.num_k_heads * self.k_head_dim * torch.half.itemsize
+        overhead_s += 2 * self.num_v_heads * self.v_head_dim * torch.half.itemsize
+        recons = max(
+            self.qkv_proj.recons_size(),
+            self.z_proj.recons_size(),
+        )
+        channel_width = 1
+        channels_to_split = self.num_k_heads
+        assert self.num_v_heads % self.num_k_heads == 0, \
+            "num_k_heads doesn't divide num_v_heads"
+        while channel_width * self.k_head_dim < 128:
+            assert channels_to_split % 2 == 0, \
+                "Model's K/V heads cannot divide into 128-channel tensors"
+            channel_width *= 2
+            channels_to_split //= 2
+        assert (channel_width * self.k_head_dim) % 128 == 0 and (channel_width * self.v_head_dim) % 128 == 0, \
+            "Model's K/V heads cannot divide into 128-channel tensors"
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = channel_width,
+            channel_unit = "K-heads",
+            storage_per_device = 0,
+            storage_to_split = storage,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = channels_to_split,
+            limit_key = "attn"
+        )
+        return [tpa]
 
 
     def tp_export(self, plan, producer):
-        raise NotImplementedError()
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            nonlocal producer
+            if child is None:
+                return None
+            if isinstance(child, torch.Tensor):
+                return TPTensorWrapper.tp_export(child, plan, producer)
+            else:
+                return child.tp_export(plan, producer)
+
+        return {
+            "cls": GatedDeltaNet,
+            "kwargs": {
+                "key": self.key,
+                "layer_idx": self.layer_idx,
+                "hidden_size": self.hidden_size,
+                "k_head_dim": self.k_head_dim,
+                "v_head_dim": self.k_head_dim,
+                "rms_norm_eps": self.rms_norm_eps,
+                "conv_kernel_size": self.conv_kernel_size,
+                "beta_scale": self.beta_scale,
+                "out_dtype": self.out_dtype,
+            },
+            "num_k_heads": self.num_k_heads,
+            "num_v_heads": self.num_v_heads,
+            "num_kv_group": self.num_v_heads // self.num_k_heads,
+            **{name: _export(getattr(self, name, None)) for name in (
+                "qkv_proj",
+                "z_proj",
+                "b_proj",
+                "a_proj",
+                "o_proj",
+                "norm",
+                "conv1d_weight",
+                "a_log",
+                "dt_bias",
+            )},
+            "device": self.device,
+        }
 
 
     @staticmethod
     def tp_import(local_context, exported, plan, **kwargs):
-        raise NotImplementedError()
+        key = exported["kwargs"]["key"]
+        k_head_dim = exported["kwargs"]["k_head_dim"]
+        v_head_dim = exported["kwargs"]["v_head_dim"]
+        G = exported["num_kv_group"]
+        global_num_k_heads = exported["num_k_heads"]
+        global_num_v_heads = exported["num_v_heads"]
+        device = local_context["device"]
+        first, last, unit = plan[key]
+        assert unit == "K-heads"
+        num_k_heads = last - first
+        num_v_heads = (last - first) * G
+
+        q_split = (True, first * k_head_dim, last * k_head_dim) \
+            if num_k_heads else None
+        k_split = (True, (global_num_k_heads + first) * k_head_dim, (global_num_k_heads + last) * k_head_dim) \
+            if num_k_heads else None
+        v_split = (True, (global_num_k_heads * 2 + first * G) * v_head_dim, (global_num_k_heads * 2 + last * G) * v_head_dim) \
+            if num_k_heads else None
+        z_split = (True, first * v_head_dim * G, last * v_head_dim * G) \
+            if num_k_heads else None
+        o_split = (False, first * v_head_dim * G, last * v_head_dim * G) \
+            if num_k_heads else None
+        a_split = (True, first * G, last * G) \
+            if num_k_heads else None
+        b_split = (True, first * G, last * G) \
+            if num_k_heads else None
+
+        def _import(name):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import(local_context, exported[name], plan) \
+                if exported.get(name) else None
+
+        def _import_split(name, split):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import_split(local_context, exported[name], plan, split) \
+                if split and exported.get(name) else None
+
+        def _import_split_3(name, split_0, split_1, split_2):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import_split_3(local_context, exported[name], plan, split_0, split_1, split_2) \
+                if split_0 and exported.get(name) else None
+
+        module = GatedDeltaNet(
+            config = None,
+            **exported["kwargs"],
+            num_k_heads = num_k_heads,
+            num_v_heads = num_v_heads,
+            conv1d_weight = _import_split_3("conv1d_weight", q_split, k_split, v_split),
+            qkv_proj = _import_split_3("qkv_proj", q_split, k_split, v_split),
+            z_proj = _import_split("z_proj", z_split),
+            o_proj = _import_split("o_proj", o_split),
+            b_proj = _import_split("b_proj", b_split),
+            a_proj = _import_split("a_proj", a_split),
+            norm = _import("norm"),
+            a_log = _import_split("a_log", a_split),
+            dt_bias = _import_split("dt_bias", a_split),
+        )
+
+        module.device = device
+        if not kwargs.get("skip_reduction"):
+            module.tp_reduce = True
+
+        module.load_local(device)
+        torch.cuda.synchronize()
+        return module
