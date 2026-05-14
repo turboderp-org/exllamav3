@@ -142,11 +142,11 @@ class Mistral3Model(Model):
         # Auto-detect key naming convention
         if config.new_key_style:
             # New keys: model.language_model.{name}
-            lm = "model.language_model."
+            lm = "model.language_model"
             head = "lm_head"
         else:
             # Original keys: language_model.model.{name}
-            lm = key_prefix + "model."
+            lm = key_prefix + "model"
             head = key_prefix + "lm_head"
 
         self.modules += [
