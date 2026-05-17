@@ -680,9 +680,10 @@ class Generator:
                     completed_jobs.append(job)
                     break
 
-                # Continue sampling from logit batch as long as result matches draft
+                # Continue sampling from logit batch as long as result matches draft, unless hitting checkpoint mark
                 if draft_tokens is not None and i < batch_logits.shape[1] - 1:
-                    if draft_tokens[j, i].item() != sampled_token.item():
+                    cp_boundary = batch_states is not None and job.is_checkpoint_boundary(self.recurrent_checkpoint_interval)
+                    if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
 
                         # Count rejected draft tokens
                         rejected = batch_logits.shape[1] - 1 - i
