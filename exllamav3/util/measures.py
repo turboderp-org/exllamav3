@@ -107,19 +107,20 @@ def compute_target_log_probs(logits: torch.Tensor, target_ids: torch.Tensor, voc
     partial_sum = torch.empty(partial_shape, dtype = torch.float32, device = logits.device)
     partial_target = torch.empty(partial_shape, dtype = torch.float32, device = logits.device)
 
-    _target_logprob_partial_kernel[(num_rows, num_blocks)](
-        logits_2d,
-        target_ids,
-        partial_max,
-        partial_sum,
-        partial_target,
-        logits_2d.stride(0),
-        logits_2d.stride(1),
-        vocab_size,
-        num_blocks,
-        block_size,
-        num_warps = 4,
-    )
+    with torch.cuda.device(logits.device):
+        _target_logprob_partial_kernel[(num_rows, num_blocks)](
+            logits_2d,
+            target_ids,
+            partial_max,
+            partial_sum,
+            partial_target,
+            logits_2d.stride(0),
+            logits_2d.stride(1),
+            vocab_size,
+            num_blocks,
+            block_size,
+            num_warps = 4,
+        )
 
     row_max = partial_max.max(dim = 1).values
     row_sum = (partial_sum * torch.exp(partial_max - row_max[:, None])).sum(dim = 1)
@@ -235,6 +236,8 @@ def compute_kl_div(
 
     if not has_triton or not input_logits.is_cuda or not target_logits.is_cuda:
         return _kl_div_torch(input_logits, target_logits, vocab_size)
+    if target_logits.device != input_logits.device:
+        raise ValueError("input_logits and target_logits must be on the same CUDA device")
 
     input_logits_2d = _flatten_logits(input_logits)
     target_logits_2d = _flatten_logits(target_logits)
@@ -250,22 +253,23 @@ def compute_kl_div(
     partial_target_max = torch.empty(partial_shape, dtype = torch.float32, device = input_logits.device)
     partial_target_sum = torch.empty(partial_shape, dtype = torch.float32, device = input_logits.device)
 
-    _kl_div_stats_kernel[(num_rows, num_blocks)](
-        input_logits_2d,
-        target_logits_2d,
-        partial_input_max,
-        partial_input_sum,
-        partial_target_max,
-        partial_target_sum,
-        input_logits_2d.stride(0),
-        input_logits_2d.stride(1),
-        target_logits_2d.stride(0),
-        target_logits_2d.stride(1),
-        vocab_size,
-        num_blocks,
-        block_size,
-        num_warps = 4,
-    )
+    with torch.cuda.device(input_logits.device):
+        _kl_div_stats_kernel[(num_rows, num_blocks)](
+            input_logits_2d,
+            target_logits_2d,
+            partial_input_max,
+            partial_input_sum,
+            partial_target_max,
+            partial_target_sum,
+            input_logits_2d.stride(0),
+            input_logits_2d.stride(1),
+            target_logits_2d.stride(0),
+            target_logits_2d.stride(1),
+            vocab_size,
+            num_blocks,
+            block_size,
+            num_warps = 4,
+        )
 
     input_max = partial_input_max.max(dim = 1).values
     target_max = partial_target_max.max(dim = 1).values
@@ -273,20 +277,21 @@ def compute_kl_div(
     target_log_z = target_max + torch.log((partial_target_sum * torch.exp(partial_target_max - target_max[:, None])).sum(dim = 1))
 
     partial_kl = torch.empty(partial_shape, dtype = torch.float32, device = input_logits.device)
-    _kl_div_partial_kernel[(num_rows, num_blocks)](
-        input_logits_2d,
-        target_logits_2d,
-        input_log_z,
-        target_log_z,
-        partial_kl,
-        input_logits_2d.stride(0),
-        input_logits_2d.stride(1),
-        target_logits_2d.stride(0),
-        target_logits_2d.stride(1),
-        vocab_size,
-        num_blocks,
-        block_size,
-        num_warps = 4,
-    )
+    with torch.cuda.device(input_logits.device):
+        _kl_div_partial_kernel[(num_rows, num_blocks)](
+            input_logits_2d,
+            target_logits_2d,
+            input_log_z,
+            target_log_z,
+            partial_kl,
+            input_logits_2d.stride(0),
+            input_logits_2d.stride(1),
+            target_logits_2d.stride(0),
+            target_logits_2d.stride(1),
+            vocab_size,
+            num_blocks,
+            block_size,
+            num_warps = 4,
+        )
 
     return partial_kl.sum(dim = 1)
