@@ -11,7 +11,7 @@ from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache
-from .attention import attn_dispatch
+from .attention_fn import attn_dispatch
 
 """
                    
