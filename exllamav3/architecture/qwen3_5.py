@@ -16,6 +16,7 @@ from ..modules import (
     Linear,
     GatedDeltaNet,
     GatedMLP,
+    GDNState,
 )
 from ..modules.arch_specific.qwen3_vl import DeepstackEmbed
 from ..modules.attn import prepare_for_attn
@@ -465,6 +466,7 @@ class Qwen3_5BaseModel(Model):
             "default_recurrent_checkpoint_interval": 2048,
             "linear_attn": True,
         })
+        self.recurrent_state_cls = GDNState
 
         # TP for this architecture is not implemented yet
         self.caps.update({"supports_tp": False})

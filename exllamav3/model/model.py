@@ -8,6 +8,7 @@ from ..util.memory import free_mem
 from .model_tp import Model_TPMixin
 from .model_ls import Model_LSMixin
 from ..util.tensor import g_tensor_cache
+from ..cache.recurrent_util import advance_recurrent_states
 
 class Model(Model_TPMixin, Model_LSMixin):
 
@@ -27,6 +28,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.active_devices = []
         self.output_device = None
         self.cache_weakrefs = {}
+        self.recurrent_state_cls = None
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
@@ -185,9 +187,13 @@ class Model(Model_TPMixin, Model_LSMixin):
             params = {}
         x = self.prepare_inputs(input_ids, params)
         if self.loaded_tp:
-            return self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
+            y = self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
+            advance_recurrent_states(input_ids, params, self)
+            return y
         else:
-            return self.prefill_ls(x, params)
+            y = self.prefill_ls(x, params)
+            advance_recurrent_states(input_ids, params, self)
+            return y
 
 
     @torch.inference_mode
@@ -196,9 +202,13 @@ class Model(Model_TPMixin, Model_LSMixin):
             params = {}
         x = self.prepare_inputs(input_ids, params)
         if self.loaded_tp:
-            return self.forward_tp(x, params, self.last_kv_module_idx, self.modules)
+            y = self.forward_tp(x, params, self.last_kv_module_idx, self.modules)
+            advance_recurrent_states(input_ids, params, self)
+            return y
         else:
-            return self.forward_ls(x, params)
+            y = self.forward_ls(x, params)
+            advance_recurrent_states(input_ids, params, self)
+            return y
 
 
     def unload(self):
@@ -558,18 +568,3 @@ class Model(Model_TPMixin, Model_LSMixin):
         Decide if any model-specific requirements are met when creating Model
         """
         pass
-
-    def get_empty_state(self, initial_length: int = 0):
-        """
-        Create an empty recurrent state. initial_length > 0 is for testing/benchmark purposes
-        """
-        if "recurrent_states" not in self.caps:
-            return None
-        new_state = {}
-        for m in self.get_recurrent_layers():
-            for i in self.get_layer_instances(m.layer_idx):
-                s = m.new_recurrent_state()
-                if initial_length:
-                    s.force_position(initial_length)
-                new_state[i] = s
-        return new_state

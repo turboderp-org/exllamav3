@@ -941,7 +941,7 @@ class Job:
             if seq.prefill_complete:
                 continue
 
-            cp_pos = next(iter(self.recurrent_state.values())).position if self.recurrent_state is not None else -1
+            cp_pos = self.recurrent_state.position if self.recurrent_state is not None else -1
 
             prefill_start = seq.kv_position
             prefill_end = seq.kv_position + self.generator.max_chunk_size
@@ -1050,7 +1050,7 @@ class Job:
                     "block_table": seq.block_index_tensor,
                     "cache": self.generator.cache,
                     "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                    "recurrent_states": self.recurrent_state,
+                    "recurrent_states": [self.recurrent_state],
                     "indexed_embeddings": self.embeddings,
                     "inv_freq": self.alt_rope_freqs,
                 }
@@ -1120,17 +1120,19 @@ class Job:
 
     def allocate_pages(self):
         for seq in self.sequences:
-            allocated_pages, cached_pages, non_sequential_pages, recurrent_state = \
+            allocated_pages, cached_pages, non_sequential_pages, stashed_recurrent_state = \
                 seq.allocate_pages(self.pagetable, self.generator.recurrent_cache)
 
             self.recurrent_state = None
             if self.generator.recurrent_cache is not None:
-                if recurrent_state is None:
-                    self.recurrent_state = self.generator.recurrent_cache.get_empty_state()
+                if stashed_recurrent_state is None:
+                    self.recurrent_state = self.generator.cache.get_new_state()
                 else:
-                    self.recurrent_state = self.generator.recurrent_cache.get_unstashed(recurrent_state, cached_pages * PAGE_SIZE)
-                    first_rec_layer_state = next(iter(self.recurrent_state.values()))
-                    self.last_recurrent_checkpoint_pos = first_rec_layer_state.position
+                    self.recurrent_state = self.generator.cache.new_from_stashed(
+                        stashed_recurrent_state,
+                        position = cached_pages * PAGE_SIZE,
+                    )
+                    self.last_recurrent_checkpoint_pos = self.recurrent_state.position
 
             # Metrics
             self.cached_pages += cached_pages
@@ -1164,6 +1166,11 @@ class Job:
                 f.is_active = f.trigger_token is None
 
 
+    def is_checkpoint_boundary(self, interval):
+        seq = self.sequences[0]
+        return seq.kv_position % interval == 0
+
+
     def maybe_stash_recurrent(self, cache, interval):
         seq = self.sequences[0]
         if seq.kv_position % interval == 0 and \
@@ -1173,28 +1180,18 @@ class Job:
             self.last_recurrent_checkpoint_pos = seq.kv_position
             last_page = (seq.kv_position - 1) // PAGE_SIZE
 
-            # Collect valid checkpoint positions
-
-            first_rec_layer_state = next(iter(self.recurrent_state.values()))
-            max_offset = first_rec_layer_state.get_cachable_interval()
-            hashes = []
-            for page_offset, offset in enumerate(range(0, max_offset + 1, PAGE_SIZE)):
-                if last_page - page_offset < 0:
-                    break
-                page = seq.allocated_pages[last_page - page_offset]
-                assert page.kv_position == PAGE_SIZE
-                hashes.append((offset, page.phash))
-
-            # Insert oldest hash first
-            hashes.sort(reverse = True)
-            cache.stash(hashes, self.recurrent_state)
+            page = seq.allocated_pages[last_page]
+            assert page.kv_position == PAGE_SIZE
+            cache.put(page.phash, self.recurrent_state)
 
             # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk
             self.last_recurrent_checkpoint_pos = seq.kv_position
 
 
     def free_recurrent_state(self):
-        self.recurrent_state = None
+        if self.recurrent_state is not None:
+            self.generator.cache.release_state(self.recurrent_state)
+            self.recurrent_state = None
 
 
     def get_ngram_draft(self, draft_length: int):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from collections import deque
 from typing import Type
 import torch
 from typing import TYPE_CHECKING
@@ -80,6 +81,8 @@ class Cache:
         model: Model,
         max_num_tokens: int,
         layer_type: Type[CacheLayer] | None = None,
+        max_batch_size: int = 16,
+        max_history: int = 0,
         **kwargs
     ):
         """
@@ -91,19 +94,25 @@ class Cache:
             deleting the reference to the model, use detach_from_model
 
         :param layer_type:
-            Cache layer class, CacheLayer_fp16 or CacheLayer_quant
+            Cache layer class, CacheLayer_fp16 or CacheLayer_quant. Only affects global-attn transformer cache layers
 
         :param max_num_tokens:
             Max number of total tokens in the cache. Must be a multiple of the page size (256). For use with the
             dynamic generator, this is the total number of tokens that can be allocated across concurrent jobs. For
             batched inference, seq_len * batch_size <= max_num_tokens
 
+        :param max_batch_size:
+            Max number of recurrent state slots (max supported batch size for recurrent models)
+
+        :param max_history:
+            For recurrent models, max number of past states to reserve space for per batch item. For speculative
+            decoding on recurrent models, this should be equal to the number of draft tokens.
+
         :param k_bits:
             If layer_type == CacheLayer_quant, bits per element of the quantized keys tensor
 
         :param v_bits:
             If layer_type == CacheLayer_quant, bits per element of the quantized values tensor
-
         """
         self.model = model
         self.config = model.config
@@ -113,6 +122,7 @@ class Cache:
         self.layer_type = layer_type or CacheLayer_fp16
         # self.recurrent_layer_type = recurrent_layer_type or RecurrentLayer_fp16
 
+        # Attach transformer cache layers
         cl = self.model.get_cache_layers()
         self.num_layers = len(cl)
         self.layers = {}
@@ -121,10 +131,24 @@ class Cache:
                 self.layers[instance] = \
                     self.layer_type(self.config, attn, id(self), self.max_num_tokens, **kwargs)
 
+        # Attach recurrent (SWA/linear-attn) layers
+        self.num_slots = max_batch_size
+        self.free_list = deque(range(self.num_slots))
+        self.recurrent_state_cls = model.recurrent_state_cls
+
+        rl = self.model.get_recurrent_layers()
+        self.num_layers = len(rl)
+        self.recurrent_layers = {}
+        for layer in rl:
+            for instance in self.model.get_layer_instances(layer.layer_idx):
+                self.recurrent_layers[instance] = layer.layer_state_cls(layer, max_batch_size, max_history)
+
+        # Attach
+        self.recurrent_instances = {}
         self.attach_to_model()
 
 
-    def attach_to_model(self, model: Model | None = None):
+    def attach_to_model(self, model: Model = None):
         """
         Attach cache to model. Registering the cache with the model (done automatically by the Cache constructor)
         is necessary in order to tie loading of the model to allocation of cache tensors. Multiple caches can be
@@ -142,8 +166,15 @@ class Cache:
                 assert layer not in module.cache_layers, "Cannot attach cache twice to the same model."
                 module.cache_layers.append(layer)
 
+        rl = model.get_recurrent_layers()
+        for module in rl:
+            for instance in self.model.get_layer_instances(module.layer_idx):
+                layer = self.recurrent_layers[instance]
+                assert layer not in module.recurrent_layers, "Cannot attach cache twice to the same model."
+                module.recurrent_layers.append(layer)
 
-    def detach_from_model(self, model: Model | None = None):
+
+    def detach_from_model(self, model: Model = None):
         """
         Detach cache from model. Must be called if you want to delete a cache without deleting the model.
         """
@@ -157,6 +188,13 @@ class Cache:
             for instance in self.model.get_layer_instances(module.layer_idx):
                 layer = self.layers[instance]
                 module.cache_layers.remove(layer)
+
+        rl = model.get_recurrent_layers()
+        for module in rl:
+            for instance in self.model.get_layer_instances(module.layer_idx):
+                layer = self.recurrent_layers[instance]
+                module.recurrent_layers.remove(layer)
+        self.recurrent_instances = {}
 
 
     def get_layer(
@@ -212,10 +250,63 @@ class Cache:
         return tensors
 
 
-    def new_recurrent_state(self):
-        rl = self.model.get_recurrent_layers()
-        state = {}
-        for attn in rl:
-            for instance in self.model.get_layer_instances(attn.layer_idx):
-                state[instance]: attn.new_recurrent_state()
-        return state
+    def alloc_state(self, layer_instance, device: torch.Device):
+        """
+        Create recurrent state layer tensors on device
+        """
+        self.recurrent_layers[layer_instance].alloc()
+
+
+    def free_state(self, layer_instance):
+        """
+        Remove recurrent state layer tensors from device
+        """
+        self.recurrent_layers[layer_instance].free()
+
+
+    def get_new_state(self):
+        """
+        Allocate a new, empty state
+        """
+        assert len(self.free_list) > 0, "Cannot create new state: no available slots"
+        handle = self.free_list.popleft()
+        return self.recurrent_state_cls(
+            self,
+            handle,
+            0,
+            clear = True,
+        )
+
+
+    def new_from_stashed(self, stashed_state, position):
+        """
+        Allocate a new state from a stashed state
+        """
+        assert len(self.free_list) > 0, "Cannot create new state: no available slots"
+        handle = self.free_list.popleft()
+        return self.recurrent_state_cls(
+            self,
+            handle,
+            position,
+            clear = False,
+            stashed = stashed_state
+        )
+
+
+    def release_state(self, state):
+        """
+        Return state to the pool
+        """
+        state.free()
+        self.free_list.appendleft(state.slot)
+
+
+    def get_recurrent_layer(
+        self,
+        layer_instance: tuple,
+    ):
+        return self.recurrent_layers[layer_instance]
+
+
+    def get_all_recurrent_layers(self):
+        return self.recurrent_layers

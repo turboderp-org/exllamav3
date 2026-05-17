@@ -579,16 +579,10 @@ class Generator:
         logit_mapping.append(len(input_ids_list))
         batch_ids = torch.cat(input_ids_list, dim = 0)
 
-        # Collect recurrent states for batch
-        # TODO: Figure out a way to minimize redundant batching and unbatching
-        states, batch_states = None, None
+        # # Collect recurrent states for batch
+        batch_states = None
         if self.recurrent_cache is not None:
-            if batch_size == 1:
-                states = [batch_jobs[0].recurrent_state]
-                batch_states = batch_jobs[0].recurrent_state
-            else:
-                states = [job.recurrent_state for job in batch_jobs]
-                batch_states = {key: states[0][key].collect_batch([s[key] for s in states]) for key in states[0].keys()}
+            batch_states = [job.recurrent_state for job in batch_jobs]
 
         # GPU workload is scheduled here, so launch any sampling filters that can run in the background
         for job in batch_jobs:
@@ -622,13 +616,6 @@ class Generator:
         p_cache_seqlens = params.get("cache_seqlens")
         params = None
 
-        # Split batched recurrent states
-        if self.recurrent_cache is not None:
-            if batch_size > 1:
-                for key, v in batch_states.items():
-                    v.distribute_batch([s[key] for s in states])
-                del batch_states
-
         # Run foreground filters here, while GPU workload is queued up and running
         for job in batch_jobs:
             if job.new_tokens < 0: continue
@@ -650,6 +637,7 @@ class Generator:
         completed_jobs = []
         requeuing_jobs = []
         accepted_lengths = []
+        rejected = 0
         j = 0
         for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
             if a == b: continue
@@ -672,6 +660,9 @@ class Generator:
 
                 # Requeue
                 if len(job.sequences) == 1 and rq:
+                    # if draft_tokens is not None:
+                    #     rejected = batch_logits.shape[1] - 1 - i
+                    #     batch_states[j].rewind(rejected)
                     requeuing_jobs.append(job)
                     break
 
@@ -690,10 +681,8 @@ class Generator:
                         job.rejected_draft_tokens += rejected
 
                         # Rewind recurrent states
-                        if rejected and states:
-                            for layer, state in states[j].items():
-                                assert len(job.sequences) == 1
-                                state.rewind(rejected)
+                        if batch_states is not None:
+                            batch_states[j].rewind(rejected)
 
                         # Rewind cache position (draft model cache layout is always the same as target)
                         for seq in job.sequences:
@@ -724,15 +713,12 @@ class Generator:
                         job.prepare_logit_mask()
                         job.prepare_sampling_past_ids()
 
+            # Make sure outgoing state is valid if entire draft was accepted
+            if batch_states and draft_tokens is not None and rejected == 0:
+                batch_states[j].rewind(0)
+
             accepted_lengths.append(accepted_length)
-
-            # Drop recurrent state histories
-            if states:
-                for layer, state in states[j].items():
-                    state.drop_history()
-
             j += 1
-
 
         # Accept new target_hidden if DFlash
         if self.dflash_draft:

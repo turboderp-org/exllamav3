@@ -97,6 +97,7 @@ setup(
         "exllamav3.modules",
         "exllamav3.modules.attention_fn",
         "exllamav3.modules.arch_specific",
+        "exllamav3.modules.gated_delta_net_fn",
         "exllamav3.modules.quant",
         "exllamav3.modules.quant.exl3_lib",
         "exllamav3.tokenizer",

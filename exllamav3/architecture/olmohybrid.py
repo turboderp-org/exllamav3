@@ -14,6 +14,7 @@ from ..modules import (
     Linear,
     GatedDeltaNet,
     GatedMLP,
+    GDNState,
 )
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
@@ -240,6 +241,7 @@ class OlmoHybridModel(Model):
             "recurrent_states": True,
             "linear_attn": True,
         })
+        self.recurrent_state_cls = GDNState
 
         # TP for this architecture is not implemented yet
         self.caps.update({"supports_tp": False})

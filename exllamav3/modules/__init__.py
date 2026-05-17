@@ -7,7 +7,7 @@ from .layernorm import LayerNorm
 from .embedding import Embedding
 from .attn import Attention
 from .sliding_attn import SlidingAttention
-from .gated_delta_net import GatedDeltaNet
+from .gated_delta_net import GatedDeltaNet, GDNState, GDNLayerState
 from .gated_rmsnorm import GatedRMSNorm
 from .transformer import TransformerBlock, ParallelDecoderBlock
 from .conv import Conv

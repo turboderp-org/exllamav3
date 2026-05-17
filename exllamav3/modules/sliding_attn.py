@@ -1,7 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from ..cache import CacheableState
 from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
@@ -18,7 +17,7 @@ MAX_PRE_SEQ = 8192
 Dedicated attention layer for SWA layers. Maintains recurrent state instead of KV cache
 """
 
-class SWA_RecurrentState(CacheableState):
+class SWA_RecurrentState:
     def __init__(
         self,
         position: int | None = 0,
@@ -42,7 +41,6 @@ class SWA_RecurrentState(CacheableState):
         self.attn_window_size = attn_window_size
         self.kept_window_size = kept_window_size
 
-    @override
     def stash(self):
         # TODO: Option to preallocate and pin space for stashed states
         assert isinstance(self.k_state, torch.Tensor)
@@ -56,7 +54,6 @@ class SWA_RecurrentState(CacheableState):
             kept_window_size = self.kept_window_size,
         )
 
-    @override
     def unstash(self, device, trim_position):
         trim = self.position - trim_position
         assert 0 <= trim <= self.get_cachable_interval()
@@ -73,7 +70,6 @@ class SWA_RecurrentState(CacheableState):
             kept_window_size = self.kept_window_size,
         )
 
-    @override
     def get_size(self):
         if self.k_state is None:
             return 0
@@ -82,7 +78,6 @@ class SWA_RecurrentState(CacheableState):
             self.v_state.element_size() * self.v_state.numel()
         )
 
-    @override
     def get_cachable_interval(self):
         # As long as the start of the context remains, we can reconstruct back to position 0
         if self.position <= self.kept_window_size:
@@ -107,20 +102,17 @@ class SWA_RecurrentState(CacheableState):
         assert self.batched
         # .forward() has already updated each batch item separately
 
-    @override
     def reset(self):
         self.k_state = None
         self.v_state = None
         self.window_beg = 0
         self.position = 0
 
-    @override
     def force_position(self, position: int):
         self.position = position
         self.window_beg = (position + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE - self.attn_window_size
         self.window_beg = max(self.window_beg, 0)
 
-    @override
     def clone(self):
         return SWA_RecurrentState(
             self.position,
@@ -134,13 +126,11 @@ class SWA_RecurrentState(CacheableState):
             self.kept_window_size,
         )
 
-    @override
     def rewind(self, count: int):
         assert not self.batched
         assert count <= self.position - self.window_beg
         self.position -= count
 
-    @override
     def drop_history(self):
         pass
 
