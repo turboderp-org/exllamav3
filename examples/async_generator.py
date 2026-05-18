@@ -12,7 +12,7 @@ batch of async tasks at once.
 async def main():
 
     # Load model etc.
-    config = Config.from_directory("/mnt/str/eval_models/llama3.1-8b-instruct/exl3/4.0bpw/")
+    config = Config.from_directory("/mnt/str/models/llama3.1-8b-instruct/exl3/4.0bpw/")
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens = 32768)
     model.load()
@@ -63,7 +63,9 @@ async def main():
                 await job.cancel()
                 break
         else:
-            full_completion += " [max_new_tokens reached]"
+            full_completion += " [max_new_tokens reached]\n"
+            tps = result["new_tokens"] / result["time_generate"]
+            full_completion += f"{tps:.2f} t/s"
 
         return full_completion
 

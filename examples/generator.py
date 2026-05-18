@@ -171,11 +171,21 @@ def main():
         draft_model = None
         draft_cache = None
 
-    # Load a model with cache
+    # Prepare model
     config = Config.from_directory(model_dir)
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens = cache_size)
-    model.load(progressbar = True)
+
+    # Prepare cache. Batch size is only relevant for recurrent models. History is required for drafting
+    # with recurrent target model.
+    cache = Cache(
+        model,
+        max_num_tokens = cache_size,
+        max_batch_size = len(instructions),
+        max_history = draft_model.caps.get("default_draft_size") if draft_model else 0,
+    )
+
+    # Load model
+    model.load(progressbar = True, device = "cuda:1")
     tokenizer = Tokenizer.from_config(config)
 
     # Create generator
@@ -197,4 +207,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
