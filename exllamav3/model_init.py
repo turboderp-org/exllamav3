@@ -207,7 +207,9 @@ def init(
                 max_num_tokens = args.cache_size,
                 layer_type = CacheLayer_quant,
                 k_bits = k_bits,
-                v_bits = v_bits
+                v_bits = v_bits,
+                max_history = draft_model.caps.get("default_draft_size") if draft_model_dir else 0,
+                max_batch_size = args.autosplit_max_batch_size,
             )
             draft_cache = Cache(
                 draft_model,
@@ -220,7 +222,9 @@ def init(
             cache = Cache(
                 model,
                 max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_fp16
+                layer_type = CacheLayer_fp16,
+                max_history = draft_model.caps.get("default_draft_size") if draft_model_dir else 0,
+                max_batch_size = args.autosplit_max_batch_size,
             )
             draft_cache = Cache(
                 draft_model,

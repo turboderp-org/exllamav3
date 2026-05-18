@@ -166,6 +166,8 @@ class Generator:
         self.recurrent_cache_size = recurrent_cache_size
         if self.model.caps.get("recurrent_states"):
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
+            # Limit batch size if cache has recurrent states
+            self.max_batch_size = min(self.max_batch_size, cache.num_slots)
         else:
             self.recurrent_cache = None
         if recurrent_checkpoint_interval is None:

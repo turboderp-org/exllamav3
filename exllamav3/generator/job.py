@@ -1050,7 +1050,7 @@ class Job:
                     "block_table": seq.block_index_tensor,
                     "cache": self.generator.cache,
                     "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                    "recurrent_states": [self.recurrent_state],
+                    "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
                     "indexed_embeddings": self.embeddings,
                     "inv_freq": self.alt_rope_freqs,
                 }

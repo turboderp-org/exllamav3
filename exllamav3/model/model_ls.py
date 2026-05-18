@@ -94,6 +94,8 @@ class Model_LSMixin(ABC):
                 if rl:
                     prepare_for_recurrence(None, params, self)
 
+        recurrent_states = params.get("recurrent_states")
+
         with ProgressBar(f"Loading (LS)" if progressbar else None, len(modules)) as progress:
 
             for idx, module in enumerate(modules):
@@ -156,16 +158,7 @@ class Model_LSMixin(ABC):
                             dummy_state = module.prepare_for_device(dummy_state, params)
                             dummy_state = module.forward(dummy_state, params)
 
-                        # Create extra dummy recurrent states to account for max_batch_size
-                        recurrent = params.get("recurrent_states")
-                        if recurrent:
-                            dummy_recurrent_states = []
-                            for _ in range(1, max_batch_size):
-                                s = {k: v.clone() for k, v in recurrent.items()}
-                                dummy_recurrent_states.append(s)
-                            del dummy_recurrent_states
-
-                        # Account for max_output_factor after last layer,
+                        # Account for max_output_factor after last layer
                         extra_dummy_out_states = None
                         if is_logits_layer:
                             extra_dummy_out_states = [
@@ -218,6 +211,10 @@ class Model_LSMixin(ABC):
 
             dummy_state = None
             unset_memory_fraction(touched_devices)
+
+        if recurrent_states is not None:
+            for rs in recurrent_states:
+                rs.free()
 
         config.stc.close()
         self.active_devices = active_devices
