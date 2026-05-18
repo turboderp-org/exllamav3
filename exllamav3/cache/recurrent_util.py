@@ -58,3 +58,4 @@ def advance_recurrent_states(input_ids: torch.Tensor, params: dict, model):
         for r in rs:
             r.position += seqlen
             r.last_history = (seqlen - 1) if history else 0
+            r.post_advance()

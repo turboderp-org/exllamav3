@@ -16,6 +16,7 @@ from ..modules import (
     RMSNorm,
     SlidingAttention,
     TransformerBlock,
+    SWAState,
 )
 from ..modules.attn import prepare_for_attn
 from ..util.rope import RoPE, RopeStyle
@@ -246,12 +247,15 @@ class AfmoeModel(Model):
         # Activate all experts during H capture pass in quantization
         self.calibration_all_experts = True
 
+        self.recurrent_state_cls = None
         if not self.swa_full:
             self.caps.update({
                 "supports_tp": False,
                 "recurrent_states": True,
                 "default_recurrent_checkpoint_interval": 6144,
             })
+            self.recurrent_state_cls = SWAState
+
 
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         if not self.swa_full:

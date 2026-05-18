@@ -9,130 +9,138 @@ from ..constants import PAGE_SIZE
 from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
+from ..cache import Cache
 from ..util import profile_opt
 
 MAX_PRE_SEQ = 8192
 
-"""
-Dedicated attention layer for SWA layers. Maintains recurrent state instead of KV cache
-"""
+class SWAState:
 
-class SWA_RecurrentState:
     def __init__(
         self,
-        position: int | None = 0,
-        positions: list[int] | None = None,
-        k_state: torch.Tensor | None = None,
-        v_state: torch.Tensor | None = None,
-        batched = False,
-        batch: list[SWA_RecurrentState] | None = None,
-        window_beg: int = 0,
-        attn_window_size: int = None,
-        kept_window_size: int = None,
+        cache: Cache,
+        slot: int,
+        position: int,
+        clear: bool = True,
+        stashed: dict = None
     ):
-        super().__init__()
+        self.slot = slot
         self.position = position
-        self.positions = positions
-        self.k_state = k_state
-        self.v_state = v_state
-        self.batched = batched
-        self.batch = batch
-        self.window_beg = window_beg
-        self.attn_window_size = attn_window_size
-        self.kept_window_size = kept_window_size
+        self.cache = cache
+        self.last_history = 0
+        self.window_beg = 0
+        self.wshift = 0
+
+        if stashed is not None:
+            self.unstash(stashed)
+
+        self.checkpoint_size = sum(
+            l.get_checkpoint_size()
+            for l in self.cache.get_all_recurrent_layers().values()
+        )
+
+
+    def free(self):
+        self.cache.release_state(self)
+
+
+    def rewind(self, num_tokens: int):
+        assert num_tokens <= self.position - self.window_beg
+        self.position -= num_tokens
+        self.last_history = 0
+
 
     def stash(self):
-        # TODO: Option to preallocate and pin space for stashed states
-        assert isinstance(self.k_state, torch.Tensor)
-        return SWA_RecurrentState(
-            self.position,
-            self.positions,
-            self.k_state.cpu(),
-            self.v_state.cpu(),
-            window_beg = self.window_beg,
-            attn_window_size = self.attn_window_size,
-            kept_window_size = self.kept_window_size,
-        )
+        stashed = {
+            "position": self.position,
+            "checkpoint_size": self.checkpoint_size,
+            "window_beg": self.window_beg,
+        }
+        for k, l in self.cache.get_all_recurrent_layers().items():
+            stashed[k] = l.stash(self.slot)
+        return stashed
 
-    def unstash(self, device, trim_position):
-        trim = self.position - trim_position
-        assert 0 <= trim <= self.get_cachable_interval()
-        k = self.k_state
-        v = self.v_state
-        assert self.positions is None
-        return SWA_RecurrentState(
-            trim_position,
-            self.positions,
-            k.to(device, non_blocking = True),
-            v.to(device, non_blocking = True),
-            window_beg = self.window_beg,
-            attn_window_size = self.attn_window_size,
-            kept_window_size = self.kept_window_size,
-        )
 
-    def get_size(self):
-        if self.k_state is None:
-            return 0
+    def unstash(self, stashed: dict):
+        assert self.position == stashed["position"]
+        self.window_beg = stashed["window_beg"]
+        for k, l in self.cache.get_all_recurrent_layers().items():
+            l.unstash(self.slot, stashed[k])
+
+
+    def post_advance(self):
+        self.window_beg += self.wshift
+
+
+class SWALayerState:
+
+    def __init__(
+        self,
+        module: SlidingAttention,
+        max_batch_size: int,
+        max_history: int,
+    ):
+        assert module.kv_state_size % 256 == 0
+        self.module = module
+        self.k_state = torch.empty(
+            (max_batch_size, module.kv_state_size, module.num_kv_heads, module.head_dim),
+            dtype = torch.half,
+            device = "meta"
+        )
+        self.v_state = torch.empty(
+            (max_batch_size, module.kv_state_size, module.num_kv_heads, module.head_dim),
+            dtype = torch.half,
+            device = "meta"
+        )
+        self.device = None
+        self.max_history = max_history
+
+
+    def get_checkpoint_size(self):
         return (
-            self.k_state.element_size() * self.k_state.numel() +
-            self.v_state.element_size() * self.v_state.numel()
+            self.module.kv_state_size * self.module.num_kv_heads * self.module.head_dim * 2 +
+            self.module.kv_state_size * self.module.num_kv_heads * self.module.head_dim * 2
         )
 
-    def get_cachable_interval(self):
-        # As long as the start of the context remains, we can reconstruct back to position 0
-        if self.position <= self.kept_window_size:
-            return self.position
-        # Otherwise we can reconstruct up to the overprovisioned interval
-        return self.kept_window_size - self.attn_window_size
 
-    def collect_batch(self, batch: list[SWA_RecurrentState]):
-        assert len(batch) > 1
-        return SWA_RecurrentState(
-            None,
-            None,
-            None,
-            None,
-            batched = True,
-            batch = batch,
-            attn_window_size = self.attn_window_size,
-            kept_window_size = self.kept_window_size,
-        )
+    def alloc(self, device):
+        self.k_state = torch.empty_like(self.k_state, device = device)
+        self.v_state = torch.empty_like(self.v_state, device = device)
+        self.device = device
 
-    def distribute_batch(self, batch: list[SWA_RecurrentState]):
-        assert self.batched
-        # .forward() has already updated each batch item separately
 
-    def reset(self):
-        self.k_state = None
-        self.v_state = None
-        self.window_beg = 0
-        self.position = 0
+    def free(self):
+        self.k_state = torch.empty_like(self.k_state, device = "meta")
+        self.v_state = torch.empty_like(self.v_state, device = "meta")
+        self.device = None
 
-    def force_position(self, position: int):
-        self.position = position
-        self.window_beg = (position + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE - self.attn_window_size
-        self.window_beg = max(self.window_beg, 0)
 
-    def clone(self):
-        return SWA_RecurrentState(
-            self.position,
-            self.positions,
-            self.k_state.clone() if self.k_state is not None else None,
-            self.v_state.clone() if self.v_state is not None else None,
-            self.batched,
-            self.batch,
-            self.window_beg,
-            self.attn_window_size,
-            self.kept_window_size,
-        )
-
-    def rewind(self, count: int):
-        assert not self.batched
-        assert count <= self.position - self.window_beg
-        self.position -= count
-
-    def drop_history(self):
+    def clear(self, idx: int):
         pass
+
+
+    def get_state_tensors(self):
+        return (
+            self.k_state,
+            self.v_state,
+        )
+
+
+    def rewind(self, slot: int, last_history: int, num_tokens: int):
+        pass
+
+
+    def stash(self, slot):
+        return (
+            self.k_state[slot].cpu(),
+            self.v_state[slot].cpu()
+        )
+
+
+    def unstash(self, slot, stashed):
+        k, v = stashed
+        self.k_state[slot].copy_(k)
+        self.v_state[slot].copy_(v)
 
 
 class SlidingAttention(Module):
@@ -328,10 +336,10 @@ class SlidingAttention(Module):
             "recurrent_cache": True,
             "sliding_window_overp": sliding_window_overp
         })
+        self.layer_state_cls = SWALayerState
 
         self.multi_kv = None
         self.multi_qg = None
-        self.tp_reduce = False
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
@@ -343,6 +351,10 @@ class SlidingAttention(Module):
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
         self.pre_seqs = None
+
+        self.recurrent_layers = []
+        self.tp_recurrent_lookup = {}
+        self.tp_reduce = False
 
 
     @override
@@ -358,6 +370,10 @@ class SlidingAttention(Module):
 
         if self.num_kv_heads == 0:
             return
+
+        # Recurrent states
+        for rl in self.recurrent_layers:
+            rl.alloc(device)
 
         if self.rope_settings:
             self.rope = RoPE(
@@ -407,8 +423,8 @@ class SlidingAttention(Module):
     def load(self, device: torch.Device, **kwargs):
         super().load(device, **kwargs)
         max_chunk_size = kwargs.get("max_chunk_size", 2048)
-        self.stage_k = g_tensor_cache.get(device, (1, max_chunk_size + self.kv_state_size, self.num_kv_heads, self.head_dim), torch.half, "swa_k")
-        self.stage_v = g_tensor_cache.get(device, (1, max_chunk_size + self.kv_state_size, self.num_kv_heads, self.head_dim), torch.half, "swa_v")
+        self.stage_k = g_tensor_cache.get(device, (1, max_chunk_size + self.kv_state_size, self.num_kv_heads, self.head_dim), torch.half, "swa_stage_k")
+        self.stage_v = g_tensor_cache.get(device, (1, max_chunk_size + self.kv_state_size, self.num_kv_heads, self.head_dim), torch.half, "swa_stage_v")
         self.load_local(device, **kwargs)
 
 
@@ -436,13 +452,6 @@ class SlidingAttention(Module):
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
         self.pre_seqs = None
-
-
-    def new_recurrent_state(self):
-        return SWA_RecurrentState(
-            attn_window_size = self.sliding_window,
-            kept_window_size = self.kv_state_size,
-        )
 
 
     @override
@@ -646,31 +655,23 @@ class SlidingAttention(Module):
                 self.post_rope_norm
             )
 
-        # Get or initialize recurrent state, may be list of tensors if some batch items haven't filled the window yet
-        # TODO: Currently, batch is a list of split caches processed at bsz 1, since caches are large and constructing
-        #       temporary batch tensors causes excessive fragmentation and unpredictable VRAM usage
-        rsb = params.get("recurrent_states")
-        assert rsb is not None
-        rsb = rsb[self.layer_idx, params.get("layer_instance", 0)]
-        if rsb.batched:
-            rsb = rsb.batch
-        else:
-            rsb = [rsb]
-        assert len(rsb) == bsz
+        # Get recurrent state tensors
+        rsg = params.get("recurrent_states")
+        assert rsg is not None, "SlidingAttention.forward() called in flash_attn mode with no recurrent states"
+        layer_instance = (self.layer_idx, params.get("layer_instance", 0))
+        rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+        k_states, v_states = rsl.get_state_tensors()
 
+        # TODO: Currently iterates over batch items, but could use paged attn to batch items together, at least
+        #       when no noncausal spans
         ro = []
-        for i, rs in enumerate(rsb):
+        for i, rs in enumerate(rsg):
             q_ = q[i:i+1]
             k_ = k[i:i+1]
             v_ = v[i:i+1]
 
-            # Create empty state if unitialized
-            if rs.k_state is None:
-                rs.k_state = torch.empty((1, self.kv_state_size, self.num_kv_heads, self.head_dim), dtype = torch.half, device = x.device)
-                rs.v_state = torch.empty((1, self.kv_state_size, self.num_kv_heads, self.head_dim), dtype = torch.half, device = x.device)
-
-            k_state = rs.k_state
-            v_state = rs.v_state
+            k_state = k_states[rs.slot].unsqueeze(0)
+            v_state = v_states[rs.slot].unsqueeze(0)
 
             # Physical cache state
             cache_beg = rs.window_beg
@@ -685,7 +686,7 @@ class SlidingAttention(Module):
             # Case 1: new KV fits in cache without shifting
             if cache_pos + seqlen <= self.kv_state_size:
                 shift = 0
-                wshift = 0
+                rs.wshift = 0
                 cache_seqlens = cache_pos
                 cache_seqlens_nc = cache_pos
                 temp_cache = False
@@ -693,7 +694,7 @@ class SlidingAttention(Module):
             # Case 2: new KV fits in cache if we shift
             elif seqlen_pad <= self.sliding_window_overp - PAGE_SIZE:
                 shift = seqlen_pad
-                wshift = seqlen_pad
+                rs.wshift = seqlen_pad
                 k_state[:, :-shift, :, :].copy_(k_state[:, shift:, :, :].clone())
                 v_state[:, :-shift, :, :].copy_(v_state[:, shift:, :, :].clone())
                 cache_seqlens = cache_pos - shift
@@ -707,6 +708,8 @@ class SlidingAttention(Module):
                     self.stage_v[:, :cache_hot].copy_(v_state[:, cache_wpos : cache_pos])
                 self.stage_k[:, cache_hot : cache_hot + seqlen].copy_(k_)
                 self.stage_v[:, cache_hot : cache_hot + seqlen].copy_(v_)
+                c_k_state = k_state
+                c_v_state = v_state
                 k_state = self.stage_k
                 v_state = self.stage_v
                 k_ = None
@@ -714,12 +717,14 @@ class SlidingAttention(Module):
                 cache_seqlens = cache_hot + seqlen
                 cache_seqlens_nc = cache_hot
                 shift = pad(cache_seqlens) - self.kv_state_size
-                wshift = shift + cache_wpos
+                rs.wshift = shift + cache_wpos
                 temp_cache = True
                 # assert shift > 0
 
             # Case 4: create new temp tensors
             else:
+                c_k_state = k_state
+                c_v_state = v_state
                 k_state = torch.cat((k_state[:, cache_wpos : cache_pos], k_), dim = 1)
                 v_state = torch.cat((v_state[:, cache_wpos : cache_pos], v_), dim = 1)
                 k_ = None
@@ -727,7 +732,7 @@ class SlidingAttention(Module):
                 cache_seqlens = cache_hot + seqlen
                 cache_seqlens_nc = cache_hot
                 shift = pad(cache_seqlens) - self.kv_state_size
-                wshift = shift + cache_wpos
+                rs.wshift = shift + cache_wpos
                 temp_cache = True
                 assert shift > 0
 
@@ -778,14 +783,12 @@ class SlidingAttention(Module):
             # If KV not updated inplace, copy tail of extended temp tensors back into state
             # Copy inplace to keep tensors contiguous and to avoid fragmentation
             if temp_cache:
-                rs.k_state.copy_(k_state[:, shift : shift + self.kv_state_size, :, :])
-                rs.v_state.copy_(v_state[:, shift : shift + self.kv_state_size, :, :])
+                c_k_state.copy_(k_state[:, shift : shift + self.kv_state_size, :, :])
+                c_v_state.copy_(v_state[:, shift : shift + self.kv_state_size, :, :])
+                k_state = c_k_state
+                v_state = c_v_state
 
-            # Advance state
-            rs.position += seqlen
-            rs.window_beg += wshift
-
-            assert rs.k_state.shape[1] == self.kv_state_size
+            assert k_state.shape[1] == self.kv_state_size
 
         # Concat attn outputs for batch
         o = torch.cat(ro, dim = 0) if len(ro) > 1 else o

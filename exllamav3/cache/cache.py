@@ -297,7 +297,6 @@ class Cache:
         """
         Return state to the pool
         """
-        state.free()
         self.free_list.appendleft(state.slot)
 
 

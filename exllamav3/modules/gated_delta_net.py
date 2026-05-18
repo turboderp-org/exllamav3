@@ -42,7 +42,7 @@ class GDNState:
 
 
     def free(self):
-        pass
+        self.cache.release_state(self)
 
 
     def rewind(self, num_tokens: int):
@@ -68,8 +68,8 @@ class GDNState:
             l.unstash(self.slot, stashed[k])
 
 
-    def get_checkpoint_size(self):
-        return self.checkpoint_size
+    def post_advance(self):
+        pass
 
 
 class GDNLayerState:
