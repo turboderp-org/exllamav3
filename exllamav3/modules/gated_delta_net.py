@@ -155,8 +155,8 @@ class GDNLayerState:
     def unstash(self, slot, stashed):
         cdim = self.module.conv_kernel_size
         s, c = stashed
-        self.recurrent_state[slot, :1].copy_(s.to(self.module.device))
-        self.conv_state[slot, :, :cdim].copy_(c.to(self.module.device))
+        self.recurrent_state[slot, :1].copy_(s)
+        self.conv_state[slot, :, :cdim].copy_(c)
 
 
 class GatedDeltaNet(Module):
