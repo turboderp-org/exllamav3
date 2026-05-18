@@ -22,13 +22,17 @@ class SWAState:
         slot: int,
         position: int,
         clear: bool = True,
-        stashed: dict = None
+        stashed: dict = None,
+        test_state: bool = False,
     ):
+        assert test_state or position == 0 or stashed is not None, \
+            "State must be new, restored from checkpoint or marked as a test state."
+
         self.slot = slot
         self.position = position
         self.cache = cache
         self.last_history = 0
-        self.window_beg = 0
+        self.window_beg = position // PAGE_SIZE * PAGE_SIZE
         self.wshift = 0
 
         if stashed is not None:

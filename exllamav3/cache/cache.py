@@ -133,6 +133,7 @@ class Cache:
 
         # Attach recurrent (SWA/linear-attn) layers
         self.num_slots = max_batch_size
+        self.max_history = max_history
         self.free_list = deque(range(self.num_slots))
         self.recurrent_state_cls = model.recurrent_state_cls
 
@@ -275,6 +276,22 @@ class Cache:
             handle,
             0,
             clear = True,
+        )
+
+
+    def get_test_state(self, position: int):
+        """
+        Allocate a new state for given position, for testing/benchmarking purposes. If position > 0 this will
+        not be a valid recurrent state for the model.
+        """
+        assert len(self.free_list) > 0, "Cannot create new state: no available slots"
+        handle = self.free_list.popleft()
+        return self.recurrent_state_cls(
+            self,
+            handle,
+            position,
+            clear = True,
+            test_state = True,
         )
 
 
