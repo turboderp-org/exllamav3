@@ -126,6 +126,7 @@ def init(
     quiet: bool = False,
     progress: bool = True,
     override_dynamic_seq_len: int | None = None,
+    min_draft_len: int = None,
     **kwargs
 ):
     """
@@ -147,6 +148,9 @@ def init(
         (optional) Some models (Like Phi4) have two RoPE modes and adjust their positional embeddings depending on
         sequence length. This argument sets the expected max context length to help select the right mode at load time.
         Mostly relevant if you know ahead of time that you're going to use a long-context model with a short context.
+
+    :param min_draft_len:
+        Minimum draft length, even if no draft model is given (for ngram etc.)
 
     :param kwargs:
         Additional parameters to forwart to Model.load()
@@ -193,6 +197,11 @@ def init(
     draft_model = Model.from_config(draft_config, swa_full = args.swa_full) if draft_model_dir else None
 
     # Cache
+    max_history = max(
+        min_draft_len or 0,
+        draft_model.caps.get("default_draft_size") if draft_model else 0,
+        vars(args).get("num_draft_tokens") or 0
+    )
     if "cache_size" in vars(args):
         if args.cache_quant is not None:
             split = [int(bits) for bits in args.cache_quant.split(",")]
@@ -208,7 +217,7 @@ def init(
                 layer_type = CacheLayer_quant,
                 k_bits = k_bits,
                 v_bits = v_bits,
-                max_history = draft_model.caps.get("default_draft_size") if draft_model_dir else 0,
+                max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
             )
             draft_cache = Cache(
@@ -223,7 +232,7 @@ def init(
                 model,
                 max_num_tokens = args.cache_size,
                 layer_type = CacheLayer_fp16,
-                max_history = draft_model.caps.get("default_draft_size") if draft_model_dir else 0,
+                max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
             )
             draft_cache = Cache(
