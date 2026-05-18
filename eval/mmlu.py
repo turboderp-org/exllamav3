@@ -234,7 +234,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = "Run MMLU evaluation")
-    model_init.add_args(parser)
+    model_init.add_args(
+        parser,
+        default_autosplit_max_batch_size = 16,
+    )
     parser.add_argument("-fs", "--fewshot_examples", type = int, default = 5, help = "Number of examples for fewshot examples, max 5")
     parser.add_argument("-sub", "--subjects", type = str, default = "all", help = "Comma-separated list of categories to test, or 'all'")
     parser.add_argument("-shf", "--shuffle", action = "store_true", help = "Shuffle choices randomly")

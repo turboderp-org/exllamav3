@@ -186,7 +186,12 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    model_init.add_args(parser, add_draft_model_args = True, default_cache_size = 65536, default_autosplit_max_batch_size = 9)
+    model_init.add_args(
+        parser,
+        add_draft_model_args = True,
+        default_cache_size = 65536,
+        default_autosplit_max_batch_size = 9
+    )
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     _args = parser.parse_args()
     main(_args)

@@ -37,6 +37,7 @@ def measure_prefill(args, model, cache, warmup = False):
     if args.short_prefill:
         lengths = list(range(lengths[0])) + lengths
 
+    is_recurrent = model.caps.get("recurrent_states", False)
     progress = 0
     results = {}
     max_progress = sum(lengths)
@@ -50,7 +51,7 @@ def measure_prefill(args, model, cache, warmup = False):
                     pre_time = (length // 2) / results[length // 2]
                     start = length // 2
                 chunks = [(i, min(i + chunk_size, end)) for i in range(start, end, chunk_size)]
-                recurrent = model.get_empty_state(start)
+                recurrent = [cache.get_test_state(start)] if is_recurrent else None
                 for start, end in chunks:
                     params = {
                         "attn_mode": "flash_attn",
@@ -60,8 +61,9 @@ def measure_prefill(args, model, cache, warmup = False):
                         "recurrent_states": recurrent,
                     }
                     model.prefill(cached_ids(end - start), params)
-                    recurrent = params.get("recurrent_states")
                 cuda_sync_active()
+                if is_recurrent:
+                    recurrent[0].free()
 
             results[length] = length / (pre_time + t.interval)
             if not warmup:
@@ -75,12 +77,13 @@ def measure_prefill(args, model, cache, warmup = False):
 def measure_generate(args, model, cache, warmup = False):
     chunk_size = args.chunk_size
     lengths = [0] + get_lengths(chunk_size if warmup else args.max_length - 256)
+    is_recurrent = model.caps.get("recurrent_states", False)
     progress = 0
     results = {}
     max_progress = len(lengths)
     with (ProgressBar("Warmup" if warmup else "Generate", max_progress) as pb):
         for length in lengths:
-            recurrent = model.get_empty_state(length)
+            recurrent = [cache.get_test_state(length)] if is_recurrent else None
             torch.cuda.synchronize()
             with Timer() as t:
                 for i in range(100):
@@ -95,7 +98,8 @@ def measure_generate(args, model, cache, warmup = False):
                     sample = torch.argmax(logits)
                     sample = sample.cpu()  # force sync
                     del logits
-                    recurrent = params.get("recurrent_states")
+            if is_recurrent:
+                recurrent[0].free()
             results[length] = 100 / t.interval
             if not warmup:
                 print(f"Context {length: 6}: {col_green}{results[length]:10.2f}{col_default} tokens/s")
@@ -139,6 +143,7 @@ if __name__ == "__main__":
     model_init.add_args(
         parser,
         default_cache_size = 32768,
+        default_autosplit_max_batch_size = 1,
     )
     parser.add_argument("-max_length", "--max_length", type = int, help = "Max context length to measure (default: 32768)", default = 32768)
     parser.add_argument("-chunk_size", "--chunk_size", type = int, help = "Max chunk size (default: 4096)", default = 4096)

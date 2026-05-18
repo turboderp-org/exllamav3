@@ -223,7 +223,8 @@ if __name__ == "__main__":
         default_sampling_args = {
             "temperature": 0.8,
             "min_p": 0.08,
-        }
+        },
+        default_autosplit_max_batch_size = 16,
     )
     parser.add_argument("-samples", "--num_samples", type = int, help = "Number of samples (default: 50)", default = 50)
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
