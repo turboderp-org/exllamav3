@@ -83,6 +83,7 @@ class SWALayerState:
         module: SlidingAttention,
         max_batch_size: int,
         max_history: int,
+        cache_id: int,
     ):
         assert module.kv_state_size % 256 == 0
         self.module = module
@@ -98,6 +99,8 @@ class SWALayerState:
         )
         self.device = None
         self.max_history = max_history
+        self.max_batch_size = max_batch_size
+        self.cache_id = cache_id
 
 
     def get_checkpoint_size(self):

@@ -142,7 +142,7 @@ class Cache:
         self.recurrent_layers = {}
         for layer in rl:
             for instance in self.model.get_layer_instances(layer.layer_idx):
-                self.recurrent_layers[instance] = layer.layer_state_cls(layer, max_batch_size, max_history)
+                self.recurrent_layers[instance] = layer.layer_state_cls(layer, max_batch_size, max_history, id(self))
 
         # Attach
         self.recurrent_instances = {}

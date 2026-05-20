@@ -51,6 +51,7 @@ def add_args(
     parser.add_argument("-tp_mlp", "--tp_max_parallelism_mlp", type = int, help = "(TP) Maximum parallelism for MLP layers", default = None)
     parser.add_argument("-tp_moe", "--tp_max_parallelism_moe", type = int, help = "(TP) Maximum parallelism for MoE layers", default = None)
     parser.add_argument("-tp_linear", "--tp_max_parallelism_linear", type = int, help = "(TP) Maximum parallelism for linear (output) layers", default = None)
+    parser.add_argument("-tp_linear_attn", "--tp_max_parallelism_linear_attn", type = int, help = "(TP) Maximum parallelism for linear-attention layers", default = None)
     parser.add_argument("-tp_moe_ts", "--tp_moe_tensor_split", action = "store_true", help = "(TP) Use tensor split for MoE layers rather than expert parallelism")
 
     parser.add_argument("-swa_full", "--swa_full", action = "store_true", help = f"Use full cache for SWA layers. Default is recurrent mode with snapshots")
@@ -262,6 +263,7 @@ def init(
         ("mlp", "tp_max_parallelism_mlp"),
         ("moe", "tp_max_parallelism_moe"),
         ("linear", "tp_max_parallelism_linear"),
+        ("linear_attn", "tp_max_parallelism_linear_attn"),
     ]:
         value = getattr(args, arg_name, None)
         if value is not None:

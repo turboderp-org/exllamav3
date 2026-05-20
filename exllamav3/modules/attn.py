@@ -824,7 +824,8 @@ class Attention(Module):
                 "logit_softcapping": self.logit_softcapping,
                 "post_rope_norm": self.post_rope_norm,
                 "tp_split_norm": self.tp_split_norm,
-                "use_k_as_v": self.use_k_as_v
+                "use_k_as_v": self.use_k_as_v,
+                "interleaved_gate": self.interleaved_gate,
             },
             "num_kv_heads": self.num_kv_heads,
             **{name: _export(getattr(self, name, None)) for name in (
@@ -852,6 +853,7 @@ class Attention(Module):
     @staticmethod
     def tp_import(local_context, exported, plan, **kwargs):
         key = exported["kwargs"]["key"]
+        interleaved_gate = exported["kwargs"]["interleaved_gate"]
         head_dim = exported["kwargs"]["head_dim"]
         n_gqa = exported["n_gqa"]
         device = local_context["device"]
@@ -863,6 +865,8 @@ class Attention(Module):
 
         q_split = (True, first * head_dim * n_gqa, last * head_dim * n_gqa) \
             if num_kv_heads else None
+        if interleaved_gate and num_kv_heads:
+            q_split = q_split[0], q_split[1] * 2, q_split[2] * 2
         qh_split = (True, first * n_gqa, last * n_gqa) \
             if num_kv_heads else None
         kv_split = (True, first * head_dim, last * head_dim) \

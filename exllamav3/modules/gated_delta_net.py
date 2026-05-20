@@ -24,25 +24,30 @@ class GDNState:
         clear: bool = True,
         stashed: dict = None,
         test_state: bool = False,
+        exported: bool = False,
     ):
-        assert test_state or position == 0 or stashed is not None, \
-            "State must be new, restored from checkpoint or marked as a test state."
-
         self.slot = slot
         self.position = position
         self.cache = cache
-        if clear and stashed is None:
-            for l in self.cache.get_all_recurrent_layers().values():
-                l.clear(slot)
         self.last_history = 0
+        self.exported = exported
 
-        if stashed is not None:
-            self.unstash(stashed)
+        if not exported:
+            assert test_state or position == 0 or stashed is not None, \
+                "State must be new, restored from checkpoint or marked as a test state."
 
-        self.checkpoint_size = sum(
-            l.get_checkpoint_size()
-            for l in self.cache.get_all_recurrent_layers().values()
-        )
+            if clear and stashed is None:
+                # TODO: TP func
+                for l in self.cache.get_all_recurrent_layers().values():
+                    l.clear(slot)
+
+            if stashed is not None:
+                self.unstash(stashed)
+
+            self.checkpoint_size = sum(
+                l.get_checkpoint_size()
+                for l in self.cache.get_all_recurrent_layers().values()
+            )
 
 
     def free(self):
@@ -76,6 +81,15 @@ class GDNState:
         pass
 
 
+    def tp_export(self):
+        return GDNState(
+            cache = id(self.cache),
+            slot = self.slot,
+            position = self.position,
+            exported = True,
+        )
+
+
 class GDNLayerState:
 
     def __init__(
@@ -83,6 +97,7 @@ class GDNLayerState:
         module: GatedDeltaNet,
         max_batch_size: int,
         max_history: int,
+        cache_id: int,
     ):
         self.module = module
         self.conv_state = torch.empty(
@@ -97,6 +112,8 @@ class GDNLayerState:
         )
         self.device = None
         self.max_history = max_history
+        self.max_batch_size = max_batch_size
+        self.cache_id = cache_id
 
 
     def get_checkpoint_size(self):
@@ -104,6 +121,10 @@ class GDNLayerState:
             self.module.fdim_qkv * self.module.conv_kernel_size * 2 +
             self.module.num_v_heads * self.module.k_head_dim * self.module.v_head_dim * 4
         )
+
+
+    def storage_size(self):
+        return sum(t.numel() * t.element_size() for t in [self.conv_state, self.recurrent_state])
 
 
     def alloc(self, device):
@@ -163,6 +184,17 @@ class GDNLayerState:
         self.conv_state[slot, :, :cdim].copy_(c)
 
 
+    def tp_export(self, plan):
+        return {
+            "cls": GDNLayerState,
+            "args": {
+                "cache_id": self.cache_id,
+                "max_history": self.max_history,
+                "max_batch_size": self.max_batch_size,
+            }
+        }
+
+
 class GatedDeltaNet(Module):
 
     def __init__(
@@ -196,6 +228,7 @@ class GatedDeltaNet(Module):
         a_log: torch.Tensor | None = None,
         dt_bias: torch.Tensor | None = None,
         conv1d_weight: torch.Tensor | None = None,
+        conv1d_bias: torch.Tensor | None = None,
         qkv_proj: Linear | None = None,
         z_proj: Linear | None = None,
         b_proj: Linear | None = None,
@@ -216,7 +249,7 @@ class GatedDeltaNet(Module):
         self.v_head_dim = v_head_dim
         self.num_k_heads = num_k_heads
         self.num_v_heads = num_v_heads
-        self.num_v_groups = num_v_heads // num_k_heads
+        self.num_v_groups = num_v_heads // num_k_heads if num_k_heads else 0
         self.rms_norm_eps = rms_norm_eps
         self.conv_kernel_size = conv_kernel_size
         self.k_dim = self.k_head_dim * self.num_k_heads
@@ -228,6 +261,9 @@ class GatedDeltaNet(Module):
         self.fdim_qkvz = 2 * self.num_k_heads * self.k_head_dim + 2 * self.num_v_heads * self.v_head_dim
         self.fdim_ba = 2 * self.num_v_heads
         self.fdim_qkv = 2 * self.num_k_heads * self.k_head_dim + self.num_v_heads * self.v_head_dim
+
+        if self.num_k_heads == 0:
+            return
 
         if key_qkv or key_z:
             assert key_qkv and key_z, \
@@ -359,6 +395,7 @@ class GatedDeltaNet(Module):
             self.key_dt_bias = f"{key}.{key_dt_bias}"
         if conv1d_weight is not None:
             self.conv1d_weight = conv1d_weight
+            self.conv1d_bias = conv1d_bias
             self.key_conv1d_weight = None,
             self.key_conv1d_bias = None,
             self.key_conv1d_q_weight = None,
@@ -384,6 +421,7 @@ class GatedDeltaNet(Module):
         self.recurrent_layers = []
         self.tp_recurrent_lookup = {}
         self.tp_reduce = False
+        self.has_split_cache = False
 
 
     @override
@@ -558,7 +596,10 @@ class GatedDeltaNet(Module):
         if rsg:
             recurrent_slots = get_for_device(params, "recurrent_slots", self.device)
             layer_instance = (self.layer_idx, params.get("layer_instance", 0))
-            rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+            if rsg[0].exported:
+                rsl = self.tp_recurrent_lookup[rsg[0].cache]
+            else:
+                rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
             conv_state, recurrent_state = rsl.get_state_tensors()
             save_state = True
         else:
@@ -691,6 +732,8 @@ class GatedDeltaNet(Module):
         storage += self.z_proj.storage_size()
         storage += self.b_proj.storage_size()
         storage += self.a_proj.storage_size()
+        for cl in self.recurrent_layers:
+            storage += cl.storage_size()
         overhead_d = 0
         overhead_d += self.hidden_size * (self.out_dtype or torch.half).itemsize
         overhead_s = 0
@@ -721,7 +764,7 @@ class GatedDeltaNet(Module):
             overhead_to_split = overhead_s,
             recons_temp = recons,
             channels_to_split = channels_to_split,
-            limit_key = "attn"
+            limit_key = "linear_attn"
         )
         return [tpa]
 
@@ -745,7 +788,7 @@ class GatedDeltaNet(Module):
                 "layer_idx": self.layer_idx,
                 "hidden_size": self.hidden_size,
                 "k_head_dim": self.k_head_dim,
-                "v_head_dim": self.k_head_dim,
+                "v_head_dim": self.v_head_dim,
                 "rms_norm_eps": self.rms_norm_eps,
                 "conv_kernel_size": self.conv_kernel_size,
                 "beta_scale": self.beta_scale,
@@ -762,10 +805,14 @@ class GatedDeltaNet(Module):
                 "o_proj",
                 "norm",
                 "conv1d_weight",
+                "conv1d_bias",
                 "a_log",
                 "dt_bias",
             )},
             "device": self.device,
+            "recurrent_layers": [
+                rl.tp_export(plan) for rl in self.recurrent_layers
+            ]
         }
 
 
@@ -819,6 +866,7 @@ class GatedDeltaNet(Module):
             num_k_heads = num_k_heads,
             num_v_heads = num_v_heads,
             conv1d_weight = _import_split_3("conv1d_weight", q_split, k_split, v_split),
+            conv1d_bias = _import_split_3("conv1d_bias", q_split, k_split, v_split),
             qkv_proj = _import_split_3("qkv_proj", q_split, k_split, v_split),
             z_proj = _import_split("z_proj", z_split),
             o_proj = _import_split("o_proj", o_split),
@@ -828,6 +876,15 @@ class GatedDeltaNet(Module):
             a_log = _import_split("a_log", a_split),
             dt_bias = _import_split("dt_bias", a_split),
         )
+
+        if num_k_heads:
+            recurrent_layers = exported["recurrent_layers"]
+            if len(recurrent_layers):
+                module.has_split_cache = True
+                for rl in exported["recurrent_layers"]:
+                    rli = rl["cls"](module, **rl["args"])
+                    module.recurrent_layers.append(rli)
+                    module.tp_recurrent_lookup[rl["args"]["cache_id"]] = rli
 
         module.device = device
         if not kwargs.get("skip_reduction"):

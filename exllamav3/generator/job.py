@@ -1141,6 +1141,7 @@ class Job:
 
 
     def deallocate_pages(self):
+        self.free_recurrent_state()
         for seq in self.sequences:
             if seq.allocated_pages is not None:
                 self.pagetable.deallocate_pages(seq.allocated_pages)
@@ -1190,7 +1191,7 @@ class Job:
 
     def free_recurrent_state(self):
         if self.recurrent_state is not None:
-            self.generator.cache.release_state(self.recurrent_state)
+            self.recurrent_state.free()
             self.recurrent_state = None
 
 

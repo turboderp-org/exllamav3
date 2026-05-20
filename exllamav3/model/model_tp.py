@@ -345,6 +345,7 @@ class Model_TPMixin:
     def prepare_inputs_for_tp(self, x: torch.Tensor, params: dict) -> torch.Tensor:
         self.tp_producer.clear()
         # Use ID of Cache object as reference to avoid having to pickle it
+        reserve = {}
         if "cache" in params:
             params["cache"] = id(params["cache"])
         # Share memory of any additional CPU tensors
@@ -362,7 +363,12 @@ class Model_TPMixin:
         if p is not None:
             params["indexed_embeddings"] = send_embeddings(self.tp_producer, p)
 
-        return self.tp_producer.send(x)
+        p = params.get("recurrent_states")
+        if p is not None:
+            reserve["recurrent_states"] = params["recurrent_states"]
+            params["recurrent_states"] = [(rs.tp_export() if rs is not None else None) for rs in p]
+
+        return self.tp_producer.send(x), reserve
 
 
     def prefill_tp(
@@ -374,7 +380,7 @@ class Model_TPMixin:
     ):
         self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
-        x = self.prepare_inputs_for_tp(x, params)
+        x, reserve = self.prepare_inputs_for_tp(x, params)
         for device in self.active_devices:
             self.tp_worker_dispatch(device, mp_model_forward, (
                 x,
@@ -387,6 +393,7 @@ class Model_TPMixin:
             assert r is None, "TP logic error"
 
         self.tp_worker_result(-1)
+        params.update(reserve)
         return None
 
 
@@ -399,7 +406,7 @@ class Model_TPMixin:
     ):
         self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
-        x = self.prepare_inputs_for_tp(x, params)
+        x, reserve = self.prepare_inputs_for_tp(x, params)
         for device in self.active_devices:
             self.tp_worker_dispatch(device, mp_model_forward, (
                 x,
@@ -415,6 +422,7 @@ class Model_TPMixin:
         assert len(return_tensors) == 1, "TP logic error"
 
         self.tp_worker_result(-1)
+        params.update(reserve)
         return return_tensors[0]
 
 

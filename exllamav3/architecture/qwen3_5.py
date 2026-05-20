@@ -468,9 +468,6 @@ class Qwen3_5BaseModel(Model):
         })
         self.recurrent_state_cls = GDNState
 
-        # TP for this architecture is not implemented yet
-        self.caps.update({"supports_tp": False})
-
         # Generator needs MRoPE freqs when using MMEmbeddings
         if config.vision:
             self.caps.update({"mrope": True})
