@@ -68,7 +68,8 @@ class Model_LSMixin(ABC):
         modules: list,
         verbose: bool,
         max_batch_size: int,
-        cache_weakrefs: dict
+        cache_weakrefs: dict,
+        autosplit_no_forward: bool,
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
@@ -105,7 +106,7 @@ class Model_LSMixin(ABC):
 
                 # Narrow state to max_output_size for logit output layer
                 is_logits_layer = module.caps.get("logits_output")
-                if is_logits_layer:
+                if is_logits_layer and not autosplit_no_forward:
                     b, c, d = backup_shape
                     backup_shape = (b, min(max_output_size, c), d)
                     if dummy_state is not None:
@@ -154,7 +155,7 @@ class Model_LSMixin(ABC):
                                 qcache_overhead.append(cl.get_kv_alloc_placeholder())
 
                         # Forward dummy state through module
-                        if self.caps.get("autosplit_load_fwd", True):
+                        if self.caps.get("autosplit_load_fwd", True) and not autosplit_no_forward:
                             dummy_state = module.prepare_for_device(dummy_state, params)
                             dummy_state = module.forward(dummy_state, params)
 

@@ -237,6 +237,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         verbose: bool = False,
         max_batch_size: int = 1,
         tp_options: dict | None = None,
+        autosplit_no_forward: bool = False,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -323,6 +324,9 @@ class Model(Model_TPMixin, Model_LSMixin):
         :param tp_options:
             dict of optional values:
                 "moe_tensor_split": bool - use tensor split rather than expert parallelism for MoE layers
+
+        :param autosplit_no_forward:
+            For debug purposes, skip reference forward pass during autosplit load.
         """
 
         free_mem()
@@ -392,7 +396,8 @@ class Model(Model_TPMixin, Model_LSMixin):
                     self.modules,
                     verbose,
                     max_batch_size,
-                    self.cache_weakrefs
+                    self.cache_weakrefs,
+                    autosplit_no_forward,
                 )
                 self.output_device = self.modules[-1].device
 

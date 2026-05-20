@@ -58,6 +58,7 @@ def add_args(
     parser.add_argument("-ambs", "--autosplit_max_batch_size", type = int, help = f"Max batch size to account for when loading in autosplit mode (default: {default_autosplit_max_batch_size})", default = default_autosplit_max_batch_size)
 
     parser.add_argument("-lv", "--load_verbose", action = "store_true", help = "Verbose output while loading")
+    parser.add_argument("-asnf", "--autosplit_no_forward", action = "store_true", help = "Skip forward pass in autosplit, for debug purposes.")
 
     parser.add_argument("-layer_map", "--layer_map", type = str, help = "RYS layer map as a list of ints or (inclusive) ranges, example: 0..15,11..31 (repeats layers 11 through 15 once)", default = None)
 
@@ -279,6 +280,7 @@ def init(
             progressbar = progress,
             verbose = args.load_verbose,
             max_batch_size = args.autosplit_max_batch_size,
+            autosplit_no_forward = args.autosplit_no_forward,
             **kwargs
         )
 
@@ -293,6 +295,7 @@ def init(
         verbose = args.load_verbose,
         tp_options = tp_options,
         max_batch_size = args.autosplit_max_batch_size,
+        autosplit_no_forward = args.autosplit_no_forward,
         **kwargs
     )
 
