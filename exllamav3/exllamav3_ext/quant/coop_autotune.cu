@@ -480,17 +480,20 @@ CoopAutotuneLaunch tune
     cuda_check(cudaEventCreate(&start));
     cuda_check(cudaEventCreate(&end));
 
-    int repeats = 20;
-    if (numel_B > 1e6) repeats = 10;
+    int repeats = 10;
+    if (numel_B > 1e6) repeats = 6;
     if (numel_B > 1e7) repeats = 5;
     if (numel_B > 1e8) repeats = 3;
     if (numel_B > 2e8) repeats = 2;
-    int max_rounds = 64;
-    if (numel_B > 1e7) max_rounds = 20;
+    int max_rounds = 32;
+    if (numel_B > 1e6) max_rounds = 16;
+    if (numel_B > 1e7) max_rounds = 10;
     if (numel_B > 1e8) max_rounds = 5;
     if (numel_B > 2e8) max_rounds = 2;
     int max_cands = 8;
-    if (numel_B > 1e8) max_cands = 4;
+    if (numel_B > 1e6) max_cands = 5;
+    if (numel_B > 1e7) max_cands = 4;
+    if (numel_B > 1e8) max_cands = 3;
     if (numel_B > 2e8) max_cands = 2;
 
     if (candidates.size() > 1 && max_cands > 4)
