@@ -44,6 +44,8 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
         "device": device,
         "modules": [],
         "kv_modules": [],
+        "recurrent_modules": [],
+        "recurrent_cache": {},
         "rank": rank,
         "world_size": world_size,
         "output_rank": output_rank,
@@ -159,6 +161,7 @@ def mp_model_append(local_context: dict, exported: dict):
     """
     modules = local_context["modules"]
     kv_modules = local_context["kv_modules"]
+    recurrent_modules = local_context["recurrent_modules"]
     device = local_context["device"]
     cls = exported["cls"]
     plan = local_context["plan"]
@@ -166,6 +169,7 @@ def mp_model_append(local_context: dict, exported: dict):
     module = cls.tp_import(local_context, exported, plan[device])
     modules.append(module)
     kv_modules += module.all_cache_modules()
+    recurrent_modules += module.all_recurrent_modules()
     return None
 
 

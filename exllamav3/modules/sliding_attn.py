@@ -76,6 +76,11 @@ class SWAState:
         self.window_beg += self.wshift
 
 
+    def reset(self):
+        self.position = 0
+        self.window_beg = 0
+        self.wshift = 0
+
 class SWALayerState:
 
     def __init__(

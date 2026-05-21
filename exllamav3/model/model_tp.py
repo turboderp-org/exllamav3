@@ -221,6 +221,13 @@ class Model_TPMixin:
         for device in self.active_devices:
             self.tp_worker_result(device)
 
+    def tp_dispatch_all(self, func, args):
+        for device in self.active_devices:
+            self.tp_worker_dispatch(device, func, args)
+        for device in self.active_devices:
+            self.tp_worker_result(device)
+
+
 
     def _load_tp(
         self,

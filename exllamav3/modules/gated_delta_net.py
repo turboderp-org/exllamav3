@@ -12,7 +12,21 @@ from ..cache import Cache
 from ..util.tensor import g_tensor_cache
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
+from ..cache.recurrent import (
+    mp_cache_recurrent_stash,
+    mp_cache_recurrent_unstash,
+    mp_cache_recurrent_clear
+)
 from ..util import profile_opt
+
+next_checkpoint_handle = 0
+
+def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
+    recurrent_modules = local_context["recurrent_modules"]
+    for module in recurrent_modules:
+        l = module.tp_recurrent_lookup[cache_id]
+        l.rewind(slot, last_history, num_tokens)
+
 
 class GDNState:
 
@@ -37,9 +51,11 @@ class GDNState:
                 "State must be new, restored from checkpoint or marked as a test state."
 
             if clear and stashed is None:
-                # TODO: TP func
-                for l in self.cache.get_all_recurrent_layers().values():
-                    l.clear(slot)
+                if not self.cache.model.loaded_tp:
+                    for l in self.cache.get_all_recurrent_layers().values():
+                        l.clear(slot)
+                else:
+                    self.cache.model.tp_dispatch_all(mp_cache_recurrent_clear, (id(self.cache), self.slot))
 
             if stashed is not None:
                 self.unstash(stashed)
@@ -55,26 +71,39 @@ class GDNState:
 
 
     def rewind(self, num_tokens: int):
-        for l in self.cache.get_all_recurrent_layers().values():
-            l.rewind(self.slot, self.last_history, num_tokens)
+        if not self.cache.model.loaded_tp:
+            for l in self.cache.get_all_recurrent_layers().values():
+                l.rewind(self.slot, self.last_history, num_tokens)
+        else:
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_rewind, (id(self.cache), self.slot, self.last_history, num_tokens))
         self.position -= num_tokens
         self.last_history = 0
 
 
     def stash(self):
+        global next_checkpoint_handle
         stashed = {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size
         }
-        for k, l in self.cache.get_all_recurrent_layers().items():
-            stashed[k] = l.stash(self.slot)
+        if not self.cache.model.loaded_tp:
+            for k, l in self.cache.get_all_recurrent_layers().items():
+                stashed[k] = l.stash(self.slot)
+        else:
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), next_checkpoint_handle, self.slot))
+            stashed["tp_handle"] = next_checkpoint_handle
+            next_checkpoint_handle += 1
         return stashed
 
 
     def unstash(self, stashed: dict):
         assert self.position == stashed["position"]
-        for k, l in self.cache.get_all_recurrent_layers().items():
-            l.unstash(self.slot, stashed[k])
+        if not self.cache.model.loaded_tp:
+            for k, l in self.cache.get_all_recurrent_layers().items():
+                l.unstash(self.slot, stashed[k])
+        else:
+            cp_handle = stashed["tp_handle"]
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot))
 
 
     def post_advance(self):
@@ -88,6 +117,10 @@ class GDNState:
             position = self.position,
             exported = True,
         )
+
+
+    def reset(self):
+        self.position = 0
 
 
 class GDNLayerState:

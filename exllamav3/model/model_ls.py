@@ -191,12 +191,8 @@ class Model_LSMixin(ABC):
                         module.unload()
                         dummy_state = None
                         if "recurrent_states" in params:
-                            rls = [m for m in module if m.caps.get("recurrent_cache")]
-                            for rl in rls:
-                                for instance in self.get_layer_instances(rl.layer_idx):
-                                    s = params["recurrent_states"].get(instance)
-                                    if s:
-                                        s.reset()
+                            for rs in params["recurrent_states"]:
+                                rs.reset()
 
                         free_mem()
                         current_device_i += 1
