@@ -208,7 +208,7 @@ void perform_cpu_reduce_avx2
                 timeout_spin = 0;
                 const auto now = std::chrono::high_resolution_clock::now();
                 const std::chrono::duration<double, std::milli> elapsed = now - start;
-                if (elapsed > std::chrono::duration<double, std::milli>(6000.0))
+                if (elapsed > std::chrono::duration<double, std::milli>(45000.0))
                 {
                     printf(" ## CPU reduce process timeout\n");
                     TORCH_CHECK(false, "CPU reduce process timeout");
