@@ -1033,6 +1033,8 @@ class BlockSparseMLP(Module):
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         storage += self.routing_gate.storage_size()
+        if self.shared_gate:
+            storage += self.shared_gate.storage_size()
         for g in self.gates: storage += g.storage_size()
         for u in self.ups: storage += u.storage_size()
         for d in self.downs: storage += d.storage_size()
@@ -1089,6 +1091,7 @@ class BlockSparseMLP(Module):
                 "act_limit": self.act_limit,
             },
             "routing_gate": _export(self.routing_gate),
+            "shared_gate": _export(self.shared_gate),
             "e_score_correction_bias": producer.send(self.e_score_correction_bias),
             "gates": [_export(self.gates[i]) for i in range(self.num_experts)],
             "ups": [_export(self.ups[i]) for i in range(self.num_experts)],
@@ -1159,6 +1162,7 @@ class BlockSparseMLP(Module):
             ups = ups,
             downs = downs,
             shared_experts = _import_no_reduce("shared_experts"),
+            shared_gate = _import("shared_gate"),
             routing_gate = _import("routing_gate") if device == output_device else None,
             routing_first = routing_first,
             routing_last = routing_last,
