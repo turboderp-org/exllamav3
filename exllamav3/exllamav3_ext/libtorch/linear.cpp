@@ -62,6 +62,7 @@ at::Tensor BC_LinearEXL3::run_alloc(const at::Tensor& x, int64_t out_features, b
         out_shape,
         x.options().dtype(output_fp32 ? at::kFloat : at::kHalf)
     );
+    if (out_features == 0) return y;
 
     at::Tensor x_flat = x.view({-1, x.size(-1)});
     at::Tensor y_flat = y.view({-1, out_features});
