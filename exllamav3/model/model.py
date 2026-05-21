@@ -29,6 +29,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.output_device = None
         self.cache_weakrefs = {}
         self.recurrent_state_cls = None
+        self.draft_verifier_params = {}
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None

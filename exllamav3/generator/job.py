@@ -1054,6 +1054,8 @@ class Job:
                     "indexed_embeddings": self.embeddings,
                     "inv_freq": self.alt_rope_freqs,
                 }
+                if self.generator.draft_model:
+                    params.update(self.generator.draft_model.draft_verifier_params)
                 self.generator.model.prefill(
                     input_ids = prefill_ids,
                     params = params,

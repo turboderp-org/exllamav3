@@ -170,6 +170,8 @@ def mp_model_append(local_context: dict, exported: dict):
     modules.append(module)
     kv_modules += module.all_cache_modules()
     recurrent_modules += module.all_recurrent_modules()
+    if module.caps.get("logits_output"):
+        local_context["logits_module"] = module
     return None
 
 
@@ -212,6 +214,7 @@ def mp_model_forward(
     params: dict,
     last_kv_module_idx: int,
     prefill: bool,
+    single_idx: int,
 ):
     """
     Forward pass for parallel slice of a model
@@ -219,7 +222,7 @@ def mp_model_forward(
     backend = local_context["backend"]
     backend.fwd_barrier()
 
-    modules = local_context["modules"]
+    modules = local_context["modules"] if single_idx is None else [local_context["modules"][single_idx]]
     consumer = local_context["inf_consumer"]
 
     for tensor_param in [
@@ -255,6 +258,34 @@ def mp_model_forward(
 
     backend.end_cpu_reduce_jobs()
     return x
+
+
+def mp_model_forward_embedding(
+    local_context: dict,
+    shared_input: dict,
+    params: dict,
+):
+    consumer = local_context["inf_consumer"]
+    module = local_context["modules"][0]
+    x = consumer.recv(shared_input)
+    x = module.forward(x, params)
+    return x
+
+
+def mp_model_forward_lm_head_argmax(
+    local_context: dict,
+    shared_input: dict,
+    params: dict,
+    offset: int,
+):
+    consumer = local_context["inf_consumer"]
+    module = local_context["logits_module"]
+    x = consumer.recv(shared_input)
+    x = module.prepare_for_device(x, params)
+    x = module.forward(x, params)
+    v, i = x.max(dim = -1)
+    i += offset
+    return v, i
 
 
 def mp_cache_page_copy(

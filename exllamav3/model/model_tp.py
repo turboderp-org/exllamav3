@@ -221,12 +221,43 @@ class Model_TPMixin:
         for device in self.active_devices:
             self.tp_worker_result(device)
 
+
     def tp_dispatch_all(self, func, args):
         for device in self.active_devices:
             self.tp_worker_dispatch(device, func, args)
         for device in self.active_devices:
             self.tp_worker_result(device)
 
+
+    def tp_dispatch_master(self, func, args):
+        self.tp_worker_dispatch(self.tp_output_device, func, args)
+        r = self.tp_worker_result(self.tp_output_device)
+        return r
+
+
+    def tp_dispatch_lm_head_argmax(self, args):
+        ad = []
+        for device in self.active_devices:
+            a, b, _ = self.plan[device]["lm_head"]
+            if b > a:
+                self.tp_worker_dispatch(device, mp_model_forward_lm_head_argmax, args + (a,))
+                ad.append(device)
+        results = []
+        for device in ad:
+            r = self.tp_worker_result(device)
+            results.append((device, r))
+
+        device = self.tp_output_device
+        vals, inds = [], []
+        for (_, result) in sorted(results):
+            v, i = result
+            vals.append(v.to(device))
+            inds.append(i.to(device))
+        vals = torch.stack(vals, dim = -1)
+        inds = torch.stack(inds, dim = -1)
+        winner = vals.argmax(dim = -1)
+        argmax = inds.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
+        return argmax
 
 
     def _load_tp(
@@ -289,8 +320,8 @@ class Model_TPMixin:
         allocator.initial_split(max_mem)
         if verbose:
             allocator.print_split()
-        plan = allocator.compile_tp_plan()
-        self.tp_worker_dispatch_wait_multi(self.active_devices, mp_set_plan, (plan, self.active_devices))
+        self.plan = allocator.compile_tp_plan()
+        self.tp_worker_dispatch_wait_multi(self.active_devices, mp_set_plan, (self.plan, self.active_devices))
 
         # Distribution pipeline
         producer = SMProducer()
@@ -318,7 +349,7 @@ class Model_TPMixin:
                     config.stc.end_deferred_load()
 
                 # Do module-specific device/process split
-                exported = module.tp_export(plan, producer)
+                exported = module.tp_export(self.plan, producer)
                 self.tp_worker_dispatch_wait_multi(self.active_devices, mp_model_append, (exported,))
                 producer.clear()
 
@@ -400,7 +431,8 @@ class Model_TPMixin:
                 x,
                 params,
                 last_kv_module_idx,
-                True
+                True,
+                None
             ))
         for device in self.active_devices:
             r = self.tp_worker_result(device)
@@ -426,7 +458,8 @@ class Model_TPMixin:
                 x,
                 params,
                 last_kv_module_idx,
-                False
+                False,
+                None
             ))
         return_tensors = []
         for device in self.active_devices:

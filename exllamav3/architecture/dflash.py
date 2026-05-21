@@ -173,19 +173,20 @@ class DFlashModel(Model):
             "supports_tp": False,
             "attach_target": True,
             "dflash_draft": True,
-            "default_draft_size": self.config.block_size - 1,
+            "default_draft_size": config.block_size - 1,
             "autosplit_load_fwd": False,
         })
 
-        self.lm_head = None
+        self.attached_model = None
+
+        self.draft_verifier_params.update({
+            "export_state_layers": set(config.target_layer_ids),
+        })
 
 
     def attach_to(self, target):
-        for i, l in enumerate(self.config.target_layer_ids):
-            t = target.modules[target.first_block_idx + l]
-            t.export_state = True
-        self.input_layer.embedding = weakref.ref(target.modules[0])
-        self.lm_head = weakref.ref(target.modules[-1])
+        self.attached_model = weakref.ref(target)
+        self.input_layer.attached_model = weakref.ref(target)
 
 
     def update_kv_from_target(
@@ -270,9 +271,16 @@ class DFlashModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        logits = self.lm_head().prepare_for_device(state, params)
-        logits = self.lm_head().forward(logits, params)
-        return torch.argmax(logits, dim = -1)
+        if not self.attached_model().loaded_tp:
+            ll = self.attached_model().logit_layer_idx
+            lm = self.attached_model().modules[ll]
+            logits = lm.prepare_for_device(state, params)
+            logits = lm.forward(logits, params)
+            return torch.argmax(logits, dim = -1)
+        else:
+            state = self.attached_model().tp_producer.send(state)
+            argmax = self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
+            return argmax
 
 
     def default_load_shape_dtype(self, chunk_size):

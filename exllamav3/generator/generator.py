@@ -608,6 +608,8 @@ class Generator:
             "positions": positions,
             "recurrent_history": draft_tokens is not None,
         }
+        if self.draft_model:
+            params.update(self.draft_model.draft_verifier_params)
         batch_logits = self.model.forward(
             input_ids = batch_ids,
             params = params,
