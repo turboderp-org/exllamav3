@@ -15,7 +15,7 @@ from ..util import log_tp, global_t0
 from ..tokenizer.mm_embedding import send_embeddings
 
 cleanupper = Cleanupper()
-DISPATCH_TIMEOUT = 5
+DISPATCH_TIMEOUT = 20
 
 class Model_TPMixin:
 
