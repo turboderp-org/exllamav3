@@ -15,6 +15,7 @@ from ..util import log_tp, global_t0
 from ..tokenizer.mm_embedding import send_embeddings
 
 cleanupper = Cleanupper()
+DISPATCH_TIMEOUT = 5
 
 class Model_TPMixin:
 
@@ -157,7 +158,10 @@ class Model_TPMixin:
         """
         conn = self.mp_parent_conn[device]
         conn.send((fn, args))
-        result = conn.recv()
+        if conn.poll(DISPATCH_TIMEOUT):
+            result = conn.recv()
+        else:
+            raise TimeoutError("Timed out waiting for worker")
         if isinstance(result, Exception):
             raise result
         return result
@@ -176,7 +180,10 @@ class Model_TPMixin:
         Await and return result from child function, and propagate any exceptions to main process
         """
         conn = self.mp_parent_conn[device]
-        result = conn.recv()
+        if conn.poll(DISPATCH_TIMEOUT):
+            result = conn.recv()
+        else:
+            raise TimeoutError("Timed out waiting for worker")
         if isinstance(result, Exception):
             raise result
         return result
