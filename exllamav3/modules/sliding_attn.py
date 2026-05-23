@@ -61,7 +61,7 @@ class SWAState:
             "window_beg": self.window_beg,
         }
         for k, l in self.cache.get_all_recurrent_layers().items():
-            stashed[k] = l.stash(self.slot)
+            stashed[k] = l.stash(self.slot, self.position)
         return stashed
 
 
@@ -69,7 +69,7 @@ class SWAState:
         assert self.position == stashed["position"]
         self.window_beg = stashed["window_beg"]
         for k, l in self.cache.get_all_recurrent_layers().items():
-            l.unstash(self.slot, stashed[k])
+            l.unstash(self.slot, stashed[k], self.position)
 
 
     def post_advance(self):
@@ -110,8 +110,8 @@ class SWALayerState:
 
     def get_checkpoint_size(self):
         return (
-            self.module.kv_state_size * self.module.num_kv_heads * self.module.head_dim * 2 +
-            self.module.kv_state_size * self.module.num_kv_heads * self.module.head_dim * 2
+            self.module.sliding_window * self.module.num_kv_heads * self.module.head_dim * 2 +
+            self.module.sliding_window * self.module.num_kv_heads * self.module.head_dim * 2
         )
 
 
@@ -142,17 +142,21 @@ class SWALayerState:
         pass
 
 
-    def stash(self, slot):
+    def stash(self, slot, position):
+        b = min(self.module.kv_state_size, position)
+        a = max(0, b - self.module.sliding_window)
         return (
-            self.k_state[slot].cpu(),
-            self.v_state[slot].cpu()
+            self.k_state[slot, a:b].cpu(),
+            self.v_state[slot, a:b].cpu()
         )
 
 
-    def unstash(self, slot, stashed):
+    def unstash(self, slot, stashed, position):
+        b = min(self.module.kv_state_size, position)
+        a = max(0, b - self.module.sliding_window)
         k, v = stashed
-        self.k_state[slot].copy_(k)
-        self.v_state[slot].copy_(v)
+        self.k_state[slot, a:b].copy_(k)
+        self.v_state[slot, a:b].copy_(v)
 
 
 class SlidingAttention(Module):
