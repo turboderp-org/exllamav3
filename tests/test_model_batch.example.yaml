@@ -1,0 +1,13 @@
+defaults: --tasks all --max_response_tokens 8192
+
+runs:
+  - name: model-a-default
+    model_dir: /path/to/model-a
+
+  - name: model-a-cache-q4
+    model_dir: /path/to/model-a
+    args: --cache_quant 4
+
+  - name: model-b-low-temp
+    model_dir: /path/to/model-b
+    args: --temperature 0.2 --system_prompt "Answer tersely." --tasks valid_svg
