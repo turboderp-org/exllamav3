@@ -1169,14 +1169,21 @@ class Job:
                 f.is_active = f.trigger_token is None
 
 
-    def is_checkpoint_boundary(self, interval):
+    def is_checkpoint_boundary(self, override_interval):
         seq = self.sequences[0]
-        return seq.kv_position % interval == 0
+        prompt_len = len(seq.sequence_ids) - 1
+        seq_pos = seq.kv_position
+        if override_interval:
+            return seq_pos % override_interval == 0
+        elif seq_pos >= prompt_len - self.generator.max_chunk_size * 2:
+            return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0
+        else:
+            return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval_pp == 0
 
 
-    def maybe_stash_recurrent(self, cache, interval):
+    def maybe_stash_recurrent(self, cache, interval = None):
         seq = self.sequences[0]
-        if seq.kv_position % interval == 0 and \
+        if self.is_checkpoint_boundary(interval) and \
             self.last_recurrent_checkpoint_pos != seq.kv_position:
             assert seq.kv_position % PAGE_SIZE == 0
 

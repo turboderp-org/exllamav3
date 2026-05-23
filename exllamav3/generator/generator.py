@@ -34,6 +34,7 @@ class Generator:
         enable_defrag: bool = True,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
+        recurrent_checkpoint_interval_pp: int = 32768,
         ngram_match_min: int = 0,
         **kwargs
     ):
@@ -87,8 +88,12 @@ class Generator:
             Ignored if model doesn't use recurrent states
 
         :param recurrent_checkpoint_interval:
-            Minimum number of tokens between recurrent checkpoints. Must be a multiple of the page size.
-            Model architecture determines default
+            Minimum number of tokens between recurrent checkpoints in model output and the tail end of
+            the prompt. Must be a multiple of the page size. Model architecture determines default
+
+        :param recurrent_checkpoint_interval_pp]:
+            Minimum number of tokens between recurrent checkpoints during prompt ingestion. Must be a
+            multiple of the page size. Default is 32768 tokens
 
         :param kwargs:
         """
@@ -173,10 +178,13 @@ class Generator:
         if recurrent_checkpoint_interval is None:
             recurrent_checkpoint_interval = model.caps.get("default_recurrent_checkpoint_interval", 2048)
 
-        assert recurrent_checkpoint_interval % PAGE_SIZE == 0, \
-            "recurrent_checkpoint_interval must be a multiple of the page size (256)"
-        recurrent_checkpoint_interval = min(recurrent_checkpoint_interval, self.max_chunk_size)
+        assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval % PAGE_SIZE == 0, \
+            "checkpoint interval must be a multiple of the page size (256)"
+        def ceil_span(a, b):
+            return (a + b - 1) // b * b
+        recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
+        self.recurrent_checkpoint_interval_pp = ceil_span(recurrent_checkpoint_interval_pp, self.max_chunk_size)
 
         # Drafting mode
         if draft_model is not None and draft_model.caps.get("attach_target"):
@@ -355,7 +363,7 @@ class Generator:
 
     def recurrent_checkpoint(self):
         for job in self.active_jobs:
-            job.maybe_stash_recurrent(self.recurrent_cache, self.recurrent_checkpoint_interval)
+            job.maybe_stash_recurrent(self.recurrent_cache)
 
 
     def update_visualizer(self):
@@ -677,7 +685,7 @@ class Generator:
 
                 # Continue sampling from logit batch as long as result matches draft, unless hitting checkpoint mark
                 if draft_tokens is not None and i < batch_logits.shape[1] - 1:
-                    cp_boundary = batch_states is not None and job.is_checkpoint_boundary(self.recurrent_checkpoint_interval)
+                    cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
                     if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
 
                         # Count rejected draft tokens
@@ -740,7 +748,7 @@ class Generator:
         num_jobs = self.num_remaining_jobs()
         for job in completed_jobs + requeuing_jobs:
             if job in requeuing_jobs and self.recurrent_cache is not None:
-                job.maybe_stash_recurrent(self.recurrent_cache, self.recurrent_checkpoint_interval)
+                job.maybe_stash_recurrent(self.recurrent_cache)
             job.deallocate_pages()
             self.active_jobs.remove(job)
 
