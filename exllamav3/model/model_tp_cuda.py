@@ -1,6 +1,6 @@
 import ctypes
 from functools import lru_cache
-import os, glob
+import os
 
 CUDA_SUCCESS = 0
 CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED = 34
@@ -11,19 +11,34 @@ CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED = 719
 @lru_cache(maxsize = 1)
 def _cudart():
 
-    # Windows: Try to find cudart64_*.dll in common paths
-    # TODO: Test that this actually works
+    # Windows: Try to find cudart64_*.dll in known CUDA installation paths
     if os.name == "nt":
-        candidates = [f"cudart64_{v}.dll" for v in ("130","120","118","117","116","110","101","100")]
-        for p in os.getenv("PATH","").split(os.pathsep):
-            candidates += glob.glob(os.path.join(p, "cudart64_*.dll"))
-        last_err = None
-        for name in candidates:
-            try:
-                return ctypes.WinDLL(name)  # __stdcall
-            except OSError as e:
-                last_err = e
-        raise OSError("Could not load cudart64_*.dll; ensure CUDA runtime is on PATH") from last_err
+        candidates = []
+        for v in ("130","120","118","117","116","110","101","100"):
+            candidates.append(f"cudart64_{v}.dll")
+        # Search known CUDA installation directories only
+        cuda_paths = []
+        for env_var in ("CUDA_PATH", "CUDA_PATH_V12_0", "CUDA_PATH_V11_8"):
+            val = os.getenv(env_var)
+            if val:
+                cuda_paths.append(os.path.join(val, "bin"))
+        # Fallback to Program Files
+        for pf in ("ProgramFiles", "ProgramW6432"):
+            base = os.environ.get(pf)
+            if base:
+                for d in os.listdir(base) if os.path.isdir(base) else []:
+                    if d.lower().startswith("cuda"):
+                        cuda_paths.append(os.path.join(base, d, "bin"))
+        for cp in cuda_paths:
+            if os.path.isdir(cp):
+                for name in candidates:
+                    full = os.path.join(cp, name)
+                    if os.path.isfile(full):
+                        try:
+                            return ctypes.WinDLL(full)
+                        except OSError:
+                            pass
+        raise OSError("Could not load cudart64_*.dll; ensure CUDA runtime is installed")
 
     # Linux: try unversioned and common SONAMEs, then ctypes.util.find_library
     else:
