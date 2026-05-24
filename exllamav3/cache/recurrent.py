@@ -33,7 +33,7 @@ class RecurrentCache(OrderedDict):
             state_size = stashed_state["checkpoint_size"]
             while self.update_total_size() + state_size > self.max_size:
                 assert self.current_size >= 0, "Not enough space in cache for single state"
-                popped = self.popitem(last = False)
+                _, popped = self.popitem(last = False)
                 if self.model.loaded_tp:
                     self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
 
@@ -79,6 +79,6 @@ def mp_cache_recurrent_unstash(local_context: dict, cache_id: int, cp_handle: in
         l.unstash(slot, s)
 
 
-def mp_cache_recurrent_del(local_context: dict, cp_handle: int):
+def mp_cache_recurrent_del(local_context: dict, cache_id: int, cp_handle: int):
     recurrent_cache = local_context["recurrent_cache"]
     del recurrent_cache[cp_handle]
