@@ -236,3 +236,43 @@ class SMConsumer:
             cuda_host_unregister(self.arena.data_ptr())
         if self.producer is not None:
             self.shm.close()
+
+
+class TPTensorWrapper:
+
+    @staticmethod
+    def tp_export(t: torch.Tensor, plan, producer):
+        return {
+            "cls": TPTensorWrapper,
+            "weight": producer.send(t),
+            "device": t.device,
+        }
+
+    @staticmethod
+    def tp_import_split(local_context, exported, plan, split, dbg = False):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        id_w = exported["weight"]
+
+        assert split is not None
+        _, first, last = split
+        w = consumer.recv(id_w, cuda = True, slice_dim = 0, first = first, last = last)
+        return w
+
+
+    @staticmethod
+    def tp_import_split_3(local_context, exported, plan, split_0, split_1, split_2, dbg = False):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        id_w = exported["weight"]
+
+        w_ = []
+
+        for split in [split_0, split_1, split_2]:
+            assert split is not None
+            _, first, last = split
+            w = consumer.recv(id_w, cuda = True, slice_dim = 0, first = first, last = last)
+            w_.append(w)
+
+        w = torch.cat(w_, dim = 0).contiguous()
+        return w

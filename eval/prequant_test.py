@@ -5,13 +5,14 @@ import argparse
 from exllamav3.util.file import disk_lru_cache
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.memory import free_mem
+from exllamav3.util.misc import prepend_hf_chat_context
+from exllamav3.util.measures import compute_target_log_probs
 from exllamav3 import Config, Model, Tokenizer
 from exllamav3.ext import exllamav3_ext as ext
 from datasets import load_dataset
 from exllamav3.modules import Linear
 from exllamav3.modules.quant.exl3_lib.quantize import regularize
 import torch
-import torch.nn.functional as F
 import math
 
 # ANSI codes
@@ -277,6 +278,8 @@ def main(args):
     # Input state
     bos = None if not args.bos else torch.tensor([[config.bos_token_id]], dtype = torch.long)
     eval_ids = get_test_tokens(tokenizer, args.rows, bos)
+    if args.gen_prompt:
+        eval_ids = prepend_hf_chat_context(tokenizer, eval_ids)
     state = eval_ids
 
     # Streaming forward pass
@@ -318,15 +321,13 @@ def main(args):
             pb.update(row)
             input_ids = eval_ids[row:row + 1, :]
             logits = state[row:row+1, ...]
-            logits = logits[:, :-1, :vocab_size].float()
-            log_probs = F.log_softmax(logits, dim = -1)
-            del logits
-            target_ids = input_ids[:, 1:].to(log_probs.device)
+            logits = logits[:, :-1, :]
+            target_ids = input_ids[:, 1:].to(logits.device)
             del input_ids
-            target_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+            target_log_probs = compute_target_log_probs(logits, target_ids, vocab_size)
             logprob_sum += target_log_probs.sum().item()
             logprob_count += target_ids.numel()
-            del log_probs
+            del logits
             del target_log_probs
             del target_ids
             torch.cuda.empty_cache()
@@ -350,6 +351,7 @@ if __name__ == "__main__":
     parser.add_argument("-fl", "--from_layer", type = int, help = "From layer", default = None)
     parser.add_argument("-tl", "--to_layer", type = int, help = "To layer", default = None)
     parser.add_argument("-nim", "--no_inspect_modules", action = "store_true", help = "Skip module inspection")
+    parser.add_argument("-gp", "--gen_prompt", action = "store_true", help = "Prepend chat template generation prompt to every row")
     # parser.add_argument("-rb", "--regularize_bits", type = int, help = "Target bitrate for regularization test", default = 4)
     _args = parser.parse_args()
     main(_args)

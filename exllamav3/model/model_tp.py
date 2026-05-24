@@ -15,6 +15,7 @@ from ..util import log_tp, global_t0
 from ..tokenizer.mm_embedding import send_embeddings
 
 cleanupper = Cleanupper()
+DISPATCH_TIMEOUT = 20
 
 class Model_TPMixin:
 
@@ -157,7 +158,10 @@ class Model_TPMixin:
         """
         conn = self.mp_parent_conn[device]
         conn.send((fn, args))
-        result = conn.recv()
+        if conn.poll(DISPATCH_TIMEOUT):
+            result = conn.recv()
+        else:
+            raise TimeoutError("Timed out waiting for worker")
         if isinstance(result, Exception):
             raise result
         return result
@@ -176,7 +180,10 @@ class Model_TPMixin:
         Await and return result from child function, and propagate any exceptions to main process
         """
         conn = self.mp_parent_conn[device]
-        result = conn.recv()
+        if conn.poll(DISPATCH_TIMEOUT):
+            result = conn.recv()
+        else:
+            raise TimeoutError("Timed out waiting for worker")
         if isinstance(result, Exception):
             raise result
         return result
@@ -213,6 +220,44 @@ class Model_TPMixin:
             ))
         for device in self.active_devices:
             self.tp_worker_result(device)
+
+
+    def tp_dispatch_all(self, func, args):
+        for device in self.active_devices:
+            self.tp_worker_dispatch(device, func, args)
+        for device in self.active_devices:
+            self.tp_worker_result(device)
+
+
+    def tp_dispatch_master(self, func, args):
+        self.tp_worker_dispatch(self.tp_output_device, func, args)
+        r = self.tp_worker_result(self.tp_output_device)
+        return r
+
+
+    def tp_dispatch_lm_head_argmax(self, args):
+        ad = []
+        for device in self.active_devices:
+            a, b, _ = self.plan[device]["lm_head"]
+            if b > a:
+                self.tp_worker_dispatch(device, mp_model_forward_lm_head_argmax, args + (a,))
+                ad.append(device)
+        results = []
+        for device in ad:
+            r = self.tp_worker_result(device)
+            results.append((device, r))
+
+        device = self.tp_output_device
+        vals, inds = [], []
+        for (_, result) in sorted(results):
+            v, i = result
+            vals.append(v.to(device))
+            inds.append(i.to(device))
+        vals = torch.stack(vals, dim = -1)
+        inds = torch.stack(inds, dim = -1)
+        winner = vals.argmax(dim = -1)
+        argmax = inds.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
+        return argmax
 
 
     def _load_tp(
@@ -275,8 +320,8 @@ class Model_TPMixin:
         allocator.initial_split(max_mem)
         if verbose:
             allocator.print_split()
-        plan = allocator.compile_tp_plan()
-        self.tp_worker_dispatch_wait_multi(self.active_devices, mp_set_plan, (plan, self.active_devices))
+        self.plan = allocator.compile_tp_plan()
+        self.tp_worker_dispatch_wait_multi(self.active_devices, mp_set_plan, (self.plan, self.active_devices))
 
         # Distribution pipeline
         producer = SMProducer()
@@ -304,7 +349,7 @@ class Model_TPMixin:
                     config.stc.end_deferred_load()
 
                 # Do module-specific device/process split
-                exported = module.tp_export(plan, producer)
+                exported = module.tp_export(self.plan, producer)
                 self.tp_worker_dispatch_wait_multi(self.active_devices, mp_model_append, (exported,))
                 producer.clear()
 
@@ -345,6 +390,7 @@ class Model_TPMixin:
     def prepare_inputs_for_tp(self, x: torch.Tensor, params: dict) -> torch.Tensor:
         self.tp_producer.clear()
         # Use ID of Cache object as reference to avoid having to pickle it
+        reserve = {}
         if "cache" in params:
             params["cache"] = id(params["cache"])
         # Share memory of any additional CPU tensors
@@ -362,7 +408,12 @@ class Model_TPMixin:
         if p is not None:
             params["indexed_embeddings"] = send_embeddings(self.tp_producer, p)
 
-        return self.tp_producer.send(x)
+        p = params.get("recurrent_states")
+        if p is not None:
+            reserve["recurrent_states"] = params["recurrent_states"]
+            params["recurrent_states"] = [(rs.tp_export() if rs is not None else None) for rs in p]
+
+        return self.tp_producer.send(x), reserve
 
 
     def prefill_tp(
@@ -374,19 +425,21 @@ class Model_TPMixin:
     ):
         self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
-        x = self.prepare_inputs_for_tp(x, params)
+        x, reserve = self.prepare_inputs_for_tp(x, params)
         for device in self.active_devices:
             self.tp_worker_dispatch(device, mp_model_forward, (
                 x,
                 params,
                 last_kv_module_idx,
-                True
+                True,
+                None
             ))
         for device in self.active_devices:
             r = self.tp_worker_result(device)
             assert r is None, "TP logic error"
 
         self.tp_worker_result(-1)
+        params.update(reserve)
         return None
 
 
@@ -399,13 +452,14 @@ class Model_TPMixin:
     ):
         self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
-        x = self.prepare_inputs_for_tp(x, params)
+        x, reserve = self.prepare_inputs_for_tp(x, params)
         for device in self.active_devices:
             self.tp_worker_dispatch(device, mp_model_forward, (
                 x,
                 params,
                 last_kv_module_idx,
-                False
+                False,
+                None
             ))
         return_tensors = []
         for device in self.active_devices:
@@ -415,6 +469,7 @@ class Model_TPMixin:
         assert len(return_tensors) == 1, "TP logic error"
 
         self.tp_worker_result(-1)
+        params.update(reserve)
         return return_tensors[0]
 
 

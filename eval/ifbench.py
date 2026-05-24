@@ -154,6 +154,7 @@ if __name__ == "__main__":
         parser,
         add_sampling_args = True,
         default_cache_size = 65536,
+        default_autosplit_max_batch_size = 16,
         default_sampling_args = {
             "temperature": 0.0,
             "repetition_penalty": 1.0,

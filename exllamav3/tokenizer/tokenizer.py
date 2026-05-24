@@ -46,8 +46,10 @@ class Tokenizer:
         self.path_tokenizer_json = os.path.join(self.config.directory, "tokenizer.json")
         self.path_tokenizer_config_json = os.path.join(self.config.directory, "tokenizer_config.json")
         self.path_added_tokens_json = os.path.join(self.config.directory, "added_tokens.json")
+        self.path_generation_config_json = os.path.join(self.config.directory, "generation_config.json")
         self.tokenizer = HFTokenizer.from_file(self.path_tokenizer_json)
         self.tokenizer_config_dict = maybe_read_json(self.path_tokenizer_config_json)
+        self.generation_config_dict = maybe_read_json(self.path_generation_config_json)
         self.added_tokens_dict = maybe_read_json(self.path_added_tokens_json)
 
         # Disable truncation
@@ -135,6 +137,15 @@ class Tokenizer:
                 config.eos_token_id = e
             if e not in config.eos_token_id_list:
                 config.eos_token_id_list.append(e)
+
+        # Read extra additional bonus EOS tokens from generation_config.json because nothing matters anymore
+        ee = self.generation_config_dict.get("eos_token_id")
+        if ee:
+            if not isinstance(ee, list):
+                ee = [ee]
+            for e in ee:
+                if e not in config.eos_token_id_list:
+                    config.eos_token_id_list.append(e)
 
         # Get control token strings
         self.unk_token = self.tokenizer.model.unk_token

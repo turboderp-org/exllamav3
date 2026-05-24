@@ -514,6 +514,9 @@ def fallback_quant(
         weight_q = torch.zeros((size_k, size_n), dtype = torch.float, device = buffer_device)
         encoded = torch.zeros((tiles_k, tiles_n, 256), dtype = torch.short, device = buffer_device)
 
+        # Accumulate sum of squared error on-device to avoid per-block CPU syncs
+        mse_sum = torch.zeros((), dtype=torch.float64, device=device)
+
         for j in range(size_k, 0, -buf_size_k):
             i = j - buf_size_k
 
@@ -541,8 +544,16 @@ def fallback_quant(
                 # Undo permutation on reconstructed tiles, but keep indices in tensor core layout
                 quant_w = quant_w[:, tensor_core_perm_i(device)]
 
-                # Store result
+                # Restore row-major block layout
                 quant_w = quant_w.reshape(tiles_n, 16, 16).permute(1, 0, 2).reshape(16, size_n)
+
+                # Accumulate squared error for this block
+                mse_sum += torch.sum(
+                    (rows.float() - quant_w.float()).pow(2),
+                    dtype=torch.float64,
+                )
+
+                # Store result
                 b_weight_q[bi:bj] = quant_w
                 b_encoded[bi // 16 : bj // 16] = quant_i.unsqueeze(0)
 
@@ -559,13 +570,28 @@ def fallback_quant(
         for device in devices:
             torch.cuda.synchronize(device)
 
-    return weight_q, encoded
+        mse = (mse_sum / weight.numel()).item()
+
+    return weight_q, encoded, mse
 
 
 finalize_capture_H_mutex = threading.Lock()
 
 def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
     with finalize_capture_H_mutex:
+
+        if H_data["H"].is_meta:
+            H_data["L"] = None
+            H_data["finalized"] = True
+            H_data["diag"] = None
+            H_data["q_fallback"] = True
+
+            H = H_data["H"]
+            k = H.shape[0]
+            su = (torch.randn(k, device = H_data["device"]).sign() + 1e-5).sign().to(torch.float).unsqueeze(1)
+            H_data["su"] = su
+
+            return True, None, None, su, None
 
         # Unswap H
         if "H_swap_device" in H_data:
@@ -939,13 +965,13 @@ def quantize_exl3(
 
         # Get H, LDL decomp. and input/output sign flips
         q_fallback, H, L, su, H_diag = finalize_capture_H(H_data, quant_args, verbose)
-        if H.is_cuda:
+        if H is not None and H.is_cuda:
             H = H.to(device)
         if L is not None and L.is_cuda:
             L = L.to(device)
         if su.is_cuda:
             su = su.to(device)
-        if H_diag.is_cuda:
+        if H_diag is not None and H_diag.is_cuda:
             H_diag = H_diag.to(device)
         sv = (torch.randn(n, device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
 
@@ -999,7 +1025,7 @@ def quantize_exl3(
             weight_q, encoded_q = ldlq(weight_r, L, quant_args, pb)  #zxc
             del L
         else:
-            weight_q, encoded_q = fallback_quant(weight_r, device, quant_args, pb)  # zxc
+            weight_q, encoded_q, mse_err = fallback_quant(weight_r, device, quant_args, pb)  # zxc
 
         pb.update(tiles_k)
 
@@ -1034,7 +1060,7 @@ def quantize_exl3(
                 Hd = None
                 proxy_err = -1.0
         else:
-            proxy_err = 0.0
+            proxy_err = mse_err
 
         # free_mem()
 

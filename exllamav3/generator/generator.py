@@ -34,6 +34,7 @@ class Generator:
         enable_defrag: bool = True,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
+        recurrent_checkpoint_interval_pp: int = 32768,
         ngram_match_min: int = 0,
         **kwargs
     ):
@@ -87,8 +88,12 @@ class Generator:
             Ignored if model doesn't use recurrent states
 
         :param recurrent_checkpoint_interval:
-            Minimum number of tokens between recurrent checkpoints. Must be a multiple of the page size.
-            Model architecture determines default
+            Minimum number of tokens between recurrent checkpoints in model output and the tail end of
+            the prompt. Must be a multiple of the page size. Model architecture determines default
+
+        :param recurrent_checkpoint_interval_pp]:
+            Minimum number of tokens between recurrent checkpoints during prompt ingestion. Must be a
+            multiple of the page size. Default is 32768 tokens
 
         :param kwargs:
         """
@@ -166,15 +171,20 @@ class Generator:
         self.recurrent_cache_size = recurrent_cache_size
         if self.model.caps.get("recurrent_states"):
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
+            # Limit batch size if cache has recurrent states
+            self.max_batch_size = min(self.max_batch_size, cache.num_slots)
         else:
             self.recurrent_cache = None
         if recurrent_checkpoint_interval is None:
             recurrent_checkpoint_interval = model.caps.get("default_recurrent_checkpoint_interval", 2048)
 
-        assert recurrent_checkpoint_interval % PAGE_SIZE == 0, \
-            "recurrent_checkpoint_interval must be a multiple of the page size (256)"
-        recurrent_checkpoint_interval = min(recurrent_checkpoint_interval, self.max_chunk_size)
+        assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval % PAGE_SIZE == 0, \
+            "checkpoint interval must be a multiple of the page size (256)"
+        def ceil_span(a, b):
+            return (a + b - 1) // b * b
+        recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
+        self.recurrent_checkpoint_interval_pp = ceil_span(recurrent_checkpoint_interval_pp, self.max_chunk_size)
 
         # Drafting mode
         if draft_model is not None and draft_model.caps.get("attach_target"):
@@ -353,7 +363,7 @@ class Generator:
 
     def recurrent_checkpoint(self):
         for job in self.active_jobs:
-            job.maybe_stash_recurrent(self.recurrent_cache, self.recurrent_checkpoint_interval)
+            job.maybe_stash_recurrent(self.recurrent_cache)
 
 
     def update_visualizer(self):
@@ -579,16 +589,10 @@ class Generator:
         logit_mapping.append(len(input_ids_list))
         batch_ids = torch.cat(input_ids_list, dim = 0)
 
-        # Collect recurrent states for batch
-        # TODO: Figure out a way to minimize redundant batching and unbatching
-        states, batch_states = None, None
+        # # Collect recurrent states for batch
+        batch_states = None
         if self.recurrent_cache is not None:
-            if batch_size == 1:
-                states = [batch_jobs[0].recurrent_state]
-                batch_states = batch_jobs[0].recurrent_state
-            else:
-                states = [job.recurrent_state for job in batch_jobs]
-                batch_states = {key: states[0][key].collect_batch([s[key] for s in states]) for key in states[0].keys()}
+            batch_states = [job.recurrent_state for job in batch_jobs]
 
         # GPU workload is scheduled here, so launch any sampling filters that can run in the background
         for job in batch_jobs:
@@ -612,17 +616,17 @@ class Generator:
             "positions": positions,
             "recurrent_history": draft_tokens is not None,
         }
+        if self.draft_model:
+            params.update(self.draft_model.draft_verifier_params)
         batch_logits = self.model.forward(
             input_ids = batch_ids,
             params = params,
         )
 
-        # Split batched recurrent states
-        if self.recurrent_cache is not None:
-            if batch_size > 1:
-                for key, v in batch_states.items():
-                    v.distribute_batch([s[key] for s in states])
-                del batch_states
+        # Don't keep recurrent states in params longer than needed
+        p_export_states = params.get("export_states")
+        p_cache_seqlens = params.get("cache_seqlens")
+        params = None
 
         # Run foreground filters here, while GPU workload is queued up and running
         for job in batch_jobs:
@@ -645,6 +649,7 @@ class Generator:
         completed_jobs = []
         requeuing_jobs = []
         accepted_lengths = []
+        rejected = 0
         j = 0
         for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
             if a == b: continue
@@ -667,6 +672,9 @@ class Generator:
 
                 # Requeue
                 if len(job.sequences) == 1 and rq:
+                    # if draft_tokens is not None:
+                    #     rejected = batch_logits.shape[1] - 1 - i
+                    #     batch_states[j].rewind(rejected)
                     requeuing_jobs.append(job)
                     break
 
@@ -675,19 +683,18 @@ class Generator:
                     completed_jobs.append(job)
                     break
 
-                # Continue sampling from logit batch as long as result matches draft
+                # Continue sampling from logit batch as long as result matches draft, unless hitting checkpoint mark
                 if draft_tokens is not None and i < batch_logits.shape[1] - 1:
-                    if draft_tokens[j, i].item() != sampled_token.item():
+                    cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
+                    if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
 
                         # Count rejected draft tokens
                         rejected = batch_logits.shape[1] - 1 - i
                         job.rejected_draft_tokens += rejected
 
                         # Rewind recurrent states
-                        if rejected and states:
-                            for layer, state in states[idx].items():
-                                assert len(job.sequences) == 1
-                                state.rewind(rejected)
+                        if batch_states is not None:
+                            batch_states[j].rewind(rejected)
 
                         # Rewind cache position (draft model cache layout is always the same as target)
                         for seq in job.sequences:
@@ -718,18 +725,22 @@ class Generator:
                         job.prepare_logit_mask()
                         job.prepare_sampling_past_ids()
 
-            j += 1
+            # Make sure outgoing state is valid if entire draft was accepted
+            if batch_states and draft_tokens is not None and rejected == 0:
+                batch_states[j].rewind(0)
+
             accepted_lengths.append(accepted_length)
+            j += 1
 
         # Accept new target_hidden if DFlash
         if self.dflash_draft:
             self.draft_model.update_kv_from_target(
-                target_hidden = params.get("export_states"),
+                target_hidden = p_export_states,
                 cache = self.draft_cache,
                 lengths = accepted_lengths,
                 params = {
                     "block_table": block_index,
-                    "cache_seqlens": params["cache_seqlens"],
+                    "cache_seqlens": p_cache_seqlens,
                 }
             )
 
@@ -737,9 +748,8 @@ class Generator:
         num_jobs = self.num_remaining_jobs()
         for job in completed_jobs + requeuing_jobs:
             if job in requeuing_jobs and self.recurrent_cache is not None:
-                job.maybe_stash_recurrent(self.recurrent_cache, self.recurrent_checkpoint_interval)
+                job.maybe_stash_recurrent(self.recurrent_cache)
             job.deallocate_pages()
-            job.free_recurrent_state()
             self.active_jobs.remove(job)
 
         # Requeue jobs

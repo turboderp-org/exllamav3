@@ -239,13 +239,13 @@ class Sequence:
         self.build_block_index_tensor()
 
         # If recurrent model, grab cached state for prefix length
-        recurrent_state = None
+        stashed_recurrent_state = None
         if recurrent_cache is not None:
             if cached_pages > 0:
-                recurrent_state = recurrent_cache.get(self.page_hashes[cached_pages - 1])
-                assert recurrent_state is not None, "Failed to get cached recurrent state"
+                stashed_recurrent_state = recurrent_cache.get_stashed(self.page_hashes[cached_pages - 1])
+                assert stashed_recurrent_state is not None, "Failed to get cached recurrent state"
 
-        return len(self.allocated_pages), cached_pages, non_sequential_pages, recurrent_state
+        return len(self.allocated_pages), cached_pages, non_sequential_pages, stashed_recurrent_state
 
 
 class PageTable:

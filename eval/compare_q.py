@@ -1,7 +1,7 @@
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
-import torch.nn.functional as F
+from exllamav3.util.measures import compute_kl_div, compute_target_log_probs
 from exllamav3.util.file import disk_lru_cache, disk_lru_cache_clear
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.memory import free_mem
@@ -9,12 +9,14 @@ from datasets import load_dataset
 import math
 import argparse
 import json
-import matplotlib.pyplot as plt
-from adjustText import adjust_text
 import glob
 from safetensors.torch import save_file
 from safetensors import safe_open
 import gc
+try:
+    from compare_q_plot import plot
+except ImportError:
+    from eval.compare_q_plot import plot
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
@@ -26,7 +28,8 @@ from compare_q_transformers import (
     load_transformers,
     fwd_transformers,
     tokenize_transformers,
-    chat_template_transformers
+    chat_template_transformers,
+    load_transformers_mm
 )
 from compare_q_exllamav2 import (
     load_exllamav2,
@@ -52,6 +55,7 @@ from compare_q_qtip import (
 load_fns = {
     "transformers_auto_bf16": load_transformers_auto_bf16,
     "transformers_auto": load_transformers_auto,
+    "transformers_mm": load_transformers_mm,
     "transformers": load_transformers,
     "exllamav2": load_exllamav2,
     "exllamav3": load_exllamav3,
@@ -101,20 +105,122 @@ def save_tensor(tensor, filename: str):
 
 # Tokenize ppl test data
 
+DATASET_ALIASES = {
+    "wiki2": {
+        "path": "wikitext",
+        "name": "wikitext-2-raw-v1",
+        "split": "test",
+        "text_column": "text",
+    },
+    "wikitext2": {
+        "path": "wikitext",
+        "name": "wikitext-2-raw-v1",
+        "split": "test",
+        "text_column": "text",
+    },
+    "wiki103": {
+        "path": "wikitext",
+        "name": "wikitext-103-raw-v1",
+        "split": "test",
+        "text_column": "text",
+    },
+    "wikitext103": {
+        "path": "wikitext",
+        "name": "wikitext-103-raw-v1",
+        "split": "test",
+        "text_column": "text",
+    },
+    "ptb": {
+        "path": "ptb_text_only",
+        "name": "penn_treebank",
+        "split": "test",
+        "text_column": "sentence",
+    },
+    "lambada": {
+        "path": "EleutherAI/lambada_openai",
+        "name": None,
+        "split": "test",
+        "text_column": "text",
+    },
+    "tinystories": {
+        "path": "roneneldan/TinyStories",
+        "name": None,
+        "split": "validation",
+        "text_column": "text",
+    },
+    "c4": {
+        "path": "allenai/c4",
+        "name": "en",
+        "split": "validation",
+        "text_column": "text",
+    },
+    "openwebtext10k": {
+        "path": "stas/openwebtext-10k",
+        "name": None,
+        "split": "val",
+        "text_column": "text",
+    },
+    "openwebtext": {
+        "path": "Skylion007/openwebtext",
+        "name": None,
+        "split": "train[:1000]",
+        "text_column": "text",
+    },
+    "fineweb": {
+        "path": "HuggingFaceFW/fineweb",
+        "name": "sample-10BT",
+        "split": "train[:1000]",
+        "text_column": "text",
+    },
+    "fineweb-edu": {
+        "path": "HuggingFaceFW/fineweb-edu",
+        "name": "sample-10BT",
+        "split": "train[:1000]",
+        "text_column": "text",
+    },
+}
+
+
+def get_dataset_text(spec: dict) -> str:
+    dataset = spec["dataset"]
+    dataset_spec = DATASET_ALIASES.get(dataset.lower(), {})
+    path = spec.get("dataset_path", dataset_spec.get("path", dataset))
+    name = spec.get("dataset_name", dataset_spec.get("name"))
+    split = spec.get("dataset_split", spec.get("split", dataset_spec.get("split", "test")))
+    text_column = spec.get("text_column", dataset_spec.get("text_column", "text"))
+    max_text_rows = spec.get("max_text_rows", spec.get("max_dataset_rows", 0))
+
+    print(f"Loading text dataset: {path}" + (f"/{name}" if name else "") + f" ({split})")
+    if name is None:
+        ds = load_dataset(path, split = split)
+    else:
+        ds = load_dataset(path, name, split = split)
+
+    if text_column not in ds.column_names:
+        raise ValueError(
+            f"Dataset '{dataset}' does not have text column '{text_column}'. "
+            f"Available columns: {', '.join(ds.column_names)}"
+        )
+
+    texts = ds[text_column]
+    if max_text_rows:
+        texts = texts[:max_text_rows]
+    texts = [t for t in texts if isinstance(t, str) and t.strip()]
+    if not texts:
+        raise ValueError(f"Dataset '{dataset}' produced no non-empty text rows")
+    return "\n\n".join(texts)
+
+
 @disk_lru_cache("get_dataset")
 def get_test_data(spec: dict):
     tokenize_fn = tokenize_fns[spec["tokenize_fn"]]
     template_fn = template_fns[spec["tokenize_fn"]] if spec.get("chat_template") else None
-    assert spec["dataset"] == "wiki2", "Only wiki2 implemented atm"
     eval_stride = spec["eval_stride"]
     eval_len = spec["eval_len"]
     max_rows = spec.get("max_rows", 0)
     eval_tokens = tokenize_fn(
         spec["tokenizer_dir"],
-        "\n\n".join(
-            load_dataset("wikitext", "wikitext-2-raw-v1", split = "test")
-            ["text"]
-        )
+        get_dataset_text(spec)
     )
     num_tokens = eval_tokens.shape[-1]
     seqs = []
@@ -140,9 +246,10 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
     print(f"Loading dataset: {data_spec['dataset']}")
     eval_ids = get_test_data(data_spec)
     rows = eval_ids.shape[0]
+    length = eval_ids.shape[1]
 
     print(f"Loading: {model_dir}")
-    model_instance, bpw_layer, bpw_head, vram_bits = load_fn(model_dir)
+    model_instance, bpw_layer, bpw_head, vram_bits = load_fn(model_dir, size = length + 512)
     vram_gb = vram_bits / 8 / 1024**3
 
     logprob_sum = 0.0
@@ -170,38 +277,29 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
             pb.update(row)
             input_ids = eval_ids[row:row + 1, :]
             logits = fwd_fn(model_instance, input_ids)
-            logits = logits.float()[..., -eval_len:, :]
+            logits = logits[..., -eval_len:, :]
 
             # kld
             if logits_file and row < 10:
-                probs_a = torch.softmax(logits, dim = -1)
                 if collect_logits:
-                    ref_logits.append(logits.cpu())
+                    ref_logits.append(logits.float().cpu())
                     kl_div_count += 1
                 else:
-                    probs_b = torch.softmax(ref_logits[row].to(logits.device), dim = -1)
-                    vs = min(probs_a.shape[-1], probs_b.shape[-1])
-                    probs_a = probs_a[..., :vs]
-                    probs_b = probs_b[..., :vs]
-                    for r in range(probs_a.shape[1]):
-                        kl_div = F.kl_div(torch.log(probs_a[:, r:r+1, :] + 1e-10), probs_b[:, r:r+1, :], reduction = 'sum')
-                        kl_div_sum_ab += kl_div.item()
-                        kl_div_count += 1
+                    ref = ref_logits[row].to(logits.device)
+                    vs = min(logits.shape[-1], ref.shape[-1])
+                    kl_div = compute_kl_div(logits, ref, vs)
+                    kl_div_sum_ab += kl_div.sum().item()
+                    kl_div_count += kl_div.numel()
                     del kl_div
-                    del probs_b
-                del probs_a
 
             # ppl
             logits = logits[:, :-1, :]
-            logits += 1e-10
-            log_probs = F.log_softmax(logits, dim = -1)
-            del logits
-            target_ids = input_ids[:, -eval_len:][:, 1:].to(log_probs.device)
+            target_ids = input_ids[:, -eval_len:][:, 1:].to(logits.device)
             del input_ids
-            target_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-            del log_probs
+            target_log_probs = compute_target_log_probs(logits, target_ids, logits.shape[-1])
             logprob_sum += target_log_probs.sum().item()
             logprob_count += target_ids.numel()
+            del logits
             del target_log_probs
             del target_ids
             torch.cuda.empty_cache()
@@ -236,102 +334,6 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
         })
 
     return res
-
-
-def plot(results, args):
-
-    def col(light, dark):
-        return dark if args.dark else light
-
-    if args.dark:
-        plt.style.use('dark_background')
-
-    def get_color(s):
-        d = {
-            "EXL2": col("green", "greenyellow"),
-            "EXL3": col("purple", "palevioletred"),
-            "AWQ": col("olive", "tan"),
-            "imat": col("brown", "darkorange"),
-            "GGUF": col("red", "tomato"),
-            "VPTQ": col("blue", "cornflowerblue"),
-            "QTIP": col("teal", "lightseagreen"),
-            "****": col("black", "silver"),
-        }
-        for k, v in d.items():
-            if f"[{v}]" in s:
-                return v
-        for k, v in d.items():
-            if k in s:
-                return v
-        return col("black", "silver")
-
-    plt.rcParams["figure.figsize"] = (14, 11)
-    plt.subplots_adjust(left = 0.05, right = 0.95, top = 0.95, bottom = 0.05)
-
-    lpoints = {}
-    x = []
-    y = []
-    labels = []
-    colors = []
-    for r in results:
-        x_ = r["vram_gb"] if args.vram else r["layer_bpw"]
-        y_ = r["ppl"] if not args.kld else r["kld"]
-        if x_ > args.max_x or y_ > args.max_y:
-            continue
-        x.append(x_)
-        y.append(y_)
-        labels.append(r["label"].split("[")[0].strip() + f"\n{y_:.3f}")
-        color = get_color(r["label"])
-        colors.append(color)
-        if color != col("black", "silver"):
-            if color not in lpoints:
-                lpoints[color] = []
-            lpoints[color].append((x_, y_))
-
-    plt.scatter(x, y, c = colors, marker = "o")
-
-    texts = []
-    for i, label in enumerate(labels):
-        texts.append(
-            plt.text(
-                x[i],
-                y[i],
-                label,
-                fontsize = 8.5,
-                ha = "left",
-                va = "bottom",
-                color = colors[i],
-            )
-        )
-    adjust_text(
-        texts,
-        x = x,
-        y = y,
-        arrowprops = {"arrowstyle": "->", "color": col("lightgray", "dimgray")},
-        expand = (1.35, 2.3),
-        ensure_inside_axes = True,
-        min_arrow_len = 0.10,
-        prevent_crossings = False,
-        pull_threshold = 0.20,
-        # force_explode = (0.2, 0.6),
-        max_move = 100
-    )
-
-    for col, lines in lpoints.items():
-        x, y = zip(*sorted(lines))
-        plt.plot(x, y, color = col, linestyle=':')
-
-    plt.xlabel("VRAM // GB (decoder + head)" if args.vram else "bits per weight (decoder only)")
-    plt.ylabel("Perplexity" if not args.kld else "KL divergence")
-    plt.title(args.title)
-    if args.dark:
-        plt.grid(color = 'dimgray', linestyle = '--', linewidth = 0.5)
-    else:
-        plt.grid(True)
-    if args.plot_file:
-        plt.savefig(args.plot_file)
-    else:
-        plt.show()
 
 
 def dict_hash(x: dict) -> str:
@@ -420,5 +422,3 @@ if __name__ == "__main__":
     parser.add_argument("-pf", "--plot_file", type = str, help = "Write the plot to a file")
     _args = parser.parse_args()
     main(_args)
-
-

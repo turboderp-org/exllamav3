@@ -59,7 +59,6 @@ class TransformerBlock(Module):
         self.register_submodule(self.mlp_post_norm)
 
         self.num_slices = mlp.num_slices if mlp else 1
-        self.export_state = False
 
 
     @override
@@ -170,12 +169,12 @@ class TransformerBlock(Module):
             else:
                 x += y
 
-        if self.export_state:
-            if params.get("layer_instance", 0) == 0:
-                s = params.get("export_states")
-                if not s:
-                    s = params["export_states"] = []
-                s.append(x.half())
+        export_state = params.get("export_state_layers")
+        if export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0:
+            s = params.get("export_states")
+            if not s:
+                s = params["export_states"] = []
+            s.append(x.half())
 
         if self.backout_lambda is not None:
             x = self._apply_backout(x, params)
@@ -238,6 +237,7 @@ class TransformerBlock(Module):
             mlp = _import("mlp"),
             mlp_post_norm = _import("mlp_post_norm"),
         )
+
         module.device = device
         return module
 
@@ -301,7 +301,6 @@ class ParallelDecoderBlock(Module):
             x += y1
 
         return to2(x, out_dtype, self.out_dtype)
-
 
 
     def get_name(self):

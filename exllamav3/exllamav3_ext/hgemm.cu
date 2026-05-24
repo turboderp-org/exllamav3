@@ -5,6 +5,7 @@
 #include "util.h"
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
+#include <limits>
 
 /*
 
@@ -34,8 +35,10 @@ static void hgemm_gemmex_impl
     TORCH_CHECK_DTYPE(a, kHalf);
     TORCH_CHECK_DTYPE(b, kHalf);
     TORCH_CHECK_DIM(b, 2);
+    TORCH_CHECK(c.dim() >= 2, "c must have at least 2 dimensions");
     TORCH_CHECK_SHAPES(a, -1, b, 0, 1);
     TORCH_CHECK_SHAPES(b, 1, c, -1, 1);
+    TORCH_CHECK(c.stride(-1) == 1, "c must have contiguous columns");
 
     const half* a_ptr = (const half*) a.data_ptr();
     const half* b_ptr = (const half*) b.data_ptr();
@@ -43,6 +46,9 @@ static void hgemm_gemmex_impl
     int size_k = a.size(-1);
     int size_m = a.numel() / size_k;
     int size_n = b.size(-1);
+    int64_t c_stride_m = c.stride(-2);
+    TORCH_CHECK(c_stride_m >= size_n, "c row stride is too small");
+    TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
 
     // Set cuBLAS modes and workspace
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
@@ -63,7 +69,7 @@ static void hgemm_gemmex_impl
         size_n, size_m, size_k,
         &alpha_, b_ptr, CUDA_R_16F, size_n,
                  a_ptr, CUDA_R_16F, size_k,
-        &beta_,  c.data_ptr(), c_type, size_n,
+        &beta_,  c.data_ptr(), c_type, (int) c_stride_m,
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );

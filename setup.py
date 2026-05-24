@@ -25,8 +25,10 @@ extra_cuda_cflags = [
 ]
 
 if windows:
-    extra_cflags += ["/Ox"]
-    extra_cuda_cflags += []
+    # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break
+    #       older cu128 builds
+    extra_cflags += ["/Ox", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN"]
+    extra_cuda_cflags += ["-DWIN32_LEAN_AND_MEAN", "-Xcompiler=/Zc:preprocessor"]
     if ext_debug:
         extra_cflags += ["/Zi"]
         extra_cuda_cflags += []
@@ -93,7 +95,9 @@ setup(
         "exllamav3.architecture.mm_processing",
         "exllamav3.model",
         "exllamav3.modules",
+        "exllamav3.modules.attention_fn",
         "exllamav3.modules.arch_specific",
+        "exllamav3.modules.gated_delta_net_fn",
         "exllamav3.modules.quant",
         "exllamav3.modules.quant.exl3_lib",
         "exllamav3.tokenizer",
@@ -117,7 +121,7 @@ setup(
         "marisa_trie",
         "kbnf>=0.4.2",
         "formatron>=0.5.0",
-        "pydantic==2.11.0",
+        "pydantic",
         "xformers"
     ],
     include_package_data=True,

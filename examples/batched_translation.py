@@ -28,7 +28,7 @@ def get_dataset(path: str, name: str, split: str, key: str, min_length: int):
             r.append(ds)
     return r
 
-def format_request(hf_tokenizer, eos_tokens, text, max_new_tokens, idx):
+def format_request(tokenizer, eos_tokens, text, max_new_tokens, idx):
     instruction = (
         f"Translate the the text between the #BEGIN# and #END# tags into zoomer slang. "
         f"Reply only with the translation enclosed in the same tags:\n\n"
@@ -41,8 +41,7 @@ def format_request(hf_tokenizer, eos_tokens, text, max_new_tokens, idx):
         "role": "user",
         "content": instruction
     }]
-    input_ids = hf_tokenizer.apply_chat_template(chat, add_generation_prompt = True)
-    input_ids = torch.tensor(input_ids, dtype = torch.long).unsqueeze(0)
+    input_ids = tokenizer.hf_chat_template(chat, add_generation_prompt = True)
     job = Job(
         input_ids = input_ids,
         max_new_tokens = max_new_tokens,
@@ -67,15 +66,11 @@ def main(args):
     print(f" -- Model: {args.model_dir}")
     print(f" -- Bitrate: {bpw_layer:.2f} bpw / {bpw_head:.2f} bpw (head)")
 
-    # Use HF tokenizer for prompt formatting
-    print(f" -- Loading HF tokenizer...")
-    hf_tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-
     # Create jobs
     completions = []
     with ProgressBar(" -- Creating jobs", len(in_data)) as pb:
         for idx, text in enumerate(in_data):
-            job = format_request(hf_tokenizer, config.eos_token_id_list, text, args.max_reply, idx)
+            job = format_request(tokenizer, config.eos_token_id_list, text, args.max_reply, idx)
             generator.enqueue(job)
             completions.append("")
             pb.update(idx)
@@ -124,7 +119,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    model_init.add_args(parser, default_cache_size = 65536)
+    model_init.add_args(parser, default_cache_size = 65536, default_autosplit_max_batch_size = 32)
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     parser.add_argument("-dsp", "--dataset_path", type = str, default = "wikitext", help = "Dataset path")
     parser.add_argument("-dsn", "--dataset_name", type = str, default = "wikitext-2-raw-v1", help = "Dataset name")

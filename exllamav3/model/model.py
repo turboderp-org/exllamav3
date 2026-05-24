@@ -8,6 +8,7 @@ from ..util.memory import free_mem
 from .model_tp import Model_TPMixin
 from .model_ls import Model_LSMixin
 from ..util.tensor import g_tensor_cache
+from ..cache.recurrent_util import advance_recurrent_states
 
 class Model(Model_TPMixin, Model_LSMixin):
 
@@ -27,10 +28,12 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.active_devices = []
         self.output_device = None
         self.cache_weakrefs = {}
+        self.recurrent_state_cls = None
+        self.draft_verifier_params = {}
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
-        self.last_kv_module_instance = None
+        self.last_kv_module_idx_instance = None
         self.logit_layer_idx = None
         self.first_block_idx = None
 
@@ -104,6 +107,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         # No layer map
         if not self.config.layer_map:
             self.fwd_modules = [(m, 0, idx) for idx, m in enumerate(self.modules)]
+            self.last_kv_module_idx_instance = (self.last_kv_module_idx, 0)
             return
 
         # Isolate and enumerate indexed layers
@@ -137,7 +141,7 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         self.fwd_modules = relayered
         if self.last_kv_module_idx is not None:
-            self.last_kv_module_instance = (
+            self.last_kv_module_idx_instance = (
                 self.last_kv_module_idx,
                 inner_count[self.last_kv_module_idx - len(prolog)] - 1
             )
@@ -184,9 +188,13 @@ class Model(Model_TPMixin, Model_LSMixin):
             params = {}
         x = self.prepare_inputs(input_ids, params)
         if self.loaded_tp:
-            return self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
+            y = self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
+            advance_recurrent_states(input_ids, params, self)
+            return y
         else:
-            return self.prefill_ls(x, params)
+            y = self.prefill_ls(x, params)
+            advance_recurrent_states(input_ids, params, self)
+            return y
 
 
     @torch.inference_mode
@@ -195,9 +203,13 @@ class Model(Model_TPMixin, Model_LSMixin):
             params = {}
         x = self.prepare_inputs(input_ids, params)
         if self.loaded_tp:
-            return self.forward_tp(x, params, self.last_kv_module_idx, self.modules)
+            y = self.forward_tp(x, params, self.last_kv_module_idx, self.modules)
+            advance_recurrent_states(input_ids, params, self)
+            return y
         else:
-            return self.forward_ls(x, params)
+            y = self.forward_ls(x, params)
+            advance_recurrent_states(input_ids, params, self)
+            return y
 
 
     def unload(self):
@@ -226,6 +238,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         verbose: bool = False,
         max_batch_size: int = 1,
         tp_options: dict | None = None,
+        autosplit_no_forward: bool = False,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -312,6 +325,9 @@ class Model(Model_TPMixin, Model_LSMixin):
         :param tp_options:
             dict of optional values:
                 "moe_tensor_split": bool - use tensor split rather than expert parallelism for MoE layers
+
+        :param autosplit_no_forward:
+            For debug purposes, skip reference forward pass during autosplit load.
         """
 
         free_mem()
@@ -381,7 +397,8 @@ class Model(Model_TPMixin, Model_LSMixin):
                     self.modules,
                     verbose,
                     max_batch_size,
-                    self.cache_weakrefs
+                    self.cache_weakrefs,
+                    autosplit_no_forward,
                 )
                 self.output_device = self.modules[-1].device
 
@@ -557,18 +574,3 @@ class Model(Model_TPMixin, Model_LSMixin):
         Decide if any model-specific requirements are met when creating Model
         """
         pass
-
-    def get_empty_state(self, initial_length: int = 0):
-        """
-        Create an empty recurrent state. initial_length > 0 is for testing/benchmark purposes
-        """
-        if "recurrent_states" not in self.caps:
-            return None
-        new_state = {}
-        for m in self.get_recurrent_layers():
-            for i in self.get_layer_instances(m.layer_idx):
-                s = m.new_recurrent_state()
-                if initial_length:
-                    s.force_position(initial_length)
-                new_state[i] = s
-        return new_state

@@ -53,7 +53,8 @@ void BC_GatedDeltaNet::run_bsz1_b
         num_v_heads,
         k_head_dim,
         v_head_dim,
-        c10::nullopt
+        c10::nullopt,
+        false
     );
 
     norm->run(core_attn_out, core_attn_out_f, z);

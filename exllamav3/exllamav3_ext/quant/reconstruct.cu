@@ -12,7 +12,9 @@ __global__ __launch_bounds__(256)
 void reconstruct_kernel
 (
     half* __restrict__ g_unpacked,
-    const uint16_t* __restrict__ g_packed
+    const uint16_t* __restrict__ g_packed,
+    int packed_blocks_n,
+    int packed_n_offset
 )
 {
     constexpr int packed_size = 256 * K / 16;  // in uint16s
@@ -23,11 +25,11 @@ void reconstruct_kernel
     int k = blockIdx.y;
     int n = blockIdx.x * 8;
     int tiles_n = gridDim.x;
-    int blocks_n = tiles_n * 8;
+    int out_blocks_n = tiles_n * 8;
 
     // Load packed 16*128 tile
     __shared__ uint32_t s_packed[8][packed_size / 2];
-    g_packed += (k * blocks_n + n) * packed_size;
+    g_packed += (k * packed_blocks_n + packed_n_offset + n) * packed_size;
     if (t < packed_size)
         ((int4*) s_packed)[t] = ((int4*) g_packed)[t];
     __syncthreads();
@@ -76,7 +78,7 @@ void reconstruct_kernel
     int r = t / 16;
     int c = t % 16;
     int4* tile_int4 = (reinterpret_cast<int4*> (tile));
-    int4* out_int4 = ((int4*) g_unpacked) + (k * 16 + r) * 2 * blocks_n + n * 2 + c;
+    int4* out_int4 = ((int4*) g_unpacked) + (k * 16 + r) * 2 * out_blocks_n + n * 2 + c;
     *out_int4 = tile_int4[t];
 }
 
@@ -92,25 +94,32 @@ constexpr auto reconstruct_kernel_instances = std::array
 /*
 Reconstruct encoded+packed tensor
 */
-void reconstruct
+void reconstruct_slice
 (
     at::Tensor unpacked,
     at::Tensor packed,
     int K,
     bool mcg,
-    bool mul1
+    bool mul1,
+    int64_t n_offset
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_SHAPES(unpacked, 0, packed, 0, 16);
-    TORCH_CHECK_SHAPES(unpacked, 1, packed, 1, 16);
     TORCH_CHECK_SIZE(packed, 2, 256 * K / 16);
     TORCH_CHECK_DTYPE(unpacked, kHalf);
 
     int rows = packed.size(0);
-    int cols = packed.size(1);
+    int packed_cols = packed.size(1);
+    TORCH_CHECK(unpacked.size(1) % 128 == 0, "unpacked N dimension must be divisible by 128");
+    TORCH_CHECK(n_offset % 128 == 0, "n_offset must be divisible by 128");
+    TORCH_CHECK(n_offset >= 0, "n_offset must be non-negative");
+    TORCH_CHECK(n_offset + unpacked.size(1) <= packed.size(1) * 16, "reconstruct slice exceeds packed tensor bounds");
+
+    int cols = unpacked.size(1) / 16;
+    int packed_n_offset = n_offset / 16;
 
     dim3 blockDim(256);
     dim3 gridDim(cols / 8, rows);
@@ -122,7 +131,22 @@ void reconstruct
     reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
-        (const uint16_t*) packed.data_ptr()
+        (const uint16_t*) packed.data_ptr(),
+        packed_cols,
+        packed_n_offset
     );
     cuda_check(cudaPeekAtLastError());
+}
+
+void reconstruct
+(
+    at::Tensor unpacked,
+    at::Tensor packed,
+    int K,
+    bool mcg,
+    bool mul1
+)
+{
+    TORCH_CHECK_SHAPES(unpacked, 1, packed, 1, 16);
+    reconstruct_slice(unpacked, packed, K, mcg, mul1, 0);
 }

@@ -212,3 +212,18 @@ def parse_int_list(
         result.extend(range(start, end + step, step))
 
     return result
+
+
+def prepend_hf_chat_context(tokenizer, tokens: torch.Tensor):
+    prefix = tokenizer.hf_chat_template(
+        [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "Say something."},
+        ],
+        add_special_tokens = True,
+        add_generation_prompt = True,
+        return_tensors = "pt"
+    )
+    prefix = prefix.repeat(tokens.shape[0], 1)
+    tokens = torch.cat((prefix, tokens), dim = -1)
+    return tokens

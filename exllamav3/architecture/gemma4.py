@@ -17,6 +17,7 @@ from ..modules import (
     Attention,
     SlidingAttention,
     BlockSparseMLP,
+    SWAState,
 )
 from ..modules.arch_specific.gemma4 import (
     Gemma4VisionPatchEmbedder,
@@ -402,11 +403,13 @@ class Gemma4TextModel(Model):
         })
 
         # SWA layers are recurrent, optionally. Checkpoints are expensive so default to a longer interval
+        self.recurrent_state_cls = None
         if not self.swa_full:
             self.caps.update({
                 "recurrent_states": True,
                 "default_recurrent_checkpoint_interval": 6144,
             })
+            self.recurrent_state_cls = SWAState
 
 
     @override

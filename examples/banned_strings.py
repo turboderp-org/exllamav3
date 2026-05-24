@@ -9,7 +9,7 @@ predefined set of phrases.
 """
 
 # Initialize model, tokenizer etc.
-config = Config.from_directory("/mnt/str/eval_models/llama3.1-8b-instruct/exl3/4.0bpw/")
+config = Config.from_directory("/mnt/str/models/llama3.1-8b-instruct/exl3/5.0bpw/")
 model = Model.from_config(config)
 cache = Cache(model, max_num_tokens = 8192)
 model.load()

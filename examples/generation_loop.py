@@ -53,6 +53,10 @@ model.prefill(
     params = params
 )
 
+# If model is recurrent and no "recurrent_states" is provided in params, one will be allocated from the cache.
+# Read it off here so it can be used in the loop. (This is always a list of the same length as the batch size.)
+recurrent_states = params.get("recurrent_states")
+
 # Generation loop
 max_new_tokens = 600
 generated_tokens = 0
@@ -62,13 +66,13 @@ torch.cuda.synchronize()
 with Timer() as t:
     while generated_tokens < max_new_tokens:
 
-        # Inference params. Recurrent states must carry over from the previous forward pass to support recurrence
+        # Inference params, including recurrent state if any
         params = {
             "attn_mode": "flash_attn",
             "cache": cache,
             "past_len": context_ids.shape[-1] - 1,
             "batch_shape": (1, 2048),
-            "recurrent_states": params.get("recurrent_states")
+            "recurrent_states": recurrent_states,
         }
 
         # Get logits for current position
@@ -93,6 +97,12 @@ with Timer() as t:
 
         # Stream to the console
         print(token, end = "", flush = True)
+
+# The Generator manages recurrent state lifetimes, but since we're calling the model forward function directly,
+# we need to release the state afterwards
+if recurrent_states:
+    for rs in recurrent_states:
+        rs.free()
 
 print()
 print("---")

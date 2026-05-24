@@ -23,7 +23,9 @@ class AsyncGenerator:
                 results = self.generator.iterate()
                 for result in results:
                     job = result["job"]
-                    async_job = self.jobs[job]
+                    async_job = self.jobs.get(job)
+                    if not async_job:
+                        continue
                     await async_job.put_result(result)
                     if result["eos"]:
                         del self.jobs[job]
@@ -69,7 +71,7 @@ class AsyncJob:
     def __init__(self, generator: AsyncGenerator, *args: object, **kwargs: object):
         self.generator = generator
         self.job = Job(*args, **kwargs)
-        self.queue = asyncio.Queue()
+        self.queue = asyncio.Queue(maxsize=16)
         self.generator.enqueue(self)
         self.cancelled = False
 

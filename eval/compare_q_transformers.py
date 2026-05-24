@@ -1,23 +1,35 @@
 from functools import lru_cache
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForImageTextToText
+
 
 class dummy:
     pass
 
 try:
-    from gptqmodel.nn_modules.qlinear.marlin import MarlinQuantLinear
-    from gptqmodel.nn_modules.qlinear.tritonv2 import TritonV2QuantLinear
-    from gptqmodel.nn_modules.qlinear.exllamav2 import ExllamaV2QuantLinear
-except ModuleNotFoundError:
+    import paroquant.inference.backends.transformers.quantizer
+    from paroquant.inference.backends.transformers.modules import RotateQuantizedLinear
+except (ModuleNotFoundError, ImportError, ValueError):
+    RotateQuantizedLinear = dummy
+
+try:
+    from gptqmodel.nn_modules.qlinear.marlin_awq import AwqMarlinLinear
+    from gptqmodel.nn_modules.qlinear.tritonv2 import TritonV2Linear
+    from gptqmodel.nn_modules.qlinear.exllamav2 import ExllamaV2Linear
+except (ModuleNotFoundError, ImportError):
+    AwqMarlinLinear = dummy
+    TritonV2Linear = dummy
+    ExllamaV2Linear = dummy
+
+try:
+    from auto_round_extension.cuda.gptqmodel_marlin import MarlinQuantLinear
+except (ModuleNotFoundError, ImportError):
     MarlinQuantLinear = dummy
-    TritonV2QuantLinear = dummy
-    ExllamaV2QuantLinear = dummy
 
 try:
     from aqlm import QuantizedLinear
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     QuantizedLinear = dummy
 
 try:
@@ -32,7 +44,7 @@ except (ModuleNotFoundError, ImportError):
 
 try:
     from bitsandbytes.nn import Linear4bit
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     Linear4bit = dummy
 
 def get_tensors_size(tensors):
@@ -78,6 +90,12 @@ def get_storage_info(model):
     sum_numel = 0
     head_bpw = 0
     head_numel = 0
+    h_modules = [(name, module) for name, module in model.named_modules() if "lm_head" in name]
+    if hasattr(model, "model"):
+        model = model.model
+    if hasattr(model, "language_model"):
+        model = model.language_model
+    assert model.input_modalities in ["text", ["text"]]
     if hasattr(model, "vocab_size"):
         vocab_size = model.vocab_size
     elif hasattr(model, "model") and hasattr(model.model, "vocab_size"):
@@ -85,7 +103,11 @@ def get_storage_info(model):
         vocab_size = model.vocab_size
     else:
         vocab_size = 128000
-    for name, module in model.named_modules():
+    m_modules = [(name, module) for name, module in model.named_modules() if "lm_head" not in name]
+    m_modules += h_modules
+
+    for name, module in m_modules:
+        cls = type(module).__name__
         if any(isinstance(module, x) for x in [Linear4bit]):
             if module.out_features >= vocab_size * 0.9:  # this is foolproof
                 head_numel = module.in_features * module.out_features
@@ -96,12 +118,31 @@ def get_storage_info(model):
                 sum_bits += scan_gpu_tensors(module.quant_state) * 8
                 sum_numel += module.in_features * module.out_features
         elif any(isinstance(module, x) for x in [torch.nn.Linear]):
-            if module.out_features >= vocab_size * 0.9:
-                head_bpw = module.weight.element_size() * 8
-                head_numel = module.weight.numel()
+            if hasattr(module, "weight"):
+                if module.out_features >= vocab_size * 0.9:
+                    head_bpw = module.weight.element_size() * 8
+                    head_numel = module.weight.numel()
+                else:
+                    sum_bits += get_tensor_size(module.weight)
+                    sum_numel +=  module.weight.numel()
+            elif hasattr(module, "weight_packed"):
+                if module.out_features >= vocab_size * 0.9:
+                    head_numel = module.in_features * module.out_features
+                    head_bpw = (scan_gpu_tensors(module) * 8) / head_numel
+                else:
+                    sum_bits += scan_gpu_tensors(module) * 8
+                    sum_numel += module.in_features * module.out_features
             else:
-                sum_bits += get_tensor_size(module.weight)
-                sum_numel +=  module.weight.numel()
+                raise ValueError("I can't even")
+        elif any(isinstance(module, x) for x in [RotateQuantizedLinear]):
+            sum_bits += get_tensors_size({
+                "pairs": module.pairs,
+                "qweight": module.qweight,
+                "qzeros": module.qzeros,
+                "scales": module.scales,
+                "theta": module.theta,
+            })
+            sum_numel += module.in_features * module.out_features
         elif any(isinstance(module, x) for x in [QuantizedLinear, VQuantLinear]):
             sum_bits += get_tensors_size(dict(module.named_parameters()))
             sum_numel += module.in_features * module.out_features
@@ -112,7 +153,7 @@ def get_storage_info(model):
                 "scales": module.scales,
             })
             sum_numel += module.in_features * module.out_features
-        elif any(isinstance(module, x) for x in [MarlinQuantLinear]):
+        elif any(isinstance(module, x) for x in [AwqMarlinLinear]):
             sum_bits += get_tensors_size({
                 "g_idx": module.g_idx,
                 "g_idx_sort_indices": module.g_idx_sort_indices,
@@ -121,7 +162,7 @@ def get_storage_info(model):
                 "scales": module.scales,
             })
             sum_numel += module.in_features * module.out_features
-        elif any(isinstance(module, x) for x in [TritonV2QuantLinear]):
+        elif any(isinstance(module, x) for x in [TritonV2Linear]):
             sum_bits += get_tensors_size({
                 "g_idx": module.g_idx,
                 "qweight": module.qweight,
@@ -129,18 +170,26 @@ def get_storage_info(model):
                 "scales": module.scales,
             })
             sum_numel += module.in_features * module.out_features
-        elif any(isinstance(module, x) for x in [ExllamaV2QuantLinear]):
+        elif any(isinstance(module, x) for x in [ExllamaV2Linear]):
             sum_bits += get_tensors_size(module.q_tensors)
             sum_numel += module.in_features * module.out_features
         elif module.__class__.__name__ == "Gemma4TextExperts":
             num = sum(x.numel() for x in module.parameters())
             sum_numel += num
             sum_bits += num * 16
+        elif cls == "MarlinQuantLinear":
+            sum_bits += get_tensors_size({
+                "qweight": module.qweight,
+                "qzeros": module.qzeros,
+                "scales": module.scales,
+            })
+            sum_numel += module.in_features * module.out_features
+
     vram_bits = head_numel * head_bpw + sum_bits
     return sum_bits / sum_numel, head_bpw, vram_bits
 
 @torch.inference_mode
-def load_transformers(model_dir: str, auto = False, bf16 = False):
+def load_transformers(model_dir: str, auto = False, bf16 = False, size: int = None):
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         device_map = "auto" if auto else "cuda:0",
@@ -150,11 +199,21 @@ def load_transformers(model_dir: str, auto = False, bf16 = False):
     return model, bpw_layer, bpw_head, vram_bits
 
 @torch.inference_mode
-def load_transformers_auto(model_dir: str):
+def load_transformers_mm(model_dir: str, auto = False, bf16 = False, size: int = None):
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_dir,
+        device_map = "auto" if auto else "cuda:0",
+        torch_dtype = torch.bfloat16 if bf16 else torch.half
+    )
+    bpw_layer, bpw_head, vram_bits = get_storage_info(model)
+    return model, bpw_layer, bpw_head, vram_bits
+
+@torch.inference_mode
+def load_transformers_auto(model_dir: str, size: int):
     return load_transformers(model_dir, auto = True)
 
 @torch.inference_mode
-def load_transformers_auto_bf16(model_dir: str):
+def load_transformers_auto_bf16(model_dir: str, size: int):
     return load_transformers(model_dir, auto = True, bf16 = True)
 
 @torch.inference_mode

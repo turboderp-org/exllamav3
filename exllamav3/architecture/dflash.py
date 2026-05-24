@@ -57,6 +57,7 @@ class DFlashConfig(Config):
         # DFlash
         self.mask_token_id = self.read_cfg(int, "dflash_config->mask_token_id", no_default)
         self.target_layer_ids = self.read_cfg(list, "dflash_config->target_layer_ids", no_default)
+        self.target_layer_ids = [i + 1 for i in self.target_layer_ids]
         self.block_size = self.read_cfg(int, "block_size", no_default)
 
         # RoPE
@@ -85,6 +86,7 @@ class DFlashModel(Model):
             mask_token_id = config.mask_token_id,
             rms_norm_eps = config.rms_norm_eps,
             native_draft_len = config.block_size,
+            qmap = "target_hidden",
         )
         self.modules += [self.input_layer]
 
@@ -167,23 +169,24 @@ class DFlashModel(Model):
 
         self.logit_layer_idx = None
         self.caps.update({
-            "can_quantize": False,
+            "uncalibrated_quantize": True,
             "supports_tp": False,
             "attach_target": True,
             "dflash_draft": True,
-            "default_draft_size": self.config.block_size - 1,
+            "default_draft_size": config.block_size - 1,
             "autosplit_load_fwd": False,
         })
 
-        self.lm_head = None
+        self.attached_model = None
+
+        self.draft_verifier_params.update({
+            "export_state_layers": set(config.target_layer_ids),
+        })
 
 
     def attach_to(self, target):
-        for i, l in enumerate(self.config.target_layer_ids):
-            t = target.modules[target.first_block_idx + l]
-            t.export_state = True
-        self.input_layer.embedding = weakref.ref(target.modules[0])
-        self.lm_head = weakref.ref(target.modules[-1])
+        self.attached_model = weakref.ref(target)
+        self.input_layer.attached_model = weakref.ref(target)
 
 
     def update_kv_from_target(
@@ -268,9 +271,16 @@ class DFlashModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        logits = self.lm_head().prepare_for_device(state, params)
-        logits = self.lm_head().forward(logits, params)
-        return torch.argmax(logits, dim = -1)
+        if not self.attached_model().loaded_tp:
+            ll = self.attached_model().logit_layer_idx
+            lm = self.attached_model().modules[ll]
+            logits = lm.prepare_for_device(state, params)
+            logits = lm.forward(logits, params)
+            return torch.argmax(logits, dim = -1)
+        else:
+            state = self.attached_model().tp_producer.send(state)
+            argmax = self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
+            return argmax
 
 
     def default_load_shape_dtype(self, chunk_size):
@@ -290,3 +300,11 @@ class DFlashModel(Model):
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
         raise NotImplementedError()
+
+
+    @staticmethod
+    @override
+    def get_additional_compiled_tensors(config: DFlashConfig) -> dict:
+        # "hidden_norm" is stored in DFlashInputLayer but doesn't match the "fc" prefix
+        norm_weight = config.stc.list_tensors(prefix = "hidden_norm")
+        return norm_weight

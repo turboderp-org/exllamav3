@@ -1,60 +1,4 @@
 from collections import OrderedDict
-from abc import ABC, abstractmethod
-
-class CacheableState(ABC):
-    def __init__(self):
-        self.checkpoint = None
-
-    @abstractmethod
-    def stash(self):
-        """
-        Return CPU copy of state
-        """
-        pass
-
-    @abstractmethod
-    def unstash(self, device, trim_position):
-        """
-        Return GPU copy of state
-        """
-        pass
-
-    @abstractmethod
-    def get_size(self):
-        """
-        Return size of state in bytes (in system memory after stashing)
-        """
-        pass
-
-    @abstractmethod
-    def get_cachable_interval(self):
-        """
-        Return number of past positions from which state can be trivially reconstructed
-        """
-
-    @abstractmethod
-    def reset(self):
-        """
-        Clear this recurrent state (used during autosplit load)
-        """
-
-    @abstractmethod
-    def force_position(self, position: int):
-        """
-        For testing/benchmark purposes, modify the state to mapping to a specific position. Actual state
-        value will be incorrect but state will be valid.
-        """
-
-    @abstractmethod
-    def clone(self):
-        """
-        Return a fully materialized clone of this state
-        """
-
-    @abstractmethod
-    def rewind(self, count: int):
-        pass
-
 
 class RecurrentCache(OrderedDict):
     def __init__(
@@ -67,16 +11,8 @@ class RecurrentCache(OrderedDict):
         self.current_size = 0
         self.model = model
 
-        # Get device map needed for unstashing
-        self.model = model
-        self.rl = model.get_recurrent_layers()
-        self.device_map = {}
-        for m in self.rl:
-            for instance in self.model.get_layer_instances(m.layer_idx):
-                self.device_map[instance] =  m.device
 
-
-    def get(self, key, default = None):
+    def get_stashed(self, key, default = None):
         """
         Fetch state from cache and move it to the end of the queue
         """
@@ -85,19 +21,25 @@ class RecurrentCache(OrderedDict):
             return self[key]
         return default
 
+
     def put(self, key, state):
         """
         Add state to cache
         """
         if key in self:
-            del self[key]
-        if state not in self.values():
-            state_size = self.get_size(state)
+            self.move_to_end(key)
+        else:
+            stashed_state = state.stash()
+            state_size = stashed_state["checkpoint_size"]
             while self.update_total_size() + state_size > self.max_size:
-                assert self.current_size > 0, "Not enough space in cache for single state"
-                _, oldest_state = self.popitem(last = False)
-        self[key] = state
-        self.update_total_size()
+                assert self.current_size >= 0, "Not enough space in cache for single state"
+                popped = self.popitem(last = False)
+                if self.model.loaded_tp:
+                    self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
+
+            self[key] = stashed_state
+            self.update_total_size()
+
 
     def update_total_size(self):
         seen = set()
@@ -106,43 +48,37 @@ class RecurrentCache(OrderedDict):
             if id(v) in seen:
                 continue
             seen.add(id(v))
-            total += self.get_size(v)
+            total += v["checkpoint_size"]
         self.current_size = total
         return total
 
-    def get_size(self, state):
-        elems = state if isinstance(state, list) else state.values()
-        total = sum(e.get_size() for e in elems)
-        return total
 
-    def stash(self, keys, state):
-        """
-        Save state checkpoint to system memory
-        """
-        stashed_state = None
-        for offset, key in keys:
-            if key in self:
-                self.move_to_end(key)
-            else:
-                stashed_state = stashed_state or self.get_stashed(state)
-                self.put(key, stashed_state)
+def mp_cache_recurrent_clear(local_context: dict, cache_id: int, slot: int):
+    recurrent_modules = local_context["recurrent_modules"]
+    for module in recurrent_modules:
+        recurrent_layer = module.tp_recurrent_lookup[cache_id]
+        recurrent_layer.clear(slot)
 
-    def get_stashed(self, state):
-        """
-        Move checkpoint to system RAM and prepare to store in cache
-        """
-        return {k: v.stash() for k, v in state.items()}
 
-    def get_unstashed(self, stashed_state, trim_position):
-        """
-        Retrieve state checkpoint from system memory to device memory, device-mapped according to
-        loaded model.
-        """
-        unstashed_state = {k: v.unstash(self.device_map[k], trim_position) for k, v in stashed_state.items()}
-        return unstashed_state
+def mp_cache_recurrent_stash(local_context: dict, cache_id: int, cp_handle: int, slot: int):
+    recurrent_modules = local_context["recurrent_modules"]
+    recurrent_cache = local_context["recurrent_cache"]
+    stashed = []
+    for module in recurrent_modules:
+        l = module.tp_recurrent_lookup[cache_id]
+        stashed.append(l.stash(slot))
+    recurrent_cache[cp_handle] = stashed
 
-    def get_empty_state(self):
-        """
-        Create an empty recurrent state compatible with the associated model
-        """
-        return self.model.get_empty_state()
+
+def mp_cache_recurrent_unstash(local_context: dict, cache_id: int, cp_handle: int, slot: int):
+    recurrent_modules = local_context["recurrent_modules"]
+    recurrent_cache = local_context["recurrent_cache"]
+    stashed = recurrent_cache[cp_handle]
+    for module, s in zip(recurrent_modules, stashed):
+        l = module.tp_recurrent_lookup[cache_id]
+        l.unstash(slot, s)
+
+
+def mp_cache_recurrent_del(local_context: dict, cp_handle: int):
+    recurrent_cache = local_context["recurrent_cache"]
+    del recurrent_cache[cp_handle]

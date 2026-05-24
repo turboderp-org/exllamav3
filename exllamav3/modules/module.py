@@ -136,6 +136,12 @@ class Module(ABC):
     def all_cache_modules(self):
         return self._all_cache_modules
 
+    @cached_property
+    def _all_recurrent_modules(self) -> list[Module]:
+        return [m for m in self if m.caps.get("recurrent_cache")]
+    def all_recurrent_modules(self):
+        return self._all_recurrent_modules
+
     @abstractmethod
     def optimizer_targets(self):
         pass

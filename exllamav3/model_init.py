@@ -51,12 +51,14 @@ def add_args(
     parser.add_argument("-tp_mlp", "--tp_max_parallelism_mlp", type = int, help = "(TP) Maximum parallelism for MLP layers", default = None)
     parser.add_argument("-tp_moe", "--tp_max_parallelism_moe", type = int, help = "(TP) Maximum parallelism for MoE layers", default = None)
     parser.add_argument("-tp_linear", "--tp_max_parallelism_linear", type = int, help = "(TP) Maximum parallelism for linear (output) layers", default = None)
+    parser.add_argument("-tp_linear_attn", "--tp_max_parallelism_linear_attn", type = int, help = "(TP) Maximum parallelism for linear-attention layers", default = None)
     parser.add_argument("-tp_moe_ts", "--tp_moe_tensor_split", action = "store_true", help = "(TP) Use tensor split for MoE layers rather than expert parallelism")
 
     parser.add_argument("-swa_full", "--swa_full", action = "store_true", help = f"Use full cache for SWA layers. Default is recurrent mode with snapshots")
     parser.add_argument("-ambs", "--autosplit_max_batch_size", type = int, help = f"Max batch size to account for when loading in autosplit mode (default: {default_autosplit_max_batch_size})", default = default_autosplit_max_batch_size)
 
     parser.add_argument("-lv", "--load_verbose", action = "store_true", help = "Verbose output while loading")
+    parser.add_argument("-asnf", "--autosplit_no_forward", action = "store_true", help = "Skip forward pass in autosplit, for debug purposes.")
 
     parser.add_argument("-layer_map", "--layer_map", type = str, help = "RYS layer map as a list of ints or (inclusive) ranges, example: 0..15,11..31 (repeats layers 11 through 15 once)", default = None)
 
@@ -126,6 +128,7 @@ def init(
     quiet: bool = False,
     progress: bool = True,
     override_dynamic_seq_len: int | None = None,
+    min_draft_len: int = None,
     **kwargs
 ):
     """
@@ -147,6 +150,9 @@ def init(
         (optional) Some models (Like Phi4) have two RoPE modes and adjust their positional embeddings depending on
         sequence length. This argument sets the expected max context length to help select the right mode at load time.
         Mostly relevant if you know ahead of time that you're going to use a long-context model with a short context.
+
+    :param min_draft_len:
+        Minimum draft length, even if no draft model is given (for ngram etc.)
 
     :param kwargs:
         Additional parameters to forwart to Model.load()
@@ -193,6 +199,11 @@ def init(
     draft_model = Model.from_config(draft_config, swa_full = args.swa_full) if draft_model_dir else None
 
     # Cache
+    max_history = max(
+        min_draft_len or 0,
+        draft_model.caps.get("default_draft_size") if draft_model else 0,
+        vars(args).get("num_draft_tokens") or 0
+    )
     if "cache_size" in vars(args):
         if args.cache_quant is not None:
             split = [int(bits) for bits in args.cache_quant.split(",")]
@@ -207,7 +218,9 @@ def init(
                 max_num_tokens = args.cache_size,
                 layer_type = CacheLayer_quant,
                 k_bits = k_bits,
-                v_bits = v_bits
+                v_bits = v_bits,
+                max_history = max_history,
+                max_batch_size = args.autosplit_max_batch_size,
             )
             draft_cache = Cache(
                 draft_model,
@@ -220,7 +233,9 @@ def init(
             cache = Cache(
                 model,
                 max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_fp16
+                layer_type = CacheLayer_fp16,
+                max_history = max_history,
+                max_batch_size = args.autosplit_max_batch_size,
             )
             draft_cache = Cache(
                 draft_model,
@@ -249,6 +264,7 @@ def init(
         ("mlp", "tp_max_parallelism_mlp"),
         ("moe", "tp_max_parallelism_moe"),
         ("linear", "tp_max_parallelism_linear"),
+        ("linear_attn", "tp_max_parallelism_linear_attn"),
     ]:
         value = getattr(args, arg_name, None)
         if value is not None:
@@ -264,6 +280,7 @@ def init(
             progressbar = progress,
             verbose = args.load_verbose,
             max_batch_size = args.autosplit_max_batch_size,
+            autosplit_no_forward = args.autosplit_no_forward,
             **kwargs
         )
 
@@ -278,6 +295,7 @@ def init(
         verbose = args.load_verbose,
         tp_options = tp_options,
         max_batch_size = args.autosplit_max_batch_size,
+        autosplit_no_forward = args.autosplit_no_forward,
         **kwargs
     )
 

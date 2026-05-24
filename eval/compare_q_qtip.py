@@ -44,7 +44,7 @@ def get_storage_info(model):
 
 @torch.inference_mode
 @torch.compiler.disable
-def load_qtip(model_dir: str, auto = False, bf16 = False):
+def load_qtip(model_dir: str, auto = False, bf16 = False, size: int = 2048):
     model, model_str = model_from_hf_path(model_dir, max_mem_ratio = 0.7)
     bpw_layer, bpw_head, vram_bits = get_storage_info(model)
     return model, bpw_layer, bpw_head, vram_bits

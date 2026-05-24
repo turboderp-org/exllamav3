@@ -68,7 +68,8 @@ class Model_LSMixin(ABC):
         modules: list,
         verbose: bool,
         max_batch_size: int,
-        cache_weakrefs: dict
+        cache_weakrefs: dict,
+        autosplit_no_forward: bool,
     ):
         current_device_i = 0
         backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
@@ -94,6 +95,8 @@ class Model_LSMixin(ABC):
                 if rl:
                     prepare_for_recurrence(None, params, self)
 
+        recurrent_states = params.get("recurrent_states")
+
         with ProgressBar(f"Loading (LS)" if progressbar else None, len(modules)) as progress:
 
             for idx, module in enumerate(modules):
@@ -103,7 +106,7 @@ class Model_LSMixin(ABC):
 
                 # Narrow state to max_output_size for logit output layer
                 is_logits_layer = module.caps.get("logits_output")
-                if is_logits_layer:
+                if is_logits_layer and not autosplit_no_forward:
                     b, c, d = backup_shape
                     backup_shape = (b, min(max_output_size, c), d)
                     if dummy_state is not None:
@@ -152,20 +155,11 @@ class Model_LSMixin(ABC):
                                 qcache_overhead.append(cl.get_kv_alloc_placeholder())
 
                         # Forward dummy state through module
-                        if self.caps.get("autosplit_load_fwd", True):
+                        if self.caps.get("autosplit_load_fwd", True) and not autosplit_no_forward:
                             dummy_state = module.prepare_for_device(dummy_state, params)
                             dummy_state = module.forward(dummy_state, params)
 
-                        # Create extra dummy recurrent states to account for max_batch_size
-                        recurrent = params.get("recurrent_states")
-                        if recurrent:
-                            dummy_recurrent_states = []
-                            for _ in range(1, max_batch_size):
-                                s = {k: v.clone() for k, v in recurrent.items()}
-                                dummy_recurrent_states.append(s)
-                            del dummy_recurrent_states
-
-                        # Account for max_output_factor after last layer,
+                        # Account for max_output_factor after last layer
                         extra_dummy_out_states = None
                         if is_logits_layer:
                             extra_dummy_out_states = [
@@ -197,12 +191,8 @@ class Model_LSMixin(ABC):
                         module.unload()
                         dummy_state = None
                         if "recurrent_states" in params:
-                            rls = [m for m in module if m.caps.get("recurrent_cache")]
-                            for rl in rls:
-                                for instance in self.get_layer_instances(rl.layer_idx):
-                                    s = params["recurrent_states"].get(instance)
-                                    if s:
-                                        s.reset()
+                            for rs in params["recurrent_states"]:
+                                rs.reset()
 
                         free_mem()
                         current_device_i += 1
@@ -219,6 +209,10 @@ class Model_LSMixin(ABC):
             dummy_state = None
             unset_memory_fraction(touched_devices)
 
+        if recurrent_states is not None:
+            for rs in recurrent_states:
+                rs.free()
+
         config.stc.close()
         self.active_devices = active_devices
 
@@ -234,10 +228,11 @@ class Model_LSMixin(ABC):
     ):
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
-            params["prefill"] = (instance == self.last_kv_module_instance)
+            pf = (idx, instance) == self.last_kv_module_idx_instance
+            params["prefill"] = pf
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
-            if instance == self.last_kv_module_instance:
+            if pf:
                 break
         del params["prefill"]
         return None

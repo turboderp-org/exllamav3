@@ -4,7 +4,17 @@ import torch
 from ..model.config import Config, no_default
 from ..model.model import Model
 from ..util.rope import RopeStyle
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, BlockSparseMLP, Linear, GatedDeltaNet, GatedMLP
+from ..modules import (
+    RMSNorm,
+    Embedding,
+    TransformerBlock,
+    Attention,
+    BlockSparseMLP,
+    Linear,
+    GatedDeltaNet,
+    GatedMLP,
+    GDNState
+)
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
 
@@ -226,6 +236,7 @@ class Qwen3NextModel(Model):
             "default_recurrent_checkpoint_interval": 2048,
             "linear_attn": True,
         })
+        self.recurrent_state_cls = GDNState
 
         # TODO: Enable TP for linear attn
         self.caps.update({"supports_tp": False})

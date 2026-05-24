@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from flash_attn import flash_attn_with_kvcache
 from .. import LayerNorm
 from ...model.config import Config
+from ...model.model_tp_fn import mp_model_forward_embedding
 from ...modules import Module, Linear, RMSNorm
 from ...util.rope import RopeSettings, RoPE
 from ...util.tensor import get_for_device, to2
@@ -56,8 +57,9 @@ class DFlashInputLayer(Module):
         self.mask_token_id = mask_token_id
 
         # Populated by attach_to()
-        self.embedding = None
         self.caps.update({"x_cpu": True})
+
+        self.attached_model = None
 
 
     def optimizer_targets(self):
@@ -82,7 +84,11 @@ class DFlashInputLayer(Module):
         bsz, seqlen = x.shape
         noise_mask = torch.full((bsz, self.native_draft_len - 1), self.mask_token_id, dtype = torch.long)
         x = torch.cat((x, noise_mask), dim = -1)
-        x = self.embedding().forward(x, params)
+        if not self.attached_model().loaded_tp:
+            x = self.attached_model().modules[0].forward(x, params)
+        else:
+            x = self.attached_model().tp_producer.send(x)
+            x = self.attached_model().tp_dispatch_master(mp_model_forward_embedding, (x, params))
         return x
 
 
