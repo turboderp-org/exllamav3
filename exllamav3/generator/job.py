@@ -1169,7 +1169,7 @@ class Job:
                 f.is_active = f.trigger_token is None
 
 
-    def is_checkpoint_boundary(self, override_interval):
+    def is_checkpoint_boundary(self, override_interval = None):
         seq = self.sequences[0]
         prompt_len = len(seq.sequence_ids) - 1
         seq_pos = seq.kv_position
