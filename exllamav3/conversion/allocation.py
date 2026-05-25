@@ -35,6 +35,16 @@ def create_q_strategy(
     head_bpw: int,
     hq: bool,
 ) -> (dict, float):
+    """
+    Build the per-module quantization bitrate strategy for a converted model.
+
+    Quantizable modules declare their quantization role in the model architecture, primarily through their qmap,
+    qbits_key, qgroup, q_priority and select_hq_bits attributes. This function walks the module tree, aggregates
+    all eligible Linear layers into qgroups, assigns an initial integer bitrate from the requested average bpw and
+    then spends the remaining bit budget one bit at a time according to group priority. Auxiliary targets, such as
+    output heads using head_bits, are collected alongside the main budgeted weights and merged into the returned
+    strategy.
+    """
     from ..modules.module import Module
     from ..modules.linear import Linear
 

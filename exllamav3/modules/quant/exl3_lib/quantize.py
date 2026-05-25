@@ -19,6 +19,11 @@ codebook_mul1_mult = 0x83DCD12D
 
 @lru_cache
 def tensor_core_perm(device):
+    """
+    Return the 16x16 tile permutation expected by the EXL3 tensor-core quantization kernels.
+
+    The cached index maps row-major tile elements into the lane/interleave order used by the CUDA encoder.
+    """
     perm_a = [0] * 256
     for t in range(32):
         r0 = (t % 4) * 2
@@ -52,6 +57,12 @@ def get_temp_buffers(device, K: int):
 
 
 def quantize_tiles(tiles, quant_args: dict):
+    """
+    Quantize a batch of 16x16 tiles on the current device.
+
+    tiles is shaped (num_tiles, 256) in the kernel's expected element order. The CUDA extension returns both the
+    reconstructed float tile values and the short encoded indices used later for packing.
+    """
     tiles = tiles.contiguous()
     assert tiles.shape[1] == 256
     assert tiles.dtype == torch.float
@@ -93,6 +104,13 @@ def get_pinned(num_tiles: int):
 
 
 def quantize_tiles_multigpu(tiles, quant_args: dict):
+    """
+    Quantize tiles across multiple GPUs using pinned host memory for asynchronous fan-out/fan-in.
+
+    The input starts on the first device, is copied once to pinned CPU memory, split by device_ratios or evenly, and
+    each GPU quantizes its slice on a per-device stream. Results are copied back through pinned memory and gathered
+    on the first device.
+    """
     devices = quant_args["devices"]
     if len(devices) == 1:
         return quantize_tiles(tiles, quant_args)
@@ -187,6 +205,12 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
 
 
 def quantize_tiles_multigpu_sync(tiles, quant_args: dict):
+    """
+    Simpler synchronized multi-GPU tile quantization path.
+
+    This variant explicitly copies tile chunks to each device, synchronizes around the work, then gathers results
+    back to the first device. It is easier to reason about than the pinned asynchronous path but offers less overlap.
+    """
     devices = quant_args["devices"]
     if len(devices) == 1:
         return quantize_tiles(tiles, quant_args)
@@ -684,9 +708,11 @@ def g_scale_gss(
     width: int = 3,
     pb: ProgressBar = None
 ):
-    # Select a sample of tiles along a wrapped diagonal (sampling from every row and column of tiles, hopefully
-    # representative) and search for the global scale within given range that minimizes the direct quantization
-    # error
+    """
+    Select a sample of tiles along a wrapped diagonal (sampling from every row and column of tiles, hopefully
+    representative) and search for the global scale within given range that minimizes the direct quantization
+    error
+    """
     tiles = []
     tiles_k = weight_r.shape[0] // 16
     tiles_n = weight_r.shape[1] // 16
@@ -756,7 +782,9 @@ def g_scale_gss(
 
 
 def block_rms(x: torch.Tensor, dim: int, keepdim: bool = False, blocksize: int = 32):
-    # Compute blockwise x.square().mean(dim, keepdim).sqrt()
+    """
+    Compute blockwise x.square().mean(dim, keepdim).sqrt()
+    """
     n = x.size(dim)
     sq = None
     for block in torch.split(x, blocksize, dim = dim):
@@ -770,7 +798,9 @@ def block_rms(x: torch.Tensor, dim: int, keepdim: bool = False, blocksize: int =
 
 
 def block_rms_n(x: torch.Tensor, dim: int = 0, blocksize: int = 32):
-    # Compute blockwise x.square().mean().sqrt()
+    """
+    Compute blockwise x.square().mean().sqrt()
+    """
     n = 0
     sq = None
     for block in torch.split(x, blocksize, dim = dim):
@@ -785,7 +815,9 @@ def block_rms_n(x: torch.Tensor, dim: int = 0, blocksize: int = 32):
 
 
 def block_nmse(x: torch.Tensor, y: torch.Tensor, dim: int = 0, blocksize: int = 32):
-    # Compute blockwise (x - y).square().mean().item() / y.square().mean().item()
+    """
+    Compute blockwise (x - y).square().mean().item() / y.square().mean().item()
+    """
     sq = None
     diff_sq = None
     for block_x, block_y in zip(torch.split(x, blocksize, dim = dim), torch.split(y, blocksize, dim = dim)):
@@ -811,6 +843,14 @@ def regularize(
     skip_g_scale: bool = False,
     q_fallback: bool = False
 ):
+    """
+    Transform weights into the distribution expected by EXL3 tile quantization.
+
+    The routine chooses whether to apply output-channel scaling, folds output and input sign/scale vectors into the
+    matrix, applies blockwise Hadamard transforms, and optionally searches for a global scale that minimizes sample
+    quantization error. It returns the transformed weight plus the scale metadata needed to reconstruct the original
+    linear layer behavior after quantization.
+    """
     force_out_scales = quant_args["apply_out_scales"]
 
     # dist_ref = torch.empty((512,), dtype = torch.float, device = weight.device)

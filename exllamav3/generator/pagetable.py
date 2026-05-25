@@ -255,6 +255,18 @@ class PageTable:
         generator: Generator,
         cache: Cache
     ):
+        """
+        Manage the physical cache pages backing prompt and generation state.
+
+        Completed pages are keyed by a chained hash of their token contents and previous page hash, forming an
+        implicit prefix tree: sequences with the same prefix resolve to the same chain of CachePage objects and can
+        share K/V storage during batched inference. Hash collisions are deliberately treated as impossible in
+        practice for this purpose; checking full token contents on every lookup would cost more than the vanishing
+        collision risk justifies. When a page becomes unreferenced after inference it remains indexed by its hash,
+        so later jobs can revive it for prompt-cache reuse until eviction or defragmentation overwrites it. Current
+        eviction is based on page age/access order, which keeps the bookkeeping simple but is the main place to
+        improve if future work needs a higher cache hit ratio.
+        """
         self.generator = generator
         self.cache = cache
         self.max_pages = cache.max_num_tokens // PAGE_SIZE
@@ -321,6 +333,15 @@ class PageTable:
         new_unique_pages: int,
         recurrent_pages: list[int] | None
     ):
+        """
+        Allocate physical cache pages for one sequence.
+
+        Existing full prompt pages are resolved by hash first, reusing referenced pages for shared prefixes or
+        unreferenced pages for prompt-cache hits. Missing pages, plus unique pages needed for new generation, are
+        taken from the oldest unreferenced pages. For hybrid recurrent/KV models, recurrent_pages marks which
+        hashed pages also have stashed recurrent checkpoints; the usable cached prefix is capped to the longest
+        page prefix that has both valid K/V pages and the matching recurrent state.
+        """
         allocated_pages = []
         available_pages = None
 

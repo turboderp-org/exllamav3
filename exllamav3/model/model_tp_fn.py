@@ -386,6 +386,10 @@ class PseudoParentConn:
     Standin for a Pipe to dispatch functions on the main device rather than a dedicated child process running
     `mp_model_worker`. This allows a tensor-parallel model to run partially in the main process, without additional
     IPC overhead when returning logits from forward(), and without needing two CUDA contexts on the main device.
+
+    Unlike a real Pipe, send() executes the requested function synchronously. Callers therefore keep this
+    output-device pseudo-worker last in TP fan-out order, so spawned workers are already running before the main
+    process enters collectives or barriers on its own rank.
     """
 
     def __init__(

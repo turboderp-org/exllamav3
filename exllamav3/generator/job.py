@@ -459,6 +459,17 @@ class Job:
         results: list,
         first_sample_in_sd_batch: bool = True
     ):
+        """
+        Accept one sampled token and turn it into stream events, state updates and termination decisions.
+
+        The sampled token is appended to every sequence, completed cache pages are hashed for later prefix reuse,
+        active filters are advanced, and the decoded text/tokens/probabilities are buffered until it is safe to
+        emit them. Output is held when token healing needs to remove the unhealed prefix, when a partial Unicode
+        character or stop string may still complete, or when banned-string handling may need to rewind to a
+        checkpoint and suppress text. The returned requeue flag asks the generator to stop this physical job and
+        enqueue a new one with the current sequence as its prompt, which bounds per-job cache growth and lets long
+        generations pass through prompt-cache allocation again.
+        """
         next_token = next_token.cpu()
         next_token_i = next_token.item()
 
@@ -797,6 +808,14 @@ class Job:
 
 
     def prepare_for_requeue(self):
+        """
+        Reinitialize this single-sequence job so generation can continue as a freshly queued request.
+
+        Requeueing turns the full sequence generated so far into the new prompt, reduces the remaining token
+        limits, carries over streaming buffers/timing/filter state, and disables token healing because it already
+        happened on the first pass. The resulting job keeps the original serial number so callers see one logical
+        stream even though the generator schedules it as another pending job.
+        """
         assert len(self.sequences) == 1
 
         seq = self.sequences[0]
@@ -851,6 +870,14 @@ class Job:
 
 
     def prepare_for_queue(self, generator, serial_number: int, rq: bool = False):
+        """
+        Attach the job to a generator and prepare its static queue-time state.
+
+        This runs before the job is placed in pending_jobs and before physical cache pages are allocated. It hashes
+        full prompt pages so the page table can later find reusable K/V cache entries, counts the additional unique
+        pages required for generation, checks the request against cache and batch limits, initializes streaming
+        buffers for non-requeued jobs, and prepares any model-specific embedding/position metadata needed by prefill.
+        """
 
         # Attach to generator
         self.serial_number = serial_number
@@ -932,6 +959,15 @@ class Job:
 
 
     def prefill(self, results: list):
+        """
+        Run prompt prefill chunks for already allocated cache pages.
+
+        iterate_start_jobs() allocates or revives pages before this method is called. prefill() then advances each
+        sequence's kv_position through the prompt, skipping any prefix whose K/V pages were already cached, running
+        model forward passes for uncached chunks, updating page hashes as pages become complete, and stashing
+        recurrent checkpoints when applicable. It emits progress events but does not sample new completion tokens.
+        """
+
         if self.time_first_prefill is None:
             self.time_first_prefill = time.time()
 
@@ -1121,6 +1157,14 @@ class Job:
 
 
     def allocate_pages(self):
+        """
+        Claim cache pages for this job after it leaves the pending queue.
+
+        The per-sequence page allocation consults the page table hashes prepared by prepare_for_queue(), reviving
+        prompt-cache pages where possible and assigning fresh pages for uncached prompt or future generation. For
+        recurrent models this also creates or restores the recurrent state corresponding to the cached prefix.
+        """
+
         for seq in self.sequences:
             allocated_pages, cached_pages, non_sequential_pages, stashed_recurrent_state = \
                 seq.allocate_pages(self.pagetable, self.generator.recurrent_cache)
@@ -1161,6 +1205,9 @@ class Job:
 
 
     def activate(self):
+        """
+        Mark the job active and initialize sampling filters.
+        """
         self.logits_device = self.generator.model.output_device
         if not self.is_requeued:
             for f in self.filters:
@@ -1170,6 +1217,14 @@ class Job:
 
 
     def is_checkpoint_boundary(self, override_interval = None):
+        """
+        Return whether the current sequence position should stash a recurrent checkpoint.
+
+        Checkpoints are measured from the end of the cached K/V prefix so restored pages and recurrent state stay in
+        sync. An explicit interval overrides the normal policy; otherwise prefill uses the coarser prompt-prefill
+        interval until it nears the generation boundary, where it switches to the normal recurrent checkpoint
+        interval.
+        """
         seq = self.sequences[0]
         prompt_len = len(seq.sequence_ids) - 1
         seq_pos = seq.kv_position
@@ -1182,6 +1237,9 @@ class Job:
 
 
     def maybe_stash_recurrent(self, cache, interval = None):
+        """
+        Store the current recurrent state if the sequence is at a checkpoint boundary.
+        """
         seq = self.sequences[0]
         if self.is_checkpoint_boundary(interval) and \
             self.last_recurrent_checkpoint_pos != seq.kv_position:
@@ -1205,6 +1263,9 @@ class Job:
 
 
     def get_ngram_draft(self, draft_length: int):
+        """
+        Return speculative draft tokens from the suffix-array n-gram matcher.
+        """
         assert self.sam
 
         # Update SAM with current history and find longest suffix

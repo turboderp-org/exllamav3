@@ -66,6 +66,13 @@ def attn_dispatch(
     cache_seqlens: torch.Tensor | None = None,
     non_causal_spans: list | None = None,
 ):
+    """
+    Select and run the first compatible attention implementation for the supplied tensors.
+
+    The dispatcher builds an AttnArgs description covering regular, varlen and paged-cache attention modes, obtains
+    K/V cache tensors when a Cache or CacheLayer is provided, and tries registered attention backends in preference
+    order. After a cached attention call, any updated K/V tensors are written back through the same cache interface.
+    """
     bsz, q_len, num_q_heads, dim = q.shape
     _, kv_len, num_kv_heads, _ = k.shape
 

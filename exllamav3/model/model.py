@@ -184,6 +184,14 @@ class Model(Model_TPMixin, Model_LSMixin):
 
     @torch.inference_mode
     def prefill(self, input_ids: torch.Tensor, params: dict | None = None):
+        """
+        Run prompt-prefill inference and update cache/recurrent state.
+
+        Inputs are first normalized by the architecture-specific prepare_inputs() hook. If the model is loaded in
+        tensor-parallel mode, execution is dispatched through prefill_tp(), which fans the work out to TP workers
+        and stops at the last module that affects K/V cache state. Otherwise the layer-split path prefill_ls() runs
+        directly in the current process. Both paths advance recurrent states after the forward work completes.
+        """
         if params is None:
             params = {}
         x = self.prepare_inputs(input_ids, params)
@@ -199,6 +207,14 @@ class Model(Model_TPMixin, Model_LSMixin):
 
     @torch.inference_mode
     def forward(self, input_ids: torch.Tensor, params: dict | None = None):
+        """
+        Run a normal model forward pass for generation or verification.
+
+        After architecture-specific input preparation, tensor-parallel models dispatch through forward_tp() so each
+        worker processes its shard and gathers outputs as needed. Non-TP models use the local layer-split forward
+        path forward_ls(). Recurrent state advancement is shared between the two modes and runs after the selected
+        forward path returns.
+        """
         if params is None:
             params = {}
         x = self.prepare_inputs(input_ids, params)

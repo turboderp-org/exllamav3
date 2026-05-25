@@ -30,7 +30,18 @@ class Model_TPMixin:
 
     def create_tp_context(self, tp_backend: str):
         """
-        Create child processes and pipes
+        Create the tensor-parallel worker context.
+
+        TP runs one Python process per participating CUDA device so each worker can own its CUDA context, loaded
+        module shards and cache tensors independently. The selected output device is represented in the parent
+        process by pseudo pipe/process objects, while the remaining devices are spawned with multiprocessing Pipes
+        for command dispatch. A final CPU worker slot uses device -1 for backend helper work such as native
+        CPU-based reductions. All workers receive the same backend description and shared-memory producer metadata,
+        allowing large tensors and collectives to move through shared memory instead of being pickled over pipes.
+
+        The output device is the TP "master" for this process: it runs synchronously in the main process through
+        PseudoParentConn instead of in a spawned worker. _load_tp() keeps that device last in active_devices so
+        fan-out dispatch reaches spawned workers before invoking the blocking pseudo-worker path.
         """
         log_tp(None, "Creating TP context")
 
@@ -190,6 +201,14 @@ class Model_TPMixin:
 
 
     def tp_worker_dispatch_multi(self, active_devices: list[int], fn, args, dev_args: list | None = None):
+        """
+        Dispatch one function call to multiple workers without waiting for results.
+
+        args are shared across devices; dev_args, when provided, supplies per-device argument suffixes matched by
+        active_devices order. Callers normally pass self.active_devices, whose last entry is the in-process output
+        device. That ordering matters because dispatching to the pseudo-worker executes the function immediately and
+        can block on TP collectives; spawned workers must already have received the same command before that happens.
+        """
         for idx, device in enumerate(active_devices):
             d_args = args
             if dev_args is not None:
@@ -199,6 +218,13 @@ class Model_TPMixin:
 
 
     def tp_worker_wait_multi(self, active_devices: list[int]):
+        """
+        Wait for a previously dispatched multi-worker call and return results in device order.
+
+        With the standard self.active_devices ordering this waits on child-process results before the in-process
+        output device result. This mirrors dispatch order and avoids treating the synchronous pseudo-worker as an
+        early rendezvous point while child workers are still undispatched or unread.
+        """
         r = []
         for device in active_devices:
             r.append(self.tp_worker_result(device))
@@ -206,11 +232,19 @@ class Model_TPMixin:
 
 
     def tp_worker_dispatch_wait_multi(self, active_devices: list[int], fn, args, dev_args: list | None = None):
+        """
+        Dispatch a function to multiple workers and wait for all corresponding results.
+
+        For TP-wide calls, pass devices in self.active_devices order so the output-device pseudo-worker remains
+        last for both dispatch and result collection.
+        """
         self.tp_worker_dispatch_multi(active_devices, fn, args, dev_args)
         return self.tp_worker_wait_multi(active_devices)
 
 
     def tp_cache_page_copy(self, cache_id: int, from_page: int, to_page: int, num_tokens: int):
+        # active_devices is ordered with the output-device pseudo-worker last, so all spawned workers receive the
+        # copy command before the main process enters the synchronous pseudo-worker call.
         for device in self.active_devices:
             self.tp_worker_dispatch(device, mp_cache_page_copy, (
                 cache_id,
@@ -223,6 +257,13 @@ class Model_TPMixin:
 
 
     def tp_dispatch_all(self, func, args):
+        """
+        Run the same worker function on every active TP device and require all workers to complete.
+
+        self.active_devices keeps the output device last. Since that device is executed synchronously in the main
+        process, this order gives child workers a chance to enter any collective/barrier before the main process
+        does.
+        """
         for device in self.active_devices:
             self.tp_worker_dispatch(device, func, args)
         for device in self.active_devices:
@@ -230,12 +271,25 @@ class Model_TPMixin:
 
 
     def tp_dispatch_master(self, func, args):
+        """
+        Run a worker function only on the TP output device and return its result.
+        """
         self.tp_worker_dispatch(self.tp_output_device, func, args)
         r = self.tp_worker_result(self.tp_output_device)
         return r
 
 
     def tp_dispatch_lm_head_argmax(self, args):
+        """
+        Compute argmax over a tensor-parallel sharded LM head.
+
+        Each device that owns a non-empty LM-head slice computes local maximum values and vocabulary indices for
+        its shard. The partial maxima are gathered to the output device, where the final winner is selected and the
+        global token index is returned.
+
+        Dispatch follows self.active_devices order so the output-device pseudo-worker, if participating, runs after
+        the spawned workers have been sent their local argmax command.
+        """
         ad = {}
         for device in self.active_devices:
             a, b, _ = self.plan[device]["lm_head"]
@@ -340,7 +394,9 @@ class Model_TPMixin:
             tp_output_device = active_devices[0]
         self.tp_output_device = torch.device(tp_output_device).index
 
-        # Move output device to end of active device list
+        # Move output device to end of active device list. This device is the TP "master" running synchronously in
+        # the main process via PseudoParentConn, so keeping it last prevents fan-out helpers from blocking in the
+        # main process before child workers have received their commands.
         active_devices.remove(self.tp_output_device)
         active_devices.append(self.tp_output_device)
 
@@ -479,6 +535,9 @@ class Model_TPMixin:
         self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
         x, reserve = self.prepare_inputs_for_tp(x, params)
+        # active_devices order sends work to spawned CUDA workers first and the main-process output device last.
+        # mp_model_forward enters backend barriers, so dispatching the synchronous pseudo-worker early would block
+        # before the other ranks had even received this forward command.
         for device in self.active_devices:
             self.tp_worker_dispatch(device, mp_model_forward, (
                 x,
@@ -506,6 +565,8 @@ class Model_TPMixin:
         self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
         x, reserve = self.prepare_inputs_for_tp(x, params)
+        # Keep the output-device pseudo-worker last for the same reason as prefill_tp(): its send() path executes
+        # immediately in the main process and may block inside TP collectives until child workers arrive.
         for device in self.active_devices:
             self.tp_worker_dispatch(device, mp_model_forward, (
                 x,

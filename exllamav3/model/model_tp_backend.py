@@ -37,6 +37,14 @@ class TPBackendNCCL:
         uuid: str,
         shbuf_size: int = SHBUF_SIZE,
     ):
+        """
+        NCCL-backed tensor-parallel communication backend.
+
+        CUDA worker processes join a torch.distributed NCCL process group for barriers and all-reduce operations.
+        The CPU helper process skips NCCL initialization. Operations not currently implemented directly with NCCL,
+        such as broadcast and gather variants, delegate to a native shared-memory fallback backend so the rest of
+        the TP code can use one backend interface.
+        """
         self.device = device
         if device < 0:
             log_tp(device, f"NCCL init: skip CPU process")
@@ -117,6 +125,7 @@ class TPBackendNCCL:
         ldims: list[int]
     ):
         self.fallback.gather(tensor, out_tensor, gather_devices, out_device, ldims)
+
         # dst_rank = self.active_devices.index(out_device)
         # d_ldims = [0] * (max(self.active_devices) + 1)
         # for d, m in zip(gather_devices, ldims):
@@ -140,7 +149,6 @@ class TPBackendNCCL:
         # elif tensor.shape[-1] > 0:
         #     # print(f"rank {self.rank} send {tensor.shape[-1]} to {dst_rank}")
         #     dist.send(tensor, dst = dst_rank)
-
 
 
     def gather_small(
@@ -175,6 +183,20 @@ class TPBackendNative:
         shbuf_size: int = SHBUF_SIZE,
         cpu: bool = False
     ):
+        """
+        Native shared-memory tensor-parallel communication backend.
+
+        The master process creates four named shared-memory regions and all other workers open them by UUID:
+        G stores global synchronization state for the custom process-group primitives, B is the main bulk transfer
+        buffer for large broadcast/gather payloads, R is reserved for CPU-assisted all-reduce staging, and S is a
+        small low-latency buffer for tiny broadcasts and gathers. CUDA workers register these buffers as pinned host
+        memory so device copies can be issued efficiently.
+
+        all_reduce() currently routes through pg_all_reduce_cpu(): GPU workers publish their contributions into the
+        R buffer, a designated CPU helper performs the reduction over host memory, and workers copy the reduced
+        result back. This avoids relying on NCCL for the native backend, at the cost of PCIe traffic and CPU work.
+        """
+
         self.uuid = uuid
         self.shm_g_name = uuid + "_g"
         self.shm_b_name = uuid + "_b"

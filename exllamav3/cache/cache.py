@@ -10,6 +10,14 @@ if TYPE_CHECKING:
 import weakref
 
 class CacheLayer(ABC):
+    """
+    Abstract interface for one model layer's cache storage.
+
+    Cache implementations provide the backing tensors and copy/update operations for attention KV pages or
+    cache-like layer state. The higher-level Cache class owns one CacheLayer per attention layer and calls this
+    interface without needing to know whether the concrete storage is unquantized, quantized, recurrent, or split
+    across devices.
+    """
 
     def __init__(
         self,
@@ -207,6 +215,10 @@ class Cache:
         sliding_window: int = -1,
         instance = None,
     ) -> tuple:
+        """
+        Return K/V tensors for cache layer, either reference to statically allocated tensors or temporary 
+        tensors with dequantized keys/values in the case of a quantized cache
+        """
         instance = instance or 0
         return self.layers[idx, instance].get_kv(cache_seqlens, block_table, sliding_window)
 
@@ -221,6 +233,10 @@ class Cache:
         length: int,
         instance: None,
     ):
+        """
+        Update cache layer. Quantizes updated keys/values in the case of a quantized cache, else this will
+        be a no-op since attention will have updated a reference to the static paged cache.
+        """
         instance = instance or 0
         return self.layers[idx, instance].update_kv(cache_seqlens, block_table, k, v, length)
 
@@ -232,6 +248,9 @@ class Cache:
         to_page: int,
         num_tokens: int,
     ):
+        """
+        Copy one cache page. Only used for partial page reuse in prompt caching.
+        """
         assert target == self or (not target.model.loaded_tp and not self.model.loaded_tp), \
             "Cannot copy pages between TP and non-TP caches, or between distinct TP caches."
         assert target.num_layers == self.num_layers

@@ -223,6 +223,13 @@ class Generator:
         """
         Adds a job or list of jobs to the queue.
 
+        Each job is prepared against this generator before it is appended to the pending queue. Preparation assigns
+        the current job_serial, hashes prompt pages for later cache lookup, and validates that the request can fit
+        the configured cache and batch limits. The serial is then incremented and returned to the caller; it is also
+        included in started, prefill and streaming result dictionaries so clients can correlate events with the
+        logical request. Requeued jobs keep their original serial number internally so a long generation still
+        appears as one stream.
+
         returns:
             int: (List of) unique serial number(s) for job(s)
         """
@@ -244,7 +251,12 @@ class Generator:
         job: Job
     ):
         """
-        Cancel single job
+        Cancel a single pending or active job.
+
+        Pending jobs are removed before they ever allocate cache pages. Active jobs first release their page
+        references and recurrent state, then leave active_jobs so future iterations stop sampling them. If the
+        cancellation drains the generator completely, the page table is defragmented immediately because no active
+        block tables still depend on the current physical page ordering.
         """
 
         num_jobs = self.num_remaining_jobs()
@@ -543,6 +555,8 @@ class Generator:
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
 
         # Get shape of active batch
+        # Only jobs that have finished prefill can participate in token generation. The maximum sequence length
+        # determines how many cache pages the temporary block table needs for this iteration.
         batch_size = 0
         max_seq_len = 0
         for job in self.active_jobs:
@@ -555,6 +569,8 @@ class Generator:
             max_seq_len += draft_tokens.shape[-1]
 
         # Create block index table for batch
+        # The model sees a compact batch, so build per-row mappings from logical page positions to physical cache
+        # page indices, along with current cache lengths and optional MRoPE position offsets.
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
         block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
         cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
@@ -572,6 +588,8 @@ class Generator:
                 batch += 1
 
         # Collect input IDs and indexed embeddings
+        # Jobs may contribute multiple sequence rows. logit_mapping records the slice of the model output that
+        # belongs to each active job, while batch_jobs keeps the corresponding Job objects in compact-batch order.
         input_ids_list = []
         active_embeddings = []
         logit_mapping = []
@@ -589,7 +607,9 @@ class Generator:
         logit_mapping.append(len(input_ids_list))
         batch_ids = torch.cat(input_ids_list, dim = 0)
 
-        # # Collect recurrent states for batch
+        # Collect recurrent states for batch
+        # Recurrent models carry mutable state beside the K/V cache; pass one state object per compact batch job so
+        # the model can advance or rewind it consistently with accepted draft tokens.
         batch_states = None
         if self.recurrent_cache is not None:
             batch_states = [job.recurrent_state for job in batch_jobs]
@@ -605,7 +625,8 @@ class Generator:
                 else:
                     job.filter_futures.append(None)
 
-        # Get logit batch from model
+        # Get logit batch from model. Forward writes new K/V entries into the cache for the supplied positions and
+        # returns logits for either one target token or a target-plus-draft verification window.
         params = {
             "attn_mode": "flash_attn",
             "block_table": block_index,
@@ -623,12 +644,14 @@ class Generator:
             params = params,
         )
 
-        # Don't keep recurrent states in params longer than needed
+        # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
+        # references to recurrent state objects past this iteration.
         p_export_states = params.get("export_states")
         p_cache_seqlens = params.get("cache_seqlens")
         params = None
 
-        # Run foreground filters here, while GPU workload is queued up and running
+        # Background filters were launched before forward(); synchronous filters run now to overlap CPU work with
+        # queued GPU execution as much as possible.
         for job in batch_jobs:
             if job.new_tokens < 0: continue
             assert len(job.logit_masks) == 0
@@ -646,6 +669,8 @@ class Generator:
 
         # TODO: Batch sampling
         # Pass to jobs to sample
+        # Sampling is still job-by-job. Each accepted token updates job state, may emit a stream result, may finish
+        # the job, or may request requeueing once the configured per-job token budget is reached.
         completed_jobs = []
         requeuing_jobs = []
         accepted_lengths = []
@@ -670,7 +695,8 @@ class Generator:
                     results,
                 )
 
-                # Requeue
+                # Requeue. Requeueing is only supported for single-sequence jobs because the replacement job uses the
+                # full sequence generated so far as its next prompt.
                 if len(job.sequences) == 1 and rq:
                     # if draft_tokens is not None:
                     #     rejected = batch_logits.shape[1] - 1 - i
@@ -678,12 +704,16 @@ class Generator:
                     requeuing_jobs.append(job)
                     break
 
-                # EOS
+                # EOS. Stop sampling this job immediately once a stop condition, filter condition or max token limit
+                # produces an EOS event.
                 if eos:
                     completed_jobs.append(job)
                     break
 
-                # Continue sampling from logit batch as long as result matches draft, unless hitting checkpoint mark
+                # Continue sampling from logit batch as long as result matches draft, unless hitting checkpoint mark.
+                # For speculative decoding, consume additional logits only while the sampled target token matches
+                # the draft token. A recurrent checkpoint boundary also stops draft acceptance so state can be
+                # stashed at an exact page boundary.
                 if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                     cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
                     if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
@@ -732,7 +762,8 @@ class Generator:
             accepted_lengths.append(accepted_length)
             j += 1
 
-        # Accept new target_hidden if DFlash
+        # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden
+        # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         if self.dflash_draft:
             self.draft_model.update_kv_from_target(
                 target_hidden = p_export_states,
@@ -744,7 +775,9 @@ class Generator:
                 }
             )
 
-        # Release pages for completed jobs
+        # Release pages for completed jobs. Finished and requeued jobs no longer need their active page references.
+        # Requeued recurrent jobs may stash the last checkpoint first so the next queued job can resume from cached
+        # recurrent state.
         num_jobs = self.num_remaining_jobs()
         for job in completed_jobs + requeuing_jobs:
             if job in requeuing_jobs and self.recurrent_cache is not None:
@@ -752,17 +785,27 @@ class Generator:
             job.deallocate_pages()
             self.active_jobs.remove(job)
 
-        # Requeue jobs
+        # Requeue jobs. Puts replacement jobs at the front so long generations continue promptly after they yield
+        # their cache pages.
         for job in requeuing_jobs:
             rq_job = job.prepare_for_requeue()
             self.pending_jobs.insert(0, rq_job)
 
-        # Defrag
+        # Defrag. Physical page indices can only be compacted when no active block tables are using them.
         if num_jobs and not self.num_remaining_jobs():
             self.pagetable.defrag()
 
 
     def iterate_start_jobs(self, results: list):
+        """
+        Move pending jobs into the active set when batch and cache capacity allow.
+
+        Jobs are considered in queue order, but a job can be skipped temporarily if it would exceed max_batch_size
+        or needs more fresh pages than are currently unreferenced. Later jobs may start if they fit, which improves
+        utilization, but each skipped job accumulates a skip count; once any skipped job reaches max_skips, startup
+        stops for this iteration to preserve approximate queue fairness. Started jobs allocate their cache pages
+        immediately and emit a "started" event.
+        """
 
         # Get current max batch
         current_max_batch = 0

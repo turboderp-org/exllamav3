@@ -52,6 +52,15 @@ class TPAllocator:
         output_num_tokens: int,
         dev_limits: dict = None,
     ):
+        """
+        Estimate and plan a tensor-parallel split across devices with uneven capacity.
+
+        Components describe storage that must be replicated, storage that can be divided by channel, and temporary
+        per-token overhead. initial_split() allocates each splittable component by the remaining memory ratios on
+        the devices, so larger GPUs or less-loaded GPUs receive more channels while smaller devices can receive
+        fewer or zero. The allocator tracks persistent storage as a sum and temporary overhead as a per-device max,
+        allowing irregular splits when model shards and runtime buffers do not scale uniformly.
+        """
         self.components = components
         self.current_split = None
         self.current_usage = None
@@ -145,6 +154,12 @@ class TPAllocator:
 
 
     def compile_tp_plan(self):
+        """
+        Convert per-device channel counts into explicit slice ranges for each allocation key.
+
+        The returned plan is indexed by device and maps each component key to (begin, end, unit), with channel_width
+        applied so worker import code can slice tensors in the original channel units.
+        """
         plan = []
         for _ in range(self.num_devices):
             plan.append({})

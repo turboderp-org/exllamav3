@@ -53,6 +53,8 @@ class RecurrentCache(OrderedDict):
         return total
 
 
+# Per-rank functions for tensor-parallel mode
+
 def mp_cache_recurrent_clear(local_context: dict, cache_id: int, slot: int):
     recurrent_modules = local_context["recurrent_modules"]
     for module in recurrent_modules:

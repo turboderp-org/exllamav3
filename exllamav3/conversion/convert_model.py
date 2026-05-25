@@ -269,6 +269,7 @@ def get_state_error(x, ref):
 
 @torch.inference_mode()
 def main(args, job_state):
+    # TODO: Refactor this, split into functions
     global max_progress, curr_progress
 
     torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)

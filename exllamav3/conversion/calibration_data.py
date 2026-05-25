@@ -59,6 +59,13 @@ def random_data(text, rows, columns, tokenizer):
 
 
 def get_default_calibration(args, tokenizer):
+    """
+    Return the default calibration corpus as a list of token rows.
+
+    The final calibration data is a weighted mix of fixed-width token slices drawn from several bundled text
+    sources, plus random token rows to exercise the full vocabulary. Each row is a 1 x cal_cols tensor, and the
+    number of rows is distributed across sources according to their configured weights.
+    """
     columns = args["cal_cols"]
     rows = args["cal_rows"]
 
