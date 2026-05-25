@@ -13,6 +13,7 @@ namespace cg = cooperative_groups;
 #include "barrier_inner.cuh"
 
 #define NUM_THREADS 1024
+#define NUM_THREADS_SMALL 256
 #define BATCH_STAGE 2
 #define STAGE_SIZE (NUM_THREADS * 16)
 
@@ -236,6 +237,161 @@ void pg_gather_kernel
 
     grid.sync();
     pg_barrier_inner(ctx, device_mask, this_device, out_device, abort_flag);
+}
+
+
+__global__ __launch_bounds__(NUM_THREADS_SMALL)
+void pg_gather_small_kernel
+(
+    PGContext* __restrict__ ctx,
+    const uint32_t device_mask,
+    const int this_device,
+    const int out_device,
+    uint8_t* __restrict__ data_ptr,
+    uint8_t* __restrict__ out_data_ptr,
+    const Offsets __grid_constant__ all_offsets,
+    const int batch,
+    uint8_t* __restrict__ shbuf_ptr,
+    const size_t data_size,
+    uint32_t *abort_flag
+)
+{
+    int t = threadIdx.x;
+
+    int this_rank = __popc(device_mask & ((1 << this_device) - 1));
+    int this_ldim = all_offsets[this_device + 1] - all_offsets[this_device];
+    size_t this_shbuf_offset = (size_t) all_offsets[this_device] * (size_t) batch;
+
+    // Producer: copy this rank's full small tensor into its packed shared-buffer region.
+    for (size_t i = t; i < data_size; i += NUM_THREADS_SMALL)
+        shbuf_ptr[this_shbuf_offset + i] = data_ptr[i];
+
+    __syncthreads();
+    if (t == 0)
+        stg_release_sys_u32(ctx->gather_stage_produced + this_rank, 1);
+
+    // Output rank: wait for all producers, then scatter packed per-rank payloads
+    // into the row-concatenated output tensor.
+    if (this_device == out_device)
+    {
+        size_t stride = (size_t) all_offsets[MAX_DEVICES];
+
+        for (uint32_t pending = device_mask; pending; pending &= (pending - 1))
+        {
+            int src_device = __ffs(pending) - 1;
+            int src_rank = __popc(device_mask & ((1 << src_device) - 1));
+            int src_ldim = all_offsets[src_device + 1] - all_offsets[src_device];
+            if (src_ldim == 0)
+                continue;
+
+            if (t == 0)
+            {
+                uint32_t sleep = SYNC_MIN_SLEEP;
+                uint64_t deadline = sync_deadline();
+                while (ldg_acquire_sys_u32(ctx->gather_stage_produced + src_rank) < 1)
+                {
+                    __nanosleep(sleep);
+                    if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
+                    else *abort_flag = check_timeout(ctx, deadline, "gather_small");
+                    if (*abort_flag) break;
+                }
+            }
+            __syncthreads();
+            if (*abort_flag)
+                break;
+
+            size_t src_shbuf_offset = (size_t) all_offsets[src_device] * (size_t) batch;
+            size_t bytes_to_copy = (size_t) src_ldim * (size_t) batch;
+            for (size_t i = t; i < bytes_to_copy; i += NUM_THREADS_SMALL)
+            {
+                size_t row = i / src_ldim;
+                size_t col = i % src_ldim;
+                size_t out_i = row * stride + (size_t) all_offsets[src_device] + col;
+                out_data_ptr[out_i] = shbuf_ptr[src_shbuf_offset + i];
+            }
+            __syncthreads();
+        }
+    }
+
+    pg_barrier_inner(ctx, device_mask, this_device, out_device, abort_flag);
+
+    if (t == 0)
+    {
+        ctx->gather_stage_produced[this_rank] = 0;
+        __threadfence_system();
+    }
+}
+
+
+void pg_gather_small
+(
+    uintptr_t ctx,
+    std::vector<uintptr_t> devices,
+    int this_device,
+    int out_device,
+    at::Tensor& tensor,
+    c10::optional<at::Tensor>& out_tensor,
+    std::vector<size_t> ldims,
+    uintptr_t shbuf,
+    size_t shbuf_size,
+    at::Tensor& abort_flag
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(this_device);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    pg_check_timeout(ctx);
+
+    uint8_t* data_ptr = (uint8_t*) tensor.data_ptr();
+    uint8_t* out_data_ptr = (uint8_t*) OPTPTR(out_tensor);
+    uint8_t* shbuf_ptr = (uint8_t*) shbuf;
+
+    size_t esize = tensor.element_size();
+    size_t send_size = tensor.numel() * esize;
+    TORCH_CHECK(devices.size() == ldims.size(), "Must have one ldim per active device");
+    int batch = out_data_ptr ? out_tensor.value().numel() / out_tensor.value().size(-1)
+                             : (tensor.size(-1) ? tensor.numel() / tensor.size(-1) : 0);
+
+    Offsets all_offsets = {};
+    for (int i = 0; i < MAX_DEVICES + 1; ++i) all_offsets[i] = 0;
+    for (int i = 0; i < devices.size(); ++i) all_offsets[devices[i]] = ldims[i] * esize;
+    int p = 0;
+    for (int i = 0; i < MAX_DEVICES + 1; ++i) { int q = p; p += all_offsets[i]; all_offsets[i] = q; }
+    if (out_data_ptr)
+        TORCH_CHECK(p == out_tensor.value().size(-1) * esize, "Gather small: Output tensor last dimension mismatch");
+    TORCH_CHECK((size_t) p * (size_t) batch <= shbuf_size, "Gather small: Shared buffer too small");
+
+    uint32_t device_mask = 0;
+    for (int i : devices) device_mask |= (1 << i);
+
+    uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
+    void* kernelArgs[] =
+    {
+        (void*)& ctx,  // Shared, pinned
+        (void*)& device_mask,
+        (void*)& this_device,
+        (void*)& out_device,
+        (void*)& data_ptr,
+        (void*)& out_data_ptr,
+        (void*)& all_offsets,
+        (void*)& batch,
+        (void*)& shbuf_ptr,
+        (void*)& send_size,
+        (void*)& abort_flag_ptr
+    };
+
+    dim3 block_grid(1);
+    dim3 block_dim(NUM_THREADS_SMALL);
+
+    cudaLaunchCooperativeKernel
+    (
+        (void*)pg_gather_small_kernel,
+        block_grid,
+        block_dim,
+        kernelArgs,
+        0,
+        stream
+    );
+    cuda_check(cudaPeekAtLastError());
 }
 
 
