@@ -277,15 +277,69 @@ def mp_model_forward_lm_head_argmax(
     shared_input: dict,
     params: dict,
     offset: int,
+    gather_devices: list[int] | None,
+    ldims: list[int] | None,
 ):
     consumer = local_context["inf_consumer"]
-    module = local_context["logits_module"]
+    device = local_context["device"]
+    output_device = local_context["output_device"]
+    backend = local_context["backend"]
+
     x = consumer.recv(shared_input)
-    x = module.prepare_for_device(x, params)
-    x = module.forward(x, params)
-    v, i = x.max(dim = -1)
-    i += offset
-    return v, i
+
+    if offset >= 0:
+        module = local_context["logits_module"]
+        x = module.prepare_for_device(x, params)
+        x = module.forward(x, params)
+        v, i = x.max(dim = -1)
+        i += offset
+    else:
+        v = torch.empty(*x.shape[:-1], dtype = x.dtype, device = x.device)
+        i = torch.empty(*x.shape[:-1], dtype = torch.long, device = x.device)
+
+    if gather_devices is None:
+        return v, i
+
+    v_dim = 1 if offset >= 0 else 0
+    i_dim = 1 if offset >= 0 else 0
+    vp = torch.empty(*v.shape, v_dim, dtype = v.dtype, device = v.device)
+    ip = torch.empty(*i.shape, i_dim, dtype = i.dtype, device = i.device)
+    if offset >= 0:
+        vp[..., 0] = v
+        ip[..., 0] = i
+
+    if device == output_device:
+        out_v_shape = list(vp.shape)
+        out_i_shape = list(ip.shape)
+        out_v_shape[-1] = sum(ldims)
+        out_i_shape[-1] = sum(ldims)
+        out_v = torch.empty(*out_v_shape, dtype = vp.dtype, device = vp.device)
+        out_i = torch.empty(*out_i_shape, dtype = ip.dtype, device = ip.device)
+    else:
+        out_v = None
+        out_i = None
+
+    backend.gather_small(vp, out_v, gather_devices, output_device, ldims)
+    backend.gather_small(ip, out_i, gather_devices, output_device, ldims)
+
+    return (out_v, out_i) if device == output_device else None
+
+
+# def mp_model_forward_lm_head_argmax_old(
+#     local_context: dict,
+#     shared_input: dict,
+#     params: dict,
+#     offset: int
+# ):
+#     consumer = local_context["inf_consumer"]
+#     module = local_context["logits_module"]
+#
+#     x = consumer.recv(shared_input)
+#     x = module.prepare_for_device(x, params)
+#     x = module.forward(x, params)
+#     v, i = x.max(dim = -1)
+#     i += offset
+#     return v, i
 
 
 def mp_cache_page_copy(

@@ -142,6 +142,18 @@ class TPBackendNCCL:
         #     dist.send(tensor, dst = dst_rank)
 
 
+
+    def gather_small(
+        self,
+        tensor: torch.Tensor,
+        out_tensor: torch.Tensor | None,
+        gather_devices: torch.Tensor | None,
+        out_device: int,
+        ldims: list[int]
+    ):
+        self.fallback.gather_small(tensor, out_tensor, gather_devices, out_device, ldims)
+
+
     def run_cpu_reduce_jobs(self):
         pass
 
@@ -379,6 +391,34 @@ class TPBackendNative:
             ldims,
             self.ptr_b,
             self.shbuf_size,
+            self.abort_flag
+        )
+
+
+    def gather_small(
+        self,
+        tensor: torch.Tensor,
+        out_tensor: torch.Tensor | None,
+        gather_devices: torch.Tensor | None,
+        out_device: int,
+        ldims: list[int]
+    ):
+        if out_device == self.device:
+            assert out_tensor is not None, \
+                f"Gather small: Output device must supply output tensor"
+            assert out_tensor.shape[-1] == sum(ldims), \
+                f"Gather small: Output tensor must match size of concatenated slices: {sum(ldims)}"
+
+        ext.pg_gather_small(
+            self.ptr_g,
+            gather_devices,
+            self.device,
+            out_device,
+            tensor,
+            out_tensor,
+            ldims,
+            self.ptr_s,
+            SHBUF_SIZE_S,
             self.abort_flag
         )
 

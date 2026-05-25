@@ -236,28 +236,81 @@ class Model_TPMixin:
 
 
     def tp_dispatch_lm_head_argmax(self, args):
-        ad = []
+        ad = {}
         for device in self.active_devices:
             a, b, _ = self.plan[device]["lm_head"]
             if b > a:
-                self.tp_worker_dispatch(device, mp_model_forward_lm_head_argmax, args + (a,))
-                ad.append(device)
+                ad[device] = a
+
+        if len(ad) == 1 and self.tp_output_device in ad:
+            v, i = self.tp_worker_dispatch_single(
+                self.tp_output_device,
+                mp_model_forward_lm_head_argmax,
+                args + (ad[self.tp_output_device], None, None)
+            )
+            return i
+
+        gd = sorted(set(ad.keys()) | {self.tp_output_device})
+        ldims = [1 if d in ad else 0 for d in gd]
+
+        dispatched = []
+        for device in self.active_devices:
+            if device in gd:
+                self.tp_worker_dispatch(
+                    device,
+                    mp_model_forward_lm_head_argmax,
+                    args + (ad.get(device, -1), gd, ldims)
+                )
+                dispatched.append(device)
+
         results = []
-        for device in ad:
+        for device in dispatched:
             r = self.tp_worker_result(device)
-            results.append((device, r))
+            if r is not None:
+                results.append((device, r))
+
+        assert len(results) == 1 and results[0][0] == self.tp_output_device, \
+            "TP logic error"
 
         device = self.tp_output_device
         vals, inds = [], []
-        for (_, result) in sorted(results):
-            v, i = result
-            vals.append(v.to(device))
-            inds.append(i.to(device))
+        all_vals, all_inds = results[0][1]
+        p = 0
+        for d, ldim in zip(gd, ldims):
+            if d in ad:
+                vals.append(all_vals[..., p].to(device))
+                inds.append(all_inds[..., p].to(device))
+            p += ldim
         vals = torch.stack(vals, dim = -1)
         inds = torch.stack(inds, dim = -1)
         winner = vals.argmax(dim = -1)
         argmax = inds.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
         return argmax
+
+
+    # def tp_dispatch_lm_head_argmax_old(self, args):
+    #     ad = []
+    #     for device in self.active_devices:
+    #         a, b, _ = self.plan[device]["lm_head"]
+    #         if b > a:
+    #             self.tp_worker_dispatch(device, mp_model_forward_lm_head_argmax_old, args + (a,))
+    #             ad.append(device)
+    #     results = []
+    #     for device in ad:
+    #         r = self.tp_worker_result(device)
+    #         results.append((device, r))
+    #
+    #     device = self.tp_output_device
+    #     vals, inds = [], []
+    #     for (_, result) in sorted(results):
+    #         v, i = result
+    #         vals.append(v.to(device))
+    #         inds.append(i.to(device))
+    #     vals = torch.stack(vals, dim = -1)
+    #     inds = torch.stack(inds, dim = -1)
+    #     winner = vals.argmax(dim = -1)
+    #     argmax = inds.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
+    #     return argmax
 
 
     def _load_tp(
