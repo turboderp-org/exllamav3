@@ -120,9 +120,7 @@ def gated_delta_rule_fn(
     bsz, seqlen, _ = mixed_qkv.shape
 
     # Chunked rule
-    if seqlen >= num_v_heads and chunk_gated_delta_rule is not None:
-        # History only used for short (spec decode) sequences
-        assert not history
+    if seqlen >= num_v_heads and chunk_gated_delta_rule is not None and not history:
 
         q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
         q = q.view(bsz, seqlen, -1, k_head_dim)
