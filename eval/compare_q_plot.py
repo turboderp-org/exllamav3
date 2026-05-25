@@ -621,7 +621,7 @@ def plot(results, args):
     ax.xaxis.label.set_size(14)
     ax.yaxis.label.set_size(14)
     if args.kld:
-        ax.yaxis.label.set_verticalalignment("center")
+        ax.yaxis.label.set_verticalalignment("bottom")
     tick_color = "#8e949d" if args.dark else "#5f6670"
     ax.tick_params(axis = "both", which = "major", labelsize = 13, colors = tick_color)
     ax.set_title(args.title, pad = 22)
