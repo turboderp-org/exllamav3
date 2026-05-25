@@ -748,7 +748,7 @@ class Generator:
         num_jobs = self.num_remaining_jobs()
         for job in completed_jobs + requeuing_jobs:
             if job in requeuing_jobs and self.recurrent_cache is not None:
-                job.maybe_stash_recurrent(self.recurrent_cache)
+                job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
             job.deallocate_pages()
             self.active_jobs.remove(job)
 
