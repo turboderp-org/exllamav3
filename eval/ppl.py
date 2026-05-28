@@ -204,7 +204,7 @@ def main(args):
         model = AutoModelForCausalLM.from_pretrained(
             args.model_dir,
             device_map = "auto",
-            torch_dtype = torch.half if args.hf_tight else torch.float if args.hf_fp32 else None,
+            dtype = torch.half if args.hf_tight else torch.float if args.hf_fp32 else None,
         )
 
         if args.hf_tight:

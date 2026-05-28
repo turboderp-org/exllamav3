@@ -193,7 +193,7 @@ def load_transformers(model_dir: str, auto = False, bf16 = False, size: int = No
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         device_map = "auto" if auto else "cuda:0",
-        torch_dtype = torch.bfloat16 if bf16 else torch.half
+        dtype = torch.bfloat16 if bf16 else torch.half
     )
     bpw_layer, bpw_head, vram_bits = get_storage_info(model)
     return model, bpw_layer, bpw_head, vram_bits
@@ -203,7 +203,7 @@ def load_transformers_mm(model_dir: str, auto = False, bf16 = False, size: int =
     model = AutoModelForImageTextToText.from_pretrained(
         model_dir,
         device_map = "auto" if auto else "cuda:0",
-        torch_dtype = torch.bfloat16 if bf16 else torch.half
+        dtype = torch.bfloat16 if bf16 else torch.half
     )
     bpw_layer, bpw_head, vram_bits = get_storage_info(model)
     return model, bpw_layer, bpw_head, vram_bits
