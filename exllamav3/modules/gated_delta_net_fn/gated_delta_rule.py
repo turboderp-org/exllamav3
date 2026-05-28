@@ -135,9 +135,9 @@ def gated_delta_rule_fn(
         for i, s in enumerate(recurrent_slots_cpu.tolist()):
             state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
             core_attn, new_state = chunk_gated_delta_rule(
-                q[i:i+1], k[i:i+1], v[i:i+1],
-                g = g,
-                beta = beta,
+                q[i:i + 1], k[i:i + 1], v[i:i + 1],
+                g = g[i:i + 1],
+                beta = beta[i:i + 1],
                 initial_state = state,
                 output_final_state = save_state,
                 use_qk_l2norm_in_kernel = True,
