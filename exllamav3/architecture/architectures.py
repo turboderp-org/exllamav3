@@ -43,6 +43,7 @@ from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
 from .solar_open_moe import SolarOpenMoeModel
 from .step3_5 import Step3_5Model
+from .step3_7 import Step3_7Model
 
 ARCHITECTURES = {
     m.config_class.arch_string: {
@@ -99,6 +100,7 @@ ARCHITECTURES = {
         SmolLM3Model,
         SolarOpenMoeModel,
         Step3_5Model,
+        Step3_7Model,
     ]
 }
 
