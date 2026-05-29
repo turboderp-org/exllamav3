@@ -15,6 +15,8 @@ import math
 import yaml
 from safetensors.torch import save_file
 
+torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
+
 def save_tensor(tensor, path: str, tensor_name: str = None):
     if isinstance(tensor, dict):
         save_file({

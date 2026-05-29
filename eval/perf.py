@@ -16,6 +16,7 @@ col_green = "\u001b[32;1m"
 col_red = "\u001b[31;1m"
 col_gray = "\u001b[37;1m"
 
+torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
 @lru_cache
 def cached_ids(length):
