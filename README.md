@@ -18,16 +18,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 
 ### ⚠️ Important
 
-- **Qwen3-Next** and **Qwen3.5** can take advantage of [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention), though this requires
-  Triton, and performance can be shaky due to the sporadic JIT compilation it imposes. [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) is
-  supported and recommended but not required.
-- **Qwen3-Next** and **Qwen3.5** currently do not support tensor/expert parallelism.
-- The **Gemma4** implementation benefits greatly from [xformers](https://github.com/facebookresearch/xformers)
-  (`pip install xformers`) which will be autodetected and used when available. Performance is likely to 
-  improve further with a better head_dim > 256 attention implementation soon. 
 - **Gemma4** does not currently support tensor/expert parallelism.
-- xformers is monkey-patched to force it to run on sm_120 GPUs (seems to work™.) Please open an issue if you experience
-  any problems with this.
 
 ## Architecture support
 
