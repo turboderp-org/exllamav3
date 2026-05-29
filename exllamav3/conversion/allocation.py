@@ -121,7 +121,7 @@ def create_q_strategy(
     # Keep only bitrate
     f_targets = {k: v.target_bpw for k, v in targets.items()}
 
-    return f_targets, float(final_bits) / sum_numel
+    return f_targets, float(final_bits) / sum_numel if sum_numel else 0
 
 
 def print_strategy(
