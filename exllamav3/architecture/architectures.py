@@ -19,6 +19,7 @@ from .glm4v_moe import Glm4VMoeModel
 from .hcxvisionv2 import HCXVisionV2Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
+from .lfm2_moe import Lfm2MoeModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
 from .minimax_m2 import MiniMaxM2Model
@@ -71,6 +72,7 @@ ARCHITECTURES = {
         HCXVisionV2Model,
         HyperClovaxModel,
         IQuestCoderModel,
+        Lfm2MoeModel,
         LlamaModel,
         MiMoModel,
         MiniMaxM2Model,
