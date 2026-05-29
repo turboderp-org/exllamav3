@@ -321,7 +321,7 @@ class BlockSparseMLP(Module):
                     frange = (0, intermediate_size) if key_gate_up_split else None,
                     in_features = hidden_size,
                     out_features = intermediate_size,
-                    qmap = qmap + ".input",
+                    qmap = qmap + ".input" if qmap else None,
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
@@ -337,7 +337,7 @@ class BlockSparseMLP(Module):
                     frange = (intermediate_size, intermediate_size * 2) if key_gate_up_split else None,
                     in_features = hidden_size,
                     out_features = intermediate_size,
-                    qmap = qmap + ".input",
+                    qmap = qmap + ".input" if qmap else None,
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
@@ -352,7 +352,7 @@ class BlockSparseMLP(Module):
                     fidx = idx,
                     in_features = intermediate_size,
                     out_features = hidden_size,
-                    qmap = qmap + f".{idx}.down",
+                    qmap = qmap + f".{idx}.down" if qmap else None,
                     out_dtype = torch.float,
                     allow_input_padding = True,
                     transposed_load = transposed_load,
@@ -614,12 +614,15 @@ class BlockSparseMLP(Module):
         super().load(device, **kwargs)
 
         if self.e_score_correction_bias_key:
-            self.e_score_correction_bias = self.config.stc.get_tensor(
-                f"{self.key}.{self.e_score_correction_bias_key}",
-                self.device,
-                optional = True,
-                float2half = True,
-            )
+            for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
+                self.e_score_correction_bias = self.config.stc.get_tensor(
+                    f"{self.key}.{k}",
+                    self.device,
+                    optional = True,
+                    float2half = True,
+                )
+                if self.e_score_correction_bias is not None:
+                    break
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}",
@@ -1024,7 +1027,7 @@ class BlockSparseMLP(Module):
     def get_tensors(self):
         t = super().get_tensors()
         if self.e_score_correction_bias is not None:
-            t[f"{self.key}.gate.e_score_correction_bias"] = self.e_score_correction_bias.contiguous()
+            t[f"{self.key}.{self.e_score_correction_bias_key}"] = self.e_score_correction_bias.contiguous()
         if self.per_expert_scale is not None:
             t[f"{self.key}.{self.per_expert_scale_key}"] = self.per_expert_scale.contiguous()
         return t
