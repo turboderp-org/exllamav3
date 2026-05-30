@@ -71,8 +71,17 @@ class Conv(Module):
 
     @override
     def weights_numel(self):
-        return self._numel
+        if self._numel is not None:
+            return self._numel
 
+        # Weight is not loaded, derive from metadata
+        # Conv weight shape: [out_channels, in_channels, kernel_size]
+        # It doesn't seem like there is a need for strided convolution
+        weight_numel = self.out_channels * self.in_channels
+        for k in self.kernel_size:
+            weight_numel *= k
+        # TODO: We do not count bias parameters, should we?.
+        return weight_numel
 
     @override
     def forward(

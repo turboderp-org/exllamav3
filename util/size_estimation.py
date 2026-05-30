@@ -4,25 +4,52 @@ from exllamav3 import Config, Model
 import argparse
 from exllamav3.loader.safetensors import SafetensorsCollection, VariantSafetensorsCollection
 import yaml
+from tabulate import tabulate
 
+def print_markdown_table(stats):
+    """Print layer statistics as a pretty-aligned Markdown table using tabulate."""
+    total_bytes = sum(s["size_bytes"] for s in stats.values())
 
-def tsize(t):
-    return t.nelement() * t.element_size()
+    # Sort by size descending
+    sorted_layers = sorted(stats.items(), key=lambda x: -x[1]["size_bytes"])
 
+    # Build table rows with raw numeric values
+    rows = []
+    for layer_name, stat in sorted_layers:
+        size_mib = stat["size_bytes"] / 1024**2
+        size_pct = 100 * stat["size_bytes"] / total_bytes if total_bytes > 0 else 0
+        bpw = stat["bits"] / stat["numel"]
 
-def dsize(d):
-    size = 0
-    for _, v in d.items(): size += tsize(v)
-    return size
+        rows.append([layer_name, stat["count"], size_mib, size_pct, bpw])
+
+    # Print table with github format
+    print()
+    print(
+        tabulate(
+            rows,
+            headers=["Layer name", "Number", "Size (MiB)", "Size (%)", "Effective BPW"],
+            tablefmt="github",
+            stralign="left",
+            numalign="right",
+            floatfmt=".2f",
+            intfmt=",",
+        )
+    )
+
+    # Print summary
+    total_bits = sum(s["bits"] for s in stats.values())
+    total_numel = sum(s["numel"] for s in stats.values())
+    avg_bpw = round(total_bits / total_numel, 2)
+
+    print()
+    print(f" -- Average bitrate: {avg_bpw:.2f} bpw")
+    print(f" -- Size: {total_bytes / 1024**2:,.2f} MiB")
+    print()
 
 
 def main(args):
 
-    # Config/model
     config = Config.from_directory(args.in_dir)
-    model = Model.from_config(config)
-
-    # Tensor collection
     stc = SafetensorsCollection(args.in_dir)
 
     # Override tensors
@@ -45,12 +72,28 @@ def main(args):
                 vstc.add_stc(o_keys, SafetensorsCollection(o_dir))
             config.stc = vstc
 
-    # New bpw etc.
-    bpw_layer, bpw_head, vram_bits = model.get_storage_info()
-    bpw_layer = round(bpw_layer, 2)
-    bpw_head = round(bpw_head)
-    print(f" -- New estimated model bitrate: {bpw_layer:.2f} bpw / {bpw_head:.2f} bpw (head)")
-    print(f" -- VRAM: {vram_bits / 8 / 1024**3:.0f} GiB")
+    # Iterate over all model components (text, vision, etc.)
+    all_stats = {}
+
+    for component in config.model_classes:
+        model = Model.from_config(config, component=component)
+
+        # Aggregate detailed stats
+        component_stats = model.get_detailed_weights_info()
+        for layer_name, stat in component_stats.items():
+            if layer_name not in all_stats:
+                all_stats[layer_name] = {
+                    "count": 0,
+                    "size_bytes": 0,
+                    "numel": 0,
+                    "bits": 0.0,
+                }
+            all_stats[layer_name]["count"] += stat["count"]
+            all_stats[layer_name]["size_bytes"] += stat["size_bytes"]
+            all_stats[layer_name]["numel"] += stat["numel"]
+            all_stats[layer_name]["bits"] += stat["bits"]
+
+    print_markdown_table(all_stats)
 
 
 if __name__ == "__main__":
