@@ -14,7 +14,8 @@ from ..modules import (
     BlockSparseMLP,
     Linear,
     GatedMLP,
-    SlidingAttention
+    SlidingAttention,
+    SWAState
 )
 from ..modules.attn import prepare_for_attn
 
@@ -296,12 +297,14 @@ class Step3_5Model(Model):
         self.calibration_all_experts = True
 
         # SWA layers are recurrent, optionally. Checkpoints are expensive so default to a longer interval
+        self.recurrent_state_cls = None
         if not self.swa_full:
             self.caps.update({
                 "supports_tp": False,
                 "recurrent_states": True,
                 "default_recurrent_checkpoint_interval": 6144,
             })
+            self.recurrent_state_cls = SWAState
 
 
     @override
