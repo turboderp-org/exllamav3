@@ -8,7 +8,7 @@ import requests
 import torch
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth=200)
 
-mode = "gemma4"
+mode = "step37"
 cache_size = 8192
 streaming = True
 
@@ -37,6 +37,9 @@ match mode:
     case "hcx":
         prompt_format = "chatml"
         model_dir = "/mnt/str/models/hyperclovax-seed-think-32b/exl3/4.00bpw"
+    case "step37":
+        prompt_format = "chatml"
+        model_dir = "/mnt/str/models/step-3.7-flash/exl3/4.05bpw"
 
 images = [
     # Cat
