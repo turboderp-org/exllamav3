@@ -122,7 +122,8 @@ setup(
         "kbnf>=0.4.2",
         "formatron>=0.5.0",
         "pydantic",
-        "xformers"
+        "xformers",
+        "flash-linear-attention>=0.5.0",
     ],
     include_package_data=True,
     package_data = {
