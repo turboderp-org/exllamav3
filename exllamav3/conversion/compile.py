@@ -25,7 +25,7 @@ def compile_model(args, model, config, tokenizer):
     else:
         work_dir = args["work_dir"]
         qtensors_dir = os.path.join(work_dir, "qtensors")
-        qtensors_stc = SafetensorsCollection(qtensors_dir)
+        qtensors_stc = SafetensorsCollection(qtensors_dir, tensor_name_fixes = config.get_tensor_name_fixes())
 
     # Prepare output directory
     if not os.path.exists(out_dir):
