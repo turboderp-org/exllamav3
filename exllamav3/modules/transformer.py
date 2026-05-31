@@ -25,6 +25,7 @@ class TransformerBlock(Module):
         backout_extract: bool = False,
         backout_lambda: float | None = None,
         key_layer_scalar: str | None = None,
+        residual_multiplier: float | None = None,
         qmap: str | None = None,
         qbits_key: str = "bits",
         out_dtype: torch.dtype = None
@@ -35,6 +36,7 @@ class TransformerBlock(Module):
         self.ve_gate = ve_gate
         self.resid_lambda = resid_lambda
         self.x0_lambda = x0_lambda
+        self.residual_multiplier = residual_multiplier
         self.attn_norm = attn_norm
         self.attn = attn
         self.attn_post_norm = attn_post_norm
@@ -154,6 +156,8 @@ class TransformerBlock(Module):
             if params.get("prefill"): return x
             if self.attn_post_norm:
                 self.attn_post_norm.forward(y, params, residual = x)
+            elif self.residual_multiplier is not None:
+                x += y * self.residual_multiplier
             else:
                 x += y
 
@@ -166,6 +170,8 @@ class TransformerBlock(Module):
             y = self.mlp.forward(y, params)
             if self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)
+            elif self.residual_multiplier is not None:
+                x += y * self.residual_multiplier
             else:
                 x += y
 
@@ -205,6 +211,7 @@ class TransformerBlock(Module):
                 "key": self.key,
                 "layer_idx": self.layer_idx,
                 "out_dtype": self.out_dtype,
+                "residual_multiplier": self.residual_multiplier,
             },
             **{name: _export(getattr(self, name, None)) for name in (
                 "attn_norm",

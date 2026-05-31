@@ -801,6 +801,40 @@ class PromptFormat_minimax(PromptFormat):
         return "<think>", "</think>"
 
 
+class PromptFormat_granite(PromptFormat):
+    description = "IBM Granite (Granite 3.x / 4.1)"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        # Granite 4.1's chat template emits no system block unless one is
+        # supplied (or tools/documents are passed), so there is no default.
+        return ""
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += f"<|start_of_role|>system<|end_of_role|>{system_prompt}<|end_of_text|>\n"
+        for (u, a) in messages:
+            context += f"<|start_of_role|>user<|end_of_role|>{u}<|end_of_text|>\n"
+            context += f"<|start_of_role|>assistant<|end_of_role|>"
+            if a is not None:
+                context += f"{a}<|end_of_text|>\n"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|end_of_text|>"),
+            tokenizer.single_id("<|start_of_role|>"),
+            "<|end_of_text|>",
+        ]
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -822,4 +856,5 @@ prompt_formats = {
     "seed": PromptFormat_seed,
     "apertus": PromptFormat_apertus,
     "minimax": PromptFormat_minimax,
+    "granite": PromptFormat_granite,
 }
