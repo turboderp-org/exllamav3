@@ -2,6 +2,8 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
+
+from ..util.tensor import to2
 from ..model.config import Config
 from . import Module
 from ..ext import exllamav3_ext as ext
@@ -108,7 +110,7 @@ class Conv(Module):
                 y = F.conv3d(x, self.weight, self.bias, self.kernel_size)
                 y = y.view(bsz, seqlen, self.out_channels)
 
-        return y
+        return to2(y, out_dtype, self.out_dtype)
 
 
     @override
