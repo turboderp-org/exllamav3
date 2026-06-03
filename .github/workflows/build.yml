@@ -320,7 +320,7 @@ jobs:
 
           switch -Regex ($torchVersion) {
             '^2\.7\.'  { $xformersSpec = '==0.0.30'; break }
-            '^2\.8\.'  { $xformersSpec = '==0.0.32'; break }
+            '^2\.8\.'  { $xformersSpec = '==0.0.32.post2'; break }
             '^2\.9\.'  { $xformersSpec = '==0.0.33'; break }
             '^2\.10\.' { $xformersSpec = '>=0.0.34,<0.0.36'; break }
             '^2\.11\.' { $xformersSpec = '>=0.0.34,<0.0.36'; break }
