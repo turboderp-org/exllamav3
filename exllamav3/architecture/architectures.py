@@ -11,7 +11,7 @@ from .ernie4_5_moe import Ernie4_5MoEModel
 from .exaone4 import Exaone4Model
 from .gemma2 import Gemma2Model
 from .gemma3 import Gemma3Model, Gemma3TextModel
-from .gemma4 import Gemma4TextModel
+from .gemma4 import Gemma4TextModel, Gemma4UnifiedTextModel
 from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
@@ -66,6 +66,7 @@ ARCHITECTURES = {
         Gemma3Model,
         Gemma3TextModel,
         Gemma4TextModel,
+        Gemma4UnifiedTextModel,
         Glm4Model,
         Glm4MoeModel,
         Glm4VModel,

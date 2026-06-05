@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch.nn.functional as F
-from .. import Module, Linear
+from .. import Module, Linear, LayerNorm
 from ...model import Config
 import torch
 from ...util.tensor import get_for_device, to2
@@ -183,3 +183,95 @@ class Gemma4VisionPooler(Module):
             x *= self.std_scale
 
         return to2(x, out_dtype, torch.float)
+
+
+class Gemma4UnifiedVisionEmbedder(Module):
+
+    def __init__(
+        self,
+        config: Config,
+        key: str,
+        patch_dim: int,
+        mm_embed_dim: int,
+        norm_eps: float,
+    ):
+        super().__init__(config, key, None)
+        self.mm_embed_dim = mm_embed_dim
+        self.pos_embedding_key = f"{key}.pos_embedding"
+        self.pos_embedding = None
+        self.pos_embedding_numel = 0
+
+        self.patch_ln1 = LayerNorm(config, f"{key}.patch_ln1", norm_eps, out_dtype = torch.half)
+        self.patch_dense = Linear(
+            config = config,
+            key = f"{key}.patch_dense",
+            in_features = patch_dim,
+            out_features = mm_embed_dim,
+            qmap = None,
+            out_dtype = torch.float,
+            pad_to = 1,
+        )
+        self.patch_ln2 = LayerNorm(config, f"{key}.patch_ln2", norm_eps, out_dtype = torch.float)
+        self.pos_norm = LayerNorm(config, f"{key}.pos_norm", norm_eps, out_dtype = torch.half)
+
+        self.register_submodule(self.patch_ln1)
+        self.register_submodule(self.patch_dense)
+        self.register_submodule(self.patch_ln2)
+        self.register_submodule(self.pos_norm)
+
+
+    @override
+    def optimizer_targets(self):
+        return []
+
+
+    @override
+    def load(self, device: torch.device, **kwargs):
+        super().load(device, **kwargs)
+        self.pos_embedding = self.config.stc.get_tensor(
+            self.pos_embedding_key,
+            device,
+            float2half = True,
+            allow_bf16 = True,
+        )
+        self.pos_embedding_numel = self.pos_embedding.numel()
+
+
+    @override
+    def unload(self):
+        super().unload()
+        self.pos_embedding = None
+        self.pos_embedding_numel = 0
+
+
+    @override
+    def weights_numel(self):
+        return super().weights_numel() + self.pos_embedding_numel
+
+
+    @override
+    def get_tensors(self):
+        return {
+            self.pos_embedding_key: self.pos_embedding.contiguous(),
+        }
+
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        x = self.patch_ln1.forward(x.to(self.patch_dense.inner.weight.dtype), params)
+        x = self.patch_dense.forward(x, params)
+        x = self.patch_ln2.forward(x, params)
+
+        position_ids = get_for_device(params, "position_ids", self.device)
+        clamped = position_ids.clamp(min = 0).long()
+        valid = (position_ids != -1).to(self.pos_embedding.dtype).unsqueeze(-1)
+        axes = torch.arange(2, device = position_ids.device)
+        pos_embs = (self.pos_embedding[clamped, axes] * valid).sum(-2)
+
+        x = self.pos_norm.forward(x + pos_embs, params)
+        return x
