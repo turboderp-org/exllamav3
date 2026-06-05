@@ -342,6 +342,7 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
             pb.update(row)
             input_ids = eval_ids[row:row + 1, :]
             logits = fwd_fn(model_instance, input_ids)
+            logits.clamp_(min = -200.0)
             logits = logits[..., -eval_len:, :]
 
             # kld
