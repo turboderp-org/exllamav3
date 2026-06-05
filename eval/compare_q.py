@@ -163,72 +163,85 @@ DATASET_ALIASES = {
         "name": "wikitext-2-raw-v1",
         "split": "test",
         "text_column": "text",
+        "display_name": "wikitext2",
     },
     "wikitext2": {
         "path": "wikitext",
         "name": "wikitext-2-raw-v1",
         "split": "test",
         "text_column": "text",
+        "display_name": "wikitext2",
     },
     "wiki103": {
         "path": "wikitext",
         "name": "wikitext-103-raw-v1",
         "split": "test",
         "text_column": "text",
+        "display_name": "wiki103",
     },
     "wikitext103": {
         "path": "wikitext",
         "name": "wikitext-103-raw-v1",
         "split": "test",
         "text_column": "text",
+        "display_name": "wiki103",
     },
     "ptb": {
         "path": "ptb_text_only",
         "name": "penn_treebank",
         "split": "test",
         "text_column": "sentence",
+        "display_name": "PTB",
     },
     "lambada": {
         "path": "EleutherAI/lambada_openai",
         "name": None,
         "split": "test",
         "text_column": "text",
+        "display_name": "lambada",
     },
     "tinystories": {
         "path": "roneneldan/TinyStories",
         "name": None,
         "split": "validation",
         "text_column": "text",
+        "display_name": "TinyStories",
     },
     "c4": {
         "path": "allenai/c4",
         "name": "en",
         "split": "validation",
         "text_column": "text",
+        "display_name": "c4",
     },
     "openwebtext10k": {
-        "path": "stas/openwebtext-10k",
+        "path": "parquet",
         "name": None,
-        "split": "val",
+        "split": "train",
+        "data_files": "hf://datasets/stas/openwebtext-10k@refs/convert/parquet/plain_text/train/*.parquet",
         "text_column": "text",
+        "display_name": "openwebtext",
     },
     "openwebtext": {
         "path": "Skylion007/openwebtext",
         "name": None,
         "split": "train[:1000]",
         "text_column": "text",
+        "display_name": "openwebtext",
     },
     "fineweb": {
         "path": "HuggingFaceFW/fineweb",
         "name": "sample-10BT",
         "split": "train[:1000]",
         "text_column": "text",
+        "display_name": "fineweb",
     },
     "fineweb-edu": {
         "path": "HuggingFaceFW/fineweb-edu",
         "name": "sample-10BT",
         "split": "train[:1000]",
         "text_column": "text",
+        "display_name": "fineweb-edu",
     },
 }
 
@@ -239,14 +252,15 @@ def get_dataset_text(spec: dict) -> str:
     path = spec.get("dataset_path", dataset_spec.get("path", dataset))
     name = spec.get("dataset_name", dataset_spec.get("name"))
     split = spec.get("dataset_split", spec.get("split", dataset_spec.get("split", "test")))
+    data_files = spec.get("dataset_data_files", dataset_spec.get("data_files"))
     text_column = spec.get("text_column", dataset_spec.get("text_column", "text"))
     max_text_rows = spec.get("max_text_rows", spec.get("max_dataset_rows", 0))
 
     print(f"Loading text dataset: {path}" + (f"/{name}" if name else "") + f" ({split})")
     if name is None:
-        ds = load_dataset(path, split = split)
+        ds = load_dataset(path, split = split, data_files = data_files)
     else:
-        ds = load_dataset(path, name, split = split)
+        ds = load_dataset(path, name, split = split, data_files = data_files)
 
     if text_column not in ds.column_names:
         raise ValueError(
