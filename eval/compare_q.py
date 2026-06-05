@@ -316,6 +316,9 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
 
     print(f"Loading: {model_dir}")
     model_instance, bpw_layer, bpw_head, vram_bits = load_fn(model_dir, size = length + 512)
+    bpw_layer = spec.get("override_bpw_layer", bpw_layer)
+    bpw_head = spec.get("override_bpw_head", bpw_head)
+    vram_bits = spec.get("override_vram_bits", vram_bits)
     vram_gb = vram_bits / 8 / 1024**3
 
     logprob_sum = 0.0
