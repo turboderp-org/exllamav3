@@ -103,6 +103,58 @@ def save_tensor(tensor, filename: str):
     else:
         save_file({f"tensor": tensor}, filename)
 
+
+class LogitsStore:
+
+    def __init__(
+        self,
+        filename: str,
+        write: bool = False,
+    ):
+        self.filename = filename
+        self.row_dir = filename if os.path.isdir(filename) else f"{filename}.rows"
+        self.legacy_file = filename if os.path.isfile(filename) else None
+        if write:
+            os.makedirs(self.row_dir, exist_ok = True)
+
+
+    def row_filename(self, row: int) -> str:
+        return os.path.join(self.row_dir, f"row_{row:06d}.safetensors")
+
+
+    def save_row(
+        self,
+        row: int,
+        tensor: torch.Tensor,
+    ):
+        filename = self.row_filename(row)
+        tmp_filename = f"{filename}.tmp"
+        save_tensor(tensor.float().cpu(), tmp_filename)
+        os.replace(tmp_filename, filename)
+
+
+    def load_row(
+        self,
+        row: int,
+    ) -> torch.Tensor:
+        row_filename = self.row_filename(row)
+        if os.path.exists(row_filename):
+            return load_tensor(row_filename)
+
+        if self.legacy_file:
+            with safe_open(self.legacy_file, framework = "pt", device = "cpu") as f:
+                key = f"tensor.{row}"
+                if key in f.keys():
+                    return f.get_tensor(key)
+                if "tensor" in f.keys():
+                    return f.get_slice("tensor")[row:row + 1]
+
+        raise FileNotFoundError(
+            f"Reference logits row {row} not found in {self.row_dir}"
+            + (f" or {self.legacy_file}" if self.legacy_file else "")
+        )
+
+
 # Tokenize ppl test data
 
 DATASET_ALIASES = {
@@ -262,15 +314,14 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
     print(f"Testing: {model_dir} ({spec['label']})")
 
     collect_logits = False
+    ref_logits = None
     if logits_file:
         if "out_logits" in spec:
             collect_logits = True
-            ref_logits = []
+            ref_logits = LogitsStore(logits_file, write = True)
         else:
             collect_logits = False
-            ref_logits = load_tensor(logits_file)
-            if not isinstance(ref_logits, list):
-                ref_logits = ref_logits.split(1, 0)
+            ref_logits = LogitsStore(logits_file)
 
     with ProgressBar("Evaluating", rows) as pb:
         for row in range(rows):
@@ -282,10 +333,10 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
             # kld
             if logits_file and row < 10:
                 if collect_logits:
-                    ref_logits.append(logits.float().cpu())
+                    ref_logits.save_row(row, logits)
                     kl_div_count += 1
                 else:
-                    ref = ref_logits[row].to(logits.device)
+                    ref = ref_logits.load_row(row).to(logits.device)
                     vs = min(logits.shape[-1], ref.shape[-1])
                     kl_div = compute_kl_div(logits, ref, vs)
                     kl_div_sum_ab += kl_div.sum().item()
@@ -311,9 +362,6 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
     if logits_file:
         kl_div = kl_div_sum_ab / kl_div_count
         print(f"KL div: {kl_div:.6f}")
-
-    if collect_logits:
-        save_tensor(ref_logits, logits_file)
 
     print(f"Perplexity: {perplexity:.6f}")
 
