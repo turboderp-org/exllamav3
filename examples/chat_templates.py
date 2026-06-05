@@ -314,7 +314,7 @@ class PromptFormat_gemma4(PromptFormat):
         if system_prompt:
             context = "<|turn>system\n"
             if think:
-                context += "<|think|>"
+                context += "<|think|>\n"
             context += system_prompt + "<turn|>\n"
         for (u, a) in messages:
             context += f"<|turn>user\n"
