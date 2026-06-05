@@ -17,7 +17,7 @@ try:
     from gptqmodel.nn_modules.qlinear.marlin_awq import AwqMarlinLinear
     from gptqmodel.nn_modules.qlinear.tritonv2 import TritonV2Linear
     from gptqmodel.nn_modules.qlinear.exllamav2 import ExllamaV2Linear
-except (ModuleNotFoundError, ImportError):
+except (ModuleNotFoundError, ImportError, AttributeError):
     AwqMarlinLinear = dummy
     TritonV2Linear = dummy
     ExllamaV2Linear = dummy
@@ -95,7 +95,7 @@ def get_storage_info(model):
         model = model.model
     if hasattr(model, "language_model"):
         model = model.language_model
-    assert model.input_modalities in ["text", ["text"]]
+    assert model.input_modalities in ["text", ["text"], ("text",)]
     if hasattr(model, "vocab_size"):
         vocab_size = model.vocab_size
     elif hasattr(model, "model") and hasattr(model.model, "vocab_size"):
