@@ -407,10 +407,33 @@ def dict_hash(x: dict) -> str:
     return hex_digest
 
 
+def get_dataset_display_name(spec: dict) -> str:
+    dataset = spec["dataset"]
+    dataset_spec = DATASET_ALIASES.get(dataset.lower(), {})
+    return spec.get("dataset_display_name", dataset_spec.get("display_name", dataset))
+
+
+def format_dataset_subtitle(spec: dict) -> str:
+    dataset_name = get_dataset_display_name(spec)
+    rows = spec.get("display_rows", spec.get("max_rows", 0))
+    if not rows:
+        rows = "?"
+    wut = spec.get("warmup_tokens", 0)
+    length = spec.get("display_eval_len", spec["eval_len"] - wut)
+    if wut:
+        st = f"{dataset_name}, {rows} × ({wut} + {length}) tokens"
+    else:
+        st = f"{dataset_name}, {rows} × {length} tokens"
+    if spec.get("chat_template"):
+        st += ", formatted"
+    return st
+
+
 @torch.inference_mode()
 def main(args):
     with open(args.dataspec, "r", encoding = "utf8") as f:
         test_data_spec = json.load(f)
+    args.subtitle = format_dataset_subtitle(test_data_spec)
 
     models_files = args.modelspec
     models_files_g = []
