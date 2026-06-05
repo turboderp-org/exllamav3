@@ -25,8 +25,6 @@ extra_cuda_cflags = [
 ]
 
 if windows:
-    # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break
-    #       older cu128 builds
     extra_cflags += ["/Ox", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN"]
     extra_cuda_cflags += ["-DWIN32_LEAN_AND_MEAN", "-Xcompiler=/Zc:preprocessor"]
     if ext_debug:
@@ -38,6 +36,9 @@ else:
     if ext_debug:
         extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
         extra_cuda_cflags += []
+
+if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
+    extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
 
 if torch and torch_version.hip:
     extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
