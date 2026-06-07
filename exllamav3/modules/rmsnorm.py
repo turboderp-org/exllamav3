@@ -109,19 +109,26 @@ class RMSNorm(Module):
                 self.span_heads,
                 residual is not None,
             )
-            return y_2d.view_as(x)
+            y = y_2d.view_as(x)
+        else:
+            y = torch.empty_like(x, dtype = dtype) if residual is None else residual.view_as(x)
+            ext.rms_norm(
+                x,
+                self.weight,
+                y,
+                self.rms_norm_eps,
+                self.constant_bias,
+                self.constant_scale,
+                self.span_heads,
+                residual is not None,
+            )
 
-        y = torch.empty_like(x, dtype = dtype) if residual is None else residual.view_as(x)
-        ext.rms_norm(
-            x,
-            self.weight,
-            y,
-            self.rms_norm_eps,
-            self.constant_bias,
-            self.constant_scale,
-            self.span_heads,
-            residual is not None,
-        )
+        if self.key in params.get("export_state_norm_keys", ()):
+            states = params.get("export_states")
+            if states is None:
+                states = params["export_states"] = []
+            states.append(y.half())
+
         return y
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:

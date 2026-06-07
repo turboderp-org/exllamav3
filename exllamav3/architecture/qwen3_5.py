@@ -22,6 +22,7 @@ from ..modules.arch_specific.qwen3_vl import DeepstackEmbed
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
 from .qwen3_vl import read_qwen3_vl_vision_config, read_qwen3_vl_pp_config, Qwen3VLVisionModel
+from .qwen3_5_mtp import Qwen3_5MTPModel
 
 
 def read_qwen3_5_layer_types(config: Config, text_config_path: str, num_layers: int, full_attention_interval: int) -> list[str]:
@@ -40,7 +41,6 @@ def read_qwen3_5_layer_types(config: Config, text_config_path: str, num_layers: 
     ]
 
 
-
 class Qwen3_5VLBaseConfig(Config):
 
     def __init__(
@@ -49,12 +49,14 @@ class Qwen3_5VLBaseConfig(Config):
         text_cfg: str | None = "text_config",
         text_model = None,
         vision_model = None,
+        mtp_model = None,
         **kwargs,
     ):
         super().__init__(
             directory,
             ({"text": text_model} if text_model else {}) |
-            ({"vision": vision_model} if vision_model else {}),
+            ({"vision": vision_model} if vision_model else {}) |
+            ({"mtp": mtp_model} if mtp_model else {}),
             **kwargs
         )
 
@@ -96,10 +98,6 @@ class Qwen3_5VLBaseConfig(Config):
             self.full_attention_interval,
         )
 
-        # MTP (multi-token prediction) head — informational; head loaded as separate draft model
-        self.mtp_num_hidden_layers = self.read_cfg(int, pfx("mtp_num_hidden_layers"), 0)
-        self.mtp_use_dedicated_embeddings = self.read_cfg(bool, pfx("mtp_use_dedicated_embeddings"), False)
-
         # RoPE
         self.rope_settings = self.read_rope_settings_default(
             RopeStyle.NEOX,
@@ -123,6 +121,12 @@ class Qwen3_5VLBaseConfig(Config):
             self.vision = None
             self.vision_pp = None
 
+        # MTP (multi-token prediction) head — informational; head loaded as separate draft model
+        self.mtp_num_hidden_layers = self.read_cfg(int, pfx("mtp_num_hidden_layers"), 0)
+        self.mtp_use_dedicated_embeddings = self.read_cfg(bool, pfx("mtp_use_dedicated_embeddings"), False)
+        if self.mtp_num_hidden_layers == 0:
+            del self.model_classes["mtp"]
+
 
 class Qwen3_5VLConfig(Qwen3_5VLBaseConfig):
     arch_string = "Qwen3_5ForConditionalGeneration"
@@ -137,6 +141,7 @@ class Qwen3_5VLConfig(Qwen3_5VLBaseConfig):
             "text_config",
             Qwen3_5VLModel,
             Qwen3VLVisionModel,
+            Qwen3_5MTPModel,
             **kwargs
         )
 
@@ -166,12 +171,14 @@ class Qwen3_5VLMoeBaseConfig(Config):
         text_cfg: str | None = "text_config",
         text_model = None,
         vision_model = None,
+        mtp_model = None,
         **kwargs,
     ):
         super().__init__(
             directory,
             ({"text": text_model} if text_model else {}) |
             ({"vision": vision_model} if vision_model else {}),
+            ({"mtp": mtp_model} if mtp_model else {}),
             **kwargs
         )
 
@@ -217,10 +224,6 @@ class Qwen3_5VLMoeBaseConfig(Config):
             self.full_attention_interval,
         )
 
-        # MTP (multi-token prediction) head — informational; head loaded as separate draft model
-        self.mtp_num_hidden_layers = self.read_cfg(int, pfx("mtp_num_hidden_layers"), 0)
-        self.mtp_use_dedicated_embeddings = self.read_cfg(bool, pfx("mtp_use_dedicated_embeddings"), False)
-
         # RoPE
         self.rope_settings = self.read_rope_settings_default(
             RopeStyle.NEOX,
@@ -244,6 +247,14 @@ class Qwen3_5VLMoeBaseConfig(Config):
             self.vision = None
             self.vision_pp = None
 
+        # MTP (multi-token prediction) head — informational; head loaded as separate draft model
+        self.mtp_num_hidden_layers = self.read_cfg(int, pfx("mtp_num_hidden_layers"), 0)
+        self.mtp_use_dedicated_embeddings = self.read_cfg(bool, pfx("mtp_use_dedicated_embeddings"), False)
+        if self.mtp_num_hidden_layers == 0:
+            del self.model_classes["mtp"]
+
+        assert not self.mtp_use_dedicated_embeddings, "MTP dedicated embeddings not currently supported"
+
 
 class Qwen3_5VLMoeConfig(Qwen3_5VLMoeBaseConfig):
     arch_string = "Qwen3_5MoeForConditionalGeneration"
@@ -258,6 +269,7 @@ class Qwen3_5VLMoeConfig(Qwen3_5VLMoeBaseConfig):
             "text_config",
             Qwen3_5VLMoeModel,
             Qwen3VLVisionModel,
+            Qwen3_5MTPModel,
             **kwargs
         )
 

@@ -295,6 +295,9 @@ class Job:
         # N-gram automaton
         self.sam = rq_state.get("sam", None)
 
+        # MTP state
+        self.mtp_last_hidden = None
+
 
     def get_pinned_logit_mask(self):
         if self.pinned_logit_mask is None:
@@ -905,12 +908,19 @@ class Job:
         all_unique_pages = 0
         for seq in self.sequences:
             unique_hashes, unique_pages = seq.prepare(self.prefix_token is not None, self.max_rq_tokens)
-            all_unique_hashes |= unique_hashes
-            all_unique_pages += unique_pages
+            if self.generator.mtp_draft:
+                seq.max_cached_pages = max(0, (len(seq.sequence_ids) - 2) // PAGE_SIZE)
+                cached_hashes = seq.page_hashes[:seq.max_cached_pages]
+                omitted_pages = len(seq.page_hashes) - len(cached_hashes)
+                all_unique_hashes.update(cached_hashes)
+                all_unique_pages += unique_pages + omitted_pages
+            else:
+                all_unique_hashes |= unique_hashes
+                all_unique_pages += unique_pages
         self.all_unique_hashes = list(all_unique_hashes)
 
         # Make sure the request can potentially fit
-        total_pages = len(self.all_unique_hashes) + seq.new_unique_pages
+        total_pages = len(self.all_unique_hashes) + all_unique_pages
         max_pages = self.pagetable.max_pages
         assert total_pages <= max_pages, \
             f"Job requires {total_pages} pages (only {max_pages} available) and cannot " + \
@@ -954,7 +964,8 @@ class Job:
             if h not in self.pagetable.referenced_pages:
                 new_pages += 1
         for s in self.sequences:
-            new_pages += s.new_unique_pages
+            omitted_pages = 0 if s.max_cached_pages is None else len(s.page_hashes) - s.max_cached_pages
+            new_pages += s.new_unique_pages + omitted_pages
         return new_pages
 
 
@@ -1033,6 +1044,12 @@ class Job:
                     if match > best_match:
                         best_match = match
                         best_match_page = page
+
+                # MTP needs one real target-model token at the end of prompt prefill to recover
+                # the post-final-norm carry state. Partial-page reuse must not consume that token.
+                if self.generator.mtp_draft and prefill_end == len(seq.sequence_ids) - 1:
+                    best_match = min(best_match, prefill_ids.shape[-1] - 1)
+
                 if best_match_page and best_match > 1:
                     page = seq.allocated_pages[p0]
                     for c in [self.generator.cache] if not self.generator.draft_model else \
@@ -1092,10 +1109,13 @@ class Job:
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
-                self.generator.model.prefill(
-                    input_ids = prefill_ids,
-                    params = params,
-                )
+                if self.generator.mtp_draft:
+                    # MTP needs the target's post-final-norm state for every prompt token.
+                    # Normal prefill stops at the last cache-writing layer, before final norm.
+                    params["last_tokens_only"] = 1
+                    self.generator.model.forward(input_ids = prefill_ids, params = params)
+                else:
+                    self.generator.model.prefill(input_ids = prefill_ids, params = params)
 
                 if self.generator.dflash_draft:
                     self.generator.draft_model.update_kv_from_target(
@@ -1106,53 +1126,21 @@ class Job:
                             "cache_seqlens": params["cache_seqlens"],
                         }
                     )
-                elif self.generator.mtp_draft:
-                    # MTP convention: cache slot p stores K/V from (token@(p+1), hidden@p).
-                    # For chunk covering positions [a, a+n-1] with target_hidden = [hidden@a, ..., hidden@(a+n-1)]
-                    # and prefill_ids = [token@a, ..., token@(a+n-1)], we can fill:
-                    #   - slot a-1 from (token@a, carry=hidden@(a-1))    -- only if a>=1 and carry is available
-                    #   - slots [a, a+n-2] from (token@(a+1+k), hidden@(a+k)) for k in [0, n-2]
-                    # The last slot in the chunk (a+n-1) stays empty until the NEXT chunk arrives
-                    # (or until job.prefill's iter-1 path picks up the held-back last prompt token).
-                    exports = params.get("export_states") or []
-                    if exports:
-                        target_hidden_seq = exports[-1]
-                        if target_hidden_seq.dim() == 2:
-                            target_hidden_seq = target_hidden_seq.unsqueeze(0)
-                        bsz, n, _ = target_hidden_seq.shape
-
-                        a = prefill_start  # absolute position of chunk start
-
-                        # Carry-fill at slot a-1
-                        if a >= 1 and seq.mtp_carry_hidden is not None:
-                            self.generator.draft_model.update_kv_from_target(
-                                shifted_tokens = prefill_ids[:, 0:1],
-                                shifted_hiddens = seq.mtp_carry_hidden,
-                                cache = self.generator.draft_cache,
-                                params = {
-                                    "block_table": seq.block_index_tensor,
-                                    "cache_seqlens": torch.tensor([a - 1] * bsz, dtype = torch.int32),
-                                },
-                            )
-
-                        # Chunk-local: write n-1 entries at slots [a, a+n-2]
-                        if n >= 2:
-                            self.generator.draft_model.update_kv_from_target(
-                                shifted_tokens = prefill_ids[:, 1:n],
-                                shifted_hiddens = target_hidden_seq[:, 0:n-1, :],
-                                cache = self.generator.draft_cache,
-                                params = {
-                                    "block_table": seq.block_index_tensor,
-                                    "cache_seqlens": torch.tensor([a] * bsz, dtype = torch.int32),
-                                },
-                            )
-
-                        # Update carry = last hidden of this chunk (for next chunk's slot (a+n-1))
-                        seq.mtp_carry_hidden = target_hidden_seq[:, -1:, :].clone().half()
                 elif self.generator.draft_model:
+                    if self.generator.mtp_draft:
+                        target_hidden = params.get("export_states")[-1]
+                        carry_hidden = seq.mtp_carry_hidden
+                        if carry_hidden is None:
+                            carry_hidden = torch.zeros_like(target_hidden[:, :1, :])
+                        shifted_hidden = torch.cat((carry_hidden, target_hidden[:, :-1, :]), dim = 1)
+                        seq.mtp_carry_hidden = target_hidden[:, -1:, :].clone()
+                        self.mtp_last_hidden = seq.mtp_carry_hidden
+                    else:
+                        shifted_hidden = None
                     self.generator.draft_model.prefill(
                         input_ids = prefill_ids,
                         params = {
+                            "target_hidden": shifted_hidden,
                             "attn_mode": "flash_attn",
                             "block_table": seq.block_index_tensor,
                             "cache": self.generator.draft_cache,

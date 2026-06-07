@@ -184,6 +184,7 @@ class Sequence:
         self.sequence_ids = SeqTensor.from_tensor(seq_ids, seq_dim = -1)
         self.kv_position = 0
         self.page_hashes = None
+        self.max_cached_pages = None
         self.new_unique_pages = 0
         self.allocated_pages = None
         self.block_index_tensor = None
@@ -225,19 +226,29 @@ class Sequence:
             dtype = torch.int32,
         )
 
-    def allocate_pages(self, pagetable: PageTable, recurrent_cache: None | RecurrentCache):
+    def allocate_pages(
+        self,
+        pagetable: PageTable,
+        recurrent_cache: None | RecurrentCache,
+    ):
+        if self.max_cached_pages is None:
+            page_hashes = self.page_hashes
+        else:
+            page_hashes = self.page_hashes[:self.max_cached_pages]
+        new_unique_pages = self.new_unique_pages + len(self.page_hashes) - len(page_hashes)
+
         # If recurrent model, find logest recurrent prefix
         recurrent_pages = None
         if recurrent_cache is not None:
             recurrent_pages = []
-            for pi, ph in enumerate(self.page_hashes):
+            for pi, ph in enumerate(page_hashes):
                 rs = recurrent_cache.get(ph)
                 if rs:
                     recurrent_pages.append(pi)
 
         # Allocate pages in KV cache, limit prefix caching to available recurrent states
         self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
-            pagetable.allocate_pages(self.page_hashes, self.new_unique_pages, recurrent_pages)
+            pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages)
 
         # Prepare block index
         self.build_block_index_tensor()
@@ -246,7 +257,7 @@ class Sequence:
         stashed_recurrent_state = None
         if recurrent_cache is not None:
             if cached_pages > 0:
-                stashed_recurrent_state = recurrent_cache.get_stashed(self.page_hashes[cached_pages - 1])
+                stashed_recurrent_state = recurrent_cache.get_stashed(page_hashes[cached_pages - 1])
                 assert stashed_recurrent_state is not None, "Failed to get cached recurrent state"
 
         return len(self.allocated_pages), cached_pages, non_sequential_pages, stashed_recurrent_state

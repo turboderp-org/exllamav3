@@ -57,9 +57,9 @@ class DFlashInputLayer(Module):
         self.mask_token_id = mask_token_id
 
         # Populated by attach_to()
-        self.caps.update({"x_cpu": True})
-
         self.attached_model = None
+
+        self.caps.update({"x_cpu": True})
 
 
     def optimizer_targets(self):

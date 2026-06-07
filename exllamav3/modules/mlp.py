@@ -37,6 +37,7 @@ class MLP(Module):
         downs: list[Linear | Module] = None,
         interm_scale: float | None = None,
         select_hq_bits: int = 0,
+        qbits_key: str = "bits"
     ):
         super().__init__(config, key, None)
 
@@ -106,6 +107,7 @@ class MLP(Module):
                     pad_to = pad_to,
                     select_hq_bits = select_hq_bits,
                     qgroup = key + ".u",
+                    qbits_key = qbits_key,
                 )
                 down = Linear(
                     config = config,
@@ -123,6 +125,7 @@ class MLP(Module):
                     pad_to = pad_to,
                     select_hq_bits = select_hq_bits,
                     qgroup = key + ".d",
+                    qbits_key = qbits_key,
                 )
 
                 self.ups.append(up)
@@ -385,6 +388,7 @@ class GatedMLP(Module):
         ups: list[Linear | Module] = None,
         downs: list[Linear | Module] = None,
         select_hq_bits: int = 0,
+        qbits_key: str = "bits"
     ):
         super().__init__(config, key, None)
 
@@ -465,6 +469,7 @@ class GatedMLP(Module):
                     pad_to = pad_to,
                     select_hq_bits = select_hq_bits,
                     qgroup = key + ".gu",
+                    qbits_key = qbits_key,
                 )
                 up = Linear(
                     config = config,
@@ -483,6 +488,7 @@ class GatedMLP(Module):
                     pad_to = pad_to,
                     select_hq_bits = select_hq_bits,
                     qgroup = key + ".gu",
+                    qbits_key = qbits_key,
                 )
                 down = Linear(
                     config = config,
@@ -500,6 +506,7 @@ class GatedMLP(Module):
                     pad_to = pad_to,
                     select_hq_bits = select_hq_bits,
                     qgroup = key + ".d",
+                    qbits_key = qbits_key,
                 )
 
                 self.ups.append(up)

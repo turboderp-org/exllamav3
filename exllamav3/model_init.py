@@ -6,6 +6,7 @@ from .cache import CacheLayer_fp16, CacheLayer_quant
 from .generator.sampler import ComboSampler
 from argparse import ArgumentParser
 import yaml
+from pathlib import Path
 
 def add_args(
     parser: ArgumentParser,
@@ -94,11 +95,6 @@ def add_args(
     if add_draft_model_args:
         parser.add_argument("-dm", "--draft_model_dir", type = str, help = "Path to draft model directory", default = None)
         parser.add_argument("-ndt", "--num_draft_tokens", type = int, help = "Number of draft tokens (default: draft model default, else 4)", default = None)
-        parser.add_argument(
-            "-dm_arch", "--draft_arch_override", type = str, default = None,
-            help = "Override the draft model's arch_string. Use 'Qwen3_5MTPDraftModel' to load only the "
-                   "MTP head from a Qwen3.5/3.6 BF16 directory."
-        )
 
 
 def get_arg_sampler(args):
@@ -172,15 +168,19 @@ def init(
 
     return_draft = "draft_model_dir" in args
     draft_model_dir = args.draft_model_dir if return_draft else None
-    draft_arch_override = getattr(args, "draft_arch_override", None) if return_draft else None
+
+    use_mtp = draft_model_dir and Path(args.model_dir).resolve() == Path(draft_model_dir).resolve()
+    # draft_arch_override = getattr(args, "draft_arch_override", None) if return_draft else None
 
     # Config
     config = Config.from_directory(args.model_dir, layer_map = args.layer_map)
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
-    draft_config = Config.from_directory(
-        draft_model_dir,
-        arch_override = draft_arch_override,
-    ) if draft_model_dir else None
+    if use_mtp:
+        draft_config = config
+    elif draft_model_dir:
+        draft_config = Config.from_directory(draft_model_dir)
+    else:
+        draft_config = None
 
     # Override tensors
     if args.override:
@@ -205,7 +205,11 @@ def init(
 
     # Model instance
     model = Model.from_config(config, swa_full = args.swa_full)
-    draft_model = Model.from_config(draft_config, swa_full = args.swa_full) if draft_model_dir else None
+    draft_model = Model.from_config(
+        draft_config,
+        swa_full = args.swa_full,
+        component = "mtp" if use_mtp else "text",
+    ) if draft_model_dir else None
 
     # Cache
     max_history = max(

@@ -146,6 +146,7 @@ class Attention(Module):
         full_gate: bool = False,
         tp_split_norm: bool = True,
         select_hq_bits: int = 0,
+        qbits_key: str = "bits"
     ):
         super().__init__(config, key, None)
 
@@ -199,7 +200,8 @@ class Attention(Module):
                 frange = frange_q,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
-                ftranspose_after_load = transpose_qkv
+                ftranspose_after_load = transpose_qkv,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.q_proj)
         else:
@@ -219,7 +221,8 @@ class Attention(Module):
                 frange = frange_k,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
-                ftranspose_after_load = transpose_qkv
+                ftranspose_after_load = transpose_qkv,
+                qbits_key = qbits_key,
             )
             self.v_proj = Linear(
                 config,
@@ -231,7 +234,8 @@ class Attention(Module):
                 frange = frange_v,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
-                ftranspose_after_load = transpose_qkv
+                ftranspose_after_load = transpose_qkv,
+                qbits_key = qbits_key,
             ) if not use_k_as_v else None
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
@@ -257,6 +261,7 @@ class Attention(Module):
                 out_dtype = out_dtype,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".o" if qmap is not None else None,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.o_proj)
         else:
@@ -306,6 +311,7 @@ class Attention(Module):
                 out_dtype = torch.half,
                 pad_to = 1,
                 select_hq_bits = select_hq_bits,
+                qbits_key = qbits_key,
             )
             self.headwise_gate = not full_gate
             self.register_submodule(self.g_proj)

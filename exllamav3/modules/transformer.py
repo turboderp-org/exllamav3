@@ -169,6 +169,9 @@ class TransformerBlock(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
+        export_state = params.get("export_state_layers")
+        export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
+
         if self.resid_lambda is not None:
             x = self._apply_resid_lambda(x, params)
 
@@ -184,7 +187,8 @@ class TransformerBlock(Module):
             else:
                 y = x.half()
             y = self.attn.forward(y, params)
-            if params.get("prefill"): return x
+            if params.get("prefill") and not export_state:
+                return x
             if self.attn_resid_scalar is not None:
                 y *= self.attn_resid_scalar
             if self.attn_post_norm:
@@ -206,8 +210,7 @@ class TransformerBlock(Module):
             else:
                 x += y
 
-        export_state = params.get("export_state_layers")
-        if export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0:
+        if export_state:
             s = params.get("export_states")
             if not s:
                 s = params["export_states"] = []

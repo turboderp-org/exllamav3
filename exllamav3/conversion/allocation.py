@@ -30,9 +30,11 @@ class QTarget:
 
 def create_q_strategy(
     model: Model,
+    mtp_model: Model,
     config: Config,
     bpw: float,
     head_bpw: int,
+    mtp_bpw: int,
     hq: bool,
 ) -> (dict, float):
     """
@@ -83,12 +85,25 @@ def create_q_strategy(
                     min_bpw = head_bpw,
                     priority = priority
                 )
+
+            elif module.qbits_key == "mtp_bits":
+                numel = module.weights_numel()
+                aux_targets[module.key] = QTarget(
+                    numel = numel,
+                    target_bpw = mtp_bpw,
+                    min_bpw = mtp_bpw,
+                    priority = priority
+                )
+
             else:
                 raise ValueError("Logic error in create_q_strategy")
         for sm in module.modules:
             _add(sm, priority)
 
-    for m in model.modules:
+    modules = model.modules
+    if mtp_model:
+        modules = modules + mtp_model.modules
+    for m in modules:
         _add(m, 0)
 
     # Target

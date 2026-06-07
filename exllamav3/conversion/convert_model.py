@@ -33,6 +33,7 @@ parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Outpu
 parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in MB, default: 8192")
 parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
 parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bits per weight, output (head) layer, default: 6")
+parser.add_argument("-mb", "--mtp_bits", type = int, default = None, help = "Bits per weight, MTP layers, default: 4")
 parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
 parser.add_argument("-resume", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
@@ -170,6 +171,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("shard_size", True, 8192),
         ("bits", False, None),
         ("head_bits", False, 6),
+        ("mtp_bits", False, 4),
         ("hq", False, False),
         ("cal_rows", False, 250),
         ("cal_cols", False, 2048),
@@ -233,6 +235,10 @@ def get_base_model(args):
     assert model.caps.get("can_quantize", True), "Cannot quantize this model type."
     print(f" -- Created model instance:")
     print(model.get_layout_tree(4))
+    mtp_model = model.from_config(config, component = "mtp") if "mtp" in config.model_classes else None
+    if mtp_model:
+        print(f" -- Created MTP model instance:")
+        print(mtp_model.get_layout_tree(4))
     if use_reference_state:
         tokenizer = Tokenizer.from_config(config)
         print(f" -- Loaded tokenizer")
@@ -241,7 +247,7 @@ def get_base_model(args):
         tokenizer = None
     if hasattr(config, "rope_settings"):
         config.rope_settings.print()
-    return config, model, tokenizer, use_reference_state
+    return config, model, mtp_model, tokenizer, use_reference_state
 
 
 def prepare_state(args, job_state, config, model, tokenizer):
@@ -267,10 +273,221 @@ def get_state_error(x, ref):
      return err.item(), cos, sq
 
 
+def quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state):
+
+    for linear in linears:
+        if strategy[linear.key] == 16:
+            print(
+                f" -- Unquantized: {linear.key:{config.stc.max_key_len() + 6}}"
+                f"  bpw: {16:5.2f}",
+                flush = True
+            )
+        else:
+            quant_args = {
+                "seed": idx,
+                "K": strategy[linear.key],
+                "devices": devices,
+                "device_ratios": device_ratios,
+                "apply_out_scales": args["apply_out_scales"],
+            }
+            if args["codebook"] == "mcg":
+                quant_args.update({"mcg": True})
+            elif args["codebook"] == "mul1":
+                quant_args.update({"mul1": True})
+
+            with Timer() as t:
+                sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
+                    if args["image_dump"] else None
+                proxy_err = linear.convert_exl3(
+                    capture_H[linear.qmap] if state else linear.init_H_data(False),
+                    quant_args = quant_args,
+                    progress_str = f" -- <step>: {linear.key}",
+                    verbose = args["verbose"],
+                    save_reg = sr,
+                )
+                assert isinstance(linear.inner, LinearEXL3)
+                linear.inner.swap_cpu()
+            flags = "o" if quant_args["apply_out_scales"] else "."
+            flags += "f" if quant_args["q_fallback"] else "."
+            proxy_err_str = (
+                "(zero)  " if quant_args["zeros"] else
+                "(big)   " if proxy_err >= 9.9 else
+                f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
+                "(OoM)   "
+            )
+            proxy_err_label = "proxy_err" if not quant_args["q_fallback"] else "rmse"
+            print(
+                f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
+                f"  bpw: {quant_args['K']:5.2f}"
+                f"  {proxy_err_label}: {proxy_err_str}"
+                f"  {flags}"
+                f"  g_sc: {quant_args['g_scale']:.6f}"
+                f"  [{t.interval:4.2f} s]",
+                flush = True
+            )
+
+
+def quantize_linears_parallel(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state):
+    assert not args["image_dump"], "Parallel mode is incompatible with --image_dump"
+
+    # Split workload
+    all_dev_linears = [[] for _ in devices]
+
+    tot_numel = sum(linear.weights_numel() for linear in linears)
+    if device_ratios is None:
+        dev_numel = [tot_numel // len(devices) for _ in devices]
+    else:
+        tot_split = sum(device_ratios)
+        dev_numel = [tot_numel * r // tot_split for _, r in zip(devices, device_ratios)]
+
+    for linear in linears:
+        l_numel = linear.weights_numel()
+        fit = [d_numel - l_numel for d_numel in dev_numel]
+        bestfit = max(range(len(fit)), key = lambda x: fit[x])
+        dev_numel[bestfit] -= l_numel
+        all_dev_linears[bestfit].append(linear)
+
+    with progress_lock:
+        curr_progress = 0
+        max_progress = len(linears)
+
+    # Worker thread
+    def work_thread(device_idx, dev_linears):
+        global curr_progress
+
+        for linear in dev_linears:
+            quant_args_local = {
+                "seed": idx,
+                "K": strategy[linear.key],
+                "devices": [device_idx],
+                "apply_out_scales": args["apply_out_scales"],
+            }
+            if args["codebook"] == "mcg":
+                quant_args_local.update({"mcg": True})
+            elif args["codebook"] == "mul1":
+                quant_args_local.update({"mul1": True})
+
+            proxy_err = linear.convert_exl3(
+                capture_H[linear.qmap] if state else linear.init_H_data(False),
+                quant_args = quant_args_local,
+                verbose = args["verbose"],
+                save_reg = False,
+                override_swap_device = device_idx
+            )
+            assert isinstance(linear.inner, LinearEXL3)
+            linear.inner.swap_cpu()
+
+            flags_local = "o" if quant_args_local["apply_out_scales"] else "."
+            flags_local += "f" if quant_args_local["q_fallback"] else "."
+            proxy_err_str_local = (
+                "(zero)  " if quant_args_local["zeros"] else
+                "(big)   " if proxy_err >= 9.9 else
+                f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
+                "(OoM)   "
+            )
+            proxy_err_label_local = "proxy_err" if not quant_args_local["q_fallback"] else "rmse"
+            print(
+                f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
+                f"  bpw: {quant_args_local['K']:5.2f}"
+                f"  {proxy_err_label_local}: {proxy_err_str_local}"
+                f"  {flags_local}"
+                f"  g_sc: {quant_args_local['g_scale']:.6f}"
+            )
+            with progress_lock:
+                curr_progress += 1
+
+    # Launch
+    threads = []
+    for i, device_idx in enumerate(devices):
+        if len(all_dev_linears[i]):
+            t = threading.Thread(target = work_thread, args = (device_idx, all_dev_linears[i]))
+            t.daemon = True
+            threads.append(t)
+    for t in threads:
+        t.start()
+
+    try:
+        with ProgressBar(" -- Quantizing (parallel)", max_progress, transient = True) as progress:
+            while any(t.is_alive() for t in threads):
+                progress.update(curr_progress)
+                time.sleep(0.1)
+    except KeyboardInterrupt as e:
+        # TODO: This is too hacky
+        from signal import pthread_kill, SIGTSTP, SIGKILL
+        for t in threads:
+            pthread_kill(t.ident, SIGTSTP)
+            pthread_kill(t.ident, SIGKILL)
+        print("Aborted.")
+        sys.exit()
+
+    for t in threads:
+        t.join(timeout = 0.1)
+
+
+def image_dump(args, linears):
+    if args["image_dump"]:
+        for linear in linears:
+            filename = f"images/{linear.key}.jpg"
+            print(f" -- Saving image: {filename}")
+            w = linear.inner.get_weight_tensor()
+            assert w.dim() == 2
+            save_tensor_image(w, os.path.join(args["work_dir"], filename))
+
+
+def feedback_module(state, module, config, final_bpw, error, cos_error, sqnr_, module_time):
+    if state:
+        print(
+            f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
+            (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"  no_weights") +
+            (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
+            f"  cos: {cos_error:.6f}"
+            f"  sqnr: {sqnr_:.6f}"
+            f"  [{module_time:.2f} s]",
+            flush = True
+        )
+    else:
+        print(
+            f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
+            (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"  no_weights") +
+            f"  [{module_time:.2f} s]",
+            flush = True
+        )
+
+timed_blocks = 0
+eta_window = deque(maxlen = 8)
+
+def feedback_eta(idx, model, module_time):
+    global timed_blocks, eta_window
+    if idx >= model.first_block_idx:
+        timed_blocks += 1
+        eta_window.append(module_time)
+        remaining_blocks = max(0, len(model.modules) - idx - 1)
+        if timed_blocks < 3:
+            print(
+                " -- Estimated remaining time: warming up "
+                f"({timed_blocks}/3 timed blocks)"
+            )
+        else:
+            avg_block_time = sum(eta_window) / len(eta_window)
+            est_remaining = avg_block_time * remaining_blocks
+            print(
+                f" -- Estimated remaining time: {human_time(est_remaining)} "
+                f"(avg over last {len(eta_window)} blocks)"
+            )
+
+
+def clear_temp_files(args):
+    clear_files = args.get("clear_files")
+    if clear_files:
+        for p in clear_files:
+            p.unlink()
+        del args["clear_files"]
+
+
 @torch.inference_mode()
 def main(args, job_state):
     # TODO: Refactor this, split into functions
-    global max_progress, curr_progress
+    global max_progress, curr_progress, timed_blocks
 
     torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
@@ -285,11 +502,9 @@ def main(args, job_state):
         device_ratios = None
 
     last_checkpoint_time = time.time()
-    timed_blocks = 0
-    eta_window = deque(maxlen = 8)
 
     # Get model
-    config, model, tokenizer, use_reference_state = get_base_model(args)
+    config, model, mtp_model, tokenizer, use_reference_state = get_base_model(args)
 
     # Check caps
     can_resume_quant = model.caps.get("can_resume_quant", use_reference_state)
@@ -322,7 +537,7 @@ def main(args, job_state):
     # Get quantization strategy for model @bitrate
     print(" -- Deciding quantization strategy")
     hq = args["hq"]
-    strategy, final_bpw = create_q_strategy(model, config, args["bits"], args["head_bits"], hq)
+    strategy, final_bpw = create_q_strategy(model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq)
     args["final_bits"] = round(final_bpw, 2)
     print(" -- Quantization strategy, summary:")
     print(print_strategy(strategy))
@@ -341,6 +556,7 @@ def main(args, job_state):
 
         # Collect output tensors
         q_tensors = {}
+        capture_H = None
 
         # Slice module if necessary
         slicing = module.num_slices > 1
@@ -430,169 +646,21 @@ def main(args, job_state):
             assert all(isinstance(linear.inner, LinearFP16) for linear in linears)
 
             # Write images
-            if args["image_dump"]:
-                for linear in linears:
-                    filename = f"images/{linear.key}.jpg"
-                    print(f" -- Saving image: {filename}")
-                    w = linear.inner.get_weight_tensor()
-                    assert w.dim() == 2
-                    save_tensor_image(w, os.path.join(args["work_dir"], filename))
+            image_dump(args, linears)
 
             # Move original tensors to system RAM (load to GPU one by one when quantizing)
             for linear in linears:
                 linear.inner.swap_cpu()
 
-            # Decide mode
-            # TODO: Might be useful to compare no. h-tiles per tensor, no. layers and no. SMs across GPUs
-            use_parallel_mode = False
-            if args["parallel_mode"] and len(linears) >= len(devices) and all(b <= 8 for _, b in strategy.items()):
-                use_parallel_mode = True
-
-            # Quantize module, layer parallel
-            if use_parallel_mode:
-                assert not args["image_dump"], "Parallel mode is incompatible with --image_dump"
-
-                # Split workload
-                all_dev_linears = [[] for _ in devices]
-
-                tot_numel = sum(linear.weights_numel() for linear in linears)
-                if device_ratios is None:
-                    dev_numel = [tot_numel // len(devices) for _ in devices]
-                else:
-                    tot_split = sum(device_ratios)
-                    dev_numel = [tot_numel * r // tot_split for _, r in zip(devices, device_ratios)]
-
-                for linear in linears:
-                    l_numel = linear.weights_numel()
-                    fit = [d_numel - l_numel for d_numel in dev_numel]
-                    bestfit = max(range(len(fit)), key = lambda x: fit[x])
-                    dev_numel[bestfit] -= l_numel
-                    all_dev_linears[bestfit].append(linear)
-
-                with progress_lock:
-                    curr_progress = 0
-                    max_progress = len(linears)
-
-                # Worker thread
-                def work_thread(device_idx, dev_linears):
-                    global curr_progress
-
-                    for linear in dev_linears:
-                        quant_args_local = {
-                            "seed": idx,
-                            "K": strategy[linear.key],
-                            "devices": [device_idx],
-                            "apply_out_scales": args["apply_out_scales"],
-                        }
-                        if args["codebook"] == "mcg": quant_args_local.update({ "mcg": True })
-                        elif args["codebook"] == "mul1": quant_args_local.update({ "mul1": True })
-
-                        proxy_err = linear.convert_exl3(
-                            capture_H[linear.qmap] if state else linear.init_H_data(False),
-                            quant_args = quant_args_local,
-                            verbose = args["verbose"],
-                            save_reg = False,
-                            override_swap_device = device_idx
-                        )
-                        assert isinstance(linear.inner, LinearEXL3)
-                        linear.inner.swap_cpu()
-
-                        flags_local = "o" if quant_args_local["apply_out_scales"] else "."
-                        flags_local += "f" if quant_args_local["q_fallback"] else "."
-                        proxy_err_str_local = (
-                            "(zero)  " if quant_args_local["zeros"] else
-                            "(big)   " if proxy_err >= 9.9 else
-                            f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
-                            "(OoM)   "
-                        )
-                        proxy_err_label_local = "proxy_err" if not quant_args_local["q_fallback"] else "rmse"
-                        print(
-                            f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
-                            f"  bpw: {quant_args_local['K']:5.2f}"
-                            f"  {proxy_err_label_local}: {proxy_err_str_local}"
-                            f"  {flags_local}"
-                            f"  g_sc: {quant_args_local['g_scale']:.6f}"
-                        )
-                        with progress_lock:
-                            curr_progress += 1
-
-                # Launch
-                threads = []
-                for i, device_idx in enumerate(devices):
-                    if len(all_dev_linears[i]):
-                        t = threading.Thread(target = work_thread, args = (device_idx, all_dev_linears[i]))
-                        t.daemon = True
-                        threads.append(t)
-                for t in threads:
-                    t.start()
-
-                try:
-                    with ProgressBar(" -- Quantizing (parallel)", max_progress, transient = True) as progress:
-                        while any(t.is_alive() for t in threads):
-                            progress.update(curr_progress)
-                            time.sleep(0.1)
-                except KeyboardInterrupt as e:
-                    # TODO: This is too hacky
-                    from signal import pthread_kill, SIGTSTP, SIGKILL
-                    for t in threads:
-                        pthread_kill(t.ident, SIGTSTP)
-                        pthread_kill(t.ident, SIGKILL)
-                    print("Aborted.")
-                    sys.exit()
-
-                for t in threads:
-                    t.join(timeout = 0.1)
-
-            # Quantize module, single GPU or tensor split
+            # Quantize
+            if (
+                args["parallel_mode"] and
+                len(linears) >= len(devices) and
+                all(b <= 8 for _, b in strategy.items())
+            ):
+                quantize_linears_parallel(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state)
             else:
-                for linear in linears:
-                    if strategy[linear.key] == 16:
-                        print(
-                            f" -- Unquantized: {linear.key:{config.stc.max_key_len() + 6}}"
-                            f"  bpw: {16:5.2f}",
-                            flush = True
-                        )
-                    else:
-                        quant_args = {
-                            "seed": idx,
-                            "K": strategy[linear.key],
-                            "devices": devices,
-                            "device_ratios": device_ratios,
-                            "apply_out_scales": args["apply_out_scales"],
-                        }
-                        if args["codebook"] == "mcg": quant_args.update({ "mcg": True })
-                        elif args["codebook"] == "mul1": quant_args.update({ "mul1": True })
-
-                        with Timer() as t:
-                            sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
-                                if args["image_dump"] else None
-                            proxy_err = linear.convert_exl3(
-                                capture_H[linear.qmap] if state else linear.init_H_data(False),
-                                quant_args = quant_args,
-                                progress_str = f" -- <step>: {linear.key}",
-                                verbose = args["verbose"],
-                                save_reg = sr,
-                            )
-                            assert isinstance(linear.inner, LinearEXL3)
-                            linear.inner.swap_cpu()
-                        flags = "o" if quant_args["apply_out_scales"] else "."
-                        flags += "f" if quant_args["q_fallback"] else "."
-                        proxy_err_str = (
-                            "(zero)  " if quant_args["zeros"] else
-                            "(big)   " if proxy_err >= 9.9 else
-                            f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
-                            "(OoM)   "
-                        )
-                        proxy_err_label = "proxy_err" if not quant_args["q_fallback"] else "rmse"
-                        print(
-                            f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
-                            f"  bpw: {quant_args['K']:5.2f}"
-                            f"  {proxy_err_label}: {proxy_err_str}"
-                            f"  {flags}"
-                            f"  g_sc: {quant_args['g_scale']:.6f}"
-                            f"  [{t.interval:4.2f} s]",
-                            flush = True
-                        )
+                quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state)
 
             # Collect converted module tensors
             for m in module:
@@ -605,11 +673,7 @@ def main(args, job_state):
             config.stc.close()
 
         # Save layer tensors to working directory
-        clear_files = args.get("clear_files")
-        if clear_files:
-            for p in clear_files:
-                p.unlink()
-            del args["clear_files"]
+        clear_temp_files(args)
         save_tensor(q_tensors, f"qtensors/{module.key}.safetensors", args)
 
         # Output final bpw for layer
@@ -627,10 +691,10 @@ def main(args, job_state):
         del q_tensors
 
         # Advance state
+        error = 0
+        cos_error = 0
+        sqnr_ = 0
         if state is not None:
-            error = 0
-            cos_error = 0
-            sqnr_ = 0
             with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
                 for i in range(len(state)):
                     progress.update(i)
@@ -657,44 +721,12 @@ def main(args, job_state):
 
         # Feedback after module
         module_time = time.time() - start_module_time
-        if state:
-            print(
-                f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
-                (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"  no_weights") +
-                (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
-                f"  cos: {cos_error:.6f}"
-                f"  sqnr: {sqnr_:.6f}"
-                f"  [{module_time:.2f} s]",
-                flush = True
-            )
-        else:
-            print(
-                f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
-                (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"  no_weights") +
-                f"  [{module_time:.2f} s]",
-                flush = True
-            )
-        if idx >= model.first_block_idx:
-            timed_blocks += 1
-            eta_window.append(module_time)
-            remaining_blocks = max(0, len(model.modules) - idx - 1)
-            if timed_blocks < 3:
-                print(
-                    " -- Estimated remaining time: warming up "
-                    f"({timed_blocks}/3 timed blocks)"
-                )
-            else:
-                avg_block_time = sum(eta_window) / len(eta_window)
-                est_remaining = avg_block_time * remaining_blocks
-                print(
-                    f" -- Estimated remaining time: {human_time(est_remaining)} "
-                    f"(avg over last {len(eta_window)} blocks)"
-                )
+        feedback_module(state, module, config, final_bpw, error, cos_error, sqnr_, module_time)
+        feedback_eta(idx, model, module_time)
 
         # Unload current module
         if not module.caps.get("retain_during_quant"):
             module.unload()
-        # free_mem()
 
         # Checkpoint
         job_state["next_module_idx"] = idx + 1
@@ -714,8 +746,72 @@ def main(args, job_state):
             os.rename(ckpt_dir_new, ckpt_dir)
             last_checkpoint_time = time.time()
 
+    # Quantize additional modules
+    if mtp_model:
+        print(" -- Quantizing MTP tensors")
+
+        for idx, module in enumerate(mtp_model.modules):
+            assert module.num_slices <= 1
+            start_module_time = time.time()
+
+            q_tensors = {}
+            print(f" -- Loading unquantized module: {module.key}")
+            module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
+            for m in module:
+                if m.used_alt_key:
+                    print(f"     - Cloned {m.key} from {m.alt_key}")
+            module.config.stc.close()
+
+            linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]
+            for linear in linears:
+                assert linear.key in strategy, \
+                    f" ## Logic error, no quantization strategy for module {linear.key}"
+            assert all(isinstance(linear.inner, LinearFP16) for linear in linears)
+
+            # Write images
+            image_dump(args, linears)
+
+            # Move original tensors to system RAM (load to GPU one by one when quantizing)
+            for linear in linears:
+                linear.inner.swap_cpu()
+
+            # Quantize
+            if (
+                args["parallel_mode"] and
+                len(linears) >= len(devices) and
+                all(b <= 8 for _, b in strategy.items())
+            ):
+                quantize_linears_parallel(args, linears, config, strategy, idx, devices, device_ratios, None, None)
+            else:
+                quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, None, None)
+
+            # Collect converted module tensors
+            for m in module:
+                q_tensors.update(m.get_tensors())
+
+            # Unload module
+            module.unload()
+            config.stc.close()
+
+            # Save layer tensors to working directory
+            clear_temp_files(args)
+            save_tensor(q_tensors, f"qtensors/{module.key}.safetensors", args)
+
+            # Output final bpw for layer
+            num_bytes = dsize(q_tensors)
+            num_bits = num_bytes * 8
+            final_bpw = num_bits / module.weights_numel() if module.weights_numel() else None
+
+            # Feedback after module
+            module_time = time.time() - start_module_time
+            feedback_module(state, module, config, final_bpw, 0, 0, 0, module_time)
+
+            # Unload current module
+            module.unload()
+            del q_tensors
+
     # Compile model
-    compile_model(args, model, config, tokenizer)
+    compile_model(args, model, config, tokenizer, mtp_model)
 
     # All done
     print(" -- All done")
