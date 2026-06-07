@@ -103,6 +103,58 @@ def save_tensor(tensor, filename: str):
     else:
         save_file({f"tensor": tensor}, filename)
 
+
+class LogitsStore:
+
+    def __init__(
+        self,
+        filename: str,
+        write: bool = False,
+    ):
+        self.filename = filename
+        self.row_dir = filename if os.path.isdir(filename) else f"{filename}.rows"
+        self.legacy_file = filename if os.path.isfile(filename) else None
+        if write:
+            os.makedirs(self.row_dir, exist_ok = True)
+
+
+    def row_filename(self, row: int) -> str:
+        return os.path.join(self.row_dir, f"row_{row:06d}.safetensors")
+
+
+    def save_row(
+        self,
+        row: int,
+        tensor: torch.Tensor,
+    ):
+        filename = self.row_filename(row)
+        tmp_filename = f"{filename}.tmp"
+        save_tensor(tensor.float().cpu(), tmp_filename)
+        os.replace(tmp_filename, filename)
+
+
+    def load_row(
+        self,
+        row: int,
+    ) -> torch.Tensor:
+        row_filename = self.row_filename(row)
+        if os.path.exists(row_filename):
+            return load_tensor(row_filename)
+
+        if self.legacy_file:
+            with safe_open(self.legacy_file, framework = "pt", device = "cpu") as f:
+                key = f"tensor.{row}"
+                if key in f.keys():
+                    return f.get_tensor(key)
+                if "tensor" in f.keys():
+                    return f.get_slice("tensor")[row:row + 1]
+
+        raise FileNotFoundError(
+            f"Reference logits row {row} not found in {self.row_dir}"
+            + (f" or {self.legacy_file}" if self.legacy_file else "")
+        )
+
+
 # Tokenize ppl test data
 
 DATASET_ALIASES = {
@@ -111,72 +163,85 @@ DATASET_ALIASES = {
         "name": "wikitext-2-raw-v1",
         "split": "test",
         "text_column": "text",
+        "display_name": "wikitext2",
     },
     "wikitext2": {
         "path": "wikitext",
         "name": "wikitext-2-raw-v1",
         "split": "test",
         "text_column": "text",
+        "display_name": "wikitext2",
     },
     "wiki103": {
         "path": "wikitext",
         "name": "wikitext-103-raw-v1",
         "split": "test",
         "text_column": "text",
+        "display_name": "wiki103",
     },
     "wikitext103": {
         "path": "wikitext",
         "name": "wikitext-103-raw-v1",
         "split": "test",
         "text_column": "text",
+        "display_name": "wiki103",
     },
     "ptb": {
         "path": "ptb_text_only",
         "name": "penn_treebank",
         "split": "test",
         "text_column": "sentence",
+        "display_name": "PTB",
     },
     "lambada": {
         "path": "EleutherAI/lambada_openai",
         "name": None,
         "split": "test",
         "text_column": "text",
+        "display_name": "lambada",
     },
     "tinystories": {
         "path": "roneneldan/TinyStories",
         "name": None,
         "split": "validation",
         "text_column": "text",
+        "display_name": "TinyStories",
     },
     "c4": {
         "path": "allenai/c4",
         "name": "en",
         "split": "validation",
         "text_column": "text",
+        "display_name": "c4",
     },
     "openwebtext10k": {
-        "path": "stas/openwebtext-10k",
+        "path": "parquet",
         "name": None,
-        "split": "val",
+        "split": "train",
+        "data_files": "hf://datasets/stas/openwebtext-10k@refs/convert/parquet/plain_text/train/*.parquet",
         "text_column": "text",
+        "display_name": "openwebtext",
     },
     "openwebtext": {
         "path": "Skylion007/openwebtext",
         "name": None,
         "split": "train[:1000]",
         "text_column": "text",
+        "display_name": "openwebtext",
     },
     "fineweb": {
         "path": "HuggingFaceFW/fineweb",
         "name": "sample-10BT",
         "split": "train[:1000]",
         "text_column": "text",
+        "display_name": "fineweb",
     },
     "fineweb-edu": {
         "path": "HuggingFaceFW/fineweb-edu",
         "name": "sample-10BT",
         "split": "train[:1000]",
         "text_column": "text",
+        "display_name": "fineweb-edu",
     },
 }
 
@@ -187,14 +252,15 @@ def get_dataset_text(spec: dict) -> str:
     path = spec.get("dataset_path", dataset_spec.get("path", dataset))
     name = spec.get("dataset_name", dataset_spec.get("name"))
     split = spec.get("dataset_split", spec.get("split", dataset_spec.get("split", "test")))
+    data_files = spec.get("dataset_data_files", dataset_spec.get("data_files"))
     text_column = spec.get("text_column", dataset_spec.get("text_column", "text"))
     max_text_rows = spec.get("max_text_rows", spec.get("max_dataset_rows", 0))
 
     print(f"Loading text dataset: {path}" + (f"/{name}" if name else "") + f" ({split})")
     if name is None:
-        ds = load_dataset(path, split = split)
+        ds = load_dataset(path, split = split, data_files = data_files)
     else:
-        ds = load_dataset(path, name, split = split)
+        ds = load_dataset(path, name, split = split, data_files = data_files)
 
     if text_column not in ds.column_names:
         raise ValueError(
@@ -250,6 +316,9 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
 
     print(f"Loading: {model_dir}")
     model_instance, bpw_layer, bpw_head, vram_bits = load_fn(model_dir, size = length + 512)
+    bpw_layer = spec.get("override_bpw_layer", bpw_layer)
+    bpw_head = spec.get("override_bpw_head", bpw_head)
+    vram_bits = spec.get("override_vram_bits", vram_bits)
     vram_gb = vram_bits / 8 / 1024**3
 
     logprob_sum = 0.0
@@ -262,30 +331,30 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
     print(f"Testing: {model_dir} ({spec['label']})")
 
     collect_logits = False
+    ref_logits = None
     if logits_file:
         if "out_logits" in spec:
             collect_logits = True
-            ref_logits = []
+            ref_logits = LogitsStore(logits_file, write = True)
         else:
             collect_logits = False
-            ref_logits = load_tensor(logits_file)
-            if not isinstance(ref_logits, list):
-                ref_logits = ref_logits.split(1, 0)
+            ref_logits = LogitsStore(logits_file)
 
     with ProgressBar("Evaluating", rows) as pb:
         for row in range(rows):
             pb.update(row)
             input_ids = eval_ids[row:row + 1, :]
             logits = fwd_fn(model_instance, input_ids)
+            logits.clamp_(min = -200.0)
             logits = logits[..., -eval_len:, :]
 
             # kld
             if logits_file and row < 10:
                 if collect_logits:
-                    ref_logits.append(logits.float().cpu())
+                    ref_logits.save_row(row, logits)
                     kl_div_count += 1
                 else:
-                    ref = ref_logits[row].to(logits.device)
+                    ref = ref_logits.load_row(row).to(logits.device)
                     vs = min(logits.shape[-1], ref.shape[-1])
                     kl_div = compute_kl_div(logits, ref, vs)
                     kl_div_sum_ab += kl_div.sum().item()
@@ -311,9 +380,6 @@ def test_ppl(data_spec: dict, spec: dict, logits_file: str):
     if logits_file:
         kl_div = kl_div_sum_ab / kl_div_count
         print(f"KL div: {kl_div:.6f}")
-
-    if collect_logits:
-        save_tensor(ref_logits, logits_file)
 
     print(f"Perplexity: {perplexity:.6f}")
 
@@ -345,10 +411,32 @@ def dict_hash(x: dict) -> str:
     return hex_digest
 
 
+def get_dataset_display_name(spec: dict) -> str:
+    dataset = spec["dataset"]
+    dataset_spec = DATASET_ALIASES.get(dataset.lower(), {})
+    return spec.get("dataset_display_name", dataset_spec.get("display_name", dataset))
+
+
+def format_dataset_subtitle(spec: dict) -> str:
+    dataset_name = get_dataset_display_name(spec)
+    rows = spec.get("display_rows", spec.get("max_rows", 0))
+    if not rows:
+        rows = "?"
+    wut = spec.get("warmup_tokens", 0)
+    length = spec.get("display_eval_len", spec["eval_len"] - wut)
+    st = f"{dataset_name}, {rows} × {length} tokens"
+    if wut:
+        spec += f", {wut} token warmup"
+    if spec.get("chat_template"):
+        st += ", formatted"
+    return st
+
+
 @torch.inference_mode()
 def main(args):
     with open(args.dataspec, "r", encoding = "utf8") as f:
         test_data_spec = json.load(f)
+    args.subtitle = format_dataset_subtitle(test_data_spec)
 
     models_files = args.modelspec
     models_files_g = []

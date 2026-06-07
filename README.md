@@ -33,7 +33,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **EXAONE 4.0** (Exaone4ForCausalLM)
 - **Gemma 2** (Gemma2ForCausalLM)
 - **Gemma 3** (Gemma3ForCausalLM, Gemma3ForConditionalGeneration) *- multimodal*
-- **Gemma 4** (Gemma4ForConditionalGeneration) *- multimodal* (E2B/E4B currently not supported)
+- **Gemma 4** (Gemma4ForConditionalGeneration, Gemma4UnifiedForConditionalGeneration) *- multimodal* (E2B/E4B currently not supported)
 - **GLM 4**, **GLM 4.5**, **GLM 4.5-Air**, **GLM 4.6** (Glm4ForCausalLM, Glm4MoeForCausalLM)
 - **GLM 4.1V**, **GLM 4.5V** (Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration) *- multimodal*
 - **HyperCLOVAX** (HyperCLOVAXForCausalLM, HCXVisionV2ForCausalLM) *- multimodal*
@@ -59,6 +59,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **SmolLM** (SmolLM3ForCausalLM)
 - **SolarOpen** (SolarOpenForCausalLM)
 - **Step 3.5 Flash** (Step3p5ForCausalLM)
+- **Step 3.7 Flash** (Step3p7ForConditionalGeneration) *- multimodal*
 
 Always adding more, stay tuned.
 
@@ -94,6 +95,10 @@ pip install exllamav3
 Note that the PyPi package does not contain a prebuilt extension and requires the CUDA toolkit and build prerequisites (i.e. VS Build Tools on Windows, gcc on Linux, `python-dev` headers etc.).    
 
 ### Method 3: Building from source
+
+Before building, make sure you have an appropriate version of Torch installed. Install a `flash-attn-2` wheel, e.g. from [here](https://mjunya.com/flash-attention-prebuild-wheels/). 
+
+On Windows, you should also make sure you have the `triton-windows` package installed. ExLlamaV3 may work without it, but many things will work suboptimally.   
 
 ```sh
 # Clone the repo

@@ -59,7 +59,7 @@ class Config(ABC):
             self.architecture = arch_override
 
         # Collect all .safetensors files in directory
-        self.stc = SafetensorsCollection(directory, load_method = kwargs.get("load_method"))
+        self.stc = SafetensorsCollection(directory, kwargs.get("load_method"), self.get_tensor_name_fixes())
 
         # Standard params, vocab
         self.bos_token_id = self.read_cfg(int, ["bos_token_id", "text_config->bos_token_id"], None)
@@ -100,6 +100,10 @@ class Config(ABC):
             assert isinstance(layer_map, list), "layer_map must be string or list of ints"
             self.layer_map = layer_map
             self.layer_map_str = None
+
+
+    def get_tensor_name_fixes(self):
+        return {}
 
 
     def default_max_position_embeddings(self):

@@ -224,10 +224,12 @@ class Linear(Module):
             if bias is not None:
                 bias = bias[self.frange[0] : self.frange[1]].contiguous()
                 bias = self.pad_out(bias)
+            if self.ftranspose_after_load:
+                weight = weight.T.contiguous()
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
-                weight.T.contiguous(),
+                weight,
                 bias,
                 self.full_in_features,
                 self.full_out_features,

@@ -17,7 +17,7 @@ try:
     from gptqmodel.nn_modules.qlinear.marlin_awq import AwqMarlinLinear
     from gptqmodel.nn_modules.qlinear.tritonv2 import TritonV2Linear
     from gptqmodel.nn_modules.qlinear.exllamav2 import ExllamaV2Linear
-except (ModuleNotFoundError, ImportError):
+except (ModuleNotFoundError, ImportError, AttributeError):
     AwqMarlinLinear = dummy
     TritonV2Linear = dummy
     ExllamaV2Linear = dummy
@@ -95,7 +95,7 @@ def get_storage_info(model):
         model = model.model
     if hasattr(model, "language_model"):
         model = model.language_model
-    assert model.input_modalities in ["text", ["text"]]
+    assert model.input_modalities in ["text", ["text"], ("text",)]
     if hasattr(model, "vocab_size"):
         vocab_size = model.vocab_size
     elif hasattr(model, "model") and hasattr(model.model, "vocab_size"):
@@ -188,6 +188,16 @@ def get_storage_info(model):
     vram_bits = head_numel * head_bpw + sum_bits
     return sum_bits / sum_numel, head_bpw, vram_bits
 
+def _get_input_device(model):
+    # Try the actual input embedding module
+    try:
+        return model.get_input_embeddings().weight.device
+    except Exception:
+        pass
+
+    # Fallback: first parameter device
+    return next(model.parameters()).device
+
 @torch.inference_mode
 def load_transformers(model_dir: str, auto = False, bf16 = False, size: int = None):
     model = AutoModelForCausalLM.from_pretrained(
@@ -218,7 +228,7 @@ def load_transformers_auto_bf16(model_dir: str, size: int):
 
 @torch.inference_mode
 def fwd_transformers(model_instance, input_ids: torch.Tensor):
-    input_ids = input_ids.to("cuda:0")
+    input_ids = input_ids.to(_get_input_device(model_instance))
     output = model_instance(input_ids)
     return output.logits
 

@@ -13,3 +13,4 @@ kbnf>=0.4.2
 pydantic
 formatron>=0.5.0
 xformers
+flash-linear-attention>=0.5.0

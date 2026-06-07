@@ -22,6 +22,7 @@ from ..modules import (
 from ..modules.arch_specific.gemma4 import (
     Gemma4VisionPatchEmbedder,
     Gemma4VisionPooler,
+    Gemma4UnifiedVisionEmbedder,
 )
 from ..modules.attn import prepare_for_attn
 from ..tokenizer import MMEmbedding, Tokenizer
@@ -38,6 +39,9 @@ from ..cache.recurrent_util import prepare_for_recurrence
 class Gemma4Config(Config):
     arch_string = "Gemma4ForConditionalGeneration"
 
+    def get_model_classes(self):
+        return {"text": Gemma4TextModel, "vision": Gemma4VisionModel}
+
     def __init__(
         self,
         directory: str,
@@ -45,9 +49,10 @@ class Gemma4Config(Config):
     ):
         super().__init__(
             directory,
-            {"text": Gemma4TextModel, "vision": Gemma4VisionModel},
+            self.get_model_classes(),
             **kwargs
         )
+        self.is_unified = self.arch_string == "Gemma4UnifiedForConditionalGeneration"
 
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "text_config->num_hidden_layers", no_default)
@@ -127,22 +132,38 @@ class Gemma4Config(Config):
         self.image_token_id = self.read_cfg(int, "image_token_id", None)
         self.boi_token_id = self.read_cfg(int, "boi_token_id", None)
         self.eoi_token_id = self.read_cfg(int, "eoi_token_id", None)
-        self.vision_soft_tokens_per_image = self.read_cfg(int, "vision_soft_tokens_per_image", no_default)
-
-        self.vision = SimpleNamespace(
-            hidden_size = self.read_cfg(int, "vision_config->hidden_size", no_default),
-            intermediate_size = self.read_cfg(int, "vision_config->intermediate_size", no_default),
-            num_hidden_layers = self.read_cfg(int, "vision_config->num_hidden_layers", no_default),
-            num_q_heads = self.read_cfg(int, "vision_config->num_attention_heads", no_default),
-            head_dim = self.read_cfg(int, "vision_config->head_dim", no_default),
-            patch_size = self.read_cfg(int, "vision_config->patch_size", no_default),
-            pooling_kernel_size = self.read_cfg(int, "vision_config->pooling_kernel_size", no_default),
-            position_embedding_size = self.read_cfg(int, "vision_config->position_embedding_size", no_default),
-            rms_norm_eps = self.read_cfg(float, "vision_config->rms_norm_eps", no_default),
-            standardize = self.read_cfg(bool, "vision_config->standardize", False),
-            num_channels = 3,
-            rope_theta = self.read_cfg(float, "vision_config->rope_theta", 100.0),
+        self.vision_soft_tokens_per_image = self.read_cfg(
+            int,
+            ["vision_soft_tokens_per_image", "vision_config->num_soft_tokens"],
+            no_default,
         )
+
+        if self.is_unified:
+            self.vision = SimpleNamespace(
+                hidden_size = self.read_cfg(int, "vision_config->mm_embed_dim", no_default),
+                output_proj_dims = self.read_cfg(int, "vision_config->output_proj_dims", no_default),
+                patch_size = self.read_cfg(int, "vision_config->model_patch_size", no_default),
+                processor_patch_size = self.read_cfg(int, "vision_config->patch_size", no_default),
+                pooling_kernel_size = self.read_cfg(int, "vision_config->pooling_kernel_size", no_default),
+                position_embedding_size = self.read_cfg(int, "vision_config->mm_posemb_size", no_default),
+                rms_norm_eps = self.read_cfg(float, "vision_config->rms_norm_eps", no_default),
+                num_channels = 3,
+            )
+        else:
+            self.vision = SimpleNamespace(
+                hidden_size = self.read_cfg(int, "vision_config->hidden_size", no_default),
+                intermediate_size = self.read_cfg(int, "vision_config->intermediate_size", no_default),
+                num_hidden_layers = self.read_cfg(int, "vision_config->num_hidden_layers", no_default),
+                num_q_heads = self.read_cfg(int, "vision_config->num_attention_heads", no_default),
+                head_dim = self.read_cfg(int, "vision_config->head_dim", no_default),
+                patch_size = self.read_cfg(int, "vision_config->patch_size", no_default),
+                pooling_kernel_size = self.read_cfg(int, "vision_config->pooling_kernel_size", no_default),
+                position_embedding_size = self.read_cfg(int, "vision_config->position_embedding_size", no_default),
+                rms_norm_eps = self.read_cfg(float, "vision_config->rms_norm_eps", no_default),
+                standardize = self.read_cfg(bool, "vision_config->standardize", False),
+                num_channels = 3,
+                rope_theta = self.read_cfg(float, "vision_config->rope_theta", 100.0),
+            )
 
         processor_path = os.path.join(self.directory, "processor_config.json")
         with open(processor_path, encoding = "utf8") as f:
@@ -162,9 +183,12 @@ class Gemma4Config(Config):
             pooling_kernel_size = image_processor["pooling_kernel_size"],
         )
 
-        self.vision.num_kv_heads = self.read_cfg(int, "vision_config->num_key_value_heads", self.vision.num_q_heads)
         self.vision.patch_dim = self.vision.num_channels * self.vision.patch_size ** 2
-        self.vision.max_patches = self.vision_pp.max_soft_tokens * (self.vision_pp.pooling_kernel_size ** 2)
+        if self.is_unified:
+            self.vision.max_patches = self.vision_pp.max_soft_tokens
+        else:
+            self.vision.num_kv_heads = self.read_cfg(int, "vision_config->num_key_value_heads", self.vision.num_q_heads)
+            self.vision.max_patches = self.vision_pp.max_soft_tokens * (self.vision_pp.pooling_kernel_size ** 2)
 
 
 class Gemma4TextModel(Model):
@@ -691,3 +715,120 @@ class Gemma4VisionModel(Model):
             "model_architecture": cfg.architecture,
         })
         return mme
+
+
+class Gemma4UnifiedConfig(Gemma4Config):
+    arch_string = "Gemma4UnifiedForConditionalGeneration"
+
+    def get_model_classes(self):
+        return {"text": Gemma4UnifiedTextModel, "vision": Gemma4UnifiedVisionModel}
+
+
+class Gemma4UnifiedTextModel(Gemma4TextModel):
+    config_class = Gemma4UnifiedConfig
+
+
+class Gemma4UnifiedVisionModel(Gemma4VisionModel):
+
+    @staticmethod
+    @override
+    def get_additional_compiled_tensors(config: Gemma4UnifiedConfig) -> dict:
+        return (
+            config.stc.list_tensors(prefix = "model.vision_embedder") |
+            config.stc.list_tensors(prefix = "model.embed_vision") |
+            config.stc.list_tensors(prefix = "model.embed_audio")
+        )
+
+    def __init__(
+        self,
+        config: Gemma4UnifiedConfig,
+        **kwargs,
+    ):
+        Model.__init__(self, config, **kwargs)
+        self.config = config
+        self.caps.update({
+            "image_input": True,
+            "supports_tp": False,
+        })
+        v = self.config.vision
+
+        self.modules += [
+            Gemma4UnifiedVisionEmbedder(
+                config = config,
+                key = "model.vision_embedder",
+                patch_dim = v.patch_dim,
+                mm_embed_dim = v.hidden_size,
+                norm_eps = v.rms_norm_eps,
+            ),
+            RMSNorm(
+                config = config,
+                key = "model.embed_vision.embedding_pre_projection_norm",
+                rms_norm_eps = v.rms_norm_eps,
+                unweighted = True,
+            ),
+            Linear(
+                config = config,
+                key = f"model.embed_vision.embedding_projection",
+                in_features = v.output_proj_dims,
+                out_features = config.hidden_size,
+            )
+        ]
+
+
+    def default_load_shape_dtype(self, chunk_size):
+        return (1, self.config.vision.max_patches, self.config.vision.patch_dim,), torch.half
+
+
+    def default_load_params(self, chunk_size):
+        h_patches = 14
+        w_patches = self.config.vision.max_patches // h_patches
+        grid_x, grid_y = np.meshgrid(np.arange(w_patches), np.arange(h_patches), indexing = "xy")
+        position_ids = np.stack([grid_x, grid_y], axis = -1).reshape(self.config.vision.max_patches, 2)
+        return {
+            "input_ids": torch.zeros((1, self.config.vision.max_patches, self.config.vision.patch_dim), dtype = torch.half),
+            "position_ids": torch.from_numpy(position_ids).int().unsqueeze(0),
+            "causal": False,
+        }
+
+
+    def preprocess(
+        self,
+        image: Image.Image,
+    ):
+        v = self.config.vision
+        vpp = self.config.vision_pp
+
+        image = convert_to_rgb(image)
+        old_size = image.size
+        new_size = get_aspect_ratio_preserving_size(
+            size = old_size,
+            patch_size = v.processor_patch_size,
+            max_patches = vpp.max_soft_tokens * (vpp.pooling_kernel_size ** 2),
+            pooling_kernel_size = vpp.pooling_kernel_size,
+        )
+
+        if new_size != old_size:
+            image = image.resize(new_size, resample = Image.Resampling(vpp.resample))
+
+        image_np = np.array(image).astype(np.float32)
+        image_np = image_np.transpose(2, 0, 1)
+
+        if vpp.do_rescale:
+            image_np *= vpp.rescale_factor
+
+        if vpp.do_normalize:
+            image_mean = np.asarray(vpp.image_mean, dtype = np.float32).reshape(-1, 1, 1)
+            image_std = np.asarray(vpp.image_std, dtype = np.float32).reshape(-1, 1, 1)
+            image_np = (image_np - image_mean) / image_std
+
+        patches = convert_image_to_patches(image_np, v.patch_size)
+        num_soft_tokens = patches.shape[0]
+
+        patch_width = image_np.shape[-1] // v.patch_size
+        patch_height = image_np.shape[-2] // v.patch_size
+        grid_x, grid_y = np.meshgrid(np.arange(patch_width), np.arange(patch_height), indexing = "xy")
+        positions = np.stack([grid_x, grid_y], axis = -1).reshape(patches.shape[0], 2)
+
+        pixel_values = torch.from_numpy(patches).half().unsqueeze(0)
+        image_position_ids = torch.from_numpy(positions).int().unsqueeze(0)
+        return pixel_values, image_position_ids, num_soft_tokens, new_size

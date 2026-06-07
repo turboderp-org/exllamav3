@@ -24,24 +24,21 @@ def convert_dtype(dt: str):
         raise ValueError(f"Unknown dtype {dt}")
 
 
-tensor_name_fixes = {
-    "multi_modal_projector.mm_input_projection_weight": "multi_modal_projector.mm_input_projection.weight",
-}
-
-
-def read_header(filename: str) -> dict:
+def read_header(filename: str, tensor_name_fixes: dict | None) -> dict:
     with open(filename, "rb") as fp:
         header_size = np.fromfile(fp, dtype = np.int64, count = 1).item()
         header_json = fp.read(header_size)
         header = json.loads(header_json.decode("utf-8"))
         header["_header_offset"] = fp.tell()
-    bad_keys = []
-    for k, v in header.items():
-        if k in tensor_name_fixes:
-            bad_keys.append((k, v))
-    for k, v in bad_keys:
-        del header[k]
-        header[tensor_name_fixes[k]] = v
+    if tensor_name_fixes:
+        bad_keys = []
+        for k, v in header.items():
+            for k_, v_ in tensor_name_fixes.items():
+                if k.endswith(k_):
+                    bad_keys.append((k, k[:-len(k_)] + v_, v))
+        for k, k_, v in bad_keys:
+            del header[k]
+            header[k_] = v
     return header
 
 
@@ -72,7 +69,8 @@ class SafetensorsCollection:
     def __init__(
         self,
         directory: str,
-        load_method: str | None = None
+        load_method: str | None = None,
+        tensor_name_fixes: dict | None = None,
     ):
         """
         Scan directory for .safetensors files and build collection, preparing to load tensors indexed by key.
@@ -90,6 +88,7 @@ class SafetensorsCollection:
         self.file_headers = {}
         self.handles: dict[str, list | None] = {}
         self.load_method = load_method or "mt_fread"
+        self.tensor_name_fixes = tensor_name_fixes or {}
 
         self.metrics = STCMetrics()
         self.first_open_time = None
@@ -114,13 +113,14 @@ class SafetensorsCollection:
         overrides = 0
         for st_file in new_tensor_files:
             self.handles[st_file] = None
-            header = read_header(st_file)
+            header = read_header(st_file, self.tensor_name_fixes)
             self.file_headers[st_file] = header
             for key in header.keys():
                 if key in ["__metadata__", "_header_offset"]:
                     continue
-                if key in tensor_name_fixes:
-                    key = tensor_name_fixes[key]
+                for k, v in self.tensor_name_fixes.items():
+                    if key.endswith(k):
+                        key = key[:-len(k)] + v
                 if key in self.tensor_file_map and warn_if_override:
                     # print(f" !! Overriding {key} from {self.tensor_file_map[key]} with f{st_file}")
                     overrides += 1

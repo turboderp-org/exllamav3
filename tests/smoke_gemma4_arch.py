@@ -41,7 +41,7 @@ def main() -> None:
 
     cfg = Config.from_directory(args.model_dir)
     print("[INFO] architecture:", cfg.architecture)
-    if cfg.architecture != "Gemma4ForConditionalGeneration":
+    if cfg.architecture not in {"Gemma4ForConditionalGeneration", "Gemma4UnifiedForConditionalGeneration"}:
         fail(f"Unexpected architecture: {cfg.architecture}")
 
     model = Model.from_config(cfg)

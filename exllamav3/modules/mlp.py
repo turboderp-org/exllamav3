@@ -142,6 +142,7 @@ class MLP(Module):
         match activation_fn:
             case "silu": self.activation_fn_call = F.silu
             case "gelu": self.activation_fn_call = lambda x: F.gelu(x, approximate = "tanh")
+            case "quick_gelu": self.activation_fn_call = lambda x: x * torch.sigmoid(1.702 * x)
             case "relu2": self.activation_fn_call = lambda x: torch.square(F.relu(x))
             case "xielu": self.activation_fn_call = self.act_xielu
 

@@ -535,7 +535,7 @@ def plot(results, args):
     _set_theme(args.dark)
     plt.rcParams["figure.figsize"] = (14, 10)
     fig, ax = plt.subplots()
-    fig.subplots_adjust(left = 0.08, right = 0.96, top = 0.92, bottom = 0.10)
+    fig.subplots_adjust(left = 0.08, right = 0.96, top = 0.89, bottom = 0.10)
 
     df = pd.DataFrame(rows)
     groups = sorted(df["group"].unique())
@@ -624,7 +624,21 @@ def plot(results, args):
         ax.yaxis.label.set_verticalalignment("bottom")
     tick_color = "#8e949d" if args.dark else "#5f6670"
     ax.tick_params(axis = "both", which = "major", labelsize = 13, colors = tick_color)
-    ax.set_title(args.title, pad = 22)
+    subtitle = getattr(args, "subtitle", None)
+    if subtitle:
+        ax.set_title(args.title, pad = 42)
+        ax.text(
+            0.5,
+            1.025,
+            subtitle,
+            transform = ax.transAxes,
+            ha = "center",
+            va = "bottom",
+            fontsize = 13,
+            color = "#b9bec6" if args.dark else "#5f6670",
+        )
+    else:
+        ax.set_title(args.title, pad = 22)
     ax.margins(x = 0.08, y = 0.12)
     sns.despine(ax = ax, left = True, bottom = True)
 
