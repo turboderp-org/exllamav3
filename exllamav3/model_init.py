@@ -169,10 +169,9 @@ def init(
 
     return_draft = "draft_model_dir" in args
     draft_model_dir = args.draft_model_dir if return_draft else None
-
     assert not (args.mtp and draft_model_dir), "Cannot specify both --mtp and --draft_model_dir"
     if args.mtp:
-        draft_model_dir = args.model_dir
+        args.draft_model_dir = draft_model_dir = args.model_dir
     use_mtp = draft_model_dir and Path(args.model_dir).resolve() == Path(draft_model_dir).resolve()
 
     # Config
