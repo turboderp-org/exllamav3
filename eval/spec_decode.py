@@ -168,6 +168,8 @@ def main(args):
     draft_mode = "Draft model"
     if args.draft_model_dir and draft_model.caps.get("dflash_draft"):
         draft_mode = "DFlash"
+    if args.draft_model_dir and draft_model.caps.get("mtp_draft"):
+        draft_mode = "MTP"
     r = {
         "Baseline": result_baseline,
         "N-gram (greedy)": result_ngram,
