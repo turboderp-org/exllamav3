@@ -131,7 +131,7 @@ class Qwen3_5MTPModel(Model):
             "supports_tp": False,
             "attach_target": True,
             "mtp_draft": True,
-            "default_draft_size": 2,  # MTP-1 with 2-step recurrence
+            "default_draft_size": 4,  # best measured performance
             "autosplit_load_fwd": False,
         })
 
