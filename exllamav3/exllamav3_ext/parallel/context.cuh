@@ -32,6 +32,8 @@ struct alignas(64) PGContext
     alignas(16) uint32_t gather_stage_consumed[MAX_DEVICES];
 
     // Maintain flags in separate 64-byte regions/cache lines
+    alignas(64) uint32_t broadcast_ll_epoch; char _pad0[64 - sizeof(uint32_t)];
+    alignas(64) uint32_t broadcast_ll_sequence_device[MAX_DEVICES];
     alignas(64) uint32_t reduce_jobs_head; char _pad1[64 - sizeof(uint32_t)];
     alignas(64) uint32_t reduce_jobs_tail; char _pad2[64 - sizeof(uint32_t)];
     alignas(64) uint32_t cpusum_stage_device[MAX_DEVICES * REDUCE_STAGE_STRIDE];

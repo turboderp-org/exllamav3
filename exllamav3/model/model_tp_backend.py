@@ -11,6 +11,7 @@ GLOBALS_SIZE = 128*1024
 SHBUF_SIZE = 16 * 1024 ** 2
 SHBUF_SIZE_R = 17 * 4 * 128 * 1024
 SHBUF_SIZE_S = 16 * 1024
+SHBUF_SIZE_LL = 16 * 1024
 # MAX_CPU_REDUCE = SHBUF_SIZE_R // 17 // 256 * 256
 
 class TPBackend:
@@ -186,11 +187,11 @@ class TPBackendNative:
         """
         Native shared-memory tensor-parallel communication backend.
 
-        The master process creates four named shared-memory regions and all other workers open them by UUID:
+        The master process creates five named shared-memory regions and all other workers open them by UUID:
         G stores global synchronization state for the custom process-group primitives, B is the main bulk transfer
         buffer for large broadcast/gather payloads, R is reserved for CPU-assisted all-reduce staging, and S is a
-        small low-latency buffer for tiny broadcasts and gathers. CUDA workers register these buffers as pinned host
-        memory so device copies can be issued efficiently.
+        small buffer for tiny gathers. LL is dedicated to low-latency broadcasts so consumers can acknowledge and
+        exit without blocking other collectives. CUDA workers register these buffers as pinned host memory.
 
         all_reduce() currently routes through pg_all_reduce_cpu(): GPU workers publish their contributions into the
         R buffer, a designated CPU helper performs the reduction over host memory, and workers copy the reduced
@@ -202,6 +203,7 @@ class TPBackendNative:
         self.shm_b_name = uuid + "_b"
         self.shm_r_name = uuid + "_r"
         self.shm_s_name = uuid + "_s"
+        self.shm_ll_name = uuid + "_ll"
         self.device = device
         self.max_num_devices = max(active_devices) + 1
         self.active_devices = active_devices
@@ -214,6 +216,7 @@ class TPBackendNative:
         size_b = self.shbuf_size
         size_r = SHBUF_SIZE_R
         size_s = SHBUF_SIZE_S
+        size_ll = SHBUF_SIZE_LL
 
         if master:
             log_tp(device, f"Creating SHMs")
@@ -225,19 +228,24 @@ class TPBackendNative:
             log_tp(device, f"Created SHM: {self.shm_r_name}, {size_r} bytes")
             self.shm_s = shared_memory.SharedMemory(create = True, size = size_s, name = self.shm_s_name)
             log_tp(device, f"Created SHM: {self.shm_s_name}, {size_s} bytes")
+            self.shm_ll = shared_memory.SharedMemory(create = True, size = size_ll, name = self.shm_ll_name)
+            log_tp(device, f"Created SHM: {self.shm_ll_name}, {size_ll} bytes")
             self.buf_g = np.ndarray((size_g,), dtype = np.uint8, buffer = self.shm_g.buf)
             self.buf_b = np.ndarray((size_b,), dtype = np.uint8, buffer = self.shm_b.buf)
             self.buf_r = np.ndarray((size_r,), dtype = np.uint8, buffer = self.shm_r.buf)
             self.buf_s = np.ndarray((size_s,), dtype = np.uint8, buffer = self.shm_s.buf)
+            self.buf_ll = np.ndarray((size_ll,), dtype = np.uint8, buffer = self.shm_ll.buf)
             self.buf_g[:] = 0
             self.buf_b[: size_b: 4096] = 0
             self.buf_r[:] = 0
             self.buf_s[:] = 0
+            self.buf_ll[:] = 0
         else:
             self.shm_g = None
             self.shm_b = None
             self.shm_r = None
             self.shm_s = None
+            self.shm_ll = None
             deadline = time.time() + 15
             log_tp(device, f"Opening SHMs")
             first_fnf = True
@@ -255,6 +263,9 @@ class TPBackendNative:
                     if self.shm_s is None:
                         self.shm_s = shared_memory.SharedMemory(name = self.shm_s_name)
                         log_tp(device, f"Opened SHM {self.shm_s_name}")
+                    if self.shm_ll is None:
+                        self.shm_ll = shared_memory.SharedMemory(name = self.shm_ll_name)
+                        log_tp(device, f"Opened SHM {self.shm_ll_name}")
                     break
                 except FileNotFoundError:
                     if first_fnf:
@@ -284,10 +295,12 @@ class TPBackendNative:
         self.tensor_b = get_local_tensor(self.shm_b.buf, size_b)
         self.tensor_r = get_local_tensor(self.shm_r.buf, size_r)
         self.tensor_s = get_local_tensor(self.shm_s.buf, size_s)
+        self.tensor_ll = get_local_tensor(self.shm_ll.buf, size_ll)
         self.ptr_g = self.tensor_g.data_ptr()
         self.ptr_b = self.tensor_b.data_ptr()
         self.ptr_r = self.tensor_r.data_ptr()
         self.ptr_s = self.tensor_s.data_ptr()
+        self.ptr_ll = self.tensor_ll.data_ptr()
         if not self.cpu:
             log_tp(device, f"Host register G")
             cuda_host_register(self.ptr_g, self.tensor_g.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
@@ -297,6 +310,8 @@ class TPBackendNative:
             cuda_host_register(self.ptr_r, self.tensor_r.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
             log_tp(device, f"Host register S")
             cuda_host_register(self.ptr_s, self.tensor_s.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
+            log_tp(device, f"Host register LL")
+            cuda_host_register(self.ptr_ll, self.tensor_ll.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
 
         # Init global context
         if master:
@@ -314,6 +329,8 @@ class TPBackendNative:
             cuda_host_unregister(self.ptr_r)
             log_tp(self.device, f"Host unregister S")
             cuda_host_unregister(self.ptr_s)
+            log_tp(self.device, f"Host unregister LL")
+            cuda_host_unregister(self.ptr_ll)
         self.shm_g.close()
         log_tp(self.device, f"Closed {self.shm_g_name}")
         self.shm_b.close()
@@ -322,6 +339,8 @@ class TPBackendNative:
         log_tp(self.device, f"Closed {self.shm_r_name}")
         self.shm_s.close()
         log_tp(self.device, f"Closed {self.shm_s_name}")
+        self.shm_ll.close()
+        log_tp(self.device, f"Closed {self.shm_ll_name}")
         if self.master:
             log_tp(self.device, f"Master unlink G")
             self.shm_g.unlink()
@@ -331,6 +350,8 @@ class TPBackendNative:
             self.shm_r.unlink()
             log_tp(self.device, f"Master unlink S")
             self.shm_s.unlink()
+            log_tp(self.device, f"Master unlink LL")
+            self.shm_ll.unlink()
 
 
     def fwd_barrier(self):
@@ -345,8 +366,8 @@ class TPBackendNative:
                 self.device,
                 src_device,
                 tensor,
-                self.ptr_s,
-                SHBUF_SIZE_S,
+                self.ptr_ll,
+                SHBUF_SIZE_LL,
                 self.abort_flag
             )
         else:
