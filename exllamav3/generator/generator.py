@@ -492,12 +492,6 @@ class Generator:
                 cache_seqlens[batch] = seq.kv_position
                 batch += 1
 
-        # Indexed embeddings not supported when drafting
-        # TODO: Allow multimodal draft model, perhaps with dummy embeddings?
-        for job in self.active_jobs:
-            assert not job.embeddings, \
-                "MM embeddings not supported while using draft model."
-
         # Collect input IDs
         input_ids_list = []
         mtp_hidden_list = []
