@@ -8,7 +8,7 @@ from ..ext import exllamav3_ext as ext
 from ..model.config import Config, no_default
 from ..model.model import Model
 from ..util.rope import RopeStyle
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
+from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear, BlockSparseMLP
 from ..modules.arch_specific.qwen3_5_mtp import Qwen3_5MTPInputLayer
 from ..modules.attn import prepare_for_attn
 from ..modules.module import no_p2p_copy
@@ -24,9 +24,11 @@ class Qwen3_5MTPModel(Model):
     def __init__(
         self,
         config: Qwen3_5Config | Qwen3_5MoeConfig,
+        use_moe: bool = False,
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        self.use_moe = use_moe
 
         # Module list: optional embed, then pre_fc norms + fc, then num_mtp_layers * TransformerBlock, then norm
         self.input_layer = Qwen3_5MTPInputLayer(
@@ -99,18 +101,54 @@ class Qwen3_5MTPModel(Model):
                         rms_norm_eps = config.rms_norm_eps,
                         constant_bias = 1.0,
                     ),
-                    mlp = GatedMLP(
-                        config = config,
-                        key = f"mtp.layers.{idx}.mlp",
-                        hidden_size = config.hidden_size,
-                        intermediate_size = config.intermediate_size,
-                        key_up = "up_proj",
-                        key_gate = "gate_proj",
-                        key_down = "down_proj",
-                        qmap = "block.mlp",
-                        interm_dtype = torch.half,
-                        out_dtype = torch.float,
-                        qbits_key = "mtp_bits",
+                    mlp = (
+                        BlockSparseMLP(
+                            config = config,
+                            key = f"mtp.layers.{idx}.mlp",
+                            hidden_size = config.hidden_size,
+                            intermediate_size = config.moe_intermediate_size,
+                            num_experts = config.num_experts,
+                            num_experts_per_tok = config.num_experts_per_tok,
+                            key_up = "experts.{expert_idx}.up_proj",
+                            key_gate = "experts.{expert_idx}.gate_proj",
+                            key_down = "experts.{expert_idx}.down_proj",
+                            key_gate_up_split = "experts.gate_up_proj",
+                            key_down_split = "experts.down_proj",
+                            key_routing_gate = "gate",
+                            key_shared_gate = "shared_expert_gate",
+                            transpose_fused_weights = False,
+                            qmap = "block.mlp",
+                            interm_dtype = torch.half,
+                            out_dtype = torch.float,
+                            qbits_key = "mtp_bits",
+                            shared_experts = GatedMLP(
+                                config = config,
+                                key = f"mtp.layers.{idx}.mlp.shared_expert",
+                                hidden_size = config.hidden_size,
+                                intermediate_size = config.shared_expert_intermediate_size,
+                                key_up = "up_proj",
+                                key_gate = "gate_proj",
+                                key_down = "down_proj",
+                                qmap = "block.mlp",
+                                interm_dtype = torch.half,
+                                out_dtype = torch.float,
+                                qbits_key = "mtp_bits",
+                                select_hq_bits = 2,
+                            )
+                        ) if use_moe else
+                        GatedMLP(
+                            config = config,
+                            key = f"mtp.layers.{idx}.mlp",
+                            hidden_size = config.hidden_size,
+                            intermediate_size = config.intermediate_size,
+                            key_up = "up_proj",
+                            key_gate = "gate_proj",
+                            key_down = "down_proj",
+                            qmap = "block.mlp",
+                            interm_dtype = torch.half,
+                            out_dtype = torch.float,
+                            qbits_key = "mtp_bits",
+                        )
                     ),
                 )
             )
@@ -187,3 +225,14 @@ class Qwen3_5MTPModel(Model):
 
     def default_load_params(self, max_chunk_size):
         return {}
+
+
+class Qwen3_5MoeMTPModel(Qwen3_5MTPModel):
+
+    def __init__(
+        self,
+        config: Qwen3_5Config | Qwen3_5MoeConfig,
+        **kwargs
+    ):
+        super().__init__(config, use_moe = True, **kwargs)
+

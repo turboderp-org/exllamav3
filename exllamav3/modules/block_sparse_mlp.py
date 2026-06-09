@@ -219,7 +219,8 @@ class BlockSparseMLP(Module):
         transpose_fused_weights: bool = True,
         ftranspose_after_load: bool = True,
         frange_dim: int = 0,
-        alt_residual_channel: bool = False
+        alt_residual_channel: bool = False,
+        qbits_key: str = "bits"
     ):
         super().__init__(config, key, None)
 
@@ -328,6 +329,7 @@ class BlockSparseMLP(Module):
                     ftranspose_after_load = ftranspose_after_load,
                     frange_dim = frange_dim,
                     qgroup = key + ".block_gud",
+                    qbits_key = qbits_key,
                 )
                 up = Linear(
                     config = config,
@@ -344,6 +346,7 @@ class BlockSparseMLP(Module):
                     ftranspose_after_load = ftranspose_after_load,
                     frange_dim = frange_dim,
                     qgroup = key + ".block_gud",
+                    qbits_key = qbits_key,
                 )
                 down = Linear(
                     config = config,
@@ -359,6 +362,7 @@ class BlockSparseMLP(Module):
                     transpose_fused_weights = transpose_fused_weights,
                     ftranspose_after_load = ftranspose_after_load,
                     qgroup = key + ".block_gud",
+                    qbits_key = qbits_key,
                 )
 
                 self.ups.append(up)

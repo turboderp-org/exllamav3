@@ -22,7 +22,7 @@ from ..modules.arch_specific.qwen3_vl import DeepstackEmbed
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
 from .qwen3_vl import read_qwen3_vl_vision_config, read_qwen3_vl_pp_config, Qwen3VLVisionModel
-from .qwen3_5_mtp import Qwen3_5MTPModel
+from .qwen3_5_mtp import Qwen3_5MTPModel, Qwen3_5MoeMTPModel
 
 
 def read_qwen3_5_layer_types(config: Config, text_config_path: str, num_layers: int, full_attention_interval: int) -> list[str]:
@@ -269,7 +269,7 @@ class Qwen3_5VLMoeConfig(Qwen3_5VLMoeBaseConfig):
             "text_config",
             Qwen3_5VLMoeModel,
             Qwen3VLVisionModel,
-            Qwen3_5MTPModel,
+            Qwen3_5MoeMTPModel,
             **kwargs
         )
 
