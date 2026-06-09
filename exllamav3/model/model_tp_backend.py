@@ -338,7 +338,47 @@ class TPBackendNative:
 
 
     def broadcast(self, tensor: torch.Tensor, src_device: int):
-        if tensor.numel() * tensor.element_size() <= 2048:
+        nelem = tensor.numel()
+        esize = tensor.element_size()
+        data_size = nelem * esize
+
+        # NCCL requires data_size to be a multiple of 16 bytes.
+        # Pad the tensor if necessary (e.g. MoE routing_weights with
+        # num_experts_per_tok=10 gives (bsz*10*2) bytes, which misaligns
+        # when bsz is not a multiple of 4).
+        if data_size % 16 != 0:
+            pad_bytes = 16 - (data_size % 16)
+            pad_elements = pad_bytes // esize
+            shape = tensor.shape
+            padded = torch.cat([tensor.reshape(-1),
+                                torch.zeros(pad_elements, dtype = tensor.dtype, device = tensor.device)])
+            padded_nelem = padded.numel()
+            if padded_nelem * esize <= 2048:
+                ext.pg_broadcast_ll(
+                    self.ptr_g,
+                    self.active_devices,
+                    self.device,
+                    src_device,
+                    padded,
+                    self.ptr_s,
+                    SHBUF_SIZE_S,
+                    self.abort_flag
+                )
+            else:
+                ext.pg_broadcast(
+                    self.ptr_g,
+                    self.active_devices,
+                    self.device,
+                    src_device,
+                    padded,
+                    self.ptr_b,
+                    self.shbuf_size,
+                    self.abort_flag
+                )
+            tensor.copy_(padded[:nelem].view(shape))
+            return
+
+        if data_size <= 2048:
             ext.pg_broadcast_ll(
                 self.ptr_g,
                 self.active_devices,
