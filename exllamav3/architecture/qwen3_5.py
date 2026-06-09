@@ -177,7 +177,7 @@ class Qwen3_5VLMoeBaseConfig(Config):
         super().__init__(
             directory,
             ({"text": text_model} if text_model else {}) |
-            ({"vision": vision_model} if vision_model else {}),
+            ({"vision": vision_model} if vision_model else {}) |
             ({"mtp": mtp_model} if mtp_model else {}),
             **kwargs
         )
