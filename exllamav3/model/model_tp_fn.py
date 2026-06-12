@@ -325,6 +325,52 @@ def mp_model_forward_lm_head_argmax(
     return (out_v, out_i) if device == output_device else None
 
 
+def mp_model_forward_lm_head_logits(
+    local_context: dict,
+    shared_input: dict,
+    params: dict,
+    gather_devices: list[int] | None,
+    ldims: list[int] | None,
+):
+    """
+    Forward pass through the sharded lm_head and gather full logits.
+
+    Unlike mp_model_forward_lm_head_argmax which only returns argmax values,
+    this returns the complete logits tensor. Used by MTP speculative decoding
+    where the caller needs full logits for greedy sampling.
+    """
+    consumer = local_context["inf_consumer"]
+    device = local_context["device"]
+    output_device = local_context["output_device"]
+    backend = local_context["backend"]
+
+    # Reconstruct tensor params sent through shared memory.
+    # target_hidden is a CUDA tensor from the target model that was sent via
+    # tp_producer.send() to avoid cudaMallocAsync shareIpcHandle issues.
+    p = params.get("target_hidden")
+    if p is not None:
+        params["target_hidden"] = consumer.recv(p, cuda = True)
+
+    x = consumer.recv(shared_input)
+
+    module = local_context["logits_module"]
+    x = module.prepare_for_device(x, params)
+    x = module.forward(x, params)
+
+    if gather_devices is None:
+        return x
+
+    if device == output_device:
+        out_shape = list(x.shape)
+        out_shape[-1] = sum(ldims)
+        out_tensor = torch.empty(*out_shape, dtype = x.dtype, device = x.device)
+    else:
+        out_tensor = None
+
+    backend.gather(x, out_tensor, gather_devices, output_device, ldims)
+    return out_tensor if device == output_device else None
+
+
 # def mp_model_forward_lm_head_argmax_old(
 #     local_context: dict,
 #     shared_input: dict,

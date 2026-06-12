@@ -513,6 +513,7 @@ class Generator:
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
 
         # Greedy sample num_draft_tokens batched tokens
+        use_tp = self.model.loaded_tp
         for idx in range(self.num_draft_tokens):
             params = {
                 "target_hidden": temp_hidden,
@@ -522,7 +523,23 @@ class Generator:
                 "cache_seqlens": cache_seqlens,
             }
             batch_state = self.draft_model.forward(batch_ids, params)
-            batch_logits = self.model.modules[self.model.logit_layer_idx].forward(batch_state, params)
+
+            if use_tp:
+                # In TP mode the lm_head lives in worker processes; dispatch through TP.
+                # Must prepare params for inter-process transfer: send CUDA tensors
+                # through the shared-memory producer instead of pickling them directly,
+                # because cudaMallocAsync does not support shareIpcHandle.
+                self.model.tp_producer.clear()
+                tp_params = {
+                    "target_hidden": self.model.tp_producer.send(temp_hidden),
+                    "attn_mode": "flash_attn",
+                }
+                batch_logits = self.model.tp_dispatch_lm_head_logits(
+                    (self.model.tp_producer.send(batch_state), tp_params)
+                )
+            else:
+                batch_logits = self.model.modules[self.model.logit_layer_idx].forward(batch_state, params)
+
             new_ids = torch.argmax(batch_logits, dim = -1)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
