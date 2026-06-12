@@ -522,7 +522,8 @@ class Generator:
                 "cache_seqlens": cache_seqlens,
             }
             batch_state = self.draft_model.forward(batch_ids, params)
-            batch_logits = self.model.modules[self.model.logit_layer_idx].forward(batch_state, params)
+            lm_head = self.model.modules[self.model.logit_layer_idx]
+            batch_logits = lm_head.forward(lm_head.prepare_for_device(batch_state, params), params)
             new_ids = torch.argmax(batch_logits, dim = -1)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
