@@ -75,9 +75,9 @@ class AsyncGenerator:
     async def cancel(self, job: AsyncJob):
         # Remove the underlying Job from the synchronous generator first so no new tokens are produced, then drop
         # the async mapping so any late results from an in-flight iteration are ignored.
+        self.generator.cancel(job.job)
         if job.job not in self.jobs:
             return
-        self.generator.cancel(job.job)
         del self.jobs[job.job]
 
 
@@ -114,5 +114,5 @@ class AsyncJob:
     async def cancel(self):
         # Delegate cancellation to the wrapper so it can update both the sync generator queue and the async job map,
         # then mark this iterator as closed for any current or future consumers.
-        self.cancelled = True
         await self.generator.cancel(self)
+        self.cancelled = True
