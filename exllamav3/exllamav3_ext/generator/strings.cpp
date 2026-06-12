@@ -30,8 +30,8 @@ int partial_strings_match
 
     for (int i = 0; i < num_strings; ++i)
     {
-        int beg = offsets_int[i] / 4;
-        int s_len = offsets_int[i + 1] / 4 - beg;
+        int beg = offsets_int[i] / 4; if (beg < 0 || beg >= info.size / 4) return -1;
+        int s_len = offsets_int[i + 1] / 4 - beg; if (s_len < 0 || beg + s_len > info.size / 4) return -1;
         uint32_t* s = strings_utf32 + beg;
 
         int a = 0;
