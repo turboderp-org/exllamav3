@@ -342,6 +342,55 @@ class Model_TPMixin:
         return argmax
 
 
+    def tp_dispatch_lm_head_logits(self, args):
+        """
+        Forward pass through the tensor-parallel sharded LM head and gather full logits.
+
+        Each device that owns a non-empty LM-head slice computes its portion of the
+        logits. The partial logits are gathered to the output device via the bulk
+        gather buffer, returning the complete (batch, seq, vocab) logits tensor.
+
+        Used by MTP speculative decoding where full logits are needed for greedy
+        sampling, unlike tp_dispatch_lm_head_argmax which only returns argmax.
+        """
+        ad = {}
+        for device in self.active_devices:
+            a, b, _ = self.plan[device]["lm_head"]
+            if b > a:
+                ad[device] = (a, b)
+
+        if len(ad) == 1 and self.tp_output_device in ad:
+            return self.tp_worker_dispatch_single(
+                self.tp_output_device,
+                mp_model_forward_lm_head_logits,
+                args + (None, None)
+            )
+
+        gd = sorted(set(ad.keys()) | {self.tp_output_device})
+        ldims = [ad[d][1] - ad[d][0] if d in ad else 0 for d in gd]
+
+        dispatched = []
+        for device in self.active_devices:
+            if device in gd:
+                self.tp_worker_dispatch(
+                    device,
+                    mp_model_forward_lm_head_logits,
+                    args + (gd, ldims)
+                )
+                dispatched.append(device)
+
+        results = []
+        for device in dispatched:
+            r = self.tp_worker_result(device)
+            if r is not None:
+                results.append((device, r))
+
+        assert len(results) == 1 and results[0][0] == self.tp_output_device, \
+            "TP logic error"
+
+        return results[0][1]
+
+
     # def tp_dispatch_lm_head_argmax_old(self, args):
     #     ad = []
     #     for device in self.active_devices:
