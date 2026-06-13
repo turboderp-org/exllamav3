@@ -315,7 +315,7 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                 f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
                 "(OoM)   "
             )
-            proxy_err_label = "proxy_err" if not quant_args["q_fallback"] else "rmse"
+            proxy_err_label = "proxy_err" if not quant_args["q_fallback"] else "rmse     "
             print(
                 f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
                 f"  bpw: {quant_args['K']:5.2f}"
