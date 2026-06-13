@@ -176,6 +176,7 @@ class Qwen3_5MTPModel(Model):
         # Cross-references populated by attach_to()
         self.target_embed = None
         self.target_lm_head = None
+        self.attached_model = None
 
 
     @override
@@ -198,6 +199,7 @@ class Qwen3_5MTPModel(Model):
         DeepSeek/GLM-style MTP heads, which consume a pre-norm residual stream.
         """
         self.input_layer.attached_model = weakref.ref(target)
+        self.attached_model = weakref.ref(target)
 
         # Find the target's embedding (first module of class Embedding)
         target_embed = None
@@ -225,6 +227,23 @@ class Qwen3_5MTPModel(Model):
 
     def default_load_params(self, max_chunk_size):
         return {}
+
+
+    def sample_from_state(
+        self,
+        state: torch.Tensor,
+        params: dict
+    ) -> torch.Tensor:
+        if not self.attached_model().loaded_tp:
+            ll = self.attached_model().logit_layer_idx
+            lm = self.attached_model().modules[ll]
+            logits = lm.prepare_for_device(state, params)
+            logits = lm.forward(logits, params)
+            return torch.argmax(logits, dim = -1)
+        else:
+            state = self.attached_model().tp_producer.send(state)
+            argmax = self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
+            return argmax
 
 
 class Qwen3_5MoeMTPModel(Qwen3_5MTPModel):
