@@ -522,10 +522,14 @@ class Generator:
                 "cache_seqlens": cache_seqlens,
             }
             batch_state = self.draft_model.forward(batch_ids, params)
-            lm_head = self.model.modules[self.model.logit_layer_idx]
-            batch_state = lm_head.prepare_for_device(batch_state, params)
-            batch_logits = lm_head.forward(batch_state, params)
-            new_ids = torch.argmax(batch_logits, dim = -1)
+            if self.model.loaded_tp:
+                shared_state = self.model.tp_producer.send(batch_state)
+                new_ids = self.model.tp_dispatch_lm_head_argmax((shared_state, {}))
+            else:
+                lm_head = self.model.modules[self.model.logit_layer_idx]
+                batch_state = lm_head.prepare_for_device(batch_state, params)
+                batch_logits = lm_head.forward(batch_state, params)
+                new_ids = torch.argmax(batch_logits, dim = -1)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
             cache_seqlens += 1
