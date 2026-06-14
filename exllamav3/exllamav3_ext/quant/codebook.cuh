@@ -103,6 +103,17 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
     }
 }
 
+__device__ inline half2 decode_mcg_product_2(uint32_t x0, uint32_t x1)
+{
+    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
+    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+    half2_uint32 xu0(x0);
+    half2_uint32 xu1(x1);
+    half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
+    half2 d1 = __highs2half2(xu0.as_half2, xu1.as_half2);
+    return __hadd2(d0, d1);
+}
+
 template <int cb>
 __device__ inline float decode_3inst_f(uint64_t x)
 {

@@ -58,7 +58,20 @@ void quantize_tiles_kernel
         {
             const half2 w2 = __half2half2(sh_input_tile[ri]);
             int in_edge_idx = out_edge_idx >> K;
-            half2 dh2 = __hsub2(decode_3inst_2<cb>(out_edge_idx, out_edge_idx + 1), w2);
+            uint32_t product0 = 0;
+            uint32_t product1 = 0;
+            half2 decoded2;
+            if constexpr (cb == 1)
+            {
+                product0 = mul_const_u32<0xCBAC1FEDu>(out_edge_idx);
+                product1 = product0 + 0xCBAC1FEDu;
+                decoded2 = decode_mcg_product_2(product0, product1);
+            }
+            else
+            {
+                decoded2 = decode_3inst_2<cb>(out_edge_idx, out_edge_idx + 1);
+            }
+            half2 dh2 = __hsub2(decoded2, w2);
             half2 min_err2 = __hmul2(dh2, dh2);
             if (pre_state >= 0 && in_edge_idx != pre_state) min_err2 = __half2half2(H_INF);
             int min_in_edge0 = in_edge_idx;
@@ -69,7 +82,19 @@ void quantize_tiles_kernel
             {
                 const int state0 = (k << Kr) | out_edge_idx;
                 in_edge_idx = state0 >> K;
-                dh2 = __hsub2(decode_3inst_2<cb>(state0, state0 + 1), w2);
+                if constexpr (cb == 1)
+                {
+                    // MCG multiplication is linear modulo 2^32 across successive branch states.
+                    constexpr uint32_t product_step = 0xCBAC1FEDu << Kr;
+                    product0 += product_step;
+                    product1 += product_step;
+                    decoded2 = decode_mcg_product_2(product0, product1);
+                }
+                else
+                {
+                    decoded2 = decode_3inst_2<cb>(state0, state0 + 1);
+                }
+                dh2 = __hsub2(decoded2, w2);
                 half2 err2 = __hmul2(dh2, dh2);
                 if (pre_state >= 0 && in_edge_idx != pre_state) err2 = __half2half2(H_INF);
                 if (__hlt(__low2half(err2), __low2half(min_err2)))
@@ -101,7 +126,20 @@ void quantize_tiles_kernel
             {
                 const half2 w2 = __half2half2(sh_input_tile[ri]);
                 int in_edge_idx = out_edge_idx >> K;
-                half2 dh2 = __hsub2(decode_3inst_2<cb>(out_edge_idx, out_edge_idx + 1), w2);
+                uint32_t product0 = 0;
+                uint32_t product1 = 0;
+                half2 decoded2;
+                if constexpr (cb == 1)
+                {
+                    product0 = mul_const_u32<0xCBAC1FEDu>(out_edge_idx);
+                    product1 = product0 + 0xCBAC1FEDu;
+                    decoded2 = decode_mcg_product_2(product0, product1);
+                }
+                else
+                {
+                    decoded2 = decode_3inst_2<cb>(out_edge_idx, out_edge_idx + 1);
+                }
+                half2 dh2 = __hsub2(decoded2, w2);
                 half2 min_err2 = __hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
                 int min_in_edge0 = in_edge_idx;
                 int min_in_edge1 = in_edge_idx;
@@ -111,7 +149,19 @@ void quantize_tiles_kernel
                 {
                     const int state0 = (k << Kr) | out_edge_idx;
                     in_edge_idx = state0 >> K;
-                    dh2 = __hsub2(decode_3inst_2<cb>(state0, state0 + 1), w2);
+                    if constexpr (cb == 1)
+                    {
+                        // MCG multiplication is linear modulo 2^32 across successive branch states.
+                        constexpr uint32_t product_step = 0xCBAC1FEDu << Kr;
+                        product0 += product_step;
+                        product1 += product_step;
+                        decoded2 = decode_mcg_product_2(product0, product1);
+                    }
+                    else
+                    {
+                        decoded2 = decode_3inst_2<cb>(state0, state0 + 1);
+                    }
+                    dh2 = __hsub2(decoded2, w2);
                     half2 err2 = __hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
                     if (__hlt(__low2half(err2), __low2half(min_err2)))
                     {
