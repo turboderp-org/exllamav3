@@ -46,8 +46,7 @@ def compile_model(args, model, config, tokenizer, mtp_model = None):
     if mtp_model:
         modules = modules + mtp_model.modules
     for module in modules:
-        prefix = module.key
-        sizes = qtensors_stc.get_tensor_sizes(prefix)
+        sizes = module.get_compile_sizes(qtensors_stc)
         if len(sizes) == 0:
             continue
         size = sum(sizes)
@@ -87,8 +86,7 @@ def compile_model(args, model, config, tokenizer, mtp_model = None):
         file_dict = {}
         for m in modules:
             if isinstance(m, Module):
-                prefix = m.key
-                tensors = qtensors_stc.get_tensors(prefix, allow_bf16 = True)
+                tensors = m.get_compile_tensors(qtensors_stc)
                 tensors = {k: v.contiguous() for k, v in tensors.items()}
                 qtensors_stc.close()
             elif isinstance(m, str):

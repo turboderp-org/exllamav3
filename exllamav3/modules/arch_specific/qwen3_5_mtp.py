@@ -34,6 +34,9 @@ class Qwen3_5MTPInputLayer(Module):
         self.hidden_size = hidden_size
         self.out_dtype = out_dtype
         self.native_draft_len = native_draft_len
+        self.key_pre_fc_norm_hidden = key_pre_fc_norm_hidden
+        self.key_pre_fc_norm_embedding = key_pre_fc_norm_embedding
+        self.key_fc = key_fc
 
         # Pre-fc norms applied to incoming hidden state and embeddings before they get concatenated
         self.pre_fc_norm_hidden = RMSNorm(
@@ -108,3 +111,18 @@ class Qwen3_5MTPInputLayer(Module):
         x = torch.cat((x.to(y.device), y), dim = -1)
         x = self.fc.forward(x, params)
         return to2(x, out_dtype, self.out_dtype)
+
+
+    def get_compile_sizes(self, stc):
+        return (
+            stc.get_tensor_sizes(self.key_pre_fc_norm_hidden) +
+            stc.get_tensor_sizes(self.key_pre_fc_norm_embedding) +
+            stc.get_tensor_sizes(self.key_fc)
+        )
+
+    def get_compile_tensors(self, stc):
+        r = {}
+        r.update(stc.get_tensors(self.key_pre_fc_norm_hidden, allow_bf16 = True))
+        r.update(stc.get_tensors(self.key_pre_fc_norm_embedding, allow_bf16 = True))
+        r.update(stc.get_tensors(self.key_fc, allow_bf16 = True))
+        return r

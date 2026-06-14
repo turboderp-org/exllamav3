@@ -145,3 +145,9 @@ class Module(ABC):
     @abstractmethod
     def optimizer_targets(self):
         pass
+
+    def get_compile_sizes(self, stc):
+        return stc.get_tensor_sizes(self.key)
+
+    def get_compile_tensors(self, stc):
+        return stc.get_tensors(self.key, allow_bf16 = True)
