@@ -329,6 +329,7 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
 
 def quantize_linears_parallel(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state):
     assert not args["image_dump"], "Parallel mode is incompatible with --image_dump"
+    global curr_progress, max_progress
 
     # Split workload
     all_dev_linears = [[] for _ in devices]
@@ -385,7 +386,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                 f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
                 "(OoM)   "
             )
-            proxy_err_label_local = "proxy_err" if not quant_args_local["q_fallback"] else "rmse"
+            proxy_err_label_local = "proxy_err" if not quant_args_local["q_fallback"] else "rmse     "
             print(
                 f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
                 f"  bpw: {quant_args_local['K']:5.2f}"
