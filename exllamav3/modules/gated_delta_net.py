@@ -319,12 +319,7 @@ class GatedDeltaNet(Module):
             self.qkv_proj = None
             self.z_proj = None
             self.register_submodule(self.qkvz_proj)
-        else:
-            self.qkvz_proj = None
-            self.qkv_proj = None
-            self.z_proj = None
-
-        if qkv_proj:
+        elif qkv_proj:
             self.qkv_proj = qkv_proj
             self.z_proj = z_proj
             self.qkvz_proj = None
@@ -365,12 +360,7 @@ class GatedDeltaNet(Module):
             self.b_proj = None
             self.a_proj = None
             self.register_submodule(self.ba_proj)
-        else:
-            self.b_proj = None
-            self.a_proj = None
-            self.ba_proj = None
-
-        if b_proj:
+        elif b_proj:
             self.b_proj = b_proj
             self.a_proj = a_proj
             self.ba_proj = None
