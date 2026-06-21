@@ -121,7 +121,7 @@ void pg_gather_kernel
                 {
                     size_t row = copy_t / ldim;
                     size_t col = copy_t % ldim;
-                    size_t out_t = row * stride + col;
+                    size_t out_t = row * stride + col + dst_offset;
                     *((uint4*) (out_data_ptr + out_t)) = src[t];
                 }
             }
