@@ -597,7 +597,7 @@ class Generator:
 
     def iterate_ngram_gen(self, results: list):
 
-         # Get shape of active batch
+        # Get shape of active batch
         batch_size = 0
         max_seq_len = 0
         for job in self.active_jobs:
@@ -611,6 +611,7 @@ class Generator:
         draft_ids = []
         min_len = self.num_draft_tokens
         for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
             d = job.get_ngram_draft(self.num_draft_tokens)
             min_len = min(min_len, d.shape[-1])
             draft_ids.append(d)
