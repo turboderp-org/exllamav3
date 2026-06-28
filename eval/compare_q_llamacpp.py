@@ -3,7 +3,7 @@ try:
     import gguf
     from gguf import GGUFReader
     from llama_cpp import Llama
-except:
+except ModuleNotFoundError:
     pass
 import torch
 from functools import lru_cache
