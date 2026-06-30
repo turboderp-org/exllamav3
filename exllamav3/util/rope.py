@@ -198,12 +198,41 @@ class RoPE:
         base = rs.rope_theta
         dim = rs.rotary_dim or int(rs.head_dim * rs.partial_rotary_factor)
         original_max_position_embeddings = rs.rope_scaling.get("original_max_position_embeddings")
-        if original_max_position_embeddings is not None:
+        has_original_max_position_embeddings = original_max_position_embeddings is not None
+        if not has_original_max_position_embeddings:
+            original_max_position_embeddings = max_position_embeddings
+
+        try:
+            original_max_position_embeddings_int = int(original_max_position_embeddings)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                "YaRN original_max_position_embeddings must be an integer, "
+                f"got {original_max_position_embeddings!r}"
+            ) from None
+        if original_max_position_embeddings != original_max_position_embeddings_int:
+            raise ValueError(
+                "YaRN original_max_position_embeddings must be an integer, "
+                f"got {original_max_position_embeddings!r}"
+            )
+        original_max_position_embeddings = original_max_position_embeddings_int
+
+        if has_original_max_position_embeddings:
             factor = max_position_embeddings / original_max_position_embeddings
         else:
             factor = rs.rope_scaling.get("factor")
-            original_max_position_embeddings = max_position_embeddings
-        attn_factor = rs.rope_scaling.get("attention_factor", 0.1 * math.log(factor) + 1.0)
+
+        attn_factor = rs.rope_scaling.get("attention_factor")
+        if attn_factor is None:
+            def get_mscale(scale, mscale = 1.0):
+                if scale <= 1:
+                    return 1.0
+                return 0.1 * mscale * math.log(scale) + 1.0
+            mscale = rs.rope_scaling.get("mscale")
+            mscale_all_dim = rs.rope_scaling.get("mscale_all_dim")
+            if mscale and mscale_all_dim:
+                attn_factor = get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)
+            else:
+                attn_factor = get_mscale(factor)
         beta_fast = rs.rope_scaling.get("beta_fast", 32)
         beta_slow = rs.rope_scaling.get("beta_slow", 1)
         self.llama_4_scaling_beta = rs.rope_scaling.get("llama_4_scaling_beta", 0.0)
