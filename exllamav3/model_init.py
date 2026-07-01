@@ -169,10 +169,13 @@ def init(
 
     return_draft = "draft_model_dir" in args
     draft_model_dir = args.draft_model_dir if return_draft else None
-    assert not (args.mtp and draft_model_dir), "Cannot specify both --mtp and --draft_model_dir"
-    if args.mtp:
-        args.draft_model_dir = draft_model_dir = args.model_dir
-    use_mtp = draft_model_dir and Path(args.model_dir).resolve() == Path(draft_model_dir).resolve()
+    if "mtp" in args:
+        assert not (args.mtp and draft_model_dir), "Cannot specify both --mtp and --draft_model_dir"
+        if args.mtp:
+            args.draft_model_dir = draft_model_dir = args.model_dir
+        use_mtp = draft_model_dir and Path(args.model_dir).resolve() == Path(draft_model_dir).resolve()
+    else:
+        use_mtp = False
 
     # Config
     config = Config.from_directory(args.model_dir, layer_map = args.layer_map)
