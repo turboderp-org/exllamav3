@@ -1,7 +1,9 @@
 from typing_extensions import override
 from .llama import LlamaConfig, LlamaModel
+from .mimo_mtp import MiMoMTPModel
 
-# Identical to Llama except for MTP layers, ignored for now
+# Llama with an MTP layer, loadable as a separate draft model for
+# self-speculative decoding (component = "mtp")
 
 class MiMoConfig(LlamaConfig):
     arch_string = "MiMoForCausalLM"
@@ -13,9 +15,14 @@ class MiMoConfig(LlamaConfig):
     ):
         super().__init__(
             directory,
-            derived_model = {"text": MiMoModel},
+            derived_model = {"text": MiMoModel, "mtp": MiMoMTPModel},
             **kwargs
         )
+
+        # MTP (multi-token prediction) head — informational; head loaded as separate draft model
+        self.num_nextn_predict_layers = self.read_cfg(int, "num_nextn_predict_layers", 0)
+        if self.num_nextn_predict_layers == 0:
+            del self.model_classes["mtp"]
 
 
 class MiMoModel(LlamaModel):
