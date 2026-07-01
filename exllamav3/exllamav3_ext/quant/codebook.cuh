@@ -1,7 +1,8 @@
 #pragma once
 
-// Force integer MAD on sm<=86. For some reason this performs better than letting the compiler emit IMUL
-// TODO: Keep an eye on new behavior in future versions of nvcc. While this is faster on RTX 3090, it really shouldn't be.
+// This used to force integer MAD on sm_86 via inline asm, which outperformed the IMUL emitted by older
+// nvcc versions on the RTX 3090. As of CUDA 13.2 the workaround has inverted: the plain multiply is ~4%
+// faster end-to-end at m=1. Kept as a hook in case it regresses again.
 template <uint32_t w>
 __device__ __forceinline__
 uint32_t mul_const_u32(uint32_t x)
@@ -35,8 +36,8 @@ __device__ inline half decode_3inst(uint32_t x)
     }
     if constexpr (cb == 1)
     {
-//        x *= 0xCBAC1FEDu;
-        x = mul_const_u32<0xCBAC1FEDu>(x);
+        x *= 0xCBAC1FEDu;
+        // x = mul_const_u32<0xCBAC1FEDu>(x);
 
         asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
         half2_uint32 xu(x);
