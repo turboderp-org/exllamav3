@@ -29,7 +29,7 @@ def quantize_linears_single(bitrate, device, linears, config):
         else:
             quant_args = {
                 "seed": 0,
-                "mcg": True,
+                "mul1": True,
                 "K": bitrate,
                 "devices": [device],
                 "device_ratios": None,
