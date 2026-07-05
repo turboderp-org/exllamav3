@@ -1,0 +1,1812 @@
+#include <cuda_fp16.h>
+#include "exl3_gemv_int8.cuh"
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
+#include "../util.h"
+#include "../util.cuh"
+#include "../ptx.cuh"
+#include "exl3_dq.cuh"
+#include "exl3_devctx.cuh"
+#include "hadamard_inner.cuh"
+#include <cooperative_groups.h>
+#include <cstdlib>
+#include <set>
+#include <map>
+
+namespace cg_gemv = cooperative_groups;
+
+// Fused int8-activation GEMV for mul1 (cb 2) tensors, single cooperative launch.
+//
+// The mul1 codebook value is affine in the byte sum of x * 0x83DCD12D, so with activations quantized
+// to int8, dp4a(x * M, splat(a_int8), acc) evaluates codebook(x) * a in a single instruction with
+// exact int32 accumulation, and
+//
+//   y[n] = k_inv * (q * acc1[n] + q2 * acc2[n]) + (1024 * k_inv + k_bias) * (q * sum1 + q2 * sum2)
+//
+// recovers the result. In residual mode (EXL3_INT8_GEMV=1) the int8 rounding error r = a - q*i, which
+// has range +/-q/2 by construction, is quantized with the fixed scale q2 = q/254 and accumulated by a
+// second dp4a sharing the decoded products, for ~15-16 bit effective activation precision (KL at
+// parity with the fp16 kernel or better). EXL3_INT8_GEMV=2 is the plain int8 mode.
+//
+// One cooperative launch with the same argument list as exl3_gemm_kernel; `locks` doubles as
+// workspace: [2*size_n int32 accumulators][{float q, int s1, int s2, pad} per row][partial max per
+// block]. Phases (persistent 256-thread blocks):
+//   1a. input Hadamard A -> A_had (as in exl3_gemm_kernel) + accumulator zeroing; for m == 1 also a
+//       per-block partial max of the transformed activations
+//   1b. (m > 1 only) per-row scale and exact int sums
+//   per row:
+//     2. GEMV over (256-column x k-slice) units; activation splats are quantized INLINE while
+//        staging to shared memory (for m == 1, every block re-derives q from the phase-1a partial
+//        maxes - fmax is order-independent so this is deterministic - and block 0 computes the exact
+//        epilogue sums concurrently); grid.sync
+//     3. epilogue: affine correction + output Hadamard + svh + accumulator reset, warp-striped
+//
+// K == 4 uses the wide unit: a warp owns an ADJACENT BLOCK PAIR; lane l's uint2 = words {2m, 2m+1} of
+// the contiguous 64-word region are exactly the primary words of runs t = 8*(2m), 8*(2m+1), which
+// scatter to the SAME two n values (accumulator count unchanged, splats merge into two uint4 loads,
+// single-stage butterfly, boundary word via one shuffle). 256 B contiguous per warp per block row
+// with two-row prefetch. Other K use a generic narrow unit (two blocks per warp, pointer-based
+// extraction). Natural register allocation (2-3 resident blocks/SM) measures faster than forcing
+// higher occupancy: with wide loads the per-warp ILP is worth more than the extra warps.
+
+#define NUM_THREADS 256
+
+// ---------------------------------------------------------------------------------------------------------
+// Extract 8 packed 16-bit trellis windows for positions t0..t0+7 as masked uint32s. Index math copied
+// from the corresponding paths in exl3_dq.cuh (dq8_aligned_*, dq8, dq4, dq2x2).
+
+__device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c)
+{
+    int d;
+    asm ("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+
+// i0/i2 land in [0, 2*words); a compare+subtract replaces the modulo (words is not a power of two for
+// odd bit widths)
+template <int bits>
+__device__ __forceinline__ int wrap_idx(int i)
+{
+    constexpr int words = bits * 256 / 32;
+    return i >= words ? i - words : i;
+}
+
+template <int bits>
+__device__ __forceinline__ void ext4w(const uint32_t* ptr, int t0, uint32_t& w0, uint32_t& w1, uint32_t& w2, uint32_t& w3)
+{
+    int b0 = (t0 + 257) * bits - 16;
+    int b2 = b0 + 3 * bits + 16;
+    int i0 = b0 / 32;
+    int i2 = (b2 - 1) / 32;
+    int s2 = (i2 + 1) * 32 - b2;
+    uint32_t a = ptr[wrap_idx<bits>(i0)];
+    uint32_t b = ptr[wrap_idx<bits>(i2)];
+    w3 = fshift(b, a, s2) & 0xffff;
+    w2 = fshift(b, a, s2 + bits) & 0xffff;
+    w1 = fshift(b, a, s2 + bits * 2) & 0xffff;
+    w0 = fshift(b, a, s2 + bits * 3) & 0xffff;
+}
+
+template <int bits>
+__device__ __forceinline__ void ext2w(const uint32_t* ptr, int t0, uint32_t& w0, uint32_t& w1)
+{
+    int b0 = (t0 + 257) * bits - 16;
+    int b2 = b0 + bits + 16;
+    int i0 = b0 / 32;
+    int i2 = (b2 - 1) / 32;
+    int s2 = (i2 + 1) * 32 - b2;
+    uint32_t a = ptr[wrap_idx<bits>(i0)];
+    uint32_t b = ptr[wrap_idx<bits>(i2)];
+    w1 = fshift(b, a, s2) & 0xffff;
+    w0 = fshift(b, a, s2 + bits) & 0xffff;
+}
+
+template <int bits>
+__device__ __forceinline__ void ext8w
+(
+    const uint32_t* ptr, int t0,
+    uint32_t& w0, uint32_t& w1, uint32_t& w2, uint32_t& w3,
+    uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7
+)
+{
+    if constexpr (bits == 1)
+    {
+        uint32_t i1 = t0 >> 5;
+        uint32_t i0 = (i1 + 7) & 7;
+        uint32_t a = ptr[i0];
+        uint32_t b = ptr[i1];
+        b = fshift(b, a, ((~t0) & 24));
+        w7 = b & 0xffff;
+        BFE16_IMM(w6, b, 1);
+        BFE16_IMM(w5, b, 2);
+        BFE16_IMM(w4, b, 3);
+        BFE16_IMM(w3, b, 4);
+        BFE16_IMM(w2, b, 5);
+        BFE16_IMM(w1, b, 6);
+        BFE16_IMM(w0, b, 7);
+    }
+    else if constexpr (bits == 2)
+    {
+        uint32_t i1 = t0 >> 4;
+        uint32_t i0 = (i1 + 15) & 15;
+        uint32_t a = ptr[i0];
+        uint32_t b = ptr[i1];
+        b = fshift(b, a, ((~t0) & 8) << 1);
+        w7 = b & 0xffff;
+        BFE16_IMM(w6, b, 2);
+        BFE16_IMM(w5, b, 4);
+        BFE16_IMM(w4, b, 6);
+        BFE16_IMM(w3, b, 8);
+        BFE16_IMM(w2, b, 10);
+        BFE16_IMM(w1, b, 12);
+        BFE16_IMM(w0, b, 14);
+    }
+    else if constexpr (bits == 3)
+    {
+        int b1 = (t0 + 257) * bits;
+        int b0 = b1 - 16;
+        int b2 = b1 + bits * 7;
+        int i0 = b0 / 32;
+        int i2 = (b2 - 1) / 32;
+        int s2 = (i2 + 1) * 32 - b2;
+        uint32_t a = ptr[wrap_idx<bits>(i0)];
+        uint32_t b = ptr[wrap_idx<bits>(i2)];
+        w7 = fshift(b, a, s2);
+        w6 = w7 >> bits;
+        w5 = w6 >> bits;
+        w4 = w5 >> bits;
+        w3 = fshift(b, a, s2 + bits * 4);
+        w2 = w3 >> bits;
+        w1 = w2 >> bits;
+        w0 = w1 >> bits;
+        w7 &= 0xffff; w6 &= 0xffff; w5 &= 0xffff; w4 &= 0xffff;
+        w3 &= 0xffff; w2 &= 0xffff; w1 &= 0xffff; w0 &= 0xffff;
+    }
+    else if constexpr (bits == 4)
+    {
+        uint32_t i1 = t0 >> 3;
+        uint32_t i0 = (i1 + 31) & 31;
+        uint32_t a = ptr[i0];
+        uint32_t b = ptr[i1];
+        uint32_t s;
+        FSHF_IMM(s, b, a, 20);
+        w7 = b & 0xffff;
+        BFE16_IMM(w6, b, 4);
+        BFE16_IMM(w5, b, 8);
+        BFE16_IMM(w4, b, 12);
+        BFE16_IMM(w3, b, 16);
+        w2 = s & 0xffff;
+        BFE16_IMM(w1, s, 4);
+        BFE16_IMM(w0, s, 8);
+    }
+    else if constexpr (bits == 7)
+    {
+        ext2w<bits>(ptr, t0,     w0, w1);
+        ext2w<bits>(ptr, t0 + 2, w2, w3);
+        ext2w<bits>(ptr, t0 + 4, w4, w5);
+        ext2w<bits>(ptr, t0 + 6, w6, w7);
+    }
+    else  // 5, 6, 8
+    {
+        ext4w<bits>(ptr, t0,     w0, w1, w2, w3);
+        ext4w<bits>(ptr, t0 + 4, w4, w5, w6, w7);
+    }
+}
+
+// 4bpw extraction from two already-loaded words (same window order)
+__device__ __forceinline__ void extract8_4bits_words(uint32_t a, uint32_t b,
+    uint32_t& w0, uint32_t& w1, uint32_t& w2, uint32_t& w3,
+    uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7)
+{
+    uint32_t s;
+    FSHF_IMM(s, b, a, 20);
+    w7 = b & 0xffff;
+    BFE16_IMM(w6, b, 4);
+    BFE16_IMM(w5, b, 8);
+    BFE16_IMM(w4, b, 12);
+    BFE16_IMM(w3, b, 16);
+    w2 = s & 0xffff;
+    BFE16_IMM(w1, s, 4);
+    BFE16_IMM(w0, s, 8);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Device building blocks (also reusable from batched mgemm/MoE-style kernels)
+
+// Quantize one k-slice of the (Hadamard-transformed) activation row into int8 byte-splats in shared
+// memory, plus optional error-feedback residual splats
+template <bool residual>
+__device__ __forceinline__ void gemv_int8_stage_splats
+(
+    const half* __restrict__ A_had_row,
+    float q,
+    uint32_t* __restrict__ sh_as,
+    uint32_t* __restrict__ sh_as2,
+    int kb0,
+    int nrows
+)
+{
+    __syncthreads();
+    float rq = 1.0f / q;
+    float rq2 = rq * 254.0f;
+    for (int i = threadIdx.x; i < nrows * 16; i += NUM_THREADS)
+    {
+        float a = __half2float(A_had_row[(kb0 << 4) + i]);
+        int v = __float2int_rn(a * rq);
+        v = max(-127, min(127, v));
+        sh_as[i] = ((uint32_t)(uint8_t)(int8_t) v) * 0x01010101u;
+        if constexpr (residual)
+        {
+            float r = a - q * (float) v;
+            int v2 = __float2int_rn(r * rq2);
+            v2 = max(-127, min(127, v2));
+            sh_as2[i] = ((uint32_t)(uint8_t)(int8_t) v2) * 0x01010101u;
+        }
+    }
+    __syncthreads();
+}
+
+// Block-wide: exact int8(+residual) sums of one activation row, writes {q, s1, s2} to qsums_row
+template <bool residual>
+__device__ __forceinline__ void gemv_int8_row_sums
+(
+    const half* __restrict__ Ar,
+    float q,
+    int size_k,
+    float* __restrict__ qsums_row
+)
+{
+    __shared__ int sh_s1[32];
+    __shared__ int sh_s2[32];
+    int t = threadIdx.x;
+    float rq = 1.0f / q;
+    float rq2 = rq * 254.0f;
+    int s1 = 0, s2 = 0;
+    for (int i = t; i < size_k; i += NUM_THREADS)
+    {
+        float a = __half2float(Ar[i]);
+        int v = __float2int_rn(a * rq);
+        v = max(-127, min(127, v));
+        s1 += v;
+        if constexpr (residual)
+        {
+            float r = a - q * (float) v;
+            int v2 = __float2int_rn(r * rq2);
+            s2 += max(-127, min(127, v2));
+        }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        s1 += __shfl_xor_sync(0xffffffff, s1, o);
+        s2 += __shfl_xor_sync(0xffffffff, s2, o);
+    }
+    if ((t & 31) == 0) { sh_s1[t >> 5] = s1; sh_s2[t >> 5] = s2; }
+    __syncthreads();
+    if (t < 32)
+    {
+        int v1 = t < (NUM_THREADS >> 5) ? sh_s1[t] : 0;
+        int v2 = t < (NUM_THREADS >> 5) ? sh_s2[t] : 0;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            v1 += __shfl_xor_sync(0xffffffff, v1, o);
+            v2 += __shfl_xor_sync(0xffffffff, v2, o);
+        }
+        if (t == 0)
+        {
+            qsums_row[0] = q;
+            ((int*) qsums_row)[1] = v1;
+            ((int*) qsums_row)[2] = v2;
+        }
+    }
+    __syncthreads();
+}
+
+// Wide unit (4 bpw): one (256-column x k-slice) unit, warp per adjacent block pair, uint2 loads
+template <bool residual, bool atomic = true>
+__device__ __forceinline__ void gemv_int8_unit_wide
+(
+    const uint16_t* __restrict__ B,
+    int* __restrict__ accs,
+    const uint32_t* __restrict__ sh_as,
+    const uint32_t* __restrict__ sh_as2,
+    int nb256,
+    int kb0,
+    int nrows,
+    int size_n
+)
+{
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int nbp = nb256 * 8 + warp;
+    const int row_stride = size_n * 2;                              // u32 per block row at 4 bpw
+    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * 64 + 2 * lane;
+    int c2 = (lane & 1) ? 4 : 0;
+    int shfl_src = (lane & 16) | ((lane + 15) & 15);
+
+    int iacc0 = 0, iacc1 = 0, jacc0 = 0, jacc1 = 0;
+    uint2 r0 = *(const uint2*) bp;
+    uint2 r1 = {};
+    if (nrows > 1) r1 = *(const uint2*) (bp + row_stride);
+
+    for (int kb = 0; kb < nrows; ++kb)
+    {
+        uint2 r2 = {};
+        if (kb + 2 < nrows) r2 = *(const uint2*) (bp + (size_t) (kb + 2) * row_stride);
+        uint32_t prev = __shfl_sync(0xffffffff, r0.y, shfl_src);
+
+        const uint32_t* as = sh_as + (kb << 4);
+        uint4 as0 = *(const uint4*) (as + c2);
+        uint4 as8 = *(const uint4*) (as + c2 + 8);
+
+        uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+
+        // Run t = 8*(2m)
+        extract8_4bits_words(prev, r0.x, w0, w1, w2, w3, w4, w5, w6, w7);
+        w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
+        w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
+        iacc0 = dp4a_us(w0, as0.x, iacc0);
+        iacc0 = dp4a_us(w1, as0.y, iacc0);
+        iacc0 = dp4a_us(w2, as8.x, iacc0);
+        iacc0 = dp4a_us(w3, as8.y, iacc0);
+        iacc1 = dp4a_us(w4, as0.x, iacc1);
+        iacc1 = dp4a_us(w5, as0.y, iacc1);
+        iacc1 = dp4a_us(w6, as8.x, iacc1);
+        iacc1 = dp4a_us(w7, as8.y, iacc1);
+        if constexpr (residual)
+        {
+            const uint32_t* as2 = sh_as2 + (kb << 4);
+            uint4 bs0 = *(const uint4*) (as2 + c2);
+            uint4 bs8 = *(const uint4*) (as2 + c2 + 8);
+            jacc0 = dp4a_us(w0, bs0.x, jacc0);
+            jacc0 = dp4a_us(w1, bs0.y, jacc0);
+            jacc0 = dp4a_us(w2, bs8.x, jacc0);
+            jacc0 = dp4a_us(w3, bs8.y, jacc0);
+            jacc1 = dp4a_us(w4, bs0.x, jacc1);
+            jacc1 = dp4a_us(w5, bs0.y, jacc1);
+            jacc1 = dp4a_us(w6, bs8.x, jacc1);
+            jacc1 = dp4a_us(w7, bs8.y, jacc1);
+
+            // Run t = 8*(2m+1)
+            extract8_4bits_words(r0.x, r0.y, w0, w1, w2, w3, w4, w5, w6, w7);
+            w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
+            w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
+            iacc0 = dp4a_us(w0, as0.z, iacc0);
+            iacc0 = dp4a_us(w1, as0.w, iacc0);
+            iacc0 = dp4a_us(w2, as8.z, iacc0);
+            iacc0 = dp4a_us(w3, as8.w, iacc0);
+            iacc1 = dp4a_us(w4, as0.z, iacc1);
+            iacc1 = dp4a_us(w5, as0.w, iacc1);
+            iacc1 = dp4a_us(w6, as8.z, iacc1);
+            iacc1 = dp4a_us(w7, as8.w, iacc1);
+            jacc0 = dp4a_us(w0, bs0.z, jacc0);
+            jacc0 = dp4a_us(w1, bs0.w, jacc0);
+            jacc0 = dp4a_us(w2, bs8.z, jacc0);
+            jacc0 = dp4a_us(w3, bs8.w, jacc0);
+            jacc1 = dp4a_us(w4, bs0.z, jacc1);
+            jacc1 = dp4a_us(w5, bs0.w, jacc1);
+            jacc1 = dp4a_us(w6, bs8.z, jacc1);
+            jacc1 = dp4a_us(w7, bs8.w, jacc1);
+        }
+        else
+        {
+            // Run t = 8*(2m+1)
+            extract8_4bits_words(r0.x, r0.y, w0, w1, w2, w3, w4, w5, w6, w7);
+            w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
+            w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
+            iacc0 = dp4a_us(w0, as0.z, iacc0);
+            iacc0 = dp4a_us(w1, as0.w, iacc0);
+            iacc0 = dp4a_us(w2, as8.z, iacc0);
+            iacc0 = dp4a_us(w3, as8.w, iacc0);
+            iacc1 = dp4a_us(w4, as0.z, iacc1);
+            iacc1 = dp4a_us(w5, as0.w, iacc1);
+            iacc1 = dp4a_us(w6, as8.z, iacc1);
+            iacc1 = dp4a_us(w7, as8.w, iacc1);
+        }
+
+        r0 = r1;
+        r1 = r2;
+    }
+
+    // Lanes l, l^1 share both n values
+    iacc0 += __shfl_xor_sync(0xffffffff, iacc0, 1);
+    iacc1 += __shfl_xor_sync(0xffffffff, iacc1, 1);
+    if constexpr (residual)
+    {
+        jacc0 += __shfl_xor_sync(0xffffffff, jacc0, 1);
+        jacc1 += __shfl_xor_sync(0xffffffff, jacc1, 1);
+    }
+    if (!(lane & 1))
+    {
+        int nb = nbp * 2 + (lane >> 4);
+        int n0 = nb * 16 + ((lane & 15) >> 1);
+        if constexpr (atomic)
+        {
+            atomicAdd(accs + n0, iacc0);
+            atomicAdd(accs + n0 + 8, iacc1);
+            if constexpr (residual)
+            {
+                atomicAdd(accs + size_n + n0, jacc0);
+                atomicAdd(accs + size_n + n0 + 8, jacc1);
+            }
+        }
+        else
+        {
+            accs[n0] = iacc0;
+            accs[n0 + 8] = iacc1;
+            if constexpr (residual)
+            {
+                accs[size_n + n0] = jacc0;
+                accs[size_n + n0 + 8] = jacc1;
+            }
+        }
+    }
+}
+
+// One k-row of an adjacent block pair, generic K: extract + dp4a for both blocks from block pointers
+// (global or shared memory)
+template <int bits, bool residual>
+__device__ __forceinline__ void gemv_int8_pair_row
+(
+    const uint32_t* blockA, const uint32_t* blockB,
+    const uint32_t* as, const uint32_t* as2, int c2, int t0,
+    int& ia0, int& ia1, int& ib0, int& ib1,
+    int& ja0, int& ja1, int& jb0, int& jb1
+)
+{
+    uint2 as01 = *(const uint2*) (as + c2);
+    uint2 as89 = *(const uint2*) (as + c2 + 8);
+    uint2 bs01, bs89;
+    if constexpr (residual)
+    {
+        bs01 = *(const uint2*) (as2 + c2);
+        bs89 = *(const uint2*) (as2 + c2 + 8);
+    }
+
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    ext8w<bits>(blockA, t0, w0, w1, w2, w3, w4, w5, w6, w7);
+    w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
+    w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
+    ia0 = dp4a_us(w0, as01.x, ia0);
+    ia0 = dp4a_us(w1, as01.y, ia0);
+    ia0 = dp4a_us(w2, as89.x, ia0);
+    ia0 = dp4a_us(w3, as89.y, ia0);
+    ia1 = dp4a_us(w4, as01.x, ia1);
+    ia1 = dp4a_us(w5, as01.y, ia1);
+    ia1 = dp4a_us(w6, as89.x, ia1);
+    ia1 = dp4a_us(w7, as89.y, ia1);
+    if constexpr (residual)
+    {
+        ja0 = dp4a_us(w0, bs01.x, ja0);
+        ja0 = dp4a_us(w1, bs01.y, ja0);
+        ja0 = dp4a_us(w2, bs89.x, ja0);
+        ja0 = dp4a_us(w3, bs89.y, ja0);
+        ja1 = dp4a_us(w4, bs01.x, ja1);
+        ja1 = dp4a_us(w5, bs01.y, ja1);
+        ja1 = dp4a_us(w6, bs89.x, ja1);
+        ja1 = dp4a_us(w7, bs89.y, ja1);
+    }
+
+    ext8w<bits>(blockB, t0, w0, w1, w2, w3, w4, w5, w6, w7);
+    w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
+    w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
+    ib0 = dp4a_us(w0, as01.x, ib0);
+    ib0 = dp4a_us(w1, as01.y, ib0);
+    ib0 = dp4a_us(w2, as89.x, ib0);
+    ib0 = dp4a_us(w3, as89.y, ib0);
+    ib1 = dp4a_us(w4, as01.x, ib1);
+    ib1 = dp4a_us(w5, as01.y, ib1);
+    ib1 = dp4a_us(w6, as89.x, ib1);
+    ib1 = dp4a_us(w7, as89.y, ib1);
+    if constexpr (residual)
+    {
+        jb0 = dp4a_us(w0, bs01.x, jb0);
+        jb0 = dp4a_us(w1, bs01.y, jb0);
+        jb0 = dp4a_us(w2, bs89.x, jb0);
+        jb0 = dp4a_us(w3, bs89.y, jb0);
+        jb1 = dp4a_us(w4, bs01.x, jb1);
+        jb1 = dp4a_us(w5, bs01.y, jb1);
+        jb1 = dp4a_us(w6, bs89.x, jb1);
+        jb1 = dp4a_us(w7, bs89.y, jb1);
+    }
+}
+
+// Shared reduction tail for the pair-per-warp generic units (atomic, or exclusive plain stores for
+// the per-slice partials of the sq kernel): four lanes share each n
+template <bool residual, bool atomic = true>
+__device__ __forceinline__ void gemv_int8_pair_tail
+(
+    int* __restrict__ accs, int nbp, int lane, int size_n,
+    int ia0, int ia1, int ib0, int ib1,
+    int ja0, int ja1, int jb0, int jb1
+)
+{
+    #pragma unroll
+    for (int o = 1; o < 4; o <<= 1)
+    {
+        ia0 += __shfl_xor_sync(0xffffffff, ia0, o);
+        ia1 += __shfl_xor_sync(0xffffffff, ia1, o);
+        ib0 += __shfl_xor_sync(0xffffffff, ib0, o);
+        ib1 += __shfl_xor_sync(0xffffffff, ib1, o);
+        if constexpr (residual)
+        {
+            ja0 += __shfl_xor_sync(0xffffffff, ja0, o);
+            ja1 += __shfl_xor_sync(0xffffffff, ja1, o);
+            jb0 += __shfl_xor_sync(0xffffffff, jb0, o);
+            jb1 += __shfl_xor_sync(0xffffffff, jb1, o);
+        }
+    }
+    if ((lane & 3) == 0)
+    {
+        int nA = (nbp * 2) * 16 + (lane >> 2);
+        int nB = nA + 16;
+        if constexpr (atomic)
+        {
+            atomicAdd(accs + nA, ia0);
+            atomicAdd(accs + nA + 8, ia1);
+            atomicAdd(accs + nB, ib0);
+            atomicAdd(accs + nB + 8, ib1);
+            if constexpr (residual)
+            {
+                atomicAdd(accs + size_n + nA, ja0);
+                atomicAdd(accs + size_n + nA + 8, ja1);
+                atomicAdd(accs + size_n + nB, jb0);
+                atomicAdd(accs + size_n + nB + 8, jb1);
+            }
+        }
+        else
+        {
+            accs[nA] = ia0;
+            accs[nA + 8] = ia1;
+            accs[nB] = ib0;
+            accs[nB + 8] = ib1;
+            if constexpr (residual)
+            {
+                accs[size_n + nA] = ja0;
+                accs[size_n + nA + 8] = ja1;
+                accs[size_n + nB] = jb0;
+                accs[size_n + nB + 8] = jb1;
+            }
+        }
+    }
+}
+
+// Narrow generic unit (any K): one (256-column x k-slice) unit, warp per adjacent block pair
+// processed sequentially with pointer-based extraction straight from global memory
+template <int bits, bool residual, bool atomic = true>
+__device__ __forceinline__ void gemv_int8_unit_narrow
+(
+    const uint16_t* __restrict__ B,
+    int* __restrict__ accs,
+    const uint32_t* __restrict__ sh_as,
+    const uint32_t* __restrict__ sh_as2,
+    int nb256,
+    int kb0,
+    int nrows,
+    int size_n
+)
+{
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int nbp = nb256 * 8 + warp;
+    const int row_stride = size_n * bits / 2;
+    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * (bits * 16);
+    int c2 = 2 * (lane & 3);
+    int ia0 = 0, ia1 = 0, ib0 = 0, ib1 = 0;
+    int ja0 = 0, ja1 = 0, jb0 = 0, jb1 = 0;
+
+    for (int kb = 0; kb < nrows; ++kb)
+    {
+        const uint32_t* blockA = bp + (size_t) kb * row_stride;
+        gemv_int8_pair_row<bits, residual>(blockA, blockA + 8 * bits,
+            sh_as + (kb << 4), sh_as2 + (kb << 4), c2, lane << 3,
+            ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+    }
+    gemv_int8_pair_tail<residual, atomic>(accs, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+}
+
+#define GEMV_INT8_MAX_K 5   // fall back to the regular kernel above this (DRAM-bound regime)
+#define GEMV_STAGE_D 4      // cp.async pipeline depth (rows) for the smem-staged unit
+#define GEMV_STAGE_MAX_BYTES (8 * GEMV_STAGE_D * 16 * 8 * 4)   // 8 warps, K = 8
+
+// Per-slice-scale ("sq") m == 1 kernel parameters
+#define SQ_KSPLIT_CAP 64
+#define SQ_MINROWS 16       // minimum slice height (staging overhead amortization)
+#define SQ_ROWS_MAX 512     // shared memory cap
+#define SQ_COUNTERS_CAP 4096                                    // fixed counter region: size_n up to 1M
+#define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP)    // sq-private region at workspace start
+
+// Smem-staged generic unit: the warp stages its block pair's rows into a warp-private shared memory
+// slice with cp.async (coalesced 16 B chunks, one commit group per row, GEMV_STAGE_D rows deep) and
+// extracts from shared memory. Used for the K where scattered pointer extraction leaves the most
+// load latency exposed (3, 5, 7); warp-private slices need no block-level synchronization.
+template <int bits, bool residual, bool atomic = true>
+__device__ __forceinline__ void gemv_int8_unit_smem
+(
+    const uint16_t* __restrict__ B,
+    int* __restrict__ accs,
+    const uint32_t* __restrict__ sh_as,
+    const uint32_t* __restrict__ sh_as2,
+    uint32_t* __restrict__ sh_b,
+    int nb256,
+    int kb0,
+    int nrows,
+    int size_n
+)
+{
+    constexpr int D = GEMV_STAGE_D;
+    constexpr int pairwords = 16 * bits;
+    constexpr int chunks = pairwords / 4;      // 16 B cp.async chunks per pair row
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int nbp = nb256 * 8 + warp;
+    const int row_stride = size_n * bits / 2;
+    const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * pairwords;
+    uint32_t* sb = sh_b + warp * (D * pairwords);
+
+    auto stage_row = [&] (int kb)
+    {
+        if (kb < nrows && lane < chunks)
+            cp_async(sb + (kb % D) * pairwords + lane * 4, bp + (size_t) kb * row_stride + lane * 4);
+        cp_async_fence();
+    };
+    #pragma unroll
+    for (int r = 0; r < D - 1; ++r) stage_row(r);
+
+    int c2 = 2 * (lane & 3);
+    int ia0 = 0, ia1 = 0, ib0 = 0, ib1 = 0;
+    int ja0 = 0, ja1 = 0, jb0 = 0, jb1 = 0;
+
+    for (int kb = 0; kb < nrows; ++kb)
+    {
+        cp_async_wait<D - 2>();
+        // Also orders the previous iteration's smem reads (all lanes) before the overwrite below
+        __syncwarp();
+        stage_row(kb + D - 1);
+
+        const uint32_t* blockA = sb + (kb % D) * pairwords;
+        gemv_int8_pair_row<bits, residual>(blockA, blockA + 8 * bits,
+            sh_as + (kb << 4), sh_as2 + (kb << 4), c2, lane << 3,
+            ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+    }
+    gemv_int8_pair_tail<residual, atomic>(accs, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+}
+
+// K values routed to the smem-staged unit (measured on 3090: K=3 -13%; narrow wins for 2/6/8 which
+// are at the ALU floor / DRAM-bound, wide covers 4)
+__host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
+{
+    return bits == 3 || bits == 5 || bits == 7;
+}
+
+// Epilogue for one row: affine correction + output Hadamard + svh scale + accumulator reset,
+// striped over all warps of the grid. sh_tmp: 128 floats per warp.
+template <bool c_fp32, bool residual>
+__device__ __forceinline__ void gemv_int8_epilogue
+(
+    int* __restrict__ accs,
+    void* __restrict__ C_row,
+    const float* __restrict__ qrow,
+    const half* __restrict__ svh,
+    float* __restrict__ sh_tmp,
+    int size_n,
+    float output_scale
+)
+{
+    int lane = threadIdx.x & 31;
+    int warps_grid = gridDim.x * NUM_THREADS / 32;
+    int this_warp = threadIdx.x / 32 + NUM_THREADS / 32 * blockIdx.x;
+    float* tmp = sh_tmp + (threadIdx.x / 32) * 128;
+
+    float k_inv  = __half2float(__ushort_as_half(0x1eee));
+    float k_bias = __half2float(__ushort_as_half(0xc931));
+    float q = qrow[0];
+    float q2 = q * (1.0f / 254.0f);
+    float suma = q * (float) ((const int*) qrow)[1];
+    if constexpr (residual) suma += q2 * (float) ((const int*) qrow)[2];
+    float corr = (1024.0f * k_inv + k_bias) * suma;
+
+    int total_chunks = size_n / 128;
+    for (; this_warp < total_chunks; this_warp += warps_grid)
+    {
+        int base = this_warp * 128;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            int j = lane * 4 + i;
+            float s = q * (float) accs[base + j];
+            accs[base + j] = 0;
+            if constexpr (residual)
+            {
+                s += q2 * (float) accs[size_n + base + j];
+                accs[size_n + base + j] = 0;
+            }
+            tmp[j] = k_inv * s + corr;
+        }
+        __syncwarp();
+        // gridDim.y == 1, so the inner's blockIdx.y-based scale offset is zero; pre-offset svh
+        if constexpr (c_fp32)
+            had_ff_r_128_inner<false, true>(tmp, ((float*) C_row) + base, svh + base, 0.088388347648f * output_scale);
+        else
+            had_fh_r_128_inner<false, true>(tmp, ((half*) C_row) + base, svh + base, 0.088388347648f * output_scale);
+        __syncwarp();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Per-slice-scale ("sq") kernel for m == 1: kills ALL global pre-GEMV coordination. Each k-slice is
+// Hadamard-transformed, maxed and quantized block-locally during staging with its own
+// q_s = slicemax/127 (deterministic, so duplicating blocks agree bit-exactly - and strictly finer
+// quantization than a global q), units write exact per-slice int32 partials with plain stores
+// (exclusive writers - no atomics, no accumulator zeroing), and a per-256-column completion counter
+// gates an inline epilogue that combines sum_s q_s*acc_s in fixed slice order (deterministic) plus
+// the per-slice affine corrections. One REGULAR launch: no cooperative machinery, no grid.sync, no
+// A_had traffic. Same 10 kernel arguments (A_had unused). Workspace layout (fixed offsets so mixed
+// sq/coop calls of any shape can share the buffer):
+//   [counters: SQ_COUNTERS_CAP][{q_s, s1_s, s2_s, pad} x SQ_KSPLIT_CAP][partials: ksplit x pstride]
+// The coop kernels use the region beyond SQ_WS_RESERVED. Counters are zeroed when the workspace is
+// (re)allocated and reset by the finishing block, so they stay zero between calls.
+
+// Stage one slice: Hadamard from A into sh_ah, slice max -> q_s, splats + exact sums. Bit-identical
+// in every block that stages the same slice.
+template <bool residual>
+__device__ __forceinline__ void gemv_int8_stage_slice
+(
+    const half* __restrict__ A,
+    const half* __restrict__ suh,
+    float* __restrict__ qs,            // qsums + 4 * slice, published (idempotent)
+    half* __restrict__ sh_ah,
+    uint32_t* __restrict__ sh_as,
+    uint32_t* __restrict__ sh_as2,
+    float* __restrict__ sh_red,        // 33 floats
+    int kb0,
+    int nrows,
+    float& q_s, int& s1, int& s2
+)
+{
+    int t = threadIdx.x;
+    int nel = nrows * 16;
+    __syncthreads();
+    for (int s = t >> 5; s < (nel >> 7); s += NUM_THREADS >> 5)
+        had_hf_r_128_inner<true, false>(A + (kb0 << 4) + (s << 7), sh_ah + (s << 7), suh + (kb0 << 4) + (s << 7), 0.088388347648f);
+    __syncthreads();
+
+    float mx = 0.0f;
+    for (int i = t; i < nel; i += NUM_THREADS) mx = fmaxf(mx, fabsf(__half2float(sh_ah[i])));
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+    if ((t & 31) == 0) sh_red[t >> 5] = mx;
+    __syncthreads();
+    if (t < 32)
+    {
+        float v = t < (NUM_THREADS >> 5) ? sh_red[t] : 0.0f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+        if (t == 0) sh_red[32] = fmaxf(v, 1e-8f) / 127.0f;
+    }
+    __syncthreads();
+    q_s = sh_red[32];
+
+    float rq = 1.0f / q_s;
+    float rq2 = rq * 254.0f;
+    int l1 = 0, l2 = 0;
+    for (int i = t; i < nel; i += NUM_THREADS)
+    {
+        float a = __half2float(sh_ah[i]);
+        int v = __float2int_rn(a * rq);
+        v = max(-127, min(127, v));
+        sh_as[i] = ((uint32_t)(uint8_t)(int8_t) v) * 0x01010101u;
+        l1 += v;
+        if constexpr (residual)
+        {
+            float r = a - q_s * (float) v;
+            int v2 = __float2int_rn(r * rq2);
+            v2 = max(-127, min(127, v2));
+            sh_as2[i] = ((uint32_t)(uint8_t)(int8_t) v2) * 0x01010101u;
+            l2 += v2;
+        }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        l1 += __shfl_xor_sync(0xffffffff, l1, o);
+        l2 += __shfl_xor_sync(0xffffffff, l2, o);
+    }
+    if ((t & 31) == 0) { ((int*) sh_red)[t >> 5] = l1; sh_red[16 + (t >> 5)] = __int_as_float(l2); }
+    __syncthreads();
+    if (t < 32)
+    {
+        int v1 = t < (NUM_THREADS >> 5) ? ((int*) sh_red)[t] : 0;
+        int v2 = t < (NUM_THREADS >> 5) ? __float_as_int(sh_red[16 + t]) : 0;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            v1 += __shfl_xor_sync(0xffffffff, v1, o);
+            v2 += __shfl_xor_sync(0xffffffff, v2, o);
+        }
+        if (t == 0)
+        {
+            ((int*) sh_red)[0] = v1;
+            ((int*) sh_red)[1] = v2;
+            qs[0] = sh_red[32];
+            ((int*) qs)[1] = v1;
+            ((int*) qs)[2] = v2;
+        }
+    }
+    __syncthreads();
+    s1 = ((int*) sh_red)[0];
+    s2 = ((int*) sh_red)[1];
+}
+
+// Epilogue for one 256-column group: deterministic fixed-order combine over the per-slice partials.
+// Reads bypass L1 (__ldcg): the contributions arrived from other blocks with no grid-wide barrier.
+template <bool c_fp32, bool residual>
+__device__ __forceinline__ void gemv_int8_epilogue_group_sq
+(
+    const int* __restrict__ partials,
+    const float* __restrict__ qsums,
+    int pstride,
+    int ksplit,
+    void* __restrict__ C,
+    const half* __restrict__ svh,
+    float* __restrict__ sh_tmp,
+    int nb256,
+    int size_n
+)
+{
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp >= 2) return;
+    float k_inv  = __half2float(__ushort_as_half(0x1eee));
+    float k_bias = __half2float(__ushort_as_half(0xc931));
+    float aff = 1024.0f * k_inv + k_bias;
+
+    int base = nb256 * 256 + warp * 128;
+    float* tmp = sh_tmp + warp * 128;
+    float acc[4] = {};
+    float corr = 0.0f;
+    for (int s = 0; s < ksplit; ++s)
+    {
+        float q_s = qsums[4 * s];
+        float suma = q_s * (float) ((const int*) qsums)[4 * s + 1];
+        const int* p = partials + (size_t) s * pstride + base;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+            acc[i] += q_s * (float) __ldcg(p + lane * 4 + i);
+        if constexpr (residual)
+        {
+            float q2_s = q_s * (1.0f / 254.0f);
+            suma += q2_s * (float) ((const int*) qsums)[4 * s + 2];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                acc[i] += q2_s * (float) __ldcg(p + size_n + lane * 4 + i);
+        }
+        corr += aff * suma;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        tmp[lane * 4 + i] = k_inv * acc[i] + corr;
+    __syncwarp();
+    if constexpr (c_fp32)
+        had_ff_r_128_inner<false, true>(tmp, ((float*) C) + base, svh + base, 0.088388347648f);
+    else
+        had_fh_r_128_inner<false, true>(tmp, ((half*) C) + base, svh + base, 0.088388347648f);
+}
+
+template <int bits, bool c_fp32, bool residual>
+__global__ __launch_bounds__(NUM_THREADS)
+void exl3_gemv_int8_sq_kernel
+(
+    const half* __restrict__ A,
+    const uint16_t* __restrict__ B,
+    void* __restrict__ C,
+    const int size_m,       // must be 1
+    const int size_k,
+    const int size_n,
+    int* __restrict__ locks,
+    const half* __restrict__ suh,
+    half* __restrict__ A_had,
+    const half* __restrict__ svh
+)
+{
+    extern __shared__ uint32_t shmem[];
+
+    // Work decomposition: rows_per multiple of 8 (whole 128-spans for the local Hadamard); the host
+    // mirrors this for the shared memory size and workspace bound. Swept on 3090: the wall time is
+    // ~one unit's duration as long as all (slice x 256-column) units fit in one wave of the grid, so
+    // take the smallest slice height with units <= gridDim.x - but at least half-wave occupancy up
+    // to 32 rows, since very short slices inflate ksplit and the epilogue's serial per-slice combine
+    int rows_total = size_k >> 4;
+    int nb256_total = size_n / 256;
+    int r = CEIL_DIVIDE(rows_total * nb256_total, (int) gridDim.x);
+    int rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
+    rows_per = MAX(rows_per, SQ_MINROWS);
+    rows_per = MIN(rows_per, SQ_ROWS_MAX);
+    rows_per = MIN(rows_per, (rows_total + 7) & ~7);
+    int ksplit = CEIL_DIVIDE(rows_total, rows_per);
+    int units = nb256_total * ksplit;
+    int pstride = size_n * (residual ? 2 : 1);
+
+    int* counters = locks;
+    float* qsums = (float*) (locks + SQ_COUNTERS_CAP);
+    int* partials = locks + SQ_WS_RESERVED;
+
+    // Shared layout: [slice halfs][splats(+res)][B stage][epi tmp]
+    half* sh_ah = (half*) shmem;
+    uint32_t* sh_as = shmem + rows_per * 8;
+    uint32_t* sh_as2 = sh_as + rows_per * 16;
+    uint32_t* sh_b = sh_as + rows_per * 16 * (residual ? 2 : 1);
+    float* sh_tmp = (float*) (sh_b + (gemv_int8_stage_smem(bits) ? 8 * GEMV_STAGE_D * 16 * bits : 0));
+    __shared__ float sh_red[33];
+    __shared__ int sh_last;
+
+    float q_s = 1.0f; int s1 = 0, s2 = 0;
+    int t = threadIdx.x;
+    int prev_slice = -1;
+    for (int unit = blockIdx.x; unit < units; unit += gridDim.x)
+    {
+        int slice = unit / nb256_total;
+        int nb256 = unit % nb256_total;
+        int kb0 = slice * rows_per;
+        int nrows = MIN(rows_per, rows_total - kb0);
+        if (slice != prev_slice)
+        {
+            gemv_int8_stage_slice<residual>(A, suh, qsums + 4 * slice, sh_ah, sh_as, sh_as2,
+                                            sh_red, kb0, nrows, q_s, s1, s2);
+            prev_slice = slice;
+        }
+        int* pacc = partials + (size_t) slice * pstride;
+        if constexpr (bits == 4)
+            gemv_int8_unit_wide<residual, false>(B, pacc, sh_as, sh_as2, nb256, kb0, nrows, size_n);
+        else if constexpr (gemv_int8_stage_smem(bits))
+            gemv_int8_unit_smem<bits, residual, false>(B, pacc, sh_as, sh_as2, sh_b, nb256, kb0, nrows, size_n);
+        else
+            gemv_int8_unit_narrow<bits, residual, false>(B, pacc, sh_as, sh_as2, nb256, kb0, nrows, size_n);
+
+        // Completion counter: the ksplit-th contributor runs the epilogue for this 256-column group.
+        // (sh_last reuse across iterations is ordered by the next iteration's __syncthreads.)
+        __threadfence();
+        __syncthreads();
+        if (t == 0) sh_last = (atomicAdd(&counters[nb256], 1) == ksplit - 1) ? 1 : 0;
+        __syncthreads();
+        if (sh_last)
+        {
+            gemv_int8_epilogue_group_sq<c_fp32, residual>(partials, qsums, pstride, ksplit, C, svh,
+                                                          sh_tmp, nb256, size_n);
+            if (t == 0) counters[nb256] = 0;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Cooperative kernel: same argument list as exl3_gemm_kernel
+
+template <int bits, bool c_fp32, bool residual>
+__global__ __launch_bounds__(NUM_THREADS)
+void exl3_gemv_int8_coop_kernel
+(
+    const half* __restrict__ A,
+    const uint16_t* __restrict__ B,
+    void* __restrict__ C,
+    const int size_m,
+    const int size_k,
+    const int size_n,
+    int* __restrict__ locks,
+    const half* __restrict__ suh,
+    half* __restrict__ A_had,
+    const half* __restrict__ svh
+)
+{
+    auto grid = cg_gemv::this_grid();
+    extern __shared__ uint32_t shmem[];
+
+    int* accs = locks;
+    float* qsums = (float*) (locks + 2 * size_n);
+    float* partial_max = qsums + 4 * size_m;   // [gridDim.x], m == 1 fast path
+
+    // Phase 1a: input Hadamard (as in exl3_gemm_kernel) + zero the accumulators. For m == 1, also
+    // track a per-block partial max of the transformed activations.
+    {
+        __shared__ float sh_m[32];
+        int total_warps = size_m * size_k / 128;
+        int warps_grid = gridDim.x * NUM_THREADS / 32;
+        int this_warp = threadIdx.x / 32 + NUM_THREADS / 32 * blockIdx.x;
+        int lane = threadIdx.x & 31;
+        float mx = 0.0f;
+        for (; this_warp < total_warps; this_warp += warps_grid)
+        {
+            had_hf_r_128_inner<true, false>
+            (
+                A + this_warp * 128,
+                A_had + this_warp * 128,
+                suh + (this_warp * 128) % size_k,
+                0.088388347648f
+            );
+            if (size_m == 1)
+            {
+                __syncwarp();
+                const half2* h2 = (const half2*) (A_had + this_warp * 128);
+                #pragma unroll
+                for (int i = 0; i < 2; ++i)
+                {
+                    half2 v = h2[lane * 2 + i];
+                    mx = fmaxf(mx, fabsf(__half2float(__low2half(v))));
+                    mx = fmaxf(mx, fabsf(__half2float(__high2half(v))));
+                }
+            }
+        }
+        if (size_m == 1)
+        {
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+            if (lane == 0) sh_m[threadIdx.x >> 5] = mx;
+            __syncthreads();
+            if (threadIdx.x < 32)
+            {
+                float v = threadIdx.x < (NUM_THREADS >> 5) ? sh_m[threadIdx.x] : 0.0f;
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+                if (threadIdx.x == 0) partial_max[blockIdx.x] = v;
+            }
+        }
+        int tg = blockIdx.x * NUM_THREADS + threadIdx.x;
+        for (int i = tg; i < 2 * size_n; i += gridDim.x * NUM_THREADS) accs[i] = 0;
+    }
+    grid.sync();
+
+    // Phase 1b (m > 1 only): per-row activation scale and exact sums
+    if (size_m > 1)
+    {
+        __shared__ float sh_r[33];
+        for (int row = blockIdx.x; row < size_m; row += gridDim.x)
+        {
+            const half* Ar = A_had + (size_t) row * size_k;
+            int t = threadIdx.x;
+            float mx = 0.0f;
+            for (int i = t; i < size_k; i += NUM_THREADS) mx = fmaxf(mx, fabsf(__half2float(Ar[i])));
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+            if ((t & 31) == 0) sh_r[t >> 5] = mx;
+            __syncthreads();
+            if (t < 32)
+            {
+                float v = t < (NUM_THREADS >> 5) ? sh_r[t] : 0.0f;
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+                if (t == 0) sh_r[32] = fmaxf(v, 1e-8f) / 127.0f;
+            }
+            __syncthreads();
+            gemv_int8_row_sums<residual>(Ar, sh_r[32], size_k, qsums + 4 * row);
+        }
+        grid.sync();
+    }
+
+    // Work decomposition for phase 2 (host must mirror this for the shared memory size).
+    // Units are 256 columns (warp per adjacent block pair) x k-slice; fine-grained (~4 per block)
+    // because with grid.sync at the end of the phase, tail imbalance stalls the whole grid.
+    int rows_total = size_k >> 4;
+    int nb256_total = size_n / 256;
+    int smem_rows_max = residual ? 384 : 768;
+    int ksplit = CEIL_DIVIDE(4 * gridDim.x, nb256_total);
+    ksplit = MAX(ksplit, CEIL_DIVIDE(rows_total, smem_rows_max));
+    ksplit = MIN(ksplit, rows_total);
+    int rows_per = CEIL_DIVIDE(rows_total, ksplit);
+    int units = nb256_total * ksplit;
+
+    uint32_t* sh_as = shmem;
+    uint32_t* sh_as2 = shmem + rows_per * 16;
+    uint32_t* sh_b = shmem + rows_per * 16 * (residual ? 2 : 1);   // smem-staged unit region
+
+    __shared__ float sh_q[33];
+
+    for (int row = 0; row < size_m; ++row)
+    {
+        const half* Ar = A_had + (size_t) row * size_k;
+        const float* qrow = qsums + 4 * row;
+
+        // Row scale: for m == 1, derived from the phase-1a partial maxes (deterministic: fmax is
+        // order-independent). Block 0 also computes the exact sums for the epilogue, concurrently
+        // with the other blocks' GEMV work.
+        float q_row;
+        if (size_m == 1)
+        {
+            float v = 0.0f;
+            for (int i = threadIdx.x; i < gridDim.x; i += NUM_THREADS) v = fmaxf(v, partial_max[i]);
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+            if ((threadIdx.x & 31) == 0) sh_q[threadIdx.x >> 5] = v;
+            __syncthreads();
+            if (threadIdx.x < 32)
+            {
+                float w = threadIdx.x < (NUM_THREADS >> 5) ? sh_q[threadIdx.x] : 0.0f;
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) w = fmaxf(w, __shfl_xor_sync(0xffffffff, w, o));
+                if (threadIdx.x == 0) sh_q[32] = fmaxf(w, 1e-8f) / 127.0f;
+            }
+            __syncthreads();
+            q_row = sh_q[32];
+            if (blockIdx.x == 0)
+                gemv_int8_row_sums<residual>(Ar, q_row, size_k, qsums);
+        }
+        else q_row = qrow[0];
+
+        // Phase 2: GEMV over (nb256, k-slice) units, splats quantized inline during smem staging
+        int prev_slice = -1;
+        for (int unit = blockIdx.x; unit < units; unit += gridDim.x)
+        {
+            int slice = unit / nb256_total;
+            int nb256 = unit % nb256_total;
+            int kb0 = slice * rows_per;
+            int nrows = MIN(rows_per, rows_total - kb0);
+            if (slice != prev_slice)
+            {
+                gemv_int8_stage_splats<residual>(Ar, q_row, sh_as, sh_as2, kb0, nrows);
+                prev_slice = slice;
+            }
+            if constexpr (bits == 4)
+                gemv_int8_unit_wide<residual>(B, accs, sh_as, sh_as2, nb256, kb0, nrows, size_n);
+            else if constexpr (gemv_int8_stage_smem(bits))
+                gemv_int8_unit_smem<bits, residual>(B, accs, sh_as, sh_as2, sh_b, nb256, kb0, nrows, size_n);
+            else
+                gemv_int8_unit_narrow<bits, residual>(B, accs, sh_as, sh_as2, nb256, kb0, nrows, size_n);
+        }
+        grid.sync();
+
+        // Phase 3: epilogue + output Hadamard (shared memory reused as per-warp staging)
+        void* C_row = c_fp32 ? (void*) (((float*) C) + (size_t) row * size_n)
+                             : (void*) (((half*)  C) + (size_t) row * size_n);
+        gemv_int8_epilogue<c_fp32, residual>(accs, C_row, qrow, svh, (float*) shmem, size_n, 1.0f);
+
+        if (row + 1 < size_m) grid.sync();
+    }
+}
+
+// Multi-matrix variant. Matrices are deliberately processed one at a time: this keeps the
+// accumulator footprint at 2*n and lets every matrix use the full cooperative grid, while the
+// pointer-table/index logic stays outside the hot DP4A device components above.
+template <int bits, bool c_fp32, bool residual>
+__global__ __launch_bounds__(NUM_THREADS)
+void exl3_mgemv_int8_coop_kernel
+(
+    const half* __restrict__ A,
+    const uintptr_t* __restrict__ B_list,
+    void* __restrict__ C,
+    const int size_m,
+    const int size_k,
+    const int size_n,
+    int* __restrict__ workspace,
+    const uintptr_t* __restrict__ suh_list,
+    half* __restrict__ A_had,
+    const uintptr_t* __restrict__ svh_list,
+    const int64_t* __restrict__ B_indices,
+    const half* __restrict__ B_weights,
+    const int bszm_in,
+    const int bszm_out,
+    const int min_index,
+    const int max_index
+)
+{
+    auto grid = cg_gemv::this_grid();
+    extern __shared__ uint32_t shmem[];
+    int* accs = workspace;
+    float* qsums = (float*) (workspace + 2 * size_n);
+    int* active_ptr = workspace + 2 * size_n + 4 * size_m;
+    int bszm = MAX(bszm_in, bszm_out);
+
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        int active = bszm;
+        if (min_index >= 0)
+        {
+            active = 0;
+            for (int i = 0; i < bszm; ++i)
+            {
+                int q = (int) B_indices[i];
+                active += q >= min_index && q < max_index;
+            }
+        }
+        *active_ptr = active;
+    }
+    grid.sync();
+    int active = *active_ptr;
+
+    int rows_total = size_k >> 4;
+    int nb256_total = size_n / 256;
+    int smem_rows_max = residual ? 384 : 768;
+    int ksplit = CEIL_DIVIDE(4 * gridDim.x, nb256_total);
+    ksplit = MAX(ksplit, CEIL_DIVIDE(rows_total, smem_rows_max));
+    ksplit = MIN(ksplit, rows_total);
+    int rows_per = CEIL_DIVIDE(rows_total, ksplit);
+    int units = nb256_total * ksplit;
+    uint32_t* sh_as = shmem;
+    uint32_t* sh_as2 = shmem + rows_per * 16;
+    uint32_t* sh_b = shmem + rows_per * 16 * (residual ? 2 : 1);   // smem-staged unit region
+
+    for (int j = 0; j < active; ++j)
+    {
+        int source_j = j;
+        int mat_index;
+        if (min_index >= 0)
+        {
+            int found = -1;
+            for (int i = 0, n = 0; i < bszm; ++i)
+            {
+                int q = (int) B_indices[i];
+                if (q >= min_index && q < max_index)
+                {
+                    if (n++ == j) { found = i; break; }
+                }
+            }
+            source_j = found;
+            mat_index = (int) B_indices[found] - min_index;
+        }
+        else mat_index = B_indices ? (int) B_indices[j] : j;
+
+        const uint16_t* B = mat_index >= 0 ? (const uint16_t*) B_list[mat_index] : nullptr;
+        const half* suh = mat_index >= 0 ? (const half*) suh_list[mat_index] : nullptr;
+        const half* svh = mat_index >= 0 ? (const half*) svh_list[mat_index] : nullptr;
+        const half* A_slot = bszm_in == 1 ? A : A + (size_t) j * size_m * size_k;
+        half* A_had_slot = A_had + (size_t) j * size_m * size_k;
+
+        // Input transform and accumulator reset.
+        if (B)
+        {
+            int total_warps = size_m * size_k / 128;
+            int warps_grid = gridDim.x * NUM_THREADS / 32;
+            int warp = threadIdx.x / 32 + NUM_THREADS / 32 * blockIdx.x;
+            for (; warp < total_warps; warp += warps_grid)
+                had_hf_r_128_inner<true, false>
+                (
+                    A_slot + warp * 128, A_had_slot + warp * 128,
+                    suh + (warp * 128) % size_k, 0.088388347648f
+                );
+        }
+        int tg = blockIdx.x * NUM_THREADS + threadIdx.x;
+        for (int i = tg; i < 2 * size_n; i += gridDim.x * NUM_THREADS) accs[i] = 0;
+        grid.sync();
+
+        if (B)
+        {
+            // Per-row activation scales and exact integer sums.
+            __shared__ float sh_r[33];
+            for (int row = blockIdx.x; row < size_m; row += gridDim.x)
+            {
+                const half* Ar = A_had_slot + (size_t) row * size_k;
+                int t = threadIdx.x;
+                float mx = 0.0f;
+                for (int i = t; i < size_k; i += NUM_THREADS)
+                    mx = fmaxf(mx, fabsf(__half2float(Ar[i])));
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1)
+                    mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+                if ((t & 31) == 0) sh_r[t >> 5] = mx;
+                __syncthreads();
+                if (t < 32)
+                {
+                    float v = t < (NUM_THREADS >> 5) ? sh_r[t] : 0.0f;
+                    #pragma unroll
+                    for (int o = 16; o > 0; o >>= 1)
+                        v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+                    if (t == 0) sh_r[32] = fmaxf(v, 1e-8f) / 127.0f;
+                }
+                __syncthreads();
+                gemv_int8_row_sums<residual>(Ar, sh_r[32], size_k, qsums + 4 * row);
+            }
+        }
+        grid.sync();
+
+        for (int row = 0; row < size_m; ++row)
+        {
+            if (B)
+            {
+                const half* Ar = A_had_slot + (size_t) row * size_k;
+                const float* qrow = qsums + 4 * row;
+                int prev_slice = -1;
+                for (int unit = blockIdx.x; unit < units; unit += gridDim.x)
+                {
+                    int slice = unit / nb256_total;
+                    int nb256 = unit % nb256_total;
+                    int kb0 = slice * rows_per;
+                    int nrows = MIN(rows_per, rows_total - kb0);
+                    if (slice != prev_slice)
+                    {
+                        gemv_int8_stage_splats<residual>(Ar, qrow[0], sh_as, sh_as2, kb0, nrows);
+                        prev_slice = slice;
+                    }
+                    if constexpr (bits == 4)
+                        gemv_int8_unit_wide<residual>(B, accs, sh_as, sh_as2, nb256, kb0, nrows, size_n);
+                    else if constexpr (gemv_int8_stage_smem(bits))
+                        gemv_int8_unit_smem<bits, residual>(B, accs, sh_as, sh_as2, sh_b, nb256, kb0, nrows, size_n);
+                    else
+                        gemv_int8_unit_narrow<bits, residual>(B, accs, sh_as, sh_as2, nb256, kb0, nrows, size_n);
+                }
+            }
+            grid.sync();
+
+            if (B)
+            {
+                void* C_row = c_fp32
+                    ? (void*) (((float*) C) + ((size_t) j * size_m + row) * size_n)
+                    : (void*) (((half*) C) + ((size_t) j * size_m + row) * size_n);
+                float weight = B_weights ? __half2float(B_weights[source_j]) : 1.0f;
+                gemv_int8_epilogue<c_fp32, residual>
+                    (accs, C_row, qsums + 4 * row, svh, (float*) shmem, size_n, weight);
+            }
+            grid.sync();
+        }
+    }
+
+    // Match mgemm: weighted expert outputs are scratch, with their sum returned in C[0].
+    if (B_weights)
+    {
+        int tg = blockIdx.x * NUM_THREADS + threadIdx.x;
+        int stride = gridDim.x * NUM_THREADS;
+        int row_elems = size_m * size_n;
+        for (int i = tg; i < row_elems; i += stride)
+        {
+            if constexpr (c_fp32)
+            {
+                float sum = 0.0f;
+                for (int j = 0; j < active; ++j) sum += ((float*) C)[(size_t) j * row_elems + i];
+                ((float*) C)[i] = sum;
+            }
+            else
+            {
+                half sum = {};
+                for (int j = 0; j < active; ++j) sum = __hadd(sum, ((half*) C)[(size_t) j * row_elems + i]);
+                ((half*) C)[i] = sum;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Host
+
+// Mode 0: disabled; 1: int8 + error-feedback residual pass (~15-16 bit effective activation
+// precision, KL at parity with fp16 or better); 2: plain int8 (cheaper, ~0.9% output RMS deviation).
+int _exl3_gemv_int8_mode = 0;
+bool _exl3_gemv_int8_mode_chk = false;
+
+static int exl3_gemv_int8_mode()
+{
+    if (_exl3_gemv_int8_mode_chk) return _exl3_gemv_int8_mode;
+    const char* e = getenv("EXL3_INT8_GEMV");
+    _exl3_gemv_int8_mode = e ? atoi(e) : 0;
+    return _exl3_gemv_int8_mode;
+}
+
+bool exl3_gemv_int8_enabled()
+{
+    return exl3_gemv_int8_mode() != 0;
+}
+
+struct GemvInt8Workspace
+{
+    int* ws = nullptr;
+    size_t ws_ints = 0;
+};
+
+static GemvInt8Workspace gemv_ws[MAX_DEVICES];
+static std::set<void*> gemv_attr_set[MAX_DEVICES];
+static std::map<std::pair<void*, size_t>, int> gemv_occ_cache[MAX_DEVICES];
+
+typedef void (*gemv_int8_coop_fn)
+    (const half*, const uint16_t*, void*, int, int, int, int*, const half*, half*, const half*);
+
+static void* select_gemv_int8_kernel(int K, bool c_fp32, bool residual)
+{
+    #define SEL_(K_) \
+        if (c_fp32)  return residual ? (void*) exl3_gemv_int8_coop_kernel<K_, true, true> \
+                                     : (void*) exl3_gemv_int8_coop_kernel<K_, true, false>; \
+        else         return residual ? (void*) exl3_gemv_int8_coop_kernel<K_, false, true> \
+                                     : (void*) exl3_gemv_int8_coop_kernel<K_, false, false>;
+    switch (K)
+    {
+        case 1: { SEL_(1) }
+        case 2: { SEL_(2) }
+        case 3: { SEL_(3) }
+        case 4: { SEL_(4) }
+        case 5: { SEL_(5) }
+        case 6: { SEL_(6) }
+        case 7: { SEL_(7) }
+        case 8: { SEL_(8) }
+    }
+    #undef SEL_
+    return nullptr;
+}
+
+static void* select_gemv_int8_sq_kernel(int K, bool c_fp32, bool residual)
+{
+    #define SEL_(K_) \
+        if (c_fp32)  return residual ? (void*) exl3_gemv_int8_sq_kernel<K_, true, true> \
+                                     : (void*) exl3_gemv_int8_sq_kernel<K_, true, false>; \
+        else         return residual ? (void*) exl3_gemv_int8_sq_kernel<K_, false, true> \
+                                     : (void*) exl3_gemv_int8_sq_kernel<K_, false, false>;
+    switch (K)
+    {
+        case 1: { SEL_(1) }
+        case 2: { SEL_(2) }
+        case 3: { SEL_(3) }
+        case 4: { SEL_(4) }
+        case 5: { SEL_(5) }
+        case 6: { SEL_(6) }
+        case 7: { SEL_(7) }
+        case 8: { SEL_(8) }
+    }
+    #undef SEL_
+    return nullptr;
+}
+
+// Grow-only per-device workspace shared by the sq and coop paths. The buffer is zeroed on
+// (re)allocation so the sq completion counters (fixed region at the start, self-resetting
+// thereafter) begin at zero; the coop kernels only use the region beyond SQ_WS_RESERVED.
+static int* gemv_int8_get_ws(int device, size_t ws_ints)
+{
+    GemvInt8Workspace& ws = gemv_ws[device];
+    if (ws.ws_ints < ws_ints)
+    {
+        if (ws.ws) cudaFree(ws.ws);
+        cuda_check(cudaMalloc(&ws.ws, ws_ints * sizeof(int)));
+        cuda_check(cudaMemset(ws.ws, 0, ws_ints * sizeof(int)));
+        ws.ws_ints = ws_ints;
+    }
+    return ws.ws;
+}
+
+// m == 1 fast path: per-slice-scale kernel, regular launch. Returns false to fall through to the
+// cooperative kernel (and from there to the regular fp16 kernel).
+static bool exl3_gemv_int8_sq
+(
+    const half* A_ptr, const uint16_t* B_ptr, void* C_ptr,
+    int size_k, int size_n, int K, bool c_fp32, bool residual,
+    const half* suh_ptr, half* A_had_ptr, const half* svh_ptr,
+    int device, int num_sms, cudaStream_t stream, Graph* graph
+)
+{
+    void* fn = select_gemv_int8_sq_kernel(K, c_fp32, residual);
+    if (!fn) return false;
+
+    // Mirror of the kernel's work decomposition (single-wave rule with a half-wave floor)
+    auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
+    {
+        int rows_total = size_k / 16;
+        int nb256 = size_n / 256;
+        int r = CEIL_DIVIDE(rows_total * nb256, grid_);
+        rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
+        rows_per = MAX(rows_per, SQ_MINROWS);
+        rows_per = MIN(rows_per, SQ_ROWS_MAX);
+        rows_per = MIN(rows_per, (rows_total + 7) & ~7);
+        ksplit = CEIL_DIVIDE(rows_total, rows_per);
+    };
+    auto smem_for = [&] (int rows_per) -> size_t
+    {
+        size_t stage = gemv_int8_stage_smem(K) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
+        return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * (residual ? 2 : 1) + stage + 256 * 4;
+    };
+
+    if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
+    {
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_for(SQ_ROWS_MAX));
+        gemv_attr_set[device].insert(fn);
+        cuda_check(cudaPeekAtLastError());
+    }
+
+    int ksplit, rows_per;
+    decomp(6 * num_sms, ksplit, rows_per);
+    size_t smem_guess = smem_for(rows_per);
+    int maxb;
+    auto occ_key = std::make_pair(fn, smem_guess);
+    auto occ_it = gemv_occ_cache[device].find(occ_key);
+    if (occ_it != gemv_occ_cache[device].end()) maxb = occ_it->second;
+    else
+    {
+        maxb = 1;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, fn, NUM_THREADS, smem_guess);
+        gemv_occ_cache[device][occ_key] = maxb;
+    }
+    int grid = MIN(MAX(maxb, 1) * num_sms, 1024);
+    decomp(grid, ksplit, rows_per);
+    size_t smem = smem_for(rows_per);
+    if (ksplit > SQ_KSPLIT_CAP) return false;
+    if (size_n / 256 > SQ_COUNTERS_CAP) return false;
+
+    int pstride = size_n * (residual ? 2 : 1);
+    int* ws_ptr = gemv_int8_get_ws(device, SQ_WS_RESERVED + (size_t) ksplit * pstride);
+
+    int size_m = 1;
+    void* kernelArgs[] =
+    {
+        (void*) &A_ptr,
+        (void*) &B_ptr,
+        (void*) &C_ptr,
+        (void*) &size_m,
+        (void*) &size_k,
+        (void*) &size_n,
+        (void*) &ws_ptr,
+        (void*) &suh_ptr,
+        (void*) &A_had_ptr,
+        (void*) &svh_ptr
+    };
+
+    cudaError_t err = cudaLaunchKernel(fn, dim3(grid), dim3(NUM_THREADS), kernelArgs, smem, stream);
+    if (graph)
+    {
+        graph->record_param(fn, GP_gemm_A, 0);
+        graph->record_param(fn, GP_gemm_B_trellis, 1);
+        graph->record_param(fn, GP_gemm_C, 2);
+        graph->record_param(fn, GP_gemm_B_suh, 7);
+        graph->record_param(fn, GP_gemm_A_had, 8);
+        graph->record_param(fn, GP_gemm_B_svh, 9);
+        graph->record_param(fn, GP_end, 0);
+    }
+    if (err != cudaSuccess)
+    {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+static void* select_mgemv_int8_kernel(int K, bool c_fp32, bool residual)
+{
+    #define SEL_(K_) \
+        if (c_fp32)  return residual ? (void*) exl3_mgemv_int8_coop_kernel<K_, true, true> \
+                                     : (void*) exl3_mgemv_int8_coop_kernel<K_, true, false>; \
+        else         return residual ? (void*) exl3_mgemv_int8_coop_kernel<K_, false, true> \
+                                     : (void*) exl3_mgemv_int8_coop_kernel<K_, false, false>;
+    switch (K)
+    {
+        case 1: { SEL_(1) }
+        case 2: { SEL_(2) }
+        case 3: { SEL_(3) }
+        case 4: { SEL_(4) }
+        case 5: { SEL_(5) }
+        case 6: { SEL_(6) }
+        case 7: { SEL_(7) }
+        case 8: { SEL_(8) }
+    }
+    #undef SEL_
+    return nullptr;
+}
+
+bool exl3_gemv_int8
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const c10::optional<at::Tensor>& suh,
+    const c10::optional<at::Tensor>& A_had,
+    const c10::optional<at::Tensor>& svh,
+    cudaStream_t stream,
+    Graph* graph
+)
+{
+    if (!suh.has_value() || !A_had.has_value() || !svh.has_value()) return false;
+
+    int K = B.size(2) / 16;
+    int size_k = A.size(-1);
+    int size_n = B.size(1) * 16;
+    int size_m = A.numel() / size_k;
+    if (size_n % 256) return false;
+    if (size_k % 128) return false;
+    // K >= 6 is DRAM-bound and the regular kernel reads the same bytes with less overhead; the int8
+    // path only wins where the fp16 pipeline is compute/latency-limited (measured 3090: -29/-22/-9/-6%
+    // at K=2/3/4/5, +5% at K=6)
+    if (K < 1 || K > GEMV_INT8_MAX_K) return false;
+
+    int device;
+    cudaGetDevice(&device);
+    int num_sms = DevCtx::instance().get_num_sms(device);
+    bool c_fp32 = C.dtype() == at::kFloat;
+    bool residual = exl3_gemv_int8_mode() == 1;
+
+    // m == 1: per-slice-scale kernel (regular launch, no global phases); falls through to the
+    // cooperative kernel on any constraint miss
+    if (size_m == 1 && exl3_gemv_int8_sq(
+        (const half*) A.data_ptr(), (const uint16_t*) B.data_ptr(), C.data_ptr(),
+        size_k, size_n, K, c_fp32, residual,
+        (const half*) suh->data_ptr(), (half*) A_had->data_ptr(), (const half*) svh->data_ptr(),
+        device, num_sms, stream, graph))
+        return true;
+
+    void* fn = select_gemv_int8_kernel(K, c_fp32, residual);
+    if (!fn) return false;
+
+    // Mirror the kernel's work decomposition for the shared memory size; grid = max co-resident
+    // blocks (natural register allocation measures faster than forcing higher occupancy)
+    auto smem_for_grid = [&] (int grid_) -> size_t
+    {
+        int rows_total = size_k / 16;
+        int nb256 = size_n / 256;
+        int smem_rows_max = residual ? 384 : 768;
+        int ksplit = CEIL_DIVIDE(4 * grid_, nb256);
+        ksplit = MAX(ksplit, CEIL_DIVIDE(rows_total, smem_rows_max));
+        ksplit = MIN(ksplit, rows_total);
+        int rows_per = CEIL_DIVIDE(rows_total, ksplit);
+        size_t stage = gemv_int8_stage_smem(K) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
+        return MAX((size_t) rows_per * 16 * 4 * (residual ? 2 : 1) + stage, (size_t) 8 * 128 * 4);
+    };
+
+    if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
+    {
+        // Upper bound over all shapes: smem_rows_max * 64 B
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, 768 * 16 * 4 + GEMV_STAGE_MAX_BYTES);
+        gemv_attr_set[device].insert(fn);
+        cuda_check(cudaPeekAtLastError());
+    }
+
+    size_t smem_guess = smem_for_grid(6 * num_sms);
+    int maxb;
+    auto occ_key = std::make_pair(fn, smem_guess);
+    auto occ_it = gemv_occ_cache[device].find(occ_key);
+    if (occ_it != gemv_occ_cache[device].end()) maxb = occ_it->second;
+    else
+    {
+        maxb = 1;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, fn, NUM_THREADS, smem_guess);
+        gemv_occ_cache[device][occ_key] = maxb;
+    }
+    int grid = MIN(MAX(maxb, 1) * num_sms, 1024);
+    size_t smem = smem_for_grid(grid);
+
+    // Coop region beyond the sq-reserved prefix: [2n accs][4m qsums][grid partial maxes]
+    size_t ws_ints = SQ_WS_RESERVED + (size_t) 2 * size_n + 4 * size_m + 1024;
+    int* ws_ptr = gemv_int8_get_ws(device, ws_ints) + SQ_WS_RESERVED;
+
+    const half* A_ptr = (const half*) A.data_ptr();
+    const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
+    void* C_ptr = C.data_ptr();
+    const half* suh_ptr = (const half*) suh->data_ptr();
+    half* A_had_ptr = (half*) A_had->data_ptr();   // scratch; used through a raw half* like the regular kernel
+    const half* svh_ptr = (const half*) svh->data_ptr();
+
+    void* kernelArgs[] =
+    {
+        (void*) &A_ptr,
+        (void*) &B_ptr,
+        (void*) &C_ptr,
+        (void*) &size_m,
+        (void*) &size_k,
+        (void*) &size_n,
+        (void*) &ws_ptr,
+        (void*) &suh_ptr,
+        (void*) &A_had_ptr,
+        (void*) &svh_ptr
+    };
+
+    auto add_graph_args = [&](void* kernel_ptr)
+    {
+        if (graph)
+        {
+            graph->record_param(kernel_ptr, GP_gemm_A, 0);
+            graph->record_param(kernel_ptr, GP_gemm_B_trellis, 1);
+            graph->record_param(kernel_ptr, GP_gemm_C, 2);
+            graph->record_param(kernel_ptr, GP_gemm_B_suh, 7);
+            graph->record_param(kernel_ptr, GP_gemm_A_had, 8);
+            graph->record_param(kernel_ptr, GP_gemm_B_svh, 9);
+            graph->record_param(kernel_ptr, GP_end, 0);
+        }
+    };
+
+    cudaError_t err = cudaLaunchCooperativeKernel(fn, grid, NUM_THREADS, kernelArgs, smem, stream);
+    add_graph_args((void*) fn);
+
+    if (err != cudaSuccess)
+    {
+        // e.g. cooperative launch unsupported or co-residency violated: fall back to the regular kernel
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+bool exl3_mgemv_int8
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const at::Tensor& suh,
+    const at::Tensor& A_had,
+    const at::Tensor& svh,
+    const c10::optional<at::Tensor>& indices,
+    const c10::optional<at::Tensor>& weights,
+    int K,
+    int min_index,
+    int max_index,
+    cudaStream_t stream,
+    Graph* graph
+)
+{
+    int size_m = A.size(1);
+    int size_k = A.size(2);
+    int size_n = C.size(2);
+    int bszm_in = A.size(0);
+    int bszm_out = C.size(0);
+    int bszm = MAX(bszm_in, bszm_out);
+    if (indices)
+    {
+        int num_indices = indices->size(1);
+        if (bszm_in > num_indices) bszm_in = num_indices;
+        if (bszm_out > num_indices) bszm_out = num_indices;
+        bszm = MAX(bszm_in, bszm_out);
+    }
+    if (min_index >= 0 && !indices) return false;
+    if (size_n % 256 || size_k % 128 || K < 1 || K > GEMV_INT8_MAX_K || bszm == 0) return false;
+
+    int device;
+    cudaGetDevice(&device);
+    int num_sms = DevCtx::instance().get_num_sms(device);
+    bool c_fp32 = C.dtype() == at::kFloat;
+    bool residual = exl3_gemv_int8_mode() == 1;
+    void* fn = select_mgemv_int8_kernel(K, c_fp32, residual);
+    if (!fn) return false;
+
+    auto smem_for_grid = [&] (int grid_) -> size_t
+    {
+        int rows_total = size_k / 16;
+        int nb256 = size_n / 256;
+        int smem_rows_max = residual ? 384 : 768;
+        int ksplit = CEIL_DIVIDE(4 * grid_, nb256);
+        ksplit = MAX(ksplit, CEIL_DIVIDE(rows_total, smem_rows_max));
+        ksplit = MIN(ksplit, rows_total);
+        int rows_per = CEIL_DIVIDE(rows_total, ksplit);
+        size_t stage = gemv_int8_stage_smem(K) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
+        return MAX((size_t) rows_per * 16 * 4 * (residual ? 2 : 1) + stage, (size_t) 8 * 128 * 4);
+    };
+
+    if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
+    {
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, 768 * 16 * 4 + GEMV_STAGE_MAX_BYTES);
+        gemv_attr_set[device].insert(fn);
+        cuda_check(cudaPeekAtLastError());
+    }
+    size_t smem_guess = smem_for_grid(6 * num_sms);
+    int maxb;
+    auto occ_key = std::make_pair(fn, smem_guess);
+    auto occ_it = gemv_occ_cache[device].find(occ_key);
+    if (occ_it != gemv_occ_cache[device].end()) maxb = occ_it->second;
+    else
+    {
+        maxb = 1;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, fn, NUM_THREADS, smem_guess);
+        gemv_occ_cache[device][occ_key] = maxb;
+    }
+    int grid = MIN(MAX(maxb, 1) * num_sms, 1024);
+    size_t smem = smem_for_grid(grid);
+
+    size_t ws_ints = SQ_WS_RESERVED + (size_t) 2 * size_n + 4 * size_m + 1024;
+    int* ws_ptr = gemv_int8_get_ws(device, ws_ints) + SQ_WS_RESERVED;
+
+    const half* A_ptr = (const half*) A.data_ptr();
+    const uintptr_t* B_ptr = (const uintptr_t*) B.data_ptr();
+    void* C_ptr = C.data_ptr();
+    const uintptr_t* suh_ptr = (const uintptr_t*) suh.data_ptr();
+    half* A_had_ptr = (half*) A_had.data_ptr();
+    const uintptr_t* svh_ptr = (const uintptr_t*) svh.data_ptr();
+    const int64_t* indices_ptr = (const int64_t*) OPTPTR(indices);
+    const half* weights_ptr = (const half*) OPTPTR(weights);
+
+    void* kernelArgs[] =
+    {
+        &A_ptr, &B_ptr, &C_ptr, &size_m, &size_k, &size_n, &ws_ptr, &suh_ptr,
+        &A_had_ptr, &svh_ptr, &indices_ptr, &weights_ptr, &bszm_in, &bszm_out,
+        &min_index, &max_index
+    };
+    cudaError_t err = cudaLaunchCooperativeKernel(fn, grid, NUM_THREADS, kernelArgs, smem, stream);
+    if (graph)
+    {
+        graph->record_param(fn, GP_mgemm_A, 0);
+        graph->record_param(fn, GP_mgemm_C, 2);
+        graph->record_param(fn, GP_mgemm_indices, 10);
+        graph->record_param(fn, GP_mgemm_weights, 11);
+        graph->record_param(fn, GP_end, 0);
+    }
+    if (err != cudaSuccess)
+    {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}

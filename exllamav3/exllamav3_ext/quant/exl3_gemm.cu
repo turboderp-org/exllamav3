@@ -11,6 +11,7 @@ namespace cg = cooperative_groups;
 #include "exl3_kernel_map.cuh"
 #include "exl3_devctx.cuh"
 #include "exl3_gemv.cuh"
+#include "exl3_gemv_int8.cuh"
 #include "coop_autotune.cuh"
 #include <set>
 #include <vector>
@@ -174,6 +175,16 @@ int exl3_gemm_gr
     if (mcg) cb = 1;
     if (mul1) cb = 2;
 
+    // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
+    // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
+    // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
+    // to the regular kernel.
+    if (mul1 && exl3_gemv_int8_enabled())
+    {
+        if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
+            return 0;
+    }
+
     int block_dim;
     int shape_idx;
     fp_exl3_gemm_kernel kernel;
@@ -310,18 +321,45 @@ int exl3_gemm
 }
 
 /*
-EXL3 multi matmul, A @ B -> C
+EXL3 batched/multi-matrix matmul.
 
-- A: row-major A tensor, shape (m, k), dtype float16, contiguous
-- B: EXL3-quantized B tensor, shape (k//16, n//16, 16*K), dtype uint16
-- C: empty row-major C tensor, shape (m, n), dtype float16 or float23, contiguous. Does not need to be zero-initialized
-- suh: optional, packed input scales/flips, shape (k//16), dtype float16
-- A_had: required if suh given, may be reference to A, temporary storage for input transform, size and dtype as A
-- svh: optional, packed output scales/flips, shape (n//16), dtype float16
+This is not a conventional batched A @ B. B, suh and svh are CUDA int64
+tensors containing device addresses (one address per quantized matrix), rather
+than the matrix data themselves. Entry q of each table describes one linear:
 
-limitations:
-- k % 16 == 0
-- n % 128 == 0
+    B[q]   -> EXL3 trellis, logically (k / 16, n / 16, 16 * K) uint16
+    suh[q] -> packed input scales/flips, logically (k / 16) float16
+    svh[q] -> packed output scales/flips, logically (n / 16) float16
+
+A is contiguous float16 [a_batches, m, k], C is contiguous float16 or
+float32 [c_batches, m, n], and A_had is float16 scratch with room for every
+active matrix. The kernel applies the input Hadamard transform into A_had,
+performs the selected EXL3 matmul, then applies the output transform.
+
+The active matrix/output slot j selects q = indices[j] when indices is given,
+or q = j otherwise. This supports the following modes:
+
+- Multiple inputs and outputs: A[j] @ B[q] -> C[j].
+- One input, multiple outputs: when a_batches == 1, A[0] is broadcast and
+  transformed separately for each selected B[q], producing C[j]. This is used
+  for e.g. fused gate/up projections and MoE expert fan-out.
+- Indexed matrices: indices is a contiguous int64 [*, num_indices] tensor;
+  the kernel reads its first num_indices entries as q values. Negative indices
+  skip that slot.
+- Weighted MoE reduction: weights is a float16 tensor parallel to indices.
+  Each transformed result is multiplied by weights[j], then all active C[j]
+  are summed into C[0]. C therefore also serves as per-expert scratch; only
+  C[0] is the reduced result.
+- Expert-range filtering: with min_index >= 0, selections outside
+  [min_index, max_index) are removed and retained indices are rebased by
+  min_index. This allows B/suh/svh to be local pointer tables for an expert
+  shard. Weights are compacted in the same order.
+
+Without weights, every active C[j] is a separate output. The active slot count
+is max(a_batches, c_batches), capped to num_indices when indices is present.
+
+Limitations: k must be divisible by 16 and n by 128. Range filtering supports
+at most 128 slots (the kernel's index-compaction capacity).
 */
 
 int exl3_mgemm_gr
@@ -410,6 +448,13 @@ int exl3_mgemm_gr
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
+
+    if (mul1 && exl3_gemv_int8_enabled())
+    {
+        if (exl3_mgemv_int8
+            (A, B, C, suh, A_had, svh, indices, weights, K, min_index, max_index, stream, graph))
+            return 0;
+    }
 
     int shape_idx;
     int block_dim;
