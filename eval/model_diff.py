@@ -88,6 +88,10 @@ def main(args):
     model_b = Model.from_config(config_b)
     vocab_size = tokenizer.actual_vocab_size
 
+    if args.no_reconstruct:
+        config_a.infer_params.no_reconstruct = True
+        config_b.infer_params.no_reconstruct = True
+
     # Override tensors
     if args.override:
         with open(args.override, "r") as f:
@@ -318,5 +322,6 @@ if __name__ == "__main__":
     parser.add_argument("-slb", "--save_logits_b", type = str, help = "Save model B logits (filename)", default = None)
     parser.add_argument("-bsz", "--batch_size", type = int, help = "Batch size", default = 1)
     parser.add_argument("-gp", "--gen_prompt", action = "store_true", help = "Prepend chat template generation prompt to every row")
+    parser.add_argument("-nr", "--no_reconstruct", action = "store_true", help = "Avoid GEMM reconstruct (slow)")
     _args = parser.parse_args()
     main(_args)

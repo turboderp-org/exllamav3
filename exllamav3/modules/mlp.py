@@ -561,6 +561,7 @@ class GatedMLP(Module):
     def load_local(self, device: torch.Device, load_slice: int, **kwargs):
         # Test if gate and up proj can be fused
         if (
+            not self.config.infer_params.no_reconstruct and
             device != torch.device("cpu") and
             self.gates[load_slice].quant_type == "exl3" and
             self.ups[load_slice].quant_type == "exl3" and

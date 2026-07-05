@@ -1,10 +1,23 @@
 from __future__ import annotations
 from abc import ABC
 import os, json
+from dataclasses import dataclass
 from ..util.rope import RopeSettings, RopeStyle
 from ..loader import SafetensorsCollection
 from ..util.file import read_dict, no_value, no_default
 import uuid
+
+@dataclass
+class InferParams:
+
+    # Avoid reconstruct path during GEMM. Forces use of low-bsz GEMM/GEMV kernels. Also disables MGEMM path
+    no_reconstruct: bool = False
+
+
+class NullConfig:
+    def __init__(self):
+        self.infer_params = InferParams()
+
 
 class Config(ABC):
     arch_string = None
@@ -94,6 +107,9 @@ class Config(ABC):
             assert isinstance(layer_map, list), "layer_map must be string or list of ints"
             self.layer_map = layer_map
             self.layer_map_str = None
+
+        # Inference parameters
+        self.infer_params = InferParams()
 
 
     def get_tensor_name_fixes(self):

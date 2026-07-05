@@ -399,6 +399,7 @@ class SlidingAttention(Module):
 
         # Test if K and V proj can be fused
         if (
+            not self.config.infer_params.no_reconstruct and
             device != torch.device("cpu") and
             self.k_proj.quant_type == "exl3" and
             self.v_proj.quant_type == "exl3" and
@@ -413,6 +414,7 @@ class SlidingAttention(Module):
 
         # Test if Q and G proj can be fused
         if (
+            not self.config.infer_params.no_reconstruct and
             self.g_proj is not None and
             device != torch.device("cpu") and
             self.q_proj.quant_type == "exl3" and

@@ -449,7 +449,7 @@ class BlockSparseMLP(Module):
         self.is_quantized = (num_exl3_tensors > 0 and num_nonexl3_tensors == 0)
 
         # Make fused modules
-        if self.is_quantized:
+        if self.is_quantized and not self.config.infer_params.no_reconstruct:
             self.multi_gate = MultiLinear(self.device, self.gates)
             self.multi_up = MultiLinear(self.device, self.ups)
             self.multi_down = MultiLinear(self.device, self.downs)
@@ -700,7 +700,7 @@ class BlockSparseMLP(Module):
             final_hidden_states = torch.zeros_like(x, dtype = torch.float)
 
         # Torch/C++/fused path
-        elif bsz >= self.f_threshold or not self.is_quantized:
+        elif bsz >= self.f_threshold or not self.is_quantized or self.config.infer_params.no_reconstruct:
             final_hidden_states = torch.zeros_like(y, dtype = torch.float)
 
             # if self.routing_device is None or self.num_local_experts == self.num_experts:
