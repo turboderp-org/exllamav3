@@ -75,35 +75,35 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 
 #define EXL3_GEMM_BASE_THREADS 256
 
-#define ALL_EXL3_KERNEL_EXTERNS(K) \
-    extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K[]; \
-    extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K[]; \
-    extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K[]; \
-    extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K[]; \
+// Instance arrays are indexed by shape and defined per (K, cb) so each codebook compiles as a separate
+// translation unit (see comp_units/exl3_comp_unit_K_cbX.cu)
 
-#define ALL_EXL3_KERNEL_INSTANCES(K) \
-    fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K[] = { \
-        EXL3_GEMM_KERNEL_INSTANCES(K, true, 0), \
-        EXL3_GEMM_KERNEL_INSTANCES(K, true, 1), \
-        EXL3_GEMM_KERNEL_INSTANCES(K, true, 2) \
+#define EXL3_KERNEL_EXTERNS_CB(K, cb) \
+    extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K##_cb##cb[]; \
+    extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K##_cb##cb[]; \
+    extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K##_cb##cb[]; \
+    extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K##_cb##cb[]; \
+
+#define ALL_EXL3_KERNEL_EXTERNS(K) \
+    EXL3_KERNEL_EXTERNS_CB(K, 0) \
+    EXL3_KERNEL_EXTERNS_CB(K, 1) \
+    EXL3_KERNEL_EXTERNS_CB(K, 2) \
+
+#define EXL3_KERNEL_INSTANCES_CB(K, cb) \
+    fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K##_cb##cb[] = { \
+        EXL3_GEMM_KERNEL_INSTANCES(K, true, cb) \
     }; \
     \
-    fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K[] = { \
-        EXL3_GEMM_KERNEL_INSTANCES(K, false, 0), \
-        EXL3_GEMM_KERNEL_INSTANCES(K, false, 1), \
-        EXL3_GEMM_KERNEL_INSTANCES(K, false, 2) \
+    fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K##_cb##cb[] = { \
+        EXL3_GEMM_KERNEL_INSTANCES(K, false, cb) \
     }; \
     \
-    fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K[] = { \
-        EXL3_MGEMM_KERNEL_INSTANCES(K, true, 0), \
-        EXL3_MGEMM_KERNEL_INSTANCES(K, true, 1), \
-        EXL3_MGEMM_KERNEL_INSTANCES(K, true, 2) \
+    fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K##_cb##cb[] = { \
+        EXL3_MGEMM_KERNEL_INSTANCES(K, true, cb) \
     }; \
     \
-    fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K[] = { \
-        EXL3_MGEMM_KERNEL_INSTANCES(K, false, 0), \
-        EXL3_MGEMM_KERNEL_INSTANCES(K, false, 1), \
-        EXL3_MGEMM_KERNEL_INSTANCES(K, false, 2) \
+    fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K##_cb##cb[] = { \
+        EXL3_MGEMM_KERNEL_INSTANCES(K, false, cb) \
     };
 
 fp_exl3_gemm_kernel select_exl3_gemm_kernel
