@@ -1,5 +1,7 @@
 #include "exl3_moe_instances.cuh"
 #include "../exl3_moe_kernel.cuh"
 
-fp_exl3_moe_kernel exl3_moe_kernel_k2_n128() { return exl3_moe_kernel<2, 128>; }
-fp_exl3_moe_kernel exl3_moe_kernel_k2_n256() { return exl3_moe_kernel<2, 256>; }
+fp_exl3_moe_kernel exl3_moe_kernel_k2_n128_cb1() { return exl3_moe_kernel<2, 128, 1>; }
+fp_exl3_moe_kernel exl3_moe_kernel_k2_n128_cb2() { return exl3_moe_kernel<2, 128, 2>; }
+fp_exl3_moe_kernel exl3_moe_kernel_k2_n256_cb1() { return exl3_moe_kernel<2, 256, 1>; }
+fp_exl3_moe_kernel exl3_moe_kernel_k2_n256_cb2() { return exl3_moe_kernel<2, 256, 2>; }
