@@ -6,7 +6,8 @@
 #define MOE_ACT_SILU 0
 #define MOE_ACT_GELU 1
 
-#define MOE_SMS_PER_EXPERT 8
+#define MOE_SMS_PER_EXPERT 8       // default/minimum group width, also sets max concurrency (buffer count)
+#define MOE_MAX_SMS_PER_EXPERT 32  // widest expert group when few experts are active
 #define MOE_TILESIZE_K 32
 #define MOE_TILESIZE_M 16
 #define MOE_SH_STAGES 3

@@ -89,6 +89,11 @@ inputs:
     down_mcg
     down_mul1:
         bool, codebook flags
+
+    num_active:
+        number of experts with 0 < token count <= max_tokens_per_expert, i.e. the number of experts this kernel
+        will process. Used to size the launch: fewer, wider expert groups when few experts are active. Pass -1 if
+        unknown (defaults to MOE_SMS_PER_EXPERT-wide groups at max concurrency)
 */
 
 void exl3_moe
@@ -127,11 +132,15 @@ void exl3_moe
     const bool down_mcg,
     const bool down_mul1,
 
-    const float act_limit
+    const float act_limit,
+    const int num_active
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    // Nothing for the fused kernel to do
+    if (num_active == 0) return;
 
     // Validate args
     TORCH_CHECK_DTYPE(hidden_state, kHalf);
@@ -198,10 +207,19 @@ void exl3_moe
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);
 
-    // Launch
+    // Launch. All blocks of the grid must be co-resident for the group barriers, so groups * width <= num_sms.
+    // With a known number of active experts, launch only as many groups as there are experts and widen them to
+    // use the freed SMs, up to MOE_MAX_SMS_PER_EXPERT
     int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
     TORCH_CHECK(concurrency * MOE_SMS_PER_EXPERT <= num_sms, "Concurrency too high for device num_sms");
-    dim3 grid_dim(MOE_SMS_PER_EXPERT, 1, concurrency);
+    int num_groups = MIN((int) concurrency, MOE_MAX_GROUPS);
+    int group_size = MOE_SMS_PER_EXPERT;
+    if (num_active > 0)
+    {
+        num_groups = MIN(num_groups, num_active);
+        group_size = MIN(num_sms / num_groups, MOE_MAX_SMS_PER_EXPERT);
+    }
+    dim3 grid_dim(group_size, 1, num_groups);
 
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0) N_off = 1;
@@ -260,7 +278,7 @@ void exl3_moe
         (void*) &num_experts,
         (void*) &num_experts_per_tok,
         (void*) &max_tokens_per_expert,
-        (void*) &concurrency,
+        (void*) &num_groups,
         (void*) &act_limit,
         (void*) &act_function,
         (void*) &K_gate,

@@ -744,6 +744,7 @@ class BlockSparseMLP(Module):
 
                 # Run fused path if possible, skips experts with more than TEMP_ROWS_FUSED tokens
                 if self.fused_mode_buffers is not None:
+                    num_active = sum(1 for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED)
                     ext.exl3_moe(
                         y,
                         final_hidden_states,
@@ -773,7 +774,8 @@ class BlockSparseMLP(Module):
                         self.multi_up.mul1,
                         self.multi_down.mcg,
                         self.multi_down.mul1,
-                        self.act_limit
+                        self.act_limit,
+                        num_active
                     )
                     min_rows = TEMP_ROWS_FUSED
                 else:
