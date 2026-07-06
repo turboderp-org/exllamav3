@@ -303,14 +303,33 @@ __device__ __forceinline__ void gemv_int8_row_sums
     __syncthreads();
 }
 
-// Wide unit (4 bpw): one (256-column x k-slice) unit, warp per adjacent block pair, uint2 loads
-template <bool residual, bool atomic = true>
+// K >= 6 is DRAM-bound and the regular kernel reads the same bytes with less overhead; the int8
+// path only wins where the fp16 pipeline is compute/latency-limited
+#define GEMV_INT8_MAX_K 5   // fall back to the regular kernel above this (DRAM-bound regime)
+#define GEMV_STAGE_D 4      // cp.async pipeline depth (rows) for the smem-staged unit
+#define GEMV_STAGE_MAX_BYTES (8 * GEMV_STAGE_D * 16 * 8 * 4)   // 8 warps, K = 8
+
+// Per-slice-scale ("sq") kernel parameters
+#define SQ_KSPLIT_CAP 64
+#define SQ_MINROWS 16       // minimum slice height (staging overhead amortization)
+#define SQ_ROWS_MAX 512     // shared memory cap
+#define SQ_COUNTERS_CAP 4096                                    // fixed counter region: size_n up to 1M
+#define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP * 4)    // sq-private region at workspace start (counters + per-slice-per-row scales, m <= 4)
+
+// Wide unit (4 bpw): one (256-column x k-slice) unit, warp per adjacent block pair, uint2 loads.
+// M activation rows share the decoded weights: extraction and the B stream are amortized, each row
+// only adds its dp4a chains against its own splat region (sh_as + r * slice_stride; residual splats
+// at (M + r) * slice_stride - at M = 1 this is exactly the coop kernel's sh_as/sh_as2 layout). Row
+// accumulators go to accs + r * acc_stride, atomically or with plain stores (exclusive per-slice
+// partials of the sq kernel).
+template <int M, bool residual, bool atomic = true>
 __device__ __forceinline__ void gemv_int8_unit_wide
 (
     const uint16_t* __restrict__ B,
     int* __restrict__ accs,
+    size_t acc_stride,
     const uint32_t* __restrict__ sh_as,
-    const uint32_t* __restrict__ sh_as2,
+    int slice_stride,
     int nb256,
     int kb0,
     int nrows,
@@ -325,7 +344,7 @@ __device__ __forceinline__ void gemv_int8_unit_wide
     int c2 = (lane & 1) ? 4 : 0;
     int shfl_src = (lane & 16) | ((lane + 15) & 15);
 
-    int iacc0 = 0, iacc1 = 0, jacc0 = 0, jacc1 = 0;
+    int iacc0[M] = {}, iacc1[M] = {}, jacc0[M] = {}, jacc1[M] = {};
     uint2 r0 = *(const uint2*) bp;
     uint2 r1 = {};
     if (nrows > 1) r1 = *(const uint2*) (bp + row_stride);
@@ -336,73 +355,59 @@ __device__ __forceinline__ void gemv_int8_unit_wide
         if (kb + 2 < nrows) r2 = *(const uint2*) (bp + (size_t) (kb + 2) * row_stride);
         uint32_t prev = __shfl_sync(0xffffffff, r0.y, shfl_src);
 
-        const uint32_t* as = sh_as + (kb << 4);
-        uint4 as0 = *(const uint4*) (as + c2);
-        uint4 as8 = *(const uint4*) (as + c2 + 8);
-
         uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
-
-        // Run t = 8*(2m)
-        extract8_4bits_words(prev, r0.x, w0, w1, w2, w3, w4, w5, w6, w7);
+        uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
+        extract8_4bits_words(prev, r0.x, w0, w1, w2, w3, w4, w5, w6, w7);   // run t = 8*(2m)
+        extract8_4bits_words(r0.x, r0.y, v0, v1, v2, v3, v4, v5, v6, v7);   // run t = 8*(2m+1)
         w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
         w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
-        iacc0 = dp4a_us(w0, as0.x, iacc0);
-        iacc0 = dp4a_us(w1, as0.y, iacc0);
-        iacc0 = dp4a_us(w2, as8.x, iacc0);
-        iacc0 = dp4a_us(w3, as8.y, iacc0);
-        iacc1 = dp4a_us(w4, as0.x, iacc1);
-        iacc1 = dp4a_us(w5, as0.y, iacc1);
-        iacc1 = dp4a_us(w6, as8.x, iacc1);
-        iacc1 = dp4a_us(w7, as8.y, iacc1);
-        if constexpr (residual)
-        {
-            const uint32_t* as2 = sh_as2 + (kb << 4);
-            uint4 bs0 = *(const uint4*) (as2 + c2);
-            uint4 bs8 = *(const uint4*) (as2 + c2 + 8);
-            jacc0 = dp4a_us(w0, bs0.x, jacc0);
-            jacc0 = dp4a_us(w1, bs0.y, jacc0);
-            jacc0 = dp4a_us(w2, bs8.x, jacc0);
-            jacc0 = dp4a_us(w3, bs8.y, jacc0);
-            jacc1 = dp4a_us(w4, bs0.x, jacc1);
-            jacc1 = dp4a_us(w5, bs0.y, jacc1);
-            jacc1 = dp4a_us(w6, bs8.x, jacc1);
-            jacc1 = dp4a_us(w7, bs8.y, jacc1);
+        v0 *= 0x83DCD12Du; v1 *= 0x83DCD12Du; v2 *= 0x83DCD12Du; v3 *= 0x83DCD12Du;
+        v4 *= 0x83DCD12Du; v5 *= 0x83DCD12Du; v6 *= 0x83DCD12Du; v7 *= 0x83DCD12Du;
 
-            // Run t = 8*(2m+1)
-            extract8_4bits_words(r0.x, r0.y, w0, w1, w2, w3, w4, w5, w6, w7);
-            w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
-            w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
-            iacc0 = dp4a_us(w0, as0.z, iacc0);
-            iacc0 = dp4a_us(w1, as0.w, iacc0);
-            iacc0 = dp4a_us(w2, as8.z, iacc0);
-            iacc0 = dp4a_us(w3, as8.w, iacc0);
-            iacc1 = dp4a_us(w4, as0.z, iacc1);
-            iacc1 = dp4a_us(w5, as0.w, iacc1);
-            iacc1 = dp4a_us(w6, as8.z, iacc1);
-            iacc1 = dp4a_us(w7, as8.w, iacc1);
-            jacc0 = dp4a_us(w0, bs0.z, jacc0);
-            jacc0 = dp4a_us(w1, bs0.w, jacc0);
-            jacc0 = dp4a_us(w2, bs8.z, jacc0);
-            jacc0 = dp4a_us(w3, bs8.w, jacc0);
-            jacc1 = dp4a_us(w4, bs0.z, jacc1);
-            jacc1 = dp4a_us(w5, bs0.w, jacc1);
-            jacc1 = dp4a_us(w6, bs8.z, jacc1);
-            jacc1 = dp4a_us(w7, bs8.w, jacc1);
-        }
-        else
+        #pragma unroll
+        for (int r = 0; r < M; ++r)
         {
-            // Run t = 8*(2m+1)
-            extract8_4bits_words(r0.x, r0.y, w0, w1, w2, w3, w4, w5, w6, w7);
-            w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
-            w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
-            iacc0 = dp4a_us(w0, as0.z, iacc0);
-            iacc0 = dp4a_us(w1, as0.w, iacc0);
-            iacc0 = dp4a_us(w2, as8.z, iacc0);
-            iacc0 = dp4a_us(w3, as8.w, iacc0);
-            iacc1 = dp4a_us(w4, as0.z, iacc1);
-            iacc1 = dp4a_us(w5, as0.w, iacc1);
-            iacc1 = dp4a_us(w6, as8.z, iacc1);
-            iacc1 = dp4a_us(w7, as8.w, iacc1);
+            const uint32_t* as = sh_as + r * slice_stride + (kb << 4);
+            uint4 as0 = *(const uint4*) (as + c2);
+            uint4 as8 = *(const uint4*) (as + c2 + 8);
+            iacc0[r] = dp4a_us(w0, as0.x, iacc0[r]);
+            iacc0[r] = dp4a_us(w1, as0.y, iacc0[r]);
+            iacc0[r] = dp4a_us(w2, as8.x, iacc0[r]);
+            iacc0[r] = dp4a_us(w3, as8.y, iacc0[r]);
+            iacc1[r] = dp4a_us(w4, as0.x, iacc1[r]);
+            iacc1[r] = dp4a_us(w5, as0.y, iacc1[r]);
+            iacc1[r] = dp4a_us(w6, as8.x, iacc1[r]);
+            iacc1[r] = dp4a_us(w7, as8.y, iacc1[r]);
+            iacc0[r] = dp4a_us(v0, as0.z, iacc0[r]);
+            iacc0[r] = dp4a_us(v1, as0.w, iacc0[r]);
+            iacc0[r] = dp4a_us(v2, as8.z, iacc0[r]);
+            iacc0[r] = dp4a_us(v3, as8.w, iacc0[r]);
+            iacc1[r] = dp4a_us(v4, as0.z, iacc1[r]);
+            iacc1[r] = dp4a_us(v5, as0.w, iacc1[r]);
+            iacc1[r] = dp4a_us(v6, as8.z, iacc1[r]);
+            iacc1[r] = dp4a_us(v7, as8.w, iacc1[r]);
+            if constexpr (residual)
+            {
+                const uint32_t* as2 = sh_as + (M + r) * slice_stride + (kb << 4);
+                uint4 bs0 = *(const uint4*) (as2 + c2);
+                uint4 bs8 = *(const uint4*) (as2 + c2 + 8);
+                jacc0[r] = dp4a_us(w0, bs0.x, jacc0[r]);
+                jacc0[r] = dp4a_us(w1, bs0.y, jacc0[r]);
+                jacc0[r] = dp4a_us(w2, bs8.x, jacc0[r]);
+                jacc0[r] = dp4a_us(w3, bs8.y, jacc0[r]);
+                jacc1[r] = dp4a_us(w4, bs0.x, jacc1[r]);
+                jacc1[r] = dp4a_us(w5, bs0.y, jacc1[r]);
+                jacc1[r] = dp4a_us(w6, bs8.x, jacc1[r]);
+                jacc1[r] = dp4a_us(w7, bs8.y, jacc1[r]);
+                jacc0[r] = dp4a_us(v0, bs0.z, jacc0[r]);
+                jacc0[r] = dp4a_us(v1, bs0.w, jacc0[r]);
+                jacc0[r] = dp4a_us(v2, bs8.z, jacc0[r]);
+                jacc0[r] = dp4a_us(v3, bs8.w, jacc0[r]);
+                jacc1[r] = dp4a_us(v4, bs0.z, jacc1[r]);
+                jacc1[r] = dp4a_us(v5, bs0.w, jacc1[r]);
+                jacc1[r] = dp4a_us(v6, bs8.z, jacc1[r]);
+                jacc1[r] = dp4a_us(v7, bs8.w, jacc1[r]);
+            }
         }
 
         r0 = r1;
@@ -410,163 +415,193 @@ __device__ __forceinline__ void gemv_int8_unit_wide
     }
 
     // Lanes l, l^1 share both n values
-    iacc0 += __shfl_xor_sync(0xffffffff, iacc0, 1);
-    iacc1 += __shfl_xor_sync(0xffffffff, iacc1, 1);
-    if constexpr (residual)
+    #pragma unroll
+    for (int r = 0; r < M; ++r)
     {
-        jacc0 += __shfl_xor_sync(0xffffffff, jacc0, 1);
-        jacc1 += __shfl_xor_sync(0xffffffff, jacc1, 1);
+        iacc0[r] += __shfl_xor_sync(0xffffffff, iacc0[r], 1);
+        iacc1[r] += __shfl_xor_sync(0xffffffff, iacc1[r], 1);
+        if constexpr (residual)
+        {
+            jacc0[r] += __shfl_xor_sync(0xffffffff, jacc0[r], 1);
+            jacc1[r] += __shfl_xor_sync(0xffffffff, jacc1[r], 1);
+        }
     }
     if (!(lane & 1))
     {
         int nb = nbp * 2 + (lane >> 4);
         int n0 = nb * 16 + ((lane & 15) >> 1);
-        if constexpr (atomic)
+        #pragma unroll
+        for (int r = 0; r < M; ++r)
         {
-            atomicAdd(accs + n0, iacc0);
-            atomicAdd(accs + n0 + 8, iacc1);
-            if constexpr (residual)
+            int* acc = accs + r * acc_stride;
+            if constexpr (atomic)
             {
-                atomicAdd(accs + size_n + n0, jacc0);
-                atomicAdd(accs + size_n + n0 + 8, jacc1);
+                atomicAdd(acc + n0, iacc0[r]);
+                atomicAdd(acc + n0 + 8, iacc1[r]);
+                if constexpr (residual)
+                {
+                    atomicAdd(acc + size_n + n0, jacc0[r]);
+                    atomicAdd(acc + size_n + n0 + 8, jacc1[r]);
+                }
             }
-        }
-        else
-        {
-            accs[n0] = iacc0;
-            accs[n0 + 8] = iacc1;
-            if constexpr (residual)
+            else
             {
-                accs[size_n + n0] = jacc0;
-                accs[size_n + n0 + 8] = jacc1;
+                acc[n0] = iacc0[r];
+                acc[n0 + 8] = iacc1[r];
+                if constexpr (residual)
+                {
+                    acc[size_n + n0] = jacc0[r];
+                    acc[size_n + n0 + 8] = jacc1[r];
+                }
             }
         }
     }
 }
 
 // One k-row of an adjacent block pair, generic K: extract + dp4a for both blocks from block pointers
-// (global or shared memory)
-template <int bits, bool residual>
+// (global or shared memory), M rows sharing the extraction
+template <int bits, int M, bool residual>
 __device__ __forceinline__ void gemv_int8_pair_row
 (
     const uint32_t* blockA, const uint32_t* blockB,
-    const uint32_t* as, const uint32_t* as2, int c2, int t0,
-    int& ia0, int& ia1, int& ib0, int& ib1,
-    int& ja0, int& ja1, int& jb0, int& jb1
+    const uint32_t* as_kb,             // sh_as + (kb << 4)
+    int slice_stride, int c2, int t0,
+    int* ia0, int* ia1, int* ib0, int* ib1,
+    int* ja0, int* ja1, int* jb0, int* jb1
 )
 {
-    uint2 as01 = *(const uint2*) (as + c2);
-    uint2 as89 = *(const uint2*) (as + c2 + 8);
-    uint2 bs01, bs89;
-    if constexpr (residual)
-    {
-        bs01 = *(const uint2*) (as2 + c2);
-        bs89 = *(const uint2*) (as2 + c2 + 8);
-    }
-
     uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
     ext8w<bits>(blockA, t0, w0, w1, w2, w3, w4, w5, w6, w7);
     w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
     w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
-    ia0 = dp4a_us(w0, as01.x, ia0);
-    ia0 = dp4a_us(w1, as01.y, ia0);
-    ia0 = dp4a_us(w2, as89.x, ia0);
-    ia0 = dp4a_us(w3, as89.y, ia0);
-    ia1 = dp4a_us(w4, as01.x, ia1);
-    ia1 = dp4a_us(w5, as01.y, ia1);
-    ia1 = dp4a_us(w6, as89.x, ia1);
-    ia1 = dp4a_us(w7, as89.y, ia1);
-    if constexpr (residual)
+    #pragma unroll
+    for (int r = 0; r < M; ++r)
     {
-        ja0 = dp4a_us(w0, bs01.x, ja0);
-        ja0 = dp4a_us(w1, bs01.y, ja0);
-        ja0 = dp4a_us(w2, bs89.x, ja0);
-        ja0 = dp4a_us(w3, bs89.y, ja0);
-        ja1 = dp4a_us(w4, bs01.x, ja1);
-        ja1 = dp4a_us(w5, bs01.y, ja1);
-        ja1 = dp4a_us(w6, bs89.x, ja1);
-        ja1 = dp4a_us(w7, bs89.y, ja1);
+        const uint32_t* as = as_kb + r * slice_stride;
+        uint2 as01 = *(const uint2*) (as + c2);
+        uint2 as89 = *(const uint2*) (as + c2 + 8);
+        ia0[r] = dp4a_us(w0, as01.x, ia0[r]);
+        ia0[r] = dp4a_us(w1, as01.y, ia0[r]);
+        ia0[r] = dp4a_us(w2, as89.x, ia0[r]);
+        ia0[r] = dp4a_us(w3, as89.y, ia0[r]);
+        ia1[r] = dp4a_us(w4, as01.x, ia1[r]);
+        ia1[r] = dp4a_us(w5, as01.y, ia1[r]);
+        ia1[r] = dp4a_us(w6, as89.x, ia1[r]);
+        ia1[r] = dp4a_us(w7, as89.y, ia1[r]);
+        if constexpr (residual)
+        {
+            const uint32_t* as2 = as_kb + (M + r) * slice_stride;
+            uint2 bs01 = *(const uint2*) (as2 + c2);
+            uint2 bs89 = *(const uint2*) (as2 + c2 + 8);
+            ja0[r] = dp4a_us(w0, bs01.x, ja0[r]);
+            ja0[r] = dp4a_us(w1, bs01.y, ja0[r]);
+            ja0[r] = dp4a_us(w2, bs89.x, ja0[r]);
+            ja0[r] = dp4a_us(w3, bs89.y, ja0[r]);
+            ja1[r] = dp4a_us(w4, bs01.x, ja1[r]);
+            ja1[r] = dp4a_us(w5, bs01.y, ja1[r]);
+            ja1[r] = dp4a_us(w6, bs89.x, ja1[r]);
+            ja1[r] = dp4a_us(w7, bs89.y, ja1[r]);
+        }
     }
 
     ext8w<bits>(blockB, t0, w0, w1, w2, w3, w4, w5, w6, w7);
     w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
     w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
-    ib0 = dp4a_us(w0, as01.x, ib0);
-    ib0 = dp4a_us(w1, as01.y, ib0);
-    ib0 = dp4a_us(w2, as89.x, ib0);
-    ib0 = dp4a_us(w3, as89.y, ib0);
-    ib1 = dp4a_us(w4, as01.x, ib1);
-    ib1 = dp4a_us(w5, as01.y, ib1);
-    ib1 = dp4a_us(w6, as89.x, ib1);
-    ib1 = dp4a_us(w7, as89.y, ib1);
-    if constexpr (residual)
+    #pragma unroll
+    for (int r = 0; r < M; ++r)
     {
-        jb0 = dp4a_us(w0, bs01.x, jb0);
-        jb0 = dp4a_us(w1, bs01.y, jb0);
-        jb0 = dp4a_us(w2, bs89.x, jb0);
-        jb0 = dp4a_us(w3, bs89.y, jb0);
-        jb1 = dp4a_us(w4, bs01.x, jb1);
-        jb1 = dp4a_us(w5, bs01.y, jb1);
-        jb1 = dp4a_us(w6, bs89.x, jb1);
-        jb1 = dp4a_us(w7, bs89.y, jb1);
+        const uint32_t* as = as_kb + r * slice_stride;
+        uint2 as01 = *(const uint2*) (as + c2);
+        uint2 as89 = *(const uint2*) (as + c2 + 8);
+        ib0[r] = dp4a_us(w0, as01.x, ib0[r]);
+        ib0[r] = dp4a_us(w1, as01.y, ib0[r]);
+        ib0[r] = dp4a_us(w2, as89.x, ib0[r]);
+        ib0[r] = dp4a_us(w3, as89.y, ib0[r]);
+        ib1[r] = dp4a_us(w4, as01.x, ib1[r]);
+        ib1[r] = dp4a_us(w5, as01.y, ib1[r]);
+        ib1[r] = dp4a_us(w6, as89.x, ib1[r]);
+        ib1[r] = dp4a_us(w7, as89.y, ib1[r]);
+        if constexpr (residual)
+        {
+            const uint32_t* as2 = as_kb + (M + r) * slice_stride;
+            uint2 bs01 = *(const uint2*) (as2 + c2);
+            uint2 bs89 = *(const uint2*) (as2 + c2 + 8);
+            jb0[r] = dp4a_us(w0, bs01.x, jb0[r]);
+            jb0[r] = dp4a_us(w1, bs01.y, jb0[r]);
+            jb0[r] = dp4a_us(w2, bs89.x, jb0[r]);
+            jb0[r] = dp4a_us(w3, bs89.y, jb0[r]);
+            jb1[r] = dp4a_us(w4, bs01.x, jb1[r]);
+            jb1[r] = dp4a_us(w5, bs01.y, jb1[r]);
+            jb1[r] = dp4a_us(w6, bs89.x, jb1[r]);
+            jb1[r] = dp4a_us(w7, bs89.y, jb1[r]);
+        }
     }
 }
 
 // Shared reduction tail for the pair-per-warp generic units (atomic, or exclusive plain stores for
 // the per-slice partials of the sq kernel): four lanes share each n
-template <bool residual, bool atomic = true>
+template <int M, bool residual, bool atomic = true>
 __device__ __forceinline__ void gemv_int8_pair_tail
 (
-    int* __restrict__ accs, int nbp, int lane, int size_n,
-    int ia0, int ia1, int ib0, int ib1,
-    int ja0, int ja1, int jb0, int jb1
+    int* __restrict__ accs, size_t acc_stride, int nbp, int lane, int size_n,
+    int* ia0, int* ia1, int* ib0, int* ib1,
+    int* ja0, int* ja1, int* jb0, int* jb1
 )
 {
     #pragma unroll
-    for (int o = 1; o < 4; o <<= 1)
+    for (int r = 0; r < M; ++r)
     {
-        ia0 += __shfl_xor_sync(0xffffffff, ia0, o);
-        ia1 += __shfl_xor_sync(0xffffffff, ia1, o);
-        ib0 += __shfl_xor_sync(0xffffffff, ib0, o);
-        ib1 += __shfl_xor_sync(0xffffffff, ib1, o);
-        if constexpr (residual)
+        #pragma unroll
+        for (int o = 1; o < 4; o <<= 1)
         {
-            ja0 += __shfl_xor_sync(0xffffffff, ja0, o);
-            ja1 += __shfl_xor_sync(0xffffffff, ja1, o);
-            jb0 += __shfl_xor_sync(0xffffffff, jb0, o);
-            jb1 += __shfl_xor_sync(0xffffffff, jb1, o);
+            ia0[r] += __shfl_xor_sync(0xffffffff, ia0[r], o);
+            ia1[r] += __shfl_xor_sync(0xffffffff, ia1[r], o);
+            ib0[r] += __shfl_xor_sync(0xffffffff, ib0[r], o);
+            ib1[r] += __shfl_xor_sync(0xffffffff, ib1[r], o);
+            if constexpr (residual)
+            {
+                ja0[r] += __shfl_xor_sync(0xffffffff, ja0[r], o);
+                ja1[r] += __shfl_xor_sync(0xffffffff, ja1[r], o);
+                jb0[r] += __shfl_xor_sync(0xffffffff, jb0[r], o);
+                jb1[r] += __shfl_xor_sync(0xffffffff, jb1[r], o);
+            }
         }
     }
     if ((lane & 3) == 0)
     {
         int nA = (nbp * 2) * 16 + (lane >> 2);
         int nB = nA + 16;
-        if constexpr (atomic)
+        #pragma unroll
+        for (int r = 0; r < M; ++r)
         {
-            atomicAdd(accs + nA, ia0);
-            atomicAdd(accs + nA + 8, ia1);
-            atomicAdd(accs + nB, ib0);
-            atomicAdd(accs + nB + 8, ib1);
-            if constexpr (residual)
+            int* acc = accs + r * acc_stride;
+            if constexpr (atomic)
             {
-                atomicAdd(accs + size_n + nA, ja0);
-                atomicAdd(accs + size_n + nA + 8, ja1);
-                atomicAdd(accs + size_n + nB, jb0);
-                atomicAdd(accs + size_n + nB + 8, jb1);
+                atomicAdd(acc + nA, ia0[r]);
+                atomicAdd(acc + nA + 8, ia1[r]);
+                atomicAdd(acc + nB, ib0[r]);
+                atomicAdd(acc + nB + 8, ib1[r]);
+                if constexpr (residual)
+                {
+                    atomicAdd(acc + size_n + nA, ja0[r]);
+                    atomicAdd(acc + size_n + nA + 8, ja1[r]);
+                    atomicAdd(acc + size_n + nB, jb0[r]);
+                    atomicAdd(acc + size_n + nB + 8, jb1[r]);
+                }
             }
-        }
-        else
-        {
-            accs[nA] = ia0;
-            accs[nA + 8] = ia1;
-            accs[nB] = ib0;
-            accs[nB + 8] = ib1;
-            if constexpr (residual)
+            else
             {
-                accs[size_n + nA] = ja0;
-                accs[size_n + nA + 8] = ja1;
-                accs[size_n + nB] = jb0;
-                accs[size_n + nB + 8] = jb1;
+                acc[nA] = ia0[r];
+                acc[nA + 8] = ia1[r];
+                acc[nB] = ib0[r];
+                acc[nB + 8] = ib1[r];
+                if constexpr (residual)
+                {
+                    acc[size_n + nA] = ja0[r];
+                    acc[size_n + nA + 8] = ja1[r];
+                    acc[size_n + nB] = jb0[r];
+                    acc[size_n + nB + 8] = jb1[r];
+                }
             }
         }
     }
@@ -574,13 +609,14 @@ __device__ __forceinline__ void gemv_int8_pair_tail
 
 // Narrow generic unit (any K): one (256-column x k-slice) unit, warp per adjacent block pair
 // processed sequentially with pointer-based extraction straight from global memory
-template <int bits, bool residual, bool atomic = true>
+template <int bits, int M, bool residual, bool atomic = true>
 __device__ __forceinline__ void gemv_int8_unit_narrow
 (
     const uint16_t* __restrict__ B,
     int* __restrict__ accs,
+    size_t acc_stride,
     const uint32_t* __restrict__ sh_as,
-    const uint32_t* __restrict__ sh_as2,
+    int slice_stride,
     int nb256,
     int kb0,
     int nrows,
@@ -593,41 +629,31 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
     const int row_stride = size_n * bits / 2;
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * (bits * 16);
     int c2 = 2 * (lane & 3);
-    int ia0 = 0, ia1 = 0, ib0 = 0, ib1 = 0;
-    int ja0 = 0, ja1 = 0, jb0 = 0, jb1 = 0;
+    int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
+    int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
 
     for (int kb = 0; kb < nrows; ++kb)
     {
         const uint32_t* blockA = bp + (size_t) kb * row_stride;
-        gemv_int8_pair_row<bits, residual>(blockA, blockA + 8 * bits,
-            sh_as + (kb << 4), sh_as2 + (kb << 4), c2, lane << 3,
+        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + 8 * bits,
+            sh_as + (kb << 4), slice_stride, c2, lane << 3,
             ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
     }
-    gemv_int8_pair_tail<residual, atomic>(accs, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+    gemv_int8_pair_tail<M, residual, atomic>(accs, acc_stride, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
 }
-
-#define GEMV_INT8_MAX_K 5   // fall back to the regular kernel above this (DRAM-bound regime)
-#define GEMV_STAGE_D 4      // cp.async pipeline depth (rows) for the smem-staged unit
-#define GEMV_STAGE_MAX_BYTES (8 * GEMV_STAGE_D * 16 * 8 * 4)   // 8 warps, K = 8
-
-// Per-slice-scale ("sq") m == 1 kernel parameters
-#define SQ_KSPLIT_CAP 64
-#define SQ_MINROWS 16       // minimum slice height (staging overhead amortization)
-#define SQ_ROWS_MAX 512     // shared memory cap
-#define SQ_COUNTERS_CAP 4096                                    // fixed counter region: size_n up to 1M
-#define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP)    // sq-private region at workspace start
 
 // Smem-staged generic unit: the warp stages its block pair's rows into a warp-private shared memory
 // slice with cp.async (coalesced 16 B chunks, one commit group per row, GEMV_STAGE_D rows deep) and
 // extracts from shared memory. Used for the K where scattered pointer extraction leaves the most
 // load latency exposed (3, 5, 7); warp-private slices need no block-level synchronization.
-template <int bits, bool residual, bool atomic = true>
+template <int bits, int M, bool residual, bool atomic = true>
 __device__ __forceinline__ void gemv_int8_unit_smem
 (
     const uint16_t* __restrict__ B,
     int* __restrict__ accs,
+    size_t acc_stride,
     const uint32_t* __restrict__ sh_as,
-    const uint32_t* __restrict__ sh_as2,
+    int slice_stride,
     uint32_t* __restrict__ sh_b,
     int nb256,
     int kb0,
@@ -655,8 +681,8 @@ __device__ __forceinline__ void gemv_int8_unit_smem
     for (int r = 0; r < D - 1; ++r) stage_row(r);
 
     int c2 = 2 * (lane & 3);
-    int ia0 = 0, ia1 = 0, ib0 = 0, ib1 = 0;
-    int ja0 = 0, ja1 = 0, jb0 = 0, jb1 = 0;
+    int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
+    int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
 
     for (int kb = 0; kb < nrows; ++kb)
     {
@@ -666,11 +692,11 @@ __device__ __forceinline__ void gemv_int8_unit_smem
         stage_row(kb + D - 1);
 
         const uint32_t* blockA = sb + (kb % D) * pairwords;
-        gemv_int8_pair_row<bits, residual>(blockA, blockA + 8 * bits,
-            sh_as + (kb << 4), sh_as2 + (kb << 4), c2, lane << 3,
+        gemv_int8_pair_row<bits, M, residual>(blockA, blockA + 8 * bits,
+            sh_as + (kb << 4), slice_stride, c2, lane << 3,
             ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
     }
-    gemv_int8_pair_tail<residual, atomic>(accs, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+    gemv_int8_pair_tail<M, residual, atomic>(accs, acc_stride, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
 }
 
 // K values routed to the smem-staged unit (measured on 3090: K=3 -13%; narrow wins for 2/6/8 which
@@ -748,106 +774,129 @@ __device__ __forceinline__ void gemv_int8_epilogue
 // The coop kernels use the region beyond SQ_WS_RESERVED. Counters are zeroed when the workspace is
 // (re)allocated and reset by the finishing block, so they stay zero between calls.
 
-// Stage one slice: Hadamard from A into sh_ah, slice max -> q_s, splats + exact sums. Bit-identical
-// in every block that stages the same slice.
-template <bool residual>
+// Stage one slice for M activation rows: Hadamard from A into sh_ah, slice max -> q_s, splats +
+// exact sums per row. Bit-identical in every block that stages the same slice. Rows >= size_m
+// (padding at M = 4, m = 3) get zero splats and dummy scales.
+template <int M, bool residual>
 __device__ __forceinline__ void gemv_int8_stage_slice
 (
     const half* __restrict__ A,
+    int size_m,
+    int size_k,
     const half* __restrict__ suh,
-    float* __restrict__ qs,            // qsums + 4 * slice, published (idempotent)
+    float* __restrict__ qs,            // qsums + 4 * slice * M, rows consecutive, published (idempotent)
     half* __restrict__ sh_ah,
-    uint32_t* __restrict__ sh_as,
-    uint32_t* __restrict__ sh_as2,
+    uint32_t* __restrict__ sh_as,      // M regions of slice_stride words (+ M more for residual)
+    int slice_stride,
     float* __restrict__ sh_red,        // 33 floats
     int kb0,
-    int nrows,
-    float& q_s, int& s1, int& s2
+    int nrows
 )
 {
     int t = threadIdx.x;
     int nel = nrows * 16;
-    __syncthreads();
-    for (int s = t >> 5; s < (nel >> 7); s += NUM_THREADS >> 5)
-        had_hf_r_128_inner<true, false>(A + (kb0 << 4) + (s << 7), sh_ah + (s << 7), suh + (kb0 << 4) + (s << 7), 0.088388347648f);
-    __syncthreads();
-
-    float mx = 0.0f;
-    for (int i = t; i < nel; i += NUM_THREADS) mx = fmaxf(mx, fabsf(__half2float(sh_ah[i])));
     #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
-    if ((t & 31) == 0) sh_red[t >> 5] = mx;
-    __syncthreads();
-    if (t < 32)
+    for (int r = 0; r < M; ++r)
     {
-        float v = t < (NUM_THREADS >> 5) ? sh_red[t] : 0.0f;
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
-        if (t == 0) sh_red[32] = fmaxf(v, 1e-8f) / 127.0f;
-    }
-    __syncthreads();
-    q_s = sh_red[32];
-
-    float rq = 1.0f / q_s;
-    float rq2 = rq * 254.0f;
-    int l1 = 0, l2 = 0;
-    for (int i = t; i < nel; i += NUM_THREADS)
-    {
-        float a = __half2float(sh_ah[i]);
-        int v = __float2int_rn(a * rq);
-        v = max(-127, min(127, v));
-        sh_as[i] = ((uint32_t)(uint8_t)(int8_t) v) * 0x01010101u;
-        l1 += v;
-        if constexpr (residual)
+        uint32_t* as = sh_as + r * slice_stride;
+        uint32_t* as2 = sh_as + (M + r) * slice_stride;
+        float* qsr = qs + 4 * r;
+        __syncthreads();
+        if (r >= size_m)
         {
-            float r = a - q_s * (float) v;
-            int v2 = __float2int_rn(r * rq2);
-            v2 = max(-127, min(127, v2));
-            sh_as2[i] = ((uint32_t)(uint8_t)(int8_t) v2) * 0x01010101u;
-            l2 += v2;
+            for (int i = t; i < nel; i += NUM_THREADS)
+            {
+                as[i] = 0;
+                if constexpr (residual) as2[i] = 0;
+            }
+            if (t == 0)
+            {
+                qsr[0] = 1.0f;
+                ((int*) qsr)[1] = 0;
+                ((int*) qsr)[2] = 0;
+            }
+            continue;
         }
-    }
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-    {
-        l1 += __shfl_xor_sync(0xffffffff, l1, o);
-        l2 += __shfl_xor_sync(0xffffffff, l2, o);
-    }
-    if ((t & 31) == 0) { ((int*) sh_red)[t >> 5] = l1; sh_red[16 + (t >> 5)] = __int_as_float(l2); }
-    __syncthreads();
-    if (t < 32)
-    {
-        int v1 = t < (NUM_THREADS >> 5) ? ((int*) sh_red)[t] : 0;
-        int v2 = t < (NUM_THREADS >> 5) ? __float_as_int(sh_red[16 + t]) : 0;
+        const half* Ar = A + (size_t) r * size_k;
+        for (int sp = t >> 5; sp < (nel >> 7); sp += NUM_THREADS >> 5)
+            had_hf_r_128_inner<true, false>(Ar + (kb0 << 4) + (sp << 7), sh_ah + (sp << 7), suh + (kb0 << 4) + (sp << 7), 0.088388347648f);
+        __syncthreads();
+
+        float mx = 0.0f;
+        for (int i = t; i < nel; i += NUM_THREADS) mx = fmaxf(mx, fabsf(__half2float(sh_ah[i])));
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+        if ((t & 31) == 0) sh_red[t >> 5] = mx;
+        __syncthreads();
+        if (t < 32)
+        {
+            float v = t < (NUM_THREADS >> 5) ? sh_red[t] : 0.0f;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
+            if (t == 0) sh_red[32] = fmaxf(v, 1e-8f) / 127.0f;
+        }
+        __syncthreads();
+        float q_s = sh_red[32];
+
+        float rq = 1.0f / q_s;
+        float rq2 = rq * 254.0f;
+        int l1 = 0, l2 = 0;
+        for (int i = t; i < nel; i += NUM_THREADS)
+        {
+            float a = __half2float(sh_ah[i]);
+            int v = __float2int_rn(a * rq);
+            v = max(-127, min(127, v));
+            as[i] = ((uint32_t)(uint8_t)(int8_t) v) * 0x01010101u;
+            l1 += v;
+            if constexpr (residual)
+            {
+                float rr = a - q_s * (float) v;
+                int v2 = __float2int_rn(rr * rq2);
+                v2 = max(-127, min(127, v2));
+                as2[i] = ((uint32_t)(uint8_t)(int8_t) v2) * 0x01010101u;
+                l2 += v2;
+            }
+        }
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1)
         {
-            v1 += __shfl_xor_sync(0xffffffff, v1, o);
-            v2 += __shfl_xor_sync(0xffffffff, v2, o);
+            l1 += __shfl_xor_sync(0xffffffff, l1, o);
+            l2 += __shfl_xor_sync(0xffffffff, l2, o);
         }
-        if (t == 0)
+        if ((t & 31) == 0) { ((int*) sh_red)[t >> 5] = l1; sh_red[16 + (t >> 5)] = __int_as_float(l2); }
+        __syncthreads();
+        if (t < 32)
         {
-            ((int*) sh_red)[0] = v1;
-            ((int*) sh_red)[1] = v2;
-            qs[0] = sh_red[32];
-            ((int*) qs)[1] = v1;
-            ((int*) qs)[2] = v2;
+            int v1 = t < (NUM_THREADS >> 5) ? ((int*) sh_red)[t] : 0;
+            int v2 = t < (NUM_THREADS >> 5) ? __float_as_int(sh_red[16 + t]) : 0;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+            {
+                v1 += __shfl_xor_sync(0xffffffff, v1, o);
+                v2 += __shfl_xor_sync(0xffffffff, v2, o);
+            }
+            if (t == 0)
+            {
+                qsr[0] = sh_red[32];
+                ((int*) qsr)[1] = v1;
+                ((int*) qsr)[2] = v2;
+            }
         }
     }
     __syncthreads();
-    s1 = ((int*) sh_red)[0];
-    s2 = ((int*) sh_red)[1];
 }
 
-// Epilogue for one 256-column group: deterministic fixed-order combine over the per-slice partials.
-// Reads bypass L1 (__ldcg): the contributions arrived from other blocks with no grid-wide barrier.
-template <bool c_fp32, bool residual>
+// Epilogue for one 256-column group: deterministic fixed-order combine over the per-slice partials,
+// warp per (row, 128-span). Reads bypass L1 (__ldcg): the contributions arrived from other blocks
+// with no grid-wide barrier.
+template <int M, bool c_fp32, bool residual>
 __device__ __forceinline__ void gemv_int8_epilogue_group_sq
 (
     const int* __restrict__ partials,
     const float* __restrict__ qsums,
     int pstride,
     int ksplit,
+    int size_m,
     void* __restrict__ C,
     const half* __restrict__ svh,
     float* __restrict__ sh_tmp,
@@ -857,27 +906,29 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
 {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    if (warp >= 2) return;
+    int row = warp >> 1;
+    if (warp >= 2 * M || row >= size_m) return;
     float k_inv  = __half2float(__ushort_as_half(0x1eee));
     float k_bias = __half2float(__ushort_as_half(0xc931));
     float aff = 1024.0f * k_inv + k_bias;
 
-    int base = nb256 * 256 + warp * 128;
+    int base = nb256 * 256 + (warp & 1) * 128;
     float* tmp = sh_tmp + warp * 128;
     float acc[4] = {};
     float corr = 0.0f;
-    for (int s = 0; s < ksplit; ++s)
+    for (int sl = 0; sl < ksplit; ++sl)
     {
-        float q_s = qsums[4 * s];
-        float suma = q_s * (float) ((const int*) qsums)[4 * s + 1];
-        const int* p = partials + (size_t) s * pstride + base;
+        int idx = sl * M + row;
+        float q_s = qsums[4 * idx];
+        float suma = q_s * (float) ((const int*) qsums)[4 * idx + 1];
+        const int* p = partials + (size_t) idx * pstride + base;
         #pragma unroll
         for (int i = 0; i < 4; ++i)
             acc[i] += q_s * (float) __ldcg(p + lane * 4 + i);
         if constexpr (residual)
         {
             float q2_s = q_s * (1.0f / 254.0f);
-            suma += q2_s * (float) ((const int*) qsums)[4 * s + 2];
+            suma += q2_s * (float) ((const int*) qsums)[4 * idx + 2];
             #pragma unroll
             for (int i = 0; i < 4; ++i)
                 acc[i] += q2_s * (float) __ldcg(p + size_n + lane * 4 + i);
@@ -889,19 +940,28 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
         tmp[lane * 4 + i] = k_inv * acc[i] + corr;
     __syncwarp();
     if constexpr (c_fp32)
-        had_ff_r_128_inner<false, true>(tmp, ((float*) C) + base, svh + base, 0.088388347648f);
+        had_ff_r_128_inner<false, true>(tmp, ((float*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
     else
-        had_fh_r_128_inner<false, true>(tmp, ((half*) C) + base, svh + base, 0.088388347648f);
+        had_fh_r_128_inner<false, true>(tmp, ((half*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
 }
 
-template <int bits, bool c_fp32, bool residual>
+// Shared-memory cap for the sq decomposition: row halfs (32 B/row) + M splat regions (64 B/row each,
+// x2 residual), within ~80 KB so the stage region and epilogue staging still fit under the opt-in max
+__host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
+{
+    int cap = (80 * 1024) / (32 + 64 * M * (residual ? 2 : 1));
+    cap &= ~7;
+    return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
+}
+
+template <int bits, int M, bool c_fp32, bool residual>
 __global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_sq_kernel
 (
     const half* __restrict__ A,
     const uint16_t* __restrict__ B,
     void* __restrict__ C,
-    const int size_m,       // must be 1
+    const int size_m,       // 1 <= size_m <= M
     const int size_k,
     const int size_n,
     int* __restrict__ locks,
@@ -922,26 +982,25 @@ void exl3_gemv_int8_sq_kernel
     int r = CEIL_DIVIDE(rows_total * nb256_total, (int) gridDim.x);
     int rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
     rows_per = MAX(rows_per, SQ_MINROWS);
-    rows_per = MIN(rows_per, SQ_ROWS_MAX);
+    rows_per = MIN(rows_per, gemv_int8_sq_rows_max(M, residual));
     rows_per = MIN(rows_per, (rows_total + 7) & ~7);
     int ksplit = CEIL_DIVIDE(rows_total, rows_per);
     int units = nb256_total * ksplit;
+    int slice_stride = rows_per * 16;
     int pstride = size_n * (residual ? 2 : 1);
 
     int* counters = locks;
     float* qsums = (float*) (locks + SQ_COUNTERS_CAP);
     int* partials = locks + SQ_WS_RESERVED;
 
-    // Shared layout: [slice halfs][splats(+res)][B stage][epi tmp]
+    // Shared layout: [slice halfs][M x splats (+ M x residual splats)][B stage][epilogue tmp]
     half* sh_ah = (half*) shmem;
     uint32_t* sh_as = shmem + rows_per * 8;
-    uint32_t* sh_as2 = sh_as + rows_per * 16;
-    uint32_t* sh_b = sh_as + rows_per * 16 * (residual ? 2 : 1);
+    uint32_t* sh_b = sh_as + slice_stride * M * (residual ? 2 : 1);
     float* sh_tmp = (float*) (sh_b + (gemv_int8_stage_smem(bits) ? 8 * GEMV_STAGE_D * 16 * bits : 0));
     __shared__ float sh_red[33];
     __shared__ int sh_last;
 
-    float q_s = 1.0f; int s1 = 0, s2 = 0;
     int t = threadIdx.x;
     int prev_slice = -1;
     for (int unit = blockIdx.x; unit < units; unit += gridDim.x)
@@ -952,17 +1011,17 @@ void exl3_gemv_int8_sq_kernel
         int nrows = MIN(rows_per, rows_total - kb0);
         if (slice != prev_slice)
         {
-            gemv_int8_stage_slice<residual>(A, suh, qsums + 4 * slice, sh_ah, sh_as, sh_as2,
-                                            sh_red, kb0, nrows, q_s, s1, s2);
+            gemv_int8_stage_slice<M, residual>(A, size_m, size_k, suh, qsums + 4 * slice * M,
+                                               sh_ah, sh_as, slice_stride, sh_red, kb0, nrows);
             prev_slice = slice;
         }
-        int* pacc = partials + (size_t) slice * pstride;
+        int* pacc = partials + (size_t) slice * M * pstride;
         if constexpr (bits == 4)
-            gemv_int8_unit_wide<residual, false>(B, pacc, sh_as, sh_as2, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_wide<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
         else if constexpr (gemv_int8_stage_smem(bits))
-            gemv_int8_unit_smem<bits, residual, false>(B, pacc, sh_as, sh_as2, sh_b, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n);
         else
-            gemv_int8_unit_narrow<bits, residual, false>(B, pacc, sh_as, sh_as2, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_narrow<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
 
         // Completion counter: the ksplit-th contributor runs the epilogue for this 256-column group.
         // (sh_last reuse across iterations is ordered by the next iteration's __syncthreads.)
@@ -972,8 +1031,8 @@ void exl3_gemv_int8_sq_kernel
         __syncthreads();
         if (sh_last)
         {
-            gemv_int8_epilogue_group_sq<c_fp32, residual>(partials, qsums, pstride, ksplit, C, svh,
-                                                          sh_tmp, nb256, size_n);
+            gemv_int8_epilogue_group_sq<M, c_fp32, residual>(partials, qsums, pstride, ksplit, size_m,
+                                                             C, svh, sh_tmp, nb256, size_n);
             if (t == 0) counters[nb256] = 0;
         }
     }
@@ -1145,11 +1204,11 @@ void exl3_gemv_int8_coop_kernel
                 prev_slice = slice;
             }
             if constexpr (bits == 4)
-                gemv_int8_unit_wide<residual>(B, accs, sh_as, sh_as2, nb256, kb0, nrows, size_n);
+                gemv_int8_unit_wide<1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n);
             else if constexpr (gemv_int8_stage_smem(bits))
-                gemv_int8_unit_smem<bits, residual>(B, accs, sh_as, sh_as2, sh_b, nb256, kb0, nrows, size_n);
+                gemv_int8_unit_smem<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, sh_b, nb256, kb0, nrows, size_n);
             else
-                gemv_int8_unit_narrow<bits, residual>(B, accs, sh_as, sh_as2, nb256, kb0, nrows, size_n);
+                gemv_int8_unit_narrow<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n);
         }
         grid.sync();
 
@@ -1315,11 +1374,11 @@ void exl3_mgemv_int8_coop_kernel
                         prev_slice = slice;
                     }
                     if constexpr (bits == 4)
-                        gemv_int8_unit_wide<residual>(B, accs, sh_as, sh_as2, nb256, kb0, nrows, size_n);
+                        gemv_int8_unit_wide<1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n);
                     else if constexpr (gemv_int8_stage_smem(bits))
-                        gemv_int8_unit_smem<bits, residual>(B, accs, sh_as, sh_as2, sh_b, nb256, kb0, nrows, size_n);
+                        gemv_int8_unit_smem<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, sh_b, nb256, kb0, nrows, size_n);
                     else
-                        gemv_int8_unit_narrow<bits, residual>(B, accs, sh_as, sh_as2, nb256, kb0, nrows, size_n);
+                        gemv_int8_unit_narrow<bits, 1, residual>(B, accs, 0, sh_as, rows_per * 16, nb256, kb0, nrows, size_n);
                 }
             }
             grid.sync();
@@ -1417,25 +1476,30 @@ static void* select_gemv_int8_kernel(int K, bool c_fp32, bool residual)
     return nullptr;
 }
 
-static void* select_gemv_int8_sq_kernel(int K, bool c_fp32, bool residual)
+static void* select_gemv_int8_sq_kernel(int K, int M, bool c_fp32, bool residual)
 {
-    #define SEL_(K_) \
-        if (c_fp32)  return residual ? (void*) exl3_gemv_int8_sq_kernel<K_, true, true> \
-                                     : (void*) exl3_gemv_int8_sq_kernel<K_, true, false>; \
-        else         return residual ? (void*) exl3_gemv_int8_sq_kernel<K_, false, true> \
-                                     : (void*) exl3_gemv_int8_sq_kernel<K_, false, false>;
+    #define SELM_(K_, M_) \
+        if (c_fp32)  return residual ? (void*) exl3_gemv_int8_sq_kernel<K_, M_, true, true> \
+                                     : (void*) exl3_gemv_int8_sq_kernel<K_, M_, true, false>; \
+        else         return residual ? (void*) exl3_gemv_int8_sq_kernel<K_, M_, false, true> \
+                                     : (void*) exl3_gemv_int8_sq_kernel<K_, M_, false, false>;
+    #define SELK_(K_) \
+        switch (M) \
+        { \
+            case 1: { SELM_(K_, 1) } \
+            case 2: { SELM_(K_, 2) } \
+        } \
+        return nullptr;
     switch (K)
     {
-        case 1: { SEL_(1) }
-        case 2: { SEL_(2) }
-        case 3: { SEL_(3) }
-        case 4: { SEL_(4) }
-        case 5: { SEL_(5) }
-        case 6: { SEL_(6) }
-        case 7: { SEL_(7) }
-        case 8: { SEL_(8) }
+        case 1: { SELK_(1) }
+        case 2: { SELK_(2) }
+        case 3: { SELK_(3) }
+        case 4: { SELK_(4) }
+        case 5: { SELK_(5) }
     }
-    #undef SEL_
+    #undef SELK_
+    #undef SELM_
     return nullptr;
 }
 
@@ -1460,13 +1524,17 @@ static int* gemv_int8_get_ws(int device, size_t ws_ints)
 static bool exl3_gemv_int8_sq
 (
     const half* A_ptr, const uint16_t* B_ptr, void* C_ptr,
-    int size_k, int size_n, int K, bool c_fp32, bool residual,
+    int size_m, int size_k, int size_n, int K, bool c_fp32, bool residual,
     const half* suh_ptr, half* A_had_ptr, const half* svh_ptr,
     int device, int num_sms, cudaStream_t stream, Graph* graph
 )
 {
-    void* fn = select_gemv_int8_sq_kernel(K, c_fp32, residual);
+    if (size_m > 2) return false;
+    int M = size_m;
+    void* fn = select_gemv_int8_sq_kernel(K, M, c_fp32, residual);
     if (!fn) return false;
+
+    int rows_max = gemv_int8_sq_rows_max(M, residual);
 
     // Mirror of the kernel's work decomposition (single-wave rule with a half-wave floor)
     auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
@@ -1476,19 +1544,20 @@ static bool exl3_gemv_int8_sq
         int r = CEIL_DIVIDE(rows_total * nb256, grid_);
         rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
         rows_per = MAX(rows_per, SQ_MINROWS);
-        rows_per = MIN(rows_per, SQ_ROWS_MAX);
+        rows_per = MIN(rows_per, rows_max);
         rows_per = MIN(rows_per, (rows_total + 7) & ~7);
         ksplit = CEIL_DIVIDE(rows_total, rows_per);
     };
     auto smem_for = [&] (int rows_per) -> size_t
     {
         size_t stage = gemv_int8_stage_smem(K) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
-        return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * (residual ? 2 : 1) + stage + 256 * 4;
+        return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * M * (residual ? 2 : 1)
+               + stage + (size_t) 2 * M * 128 * 4;
     };
 
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
-        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_for(SQ_ROWS_MAX));
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_for(rows_max));
         gemv_attr_set[device].insert(fn);
         cuda_check(cudaPeekAtLastError());
     }
@@ -1513,9 +1582,8 @@ static bool exl3_gemv_int8_sq
     if (size_n / 256 > SQ_COUNTERS_CAP) return false;
 
     int pstride = size_n * (residual ? 2 : 1);
-    int* ws_ptr = gemv_int8_get_ws(device, SQ_WS_RESERVED + (size_t) ksplit * pstride);
+    int* ws_ptr = gemv_int8_get_ws(device, SQ_WS_RESERVED + (size_t) ksplit * M * pstride);
 
-    int size_m = 1;
     void* kernelArgs[] =
     {
         (void*) &A_ptr,
@@ -1602,14 +1670,17 @@ bool exl3_gemv_int8
     bool c_fp32 = C.dtype() == at::kFloat;
     bool residual = exl3_gemv_int8_mode() == 1;
 
-    // m == 1: per-slice-scale kernel (regular launch, no global phases); falls through to the
-    // cooperative kernel on any constraint miss
-    if (size_m == 1 && exl3_gemv_int8_sq(
+    // Per-slice-scale kernel: m == 1, plus m == 2 in plain int8 mode (rows share the decoded
+    // weights and the B stream; measured on 3090, larger m and batched residual lose to the fp16
+    // tensor-core kernel). Falls through to the cooperative kernel on a constraint miss at m == 1;
+    // batched rows beyond the gate go straight to the regular kernel.
+    if (size_m <= (residual ? 1 : 2) && exl3_gemv_int8_sq(
         (const half*) A.data_ptr(), (const uint16_t*) B.data_ptr(), C.data_ptr(),
-        size_k, size_n, K, c_fp32, residual,
+        size_m, size_k, size_n, K, c_fp32, residual,
         (const half*) suh->data_ptr(), (half*) A_had->data_ptr(), (const half*) svh->data_ptr(),
         device, num_sms, stream, graph))
         return true;
+    if (size_m > 1) return false;
 
     void* fn = select_gemv_int8_kernel(K, c_fp32, residual);
     if (!fn) return false;
