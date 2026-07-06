@@ -9,9 +9,20 @@ import uuid
 
 @dataclass
 class InferParams:
+    """
+    Runtime inference parameters. Configure before loading model/modules
+    """
 
     # Avoid reconstruct path during GEMM. Forces use of low-bsz GEMM/GEMV kernels. Also disables MGEMM path
     no_reconstruct: bool = False
+
+    # Bitrate threshold for enabling MGEMM
+    mgemm_K_threshold: int = 0
+
+    def __init__(self):
+        # By default, experimental GEMV mode disables mgemm for K < 6 (for now)
+        if int(os.environ.get("EXL3_INT8_GEMV", 0)) > 0:
+            self.mgemm_K_threshold = 6
 
 
 class NullConfig:

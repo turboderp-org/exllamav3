@@ -454,8 +454,9 @@ class BlockSparseMLP(Module):
             self.multi_up = MultiLinear(self.device, self.ups)
             self.multi_down = MultiLinear(self.device, self.downs)
 
-            # Enable fully fused kernel if possible
-            self.support_fused = ((True, False) == self.multi_gate.q_cb() == self.multi_up.q_cb() == self.multi_down.q_cb())
+            # Enable fully fused kernel if possible (uniform mcg or mul1 codebook across gate/up/down)
+            cbs = (self.multi_gate.q_cb(), self.multi_up.q_cb(), self.multi_down.q_cb())
+            self.support_fused = cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True))
 
         # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok
