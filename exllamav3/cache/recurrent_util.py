@@ -1,5 +1,20 @@
 import torch
 
+# Slot index tensors are tiny and recur across forward passes; cache them with persistent device
+# copies so each decode step doesn't rebuild and re-upload one
+_slot_tensors = {}
+
+def _get_slot_tensor(slots: tuple) -> torch.Tensor:
+    t = _slot_tensors.get(slots)
+    if t is None:
+        if len(_slot_tensors) > 4096:
+            _slot_tensors.clear()
+        t = torch.tensor(list(slots), dtype = torch.int32)
+        t._static_dev_cache = True
+        _slot_tensors[slots] = t
+    return t
+
+
 def prepare_for_recurrence(input_ids: torch.Tensor, params: dict, model) -> torch.Tensor:
     """
     Add linear attn/SWA/recurrent parameters to state
@@ -45,8 +60,7 @@ def prepare_for_recurrence(input_ids: torch.Tensor, params: dict, model) -> torc
 
     # Create slot index tensor
     if rs is not None:
-        recurrent_slots = torch.tensor([r.slot for r in rs], dtype = torch.int32)
-        params["recurrent_slots"] = recurrent_slots
+        params["recurrent_slots"] = _get_slot_tensor(tuple(r.slot for r in rs))
 
 
 def advance_recurrent_states(input_ids: torch.Tensor, params: dict, model):
