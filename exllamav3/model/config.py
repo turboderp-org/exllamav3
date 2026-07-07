@@ -19,10 +19,21 @@ class InferParams:
     # Bitrate threshold for enabling MGEMM
     mgemm_K_threshold: int = 0
 
+    # Width threshold for enabling MGEMM regardless of bitrate
+    mgemm_n_threshold: int = 0
+
     def __init__(self):
-        # By default, experimental GEMV mode disables mgemm for K < 6 (for now)
+        # With the experimental GEMV mode, separate int8 GEMV calls beat the fused MGEMM only when
+        # a single matrix is wide enough to fill the GPU on its own (and K is within the int8 gate);
+        # narrow same-input pairs stay fused, where batching is what restores utilization
         if int(os.environ.get("EXL3_INT8_GEMV", 0)) > 0:
-            self.mgemm_K_threshold = 6
+            self.mgemm_K_threshold = int(os.environ.get("EXL3_MGEMM_K_THRESHOLD", 6))
+            self.mgemm_n_threshold = int(os.environ.get("EXL3_MGEMM_N_THRESHOLD", 8192))
+
+    def use_mgemm(self, K: int, out_features: int) -> bool:
+        # Fuse when K is at/above the bitrate threshold (int8 GEMV can't take those anyway) or the
+        # matrices are too narrow for separate GEMV calls to fill the GPU
+        return K >= self.mgemm_K_threshold or (self.mgemm_n_threshold > 0 and out_features < self.mgemm_n_threshold)
 
 
 class NullConfig:
