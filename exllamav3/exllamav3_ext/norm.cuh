@@ -16,6 +16,17 @@ void rms_norm
     bool add_residual
 );
 
+void rms_norm_res_in
+(
+    at::Tensor x,
+    c10::optional<at::Tensor> w,
+    at::Tensor y,
+    at::Tensor r,
+    float epsilon,
+    float constant_bias,
+    float constant_scale
+);
+
 void gated_rms_norm
 (
     at::Tensor x,

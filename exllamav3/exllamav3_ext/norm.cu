@@ -131,13 +131,35 @@ __device__ __forceinline__ float _silu(float x)
 }
 
 
-template <bool add_residual, typename input_t, typename output_t, typename weight_t>
+// Block-size-agnostic reduction (any multiple of 32 threads)
+__device__ inline float reduce_dyn(float sum, int warp_id, int lane_id)
+{
+    __shared__ float sums[32];
+    for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    int num_warps = blockDim.x / 32;
+    if (num_warps == 1) return sum;
+    if (lane_id == 0) sums[warp_id] = sum;
+    __syncthreads();
+    sum = lane_id < num_warps ? sums[lane_id] : 0.0f;
+    for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    return sum;
+}
+
+// res_mode 0: y = norm(x) * w
+// res_mode 1: y += norm(x) * w                            (post-norm residual accumulate)
+// res_mode 2: r += x; y = norm(r) * w                     (fused pre-norm residual add)
+#define RES_NONE 0
+#define RES_POST 1
+#define RES_IN 2
+
+template <int res_mode, typename input_t, typename output_t, typename weight_t, typename residual_t>
 __global__ __launch_bounds__(NUM_THREADS)
 void rms_norm_kernel
 (
     const input_t* __restrict__ x,
     const weight_t* __restrict__ w,
     output_t* __restrict__ y,
+    residual_t* __restrict__ r,
     const float epsilon,
     const int rows,
     const int dim,
@@ -152,6 +174,7 @@ void rms_norm_kernel
     static_assert(input_fp32 || input_fp16, "rms_norm_kernel: input must be float or half type");
     static_assert(output_fp32 || output_fp16, "rms_norm_kernel: output must be float or half type");
     constexpr bool weight_bf16 = std::is_same_v<weight_t, bfloat16>;
+    constexpr bool residual_fp16 = std::is_same_v<residual_t, half>;
 
     int t = threadIdx.x;
     int warp_id = threadIdx.x / 32;
@@ -159,36 +182,48 @@ void rms_norm_kernel
     int row = blockIdx.x;
 
     int columns = dim / 4;
+    bool single = columns <= blockDim.x;
 
-    // Compute sum of squares
-    float sum = 0.0f;
-    for (int column = t; column < columns; column += NUM_THREADS)
+    auto read_in = [&] (float4& f4, const input_t* addr)
     {
-        float4 x4;
-        if constexpr (input_fp16) read_half4<true>(x4, ((const half4*) (x + row * dim)) + column);
-        if constexpr (input_fp32) read_float4(x4, ((const float4*) (x + row * dim)) + column);
-        sum = sum_sq4(sum, x4);
-    }
-    sum = reduce<NUM_THREADS>(sum, warp_id, lane_id);
+        if constexpr (input_fp16) read_half4<true>(f4, (const half4*) addr);
+        if constexpr (input_fp32) read_float4(f4, (const float4*) addr);
+    };
 
-    // Get norm
-    float rmf = rsqrtf(sum / (float)dim + epsilon) * constant_scale;
-
-    // Normalize x, scaling by w
-    for (int column = t; column < columns; column += NUM_THREADS)
+    auto add_resid_in = [&] (float4& x4, int column)
     {
-        float4 x4;
+        // r += x, rounded to the residual dtype so the result matches an unfused add
+        float4 r4;
+        if constexpr (residual_fp16) read_half4<false>(r4, ((const half4*) (r + row * dim)) + column);
+        else                         read_float4(r4, ((const float4*) (r + row * dim)) + column);
+        x4.x += r4.x;
+        x4.y += r4.y;
+        x4.z += r4.z;
+        x4.w += r4.w;
+        if constexpr (residual_fp16)
+        {
+            half4 h4
+            (
+                __halves2half2(__float2half_rn(x4.x), __float2half_rn(x4.y)),
+                __halves2half2(__float2half_rn(x4.z), __float2half_rn(x4.w))
+            );
+            WRITE64(((half4*) (r + row * dim)) + column, h4);
+            x4.x = LOW_TO_FLOAT(h4.x);
+            x4.y = HIGH_TO_FLOAT(h4.x);
+            x4.z = LOW_TO_FLOAT(h4.y);
+            x4.w = HIGH_TO_FLOAT(h4.y);
+        }
+        else
+            write_float4(x4, ((float4*) (r + row * dim)) + column);
+    };
 
-        if constexpr (input_fp16) read_half4<true>(x4, ((const half4*)  (x + row * dim)) + column);
-        if constexpr (input_fp32) read_float4     (x4, ((const float4*) (x + row * dim)) + column);
-
+    auto apply_out = [&] (float4& x4, int column, float rmf)
+    {
         if (w)
         {
             float4 w4;
-
             if constexpr (weight_bf16) read_bfloat164   (w4, ((const bfloat164*) w) + column);
             else                       read_half4<false>(w4, ((const half4*)     w) + column);
-
             if (constant_bias != 0.0f)
             {
                 w4.x += constant_bias;
@@ -203,7 +238,7 @@ void rms_norm_kernel
             apply4_nw(x4, rmf);
         }
 
-        if constexpr (add_residual)
+        if constexpr (res_mode == RES_POST)
         {
             float4 r4;
             if constexpr (output_fp16) read_half4<false>(r4, ((half4*) (y + row * dim)) + column);
@@ -216,6 +251,50 @@ void rms_norm_kernel
 
         if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row * dim)) + column);
         if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row * dim)) + column);
+    };
+
+    if (single)
+    {
+        // One float4 per thread: keep the value in a register between the two phases
+        float4 x4 = {};
+        float sum = 0.0f;
+        if (t < columns)
+        {
+            read_in(x4, x + row * dim + 4 * t);
+            if constexpr (res_mode == RES_IN) add_resid_in(x4, t);
+            sum = sum_sq4(sum, x4);
+        }
+        sum = reduce_dyn(sum, warp_id, lane_id);
+        float rmf = rsqrtf(sum / (float) dim + epsilon) * constant_scale;
+        if (t < columns)
+            apply_out(x4, t, rmf);
+    }
+    else
+    {
+        float sum = 0.0f;
+        for (int column = t; column < columns; column += blockDim.x)
+        {
+            float4 x4;
+            read_in(x4, x + row * dim + 4 * column);
+            if constexpr (res_mode == RES_IN) add_resid_in(x4, column);
+            sum = sum_sq4(sum, x4);
+        }
+        sum = reduce_dyn(sum, warp_id, lane_id);
+        float rmf = rsqrtf(sum / (float) dim + epsilon) * constant_scale;
+
+        for (int column = t; column < columns; column += blockDim.x)
+        {
+            float4 x4;
+            // For RES_IN the summed values were written back to r in the first pass
+            if constexpr (res_mode == RES_IN)
+            {
+                if constexpr (residual_fp16) read_half4<false>(x4, ((const half4*) (r + row * dim)) + column);
+                else                         read_float4(x4, ((const float4*) (r + row * dim)) + column);
+            }
+            else
+                read_in(x4, x + row * dim + 4 * column);
+            apply_out(x4, column, rmf);
+        }
     }
 }
 
@@ -226,16 +305,17 @@ Compute RMSNorm: y = x * w / sqrt(row_mean(x * x) + epsilon)
 - y can be either float or half dtype
 - w can be either bfloat16 or half dtype
 */
-void rms_norm
+void rms_norm_impl
 (
     at::Tensor x,
     c10::optional<at::Tensor> w,
     at::Tensor y,
+    c10::optional<at::Tensor> r,
     float epsilon,
     float constant_bias,
     float constant_scale,
     bool span_heads,
-    bool add_residual
+    int res_mode
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -261,21 +341,34 @@ void rms_norm
         tw = w.value().scalar_type();
     }
 
+    void* r_ptr = OPTPTR(r);
+    if (res_mode == RES_IN)
+    {
+        TORCH_CHECK(r_ptr, "rms_norm: res_mode RES_IN requires residual tensor");
+        TORCH_CHECK_SHAPES_FULL(x, r.value());
+    }
+
     int rows = 1;
     for (int i = 0; i < x.dim() - 1; ++i) rows *= x.size(i);
     int dim = x.size(-1);
 
-    dim3 blockDim(NUM_THREADS, 1, 1);
+    // Size the block to the row so short rows don't idle warps through the reduction
+    int threads = MIN(NUM_THREADS, CEIL_DIVIDE(dim / 4, 32) * 32);
+
+    dim3 blockDim(threads, 1, 1);
     dim3 gridDim(rows, 1, 1);
 
+    auto tr = res_mode == RES_IN ? r.value().scalar_type() : tx;
+
     // Launch macro
-    #define __(_tx, __tx, _tw, __tw, _ty, __ty, _res)                               \
-    if (tx == at::_tx && tw == at::_tw && ty == at::_ty && add_residual == _res)    \
-        rms_norm_kernel<_res><<<gridDim, blockDim, 0, stream>>>                     \
-        (                                                                           \
-            (const __tx*) x.data_ptr(),                                             \
-            (const __tw*) w_ptr,                                                    \
-            (__ty*) y.data_ptr(),                                                   \
+    #define __(_tx, __tx, _tw, __tw, _ty, __ty, _res, _tr, __tr)                                   \
+    if (tx == at::_tx && tw == at::_tw && ty == at::_ty && res_mode == _res && tr == at::_tr)      \
+        rms_norm_kernel<_res, __tx, __ty, __tw, __tr><<<gridDim, blockDim, 0, stream>>>            \
+        (                                                                                          \
+            (const __tx*) x.data_ptr(),                                                            \
+            (const __tw*) w_ptr,                                                                   \
+            (__ty*) y.data_ptr(),                                                                  \
+            (__tr*) r_ptr,                                                                         \
             epsilon,                                                                \
             rows,                                                                   \
             dim,                                                                    \
@@ -283,28 +376,67 @@ void rms_norm
             constant_scale                                                          \
         );
 
-    //      x_type________ w_type_____________  y_type_______
-         __(kHalf,  half,  kHalf,     half,     kHalf,  half,  false)
-    else __(kHalf,  half,  kHalf,     half,     kFloat, float, false)
-    else __(kFloat, float, kHalf,     half,     kHalf,  half,  false)
-    else __(kFloat, float, kHalf,     half,     kFloat, float, false)
-    else __(kHalf,  half,  kBFloat16, bfloat16, kHalf,  half,  false)
-    else __(kHalf,  half,  kBFloat16, bfloat16, kFloat, float, false)
-    else __(kFloat, float, kBFloat16, bfloat16, kHalf,  half,  false)
-    else __(kFloat, float, kBFloat16, bfloat16, kFloat, float, false)
-    else __(kHalf,  half,  kHalf,     half,     kHalf,  half,  true)
-    else __(kHalf,  half,  kHalf,     half,     kFloat, float, true)
-    else __(kFloat, float, kHalf,     half,     kHalf,  half,  true)
-    else __(kFloat, float, kHalf,     half,     kFloat, float, true)
-    else __(kHalf,  half,  kBFloat16, bfloat16, kHalf,  half,  true)
-    else __(kHalf,  half,  kBFloat16, bfloat16, kFloat, float, true)
-    else __(kFloat, float, kBFloat16, bfloat16, kHalf,  half,  true)
-    else __(kFloat, float, kBFloat16, bfloat16, kFloat, float, true)
+    //      x_type________ w_type_____________  y_type_______        mode      r_type
+         __(kHalf,  half,  kHalf,     half,     kHalf,  half,  RES_NONE, kHalf,  half)
+    else __(kHalf,  half,  kHalf,     half,     kFloat, float, RES_NONE, kHalf,  half)
+    else __(kFloat, float, kHalf,     half,     kHalf,  half,  RES_NONE, kFloat, float)
+    else __(kFloat, float, kHalf,     half,     kFloat, float, RES_NONE, kFloat, float)
+    else __(kHalf,  half,  kBFloat16, bfloat16, kHalf,  half,  RES_NONE, kHalf,  half)
+    else __(kHalf,  half,  kBFloat16, bfloat16, kFloat, float, RES_NONE, kHalf,  half)
+    else __(kFloat, float, kBFloat16, bfloat16, kHalf,  half,  RES_NONE, kFloat, float)
+    else __(kFloat, float, kBFloat16, bfloat16, kFloat, float, RES_NONE, kFloat, float)
+    else __(kHalf,  half,  kHalf,     half,     kHalf,  half,  RES_POST, kHalf,  half)
+    else __(kHalf,  half,  kHalf,     half,     kFloat, float, RES_POST, kHalf,  half)
+    else __(kFloat, float, kHalf,     half,     kHalf,  half,  RES_POST, kFloat, float)
+    else __(kFloat, float, kHalf,     half,     kFloat, float, RES_POST, kFloat, float)
+    else __(kHalf,  half,  kBFloat16, bfloat16, kHalf,  half,  RES_POST, kHalf,  half)
+    else __(kHalf,  half,  kBFloat16, bfloat16, kFloat, float, RES_POST, kHalf,  half)
+    else __(kFloat, float, kBFloat16, bfloat16, kHalf,  half,  RES_POST, kFloat, float)
+    else __(kFloat, float, kBFloat16, bfloat16, kFloat, float, RES_POST, kFloat, float)
+    else __(kHalf,  half,  kHalf,     half,     kHalf,  half,  RES_IN,   kHalf,  half)
+    else __(kHalf,  half,  kHalf,     half,     kHalf,  half,  RES_IN,   kFloat, float)
+    else __(kFloat, float, kHalf,     half,     kHalf,  half,  RES_IN,   kHalf,  half)
+    else __(kFloat, float, kHalf,     half,     kHalf,  half,  RES_IN,   kFloat, float)
+    else __(kHalf,  half,  kBFloat16, bfloat16, kHalf,  half,  RES_IN,   kHalf,  half)
+    else __(kHalf,  half,  kBFloat16, bfloat16, kHalf,  half,  RES_IN,   kFloat, float)
+    else __(kFloat, float, kBFloat16, bfloat16, kHalf,  half,  RES_IN,   kHalf,  half)
+    else __(kFloat, float, kBFloat16, bfloat16, kHalf,  half,  RES_IN,   kFloat, float)
 
     else TORCH_CHECK(false, "rms_norm: Invalid datatypes for input/output");
     #undef __
 
     cuda_check(cudaPeekAtLastError());
+}
+
+void rms_norm
+(
+    at::Tensor x,
+    c10::optional<at::Tensor> w,
+    at::Tensor y,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    bool span_heads,
+    bool add_residual
+)
+{
+    rms_norm_impl(x, w, y, {}, epsilon, constant_bias, constant_scale, span_heads,
+                  add_residual ? RES_POST : RES_NONE);
+}
+
+// Fused pre-norm residual add: r += x (in place), y = norm(r) * w
+void rms_norm_res_in
+(
+    at::Tensor x,
+    c10::optional<at::Tensor> w,
+    at::Tensor y,
+    at::Tensor r,
+    float epsilon,
+    float constant_bias,
+    float constant_scale
+)
+{
+    rms_norm_impl(x, w, y, r, epsilon, constant_bias, constant_scale, false, RES_IN);
 }
 
 

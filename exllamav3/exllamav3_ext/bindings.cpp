@@ -65,6 +65,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("stloader_deferred_cuda", &stloader_deferred_cuda, py::arg("jobs"), py::arg("max_chunk_size"));
 
     m.def("rms_norm", &rms_norm, "rms_norm");
+    m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
 

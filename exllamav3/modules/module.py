@@ -107,6 +107,10 @@ class Module(ABC):
     def quant_format_id(self):
         return None
 
+    def can_fuse_residual(self, x: torch.Tensor, y: torch.Tensor) -> bool:
+        # Overridden by norm modules that support forward(residual_in = ...)
+        return False
+
     def get_name(self):
         return self.__class__.__name__
 

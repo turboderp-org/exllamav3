@@ -181,6 +181,8 @@ class TransformerBlock(Module):
         if self.ve_gate:
             x = self._compute_ve_addend(x, params)
 
+        y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
+
         if self.attn:
             if self.attn_norm:
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
@@ -193,12 +195,16 @@ class TransformerBlock(Module):
                 y *= self.attn_resid_scalar
             if self.attn_post_norm:
                 self.attn_post_norm.forward(y, params, residual = x)
+            elif self.mlp is not None and self.mlp_norm is not None and self.mlp_norm.can_fuse_residual(x, y):
+                y_resid = y
             else:
                 x += y
 
         if self.mlp:
             params["residual"] = x
-            if self.mlp_norm:
+            if y_resid is not None:
+                y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
+            elif self.mlp_norm:
                 y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
