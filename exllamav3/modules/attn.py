@@ -49,6 +49,20 @@ def prepare_flash_attn_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor
     return input_ids
 
 
+# Rectangular (batch_shape mode) block tables are static per shape; cache them with persistent
+# device copies so they aren't rebuilt and re-uploaded every forward pass
+_block_tables = {}
+
+def _get_block_table(cache_bsz: int, pages_per_seq: int) -> torch.Tensor:
+    key = (cache_bsz, pages_per_seq)
+    bt = _block_tables.get(key)
+    if bt is None:
+        bt = torch.arange(cache_bsz * pages_per_seq, dtype = torch.int32).view(cache_bsz, pages_per_seq)
+        bt._static_dev_cache = True
+        _block_tables[key] = bt
+    return bt
+
+
 def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     bsz, seq_len = input_ids.shape
 
@@ -65,8 +79,7 @@ def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         # assert (past_len is not None) ^ (cache_seqlens is not None), "Need either past_len or cache_seqlens"
         assert bsz * cache_max_seq_len <= cache.max_num_tokens, "Cache too small for batch shape"
         cache_bsz = min(bsz, cache_bsz)
-        num_pages = cache_bsz * cache_max_seq_len // PAGE_SIZE
-        block_table = torch.arange(num_pages, dtype = torch.int32).view(cache_bsz, cache_max_seq_len // PAGE_SIZE)
+        block_table = _get_block_table(cache_bsz, cache_max_seq_len // PAGE_SIZE)
         if past_len is not None:
             cache_seqlens = torch.tensor([past_len], dtype = torch.int32).repeat(bsz)
             if position is None: position = past_len
