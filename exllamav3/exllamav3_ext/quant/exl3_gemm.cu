@@ -449,12 +449,13 @@ int exl3_mgemm_gr
     if (mcg) cb = 1;
     if (mul1) cb = 2;
 
-    if (mul1 && exl3_gemv_int8_enabled())
-    {
-        if (exl3_mgemv_int8
-            (A, B, C, suh, A_had, svh, indices, weights, K, min_index, max_index, stream, graph))
-            return 0;
-    }
+    // mgemv disabled for now; loses to TC matmul in all cases
+//    if (mul1 && exl3_gemv_int8_enabled())
+//    {
+//        if (exl3_mgemv_int8
+//            (A, B, C, suh, A_had, svh, indices, weights, K, min_index, max_index, stream, graph))
+//            return 0;
+//    }
 
     int shape_idx;
     int block_dim;

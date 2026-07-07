@@ -76,18 +76,22 @@ static void* select_gemv_int8_sq_kernel(int K, int M, bool c_fp32, bool residual
     return nullptr;
 }
 
-// Grow-only per-device workspace shared by the sq and coop paths. The buffer is zeroed on
-// (re)allocation so the sq completion counters (fixed region at the start, self-resetting
-// thereafter) begin at zero; the coop kernels only use the region beyond SQ_WS_RESERVED.
+// Fixed-size per-device workspace shared by the sq and coop paths, allocated once and never
+// reallocated: the pointer is baked as a kernel argument into captured CUDA graphs, so growing the
+// buffer would leave every previously captured graph with a dangling workspace pointer (and let a
+// reallocation clobber the self-resetting completion counters at the start of the buffer). Zeroed
+// at allocation so the counters begin at zero. Callers must reject work that exceeds the fixed size
+// (returns nullptr) and fall through to a non-workspace path.
+#define GEMV_INT8_WS_INTS (WORKSPACE_SIZE / sizeof(int))    // 16 MB
 static int* gemv_int8_get_ws(int device, size_t ws_ints)
 {
+    if (ws_ints > GEMV_INT8_WS_INTS) return nullptr;
     GemvInt8Workspace& ws = gemv_ws[device];
-    if (ws.ws_ints < ws_ints)
+    if (!ws.ws)
     {
-        if (ws.ws) cudaFree(ws.ws);
-        cuda_check(cudaMalloc(&ws.ws, ws_ints * sizeof(int)));
-        cuda_check(cudaMemset(ws.ws, 0, ws_ints * sizeof(int)));
-        ws.ws_ints = ws_ints;
+        cuda_check(cudaMalloc(&ws.ws, GEMV_INT8_WS_INTS * sizeof(int)));
+        cuda_check(cudaMemset(ws.ws, 0, GEMV_INT8_WS_INTS * sizeof(int)));
+        ws.ws_ints = GEMV_INT8_WS_INTS;
     }
     return ws.ws;
 }
@@ -131,6 +135,11 @@ static bool exl3_gemv_int8_sq
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
         cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_for(rows_max));
+        // Match the tensor-core kernels' shared-memory carveout: these kernels interleave with
+        // them (hundreds of launches per decoded token), and a smaller carveout would make the GPU
+        // drain and reconfigure the SMs on every transition - measured at ~4 us per launch in
+        // graph replay
+        cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         gemv_attr_set[device].insert(fn);
         cuda_check(cudaPeekAtLastError());
     }
@@ -156,6 +165,7 @@ static bool exl3_gemv_int8_sq
 
     int pstride = size_n * (residual ? 2 : 1);
     int* ws_ptr = gemv_int8_get_ws(device, SQ_WS_RESERVED + (size_t) ksplit * M * pstride);
+    if (!ws_ptr) return false;
 
     void* kernelArgs[] =
     {
@@ -271,6 +281,11 @@ bool exl3_gemv_int8
     {
         // Upper bound over all shapes: smem_rows_max * 64 B
         cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, 768 * 16 * 4 + GEMV_STAGE_MAX_BYTES);
+        // Match the tensor-core kernels' shared-memory carveout: these kernels interleave with
+        // them (hundreds of launches per decoded token), and a smaller carveout would make the GPU
+        // drain and reconfigure the SMs on every transition - measured at ~4 us per launch in
+        // graph replay
+        cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         gemv_attr_set[device].insert(fn);
         cuda_check(cudaPeekAtLastError());
     }
@@ -291,7 +306,9 @@ bool exl3_gemv_int8
 
     // Coop region beyond the sq-reserved prefix: [2n accs][4m qsums][grid partial maxes]
     size_t ws_ints = SQ_WS_RESERVED + (size_t) 2 * size_n + 4 * size_m + 1024;
-    int* ws_ptr = gemv_int8_get_ws(device, ws_ints) + SQ_WS_RESERVED;
+    int* ws_base = gemv_int8_get_ws(device, ws_ints);
+    if (!ws_base) return false;
+    int* ws_ptr = ws_base + SQ_WS_RESERVED;
 
     const half* A_ptr = (const half*) A.data_ptr();
     const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
@@ -373,6 +390,12 @@ bool exl3_mgemv_int8
     if (min_index >= 0 && !indices) return false;
     if (size_n % 256 || size_k % 128 || K < 1 || K > GEMV_INT8_MAX_K || bszm == 0) return false;
 
+    // The serialized cooperative kernel loses to the tensor-core mgemm on MoE decode shapes
+    // (~2x at top-8 with small experts), so it is a diagnostic path only: EXL3_INT8_GEMV by itself
+    // must not reroute mgemm. Checked per call, like the mode itself
+    const char* coop_env = getenv("EXL3_MGEMV_COOP");
+    if (!coop_env || atoi(coop_env) == 0) return false;
+
     int device;
     cudaGetDevice(&device);
     int num_sms = DevCtx::instance().get_num_sms(device);
@@ -397,6 +420,11 @@ bool exl3_mgemv_int8
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
         cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, 768 * 16 * 4 + GEMV_STAGE_MAX_BYTES);
+        // Match the tensor-core kernels' shared-memory carveout: these kernels interleave with
+        // them (hundreds of launches per decoded token), and a smaller carveout would make the GPU
+        // drain and reconfigure the SMs on every transition - measured at ~4 us per launch in
+        // graph replay
+        cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         gemv_attr_set[device].insert(fn);
         cuda_check(cudaPeekAtLastError());
     }
@@ -415,7 +443,9 @@ bool exl3_mgemv_int8
     size_t smem = smem_for_grid(grid);
 
     size_t ws_ints = SQ_WS_RESERVED + (size_t) 2 * size_n + 4 * size_m + 1024;
-    int* ws_ptr = gemv_int8_get_ws(device, ws_ints) + SQ_WS_RESERVED;
+    int* ws_base = gemv_int8_get_ws(device, ws_ints);
+    if (!ws_base) return false;
+    int* ws_ptr = ws_base + SQ_WS_RESERVED;
 
     const half* A_ptr = (const half*) A.data_ptr();
     const uintptr_t* B_ptr = (const uintptr_t*) B.data_ptr();
