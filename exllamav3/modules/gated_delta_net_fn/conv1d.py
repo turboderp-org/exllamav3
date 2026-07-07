@@ -1,6 +1,13 @@
 import torch
 import torch.nn.functional as F
 from ...util.tensor import get_for_device, buffered_arange
+from ...ext import exllamav3_ext as ext
+
+# Above this length the triton kernel splits into separate output/state kernels and its launch
+# overhead is amortized anyway; the CUDA kernel keeps the conv window in registers per thread
+# so it only makes sense for short sequences (decode and SD verification steps)
+MAX_CUDA_SEQLEN = 32
+MAX_CUDA_K = 16
 
 try:
     import triton
@@ -395,6 +402,28 @@ def causal_conv1d_update(
         dummy_slots = True
     else:
         dummy_slots = False
+
+    if (
+        mixed_qkv.is_cuda and
+        seqlen <= MAX_CUDA_SEQLEN and
+        conv1d_weight.shape[-1] <= MAX_CUDA_K and
+        mixed_qkv.dtype == torch.bfloat16 and
+        conv_state.dtype == torch.bfloat16 and
+        conv1d_weight.dtype == torch.bfloat16 and
+        (conv1d_bias is None or conv1d_bias.dtype == torch.bfloat16)
+    ):
+        out = torch.empty((bsz, seqlen, dim), dtype = torch.bfloat16, device = mixed_qkv.device)
+        ext.cuda_causal_conv1d_update(
+            mixed_qkv,
+            conv_state,
+            None if dummy_slots else recurrent_slots,
+            conv1d_weight,
+            conv1d_bias,
+            out,
+            True,
+            history,
+        )
+        return out
 
     if has_triton:
         if dummy_slots:

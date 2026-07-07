@@ -40,3 +40,15 @@ void cuda_recurrent_gated_delta_rule
     const c10::optional<at::Tensor>& slots,
     bool history
 );
+
+void cuda_causal_conv1d_update
+(
+    const at::Tensor& x,
+    at::Tensor& conv_state,
+    const c10::optional<at::Tensor>& slots,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias,
+    at::Tensor& out,
+    bool activation,
+    bool history
+);

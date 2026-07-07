@@ -403,6 +403,7 @@ class GatedDeltaNet(Module):
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
+        self.conv1d_weight_flat = None
         self.conv1d_bias = None
         self.conv1d_q_weight = None
         self.conv1d_k_weight = None
@@ -534,6 +535,7 @@ class GatedDeltaNet(Module):
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
+        self.conv1d_weight_flat = None
         self.conv1d_bias = None
         self.conv1d_q_weight = None
         self.conv1d_k_weight = None
@@ -613,6 +615,8 @@ class GatedDeltaNet(Module):
             self.conv1d_q_weight = None
             self.conv1d_k_weight = None
             self.conv1d_v_weight = None
+        if self.conv1d_weight_flat is None:
+            self.conv1d_weight_flat = self.conv1d_weight.squeeze(1).contiguous()
 
         # Previous state
         rsg = params.get("recurrent_states")
@@ -693,7 +697,7 @@ class GatedDeltaNet(Module):
             mixed_qkv = mixed_qkv,
             conv_state = conv_state,
             recurrent_slots = recurrent_slots,
-            conv1d_weight = self.conv1d_weight.squeeze(1).contiguous(),
+            conv1d_weight = self.conv1d_weight_flat,
             conv1d_bias = self.conv1d_bias,
             history = save_history,
             params = params,

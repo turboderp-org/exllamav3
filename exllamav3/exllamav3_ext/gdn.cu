@@ -828,3 +828,177 @@ void cuda_recurrent_gated_delta_rule
 
     cuda_check(cudaPeekAtLastError());
 }
+
+#define CONV1D_MAX_K 16
+#define CONV1D_NUM_THREADS 256
+
+// Causal conv1d update for short decode steps. Equivalent to the triton kernel in
+// modules/gated_delta_net_fn/conv1d.py but launchable in ~4us instead of ~50us of host time.
+//
+// out[b,s,d] = act(bias[d] + sum_k w[d,k] * in(b,d,s+k+1)) where the input sequence is the
+// concatenation of conv_state[slot,d,0:K] and x[b,d,0:seqlen]. Without history, the last K
+// inputs are written back to conv_state[slot,d,0:K]; with history, the last
+// min(state_size, K+seqlen) inputs are written to the tail of the state buffer (rewindable).
+
+template <bool ACT, bool HISTORY>
+__global__ __launch_bounds__(CONV1D_NUM_THREADS)
+void conv1d_update_kernel
+(
+    const bfloat16* __restrict__ x,           // (bsz, dim, seqlen)
+    bfloat16* __restrict__ conv_state,        // (num_slots, dim, state_size)
+    const int* __restrict__ slots,            // (bsz) or null (identity)
+    const bfloat16* __restrict__ weight,      // (dim, K)
+    const bfloat16* __restrict__ bias,        // (dim) or null
+    bfloat16* __restrict__ out,               // (bsz, seqlen, dim)
+    const int dim,
+    const int seqlen,
+    const int state_size,
+    const int K
+)
+{
+    int d = blockIdx.x * CONV1D_NUM_THREADS + threadIdx.x;
+    if (d >= dim) return;
+    int b = blockIdx.y;
+    int slot = slots ? slots[b] : b;
+
+    const bfloat16* x_d = x + ((size_t) b * dim + d) * seqlen;
+    bfloat16* state_d = conv_state + ((size_t) slot * dim + d) * state_size;
+
+    float w[CONV1D_MAX_K];
+    #pragma unroll
+    for (int k = 0; k < CONV1D_MAX_K; ++k)
+        if (k < K) w[k] = __bfloat162float(weight[(size_t) d * K + k]);
+
+    float bias_d = bias ? __bfloat162float(bias[d]) : 0.0f;
+
+    // Previous window; win[K-1] slot is filled with the current input each step
+    float old_state[CONV1D_MAX_K];
+    float win[CONV1D_MAX_K];
+    #pragma unroll
+    for (int k = 0; k < CONV1D_MAX_K; ++k)
+        if (k < K) old_state[k] = __bfloat162float(state_d[k]);
+    #pragma unroll
+    for (int k = 0; k < CONV1D_MAX_K - 1; ++k)
+        if (k < K - 1) win[k] = old_state[k + 1];
+
+    for (int s = 0; s < seqlen; ++s)
+    {
+        win[K - 1] = __bfloat162float(x_d[s]);
+
+        float acc = bias_d;
+        #pragma unroll
+        for (int k = 0; k < CONV1D_MAX_K; ++k)
+            if (k < K) acc = fmaf(w[k], win[k], acc);
+
+        if constexpr (ACT)
+            acc *= _sigmoid_fast_exp(acc);
+
+        out[((size_t) b * seqlen + s) * dim + d] = __float2bfloat16_rn(acc);
+
+        #pragma unroll
+        for (int k = 0; k < CONV1D_MAX_K - 1; ++k)
+            if (k < K - 1) win[k] = win[k + 1];
+    }
+
+    if constexpr (!HISTORY)
+    {
+        #pragma unroll
+        for (int k = 0; k < CONV1D_MAX_K; ++k)
+        {
+            if (k < K)
+            {
+                int src_t = seqlen + k;
+                float v = (src_t < K) ? old_state[src_t] : __bfloat162float(x_d[src_t - K]);
+                state_d[k] = __float2bfloat16_rn(v);
+            }
+        }
+    }
+    else
+    {
+        int total = K + seqlen;
+        int write_size = state_size < total ? state_size : total;
+        int dst_start = state_size - write_size;
+        int src_start = total - write_size;
+        for (int j = 0; j < write_size; ++j)
+        {
+            int src_t = src_start + j;
+            float v = (src_t < K) ? old_state[src_t] : __bfloat162float(x_d[src_t - K]);
+            state_d[dst_start + j] = __float2bfloat16_rn(v);
+        }
+    }
+}
+
+void cuda_causal_conv1d_update
+(
+    const at::Tensor& x,
+    at::Tensor& conv_state,
+    const c10::optional<at::Tensor>& slots,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias,
+    at::Tensor& out,
+    bool activation,
+    bool history
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    int bsz = x.size(0);
+    int dim = x.size(1);
+    int seqlen = x.size(2);
+    int state_size = conv_state.size(2);
+    int K = weight.size(1);
+
+    TORCH_CHECK(K <= CONV1D_MAX_K, "conv kernel size exceeds CONV1D_MAX_K");
+    TORCH_CHECK(state_size >= K, "conv_state must have at least K entries");
+    TORCH_CHECK(x.is_contiguous() && conv_state.is_contiguous() && weight.is_contiguous() && out.is_contiguous(),
+                "x, conv_state, weight and out must be contiguous");
+    TORCH_CHECK(conv_state.dim() == 3 && conv_state.size(1) == dim,
+                "conv_state must be (num_slots, dim, state_size)");
+    TORCH_CHECK(weight.dim() == 2 && weight.size(0) == dim,
+                "weight must be (dim, K)");
+    TORCH_CHECK(out.dim() == 3 && out.size(0) == bsz && out.size(1) == seqlen && out.size(2) == dim,
+                "out must be (bsz, seqlen, dim)");
+    TORCH_CHECK_DTYPE(x, kBFloat16);
+    TORCH_CHECK_DTYPE(conv_state, kBFloat16);
+    TORCH_CHECK_DTYPE(weight, kBFloat16);
+    TORCH_CHECK_DTYPE_OPT(bias, kBFloat16);
+    TORCH_CHECK_DTYPE(out, kBFloat16);
+    TORCH_CHECK_DTYPE_OPT(slots, kInt);
+
+    const int* slots_ptr = (const int*) OPTPTR(slots);
+    if (slots_ptr)
+    {
+        TORCH_CHECK(slots.value().dim() == 1 && slots.value().size(0) == bsz, "slots must be (bsz)");
+    }
+    else
+    {
+        TORCH_CHECK(conv_state.size(0) >= bsz, "conv_state too small for batch without slots");
+    }
+    const bfloat16* bias_ptr = (const bfloat16*) OPTPTR(bias);
+
+    dim3 blocks(CEIL_DIVIDE(dim, CONV1D_NUM_THREADS), bsz);
+
+    #define KERNEL_ARGS                             \
+        (const bfloat16*) x.data_ptr(),             \
+        (bfloat16*) conv_state.data_ptr(),          \
+        slots_ptr,                                  \
+        (const bfloat16*) weight.data_ptr(),        \
+        bias_ptr,                                   \
+        (bfloat16*) out.data_ptr(),                 \
+        dim, seqlen, state_size, K
+
+    if (activation)
+    {
+        if (history) conv1d_update_kernel<true, true><<<blocks, CONV1D_NUM_THREADS, 0, stream>>>(KERNEL_ARGS);
+        else         conv1d_update_kernel<true, false><<<blocks, CONV1D_NUM_THREADS, 0, stream>>>(KERNEL_ARGS);
+    }
+    else
+    {
+        if (history) conv1d_update_kernel<false, true><<<blocks, CONV1D_NUM_THREADS, 0, stream>>>(KERNEL_ARGS);
+        else         conv1d_update_kernel<false, false><<<blocks, CONV1D_NUM_THREADS, 0, stream>>>(KERNEL_ARGS);
+    }
+    #undef KERNEL_ARGS
+
+    cuda_check(cudaPeekAtLastError());
+}
