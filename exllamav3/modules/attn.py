@@ -480,8 +480,14 @@ class Attention(Module):
         if self.multi_qg is None or bsz * q_len > 32:
             q = self.q_proj.forward(x, params)
             if self.interleaved_gate:
-                q, g = torch.chunk(q.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
-                g = g.reshape(bsz, q_len, -1)
+                if self.head_dim % 8 == 0 and q.dtype == torch.half:
+                    qg = q
+                    q = torch.empty((bsz, q_len, self.num_q_heads, self.head_dim), dtype = torch.half, device = qg.device)
+                    g = torch.empty((bsz, q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = qg.device)
+                    ext.deinterleave_qg(qg, q, g, self.head_dim)
+                else:
+                    q, g = torch.chunk(q.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
+                    g = g.reshape(bsz, q_len, -1)
             elif self.g_proj:
                 g = self.g_proj.forward(x, params)
             else:

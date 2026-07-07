@@ -487,3 +487,60 @@ void add_sigmoid_gate_proj
 {
     add_sigmoid_gate_proj_gr(x, y, z, w, nullptr);
 }
+
+// Split per-head-interleaved projection output [.., heads, (q: head_dim, g: head_dim)] into
+// contiguous q and g tensors. Replaces a chunk/reshape copy pair (and the contiguous() the RoPE
+// kernel would otherwise force on the strided q view)
+
+__global__ __launch_bounds__(NUM_THREADS)
+void deinterleave_qg_kernel
+(
+    const uint4* __restrict__ qg,
+    uint4* __restrict__ q,
+    uint4* __restrict__ g,
+    const int hd8,                  // head_dim / 8
+    const size_t n8                 // rows * heads * head_dim / 8
+)
+{
+    size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x;
+    if (i >= n8) return;
+    size_t d = i % hd8;
+    size_t h = i / hd8;
+    size_t src = h * 2 * hd8 + d;
+    q[i] = qg[src];
+    g[i] = qg[src + hd8];
+}
+
+void deinterleave_qg
+(
+    const at::Tensor& qg,           // (.., heads * 2 * head_dim) half
+    at::Tensor& q,                  // out (.., heads * head_dim) half
+    at::Tensor& g,                  // out (.., heads * head_dim) half
+    int head_dim
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(qg.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(qg, kHalf);
+    TORCH_CHECK_DTYPE(q, kHalf);
+    TORCH_CHECK_DTYPE(g, kHalf);
+    TORCH_CHECK(head_dim % 8 == 0, "head_dim must be a multiple of 8");
+    TORCH_CHECK(qg.is_contiguous() && q.is_contiguous() && g.is_contiguous(), "tensors must be contiguous");
+    TORCH_CHECK(q.numel() == g.numel() && q.numel() * 2 == qg.numel(), "size mismatch");
+
+    int hd8 = head_dim / 8;
+    size_t n8 = q.numel() / 8;
+    size_t blocks = CEIL_DIVIDE(n8, NUM_THREADS);
+
+    deinterleave_qg_kernel<<<blocks, NUM_THREADS, 0, stream>>>
+    (
+        (const uint4*) qg.data_ptr(),
+        (uint4*) q.data_ptr(),
+        (uint4*) g.data_ptr(),
+        hd8,
+        n8
+    );
+
+    cuda_check(cudaPeekAtLastError());
+}

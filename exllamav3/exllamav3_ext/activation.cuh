@@ -92,6 +92,14 @@ void mul_sigmoid_
     const at::Tensor& y
 );
 
+void deinterleave_qg
+(
+    const at::Tensor& qg,
+    at::Tensor& q,
+    at::Tensor& g,
+    int head_dim
+);
+
 void mul_sigmoid_broadcast_
 (
     at::Tensor& x,
