@@ -189,6 +189,10 @@ def prepare(args) -> (dict, dict, bool, str):
     in_args["verbose"] = args.verbose
     in_args["apply_out_scales"] = {"always": True, "never": False, "auto": None}[args.out_scales]
 
+    if in_args["codebook"] == "mul1" and in_args["parallel_mode"]:
+        print(" !! Warning: --parallel_mode is currently unsafe with --codebook mul1; disabling parallel mode")
+        in_args["parallel_mode"] = False
+
     if args.resume:
         job_state = load_dict("ckpt/job.json", in_args)
         print(f" -- Resuming existing job")
