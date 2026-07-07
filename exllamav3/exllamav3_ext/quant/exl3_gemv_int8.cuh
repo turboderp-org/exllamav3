@@ -26,20 +26,3 @@ bool exl3_gemv_int8
     cudaStream_t stream,
     Graph* graph
 );
-
-bool exl3_mgemv_int8
-(
-    const at::Tensor& A,
-    const at::Tensor& B,
-    at::Tensor& C,
-    const at::Tensor& suh,
-    const at::Tensor& A_had,
-    const at::Tensor& svh,
-    const c10::optional<at::Tensor>& indices,
-    const c10::optional<at::Tensor>& weights,
-    int K,
-    int min_index,
-    int max_index,
-    cudaStream_t stream,
-    Graph* graph
-);
