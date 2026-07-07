@@ -333,6 +333,7 @@ class Attention(Module):
         self.multi_kv = None
         self.multi_qg = None
         self.tp_reduce = False
+        self.dispatch_cache = {}
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
@@ -686,6 +687,7 @@ class Attention(Module):
             sm_scale = self.sm_scale,
             window_size = self.sliding_window,
             softcap = self.logit_softcapping,
+            dispatch_cache = self.dispatch_cache,
         )
 
         if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
@@ -760,6 +762,7 @@ class Attention(Module):
             window_size = self.sliding_window,
             softcap = self.logit_softcapping,
             non_causal_spans = non_causal_spans,
+            dispatch_cache = self.dispatch_cache,
         )
 
         if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)

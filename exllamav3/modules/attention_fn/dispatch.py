@@ -65,6 +65,7 @@ def attn_dispatch(
     block_table: torch.Tensor | None = None,
     cache_seqlens: torch.Tensor | None = None,
     non_causal_spans: list | None = None,
+    dispatch_cache: dict | None = None,
 ):
     """
     Select and run the first compatible attention implementation for the supplied tensors.
@@ -105,15 +106,22 @@ def attn_dispatch(
         block_table, cache_seqlens,
         non_causal_spans,
     )
-    args.sanity_check()
+    # Retry the backend that matched last time for this caller before scanning the full list.
+    # Candidate functions return None on incompatible arguments, so a stale hint self-corrects
+    fn = dispatch_cache.get("fn") if dispatch_cache is not None else None
+    o = fn(args) if fn is not None else None
 
-    for fn in attn_fns:
-        o = fn(args)
-        if o is not None:
-            break
-    else:
-        _print_no_attn_match_report(args)
-        raise ValueError("No matching attention function")
+    if o is None:
+        args.sanity_check()
+        for fn in attn_fns:
+            o = fn(args)
+            if o is not None:
+                break
+        else:
+            _print_no_attn_match_report(args)
+            raise ValueError("No matching attention function")
+        if dispatch_cache is not None:
+            dispatch_cache["fn"] = fn
 
     # Update cache
     if cache is not None:
