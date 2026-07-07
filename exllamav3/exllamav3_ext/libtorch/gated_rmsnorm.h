@@ -23,4 +23,5 @@ struct BC_GatedRMSNorm
     {}
 
     void run(const at::Tensor& x, at::Tensor& y, const at::Tensor& gate);
+    void run_gr(const at::Tensor& x, at::Tensor& y, const at::Tensor& gate, class Graph* graph);
 };

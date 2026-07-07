@@ -2,6 +2,8 @@
 
 #include <ATen/Tensor.h>
 
+class Graph;
+
 void rms_norm
 (
     at::Tensor x,
@@ -22,4 +24,15 @@ void gated_rms_norm
     at::Tensor g,
     float epsilon,
     float constant_bias
+);
+
+void gated_rms_norm_gr
+(
+    at::Tensor x,
+    at::Tensor w,
+    at::Tensor y,
+    at::Tensor g,
+    float epsilon,
+    float constant_bias,
+    Graph* graph
 );

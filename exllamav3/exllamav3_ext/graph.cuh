@@ -53,7 +53,13 @@ enum GraphedParams
 
     GP_add_x,
     GP_add_y,
-    GP_add_z
+    GP_add_z,
+
+    GP_gdn_ba_x,
+    GP_conv1d_state,
+    GP_conv1d_slots,
+    GP_gdn_rule_state,
+    GP_gdn_rule_slots
 };
 
 class Graph

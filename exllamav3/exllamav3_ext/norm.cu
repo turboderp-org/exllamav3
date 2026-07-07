@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include "norm.cuh"
+#include "graph.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
@@ -384,18 +385,19 @@ void gated_rms_norm_kernel
 Compute RMSNorm: y = x * w / sqrt(row_mean(x * x) + epsilon) * silu(g)
 - bfloat16 input only, half/float output
 */
-void gated_rms_norm
+void gated_rms_norm_gr
 (
     at::Tensor x,
     at::Tensor w,
     at::Tensor y,
     at::Tensor g,
     float epsilon,
-    float constant_bias
+    float constant_bias,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DIV(x, -1, 4);
     TORCH_CHECK_SHAPES(x, -1, w, 0, 1);
@@ -452,4 +454,17 @@ void gated_rms_norm
     #undef __
 
     cuda_check(cudaPeekAtLastError());
+}
+
+void gated_rms_norm
+(
+    at::Tensor x,
+    at::Tensor w,
+    at::Tensor y,
+    at::Tensor g,
+    float epsilon,
+    float constant_bias
+)
+{
+    gated_rms_norm_gr(x, w, y, g, epsilon, constant_bias, nullptr);
 }
