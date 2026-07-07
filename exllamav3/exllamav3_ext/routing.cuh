@@ -10,7 +10,8 @@ void routing_ds3_nogroup
     const c10::optional<at::Tensor>& bias,
     at::Tensor topk_indices,
     at::Tensor topk_weights,
-    const float scaling_factor
+    const float scaling_factor,
+    const c10::optional<at::Tensor>& gate_t
 );
 
 void routing_ds3_nogroup_logits
@@ -30,7 +31,8 @@ void routing_std
     at::Tensor scores,
     at::Tensor topk_indices,
     at::Tensor topk_weights,
-    const c10::optional<at::Tensor>& per_expert_scale
+    const c10::optional<at::Tensor>& per_expert_scale,
+    const c10::optional<at::Tensor>& gate_t
 );
 
 void routing_std_logits

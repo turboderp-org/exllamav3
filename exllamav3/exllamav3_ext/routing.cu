@@ -24,23 +24,35 @@ float sigmoid_stable_hf(float xf)
 __device__ __forceinline__
 void warp_reduce_best_f32(float& key, float& payload, int& idx)
 {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-    {
-        float other_key = __shfl_down_sync(0xffffffffu, key, offset);
-        float other_payload = __shfl_down_sync(0xffffffffu, payload, offset);
-        int other_idx = __shfl_down_sync(0xffffffffu, idx, offset);
-        if (other_key > key)
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(USE_ROCM)
+        // Monotonic unsigned encoding of the float key, hardware max-reduce, then fetch the
+        // winner's values from the lowest tied lane
+        unsigned int ku = __float_as_uint(key);
+        ku = (ku & 0x80000000u) ? ~ku : (ku | 0x80000000u);
+        unsigned int m = __reduce_max_sync(0xffffffffu, ku);
+        int src = __ffs(__ballot_sync(0xffffffffu, ku == m)) - 1;
+        key = __shfl_sync(0xffffffffu, key, src);
+        payload = __shfl_sync(0xffffffffu, payload, src);
+        idx = __shfl_sync(0xffffffffu, idx, src);
+    #else
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
         {
-            key = other_key;
-            payload = other_payload;
-            idx = other_idx;
+            float other_key = __shfl_down_sync(0xffffffffu, key, offset);
+            float other_payload = __shfl_down_sync(0xffffffffu, payload, offset);
+            int other_idx = __shfl_down_sync(0xffffffffu, idx, offset);
+            if (other_key > key)
+            {
+                key = other_key;
+                payload = other_payload;
+                idx = other_idx;
+            }
         }
-    }
 
-    key = __shfl_sync(0xffffffffu, key, 0);
-    payload = __shfl_sync(0xffffffffu, payload, 0);
-    idx = __shfl_sync(0xffffffffu, idx, 0);
+        key = __shfl_sync(0xffffffffu, key, 0);
+        payload = __shfl_sync(0xffffffffu, payload, 0);
+        idx = __shfl_sync(0xffffffffu, idx, 0);
+    #endif
 }
 
 
@@ -110,6 +122,74 @@ void warp_radixsort_posf32_pl(float& key, float& payload, int& idx, int* src_lan
         idx = __shfl_sync(active, idx, src);
     }
     key = __uint_as_float(ku);
+}
+
+
+// Single-token router gemv on a transposed gate copy: scores = x @ gate_t.T. One warp per
+// expert; cheaper than a cublas call at this size
+#define RGEMV_WARPS 8
+
+__global__ __launch_bounds__(RGEMV_WARPS * 32)
+void routing_gemv_kernel
+(
+    const half* __restrict__ x,         // (k)
+    const half* __restrict__ gate_t,    // (E, k)
+    half* __restrict__ scores,          // (E)
+    const int k,
+    const int E
+)
+{
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int row = blockIdx.x * RGEMV_WARPS + warp;
+    if (row >= E) return;
+
+    const half2* x2 = (const half2*) x;
+    const half2* w2 = (const half2*) (gate_t + (size_t) row * k);
+
+    float sum = 0.0f;
+    for (int j = lane; j < k / 2; j += 32)
+    {
+        float2 xf = __half22float2(x2[j]);
+        float2 wf = __half22float2(w2[j]);
+        sum = fmaf(xf.x, wf.x, sum);
+        sum = fmaf(xf.y, wf.y, sum);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+
+    if (lane == 0)
+        scores[row] = __float2half_rn(sum);
+}
+
+void routing_gemv
+(
+    const at::Tensor& hidden,
+    const at::Tensor& gate,
+    const c10::optional<at::Tensor>& gate_t,
+    at::Tensor& scores,
+    cudaStream_t stream
+)
+{
+    int k = hidden.size(-1);
+    int E = scores.size(-1);
+    bool bsz1 = hidden.numel() == k;
+
+    if (bsz1 && gate_t.has_value() && !(k & 1))
+    {
+        routing_gemv_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>
+        (
+            (const half*) hidden.data_ptr(),
+            (const half*) gate_t.value().data_ptr(),
+            (half*) scores.data_ptr(),
+            k, E
+        );
+    }
+    else
+    {
+        hgemm(hidden, gate, scores);
+    }
 }
 
 
@@ -613,13 +693,14 @@ void routing_ds3_nogroup
     const c10::optional<at::Tensor>& bias,
     at::Tensor topk_indices,
     at::Tensor topk_weights,
-    const float scaling_factor
+    const float scaling_factor,
+    const c10::optional<at::Tensor>& gate_t
 )
 {
-    hgemm(hidden, gate, scores);
-
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    routing_gemv(hidden, gate, gate_t, scores, stream);
 
     TORCH_CHECK_DTYPE(hidden, kHalf);
     TORCH_CHECK_DTYPE(gate, kHalf);
@@ -645,40 +726,19 @@ void routing_ds3_nogroup
     int num_warps = CEIL_DIVIDE(num_experts, 32);
     int num_threads = num_warps * 32;
 
-    if (num_experts >= 128)
-    {
-        size_t shmem = num_warps * K * (2 * sizeof(float) + sizeof(int));
-        routing_ds3_nogroup_topk_kernel<<<bsz, num_threads, shmem, stream>>>
-        (
-            (const half*) scores.data_ptr(),
-            (const half*) OPTPTR(bias),
-            (int64_t*) topk_indices.data_ptr(),
-            (half*) topk_weights.data_ptr(),
-            scaling_factor,
-            num_experts,
-            K,
-            bsz
-        );
-    }
-    else
-    {
-        int K_ = K + (K & 1);
-        size_t shmem = num_warps * K_ * (2 * sizeof(float) + sizeof(int))
-                     + num_threads * sizeof(int)
-                     + num_warps * sizeof(float);
-
-        routing_ds3_nogroup_kernel<<<bsz, num_threads, shmem, stream>>>
-        (
-            (const half*) scores.data_ptr(),
-            (const half*) OPTPTR(bias),
-            (int64_t*) topk_indices.data_ptr(),
-            (half*) topk_weights.data_ptr(),
-            scaling_factor,
-            num_experts,
-            K,
-            bsz
-        );
-    }
+    // The iterative top-K kernel beats the radix-sort kernel at every measured size
+    size_t shmem = num_warps * K * (2 * sizeof(float) + sizeof(int));
+    routing_ds3_nogroup_topk_kernel<<<bsz, num_threads, shmem, stream>>>
+    (
+        (const half*) scores.data_ptr(),
+        (const half*) OPTPTR(bias),
+        (int64_t*) topk_indices.data_ptr(),
+        (half*) topk_weights.data_ptr(),
+        scaling_factor,
+        num_experts,
+        K,
+        bsz
+    );
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -770,13 +830,14 @@ void routing_std
     at::Tensor scores,
     at::Tensor topk_indices,
     at::Tensor topk_weights,
-    const c10::optional<at::Tensor>& per_expert_scale
+    const c10::optional<at::Tensor>& per_expert_scale,
+    const c10::optional<at::Tensor>& gate_t
 )
 {
-    hgemm(hidden, gate, scores);
-
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    routing_gemv(hidden, gate, gate_t, scores, stream);
 
     TORCH_CHECK_DTYPE(hidden, kHalf);
     TORCH_CHECK_DTYPE(gate, kHalf);

@@ -21,6 +21,7 @@ TEMP_ROWS_GRAPH = 32
 @dataclass
 class RoutingCFG:
     gate_tensor: torch.Tensor
+    gate_tensor_t: torch.Tensor | None
     num_experts: int
     num_experts_per_tok: int
     router_logits_bsz1: torch.Tensor
@@ -42,6 +43,8 @@ class FusedBuffers:
 
 def routing_std(bsz, cfg, y, params):
     if bsz == 1:
+        if cfg.gate_tensor_t is None:
+            cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
         ext.routing_std(
             y,
             cfg.gate_tensor,
@@ -49,6 +52,7 @@ def routing_std(bsz, cfg, y, params):
             cfg.selected_experts_bsz1,
             cfg.routing_weights_bsz1,
             cfg.per_expert_scale,
+            cfg.gate_tensor_t,
         )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
     else:
@@ -74,6 +78,7 @@ def routing_std(bsz, cfg, y, params):
                 selected_experts,
                 routing_weights,
                 cfg.per_expert_scale,
+                None,
             )
         return selected_experts, routing_weights
 
@@ -119,6 +124,8 @@ def routing_ds3(bsz, cfg, y, params):
 def routing_dots(bsz, cfg, y, params):
 
     if bsz == 1:
+        if cfg.gate_tensor_t is None:
+            cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
         ext.routing_ds3_nogroup(
             y,
             cfg.gate_tensor,
@@ -126,7 +133,8 @@ def routing_dots(bsz, cfg, y, params):
             cfg.e_score_correction_bias,
             cfg.selected_experts_bsz1,
             cfg.routing_weights_bsz1,
-            cfg.routed_scaling_factor
+            cfg.routed_scaling_factor,
+            cfg.gate_tensor_t,
         )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
 
@@ -154,7 +162,8 @@ def routing_dots(bsz, cfg, y, params):
                 cfg.e_score_correction_bias,
                 selected_experts,
                 routing_weights,
-                cfg.routed_scaling_factor
+                cfg.routed_scaling_factor,
+                None,
             )
         return selected_experts, routing_weights
 
@@ -601,6 +610,7 @@ class BlockSparseMLP(Module):
 
         self.routing_cfg = RoutingCFG(
             gate_tensor = self.routing_gate.inner.weight,
+            gate_tensor_t = None,  # created lazily on first bsz-1 call (weights may be deferred here)
             num_experts = self.num_experts,
             num_experts_per_tok = self.num_experts_per_tok,
             router_logits_bsz1 = router_logits_bsz1,
