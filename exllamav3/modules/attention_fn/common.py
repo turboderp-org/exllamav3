@@ -22,15 +22,20 @@ class AttnArgs(NamedTuple):
     block_table: torch.Tensor | None
     cache_seqlens: torch.Tensor | None
     non_causal_spans: list | None = None
+    q_cache: tuple | None = None    # (qk, sk, qv, sv, k_bits, v_bits): packed quantized cache
 
     def sanity_check(self):
         # Cache must be paged
-        assert (
-            (self.k_cache is not None) ==
-            (self.v_cache is not None) ==
-            (self.block_table is not None) ==
-            (self.cache_seqlens is not None)
-        )
+        if self.q_cache is not None:
+            assert self.block_table is not None and self.cache_seqlens is not None
+            assert self.k_cache is None and self.v_cache is None
+        else:
+            assert (
+                (self.k_cache is not None) ==
+                (self.v_cache is not None) ==
+                (self.block_table is not None) ==
+                (self.cache_seqlens is not None)
+            )
         # cu_seqlens requires max seqlen
         assert (
             (self.cu_seqlens is not None) ==

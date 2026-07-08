@@ -120,7 +120,8 @@ void quant_cache_paged
     const at::Tensor& block_table,
     int page_size,
     int seq_len,
-    float compand_a
+    float compand_a,
+    bool in_contiguous
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(k_in.device());
@@ -174,7 +175,8 @@ void quant_cache_paged
         (const uint32_t*) block_table.data_ptr(),
         blocks_per_seq,
         groups_per_token,
-        compand_a
+        compand_a,
+        in_contiguous ? 1 : 0
     );
     cuda_check(cudaPeekAtLastError());
 }

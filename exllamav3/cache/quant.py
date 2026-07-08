@@ -66,6 +66,30 @@ class CacheLayer_quant(CacheLayer):
         self.sv = None
 
 
+    def get_qkv(self):
+        # Raw quantized tensors for attention kernels with online dequant; no temp allocation
+        return self.qk, self.sk, self.qv, self.sv, self.k_bits, self.v_bits
+
+    def update_kv_direct(
+        self,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int
+    ):
+        # Quantize new contiguous K/V rows (bsz, length, kv_heads, head_dim) straight into the
+        # paged quantized cache at positions cache_seqlens..+length
+        ext.quant_cache_paged(
+            k.contiguous(), self.qk, self.sk,
+            v.contiguous(), self.qv, self.sv,
+            cache_seqlens, block_table,
+            PAGE_SIZE,
+            length,
+            self.compand_a,
+            True
+        )
+
     @override
     def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor, sliding_window: int = -1):
         k = torch.empty(self.shape, dtype = torch.half, device = self.device)
@@ -96,7 +120,8 @@ class CacheLayer_quant(CacheLayer):
             cache_seqlens, block_table,
             PAGE_SIZE,
             length,
-            self.compand_a
+            self.compand_a,
+            False
         )
 
 

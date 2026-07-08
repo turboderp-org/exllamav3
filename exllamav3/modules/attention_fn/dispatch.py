@@ -1,11 +1,11 @@
 import torch
-from ...cache import CacheLayer, Cache
+from ...cache import CacheLayer, Cache, CacheLayer_quant
 from .common import AttnArgs, AttnFn
 from .flash_attn_2 import fn_flash_attn_with_kvcache, fn_flash_attn_func, fn_flash_attn_varlen_func
 from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
-from .triton_paged import fn_triton_paged_attn, fn_triton_paged_attn_longq, fn_triton_paged_attn_decode, fn_triton_paged_attn_prefill
+from .triton_paged import fn_triton_paged_attn, fn_triton_paged_attn_longq, fn_triton_paged_attn_decode, fn_triton_paged_attn_prefill, fn_triton_varlen_attn, fn_triton_paged_attn_decode_qc, fn_triton_paged_attn_prefill_qc, has_triton, _is_power_of_2
 
 # Candidate attn functions in order of preference. The Triton decode/prefill kernels lead by
 # default (measured faster than FA2 on Ampere/Ada/consumer Blackwell); set EXL3_PREFER_FA2=1 to
@@ -14,9 +14,17 @@ import os
 _prefer_fa2 = os.environ.get("EXL3_PREFER_FA2", "0") != "0"
 
 _fns_triton_fast: list[AttnFn] = [
+    fn_triton_paged_attn_decode_qc,
+    fn_triton_paged_attn_prefill_qc,
     fn_triton_paged_attn_decode,
     fn_triton_paged_attn_prefill,
+    fn_triton_varlen_attn,
 ]
+
+# Quantized caches feed the attention kernels directly (online dequant, no full-size fp16
+# temporaries). EXL3_QC_ATTN=0 restores the dequantize-then-attend path for A/B testing
+_qc_attn = os.environ.get("EXL3_QC_ATTN", "1") != "0"
+
 _fns_fa2: list[AttnFn] = [
     fn_flash_attn_with_kvcache,
     fn_flash_attn_func,
@@ -26,9 +34,9 @@ _fns_fa2: list[AttnFn] = [
 attn_fns: list[AttnFn] = (
     (_fns_fa2 + _fns_triton_fast) if _prefer_fa2 else (_fns_triton_fast + _fns_fa2)
 ) + [
-    fn_bighead_scalar_attn,
     fn_triton_paged_attn,
     fn_triton_paged_attn_longq,
+    fn_bighead_scalar_attn,
     fn_xformers_cutlass_fallback_cache,
     fn_xformers_cutlass_fallback_nocache,
     fn_torch_sdpa_fallback_cache,
@@ -91,14 +99,28 @@ def attn_dispatch(
     bsz, q_len, num_q_heads, dim = q.shape
     _, kv_len, num_kv_heads, _ = k.shape
 
-    # Get cache tensors
+    # Get cache tensors. Quantized layers pass their packed tensors straight to the attention
+    # kernels when possible: new K/V are quantized into the cache up front and never
+    # materialized as full fp16 cache-sized temporaries
+    q_cache = None
     if cache is not None:
         assert block_table is not None
         assert cache_seqlens is not None
-        if isinstance(cache, CacheLayer):
-            k_cache, v_cache = cache.get_kv(cache_seqlens, block_table, window_size)
-        elif isinstance(cache, Cache):
-            k_cache, v_cache = cache.get_layer(cache_idx, cache_seqlens, block_table, window_size, cache_instance)
+        layer = cache if isinstance(cache, CacheLayer) else cache.layers[cache_idx, cache_instance or 0]
+        if (
+            _qc_attn and has_triton and
+            isinstance(layer, CacheLayer_quant) and
+            layer.compand_a == 0.0 and
+            q.dtype == torch.float16 and
+            dim <= 512 and _is_power_of_2(dim) and
+            non_causal_spans is None and
+            cu_seqlens is None
+        ):
+            layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
+            q_cache = layer.get_qkv()
+            k_cache, v_cache = None, None
+        else:
+            k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, window_size)
     else:
         k_cache, v_cache = None, None
 
@@ -119,6 +141,7 @@ def attn_dispatch(
         softcap,
         block_table, cache_seqlens,
         non_causal_spans,
+        q_cache,
     )
     # Retry the backend that matched last time for this caller before scanning the full list.
     # Candidate functions return None on incompatible arguments, so a stale hint self-corrects
@@ -137,8 +160,8 @@ def attn_dispatch(
         if dispatch_cache is not None:
             dispatch_cache["fn"] = fn
 
-    # Update cache
-    if cache is not None:
+    # Update cache (quant-direct mode already wrote the new K/V before the attention call)
+    if cache is not None and q_cache is None:
         if isinstance(cache, CacheLayer):
             cache.update_kv(cache_seqlens, block_table, k_cache, v_cache, q_len)
         elif isinstance(cache, Cache):

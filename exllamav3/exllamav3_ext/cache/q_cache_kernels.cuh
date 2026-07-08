@@ -127,17 +127,23 @@ __device__ __forceinline__ void quant_block_x4
         q0 = quant1(v0); q1 = quant1(v1); q2 = quant1(v2); q3 = quant1(v3);
     }
 
-    // Pack the lane's 16*num_bits-bit field into the group's words
+    // Pack into power-of-two bit planes (num_bits = sum of set bits; e.g. 5 = 4-bit plane +
+    // 1-bit plane). Aligned plane fields never straddle a word, and every plane unpacks with
+    // vectorized shifts on the consumer side (attention kernels included)
     if (active)
     {
-        uint32_t field = q0 | (q1 << num_bits) | (q2 << 2 * num_bits) | (q3 << 3 * num_bits);
-        int off = sl * 4 * num_bits;
-        int w0 = off >> 5;
-        int sh = off & 31;
-        atomicOr(&sh_pack[sg * num_bits + w0], field << sh);
-        int w1 = (off + 4 * num_bits - 1) >> 5;
-        if (w1 != w0)
-            atomicOr(&sh_pack[sg * num_bits + w1], field >> (32 - sh));  // w1 != w0 implies sh > 0
+        auto pack_plane = [&] (int w, int word_base, uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3)
+        {
+            uint32_t field = v0 | (v1 << w) | (v2 << (2 * w)) | (v3 << (3 * w));
+            int off = sl * 4 * w;
+            atomicOr(&sh_pack[sg * num_bits + word_base + (off >> 5)], field << (off & 31));
+        };
+        int rem = num_bits;
+        int wb = 0;
+        if constexpr (num_bits & 8) { rem -= 8; pack_plane(8, wb, (q0 >> rem) & 255, (q1 >> rem) & 255, (q2 >> rem) & 255, (q3 >> rem) & 255); wb += 8; }
+        if constexpr (num_bits & 4) { rem -= 4; pack_plane(4, wb, (q0 >> rem) & 15,  (q1 >> rem) & 15,  (q2 >> rem) & 15,  (q3 >> rem) & 15);  wb += 4; }
+        if constexpr (num_bits & 2) { rem -= 2; pack_plane(2, wb, (q0 >> rem) & 3,   (q1 >> rem) & 3,   (q2 >> rem) & 3,   (q3 >> rem) & 3);   wb += 2; }
+        if constexpr (num_bits & 1) {           pack_plane(1, wb, q0 & 1,            q1 & 1,            q2 & 1,            q3 & 1);                     }
     }
     __syncwarp();
 
@@ -170,12 +176,26 @@ __device__ __forceinline__ void dequant_block_x4
     const int sl = lane & 7;
     const bool active = sg < active_groups;
 
-    // Two-word funnel window holds the lane's 4 values for any bit width
-    const int off = sl * 4 * num_bits;
+    // Gather the lane's 4 values from the bit planes; aligned plane fields sit in one word
     const uint32_t* gw = in + sg * num_bits;
-    uint32_t w0 = active ? gw[off >> 5] : 0;
-    uint32_t w1 = active ? gw[(off + 4 * num_bits - 1) >> 5] : 0;
-    uint32_t win = __funnelshift_r(w0, w1, off);
+    uint32_t q0 = 0, q1 = 0, q2 = 0, q3 = 0;
+    {
+        auto unpack_plane = [&] (int w, int word_base)
+        {
+            int off = sl * 4 * w;
+            uint32_t word = active ? (gw[word_base + (off >> 5)] >> (off & 31)) : 0;
+            uint32_t mask = (1u << w) - 1;
+            q0 = (q0 << w) | (word & mask);
+            q1 = (q1 << w) | ((word >> w) & mask);
+            q2 = (q2 << w) | ((word >> (2 * w)) & mask);
+            q3 = (q3 << w) | ((word >> (3 * w)) & mask);
+        };
+        int wb = 0;
+        if constexpr (num_bits & 8) { unpack_plane(8, wb); wb += 8; }
+        if constexpr (num_bits & 4) { unpack_plane(4, wb); wb += 4; }
+        if constexpr (num_bits & 2) { unpack_plane(2, wb); wb += 2; }
+        if constexpr (num_bits & 1) { unpack_plane(1, wb);          }
+    }
 
     float s = active ? __half2float(in_scales[sg]) : 0.0f;
     constexpr float r32 = 0.17677669529663688110f;  // 1/sqrt(32)
@@ -185,18 +205,18 @@ __device__ __forceinline__ void dequant_block_x4
     if (compand_a > 0.0f)
     {
         LMCubic<num_bits> lm(compand_a);
-        v0 = lm.decode((win                ) & qmask) * s;
-        v1 = lm.decode((win >>     num_bits) & qmask) * s;
-        v2 = lm.decode((win >> 2 * num_bits) & qmask) * s;
-        v3 = lm.decode((win >> 3 * num_bits) & qmask) * s;
+        v0 = lm.decode(q0) * s;
+        v1 = lm.decode(q1) * s;
+        v2 = lm.decode(q2) * s;
+        v3 = lm.decode(q3) * s;
     }
     else
     {
         constexpr float mh = (float) m - 0.5f;
-        v0 = (float) (int) ((win                ) & qmask) - mh;
-        v1 = (float) (int) ((win >>     num_bits) & qmask) - mh;
-        v2 = (float) (int) ((win >> 2 * num_bits) & qmask) - mh;
-        v3 = (float) (int) ((win >> 3 * num_bits) & qmask) - mh;
+        v0 = ((float) (int) q0 - mh);
+        v1 = ((float) (int) q1 - mh);
+        v2 = ((float) (int) q2 - mh);
+        v3 = ((float) (int) q3 - mh);
         float sm = s * inv_mf;
         v0 *= sm; v1 *= sm; v2 *= sm; v3 *= sm;
     }
@@ -283,7 +303,8 @@ void quant_cache_paged_kernel
     const uint32_t* __restrict__ block_table,
     const int blocks_per_seq,
     const int groups_per_token,
-    const float compand_a
+    const float compand_a,
+    const int in_contiguous   // k_in/v_in indexed (batch, append_pos) instead of paged positions
 )
 {
     __shared__ uint32_t sh_pack[MAX_WARPS][32];
@@ -291,16 +312,18 @@ void quant_cache_paged_kernel
     int token_idx = blockIdx.y + cache_seqlens[batch_idx];
     int page_idx = token_idx / CQ_PAGE_SIZE;
     int token_pos = block_table[blocks_per_seq * batch_idx + page_idx] * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
+    int in_pos = in_contiguous ? (batch_idx * gridDim.y + blockIdx.y) : token_pos;
 
     int warp = threadIdx.x >> 5;
     int g0 = (blockIdx.x * (blockDim.x >> 5) + warp) * 4;
     if (g0 >= groups_per_token) return;
     int active = min(4, groups_per_token - g0);
     int base = token_pos * groups_per_token + g0;
+    int in_base = in_pos * groups_per_token + g0;
 
-    quant_block_x4<k_bits>(k_in + base * 32, k_out + base * k_bits, k_out_scales + base, sh_pack[warp], active, compand_a);
+    quant_block_x4<k_bits>(k_in + in_base * 32, k_out + base * k_bits, k_out_scales + base, sh_pack[warp], active, compand_a);
     __syncwarp();
-    quant_block_x4<v_bits>(v_in + base * 32, v_out + base * v_bits, v_out_scales + base, sh_pack[warp], active, compand_a);
+    quant_block_x4<v_bits>(v_in + in_base * 32, v_out + base * v_bits, v_out_scales + base, sh_pack[warp], active, compand_a);
 }
 
 #define __(i, j) quant_cache_paged_kernel<i, j>
