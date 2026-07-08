@@ -20,8 +20,10 @@ class CacheLayer_quant(CacheLayer):
         max_num_tokens: int,
         k_bits: int,
         v_bits: int,
+        compand_a: float = 0.0,
     ):
         super().__init__(config, attention, cache_id, max_num_tokens)
+        self.compand_a = compand_a
 
         assert max_num_tokens % PAGE_SIZE == 0, \
             f"max_num_tokens must be a multiple of {PAGE_SIZE}."
@@ -68,7 +70,7 @@ class CacheLayer_quant(CacheLayer):
     def get_kv(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor, sliding_window: int = -1):
         k = torch.empty(self.shape, dtype = torch.half, device = self.device)
         v = torch.empty(self.shape, dtype = torch.half, device = self.device)
-        ext.dequant_cache_paged(self.qk, self.sk, k, self.qv, self.sv, v, cache_seqlens, block_table, PAGE_SIZE, sliding_window)
+        ext.dequant_cache_paged(self.qk, self.sk, k, self.qv, self.sv, v, cache_seqlens, block_table, PAGE_SIZE, sliding_window, self.compand_a)
         return k, v
 
 
@@ -93,7 +95,8 @@ class CacheLayer_quant(CacheLayer):
             v, self.qv, self.sv,
             cache_seqlens, block_table,
             PAGE_SIZE,
-            length
+            length,
+            self.compand_a
         )
 
 

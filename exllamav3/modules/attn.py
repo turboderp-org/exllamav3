@@ -10,6 +10,26 @@ from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+
+
+def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
+    """
+    Round one K or V tensor through cache quantization in place (quantize to a temporary buffer,
+    dequantize back), so an fp16 cache downstream holds exactly what a quantized cache would
+    reproduce.
+    """
+    if bits is None or bits >= 16:
+        return
+    assert t.dtype == torch.half and t.size(-1) % 32 == 0
+    tc = t.contiguous()
+    blocks = t.size(-1) // 32
+    q = torch.empty(t.shape[:-1] + (blocks * bits,), dtype = torch.int, device = t.device)
+    scales = torch.empty(t.shape[:-1] + (blocks,), dtype = torch.half, device = t.device)
+    ext.quant_cache_cont(tc, q, scales, compand_a)
+    ext.dequant_cache_cont(q, scales, tc, compand_a)
+    if tc is not t:
+        t.copy_(tc)
+
 from ..util.tensor import g_tensor_cache
 from .attention_fn import attn_dispatch
 
@@ -659,6 +679,7 @@ class Attention(Module):
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
         cu_seqlens = get_for_device(params, "cu_seqlens", self.device, None) if self.use_cu_seqlens else None
         max_seqlen = params["max_seqlen"] if cu_seqlens is not None else None
+        simulate_kv_quant = params.get("sim_kvq", None)
 
         q, k, v, g = self.project_qkv(x, params)
 
@@ -689,6 +710,12 @@ class Attention(Module):
                 inv_freq,
                 self.post_rope_norm
             )
+
+        if simulate_kv_quant:
+            # (k_bits, v_bits) or (k_bits, v_bits, compand_a)
+            sq_ca = simulate_kv_quant[2] if len(simulate_kv_quant) > 2 else 0.0
+            _sim_kvq_inplace(k, simulate_kv_quant[0], sq_ca)
+            _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
 
         o = attn_dispatch(
             q = q,
@@ -727,6 +754,7 @@ class Attention(Module):
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
         causal = params.get("causal", True)
         non_causal_spans = params.get("non_causal_spans")
+        simulate_kv_quant = params.get("sim_kvq", None)
 
         q, k, v, g = self.project_qkv(x, params)
 
@@ -760,6 +788,12 @@ class Attention(Module):
 
         if self.has_split_cache:
             cache = self.tp_cache_lookup[cache]
+
+        if simulate_kv_quant:
+            # (k_bits, v_bits) or (k_bits, v_bits, compand_a)
+            sq_ca = simulate_kv_quant[2] if len(simulate_kv_quant) > 2 else 0.0
+            _sim_kvq_inplace(k, simulate_kv_quant[0], sq_ca)
+            _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
 
         o = attn_dispatch(
             q = q,

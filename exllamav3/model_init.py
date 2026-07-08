@@ -91,6 +91,8 @@ def add_args(
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
+        parser.add_argument("-cca", "--cache_compand_a", type = float, help = "Compand a value for simulated cache, default: 0.0", default = 0.0)
+
 
     if add_draft_model_args:
         parser.add_argument("-dm", "--draft_model_dir", type = str, help = "Path to draft model directory", default = None)
@@ -237,6 +239,7 @@ def init(
                 layer_type = CacheLayer_quant,
                 k_bits = k_bits,
                 v_bits = v_bits,
+                compand_a = args.cache_compand_a,
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
             )

@@ -92,6 +92,19 @@ def main(args):
         config_a.infer_params.no_reconstruct = True
         config_b.infer_params.no_reconstruct = True
 
+    if args.cache_quant is not None:
+        split = [int(bits) for bits in args.cache_quant.split(",")]
+        if len(split) == 1:
+            sim_kvq = split + split
+        elif len(split) == 2:
+            sim_kvq = tuple(split)
+        else:
+            raise ValueError("Specify either one or two bitrates for cache quantization")
+        if args.cache_compand_a > 0.0:
+            sim_kvq = sim_kvq + (args.cache_compand_a,)
+    else:
+        sim_kvq = None
+
     # Override tensors
     if args.override:
         with open(args.override, "r") as f:
@@ -113,7 +126,7 @@ def main(args):
             config_a.stc = vstc
 
     # Dataset
-    all_eval_ids = get_test_tokens(tokenizer, args.rows)
+    all_eval_ids = get_test_tokens(tokenizer, args.rows, args.length, args.length)
     if args.gen_prompt:
         all_eval_ids = prepend_hf_chat_context(tokenizer, all_eval_ids)
 
@@ -169,7 +182,7 @@ def main(args):
             state_b = states_b[b]
             eval_ids = all_eval_ids[b]
 
-            params_a = {}
+            params_a = {"sim_kvq": sim_kvq}
             state_a = module_a.prepare_for_device(state_a, params_a)
             state_a = module_a.forward(state_a, params_a)
 
@@ -307,12 +320,116 @@ def main(args):
     print(f" -- KL divergence (A, B): {kl_div_ab:11.8f}")
     print(f" -- KL divergence (B, A): {kl_div_ba:11.8f}")
 
+    return kl_div_ab
+
+
+def print_cqs_tables(results, compands):
+    from tabulate import tabulate
+    for cq_a in compands:
+        title = "no compand" if cq_a == 0.0 else f"compand a = {cq_a:.2f}"
+        print()
+        print(f" -- KL divergence (A, B), {title}:")
+        rows = [
+            [f"K{cq_k}"] + [f"{results[cq_a][(cq_k, cq_v)]:.6f}" for cq_v in range(2, 9)]
+            for cq_k in range(2, 9)
+        ]
+        print(tabulate(
+            rows,
+            headers = [""] + [f"V{cq_v}" for cq_v in range(2, 9)],
+            tablefmt = "github",
+            stralign = "right",
+            floatfmt = ".6f"
+        ))
+
+
+def cache_quant_sweep(args):
+    compands = [0.0]
+    if args.cache_compand_a:
+        compands.append(args.cache_compand_a)
+    results = {cq_a: {} for cq_a in compands}
+    for cq_k in range(2, 9):
+        for cq_v in range(2, 9):
+            for cq_a in compands:
+                args.cache_quant = f"{cq_k},{cq_v}"
+                args.cache_compand_a = cq_a
+                kld = main(args)
+                results[cq_a][(cq_k, cq_v)] = kld
+
+    print_cqs_tables(results, compands)
+
+
+@torch.inference_mode()
+def cache_quant_sweep_fast(args):
+    """
+    Same sweep as cache_quant_sweep, but both models are loaded whole and the reference logits
+    are kept in VRAM, so the B model runs once and the A model loads once for all 49 (98 with
+    compand) cache settings. For models small enough to share the device with rows * length *
+    vocab_size fp16 reference logits.
+    """
+    device = torch.device(args.device)
+
+    compands = [0.0]
+    if args.cache_compand_a:
+        compands.append(args.cache_compand_a)
+
+    # Dataset
+    config_b = Config.from_directory(args.model_b)
+    config_b.override_dynamic_seq_len(2048)
+    tokenizer = Tokenizer.from_config(config_b)
+    vocab_size = tokenizer.actual_vocab_size
+    all_eval_ids = get_test_tokens(tokenizer, args.rows, args.length, args.length)
+    if args.gen_prompt:
+        all_eval_ids = prepend_hf_chat_context(tokenizer, all_eval_ids)
+    batches = [ids.to(device) for ids in all_eval_ids.split(args.batch_size)]
+
+    # Reference logits from model B, kept on the device
+    if args.no_reconstruct:
+        config_b.infer_params.no_reconstruct = True
+    model_b = Model.from_config(config_b)
+    model_b.load(device = args.device)
+    ref_logits = []
+    with ProgressBar("Model B reference", len(batches)) as pb:
+        for i, ids in enumerate(batches):
+            ref_logits.append(model_b.forward(ids, {}).half())
+            pb.update(i + 1)
+    model_b.unload()
+    free_mem()
+
+    # Model A, loaded once for the whole sweep
+    config_a = Config.from_directory(args.model_a)
+    config_a.override_dynamic_seq_len(2048)
+    if args.no_reconstruct:
+        config_a.infer_params.no_reconstruct = True
+    model_a = Model.from_config(config_a)
+    model_a.load(device = args.device)
+
+    results = {cq_a: {} for cq_a in compands}
+    for cq_k in range(2, 9):
+        for cq_v in range(2, 9):
+            for cq_a in compands:
+                sim_kvq = (cq_k, cq_v) if cq_a == 0.0 else (cq_k, cq_v, cq_a)
+                kl_div_sum = 0.0
+                num_rows = 0
+                for ids, ref in zip(batches, ref_logits):
+                    logits_a = model_a.forward(ids, {"sim_kvq": sim_kvq})
+                    kl_vocab_size = min(vocab_size, logits_a.shape[-1], ref.shape[-1])
+                    for j in range(logits_a.shape[0]):
+                        kl_div_sum += compute_kl_div(logits_a[j], ref[j], kl_vocab_size).mean().item()
+                        num_rows += 1
+                    del logits_a
+                kld = kl_div_sum / num_rows
+                results[cq_a][(cq_k, cq_v)] = kld
+                print(f" -- K{cq_k} V{cq_v} a={cq_a:.2f}: kld {kld:11.8f}")
+
+    print_cqs_tables(results, compands)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-ma", "--model_a", type = str, help = "Model A", required = True)
     parser.add_argument("-mb", "--model_b", type = str, help = "Model B", required = True)
-    parser.add_argument("-r", "--rows", type = int, help = "Number of rows", default = 100)
+    parser.add_argument("-r", "--rows", type = int, help = "Number of rows, default: 100", default = 100)
+    parser.add_argument("-l", "--length", type = int, help = "Tokens per row, default: 2048", default = 2048)
     parser.add_argument("-kb", "--keep_b", type = int, help = "Maintain B state for number of modules", default = 0)
     parser.add_argument("-tkm", "--topk_max", type = int, default = 5, help = "Max top-K interval to test")
     parser.add_argument("-d", "--device", type = int, help = "CUDA device index", default = 0)
@@ -323,5 +440,15 @@ if __name__ == "__main__":
     parser.add_argument("-bsz", "--batch_size", type = int, help = "Batch size", default = 1)
     parser.add_argument("-gp", "--gen_prompt", action = "store_true", help = "Prepend chat template generation prompt to every row")
     parser.add_argument("-nr", "--no_reconstruct", action = "store_true", help = "Avoid GEMM reconstruct (slow)")
+    parser.add_argument("-cq", "--cache_quant", type = str, help = "Simulate quantized cache for A model. Specify either kv_bits or k_bits,v_bits pair")
+    parser.add_argument("-cca", "--cache_compand_a", type = float, help = "Compand a value for simulated cache, default: 0.0", default = 0.0)
+    parser.add_argument("-cqs", "--cache_quant_sweep", action = "store_true", help = "Sweep all k/v combinations and toggle compand if given, output KLD table")
+    parser.add_argument("-cqsf", "--cache_quant_sweep_fast", action = "store_true", help = "Sweep all k/v combinations, preload models")
     _args = parser.parse_args()
-    main(_args)
+
+    if _args.cache_quant_sweep_fast:
+        cache_quant_sweep_fast(_args)
+    elif _args.cache_quant_sweep:
+        cache_quant_sweep(_args)
+    else:
+        main(_args)
