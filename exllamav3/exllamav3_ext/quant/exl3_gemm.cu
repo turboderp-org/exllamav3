@@ -217,6 +217,24 @@ int exl3_gemm_gr
         }
     };
 
+    // QTIP-style GEMV path for small m (exl3_gemv_kernel.cuh). Same kernel arguments, so graph
+    // recording is identical; falls through to the regular kernel when the heuristic declines
+    if (force_shape_idx <= 0 && force_num_sms <= 0)
+    {
+        void* gemv_kernel = nullptr;
+        if (exl3_gemv_try_launch
+        (
+            kernelArgs, size_m, size_k, size_n, K, cb, c_fp32,
+            suh_ptr && A_had_ptr && svh_ptr,
+            device, stream, &gemv_kernel, false
+        ))
+        {
+            add_graph_args(gemv_kernel);
+            cuda_check(cudaPeekAtLastError());
+            return 90;
+        }
+    }
+
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
