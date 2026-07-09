@@ -110,7 +110,6 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
 .def("configure_slot", &BC_Attention::configure_slot,
     py::arg("bsz"),
     py::arg("q_len"),
-    py::arg("bt_width"),
     py::arg("q"),
     py::arg("kv"),
     py::arg("o"),
@@ -121,7 +120,7 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("k_split"),
     py::arg("k_combine"),
     py::arg("k_update"),
-    py::arg("num_splits"),
-    py::arg("split_len")
+    py::arg("block_n"),
+    py::arg("splits_cap")
 )
 .def("run", &BC_Attention::run);

@@ -114,18 +114,16 @@ BC_Attention::BC_Attention
     slots.resize(MAX_BSZ * MAX_QLEN);
 }
 
-bool BC_Attention::needs_configure(int bsz, int q_len, int bt_width)
+bool BC_Attention::needs_configure(int bsz, int q_len)
 {
     TORCH_CHECK(1 <= bsz && bsz <= MAX_BSZ && 1 <= q_len && q_len <= MAX_QLEN, "BC_Attention: shape out of range");
-    Slot& s = slot(bsz, q_len);
-    return !s.configured || s.bt_width != bt_width;
+    return !slot(bsz, q_len).configured;
 }
 
 void BC_Attention::configure_slot
 (
     int bsz,
     int q_len,
-    int bt_width,
     at::Tensor q,
     at::Tensor kv,
     at::Tensor o,
@@ -136,8 +134,8 @@ void BC_Attention::configure_slot
     std::shared_ptr<TritonKernel> k_split,
     std::shared_ptr<TritonKernel> k_combine,
     std::shared_ptr<TritonKernel> k_update,
-    int num_splits,
-    int split_len
+    int block_n,
+    int splits_cap
 )
 {
     Slot& s = slot(bsz, q_len);
@@ -153,12 +151,12 @@ void BC_Attention::configure_slot
     s.k_split = k_split;
     s.k_combine = k_combine;
     s.k_update = k_update;
-    s.num_splits = num_splits;
-    s.split_len = split_len;
-    s.bt_width = bt_width;
+    s.block_n = block_n;
+    s.splits_cap = splits_cap;
 
     TORCH_CHECK(s.q.is_contiguous() && s.kv.is_contiguous() && s.o.is_contiguous(), "BC_Attention: statics must be contiguous");
     TORCH_CHECK(quant_cache == (k_update == nullptr), "BC_Attention: k_update iff fp16 cache");
+    TORCH_CHECK(k_combine, "BC_Attention: combine kernel required");
 
     s.q2 = s.q.view({R, num_q_heads * head_dim});
     s.q4 = s.q.view({bsz, q_len, num_q_heads, head_dim});
@@ -191,11 +189,19 @@ void BC_Attention::configure_slot
     s.programs = bsz * num_kv_heads * h_blocks;
     s.upd_grid = dim3(bsz * q_len, num_kv_heads, 1);
 
-    // Any change to the frozen kernel arguments (block-table width, split length) invalidates
-    // the captured graph
     s.graph = std::make_unique<Graph>();
     s.runs = 0;
     s.configured = true;
+}
+
+// Live split configuration from the current block-table bound (same formula as the python
+// dispatch path, so the two produce identical numerics)
+static inline void split_config(int bt_width, int page_size, int q_len, int block_n, int splits_cap,
+                                int* num_splits, int* split_len)
+{
+    int bound = bt_width * page_size + q_len;
+    *num_splits = MAX(1, MIN(splits_cap, CEIL_DIVIDE(bound, 4 * block_n)));
+    *split_len = CEIL_DIVIDE(CEIL_DIVIDE(bound, *num_splits), block_n) * block_n;
 }
 
 void BC_Attention::run_gr
@@ -324,20 +330,24 @@ void BC_Attention::run_gr
             (void*) cache_v.data_ptr(),
             (void*) block_table.data_ptr(),
             (void*) cache_seqlens.data_ptr(),
-            (void*) (intptr_t) s.bt_width,
+            (void*) (intptr_t) (int) block_table.size(1),
         };
         s.k_update->launch(s.upd_grid.x, s.upd_grid.y, s.upd_grid.z, args, stream);
         if (graph)
         {
             graph->record_param(s.k_update->handle(), GP_attn_block_table, 4);
             graph->record_param(s.k_update->handle(), GP_attn_seqlens, 5);
+            graph->record_param(s.k_update->handle(), GP_attn_num_pages, 6, 4);
             graph->record_param(s.k_update->handle(), GP_end, 0);
         }
     }
 
-    // Flash-decoding split kernel (+ combine when the kv range is split)
+    // Flash-decoding split kernel + combine, with the split configuration derived from the
+    // current block-table bound per call
     void* scales_k = quant_cache ? cache_k_scales.value().data_ptr() : s.q.data_ptr();
     void* scales_v = quant_cache ? cache_v_scales.value().data_ptr() : s.q.data_ptr();
+    int num_splits, split_len;
+    split_config((int) block_table.size(1), page_size, q_len, s.block_n, s.splits_cap, &num_splits, &split_len);
     {
         std::vector<void*> args =
         {
@@ -352,18 +362,23 @@ void BC_Attention::run_gr
             scales_k,
             scales_v,
             (void*) h32.data_ptr(),
-            (void*) (intptr_t) s.split_len,
-            (void*) (intptr_t) s.bt_width,
+            (void*) (intptr_t) split_len,
+            (void*) (intptr_t) (int) block_table.size(1),
+            (void*) (intptr_t) num_splits,
         };
-        s.k_split->launch(s.programs, s.num_splits, 1, args, stream);
+        // Launched at the split cap so the captured grid never changes; splits at or above the
+        // live count exit without storing
+        s.k_split->launch(s.programs, s.splits_cap, 1, args, stream);
         if (graph)
         {
             graph->record_param(s.k_split->handle(), GP_attn_block_table, 3);
             graph->record_param(s.k_split->handle(), GP_attn_seqlens, 4);
+            graph->record_param(s.k_split->handle(), GP_attn_split_len, 11, 4);
+            graph->record_param(s.k_split->handle(), GP_attn_num_pages, 12, 4);
+            graph->record_param(s.k_split->handle(), GP_attn_num_splits, 13, 4);
             graph->record_param(s.k_split->handle(), GP_end, 0);
         }
     }
-    if (s.num_splits > 1)
     {
         std::vector<void*> args =
         {
@@ -371,8 +386,14 @@ void BC_Attention::run_gr
             (void*) s.partial_ml.data_ptr(),
             (void*) s.o.data_ptr(),
             (void*) h32.data_ptr(),
+            (void*) (intptr_t) num_splits,
         };
         s.k_combine->launch(s.programs, 1, 1, args, stream);
+        if (graph)
+        {
+            graph->record_param(s.k_combine->handle(), GP_attn_num_splits, 4, 4);
+            graph->record_param(s.k_combine->handle(), GP_end, 0);
+        }
     }
 
     // Output gate
@@ -408,7 +429,6 @@ void BC_Attention::run
     Slot& s = slot(bsz, q_len);
     TORCH_CHECK(s.configured, "BC_Attention: slot not configured");
     TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "BC_Attention: x and y must be contiguous");
-    TORCH_CHECK(block_table.size(1) == s.bt_width, "BC_Attention: block table width changed without reconfigure");
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
     // captured, then launched below like every later run, with only the I/O pointers patched
@@ -468,18 +488,30 @@ void BC_Attention::run
     params.emplace_back(GP_rope_positions, positions ? (void*) positions.value().data_ptr() : nullptr);
     params.emplace_back(GP_rope_position_ids, position_ids ? (void*) position_ids.value().data_ptr() : nullptr);
     params.emplace_back(GP_rope_pid_stride, (void*) (uintptr_t) pid_stride);
+
+    // Cache append and attention: the block-table geometry and split configuration are runtime
+    // kernel arguments, patched per call like the pointers, so context growth never recaptures
+    int bt_width = (int) block_table.size(1);
+    int num_splits, split_len;
+    split_config(bt_width, page_size, q_len, s.block_n, s.splits_cap, &num_splits, &split_len);
     if (quant_cache)
     {
         params.emplace_back(GP_qcache_seqlens, (void*) cache_seqlens.data_ptr());
         params.emplace_back(GP_qcache_block_table, (void*) block_table.data_ptr());
+        params.emplace_back(GP_qcache_blocks_per_seq, (void*) (uintptr_t) bt_width);
     }
     else
     {
         params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
         params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
+        params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
     }
     params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
     params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
+    params.emplace_back(GP_attn_split_len, (void*) (uintptr_t) split_len);
+    params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
+    params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);
+    params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);   // combine kernel
     params.emplace_back(GP_gemm_C, (void*) y.data_ptr());
     if (o_proj->bias)
     {

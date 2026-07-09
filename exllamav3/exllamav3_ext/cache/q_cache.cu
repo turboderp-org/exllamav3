@@ -196,6 +196,7 @@ void quant_cache_paged_gr
     {
         graph->record_param(kernel_ptr, GP_qcache_seqlens, 6);
         graph->record_param(kernel_ptr, GP_qcache_block_table, 7);
+        graph->record_param(kernel_ptr, GP_qcache_blocks_per_seq, 8, 4);
         graph->record_param(kernel_ptr, GP_end, 0);
     }
     cuda_check(cudaPeekAtLastError());

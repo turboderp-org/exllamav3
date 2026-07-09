@@ -70,9 +70,13 @@ enum GraphedParams
 
     GP_qcache_seqlens,
     GP_qcache_block_table,
+    GP_qcache_blocks_per_seq,
 
     GP_attn_seqlens,
-    GP_attn_block_table
+    GP_attn_block_table,
+    GP_attn_num_pages,
+    GP_attn_split_len,
+    GP_attn_num_splits
 };
 
 class Graph

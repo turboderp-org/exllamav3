@@ -167,7 +167,7 @@ class BCAttn:
         )
         self.slot_widths = {}
 
-    def _configure(self, bsz: int, q_len: int, bt_width: int):
+    def _configure(self, bsz: int, q_len: int):
         import triton
         from .triton_paged import (
             _paged_attn_decode_split_kernel,
@@ -188,10 +188,10 @@ class BCAttn:
         h_blocks = triton.cdiv(group_size, block_h)
         programs = bsz * kvh * h_blocks
 
-        max_k_len = bt_width * PAGE_SIZE + q_len
+        # The live split count and split length are runtime kernel arguments derived from the
+        # block-table bound per call (patched into the graph); the grid is sized to the cap
         target = 2 * _get_sm_count(dev)
-        num_splits = max(1, min(target // programs, triton.cdiv(max_k_len, 4 * block_n), 128))
-        split_len = triton.cdiv(triton.cdiv(max_k_len, num_splits), block_n) * block_n
+        splits_cap = max(1, min(target // programs, 128))
         window_left, window_right = _normalize_window(self.window_size)
 
         cache_t = "*i32" if self.quant else "*fp16"
@@ -200,34 +200,33 @@ class BCAttn:
             "block_table": "*i32", "cache_seqlens": "*i32", "out": "*fp16",
             "partial_o": "*fp32", "partial_ml": "*fp32",
             "k_scales": "*fp16", "v_scales": "*fp16", "h32": "*fp16",
-            "split_len": "i32", "num_pages_per_seq": "i32",
+            "split_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
         } | {n: "constexpr" for n in (
-            "num_splits", "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
+            "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
             "page_size", "head_dim", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
             "SOFTCAP", "FINAL", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N")}
         consts = dict(
-            num_splits = num_splits, QCK = self.k_bits, QCV = self.v_bits,
+            QCK = self.k_bits, QCV = self.v_bits,
             q_len = q_len, kv_append_len = q_len, n_q_heads = qh, n_kv_heads = kvh,
             page_size = PAGE_SIZE, head_dim = hd, scale = float(self.sm_scale),
             CAUSAL = True, WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
-            SOFTCAP = float(self.softcap or 0.0), FINAL = num_splits == 1,
+            SOFTCAP = float(self.softcap or 0.0), FINAL = False,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
         k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, 4, 2)
 
-        k_combine = None
-        if num_splits > 1:
-            sig_c = {
-                "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
-            } | {n: "constexpr" for n in (
-                "num_splits", "QCV", "q_len", "n_q_heads", "n_kv_heads", "head_dim",
-                "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")}
-            consts_c = dict(
-                num_splits = num_splits, QCV = self.v_bits, q_len = q_len,
-                n_q_heads = qh, n_kv_heads = kvh, head_dim = hd,
-                BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
-            )
-            k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
+        sig_c = {
+            "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
+            "num_splits": "i32",
+        } | {n: "constexpr" for n in (
+            "QCV", "q_len", "n_q_heads", "n_kv_heads", "head_dim",
+            "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")}
+        consts_c = dict(
+            QCV = self.v_bits, q_len = q_len,
+            n_q_heads = qh, n_kv_heads = kvh, head_dim = hd,
+            BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
+        )
+        k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
 
         k_update = None
         if not self.quant:
@@ -257,19 +256,15 @@ class BCAttn:
                 gate_b = g_tensor_cache.get(dev, (R, qh * hd), torch.half, "bca_g")
         kv = g_tensor_cache.get(dev, (2, R, kvh * hd), torch.half, "bca_kv")
         o = g_tensor_cache.get(dev, (bsz, q_len, qh, hd), torch.half, "bca_o")
-        if num_splits > 1:
-            partial_o = g_tensor_cache.get(dev, (programs * num_splits * block_rows * hd,), torch.float, "bca_po")
-            partial_ml = g_tensor_cache.get(dev, (programs * num_splits * block_rows * 2,), torch.float, "bca_ml")
-        else:
-            partial_o = g_tensor_cache.get(dev, (1,), torch.float, "bca_po1")
-            partial_ml = g_tensor_cache.get(dev, (1,), torch.float, "bca_ml1")
+        partial_o = g_tensor_cache.get(dev, (programs * splits_cap * block_rows * hd,), torch.float, "bca_po")
+        partial_ml = g_tensor_cache.get(dev, (programs * splits_cap * block_rows * 2,), torch.float, "bca_ml")
 
         self.bc.configure_slot(
-            bsz, q_len, bt_width,
+            bsz, q_len,
             q, kv, o, partial_o, partial_ml,
             gate_a, gate_b,
             k_split, k_combine, k_update,
-            num_splits, split_len,
+            block_n, splits_cap,
         )
 
     def step(
@@ -283,13 +278,13 @@ class BCAttn:
         inv_freq: torch.Tensor | None,
     ) -> torch.Tensor:
         bsz, q_len, _ = x.shape
-        bt_width = block_table.shape[1]
-        # The captured graph freezes the block-table width and the inv_freq table geometry
-        # (table flag, stride, partial head dim); either changing means reconfigure. The
-        # position source (scalar/positions/position_ids) is a runtime branch, patched per call
-        skey = (bt_width, tuple(inv_freq.shape) if inv_freq is not None else None)
-        if self.slot_widths.get((bsz, q_len)) != skey:
-            self._configure(bsz, q_len, bt_width)
+        # The captured graph freezes the inv_freq table geometry (table flag, stride, partial
+        # head dim), so an override shape change means reconfigure. Everything else that varies
+        # per call -- position source, block-table pointer/width, split configuration -- is a
+        # runtime argument patched into the graph
+        skey = tuple(inv_freq.shape) if inv_freq is not None else None
+        if self.slot_widths.get((bsz, q_len), ...) != skey:
+            self._configure(bsz, q_len)
             self.slot_widths[(bsz, q_len)] = skey
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq)

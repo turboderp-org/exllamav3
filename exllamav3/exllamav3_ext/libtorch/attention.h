@@ -101,9 +101,9 @@ struct BC_Attention
     {
         bool configured = false;
         int runs = 0;
-        int bt_width = 0;
-        int num_splits = 0;
-        int split_len = 0;
+        int block_n = 0;
+        int splits_cap = 0;   // grid height of the split kernel; the live split count is a
+                              // runtime argument patched per call, extra splits idle
         int programs = 0;
         dim3 upd_grid;
 
@@ -172,15 +172,12 @@ struct BC_Attention
         at::Tensor h32
     );
 
-    // True when the slot must be (re)configured before run(): not yet configured, or captured
-    // against a different block-table width
-    bool needs_configure(int bsz, int q_len, int bt_width);
+    bool needs_configure(int bsz, int q_len);
 
     void configure_slot
     (
         int bsz,
         int q_len,
-        int bt_width,
         at::Tensor q,
         at::Tensor kv,
         at::Tensor o,
@@ -191,8 +188,8 @@ struct BC_Attention
         std::shared_ptr<TritonKernel> k_split,
         std::shared_ptr<TritonKernel> k_combine,
         std::shared_ptr<TritonKernel> k_update,
-        int num_splits,
-        int split_len
+        int block_n,
+        int splits_cap
     );
 
     void run

@@ -797,7 +797,7 @@ def _paged_attn_decode_split_kernel(
     h32,
     split_len,           # runtime: derived from the block-table bound, changes as it grows
     num_pages_per_seq,   # runtime: block-table width can grow without recompiling
-    num_splits: tl.constexpr,
+    num_splits,          # runtime: the grid may be launched wider (graph path); extra splits idle
     QCK: tl.constexpr,
     QCV: tl.constexpr,
     q_len: tl.constexpr,
@@ -905,11 +905,12 @@ def _paged_attn_decode_split_kernel(
         out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
         tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None])
     else:
-        po_base = (pid * num_splits + split) * BLOCK_ROWS * head_dim
-        tl.store(partial_o + po_base + rows[:, None] * head_dim + offs_d[None, :], acc)
-        ml_base = (pid * num_splits + split) * BLOCK_ROWS * 2
-        tl.store(partial_ml + ml_base + rows * 2, m)
-        tl.store(partial_ml + ml_base + rows * 2 + 1, l)
+        if split < num_splits:
+            po_base = (pid * num_splits + split) * BLOCK_ROWS * head_dim
+            tl.store(partial_o + po_base + rows[:, None] * head_dim + offs_d[None, :], acc)
+            ml_base = (pid * num_splits + split) * BLOCK_ROWS * 2
+            tl.store(partial_ml + ml_base + rows * 2, m)
+            tl.store(partial_ml + ml_base + rows * 2 + 1, l)
 
 
 @triton.jit
@@ -918,7 +919,7 @@ def _paged_attn_decode_combine_kernel(
     partial_ml,
     out,
     h32,
-    num_splits: tl.constexpr,
+    num_splits,          # runtime
     QCV: tl.constexpr,
     q_len: tl.constexpr,
     n_q_heads: tl.constexpr,
