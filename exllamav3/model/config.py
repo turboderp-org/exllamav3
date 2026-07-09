@@ -23,10 +23,11 @@ class InferParams:
     mgemm_n_threshold: int = 0
 
     def __init__(self):
-        # With the experimental GEMV mode, separate int8 GEMV calls beat the fused MGEMM only when
-        # a single matrix is wide enough to fill the GPU on its own (and K is within the int8 gate);
-        # narrow same-input pairs stay fused, where batching is what restores utilization
-        if int(os.environ.get("EXL3_INT8_GEMV", 0)) > 0:
+        # With the int8 GEMV mode (on by default), separate int8 GEMV calls beat the fused MGEMM
+        # only when a single matrix is wide enough to fill the GPU on its own (and K is within the
+        # int8 gate); narrow same-input pairs stay fused, where batching is what restores
+        # utilization. Only pairs the int8 path can take (mul1 codebook) are ever unfused
+        if int(os.environ.get("EXL3_INT8_GEMV", 2)) > 0:
             self.mgemm_K_threshold = int(os.environ.get("EXL3_MGEMM_K_THRESHOLD", 6))
             self.mgemm_n_threshold = int(os.environ.get("EXL3_MGEMM_N_THRESHOLD", 8192))
 

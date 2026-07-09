@@ -23,11 +23,12 @@ Instances are keyed per cache layer, since the cache tensors are baked into the 
 graphs. Static intermediates come from g_tensor_cache and are shared between layers of the same
 shape on the same device.
 
-EXL3_BC_ATTN=0 disables the path.
+Enabled by default; EXL3_BC_ATTN=0 disables the path. Unsupported module/cache configurations
+fall back to the dispatch path by design (build_bc_attn returns None); unexpected failures
+while building the path raise.
 """
 
-bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "0") != "0"
-bc_attn_debug = os.environ.get("EXL3_BC_ATTN_DEBUG", "0") != "0"
+bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "1") != "0"
 
 MAX_BSZ = 4
 MAX_QLEN = 16
@@ -297,8 +298,7 @@ def build_bc_attn(module, layer):
     from ...cache import CacheLayer_quant, CacheLayer_fp16
 
     m = module
-    try:
-        if not (
+    if not (
             bc_attn_enable and
             isinstance(layer, (CacheLayer_quant, CacheLayer_fp16)) and
             (not isinstance(layer, CacheLayer_quant) or (
@@ -331,9 +331,5 @@ def build_bc_attn(module, layer):
                 ))
             ))
         ):
-            return None
-        return BCAttn(m, layer)
-    except Exception:
-        if bc_attn_debug:
-            raise
         return None
+    return BCAttn(m, layer)
