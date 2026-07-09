@@ -30,7 +30,11 @@ class InferParams:
             self.mgemm_K_threshold = int(os.environ.get("EXL3_MGEMM_K_THRESHOLD", 6))
             self.mgemm_n_threshold = int(os.environ.get("EXL3_MGEMM_N_THRESHOLD", 8192))
 
-    def use_mgemm(self, K: int, out_features: int) -> bool:
+    def use_mgemm(self, K: int, out_features: int, mul1: bool = False) -> bool:
+        # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
+        # requires the mul1 codebook; other tensors always keep the fused MGEMM
+        if not mul1:
+            return True
         # Fuse when K is at/above the bitrate threshold (int8 GEMV can't take those anyway) or the
         # matrices are too narrow for separate GEMV calls to fill the GPU
         return K >= self.mgemm_K_threshold or (self.mgemm_n_threshold > 0 and out_features < self.mgemm_n_threshold)

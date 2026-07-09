@@ -383,6 +383,7 @@ class Attention(Module):
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
 
+
     @override
     def optimizer_targets(self):
         q = self.q_proj.optimizer_targets()
@@ -419,7 +420,10 @@ class Attention(Module):
             self.k_proj.inner.K == self.v_proj.inner.K and
             self.k_proj.inner.bias is None and
             self.v_proj.inner.bias is None and
-            self.config.infer_params.use_mgemm(self.k_proj.inner.K, self.k_proj.out_features)
+            self.config.infer_params.use_mgemm(
+                self.k_proj.inner.K, self.k_proj.out_features,
+                self.k_proj.inner.mul1 and self.v_proj.inner.mul1,
+            )
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
             self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "kvh_1")
@@ -436,7 +440,10 @@ class Attention(Module):
             self.q_proj.inner.K == self.g_proj.inner.K and
             self.q_proj.inner.bias is None and
             self.g_proj.inner.bias is None and
-            self.config.infer_params.use_mgemm(self.q_proj.inner.K, self.q_proj.out_features)
+            self.config.infer_params.use_mgemm(
+                self.q_proj.inner.K, self.q_proj.out_features,
+                self.q_proj.inner.mul1 and self.g_proj.inner.mul1,
+            )
         ):
             self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
             self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "qgh_1")

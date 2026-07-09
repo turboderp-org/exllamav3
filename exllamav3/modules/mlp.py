@@ -569,7 +569,11 @@ class GatedMLP(Module):
             self.gates[load_slice].inner.K == self.ups[load_slice].inner.K and
             self.gates[load_slice].inner.bias is None and
             self.ups[load_slice].inner.bias is None and
-            self.config.infer_params.use_mgemm(self.gates[load_slice].inner.K, self.gates[load_slice].out_features)
+            self.config.infer_params.use_mgemm(
+                self.gates[load_slice].inner.K,
+                self.gates[load_slice].out_features,
+                self.gates[load_slice].inner.mul1 and self.ups[load_slice].inner.mul1,
+            )
         ):
             self.multi_gu[load_slice] = MultiLinear(self.device, [self.gates[load_slice], self.ups[load_slice]])
 
