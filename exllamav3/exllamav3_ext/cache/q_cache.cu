@@ -108,7 +108,7 @@ page_size: 256
 seq_len: number of positions (size: dim) to update from end of each sequence
 */
 
-void quant_cache_paged
+void quant_cache_paged_gr
 (
     const at::Tensor& k_in,
     const at::Tensor& k_out,
@@ -121,11 +121,12 @@ void quant_cache_paged
     int page_size,
     int seq_len,
     float compand_a,
-    bool in_contiguous
+    bool in_contiguous,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(k_in.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(k_in, kHalf);
     TORCH_CHECK_DTYPE(k_out, kInt);
@@ -163,22 +164,61 @@ void quant_cache_paged
 
     TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
 
-    quant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
-    (
-        (const half*) k_in.data_ptr(),
-        (uint32_t*) k_out.data_ptr(),
-        (half*) k_out_scales.data_ptr(),
-        (const half*) v_in.data_ptr(),
-        (uint32_t*) v_out.data_ptr(),
-        (half*) v_out_scales.data_ptr(),
-        (const uint32_t*) cache_seqlens.data_ptr(),
-        (const uint32_t*) block_table.data_ptr(),
-        blocks_per_seq,
-        groups_per_token,
-        compand_a,
-        in_contiguous ? 1 : 0
-    );
+    void* kernel_ptr = (void*) quant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2];
+    const half* k_in_ptr = (const half*) k_in.data_ptr();
+    uint32_t* k_out_ptr = (uint32_t*) k_out.data_ptr();
+    half* k_out_scales_ptr = (half*) k_out_scales.data_ptr();
+    const half* v_in_ptr = (const half*) v_in.data_ptr();
+    uint32_t* v_out_ptr = (uint32_t*) v_out.data_ptr();
+    half* v_out_scales_ptr = (half*) v_out_scales.data_ptr();
+    const uint32_t* cache_seqlens_ptr = (const uint32_t*) cache_seqlens.data_ptr();
+    const uint32_t* block_table_ptr = (const uint32_t*) block_table.data_ptr();
+    int in_cont = in_contiguous ? 1 : 0;
+
+    void* kernel_args[] =
+    {
+        &k_in_ptr,
+        &k_out_ptr,
+        &k_out_scales_ptr,
+        &v_in_ptr,
+        &v_out_ptr,
+        &v_out_scales_ptr,
+        &cache_seqlens_ptr,
+        &block_table_ptr,
+        &blocks_per_seq,
+        &groups_per_token,
+        &compand_a,
+        &in_cont
+    };
+    cuda_check(cudaLaunchKernel(kernel_ptr, blocks, threads, kernel_args, 0, stream));
+
+    if (graph)
+    {
+        graph->record_param(kernel_ptr, GP_qcache_seqlens, 6);
+        graph->record_param(kernel_ptr, GP_qcache_block_table, 7);
+        graph->record_param(kernel_ptr, GP_end, 0);
+    }
     cuda_check(cudaPeekAtLastError());
+}
+
+void quant_cache_paged
+(
+    const at::Tensor& k_in,
+    const at::Tensor& k_out,
+    const at::Tensor& k_out_scales,
+    const at::Tensor& v_in,
+    const at::Tensor& v_out,
+    const at::Tensor& v_out_scales,
+    const at::Tensor& cache_seqlens,
+    const at::Tensor& block_table,
+    int page_size,
+    int seq_len,
+    float compand_a,
+    bool in_contiguous
+)
+{
+    quant_cache_paged_gr(k_in, k_out, k_out_scales, v_in, v_out, v_out_scales, cache_seqlens,
+                         block_table, page_size, seq_len, compand_a, in_contiguous, nullptr);
 }
 
 /*
