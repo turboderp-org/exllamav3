@@ -10,6 +10,8 @@ from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+import os
+from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
@@ -367,6 +369,7 @@ class Attention(Module):
         self.multi_qg = None
         self.tp_reduce = False
         self.dispatch_cache = {}
+        self.bc_attn = {}
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
@@ -464,6 +467,8 @@ class Attention(Module):
     @override
     def unload(self):
         super().unload()
+
+        self.bc_attn = {}
 
         for cl in self.cache_layers:
             cl.free()
@@ -745,6 +750,33 @@ class Attention(Module):
         return o
 
 
+    def bc_attn_step(self, x, cache, params, block_table, cache_seqlens):
+        """
+        Graph-captured decode attention block (projections through o_proj as one C++ call,
+        replayed as one CUDA graph after warmup). Returns the block output, or None when the
+        call must take the regular python path.
+        """
+        from ..cache import CacheLayer
+
+        if cache is None or x.dtype != torch.float16 or not x.is_contiguous():
+            return None
+        if params.get("sim_kvq") is not None:
+            return None
+        positions = get_for_device(params, "positions", self.device, None)
+        position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
+        position = params.get("position", 0)
+
+        layer = cache if isinstance(cache, CacheLayer) else cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+        key = id(layer)
+        bca = self.bc_attn.get(key)
+        if bca is None:
+            bca = self.bc_attn[key] = (build_bc_attn(self, layer) or False)
+        if bca is False:
+            return None
+        return bca.step(x, cache_seqlens, block_table, position, positions, position_ids, inv_freq)
+
+
     def decode_flash_attn(
         self,
         x: torch.Tensor,
@@ -762,6 +794,15 @@ class Attention(Module):
         causal = params.get("causal", True)
         non_causal_spans = params.get("non_causal_spans")
         simulate_kv_quant = params.get("sim_kvq", None)
+
+        # Graph-captured C++ path for the whole decode attention block
+        if (
+            _bc_attn_enable and causal and non_causal_spans is None and
+            bsz <= 4 and seqlen <= 16
+        ):
+            o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens)
+            if o is not None:
+                return o
 
         q, k, v, g = self.project_qkv(x, params)
 

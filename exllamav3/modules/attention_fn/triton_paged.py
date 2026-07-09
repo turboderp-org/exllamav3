@@ -36,9 +36,9 @@ def _paged_kv_update_kernel(
     v_cache,
     block_table,
     cache_seqlens,
+    num_pages_per_seq,   # runtime: block-table width can grow without recompiling
     kv_append_len: tl.constexpr,
     n_kv_heads: tl.constexpr,
-    num_pages_per_seq: tl.constexpr,
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -406,9 +406,9 @@ def paged_attn_triton(
                 v_cache,
                 block_table,
                 cache_seqlens,
+                num_pages_per_seq,
                 kv_append_len,
                 n_kv_heads,
-                num_pages_per_seq,
                 page_size,
                 head_dim,
                 update_block_d,
@@ -551,9 +551,9 @@ def paged_attn_triton_longq(
                 v_cache,
                 block_table,
                 cache_seqlens,
+                num_pages_per_seq,
                 kv_append_len,
                 n_kv_heads,
-                num_pages_per_seq,
                 page_size,
                 head_dim,
                 update_block_d,
@@ -795,7 +795,8 @@ def _paged_attn_decode_split_kernel(
     k_scales,
     v_scales,
     h32,
-    split_len: tl.constexpr,
+    split_len,           # runtime: derived from the block-table bound, changes as it grows
+    num_pages_per_seq,   # runtime: block-table width can grow without recompiling
     num_splits: tl.constexpr,
     QCK: tl.constexpr,
     QCV: tl.constexpr,
@@ -803,7 +804,6 @@ def _paged_attn_decode_split_kernel(
     kv_append_len: tl.constexpr,
     n_q_heads: tl.constexpr,
     n_kv_heads: tl.constexpr,
-    num_pages_per_seq: tl.constexpr,
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
     scale: tl.constexpr,
@@ -1091,15 +1091,15 @@ def paged_attn_triton_decode(
             update_block_d = triton.next_power_of_2(head_dim)
             _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
                 k, v, k_cache, v_cache, block_table, cache_seqlens,
-                kv_append_len, n_kv_heads, num_pages_per_seq, page_size, head_dim, update_block_d,
+                num_pages_per_seq, kv_append_len, n_kv_heads, page_size, head_dim, update_block_d,
                 num_warps=2, num_stages=3,
             )
 
         _paged_attn_decode_split_kernel[(programs, num_splits)](
             q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
             k_scales, v_scales, h32,
-            split_len, num_splits, qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
-            num_pages_per_seq, page_size, head_dim, float(softmax_scale),
+            split_len, num_pages_per_seq, num_splits, qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
+            page_size, head_dim, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
             num_splits == 1, block_m, block_h, block_rows, block_n,
             num_warps=num_warps, num_stages=num_stages,
@@ -1530,7 +1530,7 @@ def paged_attn_triton_prefill(
             update_block_d = triton.next_power_of_2(head_dim)
             _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
                 k, v, k_cache, v_cache, block_table, cache_seqlens,
-                kv_append_len, n_kv_heads, num_pages_per_seq, page_size, head_dim, update_block_d,
+                num_pages_per_seq, kv_append_len, n_kv_heads, page_size, head_dim, update_block_d,
                 num_warps=2, num_stages=3,
             )
 
