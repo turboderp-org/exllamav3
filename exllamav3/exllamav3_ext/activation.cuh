@@ -107,6 +107,15 @@ void deinterleave_qg
     int head_dim
 );
 
+void deinterleave_qg_gr
+(
+    const at::Tensor& qg,
+    at::Tensor& q,
+    at::Tensor& g,
+    int head_dim,
+    Graph* graph
+);
+
 void mul_sigmoid_broadcast_
 (
     at::Tensor& x,

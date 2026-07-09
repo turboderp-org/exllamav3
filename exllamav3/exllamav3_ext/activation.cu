@@ -531,16 +531,17 @@ void deinterleave_qg_kernel
     g[i] = qg[src + hd8];
 }
 
-void deinterleave_qg
+void deinterleave_qg_gr
 (
     const at::Tensor& qg,           // (.., heads * 2 * head_dim) half
     at::Tensor& q,                  // out (.., heads * head_dim) half
     at::Tensor& g,                  // out (.., heads * head_dim) half
-    int head_dim
+    int head_dim,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(qg.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(qg, kHalf);
     TORCH_CHECK_DTYPE(q, kHalf);
@@ -563,4 +564,15 @@ void deinterleave_qg
     );
 
     cuda_check(cudaPeekAtLastError());
+}
+
+void deinterleave_qg
+(
+    const at::Tensor& qg,
+    at::Tensor& q,
+    at::Tensor& g,
+    int head_dim
+)
+{
+    deinterleave_qg_gr(qg, q, g, head_dim, nullptr);
 }
