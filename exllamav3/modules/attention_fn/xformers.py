@@ -14,7 +14,7 @@ try:
     from xformers.ops.fmha import cutlass as xf_cutlass
     xf_cutlass.FwOp.CUDA_MAXIMUM_COMPUTE_CAPABILITY = (12, 0)
     has_xformers = True
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     has_xformers = False
 
 
