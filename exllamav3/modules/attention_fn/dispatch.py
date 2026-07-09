@@ -5,7 +5,18 @@ from .flash_attn_2 import fn_flash_attn_with_kvcache, fn_flash_attn_func, fn_fla
 from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
-from .triton_paged import fn_triton_paged_attn, fn_triton_paged_attn_longq, fn_triton_paged_attn_decode, fn_triton_paged_attn_prefill, fn_triton_varlen_attn, fn_triton_paged_attn_decode_qc, fn_triton_paged_attn_prefill_qc, has_triton, _is_power_of_2
+from .triton_paged import (
+    fn_triton_paged_attn,
+    fn_triton_paged_attn_longq,
+    fn_triton_paged_attn_decode,
+    fn_triton_paged_attn_prefill,
+    fn_triton_varlen_attn,
+    fn_triton_paged_attn_decode_qc,
+    fn_triton_paged_attn_prefill_qc,
+    fn_triton_attn_nocache,
+    has_triton,
+    _is_power_of_2,
+)
 
 # Candidate attn functions in order of preference. The Triton decode/prefill kernels lead by
 # default (measured faster than FA2 on Ampere/Ada/consumer Blackwell); set EXL3_PREFER_FA2=1 to
@@ -34,6 +45,7 @@ _fns_fa2: list[AttnFn] = [
 attn_fns: list[AttnFn] = (
     (_fns_fa2 + _fns_triton_fast) if _prefer_fa2 else (_fns_triton_fast + _fns_fa2)
 ) + [
+    fn_triton_attn_nocache,
     fn_triton_paged_attn,
     fn_triton_paged_attn_longq,
     fn_bighead_scalar_attn,

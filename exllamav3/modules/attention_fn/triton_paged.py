@@ -1161,25 +1161,37 @@ def _paged_attn_prefill_inner(
     head_dim: tl.constexpr,
     QCK: tl.constexpr,
     QCV: tl.constexpr,
+    CAUSAL: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
     WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
     MASKED: tl.constexpr,
+    SRC_NEW: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """One pass over kv tiles [n_start, n_end). With MASKED = False the tiles are known to be
-    fully inside the causal/window region for every row and all bounds/mask logic is skipped."""
+    fully inside the causal/window region for every row and all bounds/mask logic is skipped.
+    With SRC_NEW the k_cache/v_cache arguments are contiguous (rows, kv_heads, head_dim) base
+    pointers pre-offset so the absolute kv index addresses them directly (block table unused)."""
     offs_d = tl.arange(0, head_dim)
     for n0 in range(n_start, n_end, BLOCK_N):
         offs_n = n0 + offs_n_base
         page = offs_n // page_size
         page_off = offs_n - page * page_size
-        if MASKED:
+        if SRC_NEW:
+            phys = tl.zeros((BLOCK_N,), tl.int32)
+        elif MASKED:
             phys = tl.load(block_table_b + page, mask = offs_n < n_end, other = 0)
         else:
             phys = tl.load(block_table_b + page)
 
-        if QCK > 0:
+        if SRC_NEW:
+            k_ptrs = k_cache + ((offs_n[None, :] * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
+            if MASKED:
+                k_tile = tl.load(k_ptrs, mask = offs_n[None, :] < n_end, other = 0.0)
+            else:
+                k_tile = tl.load(k_ptrs)
+        elif QCK > 0:
             tok_rows = phys * page_size + page_off
             if MASKED:
                 k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n < n_end, QCK, n_kv_heads, head_dim)
@@ -1202,7 +1214,8 @@ def _paged_attn_prefill_inner(
 
         if MASKED:
             valid = valid_row[:, None] & (offs_n[None, :] < n_end)
-            valid = valid & (offs_n[None, :] <= q_abs[:, None])
+            if CAUSAL:
+                valid = valid & (offs_n[None, :] <= q_abs[:, None])
             if WINDOW_LEFT >= 0:
                 valid = valid & (offs_n[None, :] >= q_abs[:, None] - WINDOW_LEFT)
             if WINDOW_RIGHT >= 0:
@@ -1222,7 +1235,13 @@ def _paged_attn_prefill_inner(
             alpha = tl.exp2(m - m_exp)
         l = l * alpha + tl.sum(p, axis = 1)
 
-        if QCV > 0:
+        if SRC_NEW:
+            v_ptrs = v_cache + ((offs_n[:, None] * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
+            if MASKED:
+                v_tile = tl.load(v_ptrs, mask = offs_n[:, None] < n_end, other = 0.0)
+            else:
+                v_tile = tl.load(v_ptrs)
+        elif QCV > 0:
             tok_rows_v = phys * page_size + page_off
             if MASKED:
                 v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n < n_end, QCV, n_kv_heads, head_dim)
@@ -1252,7 +1271,11 @@ def _paged_attn_prefill_kernel(
     k_scales,
     v_scales,
     h32,
+    k_new,
+    v_new,
     num_splits: tl.constexpr,
+    NEW_KV: tl.constexpr,     # 0: all kv in cache; 1: kv >= cache_seqlens[b] read from k_new/v_new;
+                              # 2: like 1 but the cache is known empty (keeps the maskless split)
     QCK: tl.constexpr,
     QCV: tl.constexpr,
     q_len: tl.constexpr,
@@ -1322,26 +1345,75 @@ def _paged_attn_prefill_kernel(
         s_lo = n_lo
         s_hi = n_hi
 
-    if CAUSAL and WINDOW_LEFT < 0 and WINDOW_RIGHT < 0:
+    if NEW_KV > 0:
+        # Base pointers for the direct-kv source: absolute kv index n >= past addresses row
+        # (n - past) of the (bsz, kv_append_len, kvh, hd) tensors
+        past = total_k_len - kv_append_len
+        k_new_b = k_new + ((batch * kv_append_len - past) * n_kv_heads) * head_dim
+        v_new_b = v_new + ((batch * kv_append_len - past) * n_kv_heads) * head_dim
+    else:
+        past = total_k_len
+        k_new_b = k_new
+        v_new_b = v_new
+
+    if NEW_KV == 1:
+        # Dual source, everything masked: the boundary at `past` breaks tile alignment, and the
+        # only current user (sliding-window attention) runs fully masked regardless
+        acc, m, l = _paged_attn_prefill_inner(
+            q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
+            offs_n_base, s_lo, tl.minimum(s_hi, past), q_abs, valid_row, qk_scale_log2e, total_k_len,
+            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+            True, False, BLOCK_N,
+        )
+        acc, m, l = _paged_attn_prefill_inner(
+            q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
+            offs_n_base, tl.maximum(s_lo, past), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
+            n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+            True, True, BLOCK_N,
+        )
+    elif NEW_KV == 2:
+        # Cache known empty: same structure as the cache path, reading the contiguous source
+        if CAUSAL and WINDOW_LEFT < 0 and WINDOW_RIGHT < 0:
+            n_full = tl.maximum(((q_abs_min + 1) // BLOCK_N) * BLOCK_N, 0)
+            acc, m, l = _paged_attn_prefill_inner(
+                q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
+                offs_n_base, s_lo, tl.minimum(n_full, s_hi), q_abs, valid_row, qk_scale_log2e, total_k_len,
+                n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+                False, True, BLOCK_N,
+            )
+            acc, m, l = _paged_attn_prefill_inner(
+                q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
+                offs_n_base, tl.maximum(n_full, s_lo), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
+                n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+                True, True, BLOCK_N,
+            )
+        else:
+            acc, m, l = _paged_attn_prefill_inner(
+                q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
+                offs_n_base, s_lo, s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
+                n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+                True, True, BLOCK_N,
+            )
+    elif CAUSAL and WINDOW_LEFT < 0 and WINDOW_RIGHT < 0:
         n_full = tl.maximum(((q_abs_min + 1) // BLOCK_N) * BLOCK_N, 0)
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, tl.minimum(n_full, s_hi), q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, QCK, QCV, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
-            False, BLOCK_N,
+            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+            False, False, BLOCK_N,
         )
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, tl.maximum(n_full, s_lo), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, QCK, QCV, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
-            True, BLOCK_N,
+            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+            True, False, BLOCK_N,
         )
     else:
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, QCK, QCV, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
-            True, BLOCK_N,
+            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+            True, False, BLOCK_N,
         )
 
     if num_splits > 1:
@@ -1410,10 +1482,10 @@ def paged_attn_triton_prefill(
     q: torch.Tensor,
     k: torch.Tensor | None,
     v: torch.Tensor | None,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
+    k_cache: torch.Tensor | None,
+    v_cache: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+    cache_seqlens: torch.Tensor | None,
     causal: bool = False,
     softmax_scale: float | None = None,
     window_size: int | tuple[int, int] | None = None,
@@ -1428,17 +1500,42 @@ def paged_attn_triton_prefill(
     qc: tuple | None = None,
     pre_appended_len: int = 0,
     n_kv_heads_override: int | None = None,
+    k_new: torch.Tensor | None = None,
+    v_new: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Prefill (large q_len) attention over the paged cache."""
+    """Prefill (large q_len) attention over the paged cache.
+
+    Two ways to supply new K/V: `k`/`v` are appended to the cache before attention (the cache
+    must have room); `k_new`/`v_new` are attended directly from the contiguous tensors without
+    touching the cache -- kv positions at or above cache_seqlens[b] read from them. The direct
+    form also works without a cache at all (k_cache = None), covering plain non-cached
+    attention."""
     if not has_triton:
         raise RuntimeError("paged_attn_triton_prefill requires Triton, but Triton is not available")
 
     _check_tensor("q", q)
-    _check_tensor("block_table", block_table, None)
-    _check_tensor("cache_seqlens", cache_seqlens, None)
 
     bsz, q_len, n_q_heads, head_dim = q.shape
-    if qc is None:
+    new_kv_mode = 0
+    if k_new is not None or v_new is not None:
+        if k_new is None or v_new is None:
+            raise ValueError("k_new and v_new must be provided together")
+        if k is not None or qc is not None or pre_appended_len:
+            raise ValueError("k_new/v_new cannot be combined with k/v, qc or pre_appended_len")
+        _check_tensor("k_new", k_new)
+        _check_tensor("v_new", v_new)
+        new_kv_mode = 1 if k_cache is not None else 2
+
+    if k_cache is None:
+        if new_kv_mode != 2:
+            raise ValueError("k_cache required unless attending directly over k_new/v_new")
+        n_kv_heads = k_new.shape[2]
+        page_size = 256
+        block_table = torch.zeros((bsz, 1), dtype = torch.int32, device = q.device)
+        cache_seqlens = torch.zeros((bsz,), dtype = torch.int32, device = q.device)
+        k_cache = q  # never dereferenced: the page ranges are empty
+        v_cache = q
+    elif qc is None:
         _check_tensor("k_cache", k_cache)
         _check_tensor("v_cache", v_cache)
         _, page_size, n_kv_heads, cache_dim = k_cache.shape
@@ -1449,6 +1546,8 @@ def paged_attn_triton_prefill(
     else:
         page_size = k_cache.shape[1]
         n_kv_heads = n_kv_heads_override
+    _check_tensor("block_table", block_table, None)
+    _check_tensor("cache_seqlens", cache_seqlens, None)
     if n_q_heads % n_kv_heads != 0:
         raise ValueError("n_q_heads must be divisible by n_kv_heads")
     if head_dim > 512 or not _is_power_of_2(head_dim):
@@ -1463,6 +1562,12 @@ def paged_attn_triton_prefill(
         if k.shape[:1] != (bsz,) or k.shape[2:] != (n_kv_heads, head_dim):
             raise ValueError("k/v shape must be [batch, seqlen_new, kv_heads, head_dim]")
         kv_append_len = k.shape[1]
+    if new_kv_mode:
+        if k_new.shape[:1] != (bsz,) or k_new.shape[2:] != (n_kv_heads, head_dim):
+            raise ValueError("k_new/v_new shape must be [batch, seqlen_new, kv_heads, head_dim]")
+        if v_new.shape != k_new.shape:
+            raise ValueError("v_new must have the same shape as k_new")
+        kv_append_len = k_new.shape[1]
 
     if out is None:
         out = torch.empty_like(q)
@@ -1539,7 +1644,8 @@ def paged_attn_triton_prefill(
         _paged_attn_prefill_kernel[grid](
             q, k_cache, v_cache, block_table, cache_seqlens, out,
             partial_o, partial_ml, k_scales, v_scales, h32,
-            num_splits, qck, qcv,
+            k_new if new_kv_mode else q, v_new if new_kv_mode else q,
+            num_splits, new_kv_mode, qck, qcv,
             q_len, kv_append_len, n_q_heads, n_kv_heads,
             num_pages_per_seq, page_size, head_dim, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
@@ -1553,6 +1659,33 @@ def paged_attn_triton_prefill(
                 num_warps=8, num_stages=1,
             )
     return out
+
+
+def fn_triton_attn_nocache(args: AttnArgs) -> torch.Tensor | None:
+    """Non-cached attention through the prefill kernel's direct-kv source (NEW_KV=2)."""
+    if (
+        not has_triton or
+        args.is_varlen() or
+        args.has_kv_cache() or
+        args.dim > 512 or
+        not _is_power_of_2(args.dim) or
+        args.q.dtype != torch.float16 or
+        args.non_causal_spans or
+        not args.q.is_contiguous() or
+        not args.k.is_contiguous() or
+        not args.v.is_contiguous()
+    ):
+        return None
+
+    return paged_attn_triton_prefill(
+        args.q, None, None, None, None, None, None,
+        causal = args.causal,
+        softmax_scale = args.sm_scale,
+        window_size = args.get_window_size(),
+        softcap = args.softcap,
+        k_new = args.k,
+        v_new = args.v,
+    )
 
 
 def fn_triton_paged_attn_prefill(args: AttnArgs) -> torch.Tensor | None:

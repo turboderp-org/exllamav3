@@ -6,13 +6,11 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
-from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
+from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..cache import Cache
 from ..util import profile_opt
-
-MAX_PRE_SEQ = 8192
 
 class SWAState:
 
@@ -214,8 +212,7 @@ class SlidingAttention(Module):
         self.logit_softcapping = logit_softcapping
         self.post_rope_norm = post_rope_norm
         self.full_gate = full_gate
-        self.stage_k = None
-        self.stage_v = None
+        self.bt_cache = {}
 
         if post_rope_norm:
             assert q_norm is None and k_norm is None, \
@@ -366,7 +363,6 @@ class SlidingAttention(Module):
         self.prealloc_qg_1 = None
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
-        self.pre_seqs = None
 
         self.recurrent_layers = []
         self.tp_recurrent_lookup = {}
@@ -441,16 +437,11 @@ class SlidingAttention(Module):
             self.q_norm_tensor = self.q_norm.weight.data
             self.k_norm_tensor = self.k_norm.weight.data
 
-        # Create seqlens for flash_attn_with_kvcache to avoid extra torch.full on launch
-        self.pre_seqs = torch.arange(MAX_PRE_SEQ, dtype = torch.int, device = device)
 
 
     @override
     def load(self, device: torch.Device, **kwargs):
         super().load(device, **kwargs)
-        max_chunk_size = kwargs.get("max_chunk_size", 2048)
-        self.stage_k = g_tensor_cache.get(device, (1, max_chunk_size + self.kv_state_size, self.num_kv_heads, self.head_dim), torch.half, "swa_stage_k")
-        self.stage_v = g_tensor_cache.get(device, (1, max_chunk_size + self.kv_state_size, self.num_kv_heads, self.head_dim), torch.half, "swa_stage_v")
         self.load_local(device, **kwargs)
 
 
@@ -470,14 +461,12 @@ class SlidingAttention(Module):
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
-        self.stage_k = None
-        self.stage_v = None
 
         self.prealloc_qgh_1 = None
         self.prealloc_qg_1 = None
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
-        self.pre_seqs = None
+        self.bt_cache = {}
 
 
     @override
@@ -628,14 +617,14 @@ class SlidingAttention(Module):
                 self.post_rope_norm
             )
 
-        o = flash_attn_func(
-            q = q,
-            k = k,
-            v = v,
+        o = paged_attn_triton_prefill(
+            q, None, None, None, None, None, None,
             causal = causal,
             softmax_scale = self.sm_scale,
             window_size = (self.sliding_window, self.sliding_window),
-            softcap = self.logit_softcapping
+            softcap = self.logit_softcapping,
+            k_new = k,
+            v_new = v,
         )
 
         if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
@@ -681,144 +670,125 @@ class SlidingAttention(Module):
                 self.post_rope_norm
             )
 
-        # Get recurrent state tensors
+        # Recurrent state: a short contiguous fp16 K/V span per sequence, viewed as a paged
+        # cache (kv_state_size is a multiple of the page size) so the batch runs as one kernel
+        # call with per-row block tables and sequence lengths
         rsg = params.get("recurrent_states")
         assert rsg is not None, "SlidingAttention.forward() called in flash_attn mode with no recurrent states"
         layer_instance = (self.layer_idx, params.get("layer_instance", 0))
         rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
         k_states, v_states = rsl.get_state_tensors()
 
-        # TODO: Currently iterates over batch items, but could use paged attn to batch items together, at least
-        #       when no noncausal spans
-        ro = []
-        for i, rs in enumerate(rsg):
-            q_ = q[i:i+1]
-            k_ = k[i:i+1]
-            v_ = v[i:i+1]
+        S = self.kv_state_size
+        pps = S // PAGE_SIZE
+        k_pages = k_states.view(-1, PAGE_SIZE, self.num_kv_heads, self.head_dim)
+        v_pages = v_states.view(-1, PAGE_SIZE, self.num_kv_heads, self.head_dim)
+        sw = self.sliding_window
 
-            k_state = k_states[rs.slot].unsqueeze(0)
-            v_state = v_states[rs.slot].unsqueeze(0)
+        def pad(z):
+            return (z + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
 
-            # Physical cache state
-            cache_beg = rs.window_beg
-            cache_pos = rs.position - cache_beg
-            cache_wpos = max(cache_pos - self.sliding_window, 0) // PAGE_SIZE * PAGE_SIZE
-            cache_hot = cache_pos - cache_wpos
+        if seqlen <= 16 and not non_causal_spans:
+            # Decode: append into the state (shifting it left first on the rare step where the
+            # window run reaches the end of the buffer) and attend over the pages
+            positions_l = []
+            for i, rs in enumerate(rsg):
+                cache_pos = rs.position - rs.window_beg
+                if cache_pos + seqlen > S:
+                    shift = pad(seqlen)
+                    k_states[rs.slot, :-shift].copy_(k_states[rs.slot, shift:].clone())
+                    v_states[rs.slot, :-shift].copy_(v_states[rs.slot, shift:].clone())
+                    rs.wshift = shift
+                    cache_pos -= shift
+                else:
+                    rs.wshift = 0
+                positions_l.append(cache_pos)
 
-            def pad(z):
-                return (z + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
-            seqlen_pad = pad(seqlen)
+            slots = tuple(rs.slot for rs in rsg)
+            bt = self.bt_cache.get(slots)
+            if bt is None:
+                bt = torch.tensor(
+                    [[slot * pps + j for j in range(pps)] for slot in slots],
+                    dtype = torch.int32, device = self.device
+                )
+                self.bt_cache[slots] = bt
+            cache_seqlens = torch.tensor(positions_l, dtype = torch.int32).to(self.device, non_blocking = True)
 
-            # Case 1: new KV fits in cache without shifting
-            if cache_pos + seqlen <= self.kv_state_size:
-                shift = 0
-                rs.wshift = 0
-                cache_seqlens = cache_pos
-                cache_seqlens_nc = cache_pos
-                temp_cache = False
+            o = paged_attn_triton_decode(
+                q, k, v, k_pages, v_pages, bt, cache_seqlens,
+                causal = causal,
+                softmax_scale = self.sm_scale,
+                window_size = (sw, 0),
+                softcap = self.logit_softcapping,
+                max_kv_len = S,
+            )
 
-            # Case 2: new KV fits in cache if we shift
-            elif seqlen_pad <= self.sliding_window_overp - PAGE_SIZE:
-                shift = seqlen_pad
-                rs.wshift = seqlen_pad
-                k_state[:, :-shift, :, :].copy_(k_state[:, shift:, :, :].clone())
-                v_state[:, :-shift, :, :].copy_(v_state[:, shift:, :, :].clone())
-                cache_seqlens = cache_pos - shift
-                cache_seqlens_nc = cache_pos - shift
-                temp_cache = False
+        else:
+            # Prefill: attend over [hot window of the state || new K/V], reading the new tokens
+            # straight from the projection output (nothing staged, the state is untouched until
+            # after), then rebase the state onto the tail
+            hots, wposs = [], []
+            for rs in rsg:
+                cache_pos = rs.position - rs.window_beg
+                cache_wpos = max(cache_pos - sw, 0) // PAGE_SIZE * PAGE_SIZE
+                wposs.append(cache_wpos)
+                hots.append(cache_pos - cache_wpos)
 
-            # Case 3: temporary cache+kv fits in preallocated buffer
-            elif cache_hot + seqlen_pad <= self.stage_k.shape[1]:
-                if cache_hot:
-                    self.stage_k[:, :cache_hot].copy_(k_state[:, cache_wpos : cache_pos])
-                    self.stage_v[:, :cache_hot].copy_(v_state[:, cache_wpos : cache_pos])
-                self.stage_k[:, cache_hot : cache_hot + seqlen].copy_(k_)
-                self.stage_v[:, cache_hot : cache_hot + seqlen].copy_(v_)
-                c_k_state = k_state
-                c_v_state = v_state
-                k_state = self.stage_k
-                v_state = self.stage_v
-                k_ = None
-                v_ = None
-                cache_seqlens = cache_hot + seqlen
-                cache_seqlens_nc = cache_hot
-                shift = pad(cache_seqlens) - self.kv_state_size
-                rs.wshift = shift + cache_wpos
-                temp_cache = True
-                # assert shift > 0
-
-            # Case 4: create new temp tensors
-            else:
-                c_k_state = k_state
-                c_v_state = v_state
-                k_state = torch.cat((k_state[:, cache_wpos : cache_pos], k_), dim = 1)
-                v_state = torch.cat((v_state[:, cache_wpos : cache_pos], v_), dim = 1)
-                k_ = None
-                v_ = None
-                cache_seqlens = cache_hot + seqlen
-                cache_seqlens_nc = cache_hot
-                shift = pad(cache_seqlens) - self.kv_state_size
-                rs.wshift = shift + cache_wpos
-                temp_cache = True
-                assert shift > 0
+            bt = torch.tensor(
+                [[rs.slot * pps + wposs[i] // PAGE_SIZE + j for j in range(pps)] for i, rs in enumerate(rsg)],
+                dtype = torch.int32, device = self.device
+            )
+            cache_seqlens = torch.tensor(hots, dtype = torch.int32).to(self.device, non_blocking = True)
 
             if not non_causal_spans:
-                if cache_seqlens < MAX_PRE_SEQ:
-                    cache_seqlens = self.pre_seqs[cache_seqlens : cache_seqlens + 1]
-
-                o = flash_attn_with_kvcache(
-                    q = q_,
-                    k = k_,
-                    v = v_,
-                    k_cache = k_state,
-                    v_cache = v_state,
+                o = paged_attn_triton_prefill(
+                    q, None, None, k_pages, v_pages, bt, cache_seqlens,
                     causal = causal,
-                    cache_seqlens = cache_seqlens,
                     softmax_scale = self.sm_scale,
-                    window_size = (self.sliding_window, 0),
-                    softcap = self.logit_softcapping
+                    window_size = (sw, 0),
+                    softcap = self.logit_softcapping,
+                    k_new = k,
+                    v_new = v,
                 )
             else:
+                # Spans tile the chunk; each attends over the state plus the new tokens up to its
+                # own end, bidirectionally within itself when flagged non-causal
                 o = []
                 for a, b, c in non_causal_spans:
                     l = b - a
-                    if k_ is None:
-                        cache_seqlens_nc += l
-                    o_ = flash_attn_with_kvcache(
-                        q = q_[:, a : b],
-                        k = k_[:, a : b] if k_ is not None else None,
-                        v = v_[:, a : b] if v_ is not None else None,
-                        k_cache = k_state,
-                        v_cache = v_state,
+                    o_ = paged_attn_triton_prefill(
+                        q[:, a : b].contiguous(), None, None, k_pages, v_pages, bt, cache_seqlens,
                         causal = not c,
-                        cache_seqlens = cache_seqlens_nc,
                         softmax_scale = self.sm_scale,
-                        window_size = (
-                            (max(self.sliding_window, l), l - 1)
-                            if c else
-                            (self.sliding_window, 0)
-                        ),
-                        softcap = self.logit_softcapping
+                        window_size = (max(sw, l), l - 1) if c else (sw, 0),
+                        softcap = self.logit_softcapping,
+                        k_new = k[:, : b].contiguous(),
+                        v_new = v[:, : b].contiguous(),
                     )
-                    if k_ is not None:
-                        cache_seqlens_nc += l
                     o.append(o_)
                 o = torch.cat(o, dim = 1)
-            ro.append(o)
 
-            # If KV not updated inplace, copy tail of extended temp tensors back into state
-            # Copy inplace to keep tensors contiguous and to avoid fragmentation
-            if temp_cache:
-                c_k_state.copy_(k_state[:, shift : shift + self.kv_state_size, :, :])
-                c_v_state.copy_(v_state[:, shift : shift + self.kv_state_size, :, :])
-                k_state = c_k_state
-                v_state = c_v_state
-
-            assert k_state.shape[1] == self.kv_state_size
-
-        # Concat attn outputs for batch
-        o = torch.cat(ro, dim = 0) if len(ro) > 1 else o
-        assert o.shape[1] == seqlen
+            # State update: keep the last window (page-aligned base) of [old || new] per row
+            for i, rs in enumerate(rsg):
+                cache_pos = rs.position - rs.window_beg
+                if cache_pos + seqlen <= S:
+                    k_states[rs.slot, cache_pos : cache_pos + seqlen].copy_(k[i])
+                    v_states[rs.slot, cache_pos : cache_pos + seqlen].copy_(v[i])
+                    rs.wshift = 0
+                else:
+                    cache_wpos, cache_hot = wposs[i], hots[i]
+                    shift = pad(cache_hot + seqlen) - S
+                    rs.wshift = shift + cache_wpos
+                    n_keep = cache_hot - shift
+                    if n_keep > 0:
+                        k_states[rs.slot, :n_keep].copy_(k_states[rs.slot, cache_wpos + shift : cache_wpos + cache_hot].clone())
+                        v_states[rs.slot, :n_keep].copy_(v_states[rs.slot, cache_wpos + shift : cache_wpos + cache_hot].clone())
+                        k_states[rs.slot, n_keep : n_keep + seqlen].copy_(k[i])
+                        v_states[rs.slot, n_keep : n_keep + seqlen].copy_(v[i])
+                    else:
+                        skip = shift - cache_hot
+                        k_states[rs.slot, : seqlen - skip].copy_(k[i, skip:])
+                        v_states[rs.slot, : seqlen - skip].copy_(v[i, skip:])
 
         if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
