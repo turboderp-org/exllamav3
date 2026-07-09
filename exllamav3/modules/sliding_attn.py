@@ -7,6 +7,7 @@ from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
+from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..cache import Cache
@@ -367,6 +368,7 @@ class SlidingAttention(Module):
         self.recurrent_layers = []
         self.tp_recurrent_lookup = {}
         self.tp_reduce = False
+        self.bc_attn = {}
 
 
     @override
@@ -449,6 +451,7 @@ class SlidingAttention(Module):
     def unload(self):
         super().unload()
 
+        self.bc_attn = {}
         self.rope = None
 
         if self.multi_kv is not None:
@@ -582,6 +585,61 @@ class SlidingAttention(Module):
         return x
 
 
+    def _decode_state_prep(self, rsg, k_states, v_states, seqlen):
+        """Per-row page shift when the window run reaches the end of the state buffer, cached
+        per-slot block table, and the in-state sequence lengths for a decode step."""
+        S = self.kv_state_size
+        pps = S // PAGE_SIZE
+        positions_l = []
+        for rs in rsg:
+            cache_pos = rs.position - rs.window_beg
+            if cache_pos + seqlen > S:
+                shift = (seqlen + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+                k_states[rs.slot, :-shift].copy_(k_states[rs.slot, shift:].clone())
+                v_states[rs.slot, :-shift].copy_(v_states[rs.slot, shift:].clone())
+                rs.wshift = shift
+                cache_pos -= shift
+            else:
+                rs.wshift = 0
+            positions_l.append(cache_pos)
+
+        slots = tuple(rs.slot for rs in rsg)
+        bt = self.bt_cache.get(slots)
+        if bt is None:
+            bt = torch.tensor(
+                [[slot * pps + j for j in range(pps)] for slot in slots],
+                dtype = torch.int32, device = self.device
+            )
+            self.bt_cache[slots] = bt
+        cache_seqlens = torch.tensor(positions_l, dtype = torch.int32).to(self.device, non_blocking = True)
+        return bt, cache_seqlens
+
+
+    def bc_swa_step(self, x, rsg, params, seqlen):
+        """Graph-captured decode step over the sliding-window state (projections through
+        o_proj as one replayed CUDA graph). Returns the block output, or None when the
+        configuration is unsupported."""
+        if x.dtype != torch.float16 or not x.is_contiguous():
+            return None
+        layer_instance = (self.layer_idx, params.get("layer_instance", 0))
+        rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+        key = id(rsl)
+        bca = self.bc_attn.get(key)
+        if bca is None:
+            bca = self.bc_attn[key] = (build_bc_swa(self, rsl) or False)
+        if bca is False:
+            return None
+
+        positions = get_for_device(params, "positions", self.device, None)
+        position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
+        position = params.get("position", 0)
+
+        k_states, v_states = rsl.get_state_tensors()
+        bt, cache_seqlens = self._decode_state_prep(rsg, k_states, v_states, seqlen)
+        return bca.step(x, cache_seqlens, bt, position, positions, position_ids, inv_freq)
+
+
     def decode_flash_attn_nc(
         self,
         x: torch.Tensor,
@@ -648,6 +706,17 @@ class SlidingAttention(Module):
         causal = params.get("causal", True)
         non_causal_spans = params.get("non_causal_spans")
 
+        # Graph-captured C++ path for the whole decode step
+        if (
+            _bc_attn_enable and causal and non_causal_spans is None and
+            bsz <= 4 and seqlen <= 16
+        ):
+            rsg = params.get("recurrent_states")
+            if rsg is not None:
+                o = self.bc_swa_step(x, rsg, params, seqlen)
+                if o is not None:
+                    return o
+
         q, k, v, g = self.project_qkv(x, params)
 
         if self.q_norm:
@@ -691,28 +760,7 @@ class SlidingAttention(Module):
         if seqlen <= 16 and not non_causal_spans:
             # Decode: append into the state (shifting it left first on the rare step where the
             # window run reaches the end of the buffer) and attend over the pages
-            positions_l = []
-            for i, rs in enumerate(rsg):
-                cache_pos = rs.position - rs.window_beg
-                if cache_pos + seqlen > S:
-                    shift = pad(seqlen)
-                    k_states[rs.slot, :-shift].copy_(k_states[rs.slot, shift:].clone())
-                    v_states[rs.slot, :-shift].copy_(v_states[rs.slot, shift:].clone())
-                    rs.wshift = shift
-                    cache_pos -= shift
-                else:
-                    rs.wshift = 0
-                positions_l.append(cache_pos)
-
-            slots = tuple(rs.slot for rs in rsg)
-            bt = self.bt_cache.get(slots)
-            if bt is None:
-                bt = torch.tensor(
-                    [[slot * pps + j for j in range(pps)] for slot in slots],
-                    dtype = torch.int32, device = self.device
-                )
-                self.bt_cache[slots] = bt
-            cache_seqlens = torch.tensor(positions_l, dtype = torch.int32).to(self.device, non_blocking = True)
+            bt, cache_seqlens = self._decode_state_prep(rsg, k_states, v_states, seqlen)
 
             o = paged_attn_triton_decode(
                 q, k, v, k_pages, v_pages, bt, cache_seqlens,

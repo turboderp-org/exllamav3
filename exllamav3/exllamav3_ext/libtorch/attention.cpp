@@ -270,7 +270,12 @@ void BC_Attention::run_gr
             add_gr(k2, k_proj->bias.value(), k2, graph);
         at::Tensor v2 = kv2.select(0, 1);
         if (v_norm)
-            rms_norm_gr(k2, v_norm_w, v2, v_norm_eps, v_norm_constant_bias, v_norm_constant_scale, graph);
+        {
+            // Norm is per head: view (R, kvh * hd) as (R * kvh, hd)
+            at::Tensor k2h = k2.view({R * num_kv_heads, head_dim});
+            at::Tensor v2h = v2.view({R * num_kv_heads, head_dim});
+            rms_norm_gr(k2h, v_norm_w, v2h, v_norm_eps, v_norm_constant_bias, v_norm_constant_scale, graph);
+        }
         else
             cuda_check(cudaMemcpyAsync(
                 v2.data_ptr(), k2.data_ptr(),
@@ -300,8 +305,9 @@ void BC_Attention::run_gr
 
     if (v_norm && !use_k_as_v)
     {
-        at::Tensor v2 = kv2.select(0, 1);
-        rms_norm_gr(v2, v_norm_w, v2, v_norm_eps, v_norm_constant_bias, v_norm_constant_scale, graph);
+        // Norm is per head: view (R, kvh * hd) as (R * kvh, hd)
+        at::Tensor v2h = kv2.select(0, 1).view({R * num_kv_heads, head_dim});
+        rms_norm_gr(v2h, v_norm_w, v2h, v_norm_eps, v_norm_constant_bias, v_norm_constant_scale, graph);
     }
 
     // Fused head norm + RoPE, in place on the statics. All position sources and inv_freq are

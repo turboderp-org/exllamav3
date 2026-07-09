@@ -72,9 +72,8 @@ class BCAttn:
     def _has_bc(proj):
         return proj is not None and proj.quant_type == "exl3" and proj.inner.bc is not None
 
-    def __init__(self, module, layer):
-        from ...cache import CacheLayer_quant
-
+    def __init__(self, module, cache_k, cache_v, k_scales = None, v_scales = None,
+                 k_bits = 0, v_bits = 0):
         self.module = module
         self.device = module.device
         self.head_dim = module.head_dim
@@ -85,17 +84,14 @@ class BCAttn:
         self.window_size = module.sliding_window
         self.softcap = module.logit_softcapping
 
-        self.quant = isinstance(layer, CacheLayer_quant)
+        self.quant = k_bits > 0
+        self.cache_k, self.cache_v = cache_k, cache_v
+        self.k_scales, self.v_scales = k_scales, v_scales
+        self.k_bits, self.v_bits = k_bits, v_bits
         if self.quant:
-            self.cache_k, self.cache_v = layer.qk, layer.qv
-            self.k_scales, self.v_scales = layer.sk, layer.sv
-            self.k_bits, self.v_bits = layer.k_bits, layer.v_bits
             from .triton_paged import _get_h32
             h32 = _get_h32(self.device)
         else:
-            self.cache_k, self.cache_v = layer.k, layer.v
-            self.k_scales = self.v_scales = None
-            self.k_bits = self.v_bits = 0
             h32 = g_tensor_cache.get(self.device, (1,), torch.half, "bca_dummy")
         self.max_pages = self.cache_k.shape[0]
 
@@ -106,11 +102,11 @@ class BCAttn:
         xh = g_tensor_cache.get(self.device, (2 * MAX_R * w,), torch.half, "bca_xh")
 
         self.o_dtype = module.o_proj.inner.default_out_dtype
-        self.use_k_as_v = module.use_k_as_v
+        self.use_k_as_v = getattr(module, "use_k_as_v", False)
 
         # 0 = none, 2 = full (o *= sigmoid(g)), 3 = interleaved q/g projection. Headwise gates
-        # (fp16 projection through cublas, no patchable sites) are rejected by build_bc_attn
-        if module.interleaved_gate:
+        # (fp16 projection through cublas, no patchable sites) are rejected by the builders
+        if getattr(module, "interleaved_gate", False):
             self.gate_mode = 3
         elif module.g_proj is not None:
             self.gate_mode = 2
@@ -125,7 +121,7 @@ class BCAttn:
             page_size = PAGE_SIZE,
             q_proj = module.q_proj.inner.bc,
             k_proj = module.k_proj.inner.bc if self._has_bc(module.k_proj) else None,
-            v_proj = module.v_proj.inner.bc if (not module.use_k_as_v and self._has_bc(module.v_proj)) else None,
+            v_proj = module.v_proj.inner.bc if (not self.use_k_as_v and self._has_bc(module.v_proj)) else None,
             kv_ptrs_trellis = mkv.ptrs_trellis if mkv is not None else None,
             kv_ptrs_suh = mkv.ptrs_suh if mkv is not None else None,
             kv_ptrs_svh = mkv.ptrs_svh if mkv is not None else None,
@@ -292,6 +288,53 @@ class BCAttn:
         return y
 
 
+def _module_eligible(m):
+    """Module-level requirements shared by the global-attention and SWA builders."""
+    return (
+        bc_attn_enable and
+        m.rope is not None and
+        m.rope_settings is not None and
+        # Gates: interleaved and full are graphed; headwise (fp16 gate projection through
+        # cublas, no patchable sites) is not
+        not m.headwise_gate and
+        not getattr(m, "ve_gate", False) and
+        (not getattr(m, "interleaved_gate", False) or m.head_dim % 8 == 0) and
+        (not m.full_gate or m.g_proj is None or m.multi_qg is not None or
+            (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None)) and
+        (m.v_norm is None or (type(m.v_norm).__name__ == "RMSNorm" and not m.v_norm.span_heads)) and
+        not m.tp_reduce and not m.has_split_cache and not getattr(m, "tp_span_heads_norm", False) and
+        (m.q_norm is None or m.q_norm_tensor is not None) and
+        _is_pow2(m.head_dim) and m.head_dim <= 512 and
+        m.num_q_heads % m.num_kv_heads == 0 and
+        m.q_proj is not None and m.q_proj.quant_type == "exl3" and m.q_proj.inner.bc is not None and
+        m.o_proj is not None and m.o_proj.quant_type == "exl3" and m.o_proj.inner.bc is not None and
+        (m.multi_kv is not None or (
+            m.k_proj is not None and m.k_proj.quant_type == "exl3" and m.k_proj.inner.bc is not None and
+            (getattr(m, "use_k_as_v", False) or (
+                m.v_proj is not None and m.v_proj.quant_type == "exl3" and m.v_proj.inner.bc is not None
+            ))
+        ))
+    )
+
+
+def build_bc_swa(module, layer_state):
+    """Build a BCAttn over a sliding-window recurrent state: the per-slot fp16 K/V span pool
+    viewed as a paged cache (state size is a multiple of the page size, so the geometry is fixed
+    and each slot captures exactly once). Returns None when unsupported."""
+    m = module
+    k_states, v_states = layer_state.get_state_tensors()
+    if not (
+        _module_eligible(m) and
+        k_states is not None and
+        k_states.device == torch.device(m.device) and
+        m.kv_state_size % PAGE_SIZE == 0
+    ):
+        return None
+    k_pages = k_states.view(-1, PAGE_SIZE, m.num_kv_heads, m.head_dim)
+    v_pages = v_states.view(-1, PAGE_SIZE, m.num_kv_heads, m.head_dim)
+    return BCAttn(m, k_pages, v_pages)
+
+
 def build_bc_attn(module, layer):
     """Build a BCAttn for the module/cache-layer pair, or return None when the configuration
     is not supported (caller falls back to the dispatch path)."""
@@ -299,37 +342,17 @@ def build_bc_attn(module, layer):
 
     m = module
     if not (
-            bc_attn_enable and
-            isinstance(layer, (CacheLayer_quant, CacheLayer_fp16)) and
-            (not isinstance(layer, CacheLayer_quant) or (
-                layer.compand_a == 0.0 and layer.qk is not None and
-                layer.qk.device == torch.device(m.device)
-            )) and
-            (not isinstance(layer, CacheLayer_fp16) or (
-                layer.k is not None and layer.k.device == torch.device(m.device)
-            )) and
-            m.rope is not None and
-            m.rope_settings is not None and
-            # Gates: interleaved and full are graphed; headwise (fp16 gate projection through
-            # cublas, no patchable sites) is not
-            not m.headwise_gate and
-            not m.ve_gate and
-            (not m.interleaved_gate or m.head_dim % 8 == 0) and
-            (not m.full_gate or m.g_proj is None or m.multi_qg is not None or
-                (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None)) and
-            (m.v_norm is None or (type(m.v_norm).__name__ == "RMSNorm" and not m.v_norm.span_heads)) and
-            not m.tp_reduce and not m.has_split_cache and not m.tp_span_heads_norm and
-            (m.q_norm is None or m.q_norm_tensor is not None) and
-            _is_pow2(m.head_dim) and m.head_dim <= 512 and
-            m.num_q_heads % m.num_kv_heads == 0 and
-            m.q_proj is not None and m.q_proj.quant_type == "exl3" and m.q_proj.inner.bc is not None and
-            m.o_proj is not None and m.o_proj.quant_type == "exl3" and m.o_proj.inner.bc is not None and
-            (m.multi_kv is not None or (
-                m.k_proj is not None and m.k_proj.quant_type == "exl3" and m.k_proj.inner.bc is not None and
-                (m.use_k_as_v or (
-                    m.v_proj is not None and m.v_proj.quant_type == "exl3" and m.v_proj.inner.bc is not None
-                ))
-            ))
-        ):
+        _module_eligible(m) and
+        isinstance(layer, (CacheLayer_quant, CacheLayer_fp16)) and
+        (not isinstance(layer, CacheLayer_quant) or (
+            layer.compand_a == 0.0 and layer.qk is not None and
+            layer.qk.device == torch.device(m.device)
+        )) and
+        (not isinstance(layer, CacheLayer_fp16) or (
+            layer.k is not None and layer.k.device == torch.device(m.device)
+        ))
+    ):
         return None
-    return BCAttn(m, layer)
+    if isinstance(layer, CacheLayer_quant):
+        return BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits)
+    return BCAttn(m, layer.k, layer.v)
