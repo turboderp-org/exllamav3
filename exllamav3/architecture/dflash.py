@@ -5,13 +5,12 @@ import torch
 from ..cache import Cache
 from ..model.config import Config, no_default
 from ..model.model import Model
-from ..util.rope import RopeStyle, RoPE
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
-from ..modules.arch_specific.dflash import DFlashInputLayer, DFlashAttention
+from ..util.rope import RopeStyle
+from ..modules import RMSNorm, TransformerBlock, Attention, GatedMLP
+from ..modules.arch_specific.dflash import DFlashInputLayer
 from ..modules.attn import prepare_for_attn
 from ..modules.module import no_p2p_copy
 from ..ext import exllamav3_ext as ext
-from flash_attn import flash_attn_with_kvcache
 import weakref
 
 from ..util.tensor import get_for_device
@@ -96,7 +95,7 @@ class DFlashModel(Model):
         for idx in range(config.num_hidden_layers):
             is_swa = config.layer_types[idx] == "sliding_attention"
 
-            attn = DFlashAttention(
+            attn = Attention(
                 config = config,
                 key = f"layers.{idx}.self_attn",
                 layer_idx = idx,
@@ -293,6 +292,9 @@ class DFlashModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        # The draft block attends to itself bidirectionally; causality on the sliding-window
+        # layers is expressed through their window (left sw, right 0) instead
+        params["causal"] = False
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 

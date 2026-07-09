@@ -164,7 +164,7 @@ class BCAttn:
         )
         self.slot_widths = {}
 
-    def _configure(self, bsz: int, q_len: int):
+    def _configure(self, bsz: int, q_len: int, causal: bool):
         import triton
         from .triton_paged import (
             _paged_attn_decode_split_kernel,
@@ -206,7 +206,7 @@ class BCAttn:
             QCK = self.k_bits, QCV = self.v_bits,
             q_len = q_len, kv_append_len = q_len, n_q_heads = qh, n_kv_heads = kvh,
             page_size = PAGE_SIZE, head_dim = hd, scale = float(self.sm_scale),
-            CAUSAL = True, WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
+            CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
             SOFTCAP = float(self.softcap or 0.0), FINAL = False,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
@@ -273,15 +273,17 @@ class BCAttn:
         positions: torch.Tensor | None,
         position_ids: torch.Tensor | None,
         inv_freq: torch.Tensor | None,
+        causal: bool = True,
     ) -> torch.Tensor:
         bsz, q_len, _ = x.shape
         # The captured graph freezes the inv_freq table geometry (table flag, stride, partial
-        # head dim), so an override shape change means reconfigure. Everything else that varies
-        # per call -- position source, block-table pointer/width, split configuration -- is a
-        # runtime argument patched into the graph
-        skey = tuple(inv_freq.shape) if inv_freq is not None else None
+        # head dim) and the causality of the attention kernels, so either changing means
+        # reconfigure (in practice constant per model). Everything else that varies per call --
+        # position source, block-table pointer/width, split configuration -- is a runtime
+        # argument patched into the graph
+        skey = (tuple(inv_freq.shape) if inv_freq is not None else None, causal)
         if self.slot_widths.get((bsz, q_len), ...) != skey:
-            self._configure(bsz, q_len)
+            self._configure(bsz, q_len, causal)
             self.slot_widths[(bsz, q_len)] = skey
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq)

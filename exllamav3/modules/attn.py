@@ -774,7 +774,8 @@ class Attention(Module):
             bca = self.bc_attn[key] = (build_bc_attn(self, layer) or False)
         if bca is False:
             return None
-        return bca.step(x, cache_seqlens, block_table, position, positions, position_ids, inv_freq)
+        return bca.step(x, cache_seqlens, block_table, position, positions, position_ids, inv_freq,
+                        causal = params.get("causal", True))
 
 
     def decode_flash_attn(
@@ -795,9 +796,10 @@ class Attention(Module):
         non_causal_spans = params.get("non_causal_spans")
         simulate_kv_quant = params.get("sim_kvq", None)
 
-        # Graph-captured C++ path for the whole decode attention block
+        # Graph-captured C++ path for the whole decode attention block (causality is baked
+        # into the slot kernels, so non-causal callers like the DFlash draft graph too)
         if (
-            _bc_attn_enable and causal and non_causal_spans is None and
+            _bc_attn_enable and non_causal_spans is None and
             bsz <= 4 and seqlen <= 16
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens)

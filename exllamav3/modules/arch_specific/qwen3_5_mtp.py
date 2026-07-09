@@ -2,7 +2,6 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
-from flash_attn import flash_attn_with_kvcache
 from .. import LayerNorm
 from ..module import no_p2p_copy
 from ...model.config import Config

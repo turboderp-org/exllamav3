@@ -1,7 +1,7 @@
 import torch
 from ...cache import CacheLayer, Cache, CacheLayer_quant
 from .common import AttnArgs, AttnFn
-from .flash_attn_2 import fn_flash_attn_with_kvcache, fn_flash_attn_func, fn_flash_attn_varlen_func
+from .flash_attn_2 import fn_flash_attn_with_kvcache, fn_flash_attn_func, fn_flash_attn_varlen_func, has_fa2
 from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
@@ -23,6 +23,9 @@ from .triton_paged import (
 # restore flash-attn priority for A/B testing (read once at import)
 import os
 _prefer_fa2 = os.environ.get("EXL3_PREFER_FA2", "0") != "0"
+if _prefer_fa2 and not has_fa2:
+    print(" !! EXL3_PREFER_FA2 is set but flash-attn is not available; using built-in kernels")
+    _prefer_fa2 = False
 
 _fns_triton_fast: list[AttnFn] = [
     fn_triton_paged_attn_decode_qc,

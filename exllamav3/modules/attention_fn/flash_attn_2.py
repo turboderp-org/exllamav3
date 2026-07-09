@@ -1,9 +1,17 @@
 import torch
-from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
+
+# flash-attn 2 is an optional dependency; when absent (or broken), these backends decline every
+# call and the built-in Triton kernels serve instead
+try:
+    from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
+    has_fa2 = True
+except (ModuleNotFoundError, ImportError):
+    has_fa2 = False
 
 def fn_flash_attn_with_kvcache(args: AttnArgs) -> torch.Tensor | None:
     if (
+        not has_fa2 or
         args.is_varlen() or
         not args.has_kv_cache() or
         args.dim > 256
@@ -32,6 +40,7 @@ def fn_flash_attn_with_kvcache(args: AttnArgs) -> torch.Tensor | None:
 
 def fn_flash_attn_func(args: AttnArgs) -> torch.Tensor | None:
     if (
+        not has_fa2 or
         args.is_varlen() or
         args.has_kv_cache() or
         args.dim > 256 or
@@ -52,6 +61,7 @@ def fn_flash_attn_func(args: AttnArgs) -> torch.Tensor | None:
 
 def fn_flash_attn_varlen_func(args: AttnArgs) -> torch.Tensor | None:
     if (
+        not has_fa2 or
         not args.is_varlen() or
         args.bsz > 1 or
         args.has_kv_cache() or

@@ -34,9 +34,10 @@ affects quantized caches.
 ### `EXL3_PREFER_FA2` (default: `0`)
 
 Put the flash-attn-2 backends ahead of the built-in Triton attention kernels in the dispatch
-order, where available. The Triton kernels match or beat FA2 across supported hardware and
-cover more cases (quantized caches, head dims > 256, attention sinks); this switch exists for
-A/B comparison.
+order. flash-attn is an optional dependency; when it is not installed, this switch is ignored
+(with a warning) and the built-in kernels serve everything. The Triton kernels match or beat
+FA2 across supported hardware and cover more cases (quantized caches, head dims > 256,
+attention sinks); this switch exists for A/B comparison.
 
 ## EXL3 GEMM / GEMV
 
