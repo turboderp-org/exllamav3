@@ -369,14 +369,15 @@ void add_sigmoid_gate
 
 // x *= sigmoid(y)
 
-void mul_sigmoid_
+void mul_sigmoid__gr
 (
     at::Tensor& x,
-    const at::Tensor& y
+    const at::Tensor& y,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(x, kHalf);
     TORCH_CHECK_DTYPE(y, kHalf);
@@ -397,16 +398,26 @@ void mul_sigmoid_
     cuda_check(cudaPeekAtLastError());
 }
 
-// x *= sigmoid(y), where x is [B, S, H, D] and y is [B, S, H]
-
-void mul_sigmoid_broadcast_
+void mul_sigmoid_
 (
     at::Tensor& x,
     const at::Tensor& y
 )
 {
+    mul_sigmoid__gr(x, y, nullptr);
+}
+
+// x *= sigmoid(y), where x is [B, S, H, D] and y is [B, S, H]
+
+void mul_sigmoid_broadcast__gr
+(
+    at::Tensor& x,
+    const at::Tensor& y,
+    Graph* graph
+)
+{
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(x, kHalf);
     TORCH_CHECK_DTYPE(y, kHalf);
@@ -431,6 +442,15 @@ void mul_sigmoid_broadcast_
     );
 
     cuda_check(cudaPeekAtLastError());
+}
+
+void mul_sigmoid_broadcast_
+(
+    at::Tensor& x,
+    const at::Tensor& y
+)
+{
+    mul_sigmoid_broadcast__gr(x, y, nullptr);
 }
 
 // x * sigmoid(y @ w) + z -> z

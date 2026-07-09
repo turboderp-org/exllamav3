@@ -92,6 +92,13 @@ void mul_sigmoid_
     const at::Tensor& y
 );
 
+void mul_sigmoid__gr
+(
+    at::Tensor& x,
+    const at::Tensor& y,
+    Graph* graph
+);
+
 void deinterleave_qg
 (
     const at::Tensor& qg,
@@ -104,6 +111,13 @@ void mul_sigmoid_broadcast_
 (
     at::Tensor& x,
     const at::Tensor& y
+);
+
+void mul_sigmoid_broadcast__gr
+(
+    at::Tensor& x,
+    const at::Tensor& y,
+    Graph* graph
 );
 
 void add_sigmoid_gate_proj_gr
