@@ -315,11 +315,12 @@ void rms_norm_impl
     float constant_bias,
     float constant_scale,
     bool span_heads,
-    int res_mode
+    int res_mode,
+    Graph* graph = nullptr
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     if (span_heads)
     {
@@ -422,6 +423,22 @@ void rms_norm
 {
     rms_norm_impl(x, w, y, {}, epsilon, constant_bias, constant_scale, span_heads,
                   add_residual ? RES_POST : RES_NONE);
+}
+
+// Graphable variant: launches on the capture stream, records nothing (BC callers norm between
+// static buffers)
+void rms_norm_gr
+(
+    at::Tensor x,
+    c10::optional<at::Tensor> w,
+    at::Tensor y,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    Graph* graph
+)
+{
+    rms_norm_impl(x, w, y, {}, epsilon, constant_bias, constant_scale, false, RES_NONE, graph);
 }
 
 // Fused pre-norm residual add: r += x (in place), y = norm(r) * w

@@ -16,6 +16,17 @@ void rms_norm
     bool add_residual
 );
 
+void rms_norm_gr
+(
+    at::Tensor x,
+    const c10::optional<at::Tensor> w,
+    at::Tensor y,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    Graph* graph
+);
+
 void rms_norm_res_in
 (
     at::Tensor x,
