@@ -464,8 +464,12 @@ def _prepare_noncausal_mm_spans(input_ids, params):
     change_points = torch.nonzero(mask[1:] != mask[:-1], as_tuple=True)[0] + 1
     boundaries = torch.cat([torch.tensor([0]), change_points, torch.tensor([l])])
     values = mask[boundaries[:-1]]
+    # A span that starts at the chunk boundary may be the suffix of a larger span whose prefix
+    # was processed by the previous (atomically extended) chunk; carry its pre-chunk extent so
+    # attention windows span the whole image
+    pre = params.get("mm_span_prefix", 0)
     spans = [
-        (int(start), int(end), bool(val))
+        (int(start), int(end), bool(val), pre if (start == 0 and bool(val)) else 0)
         for start, end, val in zip(boundaries[:-1], boundaries[1:], values)
     ]
     if (len(spans) > 0 and spans[0][2]) or len(spans) > 1:

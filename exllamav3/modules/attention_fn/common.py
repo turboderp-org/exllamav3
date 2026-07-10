@@ -74,7 +74,9 @@ class AttnFn(Protocol):
 
 def get_non_causal_span_arglist(args: AttnArgs):
     arglist = []
-    for a, b, nc in args.non_causal_spans:
+    for span in args.non_causal_spans:
+        a, b, nc = span[:3]
+        pre = span[3] if len(span) > 3 else 0
         l = b - a
         # Only the Triton wrappers take a sinks argument; backends without support decline
         # sinked calls before expanding the spans, so the key is omitted when unused
@@ -90,7 +92,7 @@ def get_non_causal_span_arglist(args: AttnArgs):
             causal = not nc,
             softmax_scale = args.sm_scale,
             window_size = (
-                (max(args.window_size, l), l - 1 if nc else 0)
+                (max(args.window_size, l + pre), l - 1 if nc else 0)
                 if args.window_size is not None and args.window_size > 0 and nc else
                 args.get_window_size()
             ),

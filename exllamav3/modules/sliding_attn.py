@@ -802,13 +802,17 @@ class SlidingAttention(Module):
                 # Spans tile the chunk; each attends over the state plus the new tokens up to its
                 # own end, bidirectionally within itself when flagged non-causal
                 o = []
-                for a, b, c in non_causal_spans:
+                for span in non_causal_spans:
+                    a, b, c = span[:3]
+                    # pre-chunk extent of a re-fed span suffix: widen the left window as if the
+                    # whole span were in the chunk
+                    pre = span[3] if len(span) > 3 else 0
                     l = b - a
                     o_ = paged_attn_triton_prefill(
                         q[:, a : b].contiguous(), None, None, k_pages, v_pages, bt, cache_seqlens,
                         causal = not c,
                         softmax_scale = self.sm_scale,
-                        window_size = (max(sw, l), l - 1) if c else (sw, 0),
+                        window_size = (max(sw, l + pre), l - 1) if c else (sw, 0),
                         softcap = self.logit_softcapping,
                         k_new = k[:, : b].contiguous(),
                         v_new = v[:, : b].contiguous(),
