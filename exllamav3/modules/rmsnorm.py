@@ -91,6 +91,7 @@ class RMSNorm(Module):
             not self.span_heads and
             x.dtype in (torch.half, torch.float) and
             y.dtype in (torch.half, torch.float) and
+            x.is_contiguous() and y.is_contiguous() and
             x.shape[-1] % 4 == 0
         )
 
