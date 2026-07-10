@@ -76,7 +76,10 @@ enum GraphedParams
     GP_attn_block_table,
     GP_attn_num_pages,
     GP_attn_split_len,
-    GP_attn_num_splits
+    GP_attn_num_splits,
+
+    GP_copy2d_src,
+    GP_copy2d_dst
 };
 
 class Graph

@@ -159,6 +159,7 @@ class Attention(Module):
         key_o: str | None = None,
         key_g: str | None = None,
         key_fused_qkv: str | None = None,
+        key_sinks: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
@@ -205,6 +206,8 @@ class Attention(Module):
         self.tp_split_norm = tp_split_norm
         self.use_k_as_v = use_k_as_v
         self.full_gate = full_gate
+        self.key_sinks = key_sinks
+        self.sinks = None
 
         if post_rope_norm:
             assert q_norm is None and k_norm is None, \
@@ -236,6 +239,7 @@ class Attention(Module):
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
                 ftranspose_after_load = transpose_qkv,
+                trim_padded_out = True,
                 qbits_key = qbits_key,
             )
             self.register_submodule(self.q_proj)
@@ -257,6 +261,7 @@ class Attention(Module):
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
                 ftranspose_after_load = transpose_qkv,
+                trim_padded_out = True,
                 qbits_key = qbits_key,
             )
             self.v_proj = Linear(
@@ -270,6 +275,7 @@ class Attention(Module):
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
                 ftranspose_after_load = transpose_qkv,
+                trim_padded_out = True,
                 qbits_key = qbits_key,
             ) if not use_k_as_v else None
             self.register_submodule(self.k_proj)
@@ -296,6 +302,7 @@ class Attention(Module):
                 out_dtype = out_dtype,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".o" if qmap is not None else None,
+                trim_padded_out = True,
                 qbits_key = qbits_key,
             )
             self.register_submodule(self.o_proj)
@@ -411,6 +418,11 @@ class Attention(Module):
                 self.rope_settings,
             )
 
+        if self.key_sinks:
+            self.sinks = self.config.stc.get_tensor(
+                f"{self.key}.{self.key_sinks}", device, no_defer = True
+            ).float().contiguous()
+
         # Test if K and V proj can be fused
         if (
             not self.config.infer_params.no_reconstruct and
@@ -465,6 +477,15 @@ class Attention(Module):
 
 
     @override
+    def get_tensors(self):
+        t = {}
+        if self.sinks is not None:
+            # bf16 -> fp16 is exact at sink-logit magnitudes; stored as loaded
+            t[f"{self.key}.{self.key_sinks}"] = self.sinks.half().contiguous()
+        return t
+
+
+    @override
     def unload(self):
         super().unload()
 
@@ -474,6 +495,7 @@ class Attention(Module):
             cl.free()
 
         self.rope = None
+        self.sinks = None
 
         if self.multi_kv is not None:
             self.multi_kv.unload()
@@ -739,6 +761,7 @@ class Attention(Module):
             sm_scale = self.sm_scale,
             window_size = self.sliding_window,
             softcap = self.logit_softcapping,
+            sinks = self.sinks,
             dispatch_cache = self.dispatch_cache,
         )
 
@@ -859,6 +882,7 @@ class Attention(Module):
             window_size = self.sliding_window,
             softcap = self.logit_softcapping,
             non_causal_spans = non_causal_spans,
+            sinks = self.sinks,
             dispatch_cache = self.dispatch_cache,
         )
 

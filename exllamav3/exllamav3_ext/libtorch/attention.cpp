@@ -18,6 +18,7 @@ BC_Attention::BC_Attention
     int _num_kv_heads,
     int _head_dim,
     int _hidden_size,
+    int _hidden_size_padded,
     int _page_size,
     std::shared_ptr<BC_LinearEXL3> _q_proj,
     std::shared_ptr<BC_LinearEXL3> _k_proj,
@@ -60,13 +61,16 @@ BC_Attention::BC_Attention
     c10::optional<at::Tensor> _cache_k_scales,
     c10::optional<at::Tensor> _cache_v_scales,
     at::Tensor _xh,
-    at::Tensor _h32
+    at::Tensor _h32,
+    c10::optional<at::Tensor> _sinks
 ) :
     num_q_heads         (_num_q_heads),
     num_kv_heads        (_num_kv_heads),
     head_dim            (_head_dim),
     hidden_size         (_hidden_size),
+    hidden_size_padded  (_hidden_size_padded),
     page_size           (_page_size),
+    sinks               (std::move(_sinks)),
     q_proj              (_q_proj),
     k_proj              (_k_proj),
     v_proj              (_v_proj),
@@ -135,7 +139,9 @@ void BC_Attention::configure_slot
     std::shared_ptr<TritonKernel> k_combine,
     std::shared_ptr<TritonKernel> k_update,
     int block_n,
-    int splits_cap
+    int splits_cap,
+    c10::optional<at::Tensor> xp,
+    c10::optional<at::Tensor> yp
 )
 {
     Slot& s = slot(bsz, q_len);
@@ -153,6 +159,18 @@ void BC_Attention::configure_slot
     s.k_update = k_update;
     s.block_n = block_n;
     s.splits_cap = splits_cap;
+
+    if (hidden_size_padded != hidden_size)
+    {
+        // Zero-padded staging for the projection input and padded o_proj output. The pad
+        // columns of xp are zeroed python-side at configure and never written after
+        TORCH_CHECK(xp && yp, "BC_Attention: padded hidden size requires xp/yp statics");
+        s.xp = xp.value();
+        s.yp = yp.value();
+        TORCH_CHECK(s.xp.is_contiguous() && s.yp.is_contiguous(), "BC_Attention: statics must be contiguous");
+        TORCH_CHECK(s.xp.size(0) >= R && s.xp.size(1) == hidden_size_padded, "BC_Attention: bad xp shape");
+        TORCH_CHECK(s.yp.size(0) >= R && s.yp.size(1) == hidden_size_padded, "BC_Attention: bad yp shape");
+    }
 
     TORCH_CHECK(s.q.is_contiguous() && s.kv.is_contiguous() && s.o.is_contiguous(), "BC_Attention: statics must be contiguous");
     TORCH_CHECK(quant_cache == (k_update == nullptr), "BC_Attention: k_update iff fp16 cache");
@@ -228,8 +246,18 @@ void BC_Attention::run_gr
     at::Tensor xh_flat = xh.view({-1});
     at::Tensor x2 = x.view({R, hidden_size});
 
+    // Padded hidden dim: stage the input through the zero-padded static; everything downstream
+    // works at the padded width (the projections' actual K)
+    const int hs = hidden_size_padded;
+    if (hs != hidden_size)
+    {
+        at::Tensor xp2 = s.xp.narrow(0, 0, R);
+        copy2d_gr(x2, xp2, graph);
+        x2 = xp2;
+    }
+
     // Q (and gate) projections into the static buffers
-    at::Tensor xh_q = xh_flat.narrow(0, 0, (int64_t) R * hidden_size).view({R, hidden_size});
+    at::Tensor xh_q = xh_flat.narrow(0, 0, (int64_t) R * hs).view({R, hs});
     bool use_qg_mgemm = gate_mode == 2 && qg_ptrs_trellis.has_value() && R <= 32;
     if (gate_mode == 3)
     {
@@ -240,8 +268,8 @@ void BC_Attention::run_gr
     }
     else if (use_qg_mgemm)
     {
-        at::Tensor x3q = x2.view({1, R, hidden_size});
-        at::Tensor xh_qg = xh_flat.narrow(0, 0, (int64_t) 2 * R * hidden_size).view({2, R, hidden_size});
+        at::Tensor x3q = x2.view({1, R, hs});
+        at::Tensor xh_qg = xh_flat.narrow(0, 0, (int64_t) 2 * R * hs).view({2, R, hs});
         exl3_mgemm_gr(x3q, qg_ptrs_trellis.value(), s.qg2, qg_ptrs_suh.value(), xh_qg, qg_ptrs_svh.value(),
                       c10::nullopt, c10::nullopt, qg_K, -1, qg_mcg, qg_mul1, -1, -1, 0, graph);
     }
@@ -264,7 +292,7 @@ void BC_Attention::run_gr
     {
         // V shares the K projection output; copy it out before norm + RoPE modify K in place
         at::Tensor k2 = kv2.select(0, 0);
-        at::Tensor xh_k = xh_flat.narrow(0, 0, (int64_t) R * hidden_size).view({R, hidden_size});
+        at::Tensor xh_k = xh_flat.narrow(0, 0, (int64_t) R * hs).view({R, hs});
         exl3_gemm_gr(x2, k_proj->trellis, k2, k_proj->suh, xh_k, k_proj->svh, -1, k_proj->mcg, k_proj->mul1, 0, graph);
         if (k_proj->bias)
             add_gr(k2, k_proj->bias.value(), k2, graph);
@@ -285,8 +313,8 @@ void BC_Attention::run_gr
     }
     else if (use_mgemm)
     {
-        at::Tensor x3 = x2.view({1, R, hidden_size});
-        at::Tensor xh_kv = xh_flat.narrow(0, 0, (int64_t) 2 * R * hidden_size).view({2, R, hidden_size});
+        at::Tensor x3 = x2.view({1, R, hs});
+        at::Tensor xh_kv = xh_flat.narrow(0, 0, (int64_t) 2 * R * hs).view({2, R, hs});
         exl3_mgemm_gr(x3, kv_ptrs_trellis.value(), kv2, kv_ptrs_suh.value(), xh_kv, kv_ptrs_svh.value(),
                       c10::nullopt, c10::nullopt, kv_K, -1, kv_mcg, kv_mul1, -1, -1, 0, graph);
     }
@@ -294,7 +322,7 @@ void BC_Attention::run_gr
     {
         at::Tensor k2 = kv2.select(0, 0);
         at::Tensor v2 = kv2.select(0, 1);
-        at::Tensor xh_k = xh_flat.narrow(0, 0, (int64_t) R * hidden_size).view({R, hidden_size});
+        at::Tensor xh_k = xh_flat.narrow(0, 0, (int64_t) R * hs).view({R, hs});
         exl3_gemm_gr(x2, k_proj->trellis, k2, k_proj->suh, xh_k, k_proj->svh, -1, k_proj->mcg, k_proj->mul1, 0, graph);
         if (k_proj->bias)
             add_gr(k2, k_proj->bias.value(), k2, graph);
@@ -394,7 +422,9 @@ void BC_Attention::run_gr
             (void*) s.o.data_ptr(),
             (void*) h32.data_ptr(),
             (void*) (intptr_t) num_splits,
-            (void*) s.q.data_ptr(),  // sinks: dead arg, slots compile with HAS_SINKS = false
+            // Static sink pointer when the module has learned sinks (combine compiled with
+            // HAS_SINKS), dead arg otherwise
+            sinks ? (void*) sinks.value().data_ptr() : (void*) s.q.data_ptr(),
         };
         s.k_combine->launch(s.programs, 1, 1, args, stream);
         if (graph)
@@ -408,12 +438,18 @@ void BC_Attention::run_gr
     if (gate_mode == 2 || gate_mode == 3)
         mul_sigmoid__gr(s.o2, s.g2, graph);
 
-    // Output projection
+    // Output projection. With a padded hidden dim the GEMM writes the padded static (N of the
+    // quantized o_proj), bias included, and the exact-width columns are copied out to y
     at::Tensor y2 = y.view({R, hidden_size});
+    at::Tensor c2 = y2;
+    if (hs != hidden_size)
+        c2 = s.yp.narrow(0, 0, R);
     at::Tensor xh_o = xh_flat.narrow(0, 0, (int64_t) R * num_q_heads * head_dim).view({R, num_q_heads * head_dim});
-    exl3_gemm_gr(s.o2, o_proj->trellis, y2, o_proj->suh, xh_o, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
+    exl3_gemm_gr(s.o2, o_proj->trellis, c2, o_proj->suh, xh_o, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
     if (o_proj->bias)
-        add_gr(y2, o_proj->bias.value(), y2, graph);
+        add_gr(c2, o_proj->bias.value(), c2, graph);
+    if (hs != hidden_size)
+        copy2d_gr(c2, y2, graph);
 }
 
 void BC_Attention::run
@@ -460,31 +496,38 @@ void BC_Attention::run
     bool use_qg_mgemm = gate_mode == 2 && qg_ptrs_trellis.has_value() && R <= 32;
 
     std::vector<PPTR> params;
-    params.reserve(18);
+    params.reserve(20);
+
+    // Padded hidden dim: x feeds the staging copy at the head of the graph and the projections
+    // read the (static) padded buffer; unpadded, the projections read x directly
+    bool padded = hidden_size_padded != hidden_size;
+    void* xptr = padded ? s.xp.data_ptr() : (void*) x.data_ptr();
+    if (padded)
+        params.emplace_back(GP_copy2d_src, (void*) x.data_ptr());
 
     // Q / gate projections
     if (use_qg_mgemm)
-        params.emplace_back(GP_mgemm_A, (void*) x.data_ptr());
+        params.emplace_back(GP_mgemm_A, xptr);
     else
     {
-        params.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+        params.emplace_back(GP_gemm_A, xptr);
         if (gate_mode == 2)
-            params.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+            params.emplace_back(GP_gemm_A, xptr);
     }
 
     // K/V projections
     if (use_k_as_v)
     {
-        params.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+        params.emplace_back(GP_gemm_A, xptr);
     }
     else if (use_mgemm)
     {
-        params.emplace_back(GP_mgemm_A, (void*) x.data_ptr());
+        params.emplace_back(GP_mgemm_A, xptr);
     }
     else
     {
-        params.emplace_back(GP_gemm_A, (void*) x.data_ptr());
-        params.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+        params.emplace_back(GP_gemm_A, xptr);
+        params.emplace_back(GP_gemm_A, xptr);
     }
 
     // RoPE: which position source is active is a runtime branch in the kernel, so nulls are
@@ -520,11 +563,14 @@ void BC_Attention::run
     params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
     params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);
     params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);   // combine kernel
-    params.emplace_back(GP_gemm_C, (void*) y.data_ptr());
+    void* yptr = padded ? s.yp.data_ptr() : (void*) y.data_ptr();
+    params.emplace_back(GP_gemm_C, yptr);
     if (o_proj->bias)
     {
-        params.emplace_back(GP_add_x, (void*) y.data_ptr());
-        params.emplace_back(GP_add_z, (void*) y.data_ptr());
+        params.emplace_back(GP_add_x, yptr);
+        params.emplace_back(GP_add_z, yptr);
     }
+    if (padded)
+        params.emplace_back(GP_copy2d_dst, (void*) y.data_ptr());
     s.graph->launch(params, stream);
 }

@@ -6,14 +6,17 @@ class MultiLinear:
     def __init__(
         self,
         device: torch.Device,
-        linears: list[Linear]
+        linears: list[Linear],
+        allow_bias: bool = False,
     ):
         self.device = device
         self.linears = linears
         self.num_linears = len(linears)
 
         assert all(l.quant_type == "exl3" for l in linears)
-        assert all(l.inner.bias is None for l in linears)
+        # The mgemm kernels never apply biases; callers setting allow_bias handle them
+        # separately (BC_BlockSparseMLP bias kernels)
+        assert allow_bias or all(l.inner.bias is None for l in linears)
         assert all(not l.softcap for l in linears)
         assert all(l.post_scale == 1.0 for l in linears)
 

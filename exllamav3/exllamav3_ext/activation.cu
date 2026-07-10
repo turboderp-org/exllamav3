@@ -14,6 +14,7 @@
 #define ACT_SILU 0
 #define ACT_GELU 1
 #define ACT_RELU2 2
+#define ACT_SILU_OAI 3
 
 #include "activation_kernels.cuh"
 
@@ -93,6 +94,85 @@ void silu_mul
 )
 {
     silu_mul_gr(x, y, z, act_limit, nullptr);
+}
+
+// gpt-oss clamped swiglu: (clamp(y, -limit, limit) + 1) * g * sigmoid(1.702 * g),
+// g = min(x, limit) -> z, in-place if z == x or z == y
+
+void silu_oai_mul_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    bool float_input = x.dtype() == at::kFloat;
+    if (float_input)
+    {
+        TORCH_CHECK_DTYPE(y, kFloat);
+    }
+    else
+    {
+        TORCH_CHECK_DTYPE(x, kHalf);
+        TORCH_CHECK_DTYPE(y, kHalf);
+    }
+
+    TORCH_CHECK_DTYPE(z, kHalf);
+
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    if (float_input)
+    {
+        act_mul_kernel_f<ACT_SILU_OAI><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const float*) x.data_ptr(),
+            (const float*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            act_limit,
+            numel
+        );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU_OAI>, GP_silu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU_OAI>, GP_silu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU_OAI>, GP_silu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU_OAI>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
+    }
+    else
+    {
+        act_mul_kernel_h<ACT_SILU_OAI><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const half*) x.data_ptr(),
+            (const half*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            act_limit,
+            numel
+        );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU_OAI>, GP_silu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU_OAI>, GP_silu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU_OAI>, GP_silu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU_OAI>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
+    }
+}
+
+void silu_oai_mul
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit
+)
+{
+    silu_oai_mul_gr(x, y, z, act_limit, nullptr);
 }
 
 // silu(x) * y -> z, in-place if z == x or z == y

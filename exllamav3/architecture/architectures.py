@@ -16,6 +16,7 @@ from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
+from .gpt_oss import GptOssModel
 from .hcxvisionv2 import HCXVisionV2Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
@@ -71,6 +72,7 @@ ARCHITECTURES = {
         Glm4MoeModel,
         Glm4VModel,
         Glm4VMoeModel,
+        GptOssModel,
         HCXVisionV2Model,
         HyperClovaxModel,
         IQuestCoderModel,

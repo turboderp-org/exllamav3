@@ -15,6 +15,7 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
         int,
         int,
         int,
+        int,
         std::shared_ptr<BC_LinearEXL3>,
         std::shared_ptr<BC_LinearEXL3>,
         std::shared_ptr<BC_LinearEXL3>,
@@ -56,12 +57,14 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
         at::Tensor,
-        at::Tensor
+        at::Tensor,
+        c10::optional<at::Tensor>
     >(),
     py::arg("num_q_heads"),
     py::arg("num_kv_heads"),
     py::arg("head_dim"),
     py::arg("hidden_size"),
+    py::arg("hidden_size_padded"),
     py::arg("page_size"),
     py::arg("q_proj"),
     py::arg("k_proj"),
@@ -104,7 +107,8 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("cache_k_scales"),
     py::arg("cache_v_scales"),
     py::arg("xh"),
-    py::arg("h32")
+    py::arg("h32"),
+    py::arg("sinks")
 )
 .def("needs_configure", &BC_Attention::needs_configure)
 .def("configure_slot", &BC_Attention::configure_slot,
@@ -121,6 +125,8 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("k_combine"),
     py::arg("k_update"),
     py::arg("block_n"),
-    py::arg("splits_cap")
+    py::arg("splits_cap"),
+    py::arg("xp"),
+    py::arg("yp")
 )
 .def("run", &BC_Attention::run);

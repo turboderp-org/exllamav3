@@ -32,7 +32,8 @@ void routing_std
     at::Tensor topk_indices,
     at::Tensor topk_weights,
     const c10::optional<at::Tensor>& per_expert_scale,
-    const c10::optional<at::Tensor>& gate_t
+    const c10::optional<at::Tensor>& gate_t,
+    const c10::optional<at::Tensor>& bias
 );
 
 void routing_std_logits

@@ -32,6 +32,7 @@ class RoutingCFG:
     n_group: int | None
     topk_group: int | None
     per_expert_scale: torch.Tensor | None
+    router_bias: torch.Tensor | None = None
 
 @dataclass
 class FusedBuffers:
@@ -53,6 +54,7 @@ def routing_std(bsz, cfg, y, params):
             cfg.routing_weights_bsz1,
             cfg.per_expert_scale,
             cfg.gate_tensor_t,
+            None,
         )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
     else:
@@ -79,8 +81,43 @@ def routing_std(bsz, cfg, y, params):
                 routing_weights,
                 cfg.per_expert_scale,
                 None,
+                None,
             )
         return selected_experts, routing_weights
+
+
+def routing_std_bias(bsz, cfg, y, params):
+    """Standard softmax routing with a bias on the router logits (gpt-oss): the bias enters
+    before top-k selection, and the weights are the softmax over the selected biased logits
+    (equivalent to renormalizing the full biased softmax over the top-k set)."""
+    if bsz == 1 and not params.get("activate_all_experts"):
+        if cfg.gate_tensor_t is None:
+            cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+        ext.routing_std(
+            y,
+            cfg.gate_tensor,
+            cfg.router_logits_bsz1,
+            cfg.selected_experts_bsz1,
+            cfg.routing_weights_bsz1,
+            cfg.per_expert_scale,
+            cfg.gate_tensor_t,
+            cfg.router_bias,
+        )
+        return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+    if cfg.router_bias is not None:
+        router_logits = torch.addmm(cfg.router_bias, y, cfg.gate_tensor)
+    else:
+        router_logits = torch.matmul(y, cfg.gate_tensor)
+    if params.get("activate_all_experts"):
+        routing_weights = torch.softmax(router_logits.float(), dim = -1).half()
+        selected_experts = (
+            torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
+            .repeat((bsz, 1))
+        )
+        return selected_experts, routing_weights
+    top_v, selected_experts = torch.topk(router_logits, cfg.num_experts_per_tok, dim = -1)
+    routing_weights = torch.softmax(top_v.float(), dim = -1).half()
+    return selected_experts, routing_weights
 
 
 # TODO: Optimize top_k groups (for DS3)
@@ -178,6 +215,7 @@ class ExpertsCFG:
     out_d2: torch.Tensor
     min_expert: int
     max_expert: int
+    out_trim: torch.Tensor | None = None
 
 
 class BlockSparseMLP(Module):
@@ -228,6 +266,7 @@ class BlockSparseMLP(Module):
         transpose_fused_weights: bool = True,
         ftranspose_after_load: bool = True,
         frange_dim: int = 0,
+        gate_up_interleaved: bool = False,
         alt_residual_channel: bool = False,
         qbits_key: str = "bits"
     ):
@@ -329,6 +368,7 @@ class BlockSparseMLP(Module):
                     fkey = fkey_gate,
                     fidx = idx,
                     frange = (0, intermediate_size) if key_gate_up_split else None,
+                    finterleaved = gate_up_interleaved,
                     in_features = hidden_size,
                     out_features = intermediate_size,
                     qmap = qmap + ".input" if qmap else None,
@@ -346,6 +386,7 @@ class BlockSparseMLP(Module):
                     fkey = fkey_up,
                     fidx = idx,
                     frange = (intermediate_size, intermediate_size * 2) if key_gate_up_split else None,
+                    finterleaved = gate_up_interleaved,
                     in_features = hidden_size,
                     out_features = intermediate_size,
                     qmap = qmap + ".input" if qmap else None,
@@ -370,6 +411,9 @@ class BlockSparseMLP(Module):
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
                     ftranspose_after_load = ftranspose_after_load,
+                    # The input dim pads to match the gate/up padded output width; padded output
+                    # columns (zeros, or quantization noise over zero weights) are trimmed
+                    trim_padded_out = True,
                     qgroup = key + ".block_gud",
                     qbits_key = qbits_key,
                 )
@@ -389,9 +433,15 @@ class BlockSparseMLP(Module):
             case "gelu":
                 self.activation_fn_call = ext.gelu_mul
                 self.activation_fn_idx = 1
+            case "swiglu_oai":
+                self.activation_fn_call = ext.silu_oai_mul
+                self.activation_fn_idx = 3
+            case _:
+                raise ValueError(f"Unknown activation function {activation_fn}")
 
         self.is_quantized = False
         self.support_fused = False
+        self.support_quant_paths = False
         self.multi_gate = None
         self.multi_up = None
         self.multi_down = None
@@ -410,6 +460,7 @@ class BlockSparseMLP(Module):
 
         match router_type:
             case "std": self.routing_fn = routing_std
+            case "std_bias": self.routing_fn = routing_std_bias
             case "ds3": self.routing_fn = routing_ds3
             case "dots": self.routing_fn = routing_dots
             case _: raise ValueError(f"Unknown router type {router_type}")
@@ -457,41 +508,80 @@ class BlockSparseMLP(Module):
             print(f" !! Warning, partially quantized block-sparse MLP layer: {self.key}")
         self.is_quantized = (num_exl3_tensors > 0 and num_nonexl3_tensors == 0)
 
-        # Make fused modules
-        if self.is_quantized and not self.config.infer_params.no_reconstruct:
-            self.multi_gate = MultiLinear(self.device, self.gates)
-            self.multi_up = MultiLinear(self.device, self.ups)
-            self.multi_down = MultiLinear(self.device, self.downs)
+        # The quantized fast paths (mgemm/BC/fused kernels) don't yet support per-expert biases,
+        # activations other than silu/gelu, or trimmed (padded) down projections; configurations
+        # with any of those run every batch size through the dense per-expert path, which
+        # handles all three (gpt-oss)
+        self.support_quant_paths = (
+            self.is_quantized and
+            self.activation_fn in ("silu", "gelu") and
+            all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
+            all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
+        )
 
-            # Enable fully fused kernel if possible (uniform mcg or mul1 codebook across gate/up/down)
+        # The BC bsz-1 graph additionally supports the gpt-oss activation, per-expert biases
+        # (all-or-nothing per projection) and padded dims (zero-padded input staging + trimmed
+        # output); the raw mgemm and dense BC paths do not, so those configurations run the
+        # dense per-expert path for every other batch shape
+        def _uniform_bias(ls):
+            has = [l.inner.bias is not None for l in ls]
+            return all(has) or not any(has)
+        self.support_bc_bsz1 = (
+            self.is_quantized and
+            self.activation_fn in ("silu", "gelu", "swiglu_oai") and
+            _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
+            self.shared_experts is None
+        )
+
+        # Make fused modules (only used by the quantized fast paths)
+        if (self.support_quant_paths or self.support_bc_bsz1) and not self.config.infer_params.no_reconstruct:
+            self.multi_gate = MultiLinear(self.device, self.gates, allow_bias = True)
+            self.multi_up = MultiLinear(self.device, self.ups, allow_bias = True)
+            self.multi_down = MultiLinear(self.device, self.downs, allow_bias = True)
+
+            # Enable fully fused kernel if possible (uniform mcg or mul1 codebook across gate/up/down,
+            # and an activation the fused kernel implements)
             cbs = (self.multi_gate.q_cb(), self.multi_up.q_cb(), self.multi_down.q_cb())
-            self.support_fused = cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True))
+            self.support_fused = (
+                cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
+                self.support_quant_paths
+            )
 
         # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok
         H = self.hidden_size
+        # The gate/up input width and the down output width are the (possibly 128-padded)
+        # quantized dims; both equal H for aligned models
+        Hi = self.gates[0].in_features
+        Ho = self.downs[0].out_features
         I = self.intermediate_size_padded
         device = self.device
 
-        temp_hidden = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH * 2, H), torch.half, "moe1_temp_hidden")
+        temp_hidden = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH * 2, Hi), torch.half, "moe1_temp_hidden")
         temp_interm = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH * 2, I), self.interm_dtype, "moe1_temp_interm")
         temp_activa = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH, I), torch.half, "moe1_temp_activa")
-        temp_output = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH, H), torch.float, "moe1_temp_output")
+        temp_output = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH, Ho), torch.float, "moe1_temp_output")
 
-        yh = temp_hidden[:numex].view(numex, 1, H)
+        yh = temp_hidden[:numex].view(numex, 1, Hi)
         interm_g = temp_interm[:numex].view(numex, 1, I)
         interm_u = temp_interm[numex:numex*2].view(numex, 1, I)
         interm_a = temp_activa[:numex].view(numex, 1, I)
         yh2 = temp_hidden
         interm_gu = temp_interm
         interm_a2 = temp_activa
-        out_d = temp_output[:numex].view(numex, 1, H)
+        out_d = temp_output[:numex].view(numex, 1, Ho)
         out_d2 = temp_output
 
         # Expert interval for split module (-1, -1) indicate no split
         mine, maxe = self.routing_first, self.routing_last
         if mine is None or maxe - mine == self.num_experts:
             mine, maxe = -1, -1
+
+        # Exact-width bsz-1 output when the down projection is padded (the BC graph copies the
+        # trimmed columns out of the padded reduction)
+        out_trim = None
+        if Ho != H:
+            out_trim = g_tensor_cache.get(device, (1, H), torch.float, "moe1_out_trim")
 
         cfg = ExpertsCFG(
             yh = yh,
@@ -502,10 +592,11 @@ class BlockSparseMLP(Module):
             out_d2 = out_d2,
             min_expert = mine,
             max_expert = maxe,
+            out_trim = out_trim,
         )
         self.experts_cfg = cfg
 
-        if self.is_quantized:
+        if self.support_quant_paths or self.support_bc_bsz1:
 
             # Embed bound classes for shared experts and shared gate
             sh_exp_bc = None
@@ -539,8 +630,22 @@ class BlockSparseMLP(Module):
             gu_suh_ptr = torch.stack((g_suh_ptr, u_suh_ptr), dim = 0).T.contiguous().to(self.device)
             gu_svh_ptr = torch.stack((g_svh_ptr, u_svh_ptr), dim = 0).T.contiguous().to(self.device)
 
-            dq_temp_up = g_tensor_cache.get(device, (H, I), torch.half, "dq_temp")
-            dq_temp_down = dq_temp_up.view(I, H)
+            dq_temp_up = g_tensor_cache.get(device, (Hi, I), torch.half, "dq_temp")
+            dq_temp_down = dq_temp_up.view(I, Ho)
+
+            # Per-expert bias pointer tables and padded-input staging for the bsz-1 graph
+            def _bias_ptrs(ls):
+                if ls[0].inner.bias is None:
+                    return None
+                return torch.tensor([l.inner.bias.data_ptr() for l in ls],
+                                    dtype = torch.long, device = device)
+            gate_bias_ptrs = _bias_ptrs(self.gates)
+            up_bias_ptrs = _bias_ptrs(self.ups)
+            down_bias_ptrs = _bias_ptrs(self.downs)
+            y_pad = None
+            if Hi != H:
+                y_pad = g_tensor_cache.get(device, (1, Hi), torch.half, "moe1_y_pad")
+                y_pad.zero_()
 
             # Bound class for graph, dq and fused-bsz1 paths
             self.bc = ext.BC_BlockSparseMLP(
@@ -579,6 +684,7 @@ class BlockSparseMLP(Module):
                 self.multi_down.mul1,
                 self.activation_fn == "silu",
                 self.activation_fn == "gelu",
+                self.activation_fn == "swiglu_oai",
                 sh_exp_bc,
                 sh_gate_bc,
                 self.act_limit,
@@ -587,7 +693,12 @@ class BlockSparseMLP(Module):
                 [x.inner.bc for x in self.downs],
                 gu_trellis_ptr,
                 gu_suh_ptr,
-                gu_svh_ptr
+                gu_svh_ptr,
+                gate_bias_ptrs,
+                up_bias_ptrs,
+                down_bias_ptrs,
+                y_pad,
+                cfg.out_trim,
             )
 
             # Larger buffers for fused path, if supported
@@ -610,6 +721,7 @@ class BlockSparseMLP(Module):
 
         self.routing_cfg = RoutingCFG(
             gate_tensor = self.routing_gate.inner.weight,
+            router_bias = getattr(self.routing_gate.inner, "bias", None),
             gate_tensor_t = None,  # created lazily on first bsz-1 call (weights may be deferred here)
             num_experts = self.num_experts,
             num_experts_per_tok = self.num_experts_per_tok,
@@ -711,7 +823,11 @@ class BlockSparseMLP(Module):
             final_hidden_states = torch.zeros_like(x, dtype = torch.float)
 
         # Torch/C++/fused path
-        elif bsz >= self.f_threshold or not self.is_quantized or self.config.infer_params.no_reconstruct:
+        elif (
+            bsz >= self.f_threshold or not self.is_quantized or
+            self.config.infer_params.no_reconstruct or
+            not (self.support_quant_paths or (bsz == 1 and self.bc is not None))
+        ):
             final_hidden_states = torch.zeros_like(y, dtype = torch.float)
 
             # if self.routing_device is None or self.num_local_experts == self.num_experts:
@@ -809,7 +925,7 @@ class BlockSparseMLP(Module):
 
                     current_state = y.index_select(0, top_x)
 
-                    if self.bc is not None:
+                    if self.bc is not None and self.support_quant_paths:
                         # Graph path
                         if count <= TEMP_ROWS_GRAPH:
                             self.bc.run_single_expert(current_state, expert_idx)
@@ -915,12 +1031,14 @@ class BlockSparseMLP(Module):
                 self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a, self.act_limit)
 
                 # Down
+                # A_had must not alias A (the autotuner relaunches on the first call); the
+                # gate buffer is free after the activation
                 ext.exl3_mgemm(
                     cfg.interm_a,
                     self.multi_down.ptrs_trellis,
                     cfg.out_d,
                     self.multi_down.ptrs_suh,
-                    cfg.interm_a,
+                    cfg.interm_g,
                     self.multi_down.ptrs_svh,
                     selected_experts[i],
                     routing_weights[i],
@@ -941,7 +1059,10 @@ class BlockSparseMLP(Module):
         # Bsz 1
         elif self.bc is not None:
             self.bc.run_bsz1(y, selected_experts, routing_weights)
-            final_hidden_states = self.experts_cfg.out_d[:1, ...].view(x.shape)
+            if self.experts_cfg.out_trim is not None:
+                final_hidden_states = self.experts_cfg.out_trim.view(x.shape)
+            else:
+                final_hidden_states = self.experts_cfg.out_d[:1, ...].view(x.shape)
             bc_sh_exp = self.bc_sh_exp
 
         else:
@@ -990,12 +1111,13 @@ class BlockSparseMLP(Module):
             self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a, self.act_limit)
 
             # Down
+            # A_had must not alias A (the autotuner relaunches on the first call)
             ext.exl3_mgemm(
                 cfg.interm_a,
                 self.multi_down.ptrs_trellis,
                 cfg.out_d,
                 self.multi_down.ptrs_suh,
-                cfg.interm_a,
+                cfg.interm_g,
                 self.multi_down.ptrs_svh,
                 selected_experts,
                 routing_weights,

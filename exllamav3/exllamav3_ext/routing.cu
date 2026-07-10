@@ -439,6 +439,7 @@ __global__ void routing_std_topk_kernel
     int64_t* __restrict__ topk_indices,
     half* __restrict__ topk_weights,
     const bfloat16* __restrict__ per_expert_scale,
+    const half* __restrict__ bias,
     int num_experts,
     int K,
     int bsz
@@ -461,6 +462,9 @@ __global__ void routing_std_topk_kernel
 
     bool mask = t < num_experts;
     float logit = mask ? __half2float(scores[t]) : -1.0e30f;
+    // Router bias (gpt-oss): biased logits drive both the top-k selection and the softmax
+    if (bias && mask)
+        logit += __half2float(bias[t]);
     float max_logit = logit;
     max_logit = warp_reduce_max_f(max_logit);
     max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
@@ -831,7 +835,8 @@ void routing_std
     at::Tensor topk_indices,
     at::Tensor topk_weights,
     const c10::optional<at::Tensor>& per_expert_scale,
-    const c10::optional<at::Tensor>& gate_t
+    const c10::optional<at::Tensor>& gate_t,
+    const c10::optional<at::Tensor>& bias
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
@@ -868,12 +873,14 @@ void routing_std
                  + num_warps * sizeof(float);
 
     //int num_blocks = bsz;
+    TORCH_CHECK_DTYPE_OPT(bias, kHalf);
     routing_std_topk_kernel<<<bsz, num_threads, shmem, stream>>>
     (
         (const half*) scores.data_ptr(),
         (int64_t*) topk_indices.data_ptr(),
         (half*) topk_weights.data_ptr(),
         (const bfloat16*) OPTPTR(per_expert_scale),
+        (const half*) OPTPTR(bias),
         num_experts,
         K,
         bsz
@@ -924,6 +931,7 @@ void routing_std_logits
             (int64_t*) topk_indices.data_ptr(),
             (half*) topk_weights.data_ptr(),
             (const bfloat16*) OPTPTR(per_expert_scale),
+            nullptr,
             num_experts,
             K,
             bsz

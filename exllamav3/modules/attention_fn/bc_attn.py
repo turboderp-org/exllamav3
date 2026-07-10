@@ -95,10 +95,15 @@ class BCAttn:
             h32 = g_tensor_cache.get(self.device, (1,), torch.half, "bca_dummy")
         self.max_pages = self.cache_k.shape[0]
 
+        # Padded hidden dim (gpt-oss): the quantized projections' K is the 128-aligned width;
+        # the graph stages x through a zero-padded static and trims the o_proj output
+        self.hidden_padded = module.q_proj.in_features
+        self.sinks = getattr(module, "sinks", None)
+
         rope = module.rope
         mkv = module.multi_kv
         mqg = module.multi_qg
-        w = max(self.hidden_size, self.num_q_heads * self.head_dim)
+        w = max(self.hidden_padded, self.num_q_heads * self.head_dim)
         xh = g_tensor_cache.get(self.device, (2 * MAX_R * w,), torch.half, "bca_xh")
 
         self.o_dtype = module.o_proj.inner.default_out_dtype
@@ -118,6 +123,7 @@ class BCAttn:
             num_kv_heads = self.num_kv_heads,
             head_dim = self.head_dim,
             hidden_size = self.hidden_size,
+            hidden_size_padded = self.hidden_padded,
             page_size = PAGE_SIZE,
             q_proj = module.q_proj.inner.bc,
             k_proj = module.k_proj.inner.bc if self._has_bc(module.k_proj) else None,
@@ -161,6 +167,7 @@ class BCAttn:
             cache_v_scales = self.v_scales,
             xh = xh,
             h32 = h32,
+            sinks = self.sinks,
         )
         self.slot_widths = {}
 
@@ -220,7 +227,7 @@ class BCAttn:
             "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim",
             "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")}
         consts_c = dict(
-            QCV = self.v_bits, HAS_SINKS = False, q_len = q_len,
+            QCV = self.v_bits, HAS_SINKS = self.sinks is not None, q_len = q_len,
             n_q_heads = qh, n_kv_heads = kvh, head_dim = hd,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
         )
@@ -257,12 +264,22 @@ class BCAttn:
         partial_o = g_tensor_cache.get(dev, (programs * splits_cap * block_rows * hd,), torch.float, "bca_po")
         partial_ml = g_tensor_cache.get(dev, (programs * splits_cap * block_rows * 2,), torch.float, "bca_ml")
 
+        # Padded hidden dim: zero-padded input staging and padded o_proj output. The pad columns
+        # of xp are zeroed here and never written afterwards (the graph copies only the exact
+        # hidden width into it)
+        xp, yp = None, None
+        if self.hidden_padded != self.hidden_size:
+            xp = g_tensor_cache.get(dev, (R, self.hidden_padded), torch.half, "bca_xp")
+            yp = g_tensor_cache.get(dev, (R, self.hidden_padded), self.o_dtype or torch.half, "bca_yp")
+            xp.zero_()
+
         self.bc.configure_slot(
             bsz, q_len,
             q, kv, o, partial_o, partial_ml,
             gate_a, gate_b,
             k_split, k_combine, k_update,
             block_n, splits_cap,
+            xp, yp,
         )
 
     def step(
@@ -309,6 +326,14 @@ def _module_eligible(m):
         (m.q_norm is None or m.q_norm_tensor is not None) and
         _is_pow2(m.head_dim) and m.head_dim <= 512 and
         m.num_q_heads % m.num_kv_heads == 0 and
+        # Padded dims: the projection inputs stage through a zero-padded static and the o_proj
+        # output is trimmed, but the q/k/v/gate outputs and the o_proj input must be the exact
+        # head dims (the attention statics are sized to them)
+        all(p is None or getattr(p, "out_features_unpadded", None) in (None, p.out_features)
+            for p in (m.q_proj, getattr(m, "k_proj", None), getattr(m, "v_proj", None),
+                      getattr(m, "g_proj", None))) and
+        (not hasattr(m.o_proj, "in_features_unpadded") or
+            m.o_proj.in_features == m.o_proj.in_features_unpadded) and
         m.q_proj is not None and m.q_proj.quant_type == "exl3" and m.q_proj.inner.bc is not None and
         m.o_proj is not None and m.o_proj.quant_type == "exl3" and m.o_proj.inner.bc is not None and
         (m.multi_kv is not None or (

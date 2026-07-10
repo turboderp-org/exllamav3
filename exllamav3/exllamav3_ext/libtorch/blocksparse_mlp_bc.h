@@ -36,6 +36,7 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
         bool,
         bool,
         bool,
+        bool,
         std::shared_ptr<BC_GatedMLP>,
         std::shared_ptr<BC_LinearFP16>,
         float,
@@ -44,7 +45,12 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
         std::vector<std::shared_ptr<BC_LinearEXL3>>,
         at::Tensor,
         at::Tensor,
-        at::Tensor
+        at::Tensor,
+        c10::optional<at::Tensor>,
+        c10::optional<at::Tensor>,
+        c10::optional<at::Tensor>,
+        c10::optional<at::Tensor>,
+        c10::optional<at::Tensor>
     >(),
     py::arg("yh2"),
     py::arg("yh"),
@@ -81,6 +87,7 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
     py::arg("down_mul1"),
     py::arg("act_silu"),
     py::arg("act_gelu"),
+    py::arg("act_silu_oai"),
     py::arg("shared_experts"),
     py::arg("shared_gate"),
     py::arg("act_limit"),
@@ -89,7 +96,12 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
     py::arg("downs"),
     py::arg("gu_trellis_ptr"),
     py::arg("gu_suh_ptr"),
-    py::arg("gu_svh_ptr")
+    py::arg("gu_svh_ptr"),
+    py::arg("gate_bias_ptrs") = py::none(),
+    py::arg("up_bias_ptrs") = py::none(),
+    py::arg("down_bias_ptrs") = py::none(),
+    py::arg("y_pad") = py::none(),
+    py::arg("out_trim") = py::none()
 )
 .def("run_bsz1", &BC_BlockSparseMLP::run_bsz1)
 .def("run_single_expert", &BC_BlockSparseMLP::run_single_expert)

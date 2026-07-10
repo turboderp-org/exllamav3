@@ -27,12 +27,19 @@ struct BC_Attention
     static constexpr int MAX_BSZ = 4;
     static constexpr int MAX_QLEN = 16;
 
-    // Model config
+    // Model config. hidden_size_padded > hidden_size when the model dim is not a multiple of
+    // the EXL3 tile alignment (gpt-oss): the projections' K/N pad to 128 and the graph stages
+    // the input through a zero-padded static and trims the o_proj output back down
     int num_q_heads;
     int num_kv_heads;
     int head_dim;
     int hidden_size;
+    int hidden_size_padded;
     int page_size;
+
+    // Learned attention sinks (one logit per q head, fp32), passed to the combine kernel
+    // (compiled with HAS_SINKS) as a static pointer
+    c10::optional<at::Tensor> sinks;
 
     // Projections. K/V run as one fused mgemm when the pointer tables are given (and
     // bsz * q_len is small enough), otherwise as separate GEMMs
@@ -109,8 +116,9 @@ struct BC_Attention
 
         // Static intermediates (python tensor cache) and precomputed views. gate_a/gate_b by
         // gate mode: full = qg (2, R, qh*hd) with q aliasing qg[0]; interleaved = qg_i
-        // (R, 2*qh*hd) staging + g (R, qh*hd)
-        at::Tensor q, kv, o, partial_o, partial_ml, gate_a, gate_b;
+        // (R, 2*qh*hd) staging + g (R, qh*hd). xp/yp: zero-padded input staging and padded
+        // o_proj output, only when hidden_size_padded > hidden_size
+        at::Tensor q, kv, o, partial_o, partial_ml, gate_a, gate_b, xp, yp;
         at::Tensor q2, q4, k4, v4, o2, o4, qg2, g2;
 
         std::shared_ptr<TritonKernel> k_split;
@@ -127,6 +135,7 @@ struct BC_Attention
         int num_kv_heads,
         int head_dim,
         int hidden_size,
+        int hidden_size_padded,
         int page_size,
         std::shared_ptr<BC_LinearEXL3> q_proj,
         std::shared_ptr<BC_LinearEXL3> k_proj,
@@ -169,7 +178,8 @@ struct BC_Attention
         c10::optional<at::Tensor> cache_k_scales,
         c10::optional<at::Tensor> cache_v_scales,
         at::Tensor xh,
-        at::Tensor h32
+        at::Tensor h32,
+        c10::optional<at::Tensor> sinks
     );
 
     bool needs_configure(int bsz, int q_len);
@@ -189,7 +199,9 @@ struct BC_Attention
         std::shared_ptr<TritonKernel> k_combine,
         std::shared_ptr<TritonKernel> k_update,
         int block_n,
-        int splits_cap
+        int splits_cap,
+        c10::optional<at::Tensor> xp,
+        c10::optional<at::Tensor> yp
     );
 
     void run
