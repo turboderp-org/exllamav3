@@ -766,7 +766,7 @@ class Attention(Module):
         )
 
         if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
@@ -887,7 +887,7 @@ class Attention(Module):
         )
 
         if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
