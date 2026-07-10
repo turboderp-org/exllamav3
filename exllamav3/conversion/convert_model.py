@@ -44,7 +44,7 @@ parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mo
 parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
-parser.add_argument("-cb", "--codebook", type = str, default = "mcg", help = "Codebook: mcg (default), mul1 or 3inst")
+parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "When possible, use new parallel mode for small tensors (MoE layers especially)")
 
 group = parser.add_mutually_exclusive_group()
@@ -179,7 +179,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("last_checkpoint_index", True, -1),
         ("devices", True, None),
         ("device_ratios", True, None),
-        ("codebook", True, "mcg"),
+        ("codebook", True, "mul1"),
         ("parallel_mode", True, False),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
