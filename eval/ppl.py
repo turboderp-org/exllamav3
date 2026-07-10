@@ -201,10 +201,22 @@ def main(args):
 
         config = Config.from_directory(args.model_dir)
         tokenizer = Tokenizer.from_config(config)
+
+        # MXFP4 checkpoints (gpt-oss): dequantize at load rather than letting Transformers use
+        # the fused MXFP4 triton kernels, which crash on unsupported GPU/triton combinations
+        hf_kwargs = {}
+        qcfg = config.read_cfg(dict, "quantization_config", None)
+        if qcfg and qcfg.get("quant_method") == "mxfp4":
+            from transformers import Mxfp4Config
+            hf_kwargs["quantization_config"] = Mxfp4Config(dequantize = True)
+            if not args.hf_tight and not args.hf_fp32:
+                hf_kwargs["dtype"] = torch.bfloat16
+
         model = AutoModelForCausalLM.from_pretrained(
             args.model_dir,
-            device_map = "auto",
-            dtype = torch.half if args.hf_tight else torch.float if args.hf_fp32 else None,
+            device_map = "auto" if args.hf_device is None else torch.device(args.hf_device),
+            dtype = torch.half if args.hf_tight else torch.float if args.hf_fp32 else hf_kwargs.pop("dtype", None),
+            **hf_kwargs,
         )
 
         if args.hf_tight:
@@ -217,7 +229,7 @@ def main(args):
             free_mem()
 
         def forward_fn_hf(_model, _input_ids):
-            return _model.forward(_input_ids)["logits"]
+            return _model.forward(_input_ids.to(_model.device))["logits"]
         forward_fn = forward_fn_hf
 
 
@@ -235,6 +247,7 @@ if __name__ == "__main__":
     parser.add_argument("-g", "--gguf", action = "store_true", help = "Use GGUF-equivalent eval logic (ignores -r and -l)")
     parser.add_argument("-c", "--ctx-size", type = int, help = "For GGUF-equiv.: size of the prompt context (default: 512)", default = 512)
     parser.add_argument("-hf", "--hf", action = "store_true", help = "Use Transformers as backend (-m must be HF model)")
+    parser.add_argument("-hf_d", "--hf_device", type = int, help = "Use specific single device ID for Transformers (default: device_map='auto')", default = None)
     parser.add_argument("-hf_t", "--hf_tight", action = "store_true", help = "For Transformers: Force FP16 dtype to save memory")
     parser.add_argument("-hf_fp32", "--hf_fp32", action = "store_true", help = "For Transformers: Force FP32 dtype")
     parser.add_argument("-gp", "--gen_prompt", action = "store_true", help = "Prepend chat template generation prompt to every row (doesn't apply to GGUF mode)")
