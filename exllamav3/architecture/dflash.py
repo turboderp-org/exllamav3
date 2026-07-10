@@ -10,7 +10,6 @@ from ..modules import RMSNorm, TransformerBlock, Attention, GatedMLP
 from ..modules.arch_specific.dflash import DFlashInputLayer
 from ..modules.attn import prepare_for_attn
 from ..modules.module import no_p2p_copy
-from ..ext import exllamav3_ext as ext
 import weakref
 
 from ..util.tensor import get_for_device
@@ -231,8 +230,6 @@ class DFlashModel(Model):
             cache_seqlens = get_for_device(params, "cache_seqlens", layer.device)
             target_hidden = get_for_device(params, "target_hidden_cc", layer.device)
 
-            cache_k, cache_v = cache.get_layer(layer.layer_idx, cache_seqlens, block_table, -1, 0)
-
             # k/v project
             k = layer.k_proj.forward(target_hidden, params)
             v = layer.v_proj.forward(target_hidden, params)
@@ -254,15 +251,9 @@ class DFlashModel(Model):
                 False,
             )
 
-            # Write k, v to paged cache
-            ext.paged_kv_cache_update(
-                k, v,
-                cache_k, cache_v,
-                block_table,
-                cache_seqlens,
-            )
-
-            cache.update_layer(layer.layer_idx, cache_seqlens, block_table, cache_k, cache_v, target_seqlen, 0)
+            # Write k, v rows to the paged cache; quantized caches quantize them in place rather
+            # than dequantizing/requantizing full layers
+            cache.update_layer_direct(layer.layer_idx, cache_seqlens, block_table, k, v, target_seqlen, 0)
 
 
     def sample_from_state(
