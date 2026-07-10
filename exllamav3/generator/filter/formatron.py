@@ -13,6 +13,15 @@ except ModuleNotFoundError:
     formatron_available = False
 except ImportError:
     formatron_available = False
+except Exception:
+    formatron_available = False
+    try:
+        import kbnf
+    except Exception:
+        kbnf = None
+    FormatterBuilder = None
+    EngineGenerationConfig = None
+    get_original_characters = default_mask_logits_fn = get_bit_mask = None
 
 
 @lru_cache(10)
