@@ -70,6 +70,7 @@ def _paged_attn_splitdv_kernel(
     block_table,
     cache_seqlens,
     out,
+    sinks,
     q_len: tl.constexpr,
     kv_append_len: tl.constexpr,
     n_q_heads: tl.constexpr,
@@ -82,6 +83,7 @@ def _paged_attn_splitdv_kernel(
     WINDOW_LEFT: tl.constexpr,
     WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -153,6 +155,14 @@ def _paged_attn_splitdv_kernel(
         m = m_new
         l = l_new
 
+    if HAS_SINKS:
+        # Learned per-head sink: one extra exp(sink - m) term in the softmax denominator,
+        # contributing no value (gpt-oss style)
+        sink = tl.load(sinks + q_head).to(tl.float32)
+        m_top = tl.maximum(m, sink)
+        alpha_s = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_top))
+        acc = acc * alpha_s[:, None]
+        l = l * alpha_s + tl.exp(sink - m_top)
     out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
     out_ptrs = out + (((batch * q_len + offs_m[:, None]) * n_q_heads + q_head) * head_dim + offs_dv[None, :])
     tl.store(out_ptrs, out_tile, mask=(offs_m[:, None] < q_len) & (offs_dv[None, :] < head_dim))
@@ -166,6 +176,7 @@ def _paged_attn_longq_grouped_kernel(
     block_table,
     cache_seqlens,
     out,
+    sinks,
     q_len: tl.constexpr,
     kv_append_len: tl.constexpr,
     n_q_heads: tl.constexpr,
@@ -178,6 +189,7 @@ def _paged_attn_longq_grouped_kernel(
     WINDOW_LEFT: tl.constexpr,
     WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -208,8 +220,6 @@ def _paged_attn_longq_grouped_kernel(
 
     q_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
     q_tile = tl.load(q + q_base[:, None] + offs_d[None, :], mask=valid_row[:, None], other=0.0)
-    if QCK > 0:
-        q_tile = _rot_h32(q_tile, h32, BLOCK_ROWS, head_dim)
 
     total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
     q_abs = total_k_len - q_len + row_q
@@ -261,6 +271,12 @@ def _paged_attn_longq_grouped_kernel(
         m = m_new
         l = l_new
 
+    if HAS_SINKS:
+        sink = tl.load(sinks + q_head, mask=valid_row, other=0.0).to(tl.float32)
+        m_top = tl.maximum(m, sink)
+        alpha_s = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_top))
+        acc = acc * alpha_s[:, None]
+        l = l * alpha_s + tl.exp(sink - m_top)
     out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
     out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
     tl.store(
@@ -289,6 +305,18 @@ def _check_tensor(name: str, tensor: torch.Tensor, dtype: torch.dtype | None = t
         raise ValueError(f"{name} must be contiguous")
 
 
+def _prep_sinks(sinks: torch.Tensor | None, n_q_heads: int, dummy: torch.Tensor):
+    """Validate a learned attention-sinks tensor (one logit per q head, gpt-oss style) and
+    return (pointer arg, HAS_SINKS). The caller's dummy stands in when sinks are absent."""
+    if sinks is None:
+        return dummy, False
+    if sinks.shape != (n_q_heads,):
+        raise ValueError("sinks must have shape (n_q_heads,)")
+    if sinks.dtype != torch.float32 or not sinks.is_contiguous():
+        sinks = sinks.float().contiguous()
+    return sinks, True
+
+
 def _same_device(*tensors: torch.Tensor | None) -> bool:
     device = None
     for tensor in tensors:
@@ -313,6 +341,7 @@ def paged_attn_triton(
     softmax_scale: float | None = None,
     window_size: int | tuple[int, int] | None = None,
     softcap: float = 0.0,
+    sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     block_m: int | None = None,
     block_n: int = 64,
@@ -383,6 +412,7 @@ def paged_attn_triton(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     window_left, window_right = _normalize_window(window_size)
+    sinks, has_sinks = _prep_sinks(sinks, n_q_heads, q)
 
     if block_m is None:
         block_m = 16
@@ -425,6 +455,7 @@ def paged_attn_triton(
             block_table,
             cache_seqlens,
             out,
+            sinks,
             q_len,
             kv_append_len,
             n_q_heads,
@@ -437,6 +468,7 @@ def paged_attn_triton(
             int(window_left),
             int(window_right),
             float(softcap or 0.0),
+            has_sinks,
             block_m,
             block_n,
             block_dv,
@@ -458,6 +490,7 @@ def paged_attn_triton_longq(
     softmax_scale: float | None = None,
     window_size: int | tuple[int, int] | None = None,
     softcap: float = 0.0,
+    sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     block_m: int = 8,
     block_h: int = 4,
@@ -524,6 +557,7 @@ def paged_attn_triton_longq(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     window_left, window_right = _normalize_window(window_size)
+    sinks, has_sinks = _prep_sinks(sinks, n_q_heads, q)
 
     if block_dv is None:
         block_dv = min(512, head_dim)
@@ -570,6 +604,7 @@ def paged_attn_triton_longq(
             block_table,
             cache_seqlens,
             out,
+            sinks,
             q_len,
             kv_append_len,
             n_q_heads,
@@ -582,6 +617,7 @@ def paged_attn_triton_longq(
             int(window_left),
             int(window_right),
             float(softcap or 0.0),
+            has_sinks,
             block_m,
             block_rows,
             block_n,
@@ -618,6 +654,7 @@ def fn_triton_paged_attn(args: AttnArgs) -> torch.Tensor | None:
         softmax_scale=args.sm_scale,
         window_size=args.get_window_size(),
         softcap=args.softcap,
+        sinks=args.sinks,
     )
 
 
@@ -648,6 +685,7 @@ def fn_triton_paged_attn_longq(args: AttnArgs) -> torch.Tensor | None:
         softmax_scale=args.sm_scale,
         window_size=args.get_window_size(),
         softcap=args.softcap,
+        sinks=args.sinks,
     )
 
 
@@ -798,6 +836,7 @@ def _paged_attn_decode_split_kernel(
     split_len,           # runtime: derived from the block-table bound, changes as it grows
     num_pages_per_seq,   # runtime: block-table width can grow without recompiling
     num_splits,          # runtime: the grid may be launched wider (graph path); extra splits idle
+    sinks,               # last runtime arg: the BC launch appends it after the patched ints
     QCK: tl.constexpr,
     QCV: tl.constexpr,
     q_len: tl.constexpr,
@@ -812,6 +851,7 @@ def _paged_attn_decode_split_kernel(
     WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
     FINAL: tl.constexpr,       # num_splits == 1: skip the combine pass, store directly to out
+    HAS_SINKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
@@ -899,6 +939,12 @@ def _paged_attn_decode_split_kernel(
         l = l_new
 
     if FINAL:
+        if HAS_SINKS:
+            sink = tl.load(sinks + q_head, mask=valid_row, other=0.0).to(tl.float32)
+            m_top = tl.maximum(m, sink)
+            alpha_s = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_top))
+            acc = acc * alpha_s[:, None]
+            l = l * alpha_s + tl.exp(sink - m_top)
         out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
         if QCV > 0:
             out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, head_dim)
@@ -920,7 +966,9 @@ def _paged_attn_decode_combine_kernel(
     out,
     h32,
     num_splits,          # runtime
+    sinks,               # last runtime arg: the BC launch appends it after the patched int
     QCV: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
     q_len: tl.constexpr,
     n_q_heads: tl.constexpr,
     n_kv_heads: tl.constexpr,
@@ -953,6 +1001,11 @@ def _paged_attn_decode_combine_kernel(
         m_s = tl.load(partial_ml + ml_base + rows * 2)
         m_max = tl.maximum(m_max, m_s)
 
+    if HAS_SINKS:
+        # Learned per-head sink joins the softmax denominator at the final reduction
+        sink = tl.load(sinks + q_head, mask=valid_row, other=0.0).to(tl.float32)
+        m_max = tl.maximum(m_max, sink)
+
     l_sum = tl.zeros((BLOCK_ROWS,), tl.float32)
     acc = tl.zeros((BLOCK_ROWS, head_dim), tl.float32)
     m_safe = tl.where(m_max == -float("inf"), 0.0, m_max)
@@ -966,6 +1019,8 @@ def _paged_attn_decode_combine_kernel(
         acc += o_s * w[:, None]
         l_sum += l_s * w
 
+    if HAS_SINKS:
+        l_sum += tl.exp(sink - m_safe)
     out_tile = acc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
     if QCV > 0:
         out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, head_dim)
@@ -987,6 +1042,7 @@ def paged_attn_triton_decode(
     softmax_scale: float | None = None,
     window_size: int | tuple[int, int] | None = None,
     softcap: float = 0.0,
+    sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     block_n: int | None = None,
     num_splits: int | None = None,
@@ -1046,6 +1102,7 @@ def paged_attn_triton_decode(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     window_left, window_right = _normalize_window(window_size)
+    sinks, has_sinks = _prep_sinks(sinks, n_q_heads, q)
 
     if qc is not None:
         k_scales, v_scales, qck, qcv = qc
@@ -1099,17 +1156,18 @@ def paged_attn_triton_decode(
         _paged_attn_decode_split_kernel[(programs, num_splits)](
             q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
             k_scales, v_scales, h32,
-            split_len, num_pages_per_seq, num_splits, qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
+            split_len, num_pages_per_seq, num_splits, sinks,
+            qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
             page_size, head_dim, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            num_splits == 1, block_m, block_h, block_rows, block_n,
+            num_splits == 1, has_sinks, block_m, block_h, block_rows, block_n,
             num_warps=num_warps, num_stages=num_stages,
         )
 
         if num_splits > 1:
             _paged_attn_decode_combine_kernel[(programs,)](
                 partial_o, partial_ml, out, h32,
-                num_splits, qcv, q_len, n_q_heads, n_kv_heads, head_dim,
+                num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim,
                 block_m, block_h, block_rows,
                 num_warps=4, num_stages=1,
             )
@@ -1145,6 +1203,7 @@ def fn_triton_paged_attn_decode(args: AttnArgs) -> torch.Tensor | None:
         softmax_scale=args.sm_scale,
         window_size=args.get_window_size(),
         softcap=args.softcap,
+        sinks=args.sinks,
     )
 
 
@@ -1273,6 +1332,7 @@ def _paged_attn_prefill_kernel(
     h32,
     k_new,
     v_new,
+    sinks,
     num_splits: tl.constexpr,
     NEW_KV: tl.constexpr,     # 0: all kv in cache; 1: kv >= cache_seqlens[b] read from k_new/v_new;
                               # 2: like 1 but the cache is known empty (keeps the maskless split)
@@ -1290,6 +1350,7 @@ def _paged_attn_prefill_kernel(
     WINDOW_LEFT: tl.constexpr,
     WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -1424,6 +1485,13 @@ def _paged_attn_prefill_kernel(
         tl.store(partial_ml + ml_base + tl.arange(0, BLOCK_M) * 2, m)
         tl.store(partial_ml + ml_base + tl.arange(0, BLOCK_M) * 2 + 1, l)
     else:
+        if HAS_SINKS:
+            # m/l live in the log2 domain here, so the sink logit is scaled by log2(e)
+            sink = tl.load(sinks + q_head).to(tl.float32) * 1.4426950408889634
+            m_top = tl.maximum(m, sink)
+            alpha_s = tl.where(m == -float("inf"), 0.0, tl.exp2(m - m_top))
+            acc = acc * alpha_s[:, None]
+            l = l * alpha_s + tl.exp2(sink - m_top)
         out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
         if QCV > 0:
             out_tile = _rot_h32(out_tile, h32, BLOCK_M, head_dim)
@@ -1437,8 +1505,10 @@ def _paged_attn_prefill_combine_kernel(
     partial_ml,
     out,
     h32,
+    sinks,
     num_splits: tl.constexpr,
     QCV: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
     q_len: tl.constexpr,
     n_q_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -1458,6 +1528,10 @@ def _paged_attn_prefill_combine_kernel(
     for sp in range(num_splits):
         m_s = tl.load(partial_ml + (pid_lin + sp) * BLOCK_M * 2 + rows * 2)
         m_max = tl.maximum(m_max, m_s)
+    if HAS_SINKS:
+        # partials are in the log2 domain; scale the sink logit by log2(e)
+        sink = tl.load(sinks + q_head).to(tl.float32) * 1.4426950408889634
+        m_max = tl.maximum(m_max, sink)
     m_safe = tl.where(m_max == -float("inf"), 0.0, m_max)
 
     l_sum = tl.zeros((BLOCK_M,), tl.float32)
@@ -1471,6 +1545,8 @@ def _paged_attn_prefill_combine_kernel(
         acc += o_s * w[:, None]
         l_sum += l_s * w
 
+    if HAS_SINKS:
+        l_sum += tl.exp2(sink - m_safe)
     out_tile = acc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
     if QCV > 0:
         out_tile = _rot_h32(out_tile, h32, BLOCK_M, head_dim)
@@ -1490,6 +1566,7 @@ def paged_attn_triton_prefill(
     softmax_scale: float | None = None,
     window_size: int | tuple[int, int] | None = None,
     softcap: float = 0.0,
+    sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     block_m: int | None = None,
     block_n: int | None = None,
@@ -1575,6 +1652,7 @@ def paged_attn_triton_prefill(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     window_left, window_right = _normalize_window(window_size)
+    sinks, has_sinks = _prep_sinks(sinks, n_q_heads, q)
 
     if qc is not None:
         k_scales, v_scales, qck, qcv = qc
@@ -1644,18 +1722,18 @@ def paged_attn_triton_prefill(
         _paged_attn_prefill_kernel[grid](
             q, k_cache, v_cache, block_table, cache_seqlens, out,
             partial_o, partial_ml, k_scales, v_scales, h32,
-            k_new if new_kv_mode else q, v_new if new_kv_mode else q,
+            k_new if new_kv_mode else q, v_new if new_kv_mode else q, sinks,
             num_splits, new_kv_mode, qck, qcv,
             q_len, kv_append_len, n_q_heads, n_kv_heads,
             num_pages_per_seq, page_size, head_dim, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            block_m, block_n,
+            has_sinks, block_m, block_n,
             num_warps=num_warps, num_stages=num_stages,
         )
         if num_splits > 1:
             _paged_attn_prefill_combine_kernel[(q_blocks, bsz * n_q_heads)](
-                partial_o, partial_ml, out, h32,
-                num_splits, qcv, q_len, n_q_heads, head_dim, block_m,
+                partial_o, partial_ml, out, h32, sinks,
+                num_splits, qcv, has_sinks, q_len, n_q_heads, head_dim, block_m,
                 num_warps=8, num_stages=1,
             )
     return out
@@ -1683,6 +1761,7 @@ def fn_triton_attn_nocache(args: AttnArgs) -> torch.Tensor | None:
         softmax_scale = args.sm_scale,
         window_size = args.get_window_size(),
         softcap = args.softcap,
+        sinks = args.sinks,
         k_new = args.k,
         v_new = args.v,
     )
@@ -1717,6 +1796,7 @@ def fn_triton_paged_attn_prefill(args: AttnArgs) -> torch.Tensor | None:
         softmax_scale=args.sm_scale,
         window_size=args.get_window_size(),
         softcap=args.softcap,
+        sinks=args.sinks,
     )
 
 
@@ -1727,6 +1807,7 @@ def _varlen_attn_kernel(
     v,
     cu_seqlens,
     out,
+    sinks,
     n_q_heads: tl.constexpr,
     n_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -1736,6 +1817,7 @@ def _varlen_attn_kernel(
     WINDOW_LEFT: tl.constexpr,
     WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -1840,6 +1922,13 @@ def _varlen_attn_kernel(
         acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
         m = m_new
 
+    if HAS_SINKS:
+        # m/l live in the log2 domain here, so the sink logit is scaled by log2(e)
+        sink = tl.load(sinks + q_head).to(tl.float32) * 1.4426950408889634
+        m_top = tl.maximum(m, sink)
+        alpha_s = tl.where(m == -float("inf"), 0.0, tl.exp2(m - m_top))
+        acc = acc * alpha_s[:, None]
+        l = l * alpha_s + tl.exp2(sink - m_top)
     out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
     out_ptrs = out + ((q0 + offs_m[:, None]) * n_q_heads + q_head) * head_dim + offs_d[None, :]
     tl.store(out_ptrs, out_tile, mask = valid_row[:, None] & d_mask[None, :])
@@ -1855,6 +1944,7 @@ def varlen_attn_triton(
     softmax_scale: float | None = None,
     window_size: int | tuple[int, int] | None = None,
     softcap: float = 0.0,
+    sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Packed varlen self-attention over (total, heads, head_dim) tensors, segments given by
@@ -1873,6 +1963,7 @@ def varlen_attn_triton(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     window_left, window_right = _normalize_window(window_size)
+    sinks, has_sinks = _prep_sinks(sinks, n_q_heads, q)
 
     num_segs = cu_seqlens.shape[0] - 1
     hd_p2 = triton.next_power_of_2(head_dim)
@@ -1891,10 +1982,10 @@ def varlen_attn_triton(
     with torch.cuda.device(q.device):
         grid = (triton.cdiv(max_seqlen, block_m), num_segs, n_q_heads)
         _varlen_attn_kernel[grid](
-            q, k, v, cu_seqlens, out,
+            q, k, v, cu_seqlens, out, sinks,
             n_q_heads, n_kv_heads, head_dim, hd_p2, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            block_m, block_n,
+            has_sinks, block_m, block_n,
             num_warps=num_warps, num_stages=num_stages,
         )
     return out.unsqueeze(0) if squeeze else out
@@ -1922,6 +2013,7 @@ def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
         softmax_scale=args.sm_scale,
         window_size=args.get_window_size(),
         softcap=args.softcap,
+        sinks=args.sinks,
     )
 
 
@@ -1946,6 +2038,7 @@ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
         softmax_scale=args.sm_scale,
         window_size=args.get_window_size(),
         softcap=args.softcap,
+        sinks=args.sinks,
         qc=(sk, sv, k_bits, v_bits),
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,
@@ -1973,6 +2066,7 @@ def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
         softmax_scale=args.sm_scale,
         window_size=args.get_window_size(),
         softcap=args.softcap,
+        sinks=args.sinks,
         qc=(sk, sv, k_bits, v_bits),
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,

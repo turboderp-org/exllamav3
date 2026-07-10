@@ -23,6 +23,7 @@ class AttnArgs(NamedTuple):
     cache_seqlens: torch.Tensor | None
     non_causal_spans: list | None = None
     q_cache: tuple | None = None    # (qk, sk, qv, sv, k_bits, v_bits): packed quantized cache
+    sinks: torch.Tensor | None = None    # learned per-q-head sink logits (gpt-oss style)
 
     def sanity_check(self):
         # Cache must be paged
@@ -75,6 +76,9 @@ def get_non_causal_span_arglist(args: AttnArgs):
     arglist = []
     for a, b, nc in args.non_causal_spans:
         l = b - a
+        # Only the Triton wrappers take a sinks argument; backends without support decline
+        # sinked calls before expanding the spans, so the key is omitted when unused
+        extra = dict(sinks = args.sinks) if args.sinks is not None else {}
         arglist.append(dict(
             q = args.q[:, a: b],
             k = args.k[:, a: b],
@@ -90,6 +94,7 @@ def get_non_causal_span_arglist(args: AttnArgs):
                 if args.window_size is not None and args.window_size > 0 and nc else
                 args.get_window_size()
             ),
-            softcap = args.softcap
+            softcap = args.softcap,
+            **extra,
         ))
     return arglist

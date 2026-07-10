@@ -72,7 +72,7 @@ def _print_no_attn_match_report(args: AttnArgs):
         f"q_heads={args.num_q_heads} kv_heads={args.num_kv_heads} dim={args.dim}\n"
         f"  flags: cache={args.has_kv_cache()} varlen={args.is_varlen()} gqa={args.is_gqa()} "
         f"causal={args.causal} window_size={args.window_size} softcap={args.softcap} "
-        f"non_causal_spans={args.non_causal_spans is not None}\n"
+        f"non_causal_spans={args.non_causal_spans is not None} sinks={args.sinks is not None}\n"
         f"  scale: sm_scale={args.sm_scale} max_seqlen={args.max_seqlen}\n"
         f"  q: {_tensor_desc(args.q)}\n"
         f"  k: {_tensor_desc(args.k)}\n"
@@ -102,6 +102,7 @@ def attn_dispatch(
     block_table: torch.Tensor | None = None,
     cache_seqlens: torch.Tensor | None = None,
     non_causal_spans: list | None = None,
+    sinks: torch.Tensor | None = None,
     dispatch_cache: dict | None = None,
 ):
     """
@@ -157,6 +158,7 @@ def attn_dispatch(
         block_table, cache_seqlens,
         non_causal_spans,
         q_cache,
+        sinks,
     )
     # Retry the backend that matched last time for this caller before scanning the full list.
     # Candidate functions return None on incompatible arguments, so a stale hint self-corrects

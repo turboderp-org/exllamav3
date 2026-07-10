@@ -12,6 +12,7 @@ def fn_bighead_scalar_attn(args: AttnArgs) -> torch.Tensor | None:
         args.dim < 512 or
         args.q_len >= 8 or
         args.softcap != 0.0 or
+        args.sinks is not None or
         args.non_causal_spans
     ):
         return None

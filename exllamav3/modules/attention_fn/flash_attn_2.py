@@ -12,6 +12,7 @@ except (ModuleNotFoundError, ImportError):
 def fn_flash_attn_with_kvcache(args: AttnArgs) -> torch.Tensor | None:
     if (
         not has_fa2 or
+        args.sinks is not None or
         args.is_varlen() or
         not args.has_kv_cache() or
         args.dim > 256
@@ -41,6 +42,7 @@ def fn_flash_attn_with_kvcache(args: AttnArgs) -> torch.Tensor | None:
 def fn_flash_attn_func(args: AttnArgs) -> torch.Tensor | None:
     if (
         not has_fa2 or
+        args.sinks is not None or
         args.is_varlen() or
         args.has_kv_cache() or
         args.dim > 256 or
@@ -62,6 +64,7 @@ def fn_flash_attn_func(args: AttnArgs) -> torch.Tensor | None:
 def fn_flash_attn_varlen_func(args: AttnArgs) -> torch.Tensor | None:
     if (
         not has_fa2 or
+        args.sinks is not None or
         not args.is_varlen() or
         args.bsz > 1 or
         args.has_kv_cache() or

@@ -198,28 +198,29 @@ class BCAttn:
             "partial_o": "*fp32", "partial_ml": "*fp32",
             "k_scales": "*fp16", "v_scales": "*fp16", "h32": "*fp16",
             "split_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
+            "sinks": "*fp32",
         } | {n: "constexpr" for n in (
             "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
             "page_size", "head_dim", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
-            "SOFTCAP", "FINAL", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N")}
+            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N")}
         consts = dict(
             QCK = self.k_bits, QCV = self.v_bits,
             q_len = q_len, kv_append_len = q_len, n_q_heads = qh, n_kv_heads = kvh,
             page_size = PAGE_SIZE, head_dim = hd, scale = float(self.sm_scale),
             CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
-            SOFTCAP = float(self.softcap or 0.0), FINAL = False,
+            SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
         k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, 4, 2)
 
         sig_c = {
             "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
-            "num_splits": "i32",
+            "num_splits": "i32", "sinks": "*fp32",
         } | {n: "constexpr" for n in (
-            "QCV", "q_len", "n_q_heads", "n_kv_heads", "head_dim",
+            "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim",
             "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")}
         consts_c = dict(
-            QCV = self.v_bits, q_len = q_len,
+            QCV = self.v_bits, HAS_SINKS = False, q_len = q_len,
             n_q_heads = qh, n_kv_heads = kvh, head_dim = hd,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
         )

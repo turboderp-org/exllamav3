@@ -371,6 +371,7 @@ void BC_Attention::run_gr
             (void*) (intptr_t) split_len,
             (void*) (intptr_t) (int) block_table.size(1),
             (void*) (intptr_t) num_splits,
+            (void*) s.q.data_ptr(),  // sinks: dead arg, slots compile with HAS_SINKS = false
         };
         // Launched at the split cap so the captured grid never changes; splits at or above the
         // live count exit without storing
@@ -393,6 +394,7 @@ void BC_Attention::run_gr
             (void*) s.o.data_ptr(),
             (void*) h32.data_ptr(),
             (void*) (intptr_t) num_splits,
+            (void*) s.q.data_ptr(),  // sinks: dead arg, slots compile with HAS_SINKS = false
         };
         s.k_combine->launch(s.programs, 1, 1, args, stream);
         if (graph)

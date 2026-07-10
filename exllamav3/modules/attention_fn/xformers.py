@@ -44,6 +44,7 @@ def fn_xformers_cutlass_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
         args.has_kv_cache() or
         args.dim < 512 or
         args.softcap != 0.0 or
+        args.sinks is not None or
         args.non_causal_spans or
         args.is_swa()
     ):
@@ -80,6 +81,7 @@ def fn_xformers_cutlass_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
         not args.has_kv_cache() or
         args.dim < 512 or
         args.softcap != 0.0 or
+        args.sinks is not None or
         args.is_swa()
     ):
         return None
