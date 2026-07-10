@@ -78,6 +78,35 @@ def get_non_causal_span_arglist(args: AttnArgs):
         a, b, nc = span[:3]
         pre = span[3] if len(span) > 3 else 0
         l = b - a
+        window_size = (
+            (max(args.window_size, l + pre), l - 1 if nc else 0)
+            if args.window_size is not None and args.window_size > 0 and nc else
+            args.get_window_size()
+        )
+        if args.q_cache is not None:
+            # Quant-direct: the whole chunk's K/V was quantized into the paged cache before
+            # dispatch, so each span is a pure read over the packed cache up to kv position
+            # cache_seqlens + b. Rows past b are already written but sit above the length the
+            # kernel derives from cache_seqlens + pre_appended_len, so they are never read
+            qk, sk, qv, sv, k_bits, v_bits = args.q_cache
+            arglist.append(dict(
+                q = args.q[:, a: b].contiguous(),
+                k = None,
+                v = None,
+                k_cache = qk,
+                v_cache = qv,
+                block_table = args.block_table,
+                cache_seqlens = args.cache_seqlens + a,
+                causal = not nc,
+                softmax_scale = args.sm_scale,
+                window_size = window_size,
+                softcap = args.softcap,
+                sinks = args.sinks,
+                qc = (sk, sv, k_bits, v_bits),
+                pre_appended_len = l,
+                n_kv_heads_override = args.num_kv_heads,
+            ))
+            continue
         # Only the Triton wrappers take a sinks argument; backends without support decline
         # sinked calls before expanding the spans, so the key is omitted when unused
         extra = dict(sinks = args.sinks) if args.sinks is not None else {}
@@ -91,11 +120,7 @@ def get_non_causal_span_arglist(args: AttnArgs):
             cache_seqlens = args.cache_seqlens + a,
             causal = not nc,
             softmax_scale = args.sm_scale,
-            window_size = (
-                (max(args.window_size, l + pre), l - 1 if nc else 0)
-                if args.window_size is not None and args.window_size > 0 and nc else
-                args.get_window_size()
-            ),
+            window_size = window_size,
             softcap = args.softcap,
             **extra,
         ))

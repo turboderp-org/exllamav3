@@ -148,13 +148,9 @@ class Model_LSMixin(ABC):
                         if defer:
                             config.stc.end_deferred_load()
 
-                        # Account for cache quant temporary tensors
-                        qcache_overhead = []
-                        for cm in module.all_cache_modules():
-                            for cl in cm.cache_layers:
-                                qcache_overhead.append(cl.get_kv_alloc_placeholder())
-
-                        # Forward dummy state through module
+                        # Forward dummy state through module. The forward runs the real cached
+                        # attention path, so any dequant temporaries a quantized cache layer
+                        # still needs are allocated (and accounted) here
                         if self.caps.get("autosplit_load_fwd", True) and not autosplit_no_forward:
                             dummy_state = module.prepare_for_device(dummy_state, params)
                             dummy_state = module.forward(dummy_state, params)
@@ -169,7 +165,6 @@ class Model_LSMixin(ABC):
 
                         # Dereference extra dummy tensors
                         extra_dummy_out_states = None
-                        qcache_overhead = None
 
                         # We're good
                         fail = False

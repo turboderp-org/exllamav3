@@ -99,13 +99,6 @@ class CacheLayer_quant(CacheLayer):
 
 
     @override
-    def get_kv_alloc_placeholder(self):
-        k = torch.empty(self.shape, dtype = torch.half, device = self.device)
-        v = torch.empty(self.shape, dtype = torch.half, device = self.device)
-        return k, v
-
-
-    @override
     def update_kv(
         self,
         cache_seqlens: torch.Tensor,

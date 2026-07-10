@@ -1675,8 +1675,13 @@ def paged_attn_triton_prefill(
     num_warps = num_warps or cfg[2]
     num_stages = num_stages or cfg[3]
     if qc is not None:
-        # compact plane tiles stage fewer smem bytes than fp16: wider kv tiles pay off
+        # compact plane tiles stage fewer smem bytes than fp16: wider kv tiles pay off. Wide
+        # bit widths at large head_dim overstep the ~99 KB smem budget with the non-causal loop
+        # structure (measured boundary: head_dim >= 256 with k_bits + v_bits >= 13), so halve
+        # the kv tile there
         block_n = max(16, min(128, 16384 // head_dim))
+        if head_dim >= 256 and qck + qcv >= 13 and block_n > 16:
+            block_n //= 2
 
     num_pages_per_seq = block_table.shape[1]
     q_blocks = triton.cdiv(q_len, block_m)
@@ -2049,13 +2054,19 @@ def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
     if (
         args.q_cache is None or
         not has_triton or
-        args.q_len <= 16 or
+        (args.q_len <= 16 and not args.non_causal_spans) or
         args.dim > 512 or
         not _is_power_of_2(args.dim) or
-        args.q.dtype != torch.float16 or
-        args.non_causal_spans
+        args.q.dtype != torch.float16
     ):
         return None
+
+    # Span chunks of any length expand into per-span reads over the packed cache (the decode
+    # qc fn declines spans, so short span chunks land here too)
+    if args.non_causal_spans:
+        arglist = get_non_causal_span_arglist(args)
+        return torch.cat([paged_attn_triton_prefill(**a) for a in arglist], dim=1)
+
     qk, sk, qv, sv, k_bits, v_bits = args.q_cache
     return paged_attn_triton_prefill(
         q=args.q, k=None, v=None,

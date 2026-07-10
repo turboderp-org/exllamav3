@@ -129,14 +129,13 @@ def attn_dispatch(
             layer.compand_a == 0.0 and
             q.dtype == torch.float16 and
             dim <= 512 and _is_power_of_2(dim) and
-            non_causal_spans is None and
             cu_seqlens is None
         ):
             layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
             q_cache = layer.get_qkv()
             k_cache, v_cache = None, None
         else:
-            k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, window_size)
+            k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, window_size if window_size is not None else -1)
     else:
         k_cache, v_cache = None, None
 
