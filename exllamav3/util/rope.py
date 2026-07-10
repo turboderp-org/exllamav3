@@ -239,9 +239,13 @@ class RoPE:
         self.llama_4_scaling_original = original_max_position_embeddings
         def find_correction_dim(_num_rotations, _dim, _base, _max_position_embeddings):
             return (_dim * math.log(_max_position_embeddings / (_num_rotations * 2 * math.pi))) / (2 * math.log(_base))
+        truncate = rs.rope_scaling.get("truncate", True)
         def find_correction_range(_low_rot, _high_rot, _dim, _base, _max_position_embeddings):
-            _low = math.floor(find_correction_dim(_low_rot, _dim, _base, _max_position_embeddings))
-            _high = math.ceil(find_correction_dim(_high_rot, _dim, _base, _max_position_embeddings))
+            _low = find_correction_dim(_low_rot, _dim, _base, _max_position_embeddings)
+            _high = find_correction_dim(_high_rot, _dim, _base, _max_position_embeddings)
+            if truncate:
+                _low = math.floor(_low)
+                _high = math.ceil(_high)
             return max(_low, 0), min(_high, dim - 1)
         def linear_ramp_factor(_min, _max, _dim):
             if _min == _max:
