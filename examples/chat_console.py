@@ -197,6 +197,92 @@ class Streamer_rich:
                 self.last_update = now
                 self.live.update(formatted_text)
 
+
+class Streamer_harmony:
+    """Render each Harmony output channel as a separate Markdown block."""
+
+    channel_tag = "<|channel|>"
+    message_tag = "<|message|>"
+    end_tag = "<|end|>"
+
+    def __init__(self, args, bot_name, think_tag, end_think_tag, updates_per_second, think):
+        self.all_text = ""
+        self.updates_per_second = updates_per_second
+        self.last_update = time.time()
+        self.buffer = ""
+        self.channel = None
+        self.channel_text = ""
+        self.live = None
+
+    def __enter__(self):
+        print()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.stream("", True)
+        self._close_channel(exc_type, exc_value, traceback)
+
+    def _close_channel(self, exc_type = None, exc_value = None, traceback = None):
+        if self.live is not None:
+            self.live.update(self.channel_text)
+            self.live.__exit__(exc_type, exc_value, traceback)
+            self.live = None
+            print()
+        self.channel = None
+        self.channel_text = ""
+
+    def _begin_channel(self, channel):
+        self.channel = channel.strip()
+        print(col_bot + self.channel + col_default + ":")
+        print()
+        self.live = MarkdownConsoleStream()
+        self.live.__enter__()
+
+    def _update(self, force = False):
+        if self.live is None:
+            return
+        now = time.time()
+        if force or now - self.last_update > 1.0 / self.updates_per_second:
+            self.last_update = now
+            self.live.update(self.channel_text)
+
+    def stream(self, text: str, force: bool = False):
+        self.all_text += text
+        self.buffer += text
+
+        while True:
+            if self.channel is None:
+                pos = self.buffer.find(self.channel_tag)
+                if pos < 0:
+                    # Retain enough of the suffix to recognize a split tag.
+                    self.buffer = self.buffer[-(len(self.channel_tag) - 1):]
+                    break
+                self.buffer = self.buffer[pos + len(self.channel_tag):]
+                pos = self.buffer.find(self.message_tag)
+                if pos < 0:
+                    self.buffer = self.channel_tag + self.buffer
+                    break
+                self._begin_channel(self.buffer[:pos])
+                self.buffer = self.buffer[pos + len(self.message_tag):]
+
+            pos = self.buffer.find(self.end_tag)
+            if pos < 0:
+                keep = len(self.end_tag) - 1
+                if len(self.buffer) > keep:
+                    self.channel_text += self.buffer[:-keep]
+                    self.buffer = self.buffer[-keep:]
+                break
+
+            self.channel_text += self.buffer[:pos]
+            self.buffer = self.buffer[pos + len(self.end_tag):]
+            self._close_channel()
+
+        if force and self.channel is not None:
+            self.channel_text += self.buffer
+            self.buffer = ""
+        self._update(force)
+
+
 class KeyReader:
     """
     Cross-platform, non-blocking key reader.

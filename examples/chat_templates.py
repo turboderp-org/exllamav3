@@ -802,7 +802,6 @@ class PromptFormat_minimax(PromptFormat):
 
 
 class PromptFormat_gptoss(PromptFormat):
-    # TODO: Separate output mode for harmony format (multiple channels)
     description = "GPT-OSS"
 
     def __init__(self, *args):
@@ -818,7 +817,7 @@ class PromptFormat_gptoss(PromptFormat):
             f"<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n"
             f"Knowledge cutoff: 2024-06\n"
             f"Current date: {self.today_str}\n\n"
-            f"Reasoning: medium\n\n"
+            f"Reasoning: {'medium' if think else 'low'}\n\n"
             f"# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\n"
         )
         if system_prompt:
@@ -829,9 +828,11 @@ class PromptFormat_gptoss(PromptFormat):
             context += u
             context += "<|end|>"
             if a is not None:
-                context += "<|start|>assistant<|channel|>final<|message|>"
-                context += a
-                context += "<|end|>"
+                context += "<|start|>assistant"
+                if a.startswith("<|channel|>"):
+                    context += a
+                else:
+                    context += "<|channel|>final<|message|>" + a + "<|end|>"
             else:
                 context += "<|start|>assistant"
         return context
@@ -846,7 +847,8 @@ class PromptFormat_gptoss(PromptFormat):
         ]
 
     def thinktag(self):
-        return "<|channel|>", "<|end|>"
+        # Harmony channels are structural output, not think tags.
+        return None, None
 
 
 prompt_formats = {

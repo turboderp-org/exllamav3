@@ -47,6 +47,9 @@ def main(args):
     if args.basic_console:
         read_input_fn = read_input_ptk
         streamer_cm = Streamer_basic
+    elif args.mode == "gptoss":
+        read_input_fn = read_input_ptk
+        streamer_cm = Streamer_harmony
     else:
         read_input_fn = read_input_ptk
         streamer_cm = Streamer_rich
@@ -88,7 +91,7 @@ def main(args):
     print("\n" + col_sysprompt + system_prompt.strip() + col_default)
     context = []
     tt = prompt_format.thinktag()
-    banned_strings = [tt[0], tt[1]] if args.no_think else []
+    banned_strings = [tag for tag in tt if tag] if args.no_think else []
     response = ""
     last_tokens = None
 
