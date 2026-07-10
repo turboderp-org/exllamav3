@@ -20,6 +20,7 @@ def convert_dtype(dt: str):
     elif dt == "BF16": return torch.bfloat16, np.float16, 2
     elif dt == "F32": return torch.float, np.float32, 4
     elif dt == "F8_E4M3": return torch.float8_e4m3fn, np.int8, 1
+    elif dt == "U8": return torch.uint8, np.uint8, 1
     else:
         raise ValueError(f"Unknown dtype {dt}")
 
