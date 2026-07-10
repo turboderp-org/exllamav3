@@ -1149,6 +1149,13 @@ class Job:
                         }
                     )
 
+                # Atomic MM prefill may have extended the forward pass past prefill_end, advancing any
+                # recurrent state beyond the chunk boundary. The extension is processed again by the
+                # next chunk, so rewind to keep the state position in sync with kv_position. Re-fed
+                # tokens map to the same state slots with the same values, leaving state content intact.
+                if self.recurrent_state is not None and self.recurrent_state.position > prefill_end:
+                    self.recurrent_state.rewind(self.recurrent_state.position - prefill_end)
+
                 seq.kv_position = prefill_end
 
                 p2 = min(p1 + 1, len(seq.allocated_pages))
