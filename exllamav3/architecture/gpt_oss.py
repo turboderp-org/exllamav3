@@ -87,6 +87,7 @@ class GptOssModel(Model):
                         key = f"{key_prefix}.layers.{idx}.input_layernorm",
                         rms_norm_eps = config.rms_norm_eps,
                     ),
+                    # TODO: Use SlidingAttention module for SWA layer, mark model as recurrent, verify checkpointing etc.
                     attn = Attention(
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.self_attn",
