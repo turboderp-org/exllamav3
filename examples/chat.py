@@ -11,6 +11,7 @@ from chat_util import *
 from chat_io import *
 import torch
 from chat_console import *
+from chat_python import *
 from safetensors.torch import save_file
 
 def get_last_assistant_response(context: list[tuple[str, str | None]], fallback: str) -> str:
@@ -136,6 +137,7 @@ def main(args):
                         "/load <filename>   Load stored session from file",
                         "/mli               Toggle multiline input",
                         "/probs             Set number of probs recorded (0 to disable), adds overhead",
+                        "/python            Extract and run the longest code block in a bwrap sandbox",
                         "/r                 Rewind and repeat last prompt",
                         "/save              Save current session to ~/chat_py_session.json",
                         "/save <filename>   Save current session to file",
@@ -293,6 +295,68 @@ def main(args):
                         path = write_svg_to_temp(svg)
                         print_info(f"Writing SVG to: {path}")
                         webbrowser.open(path.as_uri())
+                    continue
+
+                # Extract Python from last response and run it in Bubblewrap
+                case "/python":
+                    bwrap = find_bubblewrap()
+                    if not bwrap:
+                        print_error(bubblewrap_help())
+                        continue
+
+                    snippet = extract_longest_codeblock(get_last_assistant_response(context, response))
+                    if not snippet:
+                        print_error("No code block found in last response")
+                        continue
+
+                    lines = snippet.splitlines()
+                    preview = "\n".join(f"{i + 1:>3} | {line}" for i, line in enumerate(lines[:10]))
+                    if len(lines) > 10:
+                        preview += f"\n    | ... ({len(lines) - 10} more lines)"
+                    wayland = find_wayland_display()
+                    backend = find_wayland_matplotlib_backend() if wayland else None
+                    if wayland and backend.name != "Agg":
+                        display_access = (
+                            f"Wayland display access is enabled using matplotlib's {backend.name} backend; "
+                            "X11 remains unavailable."
+                        )
+                    elif wayland:
+                        display_access = (
+                            "Wayland display access is enabled, but no Wayland-native matplotlib backend "
+                            "was found; matplotlib will remain headless."
+                        )
+                    else:
+                        display_access = "No Wayland display is available; graphical libraries will run headless."
+                    warning = (
+                        "\n\u001b[1;37;41m"
+                        " WARNING: MODEL-GENERATED PYTHON IS ABOUT TO BE EXECUTED "
+                        "\u001b[0m\n\n"
+                        f"{preview}\n\n"
+                        "The code will run in a Bubblewrap sandbox with no network, "
+                        "read-only access to the current Python environment, and a "
+                        f"temporary writable directory. {display_access}\n"
+                        "Press Enter to execute or Esc to cancel: "
+                    )
+                    print(warning, end = "", flush = True)
+                    try:
+                        with KeyReader() as keyreader:
+                            keypress = keyreader.getkey(timeout = None)
+                    except KeyboardInterrupt:
+                        keypress = "\x1b"
+                    print()
+
+                    if keypress not in ("\n", "\r"):
+                        print_info("Python execution canceled")
+                        continue
+
+                    print_info("Running Python snippet in Bubblewrap sandbox\n")
+                    returncode, error = run_python_sandboxed(snippet)
+                    if error:
+                        print_error(error)
+                    elif returncode:
+                        print_error(f"Python exited with status {returncode}")
+                    else:
+                        print_info("Python exited successfully")
                     continue
 
                 # Load conversation
