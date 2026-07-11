@@ -317,25 +317,23 @@ def main(args):
                     backend = find_wayland_matplotlib_backend() if wayland else None
                     if wayland and backend.name != "Agg":
                         display_access = (
-                            f"Wayland display access is enabled using matplotlib's {backend.name} backend; "
-                            "X11 remains unavailable."
+                            f" - Wayland display access is enabled using matplotlib's {backend.name} backend; "
+                            "X11 remains unavailable.\n"
                         )
                     elif wayland:
                         display_access = (
-                            "Wayland display access is enabled, but no Wayland-native matplotlib backend "
-                            "was found; matplotlib will remain headless."
+                            " - Wayland display access is enabled, but no Wayland-native matplotlib backend "
+                            "was found; matplotlib will remain headless.\n"
                         )
                     else:
-                        display_access = "No Wayland display is available; graphical libraries will run headless."
+                        display_access = " - No Wayland display is available; graphical libraries will run headless.\n"
                     warning = (
-                        "\n\u001b[1;37;41m"
-                        " WARNING: MODEL-GENERATED PYTHON IS ABOUT TO BE EXECUTED "
-                        "\u001b[0m\n\n"
+                        f"\n{col_error} WARNING! MODEL-GENERATED PYTHON IS ABOUT TO BE EXECUTED:{col_default}\n"
                         f"{preview}\n\n"
-                        "The code will run in a Bubblewrap sandbox with no network, "
-                        "read-only access to the current Python environment, and a "
-                        f"temporary writable directory. {display_access}\n"
-                        "Press Enter to execute or Esc to cancel: "
+                        f" - The code will run in a Bubblewrap sandbox with no network, "
+                        f"read-only access to the current Python environment, and a "
+                        f"temporary writable directory.\n{display_access}\n"
+                        f"Press Enter to execute or Esc to cancel"
                     )
                     print(warning, end = "", flush = True)
                     try:
