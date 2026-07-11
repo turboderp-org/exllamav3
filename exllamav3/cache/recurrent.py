@@ -53,6 +53,17 @@ class RecurrentCache(OrderedDict):
         return total
 
 
+# Checkpoint handles key the per-rank recurrent_cache dicts and must be unique across all
+# recurrent module types (GDN, short-conv, SWA states all stash through the same dict)
+_next_checkpoint_handle = 0
+
+def new_checkpoint_handle() -> int:
+    global _next_checkpoint_handle
+    h = _next_checkpoint_handle
+    _next_checkpoint_handle += 1
+    return h
+
+
 # Per-rank functions for tensor-parallel mode
 
 def mp_cache_recurrent_clear(local_context: dict, cache_id: int, slot: int):
@@ -62,23 +73,23 @@ def mp_cache_recurrent_clear(local_context: dict, cache_id: int, slot: int):
         recurrent_layer.clear(slot)
 
 
-def mp_cache_recurrent_stash(local_context: dict, cache_id: int, cp_handle: int, slot: int):
+def mp_cache_recurrent_stash(local_context: dict, cache_id: int, cp_handle: int, slot: int, position: int = 0):
     recurrent_modules = local_context["recurrent_modules"]
     recurrent_cache = local_context["recurrent_cache"]
     stashed = []
     for module in recurrent_modules:
         l = module.tp_recurrent_lookup[cache_id]
-        stashed.append(l.stash(slot))
+        stashed.append(l.stash(slot, position))
     recurrent_cache[cp_handle] = stashed
 
 
-def mp_cache_recurrent_unstash(local_context: dict, cache_id: int, cp_handle: int, slot: int):
+def mp_cache_recurrent_unstash(local_context: dict, cache_id: int, cp_handle: int, slot: int, position: int = 0):
     recurrent_modules = local_context["recurrent_modules"]
     recurrent_cache = local_context["recurrent_cache"]
     stashed = recurrent_cache[cp_handle]
     for module, s in zip(recurrent_modules, stashed):
         l = module.tp_recurrent_lookup[cache_id]
-        l.unstash(slot, s)
+        l.unstash(slot, s, position)
 
 
 def mp_cache_recurrent_del(local_context: dict, cache_id: int, cp_handle: int):

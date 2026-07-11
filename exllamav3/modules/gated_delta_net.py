@@ -15,11 +15,11 @@ from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 from ..cache.recurrent import (
     mp_cache_recurrent_stash,
     mp_cache_recurrent_unstash,
-    mp_cache_recurrent_clear
+    mp_cache_recurrent_clear,
+    new_checkpoint_handle,
 )
 from ..util import profile_opt
 
-next_checkpoint_handle = 0
 
 def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
     recurrent_modules = local_context["recurrent_modules"]
@@ -81,7 +81,6 @@ class GDNState:
 
 
     def stash(self):
-        global next_checkpoint_handle
         stashed = {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size
@@ -90,9 +89,9 @@ class GDNState:
             for k, l in self.cache.get_all_recurrent_layers().items():
                 stashed[k] = l.stash(self.slot)
         else:
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), next_checkpoint_handle, self.slot))
-            stashed["tp_handle"] = next_checkpoint_handle
-            next_checkpoint_handle += 1
+            cp_handle = new_checkpoint_handle()
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot))
+            stashed["tp_handle"] = cp_handle
         return stashed
 
 
@@ -202,7 +201,7 @@ class GDNLayerState:
             c_state.copy_(temp)
 
 
-    def stash(self, slot):
+    def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
         return (
             self.recurrent_state[slot, :1].cpu(),
@@ -210,7 +209,7 @@ class GDNLayerState:
         )
 
 
-    def unstash(self, slot, stashed):
+    def unstash(self, slot, stashed, position: int = 0):
         cdim = self.module.conv_kernel_size
         s, c = stashed
         self.recurrent_state[slot, :1].copy_(s)

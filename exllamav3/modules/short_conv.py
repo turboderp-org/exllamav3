@@ -11,9 +11,9 @@ from ..cache.recurrent import (
     mp_cache_recurrent_stash,
     mp_cache_recurrent_unstash,
     mp_cache_recurrent_clear,
+    new_checkpoint_handle,
 )
 
-next_checkpoint_handle = 0
 
 
 def mp_cache_short_conv_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
@@ -76,7 +76,6 @@ class ShortConvState:
 
 
     def stash(self):
-        global next_checkpoint_handle
         stashed = {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size
@@ -85,9 +84,9 @@ class ShortConvState:
             for k, l in self.cache.get_all_recurrent_layers().items():
                 stashed[k] = l.stash(self.slot)
         else:
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), next_checkpoint_handle, self.slot))
-            stashed["tp_handle"] = next_checkpoint_handle
-            next_checkpoint_handle += 1
+            cp_handle = new_checkpoint_handle()
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot))
+            stashed["tp_handle"] = cp_handle
         return stashed
 
 
@@ -178,12 +177,12 @@ class ShortConvLayerState:
             c_state.copy_(temp)
 
 
-    def stash(self, slot):
+    def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
         return self.conv_state[slot, :, :cdim].cpu()
 
 
-    def unstash(self, slot, stashed):
+    def unstash(self, slot, stashed, position: int = 0):
         cdim = self.module.conv_kernel_size
         self.conv_state[slot, :, :cdim].copy_(stashed)
 
