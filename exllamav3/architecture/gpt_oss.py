@@ -169,6 +169,11 @@ class GptOssModel(Model):
         # Activate all experts during H capture pass in quantization
         self.calibration_all_experts = True
 
+        # TP is not currently supported
+        self.caps.update({
+            "supports_tp": False,
+        })
+
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
