@@ -31,9 +31,10 @@ inline void do16(uint16_t* __restrict ap, const uint16_t* __restrict bp)
     __m256 s_lo = _mm256_add_ps(_mm256_castsi256_ps(a_lo32), _mm256_castsi256_ps(b_lo32));
     __m256 s_hi = _mm256_add_ps(_mm256_castsi256_ps(a_hi32), _mm256_castsi256_ps(b_hi32));
 
-    // Truncate back to BF16
-    __m256i u_lo = _mm256_srli_epi32(_mm256_castps_si256(s_lo), 16);
-    __m256i u_hi = _mm256_srli_epi32(_mm256_castps_si256(s_hi), 16);
+    // Round back to BF16 (nearest; plain truncation is biased toward zero)
+    const __m256i rnd = _mm256_set1_epi32(0x8000);
+    __m256i u_lo = _mm256_srli_epi32(_mm256_add_epi32(_mm256_castps_si256(s_lo), rnd), 16);
+    __m256i u_hi = _mm256_srli_epi32(_mm256_add_epi32(_mm256_castps_si256(s_hi), rnd), 16);
 
     // Pack per-lane, then fix the lane ordering:
     __m256i packed = _mm256_packus_epi32(u_lo, u_hi);

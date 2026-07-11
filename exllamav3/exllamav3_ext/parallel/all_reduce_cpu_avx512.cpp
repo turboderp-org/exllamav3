@@ -35,8 +35,9 @@ static inline void do32_avx512(uint16_t* __restrict ap, const uint16_t* __restri
 
     // Truncate FP32 -> BF16 using vpmovdw (AVX-512BW)
     // srli extracts the upper 16 bits (BF16), cvtepi32_epi16 packs 16x32 -> 16x16
-    __m256i out_lo = _mm512_cvtepi32_epi16(_mm512_srli_epi32(_mm512_castps_si512(s_lo), 16));
-    __m256i out_hi = _mm512_cvtepi32_epi16(_mm512_srli_epi32(_mm512_castps_si512(s_hi), 16));
+    const __m512i rnd = _mm512_set1_epi32(0x8000);
+    __m256i out_lo = _mm512_cvtepi32_epi16(_mm512_srli_epi32(_mm512_add_epi32(_mm512_castps_si512(s_lo), rnd), 16));
+    __m256i out_hi = _mm512_cvtepi32_epi16(_mm512_srli_epi32(_mm512_add_epi32(_mm512_castps_si512(s_hi), rnd), 16));
 
     // Combine into single 512-bit register and store
     __m512i result = _mm512_inserti64x4(_mm512_castsi256_si512(out_lo), out_hi, 1);
@@ -66,8 +67,9 @@ static inline void do32_avx512_fused(uint16_t* __restrict dst,
     __m512 s_lo = _mm512_add_ps(_mm512_castsi512_ps(a_lo32), _mm512_castsi512_ps(b_lo32));
     __m512 s_hi = _mm512_add_ps(_mm512_castsi512_ps(a_hi32), _mm512_castsi512_ps(b_hi32));
 
-    __m256i out_lo = _mm512_cvtepi32_epi16(_mm512_srli_epi32(_mm512_castps_si512(s_lo), 16));
-    __m256i out_hi = _mm512_cvtepi32_epi16(_mm512_srli_epi32(_mm512_castps_si512(s_hi), 16));
+    const __m512i rnd = _mm512_set1_epi32(0x8000);
+    __m256i out_lo = _mm512_cvtepi32_epi16(_mm512_srli_epi32(_mm512_add_epi32(_mm512_castps_si512(s_lo), rnd), 16));
+    __m256i out_hi = _mm512_cvtepi32_epi16(_mm512_srli_epi32(_mm512_add_epi32(_mm512_castps_si512(s_hi), rnd), 16));
 
     __m512i result = _mm512_inserti64x4(_mm512_castsi256_si512(out_lo), out_hi, 1);
     _mm512_storeu_si512((__m512i*)dst, result);
