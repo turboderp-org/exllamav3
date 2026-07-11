@@ -20,6 +20,23 @@ void silu_mul
     const float act_limit
 );
 
+void silu_oai_mul_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit,
+    Graph* graph
+);
+
+void silu_oai_mul
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit
+);
+
 void gelu_mul_gr
 (
     const at::Tensor& x,
@@ -92,10 +109,41 @@ void mul_sigmoid_
     const at::Tensor& y
 );
 
+void mul_sigmoid__gr
+(
+    at::Tensor& x,
+    const at::Tensor& y,
+    Graph* graph
+);
+
+void deinterleave_qg
+(
+    const at::Tensor& qg,
+    at::Tensor& q,
+    at::Tensor& g,
+    int head_dim
+);
+
+void deinterleave_qg_gr
+(
+    const at::Tensor& qg,
+    at::Tensor& q,
+    at::Tensor& g,
+    int head_dim,
+    Graph* graph
+);
+
 void mul_sigmoid_broadcast_
 (
     at::Tensor& x,
     const at::Tensor& y
+);
+
+void mul_sigmoid_broadcast__gr
+(
+    at::Tensor& x,
+    const at::Tensor& y,
+    Graph* graph
 );
 
 void add_sigmoid_gate_proj_gr

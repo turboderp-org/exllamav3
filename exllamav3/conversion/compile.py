@@ -16,7 +16,7 @@ def dsize(d):
     for _, v in d.items(): size += tsize(v)
     return size
 
-def compile_model(args, model, config, tokenizer):
+def compile_model(args, model, config, tokenizer, mtp_model = None):
 
     in_dir = args["in_dir"]
     out_dir = args["out_dir"]
@@ -25,7 +25,7 @@ def compile_model(args, model, config, tokenizer):
     else:
         work_dir = args["work_dir"]
         qtensors_dir = os.path.join(work_dir, "qtensors")
-        qtensors_stc = SafetensorsCollection(qtensors_dir)
+        qtensors_stc = SafetensorsCollection(qtensors_dir, tensor_name_fixes = config.get_tensor_name_fixes())
 
     # Prepare output directory
     if not os.path.exists(out_dir):
@@ -42,9 +42,11 @@ def compile_model(args, model, config, tokenizer):
     out_map = []
     out_map.append([])
     current_shard_size = 0
-    for module in model.modules:
-        prefix = module.key
-        sizes = qtensors_stc.get_tensor_sizes(prefix)
+    modules = model.modules
+    if mtp_model:
+        modules = modules + mtp_model.modules
+    for module in modules:
+        sizes = module.get_compile_sizes(qtensors_stc)
         if len(sizes) == 0:
             continue
         size = sum(sizes)
@@ -84,8 +86,7 @@ def compile_model(args, model, config, tokenizer):
         file_dict = {}
         for m in modules:
             if isinstance(m, Module):
-                prefix = m.key
-                tensors = qtensors_stc.get_tensors(prefix, allow_bf16 = True)
+                tensors = m.get_compile_tensors(qtensors_stc)
                 tensors = {k: v.contiguous() for k, v in tensors.items()}
                 qtensors_stc.close()
             elif isinstance(m, str):

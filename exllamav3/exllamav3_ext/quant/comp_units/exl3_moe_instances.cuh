@@ -5,8 +5,10 @@
 typedef void (*fp_exl3_moe_kernel) (EXL3_MOE_KERNEL_ARGS);
 
 #define EXL3_MOE_DECLARE_GETTERS(K) \
-    fp_exl3_moe_kernel exl3_moe_kernel_k##K##_n128(); \
-    fp_exl3_moe_kernel exl3_moe_kernel_k##K##_n256(); \
+    fp_exl3_moe_kernel exl3_moe_kernel_k##K##_n128_cb1(); \
+    fp_exl3_moe_kernel exl3_moe_kernel_k##K##_n256_cb1(); \
+    fp_exl3_moe_kernel exl3_moe_kernel_k##K##_n128_cb2(); \
+    fp_exl3_moe_kernel exl3_moe_kernel_k##K##_n256_cb2(); \
 
 EXL3_MOE_DECLARE_GETTERS(0);
 EXL3_MOE_DECLARE_GETTERS(1);

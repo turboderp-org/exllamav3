@@ -18,7 +18,7 @@ match mode:
         model_dir = "/mnt/str/models/gemma3-4b-it/exl3/5.0bpw/"
     case "gemma4":
         prompt_format = "gemma4"
-        model_dir = "/mnt/str/models/gemma4-26b-a4b-it/exl3/4.00bpw/"
+        model_dir = "/mnt/str/models/gemma4-12b-it/exl3/4.00bpw"
     case "mistral3":
         prompt_format = "mistral"
         model_dir = "/mnt/str/models/mistral-small-3.1-24b-instruct-2503/exl3/4.0bpw/"
@@ -37,6 +37,9 @@ match mode:
     case "hcx":
         prompt_format = "chatml"
         model_dir = "/mnt/str/models/hyperclovax-seed-think-32b/exl3/4.00bpw"
+    case "step37":
+        prompt_format = "chatml"
+        model_dir = "/mnt/str/models/step-3.7-flash/exl3/4.05bpw"
 
 images = [
     # Cat

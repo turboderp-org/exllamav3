@@ -8,6 +8,17 @@
 
 #include "exl3_dq.cuh"
 
+// On GA10x, HMMA with fp32 accumulation runs at half rate and dominates the m=1 (decode-bound) case.
+// Accumulate MMA results in fp16 instead and fold into the fp32 accumulators once per k-slice: ~14%
+// faster at bsz 1 on RTX 3090 together with the codebook.cuh IMUL change (see benchmarks/exl3_m1_bench).
+// Max observed error vs fp32 accumulation is ~1% of output RMS at k=4096, well below quantization noise.
+// Only enabled for sm_86 for now; unvalidated on other archs where fp32-acc HMMA is also half rate.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860)
+    #define EXL3_GEMM_H_ACC 1
+#else
+    #define EXL3_GEMM_H_ACC 0
+#endif
+
 template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
 inline __device__
 void exl3_gemm_kernel_inner
@@ -192,6 +203,9 @@ void exl3_gemm_kernel_inner
     register FragA frag_a[FRAG_STAGES];
     register FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
     register FragC frag_c[FRAGS_N_PER_WARP];
+    #if EXL3_GEMM_H_ACC
+        register FragC_h frag_c_h[FRAGS_N_PER_WARP];
+    #endif
 
     auto advance2 = [&] ()
     {
@@ -290,6 +304,11 @@ void exl3_gemm_kernel_inner
         #pragma unroll
         for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             frag_c[n] = {};
+        #if EXL3_GEMM_H_ACC
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                frag_c_h[n] = {};
+        #endif
     };
 
     // Threadblock reduction
@@ -549,6 +568,18 @@ void exl3_gemm_kernel_inner
     // Output reduction
     auto reduce = [&] ()
     {
+        #if EXL3_GEMM_H_ACC
+            // Fold the fp16 MMA accumulators into the fp32 accumulators once per k-slice
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+            {
+                float2 f0 = __half22float2(frag_c_h[n][0]);
+                float2 f1 = __half22float2(frag_c_h[n][1]);
+                frag_c[n][0] += f0.x; frag_c[n][1] += f0.y;
+                frag_c[n][2] += f1.x; frag_c[n][3] += f1.y;
+            }
+        #endif
+
         // First reduce all partial sums along k for the current slice
         threadblock_reduce();
 
@@ -608,7 +639,13 @@ void exl3_gemm_kernel_inner
     {
         #pragma unroll
         for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
-            ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c[n]);
+        {
+            #if EXL3_GEMM_H_ACC
+                ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c_h[n]);
+            #else
+                ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c[n]);
+            #endif
+        }
     };
 
     // Start global to shared pipeline

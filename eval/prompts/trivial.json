@@ -1,0 +1,16 @@
+{
+    "model": "/mnt/str/models/qwen3.5-27b/exl3/4.00bpw",
+    "stream": true,
+    "messages": [
+        {
+            "role": "system",
+            "content": "This is an inference systems test. Try to follow instructions precisely without assuming your response needs to be helpful to a human user."
+        },
+        {
+            "role": "user",
+            "content": "Repeat the phrase 'All work and no play makes Jack a dull boy' 50 times."
+        }
+    ],
+    "temperature": 0.7,
+    "max_tokens": 4096
+}

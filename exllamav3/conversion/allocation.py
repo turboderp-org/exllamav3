@@ -30,11 +30,23 @@ class QTarget:
 
 def create_q_strategy(
     model: Model,
+    mtp_model: Model,
     config: Config,
     bpw: float,
     head_bpw: int,
+    mtp_bpw: int,
     hq: bool,
 ) -> (dict, float):
+    """
+    Build the per-module quantization bitrate strategy for a converted model.
+
+    Quantizable modules declare their quantization role in the model architecture, primarily through their qmap,
+    qbits_key, qgroup, q_priority and select_hq_bits attributes. This function walks the module tree, aggregates
+    all eligible Linear layers into qgroups, assigns an initial integer bitrate from the requested average bpw and
+    then spends the remaining bit budget one bit at a time according to group priority. Auxiliary targets, such as
+    output heads using head_bits, are collected alongside the main budgeted weights and merged into the returned
+    strategy.
+    """
     from ..modules.module import Module
     from ..modules.linear import Linear
 
@@ -73,12 +85,25 @@ def create_q_strategy(
                     min_bpw = head_bpw,
                     priority = priority
                 )
+
+            elif module.qbits_key == "mtp_bits":
+                numel = module.weights_numel()
+                aux_targets[module.key] = QTarget(
+                    numel = numel,
+                    target_bpw = mtp_bpw,
+                    min_bpw = mtp_bpw,
+                    priority = priority
+                )
+
             else:
                 raise ValueError("Logic error in create_q_strategy")
         for sm in module.modules:
             _add(sm, priority)
 
-    for m in model.modules:
+    modules = model.modules
+    if mtp_model:
+        modules = modules + mtp_model.modules
+    for m in modules:
         _add(m, 0)
 
     # Target
@@ -111,7 +136,7 @@ def create_q_strategy(
     # Keep only bitrate
     f_targets = {k: v.target_bpw for k, v in targets.items()}
 
-    return f_targets, float(final_bits) / sum_numel
+    return f_targets, float(final_bits) / sum_numel if sum_numel else 0
 
 
 def print_strategy(

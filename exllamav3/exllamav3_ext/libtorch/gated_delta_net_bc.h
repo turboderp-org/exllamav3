@@ -51,3 +51,58 @@ py::class_<BC_GatedDeltaNet, std::shared_ptr<BC_GatedDeltaNet>>(m, "BC_GatedDelt
 )
 .def("run_bsz1_a", &BC_GatedDeltaNet::run_bsz1_a)
 .def("run_bsz1_b", &BC_GatedDeltaNet::run_bsz1_b);
+
+py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC_GatedDeltaNetSplit").def
+(
+    py::init<
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        std::shared_ptr<BC_LinearEXL3>,
+        std::shared_ptr<BC_LinearEXL3>,
+        std::shared_ptr<BC_LinearEXL3>,
+        at::Tensor,
+        c10::optional<at::Tensor>,
+        at::Tensor,
+        at::Tensor,
+        int,
+        int,
+        int,
+        int,
+        at::Tensor,
+        c10::optional<at::Tensor>,
+        std::shared_ptr<BC_GatedRMSNorm>,
+        float
+    >(),
+    py::arg("qkv"),
+    py::arg("z"),
+    py::arg("ba"),
+    py::arg("beta"),
+    py::arg("g"),
+    py::arg("mixed_qkv"),
+    py::arg("conv_out"),
+    py::arg("core_attn_out"),
+    py::arg("core_attn_out_f"),
+    py::arg("qkv_proj"),
+    py::arg("z_proj"),
+    py::arg("o_proj"),
+    py::arg("ba_weight_t"),
+    py::arg("ba_bias"),
+    py::arg("dt_bias"),
+    py::arg("a_log"),
+    py::arg("num_k_heads"),
+    py::arg("num_v_heads"),
+    py::arg("k_head_dim"),
+    py::arg("v_head_dim"),
+    py::arg("conv1d_weight"),
+    py::arg("conv1d_bias"),
+    py::arg("norm"),
+    py::arg("beta_scale")
+)
+.def("run_bsz1", &BC_GatedDeltaNetSplit::run_bsz1);

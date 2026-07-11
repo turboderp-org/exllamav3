@@ -14,7 +14,7 @@ try:
     from xformers.ops.fmha import cutlass as xf_cutlass
     xf_cutlass.FwOp.CUDA_MAXIMUM_COMPUTE_CAPABILITY = (12, 0)
     has_xformers = True
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     has_xformers = False
 
 
@@ -44,6 +44,7 @@ def fn_xformers_cutlass_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
         args.has_kv_cache() or
         args.dim < 512 or
         args.softcap != 0.0 or
+        args.sinks is not None or
         args.non_causal_spans or
         args.is_swa()
     ):
@@ -80,6 +81,7 @@ def fn_xformers_cutlass_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
         not args.has_kv_cache() or
         args.dim < 512 or
         args.softcap != 0.0 or
+        args.sinks is not None or
         args.is_swa()
     ):
         return None

@@ -14,9 +14,14 @@ from ..modules import (
     BlockSparseMLP,
     Linear,
     GatedMLP,
-    SlidingAttention
+    SlidingAttention,
+    SWAState
 )
 from ..modules.attn import prepare_for_attn
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .step3_7 import Step3_7Config
 
 class Step3_5Config(Config):
     arch_string = "Step3p5ForCausalLM"
@@ -86,7 +91,7 @@ class Step3_5Config(Config):
 
         # Norms
         self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", 1e-5)
-        self.assert_cfg(bool, "use_qk_norm", True, True)
+        self.use_qk_norm = self.read_cfg(bool, "use_qk_norm", True)
 
 
 class Step3_5Model(Model):
@@ -94,7 +99,7 @@ class Step3_5Model(Model):
 
     def __init__(
         self,
-        config: Step3_5Config,
+        config: Step3_5Config | Step3_7Config,
         key_prefix: str = "model",
         swa_full: bool = False,
         **kwargs
@@ -152,13 +157,13 @@ class Step3_5Model(Model):
                             key = f"{key_prefix}.layers.{idx}.self_attn.q_norm",
                             rms_norm_eps = config.rms_norm_eps,
                             constant_bias = 1.0,
-                        ),
+                        ) if config.use_qk_norm else None,
                         k_norm = RMSNorm(
                             config = config,
                             key = f"{key_prefix}.layers.{idx}.self_attn.k_norm",
                             rms_norm_eps = config.rms_norm_eps,
                             constant_bias = 1.0,
-                        ),
+                        ) if config.use_qk_norm else None,
                         out_dtype = torch.float,
                         tp_split_norm = False,
                         select_hq_bits = 2,
@@ -186,13 +191,13 @@ class Step3_5Model(Model):
                             key = f"{key_prefix}.layers.{idx}.self_attn.q_norm",
                             rms_norm_eps = config.rms_norm_eps,
                             constant_bias = 1.0,
-                        ),
+                        ) if config.use_qk_norm else None,
                         k_norm = RMSNorm(
                             config = config,
                             key = f"{key_prefix}.layers.{idx}.self_attn.k_norm",
                             rms_norm_eps = config.rms_norm_eps,
                             constant_bias = 1.0,
-                        ),
+                        ) if config.use_qk_norm else None,
                         out_dtype = torch.float,
                         select_hq_bits = 2,
                     ),
@@ -254,6 +259,7 @@ class Step3_5Model(Model):
                                 select_hq_bits = 2,
                             ),
                             transposed_load = False,
+                            ftranspose_after_load = False,
                         )
                     ),
                 )
@@ -291,12 +297,14 @@ class Step3_5Model(Model):
         self.calibration_all_experts = True
 
         # SWA layers are recurrent, optionally. Checkpoints are expensive so default to a longer interval
+        self.recurrent_state_cls = None
         if not self.swa_full:
             self.caps.update({
                 "supports_tp": False,
                 "recurrent_states": True,
                 "default_recurrent_checkpoint_interval": 6144,
             })
+            self.recurrent_state_cls = SWAState
 
 
     @override

@@ -1,112 +1,238 @@
 #pragma once
 
+#include "lmq.cuh"
+
 #define MAX_WARPS 8
 #define ITER_PER_TB 32
 #define CQ_PAGE_SIZE 256
 
+/*
+Cache quantization, groups of 32 values along the head/token dim:
 
-__device__ __forceinline__ float shuffle_had_fx32(float v, int lane_id)
+- group is rotated by H32 (regularizes toward Gaussian), scaled to [-1, 1] by its absmax
+  (stored as one half per group), then quantized to num_bits linearly, or through the cubic
+  compander (lmq.cuh) when compand_a > 0
+- packing is linear little-endian: value j of a group occupies bits [j*num_bits, (j+1)*num_bits)
+  of the group's num_bits uint32 words. Unpacking any bit width is a two-word funnel window per
+  lane, so dequant needs no cross-lane traffic for the payload
+- each warp covers 4 groups (128 values): an 8-lane subgroup per group, 4 consecutive values per
+  lane. H32 then factors as an in-register H4 times a 3-round __shfl_xor H8 — same matrix as a
+  5-round per-lane butterfly, at 12 instead of 40 shuffles per warp (the old one-group-per-warp
+  bitplane kernels ran at ~92% LSU-pipe utilization and 38% of DRAM)
+
+The quantized tensors have the same shapes and sizes as the previous bitplane format.
+*/
+
+// Butterfly stages over disjoint index bits commute, so H4 (value bits 0..1, in registers) and
+// H8 (bits 2..4, across the subgroup) can be applied in either order on both endpoints
+
+__device__ __forceinline__ void had_4_inreg(float& v0, float& v1, float& v2, float& v3)
+{
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    v0 = s0 + s1;
+    v1 = d0 + d1;
+    v2 = s0 - s1;
+    v3 = d0 - d1;
+}
+
+__device__ __forceinline__ void had_8_subgroup(float& v0, float& v1, float& v2, float& v3, int lane)
 {
     #pragma unroll
-    for (int i = 1; i < 32; i <<= 1)
+    for (int i = 1; i < 8; i <<= 1)
     {
-        float pv = __shfl_xor_sync(0xffffffff, v, i);
-        uint32_t vi = __float_as_uint(v);
-        int32_t sfm = -static_cast<int32_t>(lane_id & i) >> 31;
-        vi ^= (sfm & 0x80000000);
-        v = __uint_as_float(vi) + pv;
+        uint64_t p01 = ((uint64_t) __float_as_uint(v0)) | (((uint64_t) __float_as_uint(v1)) << 32);
+        uint64_t p23 = ((uint64_t) __float_as_uint(v2)) | (((uint64_t) __float_as_uint(v3)) << 32);
+        p01 = __shfl_xor_sync(0xffffffff, p01, i);
+        p23 = __shfl_xor_sync(0xffffffff, p23, i);
+        uint32_t sfm = (uint32_t) (-(int32_t)(lane & i) >> 31) & 0x80000000u;
+        v0 = __uint_as_float(__float_as_uint(v0) ^ sfm) + __uint_as_float((uint32_t) p01);
+        v1 = __uint_as_float(__float_as_uint(v1) ^ sfm) + __uint_as_float((uint32_t) (p01 >> 32));
+        v2 = __uint_as_float(__float_as_uint(v2) ^ sfm) + __uint_as_float((uint32_t) p23);
+        v3 = __uint_as_float(__float_as_uint(v3) ^ sfm) + __uint_as_float((uint32_t) (p23 >> 32));
     }
-    return v;
 }
 
-
-__device__ __forceinline__ float shuffle_sum_fx32(float s)
-{
-    #pragma unroll
-    for (int i = 1; i < 32; i <<= 1)
-        s += __shfl_xor_sync(0xffffffff, s, i);
-    return s;
-}
-
-
-__device__ __forceinline__ float shuffle_max_fx32(float s)
-{
-    #pragma unroll
-    for (int i = 1; i < 32; i <<= 1)
-        s = fmaxf(s, __shfl_xor_sync(0xffffffff, s, i));
-    return s;
-}
-
+// Quantize 4 groups of 32 (one warp). in/out/out_scales point at the warp's 4-group span;
+// sh_pack is a zero-initialized warp-private staging area of 4 * num_bits uint32
 
 template <int num_bits>
-__device__ __forceinline__ void quant_block
+__device__ __forceinline__ void quant_block_x4
 (
     const half* __restrict__ in,
     uint32_t* __restrict__ out,
-    half* __restrict__ out_scales
+    half* __restrict__ out_scales,
+    uint32_t* __restrict__ sh_pack,
+    int active_groups,
+    float compand_a
 )
 {
-    int t = threadIdx.x & 31;
+    constexpr int m = 1 << (num_bits - 1);
+    constexpr float mf = (float) m;
+    constexpr uint32_t qmax = (1u << num_bits) - 1;
 
-    // Load, rotate and scale 32 values
-    float v = __half2float(in[t]);
-    v = shuffle_had_fx32(v, t);
-    v *= 0.17677669529663688110f;  // = 1 / sqrt(32)
-    float s = shuffle_max_fx32(fabsf(v) + 1e-10);
-    half sh = __float2half_rn(s);
-    v /= s;
+    const int lane = threadIdx.x & 31;
+    const int sg = lane >> 3;
+    const int sl = lane & 7;
+    const bool active = sg < active_groups;
 
-    // Quantize and clamp
-    int m = (1 << (num_bits - 1));
-    constexpr float mf = (1 << (num_bits - 1));
-    v *= mf;
-    int q = lrintf(v) + m;
-    q = max(min((1 << num_bits) - 1, q), 0);
+    // Zero staging
+    if (lane < 4 * num_bits)
+        sh_pack[lane] = 0;
+    __syncwarp();
 
-    // Pack bits
-    register uint32_t bitplanes[num_bits];
+    // Load 4 consecutive values, rotate, scale to 1/sqrt(32)
+    float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+    if (active)
+    {
+        half2 x01 = ((const half2*) in)[lane * 2];
+        half2 x23 = ((const half2*) in)[lane * 2 + 1];
+        v0 = __half2float(__low2half(x01));
+        v1 = __half2float(__high2half(x01));
+        v2 = __half2float(__low2half(x23));
+        v3 = __half2float(__high2half(x23));
+    }
+    had_4_inreg(v0, v1, v2, v3);
+    had_8_subgroup(v0, v1, v2, v3, lane);
+    constexpr float r32 = 0.17677669529663688110f;  // 1/sqrt(32)
+    v0 *= r32; v1 *= r32; v2 *= r32; v3 *= r32;
+
+    // Group absmax
+    float s = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3))) + 1e-10f;
     #pragma unroll
-    for (int i = 0, mask = 1; i < num_bits; ++i, mask <<= 1)
-        bitplanes[i] = __ballot_sync(0xffffffff, q & mask);
+    for (int i = 1; i < 8; i <<= 1)
+        s = fmaxf(s, __shfl_xor_sync(0xffffffff, s, i));
+    float inv_s = 1.0f / s;
 
-    // Write output
-    if (t < num_bits)
-        out[t] = bitplanes[t];
-    if (t == num_bits)
-        *out_scales = sh;
+    // Quantize
+    uint32_t q0, q1, q2, q3;
+    if (compand_a > 0.0f)
+    {
+        LMCubic<num_bits> lm(compand_a);
+        q0 = lm.encode(v0 * inv_s);
+        q1 = lm.encode(v1 * inv_s);
+        q2 = lm.encode(v2 * inv_s);
+        q3 = lm.encode(v3 * inv_s);
+    }
+    else
+    {
+        // Midpoint grid: centroids at ((2q+1)/2^bits - 1), ~5% lower MSE than the rounding grid
+        auto quant1 = [&] (float v) -> uint32_t
+        {
+            int q = __float2int_rd(fmaf(v * inv_s, mf, mf));
+            return (uint32_t) max(min(q, (int) qmax), 0);
+        };
+        q0 = quant1(v0); q1 = quant1(v1); q2 = quant1(v2); q3 = quant1(v3);
+    }
+
+    // Pack into power-of-two bit planes (num_bits = sum of set bits; e.g. 5 = 4-bit plane +
+    // 1-bit plane). Aligned plane fields never straddle a word, and every plane unpacks with
+    // vectorized shifts on the consumer side (attention kernels included)
+    if (active)
+    {
+        auto pack_plane = [&] (int w, int word_base, uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3)
+        {
+            uint32_t field = v0 | (v1 << w) | (v2 << (2 * w)) | (v3 << (3 * w));
+            int off = sl * 4 * w;
+            atomicOr(&sh_pack[sg * num_bits + word_base + (off >> 5)], field << (off & 31));
+        };
+        int rem = num_bits;
+        int wb = 0;
+        if constexpr (num_bits & 8) { rem -= 8; pack_plane(8, wb, (q0 >> rem) & 255, (q1 >> rem) & 255, (q2 >> rem) & 255, (q3 >> rem) & 255); wb += 8; }
+        if constexpr (num_bits & 4) { rem -= 4; pack_plane(4, wb, (q0 >> rem) & 15,  (q1 >> rem) & 15,  (q2 >> rem) & 15,  (q3 >> rem) & 15);  wb += 4; }
+        if constexpr (num_bits & 2) { rem -= 2; pack_plane(2, wb, (q0 >> rem) & 3,   (q1 >> rem) & 3,   (q2 >> rem) & 3,   (q3 >> rem) & 3);   wb += 2; }
+        if constexpr (num_bits & 1) {           pack_plane(1, wb, q0 & 1,            q1 & 1,            q2 & 1,            q3 & 1);                     }
+    }
+    __syncwarp();
+
+    // Write words and scales
+    if (lane < 4 * num_bits && (lane / num_bits) < active_groups)
+        out[lane] = sh_pack[lane];
+    float sw = __shfl_sync(0xffffffff, s, lane * 8);
+    if (lane < active_groups)
+        out_scales[lane] = __float2half_rn(sw);
 }
 
+// Dequantize 4 groups of 32 (one warp)
 
 template <int num_bits>
-__device__ __forceinline__ void dequant_block
+__device__ __forceinline__ void dequant_block_x4
 (
     const uint32_t* __restrict__ in,
     const half* __restrict__ in_scales,
-    half* __restrict__ out
+    half* __restrict__ out,
+    int active_groups,
+    float compand_a
 )
 {
-    int lane = threadIdx.x & 31;
+    constexpr int m = 1 << (num_bits - 1);
+    constexpr float inv_mf = 1.0f / (float) (1 << (num_bits - 1));
+    constexpr uint32_t qmask = (1u << num_bits) - 1;
 
-    // Load bitplanes
-    uint32_t word = (lane < num_bits) ? in[lane] : 0u;
+    const int lane = threadIdx.x & 31;
+    const int sg = lane >> 3;
+    const int sl = lane & 7;
+    const bool active = sg < active_groups;
 
-    // Dequantize at 1/sqrt(32) scale (preparing for Hadamard transform)
-    float mbit = -0.17677669529663688110f;
-    float v = -0.17677669529663688110f;
-    #pragma unroll
-    for (int i = num_bits - 1; i >= 0; --i)
+    // Gather the lane's 4 values from the bit planes; aligned plane fields sit in one word
+    const uint32_t* gw = in + sg * num_bits;
+    uint32_t q0 = 0, q1 = 0, q2 = 0, q3 = 0;
     {
-        uint32_t wi = __shfl_sync(0xffffffff, word, i);
-        v -= ((wi >> lane) & 1u) ? mbit : 0.0f;
-        mbit *= 0.5f;
+        auto unpack_plane = [&] (int w, int word_base)
+        {
+            int off = sl * 4 * w;
+            uint32_t word = active ? (gw[word_base + (off >> 5)] >> (off & 31)) : 0;
+            uint32_t mask = (1u << w) - 1;
+            q0 = (q0 << w) | (word & mask);
+            q1 = (q1 << w) | ((word >> w) & mask);
+            q2 = (q2 << w) | ((word >> (2 * w)) & mask);
+            q3 = (q3 << w) | ((word >> (3 * w)) & mask);
+        };
+        int wb = 0;
+        if constexpr (num_bits & 8) { unpack_plane(8, wb); wb += 8; }
+        if constexpr (num_bits & 4) { unpack_plane(4, wb); wb += 4; }
+        if constexpr (num_bits & 2) { unpack_plane(2, wb); wb += 2; }
+        if constexpr (num_bits & 1) { unpack_plane(1, wb);          }
     }
 
-    // Scale and rotate
-    v *= __half2float(*in_scales);
-    v = shuffle_had_fx32(v, lane);
+    float s = active ? __half2float(in_scales[sg]) : 0.0f;
+    constexpr float r32 = 0.17677669529663688110f;  // 1/sqrt(32)
+    s *= r32;
+
+    float v0, v1, v2, v3;
+    if (compand_a > 0.0f)
+    {
+        LMCubic<num_bits> lm(compand_a);
+        v0 = lm.decode(q0) * s;
+        v1 = lm.decode(q1) * s;
+        v2 = lm.decode(q2) * s;
+        v3 = lm.decode(q3) * s;
+    }
+    else
+    {
+        constexpr float mh = (float) m - 0.5f;
+        v0 = ((float) (int) q0 - mh);
+        v1 = ((float) (int) q1 - mh);
+        v2 = ((float) (int) q2 - mh);
+        v3 = ((float) (int) q3 - mh);
+        float sm = s * inv_mf;
+        v0 *= sm; v1 *= sm; v2 *= sm; v3 *= sm;
+    }
+
+    // Rotate back
+    had_4_inreg(v0, v1, v2, v3);
+    had_8_subgroup(v0, v1, v2, v3, lane);
 
     // Store
-    out[lane] = __float2half(v);
+    if (active)
+    {
+        half2 o01 = __floats2half2_rn(v0, v1);
+        half2 o23 = __floats2half2_rn(v2, v3);
+        ((half2*) out)[lane * 2] = o01;
+        ((half2*) out)[lane * 2 + 1] = o23;
+    }
 }
 
 
@@ -116,13 +242,17 @@ void quant_cache_cont_kernel
 (
     const half* __restrict__ in,
     uint32_t* __restrict__ out,
-    half* __restrict__ out_scales
+    half* __restrict__ out_scales,
+    const int num_groups,
+    const float compand_a
 )
 {
-    in += 32 * blockIdx.x;
-    out += bits * blockIdx.x;
-    out_scales += blockIdx.x;
-    quant_block<bits>(in, out, out_scales);
+    __shared__ uint32_t sh_pack[MAX_WARPS][32];
+    int warp = threadIdx.x >> 5;
+    int g0 = (blockIdx.x * MAX_WARPS + warp) * 4;
+    if (g0 >= num_groups) return;
+    int active = min(4, num_groups - g0);
+    quant_block_x4<bits>(in + g0 * 32, out + g0 * bits, out_scales + g0, sh_pack[warp], active, compand_a);
 }
 
 #define __(i) quant_cache_cont_kernel<i>
@@ -139,13 +269,16 @@ void dequant_cache_cont_kernel
 (
     const uint32_t* __restrict__ in,
     const half* __restrict__ in_scales,
-    half* __restrict__ out
+    half* __restrict__ out,
+    const int num_groups,
+    const float compand_a
 )
 {
-    in += bits * blockIdx.x;
-    in_scales += blockIdx.x;
-    out += 32 * blockIdx.x;
-    dequant_block<bits>(in, in_scales, out);
+    int warp = threadIdx.x >> 5;
+    int g0 = (blockIdx.x * MAX_WARPS + warp) * 4;
+    if (g0 >= num_groups) return;
+    int active = min(4, num_groups - g0);
+    dequant_block_x4<bits>(in + g0 * bits, in_scales + g0, out + g0 * 32, active, compand_a);
 }
 
 #define __(i) dequant_cache_cont_kernel<i>
@@ -168,19 +301,29 @@ void quant_cache_paged_kernel
     half* __restrict__ v_out_scales,
     const uint32_t* __restrict__ cache_seqlens,
     const uint32_t* __restrict__ block_table,
-    // int page_size,
     const int blocks_per_seq,
-    const int token_dim
+    const int groups_per_token,
+    const float compand_a,
+    const int in_contiguous   // k_in/v_in indexed (batch, append_pos) instead of paged positions
 )
 {
+    __shared__ uint32_t sh_pack[MAX_WARPS][32];
     int batch_idx = blockIdx.z;
     int token_idx = blockIdx.y + cache_seqlens[batch_idx];
     int page_idx = token_idx / CQ_PAGE_SIZE;
     int token_pos = block_table[blocks_per_seq * batch_idx + page_idx] * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
-    int sub_pos = (token_pos * token_dim + blockDim.x * blockIdx.x + threadIdx.x) / 32;
+    int in_pos = in_contiguous ? (batch_idx * gridDim.y + blockIdx.y) : token_pos;
 
-    quant_block<k_bits>(k_in + sub_pos * 32, k_out + sub_pos * k_bits, k_out_scales + sub_pos);
-    quant_block<v_bits>(v_in + sub_pos * 32, v_out + sub_pos * v_bits, v_out_scales + sub_pos);
+    int warp = threadIdx.x >> 5;
+    int g0 = (blockIdx.x * (blockDim.x >> 5) + warp) * 4;
+    if (g0 >= groups_per_token) return;
+    int active = min(4, groups_per_token - g0);
+    int base = token_pos * groups_per_token + g0;
+    int in_base = in_pos * groups_per_token + g0;
+
+    quant_block_x4<k_bits>(k_in + in_base * 32, k_out + base * k_bits, k_out_scales + base, sh_pack[warp], active, compand_a);
+    __syncwarp();
+    quant_block_x4<v_bits>(v_in + in_base * 32, v_out + base * v_bits, v_out_scales + base, sh_pack[warp], active, compand_a);
 }
 
 #define __(i, j) quant_cache_paged_kernel<i, j>
@@ -209,26 +352,24 @@ void dequant_cache_paged_kernel
     half* __restrict__ v_out,
     const uint32_t* __restrict__ cache_seqlens,
     const uint32_t* __restrict__ block_table,
-    // int page_size,
     const int pages_per_seq,
-    const int warps_per_token,
-    const int num_blocks,
-    const int sliding_window
+    const int groups_per_token,
+    const int chunks_per_token,     // ceil(groups_per_token / 4)
+    const int sliding_window,
+    const float compand_a
 )
 {
     int batch_idx = blockIdx.y;
-    int block_id = blockDim.x * (blockIdx.x * ITER_PER_TB);
-    int t_warp_id = (block_id + threadIdx.x) / 32;
-    int d_warp_id = blockDim.x / 32;
+    int chunk_id = blockDim.x / 32 * (blockIdx.x * ITER_PER_TB) + (threadIdx.x >> 5);
+    int d_chunks = blockDim.x / 32;
     int max_token_idx = cache_seqlens[batch_idx];
     const uint32_t* b_block_table = block_table + batch_idx * pages_per_seq;
 
     // Skip all whole blocks prior to the sliding window
     if (sliding_window > 0)
     {
-        int nb_block_id = block_id + blockDim.x * ITER_PER_TB;
-        int nb_t_warp_id = nb_block_id / 32;
-        int nb_token_idx = nb_t_warp_id / warps_per_token;
+        int nb_chunk_id = (blockDim.x / 32) * ((blockIdx.x + 1) * ITER_PER_TB);
+        int nb_token_idx = nb_chunk_id / chunks_per_token;
         if (nb_token_idx <= max_token_idx - sliding_window)
             return;
     }
@@ -236,17 +377,19 @@ void dequant_cache_paged_kernel
     #pragma unroll 4
     for (int iter = 0; iter < ITER_PER_TB; ++iter)
     {
-        int token_idx = t_warp_id / warps_per_token;
+        int token_idx = chunk_id / chunks_per_token;
         if (token_idx >= max_token_idx) break;
+        int g0 = (chunk_id - token_idx * chunks_per_token) * 4;
+        int active = min(4, groups_per_token - g0);
         int page_idx = token_idx / CQ_PAGE_SIZE;
-        int page_sub = t_warp_id - page_idx * CQ_PAGE_SIZE * warps_per_token;
         int mapped_page = b_block_table[page_idx];
-        int addr = mapped_page * CQ_PAGE_SIZE * warps_per_token + page_sub;
+        int token_pos = mapped_page * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
+        int base = token_pos * groups_per_token + g0;
 
-        dequant_block<k_bits>(k_in + addr * k_bits, k_in_scales + addr, k_out + addr * 32);
-        dequant_block<v_bits>(v_in + addr * v_bits, v_in_scales + addr, v_out + addr * 32);
+        dequant_block_x4<k_bits>(k_in + base * k_bits, k_in_scales + base, k_out + base * 32, active, compand_a);
+        dequant_block_x4<v_bits>(v_in + base * v_bits, v_in_scales + base, v_out + base * 32, active, compand_a);
 
-        t_warp_id += d_warp_id;
+        chunk_id += d_chunks;
     }
 }
 

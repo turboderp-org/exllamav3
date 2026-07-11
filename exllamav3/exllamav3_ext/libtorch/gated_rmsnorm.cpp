@@ -10,3 +10,8 @@ void BC_GatedRMSNorm::run(const at::Tensor& x, at::Tensor& y, const at::Tensor& 
 {
     gated_rms_norm(x, weight, y, gate, rms_norm_eps, constant_bias);
 }
+
+void BC_GatedRMSNorm::run_gr(const at::Tensor& x, at::Tensor& y, const at::Tensor& gate, Graph* graph)
+{
+    gated_rms_norm_gr(x, weight, y, gate, rms_norm_eps, constant_bias, graph);
+}

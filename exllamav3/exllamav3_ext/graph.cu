@@ -1,10 +1,12 @@
 #include <Python.h>
+#include <cstring>
 #include "graph.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 //#include <torch/extension.h>
 #include "util.h"
 #include "util.cuh"
+#include "cuda_drv.h"
 #include "quant/exl3_devctx.cuh"
 
 //#define GRAPHDEBUG 1
@@ -57,6 +59,8 @@ void Graph::capture_end()
 
     // Store copies of all node param structures
     node_params.resize(num_nodes);
+    node_params_drv.resize(num_nodes);
+    node_is_driver.resize(num_nodes);
     node_needs_update.resize(num_nodes);
     for (int i = 0; i < num_nodes; ++i)
         node_needs_update[i] = false;
@@ -71,17 +75,32 @@ void Graph::capture_end()
         // Node type: kernel
         if (t == cudaGraphNodeTypeKernel)
         {
-            cudaGraphKernelNodeGetParams(nodes[n], &node_params[n]);
+            // Nodes captured from driver-API launches (Triton cubins) can't be read through the
+            // runtime API; fall back to the driver API for those. The func handle recorded via
+            // record_param is the CUfunction in that case, so matching works the same way
+            void* node_func;
+            node_is_driver[n] = 0;
+            cudaError_t e = cudaGraphKernelNodeGetParams(nodes[n], &node_params[n]);
+            if (e == cudaSuccess)
+                node_func = (void*) node_params[n].func;
+            else
+            {
+                (void) cudaGetLastError();
+                cuda_check_drv(CudaDrv::instance().graph_kernel_node_get_params((CUgraphNode) nodes[n], &node_params_drv[n]));
+                node_is_driver[n] = 1;
+                node_func = (void*) node_params_drv[n].func;
+            }
 
             for(; c < graph_sites.size(); c++)
             {
                 void* func = std::get<0>(graph_sites[c]);
-                if (func != node_params[n].func) break;
+                if (func != node_func) break;
 
                 int param_id     = std::get<1>(graph_sites[c]);
                 int param_offset = std::get<2>(graph_sites[c]);
+                int param_size   = std::get<3>(graph_sites[c]);
 
-                graph_node_sites.push_back(std::tuple<int, int, int>(n, param_id, param_offset));
+                graph_node_sites.push_back(std::tuple<int, int, int, int>(n, param_id, param_offset, param_size));
                 if (param_id == GP_end) { c++; break; }
             }
         }
@@ -102,9 +121,9 @@ void Graph::capture_end()
     #endif
 }
 
-void Graph::record_param(void* kernel, int param_id, int param_offset)
+void Graph::record_param(void* kernel, int param_id, int param_offset, int size)
 {
-    graph_sites.push_back(std::tuple<void*, int, int>(kernel, param_id, param_offset));
+    graph_sites.push_back(std::tuple<void*, int, int, int>(kernel, param_id, param_offset, size));
 }
 
 void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
@@ -131,11 +150,15 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
                 void* new_value  = std::get<1>(params[p]);
                 int node_idx     = std::get<0>(graph_node_sites[n]);
                 int param_offset = std::get<2>(graph_node_sites[n]);
+                int param_size   = std::get<3>(graph_node_sites[n]);
 
-                void** p_old_value = (void**) node_params[node_idx].kernelParams[param_offset];
-                if (*p_old_value != new_value)
+                void** kernel_params = node_is_driver[node_idx] ?
+                    node_params_drv[node_idx].kernelParams :
+                    node_params[node_idx].kernelParams;
+                void* p_old_value = kernel_params[param_offset];
+                if (memcmp(p_old_value, &new_value, param_size))
                 {
-                    *p_old_value = new_value;
+                    memcpy(p_old_value, &new_value, param_size);
                     node_needs_update[node_idx] = true;
                 }
             }
@@ -150,7 +173,10 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
     for (int n = 0; n < nodes.size(); ++n)
     {
         if (!node_needs_update[n]) continue;
-        cudaGraphExecKernelNodeSetParams(graph_exec, nodes[n], &node_params[n]);
+        if (node_is_driver[n])
+            CudaDrv::instance().graph_exec_kernel_node_set_params((CUgraphExec) graph_exec, (CUgraphNode) nodes[n], &node_params_drv[n]);
+        else
+            cudaGraphExecKernelNodeSetParams(graph_exec, nodes[n], &node_params[n]);
         node_needs_update[n] = false;
     }
 

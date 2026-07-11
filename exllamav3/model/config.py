@@ -1,10 +1,50 @@
 from __future__ import annotations
 from abc import ABC
 import os, json
+from dataclasses import dataclass
 from ..util.rope import RopeSettings, RopeStyle
 from ..loader import SafetensorsCollection
 from ..util.file import read_dict, no_value, no_default
 import uuid
+
+@dataclass
+class InferParams:
+    """
+    Runtime inference parameters. Configure before loading model/modules
+    """
+
+    # Avoid reconstruct path during GEMM. Forces use of low-bsz GEMM/GEMV kernels. Also disables MGEMM path
+    no_reconstruct: bool = False
+
+    # Bitrate threshold for enabling MGEMM
+    mgemm_K_threshold: int = 0
+
+    # Width threshold for enabling MGEMM regardless of bitrate
+    mgemm_n_threshold: int = 0
+
+    def __init__(self):
+        # With the int8 GEMV mode (on by default), separate int8 GEMV calls beat the fused MGEMM
+        # only when a single matrix is wide enough to fill the GPU on its own (and K is within the
+        # int8 gate); narrow same-input pairs stay fused, where batching is what restores
+        # utilization. Only pairs the int8 path can take (mul1 codebook) are ever unfused
+        if int(os.environ.get("EXL3_INT8_GEMV", 2)) > 0:
+            self.mgemm_K_threshold = int(os.environ.get("EXL3_MGEMM_K_THRESHOLD", 6))
+            self.mgemm_n_threshold = int(os.environ.get("EXL3_MGEMM_N_THRESHOLD", 8192))
+
+    def use_mgemm(self, K: int, out_features: int, mul1: bool = False) -> bool:
+        # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
+        # requires the mul1 codebook; other tensors always keep the fused MGEMM
+        if not mul1:
+            return True
+        # Fuse when K is at/above the bitrate threshold (int8 GEMV can't take those anyway) or the
+        # matrices are too narrow for separate GEMV calls to fill the GPU
+        return K >= self.mgemm_K_threshold or (self.mgemm_n_threshold > 0 and out_features < self.mgemm_n_threshold)
+
+
+class NullConfig:
+    def __init__(self):
+        self.infer_params = InferParams()
+
 
 class Config(ABC):
     arch_string = None
@@ -53,7 +93,7 @@ class Config(ABC):
         self.architecture = arch
 
         # Collect all .safetensors files in directory
-        self.stc = SafetensorsCollection(directory, load_method = kwargs.get("load_method"))
+        self.stc = SafetensorsCollection(directory, kwargs.get("load_method"), self.get_tensor_name_fixes())
 
         # Standard params, vocab
         self.bos_token_id = self.read_cfg(int, ["bos_token_id", "text_config->bos_token_id"], None)
@@ -95,6 +135,13 @@ class Config(ABC):
             self.layer_map = layer_map
             self.layer_map_str = None
 
+        # Inference parameters
+        self.infer_params = InferParams()
+
+
+    def get_tensor_name_fixes(self):
+        return {}
+
 
     def default_max_position_embeddings(self):
         return 8192
@@ -133,6 +180,7 @@ class Config(ABC):
 
 
     @staticmethod
+    # def from_directory(directory: str, arch_override: str | None = None, **kwargs) -> Config:
     def from_directory(directory: str, **kwargs) -> Config:
         """
         Create config from the specified directory if it contains a HF model of a supported architecture
@@ -163,6 +211,7 @@ class Config(ABC):
 
         arch_def = architectures[arch]
         config_class = arch_def["config_class"]
+        # config = config_class(directory, arch_override = arch_override, **kwargs)
         config = config_class(directory, **kwargs)
         return config
 

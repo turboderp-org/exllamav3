@@ -141,6 +141,11 @@ class Gemma3Config(Config):
         # Fixed for Gemma3, usually not present in config.json
         return 131072
 
+    def get_tensor_name_fixes(self):
+        return {
+            ".mm_input_projection_weight": ".mm_input_projection.weight"
+        }
+
 
 class Gemma3TextConfig(Config):
     arch_string = "Gemma3ForCausalLM"

@@ -10,6 +10,14 @@ if TYPE_CHECKING:
 import weakref
 
 class CacheLayer(ABC):
+    """
+    Abstract interface for one model layer's cache storage.
+
+    Cache implementations provide the backing tensors and copy/update operations for attention KV pages or
+    cache-like layer state. The higher-level Cache class owns one CacheLayer per attention layer and calls this
+    interface without needing to know whether the concrete storage is unquantized, quantized, recurrent, or split
+    across devices.
+    """
 
     def __init__(
         self,
@@ -48,6 +56,20 @@ class CacheLayer(ABC):
         pass
 
     @abstractmethod
+    def update_kv_direct(
+        self,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int
+    ):
+        # Write new contiguous K/V rows (bsz, length, kv_heads, head_dim) into the paged cache
+        # at positions cache_seqlens..+length, without materializing full dequantized layers in
+        # the case of a quantized cache
+        pass
+
+    @abstractmethod
     def copy_page(self, source: CacheLayer, from_page: int, to_page: int, num_tokens: int):
         pass
 
@@ -65,12 +87,6 @@ class CacheLayer(ABC):
 
     @abstractmethod
     def tp_export(self, plan):
-        pass
-
-    @abstractmethod
-    def get_kv_alloc_placeholder(self):
-        # Used by layersplit loader to simulate dequant overhead, if any. Returns a reference to hold while
-        # inference is simulated, or None for unquantized cache
         pass
 
 
@@ -207,6 +223,10 @@ class Cache:
         sliding_window: int = -1,
         instance = None,
     ) -> tuple:
+        """
+        Return K/V tensors for cache layer, either reference to statically allocated tensors or temporary 
+        tensors with dequantized keys/values in the case of a quantized cache
+        """
         instance = instance or 0
         return self.layers[idx, instance].get_kv(cache_seqlens, block_table, sliding_window)
 
@@ -221,8 +241,31 @@ class Cache:
         length: int,
         instance: None,
     ):
+        """
+        Update cache layer. Quantizes updated keys/values in the case of a quantized cache, else this will
+        be a no-op since attention will have updated a reference to the static paged cache.
+        """
         instance = instance or 0
         return self.layers[idx, instance].update_kv(cache_seqlens, block_table, k, v, length)
+
+
+    def update_layer_direct(
+        self,
+        idx: int,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int,
+        instance = None,
+    ):
+        """
+        Write new contiguous K/V rows (bsz, length, kv_heads, head_dim) into the cache at positions
+        cache_seqlens..+length. Unlike get_layer/update_layer, a quantized cache quantizes the new
+        rows in place and never materializes full dequantized layer tensors.
+        """
+        instance = instance or 0
+        return self.layers[idx, instance].update_kv_direct(cache_seqlens, block_table, k, v, length)
 
 
     def copy_page(
@@ -232,6 +275,9 @@ class Cache:
         to_page: int,
         num_tokens: int,
     ):
+        """
+        Copy one cache page. Only used for partial page reuse in prompt caching.
+        """
         assert target == self or (not target.model.loaded_tp and not self.model.loaded_tp), \
             "Cannot copy pages between TP and non-TP caches, or between distinct TP caches."
         assert target.num_layers == self.num_layers

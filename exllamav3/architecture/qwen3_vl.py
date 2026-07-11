@@ -109,6 +109,7 @@ def read_qwen3_vl_vision_config(config_dict: dict):
         "qwen3_5",
         "qwen3_5_moe",
         "qwen3_5_vision",
+        "qwen3_5_moe_vision",
     ]
     assert v.model_type in model_types, \
         f"Expected vision_config->model_type to be one of {model_types}"

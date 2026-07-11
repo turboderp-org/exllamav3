@@ -41,7 +41,7 @@ def load_llamacpp(model_dir: str, size: int = 2048):
         verbose = False,
         n_ctx = size,
         n_gpu_layers = 999,
-        split_mode = llama_cpp.LLAMA_SPLIT_MODE_NONE,
+        split_mode = llama_cpp.LLAMA_SPLIT_MODE_LAYER,
         main_gpu = 0,
     )
     return model, bpw_layer, bpw_head, vram_bits

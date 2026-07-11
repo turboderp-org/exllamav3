@@ -15,6 +15,7 @@ col_red = "\u001b[31;1m"
 col_green = "\u001b[32;1m"  # Green
 
 prompt_files = [
+    ("Trivial repetition", "trivial.json", False),
     ("Agentic, code", "agentic_code_01.json", True),
     ("Agentic, code", "agentic_code_05.json", True),
     ("Agentic, code", "agentic_code_10.json", True),
@@ -167,6 +168,8 @@ def main(args):
     draft_mode = "Draft model"
     if args.draft_model_dir and draft_model.caps.get("dflash_draft"):
         draft_mode = "DFlash"
+    if args.draft_model_dir and draft_model.caps.get("mtp_draft"):
+        draft_mode = "MTP"
     r = {
         "Baseline": result_baseline,
         "N-gram (greedy)": result_ngram,

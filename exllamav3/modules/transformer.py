@@ -25,6 +25,8 @@ class TransformerBlock(Module):
         backout_extract: bool = False,
         backout_lambda: float | None = None,
         key_layer_scalar: str | None = None,
+        key_attn_resid_scalar: str | None = None,
+        key_mlp_resid_scalar: str | None = None,
         qmap: str | None = None,
         qbits_key: str = "bits",
         out_dtype: torch.dtype = None
@@ -47,8 +49,12 @@ class TransformerBlock(Module):
         self.out_dtype = out_dtype
 
         self.key_layer_scalar = key_layer_scalar
+        self.key_attn_resid_scalar = key_attn_resid_scalar
+        self.key_mlp_resid_scalar = key_mlp_resid_scalar
         self.layer_scalar_t = None
         self.layer_scalar_f = None
+        self.attn_resid_scalar = None
+        self.mlp_resid_scalar = None
 
         self.register_submodule(self.ve_gate)
         self.register_submodule(self.attn_norm)
@@ -79,19 +85,46 @@ class TransformerBlock(Module):
             assert self.layer_scalar_t.numel() == 1
             self.layer_scalar_f = self.layer_scalar_t.float().item()
 
+        # TODO: Residual scalar tensors could be baked into preceding modules for models that use them
+        #       (currently only Step3.7 vision tower)
+        if self.key_attn_resid_scalar:
+            self.attn_resid_scalar = self.config.stc.get_tensor(
+                self.key + "." + self.key_attn_resid_scalar,
+                device,
+                allow_bf16 = True,
+                no_defer = True,
+            )
+        if self.key_mlp_resid_scalar:
+            self.mlp_resid_scalar = self.config.stc.get_tensor(
+                self.key + "." + self.key_mlp_resid_scalar,
+                device,
+                allow_bf16 = True,
+                no_defer = True,
+            )
+
     def unload(self):
         super().unload()
         self.layer_scalar_t = None
+        self.attn_resid_scalar = None
+        self.mlp_resid_scalar = None
 
     def get_tensors(self):
-        if self.key_layer_scalar is None:
-            return {}
-        return {
-            self.key + "." + self.key_layer_scalar: self.layer_scalar_t.data.contiguous()
-        }
+        t = {}
+        if self.key_layer_scalar is not None:
+            t[self.key + "." + self.key_layer_scalar] = self.layer_scalar_t.data.contiguous()
+        if self.key_attn_resid_scalar is not None:
+            t[self.key + "." + self.key_attn_resid_scalar] = self.attn_resid_scalar.data.contiguous()
+        if self.key_mlp_resid_scalar is not None:
+            t[self.key + "." + self.key_mlp_resid_scalar] = self.mlp_resid_scalar.data.contiguous()
+        return t
 
     def weights_numel(self):
-        return super().weights_numel() + (1 if self.key_layer_scalar is not None else 0)
+        return (
+            super().weights_numel() +
+            (1 if self.key_layer_scalar is not None else 0) +
+            (self.attn_resid_scalar.numel() if self.attn_resid_scalar is not None else 0) +
+            (self.mlp_resid_scalar.numel() if self.mlp_resid_scalar is not None else 0)
+        )
 
     def _apply_resid_lambda(self, x: torch.Tensor, params: dict):
         if self.layer_idx == 0:
@@ -136,6 +169,9 @@ class TransformerBlock(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
+        export_state = params.get("export_state_layers")
+        export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
+
         if self.resid_lambda is not None:
             x = self._apply_resid_lambda(x, params)
 
@@ -145,32 +181,42 @@ class TransformerBlock(Module):
         if self.ve_gate:
             x = self._compute_ve_addend(x, params)
 
+        y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
+
         if self.attn:
             if self.attn_norm:
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
             y = self.attn.forward(y, params)
-            if params.get("prefill"): return x
+            if params.get("prefill") and not export_state:
+                return x
+            if self.attn_resid_scalar is not None:
+                y *= self.attn_resid_scalar
             if self.attn_post_norm:
                 self.attn_post_norm.forward(y, params, residual = x)
+            elif self.mlp is not None and self.mlp_norm is not None and self.mlp_norm.can_fuse_residual(x, y):
+                y_resid = y
             else:
                 x += y
 
         if self.mlp:
             params["residual"] = x
-            if self.mlp_norm:
+            if y_resid is not None:
+                y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
+            elif self.mlp_norm:
                 y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
             y = self.mlp.forward(y, params)
+            if self.mlp_resid_scalar is not None:
+                y *= self.mlp_resid_scalar
             if self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)
             else:
                 x += y
 
-        export_state = params.get("export_state_layers")
-        if export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0:
+        if export_state:
             s = params.get("export_states")
             if not s:
                 s = params["export_states"] = []
@@ -205,6 +251,9 @@ class TransformerBlock(Module):
                 "key": self.key,
                 "layer_idx": self.layer_idx,
                 "out_dtype": self.out_dtype,
+                "key_layer_scalar": self.key_layer_scalar,
+                "key_attn_resid_scalar": self.key_attn_resid_scalar,
+                "key_mlp_resid_scalar": self.key_mlp_resid_scalar,
             },
             **{name: _export(getattr(self, name, None)) for name in (
                 "attn_norm",

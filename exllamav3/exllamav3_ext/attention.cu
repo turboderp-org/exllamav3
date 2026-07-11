@@ -8,7 +8,7 @@
 #include <algorithm>
 #include "quant/exl3_devctx.cuh"
 
-#define G_MAX 8
+#define G_MAX 16
 #define PAGE_SIZE 256
 
 __device__ __forceinline__ uint64_t paged_cache_offset
@@ -949,6 +949,7 @@ void bighead_attn_paged
     else LAUNCH_PAGED_512(2)
     else LAUNCH_PAGED_512(4)
     else LAUNCH_PAGED_512(8)
+    else LAUNCH_PAGED_512(16)
     else LAUNCH_PAGED(64, 1)
     else LAUNCH_PAGED(64, 2)
     else LAUNCH_PAGED(64, 4)
@@ -962,7 +963,7 @@ void bighead_attn_paged
     else LAUNCH_PAGED(256, 4)
     else LAUNCH_PAGED(256, 8)
     else TORCH_CHECK(false,
-        "head_dim must be 64, 128, 256, or 512, num_kv_groups must be 1, 2, 4 or 8");
+        "head_dim must be 64, 128, 256, or 512, num_kv_groups must be 1, 2, 4 or 8 (or 16 for head_dim 512)");
 
     #undef LAUNCH_PAGED_512
     #undef LAUNCH_PAGED
@@ -1081,6 +1082,7 @@ void bighead_attn
     else LAUNCH_512(2)
     else LAUNCH_512(4)
     else LAUNCH_512(8)
+    else LAUNCH_512(16)
     else LAUNCH(64, 1)
     else LAUNCH(64, 2)
     else LAUNCH(64, 4)
@@ -1093,7 +1095,7 @@ void bighead_attn
     else LAUNCH(256, 2)
     else LAUNCH(256, 4)
     else LAUNCH(256, 8)
-    else TORCH_CHECK(false, "head_dim must be 64, 128, 256, or 512, num_kv_groups must be 1, 2, 4 or 8");
+    else TORCH_CHECK(false, "head_dim must be 64, 128, 256, or 512, num_kv_groups must be 1, 2, 4 or 8 (or 16 for head_dim 512)");
 
     #undef LAUNCH_512
     #undef LAUNCH

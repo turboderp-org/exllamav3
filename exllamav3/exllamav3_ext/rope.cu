@@ -302,7 +302,7 @@ Apply position embeddings, works in-place
 Either positions or position_ids overrides position
 */
 
-void rope
+void rope_gr
 (
     const at::Tensor& q,
     at::Tensor& out_q,
@@ -321,11 +321,12 @@ void rope
     float llama_4_scaling_beta,
     int llama_4_scaling_original,
     bool post_rope_norm,
-    int rotate_dims
+    int rotate_dims,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(q.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     int bsz = q.size(0);
     int seq_len = q.size(1);
@@ -413,23 +414,74 @@ void rope
                  position_ids_ptr, attn_factor, q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table, \
                  inv_freq_stride, llama_4_scaling_beta, llama_4_scaling_original, post_rope_norm, position_ids_stride, rotate_dims
 
+    // Pointer form of ARGS for cudaLaunchKernel; positions_ptr sits at index 12 (the
+    // GP_rope_positions record site)
+    #define ARGPTRS &q_ptr, &out_q_ptr, &k_ptr, &out_k_ptr, &inv_freq_ptr, &bsz, \
+                 &seq_len, &num_heads_q, &num_heads_k, &head_dim, &partial_head_dim, &position, &positions_ptr, \
+                 &position_ids_ptr, &attn_factor, &q_norm_ptr, &k_norm_ptr, &norm_eps, &norm_constant_bias, &inv_freq_table, \
+                 &inv_freq_stride, &llama_4_scaling_beta, &llama_4_scaling_original, &post_rope_norm, &position_ids_stride, &rotate_dims
+
+    void* kernel_ptr = nullptr;
     if (norm_fp16)
     {
-        if      (rope_mode == ROPESTYLE_GPTJ)       rope_kernel<ROPESTYLE_GPTJ, false><<<blocks, threads, 0, stream>>>(ARGS);
-        else if (rope_mode == ROPESTYLE_NEOX)       rope_kernel<ROPESTYLE_NEOX, false><<<blocks, threads, 0, stream>>>(ARGS);
-        else if (rope_mode == ROPESTYLE_NANOCHAT)   rope_kernel<ROPESTYLE_NANOCHAT, false><<<blocks, threads, 0, stream>>>(ARGS);
+        if      (rope_mode == ROPESTYLE_GPTJ)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_GPTJ, false>;
+        else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_NEOX, false>;
+        else if (rope_mode == ROPESTYLE_NANOCHAT)   kernel_ptr = (void*) rope_kernel<ROPESTYLE_NANOCHAT, false>;
     }
     else if (norm_bf16)
     {
-        if      (rope_mode == ROPESTYLE_GPTJ)       rope_kernel<ROPESTYLE_GPTJ, true><<<blocks, threads, 0, stream>>>(ARGS);
-        else if (rope_mode == ROPESTYLE_NEOX)       rope_kernel<ROPESTYLE_NEOX, true><<<blocks, threads, 0, stream>>>(ARGS);
-        else if (rope_mode == ROPESTYLE_NANOCHAT)   rope_kernel<ROPESTYLE_NANOCHAT, true><<<blocks, threads, 0, stream>>>(ARGS);
+        if      (rope_mode == ROPESTYLE_GPTJ)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_GPTJ, true>;
+        else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_NEOX, true>;
+        else if (rope_mode == ROPESTYLE_NANOCHAT)   kernel_ptr = (void*) rope_kernel<ROPESTYLE_NANOCHAT, true>;
     }
-    else TORCH_CHECK(false, "rope: incorrect norm dtype");
+    TORCH_CHECK(kernel_ptr, "rope: incorrect norm dtype");
+
+    void* kernel_args[] = { ARGPTRS };
+    cuda_check(cudaLaunchKernel(kernel_ptr, blocks, threads, kernel_args, 0, stream));
+
+    if (graph)
+    {
+        // All position sources are patchable: the kernel branches on the pointers' null-ness at
+        // runtime, so one captured graph serves scalar/positions/position_ids modes alike
+        graph->record_param(kernel_ptr, GP_rope_inv_freq, 4);
+        graph->record_param(kernel_ptr, GP_rope_position, 11, 4);
+        graph->record_param(kernel_ptr, GP_rope_positions, 12);
+        graph->record_param(kernel_ptr, GP_rope_position_ids, 13);
+        graph->record_param(kernel_ptr, GP_rope_pid_stride, 24, 4);
+        graph->record_param(kernel_ptr, GP_end, 0);
+    }
 
     #undef ARGS
+    #undef ARGPTRS
 
     cuda_check(cudaPeekAtLastError());
+}
+
+void rope
+(
+    const at::Tensor& q,
+    at::Tensor& out_q,
+    const c10::optional<at::Tensor>& k,
+    c10::optional<at::Tensor>& out_k,
+    const at::Tensor& inv_freq,
+    uint32_t position,
+    const c10::optional<at::Tensor>& positions,
+    const c10::optional<at::Tensor>& position_ids,
+    int rope_mode,
+    float attn_factor,
+    const c10::optional<at::Tensor>& q_norm,
+    const c10::optional<at::Tensor>& k_norm,
+    float norm_eps,
+    float norm_constant_bias,
+    float llama_4_scaling_beta,
+    int llama_4_scaling_original,
+    bool post_rope_norm,
+    int rotate_dims
+)
+{
+    rope_gr(q, out_q, k, out_k, inv_freq, position, positions, position_ids, rope_mode,
+            attn_factor, q_norm, k_norm, norm_eps, norm_constant_bias, llama_4_scaling_beta,
+            llama_4_scaling_original, post_rope_norm, rotate_dims, nullptr);
 }
 
 

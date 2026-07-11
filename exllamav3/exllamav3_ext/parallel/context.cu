@@ -11,11 +11,13 @@ void pg_init_context(uintptr_t ctx)
 
     ctx_ptr->sync_timeout = 0;
     ctx_ptr->barrier_epoch = 1;
+    ctx_ptr->broadcast_ll_epoch = 1;
 
     for (int i = 0; i < MAX_DEVICES; ++i)
     {
         ctx_ptr->barrier_epoch_device[i] = 0;
         ctx_ptr->broadcast_stage_device[i] = 0;
+        ctx_ptr->broadcast_ll_sequence_device[i] = 0;
         ctx_ptr->reduce_stage_produced[i] = 0;
         ctx_ptr->reduce_stage_consumed[i] = 0;
         ctx_ptr->gather_stage_produced[i] = 0;

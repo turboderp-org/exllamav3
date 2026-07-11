@@ -184,6 +184,7 @@ class Sequence:
         self.sequence_ids = SeqTensor.from_tensor(seq_ids, seq_dim = -1)
         self.kv_position = 0
         self.page_hashes = None
+        self.max_cached_pages = None
         self.new_unique_pages = 0
         self.allocated_pages = None
         self.block_index_tensor = None
@@ -192,6 +193,10 @@ class Sequence:
 
         # Multimodal token spans
         self.multimodal_mask = ids[0] >= FIRST_MM_EMBEDDING_INDEX
+
+        # MTP carry hidden — last hidden state of the previous prefill chunk, used to seed
+        # the prev_hidden shift in update_kv_from_target. None until first prefill chunk runs.
+        self.mtp_carry_hidden = None
 
 
     def prepare(self, has_prefix_token: bool, max_new_tokens: int):
@@ -221,19 +226,29 @@ class Sequence:
             dtype = torch.int32,
         )
 
-    def allocate_pages(self, pagetable: PageTable, recurrent_cache: None | RecurrentCache):
+    def allocate_pages(
+        self,
+        pagetable: PageTable,
+        recurrent_cache: None | RecurrentCache,
+    ):
+        if self.max_cached_pages is None:
+            page_hashes = self.page_hashes
+        else:
+            page_hashes = self.page_hashes[:self.max_cached_pages]
+        new_unique_pages = self.new_unique_pages + len(self.page_hashes) - len(page_hashes)
+
         # If recurrent model, find logest recurrent prefix
         recurrent_pages = None
         if recurrent_cache is not None:
             recurrent_pages = []
-            for pi, ph in enumerate(self.page_hashes):
+            for pi, ph in enumerate(page_hashes):
                 rs = recurrent_cache.get(ph)
                 if rs:
                     recurrent_pages.append(pi)
 
         # Allocate pages in KV cache, limit prefix caching to available recurrent states
         self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
-            pagetable.allocate_pages(self.page_hashes, self.new_unique_pages, recurrent_pages)
+            pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages)
 
         # Prepare block index
         self.build_block_index_tensor()
@@ -242,7 +257,7 @@ class Sequence:
         stashed_recurrent_state = None
         if recurrent_cache is not None:
             if cached_pages > 0:
-                stashed_recurrent_state = recurrent_cache.get_stashed(self.page_hashes[cached_pages - 1])
+                stashed_recurrent_state = recurrent_cache.get_stashed(page_hashes[cached_pages - 1])
                 assert stashed_recurrent_state is not None, "Failed to get cached recurrent state"
 
         return len(self.allocated_pages), cached_pages, non_sequential_pages, stashed_recurrent_state
@@ -255,6 +270,18 @@ class PageTable:
         generator: Generator,
         cache: Cache
     ):
+        """
+        Manage the physical cache pages backing prompt and generation state.
+
+        Completed pages are keyed by a chained hash of their token contents and previous page hash, forming an
+        implicit prefix tree: sequences with the same prefix resolve to the same chain of CachePage objects and can
+        share K/V storage during batched inference. Hash collisions are deliberately treated as impossible in
+        practice for this purpose; checking full token contents on every lookup would cost more than the vanishing
+        collision risk justifies. When a page becomes unreferenced after inference it remains indexed by its hash,
+        so later jobs can revive it for prompt-cache reuse until eviction or defragmentation overwrites it. Current
+        eviction is based on page age/access order, which keeps the bookkeeping simple but is the main place to
+        improve if future work needs a higher cache hit ratio.
+        """
         self.generator = generator
         self.cache = cache
         self.max_pages = cache.max_num_tokens // PAGE_SIZE
@@ -321,6 +348,15 @@ class PageTable:
         new_unique_pages: int,
         recurrent_pages: list[int] | None
     ):
+        """
+        Allocate physical cache pages for one sequence.
+
+        Existing full prompt pages are resolved by hash first, reusing referenced pages for shared prefixes or
+        unreferenced pages for prompt-cache hits. Missing pages, plus unique pages needed for new generation, are
+        taken from the oldest unreferenced pages. For hybrid recurrent/KV models, recurrent_pages marks which
+        hashed pages also have stashed recurrent checkpoints; the usable cached prefix is capped to the longest
+        page prefix that has both valid K/V pages and the matching recurrent state.
+        """
         allocated_pages = []
         available_pages = None
 

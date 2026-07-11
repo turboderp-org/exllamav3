@@ -45,6 +45,7 @@
 #include "parallel/all_reduce.cuh"
 
 #include "libtorch/gated_delta_net.h"
+#include "libtorch/attention.h"
 #include "libtorch/linear.h"
 #include "libtorch/gated_rmsnorm.h"
 #include "libtorch/mlp.h"
@@ -65,6 +66,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("stloader_deferred_cuda", &stloader_deferred_cuda, py::arg("jobs"), py::arg("max_chunk_size"));
 
     m.def("rms_norm", &rms_norm, "rms_norm");
+    m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
 
@@ -81,6 +83,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pg_broadcast_ll", &pg_broadcast_ll, "pg_broadcast_ll");
     m.def("pg_barrier", &pg_barrier, "pg_barrier");
     m.def("pg_gather", &pg_gather, "pg_gather");
+    m.def("pg_gather_small", &pg_gather_small, "pg_gather_small");
     m.def("pg_all_reduce", &pg_all_reduce, "pg_all_reduce");
     m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
     m.def("run_cpu_reduce_jobs", &run_cpu_reduce_jobs, "run_cpu_reduce_jobs");
@@ -106,11 +109,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
+    m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");
     m.def("gelu_mul", &gelu_mul, "gelu_mul");
     m.def("relu2_mul", &relu2_mul, "relu2_mul");
     m.def("xielu", &xielu, "xielu");
     m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
     m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
+    m.def("deinterleave_qg", &deinterleave_qg, "deinterleave_qg");
     m.def("mul_sigmoid_broadcast_", &mul_sigmoid_broadcast_, "mul_sigmoid_broadcast_");
     m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
@@ -118,6 +123,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
     m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
     m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
+    m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
+    m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
@@ -152,6 +159,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
+    #include "libtorch/attention_bc.h"
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"

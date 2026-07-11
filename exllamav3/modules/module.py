@@ -4,7 +4,7 @@ import torch
 import os
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from ..model.config import Config
+    from ..model.config import Config, NullConfig
 from ..model.model_tp_alloc import TPAllocation
 from functools import cached_property
 
@@ -31,7 +31,7 @@ class Module(ABC):
             in linear layers during quantization, e.g. to allow sharing between Q/K/V projections that have the same
             input state.
         """
-        self.config = config
+        self.config = config or NullConfig()
         self.key = key
         self.alt_key = None
         self.used_alt_key = False
@@ -107,6 +107,10 @@ class Module(ABC):
     def quant_format_id(self):
         return None
 
+    def can_fuse_residual(self, x: torch.Tensor, y: torch.Tensor) -> bool:
+        # Overridden by norm modules that support forward(residual_in = ...)
+        return False
+
     def get_name(self):
         return self.__class__.__name__
 
@@ -145,3 +149,9 @@ class Module(ABC):
     @abstractmethod
     def optimizer_targets(self):
         pass
+
+    def get_compile_sizes(self, stc):
+        return stc.get_tensor_sizes(self.key)
+
+    def get_compile_tensors(self, stc):
+        return stc.get_tensors(self.key, allow_bf16 = True)

@@ -125,19 +125,33 @@ def get_for_device(
     if key not in input_dict and default is not no_default:
         return default
 
-    if "dev_cache" not in input_dict:
+    v = input_dict[key]
+    if v is None:
+        return None
+
+    cache = input_dict.get("dev_cache")
+    if cache is None:
         cache = {}
         input_dict["dev_cache"] = cache
-    else:
-        cache = input_dict["dev_cache"]
 
-    cache_key = f"{key}[{str(device)}]"
-    if cache_key in cache:
-        return cache[cache_key]
-
-    v = input_dict[key]
-    dv = None if v is None else input_dict[key].to(device)
-    cache[cache_key] = dv
+    cache_key = (key, device)
+    dv = cache.get(cache_key, no_default)
+    if dv is no_default:
+        # Tensors marked _static_dev_cache = True are never mutated in place and keep persistent
+        # per-device copies (stored on the tensor itself) across forward passes
+        static = getattr(v, "_static_dev_cache", False)
+        if static:
+            scache = v.__dict__.get("_static_dev_copies")
+            if scache is None:
+                scache = {}
+                v._static_dev_copies = scache
+            dv = scache.get(device)
+            if dv is None:
+                dv = v.to(device)
+                scache[device] = dv
+        else:
+            dv = v.to(device)
+        cache[cache_key] = dv
     return dv
 
 

@@ -12,21 +12,13 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
 - Speculative decoding
 - 2-8 bit cache quantization
 - Multimodal support
+- LoRA support
 
 The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://github.com/theroyallab/tabbyAPI/), which provides an OpenAI-compatible API for local or remote inference, with extended features like HF model downloading, embedding model support and support for HF Jinja2 chat templates.
 
 ### ⚠️ Important
 
-- **Qwen3-Next** and **Qwen3.5** can take advantage of [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention), though this requires
-  Triton, and performance can be shaky due to the sporadic JIT compilation it imposes. [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) is
-  supported and recommended but not required.
-- **Qwen3-Next** and **Qwen3.5** currently do not support tensor/expert parallelism.
-- The **Gemma4** implementation benefits greatly from [xformers](https://github.com/facebookresearch/xformers)
-  (`pip install xformers`) which will be autodetected and used when available. Performance is likely to 
-  improve further with a better head_dim > 256 attention implementation soon. 
 - **Gemma4** does not currently support tensor/expert parallelism.
-- xformers is monkey-patched to force it to run on sm_120 GPUs (seems to work™.) Please open an issue if you experience
-  any problems with this.
 
 ## Architecture support
 
@@ -41,11 +33,12 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **EXAONE 4.0** (Exaone4ForCausalLM)
 - **Gemma 2** (Gemma2ForCausalLM)
 - **Gemma 3** (Gemma3ForCausalLM, Gemma3ForConditionalGeneration) *- multimodal*
-- **Gemma 4** (Gemma4ForConditionalGeneration) *- multimodal* (E2B/E4B currently not supported)
+- **Gemma 4** (Gemma4ForConditionalGeneration, Gemma4UnifiedForConditionalGeneration) *- multimodal* (E2B/E4B currently not supported)
 - **GLM 4**, **GLM 4.5**, **GLM 4.5-Air**, **GLM 4.6** (Glm4ForCausalLM, Glm4MoeForCausalLM)
 - **GLM 4.1V**, **GLM 4.5V** (Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration) *- multimodal*
 - **HyperCLOVAX** (HyperCLOVAXForCausalLM, HCXVisionV2ForCausalLM) *- multimodal*
 - **IQuest-Coder** (IQuestCoderForCausalLM)
+- **LFM 2.5** (Lfm2MoeForCausalLM)
 - **Llama**, **Llama 2**, **Llama 3**, **Llama 3.1-Nemotron** etc. (LlamaForCausalLM)
 - **MiMo-RL** (MiMoForCausalLM)
 - **MiniMax-M2** (MiniMaxM2ForCausalLM)
@@ -66,6 +59,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **SmolLM** (SmolLM3ForCausalLM)
 - **SolarOpen** (SolarOpenForCausalLM)
 - **Step 3.5 Flash** (Step3p5ForCausalLM)
+- **Step 3.7 Flash** (Step3p7ForConditionalGeneration) *- multimodal*
 
 Always adding more, stay tuned.
 
@@ -74,7 +68,6 @@ Always adding more, stay tuned.
 
 Currently on the to-do list:
 
-- LoRA support
 - ROCm support
 
 As for what is implemented, expect that some things may be a little broken at first. Please be patient, raise issues and/or contribute. 👉👈 
@@ -102,6 +95,10 @@ pip install exllamav3
 Note that the PyPi package does not contain a prebuilt extension and requires the CUDA toolkit and build prerequisites (i.e. VS Build Tools on Windows, gcc on Linux, `python-dev` headers etc.).    
 
 ### Method 3: Building from source
+
+Before building, make sure you have an appropriate version of Torch installed. Install a `flash-attn-2` wheel, e.g. from [here](https://mjunya.com/flash-attention-prebuild-wheels/). 
+
+On Windows, you should also make sure you have the `triton-windows` package installed. ExLlamaV3 may work without it, but many things will work suboptimally.   
 
 ```sh
 # Clone the repo

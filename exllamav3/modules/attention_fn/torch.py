@@ -24,6 +24,7 @@ def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
         args.is_swa() or
         args.is_varlen() or
         args.softcap != 0.0 or
+        args.sinks is not None or
         args.non_causal_spans
     ):
         return None
@@ -47,6 +48,7 @@ def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
         not args.has_kv_cache() or
         args.dim < 512 or
         args.softcap != 0.0 or
+        args.sinks is not None or
         args.is_swa()
     ):
         return None

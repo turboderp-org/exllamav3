@@ -295,6 +295,9 @@ class Job:
         # N-gram automaton
         self.sam = rq_state.get("sam", None)
 
+        # MTP state
+        self.mtp_last_hidden = None
+
 
     def get_pinned_logit_mask(self):
         if self.pinned_logit_mask is None:
@@ -459,6 +462,17 @@ class Job:
         results: list,
         first_sample_in_sd_batch: bool = True
     ):
+        """
+        Accept one sampled token and turn it into stream events, state updates and termination decisions.
+
+        The sampled token is appended to every sequence, completed cache pages are hashed for later prefix reuse,
+        active filters are advanced, and the decoded text/tokens/probabilities are buffered until it is safe to
+        emit them. Output is held when token healing needs to remove the unhealed prefix, when a partial Unicode
+        character or stop string may still complete, or when banned-string handling may need to rewind to a
+        checkpoint and suppress text. The returned requeue flag asks the generator to stop this physical job and
+        enqueue a new one with the current sequence as its prompt, which bounds per-job cache growth and lets long
+        generations pass through prompt-cache allocation again.
+        """
         next_token = next_token.cpu()
         next_token_i = next_token.item()
 
@@ -797,6 +811,14 @@ class Job:
 
 
     def prepare_for_requeue(self):
+        """
+        Reinitialize this single-sequence job so generation can continue as a freshly queued request.
+
+        Requeueing turns the full sequence generated so far into the new prompt, reduces the remaining token
+        limits, carries over streaming buffers/timing/filter state, and disables token healing because it already
+        happened on the first pass. The resulting job keeps the original serial number so callers see one logical
+        stream even though the generator schedules it as another pending job.
+        """
         assert len(self.sequences) == 1
 
         seq = self.sequences[0]
@@ -851,6 +873,14 @@ class Job:
 
 
     def prepare_for_queue(self, generator, serial_number: int, rq: bool = False):
+        """
+        Attach the job to a generator and prepare its static queue-time state.
+
+        This runs before the job is placed in pending_jobs and before physical cache pages are allocated. It hashes
+        full prompt pages so the page table can later find reusable K/V cache entries, counts the additional unique
+        pages required for generation, checks the request against cache and batch limits, initializes streaming
+        buffers for non-requeued jobs, and prepares any model-specific embedding/position metadata needed by prefill.
+        """
 
         # Attach to generator
         self.serial_number = serial_number
@@ -878,12 +908,19 @@ class Job:
         all_unique_pages = 0
         for seq in self.sequences:
             unique_hashes, unique_pages = seq.prepare(self.prefix_token is not None, self.max_rq_tokens)
-            all_unique_hashes |= unique_hashes
-            all_unique_pages += unique_pages
+            if self.generator.mtp_draft:
+                seq.max_cached_pages = max(0, (len(seq.sequence_ids) - 2) // PAGE_SIZE)
+                cached_hashes = seq.page_hashes[:seq.max_cached_pages]
+                omitted_pages = len(seq.page_hashes) - len(cached_hashes)
+                all_unique_hashes.update(cached_hashes)
+                all_unique_pages += unique_pages + omitted_pages
+            else:
+                all_unique_hashes |= unique_hashes
+                all_unique_pages += unique_pages
         self.all_unique_hashes = list(all_unique_hashes)
 
         # Make sure the request can potentially fit
-        total_pages = len(self.all_unique_hashes) + seq.new_unique_pages
+        total_pages = len(self.all_unique_hashes) + all_unique_pages
         max_pages = self.pagetable.max_pages
         assert total_pages <= max_pages, \
             f"Job requires {total_pages} pages (only {max_pages} available) and cannot " + \
@@ -927,11 +964,21 @@ class Job:
             if h not in self.pagetable.referenced_pages:
                 new_pages += 1
         for s in self.sequences:
-            new_pages += s.new_unique_pages
+            omitted_pages = 0 if s.max_cached_pages is None else len(s.page_hashes) - s.max_cached_pages
+            new_pages += s.new_unique_pages + omitted_pages
         return new_pages
 
 
     def prefill(self, results: list):
+        """
+        Run prompt prefill chunks for already allocated cache pages.
+
+        iterate_start_jobs() allocates or revives pages before this method is called. prefill() then advances each
+        sequence's kv_position through the prompt, skipping any prefix whose K/V pages were already cached, running
+        model forward passes for uncached chunks, updating page hashes as pages become complete, and stashing
+        recurrent checkpoints when applicable. It emits progress events but does not sample new completion tokens.
+        """
+
         if self.time_first_prefill is None:
             self.time_first_prefill = time.time()
 
@@ -997,6 +1044,12 @@ class Job:
                     if match > best_match:
                         best_match = match
                         best_match_page = page
+
+                # MTP needs one real target-model token at the end of prompt prefill to recover
+                # the post-final-norm carry state. Partial-page reuse must not consume that token.
+                if self.generator.mtp_draft and prefill_end == len(seq.sequence_ids) - 1:
+                    best_match = min(best_match, prefill_ids.shape[-1] - 1)
+
                 if best_match_page and best_match > 1:
                     page = seq.allocated_pages[p0]
                     for c in [self.generator.cache] if not self.generator.draft_model else \
@@ -1045,6 +1098,17 @@ class Job:
                         ext_prefill_end += 1
                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, ext_prefill_end)
 
+                # If the chunk starts inside a multimodal span (an atomic MM prefill re-feeds the
+                # extension processed by the previous chunk), tell the span builder how far the
+                # span extends before the chunk, so non-causal attention windows cover the whole
+                # span rather than just the in-chunk suffix
+                mm_span_prefix = 0
+                if self.embeddings:
+                    pp = prefill_start
+                    while pp > 0 and seq.multimodal_mask[pp - 1]:
+                        mm_span_prefix += 1
+                        pp -= 1
+
                 params = {
                     "attn_mode": "flash_attn",
                     "block_table": seq.block_index_tensor,
@@ -1053,13 +1117,17 @@ class Job:
                     "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
                     "indexed_embeddings": self.embeddings,
                     "inv_freq": self.alt_rope_freqs,
+                    "mm_span_prefix": mm_span_prefix,
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
-                self.generator.model.prefill(
-                    input_ids = prefill_ids,
-                    params = params,
-                )
+                if self.generator.mtp_draft:
+                    # MTP needs the target's post-final-norm state for every prompt token.
+                    # Normal prefill stops at the last cache-writing layer, before final norm.
+                    params["last_tokens_only"] = 1
+                    self.generator.model.forward(input_ids = prefill_ids, params = params)
+                else:
+                    self.generator.model.prefill(input_ids = prefill_ids, params = params)
 
                 if self.generator.dflash_draft:
                     self.generator.draft_model.update_kv_from_target(
@@ -1071,15 +1139,34 @@ class Job:
                         }
                     )
                 elif self.generator.draft_model:
+                    if self.generator.mtp_draft:
+                        target_hidden = params.get("export_states")[-1]
+                        carry_hidden = seq.mtp_carry_hidden
+                        if carry_hidden is None:
+                            carry_hidden = torch.zeros_like(target_hidden[:, :1, :])
+                        shifted_hidden = torch.cat((carry_hidden, target_hidden[:, :-1, :]), dim = 1)
+                        seq.mtp_carry_hidden = target_hidden[:, -1:, :].clone()
+                        self.mtp_last_hidden = seq.mtp_carry_hidden
+                    else:
+                        shifted_hidden = None
                     self.generator.draft_model.prefill(
                         input_ids = prefill_ids,
                         params = {
+                            "target_hidden": shifted_hidden,
                             "attn_mode": "flash_attn",
                             "block_table": seq.block_index_tensor,
                             "cache": self.generator.draft_cache,
                             "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                            "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
                         }
                     )
+
+                # Atomic MM prefill may have extended the forward pass past prefill_end, advancing any
+                # recurrent state beyond the chunk boundary. The extension is processed again by the
+                # next chunk, so rewind to keep the state position in sync with kv_position. Re-fed
+                # tokens map to the same state slots with the same values, leaving state content intact.
+                if self.recurrent_state is not None and self.recurrent_state.position > prefill_end:
+                    self.recurrent_state.rewind(self.recurrent_state.position - prefill_end)
 
                 seq.kv_position = prefill_end
 
@@ -1121,6 +1208,14 @@ class Job:
 
 
     def allocate_pages(self):
+        """
+        Claim cache pages for this job after it leaves the pending queue.
+
+        The per-sequence page allocation consults the page table hashes prepared by prepare_for_queue(), reviving
+        prompt-cache pages where possible and assigning fresh pages for uncached prompt or future generation. For
+        recurrent models this also creates or restores the recurrent state corresponding to the cached prefix.
+        """
+
         for seq in self.sequences:
             allocated_pages, cached_pages, non_sequential_pages, stashed_recurrent_state = \
                 seq.allocate_pages(self.pagetable, self.generator.recurrent_cache)
@@ -1161,6 +1256,9 @@ class Job:
 
 
     def activate(self):
+        """
+        Mark the job active and initialize sampling filters.
+        """
         self.logits_device = self.generator.model.output_device
         if not self.is_requeued:
             for f in self.filters:
@@ -1169,7 +1267,15 @@ class Job:
                 f.is_active = f.trigger_token is None
 
 
-    def is_checkpoint_boundary(self, override_interval):
+    def is_checkpoint_boundary(self, override_interval = None):
+        """
+        Return whether the current sequence position should stash a recurrent checkpoint.
+
+        Checkpoints are measured from the end of the cached K/V prefix so restored pages and recurrent state stay in
+        sync. An explicit interval overrides the normal policy; otherwise prefill uses the coarser prompt-prefill
+        interval until it nears the generation boundary, where it switches to the normal recurrent checkpoint
+        interval.
+        """
         seq = self.sequences[0]
         prompt_len = len(seq.sequence_ids) - 1
         seq_pos = seq.kv_position
@@ -1182,6 +1288,9 @@ class Job:
 
 
     def maybe_stash_recurrent(self, cache, interval = None):
+        """
+        Store the current recurrent state if the sequence is at a checkpoint boundary.
+        """
         seq = self.sequences[0]
         if self.is_checkpoint_boundary(interval) and \
             self.last_recurrent_checkpoint_pos != seq.kv_position:
@@ -1205,6 +1314,9 @@ class Job:
 
 
     def get_ngram_draft(self, draft_length: int):
+        """
+        Return speculative draft tokens from the suffix-array n-gram matcher.
+        """
         assert self.sam
 
         # Update SAM with current history and find longest suffix

@@ -24,7 +24,7 @@ def main(args):
     model = Model.from_config(config)
 
     # Tensor collection
-    stc = SafetensorsCollection(args.in_dir)
+    stc = SafetensorsCollection(args.in_dir, tensor_name_fixes = config.get_tensor_name_fixes())
 
     # Override tensors
     if args.override:

@@ -37,6 +37,7 @@ class MLP(Module):
         downs: list[Linear | Module] = None,
         interm_scale: float | None = None,
         select_hq_bits: int = 0,
+        qbits_key: str = "bits"
     ):
         super().__init__(config, key, None)
 
@@ -106,6 +107,7 @@ class MLP(Module):
                     pad_to = pad_to,
                     select_hq_bits = select_hq_bits,
                     qgroup = key + ".u",
+                    qbits_key = qbits_key,
                 )
                 down = Linear(
                     config = config,
@@ -123,6 +125,7 @@ class MLP(Module):
                     pad_to = pad_to,
                     select_hq_bits = select_hq_bits,
                     qgroup = key + ".d",
+                    qbits_key = qbits_key,
                 )
 
                 self.ups.append(up)
@@ -142,6 +145,7 @@ class MLP(Module):
         match activation_fn:
             case "silu": self.activation_fn_call = F.silu
             case "gelu": self.activation_fn_call = lambda x: F.gelu(x, approximate = "tanh")
+            case "quick_gelu": self.activation_fn_call = lambda x: x * torch.sigmoid(1.702 * x)
             case "relu2": self.activation_fn_call = lambda x: torch.square(F.relu(x))
             case "xielu": self.activation_fn_call = self.act_xielu
 
@@ -384,6 +388,7 @@ class GatedMLP(Module):
         ups: list[Linear | Module] = None,
         downs: list[Linear | Module] = None,
         select_hq_bits: int = 0,
+        qbits_key: str = "bits"
     ):
         super().__init__(config, key, None)
 
@@ -464,6 +469,7 @@ class GatedMLP(Module):
                     pad_to = pad_to,
                     select_hq_bits = select_hq_bits,
                     qgroup = key + ".gu",
+                    qbits_key = qbits_key,
                 )
                 up = Linear(
                     config = config,
@@ -482,6 +488,7 @@ class GatedMLP(Module):
                     pad_to = pad_to,
                     select_hq_bits = select_hq_bits,
                     qgroup = key + ".gu",
+                    qbits_key = qbits_key,
                 )
                 down = Linear(
                     config = config,
@@ -499,6 +506,7 @@ class GatedMLP(Module):
                     pad_to = pad_to,
                     select_hq_bits = select_hq_bits,
                     qgroup = key + ".d",
+                    qbits_key = qbits_key,
                 )
 
                 self.ups.append(up)
@@ -553,38 +561,57 @@ class GatedMLP(Module):
     def load_local(self, device: torch.Device, load_slice: int, **kwargs):
         # Test if gate and up proj can be fused
         if (
+            not self.config.infer_params.no_reconstruct and
             device != torch.device("cpu") and
             self.gates[load_slice].quant_type == "exl3" and
             self.ups[load_slice].quant_type == "exl3" and
             self.gates[load_slice].out_features == self.ups[load_slice].out_features and
             self.gates[load_slice].inner.K == self.ups[load_slice].inner.K and
             self.gates[load_slice].inner.bias is None and
-            self.ups[load_slice].inner.bias is None
+            self.ups[load_slice].inner.bias is None and
+            self.config.infer_params.use_mgemm(
+                self.gates[load_slice].inner.K,
+                self.gates[load_slice].out_features,
+                self.gates[load_slice].inner.mul1 and self.ups[load_slice].inner.mul1,
+            )
         ):
             self.multi_gu[load_slice] = MultiLinear(self.device, [self.gates[load_slice], self.ups[load_slice]])
 
+        # Graphed bsz-1 path: fused gate+up mgemm when available, otherwise two separate GEMV
+        # calls (the unfused configuration the int8-activation GEMV mode prefers)
         self.bc = None
-        if self.num_slices == 1 and self.multi_gu[0] is not None and self.downs[0].inner.bc is not None:
+        if self.num_slices == 1 and self.downs[0].inner.bc is not None:
             mgu = self.multi_gu[0]
-            self.bsz1_pa_args = [
-                (device, (2, 1, self.hidden_size), self.interm_dtype, "gu"),
-                (device, (2, 1, mgu.out_features), self.interm_dtype, "a1"),
-                (device, (1, 1, 1, mgu.out_features), torch.half, "a2")
-            ]
-            self.bc = ext.BC_GatedMLP(
-                *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
-                mgu.ptrs_trellis,
-                mgu.ptrs_suh,
-                mgu.ptrs_svh,
-                mgu.K,
-                mgu.mcg,
-                mgu.mul1,
-                self.activation_fn == "silu",
-                self.activation_fn == "gelu",
-                self.activation_fn == "relu2",
-                self.downs[0].inner.bc,
-                self.act_limit,
+            g0, u0 = self.gates[0], self.ups[0]
+            can_separate = (
+                mgu is None and
+                g0.quant_type == "exl3" and g0.inner.bc is not None and
+                u0.quant_type == "exl3" and u0.inner.bc is not None and
+                g0.out_features == u0.out_features
             )
+            if mgu is not None or can_separate:
+                out_f = mgu.out_features if mgu is not None else g0.out_features
+                self.bsz1_pa_args = [
+                    (device, (2, 1, self.hidden_size), self.interm_dtype, "gu"),
+                    (device, (2, 1, out_f), self.interm_dtype, "a1"),
+                    (device, (1, 1, 1, out_f), torch.half, "a2")
+                ]
+                self.bc = ext.BC_GatedMLP(
+                    *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
+                    mgu.ptrs_trellis if mgu is not None else None,
+                    mgu.ptrs_suh if mgu is not None else None,
+                    mgu.ptrs_svh if mgu is not None else None,
+                    mgu.K if mgu is not None else 0,
+                    bool(mgu.mcg) if mgu is not None else False,
+                    bool(mgu.mul1) if mgu is not None else False,
+                    self.activation_fn == "silu",
+                    self.activation_fn == "gelu",
+                    self.activation_fn == "relu2",
+                    g0.inner.bc if mgu is None else None,
+                    u0.inner.bc if mgu is None else None,
+                    self.downs[0].inner.bc,
+                    self.act_limit,
+                )
 
 
     @override
@@ -623,7 +650,12 @@ class GatedMLP(Module):
 
             for s in r:
 
-                if self.multi_gu[s] is None or bsz * q_len > 32:
+                if self.bc is not None and bsz == 1 and q_len == 1:
+                    d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
+                    x = x.view(1, bsz * q_len, dim)
+                    self.bc.run_bsz1(x, d.view(x.shape))
+
+                elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
@@ -633,11 +665,6 @@ class GatedMLP(Module):
                     if d is None: d = d_
                     else: d += d_
                     del d_
-
-                elif self.bc is not None and bsz == 1 and q_len == 1:
-                    d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
-                    x = x.view(1, bsz * q_len, dim)
-                    self.bc.run_bsz1(x, d.view(x.shape))
 
                 else:
                     x = x.view(1, bsz * q_len, dim)

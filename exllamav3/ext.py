@@ -109,6 +109,9 @@ else:
             extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
             extra_cuda_cflags += []
 
+    if not windows and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
+        extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
+
     if torch.version.hip:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
 

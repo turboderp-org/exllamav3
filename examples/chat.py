@@ -2,6 +2,9 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
+from pathlib import Path
+import tempfile
+import webbrowser
 from exllamav3 import Generator, Job, model_init
 from chat_templates import *
 from chat_util import *
@@ -9,6 +12,17 @@ from chat_io import *
 import torch
 from chat_console import *
 from safetensors.torch import save_file
+
+def get_last_assistant_response(context: list[tuple[str, str | None]], fallback: str) -> str:
+    for _, assistant_response in reversed(context):
+        if assistant_response:
+            return assistant_response
+    return fallback
+
+def write_svg_to_temp(svg: str) -> Path:
+    path = Path(tempfile.gettempdir()) / "extracted_svg.svg"
+    path.write_text(svg, encoding = "utf-8")
+    return path
 
 @torch.inference_mode()
 def main(args):
@@ -124,6 +138,7 @@ def main(args):
                         "/save <filename>   Save current session to file",
                         "/save_ids          Save last input IDs to last_ids.safetensors",
                         "/sp                Edit system prompt",
+                        "/svg               Extract SVG from last response and open in browser",
                         "/t                 Tokenize context",
                         "/think             Toggle reasoning mode",
                         "/tps               Toggle tokens/second output",
@@ -264,6 +279,17 @@ def main(args):
                         d = {"ids": last_input_ids}
                     save_file(d, "last_ids.safetensors")
                     print_info(f"Saved IDs to last_ids.safetensors")
+                    continue
+
+                # Extract SVG from last response
+                case "/svg":
+                    svg = extract_svg(get_last_assistant_response(context, response))
+                    if not svg:
+                        print_error(f"No SVG block found in last response")
+                    else:
+                        path = write_svg_to_temp(svg)
+                        print_info(f"Writing SVG to: {path}")
+                        webbrowser.open(path.as_uri())
                     continue
 
                 # Load conversation

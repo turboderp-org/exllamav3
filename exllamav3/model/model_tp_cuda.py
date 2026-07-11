@@ -10,6 +10,12 @@ CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED = 719
 
 @lru_cache(maxsize = 1)
 def _cudart():
+    """
+    Load and cache the CUDA runtime library used for host-memory registration calls.
+
+    Tensor-parallel shared-memory buffers are pinned through cudart so CUDA copies can use them efficiently. The
+    lookup handles the common Windows DLL names and Linux SONAMEs, then falls back to ctypes' library search.
+    """
 
     # Windows: Try to find cudart64_*.dll in common paths
     # TODO: Test that this actually works

@@ -10,6 +10,28 @@ from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+import os
+from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn
+
+
+def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
+    """
+    Round one K or V tensor through cache quantization in place (quantize to a temporary buffer,
+    dequantize back), so an fp16 cache downstream holds exactly what a quantized cache would
+    reproduce.
+    """
+    if bits is None or bits >= 16:
+        return
+    assert t.dtype == torch.half and t.size(-1) % 32 == 0
+    tc = t.contiguous()
+    blocks = t.size(-1) // 32
+    q = torch.empty(t.shape[:-1] + (blocks * bits,), dtype = torch.int, device = t.device)
+    scales = torch.empty(t.shape[:-1] + (blocks,), dtype = torch.half, device = t.device)
+    ext.quant_cache_cont(tc, q, scales, compand_a)
+    ext.dequant_cache_cont(q, scales, tc, compand_a)
+    if tc is not t:
+        t.copy_(tc)
+
 from ..util.tensor import g_tensor_cache
 from .attention_fn import attn_dispatch
 
@@ -49,6 +71,20 @@ def prepare_flash_attn_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor
     return input_ids
 
 
+# Rectangular (batch_shape mode) block tables are static per shape; cache them with persistent
+# device copies so they aren't rebuilt and re-uploaded every forward pass
+_block_tables = {}
+
+def _get_block_table(cache_bsz: int, pages_per_seq: int) -> torch.Tensor:
+    key = (cache_bsz, pages_per_seq)
+    bt = _block_tables.get(key)
+    if bt is None:
+        bt = torch.arange(cache_bsz * pages_per_seq, dtype = torch.int32).view(cache_bsz, pages_per_seq)
+        bt._static_dev_cache = True
+        _block_tables[key] = bt
+    return bt
+
+
 def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     bsz, seq_len = input_ids.shape
 
@@ -65,8 +101,7 @@ def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         # assert (past_len is not None) ^ (cache_seqlens is not None), "Need either past_len or cache_seqlens"
         assert bsz * cache_max_seq_len <= cache.max_num_tokens, "Cache too small for batch shape"
         cache_bsz = min(bsz, cache_bsz)
-        num_pages = cache_bsz * cache_max_seq_len // PAGE_SIZE
-        block_table = torch.arange(num_pages, dtype = torch.int32).view(cache_bsz, cache_max_seq_len // PAGE_SIZE)
+        block_table = _get_block_table(cache_bsz, cache_max_seq_len // PAGE_SIZE)
         if past_len is not None:
             cache_seqlens = torch.tensor([past_len], dtype = torch.int32).repeat(bsz)
             if position is None: position = past_len
@@ -124,6 +159,7 @@ class Attention(Module):
         key_o: str | None = None,
         key_g: str | None = None,
         key_fused_qkv: str | None = None,
+        key_sinks: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
@@ -140,11 +176,13 @@ class Attention(Module):
         interleaved_gate: bool = False,
         ve_gate: bool = False,
         use_k_as_v: bool = False,
+        transpose_qkv: bool = True,
         use_cu_seqlens: bool = False,
         post_rope_norm: bool = False,
         full_gate: bool = False,
         tp_split_norm: bool = True,
         select_hq_bits: int = 0,
+        qbits_key: str = "bits"
     ):
         super().__init__(config, key, None)
 
@@ -168,6 +206,8 @@ class Attention(Module):
         self.tp_split_norm = tp_split_norm
         self.use_k_as_v = use_k_as_v
         self.full_gate = full_gate
+        self.key_sinks = key_sinks
+        self.sinks = None
 
         if post_rope_norm:
             assert q_norm is None and k_norm is None, \
@@ -190,7 +230,7 @@ class Attention(Module):
             f = 2 if interleaved_gate else 1
             self.q_proj = Linear(
                 config,
-                f"{key}.{key_q}",
+                f"{key}.{key_q}" if key_q else f"{key}.q_proj",
                 hidden_size,
                 num_q_heads * head_dim * f,
                 qmap = qmap + ".input" if qmap is not None else None,
@@ -198,6 +238,9 @@ class Attention(Module):
                 frange = frange_q,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
+                trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.q_proj)
         else:
@@ -209,7 +252,7 @@ class Attention(Module):
             assert key_v or frange_v or use_k_as_v
             self.k_proj = Linear(
                 config,
-                f"{key}.{key_k}",
+                f"{key}.{key_k}" if key_k else f"{key}.k_proj",
                 hidden_size,
                 num_kv_heads * head_dim,
                 qmap =  qmap + ".input" if qmap is not None else None,
@@ -217,10 +260,13 @@ class Attention(Module):
                 frange = frange_k,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
+                trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.v_proj = Linear(
                 config,
-                f"{key}.{key_v}",
+                f"{key}.{key_v}" if key_v else f"{key}.v_proj",
                 hidden_size,
                 num_kv_heads * head_dim,
                 qmap =  qmap + ".input" if qmap is not None else None,
@@ -228,6 +274,9 @@ class Attention(Module):
                 frange = frange_v,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
+                trim_padded_out = True,
+                qbits_key = qbits_key,
             ) if not use_k_as_v else None
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
@@ -253,6 +302,8 @@ class Attention(Module):
                 out_dtype = out_dtype,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".o" if qmap is not None else None,
+                trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.o_proj)
         else:
@@ -302,6 +353,7 @@ class Attention(Module):
                 out_dtype = torch.half,
                 pad_to = 1,
                 select_hq_bits = select_hq_bits,
+                qbits_key = qbits_key,
             )
             self.headwise_gate = not full_gate
             self.register_submodule(self.g_proj)
@@ -323,6 +375,8 @@ class Attention(Module):
         self.multi_kv = None
         self.multi_qg = None
         self.tp_reduce = False
+        self.dispatch_cache = {}
+        self.bc_attn = {}
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
@@ -338,6 +392,7 @@ class Attention(Module):
         self.prealloc_qg_1 = None
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
+
 
     @override
     def optimizer_targets(self):
@@ -363,8 +418,14 @@ class Attention(Module):
                 self.rope_settings,
             )
 
+        if self.key_sinks:
+            self.sinks = self.config.stc.get_tensor(
+                f"{self.key}.{self.key_sinks}", device, no_defer = True
+            ).float().contiguous()
+
         # Test if K and V proj can be fused
         if (
+            not self.config.infer_params.no_reconstruct and
             not self.use_k_as_v and
             device != torch.device("cpu") and
             self.k_proj.quant_type == "exl3" and
@@ -373,7 +434,11 @@ class Attention(Module):
             self.k_proj.out_features == self.v_proj.out_features and
             self.k_proj.inner.K == self.v_proj.inner.K and
             self.k_proj.inner.bias is None and
-            self.v_proj.inner.bias is None
+            self.v_proj.inner.bias is None and
+            self.config.infer_params.use_mgemm(
+                self.k_proj.inner.K, self.k_proj.out_features,
+                self.k_proj.inner.mul1 and self.v_proj.inner.mul1,
+            )
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
             self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "kvh_1")
@@ -381,6 +446,7 @@ class Attention(Module):
 
         # Test if Q and G proj can be fused
         if (
+            not self.config.infer_params.no_reconstruct and
             self.g_proj is not None and
             device != torch.device("cpu") and
             self.q_proj.quant_type == "exl3" and
@@ -388,7 +454,11 @@ class Attention(Module):
             self.q_proj.out_features == self.g_proj.out_features and
             self.q_proj.inner.K == self.g_proj.inner.K and
             self.q_proj.inner.bias is None and
-            self.g_proj.inner.bias is None
+            self.g_proj.inner.bias is None and
+            self.config.infer_params.use_mgemm(
+                self.q_proj.inner.K, self.q_proj.out_features,
+                self.q_proj.inner.mul1 and self.g_proj.inner.mul1,
+            )
         ):
             self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
             self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "qgh_1")
@@ -407,13 +477,25 @@ class Attention(Module):
 
 
     @override
+    def get_tensors(self):
+        t = {}
+        if self.sinks is not None:
+            # bf16 -> fp16 is exact at sink-logit magnitudes; stored as loaded
+            t[f"{self.key}.{self.key_sinks}"] = self.sinks.half().contiguous()
+        return t
+
+
+    @override
     def unload(self):
         super().unload()
+
+        self.bc_attn = {}
 
         for cl in self.cache_layers:
             cl.free()
 
         self.rope = None
+        self.sinks = None
 
         if self.multi_kv is not None:
             self.multi_kv.unload()
@@ -466,8 +548,14 @@ class Attention(Module):
         if self.multi_qg is None or bsz * q_len > 32:
             q = self.q_proj.forward(x, params)
             if self.interleaved_gate:
-                q, g = torch.chunk(q.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
-                g = g.reshape(bsz, q_len, -1)
+                if self.head_dim % 8 == 0 and q.dtype == torch.half:
+                    qg = q
+                    q = torch.empty((bsz, q_len, self.num_q_heads, self.head_dim), dtype = torch.half, device = qg.device)
+                    g = torch.empty((bsz, q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = qg.device)
+                    ext.deinterleave_qg(qg, q, g, self.head_dim)
+                else:
+                    q, g = torch.chunk(q.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
+                    g = g.reshape(bsz, q_len, -1)
             elif self.g_proj:
                 g = self.g_proj.forward(x, params)
             else:
@@ -625,6 +713,7 @@ class Attention(Module):
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
         cu_seqlens = get_for_device(params, "cu_seqlens", self.device, None) if self.use_cu_seqlens else None
         max_seqlen = params["max_seqlen"] if cu_seqlens is not None else None
+        simulate_kv_quant = params.get("sim_kvq", None)
 
         q, k, v, g = self.project_qkv(x, params)
 
@@ -656,6 +745,12 @@ class Attention(Module):
                 self.post_rope_norm
             )
 
+        if simulate_kv_quant:
+            # (k_bits, v_bits) or (k_bits, v_bits, compand_a)
+            sq_ca = simulate_kv_quant[2] if len(simulate_kv_quant) > 2 else 0.0
+            _sim_kvq_inplace(k, simulate_kv_quant[0], sq_ca)
+            _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
+
         o = attn_dispatch(
             q = q,
             k = k,
@@ -666,14 +761,44 @@ class Attention(Module):
             sm_scale = self.sm_scale,
             window_size = self.sliding_window,
             softcap = self.logit_softcapping,
+            sinks = self.sinks,
+            dispatch_cache = self.dispatch_cache,
         )
 
         if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
+
+    def bc_attn_step(self, x, cache, params, block_table, cache_seqlens):
+        """
+        Graph-captured decode attention block (projections through o_proj as one C++ call,
+        replayed as one CUDA graph after warmup). Returns the block output, or None when the
+        call must take the regular python path.
+        """
+        from ..cache import CacheLayer
+
+        if cache is None or x.dtype != torch.float16 or not x.is_contiguous():
+            return None
+        if params.get("sim_kvq") is not None:
+            return None
+        positions = get_for_device(params, "positions", self.device, None)
+        position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
+        position = params.get("position", 0)
+
+        layer = cache if isinstance(cache, CacheLayer) else cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+        key = id(layer)
+        bca = self.bc_attn.get(key)
+        if bca is None:
+            bca = self.bc_attn[key] = (build_bc_attn(self, layer) or False)
+        if bca is False:
+            return None
+        return bca.step(x, cache_seqlens, block_table, position, positions, position_ids, inv_freq,
+                        causal = params.get("causal", True))
 
 
     def decode_flash_attn(
@@ -692,6 +817,17 @@ class Attention(Module):
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
         causal = params.get("causal", True)
         non_causal_spans = params.get("non_causal_spans")
+        simulate_kv_quant = params.get("sim_kvq", None)
+
+        # Graph-captured C++ path for the whole decode attention block (causality is baked
+        # into the slot kernels, so non-causal callers like the DFlash draft graph too)
+        if (
+            _bc_attn_enable and non_causal_spans is None and
+            bsz <= 4 and seqlen <= 16
+        ):
+            o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens)
+            if o is not None:
+                return o
 
         q, k, v, g = self.project_qkv(x, params)
 
@@ -726,6 +862,12 @@ class Attention(Module):
         if self.has_split_cache:
             cache = self.tp_cache_lookup[cache]
 
+        if simulate_kv_quant:
+            # (k_bits, v_bits) or (k_bits, v_bits, compand_a)
+            sq_ca = simulate_kv_quant[2] if len(simulate_kv_quant) > 2 else 0.0
+            _sim_kvq_inplace(k, simulate_kv_quant[0], sq_ca)
+            _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
+
         o = attn_dispatch(
             q = q,
             k = k,
@@ -740,10 +882,12 @@ class Attention(Module):
             window_size = self.sliding_window,
             softcap = self.logit_softcapping,
             non_causal_spans = non_causal_spans,
+            sinks = self.sinks,
+            dispatch_cache = self.dispatch_cache,
         )
 
         if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
-        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)

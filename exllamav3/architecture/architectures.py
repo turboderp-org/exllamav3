@@ -11,14 +11,16 @@ from .ernie4_5_moe import Ernie4_5MoEModel
 from .exaone4 import Exaone4Model
 from .gemma2 import Gemma2Model
 from .gemma3 import Gemma3Model, Gemma3TextModel
-from .gemma4 import Gemma4TextModel
+from .gemma4 import Gemma4TextModel, Gemma4UnifiedTextModel
 from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
+from .gpt_oss import GptOssModel
 from .hcxvisionv2 import HCXVisionV2Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
+from .lfm2_moe import Lfm2MoeModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
 from .minimax_m2 import MiniMaxM2Model
@@ -42,6 +44,7 @@ from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
 from .solar_open_moe import SolarOpenMoeModel
 from .step3_5 import Step3_5Model
+from .step3_7 import Step3_7Model
 
 ARCHITECTURES = {
     m.config_class.arch_string: {
@@ -64,13 +67,16 @@ ARCHITECTURES = {
         Gemma3Model,
         Gemma3TextModel,
         Gemma4TextModel,
+        Gemma4UnifiedTextModel,
         Glm4Model,
         Glm4MoeModel,
         Glm4VModel,
         Glm4VMoeModel,
+        GptOssModel,
         HCXVisionV2Model,
         HyperClovaxModel,
         IQuestCoderModel,
+        Lfm2MoeModel,
         LlamaModel,
         MiMoModel,
         MiniMaxM2Model,
@@ -97,6 +103,7 @@ ARCHITECTURES = {
         SmolLM3Model,
         SolarOpenMoeModel,
         Step3_5Model,
+        Step3_7Model,
     ]
 }
 

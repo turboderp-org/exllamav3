@@ -16,6 +16,7 @@ col_green = "\u001b[32;1m"
 col_red = "\u001b[31;1m"
 col_gray = "\u001b[37;1m"
 
+torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
 @lru_cache
 def cached_ids(length):
@@ -125,14 +126,16 @@ def main(args):
     if not args.skip_prefill:
         # Test prefill
         if not args.skip_warmup:
-            measure_prefill(args, model, cache, warmup = True)
+            for _ in range(2):
+                measure_prefill(args, model, cache, warmup = True)
         print(f"{col_yellow}Prefill:{col_default}")
         prefill_results = measure_prefill(args, model, cache)
         print()
 
     # Test generation
     if not args.skip_warmup:
-        measure_generate(args, model, cache, warmup = True)
+        for _ in range(2):
+            measure_generate(args, model, cache, warmup = True)
     print(f"{col_yellow}Generation{col_default}")
     generate_results = measure_generate(args, model, cache)
     print()

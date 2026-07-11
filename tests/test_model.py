@@ -118,8 +118,9 @@ def task_valid_svg(args, think = True):
 def task_kv_cache_reuse_longrec(args):
     return task_kv_cache_reuse(args, [10000, 70000, 250000, 200000, 100000, 50000], tolerance = 32768)
 
-def task_kv_cache_reuse(args, prompt_lengths = None, tolerance = 256):
-    prompt_lengths = prompt_lengths or [40000, 20000, 10000, 5000]
+def task_kv_cache_reuse(args, prompt_lengths = None, tolerance = None):
+    tolerance = tolerance or generator.recurrent_checkpoint_interval
+    prompt_lengths = prompt_lengths or [40000, 38000, 37000, 35000]
     def make_key(index: int) -> str:
         return str(uuid.uuid5(uuid.NAMESPACE_URL, f"exllamav3-kv-cache-reuse:{index}"))
 
@@ -214,7 +215,8 @@ def main(args):
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
         ngram_match_min = args.ngram_match_min,
-        recurrent_cache_size = args.sysmem_recurrent_cache * 1024**2
+        recurrent_cache_size = args.sysmem_recurrent_cache * 1024**2,
+        recurrent_checkpoint_interval_pp = args.recurrent_checkpoint_interval_pp,
     )
     stop_conditions = config.eos_token_id_list
     sampler = model_init.get_arg_sampler(args)
@@ -268,4 +270,5 @@ if __name__ == "__main__":
     parser.add_argument("-resultl", "--result_jsonl", type = str, default = None, help = "Append structured result to a JSONL file")
     parser.add_argument("-print_result", "--print_result_json", action = "store_true", help = "Print structured result as one RESULT_JSON line")
     parser.add_argument("-smc", "--sysmem_recurrent_cache", type = int, default = 4096, help = "Max size of recurrent cache (sysmem) in MB")
+    parser.add_argument("-rcpip", "--recurrent_checkpoint_interval_pp", type = int, default = 32768, help = "Recurrent checkpoint interval on long prompts")
     main(parser.parse_args())

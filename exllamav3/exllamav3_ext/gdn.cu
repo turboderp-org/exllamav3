@@ -6,6 +6,7 @@
 #include "util.h"
 #include "util.cuh"
 #include "compat.cuh"
+#include "graph.cuh"
 #include <cmath>
 
 using bfloat16 = __nv_bfloat16;
@@ -15,6 +16,7 @@ using bfloat16 = __nv_bfloat16;
 #define SUBK 4
 
 #define FUSED_OP_2_THREADS 512
+#define FUSED_OP_3_THREADS 256
 
 __device__ __forceinline__ float _sigmoid_fast_exp(float x)
 {
@@ -704,7 +706,7 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     }
 }
 
-void cuda_recurrent_gated_delta_rule
+void cuda_recurrent_gated_delta_rule_gr
 (
     const at::Tensor& mixed_qkv,
     const at::Tensor& g,
@@ -716,11 +718,14 @@ void cuda_recurrent_gated_delta_rule
     int k_head_dim,
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
-    bool history
+    bool history,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(mixed_qkv.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(!graph || !history, "cuda_recurrent_gated_delta_rule: history mode is not graph-capturable");
+    TORCH_CHECK(!graph || slots.has_value(), "cuda_recurrent_gated_delta_rule: graph capture requires slots");
 
     int bsz = mixed_qkv.size(0);
     int seqlen = mixed_qkv.size(1);
@@ -792,20 +797,32 @@ void cuda_recurrent_gated_delta_rule
         slots_ptr,                              \
         history_stride
 
+    // recurrent_state is kernel param 3 and slots is param 12, patched when running in a graph
+    #define LAUNCH_RULE(...)                                                              \
+    {                                                                                     \
+        __VA_ARGS__<<<blocks, threads, 0, stream>>>(KERNEL_ARGS);                         \
+        if (graph)                                                                        \
+        {                                                                                 \
+            graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_state, 3);              \
+            graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_slots, 12);             \
+            graph->record_param((void*) &__VA_ARGS__, GP_end, 0);                         \
+        }                                                                                 \
+    }
+
     if (!history)
     {
         if (k_head_dim == 128 && v_head_dim == 128)
         {
-            if (v_split == 4) cuda_recurrent_gated_delta_rule_kernel_128<false, 4><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
-            else              cuda_recurrent_gated_delta_rule_kernel_128<false, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 4>)
+            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 1>)
         }
         else if (threads.x <= 128)
         {
-            if (v_split == 4) cuda_recurrent_gated_delta_rule_kernel<128, false, 4><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
-            else              cuda_recurrent_gated_delta_rule_kernel<128, false, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, false, 4>)
+            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, false, 1>)
         }
         else if (threads.x <= 256)
-                              cuda_recurrent_gated_delta_rule_kernel<256, false, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+                              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<256, false, 1>)
         else TORCH_CHECK(false, "Max head dim exceeded");
     }
     else
@@ -824,7 +841,446 @@ void cuda_recurrent_gated_delta_rule
                               cuda_recurrent_gated_delta_rule_kernel<256, true, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
         else TORCH_CHECK(false, "Max head dim exceeded");
     }
+    #undef LAUNCH_RULE
     #undef KERNEL_ARGS
 
     cuda_check(cudaPeekAtLastError());
+}
+
+void cuda_recurrent_gated_delta_rule
+(
+    const at::Tensor& mixed_qkv,
+    const at::Tensor& g,
+    const at::Tensor& beta,
+    at::Tensor& recurrent_state,
+    at::Tensor& core_attn_out,
+    int num_k_heads,
+    int num_v_heads,
+    int k_head_dim,
+    int v_head_dim,
+    const c10::optional<at::Tensor>& slots,
+    bool history
+)
+{
+    cuda_recurrent_gated_delta_rule_gr(
+        mixed_qkv, g, beta, recurrent_state, core_attn_out,
+        num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, nullptr);
+}
+
+#define CONV1D_MAX_K 16
+#define CONV1D_NUM_THREADS 256
+
+// Causal conv1d update for short decode steps. Equivalent to the triton kernel in
+// modules/gated_delta_net_fn/conv1d.py but launchable in ~4us instead of ~50us of host time.
+//
+// out[b,s,d] = act(bias[d] + sum_k w[d,k] * in(b,d,s+k+1)) where the input sequence is the
+// concatenation of conv_state[slot,d,0:K] and x[b,d,0:seqlen]. Without history, the last K
+// inputs are written back to conv_state[slot,d,0:K]; with history, the last
+// min(state_size, K+seqlen) inputs are written to the tail of the state buffer (rewindable).
+
+template <bool ACT, bool HISTORY>
+__global__ __launch_bounds__(CONV1D_NUM_THREADS)
+void conv1d_update_kernel
+(
+    const bfloat16* __restrict__ x,           // (bsz, dim, seqlen)
+    bfloat16* __restrict__ conv_state,        // (num_slots, dim, state_size)
+    const int* __restrict__ slots,            // (bsz) or null (identity)
+    const bfloat16* __restrict__ weight,      // (dim, K)
+    const bfloat16* __restrict__ bias,        // (dim) or null
+    bfloat16* __restrict__ out,               // (bsz, seqlen, dim)
+    const int dim,
+    const int seqlen,
+    const int state_size,
+    const int K
+)
+{
+    int d = blockIdx.x * CONV1D_NUM_THREADS + threadIdx.x;
+    if (d >= dim) return;
+    int b = blockIdx.y;
+    int slot = slots ? slots[b] : b;
+
+    const bfloat16* x_d = x + ((size_t) b * dim + d) * seqlen;
+    bfloat16* state_d = conv_state + ((size_t) slot * dim + d) * state_size;
+
+    float w[CONV1D_MAX_K];
+    #pragma unroll
+    for (int k = 0; k < CONV1D_MAX_K; ++k)
+        if (k < K) w[k] = __bfloat162float(weight[(size_t) d * K + k]);
+
+    float bias_d = bias ? __bfloat162float(bias[d]) : 0.0f;
+
+    // Previous window; win[K-1] slot is filled with the current input each step
+    float old_state[CONV1D_MAX_K];
+    float win[CONV1D_MAX_K];
+    #pragma unroll
+    for (int k = 0; k < CONV1D_MAX_K; ++k)
+        if (k < K) old_state[k] = __bfloat162float(state_d[k]);
+    #pragma unroll
+    for (int k = 0; k < CONV1D_MAX_K - 1; ++k)
+        if (k < K - 1) win[k] = old_state[k + 1];
+
+    for (int s = 0; s < seqlen; ++s)
+    {
+        win[K - 1] = __bfloat162float(x_d[s]);
+
+        float acc = bias_d;
+        #pragma unroll
+        for (int k = 0; k < CONV1D_MAX_K; ++k)
+            if (k < K) acc = fmaf(w[k], win[k], acc);
+
+        if constexpr (ACT)
+            acc *= _sigmoid_fast_exp(acc);
+
+        out[((size_t) b * seqlen + s) * dim + d] = __float2bfloat16_rn(acc);
+
+        #pragma unroll
+        for (int k = 0; k < CONV1D_MAX_K - 1; ++k)
+            if (k < K - 1) win[k] = win[k + 1];
+    }
+
+    if constexpr (!HISTORY)
+    {
+        #pragma unroll
+        for (int k = 0; k < CONV1D_MAX_K; ++k)
+        {
+            if (k < K)
+            {
+                int src_t = seqlen + k;
+                float v = (src_t < K) ? old_state[src_t] : __bfloat162float(x_d[src_t - K]);
+                state_d[k] = __float2bfloat16_rn(v);
+            }
+        }
+    }
+    else
+    {
+        int total = K + seqlen;
+        int write_size = state_size < total ? state_size : total;
+        int dst_start = state_size - write_size;
+        int src_start = total - write_size;
+        for (int j = 0; j < write_size; ++j)
+        {
+            int src_t = src_start + j;
+            float v = (src_t < K) ? old_state[src_t] : __bfloat162float(x_d[src_t - K]);
+            state_d[dst_start + j] = __float2bfloat16_rn(v);
+        }
+    }
+}
+
+void cuda_causal_conv1d_update_gr
+(
+    const at::Tensor& x,
+    at::Tensor& conv_state,
+    const c10::optional<at::Tensor>& slots,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias,
+    at::Tensor& out,
+    bool activation,
+    bool history,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(!graph || slots.has_value(), "cuda_causal_conv1d_update: graph capture requires slots");
+
+    int bsz = x.size(0);
+    int dim = x.size(1);
+    int seqlen = x.size(2);
+    int state_size = conv_state.size(2);
+    int K = weight.size(1);
+
+    TORCH_CHECK(K <= CONV1D_MAX_K, "conv kernel size exceeds CONV1D_MAX_K");
+    TORCH_CHECK(state_size >= K, "conv_state must have at least K entries");
+    TORCH_CHECK(x.is_contiguous() && conv_state.is_contiguous() && weight.is_contiguous() && out.is_contiguous(),
+                "x, conv_state, weight and out must be contiguous");
+    TORCH_CHECK(conv_state.dim() == 3 && conv_state.size(1) == dim,
+                "conv_state must be (num_slots, dim, state_size)");
+    TORCH_CHECK(weight.dim() == 2 && weight.size(0) == dim,
+                "weight must be (dim, K)");
+    TORCH_CHECK(out.dim() == 3 && out.size(0) == bsz && out.size(1) == seqlen && out.size(2) == dim,
+                "out must be (bsz, seqlen, dim)");
+    TORCH_CHECK_DTYPE(x, kBFloat16);
+    TORCH_CHECK_DTYPE(conv_state, kBFloat16);
+    TORCH_CHECK_DTYPE(weight, kBFloat16);
+    TORCH_CHECK_DTYPE_OPT(bias, kBFloat16);
+    TORCH_CHECK_DTYPE(out, kBFloat16);
+    TORCH_CHECK_DTYPE_OPT(slots, kInt);
+
+    const int* slots_ptr = (const int*) OPTPTR(slots);
+    if (slots_ptr)
+    {
+        TORCH_CHECK(slots.value().dim() == 1 && slots.value().size(0) == bsz, "slots must be (bsz)");
+    }
+    else
+    {
+        TORCH_CHECK(conv_state.size(0) >= bsz, "conv_state too small for batch without slots");
+    }
+    const bfloat16* bias_ptr = (const bfloat16*) OPTPTR(bias);
+
+    dim3 blocks(CEIL_DIVIDE(dim, CONV1D_NUM_THREADS), bsz);
+
+    #define KERNEL_ARGS                             \
+        (const bfloat16*) x.data_ptr(),             \
+        (bfloat16*) conv_state.data_ptr(),          \
+        slots_ptr,                                  \
+        (const bfloat16*) weight.data_ptr(),        \
+        bias_ptr,                                   \
+        (bfloat16*) out.data_ptr(),                 \
+        dim, seqlen, state_size, K
+
+    // conv_state is kernel param 1 and slots is param 2, patched when running in a graph
+    #define LAUNCH_CONV(...)                                                              \
+    {                                                                                     \
+        __VA_ARGS__<<<blocks, CONV1D_NUM_THREADS, 0, stream>>>(KERNEL_ARGS);              \
+        if (graph)                                                                        \
+        {                                                                                 \
+            graph->record_param((void*) &__VA_ARGS__, GP_conv1d_state, 1);                \
+            graph->record_param((void*) &__VA_ARGS__, GP_conv1d_slots, 2);                \
+            graph->record_param((void*) &__VA_ARGS__, GP_end, 0);                         \
+        }                                                                                 \
+    }
+
+    if (activation)
+    {
+        if (history) LAUNCH_CONV(conv1d_update_kernel<true, true>)
+        else         LAUNCH_CONV(conv1d_update_kernel<true, false>)
+    }
+    else
+    {
+        if (history) LAUNCH_CONV(conv1d_update_kernel<false, true>)
+        else         LAUNCH_CONV(conv1d_update_kernel<false, false>)
+    }
+    #undef LAUNCH_CONV
+    #undef KERNEL_ARGS
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+void cuda_causal_conv1d_update
+(
+    const at::Tensor& x,
+    at::Tensor& conv_state,
+    const c10::optional<at::Tensor>& slots,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias,
+    at::Tensor& out,
+    bool activation,
+    bool history
+)
+{
+    cuda_causal_conv1d_update_gr(x, conv_state, slots, weight, bias, out, activation, history, nullptr);
+}
+
+// Split-projection (Qwen3.5) decode helper. Replaces the qkv transpose/cast done in Torch plus
+// gated_delta_net_fused_op_2: mixed_qkv[b,f,s] = bf16(qkv[b,s,f]), and beta/g computed from the
+// packed ba projection (b = ba[..,:H], a = ba[..,H:])
+
+template <typename a_log_T>
+__global__ void gated_delta_net_fused_op_3_kernel
+(
+    const float* __restrict__ in_qkv,           // [B,S,F]
+    const float* __restrict__ in_ba,            // [B,S,2H]
+    const bfloat16* __restrict__ in_dt_bias,    // [H]
+    const a_log_T* __restrict__ in_a_log,       // [H]
+    bfloat16* __restrict__ out_mixed_qkv,       // [B,F,S]
+    bfloat16* __restrict__ out_beta,            // [B,S,H]
+    float* __restrict__ out_g,                  // [B,S,H]
+    const int BS,                               // B * S
+    const int S,
+    const int F,
+    const int H,
+    const float beta_scale
+)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int cast_elems = BS * F;
+
+    if (idx < cast_elems)
+    {
+        int f = idx % F;
+        int row = idx / F;                      // b * S + s
+        int b = row / S;
+        int s = row % S;
+        out_mixed_qkv[((size_t) b * F + f) * S + s] = trunc_bf16(in_qkv[idx]);
+    }
+    else
+    {
+        idx -= cast_elems;
+        if (idx >= BS * H) return;
+        int h = idx % H;
+        int row = idx / H;
+
+        float bv = in_ba[(size_t) row * 2 * H + h];
+        float av = in_ba[(size_t) row * 2 * H + H + h];
+        float beta = _sigmoid_fast_exp(bv) * beta_scale;
+        float dt_bias = as_float(in_dt_bias[h]);
+        float gv = -softplus(av + dt_bias) * __expf(as_float(in_a_log[h]));
+
+        out_beta[(size_t) row * H + h] = trunc_bf16(beta);
+        out_g[(size_t) row * H + h] = gv;
+    }
+}
+
+void gated_delta_net_fused_op_3_gr
+(
+    const at::Tensor& qkv,          // [B,S,F] float
+    const at::Tensor& ba,           // [B,S,2H] float
+    const at::Tensor& dt_bias,      // [H] bfloat16
+    const at::Tensor& a_log,        // [H] float or bfloat16
+    at::Tensor& mixed_qkv,          // out [B,F,S] bfloat16
+    at::Tensor& beta,               // out [B,S,H] bfloat16
+    at::Tensor& g,                  // out [B,S,H] float
+    const float beta_scale,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(qkv.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(qkv, kFloat);
+    TORCH_CHECK_DTYPE(ba, kFloat);
+    TORCH_CHECK_DTYPE(dt_bias, kBFloat16);
+    TORCH_CHECK_DTYPE(mixed_qkv, kBFloat16);
+    TORCH_CHECK_DTYPE(beta, kBFloat16);
+    TORCH_CHECK_DTYPE(g, kFloat);
+
+    int B = qkv.size(0);
+    int S = qkv.size(1);
+    int F = qkv.size(2);
+    int H = beta.size(-1);
+
+    TORCH_CHECK(ba.size(-1) == 2 * H, "ba must be [B,S,2H]");
+    TORCH_CHECK(ba.numel() == B * S * 2 * H, "ba must be [B,S,2H]");
+    TORCH_CHECK(mixed_qkv.numel() == B * S * F, "mixed_qkv must be [B,F,S]");
+    TORCH_CHECK(beta.numel() == B * S * H, "beta must be [B,S,H]");
+    TORCH_CHECK(g.numel() == B * S * H, "g must be [B,S,H]");
+
+    bool a_log_fp32 = a_log.dtype() == at::kFloat;
+    bool a_log_bf16 = a_log.dtype() == at::kBFloat16;
+
+    int BS = B * S;
+    int total = BS * (F + H);
+    int blocks = CEIL_DIVIDE(total, FUSED_OP_3_THREADS);
+
+    #define ARGS(a_log_T)                       \
+        (const float*) qkv.data_ptr(),          \
+        (const float*) ba.data_ptr(),           \
+        (const bfloat16*) dt_bias.data_ptr(),   \
+        (const a_log_T*) a_log.data_ptr(),      \
+        (bfloat16*) mixed_qkv.data_ptr(),       \
+        (bfloat16*) beta.data_ptr(),            \
+        (float*) g.data_ptr(),                  \
+        BS, S, F, H,                            \
+        beta_scale
+
+    if (a_log_fp32)
+        gated_delta_net_fused_op_3_kernel<<<blocks, FUSED_OP_3_THREADS, 0, stream>>>(ARGS(float));
+    else if (a_log_bf16)
+        gated_delta_net_fused_op_3_kernel<<<blocks, FUSED_OP_3_THREADS, 0, stream>>>(ARGS(bfloat16));
+    else TORCH_CHECK(false, "gated_delta_net_fused_op_3: unsupported a_log dtype");
+
+    #undef ARGS
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+// Small fp16 GEMV with fp32 accumulation/output for the merged b/a projections. One warp per
+// output feature; n is tiny (2 * num_v_heads) so this is launch-bound anyway. Kept out of cublas
+// so the x pointer is patchable in captured graphs
+
+#define BA_GEMV_WARPS 8
+
+__global__ __launch_bounds__(BA_GEMV_WARPS * 32)
+void gdn_ba_gemv_kernel
+(
+    const half* __restrict__ x,                 // [k]
+    const half* __restrict__ w_t,               // [n, k]
+    const half* __restrict__ bias,              // [n] or null
+    float* __restrict__ y,                      // [n]
+    const int k,
+    const int n
+)
+{
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int row = blockIdx.x * BA_GEMV_WARPS + warp;
+    if (row >= n) return;
+
+    const half2* x2 = (const half2*) x;
+    const half2* w2 = (const half2*) (w_t + (size_t) row * k);
+
+    float sum = 0.0f;
+    for (int j = lane; j < k / 2; j += 32)
+    {
+        float2 xf = __half22float2(x2[j]);
+        float2 wf = __half22float2(w2[j]);
+        sum = fmaf(xf.x, wf.x, sum);
+        sum = fmaf(xf.y, wf.y, sum);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    if (lane == 0)
+    {
+        if (bias) sum += __half2float(bias[row]);
+        y[row] = sum;
+    }
+}
+
+void gdn_ba_gemv_gr
+(
+    const at::Tensor& x,            // [.., k] half
+    const at::Tensor& w_t,          // [n, k] half
+    const c10::optional<at::Tensor>& bias,  // [n] half
+    at::Tensor& y,                  // [.., n] float
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK_DTYPE(w_t, kHalf);
+    TORCH_CHECK_DTYPE_OPT(bias, kHalf);
+    TORCH_CHECK_DTYPE(y, kFloat);
+
+    int k = x.size(-1);
+    int n = w_t.size(0);
+    TORCH_CHECK(x.numel() == k, "gdn_ba_gemv: only a single input row is supported");
+    TORCH_CHECK(w_t.dim() == 2 && w_t.size(1) == k, "w_t must be [n, k]");
+    TORCH_CHECK(y.numel() == n, "y must be [.., n]");
+    TORCH_CHECK(k % 2 == 0, "k must be even");
+    TORCH_CHECK(x.is_contiguous() && w_t.is_contiguous() && y.is_contiguous(), "tensors must be contiguous");
+
+    const half* bias_ptr = (const half*) OPTPTR(bias);
+    int blocks = CEIL_DIVIDE(n, BA_GEMV_WARPS);
+
+    gdn_ba_gemv_kernel<<<blocks, BA_GEMV_WARPS * 32, 0, stream>>>
+    (
+        (const half*) x.data_ptr(),
+        (const half*) w_t.data_ptr(),
+        bias_ptr,
+        (float*) y.data_ptr(),
+        k, n
+    );
+
+    if (graph)
+    {
+        graph->record_param((void*) &gdn_ba_gemv_kernel, GP_gdn_ba_x, 0);
+        graph->record_param((void*) &gdn_ba_gemv_kernel, GP_end, 0);
+    }
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+void gdn_ba_gemv
+(
+    const at::Tensor& x,
+    const at::Tensor& w_t,
+    const c10::optional<at::Tensor>& bias,
+    at::Tensor& y
+)
+{
+    gdn_ba_gemv_gr(x, w_t, bias, y, nullptr);
 }
