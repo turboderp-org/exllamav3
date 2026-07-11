@@ -79,7 +79,11 @@ enum GraphedParams
     GP_attn_num_splits,
 
     GP_copy2d_src,
-    GP_copy2d_dst
+    GP_copy2d_dst,
+
+    GP_moe_bias_add_sel,
+    GP_moe_bias_add_weighted_sel,
+    GP_moe_bias_add_weighted_weights
 };
 
 class Graph

@@ -262,7 +262,13 @@ void moe_bias_add_gr
         min_expert,
         max_expert
     );
+    if (graph)
+    {
+        graph->record_param((void*) &moe_bias_add_kernel, GP_moe_bias_add_sel, 2);
+        graph->record_param((void*) &moe_bias_add_kernel, GP_end, 0);
+    }
     cuda_check(cudaPeekAtLastError());
+
 }
 
 void moe_bias_add_weighted_gr
@@ -297,5 +303,11 @@ void moe_bias_add_weighted_gr
         min_expert,
         max_expert
     );
+    if (graph)
+    {
+        graph->record_param((void*) &moe_bias_add_weighted_kernel, GP_moe_bias_add_weighted_sel, 2);
+        graph->record_param((void*) &moe_bias_add_weighted_kernel, GP_moe_bias_add_weighted_weights, 3);
+        graph->record_param((void*) &moe_bias_add_weighted_kernel, GP_end, 0);
+    }
     cuda_check(cudaPeekAtLastError());
 }
