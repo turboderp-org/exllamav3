@@ -239,6 +239,7 @@ class SlidingAttention(Module):
         key_v: str | None = None,
         key_o: str | None = None,
         key_g: str | None = None,
+        key_sinks: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
@@ -272,7 +273,10 @@ class SlidingAttention(Module):
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
         self.sliding_window_overp = sliding_window_overp
-        self.kv_state_size = sliding_window + sliding_window_overp
+        # The state buffer holds the window plus overprovisioned history so speculative decoding can
+        # roll back rejected drafts without recompute; the shift logic drops up to a page at a time,
+        # so round UP to whole pages to preserve at least the requested slack after a shift
+        self.kv_state_size = -(-(sliding_window + sliding_window_overp) // PAGE_SIZE) * PAGE_SIZE
         self.logit_softcapping = logit_softcapping
         self.post_rope_norm = post_rope_norm
         self.full_gate = full_gate
@@ -295,6 +299,8 @@ class SlidingAttention(Module):
         self.bc_attn = {}
         self.headwise_gate = False
         self.g_proj = None
+        self.key_sinks = key_sinks
+        self.sinks = None
 
         if post_rope_norm:
             assert q_norm is None and k_norm is None, \
@@ -368,6 +374,7 @@ class SlidingAttention(Module):
                 out_dtype = out_dtype,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".o" if qmap is not None else None,
+                trim_padded_out = True,
             )
             self.register_submodule(self.o_proj)
         else:
@@ -458,6 +465,11 @@ class SlidingAttention(Module):
                 self.rope_settings,
             )
 
+        if self.key_sinks:
+            self.sinks = self.config.stc.get_tensor(
+                f"{self.key}.{self.key_sinks}", device, no_defer = True
+            ).float().contiguous()
+
         # Test if K and V proj can be fused
         if (
             not self.config.infer_params.no_reconstruct and
@@ -516,6 +528,7 @@ class SlidingAttention(Module):
 
         self.bc_attn = {}
         self.rope = None
+        self.sinks = None
 
         if self.multi_kv is not None:
             self.multi_kv.unload()
@@ -533,6 +546,15 @@ class SlidingAttention(Module):
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
         self.bt_cache = {}
+
+
+    @override
+    def get_tensors(self):
+        t = super().get_tensors()
+        if self.sinks is not None:
+            # bf16 -> fp16 is exact at sink-logit magnitudes; stored as loaded
+            t[f"{self.key}.{self.key_sinks}"] = self.sinks.half().contiguous()
+        return t
 
 
     @override
@@ -747,6 +769,7 @@ class SlidingAttention(Module):
             softmax_scale = self.sm_scale,
             window_size = (self.sliding_window, self.sliding_window),
             softcap = self.logit_softcapping,
+            sinks = self.sinks,
             k_new = k,
             v_new = v,
         )
@@ -837,6 +860,7 @@ class SlidingAttention(Module):
                 softmax_scale = self.sm_scale,
                 window_size = (sw, 0),
                 softcap = self.logit_softcapping,
+                sinks = self.sinks,
                 max_kv_len = S,
             )
 
@@ -864,6 +888,7 @@ class SlidingAttention(Module):
                     softmax_scale = self.sm_scale,
                     window_size = (sw, 0),
                     softcap = self.logit_softcapping,
+                    sinks = self.sinks,
                     k_new = k,
                     v_new = v,
                 )
@@ -883,6 +908,7 @@ class SlidingAttention(Module):
                         softmax_scale = self.sm_scale,
                         window_size = (max(sw, l + pre), l - 1) if c else (sw, 0),
                         softcap = self.logit_softcapping,
+                        sinks = self.sinks,
                         k_new = k[:, : b].contiguous(),
                         v_new = v[:, : b].contiguous(),
                     )
@@ -1001,6 +1027,8 @@ class SlidingAttention(Module):
                 "o_proj",
                 "g_proj",
             )},
+            # Learned attention sinks (gpt-oss): one logit per query head, sliced to the local heads on import
+            "sinks": producer.send(self.sinks) if self.sinks is not None else None,
             "device": self.device,
             "recurrent_layers": [
                 rl.tp_export(plan) for rl in self.recurrent_layers
@@ -1059,6 +1087,13 @@ class SlidingAttention(Module):
             o_proj = _import_split("o_proj", o_split),
             g_proj = _import_split("g_proj", g_split),
         )
+
+        # Attention sinks are one logit per query head; each rank keeps its local head range
+        if exported.get("sinks") is not None and num_kv_heads:
+            consumer = local_context["consumer"]
+            module.sinks = consumer.recv(
+                exported["sinks"], cuda = True, slice_dim = 0, first = first * n_gqa, last = last * n_gqa
+            )
 
         if num_kv_heads:
             recurrent_layers = exported["recurrent_layers"]
