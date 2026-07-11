@@ -169,9 +169,8 @@ class GptOssModel(Model):
         # Activate all experts during H capture pass in quantization
         self.calibration_all_experts = True
 
-        # TP is not currently supported
         self.caps.update({
-            "supports_tp": False,
+            "supports_tp": True,
         })
 
 

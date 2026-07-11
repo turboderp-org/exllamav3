@@ -106,7 +106,7 @@ void BC_BlockSparseMLP::run_bsz1_gr
         graph
     );
     if (gate_bias_ptrs)
-        moe_bias_add_gr(interm_g, gate_bias_ptrs.value(), selected_experts, graph);
+        moe_bias_add_gr(interm_g, gate_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
 
     exl3_mgemm_gr
     (
@@ -129,7 +129,7 @@ void BC_BlockSparseMLP::run_bsz1_gr
     );
 
     if (up_bias_ptrs)
-        moe_bias_add_gr(interm_u, up_bias_ptrs.value(), selected_experts, graph);
+        moe_bias_add_gr(interm_u, up_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
 
     if (act_silu)
         silu_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
@@ -160,7 +160,7 @@ void BC_BlockSparseMLP::run_bsz1_gr
         graph
     );
     if (down_bias_ptrs)
-        moe_bias_add_weighted_gr(out_d, down_bias_ptrs.value(), selected_experts, routing_weights, graph);
+        moe_bias_add_weighted_gr(out_d, down_bias_ptrs.value(), selected_experts, routing_weights, min_expert, max_expert, graph);
     if (out_trim)
     {
         // Exact-width copy out of the padded down result (row 0 holds the weighted reduction)

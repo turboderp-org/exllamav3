@@ -30,6 +30,8 @@ void moe_bias_add_gr
     at::Tensor& interm,
     const at::Tensor& bias_ptrs,
     const at::Tensor& sel,
+    int min_expert,
+    int max_expert,
     Graph* graph
 );
 
@@ -39,5 +41,7 @@ void moe_bias_add_weighted_gr
     const at::Tensor& bias_ptrs,
     const at::Tensor& sel,
     const at::Tensor& weights,
+    int min_expert,
+    int max_expert,
     Graph* graph
 );

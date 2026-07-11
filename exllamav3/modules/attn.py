@@ -983,6 +983,8 @@ class Attention(Module):
                 "o_proj",
                 "g_proj",
             )},
+            # Learned attention sinks (gpt-oss): one logit per query head, sliced to the local heads on import
+            "sinks": producer.send(self.sinks) if self.sinks is not None else None,
             "device": self.device,
             "cache_layers": [
                 cl.tp_export(plan) for cl in self.cache_layers
@@ -1058,6 +1060,13 @@ class Attention(Module):
             o_proj = _import_split("o_proj", o_split),
             g_proj = _import_split("g_proj", qh_split),
         )
+
+        # Attention sinks are one logit per query head; each rank keeps its local head range
+        if exported.get("sinks") is not None and num_kv_heads:
+            consumer = local_context["consumer"]
+            module.sinks = consumer.recv(
+                exported["sinks"], cuda = True, slice_dim = 0, first = first * n_gqa, last = last * n_gqa
+            )
 
         if num_kv_heads:
             cache_layers = exported["cache_layers"]
