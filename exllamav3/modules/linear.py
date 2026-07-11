@@ -617,7 +617,7 @@ class Linear(Module):
         module.device = device
         module.inner = exported["inner"]["cls"].tp_import_split(local_context, exported["inner"], plan, split)
         module.quant_type = module.inner.quant_type
-        module.out_features = module.inner.out_features
+        module._adopt_inner_dims()
         return module
 
     @staticmethod
@@ -630,8 +630,18 @@ class Linear(Module):
         module.device = device
         module.inner = exported["inner"]["cls"].tp_import_split_3(local_context, exported["inner"], plan, split_0, split_1, split_2)
         module.quant_type = module.inner.quant_type
-        module.out_features = module.inner.out_features
+        module._adopt_inner_dims()
         return module
+
+    def _adopt_inner_dims(self):
+        # The exported kwargs carry the full unsplit dims; forward() sizes its input padding and output trim
+        # against the wrapper dims, so they must track the local slice. Splitting a padded dim across TP ranks
+        # is not supported, so the unpadded dims collapse to the actual ones here
+        self.in_features = self.inner.in_features
+        self.out_features = self.inner.out_features
+        self.in_features_unpadded = self.in_features
+        self.out_features_unpadded = self.out_features
+        self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
 
 
     @staticmethod

@@ -809,6 +809,10 @@ class Attention(Module):
         params: dict,
     ):
         cache = params.get("cache")
+        # In TP child processes the cache param arrives as an opaque id; resolve it to the local split
+        # CacheLayer before anything (like the BC-attn graph path) inspects it
+        if self.has_split_cache:
+            cache = self.tp_cache_lookup[cache]
         block_table = get_for_device(params, "block_table", self.device)
         cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
         position = params.get("position", 0)
@@ -858,9 +862,6 @@ class Attention(Module):
                 inv_freq,
                 self.post_rope_norm
             )
-
-        if self.has_split_cache:
-            cache = self.tp_cache_lookup[cache]
 
         if simulate_kv_quant:
             # (k_bits, v_bits) or (k_bits, v_bits, compand_a)
