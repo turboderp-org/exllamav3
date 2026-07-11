@@ -189,16 +189,24 @@ __global__ void moe_bias_add_kernel
     int col = blockIdx.x * C2D_THREADS + threadIdx.x;
     int k = blockIdx.y;
     if (col >= width) return;
-    // Expert-parallel split: sel holds global expert indices but the pointer table only covers
-    // the local range; skip foreign experts (their interm rows are never consumed downstream)
+    // Expert-parallel split: sel holds global expert indices but the pointer table only covers the
+    // local range, and the mgemm PACKS its output rows to the local entries of sel (in order). Skip
+    // foreign experts and add each local expert's bias at its packed row, not its position in sel
     int64_t e = sel[k];
+    int row = k;
     if (min_expert >= 0)
     {
         if (e < min_expert || e >= max_expert) return;
         e -= min_expert;
+        row = 0;
+        for (int i = 0; i < k; ++i)
+        {
+            int64_t ei = sel[i];
+            if (ei >= min_expert && ei < max_expert) row++;
+        }
     }
     const half* b = (const half*) bias_ptrs[e];
-    int64_t i = (int64_t) k * stride + col;
+    int64_t i = (int64_t) row * stride + col;
     interm[i] = __hadd(interm[i], b[col]);
 }
 
