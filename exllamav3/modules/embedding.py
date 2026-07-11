@@ -161,6 +161,7 @@ class Embedding(Module):
                 "hidden_size": self.hidden_size,
                 "out_dtype": self.out_dtype,
                 "normalize": self.normalize,
+                "multiplier": self.multiplier,
             },
             "embedding.weight": producer.send(self.embedding.weight),
             "device": self.device

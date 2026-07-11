@@ -263,12 +263,17 @@ class TransformerBlock(Module):
                 "mlp",
                 "mlp_post_norm",
             )},
+            # Per-layer scalars load from the tensor collection, which TP children don't have
+            "layer_scalar_f": self.layer_scalar_f,
+            "attn_resid_scalar": producer.send(self.attn_resid_scalar),
+            "mlp_resid_scalar": producer.send(self.mlp_resid_scalar),
             "device": self.device,
         }
 
 
     @staticmethod
     def tp_import(local_context, exported, plan):
+        consumer = local_context["consumer"]
         device = local_context["device"]
 
         def _import(name):
@@ -287,6 +292,9 @@ class TransformerBlock(Module):
             mlp_post_norm = _import("mlp_post_norm"),
         )
 
+        module.layer_scalar_f = exported.get("layer_scalar_f")
+        module.attn_resid_scalar = consumer.recv(exported.get("attn_resid_scalar"), cuda = True)
+        module.mlp_resid_scalar = consumer.recv(exported.get("mlp_resid_scalar"), cuda = True)
         module.device = device
         return module
 

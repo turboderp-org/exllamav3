@@ -422,7 +422,7 @@ class Gemma4TextModel(Model):
             self.calibration_all_experts = True
 
         self.caps.update({
-            "supports_tp": False,
+            "supports_tp": True,
             "atomic_mm_prefill": config.use_bidirectional_attention == "vision",
         })
 

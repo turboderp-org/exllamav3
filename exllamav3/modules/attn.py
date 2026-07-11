@@ -976,6 +976,7 @@ class Attention(Module):
             **{name: _export(getattr(self, name, None)) for name in (
                 "q_norm",
                 "k_norm",
+                "v_norm",
                 "q_proj",
                 "k_proj",
                 "v_proj",
@@ -1053,6 +1054,8 @@ class Attention(Module):
             num_kv_heads = num_kv_heads,
             q_norm = _import_split("q_norm", norm_q_split) if tp_split_norm else _import("q_norm"),
             k_norm = _import_split("k_norm", norm_k_split) if tp_split_norm else _import("k_norm"),
+            # V norm shares the K/V head geometry (gemma4: unweighted, so the split is a no-op there)
+            v_norm = _import_split("v_norm", norm_k_split) if tp_split_norm else _import("v_norm"),
             q_proj = _import_split("q_proj", q_split),
             k_proj = _import_split("k_proj", kv_split),
             v_proj = _import_split("v_proj", kv_split),
