@@ -534,14 +534,14 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    model_init.add_args(parser, cache = True, add_sampling_args = True, add_draft_model_args = True)
+    model_init.add_args(parser, cache = True, add_sampling_args = True, add_draft_model_args = True, default_cache_size = 32768)
     parser.add_argument("-mode", "--mode", type = str, help = "Prompt mode", default = None)
     parser.add_argument("-modes", "--modes", action = "store_true", help = "List available prompt modes and exit")
     parser.add_argument("-un", "--user_name", type = str, default = "User", help = "User name (raw mode only)")
     parser.add_argument("-bn", "--bot_name", type = str, default = "Assistant", help = "Bot name (raw mode only)")
     parser.add_argument("-mli", "--multiline", action = "store_true", help = "Enable multi line input (use Alt-Enter to submit input)")
     parser.add_argument("-sp", "--system_prompt", type = str, help = "Use custom system prompt")
-    parser.add_argument("-maxr", "--max_response_tokens", type = int, default = 1000, help = "Max tokens per response, default = 1000")
+    parser.add_argument("-maxr", "--max_response_tokens", type = int, default = 5000, help = "Max tokens per response, default = 5000")
     parser.add_argument("-basic", "--basic_console", action = "store_true", help = "Use basic console output (no markdown and fancy prompt input")
     parser.add_argument("-think", "--think", action = "store_true", help = "Use (very simplistic) reasoning template and formatting")
     parser.add_argument("-no_think", "--no_think", action = "store_true", help = "Suppress think tags (won't necessarily stop reasoning model from reasoning anyway)")
