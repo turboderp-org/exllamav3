@@ -817,7 +817,7 @@ class PromptFormat_gptoss(PromptFormat):
             f"<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n"
             f"Knowledge cutoff: 2024-06\n"
             f"Current date: {self.today_str}\n\n"
-            f"Reasoning: {'medium' if think else 'low'}\n\n"
+            f"Reasoning: {'high' if think else 'low'}\n\n"
             f"# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\n"
         )
         if system_prompt:
