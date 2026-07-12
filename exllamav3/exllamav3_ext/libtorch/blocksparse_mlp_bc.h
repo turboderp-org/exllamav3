@@ -50,7 +50,8 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
-        c10::optional<at::Tensor>
+        c10::optional<at::Tensor>,
+        bool
     >(),
     py::arg("yh2"),
     py::arg("yh"),
@@ -101,7 +102,8 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
     py::arg("up_bias_ptrs") = py::none(),
     py::arg("down_bias_ptrs") = py::none(),
     py::arg("y_pad") = py::none(),
-    py::arg("out_trim") = py::none()
+    py::arg("out_trim") = py::none(),
+    py::arg("act_relu2") = false
 )
 .def("run_bsz1", &BC_BlockSparseMLP::run_bsz1)
 .def("run_single_expert", &BC_BlockSparseMLP::run_single_expert)

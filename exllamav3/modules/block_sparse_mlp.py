@@ -336,10 +336,18 @@ class BlockSparseMLP(Module):
             self.shared_gate = shared_gate
             self.register_submodule(self.shared_gate)
 
+        # Non-gated experts (NemotronH: up/down with relu2). The quantized fast paths all assume
+        # a gate projection, so gateless configurations run the dense per-expert path at every
+        # batch size until the kernels grow a gateless mode
+        self.gated = (
+            key_gate is not None or key_gate_split is not None or key_gate_up_split is not None or
+            (gates is not None and len(gates) > 0)
+        )
+
         if gates is not None:
-            assert ups is not None and len(ups) == len(gates)
-            assert downs is not None and len(downs) == len(gates)
-            self.num_slices = len(gates)
+            assert ups is not None and (not self.gated or len(ups) == len(gates))
+            assert downs is not None and len(downs) == len(ups)
+            self.num_slices = len(ups)
             self.gates = gates
             self.ups = ups
             self.downs = downs
@@ -362,7 +370,7 @@ class BlockSparseMLP(Module):
                     None
                 )
 
-                gate = Linear(
+                gate = None if not self.gated else Linear(
                     config = config,
                     key = f"{key}.{key_gate}".replace("{expert_idx}", str(idx)),
                     fkey = fkey_gate,
@@ -419,25 +427,43 @@ class BlockSparseMLP(Module):
                 )
 
                 self.ups.append(up)
-                self.gates.append(gate)
+                if gate is not None:
+                    self.gates.append(gate)
                 self.downs.append(down)
 
                 self.register_submodule(up)
                 self.register_submodule(gate)
                 self.register_submodule(down)
 
-        match activation_fn:
-            case "silu":
-                self.activation_fn_call = ext.silu_mul
-                self.activation_fn_idx = 0
-            case "gelu":
-                self.activation_fn_call = ext.gelu_mul
-                self.activation_fn_idx = 1
-            case "swiglu_oai":
-                self.activation_fn_call = ext.silu_oai_mul
-                self.activation_fn_idx = 3
-            case _:
-                raise ValueError(f"Unknown activation function {activation_fn}")
+        if self.gated:
+            self.gateless_act = None
+            match activation_fn:
+                case "silu":
+                    self.activation_fn_call = ext.silu_mul
+                    self.activation_fn_idx = 0
+                case "gelu":
+                    self.activation_fn_call = ext.gelu_mul
+                    self.activation_fn_idx = 1
+                case "swiglu_oai":
+                    self.activation_fn_call = ext.silu_oai_mul
+                    self.activation_fn_idx = 3
+                case "relu2":
+                    self.activation_fn_call = ext.relu2_mul
+                    self.activation_fn_idx = 2
+                case _:
+                    raise ValueError(f"Unknown activation function {activation_fn}")
+        else:
+            # Gateless relu2 rides the gated fast paths via relu(u) * u = relu2(u): the act call
+            # sites pass (u, u, a) and the fused MoE kernel's MOE_ACT_RELU2_NOGATE synthesizes
+            # the gate lane from u
+            self.activation_fn_call = ext.relu_mul if activation_fn == "relu2" else None
+            self.activation_fn_idx = 2 if activation_fn == "relu2" else -1
+            match activation_fn:
+                case "silu": self.gateless_act = F.silu
+                case "gelu": self.gateless_act = lambda x: F.gelu(x, approximate = "tanh")
+                case "relu2": self.gateless_act = lambda x: torch.square(F.relu(x))
+                case _:
+                    raise ValueError(f"Unknown gateless activation function {activation_fn}")
 
         self.is_quantized = False
         self.support_fused = False
@@ -514,12 +540,12 @@ class BlockSparseMLP(Module):
         self.is_quantized = (num_exl3_tensors > 0 and num_nonexl3_tensors == 0)
 
         # The quantized fast paths (mgemm/BC/fused kernels) don't yet support per-expert biases,
-        # activations other than silu/gelu, or trimmed (padded) down projections; configurations
-        # with any of those run every batch size through the dense per-expert path, which
-        # handles all three (gpt-oss)
+        # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
+        # projections; configurations with any of those run every batch size through the dense
+        # per-expert path, which handles all of them (gpt-oss)
         self.support_quant_paths = (
             self.is_quantized and
-            self.activation_fn in ("silu", "gelu") and
+            (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
         )
@@ -533,20 +559,26 @@ class BlockSparseMLP(Module):
             return all(has) or not any(has)
         self.support_bc_bsz1 = (
             self.is_quantized and
-            self.activation_fn in ("silu", "gelu", "swiglu_oai") and
+            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
             self.shared_experts is None
         )
 
-        # Make fused modules (only used by the quantized fast paths)
+        # Make fused modules (only used by the quantized fast paths). Gateless experts have no
+        # gate MultiLinear; the up module doubles as a placeholder wherever the fast paths want
+        # gate pointer tables (never dereferenced, the gate GEMMs are skipped)
         if (self.support_quant_paths or self.support_bc_bsz1) and not self.config.infer_params.no_reconstruct:
-            self.multi_gate = MultiLinear(self.device, self.gates, allow_bias = True)
+            self.multi_gate = MultiLinear(self.device, self.gates, allow_bias = True) if self.gated else None
             self.multi_up = MultiLinear(self.device, self.ups, allow_bias = True)
             self.multi_down = MultiLinear(self.device, self.downs, allow_bias = True)
 
             # Enable fully fused kernel if possible (uniform mcg or mul1 codebook across gate/up/down,
             # and an activation the fused kernel implements)
-            cbs = (self.multi_gate.q_cb(), self.multi_up.q_cb(), self.multi_down.q_cb())
+            cbs = (
+                self.multi_gate.q_cb() if self.gated else self.multi_up.q_cb(),
+                self.multi_up.q_cb(),
+                self.multi_down.q_cb(),
+            )
             self.support_fused = (
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
                 self.support_quant_paths
@@ -557,7 +589,7 @@ class BlockSparseMLP(Module):
         H = self.hidden_size
         # The gate/up input width and the down output width are the (possibly 128-padded)
         # quantized dims; both equal H for aligned models
-        Hi = self.gates[0].in_features
+        Hi = self.ups[0].in_features
         Ho = self.downs[0].out_features
         I = self.intermediate_size_padded
         device = self.device
@@ -624,13 +656,17 @@ class BlockSparseMLP(Module):
                     sh_gate_bc = self.shared_gate.inner.bc
                     sh_gate_t = torch.empty((1, 1, 1), dtype = self.shared_gate.out_dtype, device = self.device)
 
-            # Pointer lists for fused modes
-            g_trellis_ptr = torch.tensor([l.inner.trellis.data_ptr() for l in self.gates])
+            # Pointer lists for fused modes. Gateless experts reuse the up tables as gate
+            # placeholders: valid memory for the (uniform) table loads, never dereferenced
             u_trellis_ptr = torch.tensor([l.inner.trellis.data_ptr() for l in self.ups])
-            g_suh_ptr = torch.tensor([l.inner.suh.data_ptr() for l in self.gates])
             u_suh_ptr = torch.tensor([l.inner.suh.data_ptr() for l in self.ups])
-            g_svh_ptr = torch.tensor([l.inner.svh.data_ptr() for l in self.gates])
             u_svh_ptr = torch.tensor([l.inner.svh.data_ptr() for l in self.ups])
+            if self.gated:
+                g_trellis_ptr = torch.tensor([l.inner.trellis.data_ptr() for l in self.gates])
+                g_suh_ptr = torch.tensor([l.inner.suh.data_ptr() for l in self.gates])
+                g_svh_ptr = torch.tensor([l.inner.svh.data_ptr() for l in self.gates])
+            else:
+                g_trellis_ptr, g_suh_ptr, g_svh_ptr = u_trellis_ptr, u_suh_ptr, u_svh_ptr
             gu_trellis_ptr = torch.stack((g_trellis_ptr, u_trellis_ptr), dim = 0).T.contiguous().to(self.device)
             gu_suh_ptr = torch.stack((g_suh_ptr, u_suh_ptr), dim = 0).T.contiguous().to(self.device)
             gu_svh_ptr = torch.stack((g_svh_ptr, u_svh_ptr), dim = 0).T.contiguous().to(self.device)
@@ -644,7 +680,7 @@ class BlockSparseMLP(Module):
                     return None
                 return torch.tensor([l.inner.bias.data_ptr() for l in ls],
                                     dtype = torch.long, device = device)
-            gate_bias_ptrs = _bias_ptrs(self.gates)
+            gate_bias_ptrs = _bias_ptrs(self.gates) if self.gated else None
             up_bias_ptrs = _bias_ptrs(self.ups)
             down_bias_ptrs = _bias_ptrs(self.downs)
             y_pad = None
@@ -652,7 +688,9 @@ class BlockSparseMLP(Module):
                 y_pad = g_tensor_cache.get(device, (1, Hi), torch.half, "moe1_y_pad")
                 y_pad.zero_()
 
-            # Bound class for graph, dq and fused-bsz1 paths
+            # Bound class for graph, dq and fused-bsz1 paths (gateless: the up module stands in
+            # for the unused gate pointer args, and the gates list is empty)
+            multi_gate = self.multi_gate if self.gated else self.multi_up
             self.bc = ext.BC_BlockSparseMLP(
                 yh2,
                 cfg.yh,
@@ -669,12 +707,12 @@ class BlockSparseMLP(Module):
                 dq_temp_down,
                 cfg.min_expert,
                 cfg.max_expert,
-                self.multi_gate.ptrs_trellis,
-                self.multi_gate.ptrs_suh,
-                self.multi_gate.ptrs_svh,
-                self.multi_gate.K,
-                self.multi_gate.mcg,
-                self.multi_gate.mul1,
+                multi_gate.ptrs_trellis,
+                multi_gate.ptrs_suh,
+                multi_gate.ptrs_svh,
+                multi_gate.K,
+                multi_gate.mcg,
+                multi_gate.mul1,
                 self.multi_up.ptrs_trellis,
                 self.multi_up.ptrs_suh,
                 self.multi_up.ptrs_svh,
@@ -704,6 +742,7 @@ class BlockSparseMLP(Module):
                 down_bias_ptrs,
                 y_pad,
                 cfg.out_trim,
+                act_relu2 = self.activation_fn == "relu2",
             )
 
             # Larger buffers for fused path, if supported
@@ -886,6 +925,9 @@ class BlockSparseMLP(Module):
                 # Run fused path if possible, skips experts with more than TEMP_ROWS_FUSED tokens
                 if self.fused_mode_buffers is not None:
                     num_active = sum(1 for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED)
+                    # Gateless: the up module stands in for the gate pointer tables (the kernel
+                    # skips the gate GEMM when activation_fn_idx is MOE_ACT_RELU2_NOGATE)
+                    multi_gate = self.multi_gate if self.gated else self.multi_up
                     ext.exl3_moe(
                         y,
                         final_hidden_states,
@@ -897,20 +939,20 @@ class BlockSparseMLP(Module):
                         self.fused_mode_buffers.temp_intermediate_g,
                         self.fused_mode_buffers.temp_intermediate_u,
                         self.activation_fn_idx,
-                        self.multi_gate.K,
+                        multi_gate.K,
                         self.multi_up.K,
                         self.multi_down.K,
-                        self.multi_gate.ptrs_trellis,
-                        self.multi_gate.ptrs_suh,
-                        self.multi_gate.ptrs_svh,
+                        multi_gate.ptrs_trellis,
+                        multi_gate.ptrs_suh,
+                        multi_gate.ptrs_svh,
                         self.multi_up.ptrs_trellis,
                         self.multi_up.ptrs_suh,
                         self.multi_up.ptrs_svh,
                         self.multi_down.ptrs_trellis,
                         self.multi_down.ptrs_suh,
                         self.multi_down.ptrs_svh,
-                        self.multi_gate.mcg,
-                        self.multi_gate.mul1,
+                        multi_gate.mcg,
+                        multi_gate.mul1,
                         self.multi_up.mcg,
                         self.multi_up.mul1,
                         self.multi_down.mcg,
@@ -973,10 +1015,15 @@ class BlockSparseMLP(Module):
 
                         # Torch path
                         def mlp(exp_i, xc):
-                            g = self.gates[exp_i].forward(xc, params)
                             u = self.ups[exp_i].forward(xc, params)
-                            a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
-                            self.activation_fn_call(g, u, a, self.act_limit)
+                            if self.gated:
+                                g = self.gates[exp_i].forward(xc, params)
+                                a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
+                                self.activation_fn_call(g, u, a, self.act_limit)
+                            else:
+                                a = self.gateless_act(u)
+                                if a.dtype != torch.half:
+                                    a = a.half()
                             return self.downs[exp_i].forward(a, params)
 
                         current_state = mlp(expert_idx, current_state)
@@ -1005,23 +1052,24 @@ class BlockSparseMLP(Module):
             for i in range(bsz):
 
                 # Gate
-                ext.exl3_mgemm(
-                    y[i],
-                    self.multi_gate.ptrs_trellis,
-                    cfg.interm_g,
-                    self.multi_gate.ptrs_suh,
-                    cfg.yh,
-                    self.multi_gate.ptrs_svh,
-                    selected_experts[i],
-                    None,
-                    self.multi_gate.K,
-                    -1,
-                    self.multi_gate.mcg,
-                    self.multi_gate.mul1,
-                    mine,
-                    maxe,
-                    0
-                )
+                if self.gated:
+                    ext.exl3_mgemm(
+                        y[i],
+                        self.multi_gate.ptrs_trellis,
+                        cfg.interm_g,
+                        self.multi_gate.ptrs_suh,
+                        cfg.yh,
+                        self.multi_gate.ptrs_svh,
+                        selected_experts[i],
+                        None,
+                        self.multi_gate.K,
+                        -1,
+                        self.multi_gate.mcg,
+                        self.multi_gate.mul1,
+                        mine,
+                        maxe,
+                        0
+                    )
 
                 # Up
                 ext.exl3_mgemm(
@@ -1042,8 +1090,9 @@ class BlockSparseMLP(Module):
                     0
                 )
 
-                # Activation
-                self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a, self.act_limit)
+                # Activation (gateless: relu_mul(u, u, a) = relu2(u))
+                act_g = cfg.interm_g if self.gated else cfg.interm_u
+                self.activation_fn_call(act_g, cfg.interm_u, cfg.interm_a, self.act_limit)
 
                 # Down
                 # A_had must not alias A (the autotuner relaunches on the first call); the
@@ -1085,23 +1134,24 @@ class BlockSparseMLP(Module):
             cfg = self.experts_cfg
 
             # Gate
-            ext.exl3_mgemm(
-                y,
-                self.multi_gate.ptrs_trellis,
-                cfg.interm_g,
-                self.multi_gate.ptrs_suh,
-                cfg.yh,
-                self.multi_gate.ptrs_svh,
-                selected_experts,
-                None,
-                self.multi_gate.K,
-                -1,
-                self.multi_gate.mcg,
-                self.multi_gate.mul1,
-                cfg.min_expert,
-                cfg.max_expert,
-                0
-            )
+            if self.gated:
+                ext.exl3_mgemm(
+                    y,
+                    self.multi_gate.ptrs_trellis,
+                    cfg.interm_g,
+                    self.multi_gate.ptrs_suh,
+                    cfg.yh,
+                    self.multi_gate.ptrs_svh,
+                    selected_experts,
+                    None,
+                    self.multi_gate.K,
+                    -1,
+                    self.multi_gate.mcg,
+                    self.multi_gate.mul1,
+                    cfg.min_expert,
+                    cfg.max_expert,
+                    0
+                )
 
             # Up
             ext.exl3_mgemm(
@@ -1122,8 +1172,9 @@ class BlockSparseMLP(Module):
                 0
             )
 
-            # Activation
-            self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a, self.act_limit)
+            # Activation (gateless: relu_mul(u, u, a) = relu2(u))
+            act_g = cfg.interm_g if self.gated else cfg.interm_u
+            self.activation_fn_call(act_g, cfg.interm_u, cfg.interm_a, self.act_limit)
 
             # Down
             # A_had must not alias A (the autotuner relaunches on the first call)
@@ -1201,7 +1252,7 @@ class BlockSparseMLP(Module):
         if self.interm_dtype != torch.half:
             overhead_s += self.intermediate_size * torch.half.itemsize
         recons = max(
-            self.gates[0].recons_size(),
+            self.gates[0].recons_size() if self.gated else 0,
             self.ups[0].recons_size(),
             self.downs[0].recons_size()
         )
@@ -1250,7 +1301,7 @@ class BlockSparseMLP(Module):
             "routing_gate": _export(self.routing_gate),
             "shared_gate": _export(self.shared_gate),
             "e_score_correction_bias": producer.send(self.e_score_correction_bias),
-            "gates": [_export(self.gates[i]) for i in range(self.num_experts)],
+            "gates": [_export(self.gates[i]) for i in range(self.num_experts)] if self.gated else None,
             "ups": [_export(self.ups[i]) for i in range(self.num_experts)],
             "downs": [_export(self.downs[i]) for i in range(self.num_experts)],
             "shared_experts": self.shared_experts.tp_export(plan, producer) \
@@ -1287,13 +1338,17 @@ class BlockSparseMLP(Module):
             return exported[name][i]["cls"].tp_import_split(local_context, exported[name][i], plan, split) \
                 if exported.get(name) else None
 
+        # Gateless experts (NemotronH) export gates as None; the local module gets an empty
+        # gates list so the ctor derives gated = False
+        gated = exported.get("gates") is not None
+
         # Tensor parallel
         if unit == "channels":
             num_local_experts = exported["kwargs"]["num_experts"]
             gu_split = (True, first, last)
             d_split = (False, first, last)
             exported["kwargs"]["intermediate_size"] = last - first
-            gates = [_import_i_split("gates", i, gu_split) for i in range(num_local_experts)]
+            gates = [_import_i_split("gates", i, gu_split) for i in range(num_local_experts)] if gated else []
             ups = [_import_i_split("ups", i, gu_split) for i in range(num_local_experts)]
             downs = [_import_i_split("downs", i, d_split) for i in range(num_local_experts)]
             routing_first = 0
@@ -1302,7 +1357,7 @@ class BlockSparseMLP(Module):
         # Expert parallel
         elif unit == "experts":
             num_local_experts = last - first
-            gates = [_import_i("gates", i) for i in range(first, last)]
+            gates = [_import_i("gates", i) for i in range(first, last)] if gated else []
             ups = [_import_i("ups", i) for i in range(first, last)]
             downs = [_import_i("downs", i) for i in range(first, last)]
             routing_first = first
