@@ -184,6 +184,8 @@ class RMSNorm(Module):
                 "out_dtype": self.out_dtype,
                 "constant_bias": self.constant_bias,
                 "span_heads": self.span_heads,
+                "constant_scale": self.constant_scale,
+                "unweighted": self.unweighted,
             },
             "weight": producer.send(self.weight),
             "device": self.device,

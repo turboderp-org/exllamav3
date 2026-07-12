@@ -809,6 +809,10 @@ class Attention(Module):
         params: dict,
     ):
         cache = params.get("cache")
+        # In TP child processes the cache param arrives as an opaque id; resolve it to the local split
+        # CacheLayer before anything (like the BC-attn graph path) inspects it
+        if self.has_split_cache:
+            cache = self.tp_cache_lookup[cache]
         block_table = get_for_device(params, "block_table", self.device)
         cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
         position = params.get("position", 0)
@@ -858,9 +862,6 @@ class Attention(Module):
                 inv_freq,
                 self.post_rope_norm
             )
-
-        if self.has_split_cache:
-            cache = self.tp_cache_lookup[cache]
 
         if simulate_kv_quant:
             # (k_bits, v_bits) or (k_bits, v_bits, compand_a)
@@ -975,6 +976,7 @@ class Attention(Module):
             **{name: _export(getattr(self, name, None)) for name in (
                 "q_norm",
                 "k_norm",
+                "v_norm",
                 "q_proj",
                 "k_proj",
                 "v_proj",
@@ -982,6 +984,8 @@ class Attention(Module):
                 "o_proj",
                 "g_proj",
             )},
+            # Learned attention sinks (gpt-oss): one logit per query head, sliced to the local heads on import
+            "sinks": producer.send(self.sinks) if self.sinks is not None else None,
             "device": self.device,
             "cache_layers": [
                 cl.tp_export(plan) for cl in self.cache_layers
@@ -1050,6 +1054,8 @@ class Attention(Module):
             num_kv_heads = num_kv_heads,
             q_norm = _import_split("q_norm", norm_q_split) if tp_split_norm else _import("q_norm"),
             k_norm = _import_split("k_norm", norm_k_split) if tp_split_norm else _import("k_norm"),
+            # V norm shares the K/V head geometry (gemma4: unweighted, so the split is a no-op there)
+            v_norm = _import_split("v_norm", norm_k_split) if tp_split_norm else _import("v_norm"),
             q_proj = _import_split("q_proj", q_split),
             k_proj = _import_split("k_proj", kv_split),
             v_proj = _import_split("v_proj", kv_split),
@@ -1057,6 +1063,13 @@ class Attention(Module):
             o_proj = _import_split("o_proj", o_split),
             g_proj = _import_split("g_proj", qh_split),
         )
+
+        # Attention sinks are one logit per query head; each rank keeps its local head range
+        if exported.get("sinks") is not None and num_kv_heads:
+            consumer = local_context["consumer"]
+            module.sinks = consumer.recv(
+                exported["sinks"], cuda = True, slice_dim = 0, first = first * n_gqa, last = last * n_gqa
+            )
 
         if num_kv_heads:
             cache_layers = exported["cache_layers"]

@@ -217,9 +217,14 @@ void pg_all_reduce_cpu_kernel
                     uint2* dst = (uint2*) host_ptr(this_device, stage);
                     for (int i = 0; src + t < src_end; ++i)
                     {
-                        // Truncate FP32 -> BF16
+                        // Round FP32 -> BF16 to nearest; truncation toward zero is biased and the
+                        // systematic error compounds in recurrent scans and outlier-heavy models
                         uint4 v = src[t];
-                        uint2 pack{ (v.y & 0xffff0000u) | (v.x >> 16), (v.w & 0xffff0000u) | (v.z >> 16) };
+                        uint2 pack
+                        {
+                            ((v.y + 0x8000u) & 0xffff0000u) | ((v.x + 0x8000u) >> 16),
+                            ((v.w + 0x8000u) & 0xffff0000u) | ((v.z + 0x8000u) >> 16)
+                        };
                         dst[t] = pack;
                         src += NUM_THREADS;
                         dst += NUM_THREADS;
@@ -253,7 +258,12 @@ void pg_all_reduce_cpu_kernel
                         half4 h = src[t];
                         float4 f{ __half2float(h.x.x), __half2float(h.x.y), __half2float(h.y.x), __half2float(h.y.y) };
                         uint4 v{ __float_as_uint(f.x), __float_as_uint(f.y), __float_as_uint(f.z), __float_as_uint(f.w) };
-                        uint2 pack{ (v.y & 0xffff0000) | (v.x >> 16), (v.w & 0xffff0000) | (v.z >> 16) };
+                        // Round to nearest BF16 (see float path)
+                        uint2 pack
+                        {
+                            ((v.y + 0x8000u) & 0xffff0000u) | ((v.x + 0x8000u) >> 16),
+                            ((v.w + 0x8000u) & 0xffff0000u) | ((v.z + 0x8000u) >> 16)
+                        };
                         dst[t] = pack;
                         src += NUM_THREADS;
                         dst += NUM_THREADS;

@@ -3,6 +3,10 @@ from .generator import Generator
 from .job import Job
 import asyncio
 
+# Sentinel pushed to an AsyncJob's queue on cancellation so a consumer parked in queue.get() wakes up and
+# exits, rather than waiting forever for results that will no longer be produced
+_CANCELLED_SENTINEL = object()
+
 class AsyncGenerator:
     """
     Async wrapper for dynamic generator. See definition of Generator.
@@ -10,6 +14,7 @@ class AsyncGenerator:
     def __init__(self, *args, **kwargs):
         self.generator = Generator(*args, **kwargs)
         self.jobs = {}
+        self.error = None
         self.condition = asyncio.Condition()
         self.iteration_task = asyncio.create_task(self._run_iteration())
 
@@ -24,13 +29,16 @@ class AsyncGenerator:
 
                 # Drive exactly one synchronous generator step and fan out any returned events to the owning
                 # AsyncJob queues. Missing jobs can happen if a job was cancelled after iterate() started.
+                # Delivery must never block: this single task serves every job, so waiting on one stalled
+                # consumer (e.g. a disconnected client that stopped draining its queue) would wedge the whole
+                # generator (issue #227).
                 results = self.generator.iterate()
                 for result in results:
                     job = result["job"]
                     async_job = self.jobs.get(job)
                     if not async_job:
                         continue
-                    await async_job.put_result(result)
+                    async_job.put_result(result)
                     if result["eos"]:
                         del self.jobs[job]
 
@@ -43,11 +51,20 @@ class AsyncGenerator:
             return
 
         except Exception as e:
-            # If the generator throws an exception it won't pertain to any one ongoing job, so push it to all of them
+            # If the generator throws an exception it won't pertain to any one ongoing job, so push it to all of
+            # them. The iteration task ends here and the generator is unusable, so record the error and deliver
+            # it to any job enqueued later as well, instead of letting those jobs wait forever on a dead loop.
+            self.error = e
             for async_job in self.jobs.values():
-                await async_job.put_result(e)
+                async_job.put_result(e)
+            self.jobs.clear()
 
     def enqueue(self, job: AsyncJob):
+        # The iteration task died on a generator exception; surface it to the new job's consumer immediately
+        if self.error is not None:
+            job.put_result(self.error)
+            return
+
         # Track the AsyncJob before enqueueing the underlying Job so any immediate generator result has a queue to
         # land in. The sync generator still owns scheduling and serial assignment.
         assert job.job not in self.jobs
@@ -72,13 +89,24 @@ class AsyncGenerator:
         except asyncio.CancelledError:
             pass
 
+        # Wake any consumers still parked on job queues; no more results will be produced
+        for async_job in self.jobs.values():
+            async_job.put_result(_CANCELLED_SENTINEL)
+        self.jobs.clear()
+
     async def cancel(self, job: AsyncJob):
         # Remove the underlying Job from the synchronous generator first so no new tokens are produced, then drop
-        # the async mapping so any late results from an in-flight iteration are ignored.
-        self.generator.cancel(job.job)
+        # the async mapping so any late results from an in-flight iteration are ignored. Finally wake the job's
+        # consumer in case it is parked in queue.get(), waiting for a result that will never arrive.
+        # After a generator exception the sync generator's state is suspect and every job was already delivered
+        # the error; don't poke it from consumers' cleanup handlers, or their except/finally blocks can be hit
+        # with a second exception.
+        if self.error is None:
+            self.generator.cancel(job.job)
         if job.job not in self.jobs:
             return
         del self.jobs[job.job]
+        job.put_result(_CANCELLED_SENTINEL)
 
 
 class AsyncJob:
@@ -88,12 +116,16 @@ class AsyncJob:
     def __init__(self, generator: AsyncGenerator, *args: object, **kwargs: object):
         self.generator = generator
         self.job = Job(*args, **kwargs)
-        self.queue = asyncio.Queue(maxsize=16)
+        # The queue is unbounded and written with put_nowait: the shared iteration task must never block on a
+        # consumer that stopped draining (see _run_iteration). Growth is paced by the sync generator's own token
+        # rate and ends when the job completes or is cancelled, which is the frontend's responsibility on client
+        # disconnect.
+        self.queue = asyncio.Queue()
         self.generator.enqueue(self)
         self.cancelled = False
 
-    async def put_result(self, result):
-        await self.queue.put(result)
+    def put_result(self, result):
+        self.queue.put_nowait(result)
 
     async def __aiter__(self):
         while True:
@@ -103,8 +135,11 @@ class AsyncJob:
                 break
 
             # Results are pushed by AsyncGenerator._run_iteration(). Exceptions are broadcast to all queues if the
-            # shared generator loop fails, so consuming code sees the error at the await point.
+            # shared generator loop fails, so consuming code sees the error at the await point. The sentinel wakes
+            # this iterator when the job is cancelled from another task while parked here.
             result = await self.queue.get()
+            if result is _CANCELLED_SENTINEL:
+                break
             if isinstance(result, Exception):
                 raise result
             yield result

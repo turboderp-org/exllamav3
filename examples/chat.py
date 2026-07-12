@@ -11,6 +11,7 @@ from chat_util import *
 from chat_io import *
 import torch
 from chat_console import *
+from chat_python import *
 from safetensors.torch import save_file
 
 def get_last_assistant_response(context: list[tuple[str, str | None]], fallback: str) -> str:
@@ -47,6 +48,9 @@ def main(args):
     if args.basic_console:
         read_input_fn = read_input_ptk
         streamer_cm = Streamer_basic
+    elif args.mode == "gptoss":
+        read_input_fn = read_input_ptk
+        streamer_cm = Streamer_harmony
     else:
         read_input_fn = read_input_ptk
         streamer_cm = Streamer_rich
@@ -88,7 +92,7 @@ def main(args):
     print("\n" + col_sysprompt + system_prompt.strip() + col_default)
     context = []
     tt = prompt_format.thinktag()
-    banned_strings = [tt[0], tt[1]] if args.no_think else []
+    banned_strings = [tag for tag in tt if tag] if args.no_think else []
     response = ""
     last_tokens = None
 
@@ -133,6 +137,7 @@ def main(args):
                         "/load <filename>   Load stored session from file",
                         "/mli               Toggle multiline input",
                         "/probs             Set number of probs recorded (0 to disable), adds overhead",
+                        "/python            Extract and run the longest code block in a bwrap sandbox",
                         "/r                 Rewind and repeat last prompt",
                         "/save              Save current session to ~/chat_py_session.json",
                         "/save <filename>   Save current session to file",
@@ -290,6 +295,66 @@ def main(args):
                         path = write_svg_to_temp(svg)
                         print_info(f"Writing SVG to: {path}")
                         webbrowser.open(path.as_uri())
+                    continue
+
+                # Extract Python from last response and run it in Bubblewrap
+                case "/python":
+                    bwrap = find_bubblewrap()
+                    if not bwrap:
+                        print_error(bubblewrap_help())
+                        continue
+
+                    snippet = extract_longest_codeblock(get_last_assistant_response(context, response))
+                    if not snippet:
+                        print_error("No code block found in last response")
+                        continue
+
+                    lines = snippet.splitlines()
+                    preview = "\n".join(f"{i + 1:>3} | {line}" for i, line in enumerate(lines[:10]))
+                    if len(lines) > 10:
+                        preview += f"\n    | ... ({len(lines) - 10} more lines)"
+                    wayland = find_wayland_display()
+                    backend = find_wayland_matplotlib_backend() if wayland else None
+                    if wayland and backend.name != "Agg":
+                        display_access = (
+                            f" - Wayland display access is enabled using matplotlib's {backend.name} backend; "
+                            "X11 remains unavailable.\n"
+                        )
+                    elif wayland:
+                        display_access = (
+                            " - Wayland display access is enabled, but no Wayland-native matplotlib backend "
+                            "was found; matplotlib will remain headless.\n"
+                        )
+                    else:
+                        display_access = " - No Wayland display is available; graphical libraries will run headless.\n"
+                    warning = (
+                        f"\n{col_error} WARNING! MODEL-GENERATED PYTHON IS ABOUT TO BE EXECUTED:{col_default}\n"
+                        f"{preview}\n\n"
+                        f" - The code will run in a Bubblewrap sandbox with no network, "
+                        f"read-only access to the current Python environment, and a "
+                        f"temporary writable directory.\n{display_access}\n"
+                        f"Press Enter to execute or Esc to cancel"
+                    )
+                    print(warning, end = "", flush = True)
+                    try:
+                        with KeyReader() as keyreader:
+                            keypress = keyreader.getkey(timeout = None)
+                    except KeyboardInterrupt:
+                        keypress = "\x1b"
+                    print()
+
+                    if keypress not in ("\n", "\r"):
+                        print_info("Python execution canceled")
+                        continue
+
+                    print_info("Running Python snippet in Bubblewrap sandbox\n")
+                    returncode, error = run_python_sandboxed(snippet)
+                    if error:
+                        print_error(error)
+                    elif returncode:
+                        print_error(f"Python exited with status {returncode}")
+                    else:
+                        print_info("Python exited successfully")
                     continue
 
                 # Load conversation
@@ -467,14 +532,14 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    model_init.add_args(parser, cache = True, add_sampling_args = True, add_draft_model_args = True)
+    model_init.add_args(parser, cache = True, add_sampling_args = True, add_draft_model_args = True, default_cache_size = 32768)
     parser.add_argument("-mode", "--mode", type = str, help = "Prompt mode", default = None)
     parser.add_argument("-modes", "--modes", action = "store_true", help = "List available prompt modes and exit")
     parser.add_argument("-un", "--user_name", type = str, default = "User", help = "User name (raw mode only)")
     parser.add_argument("-bn", "--bot_name", type = str, default = "Assistant", help = "Bot name (raw mode only)")
     parser.add_argument("-mli", "--multiline", action = "store_true", help = "Enable multi line input (use Alt-Enter to submit input)")
     parser.add_argument("-sp", "--system_prompt", type = str, help = "Use custom system prompt")
-    parser.add_argument("-maxr", "--max_response_tokens", type = int, default = 1000, help = "Max tokens per response, default = 1000")
+    parser.add_argument("-maxr", "--max_response_tokens", type = int, default = 5000, help = "Max tokens per response, default = 5000")
     parser.add_argument("-basic", "--basic_console", action = "store_true", help = "Use basic console output (no markdown and fancy prompt input")
     parser.add_argument("-think", "--think", action = "store_true", help = "Use (very simplistic) reasoning template and formatting")
     parser.add_argument("-no_think", "--no_think", action = "store_true", help = "Suppress think tags (won't necessarily stop reasoning model from reasoning anyway)")

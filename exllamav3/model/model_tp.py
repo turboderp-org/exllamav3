@@ -525,6 +525,18 @@ class Model_TPMixin:
         return self.tp_producer.send(x), reserve
 
 
+    def restore_tp_params(self, params: dict, reserve: dict):
+        # Read back state the forward pass wrote into the exported recurrent-state handles (the
+        # output device's pseudo worker runs in this process, so its mutations are visible), then
+        # restore the reserved originals
+        exported_rs = params.get("recurrent_states")
+        params.update(reserve)
+        if "recurrent_states" in reserve and exported_rs is not None:
+            for exp, orig in zip(exported_rs, reserve["recurrent_states"]):
+                if exp is not None and orig is not None and hasattr(orig, "tp_readback"):
+                    orig.tp_readback(exp)
+
+
     def prefill_tp(
         self,
         x: torch.Tensor,
@@ -551,7 +563,7 @@ class Model_TPMixin:
             assert r is None, "TP logic error"
 
         self.tp_worker_result(-1)
-        params.update(reserve)
+        self.restore_tp_params(params, reserve)
         return None
 
 
@@ -583,7 +595,7 @@ class Model_TPMixin:
         assert len(return_tensors) == 1, "TP logic error"
 
         self.tp_worker_result(-1)
-        params.update(reserve)
+        self.restore_tp_params(params, reserve)
         return return_tensors[0]
 
 

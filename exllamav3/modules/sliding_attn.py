@@ -11,9 +11,32 @@ from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_sw
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..cache import Cache
+from ..cache.recurrent import (
+    mp_cache_recurrent_stash,
+    mp_cache_recurrent_unstash,
+    new_checkpoint_handle,
+)
+from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 
+
+class SWAExportedState:
+    """Lightweight stand-in for an SWAState in TP worker processes: carries the fields the module
+    reads during a forward plus the wshift it writes, which the parent reads back after the pass
+    (the pseudo worker for the output device shares the parent's address space)"""
+
+    exported = True
+
+    def __init__(self, cache: int, slot: int, position: int, window_beg: int):
+        self.cache = cache
+        self.slot = slot
+        self.position = position
+        self.window_beg = window_beg
+        self.wshift = 0
+
 class SWAState:
+
+    exported = False
 
     def __init__(
         self,
@@ -59,20 +82,45 @@ class SWAState:
             "checkpoint_size": self.checkpoint_size,
             "window_beg": self.window_beg,
         }
-        for k, l in self.cache.get_all_recurrent_layers().items():
-            stashed[k] = l.stash(self.slot, self.position)
+        if not self.cache.model.loaded_tp:
+            for k, l in self.cache.get_all_recurrent_layers().items():
+                stashed[k] = l.stash(self.slot, self.position)
+        else:
+            cp_handle = new_checkpoint_handle()
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, self.position))
+            stashed["tp_handle"] = cp_handle
         return stashed
 
 
     def unstash(self, stashed: dict):
         assert self.position == stashed["position"]
         self.window_beg = stashed["window_beg"]
-        for k, l in self.cache.get_all_recurrent_layers().items():
-            l.unstash(self.slot, stashed[k], self.position)
+        if not self.cache.model.loaded_tp:
+            for k, l in self.cache.get_all_recurrent_layers().items():
+                l.unstash(self.slot, stashed[k], self.position)
+        else:
+            cp_handle = stashed["tp_handle"]
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot, self.position))
 
 
     def post_advance(self):
         self.window_beg += self.wshift
+
+
+    def tp_export(self):
+        return SWAExportedState(
+            cache = id(self.cache),
+            slot = self.slot,
+            position = self.position,
+            window_beg = self.window_beg,
+        )
+
+
+    def tp_readback(self, exported: SWAExportedState):
+        # The forward pass decides the per-step window shift; under TP it runs on the exported
+        # handle (in the parent's address space via the output device's pseudo worker), and
+        # post_advance() applies the shift parent-side afterwards
+        self.wshift = exported.wshift
 
 
     def reset(self):
@@ -112,6 +160,21 @@ class SWALayerState:
             self.module.sliding_window * self.module.num_kv_heads * self.module.head_dim * 2 +
             self.module.sliding_window * self.module.num_kv_heads * self.module.head_dim * 2
         )
+
+
+    def storage_size(self):
+        return sum(t.numel() * t.element_size() for t in (self.k_state, self.v_state))
+
+
+    def tp_export(self, plan):
+        return {
+            "cls": SWALayerState,
+            "args": {
+                "cache_id": self.cache_id,
+                "max_history": self.max_history,
+                "max_batch_size": self.max_batch_size,
+            }
+        }
 
 
     def alloc(self, device):
@@ -176,6 +239,7 @@ class SlidingAttention(Module):
         key_v: str | None = None,
         key_o: str | None = None,
         key_g: str | None = None,
+        key_sinks: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
@@ -209,11 +273,34 @@ class SlidingAttention(Module):
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
         self.sliding_window_overp = sliding_window_overp
-        self.kv_state_size = sliding_window + sliding_window_overp
+        # The state buffer holds the window plus overprovisioned history so speculative decoding can
+        # roll back rejected drafts without recompute; the shift logic drops up to a page at a time,
+        # so round UP to whole pages to preserve at least the requested slack after a shift
+        self.kv_state_size = -(-(sliding_window + sliding_window_overp) // PAGE_SIZE) * PAGE_SIZE
         self.logit_softcapping = logit_softcapping
         self.post_rope_norm = post_rope_norm
         self.full_gate = full_gate
         self.bt_cache = {}
+
+        # Set before the zero-heads early return: forward()/unload() and the TP import touch these
+        # on ranks that hold none of this layer's heads
+        self.multi_kv = None
+        self.multi_qg = None
+        self.q_norm_tensor = None
+        self.k_norm_tensor = None
+        self.has_split_cache = False
+        self.prealloc_qgh_1 = None
+        self.prealloc_qg_1 = None
+        self.prealloc_kvh_1 = None
+        self.prealloc_kv_1 = None
+        self.recurrent_layers = []
+        self.tp_recurrent_lookup = {}
+        self.tp_reduce = False
+        self.bc_attn = {}
+        self.headwise_gate = False
+        self.g_proj = None
+        self.key_sinks = key_sinks
+        self.sinks = None
 
         if post_rope_norm:
             assert q_norm is None and k_norm is None, \
@@ -287,6 +374,7 @@ class SlidingAttention(Module):
                 out_dtype = out_dtype,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".o" if qmap is not None else None,
+                trim_padded_out = True,
             )
             self.register_submodule(self.o_proj)
         else:
@@ -352,24 +440,6 @@ class SlidingAttention(Module):
         })
         self.layer_state_cls = SWALayerState
 
-        self.multi_kv = None
-        self.multi_qg = None
-
-        self.q_norm_tensor = None
-        self.k_norm_tensor = None
-
-        self.has_split_cache = False
-
-        self.prealloc_qgh_1 = None
-        self.prealloc_qg_1 = None
-        self.prealloc_kvh_1 = None
-        self.prealloc_kv_1 = None
-
-        self.recurrent_layers = []
-        self.tp_recurrent_lookup = {}
-        self.tp_reduce = False
-        self.bc_attn = {}
-
 
     @override
     def optimizer_targets(self):
@@ -394,6 +464,11 @@ class SlidingAttention(Module):
                 device,
                 self.rope_settings,
             )
+
+        if self.key_sinks:
+            self.sinks = self.config.stc.get_tensor(
+                f"{self.key}.{self.key_sinks}", device, no_defer = True
+            ).float().contiguous()
 
         # Test if K and V proj can be fused
         if (
@@ -453,6 +528,7 @@ class SlidingAttention(Module):
 
         self.bc_attn = {}
         self.rope = None
+        self.sinks = None
 
         if self.multi_kv is not None:
             self.multi_kv.unload()
@@ -470,6 +546,15 @@ class SlidingAttention(Module):
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
         self.bt_cache = {}
+
+
+    @override
+    def get_tensors(self):
+        t = super().get_tensors()
+        if self.sinks is not None:
+            # bf16 -> fp16 is exact at sink-logit magnitudes; stored as loaded
+            t[f"{self.key}.{self.key_sinks}"] = self.sinks.half().contiguous()
+        return t
 
 
     @override
@@ -622,7 +707,10 @@ class SlidingAttention(Module):
         if x.dtype != torch.float16 or not x.is_contiguous():
             return None
         layer_instance = (self.layer_idx, params.get("layer_instance", 0))
-        rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+        if rsg[0].exported:
+            rsl = self.tp_recurrent_lookup[rsg[0].cache]
+        else:
+            rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
         key = id(rsl)
         bca = self.bc_attn.get(key)
         if bca is None:
@@ -681,6 +769,7 @@ class SlidingAttention(Module):
             softmax_scale = self.sm_scale,
             window_size = (self.sliding_window, self.sliding_window),
             softcap = self.logit_softcapping,
+            sinks = self.sinks,
             k_new = k,
             v_new = v,
         )
@@ -745,7 +834,10 @@ class SlidingAttention(Module):
         rsg = params.get("recurrent_states")
         assert rsg is not None, "SlidingAttention.forward() called in flash_attn mode with no recurrent states"
         layer_instance = (self.layer_idx, params.get("layer_instance", 0))
-        rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+        if rsg[0].exported:
+            rsl = self.tp_recurrent_lookup[rsg[0].cache]
+        else:
+            rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
         k_states, v_states = rsl.get_state_tensors()
 
         S = self.kv_state_size
@@ -768,6 +860,7 @@ class SlidingAttention(Module):
                 softmax_scale = self.sm_scale,
                 window_size = (sw, 0),
                 softcap = self.logit_softcapping,
+                sinks = self.sinks,
                 max_kv_len = S,
             )
 
@@ -795,6 +888,7 @@ class SlidingAttention(Module):
                     softmax_scale = self.sm_scale,
                     window_size = (sw, 0),
                     softcap = self.logit_softcapping,
+                    sinks = self.sinks,
                     k_new = k,
                     v_new = v,
                 )
@@ -814,6 +908,7 @@ class SlidingAttention(Module):
                         softmax_scale = self.sm_scale,
                         window_size = (max(sw, l + pre), l - 1) if c else (sw, 0),
                         softcap = self.logit_softcapping,
+                        sinks = self.sinks,
                         k_new = k[:, : b].contiguous(),
                         v_new = v[:, : b].contiguous(),
                     )
@@ -848,3 +943,171 @@ class SlidingAttention(Module):
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
+
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
+        storage = 0
+        storage += self.q_proj.storage_size()
+        storage += self.k_proj.storage_size()
+        storage += self.v_proj.storage_size()
+        storage += self.o_proj.storage_size()
+        if self.g_proj is not None:
+            storage += self.g_proj.storage_size()
+        for rl in self.recurrent_layers:
+            storage += rl.storage_size()
+        overhead_d = 0
+        overhead_d += self.hidden_size * (self.out_dtype or torch.half).itemsize
+        overhead_s = 0
+        overhead_s += 2 * self.num_q_heads * self.head_dim * torch.half.itemsize  # q, o
+        overhead_s += 2 * self.num_kv_heads * self.head_dim * torch.half.itemsize  # k, v
+        recons = max(
+            self.q_proj.recons_size(),
+            self.k_proj.recons_size(),
+            self.v_proj.recons_size(),
+            self.o_proj.recons_size(),
+        )
+        channel_width = 1
+        channels_to_split = self.num_kv_heads
+        while channel_width * self.head_dim < 128:
+            assert channels_to_split % 2 == 0, \
+                "Model's K/V heads cannot divide into 128-channel tensors"
+            channel_width *= 2
+            channels_to_split //= 2
+        assert (channel_width * self.head_dim) % 128 == 0, \
+            "Model's K/V heads cannot divide into 128-channel tensors"
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = channel_width,
+            channel_unit = "heads",
+            storage_per_device = 0,
+            storage_to_split = storage,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = channels_to_split,
+            limit_key = "attn"
+        )
+        return [tpa]
+
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+        assert not (self.q_norm is not None and isinstance(self.q_norm, RMSNorm) and self.q_norm.span_heads), \
+            "TP export of SlidingAttention with span_heads norms is not implemented"
+
+        def _export(child):
+            nonlocal producer
+            return child.tp_export(plan, producer) if child is not None else None
+
+        return {
+            "cls": SlidingAttention,
+            "kwargs": {
+                "key": self.key,
+                "layer_idx": self.layer_idx,
+                "hidden_size": self.hidden_size,
+                "head_dim": self.head_dim,
+                "rope_settings": self.rope_settings,
+                "sm_scale": self.sm_scale,
+                "out_dtype": self.out_dtype,
+                "sliding_window": self.sliding_window,
+                "sliding_window_overp": self.sliding_window_overp,
+                "logit_softcapping": self.logit_softcapping,
+                "post_rope_norm": self.post_rope_norm,
+                "full_gate": self.full_gate,
+            },
+            "num_kv_heads": self.num_kv_heads,
+            "n_gqa": self.num_q_heads // self.num_kv_heads,
+            **{name: _export(getattr(self, name, None)) for name in (
+                "q_norm",
+                "k_norm",
+                "v_norm",
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "g_proj",
+            )},
+            # Learned attention sinks (gpt-oss): one logit per query head, sliced to the local heads on import
+            "sinks": producer.send(self.sinks) if self.sinks is not None else None,
+            "device": self.device,
+            "recurrent_layers": [
+                rl.tp_export(plan) for rl in self.recurrent_layers
+            ],
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan, **kwargs):
+        key = exported["kwargs"]["key"]
+        head_dim = exported["kwargs"]["head_dim"]
+        full_gate = exported["kwargs"]["full_gate"]
+        n_gqa = exported["n_gqa"]
+        device = local_context["device"]
+        first, last, unit = plan[key]
+        assert unit == "heads"
+        num_kv_heads = last - first
+        num_q_heads = num_kv_heads * n_gqa
+
+        q_split = (True, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+            if num_kv_heads else None
+        kv_split = (True, first * head_dim, last * head_dim) \
+            if num_kv_heads else None
+        o_split = (False, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+            if num_kv_heads else None
+        # Full gate spans head_dim channels per q head, headwise gate is one channel per q head
+        if full_gate:
+            g_split = (True, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+                if num_kv_heads else None
+        else:
+            g_split = (True, first * n_gqa, last * n_gqa) \
+                if num_kv_heads else None
+
+        def _import(name):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import(local_context, exported[name], plan) \
+                if exported.get(name) else None
+
+        def _import_split(name, split):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import_split(local_context, exported[name], plan, split) \
+                if split and exported.get(name) else None
+
+        module = SlidingAttention(
+            config = None,
+            **exported["kwargs"],
+            num_q_heads = num_q_heads,
+            num_kv_heads = num_kv_heads,
+            # Head-dim-wide norm weights are shared across heads; span_heads is rejected at export
+            q_norm = _import("q_norm"),
+            k_norm = _import("k_norm"),
+            v_norm = _import("v_norm"),
+            q_proj = _import_split("q_proj", q_split),
+            k_proj = _import_split("k_proj", kv_split),
+            v_proj = _import_split("v_proj", kv_split),
+            o_proj = _import_split("o_proj", o_split),
+            g_proj = _import_split("g_proj", g_split),
+        )
+
+        # Attention sinks are one logit per query head; each rank keeps its local head range
+        if exported.get("sinks") is not None and num_kv_heads:
+            consumer = local_context["consumer"]
+            module.sinks = consumer.recv(
+                exported["sinks"], cuda = True, slice_dim = 0, first = first * n_gqa, last = last * n_gqa
+            )
+
+        if num_kv_heads:
+            recurrent_layers = exported["recurrent_layers"]
+            if len(recurrent_layers):
+                module.has_split_cache = True
+                for rl in recurrent_layers:
+                    rli = rl["cls"](module, **rl["args"])
+                    module.recurrent_layers.append(rli)
+                    module.tp_recurrent_lookup[rl["args"]["cache_id"]] = rli
+
+        module.device = device
+        if not kwargs.get("skip_reduction"):
+            module.tp_reduce = True
+
+        module.load_local(device)
+        torch.cuda.synchronize()
+        return module

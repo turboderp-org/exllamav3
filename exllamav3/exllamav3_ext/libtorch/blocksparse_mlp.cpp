@@ -106,7 +106,7 @@ void BC_BlockSparseMLP::run_bsz1_gr
         graph
     );
     if (gate_bias_ptrs)
-        moe_bias_add_gr(interm_g, gate_bias_ptrs.value(), selected_experts, graph);
+        moe_bias_add_gr(interm_g, gate_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
 
     exl3_mgemm_gr
     (
@@ -129,7 +129,7 @@ void BC_BlockSparseMLP::run_bsz1_gr
     );
 
     if (up_bias_ptrs)
-        moe_bias_add_gr(interm_u, up_bias_ptrs.value(), selected_experts, graph);
+        moe_bias_add_gr(interm_u, up_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
 
     if (act_silu)
         silu_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
@@ -160,7 +160,7 @@ void BC_BlockSparseMLP::run_bsz1_gr
         graph
     );
     if (down_bias_ptrs)
-        moe_bias_add_weighted_gr(out_d, down_bias_ptrs.value(), selected_experts, routing_weights, graph);
+        moe_bias_add_weighted_gr(out_d, down_bias_ptrs.value(), selected_experts, routing_weights, min_expert, max_expert, graph);
     if (out_trim)
     {
         // Exact-width copy out of the padded down result (row 0 holds the weighted reduction)
@@ -216,15 +216,36 @@ void BC_BlockSparseMLP::run_bsz1
         args.push_back(PPTR(GP_mgemm_A,            yptr));
         args.push_back(PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()));
         args.push_back(PPTR(GP_end,                nullptr));
+
+        if (gate_bias_ptrs)
+        {
+            args.push_back(PPTR(GP_moe_bias_add_sel,   (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_end,                nullptr));
+        }
+
         args.push_back(PPTR(GP_mgemm_A,            yptr));
         args.push_back(PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()));
         args.push_back(PPTR(GP_end,                nullptr));
+
+        if (up_bias_ptrs)
+        {
+            args.push_back(PPTR(GP_moe_bias_add_sel,   (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_end,                nullptr));
+        }
+
+        auto patch_bias = [&]()
+        {
+            args.push_back(PPTR(GP_moe_bias_add_weighted_sel,       (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_moe_bias_add_weighted_weights,   (void*) routing_weights.data_ptr()));
+            args.push_back(PPTR(GP_end,                             nullptr));
+        };
 
         if (shared_experts && shared_gate)
         {
             args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
             args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
             args.push_back(PPTR(GP_end,                         nullptr));
+            if (down_bias_ptrs) patch_bias();
             args.push_back(PPTR(GP_mgemm_A,                     (void*) y.data_ptr()));
             args.push_back(PPTR(GP_add_sigmoid_gate_proj_y,     (void*) y.data_ptr()));
             args.push_back(PPTR(GP_add_sigmoid_gate_proj_z,     (void*) out_d.data_ptr()));
@@ -234,6 +255,7 @@ void BC_BlockSparseMLP::run_bsz1
             args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
             args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
             args.push_back(PPTR(GP_end,                         nullptr));
+            if (down_bias_ptrs) patch_bias();
             args.push_back(PPTR(GP_mgemm_A,                     (void*) y.data_ptr()));
             args.push_back(PPTR(GP_add_x,                       (void*) out_d.data_ptr()));
             args.push_back(PPTR(GP_add_z,                       (void*) out_d.data_ptr()));
@@ -243,6 +265,7 @@ void BC_BlockSparseMLP::run_bsz1
             args.push_back(PPTR(GP_mgemm_C,                     (void*) out_d.data_ptr()));
             args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
             args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
+            if (down_bias_ptrs) patch_bias();
         }
 
         graph_bsz1.launch(args, stream);

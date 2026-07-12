@@ -4,7 +4,7 @@ import torch
 import os
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from ..model.config import Config, NullConfig
+    from ..model.config import Config
 from ..model.model_tp_alloc import TPAllocation
 from functools import cached_property
 
@@ -31,7 +31,12 @@ class Module(ABC):
             in linear layers during quantization, e.g. to allow sharing between Q/K/V projections that have the same
             input state.
         """
-        self.config = config or NullConfig()
+        # Imported here rather than at the top of the file: importing ..model.config at module scope would pull in
+        # the model package while the modules package may still be mid-import
+        if config is None:
+            from ..model.config import NullConfig
+            config = NullConfig()
+        self.config = config
         self.key = key
         self.alt_key = None
         self.used_alt_key = False

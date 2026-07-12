@@ -28,11 +28,18 @@ if _prefer_fa2 and not has_fa2:
     _prefer_fa2 = False
 
 _fns_triton_fast: list[AttnFn] = [
-    fn_triton_paged_attn_decode_qc,
-    fn_triton_paged_attn_prefill_qc,
     fn_triton_paged_attn_decode,
     fn_triton_paged_attn_prefill,
     fn_triton_varlen_attn,
+]
+
+# Quant-direct calls carry the packed cache in q_cache and leave k_cache/v_cache as None, which makes them
+# indistinguishable from cache-less attention to any backend that only checks has_kv_cache(). Such a backend
+# would silently attend over just the new K/V rows and ignore the cached context, so quant-direct calls only
+# ever dispatch over the qc-aware functions
+_fns_qc: list[AttnFn] = [
+    fn_triton_paged_attn_decode_qc,
+    fn_triton_paged_attn_prefill_qc,
 ]
 
 # Quantized caches feed the attention kernels directly (online dequant, no full-size fp16
@@ -159,14 +166,20 @@ def attn_dispatch(
         q_cache,
         sinks,
     )
+    # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
+    # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache
+    # and would accept them as cache-less)
+    candidates = _fns_qc if q_cache is not None else attn_fns
+    hint_key = "fn_qc" if q_cache is not None else "fn"
+
     # Retry the backend that matched last time for this caller before scanning the full list.
     # Candidate functions return None on incompatible arguments, so a stale hint self-corrects
-    fn = dispatch_cache.get("fn") if dispatch_cache is not None else None
+    fn = dispatch_cache.get(hint_key) if dispatch_cache is not None else None
     o = fn(args) if fn is not None else None
 
     if o is None:
         args.sanity_check()
-        for fn in attn_fns:
+        for fn in candidates:
             o = fn(args)
             if o is not None:
                 break
@@ -174,7 +187,7 @@ def attn_dispatch(
             _print_no_attn_match_report(args)
             raise ValueError("No matching attention function")
         if dispatch_cache is not None:
-            dispatch_cache["fn"] = fn
+            dispatch_cache[hint_key] = fn
 
     # Update cache (quant-direct mode already wrote the new K/V before the attention call)
     if cache is not None and q_cache is None:

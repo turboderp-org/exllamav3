@@ -181,14 +181,32 @@ __global__ void moe_bias_add_kernel
     const uintptr_t* __restrict__ bias_ptrs,
     const int64_t* __restrict__ sel,
     const int stride,
-    const int width
+    const int width,
+    const int min_expert,
+    const int max_expert
 )
 {
     int col = blockIdx.x * C2D_THREADS + threadIdx.x;
     int k = blockIdx.y;
     if (col >= width) return;
-    const half* b = (const half*) bias_ptrs[sel[k]];
-    int64_t i = (int64_t) k * stride + col;
+    // Expert-parallel split: sel holds global expert indices but the pointer table only covers the
+    // local range, and the mgemm PACKS its output rows to the local entries of sel (in order). Skip
+    // foreign experts and add each local expert's bias at its packed row, not its position in sel
+    int64_t e = sel[k];
+    int row = k;
+    if (min_expert >= 0)
+    {
+        if (e < min_expert || e >= max_expert) return;
+        e -= min_expert;
+        row = 0;
+        for (int i = 0; i < k; ++i)
+        {
+            int64_t ei = sel[i];
+            if (ei >= min_expert && ei < max_expert) row++;
+        }
+    }
+    const half* b = (const half*) bias_ptrs[e];
+    int64_t i = (int64_t) row * stride + col;
     interm[i] = __hadd(interm[i], b[col]);
 }
 
@@ -199,7 +217,9 @@ __global__ void moe_bias_add_weighted_kernel
     const int64_t* __restrict__ sel,
     const half* __restrict__ weights,
     const int num_sel,
-    const int width
+    const int width,
+    const int min_expert,
+    const int max_expert
 )
 {
     int col = blockIdx.x * C2D_THREADS + threadIdx.x;
@@ -207,7 +227,14 @@ __global__ void moe_bias_add_weighted_kernel
     float acc = out[col];
     for (int k = 0; k < num_sel; ++k)
     {
-        const half* b = (const half*) bias_ptrs[sel[k]];
+        // Foreign experts contribute on their own rank only
+        int64_t e = sel[k];
+        if (min_expert >= 0)
+        {
+            if (e < min_expert || e >= max_expert) continue;
+            e -= min_expert;
+        }
+        const half* b = (const half*) bias_ptrs[e];
         acc += __half2float(weights[k]) * __half2float(b[col]);
     }
     out[col] = acc;
@@ -218,6 +245,8 @@ void moe_bias_add_gr
     at::Tensor& interm,
     const at::Tensor& bias_ptrs,
     const at::Tensor& sel,
+    int min_expert,
+    int max_expert,
     Graph* graph
 )
 {
@@ -237,9 +266,17 @@ void moe_bias_add_gr
         (const uintptr_t*) bias_ptrs.data_ptr(),
         (const int64_t*) sel.data_ptr(),
         stride,
-        width
+        width,
+        min_expert,
+        max_expert
     );
+    if (graph)
+    {
+        graph->record_param((void*) &moe_bias_add_kernel, GP_moe_bias_add_sel, 2);
+        graph->record_param((void*) &moe_bias_add_kernel, GP_end, 0);
+    }
     cuda_check(cudaPeekAtLastError());
+
 }
 
 void moe_bias_add_weighted_gr
@@ -248,6 +285,8 @@ void moe_bias_add_weighted_gr
     const at::Tensor& bias_ptrs,
     const at::Tensor& sel,
     const at::Tensor& weights,
+    int min_expert,
+    int max_expert,
     Graph* graph
 )
 {
@@ -268,7 +307,15 @@ void moe_bias_add_weighted_gr
         (const int64_t*) sel.data_ptr(),
         (const half*) weights.data_ptr(),
         num_sel,
-        width
+        width,
+        min_expert,
+        max_expert
     );
+    if (graph)
+    {
+        graph->record_param((void*) &moe_bias_add_weighted_kernel, GP_moe_bias_add_weighted_sel, 2);
+        graph->record_param((void*) &moe_bias_add_weighted_kernel, GP_moe_bias_add_weighted_weights, 3);
+        graph->record_param((void*) &moe_bias_add_weighted_kernel, GP_end, 0);
+    }
     cuda_check(cudaPeekAtLastError());
 }

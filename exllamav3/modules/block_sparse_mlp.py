@@ -449,6 +449,11 @@ class BlockSparseMLP(Module):
         self.routing_cfg = None
         self.experts_cfg = None
 
+        # Persistent broadcast targets for TP ranks without the router (see forward): the BC bsz-1
+        # graph bakes the routing tensors' addresses into unpatched nodes, so they must be statics
+        self.bcast_sel_bsz1 = None
+        self.bcast_weights_bsz1 = None
+
         self.e_score_correction_bias = None
         self.e_score_correction_bias_key = key_e_score_bias
         self.per_expert_scale = None
@@ -779,6 +784,8 @@ class BlockSparseMLP(Module):
         self.experts_cfg = None
         self.e_score_correction_bias = None
         self.per_expert_scale = None
+        self.bcast_sel_bsz1 = None
+        self.bcast_weights_bsz1 = None
         super().unload()
 
 
@@ -805,6 +812,14 @@ class BlockSparseMLP(Module):
 
         if self.routing_gate is not None:
             selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, z, params)
+        elif bsz == 1:
+            # Stable buffers, not per-call allocations: the BC bsz-1 graph reads the routing tensors
+            # through unpatched nodes (bias adds), whose addresses are baked at capture time
+            if self.bcast_sel_bsz1 is None:
+                self.bcast_sel_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.long, device = self.device)
+                self.bcast_weights_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.half, device = self.device)
+            selected_experts = self.bcast_sel_bsz1
+            routing_weights = self.bcast_weights_bsz1
         else:
             selected_experts = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.long, device = self.device)
             routing_weights = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.half, device = self.device)
