@@ -107,6 +107,9 @@ class PromptFormat_chatml(PromptFormat):
     def add_bos(self):
         return False
 
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
     def stop_conditions(self, tokenizer):
         return [
             tokenizer.eos_token_id,
