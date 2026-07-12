@@ -3,6 +3,9 @@
 
 #define ACT_SILU 0
 #define ACT_GELU 1
+// Non-gated relu2 (NemotronH): the g input is unused (its GEMM is skipped by the caller); the
+// gate lane is set to relu(u) so the gate multiply below yields relu(u) * u = relu^2(u) exactly
+#define ACT_RELU2_NOGATE 2
 
 // Hadamard transform 128-element vector across one warp, with optional pre and post scales
 
@@ -337,22 +340,28 @@ void had_hf_r_128_guad_inner
         return __float22half2_rn(xf);
     };
 
-    // Load
-    half4 vg = ((half4*) input_ptr_g)[t];
+    // Load. In non-gated mode the g buffer holds no data (its GEMM is skipped); the gate lane
+    // is synthesized from u in the activation switch below
+    half4 vg = {};
     half4 vu = ((half4*) input_ptr_u)[t];
 
     // Hadamard
-    vg = had(vg);
     vu = had(vu);
 
     // Post scale  TODO: should maybe do this in float32
     int i = blockIdx.y * 32 + t;
-    half4 scales_g = ((half4*) post_scale_g)[i];
     half4 scales_u = ((half4*) post_scale_u)[i];
-    vg.x = __hmul2(vg.x, scales_g.x);
-    vg.y = __hmul2(vg.y, scales_g.y);
     vu.x = __hmul2(vu.x, scales_u.x);
     vu.y = __hmul2(vu.y, scales_u.y);
+
+    if (act_function != ACT_RELU2_NOGATE)
+    {
+        vg = ((half4*) input_ptr_g)[t];
+        vg = had(vg);
+        half4 scales_g = ((half4*) post_scale_g)[i];
+        vg.x = __hmul2(vg.x, scales_g.x);
+        vg.y = __hmul2(vg.y, scales_g.y);
+    }
 
     // Activation
     switch (act_function)
@@ -365,6 +374,11 @@ void had_hf_r_128_guad_inner
         case ACT_GELU:
             vg.x = _gelu(vg.x);
             vg.y = _gelu(vg.y);
+            break;
+
+        case ACT_RELU2_NOGATE:
+            vg.x = __hmax2(vu.x, __float2half2_rn(0.0f));
+            vg.y = __hmax2(vu.y, __float2half2_rn(0.0f));
             break;
 
         default:

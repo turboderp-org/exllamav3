@@ -15,6 +15,7 @@
 #define ACT_GELU 1
 #define ACT_RELU2 2
 #define ACT_SILU_OAI 3
+#define ACT_RELU 4
 
 #include "activation_kernels.cuh"
 
@@ -329,6 +330,85 @@ void relu2_mul
 )
 {
     relu2_mul_gr(x, y, z, act_limit, nullptr);
+}
+
+// relu(x) * y -> z. With x == y this computes relu^2(y) exactly, which is how the non-gated
+// MoE paths (NemotronH) apply their activation through the same (g, u, a) call shape
+
+void relu_mul_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    bool float_input = x.dtype() == at::kFloat;
+    if (float_input)
+    {
+        TORCH_CHECK_DTYPE(y, kFloat);
+    }
+    else
+    {
+        TORCH_CHECK_DTYPE(x, kHalf);
+        TORCH_CHECK_DTYPE(y, kHalf);
+    }
+
+    TORCH_CHECK_DTYPE(z, kHalf);
+
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    if (float_input)
+    {
+        act_mul_kernel_f<ACT_RELU><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const float*) x.data_ptr(),
+            (const float*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            act_limit,
+            numel
+        );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU>, GP_relu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU>, GP_relu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU>, GP_relu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
+    }
+    else
+    {
+        act_mul_kernel_h<ACT_RELU><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const half*) x.data_ptr(),
+            (const half*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            act_limit,
+            numel
+        );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU>, GP_relu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU>, GP_relu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU>, GP_relu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
+    }
+}
+
+void relu_mul
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit
+)
+{
+    relu_mul_gr(x, y, z, act_limit, nullptr);
 }
 
 // xielu(x, alpha_p, alpha_n) -> z

@@ -123,6 +123,7 @@ class MLP(Module):
                     out_dtype = self.out_dtype,
                     allow_input_padding = True,
                     pad_to = pad_to,
+                    trim_padded_out = True,
                     select_hq_bits = select_hq_bits,
                     qgroup = key + ".d",
                     qbits_key = qbits_key,
@@ -152,6 +153,7 @@ class MLP(Module):
         self.tp_reduce = False
 
         self.bc = None
+        self.bsz1_pa_args = []
 
 
     @override
@@ -179,6 +181,51 @@ class MLP(Module):
             self.alpha_p = self.config.stc.get_tensor(self.key_alpha_p, None, optional = False, allow_bf16 = True)
         if self.key_alpha_n:
             self.alpha_n = self.config.stc.get_tensor(self.key_alpha_n, None, optional = False, allow_bf16 = True)
+        self.load_local(device, **kwargs)
+
+
+    def load_local(self, device: torch.Device, **kwargs):
+        # Graphed bsz-1 path (up -> act -> down in one C++ call)
+        self.bc = None
+        if (
+            device != torch.device("cpu") and
+            self.num_slices == 1 and
+            self.activation_fn in ("silu", "gelu", "relu2") and
+            self.interm_dtype in (None, torch.half) and
+            self.ups[0].quant_type == "exl3" and self.ups[0].inner.bc is not None and
+            self.downs[0].quant_type == "exl3" and self.downs[0].inner.bc is not None
+        ):
+            up0, down0 = self.ups[0], self.downs[0]
+            self.bsz1_pa_args = [
+                (device, (1, 1, up0.out_features), torch.half, "mlp_u"),
+                (device, (1, 1, up0.out_features), torch.half, "mlp_ones"),
+            ]
+            u, ones = (g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args)
+            ones.fill_(1.0)
+
+            # Zero-padded staging statics for padded projection dims (hidden % 128 != 0)
+            xp = None
+            if up0.in_features != self.hidden_size:
+                xp = g_tensor_cache.get(device, (1, up0.in_features), torch.half, "mlp_xp")
+                xp.zero_()
+            yp = None
+            if down0.out_features != self.out_size:
+                yp = g_tensor_cache.get(device, (1, down0.out_features), self.out_dtype or torch.half, "mlp_yp")
+
+            self.bc = ext.BC_MLP(
+                xp = xp,
+                u = u,
+                ones = ones,
+                yp = yp,
+                act_silu = self.activation_fn == "silu",
+                act_gelu = self.activation_fn == "gelu",
+                act_relu2 = self.activation_fn == "relu2",
+                up = up0.inner.bc,
+                down = down0.inner.bc,
+                act_limit = 0.0,
+                hidden_size = self.hidden_size,
+                out_size = self.out_size,
+            )
 
 
     @override
@@ -186,6 +233,8 @@ class MLP(Module):
         super().unload()
         self.alpha_p = None
         self.alpha_n = None
+        self.bc = None
+        self.bsz1_pa_args = []
 
 
     def act_xielu_torch(self, x):
@@ -212,6 +261,19 @@ class MLP(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+
+        # Fused C++ path for single-token decode, replayed through an internal CUDA graph from
+        # the third invocation on
+        bsz, q_len, _ = x.shape
+        if (
+            self.bc is not None and bsz == 1 and q_len == 1 and
+            x.dtype == torch.float16 and x.is_contiguous()
+        ):
+            d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
+            self.bc.run_bsz1(x, d)
+            if self.tp_reduce:
+                params["backend"].all_reduce(d)
+            return to2(d, out_dtype, self.out_dtype)
 
         qs = params.get("q_mlp_slice")
         r = [qs] if qs is not None else range(0, self.num_slices)
@@ -361,6 +423,8 @@ class MLP(Module):
         module.alpha_n = consumer.recv(exported["alpha_n"], cuda = False)
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+        if module.num_slices == 1:
+            module.load_local(device)
         torch.cuda.synchronize()
         return module
 

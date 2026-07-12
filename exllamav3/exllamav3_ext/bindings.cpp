@@ -112,6 +112,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");
     m.def("gelu_mul", &gelu_mul, "gelu_mul");
     m.def("relu2_mul", &relu2_mul, "relu2_mul");
+    m.def("relu_mul", &relu_mul, "relu_mul");
     m.def("xielu", &xielu, "xielu");
     m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
     m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
@@ -123,6 +124,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
     m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
     m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
+    m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
+    m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
     m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
     m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
 

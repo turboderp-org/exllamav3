@@ -87,6 +87,18 @@ __device__ __forceinline__ half2 _relu2(half2 x)
 }
 
 
+__device__ __forceinline__ float _relu(float x)
+{
+    return fmaxf(0.0f, x);
+}
+
+
+__device__ __forceinline__ half2 _relu(half2 x)
+{
+    return __hmax2(x, __float2half2_rn(0.0f));
+}
+
+
 __device__ __forceinline__ float _xielu(float x, float alpha_p, float alpha_n)
 {
     const float eps = -9.9838e-07;  // -1e-6 with BF16 rounding error
@@ -160,6 +172,8 @@ void act_mul_kernel_h
         x2 = _gelu(x2);
     else if constexpr (activation_type == ACT_RELU2)
         x2 = _relu2(x2);
+    else if constexpr (activation_type == ACT_RELU)
+        x2 = _relu(x2);
 
     if (act_limit != 0.0f)
     {
@@ -213,6 +227,11 @@ void act_mul_kernel_f
     {
         x2.x = _relu2(x2.x);
         x2.y = _relu2(x2.y);
+    }
+    else if constexpr (activation_type == ACT_RELU)
+    {
+        x2.x = _relu(x2.x);
+        x2.y = _relu(x2.y);
     }
 
     if (act_limit != 0.0f)

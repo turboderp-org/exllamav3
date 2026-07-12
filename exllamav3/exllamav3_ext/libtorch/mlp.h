@@ -85,3 +85,68 @@ struct BC_GatedMLP
         at::Tensor& d
     );
 };
+
+
+// Non-gated MLP (up -> act -> down), e.g. NemotronH's relu2 layers. The activation reuses the
+// act*y kernels with a ones vector (exact: the multiply is by 1.0f in fp32), applied in place on
+// the up output. Padded projection dims stage through zero-padded statics like BC_Attention
+
+struct BC_MLP
+{
+    c10::optional<at::Tensor> xp;   // (1, K_padded) half, zero-padded input staging
+    at::Tensor u;                   // (1, 1, interm) half, up output / activation (in place)
+    at::Tensor ones;                // (1, 1, interm) half
+    c10::optional<at::Tensor> yp;   // (1, N_padded) out dtype, padded down output
+    bool act_silu;
+    bool act_gelu;
+    bool act_relu2;
+    std::shared_ptr<BC_LinearEXL3> up;
+    std::shared_ptr<BC_LinearEXL3> down;
+    float act_limit;
+    int hidden_size;                // exact width of x
+    int out_size;                   // exact width of d
+
+    Graph graph_bsz1;
+
+    BC_MLP
+    (
+        c10::optional<at::Tensor> _xp,
+        at::Tensor _u,
+        at::Tensor _ones,
+        c10::optional<at::Tensor> _yp,
+        bool _act_silu,
+        bool _act_gelu,
+        bool _act_relu2,
+        std::shared_ptr<BC_LinearEXL3> _up,
+        std::shared_ptr<BC_LinearEXL3> _down,
+        float _act_limit,
+        int _hidden_size,
+        int _out_size
+    ) :
+        xp          (std::move(_xp)),
+        u           (std::move(_u)),
+        ones        (std::move(_ones)),
+        yp          (std::move(_yp)),
+        act_silu    (_act_silu),
+        act_gelu    (_act_gelu),
+        act_relu2   (_act_relu2),
+        up          (_up),
+        down        (_down),
+        act_limit   (_act_limit),
+        hidden_size (_hidden_size),
+        out_size    (_out_size)
+    {}
+
+    void run_bsz1_gr
+    (
+        const at::Tensor& x,
+        at::Tensor& d,
+        Graph* graph
+    );
+
+    void run_bsz1
+    (
+        const at::Tensor& x,
+        at::Tensor& d
+    );
+};

@@ -71,6 +71,24 @@ void relu2_mul
     const float act_limit
 );
 
+// relu(x) * y -> z; with x == y this is relu^2(y) (non-gated MoE activation)
+void relu_mul_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit,
+    Graph* graph
+);
+
+void relu_mul
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit
+);
+
 void xielu_gr
 (
     const at::Tensor& x,

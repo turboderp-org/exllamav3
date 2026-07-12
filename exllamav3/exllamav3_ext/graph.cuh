@@ -39,6 +39,10 @@ enum GraphedParams
     GP_relu2_mul_y,
     GP_relu2_mul_z,
 
+    GP_relu_mul_x,
+    GP_relu_mul_y,
+    GP_relu_mul_z,
+
     GP_xielu_x,
     GP_xielu_y,
 
