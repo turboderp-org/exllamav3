@@ -336,7 +336,7 @@ class MLP(Module):
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
             recons_temp = recons,
-            channels_to_split = self.num_slices if slice else self.intermediate_size // 128,
+            channels_to_split = self.num_slices if slice else self.ups[0].out_features // 128,
             limit_key = "mlp"
         )
         return [tpa]
@@ -793,7 +793,7 @@ class GatedMLP(Module):
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
             recons_temp = recons,
-            channels_to_split = self.num_slices if slice else self.intermediate_size // 128,
+            channels_to_split = self.num_slices if slice else self.ups[0].out_features // 128,
             limit_key = "mlp"
         )
         return [tpa]

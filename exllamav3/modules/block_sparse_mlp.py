@@ -1198,6 +1198,20 @@ class BlockSparseMLP(Module):
 
             final_hidden_states = cfg.out_d[:1, ...].view(x.shape)
 
+        # The post norms are nonlinear, so under TP their inputs must be complete sums, not
+        # per-rank partials: reduce the routed and shared contributions separately before the
+        # norms (Gemma4 MoE), after which every rank holds identical complete tensors and the
+        # final reduction is skipped
+        pre_norm_reduce = self.tp_reduce and (
+            self.routed_post_norm is not None or
+            (self.shared_experts is not None and self.shared_experts_post_norm is not None and not bc_sh_exp)
+        )
+        if pre_norm_reduce:
+            params["backend"].all_reduce(
+                final_hidden_states,
+                self.intermediate_size > 0 and self.num_local_experts > 0
+            )
+
         # Extra norm (Gemma4)
         if self.routed_post_norm:
             final_hidden_states = self.routed_post_norm.forward(final_hidden_states, params)
@@ -1205,6 +1219,8 @@ class BlockSparseMLP(Module):
         # Shared experts
         if self.shared_experts and not bc_sh_exp:
             y = self.shared_experts.forward(x, params)
+            if pre_norm_reduce:
+                params["backend"].all_reduce(y, True)
             if self.shared_experts_post_norm:
                 y = self.shared_experts_post_norm.forward(y, params)
             if self.shared_gate:
@@ -1217,7 +1233,7 @@ class BlockSparseMLP(Module):
                 final_hidden_states += y
 
         # Output reduction
-        if self.tp_reduce:
+        if self.tp_reduce and not pre_norm_reduce:
             params["backend"].all_reduce(
                 final_hidden_states,
                 (self.intermediate_size > 0 and self.num_local_experts > 0) or bool(self.shared_experts)
@@ -1266,7 +1282,7 @@ class BlockSparseMLP(Module):
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
             recons_temp = recons,
-            channels_to_split = self.intermediate_size // 128 if use_tp_split else self.num_experts,
+            channels_to_split = self.ups[0].out_features // 128 if use_tp_split else self.num_experts,
             limit_key = "moe"
         )
         tpa_list = [tpa]
@@ -1297,15 +1313,21 @@ class BlockSparseMLP(Module):
                 "n_group": self.n_group,
                 "topk_group": self.topk_group,
                 "act_limit": self.act_limit,
+                "alt_residual_channel": self.alt_residual_channel,
             },
             "routing_gate": _export(self.routing_gate),
             "shared_gate": _export(self.shared_gate),
             "e_score_correction_bias": producer.send(self.e_score_correction_bias),
+            "per_expert_scale": producer.send(self.per_expert_scale),
             "gates": [_export(self.gates[i]) for i in range(self.num_experts)] if self.gated else None,
             "ups": [_export(self.ups[i]) for i in range(self.num_experts)],
             "downs": [_export(self.downs[i]) for i in range(self.num_experts)],
             "shared_experts": self.shared_experts.tp_export(plan, producer) \
                 if self.shared_experts is not None else None,
+            "shared_experts_post_norm": _export(self.shared_experts_post_norm),
+            "router_pre_norm": _export(self.router_pre_norm),
+            "routed_pre_norm": _export(self.routed_pre_norm),
+            "routed_post_norm": _export(self.routed_post_norm),
             "device": self.device,
         }
 
@@ -1379,10 +1401,15 @@ class BlockSparseMLP(Module):
             routing_first = routing_first,
             routing_last = routing_last,
             routing_device = output_device,
+            shared_experts_post_norm = _import("shared_experts_post_norm"),
+            router_pre_norm = _import("router_pre_norm"),
+            routed_pre_norm = _import("routed_pre_norm"),
+            routed_post_norm = _import("routed_post_norm"),
         )
 
         module.device = device
         module.e_score_correction_bias = consumer.recv(exported["e_score_correction_bias"], cuda = True)
+        module.per_expert_scale = consumer.recv(exported["per_expert_scale"], cuda = True)
         if unit == "channels" or num_local_experts > 0:
             module.load_local()
         if module.routing_gate is not None:
