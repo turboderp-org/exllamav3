@@ -119,7 +119,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     model_init.add_args(parser, cache = False)
     parser.add_argument("-p", "--prompt", type = str, help = "Per-image prompt (yes/no question)", required = True)
     parser.add_argument("-n", "--no", action = "store_true", help = "Match images on 'No' instead of 'Yes'")

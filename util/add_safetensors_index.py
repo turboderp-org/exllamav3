@@ -42,7 +42,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-f", "--force", action = "store_true", help = "Write index even if there is only one .safetensors file in the model directory")
     _args = parser.parse_args()

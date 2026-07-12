@@ -240,7 +240,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     model_init.add_args(parser, cache = False)
     parser.add_argument("-r", "--rows", type = int, help = "Number of rows", default = 100)
     parser.add_argument("-l", "--length", type = int, help = "Length", default = 2048)

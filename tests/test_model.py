@@ -259,7 +259,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     model_init.add_args(parser, cache = True, add_sampling_args = True, add_draft_model_args = True, default_cache_size = 16384)
     parser.add_argument("-sp", "--system_prompt", type = str, help = "Use custom system prompt")
     parser.add_argument("-maxr", "--max_response_tokens", type = int, default = 8192, help = "Max tokens per response, default = 4096")

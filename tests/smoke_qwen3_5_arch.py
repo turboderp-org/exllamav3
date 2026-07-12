@@ -25,7 +25,7 @@ def fail(msg: str) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev = False)
     ap.add_argument("--model_dir", required=True)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--full_load", action="store_true")

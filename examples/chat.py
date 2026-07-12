@@ -531,7 +531,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     model_init.add_args(parser, cache = True, add_sampling_args = True, add_draft_model_args = True, default_cache_size = 32768)
     parser.add_argument("-mode", "--mode", type = str, help = "Prompt mode", default = None)
     parser.add_argument("-modes", "--modes", action = "store_true", help = "List available prompt modes and exit")

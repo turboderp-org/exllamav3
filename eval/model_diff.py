@@ -425,7 +425,7 @@ def cache_quant_sweep_fast(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("-ma", "--model_a", type = str, help = "Model A", required = True)
     parser.add_argument("-mb", "--model_b", type = str, help = "Model B", required = True)
     parser.add_argument("-r", "--rows", type = int, help = "Number of rows, default: 100", default = 100)

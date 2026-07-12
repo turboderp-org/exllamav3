@@ -118,7 +118,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     model_init.add_args(parser, default_cache_size = 65536, default_autosplit_max_batch_size = 32)
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     parser.add_argument("-dsp", "--dataset_path", type = str, default = "wikitext", help = "Dataset path")

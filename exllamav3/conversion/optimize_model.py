@@ -16,7 +16,7 @@ col_white = "\u001b[37;1m"
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
-parser = argparse.ArgumentParser()
+parser = argparse.ArgumentParser(allow_abbrev = False)
 parser.add_argument("-m", "--measurement", type = str, default = None, help = "Input measurement.json file from measure.py")
 parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Output directory for compiled model")
 parser.add_argument("-b", "--bitrate", type = float, default = None, help = "Target bitrate")

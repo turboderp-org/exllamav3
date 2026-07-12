@@ -133,7 +133,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("-m", "--model_dir", type = str, help = "Input model directory", required = True)
     parser.add_argument("-mb", "--mtp_bits", type = int, help = "MTP model bitrate, default: 4", default = 4)
     parser.add_argument("-o", "--out_file", type = str, help = "Output .safetensors file to contain quantized MTP tensors")

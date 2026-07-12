@@ -26,7 +26,7 @@ col_red = "\u001b[31;1m"
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
-parser = argparse.ArgumentParser()
+parser = argparse.ArgumentParser(allow_abbrev = False)
 parser.add_argument("-i", "--in_dir", type = str, default = None, help = "Input (model) directory")
 parser.add_argument("-w", "--work_dir", type = str, default = None, help = "Working directory")
 parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Output directory")
