@@ -620,7 +620,12 @@ class Linear(Module):
         module.device = device
         module.inner = exported["inner"]["cls"].tp_import_split(local_context, exported["inner"], plan, split)
         module.quant_type = module.inner.quant_type
-        module._adopt_inner_dims(exported)
+        if split is not None:
+            split_out, first, _ = split
+            module._adopt_inner_dims(exported, out_first = first if split_out else None,
+                                     in_first = first if not split_out else None)
+        else:
+            module._adopt_inner_dims(exported)
         return module
 
     @staticmethod
@@ -659,25 +664,36 @@ class Linear(Module):
         module.is_sliced = True
         return module
 
-    def _adopt_inner_dims(self, exported: dict):
+    def _adopt_inner_dims(self, exported: dict, in_first: int | None = None, out_first: int | None = None):
         # The exported kwargs carry the full unsplit (padded) dims; forward() sizes its input padding and
         # output trim against the wrapper dims, so they must track the local slice. A dim the split left
-        # whole keeps its true unpadded value (padded models pad the hidden dims, which are never split);
-        # splitting a padded dim across ranks has no defined trim semantics, so it must not happen
+        # whole keeps its true unpadded value (padded models pad the hidden dims, which are never split).
+        # Splitting a padded dim is fine when the slice offset is known: slices below the pad boundary
+        # are exact, and the slice containing it has (unpadded - first) real columns (e.g. an lm_head
+        # with a padded vocab split across ranks -- the pad columns ride in the tail slice like they do
+        # on a single device)
         exp_in, exp_out = exported["kwargs"]["in_features"], exported["kwargs"]["out_features"]
         unp_in, unp_out = exported.get("unpadded", (exp_in, exp_out))
         self.in_features = self.inner.in_features
         self.out_features = self.inner.out_features
         if self.in_features == exp_in:
             self.in_features_unpadded = unp_in
-        else:
-            assert exp_in == unp_in, f"{self.key}: cannot split the padded input dim across TP ranks"
+        elif exp_in == unp_in:
             self.in_features_unpadded = self.in_features
+        else:
+            assert in_first is not None, f"{self.key}: cannot split the padded input dim without the slice offset"
+            self.in_features_unpadded = max(0, min(unp_in - in_first, self.in_features))
         if self.out_features == exp_out:
             self.out_features_unpadded = unp_out
-        else:
-            assert exp_out == unp_out, f"{self.key}: cannot split the padded output dim across TP ranks"
+        elif exp_out == unp_out:
             self.out_features_unpadded = self.out_features
+        else:
+            assert out_first is not None, f"{self.key}: cannot split the padded output dim without the slice offset"
+            self.out_features_unpadded = max(0, min(unp_out - out_first, self.out_features))
+            # A load-bearing output trim (projections back into the residual stream) has no
+            # defined per-slice gather semantics; no current model splits such a dim
+            assert not self.trim_padded_out or self.out_features_unpadded == self.out_features, \
+                f"{self.key}: cannot split a padded output dim that requires trimming"
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
 
 
