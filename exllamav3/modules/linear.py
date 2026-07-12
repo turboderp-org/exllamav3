@@ -489,6 +489,10 @@ class Linear(Module):
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
 
+        if self.out_features == 0:
+            dtype = out_dtype or self.out_dtype or torch.half
+            return x.new_empty((*x.shape[:-1], 0), dtype = dtype)
+
         # When in_features is padded past the incoming activation width (dims not a multiple of
         # pad_to, e.g. gpt-oss hidden_size 2880), zero-extend the input. The padded weight rows
         # are zeros, so this is exact; H capture below sees the padded width, keeping the
