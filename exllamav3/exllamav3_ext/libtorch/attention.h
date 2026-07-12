@@ -82,8 +82,9 @@ struct BC_Attention
     float v_norm_constant_bias;
     float v_norm_constant_scale;
 
-    // RoPE
-    at::Tensor inv_freq;
+    // RoPE; nullopt for NoPE models (rope stage skipped entirely; head norms, which share the
+    // rope kernel, must be absent in that case)
+    c10::optional<at::Tensor> inv_freq;
     int rope_style;
     float attn_factor;
     float l4_scaling_beta;
@@ -165,7 +166,7 @@ struct BC_Attention
         float v_norm_eps,
         float v_norm_constant_bias,
         float v_norm_constant_scale,
-        at::Tensor inv_freq,
+        c10::optional<at::Tensor> inv_freq,
         int rope_style,
         float attn_factor,
         float l4_scaling_beta,

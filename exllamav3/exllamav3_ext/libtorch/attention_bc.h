@@ -44,7 +44,7 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
         float,
         float,
         float,
-        at::Tensor,
+        c10::optional<at::Tensor>,
         int,
         float,
         float,

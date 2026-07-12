@@ -153,13 +153,14 @@ class BCAttn:
             v_norm_eps = module.v_norm.rms_norm_eps if module.v_norm is not None else 1e-6,
             v_norm_constant_bias = module.v_norm.constant_bias if module.v_norm is not None else 0.0,
             v_norm_constant_scale = module.v_norm.constant_scale if module.v_norm is not None else 1.0,
-            inv_freq = rope.inv_freq,
-            rope_style = int(rope.rope_settings.rope_style),
-            attn_factor = rope.attn_factor,
-            l4_scaling_beta = rope.llama_4_scaling_beta,
-            l4_scaling_original = rope.llama_4_scaling_original,
+            # NoPE (rope is None): the rope stage is omitted from the graph
+            inv_freq = rope.inv_freq if rope is not None else None,
+            rope_style = int(rope.rope_settings.rope_style) if rope is not None else 0,
+            attn_factor = rope.attn_factor if rope is not None else 1.0,
+            l4_scaling_beta = rope.llama_4_scaling_beta if rope is not None else 0.0,
+            l4_scaling_original = rope.llama_4_scaling_original if rope is not None else 0,
             post_rope_norm = module.post_rope_norm,
-            rotate_dims = rope.rope_settings.rotate_dims,
+            rotate_dims = rope.rope_settings.rotate_dims if rope is not None else 0,
             quant_cache = self.quant,
             cache_k = self.cache_k,
             cache_v = self.cache_v,
@@ -312,8 +313,9 @@ def _module_eligible(m):
     """Module-level requirements shared by the global-attention and SWA builders."""
     return (
         bc_attn_enable and
-        m.rope is not None and
-        m.rope_settings is not None and
+        # NoPE is supported (the rope stage is skipped), but the head norms run inside the rope
+        # kernel, so a norm-only module without rope has nowhere to apply them
+        (m.rope is not None or m.q_norm is None) and
         # Gates: interleaved and full are graphed; headwise (fp16 gate projection through
         # cublas, no patchable sites) is not
         not m.headwise_gate and

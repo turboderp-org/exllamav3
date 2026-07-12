@@ -48,7 +48,7 @@ BC_Attention::BC_Attention
     float _v_norm_eps,
     float _v_norm_constant_bias,
     float _v_norm_constant_scale,
-    at::Tensor _inv_freq,
+    c10::optional<at::Tensor> _inv_freq,
     int _rope_style,
     float _attn_factor,
     float _l4_scaling_beta,
@@ -340,12 +340,18 @@ void BC_Attention::run_gr
 
     // Fused head norm + RoPE, in place on the statics. All position sources and inv_freq are
     // patched per call; the kernel branches on the pointers at runtime, so one graph covers the
-    // scalar/positions/position_ids modes
-    c10::optional<at::Tensor> out_k4 = s.k4;
-    const at::Tensor& ivf = inv_freq_override ? inv_freq_override.value() : inv_freq;
-    rope_gr(s.q4, s.q4, s.k4, out_k4, ivf, (uint32_t) position, positions, position_ids, rope_style,
-            attn_factor, q_norm, k_norm, norm_eps, norm_constant_bias, l4_scaling_beta,
-            l4_scaling_original, post_rope_norm, rotate_dims, graph);
+    // scalar/positions/position_ids modes. NoPE modules (no inv_freq, and by eligibility no
+    // fused head norms either) skip the stage entirely; whether the stage exists must be
+    // constant between capture and replay, so it keys on the member alone
+    TORCH_CHECK(inv_freq || !inv_freq_override, "BC_Attention: inv_freq override on a NoPE module");
+    if (inv_freq)
+    {
+        c10::optional<at::Tensor> out_k4 = s.k4;
+        const at::Tensor& ivf = inv_freq_override ? inv_freq_override.value() : inv_freq.value();
+        rope_gr(s.q4, s.q4, s.k4, out_k4, ivf, (uint32_t) position, positions, position_ids, rope_style,
+                attn_factor, q_norm, k_norm, norm_eps, norm_constant_bias, l4_scaling_beta,
+                l4_scaling_original, post_rope_norm, rotate_dims, graph);
+    }
 
     // Cache append (before attention: the split kernel counts the new tokens as part of the
     // sequence and reads them back from the cache)
@@ -531,14 +537,17 @@ void BC_Attention::run
     }
 
     // RoPE: which position source is active is a runtime branch in the kernel, so nulls are
-    // patched like any other value
-    const at::Tensor& ivf = inv_freq_override ? inv_freq_override.value() : inv_freq;
-    int pid_stride = (position_ids && position_ids.value().dim() == 3) ? rotate_dims : 1;
-    params.emplace_back(GP_rope_inv_freq, (void*) ivf.data_ptr());
-    params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
-    params.emplace_back(GP_rope_positions, positions ? (void*) positions.value().data_ptr() : nullptr);
-    params.emplace_back(GP_rope_position_ids, position_ids ? (void*) position_ids.value().data_ptr() : nullptr);
-    params.emplace_back(GP_rope_pid_stride, (void*) (uintptr_t) pid_stride);
+    // patched like any other value. NoPE graphs contain no rope node
+    if (inv_freq)
+    {
+        const at::Tensor& ivf = inv_freq_override ? inv_freq_override.value() : inv_freq.value();
+        int pid_stride = (position_ids && position_ids.value().dim() == 3) ? rotate_dims : 1;
+        params.emplace_back(GP_rope_inv_freq, (void*) ivf.data_ptr());
+        params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
+        params.emplace_back(GP_rope_positions, positions ? (void*) positions.value().data_ptr() : nullptr);
+        params.emplace_back(GP_rope_position_ids, position_ids ? (void*) position_ids.value().data_ptr() : nullptr);
+        params.emplace_back(GP_rope_pid_stride, (void*) (uintptr_t) pid_stride);
+    }
 
     // Cache append and attention: the block-table geometry and split configuration are runtime
     // kernel arguments, patched per call like the pointers, so context growth never recaptures
