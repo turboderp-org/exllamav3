@@ -636,6 +636,29 @@ class Linear(Module):
         module._adopt_inner_dims(exported)
         return module
 
+    @staticmethod
+    def tp_import_split_n(local_context, exported, plan, splits):
+        # N-range output split (Mamba2 in_proj: [z | x | B | C | dt] sections split by state
+        # group, with the dt section replicated). The ranges select only real (unpadded) columns,
+        # so the local slice is exact by construction: no output trim, no padded-out bookkeeping
+        device = local_context["device"]
+        module = Linear(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+        module.inner = exported["inner"]["cls"].tp_import_split_n(local_context, exported["inner"], plan, splits)
+        module.quant_type = module.inner.quant_type
+        module.in_features = module.inner.in_features
+        module.out_features = module.inner.out_features
+        exp_in = exported["kwargs"]["in_features"]
+        unp_in, _ = exported.get("unpadded", (exp_in, None))
+        module.in_features_unpadded = unp_in if module.in_features == exp_in else module.in_features
+        module.out_features_unpadded = module.out_features
+        module.trim_padded_out = False
+        module.is_sliced = True
+        return module
+
     def _adopt_inner_dims(self, exported: dict):
         # The exported kwargs carry the full unsplit (padded) dims; forward() sizes its input padding and
         # output trim against the wrapper dims, so they must track the local slice. A dim the split left

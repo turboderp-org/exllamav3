@@ -59,6 +59,69 @@ void cuda_recurrent_gated_delta_rule_gr
     Graph* graph
 );
 
+// Mamba2 discretization: dt = clamp(softplus(dt_raw + dt_bias), dt_min, dt_max), g = -exp(a_log) * dt
+void mamba2_dt_op
+(
+    const at::Tensor& dt_raw,       // [B,S,H] float
+    const at::Tensor& dt_bias,      // [H] float
+    const at::Tensor& a_log,        // [H] float
+    at::Tensor& dt,                 // out [B,S,H] bfloat16
+    at::Tensor& g,                  // out [B,S,H] float
+    float dt_min,
+    float dt_max
+);
+
+// Mamba2 bsz-1 BC helper: bf16 conv input + discretized dt/g from the in_proj output [z, xBC, dt]
+void mamba2_fused_op_gr
+(
+    const at::Tensor& proj,         // [1,1,>= v_dim + F + dt_first + H] float
+    at::Tensor& xbc,                // out [1, F, 1] bfloat16
+    at::Tensor& dt,                 // out [1, 1, H] bfloat16
+    at::Tensor& g,                  // out [1, 1, H] float
+    const at::Tensor& dt_bias,      // [H] float
+    const at::Tensor& a_log,        // [H] float
+    int v_dim,
+    int dt_first,
+    float dt_min,
+    float dt_max,
+    class Graph* graph
+);
+
+// Mamba2 (SSD) recurrence: gated delta rule without the correction term, over conv channel
+// order [x, B, C], with dt as input scale and per-head skip y += D * x
+void cuda_recurrent_mamba2
+(
+    const at::Tensor& mixed_xbc,
+    const at::Tensor& g,
+    const at::Tensor& dt,
+    const at::Tensor& D,
+    at::Tensor& recurrent_state,
+    at::Tensor& core_attn_out,
+    int num_k_heads,
+    int num_v_heads,
+    int k_head_dim,
+    int v_head_dim,
+    const c10::optional<at::Tensor>& slots,
+    bool history
+);
+
+void cuda_recurrent_mamba2_gr
+(
+    const at::Tensor& mixed_xbc,
+    const at::Tensor& g,
+    const at::Tensor& dt,
+    const at::Tensor& D,
+    at::Tensor& recurrent_state,
+    at::Tensor& core_attn_out,
+    int num_k_heads,
+    int num_v_heads,
+    int k_head_dim,
+    int v_head_dim,
+    const c10::optional<at::Tensor>& slots,
+    bool history,
+    Graph* graph
+);
+
 void cuda_causal_conv1d_update
 (
     const at::Tensor& x,

@@ -106,3 +106,60 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
     py::arg("beta_scale")
 )
 .def("run_bsz1", &BC_GatedDeltaNetSplit::run_bsz1);
+
+py::class_<BC_Mamba2, std::shared_ptr<BC_Mamba2>>(m, "BC_Mamba2").def
+(
+    py::init<
+        c10::optional<at::Tensor>,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        c10::optional<at::Tensor>,
+        std::shared_ptr<BC_LinearEXL3>,
+        std::shared_ptr<BC_LinearEXL3>,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        float,
+        float,
+        int,
+        int,
+        int,
+        int,
+        int,
+        at::Tensor,
+        c10::optional<at::Tensor>,
+        std::shared_ptr<BC_GatedRMSNorm>,
+        int
+    >(),
+    py::arg("xp"),
+    py::arg("proj"),
+    py::arg("mixed_xbc"),
+    py::arg("dt"),
+    py::arg("g"),
+    py::arg("conv_out"),
+    py::arg("core_attn_out"),
+    py::arg("core_attn_out_f"),
+    py::arg("yp"),
+    py::arg("in_proj"),
+    py::arg("o_proj"),
+    py::arg("dt_bias"),
+    py::arg("a_log"),
+    py::arg("d_skip"),
+    py::arg("dt_min"),
+    py::arg("dt_max"),
+    py::arg("num_k_heads"),
+    py::arg("num_v_heads"),
+    py::arg("k_head_dim"),
+    py::arg("v_head_dim"),
+    py::arg("hidden_size"),
+    py::arg("conv1d_weight"),
+    py::arg("conv1d_bias"),
+    py::arg("norm"),
+    py::arg("dt_first") = 0
+)
+.def("run_bsz1", &BC_Mamba2::run_bsz1);

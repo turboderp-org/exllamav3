@@ -335,7 +335,93 @@ void gated_delta_net_fused_op_2
 }
 
 
-template <int MAX_HEAD_DIM, bool save_history, int V_SPLIT>
+__global__ void mamba2_dt_op_kernel
+(
+    const float* __restrict__ in_dt,            // [B,S,H]
+    const float* __restrict__ in_dt_bias,       // [H]
+    const float* __restrict__ in_a_log,         // [H]
+    bfloat16* __restrict__ out_dt,              // [B,S,H]
+    float* __restrict__ out_g,                  // [B,S,H]
+    int rows,
+    int H,
+    int rows_per_block,
+    float dt_min,
+    float dt_max
+)
+{
+    int t = threadIdx.x % H;
+    int row = blockIdx.x * rows_per_block + threadIdx.x / H;
+    if (row >= rows) return;
+
+    float dtv = softplus(in_dt[row * H + t] + in_dt_bias[t]);
+    dtv = fminf(fmaxf(dtv, dt_min), dt_max);
+    out_g[row * H + t] = -__expf(in_a_log[t]) * dtv;
+    out_dt[row * H + t] = trunc_bf16(dtv);
+}
+
+/*
+Mamba2 discretization: dt = clamp(softplus(dt_raw + dt_bias)), then g = dt * A with
+A = -exp(A_log) as the per-head log decay, and dt itself as the input scale (the beta slot of the
+recurrent rule kernel)
+*/
+
+void mamba2_dt_op
+(
+    const at::Tensor& dt_raw,       // [B,S,H] float
+    const at::Tensor& dt_bias,      // [H] float
+    const at::Tensor& a_log,        // [H] float
+    at::Tensor& dt,                 // out [B,S,H] bfloat16
+    at::Tensor& g,                  // out [B,S,H] float
+    float dt_min,
+    float dt_max
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(dt_raw.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(dt_raw, kFloat);
+    TORCH_CHECK_DTYPE(dt_bias, kFloat);
+    TORCH_CHECK_DTYPE(a_log, kFloat);
+    TORCH_CHECK_DTYPE(dt, kBFloat16);
+    TORCH_CHECK_DTYPE(g, kFloat);
+
+    TORCH_CHECK_SHAPES(dt_raw, 2, dt_bias, 0, 1);
+    TORCH_CHECK_SHAPES(dt_raw, 2, a_log, 0, 1);
+    TORCH_CHECK_SHAPES_FULL(dt_raw, dt);
+    TORCH_CHECK_SHAPES_FULL(dt_raw, g);
+
+    size_t B = dt_raw.size(0);
+    size_t S = dt_raw.size(1);
+    size_t H = dt_raw.size(2);
+    TORCH_CHECK(H <= FUSED_OP_2_THREADS, "mamba2_dt_op: too many heads");
+
+    int rows_per_block = FUSED_OP_2_THREADS / H;
+    int threads = rows_per_block * H;
+    int blocks = CEIL_DIVIDE(B * S, rows_per_block);
+
+    mamba2_dt_op_kernel<<<blocks, threads, 0, stream>>>
+    (
+        (const float*) dt_raw.data_ptr(),
+        (const float*) dt_bias.data_ptr(),
+        (const float*) a_log.data_ptr(),
+        (bfloat16*) dt.data_ptr(),
+        (float*) g.data_ptr(),
+        B * S,
+        H,
+        rows_per_block,
+        dt_min,
+        dt_max
+    );
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+
+// MAMBA2 mode computes the Mamba2 (SSD) recurrence, which is the gated delta rule minus the
+// delta-correction readback: no q/k L2 norm, v used raw (beta = dt scales it in the update),
+// output y = q.S + D*v with no 1/sqrt(dk) scale. Input layout is the conv channel order
+// [x (v_dim), B (k_dim), C (k_dim)] with x->v, B->k, C->q
+template <int MAX_HEAD_DIM, bool save_history, int V_SPLIT, bool MAMBA2 = false>
 __global__ __launch_bounds__(MAX_HEAD_DIM * SUBK)
 void cuda_recurrent_gated_delta_rule_kernel
 (
@@ -354,7 +440,8 @@ void cuda_recurrent_gated_delta_rule_kernel
     const int v_head_dim,
     const float scale,
     const int* __restrict__ slots,              // [bsz]
-    const int history_stride                    // max_history + 1
+    const int history_stride,                   // max_history + 1
+    const float* __restrict__ D                 // [num_v_heads], MAMBA2 only, else nullptr
 )
 {
     int group = num_v_heads / num_k_heads;
@@ -394,9 +481,21 @@ void cuda_recurrent_gated_delta_rule_kernel
     for (int s = 0; s < seqlen; ++s)
     {
         // Advance to q/k head
-        const bfloat16* gl_q = mixed_qkv + k_head * k_head_dim;
-        const bfloat16* gl_k = mixed_qkv + (num_k_heads + k_head) * k_head_dim;
-        const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * k_head_dim) + head * v_head_dim + v_start;
+        const bfloat16* gl_q;
+        const bfloat16* gl_k;
+        const bfloat16* gl_v;
+        if constexpr (MAMBA2)
+        {
+            gl_v = mixed_qkv + head * v_head_dim + v_start;
+            gl_k = mixed_qkv + num_v_heads * v_head_dim + k_head * k_head_dim;
+            gl_q = mixed_qkv + num_v_heads * v_head_dim + num_k_heads * k_head_dim + k_head * k_head_dim;
+        }
+        else
+        {
+            gl_q = mixed_qkv + k_head * k_head_dim;
+            gl_k = mixed_qkv + (num_k_heads + k_head) * k_head_dim;
+            gl_v = mixed_qkv + (2 * num_k_heads * k_head_dim) + head * v_head_dim + v_start;
+        }
         bfloat16* out = core_attn_out + head * v_head_dim + v_start;
 
         float* gl_rs_r;
@@ -424,74 +523,90 @@ void cuda_recurrent_gated_delta_rule_kernel
             q = __bfloat162float(gl_q[t]);
             k = __bfloat162float(gl_k[t]);
 
-            float sumq = q * q;
-            float sumk = k * k;
-            #pragma unroll
-            for(int offset = 16; offset > 0; offset /= 2)
+            if constexpr (MAMBA2)
             {
-                sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
-                sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+                sh_k[t] = k;
+                sh_q[t] = q;
             }
-            if (lane == 0)
+            else
             {
-                sh_red[0][warp] = sumq;
-                sh_red[1][warp] = sumk;
+                float sumq = q * q;
+                float sumk = k * k;
+                #pragma unroll
+                for(int offset = 16; offset > 0; offset /= 2)
+                {
+                    sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
+                    sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+                }
+                if (lane == 0)
+                {
+                    sh_red[0][warp] = sumq;
+                    sh_red[1][warp] = sumk;
+                }
             }
         }
-        __syncthreads();
 
-        if (t < k_head_dim && bt == 0)
+        if constexpr (!MAMBA2)
         {
-            float sumq = lane < k_head_dim / 32 ? sh_red[0][lane] : 0.0f;
-            float sumk = lane < k_head_dim / 32 ? sh_red[1][lane] : 0.0f;
-            #pragma unroll
-            for(int offset = 16; offset > 0; offset /= 2)
+            __syncthreads();
+
+            if (t < k_head_dim && bt == 0)
             {
-                sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
-                sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+                float sumq = lane < k_head_dim / 32 ? sh_red[0][lane] : 0.0f;
+                float sumk = lane < k_head_dim / 32 ? sh_red[1][lane] : 0.0f;
+                #pragma unroll
+                for(int offset = 16; offset > 0; offset /= 2)
+                {
+                    sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
+                    sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+                }
+
+                q = q * rsqrtf(sumq + 1e-6f);
+                k = k * rsqrtf(sumk + 1e-6f);
+
+                // Write q, k to shmem
+                sh_k[t] = k;
+                sh_q[t] = q;
             }
-
-            q = q * rsqrtf(sumq + 1e-6f);
-            k = k * rsqrtf(sumk + 1e-6f);
-
-            // Write q, k to shmem
-            sh_k[t] = k;
-            sh_q[t] = q;
         }
 
         if (t < v_chunk_dim && bt == 0)
         {
-            sh_dot1[t] = 0.0f;
+            if constexpr (!MAMBA2)
+                sh_dot1[t] = 0.0f;
             sh_dot2[t] = 0.0f;
         }
         __syncthreads();
 
-        if (t < v_chunk_dim)
+        if constexpr (!MAMBA2)
         {
-            // Dot products with last state
-            float sum = 0.0f;
-            float* sh_k_rd = sh_k + bt * bts;
-            float* rs_rd = gl_rs_r + v_start + t + bt * bts * v_head_dim;
-
-            for (int i = 0; i < k_head_dim / 8 / SUBK; ++i)
+            if (t < v_chunk_dim)
             {
-                #pragma unroll
-                for (int j = 0; j < 8; ++j, rs_rd += v_head_dim, sh_k_rd++)
-                    sum = sum + *sh_k_rd * *rs_rd;
+                // Dot products with last state
+                float sum = 0.0f;
+                float* sh_k_rd = sh_k + bt * bts;
+                float* rs_rd = gl_rs_r + v_start + t + bt * bts * v_head_dim;
+
+                for (int i = 0; i < k_head_dim / 8 / SUBK; ++i)
+                {
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j, rs_rd += v_head_dim, sh_k_rd++)
+                        sum = sum + *sh_k_rd * *rs_rd;
+                }
+                atomicAdd(sh_dot1 + t, sum);
             }
-            atomicAdd(sh_dot1 + t, sum);
+            __syncthreads();
         }
-        __syncthreads();
 
         if (t < v_chunk_dim)
         {
             float g_h = __expf(g[head]);
             float beta_h = __bfloat162float(beta[head]);
 
-            float sum = sh_dot1[t];
-
-            // Read v head and update
-            float v = __bfloat162float(gl_v[t]) - sum * g_h;
+            // Read v head; delta rule subtracts the decayed state readback, Mamba2 injects raw v
+            float v = __bfloat162float(gl_v[t]);
+            if constexpr (!MAMBA2)
+                v -= sh_dot1[t] * g_h;
 
             // Update step
             float v_out = 0.0f;
@@ -523,7 +638,10 @@ void cuda_recurrent_gated_delta_rule_kernel
             float v_out = sh_dot2[t];
 
             // Store attn output
-            out[t] = __float2bfloat16_rz(v_out * scale);
+            if constexpr (MAMBA2)
+                out[t] = __float2bfloat16_rz(v_out + D[head] * __bfloat162float(gl_v[t]));
+            else
+                out[t] = __float2bfloat16_rz(v_out * scale);
         }
 
         // Next seq index
@@ -552,7 +670,8 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     const int v_head_dim,
     const float scale,
     const int* __restrict__ slots,              // [bsz]
-    const int history_stride                    // max_history + 1
+    const int history_stride,                   // max_history + 1
+    const float* __restrict__ D                 // unused, matches the generic kernel signature
 )
 {
     constexpr int HEAD_DIM = 128;
@@ -795,7 +914,8 @@ void cuda_recurrent_gated_delta_rule_gr
         v_head_dim,                             \
         scale,                                  \
         slots_ptr,                              \
-        history_stride
+        history_stride,                         \
+        nullptr
 
     // recurrent_state is kernel param 3 and slots is param 12, patched when running in a graph
     #define LAUNCH_RULE(...)                                                              \
@@ -864,6 +984,244 @@ void cuda_recurrent_gated_delta_rule
 {
     cuda_recurrent_gated_delta_rule_gr(
         mixed_qkv, g, beta, recurrent_state, core_attn_out,
+        num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, nullptr);
+}
+
+// Mamba2 bsz-1 decode helper for the BC graph: reads the in_proj output [z, xBC, dt] (float,
+// b = s = 1, so the conv-layout "transpose" of xBC is free) and writes the bf16 conv input
+// plus the discretized dt/g tensors. All pointers are statics; nothing is patched
+
+__global__ void mamba2_fused_op_kernel
+(
+    const float* __restrict__ in_proj_out,      // [1, 1, v_dim + F + dt_first + H + ... (+ padding)]
+    bfloat16* __restrict__ out_xbc,             // [1, F, 1]
+    bfloat16* __restrict__ out_dt,              // [1, 1, H]
+    float* __restrict__ out_g,                  // [1, 1, H]
+    const float* __restrict__ dt_bias,          // [H]
+    const float* __restrict__ a_log,            // [H]
+    const int v_dim,
+    const int F,
+    const int H,
+    const int dt_first,                         // rank's head offset into the (replicated) dt section
+    const float dt_min,
+    const float dt_max
+)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < F)
+        out_xbc[idx] = trunc_bf16(in_proj_out[v_dim + idx]);
+    else
+    {
+        idx -= F;
+        if (idx >= H) return;
+        float dtv = softplus(in_proj_out[v_dim + F + dt_first + idx] + dt_bias[idx]);
+        dtv = fminf(fmaxf(dtv, dt_min), dt_max);
+        out_g[idx] = -__expf(a_log[idx]) * dtv;
+        out_dt[idx] = trunc_bf16(dtv);
+    }
+}
+
+void mamba2_fused_op_gr
+(
+    const at::Tensor& proj,         // [1,1,>= v_dim + F + dt_first + H] float
+    at::Tensor& xbc,                // out [1, F, 1] bfloat16
+    at::Tensor& dt,                 // out [1, 1, H] bfloat16
+    at::Tensor& g,                  // out [1, 1, H] float
+    const at::Tensor& dt_bias,      // [H] float
+    const at::Tensor& a_log,        // [H] float
+    int v_dim,
+    int dt_first,
+    float dt_min,
+    float dt_max,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(proj.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(proj, kFloat);
+    TORCH_CHECK_DTYPE(xbc, kBFloat16);
+    TORCH_CHECK_DTYPE(dt, kBFloat16);
+    TORCH_CHECK_DTYPE(g, kFloat);
+    TORCH_CHECK_DTYPE(dt_bias, kFloat);
+    TORCH_CHECK_DTYPE(a_log, kFloat);
+
+    int F = xbc.numel();
+    int H = dt.numel();
+    TORCH_CHECK(proj.size(0) == 1 && proj.size(1) == 1, "mamba2_fused_op: bsz-1, seqlen-1 only");
+    TORCH_CHECK(proj.size(2) >= v_dim + F + dt_first + H, "mamba2_fused_op: proj too narrow");
+    TORCH_CHECK(dt_bias.numel() == H && a_log.numel() == H && g.numel() == H, "mamba2_fused_op: bad H");
+
+    int total = F + H;
+    int blocks = CEIL_DIVIDE(total, FUSED_OP_3_THREADS);
+
+    mamba2_fused_op_kernel<<<blocks, FUSED_OP_3_THREADS, 0, stream>>>
+    (
+        (const float*) proj.data_ptr(),
+        (bfloat16*) xbc.data_ptr(),
+        (bfloat16*) dt.data_ptr(),
+        (float*) g.data_ptr(),
+        (const float*) dt_bias.data_ptr(),
+        (const float*) a_log.data_ptr(),
+        v_dim,
+        F,
+        H,
+        dt_first,
+        dt_min,
+        dt_max
+    );
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+/*
+Mamba2 (SSD) recurrence over the conv output channels. mixed_xbc packs [x, B, C] in checkpoint
+order, mapping x->v, B->k, C->q of the delta rule kernel with the correction term disabled.
+num_k_heads = n_groups, k_head_dim = ssm_state_size, num_v_heads/v_head_dim = mamba heads.
+dt (precomputed by mamba2_dt_op along with g = dt * A) takes the beta slot as the input scale,
+and D adds the per-head skip connection y += D * x
+*/
+
+void cuda_recurrent_mamba2_gr
+(
+    const at::Tensor& mixed_xbc,
+    const at::Tensor& g,
+    const at::Tensor& dt,
+    const at::Tensor& D,
+    at::Tensor& recurrent_state,
+    at::Tensor& core_attn_out,
+    int num_k_heads,
+    int num_v_heads,
+    int k_head_dim,
+    int v_head_dim,
+    const c10::optional<at::Tensor>& slots,
+    bool history,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(mixed_xbc.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(!graph || !history, "cuda_recurrent_mamba2: history mode is not graph-capturable");
+    TORCH_CHECK(!graph || slots.has_value(), "cuda_recurrent_mamba2: graph capture requires slots");
+
+    int bsz = mixed_xbc.size(0);
+    int seqlen = mixed_xbc.size(1);
+    int xbc_dim = mixed_xbc.size(2);
+
+    TORCH_CHECK(num_v_heads % num_k_heads == 0, "num_v_heads must be divisible by num_k_heads");
+    TORCH_CHECK(k_head_dim >= 32 && k_head_dim % (8 * SUBK) == 0, "k_head_dim must be a multiple of 32");
+    TORCH_CHECK(MAX(k_head_dim, v_head_dim) <= 256, "Max head dim exceeded");
+
+    TORCH_CHECK(xbc_dim == 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim,
+                "mixed_xbc must be [bsz, seqlen, num_v_heads*v_head_dim + 2*num_k_heads*k_head_dim]");
+    TORCH_CHECK(g.dim() == 3 && g.size(0) == bsz && g.size(1) == seqlen && g.size(2) == num_v_heads,
+                "g must be [bsz, seqlen, num_v_heads]");
+    TORCH_CHECK(dt.dim() == 3 && dt.size(0) == bsz && dt.size(1) == seqlen && dt.size(2) == num_v_heads,
+                "dt must be [bsz, seqlen, num_v_heads]");
+    TORCH_CHECK(D.dim() == 1 && D.size(0) == num_v_heads, "D must be [num_v_heads]");
+    TORCH_CHECK(recurrent_state.dim() == 5 &&
+                recurrent_state.size(0) >= (slots.has_value() ? 1 : bsz) &&
+                recurrent_state.size(1) >= (history ? seqlen : 1) &&
+                recurrent_state.size(2) == num_v_heads &&
+                recurrent_state.size(3) == k_head_dim &&
+                recurrent_state.size(4) == v_head_dim,
+                "recurrent_state must be [num_slots, max_history + 1, num_v_heads, k_head_dim, v_head_dim]");
+    TORCH_CHECK(core_attn_out.dim() == 4 &&
+                core_attn_out.size(0) == bsz &&
+                core_attn_out.size(1) == seqlen &&
+                core_attn_out.size(2) == num_v_heads &&
+                core_attn_out.size(3) == v_head_dim,
+                "core_attn_out must be [bsz, seqlen, num_v_heads, v_head_dim]");
+
+    TORCH_CHECK_DTYPE(mixed_xbc, kBFloat16);
+    TORCH_CHECK_DTYPE(g, kFloat);
+    TORCH_CHECK_DTYPE(dt, kBFloat16);
+    TORCH_CHECK_DTYPE(D, kFloat);
+    TORCH_CHECK_DTYPE(recurrent_state, kFloat);
+    TORCH_CHECK_DTYPE(core_attn_out, kBFloat16);
+    TORCH_CHECK_DTYPE_OPT(slots, kInt);
+
+    const int* slots_ptr = (const int*) OPTPTR(slots);
+    if (slots_ptr)
+    {
+        TORCH_CHECK(slots.value().dim() == 1 &&
+                    slots.value().size(0) == bsz,
+                    "slots must be [bsz]");
+        TORCH_CHECK(slots.value().device() == mixed_xbc.device(),
+                    "slots must be on the same device as mixed_xbc");
+    }
+
+    dim3 blocks(bsz, num_v_heads, 1);
+    dim3 threads(MAX(k_head_dim, v_head_dim), SUBK);
+    int history_stride = recurrent_state.size(1);
+
+    float scale = 1.0f;  // unused in MAMBA2 mode
+
+    #define KERNEL_ARGS                         \
+        (const bfloat16*) mixed_xbc.data_ptr(), \
+        (const float*) g.data_ptr(),            \
+        (const bfloat16*) dt.data_ptr(),        \
+        (float*) recurrent_state.data_ptr(),    \
+        (bfloat16*) core_attn_out.data_ptr(),   \
+        bsz,                                    \
+        seqlen,                                 \
+        num_k_heads,                            \
+        num_v_heads,                            \
+        k_head_dim,                             \
+        v_head_dim,                             \
+        scale,                                  \
+        slots_ptr,                              \
+        history_stride,                         \
+        (const float*) D.data_ptr()
+
+    // recurrent_state is kernel param 3 and slots is param 12, patched when running in a graph
+    #define LAUNCH_RULE(...)                                                              \
+    {                                                                                     \
+        __VA_ARGS__<<<blocks, threads, 0, stream>>>(KERNEL_ARGS);                         \
+        if (graph)                                                                        \
+        {                                                                                 \
+            graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_state, 3);              \
+            graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_slots, 12);             \
+            graph->record_param((void*) &__VA_ARGS__, GP_end, 0);                         \
+        }                                                                                 \
+    }
+
+    if (!history)
+    {
+        if (threads.x <= 128)      LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, false, 1, true>)
+        else if (threads.x <= 256) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<256, false, 1, true>)
+        else TORCH_CHECK(false, "Max head dim exceeded");
+    }
+    else
+    {
+        if (threads.x <= 128)      cuda_recurrent_gated_delta_rule_kernel<128, true, 1, true><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+        else if (threads.x <= 256) cuda_recurrent_gated_delta_rule_kernel<256, true, 1, true><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+        else TORCH_CHECK(false, "Max head dim exceeded");
+    }
+    #undef LAUNCH_RULE
+    #undef KERNEL_ARGS
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+void cuda_recurrent_mamba2
+(
+    const at::Tensor& mixed_xbc,
+    const at::Tensor& g,
+    const at::Tensor& dt,
+    const at::Tensor& D,
+    at::Tensor& recurrent_state,
+    at::Tensor& core_attn_out,
+    int num_k_heads,
+    int num_v_heads,
+    int k_head_dim,
+    int v_head_dim,
+    const c10::optional<at::Tensor>& slots,
+    bool history
+)
+{
+    cuda_recurrent_mamba2_gr(
+        mixed_xbc, g, dt, D, recurrent_state, core_attn_out,
         num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, nullptr);
 }
 
