@@ -221,7 +221,7 @@ def init(
     # Cache
     max_history = max(
         min_draft_len or 0,
-        draft_model.caps.get("default_draft_size") if draft_model else 0,
+        draft_model.caps.get("default_draft_size", 4) if draft_model else 0,
         vars(args).get("num_draft_tokens") or 0
     )
     if "cache_size" in vars(args):
