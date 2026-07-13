@@ -24,7 +24,7 @@
 
 struct BC_Attention
 {
-    static constexpr int MAX_BSZ = 4;
+    static constexpr int MAX_BSZ = 8;
     static constexpr int MAX_QLEN = 16;
 
     // Model config. hidden_size_padded > hidden_size when the model dim is not a multiple of

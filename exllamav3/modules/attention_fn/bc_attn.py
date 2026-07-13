@@ -30,7 +30,7 @@ while building the path raise.
 
 bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "1") != "0"
 
-MAX_BSZ = 4
+MAX_BSZ = 8
 MAX_QLEN = 16
 MAX_R = MAX_BSZ * MAX_QLEN
 

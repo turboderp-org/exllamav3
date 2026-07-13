@@ -7,7 +7,7 @@ from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
-from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa
+from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..cache import Cache
@@ -798,7 +798,7 @@ class SlidingAttention(Module):
         # Graph-captured C++ path for the whole decode step
         if (
             _bc_attn_enable and causal and non_causal_spans is None and
-            bsz <= 4 and seqlen <= 16
+            bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
             rsg = params.get("recurrent_states")
             if rsg is not None:

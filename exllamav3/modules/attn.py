@@ -11,7 +11,7 @@ from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
-from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn
+from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
@@ -834,7 +834,7 @@ class Attention(Module):
         # into the slot kernels, so non-causal callers like the DFlash draft graph too)
         if (
             _bc_attn_enable and non_causal_spans is None and
-            bsz <= 4 and seqlen <= 16
+            bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens)
             if o is not None:
