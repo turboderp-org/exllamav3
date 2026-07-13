@@ -145,6 +145,9 @@ class Generator:
         self.filter_pool = ThreadPoolExecutor(max_workers = 16)
         self.filter_queue = []
 
+        # Pinned staging buffer for batched token readback in iterate_gen
+        self.sample_pinned = None
+
         # Buffers
         if draft_model or ngram_match_min:
             self.draft_input_ids_pinned = torch.empty(
@@ -771,17 +774,35 @@ class Generator:
                     r -= rp
             return num_rejected
 
-        for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
-            if a == b: continue
-            job_logits = batch_logits[a:b, :, :]
-            accepted_length = 1
-            rejected = 0
-
-            for i in range(batch_logits.shape[1]):
-                token_logits = job_logits[:, i:i + 1, :]
-                next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
-                    token_logits,
+        # Without a draft, each job samples exactly one independent token, so all sampler chains
+        # are launched first and the results collected in a second pass: the first collect
+        # absorbs the whole GPU tail and the remaining reads are cheap, instead of one full
+        # launch-to-readback round trip per job. Sampler launch order (and with it each job's
+        # RNG draw) matches the serial loop exactly. Per-job constraints (filters, penalties)
+        # are unaffected because no job's token depends on another job's result.
+        if draft_tokens is None and batch_logits.shape[1] == 1:
+            # Single-token results stage through one pinned buffer and one synchronize, so the
+            # batch pays one launch-to-readback round trip instead of one per job
+            pinned = self.sample_pinned
+            if pinned is None or pinned.shape[0] < batch_size:
+                self.sample_pinned = pinned = torch.empty(
+                    (max(batch_size, 32), 1), dtype = torch.long, pin_memory = True
                 )
+            launched = []
+            for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+                if a == b: continue
+                token_logits = batch_logits[a:b, :, :]
+                sampled = job.receive_logits(token_logits)
+                next_token = sampled[0]
+                if next_token.is_cuda and next_token.numel() == 1:
+                    k = len(launched)
+                    pinned[k:k + 1].copy_(next_token.view(1, 1), non_blocking = True)
+                    sampled = (pinned[k:k + 1],) + sampled[1:]
+                launched.append((job, token_logits, sampled))
+            if launched:
+                torch.cuda.synchronize(batch_logits.device)
+
+            for job, token_logits, (next_token, next_k_tokens, next_k_probs, next_prob) in launched:
                 eos, sampled_token, rq = job.receive_sample(
                     token_logits,
                     next_token,
@@ -791,55 +812,88 @@ class Generator:
                     results,
                 )
 
-                # Requeue. Requeueing is only supported for single-sequence jobs because the replacement job uses the
-                # full sequence generated so far as its next prompt. Unconsumed draft positions must be rejected here
-                # so the recurrent state and page positions match the accepted sequence before the requeue stash.
+                # Requeue. Requeueing is only supported for single-sequence jobs because the replacement job
+                # uses the full sequence generated so far as its next prompt.
                 if len(job.sequences) == 1 and rq:
-                    if draft_tokens is not None:
-                        rejected = reject_remainder(job, j, i, batch_states)
                     requeuing_jobs.append(job)
-                    break
-
-                # EOS. Stop sampling this job immediately once a stop condition, filter condition or max token limit
-                # produces an EOS event.
-                if eos:
+                elif eos:
                     completed_jobs.append(job)
-                    break
+                accepted_lengths.append(1)
 
-                # Continue sampling from logit batch as long as result matches draft, unless hitting checkpoint mark.
-                # For speculative decoding, consume additional logits only while the sampled target token matches
-                # the draft token. A recurrent checkpoint boundary also stops draft acceptance so state can be
-                # stashed at an exact page boundary.
-                if draft_tokens is not None and i < batch_logits.shape[1] - 1:
-                    cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                    if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
-                        rejected = reject_remainder(job, j, i, batch_states)
+        # With a draft, positions within a job are consumed strictly serially: acceptance of
+        # position n gates position n+1, and constrained-decoding masks and sampling past IDs
+        # must advance between positions.
+        else:
+            for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
+                if a == b: continue
+                job_logits = batch_logits[a:b, :, :]
+                accepted_length = 1
+                rejected = 0
+
+                for i in range(batch_logits.shape[1]):
+                    token_logits = job_logits[:, i:i + 1, :]
+                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+                        token_logits,
+                    )
+                    eos, sampled_token, rq = job.receive_sample(
+                        token_logits,
+                        next_token,
+                        next_k_tokens,
+                        next_k_probs,
+                        next_prob,
+                        results,
+                    )
+
+                    # Requeue. Requeueing is only supported for single-sequence jobs because the replacement job
+                    # uses the full sequence generated so far as its next prompt. Unconsumed draft positions must
+                    # be rejected here so the recurrent state and page positions match the accepted sequence
+                    # before the requeue stash.
+                    if len(job.sequences) == 1 and rq:
+                        if draft_tokens is not None:
+                            rejected = reject_remainder(job, j, i, batch_states)
+                        requeuing_jobs.append(job)
                         break
 
-                    # Accept draft token
-                    else:
-                        job.accepted_draft_tokens += 1
-                        accepted_length += 1
+                    # EOS. Stop sampling this job immediately once a stop condition, filter condition or max
+                    # token limit produces an EOS event.
+                    if eos:
+                        completed_jobs.append(job)
+                        break
 
-                        # Advance filters
-                        for f in job.filters:
-                            if not f.is_active: continue
-                            if f.use_background_worker():
-                                job.filter_futures.append(self.filter_pool.submit(f.get_next_logit_mask))
-                            else:
-                                job.logit_masks.append(f.get_next_logit_mask())
-                                job.filter_futures.append(None)
+                    # Continue sampling from logit batch as long as result matches draft, unless hitting
+                    # checkpoint mark. For speculative decoding, consume additional logits only while the
+                    # sampled target token matches the draft token. A recurrent checkpoint boundary also stops
+                    # draft acceptance so state can be stashed at an exact page boundary.
+                    if draft_tokens is not None and i < batch_logits.shape[1] - 1:
+                        cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
+                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                            rejected = reject_remainder(job, j, i, batch_states)
+                            break
 
-                        # Update masks and past IDs
-                        job.prepare_logit_mask()
-                        job.prepare_sampling_past_ids()
+                        # Accept draft token
+                        else:
+                            job.accepted_draft_tokens += 1
+                            accepted_length += 1
 
-            # Make sure outgoing state is valid if entire draft was accepted
-            if batch_states and draft_tokens is not None and rejected == 0:
-                batch_states[j].rewind(0)
+                            # Advance filters
+                            for f in job.filters:
+                                if not f.is_active: continue
+                                if f.use_background_worker():
+                                    job.filter_futures.append(self.filter_pool.submit(f.get_next_logit_mask))
+                                else:
+                                    job.logit_masks.append(f.get_next_logit_mask())
+                                    job.filter_futures.append(None)
 
-            accepted_lengths.append(accepted_length)
-            j += 1
+                            # Update masks and past IDs
+                            job.prepare_logit_mask()
+                            job.prepare_sampling_past_ids()
+
+                # Make sure outgoing state is valid if entire draft was accepted
+                if batch_states and draft_tokens is not None and rejected == 0:
+                    batch_states[j].rewind(0)
+
+                accepted_lengths.append(accepted_length)
+                j += 1
 
         # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
