@@ -85,6 +85,7 @@ def iterate(
     throughput_time,
     passed_results,
     suspicious_results,
+    completed_serials,
 ):
     if validate_interval and iteration % validate_interval == 0:
         generator.pagetable.validate_pagetable(generator.active_jobs)
@@ -103,14 +104,18 @@ def iterate(
 
     reset_throughput = False
     for result in results:
-        if result.get("requeue"):
+        requeued = result.get("requeue", False)
+        if requeued:
             print(f"{str(result['job'])}  requeued")
         if result["eos"]:
-            if check_result(result, num_pending, num_active, total_tps):
-                passed_results += 1
-            else:
-                suspicious_results += 1
             reset_throughput = True
+            serial = result["serial"]
+            if not requeued and serial not in completed_serials:
+                completed_serials.add(serial)
+                if check_result(result, num_pending, num_active, total_tps):
+                    passed_results += 1
+                else:
+                    suspicious_results += 1
 
     if reset_throughput:
         throughput_tokens = 0
@@ -130,6 +135,7 @@ def run_stress_test(args, generator, tokenizer):
     jobs_started = 0
     passed_results = 0
     suspicious_results = 0
+    completed_serials = set()
 
     while True:
         if generator.num_remaining_jobs() > next_target_q_depth:
@@ -149,6 +155,7 @@ def run_stress_test(args, generator, tokenizer):
                 throughput_time,
                 passed_results,
                 suspicious_results,
+                completed_serials,
             )
             if last_defrag_serial != generator.pagetable.last_defrag_serial:
                 print(" !! DEFRAG")
@@ -192,7 +199,7 @@ def run_stress_test(args, generator, tokenizer):
             )
 
     print()
-    print(f" -- Completed jobs: {jobs_started}")
+    print(f" -- Completed jobs: {len(completed_serials)}")
     print(f" -- Passed results: {passed_results}")
     print(f" -- Suspicious results: {suspicious_results}")
 
