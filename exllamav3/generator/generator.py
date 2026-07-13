@@ -147,6 +147,7 @@ class Generator:
 
         # Pinned staging buffer for batched token readback in iterate_gen
         self.sample_pinned = None
+        self.staging_buffers = {}
 
         # Buffers
         if draft_model or ngram_match_min:
@@ -627,6 +628,20 @@ class Generator:
         return draft_ids
 
 
+    def _staging(self, name, rows: int, width: int | None = None, dtype = torch.int32):
+        """
+        Reusable pinned staging buffer, keyed by name and row width, grown by rows on demand.
+        """
+        key = (name, width)
+        buf = self.staging_buffers.get(key)
+        if buf is None or buf.shape[0] < rows:
+            alloc_rows = max(rows, 32)
+            shape = (alloc_rows,) if width is None else (alloc_rows, width)
+            buf = torch.zeros(shape, dtype = dtype, pin_memory = True)
+            self.staging_buffers[key] = buf
+        return buf[:rows]
+
+
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
 
         # Get shape of active batch
@@ -646,12 +661,17 @@ class Generator:
         # Create block index table for batch
         # The model sees a compact batch, so build per-row mappings from logical page positions to physical cache
         # page indices, along with current cache lengths and optional MRoPE position offsets.
+        # Block-table width is padded to a multiple of 16 pages so the pinned staging buffers
+        # cover a few distinct widths only; the extra (zeroed) columns are never dereferenced
+        # since the kernels bound their reads by the cache lengths
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        block_index = self._staging("block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging("cache_seqlens", batch_size)
         batch = 0
         use_offsets = "mrope" in self.model.caps
-        positions = torch.zeros_like(cache_seqlens) if use_offsets else None
+        positions = self._staging("positions", batch_size) if use_offsets else None
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
             for seq in job.sequences:
@@ -680,7 +700,12 @@ class Generator:
             batch_jobs.append(job)
             active_embeddings += job.embeddings
         logit_mapping.append(len(input_ids_list))
-        batch_ids = torch.cat(input_ids_list, dim = 0)
+        ids_width = input_ids_list[0].shape[-1]
+        if all(ids.shape[-1] == ids_width for ids in input_ids_list):
+            ids_staging = self._staging("batch_ids", len(input_ids_list), ids_width, torch.long)
+            batch_ids = torch.cat(input_ids_list, dim = 0, out = ids_staging)
+        else:
+            batch_ids = torch.cat(input_ids_list, dim = 0)
 
         # Collect recurrent states for batch
         # Recurrent models carry mutable state beside the K/V cache; pass one state object per compact batch job so
@@ -711,6 +736,7 @@ class Generator:
             "indexed_embeddings": active_embeddings,
             "positions": positions,
             "recurrent_history": draft_tokens is not None,
+            "pinned_staging": True,
         }
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
