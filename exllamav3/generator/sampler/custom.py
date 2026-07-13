@@ -783,7 +783,7 @@ class CustomSampler(Sampler):
     ):
         out_shape = logits.shape[:-1]
 
-        if tokenizer is not None:
+        if tokenizer is not None and tokenizer.actual_vocab_size < logits.shape[-1]:
             logits[..., tokenizer.actual_vocab_size:] = -float("inf")
 
         if rand_u32 is None:
