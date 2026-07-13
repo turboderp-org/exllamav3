@@ -106,6 +106,9 @@ class Config(ABC):
         else:
             self.eos_token_id_list = [self.eos_token_id]
 
+        # Make sure no None entries in list
+        self.eos_token_id_list = [e for e in self.eos_token_id_list if e is not None]
+
         # Standard params, unused
         self.initializer_range = self.read_cfg(float, "initializer_range", 0.02)
 
