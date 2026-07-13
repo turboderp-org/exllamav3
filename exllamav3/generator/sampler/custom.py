@@ -1,4 +1,6 @@
 from .sampler import Sampler
+import math
+import os
 import torch
 from typing_extensions import override
 from ...tokenizer import Tokenizer
@@ -10,6 +12,10 @@ from dataclasses import dataclass
 from enum import Enum
 from ...util import profile_opt
 import torch.nn.functional as F
+
+# Collapse eligible sampler stacks into the fused kernel path; EXL3_FUSED_SAMPLER=0 keeps the
+# original step-by-step implementation (for testing/validation)
+fused_sampler_enable = os.environ.get("EXL3_FUSED_SAMPLER", "1") != "0"
 
 class SS(Enum):
     INIT = 0  # only state.in_logits is valid
@@ -39,6 +45,10 @@ class SamplingState:
     indices: torch.Tensor | None = None
     past_ids: torch.Tensor | None = None
     state: SS = SS.INIT
+    # Logit mask deferred into the fused kernel (fused-only stacks); fused_dim bounds the vocab
+    # scan and doubles as the -inf padding of a mask narrower than the logits
+    fused_mask: torch.Tensor | None = None
+    fused_dim: int | None = None
 
     def empty_sample(self):
         assert self.sample is None
@@ -146,6 +156,189 @@ class SS_Sample_mn(SS_Sample):
 
     def reqs_torch_seed(self):
         return True
+
+
+class SS_Fused(SS_Base):
+    """
+    Collapsed terminal step covering the common truncation/temperature/sample stacks in a few
+    fused kernel calls, working directly in logit space:
+
+        p_i >= min_p * p_max                    <=>  l_i >= max(l) + ln(min_p)
+        softmax(l)^(1/T), renormalized          <=>  softmax(l / T)
+        categorical sample from softmax(l / T)  ==   argmax(l_i / T + g_i),  g_i ~ Gumbel(0, 1)
+
+    Top-K and top-P also reduce to a single logit threshold, since every one of these filters
+    keeps a top segment of the same ordering. The threshold is found from a deterministic
+    fixed-point histogram of the logits (counts for top-K, exp-mass for top-P, normalized over
+    the top-K-truncated set), with boundary buckets refined to 1/32768 nat -- finer than fp16
+    ULP, so the kept set matches the exact sort-based truncation for fp16 logits. Tokens tied
+    exactly at a cutoff are all kept rather than truncated in sort order.
+
+    Produced by CustomSampler's stack collapse; equivalent to the steps it replaces (same
+    Gumbel noise stream for a given rand_u32, up to rounding at exact ties).
+    """
+    MODE_GREEDY = 0
+    MODE_SAMPLE = 1
+    MODE_SAMPLE_MINP = 2
+    MODE_SAMPLE_FILTERS = 3
+
+    F_TOPK = 1
+    F_TOPP = 2
+    F_MINP = 4
+
+    def __init__(
+        self,
+        mode: int,
+        temperature: float = 1.0,
+        minp_log: float = 0.0,
+        filters: int = 0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        temp_first: bool = False,
+    ):
+        self.mode = mode
+        self.inv_temp = 1.0 / temperature
+        self.minp_log = minp_log
+        self.filters = filters
+        self.top_k = top_k
+        self.top_p = top_p
+        # Filters computed on the tempered distribution (temperature before truncation in the
+        # stack) weigh the histogram mass with the sampling temperature
+        self.inv_temp_filter = self.inv_temp if temp_first else 1.0
+        self.workspaces = {}
+        self.histograms = {}
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.INIT:
+                logits = state.in_logits
+            case SS.LOGITS:
+                logits = state.logits
+            case _:
+                raise ValueError("Sampling logic error")
+        if logits.dtype not in (torch.half, torch.float):
+            logits = logits.float()
+        if not logits.is_contiguous():
+            logits = logits.contiguous()
+
+        ws_key = (logits.device, state.bsz)
+        workspace = self.workspaces.get(ws_key)
+        if workspace is None:
+            workspace = torch.empty(
+                (state.bsz * ext.FUSED_SAMPLER_MAX_BLOCKS * 3,),
+                dtype = torch.float,
+                device = logits.device,
+            )
+            self.workspaces[ws_key] = workspace
+
+        histogram = None
+        if self.mode == SS_Fused.MODE_SAMPLE_FILTERS:
+            histogram = self.histograms.get(ws_key)
+            if histogram is None:
+                histogram = torch.empty(
+                    (state.bsz * ext.FUSED_SAMPLER_HIST_STRIDE,),
+                    dtype = torch.uint8,
+                    device = logits.device,
+                )
+                self.histograms[ws_key] = histogram
+
+        state.sample = state.empty_sample()
+        ext.fused_sampler(
+            logits,
+            state.fused_mask,
+            state.sample,
+            workspace,
+            state.fused_dim or state.dim,
+            self.inv_temp,
+            self.minp_log,
+            state.rand_u32,
+            self.mode,
+            self.filters,
+            self.top_k,
+            self.top_p,
+            self.inv_temp_filter,
+            histogram,
+        )
+        state.state = SS.DONE
+
+
+# Tail patterns that collapse into SS_Fused, matched against the alt()-simplified stack:
+#
+#     [Temperature?] [MinP?] [TopK?] [TopP?] [Temperature?] (Sample | Argmax)
+#
+# with at most one temperature step, and the filters in the canonical (ComboSampler) order.
+# This covers all the preset samplers. A greedy tail absorbs preceding temperature/truncation
+# steps (they never change the top token). Whether temperature precedes or follows the filters
+# decides whether they truncate the tempered or the untempered distribution; both reduce to
+# logit-space thresholds (min-P at max(l) + ln(min_p), scaled by T when tempered; top-K/top-P
+# through the histogram select with mass at the filter temperature).
+
+def _match_fused_tail(tail: list) -> SS_Fused | None:
+    if not tail:
+        return None
+    last = tail[-1]
+    if type(last) not in (SS_Sample, SS_Argmax):
+        return None
+    pre = tail[:-1]
+    if any(isinstance(s, SS_Temperature) and s.temperature <= 0.0 for s in pre):
+        return None
+
+    if type(last) is SS_Argmax:
+        if all(type(s) in (SS_Temperature, SS_MinP, SS_TopK, SS_TopP) for s in pre):
+            return SS_Fused(SS_Fused.MODE_GREEDY)
+        return None
+
+    # At most one temperature step, leading or trailing the filter sequence
+    temp_first = False
+    temperature = 1.0
+    if pre and type(pre[0]) is SS_Temperature:
+        temp_first = True
+        temperature = pre[0].temperature
+        pre = pre[1:]
+    if pre and type(pre[-1]) is SS_Temperature:
+        if temp_first:
+            return None
+        temperature = pre[-1].temperature
+        pre = pre[:-1]
+
+    # Filters must be a subsequence of (MinP, TopK, TopP)
+    sig = tuple(type(s) for s in pre)
+    order = (SS_MinP, SS_TopK, SS_TopP)
+    pos = -1
+    for t in sig:
+        if t not in order or order.index(t) <= pos:
+            return None
+        pos = order.index(t)
+
+    min_p = next((s.min_p for s in pre if type(s) is SS_MinP), None)
+    top_k = next((s.top_k for s in pre if type(s) is SS_TopK), None)
+    top_p = next((s.top_p for s in pre if type(s) is SS_TopP), None)
+
+    # Degenerate truncations keep only the top token
+    if top_k == 1 or top_p == 0.0:
+        return SS_Fused(SS_Fused.MODE_GREEDY)
+
+    minp_log = (temperature if temp_first else 1.0) * math.log(min_p) if min_p else 0.0
+
+    if top_k is None and top_p is None:
+        if min_p is None:
+            return SS_Fused(SS_Fused.MODE_SAMPLE, temperature)
+        return SS_Fused(SS_Fused.MODE_SAMPLE_MINP, temperature, minp_log)
+
+    filters = (
+        (SS_Fused.F_MINP if min_p is not None else 0) |
+        (SS_Fused.F_TOPK if top_k is not None else 0) |
+        (SS_Fused.F_TOPP if top_p is not None else 0)
+    )
+    return SS_Fused(
+        SS_Fused.MODE_SAMPLE_FILTERS,
+        temperature,
+        minp_log,
+        filters,
+        top_k or 0,
+        top_p if top_p is not None else 1.0,
+        temp_first,
+    )
 
 
 class SS_Temperature(SS_Base):
@@ -539,21 +732,43 @@ class CustomSampler(Sampler):
     ):
         super().__init__()
 
-        self.steps = []
-        state = SS.INIT
+        # Simplify the stack (identity steps become no-ops), then collapse an eligible tail
+        # into the fused kernel step. Leading penalty steps are kept as-is; they feed fp32
+        # logits to the fused step. Ineligible stacks fall through to the step-by-step path.
+        simplified = []
         for step in steps:
             self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
             self.reqs_torch_seed = self.reqs_torch_seed or step.reqs_torch_seed()
             alt = step.alt()
             if alt:
                 step = alt
-            prep_steps = step.prep(state)
-            if prep_steps:
-                for prep_step in prep_steps:
-                    self.steps.append(prep_step())
-            self.steps.append(step)
+            if not isinstance(step, SS_NoOp):
+                simplified.append(step)
 
-        # TODO: Identify and remove redundant sampling steps, add rules for fusing steps where possible
+        head = []
+        fused_tail = None
+        if fused_sampler_enable:
+            i = 0
+            while i < len(simplified) and type(simplified[i]) in (SS_RepP, SS_PresFreqP):
+                i += 1
+            fused_tail = _match_fused_tail(simplified[i:])
+            if fused_tail is not None:
+                head = simplified[:i]
+
+        if fused_tail is not None:
+            self.steps = head + [fused_tail]
+            self.fused_only = not head
+        else:
+            self.steps = []
+            self.fused_only = False
+            state = SS.INIT
+            for step in simplified:
+                prep_steps = step.prep(state)
+                if prep_steps:
+                    for prep_step in prep_steps:
+                        self.steps.append(prep_step())
+                self.steps.append(step)
+
 
     @override
     @torch.inference_mode
@@ -581,8 +796,29 @@ class CustomSampler(Sampler):
         dim = logits.shape[-1]
         bsz = logits.numel() // dim
 
+        # For a fully fused stack the mask is applied inside the kernel; a mask narrower than
+        # the logits bounds the scan instead of being padded with -inf. Same for the padded
+        # vocab region, which the in-place fill above has already masked.
+        fused_mask = None
+        fused_dim = None
+        if (
+            self.fused_only and
+            (logit_mask is None or (
+                logit_mask.dtype == torch.half and
+                logit_mask.is_contiguous() and
+                (logit_mask.shape[0] == 1 or
+                    (logit_mask.shape[0] == bsz and logit_mask.shape[-1] == dim))
+            ))
+        ):
+            fused_dim = dim
+            if tokenizer is not None:
+                fused_dim = min(fused_dim, tokenizer.actual_vocab_size)
+            if logit_mask is not None:
+                fused_mask = logit_mask.view(logit_mask.shape[0], -1)
+                fused_dim = min(fused_dim, fused_mask.shape[-1])
+
         # Apply logit mask/bias tensor
-        if logit_mask is not None:
+        elif logit_mask is not None:
             pad = logits.shape[-1] - logit_mask.shape[-1]
             if pad > 0:
                 logit_mask = F.pad(logit_mask, (0, pad), value = float("-inf"))
@@ -594,6 +830,8 @@ class CustomSampler(Sampler):
             bsz = bsz,
             in_logits = logits.view(bsz, dim),
             past_ids = sequence_ids,
+            fused_mask = fused_mask,
+            fused_dim = fused_dim,
         )
 
         for ss in self.steps:
