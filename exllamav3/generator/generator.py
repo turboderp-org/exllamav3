@@ -746,12 +746,36 @@ class Generator:
         completed_jobs = []
         requeuing_jobs = []
         accepted_lengths = []
-        rejected = 0
         j = 0
+
+        # Reject the trailing draft positions after the last accepted token at index i: count them, roll back the
+        # job's recurrent state and return cache pages to the accepted position
+        def reject_remainder(job_, j_, i_, batch_states_):
+            num_rejected = batch_logits.shape[1] - 1 - i_
+            if num_rejected == 0:
+                return 0
+            job_.rejected_draft_tokens += num_rejected
+
+            # Rewind recurrent states
+            if batch_states_ is not None:
+                batch_states_[j_].rewind(num_rejected)
+
+            # Rewind cache position (draft model cache layout is always the same as target)
+            for seq_ in job_.sequences:
+                r = num_rejected
+                while r:
+                    pos = seq_.kv_position + r
+                    page = seq_.allocated_pages[(pos - 1) // PAGE_SIZE]
+                    rp = min(page.kv_position, r)
+                    page.kv_position -= rp
+                    r -= rp
+            return num_rejected
+
         for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
             if a == b: continue
             job_logits = batch_logits[a:b, :, :]
             accepted_length = 1
+            rejected = 0
 
             for i in range(batch_logits.shape[1]):
                 token_logits = job_logits[:, i:i + 1, :]
@@ -768,11 +792,11 @@ class Generator:
                 )
 
                 # Requeue. Requeueing is only supported for single-sequence jobs because the replacement job uses the
-                # full sequence generated so far as its next prompt.
+                # full sequence generated so far as its next prompt. Unconsumed draft positions must be rejected here
+                # so the recurrent state and page positions match the accepted sequence before the requeue stash.
                 if len(job.sequences) == 1 and rq:
-                    # if draft_tokens is not None:
-                    #     rejected = batch_logits.shape[1] - 1 - i
-                    #     batch_states[j].rewind(rejected)
+                    if draft_tokens is not None:
+                        rejected = reject_remainder(job, j, i, batch_states)
                     requeuing_jobs.append(job)
                     break
 
@@ -789,24 +813,7 @@ class Generator:
                 if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                     cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
                     if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
-
-                        # Count rejected draft tokens
-                        rejected = batch_logits.shape[1] - 1 - i
-                        job.rejected_draft_tokens += rejected
-
-                        # Rewind recurrent states
-                        if batch_states is not None:
-                            batch_states[j].rewind(rejected)
-
-                        # Rewind cache position (draft model cache layout is always the same as target)
-                        for seq in job.sequences:
-                            r = rejected
-                            while r:
-                                pos = seq.kv_position + r
-                                page = seq.allocated_pages[(pos - 1) // PAGE_SIZE]
-                                rp = min(page.kv_position, r)
-                                page.kv_position -= rp
-                                r -= rp
+                        rejected = reject_remainder(job, j, i, batch_states)
                         break
 
                     # Accept draft token
