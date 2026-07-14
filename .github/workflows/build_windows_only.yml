@@ -182,29 +182,15 @@ jobs:
           uv pip install torch==${{ matrix.torch }} --index-url $pytorchIndexUrl
           uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
 
-      - name: Compute Torch and xFormers requirement pins
+      - name: Compute Torch requirement pin
         id: dep_pins
         run: |
-          $torchVersion = '${{ matrix.torch }}'
-
-          switch -Regex ($torchVersion) {
-            '^2\.7\.'  { $xformersSpec = '==0.0.30'; break }
-            '^2\.8\.'  { $xformersSpec = '==0.0.32'; break }
-            '^2\.9\.'  { $xformersSpec = '==0.0.33'; break }
-            '^2\.10\.' { $xformersSpec = '>=0.0.34,<0.0.36'; break }
-            '^2\.11\.' { $xformersSpec = '>=0.0.34,<0.0.36'; break }
-            default { throw "No xFormers pin known for torch $torchVersion" }
-          }
-
-          $torchSpec = "==$torchVersion"
+          $torchSpec = "==${{ matrix.torch }}"
 
           Write-Host "Torch requirement: torch$torchSpec"
-          Write-Host "xFormers requirement: xformers$xformersSpec"
 
           Write-Output "TORCH_SPEC=$torchSpec" >> "$env:GITHUB_OUTPUT"
-          Write-Output "XFORMERS_SPEC=$xformersSpec" >> "$env:GITHUB_OUTPUT"
           Write-Output "TORCH_SPEC=$torchSpec" >> "$env:GITHUB_ENV"
-          Write-Output "XFORMERS_SPEC=$xformersSpec" >> "$env:GITHUB_ENV"
 
       - name: Patch setup.py dependency metadata for this wheel
         run: |
@@ -219,7 +205,6 @@ jobs:
           text = setup_py.read_text(encoding="utf-8")
 
           torch_spec = os.environ["TORCH_SPEC"]
-          xformers_spec = os.environ["XFORMERS_SPEC"]
 
           text, torch_count = re.subn(
               r'(["\'])torch>=2\.6\.0\1',
@@ -230,17 +215,8 @@ jobs:
           if torch_count != 1:
               raise SystemExit("Expected to replace exactly one torch>=2.6.0 requirement in setup.py")
 
-          text, xformers_count = re.subn(
-              r'(["\'])xformers\1',
-              f'"xformers{xformers_spec}"',
-              text,
-              count=1,
-          )
-          if xformers_count != 1:
-              raise SystemExit("Expected to replace exactly one bare xformers requirement in setup.py")
-
           setup_py.write_text(text, encoding="utf-8")
-          print(f"Pinned setup.py requirements: torch{torch_spec}, xformers{xformers_spec}")
+          print(f"Pinned setup.py requirements: torch{torch_spec}")
           '@
 
           Set-Content -Path patch_setup_deps.py -Value $patchScript -Encoding UTF8
@@ -269,10 +245,7 @@ jobs:
           if (-not $wheel) { throw "No wheel found in dist/" }
 
           # Compare parsed requirements instead of raw strings because setuptools/packaging
-          # may canonicalize equivalent specifiers, e.g.:
-          #   xformers>=0.0.34,<0.0.36
-          # becomes:
-          #   xformers<0.0.36,>=0.0.34
+          # may canonicalize equivalent specifiers
           $verifyScript = @'
           from pathlib import Path
           from zipfile import ZipFile
@@ -283,7 +256,6 @@ jobs:
           wheel = next(Path("dist").glob("*.whl"))
           expected = {
               "torch": Requirement(f"torch{os.environ['TORCH_SPEC']}"),
-              "xformers": Requirement(f"xformers{os.environ['XFORMERS_SPEC']}"),
           }
 
           with ZipFile(wheel) as zf:
