@@ -30,7 +30,7 @@ def get_storage_info(model):
 def load_exllamav2(model_dir: str | list, size: int = 2048):
     config = ExLlamaV2Config(model_dir)
     model = ExLlamaV2(config)
-    cache = ExLlamaV2Cache(model, batch_size = 1, max_seq_len = cache_size)  # Cache isn't used but reqd by autosplit
+    cache = ExLlamaV2Cache(model, batch_size = 1, max_seq_len = size)  # Cache isn't used but reqd by autosplit
     model.load_autosplit(cache, reserve_vram = 1024**3)
     bpw_layer, bpw_head, vram_bits = get_storage_info(model)
     return model, bpw_layer, bpw_head, vram_bits
