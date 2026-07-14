@@ -56,6 +56,20 @@ class CacheLayer(ABC):
         pass
 
     @abstractmethod
+    def update_kv_direct(
+        self,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int
+    ):
+        # Write new contiguous K/V rows (bsz, length, kv_heads, head_dim) into the paged cache
+        # at positions cache_seqlens..+length, without materializing full dequantized layers in
+        # the case of a quantized cache
+        pass
+
+    @abstractmethod
     def copy_page(self, source: CacheLayer, from_page: int, to_page: int, num_tokens: int):
         pass
 
@@ -73,12 +87,6 @@ class CacheLayer(ABC):
 
     @abstractmethod
     def tp_export(self, plan):
-        pass
-
-    @abstractmethod
-    def get_kv_alloc_placeholder(self):
-        # Used by layersplit loader to simulate dequant overhead, if any. Returns a reference to hold while
-        # inference is simulated, or None for unquantized cache
         pass
 
 
@@ -239,6 +247,25 @@ class Cache:
         """
         instance = instance or 0
         return self.layers[idx, instance].update_kv(cache_seqlens, block_table, k, v, length)
+
+
+    def update_layer_direct(
+        self,
+        idx: int,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int,
+        instance = None,
+    ):
+        """
+        Write new contiguous K/V rows (bsz, length, kv_heads, head_dim) into the cache at positions
+        cache_seqlens..+length. Unlike get_layer/update_layer, a quantized cache quantizes the new
+        rows in place and never materializes full dequantized layer tensors.
+        """
+        instance = instance or 0
+        return self.layers[idx, instance].update_kv_direct(cache_seqlens, block_table, k, v, length)
 
 
     def copy_page(

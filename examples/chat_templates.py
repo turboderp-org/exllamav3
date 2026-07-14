@@ -107,6 +107,9 @@ class PromptFormat_chatml(PromptFormat):
     def add_bos(self):
         return False
 
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
     def stop_conditions(self, tokenizer):
         return [
             tokenizer.eos_token_id,
@@ -801,6 +804,56 @@ class PromptFormat_minimax(PromptFormat):
         return "<think>", "</think>"
 
 
+class PromptFormat_gptoss(PromptFormat):
+    description = "GPT-OSS"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        from datetime import datetime
+        self.today_str = datetime.today().strftime("%Y-%m-%d")
+
+    def default_system_prompt(self, think):
+        return ""
+
+    def format(self, system_prompt, messages, think):
+        context = (
+            f"<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n"
+            f"Knowledge cutoff: 2024-06\n"
+            f"Current date: {self.today_str}\n\n"
+            f"Reasoning: {'high' if think else 'low'}\n\n"
+            f"# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\n"
+        )
+        if system_prompt:
+            context += system_prompt.strip() + "\n\n"
+        context += "<|end|>"
+        for (u, a) in messages:
+            context += "<|start|>user<|message|>"
+            context += u
+            context += "<|end|>"
+            if a is not None:
+                context += "<|start|>assistant"
+                if a.startswith("<|channel|>"):
+                    context += a
+                else:
+                    context += "<|channel|>final<|message|>" + a + "<|end|>"
+            else:
+                context += "<|start|>assistant"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|return|>"),
+        ]
+
+    def thinktag(self):
+        # Harmony channels are structural output, not think tags.
+        return None, None
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -822,4 +875,5 @@ prompt_formats = {
     "seed": PromptFormat_seed,
     "apertus": PromptFormat_apertus,
     "minimax": PromptFormat_minimax,
+    "gptoss": PromptFormat_gptoss
 }

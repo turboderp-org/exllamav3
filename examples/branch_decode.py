@@ -294,7 +294,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     model_init.add_args(parser, cache = True, default_cache_size = 8192)
     parser.add_argument("-host", "--host", default = "127.0.0.1")
     parser.add_argument("-port", "--port", type = int, default = 8000)

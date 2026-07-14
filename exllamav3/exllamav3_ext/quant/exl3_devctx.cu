@@ -62,7 +62,7 @@ int* DevCtx::get_locks(int device)
     if (!locks[device])
     {
         cudaSetDevice(device);
-        size_t size = (MAX_TILES_C + MAX_BARRIERS * 2) * sizeof(int);
+        size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS) * sizeof(int);
         cudaMalloc(&locks[device], size);
         cudaMemset(locks[device], 0, size);
     }

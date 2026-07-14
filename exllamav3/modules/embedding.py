@@ -29,6 +29,7 @@ class Embedding(Module):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.out_dtype = out_dtype
+        self._pinned_staging = {}
         self._numel = vocab_size * hidden_size
         self.normalize = normalize
         self.multiplier = multiplier
@@ -146,6 +147,20 @@ class Embedding(Module):
             x = to2(x, out_dtype, self.out_dtype)
             if self.normalize:
                 x *= x.shape[-1] ** 0.5
+            # When the embedding resides on the CPU, its output is uploaded to the first
+            # device layer; staging it through a reused pinned buffer makes that upload
+            # asynchronous. Only callers that guarantee a sync point between forward passes
+            # (the generator's decode loop) may set the pinned_staging flag.
+            if params.get("pinned_staging") and x.device.type == "cpu":
+                key = (x.shape, x.dtype)
+                buf = self._pinned_staging.get(key)
+                if buf is None:
+                    if len(self._pinned_staging) > 8:
+                        self._pinned_staging.clear()
+                    buf = torch.empty_like(x, pin_memory = True)
+                    self._pinned_staging[key] = buf
+                buf.copy_(x)
+                x = buf
             return x
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
@@ -161,6 +176,7 @@ class Embedding(Module):
                 "hidden_size": self.hidden_size,
                 "out_dtype": self.out_dtype,
                 "normalize": self.normalize,
+                "multiplier": self.multiplier,
             },
             "embedding.weight": producer.send(self.embedding.weight),
             "device": self.device

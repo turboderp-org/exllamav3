@@ -41,6 +41,7 @@ void exl3_moe
     const bool down_mcg,
     const bool down_mul1,
 
-    const float act_limit
+    const float act_limit,
+    const int num_active
 );
 

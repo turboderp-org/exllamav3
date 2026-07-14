@@ -73,27 +73,43 @@ void BC_BlockSparseMLP::run_bsz1_gr
 )
 {
     //py::gil_scoped_release _;
-    const at::Tensor& yi = y.unsqueeze(0);
 
-    exl3_mgemm_gr
-    (
-        yi,
-        gate_ptrs_trellis,
-        interm_g,
-        gate_ptrs_suh,
-        yh,
-        gate_ptrs_svh,
-        selected_experts,
-        {},
-        gate_K,
-        -1,
-        gate_mcg,
-        gate_mul1,
-        min_expert,
-        max_expert,
-        0,
-        graph
-    );
+    // Padded hidden dim: stage the input through the zero-padded static (the pad columns are
+    // zeroed python-side at construction and never written)
+    at::Tensor yi;
+    if (y_pad)
+    {
+        at::Tensor yp = y_pad.value();
+        copy2d_gr(y, yp, graph);
+        yi = yp.unsqueeze(0);
+    }
+    else
+        yi = y.unsqueeze(0);
+
+    if (gated)
+    {
+        exl3_mgemm_gr
+        (
+            yi,
+            gate_ptrs_trellis,
+            interm_g,
+            gate_ptrs_suh,
+            yh,
+            gate_ptrs_svh,
+            selected_experts,
+            {},
+            gate_K,
+            -1,
+            gate_mcg,
+            gate_mul1,
+            min_expert,
+            max_expert,
+            0,
+            graph
+        );
+        if (gate_bias_ptrs)
+            moe_bias_add_gr(interm_g, gate_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
+    }
 
     exl3_mgemm_gr
     (
@@ -115,18 +131,30 @@ void BC_BlockSparseMLP::run_bsz1_gr
         graph
     );
 
-    if (act_silu)
+    if (up_bias_ptrs)
+        moe_bias_add_gr(interm_u, up_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
+
+    if (!gated)
+        // relu(u) * u = relu^2(u), the non-gated activation
+        relu_mul_gr(interm_u, interm_u, interm_a, act_limit, graph);
+    else if (act_silu)
         silu_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
     else if (act_gelu)
         gelu_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
+    else if (act_silu_oai)
+        silu_oai_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
+    else if (act_relu2)
+        relu2_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
 
+    // A_had must not alias A: the kernel stages the rotated input in A_had, and the autotuner
+    // relaunches the (otherwise idempotent) kernel on the first call. interm_g is free here
     exl3_mgemm_gr
     (
         interm_a,
         down_ptrs_trellis,
         out_d,
         down_ptrs_suh,
-        interm_a,
+        interm_g,
         down_ptrs_svh,
         selected_experts,
         routing_weights,
@@ -139,6 +167,15 @@ void BC_BlockSparseMLP::run_bsz1_gr
         0,
         graph
     );
+    if (down_bias_ptrs)
+        moe_bias_add_weighted_gr(out_d, down_bias_ptrs.value(), selected_experts, routing_weights, min_expert, max_expert, graph);
+    if (out_trim)
+    {
+        // Exact-width copy out of the padded down result (row 0 holds the weighted reduction)
+        at::Tensor src = out_d.select(0, 0);
+        at::Tensor dst = out_trim.value();
+        copy2d_gr(src, dst, graph);
+    }
 
     if (shared_experts)
     {
@@ -178,14 +215,41 @@ void BC_BlockSparseMLP::run_bsz1
             graph_bsz1.capture_end();
         }
 
-        auto args = std::vector<PPTR>
+        // Padded hidden dim: y feeds the staging copy at the head of the graph and the mgemms
+        // read the (static) padded buffer
+        void* yptr = y_pad ? y_pad.value().data_ptr() : (void*) y.data_ptr();
+        auto args = std::vector<PPTR>();
+        if (y_pad)
+            args.push_back(PPTR(GP_copy2d_src, (void*) y.data_ptr()));
+
+        if (gated)
         {
-            PPTR(GP_mgemm_A,            (void*) y.data_ptr()),
-            PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()),
-            PPTR(GP_end,                nullptr),
-            PPTR(GP_mgemm_A,            (void*) y.data_ptr()),
-            PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()),
-            PPTR(GP_end,                nullptr),
+            args.push_back(PPTR(GP_mgemm_A,            yptr));
+            args.push_back(PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_end,                nullptr));
+
+            if (gate_bias_ptrs)
+            {
+                args.push_back(PPTR(GP_moe_bias_add_sel,   (void*) selected_experts.data_ptr()));
+                args.push_back(PPTR(GP_end,                nullptr));
+            }
+        }
+
+        args.push_back(PPTR(GP_mgemm_A,            yptr));
+        args.push_back(PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()));
+        args.push_back(PPTR(GP_end,                nullptr));
+
+        if (up_bias_ptrs)
+        {
+            args.push_back(PPTR(GP_moe_bias_add_sel,   (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_end,                nullptr));
+        }
+
+        auto patch_bias = [&]()
+        {
+            args.push_back(PPTR(GP_moe_bias_add_weighted_sel,       (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_moe_bias_add_weighted_weights,   (void*) routing_weights.data_ptr()));
+            args.push_back(PPTR(GP_end,                             nullptr));
         };
 
         if (shared_experts && shared_gate)
@@ -193,6 +257,7 @@ void BC_BlockSparseMLP::run_bsz1
             args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
             args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
             args.push_back(PPTR(GP_end,                         nullptr));
+            if (down_bias_ptrs) patch_bias();
             args.push_back(PPTR(GP_mgemm_A,                     (void*) y.data_ptr()));
             args.push_back(PPTR(GP_add_sigmoid_gate_proj_y,     (void*) y.data_ptr()));
             args.push_back(PPTR(GP_add_sigmoid_gate_proj_z,     (void*) out_d.data_ptr()));
@@ -202,6 +267,7 @@ void BC_BlockSparseMLP::run_bsz1
             args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
             args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
             args.push_back(PPTR(GP_end,                         nullptr));
+            if (down_bias_ptrs) patch_bias();
             args.push_back(PPTR(GP_mgemm_A,                     (void*) y.data_ptr()));
             args.push_back(PPTR(GP_add_x,                       (void*) out_d.data_ptr()));
             args.push_back(PPTR(GP_add_z,                       (void*) out_d.data_ptr()));
@@ -211,6 +277,7 @@ void BC_BlockSparseMLP::run_bsz1
             args.push_back(PPTR(GP_mgemm_C,                     (void*) out_d.data_ptr()));
             args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
             args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
+            if (down_bias_ptrs) patch_bias();
         }
 
         graph_bsz1.launch(args, stream);
@@ -254,6 +321,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     bool _down_mul1,
     bool _act_silu,
     bool _act_gelu,
+    bool _act_silu_oai,
     std::shared_ptr<BC_GatedMLP> _shared_experts,
     std::shared_ptr<BC_LinearFP16> _shared_gate,
     float _act_limit,
@@ -262,7 +330,13 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     std::vector<std::shared_ptr<BC_LinearEXL3>> _downs,
     at::Tensor _gu_trellis_ptr,
     at::Tensor _gu_suh_ptr,
-    at::Tensor _gu_svh_ptr
+    at::Tensor _gu_svh_ptr,
+    c10::optional<at::Tensor> _gate_bias_ptrs,
+    c10::optional<at::Tensor> _up_bias_ptrs,
+    c10::optional<at::Tensor> _down_bias_ptrs,
+    c10::optional<at::Tensor> _y_pad,
+    c10::optional<at::Tensor> _out_trim,
+    bool _act_relu2
 ) :
         yh2                 (std::move(_yh2)),
         yh                  (std::move(_yh)),
@@ -299,6 +373,8 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         down_mul1           (_down_mul1),
         act_silu            (_act_silu),
         act_gelu            (_act_gelu),
+        act_silu_oai        (_act_silu_oai),
+        act_relu2           (_act_relu2),
         shared_experts      (_shared_experts),
         shared_gate         (_shared_gate),
         act_limit           (_act_limit),
@@ -307,8 +383,19 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         downs               (_downs),
         gu_trellis_ptr      (_gu_trellis_ptr),
         gu_suh_ptr          (_gu_suh_ptr),
-        gu_svh_ptr          (_gu_svh_ptr)
+        gu_svh_ptr          (_gu_svh_ptr),
+        gate_bias_ptrs      (std::move(_gate_bias_ptrs)),
+        up_bias_ptrs        (std::move(_up_bias_ptrs)),
+        down_bias_ptrs      (std::move(_down_bias_ptrs)),
+        y_pad               (std::move(_y_pad)),
+        out_trim            (std::move(_out_trim))
 {
+    // Non-gated experts (NemotronH): python passes an empty gates vector (the gate pointer
+    // tables are unused placeholders) and act_relu2; the gate GEMMs are skipped throughout
+    gated = !gates.empty();
+    TORCH_CHECK(gated || act_relu2, "BC_BlockSparseMLP: gateless experts require act_relu2");
+    TORCH_CHECK(!(shared_experts && (down_bias_ptrs || y_pad)),
+        "BC_BlockSparseMLP: shared experts not supported with expert biases or padded dims");
     gate_ptrs_trellis_cpu   = gate_ptrs_trellis.cpu();
     gate_ptrs_suh_cpu       = gate_ptrs_suh.cpu();
     gate_ptrs_svh_cpu       = gate_ptrs_svh.cpu();
@@ -385,20 +472,21 @@ void BC_BlockSparseMLP::run_single_expert_gr
         at::Tensor gi = interm_gu.slice(0, 0, bsz);
         at::Tensor ui = interm_gu.slice(0, bsz, bsz * 2);
 
-        exl3_gemm_gr
-        (
-            y,
-            gates[expert_idx]->trellis,
-            gi,
-            gates[expert_idx]->suh,
-            yh,
-            gates[expert_idx]->svh,
-            -1,
-            gate_mcg,
-            gate_mul1,
-            0,
-            graph
-        );
+        if (gated)
+            exl3_gemm_gr
+            (
+                y,
+                gates[expert_idx]->trellis,
+                gi,
+                gates[expert_idx]->suh,
+                yh,
+                gates[expert_idx]->svh,
+                -1,
+                gate_mcg,
+                gate_mul1,
+                0,
+                graph
+            );
 
         exl3_gemm_gr
         (
@@ -415,19 +503,28 @@ void BC_BlockSparseMLP::run_single_expert_gr
             graph
         );
 
-        if (act_silu)
+        if (!gated)
+            relu_mul_gr(ui, ui, ai, act_limit, graph);
+        else if (act_silu)
             silu_mul_gr(gi, ui, ai, act_limit, graph);
         else if (act_gelu)
             gelu_mul_gr(gi, ui, ai, act_limit, graph);
+        else if (act_silu_oai)
+            silu_oai_mul_gr(gi, ui, ai, act_limit, graph);
+        else if (act_relu2)
+            relu2_mul_gr(gi, ui, ai, act_limit, graph);
     }
 
+    // A_had must not alias A (autotune relaunches on the first call); the gate slice is free
+    // after the activation
+    at::Tensor gi_scratch = interm_gu.slice(0, 0, bsz);
     exl3_gemm_gr
     (
         ai,
         downs[expert_idx]->trellis,
         oi,
         downs[expert_idx]->suh,
-        ai,
+        gi_scratch,
         downs[expert_idx]->svh,
         -1,
         down_mcg,
@@ -466,22 +563,23 @@ void BC_BlockSparseMLP::run_single_expert
             graph_single[graphidx].capture_end();
         }
 
-        auto args = std::vector<PPTR>
+        auto args = std::vector<PPTR>();
+        if (gated)
         {
-            PPTR(GP_gemm_A,             (void*) y.data_ptr()),
-            PPTR(GP_gemm_B_trellis,     (void*) gates[expert_idx]->trellis.data_ptr()),
-            PPTR(GP_gemm_B_suh,         (void*) gates[expert_idx]->suh.data_ptr()),
-            PPTR(GP_gemm_B_svh,         (void*) gates[expert_idx]->svh.data_ptr()),
-            PPTR(GP_end,                nullptr),
-            PPTR(GP_gemm_A,             (void*) y.data_ptr()),
-            PPTR(GP_gemm_B_trellis,     (void*) ups[expert_idx]->trellis.data_ptr()),
-            PPTR(GP_gemm_B_suh,         (void*) ups[expert_idx]->suh.data_ptr()),
-            PPTR(GP_gemm_B_svh,         (void*) ups[expert_idx]->svh.data_ptr()),
-            PPTR(GP_end,                nullptr),
-            PPTR(GP_gemm_B_trellis,     (void*) downs[expert_idx]->trellis.data_ptr()),
-            PPTR(GP_gemm_B_suh,         (void*) downs[expert_idx]->suh.data_ptr()),
-            PPTR(GP_gemm_B_svh,         (void*) downs[expert_idx]->svh.data_ptr()),
-        };
+            args.push_back(PPTR(GP_gemm_A,             (void*) y.data_ptr()));
+            args.push_back(PPTR(GP_gemm_B_trellis,     (void*) gates[expert_idx]->trellis.data_ptr()));
+            args.push_back(PPTR(GP_gemm_B_suh,         (void*) gates[expert_idx]->suh.data_ptr()));
+            args.push_back(PPTR(GP_gemm_B_svh,         (void*) gates[expert_idx]->svh.data_ptr()));
+            args.push_back(PPTR(GP_end,                nullptr));
+        }
+        args.push_back(PPTR(GP_gemm_A,             (void*) y.data_ptr()));
+        args.push_back(PPTR(GP_gemm_B_trellis,     (void*) ups[expert_idx]->trellis.data_ptr()));
+        args.push_back(PPTR(GP_gemm_B_suh,         (void*) ups[expert_idx]->suh.data_ptr()));
+        args.push_back(PPTR(GP_gemm_B_svh,         (void*) ups[expert_idx]->svh.data_ptr()));
+        args.push_back(PPTR(GP_end,                nullptr));
+        args.push_back(PPTR(GP_gemm_B_trellis,     (void*) downs[expert_idx]->trellis.data_ptr()));
+        args.push_back(PPTR(GP_gemm_B_suh,         (void*) downs[expert_idx]->suh.data_ptr()));
+        args.push_back(PPTR(GP_gemm_B_svh,         (void*) downs[expert_idx]->svh.data_ptr()));
 
         graph_single[graphidx].launch(args, stream);
     }
@@ -505,21 +603,37 @@ void BC_BlockSparseMLP::run_single_expert_dq
     at::Tensor interm1 = interm.slice(0, 0, bsz);
     at::Tensor interm2 = interm.slice(0, bsz, bsz * 2);
 
-    had_r_128_dual(y, yh1, gates[expert_idx]->suh, c10::nullopt,
-                   y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
+    if (gated)
+    {
+        had_r_128_dual(y, yh1, gates[expert_idx]->suh, c10::nullopt,
+                       y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
 
-    reconstruct(dq_temp_up, gates[expert_idx]->trellis, gate_K, gate_mcg, gate_mul1);
-    hgemm(yh1, dq_temp_up, interm1);
-    reconstruct(dq_temp_up, ups[expert_idx]->trellis, up_K, up_mcg, up_mul1);
-    hgemm(yh2, dq_temp_up, interm2);
+        reconstruct(dq_temp_up, gates[expert_idx]->trellis, gate_K, gate_mcg, gate_mul1);
+        hgemm(yh1, dq_temp_up, interm1);
+        reconstruct(dq_temp_up, ups[expert_idx]->trellis, up_K, up_mcg, up_mul1);
+        hgemm(yh2, dq_temp_up, interm2);
 
-    had_r_128_dual(interm1, interm1, c10::nullopt, gates[expert_idx]->svh,
-                   interm2, interm2, c10::nullopt, ups[expert_idx]->svh, 1.0);
+        had_r_128_dual(interm1, interm1, c10::nullopt, gates[expert_idx]->svh,
+                       interm2, interm2, c10::nullopt, ups[expert_idx]->svh, 1.0);
+    }
+    else
+    {
+        had_r_128(y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
+        reconstruct(dq_temp_up, ups[expert_idx]->trellis, up_K, up_mcg, up_mul1);
+        hgemm(yh2, dq_temp_up, interm2);
+        had_r_128(interm2, interm2, c10::nullopt, ups[expert_idx]->svh, 1.0);
+    }
 
-    if (act_silu)
+    if (!gated)
+        relu_mul(interm2, interm2, interm_a, act_limit);
+    else if (act_silu)
         silu_mul(interm1, interm2, interm_a, act_limit);
     else if (act_gelu)
         gelu_mul(interm1, interm2, interm_a, act_limit);
+    else if (act_silu_oai)
+        silu_oai_mul(interm1, interm2, interm_a, act_limit);
+    else if (act_relu2)
+        relu2_mul(interm1, interm2, interm_a, act_limit);
 
     had_r_128(interm_a, interm_a, downs[expert_idx]->suh, c10::nullopt, 1.0);
     reconstruct(dq_temp_down, downs[expert_idx]->trellis, down_K, down_mcg, down_mul1);

@@ -10,6 +10,24 @@ from .quant.exl3_lib import quantize_exl3
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 
+# MXFP4 (e2m1 + e8m0 block scale) as stored by gpt-oss: each 16-byte block packs 32 fp4 values
+# (low nibble first), one power-of-two scale byte per block
+_MXFP4_LUT = [
+    +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+]
+
+def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """(N, G, 16) uint8 blocks + (N, G) uint8 scales -> (N, G * 32) fp16"""
+    lut = torch.tensor(_MXFP4_LUT, dtype = torch.float, device = blocks.device)
+    b = blocks.int()
+    w = torch.stack((lut[b & 0x0F], lut[b >> 4]), dim = -1).view(blocks.shape[0], blocks.shape[1], 32)
+    # exp2 multiply rather than torch.ldexp: exact for these integer exponents, and the CUDA
+    # ldexp kernel in some torch builds reads out of bounds on broadcast integer exponents
+    # (silent on a warm allocator, illegal-memory-access on a freshly initialized device)
+    w = w * torch.exp2(scales.float() - 127.0).unsqueeze(-1)
+    return w.view(blocks.shape[0], -1).half()
+
 
 class Linear(Module):
 
@@ -26,9 +44,11 @@ class Linear(Module):
         frange: tuple[int, int] | None = None,
         frange_dim: int = 0,
         fidx: int | None = None,
+        finterleaved: bool = False,
         caps: dict = None,
         softcap: float = 0.0,
         pad_to: int = 128,
+        trim_padded_out: bool = False,
         full_in_features: int | None = None,
         full_out_features: int | None = None,
         first_in_feature: int | None = None,
@@ -49,6 +69,7 @@ class Linear(Module):
         self.in_features = (in_features + pad_to - 1) // pad_to * pad_to
         self.out_features_unpadded = out_features
         self.out_features = (out_features + pad_to - 1) // pad_to * pad_to
+        self.trim_padded_out = trim_padded_out
         self.full_in_features = full_in_features if full_in_features is not None else self.in_features
         self.full_out_features = full_out_features if full_out_features is not None else self.out_features
         self.first_in_feature = first_in_feature if first_in_feature is not None else 0
@@ -59,6 +80,7 @@ class Linear(Module):
         self.frange = frange
         self.frange_dim = frange_dim
         self.fidx = fidx
+        self.finterleaved = finterleaved
         self.quant_type = None
         self.softcap = softcap
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
@@ -72,8 +94,10 @@ class Linear(Module):
         self.lora_a_tensors = {}
         self.lora_b_tensors = {}
 
-        assert self.in_features_unpadded == self.in_features or allow_input_padding, \
-            f"Input padding is not allowed for {self.key}, in_dim: {self.in_features_unpadded}, pad_to: {pad_to}"
+        # in_features_unpadded < in_features is handled at runtime: inputs narrower than the
+        # (padded) weight are zero-extended in forward(). allow_input_padding marks layers whose
+        # inputs already arrive padded (e.g. MoE down projections fed from padded gate/up)
+        self.allow_input_padding = allow_input_padding
 
         if caps is not None:
             self.caps.update(caps)
@@ -85,14 +109,15 @@ class Linear(Module):
 
 
     def pad_out(self, w: torch.Tensor | None) -> torch.Tensor | None:
+        """Zero-pad a weight in (in_features, out_features) orientation (or a bias) to the padded
+        dims. Padding either or both dims with zeros is inert: pad output columns produce zero
+        (trimmed or consumed by a matching pad on the consumer's input dim), pad input rows only
+        ever see zero activations."""
         if w is None or self.out_features == self.out_features_unpadded and self.in_features == self.in_features_unpadded:
             return w
         if w.dim() == 2:
             padded = torch.zeros((self.in_features, self.out_features), dtype = w.dtype, device = w.device)
-            if self.out_features != self.out_features_unpadded:
-                padded[:, :w.shape[1]] = w
-            elif self.in_features != self.in_features_unpadded:
-                padded[:w.shape[0], :] = w
+            padded[:w.shape[0], :w.shape[1]] = w
         else:
             assert w.dim() == 1
             padded = torch.zeros((self.out_features,), dtype = w.dtype, device = w.device)
@@ -188,14 +213,63 @@ class Linear(Module):
                     weight = weight[:, self.frange[0] : self.frange[1]].contiguous()
                 else:
                     raise ValueError(f"Unsupported frange_dim={self.frange_dim} for {self.key}")
-            weight = self.pad_out(weight)
             if self.ftranspose_after_load:
                 weight = weight.T.contiguous()
+            # pad_out expects (in_features, out_features) orientation
+            weight = self.pad_out(weight)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
                 weight,
                 None,
+                self.full_in_features,
+                self.full_out_features,
+                self.first_in_feature,
+                self.first_out_feature,
+                out_dtype = self.out_dtype,
+                key = self.key
+            )
+            self.quant_type = "fp16"
+            return True
+
+        # MXFP4 batch tensor (gpt-oss): experts packed as {fkey}_blocks/_scales/_bias, one 3D/4D
+        # tensor per projection with the expert on the first dim. Dequantized to fp16 per expert
+        # slice here; the interleaved flag handles fused tensors that alternate gate/up rows
+        elif self.fkey and self.fidx is not None and self.config.stc.has_tensor(self.fkey + "_blocks"):
+
+            assert self.ftranspose_after_load, \
+                f"MXFP4 batch tensor for {self.key} requires ftranspose_after_load"
+            blocks = self.config.stc.get_tensor(
+                self.fkey + "_blocks", self.device, no_defer = True, fidx = self.fidx
+            )
+            scales = self.config.stc.get_tensor(
+                self.fkey + "_scales", self.device, no_defer = True, fidx = self.fidx
+            )
+            bias = self.config.stc.get_tensor(
+                self.fkey + "_bias", self.device, optional = True, no_defer = True, fidx = self.fidx
+            )
+            # Slice out rows (output features) before dequantizing
+            if self.frange is not None:
+                n = self.frange[1] - self.frange[0]
+                if self.finterleaved:
+                    step = blocks.shape[0] // n
+                    off = self.frange[0] // n
+                    sl = slice(off, None, step)
+                else:
+                    sl = slice(self.frange[0], self.frange[1])
+                blocks = blocks[sl].contiguous()
+                scales = scales[sl].contiguous()
+                if bias is not None:
+                    bias = bias[sl].contiguous()
+            weight = _mxfp4_dequant(blocks, scales)
+            weight = weight.T.contiguous()
+            weight = self.pad_out(weight)
+            bias = self.pad_out(bias)
+            self.inner = LinearFP16(
+                self.in_features,
+                self.out_features,
+                weight,
+                bias,
                 self.full_in_features,
                 self.full_out_features,
                 self.first_in_feature,
@@ -415,6 +489,17 @@ class Linear(Module):
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
 
+        if self.out_features == 0:
+            dtype = out_dtype or self.out_dtype or torch.half
+            return x.new_empty((*x.shape[:-1], 0), dtype = dtype)
+
+        # When in_features is padded past the incoming activation width (dims not a multiple of
+        # pad_to, e.g. gpt-oss hidden_size 2880), zero-extend the input. The padded weight rows
+        # are zeros, so this is exact; H capture below sees the padded width, keeping the
+        # quantizer's Hadamard blocks aligned
+        if x.shape[-1] < self.in_features:
+            x = torch.nn.functional.pad(x, (0, self.in_features - x.shape[-1]))
+
         if self.qmap and "capture" in params:
             self.capture_H(x, params)
 
@@ -424,6 +509,12 @@ class Linear(Module):
             lora_input = None
 
         x = self.inner.forward(x, params, out_dtype)
+
+        # Padded output columns carry only zeros (fp16) or quantization noise (EXL3); trim when
+        # the consumer expects the exact width (e.g. projections back into the residual stream).
+        # Contiguous copy: downstream kernels index flat memory
+        if self.trim_padded_out and self.out_features != self.out_features_unpadded:
+            x = x[..., :self.out_features_unpadded].contiguous()
 
         if lora_input is not None:
             self.apply_lora(lora_input, x)
@@ -504,6 +595,8 @@ class Linear(Module):
                 "frange": self.frange,
                 "frange_dim": self.frange_dim,
                 "fidx": self.fidx,
+                "finterleaved": self.finterleaved,
+                "trim_padded_out": self.trim_padded_out,
                 "ftranspose_after_load": self.ftranspose_after_load,
                 "caps": self.caps,
                 "softcap": self.softcap,
@@ -513,6 +606,9 @@ class Linear(Module):
                 "first_out_feature": self.first_out_feature,
                 "post_scale": self.post_scale,
             },
+            # Not constructor args: restored post-construction by _adopt_inner_dims for dims the
+            # split leaves whole (padded models pad the hidden dims, which are never split)
+            "unpadded": (self.in_features_unpadded, self.out_features_unpadded),
             "inner": self.inner.tp_export(plan, producer),
             "device": self.device
         }
@@ -528,7 +624,12 @@ class Linear(Module):
         module.device = device
         module.inner = exported["inner"]["cls"].tp_import_split(local_context, exported["inner"], plan, split)
         module.quant_type = module.inner.quant_type
-        module.out_features = module.inner.out_features
+        if split is not None:
+            split_out, first, _ = split
+            module._adopt_inner_dims(exported, out_first = first if split_out else None,
+                                     in_first = first if not split_out else None)
+        else:
+            module._adopt_inner_dims(exported)
         return module
 
     @staticmethod
@@ -541,8 +642,63 @@ class Linear(Module):
         module.device = device
         module.inner = exported["inner"]["cls"].tp_import_split_3(local_context, exported["inner"], plan, split_0, split_1, split_2)
         module.quant_type = module.inner.quant_type
-        module.out_features = module.inner.out_features
+        module._adopt_inner_dims(exported)
         return module
+
+    @staticmethod
+    def tp_import_split_n(local_context, exported, plan, splits):
+        # N-range output split (Mamba2 in_proj: [z | x | B | C | dt] sections split by state
+        # group, with the dt section replicated). The ranges select only real (unpadded) columns,
+        # so the local slice is exact by construction: no output trim, no padded-out bookkeeping
+        device = local_context["device"]
+        module = Linear(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+        module.inner = exported["inner"]["cls"].tp_import_split_n(local_context, exported["inner"], plan, splits)
+        module.quant_type = module.inner.quant_type
+        module.in_features = module.inner.in_features
+        module.out_features = module.inner.out_features
+        exp_in = exported["kwargs"]["in_features"]
+        unp_in, _ = exported.get("unpadded", (exp_in, None))
+        module.in_features_unpadded = unp_in if module.in_features == exp_in else module.in_features
+        module.out_features_unpadded = module.out_features
+        module.trim_padded_out = False
+        module.is_sliced = True
+        return module
+
+    def _adopt_inner_dims(self, exported: dict, in_first: int | None = None, out_first: int | None = None):
+        # The exported kwargs carry the full unsplit (padded) dims; forward() sizes its input padding and
+        # output trim against the wrapper dims, so they must track the local slice. A dim the split left
+        # whole keeps its true unpadded value (padded models pad the hidden dims, which are never split).
+        # Splitting a padded dim is fine when the slice offset is known: slices below the pad boundary
+        # are exact, and the slice containing it has (unpadded - first) real columns (e.g. an lm_head
+        # with a padded vocab split across ranks -- the pad columns ride in the tail slice like they do
+        # on a single device)
+        exp_in, exp_out = exported["kwargs"]["in_features"], exported["kwargs"]["out_features"]
+        unp_in, unp_out = exported.get("unpadded", (exp_in, exp_out))
+        self.in_features = self.inner.in_features
+        self.out_features = self.inner.out_features
+        if self.in_features == exp_in:
+            self.in_features_unpadded = unp_in
+        elif exp_in == unp_in:
+            self.in_features_unpadded = self.in_features
+        else:
+            assert in_first is not None, f"{self.key}: cannot split the padded input dim without the slice offset"
+            self.in_features_unpadded = max(0, min(unp_in - in_first, self.in_features))
+        if self.out_features == exp_out:
+            self.out_features_unpadded = unp_out
+        elif exp_out == unp_out:
+            self.out_features_unpadded = self.out_features
+        else:
+            assert out_first is not None, f"{self.key}: cannot split the padded output dim without the slice offset"
+            self.out_features_unpadded = max(0, min(unp_out - out_first, self.out_features))
+            # A load-bearing output trim (projections back into the residual stream) has no
+            # defined per-slice gather semantics; no current model splits such a dim
+            assert not self.trim_padded_out or self.out_features_unpadded == self.out_features, \
+                f"{self.key}: cannot split a padded output dim that requires trimming"
+        self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
 
 
     @staticmethod

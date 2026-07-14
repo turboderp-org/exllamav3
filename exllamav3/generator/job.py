@@ -1098,6 +1098,17 @@ class Job:
                         ext_prefill_end += 1
                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, ext_prefill_end)
 
+                # If the chunk starts inside a multimodal span (an atomic MM prefill re-feeds the
+                # extension processed by the previous chunk), tell the span builder how far the
+                # span extends before the chunk, so non-causal attention windows cover the whole
+                # span rather than just the in-chunk suffix
+                mm_span_prefix = 0
+                if self.embeddings:
+                    pp = prefill_start
+                    while pp > 0 and seq.multimodal_mask[pp - 1]:
+                        mm_span_prefix += 1
+                        pp -= 1
+
                 params = {
                     "attn_mode": "flash_attn",
                     "block_table": seq.block_index_tensor,
@@ -1106,6 +1117,7 @@ class Job:
                     "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
                     "indexed_embeddings": self.embeddings,
                     "inv_freq": self.alt_rope_freqs,
+                    "mm_span_prefix": mm_span_prefix,
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
@@ -1148,6 +1160,13 @@ class Job:
                             "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
                         }
                     )
+
+                # Atomic MM prefill may have extended the forward pass past prefill_end, advancing any
+                # recurrent state beyond the chunk boundary. The extension is processed again by the
+                # next chunk, so rewind to keep the state position in sync with kv_position. Re-fed
+                # tokens map to the same state slots with the same values, leaving state content intact.
+                if self.recurrent_state is not None and self.recurrent_state.position > prefill_end:
+                    self.recurrent_state.rewind(self.recurrent_state.position - prefill_end)
 
                 seq.kv_position = prefill_end
 

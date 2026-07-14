@@ -17,7 +17,9 @@ class GatedRMSNorm(Module):
         rms_norm_eps: float,
         out_dtype: torch.dtype | None = None,
         qmap: str | None = None,
-        constant_bias: float = 0.0
+        constant_bias: float = 0.0,
+        groups: int = 1,
+        gate_first: bool = False,
     ):
         super().__init__(config, key, None)
         assert qmap is None, "No quant scheme for RMSNorm"
@@ -28,6 +30,10 @@ class GatedRMSNorm(Module):
         self.out_dtype = out_dtype
         self._numel = None
         self.constant_bias = constant_bias
+        # Mamba2 group norm: input viewed as rows of (weight.numel() / groups) channels, weight
+        # row selected per group, and the gate applied before the norm: y = norm(x * silu(g)) * w
+        self.groups = groups
+        self.gate_first = gate_first
         self.bc = None
 
     @override
@@ -45,6 +51,8 @@ class GatedRMSNorm(Module):
             self.weight,
             self.rms_norm_eps,
             self.constant_bias,
+            self.groups,
+            self.gate_first,
         )
 
     @override
@@ -86,11 +94,18 @@ class GatedRMSNorm(Module):
         gate: torch.Tensor = None,
     ) -> torch.Tensor:
         input_dtype = x.dtype
-        hidden_states = x.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.rms_norm_eps)
-        hidden_states = self.weight * hidden_states.to(input_dtype)
-        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+        if self.gate_first:
+            hidden_states = x.to(torch.float32) * F.silu(gate.to(torch.float32))
+            variance = hidden_states.pow(2).mean(-1, keepdim = True)
+            hidden_states = hidden_states * torch.rsqrt(variance + self.rms_norm_eps)
+            w = self.weight.view(self.groups, -1) if self.groups > 1 else self.weight
+            hidden_states = w.to(torch.float32) * hidden_states
+        else:
+            hidden_states = x.to(torch.float32)
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(variance + self.rms_norm_eps)
+            hidden_states = self.weight * hidden_states.to(input_dtype)
+            hidden_states = hidden_states * F.silu(gate.to(torch.float32))
         x = hidden_states.to(out_dtype or self.out_dtype)
         return x
 
@@ -107,7 +122,7 @@ class GatedRMSNorm(Module):
         gate: torch.Tensor = None,
     ) -> torch.Tensor:
         y = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
-        ext.gated_rms_norm(x, self.weight, y, gate, self.rms_norm_eps, self.constant_bias)
+        ext.gated_rms_norm(x, self.weight, y, gate, self.rms_norm_eps, self.constant_bias, self.groups, self.gate_first)
         return y
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
@@ -130,6 +145,8 @@ class GatedRMSNorm(Module):
                 "rms_norm_eps": self.rms_norm_eps,
                 "out_dtype": self.out_dtype,
                 "constant_bias": self.constant_bias,
+                "groups": self.groups,
+                "gate_first": self.gate_first,
             },
             "weight": producer.send(self.weight),
             "device": self.device,
@@ -146,6 +163,10 @@ class GatedRMSNorm(Module):
         module.device = device
         w = consumer.recv(exported["weight"], cuda = True)
         module.weight = nn.Parameter(w)
+        # load() builds the BC alongside the weight; the TP import must too, or graphed consumers
+        # (BC_GatedDeltaNetSplit holds norm.bc) get a null pointer
+        module.bc = ext.BC_GatedRMSNorm(module.weight, module.rms_norm_eps, module.constant_bias,
+                                        module.groups, module.gate_first)
         torch.cuda.synchronize()
         return module
 
@@ -163,6 +184,12 @@ class GatedRMSNorm(Module):
         w = consumer.recv(exported["weight"], cuda = True)
         if w.dim() == 2:
             w = w[first : last, :]
+        elif w.dim() == 1 and (last - first) < w.shape[0]:
+            # Per-channel weight (Mamba2 group norm): element range; the caller fixes up
+            # module.groups to the local group count
+            w = w[first : last]
         module.weight = nn.Parameter(w.to(module.device).contiguous())
+        module.bc = ext.BC_GatedRMSNorm(module.weight, module.rms_norm_eps, module.constant_bias,
+                                        module.groups, module.gate_first)
 
         return module

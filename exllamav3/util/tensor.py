@@ -125,19 +125,42 @@ def get_for_device(
     if key not in input_dict and default is not no_default:
         return default
 
-    if "dev_cache" not in input_dict:
+    v = input_dict[key]
+    if v is None:
+        return None
+
+    cache = input_dict.get("dev_cache")
+    if cache is None:
         cache = {}
         input_dict["dev_cache"] = cache
+
+    # Key by tensor identity so the same tensor under two params keys (e.g. positions aliasing
+    # cache_seqlens) uploads only once per device. The cache entry keeps the source tensor
+    # alive so its id cannot be recycled within the lifetime of the dict
+    cache_key = (id(v), device)
+    hit = cache.get(cache_key)
+    if hit is not None:
+        return hit[1]
+
+    # Tensors marked _static_dev_cache = True are never mutated in place and keep persistent
+    # per-device copies (stored on the tensor itself) across forward passes
+    if getattr(v, "_static_dev_cache", False):
+        scache = v.__dict__.get("_static_dev_copies")
+        if scache is None:
+            scache = {}
+            v._static_dev_copies = scache
+        dv = scache.get(device)
+        if dv is None:
+            dv = v.to(device)
+            scache[device] = dv
     else:
-        cache = input_dict["dev_cache"]
-
-    cache_key = f"{key}[{str(device)}]"
-    if cache_key in cache:
-        return cache[cache_key]
-
-    v = input_dict[key]
-    dv = None if v is None else input_dict[key].to(device)
-    cache[cache_key] = dv
+        # Pinned sources upload asynchronously: the copy is stream-ordered ahead of the kernels
+        # that consume it, so the host never stalls. Callers that reuse pinned staging buffers
+        # must not refill them until a sync point (the generator syncs every iteration when
+        # collecting sampled tokens)
+        nb = v.device.type == "cpu" and v.is_pinned()
+        dv = v.to(device, non_blocking = nb)
+    cache[cache_key] = (v, dv)
     return dv
 
 

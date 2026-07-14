@@ -15,11 +15,11 @@ from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 from ..cache.recurrent import (
     mp_cache_recurrent_stash,
     mp_cache_recurrent_unstash,
-    mp_cache_recurrent_clear
+    mp_cache_recurrent_clear,
+    new_checkpoint_handle,
 )
 from ..util import profile_opt
 
-next_checkpoint_handle = 0
 
 def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
     recurrent_modules = local_context["recurrent_modules"]
@@ -81,7 +81,6 @@ class GDNState:
 
 
     def stash(self):
-        global next_checkpoint_handle
         stashed = {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size
@@ -90,9 +89,9 @@ class GDNState:
             for k, l in self.cache.get_all_recurrent_layers().items():
                 stashed[k] = l.stash(self.slot)
         else:
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), next_checkpoint_handle, self.slot))
-            stashed["tp_handle"] = next_checkpoint_handle
-            next_checkpoint_handle += 1
+            cp_handle = new_checkpoint_handle()
+            self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot))
+            stashed["tp_handle"] = cp_handle
         return stashed
 
 
@@ -202,7 +201,7 @@ class GDNLayerState:
             c_state.copy_(temp)
 
 
-    def stash(self, slot):
+    def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
         return (
             self.recurrent_state[slot, :1].cpu(),
@@ -210,7 +209,7 @@ class GDNLayerState:
         )
 
 
-    def unstash(self, slot, stashed):
+    def unstash(self, slot, stashed, position: int = 0):
         cdim = self.module.conv_kernel_size
         s, c = stashed
         self.recurrent_state[slot, :1].copy_(s)
@@ -319,12 +318,7 @@ class GatedDeltaNet(Module):
             self.qkv_proj = None
             self.z_proj = None
             self.register_submodule(self.qkvz_proj)
-        else:
-            self.qkvz_proj = None
-            self.qkv_proj = None
-            self.z_proj = None
-
-        if qkv_proj:
+        elif qkv_proj:
             self.qkv_proj = qkv_proj
             self.z_proj = z_proj
             self.qkvz_proj = None
@@ -365,12 +359,7 @@ class GatedDeltaNet(Module):
             self.b_proj = None
             self.a_proj = None
             self.register_submodule(self.ba_proj)
-        else:
-            self.b_proj = None
-            self.a_proj = None
-            self.ba_proj = None
-
-        if b_proj:
+        elif b_proj:
             self.b_proj = b_proj
             self.a_proj = a_proj
             self.ba_proj = None
@@ -413,6 +402,7 @@ class GatedDeltaNet(Module):
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
+        self.conv1d_weight_flat = None
         self.conv1d_bias = None
         self.conv1d_q_weight = None
         self.conv1d_k_weight = None
@@ -449,7 +439,11 @@ class GatedDeltaNet(Module):
         self.layer_state_cls = GDNLayerState
 
         self.bc = None
+        self.bc_split = False
         self.bsz1_pa_args = []
+        self.ba_weight_t = None
+        self.ba_bias = None
+        self.ba_weight_filled = False
 
         self.recurrent_layers = []
         self.tp_recurrent_lookup = {}
@@ -516,6 +510,81 @@ class GatedDeltaNet(Module):
                 self.beta_scale
             )
 
+        # Fuse conv1d weights and cache the flattened weight (normally done lazily in forward,
+        # needed here for the split-projection batched call)
+        if self.conv1d_weight is None and self.conv1d_q_weight is not None:
+            self.conv1d_weight = torch.cat([
+                self.conv1d_q_weight,
+                self.conv1d_k_weight,
+                self.conv1d_v_weight,
+            ], dim = 0)
+            self.conv1d_q_weight = None
+            self.conv1d_k_weight = None
+            self.conv1d_v_weight = None
+        if self.conv1d_weight_flat is None and self.conv1d_weight is not None:
+            self.conv1d_weight_flat = self.conv1d_weight.squeeze(1).contiguous()
+
+        is_quantized_split = (
+            device != torch.device("cpu") and
+            self.qkvz_proj is None and self.ba_proj is None and
+            self.qkv_proj is not None and self.qkv_proj.quant_type == "exl3" and
+            self.z_proj is not None and self.z_proj.quant_type == "exl3" and
+            self.b_proj is not None and self.b_proj.quant_type == "fp16" and
+            self.a_proj is not None and self.a_proj.quant_type == "fp16" and
+            self.o_proj is not None and self.o_proj.quant_type == "exl3" and
+            self.conv1d_weight_flat is not None and
+            self.conv1d_weight_flat.dtype == torch.bfloat16 and
+            (self.conv1d_bias is None or self.conv1d_bias.dtype == torch.bfloat16) and
+            self.dt_bias is not None and self.dt_bias.dtype == torch.bfloat16
+        )
+
+        if is_quantized_split:
+            # Merge the small unquantized b/a projections into a single fp16 GEMV. The weights may
+            # not be materialized yet (deferred load), so only allocate here — the BC keeps a
+            # reference — and copy the actual values in on the first forward pass
+            nv = self.num_v_heads
+            self.ba_weight_t = torch.empty((2 * nv, self.hidden_size), dtype = torch.half, device = device)
+            has_bias = (
+                self.b_proj.inner.get_bias_tensor() is not None or
+                self.a_proj.inner.get_bias_tensor() is not None
+            )
+            self.ba_bias = torch.empty((2 * nv,), dtype = torch.half, device = device) if has_bias else None
+            self.ba_weight_filled = False
+
+            f = self.fdim_qkv
+            nv, hv = self.num_v_heads, self.v_head_dim
+            self.bsz1_pa_args = [
+                (device, (1, 1, f), torch.float, "s_qkv"),
+                (device, (1, 1, nv, hv), torch.float, "s_z"),
+                (device, (1, 1, 2 * nv), torch.float, "s_ba"),
+                (device, (1, 1, nv), torch.bfloat16, "s_beta"),
+                (device, (1, 1, nv), torch.float, "s_g"),
+                (device, (1, f, 1), torch.bfloat16, "s_mqkv"),
+                (device, (1, 1, f), torch.bfloat16, "s_conv"),
+                (device, (1, 1, nv, hv), torch.bfloat16, "s_cao"),
+                (device, (1, 1, nv * hv), torch.half, "s_caof"),
+            ]
+
+            self.bc = ext.BC_GatedDeltaNetSplit(
+                *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
+                self.qkv_proj.inner.bc,
+                self.z_proj.inner.bc,
+                self.o_proj.inner.bc,
+                self.ba_weight_t,
+                self.ba_bias,
+                self.dt_bias,
+                self.a_log,
+                self.num_k_heads,
+                nv,
+                self.k_head_dim,
+                hv,
+                self.conv1d_weight_flat,
+                self.conv1d_bias,
+                self.norm.bc,
+                self.beta_scale
+            )
+            self.bc_split = True
+
 
     @override
     def load(self, device: torch.Device, **kwargs):
@@ -540,10 +609,15 @@ class GatedDeltaNet(Module):
             # for arg in self.bsz1_pa_args:
             #     g_tensor_cache.drop(*arg)
             self.bc = None
+            self.bc_split = False
             self.bsz1_pa_args = []
+        self.ba_weight_t = None
+        self.ba_bias = None
+        self.ba_weight_filled = False
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
+        self.conv1d_weight_flat = None
         self.conv1d_bias = None
         self.conv1d_q_weight = None
         self.conv1d_k_weight = None
@@ -623,6 +697,8 @@ class GatedDeltaNet(Module):
             self.conv1d_q_weight = None
             self.conv1d_k_weight = None
             self.conv1d_v_weight = None
+        if self.conv1d_weight_flat is None:
+            self.conv1d_weight_flat = self.conv1d_weight.squeeze(1).contiguous()
 
         # Previous state
         rsg = params.get("recurrent_states")
@@ -641,18 +717,33 @@ class GatedDeltaNet(Module):
             save_state = False
             save_history = False  # no SD without prior state, for simplicity
 
-        # C++ path (currently disabled pending testing)
-        # if self.bc is not None and bsz == 1 and seqlen == 1 and save_state and not save_history:
-        #     y = torch.empty_like(x)
-        #     mixed_qkv = self.bc.run_bsz1_a(x)
-        #     mixed_qkv = causal_conv1d_update_function(
-        #         mixed_qkv,
-        #         conv_state,  # Updated inplace
-        #         self.conv1d_weight.squeeze(1),
-        #         self.conv1d_bias,
-        #     )
-        #     self.bc.run_bsz1_b(mixed_qkv, y, recurrent_state)
-        #     x = y
+        # Deferred fill of the merged b/a projection (weights are materialized by now)
+        if self.bc_split and not self.ba_weight_filled:
+            self.ba_weight_t.copy_(torch.cat([
+                self.b_proj.inner.get_weight_tensor(),
+                self.a_proj.inner.get_weight_tensor(),
+            ], dim = -1).T)
+            if self.ba_bias is not None:
+                nv = self.num_v_heads
+                b_bias = self.b_proj.inner.get_bias_tensor()
+                a_bias = self.a_proj.inner.get_bias_tensor()
+                if b_bias is None: b_bias = torch.zeros(nv, dtype = torch.half, device = self.device)
+                if a_bias is None: a_bias = torch.zeros(nv, dtype = torch.half, device = self.device)
+                self.ba_bias.copy_(torch.cat([b_bias, a_bias]))
+            self.ba_weight_filled = True
+
+        # Fused C++ path for single-token decode with split projections. Runs the entire layer
+        # in one call, replayed through an internal CUDA graph from the third invocation on
+        if (
+            self.bc_split and bsz == 1 and seqlen == 1 and
+            save_state and not save_history and
+            recurrent_slots is not None
+        ):
+            y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
+            self.bc.run_bsz1(x, y, conv_state, recurrent_state, recurrent_slots)
+            if self.tp_reduce:
+                params["backend"].all_reduce(y)
+            return to2(y, out_dtype, self.out_dtype)
 
         # Torch path
         # Qwen3.5 uses split projections (in_proj_qkv/in_proj_z/in_proj_b/in_proj_a),
@@ -703,7 +794,7 @@ class GatedDeltaNet(Module):
             mixed_qkv = mixed_qkv,
             conv_state = conv_state,
             recurrent_slots = recurrent_slots,
-            conv1d_weight = self.conv1d_weight.squeeze(1).contiguous(),
+            conv1d_weight = self.conv1d_weight_flat,
             conv1d_bias = self.conv1d_bias,
             history = save_history,
             params = params,

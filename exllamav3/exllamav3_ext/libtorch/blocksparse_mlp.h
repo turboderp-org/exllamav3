@@ -56,6 +56,9 @@ struct BC_BlockSparseMLP
     bool down_mul1;
     bool act_silu;
     bool act_gelu;
+    bool act_silu_oai;
+    bool act_relu2;     // non-gated relu2 (NemotronH): no gate projections, act on up alone
+    bool gated;         // derived: false when the gates vector is empty
     std::shared_ptr<BC_GatedMLP> shared_experts;
     std::shared_ptr<BC_LinearFP16> shared_gate;
     float act_limit;
@@ -65,6 +68,18 @@ struct BC_BlockSparseMLP
     at::Tensor gu_trellis_ptr;
     at::Tensor gu_suh_ptr;
     at::Tensor gu_svh_ptr;
+
+    // Per-expert bias pointer tables (int64 device tensors) for models with biased experts
+    // (gpt-oss); the down bias applies before the routing weight, so the weighted mgemm
+    // reduction is corrected with the weighted bias sum
+    c10::optional<at::Tensor> gate_bias_ptrs;
+    c10::optional<at::Tensor> up_bias_ptrs;
+    c10::optional<at::Tensor> down_bias_ptrs;
+
+    // Padded hidden dim (gpt-oss): zero-padded input staging for the gate/up mgemms (the
+    // quantized K) and exact-width output copied out of the padded down result
+    c10::optional<at::Tensor> y_pad;
+    c10::optional<at::Tensor> out_trim;
 
     int max_experts_per_token;
     int max_tokens_per_expert;
@@ -115,6 +130,7 @@ struct BC_BlockSparseMLP
         bool _down_mul1,
         bool _act_silu,
         bool _act_gelu,
+        bool _act_silu_oai,
         std::shared_ptr<BC_GatedMLP> _shared_experts,
         std::shared_ptr<BC_LinearFP16> _shared_gate,
         float _act_limit,
@@ -123,7 +139,13 @@ struct BC_BlockSparseMLP
         std::vector<std::shared_ptr<BC_LinearEXL3>> _downs,
         at::Tensor _gu_trellis_ptr,
         at::Tensor _gu_suh_ptr,
-        at::Tensor _gu_svh_ptr
+        at::Tensor _gu_svh_ptr,
+        c10::optional<at::Tensor> _gate_bias_ptrs,
+        c10::optional<at::Tensor> _up_bias_ptrs,
+        c10::optional<at::Tensor> _down_bias_ptrs,
+        c10::optional<at::Tensor> _y_pad,
+        c10::optional<at::Tensor> _out_trim,
+        bool _act_relu2 = false
     );
 
     void run_bsz1_gr

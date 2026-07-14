@@ -82,6 +82,19 @@ class RMSNorm(Module):
     def weights_numel(self):
         return self._numel
 
+    def can_fuse_residual(self, x: torch.Tensor, y: torch.Tensor) -> bool:
+        """
+        True if forward() can be called with residual_in = x for new sublayer output y
+        (fused x += y; norm(x))
+        """
+        return (
+            not self.span_heads and
+            x.dtype in (torch.half, torch.float) and
+            y.dtype in (torch.half, torch.float) and
+            x.is_contiguous() and y.is_contiguous() and
+            x.shape[-1] % 4 == 0
+        )
+
     @override
     def forward(
         self,
@@ -89,14 +102,31 @@ class RMSNorm(Module):
         params,
         out_dtype: torch.dtype | None = None,
         residual: torch.Tensor | None = None,
+        residual_in: torch.Tensor | None = None,
     ) -> torch.Tensor:
         dtype = out_dtype or self.out_dtype
+
+        # Fused pre-norm residual: residual_in += x (in place), y = norm(residual_in)
+        if residual_in is not None:
+            x_2d = x.view(-1, x.shape[-1])
+            r_2d = residual_in.view(-1, residual_in.shape[-1])
+            y_2d = torch.empty_like(x_2d, dtype = dtype)
+            ext.rms_norm_res_in(
+                x_2d,
+                self.weight,
+                y_2d,
+                r_2d,
+                self.rms_norm_eps,
+                self.constant_bias,
+                self.constant_scale,
+            )
+            y = y_2d.view(x.shape)
 
         # ext.rms_norm expects row-major 2D inputs for the standard
         # per-channel RMSNorm path. Flattening keeps results consistent across
         # chunk/prefill shapes (e.g. [B, T, C] vs [B*T, C]).
         # TODO: Weight tensor is always contiguous, so this could be handled more efficiently in the extension
-        if not self.span_heads and x.dim() > 2:
+        elif not self.span_heads and x.dim() > 2:
             x_2d = x.view(-1, x.shape[-1]).contiguous()
             y_2d = torch.empty_like(x_2d, dtype = dtype) if residual is None else residual.view_as(x_2d)
             ext.rms_norm(
@@ -154,6 +184,8 @@ class RMSNorm(Module):
                 "out_dtype": self.out_dtype,
                 "constant_bias": self.constant_bias,
                 "span_heads": self.span_heads,
+                "constant_scale": self.constant_scale,
+                "unweighted": self.unweighted,
             },
             "weight": producer.send(self.weight),
             "device": self.device,

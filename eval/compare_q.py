@@ -494,7 +494,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("-d", "--dataspec", type = str, help = "Data specification (JSON file)")
     parser.add_argument("-m", "--modelspec", type = str, nargs="+", help = "Model specification (JSONL file), accepts wildcard")
     parser.add_argument("-cc", "--clear_cache", action = "store_true", help = "Clear cache")

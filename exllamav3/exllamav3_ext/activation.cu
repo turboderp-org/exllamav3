@@ -14,6 +14,8 @@
 #define ACT_SILU 0
 #define ACT_GELU 1
 #define ACT_RELU2 2
+#define ACT_SILU_OAI 3
+#define ACT_RELU 4
 
 #include "activation_kernels.cuh"
 
@@ -93,6 +95,85 @@ void silu_mul
 )
 {
     silu_mul_gr(x, y, z, act_limit, nullptr);
+}
+
+// gpt-oss clamped swiglu: (clamp(y, -limit, limit) + 1) * g * sigmoid(1.702 * g),
+// g = min(x, limit) -> z, in-place if z == x or z == y
+
+void silu_oai_mul_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    bool float_input = x.dtype() == at::kFloat;
+    if (float_input)
+    {
+        TORCH_CHECK_DTYPE(y, kFloat);
+    }
+    else
+    {
+        TORCH_CHECK_DTYPE(x, kHalf);
+        TORCH_CHECK_DTYPE(y, kHalf);
+    }
+
+    TORCH_CHECK_DTYPE(z, kHalf);
+
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    if (float_input)
+    {
+        act_mul_kernel_f<ACT_SILU_OAI><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const float*) x.data_ptr(),
+            (const float*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            act_limit,
+            numel
+        );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU_OAI>, GP_silu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU_OAI>, GP_silu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU_OAI>, GP_silu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_SILU_OAI>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
+    }
+    else
+    {
+        act_mul_kernel_h<ACT_SILU_OAI><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const half*) x.data_ptr(),
+            (const half*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            act_limit,
+            numel
+        );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU_OAI>, GP_silu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU_OAI>, GP_silu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU_OAI>, GP_silu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_SILU_OAI>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
+    }
+}
+
+void silu_oai_mul
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit
+)
+{
+    silu_oai_mul_gr(x, y, z, act_limit, nullptr);
 }
 
 // silu(x) * y -> z, in-place if z == x or z == y
@@ -251,6 +332,85 @@ void relu2_mul
     relu2_mul_gr(x, y, z, act_limit, nullptr);
 }
 
+// relu(x) * y -> z. With x == y this computes relu^2(y) exactly, which is how the non-gated
+// MoE paths (NemotronH) apply their activation through the same (g, u, a) call shape
+
+void relu_mul_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    bool float_input = x.dtype() == at::kFloat;
+    if (float_input)
+    {
+        TORCH_CHECK_DTYPE(y, kFloat);
+    }
+    else
+    {
+        TORCH_CHECK_DTYPE(x, kHalf);
+        TORCH_CHECK_DTYPE(y, kHalf);
+    }
+
+    TORCH_CHECK_DTYPE(z, kHalf);
+
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    if (float_input)
+    {
+        act_mul_kernel_f<ACT_RELU><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const float*) x.data_ptr(),
+            (const float*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            act_limit,
+            numel
+        );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU>, GP_relu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU>, GP_relu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU>, GP_relu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
+    }
+    else
+    {
+        act_mul_kernel_h<ACT_RELU><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const half*) x.data_ptr(),
+            (const half*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            act_limit,
+            numel
+        );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU>, GP_relu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU>, GP_relu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU>, GP_relu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
+    }
+}
+
+void relu_mul
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit
+)
+{
+    relu_mul_gr(x, y, z, act_limit, nullptr);
+}
+
 // xielu(x, alpha_p, alpha_n) -> z
 // alpha_p and alpha_n must be CPU tensors
 
@@ -369,14 +529,15 @@ void add_sigmoid_gate
 
 // x *= sigmoid(y)
 
-void mul_sigmoid_
+void mul_sigmoid__gr
 (
     at::Tensor& x,
-    const at::Tensor& y
+    const at::Tensor& y,
+    Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(x, kHalf);
     TORCH_CHECK_DTYPE(y, kHalf);
@@ -397,16 +558,26 @@ void mul_sigmoid_
     cuda_check(cudaPeekAtLastError());
 }
 
-// x *= sigmoid(y), where x is [B, S, H, D] and y is [B, S, H]
-
-void mul_sigmoid_broadcast_
+void mul_sigmoid_
 (
     at::Tensor& x,
     const at::Tensor& y
 )
 {
+    mul_sigmoid__gr(x, y, nullptr);
+}
+
+// x *= sigmoid(y), where x is [B, S, H, D] and y is [B, S, H]
+
+void mul_sigmoid_broadcast__gr
+(
+    at::Tensor& x,
+    const at::Tensor& y,
+    Graph* graph
+)
+{
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(x, kHalf);
     TORCH_CHECK_DTYPE(y, kHalf);
@@ -431,6 +602,15 @@ void mul_sigmoid_broadcast_
     );
 
     cuda_check(cudaPeekAtLastError());
+}
+
+void mul_sigmoid_broadcast_
+(
+    at::Tensor& x,
+    const at::Tensor& y
+)
+{
+    mul_sigmoid_broadcast__gr(x, y, nullptr);
 }
 
 // x * sigmoid(y @ w) + z -> z
@@ -486,4 +666,73 @@ void add_sigmoid_gate_proj
 )
 {
     add_sigmoid_gate_proj_gr(x, y, z, w, nullptr);
+}
+
+// Split per-head-interleaved projection output [.., heads, (q: head_dim, g: head_dim)] into
+// contiguous q and g tensors. Replaces a chunk/reshape copy pair (and the contiguous() the RoPE
+// kernel would otherwise force on the strided q view)
+
+__global__ __launch_bounds__(NUM_THREADS)
+void deinterleave_qg_kernel
+(
+    const uint4* __restrict__ qg,
+    uint4* __restrict__ q,
+    uint4* __restrict__ g,
+    const int hd8,                  // head_dim / 8
+    const size_t n8                 // rows * heads * head_dim / 8
+)
+{
+    size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x;
+    if (i >= n8) return;
+    size_t d = i % hd8;
+    size_t h = i / hd8;
+    size_t src = h * 2 * hd8 + d;
+    q[i] = qg[src];
+    g[i] = qg[src + hd8];
+}
+
+void deinterleave_qg_gr
+(
+    const at::Tensor& qg,           // (.., heads * 2 * head_dim) half
+    at::Tensor& q,                  // out (.., heads * head_dim) half
+    at::Tensor& g,                  // out (.., heads * head_dim) half
+    int head_dim,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(qg.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(qg, kHalf);
+    TORCH_CHECK_DTYPE(q, kHalf);
+    TORCH_CHECK_DTYPE(g, kHalf);
+    TORCH_CHECK(head_dim % 8 == 0, "head_dim must be a multiple of 8");
+    TORCH_CHECK(qg.is_contiguous() && q.is_contiguous() && g.is_contiguous(), "tensors must be contiguous");
+    TORCH_CHECK(q.numel() == g.numel() && q.numel() * 2 == qg.numel(), "size mismatch");
+
+    int hd8 = head_dim / 8;
+    size_t n8 = q.numel() / 8;
+    size_t blocks = CEIL_DIVIDE(n8, NUM_THREADS);
+
+    deinterleave_qg_kernel<<<blocks, NUM_THREADS, 0, stream>>>
+    (
+        (const uint4*) qg.data_ptr(),
+        (uint4*) q.data_ptr(),
+        (uint4*) g.data_ptr(),
+        hd8,
+        n8
+    );
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+void deinterleave_qg
+(
+    const at::Tensor& qg,
+    at::Tensor& q,
+    at::Tensor& g,
+    int head_dim
+)
+{
+    deinterleave_qg_gr(qg, q, g, head_dim, nullptr);
 }

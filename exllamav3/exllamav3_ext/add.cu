@@ -106,3 +106,216 @@ void add
 {
     add_gr(x, y, z, nullptr);
 }
+
+// Strided row-block copy: dst[r, :width] = src[r, :width] for 2D tensors whose row strides may
+// differ (zero-padded staging buffers around GEMMs with padded dims)
+
+#define C2D_THREADS 256
+
+template <typename T>
+__global__ void copy2d_kernel
+(
+    const T* __restrict__ src,
+    T* __restrict__ dst,
+    const int src_stride,
+    const int dst_stride,
+    const int width
+)
+{
+    int col = blockIdx.x * C2D_THREADS + threadIdx.x;
+    int row = blockIdx.y;
+    if (col >= width) return;
+    dst[(int64_t) row * dst_stride + col] = src[(int64_t) row * src_stride + col];
+}
+
+void copy2d_gr
+(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(src.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK(src.dim() == 2 && dst.dim() == 2, "copy2d: tensors must be 2D");
+    TORCH_CHECK(src.size(0) == dst.size(0), "copy2d: row count mismatch");
+    TORCH_CHECK(src.dtype() == dst.dtype(), "copy2d: dtype mismatch");
+    int rows = (int) src.size(0);
+    int width = (int) MIN(src.size(1), dst.size(1));
+    dim3 grid(CEIL_DIVIDE(width, C2D_THREADS), rows);
+
+    #define INSTANCE(dt, T) \
+    if (src.dtype() == dt) \
+    { \
+        copy2d_kernel<T><<<grid, C2D_THREADS, 0, stream>>> \
+        ( \
+            (const T*) src.data_ptr(), \
+            (T*) dst.data_ptr(), \
+            (int) src.stride(0), \
+            (int) dst.stride(0), \
+            width \
+        ); \
+        if (graph) graph->record_param((void*) &copy2d_kernel<T>, GP_copy2d_src, 0); \
+        if (graph) graph->record_param((void*) &copy2d_kernel<T>, GP_copy2d_dst, 1); \
+        if (graph) graph->record_param((void*) &copy2d_kernel<T>, GP_end, 0); \
+    }
+
+    INSTANCE(at::kHalf, half)
+    INSTANCE(at::kFloat, float)
+
+    #undef INSTANCE
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+// Per-expert bias adds for the block-sparse MLP graphs. All inputs are static buffers (the
+// routing kernel writes sel/weights in place), so the nodes never need patching:
+// - moe_bias_add: interm[k, :] += bias[sel[k]] for the gate/up intermediates
+// - moe_bias_add_weighted: out[0, :] += sum_k w[k] * bias[sel[k]], correcting the weighted
+//   expert reduction for the down bias (bias applies before the routing weight)
+
+__global__ void moe_bias_add_kernel
+(
+    half* __restrict__ interm,
+    const uintptr_t* __restrict__ bias_ptrs,
+    const int64_t* __restrict__ sel,
+    const int stride,
+    const int width,
+    const int min_expert,
+    const int max_expert
+)
+{
+    int col = blockIdx.x * C2D_THREADS + threadIdx.x;
+    int k = blockIdx.y;
+    if (col >= width) return;
+    // Expert-parallel split: sel holds global expert indices but the pointer table only covers the
+    // local range, and the mgemm PACKS its output rows to the local entries of sel (in order). Skip
+    // foreign experts and add each local expert's bias at its packed row, not its position in sel
+    int64_t e = sel[k];
+    int row = k;
+    if (min_expert >= 0)
+    {
+        if (e < min_expert || e >= max_expert) return;
+        e -= min_expert;
+        row = 0;
+        for (int i = 0; i < k; ++i)
+        {
+            int64_t ei = sel[i];
+            if (ei >= min_expert && ei < max_expert) row++;
+        }
+    }
+    const half* b = (const half*) bias_ptrs[e];
+    int64_t i = (int64_t) row * stride + col;
+    interm[i] = __hadd(interm[i], b[col]);
+}
+
+__global__ void moe_bias_add_weighted_kernel
+(
+    float* __restrict__ out,
+    const uintptr_t* __restrict__ bias_ptrs,
+    const int64_t* __restrict__ sel,
+    const half* __restrict__ weights,
+    const int num_sel,
+    const int width,
+    const int min_expert,
+    const int max_expert
+)
+{
+    int col = blockIdx.x * C2D_THREADS + threadIdx.x;
+    if (col >= width) return;
+    float acc = out[col];
+    for (int k = 0; k < num_sel; ++k)
+    {
+        // Foreign experts contribute on their own rank only
+        int64_t e = sel[k];
+        if (min_expert >= 0)
+        {
+            if (e < min_expert || e >= max_expert) continue;
+            e -= min_expert;
+        }
+        const half* b = (const half*) bias_ptrs[e];
+        acc += __half2float(weights[k]) * __half2float(b[col]);
+    }
+    out[col] = acc;
+}
+
+void moe_bias_add_gr
+(
+    at::Tensor& interm,
+    const at::Tensor& bias_ptrs,
+    const at::Tensor& sel,
+    int min_expert,
+    int max_expert,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(interm.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(interm, kHalf);
+    TORCH_CHECK_DTYPE(sel, kLong);
+    int num_sel = (int) sel.numel();
+    int width = (int) interm.size(-1);
+    int stride = (int) interm.stride(0);
+    dim3 grid(CEIL_DIVIDE(width, C2D_THREADS), num_sel);
+
+    moe_bias_add_kernel<<<grid, C2D_THREADS, 0, stream>>>
+    (
+        (half*) interm.data_ptr(),
+        (const uintptr_t*) bias_ptrs.data_ptr(),
+        (const int64_t*) sel.data_ptr(),
+        stride,
+        width,
+        min_expert,
+        max_expert
+    );
+    if (graph)
+    {
+        graph->record_param((void*) &moe_bias_add_kernel, GP_moe_bias_add_sel, 2);
+        graph->record_param((void*) &moe_bias_add_kernel, GP_end, 0);
+    }
+    cuda_check(cudaPeekAtLastError());
+
+}
+
+void moe_bias_add_weighted_gr
+(
+    at::Tensor& out,
+    const at::Tensor& bias_ptrs,
+    const at::Tensor& sel,
+    const at::Tensor& weights,
+    int min_expert,
+    int max_expert,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(out.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(out, kFloat);
+    TORCH_CHECK_DTYPE(sel, kLong);
+    TORCH_CHECK_DTYPE(weights, kHalf);
+    int num_sel = (int) sel.numel();
+    int width = (int) out.size(-1);
+    dim3 grid(CEIL_DIVIDE(width, C2D_THREADS));
+
+    moe_bias_add_weighted_kernel<<<grid, C2D_THREADS, 0, stream>>>
+    (
+        (float*) out.data_ptr(),
+        (const uintptr_t*) bias_ptrs.data_ptr(),
+        (const int64_t*) sel.data_ptr(),
+        (const half*) weights.data_ptr(),
+        num_sel,
+        width,
+        min_expert,
+        max_expert
+    );
+    if (graph)
+    {
+        graph->record_param((void*) &moe_bias_add_weighted_kernel, GP_moe_bias_add_weighted_sel, 2);
+        graph->record_param((void*) &moe_bias_add_weighted_kernel, GP_moe_bias_add_weighted_weights, 3);
+        graph->record_param((void*) &moe_bias_add_weighted_kernel, GP_end, 0);
+    }
+    cuda_check(cudaPeekAtLastError());
+}

@@ -16,6 +16,7 @@ from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
+from .gpt_oss import GptOssModel
 from .hcxvisionv2 import HCXVisionV2Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
@@ -28,6 +29,7 @@ from .mistral import MistralModel
 from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
 from .nanochat import NanoChatModel
+from .nemotronh import NemotronHModel
 from .olmo3 import Olmo3Model
 from .olmohybrid import OlmoHybridModel
 from .phi3 import Phi3Model
@@ -71,6 +73,7 @@ ARCHITECTURES = {
         Glm4MoeModel,
         Glm4VModel,
         Glm4VMoeModel,
+        GptOssModel,
         HCXVisionV2Model,
         HyperClovaxModel,
         IQuestCoderModel,
@@ -83,6 +86,7 @@ ARCHITECTURES = {
         Mistral3Model,
         MixtralModel,
         NanoChatModel,
+        NemotronHModel,
         Olmo3Model,
         OlmoHybridModel,
         Phi3Model,

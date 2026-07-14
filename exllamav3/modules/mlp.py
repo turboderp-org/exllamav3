@@ -123,6 +123,7 @@ class MLP(Module):
                     out_dtype = self.out_dtype,
                     allow_input_padding = True,
                     pad_to = pad_to,
+                    trim_padded_out = True,
                     select_hq_bits = select_hq_bits,
                     qgroup = key + ".d",
                     qbits_key = qbits_key,
@@ -152,6 +153,7 @@ class MLP(Module):
         self.tp_reduce = False
 
         self.bc = None
+        self.bsz1_pa_args = []
 
 
     @override
@@ -179,6 +181,51 @@ class MLP(Module):
             self.alpha_p = self.config.stc.get_tensor(self.key_alpha_p, None, optional = False, allow_bf16 = True)
         if self.key_alpha_n:
             self.alpha_n = self.config.stc.get_tensor(self.key_alpha_n, None, optional = False, allow_bf16 = True)
+        self.load_local(device, **kwargs)
+
+
+    def load_local(self, device: torch.Device, **kwargs):
+        # Graphed bsz-1 path (up -> act -> down in one C++ call)
+        self.bc = None
+        if (
+            device != torch.device("cpu") and
+            self.num_slices == 1 and
+            self.activation_fn in ("silu", "gelu", "relu2") and
+            self.interm_dtype in (None, torch.half) and
+            self.ups[0].quant_type == "exl3" and self.ups[0].inner.bc is not None and
+            self.downs[0].quant_type == "exl3" and self.downs[0].inner.bc is not None
+        ):
+            up0, down0 = self.ups[0], self.downs[0]
+            self.bsz1_pa_args = [
+                (device, (1, 1, up0.out_features), torch.half, "mlp_u"),
+                (device, (1, 1, up0.out_features), torch.half, "mlp_ones"),
+            ]
+            u, ones = (g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args)
+            ones.fill_(1.0)
+
+            # Zero-padded staging statics for padded projection dims (hidden % 128 != 0)
+            xp = None
+            if up0.in_features != self.hidden_size:
+                xp = g_tensor_cache.get(device, (1, up0.in_features), torch.half, "mlp_xp")
+                xp.zero_()
+            yp = None
+            if down0.out_features != self.out_size:
+                yp = g_tensor_cache.get(device, (1, down0.out_features), self.out_dtype or torch.half, "mlp_yp")
+
+            self.bc = ext.BC_MLP(
+                xp = xp,
+                u = u,
+                ones = ones,
+                yp = yp,
+                act_silu = self.activation_fn == "silu",
+                act_gelu = self.activation_fn == "gelu",
+                act_relu2 = self.activation_fn == "relu2",
+                up = up0.inner.bc,
+                down = down0.inner.bc,
+                act_limit = 0.0,
+                hidden_size = self.hidden_size,
+                out_size = self.out_size,
+            )
 
 
     @override
@@ -186,6 +233,8 @@ class MLP(Module):
         super().unload()
         self.alpha_p = None
         self.alpha_n = None
+        self.bc = None
+        self.bsz1_pa_args = []
 
 
     def act_xielu_torch(self, x):
@@ -212,6 +261,19 @@ class MLP(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+
+        # Fused C++ path for single-token decode, replayed through an internal CUDA graph from
+        # the third invocation on
+        bsz, q_len, _ = x.shape
+        if (
+            self.bc is not None and bsz == 1 and q_len == 1 and
+            x.dtype == torch.float16 and x.is_contiguous()
+        ):
+            d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
+            self.bc.run_bsz1(x, d)
+            if self.tp_reduce:
+                params["backend"].all_reduce(d)
+            return to2(d, out_dtype, self.out_dtype)
 
         qs = params.get("q_mlp_slice")
         r = [qs] if qs is not None else range(0, self.num_slices)
@@ -274,7 +336,7 @@ class MLP(Module):
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
             recons_temp = recons,
-            channels_to_split = self.num_slices if slice else self.intermediate_size // 128,
+            channels_to_split = self.num_slices if slice else self.ups[0].out_features // 128,
             limit_key = "mlp"
         )
         return [tpa]
@@ -361,6 +423,8 @@ class MLP(Module):
         module.alpha_n = consumer.recv(exported["alpha_n"], cuda = False)
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+        if module.num_slices == 1:
+            module.load_local(device)
         torch.cuda.synchronize()
         return module
 
@@ -561,38 +625,57 @@ class GatedMLP(Module):
     def load_local(self, device: torch.Device, load_slice: int, **kwargs):
         # Test if gate and up proj can be fused
         if (
+            not self.config.infer_params.no_reconstruct and
             device != torch.device("cpu") and
             self.gates[load_slice].quant_type == "exl3" and
             self.ups[load_slice].quant_type == "exl3" and
             self.gates[load_slice].out_features == self.ups[load_slice].out_features and
             self.gates[load_slice].inner.K == self.ups[load_slice].inner.K and
             self.gates[load_slice].inner.bias is None and
-            self.ups[load_slice].inner.bias is None
+            self.ups[load_slice].inner.bias is None and
+            self.config.infer_params.use_mgemm(
+                self.gates[load_slice].inner.K,
+                self.gates[load_slice].out_features,
+                self.gates[load_slice].inner.mul1 and self.ups[load_slice].inner.mul1,
+            )
         ):
             self.multi_gu[load_slice] = MultiLinear(self.device, [self.gates[load_slice], self.ups[load_slice]])
 
+        # Graphed bsz-1 path: fused gate+up mgemm when available, otherwise two separate GEMV
+        # calls (the unfused configuration the int8-activation GEMV mode prefers)
         self.bc = None
-        if self.num_slices == 1 and self.multi_gu[0] is not None and self.downs[0].inner.bc is not None:
+        if self.num_slices == 1 and self.downs[0].inner.bc is not None:
             mgu = self.multi_gu[0]
-            self.bsz1_pa_args = [
-                (device, (2, 1, self.hidden_size), self.interm_dtype, "gu"),
-                (device, (2, 1, mgu.out_features), self.interm_dtype, "a1"),
-                (device, (1, 1, 1, mgu.out_features), torch.half, "a2")
-            ]
-            self.bc = ext.BC_GatedMLP(
-                *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
-                mgu.ptrs_trellis,
-                mgu.ptrs_suh,
-                mgu.ptrs_svh,
-                mgu.K,
-                mgu.mcg,
-                mgu.mul1,
-                self.activation_fn == "silu",
-                self.activation_fn == "gelu",
-                self.activation_fn == "relu2",
-                self.downs[0].inner.bc,
-                self.act_limit,
+            g0, u0 = self.gates[0], self.ups[0]
+            can_separate = (
+                mgu is None and
+                g0.quant_type == "exl3" and g0.inner.bc is not None and
+                u0.quant_type == "exl3" and u0.inner.bc is not None and
+                g0.out_features == u0.out_features
             )
+            if mgu is not None or can_separate:
+                out_f = mgu.out_features if mgu is not None else g0.out_features
+                self.bsz1_pa_args = [
+                    (device, (2, 1, self.hidden_size), self.interm_dtype, "gu"),
+                    (device, (2, 1, out_f), self.interm_dtype, "a1"),
+                    (device, (1, 1, 1, out_f), torch.half, "a2")
+                ]
+                self.bc = ext.BC_GatedMLP(
+                    *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
+                    mgu.ptrs_trellis if mgu is not None else None,
+                    mgu.ptrs_suh if mgu is not None else None,
+                    mgu.ptrs_svh if mgu is not None else None,
+                    mgu.K if mgu is not None else 0,
+                    bool(mgu.mcg) if mgu is not None else False,
+                    bool(mgu.mul1) if mgu is not None else False,
+                    self.activation_fn == "silu",
+                    self.activation_fn == "gelu",
+                    self.activation_fn == "relu2",
+                    g0.inner.bc if mgu is None else None,
+                    u0.inner.bc if mgu is None else None,
+                    self.downs[0].inner.bc,
+                    self.act_limit,
+                )
 
 
     @override
@@ -631,7 +714,12 @@ class GatedMLP(Module):
 
             for s in r:
 
-                if self.multi_gu[s] is None or bsz * q_len > 32:
+                if self.bc is not None and bsz == 1 and q_len == 1:
+                    d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
+                    x = x.view(1, bsz * q_len, dim)
+                    self.bc.run_bsz1(x, d.view(x.shape))
+
+                elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
@@ -641,11 +729,6 @@ class GatedMLP(Module):
                     if d is None: d = d_
                     else: d += d_
                     del d_
-
-                elif self.bc is not None and bsz == 1 and q_len == 1:
-                    d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
-                    x = x.view(1, bsz * q_len, dim)
-                    self.bc.run_bsz1(x, d.view(x.shape))
 
                 else:
                     x = x.view(1, bsz * q_len, dim)
@@ -710,7 +793,7 @@ class GatedMLP(Module):
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
             recons_temp = recons,
-            channels_to_split = self.num_slices if slice else self.intermediate_size // 128,
+            channels_to_split = self.num_slices if slice else self.ups[0].out_features // 128,
             limit_key = "mlp"
         )
         return [tpa]

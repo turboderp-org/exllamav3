@@ -300,7 +300,6 @@ class Step3_5Model(Model):
         self.recurrent_state_cls = None
         if not self.swa_full:
             self.caps.update({
-                "supports_tp": False,
                 "recurrent_states": True,
                 "default_recurrent_checkpoint_interval": 6144,
             })

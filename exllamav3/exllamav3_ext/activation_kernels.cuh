@@ -87,6 +87,18 @@ __device__ __forceinline__ half2 _relu2(half2 x)
 }
 
 
+__device__ __forceinline__ float _relu(float x)
+{
+    return fmaxf(0.0f, x);
+}
+
+
+__device__ __forceinline__ half2 _relu(half2 x)
+{
+    return __hmax2(x, __float2half2_rn(0.0f));
+}
+
+
 __device__ __forceinline__ float _xielu(float x, float alpha_p, float alpha_n)
 {
     const float eps = -9.9838e-07;  // -1e-6 with BF16 rounding error
@@ -100,6 +112,20 @@ __device__ __forceinline__ float _xielu(float x, float alpha_p, float alpha_n)
 __device__ __forceinline__ float _sigmoid_fast_exp(float x)
 {
     return 1.0f / (1.0f + __expf(-x));
+}
+
+
+// gpt-oss clamped swiglu: gate clamped from above only, up clamped symmetrically, both before
+// the activation, alpha = 1.702 inside the sigmoid and +1 on the up path
+__device__ __forceinline__ float _oai_swiglu(float g, float u, const float limit)
+{
+    if (limit != 0.0f)
+    {
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+    }
+    float glu = g * _sigmoid_fast_exp(1.702f * g);
+    return (u + 1.0f) * glu;
 }
 
 
@@ -130,12 +156,24 @@ void act_mul_kernel_h
     half2 x2 = ((const half2*) x)[idx];
     half2 y2 = ((const half2*) y)[idx];
 
+    if constexpr (activation_type == ACT_SILU_OAI)
+    {
+        float2 xf = __half22float2(x2);
+        float2 yf = __half22float2(y2);
+        xf.x = _oai_swiglu(xf.x, yf.x, act_limit);
+        xf.y = _oai_swiglu(xf.y, yf.y, act_limit);
+        ((half2*) z)[idx] = __float22half2_rn(xf);
+        return;
+    }
+
     if constexpr (activation_type == ACT_SILU)
         x2 = _silu(x2);
     else if constexpr (activation_type == ACT_GELU)
         x2 = _gelu(x2);
     else if constexpr (activation_type == ACT_RELU2)
         x2 = _relu2(x2);
+    else if constexpr (activation_type == ACT_RELU)
+        x2 = _relu(x2);
 
     if (act_limit != 0.0f)
     {
@@ -165,6 +203,16 @@ void act_mul_kernel_f
     float2 x2 = ((const float2*) x)[idx];
     float2 y2 = ((const float2*) y)[idx];
 
+    if constexpr (activation_type == ACT_SILU_OAI)
+    {
+        x2.x = _oai_swiglu(x2.x, y2.x, act_limit);
+        x2.y = _oai_swiglu(x2.y, y2.y, act_limit);
+        half2 r = __float22half2_rn(x2);
+        r = clamp_half2_to_finite(r);
+        ((half2*) z)[idx] = r;
+        return;
+    }
+
     if constexpr (activation_type == ACT_SILU)
     {
         x2.x = _silu(x2.x);
@@ -179,6 +227,11 @@ void act_mul_kernel_f
     {
         x2.x = _relu2(x2.x);
         x2.y = _relu2(x2.y);
+    }
+    else if constexpr (activation_type == ACT_RELU)
+    {
+        x2.x = _relu(x2.x);
+        x2.y = _relu(x2.y);
     }
 
     if (act_limit != 0.0f)

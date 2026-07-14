@@ -233,7 +233,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description = "Run MMLU evaluation")
+    parser = argparse.ArgumentParser(description = "Run MMLU evaluation", allow_abbrev = False)
     model_init.add_args(
         parser,
         default_autosplit_max_batch_size = 16,

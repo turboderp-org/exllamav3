@@ -1,6 +1,13 @@
 import torch
 import torch.nn.functional as F
 from ...util.tensor import get_for_device, buffered_arange
+from ...ext import exllamav3_ext as ext
+
+# Above this length the triton kernel splits into separate output/state kernels and its launch
+# overhead is amortized anyway; the CUDA kernel keeps the conv window in registers per thread
+# so it only makes sense for short sequences (decode and SD verification steps)
+MAX_CUDA_SEQLEN = 32
+MAX_CUDA_K = 16
 
 try:
     import triton
@@ -29,9 +36,8 @@ def _causal_conv1d_update_slotted_kernel(
     weight,
     bias,
     out,
-    bsz: tl.constexpr,
     dim: tl.constexpr,
-    seq_len: tl.constexpr,
+    seq_len,             # runtime: chunk length varies per job; only masks and address math
     state_size: tl.constexpr,
     conv_kernel_size: tl.constexpr,
     history: tl.constexpr,
@@ -130,9 +136,8 @@ def _causal_conv1d_update_slotted_output_kernel(
     weight,
     bias,
     out,
-    bsz: tl.constexpr,
     dim: tl.constexpr,
-    seq_len: tl.constexpr,
+    seq_len,             # runtime: chunk length varies per job; only masks and address math
     state_size: tl.constexpr,
     conv_kernel_size: tl.constexpr,
     has_bias: tl.constexpr,
@@ -198,9 +203,8 @@ def _causal_conv1d_update_slotted_state_kernel(
     x,
     conv_state,
     slots,
-    bsz: tl.constexpr,
     dim: tl.constexpr,
-    seq_len: tl.constexpr,
+    seq_len,             # runtime: chunk length varies per job; only masks and address math
     state_size: tl.constexpr,
     conv_kernel_size: tl.constexpr,
     history: tl.constexpr,
@@ -298,7 +302,6 @@ def causal_conv1d_update_slotted_triton(
                 weight,
                 bias if bias is not None else weight,
                 out,
-                bsz,
                 dim,
                 seq_len,
                 state_size,
@@ -322,7 +325,6 @@ def causal_conv1d_update_slotted_triton(
                 weight,
                 bias if bias is not None else weight,
                 out,
-                bsz,
                 dim,
                 seq_len,
                 state_size,
@@ -339,7 +341,6 @@ def causal_conv1d_update_slotted_triton(
                 x,
                 conv_state,
                 slots,
-                bsz,
                 dim,
                 seq_len,
                 state_size,
@@ -395,6 +396,28 @@ def causal_conv1d_update(
         dummy_slots = True
     else:
         dummy_slots = False
+
+    if (
+        mixed_qkv.is_cuda and
+        seqlen <= MAX_CUDA_SEQLEN and
+        conv1d_weight.shape[-1] <= MAX_CUDA_K and
+        mixed_qkv.dtype == torch.bfloat16 and
+        conv_state.dtype == torch.bfloat16 and
+        conv1d_weight.dtype == torch.bfloat16 and
+        (conv1d_bias is None or conv1d_bias.dtype == torch.bfloat16)
+    ):
+        out = torch.empty((bsz, seqlen, dim), dtype = torch.bfloat16, device = mixed_qkv.device)
+        ext.cuda_causal_conv1d_update(
+            mixed_qkv,
+            conv_state,
+            None if dummy_slots else recurrent_slots,
+            conv1d_weight,
+            conv1d_bias,
+            out,
+            True,
+            history,
+        )
+        return out
 
     if has_triton:
         if dummy_slots:

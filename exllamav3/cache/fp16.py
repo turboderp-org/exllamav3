@@ -3,6 +3,7 @@ from typing_extensions import override
 import torch
 from ..constants import PAGE_SIZE
 from .cache import CacheLayer
+from exllamav3.ext import exllamav3_ext as ext
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..modules import Attention
@@ -52,11 +53,6 @@ class CacheLayer_fp16(CacheLayer):
 
 
     @override
-    def get_kv_alloc_placeholder(self):
-        return None
-
-
-    @override
     def update_kv(
         self,
         cache_seqlens: torch.Tensor,
@@ -66,6 +62,18 @@ class CacheLayer_fp16(CacheLayer):
         length: int
     ):
         pass
+
+
+    @override
+    def update_kv_direct(
+        self,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        length: int
+    ):
+        ext.paged_kv_cache_update(k, v, self.k, self.v, block_table, cache_seqlens)
 
 
     @override

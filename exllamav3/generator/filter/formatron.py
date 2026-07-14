@@ -3,6 +3,23 @@ from ...tokenizer import Tokenizer
 import torch
 from functools import lru_cache
 
+# formatron (unmaintained, see github.com/Dan-wanna-M/formatron/issues/35) references names
+# through pydantic.typing which pydantic 2.12 removed: typing.Type in annotations (an import
+# error on Python <= 3.13, deferred on 3.14) and typing.get_args/get_origin at runtime in its
+# json_schema module. Before 2.12 these were deprecation redirects to the stdlib typing module,
+# so restoring them as plain aliases reproduces exactly what formatron was written against. The
+# names are set only if absent, and only reachable through pydantic.typing, which is itself a
+# deprecated compatibility module
+try:
+    import typing as _typing
+    import pydantic.typing as _pydantic_typing
+    for _name in ("Any", "Literal", "Mapping", "Type", "Union", "get_args", "get_origin"):
+        if _name not in vars(_pydantic_typing):
+            setattr(_pydantic_typing, _name, getattr(_typing, _name))
+    del _typing, _pydantic_typing, _name
+except Exception:
+    pass
+
 try:
     import kbnf
     from formatron.integrations.utils import get_original_characters, default_mask_logits_fn, get_bit_mask
@@ -13,6 +30,15 @@ except ModuleNotFoundError:
     formatron_available = False
 except ImportError:
     formatron_available = False
+except Exception:
+    formatron_available = False
+    try:
+        import kbnf
+    except Exception:
+        kbnf = None
+    FormatterBuilder = None
+    EngineGenerationConfig = None
+    get_original_characters = default_mask_logits_fn = get_bit_mask = None
 
 
 @lru_cache(10)

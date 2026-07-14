@@ -39,7 +39,7 @@ void BC_LinearEXL3::run_gr(const at::Tensor& x, at::Tensor& y, Graph* graph)
     }
     else
     {
-        TORCH_CHECK(!graph, "BC_LinearEXL3 invoked with graph and bsz > 1");
+        TORCH_CHECK(!graph || graph->disabled, "BC_LinearEXL3 invoked with graph and bsz > 1");
         at::Tensor xh_ = at::empty_like(x);
         exl3_gemm(x, trellis, y, suh, xh_, svh, -1, mcg, mul1, 0);
     }

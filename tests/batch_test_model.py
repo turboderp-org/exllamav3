@@ -193,7 +193,7 @@ def main(args) -> int:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("batch", type = Path, help = "YAML batch spec")
     parser.add_argument("-o", "--output_dir", type = Path, default = Path("test_model_runs"), help = "Directory for logs and combined results")
     parser.add_argument("--python", type = str, default = sys.executable, help = "Python executable to use")

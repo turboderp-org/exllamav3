@@ -75,7 +75,7 @@ def main(args):
     print(f" -- Done")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-d", "--dataspec", type = str, help = "Data specification (JSON file)")
     parser.add_argument("-dev", "--device", type = int, help = "CUDA device index", default = 0)

@@ -1,19 +1,39 @@
 #pragma once
 
 #include <ATen/Tensor.h>
+#include "../graph.cuh"
 
 void quant_cache_cont
 (
     const at::Tensor& in,
     const at::Tensor& out,
-    const at::Tensor& out_scales
+    const at::Tensor& out_scales,
+    float compand_a
 );
 
 void dequant_cache_cont
 (
     const at::Tensor& in,
     const at::Tensor& in_scales,
-    const at::Tensor& out
+    const at::Tensor& out,
+    float compand_a
+);
+
+void quant_cache_paged_gr
+(
+    const at::Tensor& k_in,
+    const at::Tensor& k_out,
+    const at::Tensor& k_out_scales,
+    const at::Tensor& v_in,
+    const at::Tensor& v_out,
+    const at::Tensor& v_out_scales,
+    const at::Tensor& cache_seqlens,
+    const at::Tensor& block_table,
+    int page_size,
+    int seq_len,
+    float compand_a,
+    bool in_contiguous,
+    Graph* graph
 );
 
 void quant_cache_paged
@@ -27,7 +47,9 @@ void quant_cache_paged
     const at::Tensor& cache_seqlens,
     const at::Tensor& block_table,
     int page_size,
-    int seq_len
+    int seq_len,
+    float compand_a,
+    bool in_contiguous
 );
 
 void dequant_cache_paged
@@ -41,5 +63,6 @@ void dequant_cache_paged
     const at::Tensor& cache_seqlens,
     const at::Tensor& block_table,
     int page_size,
-    int sliding_window
+    int sliding_window,
+    float compand_a
 );
