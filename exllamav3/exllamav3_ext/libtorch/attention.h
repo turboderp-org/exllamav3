@@ -60,8 +60,11 @@ struct BC_Attention
     // Output gate: 0 = none, 2 = full (o *= sigmoid(g), g from its own projection or the fused
     // q+g mgemm), 3 = interleaved (q_proj emits q/g interleaved per head). Headwise (1) is not
     // supported: its fp16 gate projection runs through cublas, which has no patchable sites
+    // (the full-gate cublas path works because x is staged through a static, so the captured
+    // node's operands never change)
     int gate_mode;
     std::shared_ptr<BC_LinearEXL3> g_proj;
+    c10::optional<at::Tensor> g_weight;   // unquantized full gate: fp16 (hidden, qh*hd)
     c10::optional<at::Tensor> qg_ptrs_trellis;
     c10::optional<at::Tensor> qg_ptrs_suh;
     c10::optional<at::Tensor> qg_ptrs_svh;
@@ -117,8 +120,9 @@ struct BC_Attention
 
         // Static intermediates (python tensor cache) and precomputed views. gate_a/gate_b by
         // gate mode: full = qg (2, R, qh*hd) with q aliasing qg[0]; interleaved = qg_i
-        // (R, 2*qh*hd) staging + g (R, qh*hd). xp/yp: zero-padded input staging and padded
-        // o_proj output, only when hidden_size_padded > hidden_size
+        // (R, 2*qh*hd) staging + g (R, qh*hd). xp: input staging, present when the hidden dim
+        // is padded or the gate projection is fp16 (the cublas node needs a static input).
+        // yp: padded o_proj output, only when hidden_size_padded > hidden_size
         at::Tensor q, kv, o, partial_o, partial_ml, gate_a, gate_b, xp, yp;
         at::Tensor q2, q4, k4, v4, o2, o4, qg2, g2;
 
@@ -151,6 +155,7 @@ struct BC_Attention
         bool use_k_as_v,
         int gate_mode,
         std::shared_ptr<BC_LinearEXL3> g_proj,
+        c10::optional<at::Tensor> g_weight,
         c10::optional<at::Tensor> qg_ptrs_trellis,
         c10::optional<at::Tensor> qg_ptrs_suh,
         c10::optional<at::Tensor> qg_ptrs_svh,

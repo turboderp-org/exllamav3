@@ -72,6 +72,17 @@ class BCAttn:
     def _has_bc(proj):
         return proj is not None and proj.quant_type == "exl3" and proj.inner.bc is not None
 
+    @staticmethod
+    def _fp16_gate_weight(proj):
+        """Weight of an unquantized full-gate projection the graph can run through cublas
+        (input staged through a static, so the captured node needs no patching), or None."""
+        if proj is None or proj.quant_type != "fp16":
+            return None
+        w = proj.inner.weight
+        if w.dtype != torch.half or not w.is_contiguous() or proj.inner.bias is not None:
+            return None
+        return w
+
     def __init__(self, module, cache_k, cache_v, k_scales = None, v_scales = None,
                  k_bits = 0, v_bits = 0):
         self.module = module
@@ -118,6 +129,12 @@ class BCAttn:
         else:
             self.gate_mode = 0
 
+        # Unquantized full gate (older quants store g_proj in fp16): runs as a captured cublas
+        # gemm over the statically staged input instead of an exl3 kernel
+        self.g_weight = None
+        if self.gate_mode == 2 and mqg is None and not self._has_bc(module.g_proj):
+            self.g_weight = self._fp16_gate_weight(module.g_proj)
+
         self.bc = ext.BC_Attention(
             num_q_heads = self.num_q_heads,
             num_kv_heads = self.num_kv_heads,
@@ -138,6 +155,7 @@ class BCAttn:
             use_k_as_v = self.use_k_as_v,
             gate_mode = self.gate_mode,
             g_proj = module.g_proj.inner.bc if (self.gate_mode == 2 and self._has_bc(module.g_proj)) else None,
+            g_weight = self.g_weight,
             qg_ptrs_trellis = mqg.ptrs_trellis if mqg is not None else None,
             qg_ptrs_suh = mqg.ptrs_suh if mqg is not None else None,
             qg_ptrs_svh = mqg.ptrs_svh if mqg is not None else None,
@@ -267,12 +285,14 @@ class BCAttn:
 
         # Padded hidden dim: zero-padded input staging and padded o_proj output. The pad columns
         # of xp are zeroed here and never written afterwards (the graph copies only the exact
-        # hidden width into it)
+        # hidden width into it). An fp16 gate also stages the input (static operand for the
+        # captured cublas node), without the padded output
         xp, yp = None, None
-        if self.hidden_padded != self.hidden_size:
+        if self.hidden_padded != self.hidden_size or self.g_weight is not None:
             xp = g_tensor_cache.get(dev, (R, self.hidden_padded), torch.half, "bca_xp")
-            yp = g_tensor_cache.get(dev, (R, self.hidden_padded), self.o_dtype or torch.half, "bca_yp")
             xp.zero_()
+        if self.hidden_padded != self.hidden_size:
+            yp = g_tensor_cache.get(dev, (R, self.hidden_padded), self.o_dtype or torch.half, "bca_yp")
 
         self.bc.configure_slot(
             bsz, q_len,
@@ -322,7 +342,8 @@ def _module_eligible(m):
         not getattr(m, "ve_gate", False) and
         (not getattr(m, "interleaved_gate", False) or m.head_dim % 8 == 0) and
         (not m.full_gate or m.g_proj is None or m.multi_qg is not None or
-            (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None)) and
+            (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None) or
+            BCAttn._fp16_gate_weight(m.g_proj) is not None) and
         (m.v_norm is None or (type(m.v_norm).__name__ == "RMSNorm" and not m.v_norm.span_heads)) and
         not m.tp_reduce and not m.has_split_cache and not getattr(m, "tp_span_heads_norm", False) and
         (m.q_norm is None or m.q_norm_tensor is not None) and
