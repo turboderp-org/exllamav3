@@ -59,18 +59,23 @@ static void hgemm_gemmex_impl
     void* ws = DevCtx::instance().get_ws(device);
     cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
 
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
     cudaDataType_t c_type = output_fp32 ? CUDA_R_32F : CUDA_R_16F;
+    float alpha_f = 1.0f;
+    float beta_f = 0.0f;
+    half alpha_h = __float2half(1.0f);
+    half beta_h = __float2half(0.0f);
+    const void* alpha = output_fp16 ? (const void*) &alpha_h : (const void*) &alpha_f;
+    const void* beta = output_fp16 ? (const void*) &beta_h : (const void*) &beta_f;
+    auto compute_type = output_fp16 ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F;
     auto r = cublasGemmEx
     (
         cublas_handle,
         CUBLAS_OP_N, CUBLAS_OP_N,
         size_n, size_m, size_k,
-        &alpha_, b_ptr, CUDA_R_16F, size_n,
-                 a_ptr, CUDA_R_16F, size_k,
-        &beta_,  c.data_ptr(), c_type, (int) c_stride_m,
-        CUBLAS_COMPUTE_32F,
+        alpha, b_ptr, CUDA_R_16F, size_n,
+               a_ptr, CUDA_R_16F, size_k,
+        beta,  c.data_ptr(), c_type, (int) c_stride_m,
+        compute_type,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );
     cublas_check(r);

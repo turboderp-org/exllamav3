@@ -20,4 +20,10 @@ EXL3_MOE_DECLARE_GETTERS(8);
 
 #undef EXL3_MOE_DECLARE_GETTERS
 
+// Accuracy-first A1 specialization for the fixed GLM-5.2 TR3 bitrate. The
+// legacy instance table above remains unchanged for the default entrypoints.
+fp_exl3_moe_kernel exl3_moe_retile_kernel_k3_n128();
+fp_exl3_moe_kernel exl3_moe_retile_kernel_k3_n256();
+
 extern fp_exl3_moe_kernel exl3_moe_kernel_instances[];
+extern fp_exl3_moe_kernel exl3_moe_retile_kernel_instances[];

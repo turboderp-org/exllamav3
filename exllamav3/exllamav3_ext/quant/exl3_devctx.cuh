@@ -8,6 +8,13 @@
 #define MAX_BARRIERS 1024
 #define BARRIER_LOCKS_OFFSET MAX_TILES_C
 
+// MoE expert scheduler state, after the barrier counters: [0] next ticket,
+// [1] retired groups, [2 + group] ticket published to group. The state is
+// self-resetting and is zero-initialized with the rest of the lock buffer.
+#define MOE_MAX_GROUPS 64
+#define MOE_SCHED_OFFSET (MAX_TILES_C + 2 * MAX_BARRIERS)
+#define MOE_SCHED_INTS (2 + MOE_MAX_GROUPS)
+
 // Workspace size
 #define WORKSPACE_SIZE (16*1024*1024)
 
