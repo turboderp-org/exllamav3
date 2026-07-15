@@ -426,7 +426,7 @@ def format_dataset_subtitle(spec: dict) -> str:
     length = spec.get("display_eval_len", spec["eval_len"] - wut)
     st = f"{dataset_name}, {rows} × {length} tokens"
     if wut:
-        spec += f", {wut} token warmup"
+        st += f", {wut} token warmup"
     if spec.get("chat_template"):
         st += ", formatted"
     return st
