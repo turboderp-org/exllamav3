@@ -98,6 +98,7 @@ def add_args(
         parser.add_argument("-dm", "--draft_model_dir", type = str, help = "Path to draft model directory", default = None)
         parser.add_argument("-ndt", "--num_draft_tokens", type = int, help = "Number of draft tokens (default: draft model default, else 4)", default = None)
         parser.add_argument("-mtp", "--mtp", action = "store_true", help = "Use MTP drafting")
+        parser.add_argument("-ngram", "--ngram_match_min", type = int, help = "N-gram draft minimum match length, default = 0 (disabled)", default = 0)
 
 
 def get_arg_sampler(args):
@@ -222,7 +223,8 @@ def init(
     max_history = max(
         min_draft_len or 0,
         draft_model.caps.get("default_draft_size", 4) if draft_model else 0,
-        vars(args).get("num_draft_tokens") or 0
+        vars(args).get("num_draft_tokens") or 0,
+        4 if (vars(args).get("ngram_match_min") and not vars(args).get("num_draft_tokens")) else 0,
     )
     if "cache_size" in vars(args):
         if args.cache_quant is not None:
