@@ -104,6 +104,10 @@ void pg_broadcast_kernel
         {
             produce_next_stage();
             local_stage++;
+
+            // All warps must finish staging before thread 0 publishes the counter; the release store only
+            // orders the issuing thread's own prior writes
+            __syncthreads();
             stg_release_sys_u32(broadcast_stages_ptr + this_device, local_stage);
 
             // Wait for all consumers to be at most NUM_BROADCAST_STAGES - 2 behind. After last stage, wait for

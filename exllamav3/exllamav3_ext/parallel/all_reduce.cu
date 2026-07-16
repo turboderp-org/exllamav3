@@ -155,10 +155,12 @@ void pg_all_reduce_kernel
                         // Advance
                         stage_recv++;
                     }
+
+                    // All warps must finish reading their slots before thread 0 frees them for the producer
+                    __syncthreads();
+
                     if (t == 0)
                     {
-                        // __threadfence_system();
-                        // __syncthreads();
                         stg_release_sys_u32(ctx->reduce_stage_consumed + this_rank, stage_recv);
                     }
                 }
@@ -192,9 +194,12 @@ void pg_all_reduce_kernel
                         stage_send++;
                     }
 
+                    // All warps must finish staging before thread 0 publishes the counter; the release store only
+                    // orders thread 0's own prior writes
+                    __syncthreads();
+
                     if (t == 0)
                     {
-                        // __threadfence_system();
                         stg_release_sys_u32(ctx->reduce_stage_produced + this_rank, stage_send);
                     }
                 }
