@@ -7,6 +7,7 @@ from ..constants import PAGE_SIZE
 import numpy as np
 from .pagetable import Sequence, tensor_hash_checksum, random_hash
 from .filter import Filter
+import math
 import random
 import time
 from ..ext import exllamav3_ext as ext
@@ -257,6 +258,9 @@ class Job:
         self.time_generate = rq_state.get("time_generate", 0.0)
         self.accepted_draft_tokens = 0
         self.rejected_draft_tokens = 0
+        self.draft_ema = rq_state.get("draft_ema")
+        self.draft_skip_count = 0
+        self.draft_stats = []
         self.cached_pages = 0
         self.cached_tokens = 0
         self.is_finished = False
@@ -887,7 +891,8 @@ class Job:
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
             "rq_new_tokens": self.new_tokens - 1,
-            "sam": self.sam
+            "sam": self.sam,
+            "draft_ema": self.draft_ema,
         }
 
         serial_number = self.serial_number
@@ -1387,6 +1392,40 @@ class Job:
             self.recurrent_state = None
 
 
+    def draft_target(self, max_tokens: int, skip_ema: float = 0.0, probe_interval: int = 16) -> int:
+        """
+        Number of draft tokens this job wants for the next verification window, based on recent acceptance.
+        Optimistic before any window has been measured. With a skip threshold, an EMA below it requests no
+        drafting at all (0), except for a small probe window every probe_interval rounds — skipped rounds
+        produce no acceptance signal, so the probe is the only way the average can recover.
+        """
+        if self.draft_ema is None:
+            return max_tokens
+        if skip_ema > 0.0 and self.draft_ema < skip_ema:
+            self.draft_skip_count += 1
+            if self.draft_skip_count < probe_interval:
+                return 0
+            self.draft_skip_count = 0
+            return min(2, max_tokens)
+        self.draft_skip_count = 0
+        return max(1, min(max_tokens, math.ceil(self.draft_ema)))
+
+
+    def update_draft_ema(self, accepted: int, window: int, alpha_up: float, alpha_down: float):
+        """
+        Update the moving average of accepted draft tokens. Acceptance is censored by the window size, so a fully
+        accepted window counts as one more than observed, letting the window grow again while the output stays
+        predictable. Asymmetric weights let the window climb into a predictable stretch faster than it decays on
+        isolated rejections.
+        """
+        a = accepted + 1 if accepted >= window else accepted
+        if self.draft_ema is None:
+            self.draft_ema = float(a)
+        else:
+            alpha = alpha_up if a > self.draft_ema else alpha_down
+            self.draft_ema = alpha * a + (1.0 - alpha) * self.draft_ema
+
+
     def get_ngram_draft(self, draft_length: int):
         """
         Return speculative draft tokens from the suffix-array n-gram matcher.
@@ -1399,7 +1438,7 @@ class Job:
 
         # Grab continuation after longest match or return empty seq
         if end - beg >= self.generator.ngram_match_min:
-            draft = seq[:, end : end + self.generator.num_draft_tokens]
+            draft = seq[:, end : end + draft_length]
         else:
             draft = torch.empty((1, 0), dtype = torch.long)
 

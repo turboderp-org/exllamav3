@@ -36,6 +36,12 @@ class Generator:
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
         ngram_match_min: int = 0,
+        dynamic_draft_tokens: bool = False,
+        dynamic_draft_alpha_up: float = 1.30,
+        dynamic_draft_alpha_down: float = 0.65,
+        dynamic_draft_skip_ema: float = 0.3,
+        dynamic_draft_probe_interval: int = 16,
+        record_draft_stats: bool = False,
         **kwargs
     ):
         """
@@ -76,6 +82,33 @@ class Generator:
 
         :param ngram_match_min:
             Minimum number of tokens to match for n-gram draft (0 = disabled).
+
+        :param dynamic_draft_tokens:
+            Adapt the per-round draft length to the workload: each job tracks an exponential moving average of
+            accepted draft tokens per verification window, and the next window is sized just above it (bounded by
+            [1, num_draft_tokens], so num_draft_tokens acts as the ceiling). A fully accepted window counts as one
+            more than observed, since acceptance is censored by the window size; this lets the window grow again
+            when the output becomes predictable. Applies to draft-model, MTP and n-gram drafting; DFlash drafts
+            in fixed blocks and is unaffected.
+
+        :param dynamic_draft_alpha_up:
+            EMA weight of the most recent verification window when it raises the average. Asymmetric with
+            alpha_down so the window grows quickly into a predictable stretch but survives isolated rejections.
+
+        :param dynamic_draft_alpha_down:
+            EMA weight of the most recent verification window when it lowers the average.
+
+        :param dynamic_draft_skip_ema:
+            If > 0, skip drafting entirely for a job while its EMA is below this threshold, eliminating draft
+            overhead through unpredictable stretches. Since no drafts means no acceptance signal, a small probe
+            window is drafted every dynamic_draft_probe_interval rounds to allow recovery. 0 disables (window
+            floor stays at 1).
+
+        :param dynamic_draft_probe_interval:
+            Maximum number of rounds (= tokens, when not drafting) between probe windows while skipping.
+
+        :param record_draft_stats:
+            Append (position, window, accepted, ema) per verification round to job.draft_stats, for analysis.
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
@@ -130,6 +163,13 @@ class Generator:
             self.num_draft_tokens = 0
 
         self.ngram_match_min = ngram_match_min
+        is_dflash = draft_model is not None and draft_model.caps.get("dflash_draft", False)
+        self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0 and not is_dflash
+        self.dynamic_draft_alpha_up = dynamic_draft_alpha_up
+        self.dynamic_draft_alpha_down = dynamic_draft_alpha_down
+        self.dynamic_draft_skip_ema = dynamic_draft_skip_ema
+        self.dynamic_draft_probe_interval = dynamic_draft_probe_interval
+        self.record_draft_stats = record_draft_stats
         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
 
         # Chunking/partitioning
@@ -399,6 +439,24 @@ class Generator:
         self.visualizer.update(chains, usage)
 
 
+    def draft_window(self):
+        """
+        Number of tokens to draft this round. The verification batch shares one width, so take the largest target
+        among participating jobs; jobs wanting shorter windows just reject earlier. 0 means skip drafting.
+        """
+        if not self.dynamic_draft:
+            return self.num_draft_tokens
+        w = 0
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            w = max(w, job.draft_target(
+                self.num_draft_tokens,
+                self.dynamic_draft_skip_ema,
+                self.dynamic_draft_probe_interval,
+            ))
+        return w
+
+
     def iterate_draftmodel_gen(self, results: list):
 
         # Get shape of active batch
@@ -442,8 +500,11 @@ class Generator:
         batch_ids = self.draft_input_ids_pinned[:batch_size, :]
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
 
-        # Greedy sample num_draft_tokens batched tokens
-        for idx in range(self.num_draft_tokens):
+        # Greedy sample batched draft tokens
+        window = self.draft_window()
+        if window == 0:
+            return None
+        for idx in range(window):
             batch_logits = self.draft_model.forward(
                 input_ids = batch_ids,
                 params = {
@@ -468,7 +529,7 @@ class Generator:
             }
         )
 
-        return self.draft_ids_pinned
+        return self.draft_ids_pinned[:, :window]
 
 
     def iterate_draftmodel_mtp_gen(self, results: list):
@@ -516,8 +577,11 @@ class Generator:
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
 
-        # Greedy sample num_draft_tokens batched tokens
-        for idx in range(self.num_draft_tokens):
+        # Greedy sample batched draft tokens
+        window = self.draft_window()
+        if window == 0:
+            return None
+        for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
                 "attn_mode": "flash_attn",
@@ -535,7 +599,7 @@ class Generator:
             temp_hidden = batch_state
 
 
-        return self.draft_ids_pinned
+        return self.draft_ids_pinned[:, :window]
 
 
     # TODO: Refactor, share code with other draft fns
@@ -612,11 +676,14 @@ class Generator:
             return None
 
         # Generate draft
+        window = self.draft_window()
+        if window == 0:
+            return None
         draft_ids = []
-        min_len = self.num_draft_tokens
+        min_len = window
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
-            d = job.get_ngram_draft(self.num_draft_tokens)
+            d = job.get_ngram_draft(window)
             min_len = min(min_len, d.shape[-1])
             draft_ids.append(d)
 
@@ -935,6 +1002,24 @@ class Generator:
                 # Make sure outgoing state is valid if entire draft was accepted
                 if batch_states and draft_tokens is not None and rejected == 0:
                     batch_states[j].rewind(0)
+
+                # Track the moving average of accepted draft tokens. Skip abandoned windows (banned-string
+                # rewind); checkpoint-boundary truncations are rare enough to count as ordinary rejections.
+                if draft_tokens is not None and rejected != -1:
+                    if self.dynamic_draft:
+                        job.update_draft_ema(
+                            accepted_length - 1,
+                            draft_tokens.shape[-1],
+                            self.dynamic_draft_alpha_up,
+                            self.dynamic_draft_alpha_down,
+                        )
+                    if self.record_draft_stats:
+                        job.draft_stats.append((
+                            job.new_tokens,
+                            draft_tokens.shape[-1],
+                            accepted_length - 1,
+                            job.draft_ema,
+                        ))
 
                 accepted_lengths.append(accepted_length)
                 j += 1
