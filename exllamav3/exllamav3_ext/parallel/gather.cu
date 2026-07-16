@@ -330,13 +330,14 @@ void pg_gather_small_kernel
 void pg_gather_small
 (
     uintptr_t ctx,
+    uintptr_t ctx_dev,
     std::vector<uintptr_t> devices,
     int this_device,
     int out_device,
     at::Tensor& tensor,
     c10::optional<at::Tensor>& out_tensor,
     std::vector<size_t> ldims,
-    uintptr_t shbuf,
+    uintptr_t shbuf_dev,
     size_t shbuf_size,
     at::Tensor& abort_flag
 )
@@ -347,7 +348,7 @@ void pg_gather_small
 
     uint8_t* data_ptr = (uint8_t*) tensor.data_ptr();
     uint8_t* out_data_ptr = (uint8_t*) OPTPTR(out_tensor);
-    uint8_t* shbuf_ptr = (uint8_t*) shbuf;
+    uint8_t* shbuf_ptr = (uint8_t*) shbuf_dev;
 
     size_t esize = tensor.element_size();
     size_t send_size = tensor.numel() * esize;
@@ -370,7 +371,7 @@ void pg_gather_small
     uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
     void* kernelArgs[] =
     {
-        (void*)& ctx,  // Shared, pinned
+        (void*)& ctx_dev,  // Shared, pinned (device alias)
         (void*)& device_mask,
         (void*)& this_device,
         (void*)& out_device,
@@ -402,13 +403,14 @@ void pg_gather_small
 void pg_gather
 (
     uintptr_t ctx,
+    uintptr_t ctx_dev,
     std::vector<uintptr_t> devices,
     int this_device,
     int out_device,
     at::Tensor& tensor,
     c10::optional<at::Tensor>& out_tensor,
     std::vector<size_t> ldims,
-    uintptr_t shbuf,
+    uintptr_t shbuf_dev,
     size_t shbuf_size,
     at::Tensor& abort_flag
 )
@@ -419,7 +421,7 @@ void pg_gather
 
     uint8_t* data_ptr = (uint8_t*) tensor.data_ptr();
     uint8_t* out_data_ptr = (uint8_t*) OPTPTR(out_tensor);
-    uint8_t* shbuf_ptr = (uint8_t*) shbuf;
+    uint8_t* shbuf_ptr = (uint8_t*) shbuf_dev;
 
     size_t esize = tensor.element_size();
     size_t send_size = tensor.numel() * esize;
@@ -447,7 +449,7 @@ void pg_gather
     uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
     void* kernelArgs[] =
     {
-        (void*)& ctx,  // Shared, pinned
+        (void*)& ctx_dev,  // Shared, pinned (device alias)
         (void*)& device_mask,
         (void*)& this_device,
         (void*)& out_device,

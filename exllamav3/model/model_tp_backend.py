@@ -2,7 +2,15 @@ import torch
 import torch.distributed as dist
 import time
 import numpy as np
-from .model_tp_cuda import cuda_host_register, cuda_host_unregister, CUDA_HOST_REGISTER_PORTABLE
+from .model_tp_cuda import (
+    cuda_host_register,
+    cuda_host_unregister,
+    cuda_host_get_device_pointer,
+    cuda_device_get_attribute,
+    CUDA_HOST_REGISTER_PORTABLE,
+    CUDA_HOST_REGISTER_MAPPED,
+    CUDA_DEV_ATTR_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM,
+)
 from ..ext import exllamav3_ext as ext
 from multiprocessing import shared_memory
 from ..util import log_tp
@@ -301,17 +309,40 @@ class TPBackendNative:
         self.ptr_r = self.tensor_r.data_ptr()
         self.ptr_s = self.tensor_s.data_ptr()
         self.ptr_ll = self.tensor_ll.data_ptr()
+        # Register the shared regions as pinned, mapped host memory and get the device-side aliases to pass to
+        # kernels. On Linux desktop the alias equals the host pointer, but under WDDM (native Windows, and
+        # potentially WSL2) the host pointer is not directly usable in kernels and the alias must be used instead.
+        # The CPU helper process keeps the host pointers; it never launches kernels.
+        self.dev_g = self.ptr_g
+        self.dev_b = self.ptr_b
+        self.dev_r = self.ptr_r
+        self.dev_s = self.ptr_s
+        self.dev_ll = self.ptr_ll
         if not self.cpu:
-            log_tp(device, f"Host register G")
-            cuda_host_register(self.ptr_g, self.tensor_g.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
-            log_tp(device, f"Host register B")
-            cuda_host_register(self.ptr_b, self.tensor_b.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
-            log_tp(device, f"Host register R")
-            cuda_host_register(self.ptr_r, self.tensor_r.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
-            log_tp(device, f"Host register S")
-            cuda_host_register(self.ptr_s, self.tensor_s.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
-            log_tp(device, f"Host register LL")
-            cuda_host_register(self.ptr_ll, self.tensor_ll.numel(), flags = CUDA_HOST_REGISTER_PORTABLE)
+            def register(name, ptr, nbytes):
+                log_tp(device, f"Host register {name}")
+                cuda_host_register(ptr, nbytes, flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED)
+                try:
+                    dev_ptr = cuda_host_get_device_pointer(ptr)
+                except RuntimeError as e:
+                    raise RuntimeError(
+                        f"Tensor-parallel shared buffer {name} ({nbytes} bytes) was pinned but could not be mapped "
+                        f"for GPU access. The native TP collectives require GPU-mappable shared host memory, which "
+                        f"this platform/driver does not provide for this region."
+                    ) from e
+                if dev_ptr != ptr:
+                    log_tp(device, f"Host register {name}: device alias {hex(dev_ptr)} != host ptr {hex(ptr)}")
+                return dev_ptr
+
+            if self.device >= 0:
+                attr = cuda_device_get_attribute(CUDA_DEV_ATTR_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM, self.device)
+                log_tp(device, f"canUseHostPointerForRegisteredMem = {attr}")
+
+            self.dev_g = register("G", self.ptr_g, self.tensor_g.numel())
+            self.dev_b = register("B", self.ptr_b, self.tensor_b.numel())
+            self.dev_r = register("R", self.ptr_r, self.tensor_r.numel())
+            self.dev_s = register("S", self.ptr_s, self.tensor_s.numel())
+            self.dev_ll = register("LL", self.ptr_ll, self.tensor_ll.numel())
 
         # Init global context
         if master:
@@ -355,29 +386,31 @@ class TPBackendNative:
 
 
     def fwd_barrier(self):
-        ext.pg_barrier(self.ptr_g, self.active_devices, self.device, self.abort_flag)
+        ext.pg_barrier(self.ptr_g, self.dev_g, self.active_devices, self.device, self.abort_flag)
 
 
     def broadcast(self, tensor: torch.Tensor, src_device: int):
         if tensor.numel() * tensor.element_size() <= 2048:
             ext.pg_broadcast_ll(
                 self.ptr_g,
+                self.dev_g,
                 self.active_devices,
                 self.device,
                 src_device,
                 tensor,
-                self.ptr_ll,
+                self.dev_ll,
                 SHBUF_SIZE_LL,
                 self.abort_flag
             )
         else:
             ext.pg_broadcast(
                 self.ptr_g,
+                self.dev_g,
                 self.active_devices,
                 self.device,
                 src_device,
                 tensor,
-                self.ptr_b,
+                self.dev_b,
                 self.shbuf_size,
                 self.abort_flag
             )
@@ -387,12 +420,13 @@ class TPBackendNative:
         # if tensor.numel() * 2 < MAX_CPU_REDUCE:
         ext.pg_all_reduce_cpu(
             self.ptr_g,
+            self.dev_g,
             self.active_devices,
             self.device,
             self.active_devices[0],
             tensor,
             contribution,
-            self.ptr_r,
+            self.dev_r,
             SHBUF_SIZE_R,
             self.master,
             self.abort_flag
@@ -400,11 +434,12 @@ class TPBackendNative:
         # else:
         #     ext.pg_all_reduce(
         #         self.ptr_g,
+        #         self.dev_g,
         #         self.active_devices,
         #         self.device,
         #         self.active_devices[0],
         #         tensor,
-        #         self.ptr_b,
+        #         self.dev_b,
         #         self.shbuf_size,
         #         self.abort_flag
         #     )
@@ -426,13 +461,14 @@ class TPBackendNative:
 
         ext.pg_gather(
             self.ptr_g,
+            self.dev_g,
             gather_devices,
             self.device,
             out_device,
             tensor,
             out_tensor,
             ldims,
-            self.ptr_b,
+            self.dev_b,
             self.shbuf_size,
             self.abort_flag
         )
@@ -454,13 +490,14 @@ class TPBackendNative:
 
         ext.pg_gather_small(
             self.ptr_g,
+            self.dev_g,
             gather_devices,
             self.device,
             out_device,
             tensor,
             out_tensor,
             ldims,
-            self.ptr_s,
+            self.dev_s,
             SHBUF_SIZE_S,
             self.abort_flag
         )

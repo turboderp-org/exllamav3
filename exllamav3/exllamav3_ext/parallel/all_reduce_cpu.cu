@@ -377,12 +377,13 @@ void pg_all_reduce_cpu_kernel
 void pg_all_reduce_cpu
 (
     uintptr_t ctx,
+    uintptr_t ctx_dev,
     std::vector<uintptr_t> devices,
     int this_device,
     int master_device,
     at::Tensor& tensor,
     bool contributor,
-    uintptr_t shbuf,
+    uintptr_t shbuf_dev,
     size_t shbuf_size,
     bool is_master,
     at::Tensor& abort_flag
@@ -398,7 +399,7 @@ void pg_all_reduce_cpu
     for (int i : devices) device_mask |= (1 << i);
 
     uint8_t* data_ptr = (uint8_t*) tensor.data_ptr();
-    uint8_t* shbuf_ptr = (uint8_t*) shbuf;
+    uint8_t* shbuf_ptr = (uint8_t*) shbuf_dev;
     size_t cpu_data_size = tensor.numel() * 2;
     size_t device_data_size = tensor.numel() * tensor.element_size();
 
@@ -407,7 +408,7 @@ void pg_all_reduce_cpu
     uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
     void* kernelArgs[] =
     {
-        (void*)& ctx,
+        (void*)& ctx_dev,
         (void*)& device_mask,
         (void*)& this_device,
         (void*)& master_device,

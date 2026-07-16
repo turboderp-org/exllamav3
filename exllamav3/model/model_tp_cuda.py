@@ -5,8 +5,10 @@ import os, glob
 CUDA_SUCCESS = 0
 CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED = 34
 CUDA_HOST_REGISTER_PORTABLE = 1
+CUDA_HOST_REGISTER_MAPPED = 2
 CUDA_ERROR_CUDART_UNLOADING = 13
 CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED = 719
+CUDA_DEV_ATTR_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM = 91
 
 @lru_cache(maxsize = 1)
 def _cudart():
@@ -61,6 +63,35 @@ def cuda_host_register(ptr: int, nbytes: int, flags: int = 0) -> None:
     err = fn(ctypes.c_void_p(ptr), ctypes.c_size_t(nbytes), ctypes.c_uint(flags))
     if err not in (CUDA_SUCCESS, CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED):
         raise RuntimeError(f"cudaHostRegister({hex(ptr)}, {nbytes}) failed: {err} ({_cuda_error_string(err)})")
+
+
+def cuda_host_get_device_pointer(ptr: int) -> int:
+    """
+    Return the device-side alias of host memory registered with cudaHostRegisterMapped. On Linux desktop the alias
+    equals the host pointer, but under WDDM (native Windows, and potentially WSL2) the host pointer is not directly
+    usable in kernels and this alias must be passed instead.
+    """
+    lib = _cudart()
+    fn = lib.cudaHostGetDevicePointer
+    fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+    fn.restype  = ctypes.c_int
+    dptr = ctypes.c_void_p()
+    err = fn(ctypes.byref(dptr), ctypes.c_void_p(ptr), 0)
+    if err != CUDA_SUCCESS:
+        raise RuntimeError(f"cudaHostGetDevicePointer({hex(ptr)}) failed: {err} ({_cuda_error_string(err)})")
+    return dptr.value or 0
+
+
+def cuda_device_get_attribute(attr: int, device: int) -> int:
+    lib = _cudart()
+    fn = lib.cudaDeviceGetAttribute
+    fn.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+    fn.restype  = ctypes.c_int
+    out = ctypes.c_int()
+    err = fn(ctypes.byref(out), ctypes.c_int(attr), ctypes.c_int(device))
+    if err != CUDA_SUCCESS:
+        raise RuntimeError(f"cudaDeviceGetAttribute({attr}, {device}) failed: {err} ({_cuda_error_string(err)})")
+    return out.value
 
 
 def cuda_host_unregister(ptr: int) -> None:
