@@ -38,6 +38,11 @@ class SWAState:
 
     exported = False
 
+    # The state ring stores at least one page of history before the attention window at all times (kv_state_size
+    # rounds window + overprocessing up to whole pages), so in-place rollback of at least this many tokens is
+    # always possible
+    guaranteed_rollback = PAGE_SIZE
+
     def __init__(
         self,
         cache: Cache,
@@ -74,6 +79,14 @@ class SWAState:
         assert num_tokens <= self.position - self.window_beg
         self.position -= num_tokens
         self.last_history = 0
+
+
+    def rollback_capacity(self):
+        """
+        Number of tokens the state can rewind in place. K/V for all positions from window_beg are still stored in
+        the ring, so rewinding is just moving the position back; overwritten future slots don't matter.
+        """
+        return self.position - self.window_beg
 
 
     def stash(self):

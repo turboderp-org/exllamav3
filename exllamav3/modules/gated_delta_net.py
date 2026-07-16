@@ -80,6 +80,12 @@ class GDNState:
         self.last_history = 0
 
 
+    def rollback_capacity(self):
+        # The state advances destructively; rewinding is only possible immediately after a forward pass that
+        # recorded per-token history (speculative decoding), never at an arbitrary later point
+        return 0
+
+
     def stash(self):
         stashed = {
             "position": self.position,

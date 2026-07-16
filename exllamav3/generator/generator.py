@@ -775,6 +775,7 @@ class Generator:
         completed_jobs = []
         requeuing_jobs = []
         accepted_lengths = []
+        rewound_jobs = set()
         j = 0
 
         # Reject the trailing draft positions after the last accepted token at index i: count them, roll back the
@@ -837,6 +838,11 @@ class Generator:
                     next_prob,
                     results,
                 )
+                # Single-token rewinds need no batch cleanup, but the post-batch draft carry update must still be
+                # suppressed so it doesn't resurrect a stale MTP state
+                if job.checkpoint_rewound:
+                    job.checkpoint_rewound = False
+                    rewound_jobs.add(id(job))
 
                 # Requeue. Requeueing is only supported for single-sequence jobs because the replacement job
                 # uses the full sequence generated so far as its next prompt.
@@ -884,6 +890,18 @@ class Generator:
                     # token limit produces an EOS event.
                     if eos:
                         completed_jobs.append(job)
+                        break
+
+                    # A banned-string match inside receive_sample just rewound the job, resetting cache pages and
+                    # rolling back or replacing any recurrent state. The remaining logit positions extend a
+                    # sequence that no longer exists, so abandon them; everything is already consistent, and the
+                    # usual rejection rollback and state normalization must not run on top of the rewind.
+                    if job.checkpoint_rewound:
+                        job.checkpoint_rewound = False
+                        rewound_jobs.add(id(job))
+                        if draft_tokens is not None:
+                            job.rejected_draft_tokens += batch_logits.shape[1] - 1 - i
+                            rejected = -1
                         break
 
                     # Continue sampling from logit batch as long as result matches draft, unless hitting
@@ -944,6 +962,12 @@ class Generator:
                     continue
                 accepted_length = accepted_lengths[accepted_idx]
                 accepted_idx += 1
+
+                # A banned-string rewind invalidated this job's carry; leave it unset so drafting pauses until the
+                # next target forward provides a fresh one, and don't propagate hidden states from the abandoned
+                # window into the draft cache
+                if id(job) in rewound_jobs:
+                    continue
 
                 # Position K was drafted from the last target state already. Replace accepted
                 # speculative positions K+1..K+A-1 with the corresponding target-state inputs.

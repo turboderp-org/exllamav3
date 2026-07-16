@@ -245,6 +245,7 @@ class Job:
             self.banned_strings_utf32_offsets = None
 
         self.checkpoint = None
+        self.checkpoint_rewound = False
 
         # Metrics
         self.time_enqueue = None
@@ -719,6 +720,9 @@ class Job:
                     "held_logits": self.held_logits.clone(1),
                     "explored_tokens": [next_token.item()],
                 }
+                # Keep the nearest recurrent stash warm in the LRU cache in case this hold ends in a rewind
+                if self.recurrent_state is not None:
+                    self.find_recurrent_stash(self.sequences[0].kv_position - 1)
             else:
                 self.checkpoint["offset"] += 1
                 if self.checkpoint["offset"] == 1:
@@ -728,13 +732,42 @@ class Job:
             assert self.checkpoint is not None
             offset = self.checkpoint["offset"]
             self.new_tokens -= offset
+
+            # The attention cache rewinds by truncation, but recurrent states advance destructively. SWA states
+            # can roll back in place within their stored window; other states are restored from the most recent
+            # page-aligned checkpoint at or before the rewind position (or reset, if none survives in the cache)
+            # and prefill then replays the gap, since it re-processes complete pages whenever the state position
+            # is behind the K/V position.
+            replay_from = None
+            if self.recurrent_state is not None:
+                target = self.sequences[0].kv_position - offset
+                # During draft verification the state runs ahead of the accepted K/V position, so rewind by the
+                # state's actual distance from the target rather than by the checkpoint offset
+                rw = self.recurrent_state.position - target
+                if rw <= self.recurrent_state.rollback_capacity():
+                    self.recurrent_state.rewind(rw)
+                else:
+                    stashed = self.find_recurrent_stash(target)
+                    self.recurrent_state.free()
+                    if stashed is not None:
+                        replay_from = stashed["position"]
+                        self.recurrent_state = self.generator.cache.new_from_stashed(stashed, replay_from)
+                    else:
+                        replay_from = 0
+                        self.recurrent_state = self.generator.cache.get_new_state()
+                    self.last_recurrent_checkpoint_pos = replay_from or None
+
             for seq in self.sequences:
                 p_page = seq.kv_position // PAGE_SIZE
                 seq.kv_position -= offset
                 seq.sequence_ids.truncate(len(seq.sequence_ids) - offset)
                 n_page = seq.kv_position // PAGE_SIZE
-                for pi in range(n_page, p_page + 1):
+                for pi in range(n_page, len(seq.allocated_pages)):
                     page = seq.allocated_pages[pi]
+                    # Pages beyond the last accepted position can hold pre-written draft tokens from an abandoned
+                    # verification window; roll those back too, stopping at the write frontier
+                    if pi > p_page and page.kv_position == 0:
+                        break
                     page.can_revert = False
                     if page.kv_position == PAGE_SIZE:
                         page.update_hash(random_hash())
@@ -742,6 +775,18 @@ class Job:
                         page.kv_position = seq.kv_position - pi * PAGE_SIZE
                     else:
                         page.kv_position = 0
+                # Pages between the replay position and the rewind target keep their metadata: their contents are
+                # re-processed by prefill (which ignores page completeness while the state position trails the K/V
+                # position) and rewritten with identical values, and they may include shared prompt-cache pages
+                if replay_from is not None:
+                    seq.kv_position = replay_from
+                    seq.prefill_complete = False
+
+            # An MTP draft carry refers to the pre-rewind context; drop it so drafting pauses until the next
+            # target forward (or replay prefill) provides a fresh one. Signal the generator that any in-flight
+            # draft verification window must be abandoned.
+            self.mtp_last_hidden = None
+            self.checkpoint_rewound = True
             off_tokens = self.held_tokens.slice(len(self.checkpoint["held_tokens"]), None)
             off_text = self.held_text[len(self.checkpoint["held_text"]):]
             self.held_text = self.checkpoint["held_text"]
@@ -900,8 +945,19 @@ class Job:
             self.max_rq_tokens = self.max_new_tokens + 1
 
         # Compatibility checks
-        assert not self.banned_strings or self.generator.recurrent_cache is None, \
-            "Cannot use banned strings on recurrent model"
+        if self.banned_strings and self.generator.recurrent_cache is not None:
+            # SWA states rewind in place, but only within their guaranteed rollback window (one page). Since the
+            # matched text is tokenized by the model and its boundaries are ambiguous, require a margin below that
+            # limit for the reference tokenization of each banned string. States without in-place rollback rewind
+            # by restoring a past checkpoint and replaying, which has no length limit.
+            guaranteed = getattr(self.generator.cache.recurrent_state_cls, "guaranteed_rollback", 0)
+            if guaranteed:
+                max_ref_tokens = guaranteed - 8
+                for s in self.banned_strings:
+                    ref_tokens = self.generator.tokenizer.encode(s).shape[-1]
+                    assert ref_tokens <= max_ref_tokens, \
+                        f"Banned string tokenizes to {ref_tokens} tokens, exceeding the maximum of " \
+                        f"{max_ref_tokens} supported by this model's recurrent state rollback: {s!r}"
 
         # Hash full pages of input IDs
         all_unique_hashes = set()
@@ -1309,6 +1365,20 @@ class Job:
 
             # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk
             self.last_recurrent_checkpoint_pos = seq.kv_position
+
+
+    def find_recurrent_stash(self, target_pos: int):
+        """
+        Return the most recent page-aligned recurrent state stash at or before target_pos, refreshing its LRU
+        position in the recurrent cache, or None if no eligible stash remains.
+        """
+        seq = self.sequences[0]
+        rc = self.generator.recurrent_cache
+        for pi in range(target_pos // PAGE_SIZE - 1, -1, -1):
+            stashed = rc.get_stashed(seq.allocated_pages[pi].phash)
+            if stashed is not None and stashed["position"] == (pi + 1) * PAGE_SIZE:
+                return stashed
+        return None
 
 
     def free_recurrent_state(self):
