@@ -1292,6 +1292,10 @@ class Job:
         Store the current recurrent state if the sequence is at a checkpoint boundary.
         """
         seq = self.sequences[0]
+
+        if seq.kv_position == 0:
+            return
+
         if self.is_checkpoint_boundary(interval) and \
             self.last_recurrent_checkpoint_pos != seq.kv_position:
             assert seq.kv_position % PAGE_SIZE == 0
