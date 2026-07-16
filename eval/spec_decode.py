@@ -117,8 +117,13 @@ def measure(generator, tokenizer, sampler, max_new_tokens):
 def main(args):
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(
         args,
-        min_draft_len = args.ngram_draft_length
+        min_draft_len = args.s_ngram_draft_length
     )
+
+    # Optionlly limit scope
+    if args.single_workload:
+        global prompt_files
+        prompt_files = [p for p in prompt_files if p[0].lower() == args.single_workload.lower()]
 
     # Baseline
     result_baseline = None
@@ -134,13 +139,13 @@ def main(args):
     # N-gram draft
     result_ngram = None
     result_ngram_temp = None
-    if args.ngram_match_min:
+    if args.s_ngram_match_min:
         generator = Generator(
             model = model,
             cache = cache,
             tokenizer = tokenizer,
-            ngram_match_min = args.ngram_match_min,
-            num_draft_tokens = args.ngram_draft_length,
+            ngram_match_min = args.s_ngram_match_min,
+            num_draft_tokens = args.s_ngram_draft_length,
             max_chunk_size = 4096,
         )
         result_ngram = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens)
@@ -222,9 +227,10 @@ if __name__ == "__main__":
         default_autosplit_max_batch_size = 1,
     )
     parser.add_argument("-nbl", "--no_baseline", action = "store_true", help = "Skip baseline measurement")
-    parser.add_argument("-ngram_min", "--ngram_match_min", type = int, help = "N-gram minimum match length, default = 0 (disabled)", default = 0)
-    parser.add_argument("-ngram_len", "--ngram_draft_length", type = int, help = "N-gram draft length, default = 4", default = 4)
+    parser.add_argument("-ngram_min", "--s_ngram_match_min", type = int, help = "N-gram minimum match length, default = 0 (disabled)", default = 0)
+    parser.add_argument("-ngram_len", "--s_ngram_draft_length", type = int, help = "N-gram draft length, default = 4", default = 4)
     parser.add_argument("-tokens", "--max_new_tokens", type = int, help = "Max sampled tokens per round", default = 1024)
     parser.add_argument("-temp", "--temperature", action = "store_true", help = "Also sample with temperature")
+    parser.add_argument("-single", "--single_workload", type = str, help = "Limit to single workload", default = None)
     _args = parser.parse_args()
     main(_args)
