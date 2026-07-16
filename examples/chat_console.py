@@ -1,10 +1,12 @@
 import sys, shutil
+from pathlib import Path
 
 from rich.prompt import Prompt
 from rich.markdown import Markdown
 from rich.console import Console
 from prompt_toolkit import prompt as ptk_prompt
 from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.history import FileHistory
 import time, os
 import unicodedata
 
@@ -22,6 +24,8 @@ col_dark = "\u001b[0;90m"  # White
 col_b = "\u001b[100m"
 LRO = '\u202D'  # Left-to-Right Override
 PDF = '\u202C'  # Pop Directional Formatting
+
+chat_history = FileHistory(str(Path.home() / ".local" / ".exllamav3_chat_py_history"))
 
 def print_error(text):
     ftext = text.replace("\n", "\n       ")
@@ -48,7 +52,8 @@ def read_input_ptk(args, user_name, multiline: bool, prefix: str = None):
     user_prompt = ptk_prompt(
         ANSI(col_user + user_name + col_default + ": "),
         multiline = multiline,
-        default = prefix or ""
+        default = prefix or "",
+        history = chat_history if not multiline else None,
     )
     return user_prompt
 
