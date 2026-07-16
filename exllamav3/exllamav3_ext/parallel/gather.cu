@@ -211,6 +211,10 @@ void pg_gather_kernel
                     stage_send++;
                 }
 
+                // All warps must finish staging before thread 0 publishes the counter; the release store only
+                // orders thread 0's own prior writes
+                __syncthreads();
+
                 if (t == 0)
                 {
                     stg_release_sys_u32(ctx->gather_stage_produced + this_rank, stage_send);
