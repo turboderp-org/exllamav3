@@ -30,6 +30,14 @@ while building the path raise.
 
 bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "1") != "0"
 
+# EXL3_BC_ATTN_TRACE=1: print build/decline per module/layer (activation check for A/B tests)
+_bc_trace = os.environ.get("EXL3_BC_ATTN_TRACE", "0") != "0"
+
+def _trace_build(m, result, kind):
+    if _bc_trace:
+        print(f" -- BC-{kind}: {'built' if result is not None else 'DECLINED'}"
+              f" layer {getattr(m, 'layer_idx', '?')} device {m.device}")
+
 MAX_BSZ = 8
 MAX_QLEN = 16
 MAX_R = MAX_BSZ * MAX_QLEN
@@ -380,10 +388,12 @@ def build_bc_swa(module, layer_state):
         k_states.device == torch.device(m.device) and
         m.kv_state_size % PAGE_SIZE == 0
     ):
+        _trace_build(m, None, "swa")
         return None
     k_pages = k_states.view(-1, PAGE_SIZE, m.num_kv_heads, m.head_dim)
     v_pages = v_states.view(-1, PAGE_SIZE, m.num_kv_heads, m.head_dim)
     return BCAttn(m, k_pages, v_pages)
+    _trace_build(m, bca, "swa")
 
 
 def build_bc_attn(module, layer):
@@ -403,7 +413,9 @@ def build_bc_attn(module, layer):
             layer.k is not None and layer.k.device == torch.device(m.device)
         ))
     ):
+        _trace_build(m, None, "attn")
         return None
     if isinstance(layer, CacheLayer_quant):
         return BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits)
     return BCAttn(m, layer.k, layer.v)
+    _trace_build(m, bca, "attn")
