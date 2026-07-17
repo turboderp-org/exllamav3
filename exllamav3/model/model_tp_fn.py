@@ -2,12 +2,15 @@ import torch
 import traceback
 import os
 import sys
+import time
 from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
 from .model_tp_backend import TPBackendNCCL, TPBackendNative
 from ..tokenizer.mm_embedding import recv_embeddings
 from ..util import log_tp, set_t0
+
+_no_fwd_barrier = os.environ.get("EXL3_TP_NO_FWD_BARRIER", "1") != "0"
 
 
 def install_parent_death_signal() -> bool:
@@ -96,12 +99,23 @@ def mp_model_worker(
     if install_parent_death_signal():
         log_tp(device, f"Installed parent death signal")
 
+    # EXL3_TP_SPIN_RECV=<ms>: after finishing a command, poll the pipe hot for this many ms before
+    # falling back to a blocking recv. A blocking recv pays scheduler wake latency (tens to hundreds
+    # of us depending on C-states) at the start of every forward pass; during decode the next command
+    # arrives within a few ms of the previous ack, so a short spin window catches it with zero wake
+    # cost, at the price of one busy core per rank for the window
+    spin_recv_s = float(os.environ.get("EXL3_TP_SPIN_RECV", "0")) / 1e3
+
     with torch.inference_mode():
         local_context = init_pg(device, active_devices, output_device, backend_args)
         local_context["inf_consumer"] = SMConsumer(producer, device = device, pin_memory = True)
 
         # Dispatch loop
         while True:
+            if spin_recv_s > 0 and not conn.poll(0):
+                deadline = time.monotonic() + spin_recv_s
+                while not conn.poll(0) and time.monotonic() < deadline:
+                    pass
             msg = conn.recv()
             if msg == "quit":
                 log_tp(device, f"Child worker exiting")
@@ -220,7 +234,11 @@ def mp_model_forward(
     Forward pass for parallel slice of a model
     """
     backend = local_context["backend"]
-    backend.fwd_barrier()
+    # The pass-start barrier aligns all rank streams before the first collective. The collectives
+    # are individually ordered by their stage counters, so this is not required for correctness;
+    # EXL3_TP_NO_FWD_BARRIER=1 skips it (experimental) to save one spin kernel per rank per pass
+    if not _no_fwd_barrier:
+        backend.fwd_barrier()
 
     modules = local_context["modules"] if single_idx is None else [local_context["modules"][single_idx]]
     consumer = local_context["inf_consumer"]
