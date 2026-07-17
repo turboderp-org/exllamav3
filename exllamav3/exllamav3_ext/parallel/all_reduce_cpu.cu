@@ -611,13 +611,14 @@ void pg_all_reduce_cpu
     // copy (the PARCK_MODE_BF16 kernels move raw 16-bit words, so they serve both wires).
     // fp32 payloads keep the bf16 wire for range. All ranks and the CPU helper resolve this
     // identically from the tensor dtype + local CPUID
-    static const bool no_fp16_wire = getenv("EXL3_TP_NO_FP16_WIRE") != nullptr;
+    static const bool no_fp16_wire = [] { const char* e = getenv("EXL3_TP_NO_FP16_WIRE"); return e && strcmp(e, "0") != 0; }();
     bool fp16_wire = tensor.dtype() == at::kHalf && !no_fp16_wire && is_f16c_supported();
     uint32_t wire_dtype = fp16_wire ? REDUCE_WIRE_FP16 : REDUCE_WIRE_BF16;
     if (fp16_wire)
     {
+        static const bool trace_wire = [] { const char* e = getenv("EXL3_TP_TRACE_WIRE"); return e && strcmp(e, "0") != 0; }();
         static bool logged = false;
-        if (!logged && getenv("EXL3_TP_TRACE_WIRE")) { logged = true; printf(" -- all_reduce: fp16 wire active\n"); }
+        if (!logged && trace_wire) { logged = true; printf(" -- all_reduce: fp16 wire active\n"); }
     }
 
     // Single-chunk payloads (all decode-size reduces) take the split send/recv path; larger

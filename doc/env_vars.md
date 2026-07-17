@@ -23,6 +23,12 @@ span-heads head norms, non-EXL3 projections, compander-enabled quant cache, ...)
 the regular dispatch path by design. Unexpected errors while building the path are raised, not
 swallowed. Set to `0` to disable the path entirely.
 
+### `EXL3_BC_ATTN_TRACE` (default: `0`)
+
+Print one line per attention module/cache-layer pair when the graph-captured decode path is
+built or declined (module key, device). Activation check for A/B tests: a benchmark comparing
+`EXL3_BC_ATTN` settings is only meaningful if the enabled run actually built the path.
+
 ### `EXL3_QC_ATTN` (default: `1`)
 
 Quantized-cache direct attention: packed K/V cache tensors feed the attention kernels directly,
@@ -104,6 +110,37 @@ of using peer-to-peer copies. Workaround for platforms with broken or misreporte
 
 Rendezvous address and port for the tensor-parallel backend. The port defaults to a free port
 picked at startup.
+
+### `EXL3_TP_NO_FWD_BARRIER` (default: `1`)
+
+Skip the pass-start barrier in tensor-parallel forward passes. The native collectives are each
+ordered by their own stage counters, so the barrier is not required for correctness; skipping it
+saves one spin-kernel launch per rank per pass. Set to `0` to restore the barrier (one aligned
+sync point per pass at the cost of a small amount of GPU spin time).
+
+### `EXL3_TP_NO_FP16_WIRE` (default: `0`)
+
+The native backend's CPU-assisted all-reduce moves fp16 payloads over an fp16 wire when the CPU
+supports F16C (universal on AVX2-era hardware, probed at runtime): exactly-rounded results for
+two ranks, fp16-level rounding beyond, at the same PCIe traffic as the bf16 wire. fp32 payloads
+always use the bf16 wire (fp16 lacks the range for residual-stream outliers). Set to `1` to
+force the bf16 wire for fp16 payloads too, e.g. for A/B comparison.
+
+### `EXL3_TP_TRACE_WIRE` (default: `0`)
+
+Print a line (once per process) when the fp16 all-reduce wire first activates. Activation check
+for numerics A/B tests: whether the wire engages depends on the model's residual dtype, so a
+comparison is only meaningful if the fp16-wire run actually used it.
+
+### `EXL3_TP_SPIN_RECV` (default: `0`)
+
+Milliseconds each tensor-parallel child worker hot-polls its command pipe after finishing a
+command before falling back to a blocking receive. A blocking receive pays scheduler wake
+latency (tens to hundreds of microseconds, worse with deep C-states) at the start of every
+forward pass; during decode the next command arrives within a few milliseconds, so a short spin
+window (e.g. `4`) catches it with no wake cost, at the price of one busy core per rank for the
+window. `0` disables the spin. Mostly useful on hosts where TP profiling shows a large stagger
+between the main process and child workers reaching their first kernel launch.
 
 ## Debug
 
