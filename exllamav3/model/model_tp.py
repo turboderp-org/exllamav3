@@ -30,6 +30,7 @@ class Model_TPMixin:
         self.tp_backend = None
         # Devices whose per-forward None acks are still in flight (see forward_tp)
         self.tp_pending_acks = []
+        self.tp_pending_refs = None
 
     def create_tp_context(self, tp_backend: str):
         """
@@ -185,6 +186,8 @@ class Model_TPMixin:
         for device in pending:
             r = self.tp_worker_result(device)
             assert r is None, "TP logic error"
+        # All children have consumed the deferred pass's command; shared storages may be released
+        self.tp_pending_refs = None
 
 
     def tp_worker_dispatch_single(self, device, fn, args):
@@ -529,12 +532,16 @@ class Model_TPMixin:
         reserve = {}
         if "cache" in params:
             params["cache"] = id(params["cache"])
-        # Share memory of any additional CPU tensors
+        # Share memory of any additional CPU tensors. Everything tensor-shaped must go through
+        # the arena: CPU tensors pickled over the pipes become torch shared-memory segments with
+        # fragile cross-process lifetimes (the recurrent_slots tensor used to crash GDN models
+        # this way once forward acks became deferred)
         for tensor_param in [
             "block_table",
             "cache_seqlens",
             "positions",
             "position_ids",
+            "recurrent_slots",
         ]:
             p = params.get(tensor_param)
             if p is not None:
@@ -592,6 +599,8 @@ class Model_TPMixin:
         assert r is None, "TP logic error"
         self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
         self.tp_pending_acks.append(-1)
+        # See forward_tp: the exported recurrent-state handles must outlive the deferred acks
+        self.tp_pending_refs = (args, params.get("recurrent_states"))
         self.restore_tp_params(params, reserve)
         return None
 
@@ -624,6 +633,9 @@ class Model_TPMixin:
         assert out is not None, "TP logic error"
         self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
         self.tp_pending_acks.append(-1)
+        # Pin the exported recurrent-state handles too: restore_tp_params swaps them out of the
+        # params dict in place, so holding args alone would not keep their shared storages alive
+        self.tp_pending_refs = (args, params.get("recurrent_states"))
         self.restore_tp_params(params, reserve)
         return out
 
