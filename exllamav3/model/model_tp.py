@@ -28,7 +28,11 @@ class Model_TPMixin:
         self.tp_output_device = None
         self.tp_producer = None
         self.tp_backend = None
-        # Devices whose per-forward None acks are still in flight (see forward_tp)
+        # Devices whose per-forward None acks are still in flight (see forward_tp), and a strong
+        # reference to the dispatched args for that pass: pickling CPU tensors (e.g. exported
+        # recurrent-state handles) moves their storages into torch shared-memory segments that
+        # only live as long as the sender-side objects, and the children may not have read the
+        # command yet when forward_tp returns
         self.tp_pending_acks = []
         self.tp_pending_refs = None
 

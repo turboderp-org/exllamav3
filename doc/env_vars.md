@@ -132,6 +132,14 @@ Print a line (once per process) when the fp16 all-reduce wire first activates. A
 for numerics A/B tests: whether the wire engages depends on the model's residual dtype, so a
 comparison is only meaningful if the fp16-wire run actually used it.
 
+### `EXL3_TP_REDUCE_THREADS` (default: number of participating ranks)
+
+Number of threads slicing each large-payload accumulate in the native backend's CPU-reduce
+helper (persistent workers, spin-parked between jobs; AVX-512 path only). The default of one
+thread per participating rank covers the cases where a single thread's ~31 GB/s wire rate falls
+behind: three or more ranks (multiple adds per chunk) and PCIe 5.0 links. Set to `1` to force
+the single-threaded accumulate. Decode-size reduces are always single-threaded.
+
 ### `EXL3_TP_SPIN_RECV` (default: `0`)
 
 Milliseconds each tensor-parallel child worker hot-polls its command pipe after finishing a

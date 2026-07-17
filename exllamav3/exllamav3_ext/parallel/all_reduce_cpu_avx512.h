@@ -15,6 +15,26 @@ void bf16_add_inplace_avx512(
     size_t count
 );
 
+void bf16_add_twosrc_avx512(
+    uint16_t* __restrict dst,
+    const uint16_t* __restrict src_a,
+    const uint16_t* __restrict src_b,
+    size_t count
+);
+
+void fp16_add_inplace_avx512(
+    uint16_t* __restrict a,
+    const uint16_t* __restrict b,
+    size_t count
+);
+
+void fp16_add_twosrc_avx512(
+    uint16_t* __restrict dst,
+    const uint16_t* __restrict src_a,
+    const uint16_t* __restrict src_b,
+    size_t count
+);
+
 void perform_cpu_reduce_avx512(
     PGContext* ctx,
     size_t data_size,

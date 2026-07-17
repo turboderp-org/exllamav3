@@ -116,7 +116,7 @@ void bf16_add_inplace_avx512
 // Replaces the memcpy + accumulate pattern when exactly two contributions
 // arrive before a third. Assumes count % 64 == 0.
 AVX512_TARGET
-static void bf16_add_twosrc_avx512
+void bf16_add_twosrc_avx512
 (
     uint16_t* __restrict dst,
     const uint16_t* __restrict src_a,
@@ -186,7 +186,7 @@ static inline void do32_fp16_avx512_fused(uint16_t* __restrict dst,
 
 // A += B (FP16), in-place. Assumes count % 64 == 0.
 AVX512_TARGET
-static void fp16_add_inplace_avx512
+void fp16_add_inplace_avx512
 (
     uint16_t* __restrict a,
     const uint16_t* __restrict b,
@@ -214,7 +214,7 @@ static void fp16_add_inplace_avx512
 
 // dst = src_a + src_b (FP16), fused two-source add. Assumes count % 64 == 0.
 AVX512_TARGET
-static void fp16_add_twosrc_avx512
+void fp16_add_twosrc_avx512
 (
     uint16_t* __restrict dst,
     const uint16_t* __restrict src_a,
@@ -272,6 +272,20 @@ void perform_cpu_reduce_avx512
 
     int num_chunks = (int) CEIL_DIVIDE(data_size, CPUREDUCE_CHUNK_SIZE);
     size_t rem_data_size = data_size;
+    // Single-chunk jobs come from the split kernels (per-device flags); multi-chunk jobs from
+    // the striped bandwidth kernel (per-(device, block) flags). Must match the launch choice
+    const bool multi = num_chunks > 1;
+
+    // Accumulate threads: one per participating rank by default (the add work per chunk scales
+    // with contributor count and a single thread's ~31 GB/s wire rate cannot cover a PCIe5 link
+    // or 3+ ranks), capped by the pool size. EXL3_TP_REDUCE_THREADS overrides
+    static const int env_threads = [] { const char* e = getenv("EXL3_TP_REDUCE_THREADS"); return e ? atoi(e) : 0; }();
+    int acc_threads = 1;
+    if (multi)
+    {
+        acc_threads = env_threads > 0 ? env_threads : __builtin_popcount(device_mask);
+        acc_threads = MAX(acc_threads, 1);
+    }
 
     // Sync
     atomic_ref<uint32_t> stage_(&ctx->cpusum_stage_cpu);
@@ -281,10 +295,34 @@ void perform_cpu_reduce_avx512
     // Timeout
     const auto start = std::chrono::high_resolution_clock::now();
 
+    int chunk_idx = 0;
     while (num_chunks)
     {
         size_t stage_size = MIN(rem_data_size, CPUREDUCE_CHUNK_SIZE);
         rem_data_size = MAX(rem_data_size - stage_size, 0);
+
+        // Accumulator ring throttle (elastic kernel has no lockstep bounding the CPU's lead):
+        // reuse the acc slot only after every device's recv blocks consumed its previous tenant
+        if (multi && chunk_idx >= (int)max_buf_stages)
+        {
+            uint32_t recv_target = ((stage - max_buf_stages) & 0x7fffffffu) + 1u;
+            int throttle_spin = 0;
+            while (!cpusum_recv_ready(ctx, device_mask, recv_target))
+            {
+                _mm_pause();
+                if (++throttle_spin > 10000)
+                {
+                    throttle_spin = 0;
+                    const auto now = std::chrono::high_resolution_clock::now();
+                    const std::chrono::duration<double, std::milli> elapsed = now - start;
+                    if (elapsed > std::chrono::duration<double, std::milli>(45000.0))
+                    {
+                        printf(" ## CPU reduce process timeout (recv throttle)\n");
+                        TORCH_CHECK(false, "CPU reduce process timeout");
+                    }
+                }
+            }
+        }
 
         uint32_t rem_devices = device_mask;
         uint8_t* first_src = nullptr;  // Track first contribution for fused add
@@ -296,16 +334,12 @@ void perform_cpu_reduce_avx512
             {
                 if (!(rem_devices & (1 << device))) continue;
 
-                atomic_ref<uint32_t> device_stage_(&ctx->cpusum_stage_device[device * REDUCE_STAGE_STRIDE]);
-                uint32_t device_stage = device_stage_.load_acquire();
-                uint32_t no_contrib = device_stage & 0x80000000u;
-                device_stage &= 0x7fffffffu;
-
-                if (device_stage != stage)
+                bool no_contrib;
+                if (cpusum_device_arrived(ctx, device, stage, multi, &no_contrib))
                 {
                     rem_devices &= ~(1 << device);
 
-                    if (no_contrib == 0)
+                    if (!no_contrib)
                     {
                         uint8_t* src = host_ptr(device, stage);
                         uint8_t* dst = host_ptr(MAX_DEVICES, stage);
@@ -319,37 +353,29 @@ void perform_cpu_reduce_avx512
                         else if (first_src != dst)
                         {
                             // Second contribution: fused add of first + second -> dst
-                            if (wire_dtype == REDUCE_WIRE_FP16)
-                                fp16_add_twosrc_avx512(
-                                    (uint16_t*) dst,
-                                    (uint16_t*) first_src,
-                                    (uint16_t*) src,
-                                    elem_count
-                                );
-                            else
-                                bf16_add_twosrc_avx512(
-                                    (uint16_t*) dst,
-                                    (uint16_t*) first_src,
-                                    (uint16_t*) src,
-                                    elem_count
-                                );
+                            cpu_reduce_parallel(
+                                wire_dtype == REDUCE_WIRE_FP16 ? fp16_add_twosrc_avx512 : bf16_add_twosrc_avx512,
+                                nullptr,
+                                (uint16_t*) dst,
+                                (uint16_t*) first_src,
+                                (uint16_t*) src,
+                                elem_count,
+                                acc_threads
+                            );
                             first_src = dst;  // dst now holds accumulated data
                         }
                         else
                         {
                             // Third+ contribution: accumulate into dst
-                            if (wire_dtype == REDUCE_WIRE_FP16)
-                                fp16_add_inplace_avx512(
-                                    (uint16_t*) dst,
-                                    (uint16_t*) src,
-                                    elem_count
-                                );
-                            else
-                                bf16_add_inplace_avx512(
-                                    (uint16_t*) dst,
-                                    (uint16_t*) src,
-                                    elem_count
-                                );
+                            cpu_reduce_parallel(
+                                nullptr,
+                                wire_dtype == REDUCE_WIRE_FP16 ? fp16_add_inplace_avx512 : bf16_add_inplace_avx512,
+                                (uint16_t*) dst,
+                                nullptr,
+                                (uint16_t*) src,
+                                elem_count,
+                                acc_threads
+                            );
                         }
                     }
                 }
@@ -384,5 +410,6 @@ void perform_cpu_reduce_avx512
         stage_.store_release(stage);
 
         num_chunks--;
+        chunk_idx++;
     }
 }
