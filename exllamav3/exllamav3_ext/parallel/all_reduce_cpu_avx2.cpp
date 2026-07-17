@@ -65,6 +65,43 @@ inline void bf16_add_inplace_avx2
     }
 }
 
+// FP16 wire: widen with F16C, add in FP32, narrow with hardware round-to-nearest-even.
+// ~2x the per-add cost of the bf16 integer path on Zen 4 (convert-port bound), still ~1 us
+// per 16KB pair-add; used only for kHalf payloads where the wire is then exact
+AVX2_F16C_TARGET
+inline void do16_fp16(uint16_t* __restrict ap, const uint16_t* __restrict bp)
+{
+    __m256i va16 = _mm256_loadu_si256((const __m256i*)ap);
+    __m256i vb16 = _mm256_loadu_si256((const __m256i*)bp);
+    __m256 a_lo = _mm256_cvtph_ps(_mm256_castsi256_si128(va16));
+    __m256 a_hi = _mm256_cvtph_ps(_mm256_extracti128_si256(va16, 1));
+    __m256 b_lo = _mm256_cvtph_ps(_mm256_castsi256_si128(vb16));
+    __m256 b_hi = _mm256_cvtph_ps(_mm256_extracti128_si256(vb16, 1));
+    __m256 s_lo = _mm256_add_ps(a_lo, b_lo);
+    __m256 s_hi = _mm256_add_ps(a_hi, b_hi);
+    __m128i o_lo = _mm256_cvtps_ph(s_lo, _MM_FROUND_TO_NEAREST_INT);
+    __m128i o_hi = _mm256_cvtps_ph(s_hi, _MM_FROUND_TO_NEAREST_INT);
+    __m256i out = _mm256_castsi128_si256(o_lo);
+    out = _mm256_inserti128_si256(out, o_hi, 1);
+    _mm256_storeu_si256((__m256i*)ap, out);
+}
+
+// A += B (FP16), in-place. Assumes count % 32 == 0.
+AVX2_F16C_TARGET
+inline void fp16_add_inplace_avx2
+(
+    uint16_t* __restrict a,
+    const uint16_t* __restrict b,
+    size_t count
+)
+{
+    for (size_t i = 0; i < count; i += 32)
+    {
+        do16_fp16(a + i, b + i);
+        do16_fp16(a + i + 16, b + i + 16);
+    }
+}
+
 void enable_fast_fp()
 {
     if (is_avx512_supported())
@@ -86,27 +123,29 @@ void perform_cpu_reduce
     PGContext* ctx,
     size_t data_size,
     uint32_t device_mask,
+    uint32_t wire_dtype,
     uint8_t* shbuf_ptr,
     size_t shbuf_size
 )
 {
     if (is_avx512_supported())
     {
-        perform_cpu_reduce_avx512(ctx, data_size, device_mask, shbuf_ptr, shbuf_size);
+        perform_cpu_reduce_avx512(ctx, data_size, device_mask, wire_dtype, shbuf_ptr, shbuf_size);
     }
     else
     {
-        perform_cpu_reduce_avx2(ctx, data_size, device_mask, shbuf_ptr, shbuf_size);
+        perform_cpu_reduce_avx2(ctx, data_size, device_mask, wire_dtype, shbuf_ptr, shbuf_size);
     }
 }
 
 // Perform reduction on current job using AVX2
-AVX2_TARGET
+AVX2_F16C_TARGET
 void perform_cpu_reduce_avx2
 (
     PGContext* ctx,
     size_t data_size,
     uint32_t device_mask,
+    uint32_t wire_dtype,
     uint8_t* shbuf_ptr,
     size_t shbuf_size
 )
@@ -191,7 +230,11 @@ void perform_cpu_reduce_avx2
                         // Subsequent contributions: accumulate
                         else
                         {
-                            bf16_add_inplace_avx2((uint16_t*) dst, (uint16_t*) src, CEIL_DIVIDE(stage_size, 64) * 32);
+                            size_t elem_count = CEIL_DIVIDE(stage_size, 64) * 32;
+                            if (wire_dtype == REDUCE_WIRE_FP16)
+                                fp16_add_inplace_avx2((uint16_t*) dst, (uint16_t*) src, elem_count);
+                            else
+                                bf16_add_inplace_avx2((uint16_t*) dst, (uint16_t*) src, elem_count);
                         }
                     }
                 }

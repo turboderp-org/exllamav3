@@ -14,10 +14,18 @@
 // Timeout in seconds
 #define SYNC_TIMEOUT 2ull
 
+// Wire format of a CPU-assisted reduce. BF16 wire carries fp32/bf16 payloads (range-safe for
+// fp32 residual streams); FP16 wire carries fp16 payloads verbatim, making the reduce exact for
+// two ranks (single round-to-nearest of the fp32 sum) at identical PCIe traffic. Requires F16C
+// on the CPU for the fp16 accumulate.
+#define REDUCE_WIRE_BF16 0
+#define REDUCE_WIRE_FP16 1
+
 struct ReduceJob
 {
     size_t data_size;
     uint32_t device_mask;
+    uint32_t wire_dtype;
 };
 
 struct alignas(64) PGContext

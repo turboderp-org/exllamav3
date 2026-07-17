@@ -146,6 +146,101 @@ static void bf16_add_twosrc_avx512
     }
 }
 
+// FP16 wire versions: hardware widen/narrow (EVEX vcvtph2ps/vcvtps2ph, AVX512F), FP32 add,
+// round-to-nearest-even. Convert-port bound (~2x the bf16 integer path per add) but exact wire
+AVX512_TARGET
+static inline void do32_fp16_avx512(uint16_t* __restrict ap, const uint16_t* __restrict bp)
+{
+    __m512i va16 = _mm512_loadu_si512((const __m512i*)ap);
+    __m512i vb16 = _mm512_loadu_si512((const __m512i*)bp);
+    __m512 a_lo = _mm512_cvtph_ps(_mm512_castsi512_si256(va16));
+    __m512 a_hi = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(va16, 1));
+    __m512 b_lo = _mm512_cvtph_ps(_mm512_castsi512_si256(vb16));
+    __m512 b_hi = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(vb16, 1));
+    __m512 s_lo = _mm512_add_ps(a_lo, b_lo);
+    __m512 s_hi = _mm512_add_ps(a_hi, b_hi);
+    __m256i o_lo = _mm512_cvtps_ph(s_lo, _MM_FROUND_TO_NEAREST_INT);
+    __m256i o_hi = _mm512_cvtps_ph(s_hi, _MM_FROUND_TO_NEAREST_INT);
+    __m512i result = _mm512_inserti64x4(_mm512_castsi256_si512(o_lo), o_hi, 1);
+    _mm512_storeu_si512((__m512i*)ap, result);
+}
+
+AVX512_TARGET
+static inline void do32_fp16_avx512_fused(uint16_t* __restrict dst,
+                                          const uint16_t* __restrict src_a,
+                                          const uint16_t* __restrict src_b)
+{
+    __m512i va16 = _mm512_loadu_si512((const __m512i*)src_a);
+    __m512i vb16 = _mm512_loadu_si512((const __m512i*)src_b);
+    __m512 a_lo = _mm512_cvtph_ps(_mm512_castsi512_si256(va16));
+    __m512 a_hi = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(va16, 1));
+    __m512 b_lo = _mm512_cvtph_ps(_mm512_castsi512_si256(vb16));
+    __m512 b_hi = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(vb16, 1));
+    __m512 s_lo = _mm512_add_ps(a_lo, b_lo);
+    __m512 s_hi = _mm512_add_ps(a_hi, b_hi);
+    __m256i o_lo = _mm512_cvtps_ph(s_lo, _MM_FROUND_TO_NEAREST_INT);
+    __m256i o_hi = _mm512_cvtps_ph(s_hi, _MM_FROUND_TO_NEAREST_INT);
+    __m512i result = _mm512_inserti64x4(_mm512_castsi256_si512(o_lo), o_hi, 1);
+    _mm512_storeu_si512((__m512i*)dst, result);
+}
+
+// A += B (FP16), in-place. Assumes count % 64 == 0.
+AVX512_TARGET
+static void fp16_add_inplace_avx512
+(
+    uint16_t* __restrict a,
+    const uint16_t* __restrict b,
+    size_t count
+)
+{
+    size_t i = 0;
+    for (; i + 128 <= count; i += 128)
+    {
+        _mm_prefetch((const char*)(a + i + 128), _MM_HINT_T0);
+        _mm_prefetch((const char*)(a + i + 160), _MM_HINT_T0);
+        _mm_prefetch((const char*)(b + i + 128), _MM_HINT_T0);
+        _mm_prefetch((const char*)(b + i + 160), _MM_HINT_T0);
+        do32_fp16_avx512(a + i,       b + i);
+        do32_fp16_avx512(a + i + 32,  b + i + 32);
+        do32_fp16_avx512(a + i + 64,  b + i + 64);
+        do32_fp16_avx512(a + i + 96,  b + i + 96);
+    }
+    for (; i < count; i += 64)
+    {
+        do32_fp16_avx512(a + i,      b + i);
+        do32_fp16_avx512(a + i + 32, b + i + 32);
+    }
+}
+
+// dst = src_a + src_b (FP16), fused two-source add. Assumes count % 64 == 0.
+AVX512_TARGET
+static void fp16_add_twosrc_avx512
+(
+    uint16_t* __restrict dst,
+    const uint16_t* __restrict src_a,
+    const uint16_t* __restrict src_b,
+    size_t count
+)
+{
+    size_t i = 0;
+    for (; i + 128 <= count; i += 128)
+    {
+        _mm_prefetch((const char*)(src_a + i + 128), _MM_HINT_T0);
+        _mm_prefetch((const char*)(src_a + i + 160), _MM_HINT_T0);
+        _mm_prefetch((const char*)(src_b + i + 128), _MM_HINT_T0);
+        _mm_prefetch((const char*)(src_b + i + 160), _MM_HINT_T0);
+        do32_fp16_avx512_fused(dst + i,       src_a + i,       src_b + i);
+        do32_fp16_avx512_fused(dst + i + 32,  src_a + i + 32,  src_b + i + 32);
+        do32_fp16_avx512_fused(dst + i + 64,  src_a + i + 64,  src_b + i + 64);
+        do32_fp16_avx512_fused(dst + i + 96,  src_a + i + 96,  src_b + i + 96);
+    }
+    for (; i < count; i += 64)
+    {
+        do32_fp16_avx512_fused(dst + i,      src_a + i,      src_b + i);
+        do32_fp16_avx512_fused(dst + i + 32, src_a + i + 32, src_b + i + 32);
+    }
+}
+
 // Fast path enable for AVX-512
 AVX512_TARGET
 void enable_fast_fp_avx512()
@@ -161,6 +256,7 @@ void perform_cpu_reduce_avx512
     PGContext* ctx,
     size_t data_size,
     uint32_t device_mask,
+    uint32_t wire_dtype,
     uint8_t* shbuf_ptr,
     size_t shbuf_size
 )
@@ -223,22 +319,37 @@ void perform_cpu_reduce_avx512
                         else if (first_src != dst)
                         {
                             // Second contribution: fused add of first + second -> dst
-                            bf16_add_twosrc_avx512(
-                                (uint16_t*) dst,
-                                (uint16_t*) first_src,
-                                (uint16_t*) src,
-                                elem_count
-                            );
+                            if (wire_dtype == REDUCE_WIRE_FP16)
+                                fp16_add_twosrc_avx512(
+                                    (uint16_t*) dst,
+                                    (uint16_t*) first_src,
+                                    (uint16_t*) src,
+                                    elem_count
+                                );
+                            else
+                                bf16_add_twosrc_avx512(
+                                    (uint16_t*) dst,
+                                    (uint16_t*) first_src,
+                                    (uint16_t*) src,
+                                    elem_count
+                                );
                             first_src = dst;  // dst now holds accumulated data
                         }
                         else
                         {
                             // Third+ contribution: accumulate into dst
-                            bf16_add_inplace_avx512(
-                                (uint16_t*) dst,
-                                (uint16_t*) src,
-                                elem_count
-                            );
+                            if (wire_dtype == REDUCE_WIRE_FP16)
+                                fp16_add_inplace_avx512(
+                                    (uint16_t*) dst,
+                                    (uint16_t*) src,
+                                    elem_count
+                                );
+                            else
+                                bf16_add_inplace_avx512(
+                                    (uint16_t*) dst,
+                                    (uint16_t*) src,
+                                    elem_count
+                                );
                         }
                     }
                 }

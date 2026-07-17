@@ -13,6 +13,7 @@ void perform_cpu_reduce
     PGContext* ctx,
     size_t data_size,
     uint32_t device_mask,
+    uint32_t wire_dtype,
     uint8_t* shbuf_ptr,
     size_t shbuf_size
 );
@@ -22,6 +23,7 @@ void perform_cpu_reduce_avx2
     PGContext* ctx,
     size_t data_size,
     uint32_t device_mask,
+    uint32_t wire_dtype,
     uint8_t* shbuf_ptr,
     size_t shbuf_size
 );

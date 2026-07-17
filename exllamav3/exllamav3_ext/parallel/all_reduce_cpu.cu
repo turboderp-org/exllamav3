@@ -23,13 +23,14 @@ void push_reduce_job
 (
     PGContext* ctx,
     size_t data_size,
-    uint32_t device_mask
+    uint32_t device_mask,
+    uint32_t wire_dtype
 )
 {
     atomic_ref<uint32_t> tail_(&ctx->reduce_jobs_tail);
     uint32_t tail = tail_.load_acquire();
     uint32_t next = (tail + 1) % MAX_REDUCE_JOBS;
-    ctx->reduce_jobs[tail] = ReduceJob{ data_size, device_mask };
+    ctx->reduce_jobs[tail] = ReduceJob{ data_size, device_mask, wire_dtype };
     tail_.store_release(next);
 }
 
@@ -39,7 +40,7 @@ void push_reduce_job
 // end of a forward pass, by the master device process.
 void push_reduce_job_end(PGContext* ctx)
 {
-    push_reduce_job(ctx, 0, 0);
+    push_reduce_job(ctx, 0, 0, 0);
 }
 
 
@@ -66,6 +67,7 @@ void perform_cpu_reduce
     PGContext* ctx,
     size_t data_size,
     uint32_t device_mask,
+    uint32_t wire_dtype,
     uint8_t* shbuf_ptr,
     size_t shbuf_size
 );
@@ -86,22 +88,28 @@ void run_cpu_reduce_jobs
     uint8_t* shbuf_ptr = (uint8_t*) shbuf;
     ReduceJob current_job;
 
-    uint32_t max_wait = 50000; // ms
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
     while (true)
     {
-        // Wait for next job. Should never pause for more than one millisecond, since jobs are
-        // scheduled along side all-reduce kernels. The reduction itself (below) pauses in a
-        // tighter spin loop to reduce latency if the CUDA streams have not caught up yet
-        // (typical case)
+        // Wait for next job. Jobs are pushed just-in-time by the master's dispatch loop, so the
+        // queue routinely runs dry for sub-layer stretches; any sleep here gates every GPU's
+        // readback for the full sleep quantum (a 1 ms nap at this spot showed up as a slow first
+        // reduce and inter-layer stutter). This process owns the -1 rank slot, so spin hard for
+        // the in-pass case and drop to short naps only after ~1 ms without work
+        int spins = 0;
         while (true)
         {
             if (pop_reduce_job(ctx, current_job))
                 break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            max_wait--;
-            if (!max_wait)
+            if (++spins < 65536)
             {
-                // After 8 seconds of waiting for the queue to build, something surely crashed
+                __builtin_ia32_pause();
+                continue;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            if (std::chrono::steady_clock::now() > deadline)
+            {
+                // After 50 seconds of waiting for the queue to build, something surely crashed
                 printf(" ## CPU reduce wait timeout");
                 TORCH_CHECK(false, "CPU reduce wait timeout");
             }
@@ -117,6 +125,7 @@ void run_cpu_reduce_jobs
             ctx,
             current_job.data_size,
             current_job.device_mask,
+            current_job.wire_dtype,
             shbuf_ptr,
             shbuf_size
         );
@@ -374,6 +383,196 @@ void pg_all_reduce_cpu_kernel
     }
 }
 
+// Single-chunk (decode-size) fast path: the same protocol as the cooperative kernel above, but
+// as two ordinary kernels in stream order (send, then recv). Measured 1-3 us/op faster than the
+// cooperative launch at decode payloads, and this form is CUDA-graph-capturable. The cooperative
+// kernel is kept for multi-chunk payloads, where its two resident blocks pipeline send/recv
+// across chunks.
+
+template <int dtype>
+__device__ __forceinline__ void arc_wire_send(const uint8_t* src8, const uint8_t* src_end8, uint8_t* dst8, int t)
+{
+    if constexpr (dtype == PARCK_MODE_FLOAT)
+    {
+        uint4* src = (uint4*) src8;
+        uint4* src_end = (uint4*) src_end8;
+        uint2* dst = (uint2*) dst8;
+        while (src + t < src_end)
+        {
+            // Round FP32 -> BF16 to nearest (see cooperative kernel)
+            uint4 v = src[t];
+            uint2 pack
+            {
+                ((v.y + 0x8000u) & 0xffff0000u) | ((v.x + 0x8000u) >> 16),
+                ((v.w + 0x8000u) & 0xffff0000u) | ((v.z + 0x8000u) >> 16)
+            };
+            dst[t] = pack;
+            src += NUM_THREADS;
+            dst += NUM_THREADS;
+        }
+    }
+    if constexpr (dtype == PARCK_MODE_BF16)
+    {
+        uint2* src = (uint2*) src8;
+        uint2* src_end = (uint2*) src_end8;
+        uint2* dst = (uint2*) dst8;
+        while (src + t < src_end)
+        {
+            dst[t] = src[t];
+            src += NUM_THREADS;
+            dst += NUM_THREADS;
+        }
+    }
+    if constexpr (dtype == PARCK_MODE_HALF)
+    {
+        half4* src = (half4*) src8;
+        half4* src_end = (half4*) src_end8;
+        uint2* dst = (uint2*) dst8;
+        while (src + t < src_end)
+        {
+            half4 h = src[t];
+            float4 f{ __half2float(h.x.x), __half2float(h.x.y), __half2float(h.y.x), __half2float(h.y.y) };
+            uint4 v{ __float_as_uint(f.x), __float_as_uint(f.y), __float_as_uint(f.z), __float_as_uint(f.w) };
+            uint2 pack
+            {
+                ((v.y + 0x8000u) & 0xffff0000u) | ((v.x + 0x8000u) >> 16),
+                ((v.w + 0x8000u) & 0xffff0000u) | ((v.z + 0x8000u) >> 16)
+            };
+            dst[t] = pack;
+            src += NUM_THREADS;
+            dst += NUM_THREADS;
+        }
+    }
+}
+
+template <int dtype>
+__device__ __forceinline__ void arc_wire_recv(const uint8_t* src8, uint8_t* dst8, const uint8_t* dst_end8, int t)
+{
+    if constexpr (dtype == PARCK_MODE_FLOAT)
+    {
+        uint2* src = (uint2*) src8;
+        uint4* dst = (uint4*) dst8;
+        uint4* dst_end = (uint4*) dst_end8;
+        while (dst + t < dst_end)
+        {
+            uint2 pack = src[t];
+            uint4 v{ pack.x << 16, pack.x & 0xffff0000, pack.y << 16, pack.y & 0xffff0000 };
+            dst[t] = v;
+            src += NUM_THREADS;
+            dst += NUM_THREADS;
+        }
+    }
+    if constexpr (dtype == PARCK_MODE_BF16)
+    {
+        uint2* src = (uint2*) src8;
+        uint2* dst = (uint2*) dst8;
+        uint2* dst_end = (uint2*) dst_end8;
+        while (dst + t < dst_end)
+        {
+            dst[t] = src[t];
+            src += NUM_THREADS;
+            dst += NUM_THREADS;
+        }
+    }
+    if constexpr (dtype == PARCK_MODE_HALF)
+    {
+        uint2* src = (uint2*) src8;
+        half4* dst = (half4*) dst8;
+        half4* dst_end = (half4*) dst_end8;
+        while (dst + t < dst_end)
+        {
+            uint2 pack = src[t];
+            uint4 v{ pack.x << 16, pack.x & 0xffff0000, pack.y << 16, pack.y & 0xffff0000 };
+            float4 f{ __uint_as_float(v.x), __uint_as_float(v.y), __uint_as_float(v.z), __uint_as_float(v.w) };
+            half4 h(__float2half_rn(f.x), __float2half_rn(f.y), __float2half_rn(f.z), __float2half_rn(f.w));
+            dst[t] = h;
+            src += NUM_THREADS;
+            dst += NUM_THREADS;
+        }
+    }
+}
+
+template <int dtype>
+__global__ __launch_bounds__(NUM_THREADS)
+void pg_all_reduce_cpu_send_kernel
+(
+    PGContext* __restrict__ ctx,
+    int this_device,
+    uint8_t* __restrict__ data_ptr,
+    uint8_t* __restrict__ shbuf_ptr,
+    size_t data_size,
+    size_t shbuf_size,
+    bool contributor
+)
+{
+    const uint32_t buf_slot_size = (shbuf_size / (MAX_DEVICES + 1) / 1024) * 1024;
+    const uint32_t max_buf_stages = buf_slot_size / CPUREDUCE_CHUNK_SIZE;
+    int t = threadIdx.x;
+
+    __shared__ uint32_t cc;
+    if (t == 0)
+        cc = (uint32_t)ldg_acquire_sys_u32(ctx->cpusum_stage_device + this_device * REDUCE_STAGE_STRIDE);
+    __syncthreads();
+    uint32_t stage = cc & 0x7fffffffu;
+
+    if (contributor)
+    {
+        uint8_t* dst = shbuf_ptr + buf_slot_size * this_device + (stage % max_buf_stages) * CPUREDUCE_CHUNK_SIZE;
+        arc_wire_send<dtype>(data_ptr, data_ptr + data_size, dst, t);
+    }
+
+    uint32_t next = (stage + 1u) & 0x7fffffffu;
+    if (!contributor) next |= 0x80000000u;
+    __syncthreads();
+    if (t == 0)
+        stg_release_sys_u32(ctx->cpusum_stage_device + this_device * REDUCE_STAGE_STRIDE, next);
+}
+
+template <int dtype>
+__global__ __launch_bounds__(NUM_THREADS)
+void pg_all_reduce_cpu_recv_kernel
+(
+    PGContext* __restrict__ ctx,
+    int this_device,
+    uint8_t* __restrict__ data_ptr,
+    uint8_t* __restrict__ shbuf_ptr,
+    size_t data_size,
+    size_t shbuf_size,
+    uint32_t* abort_flag
+)
+{
+    const uint32_t buf_slot_size = (shbuf_size / (MAX_DEVICES + 1) / 1024) * 1024;
+    const uint32_t max_buf_stages = buf_slot_size / CPUREDUCE_CHUNK_SIZE;
+    int t = threadIdx.x;
+
+    // The send kernel ran earlier on this stream, so this device's flag already holds stage + 1
+    __shared__ uint32_t cc;
+    if (t == 0)
+    {
+        cc = (uint32_t)ldg_acquire_sys_u32(ctx->cpusum_stage_device + this_device * REDUCE_STAGE_STRIDE)
+             & 0x7fffffffu;
+        uint64_t deadline = sync_deadline();
+        uint64_t sleep = SYNC_MIN_SLEEP;
+        while (true)
+        {
+            uint32_t ep = (uint32_t)ldg_acquire_sys_u32(&ctx->cpusum_stage_cpu);
+            if (ep >= cc) break;
+            __nanosleep(sleep);
+            if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
+            else if (check_timeout(ctx, deadline, "pg_all_reduce_cpu_recv_kernel"))
+            {
+                *abort_flag = 1;
+                break;
+            }
+        }
+    }
+    __syncthreads();
+
+    uint32_t stage = (cc - 1u) & 0x7fffffffu;
+    const uint8_t* src = shbuf_ptr + buf_slot_size * MAX_DEVICES + (stage % max_buf_stages) * CPUREDUCE_CHUNK_SIZE;
+    arc_wire_recv<dtype>(src, data_ptr, data_ptr + data_size, t);
+}
+
 void pg_all_reduce_cpu
 (
     uintptr_t ctx,
@@ -406,64 +605,110 @@ void pg_all_reduce_cpu
     TORCH_CHECK(cpu_data_size % 16 == 0, "data_size must be multiple of 16");
 
     uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
-    void* kernelArgs[] =
-    {
-        (void*)& ctx_dev,
-        (void*)& device_mask,
-        (void*)& this_device,
-        (void*)& master_device,
-        (void*)& data_ptr,
-        (void*)& shbuf_ptr,
-        (void*)& device_data_size,
-        (void*)& shbuf_size,
-        (void*)& contributor,
-        (void*)& abort_flag_ptr
-    };
 
-    dim3 block_grid(2);
-    dim3 block_dim(NUM_THREADS);
+    // Wire format: fp16 tensors go over an fp16 wire when the CPU can accumulate them (F16C) —
+    // exact for two ranks, fp16-rounded beyond, and the GPU-side pack/unpack becomes a plain
+    // copy (the PARCK_MODE_BF16 kernels move raw 16-bit words, so they serve both wires).
+    // fp32 payloads keep the bf16 wire for range. All ranks and the CPU helper resolve this
+    // identically from the tensor dtype + local CPUID
+    static const bool no_fp16_wire = getenv("EXL3_TP_NO_FP16_WIRE") != nullptr;
+    bool fp16_wire = tensor.dtype() == at::kHalf && !no_fp16_wire && is_f16c_supported();
+    uint32_t wire_dtype = fp16_wire ? REDUCE_WIRE_FP16 : REDUCE_WIRE_BF16;
+    if (fp16_wire)
+    {
+        static bool logged = false;
+        if (!logged && getenv("EXL3_TP_TRACE_WIRE")) { logged = true; printf(" -- all_reduce: fp16 wire active\n"); }
+    }
 
-    if (tensor.dtype() == at::kFloat)
+    // Single-chunk payloads (all decode-size reduces) take the split send/recv path; larger
+    // payloads use the cooperative kernel, whose resident blocks pipeline send/recv across chunks
+    if (cpu_data_size <= CPUREDUCE_CHUNK_SIZE)
     {
-        cudaLaunchCooperativeKernel
-        (
-            (void*)pg_all_reduce_cpu_kernel<PARCK_MODE_FLOAT>,
-            block_grid,
-            block_dim,
-            kernelArgs,
-            0,
-            stream
-        );
+        PGContext* ctx_d = (PGContext*) ctx_dev;
+        if (tensor.dtype() == at::kFloat)
+        {
+            pg_all_reduce_cpu_send_kernel<PARCK_MODE_FLOAT><<<1, NUM_THREADS, 0, stream>>>
+                (ctx_d, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, contributor);
+            pg_all_reduce_cpu_recv_kernel<PARCK_MODE_FLOAT><<<1, NUM_THREADS, 0, stream>>>
+                (ctx_d, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, abort_flag_ptr);
+        }
+        else if (tensor.dtype() == at::kHalf && !fp16_wire)
+        {
+            pg_all_reduce_cpu_send_kernel<PARCK_MODE_HALF><<<1, NUM_THREADS, 0, stream>>>
+                (ctx_d, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, contributor);
+            pg_all_reduce_cpu_recv_kernel<PARCK_MODE_HALF><<<1, NUM_THREADS, 0, stream>>>
+                (ctx_d, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, abort_flag_ptr);
+        }
+        else if (tensor.dtype() == at::kBFloat16 || fp16_wire)
+        {
+            pg_all_reduce_cpu_send_kernel<PARCK_MODE_BF16><<<1, NUM_THREADS, 0, stream>>>
+                (ctx_d, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, contributor);
+            pg_all_reduce_cpu_recv_kernel<PARCK_MODE_BF16><<<1, NUM_THREADS, 0, stream>>>
+                (ctx_d, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, abort_flag_ptr);
+        }
+        else TORCH_CHECK(false, "pg_all_reduce_cpu: Unknown dtype");
     }
-    else if (tensor.dtype() == at::kHalf)
+    else
     {
-        cudaLaunchCooperativeKernel
-        (
-            (void*)pg_all_reduce_cpu_kernel<PARCK_MODE_HALF>,
-            block_grid,
-            block_dim,
-            kernelArgs,
-            0,
-            stream
-        );
+        void* kernelArgs[] =
+        {
+            (void*)& ctx_dev,
+            (void*)& device_mask,
+            (void*)& this_device,
+            (void*)& master_device,
+            (void*)& data_ptr,
+            (void*)& shbuf_ptr,
+            (void*)& device_data_size,
+            (void*)& shbuf_size,
+            (void*)& contributor,
+            (void*)& abort_flag_ptr
+        };
+
+        dim3 block_grid(2);
+        dim3 block_dim(NUM_THREADS);
+
+        if (tensor.dtype() == at::kFloat)
+        {
+            cudaLaunchCooperativeKernel
+            (
+                (void*)pg_all_reduce_cpu_kernel<PARCK_MODE_FLOAT>,
+                block_grid,
+                block_dim,
+                kernelArgs,
+                0,
+                stream
+            );
+        }
+        else if (tensor.dtype() == at::kHalf && !fp16_wire)
+        {
+            cudaLaunchCooperativeKernel
+            (
+                (void*)pg_all_reduce_cpu_kernel<PARCK_MODE_HALF>,
+                block_grid,
+                block_dim,
+                kernelArgs,
+                0,
+                stream
+            );
+        }
+        else if (tensor.dtype() == at::kBFloat16 || fp16_wire)
+        {
+            cudaLaunchCooperativeKernel
+            (
+                (void*)pg_all_reduce_cpu_kernel<PARCK_MODE_BF16>,
+                block_grid,
+                block_dim,
+                kernelArgs,
+                0,
+                stream
+            );
+        }
+        else TORCH_CHECK(false, "pg_all_reduce_cpu: Unknown dtype");
     }
-    else if (tensor.dtype() == at::kBFloat16)
-    {
-        cudaLaunchCooperativeKernel
-        (
-            (void*)pg_all_reduce_cpu_kernel<PARCK_MODE_BF16>,
-            block_grid,
-            block_dim,
-            kernelArgs,
-            0,
-            stream
-        );
-    }
-    else TORCH_CHECK(false, "pg_all_reduce_cpu: Unknown dtype");
 
     cuda_check(cudaPeekAtLastError());
 
     // Master also queues up CPU reduction. Job will be popped in separate CPU reduce process
     if (is_master)
-        push_reduce_job((PGContext*) ctx, cpu_data_size, device_mask);
+        push_reduce_job((PGContext*) ctx, cpu_data_size, device_mask, wire_dtype);
 }
