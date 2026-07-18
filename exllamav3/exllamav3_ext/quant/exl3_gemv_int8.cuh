@@ -14,6 +14,10 @@
 
 bool exl3_gemv_int8_enabled();
 
+// Highest K the int8 path accepts on `device` (per-arch, EXL3_INT8_GEMV_MAX_K override). Also
+// bound to Python so the mgemm fusion heuristic can mirror the gate
+int exl3_gemv_int8_max_k(int device);
+
 // Returns true if the operation was handled (false -> caller should fall through to the regular kernel)
 bool exl3_gemv_int8
 (

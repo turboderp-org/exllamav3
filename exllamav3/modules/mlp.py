@@ -637,6 +637,7 @@ class GatedMLP(Module):
                 self.gates[load_slice].inner.K,
                 self.gates[load_slice].out_features,
                 self.gates[load_slice].inner.mul1 and self.ups[load_slice].inner.mul1,
+                self.device,
             )
         ):
             self.multi_gu[load_slice] = MultiLinear(self.device, [self.gates[load_slice], self.ups[load_slice]])

@@ -496,6 +496,7 @@ class SlidingAttention(Module):
             self.config.infer_params.use_mgemm(
                 self.k_proj.inner.K, self.k_proj.out_features,
                 self.k_proj.inner.mul1 and self.v_proj.inner.mul1,
+                device,
             )
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
@@ -516,6 +517,7 @@ class SlidingAttention(Module):
             self.config.infer_params.use_mgemm(
                 self.q_proj.inner.K, self.q_proj.out_features,
                 self.q_proj.inner.mul1 and self.g_proj.inner.mul1,
+                device,
             )
         ):
             self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])

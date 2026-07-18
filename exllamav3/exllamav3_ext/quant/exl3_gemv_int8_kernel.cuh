@@ -305,9 +305,8 @@ __device__ __forceinline__ void gemv_int8_row_sums
     __syncthreads();
 }
 
-// K >= 6 is DRAM-bound and the regular kernel reads the same bytes with less overhead; the int8
-// path only wins where the fp16 pipeline is compute/latency-limited
-#define GEMV_INT8_MAX_K 5   // fall back to the regular kernel above this (DRAM-bound regime)
+// The K cap (fall back to the regular kernel in the DRAM-bound regime) is per-arch; see
+// exl3_gemv_int8_max_k in exl3_gemv_int8.cu
 #define GEMV_STAGE_D 4      // cp.async pipeline depth (rows) for the smem-staged unit
 #define GEMV_STAGE_MAX_BYTES (8 * GEMV_STAGE_D * 16 * 8 * 4)   // 8 warps, K = 8
 

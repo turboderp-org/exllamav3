@@ -71,12 +71,24 @@ also *unfused* from the batched MGEMM when each matrix is wide enough to fill th
 own — see the two thresholds below. The graphed decode paths (BC modules) handle both the fused
 and unfused configurations.
 
-### `EXL3_MGEMM_K_THRESHOLD` (default: `6`), `EXL3_MGEMM_N_THRESHOLD` (default: `8192`)
+### `EXL3_INT8_GEMV_MAX_K` (default: per-arch)
+
+Highest bitrate K the int8 GEMV path accepts; above it the regular fp16 kernel runs instead.
+The default is 6 on Hopper and Blackwell and 5 elsewhere: Ampere is DRAM-bound from K = 6 up,
+where the int8 path's reduced per-weight compute no longer helps (and Ada is marginal there),
+but on Hopper (H200 measurements in issue #242) and Blackwell (5090: +7–19% per call at K = 6)
+the fp16 kernel is throughput-bound at K = 6 as well. Values up to 8 can be forced to test the
+crossover on unmeasured parts; the MGEMM unfusing threshold below follows this cap
+automatically.
+
+### `EXL3_MGEMM_K_THRESHOLD` (default: per-arch), `EXL3_MGEMM_N_THRESHOLD` (default: `8192`)
 
 Unfusing heuristics applied when the int8 GEMV mode is enabled, to mul1 tensor pairs only: keep
 the fused MGEMM when the bitrate K is at or above the K threshold (the int8 path declines those
 anyway), or when the matrices are narrower than the N threshold (too narrow for separate GEMV
-calls to fill the GPU; batching is what restores utilization there).
+calls to fill the GPU; batching is what restores utilization there). The K threshold defaults
+to one above the int8 path's per-arch K cap (see `EXL3_INT8_GEMV_MAX_K`); setting it explicitly
+pins it on every device.
 
 ### `EXLLAMAV3_TUNE_CACHE` (default: platform cache dir)
 
