@@ -830,11 +830,68 @@ def _qc_load_v(qwords, scales, tok_rows, kv_head, offs_d, mask_n,
     inv_m = 1.0 / (1 << (BITS - 1))
     return ((raw.to(tl.float32) - mh) * (scx.to(tl.float32) * inv_m)).to(tl.float16)
 
+
+@triton.jit
+def _qc_load_q8_kt(qbytes, scales, tok_rows, kv_head, offs_d, mask_n,
+                   n_kv_heads: tl.constexpr, head_dim: tl.constexpr):
+    """Q8-specialized (head_dim, BLOCK_N) load without int32 word expansion."""
+    GPT: tl.constexpr = n_kv_heads * head_dim // 32
+    token_dim: tl.constexpr = n_kv_heads * head_dim
+    base = kv_head * head_dim
+    raw = tl.load(
+        qbytes + tok_rows[None, :] * token_dim + base + offs_d[:, None],
+        mask = mask_n[None, :],
+        other = 0,
+    )
+    sgb = kv_head * (head_dim // 32)
+    sc = tl.load(
+        scales + tok_rows[None, :] * GPT +
+        (sgb + tl.arange(0, head_dim // 32))[:, None],
+        mask = mask_n[None, :],
+        other = 0.0,
+    )
+    scx = tl.reshape(
+        tl.broadcast_to(sc[:, None, :], (head_dim // 32, 32, sc.shape[1])),
+        (head_dim, sc.shape[1]),
+    )
+    return ((raw.to(tl.float32) - 127.5) *
+            (scx.to(tl.float32) * (1.0 / 128.0))).to(tl.float16)
+
+
+@triton.jit
+def _qc_load_q8_v(qbytes, scales, tok_rows, kv_head, offs_d, mask_n,
+                  n_kv_heads: tl.constexpr, head_dim: tl.constexpr):
+    """Transposed orientation of _qc_load_q8_kt."""
+    GPT: tl.constexpr = n_kv_heads * head_dim // 32
+    token_dim: tl.constexpr = n_kv_heads * head_dim
+    base = kv_head * head_dim
+    raw = tl.load(
+        qbytes + tok_rows[:, None] * token_dim + base + offs_d[None, :],
+        mask = mask_n[:, None],
+        other = 0,
+    )
+    sgb = kv_head * (head_dim // 32)
+    sc = tl.load(
+        scales + tok_rows[:, None] * GPT +
+        (sgb + tl.arange(0, head_dim // 32))[None, :],
+        mask = mask_n[:, None],
+        other = 0.0,
+    )
+    scx = tl.reshape(
+        tl.broadcast_to(sc[:, :, None], (sc.shape[0], head_dim // 32, 32)),
+        (sc.shape[0], head_dim),
+    )
+    return ((raw.to(tl.float32) - 127.5) *
+            (scx.to(tl.float32) * (1.0 / 128.0))).to(tl.float16)
+
+
 @triton.jit
 def _paged_attn_decode_split_kernel(
     q,
     k_cache,
     v_cache,
+    k_cache_u8,
+    v_cache_u8,
     block_table,
     cache_seqlens,
     out,
@@ -849,6 +906,7 @@ def _paged_attn_decode_split_kernel(
     sinks,               # last runtime arg: the BC launch appends it after the patched ints
     QCK: tl.constexpr,
     QCV: tl.constexpr,
+    Q8_DIRECT: tl.constexpr,
     q_len: tl.constexpr,
     kv_append_len: tl.constexpr,
     n_q_heads: tl.constexpr,
@@ -913,7 +971,16 @@ def _paged_attn_decode_split_kernel(
 
         if QCK > 0:
             tok_rows = phys * page_size + page_off
-            k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n < n_end, QCK, n_kv_heads, head_dim)
+            if QCK == 8 and Q8_DIRECT:
+                k_tile = _qc_load_q8_kt(
+                    k_cache_u8, k_scales, tok_rows, kv_head, offs_d,
+                    offs_n < n_end, n_kv_heads, head_dim,
+                )
+            else:
+                k_tile = _qc_load_kt(
+                    k_cache, k_scales, tok_rows, kv_head, offs_d,
+                    offs_n < n_end, QCK, n_kv_heads, head_dim,
+                )
         else:
             k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
             k_tile = tl.load(k_ptrs, mask=offs_n[None, :] < n_end, other=0.0)
@@ -940,7 +1007,16 @@ def _paged_attn_decode_split_kernel(
 
         if QCV > 0:
             tok_rows_v = phys * page_size + page_off
-            v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n < n_end, QCV, n_kv_heads, head_dim)
+            if QCV == 8 and Q8_DIRECT:
+                v_tile = _qc_load_q8_v(
+                    v_cache_u8, v_scales, tok_rows_v, kv_head, offs_d,
+                    offs_n < n_end, n_kv_heads, head_dim,
+                )
+            else:
+                v_tile = _qc_load_v(
+                    v_cache, v_scales, tok_rows_v, kv_head, offs_d,
+                    offs_n < n_end, QCV, n_kv_heads, head_dim,
+                )
         else:
             v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
             v_tile = tl.load(v_ptrs, mask=offs_n[:, None] < n_end, other=0.0)
@@ -1062,6 +1138,7 @@ def paged_attn_triton_decode(
     n_kv_heads_override: int | None = None,
     num_warps: int = 4,
     num_stages: int = 2,
+    _q8_direct: bool = True,
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
@@ -1117,9 +1194,13 @@ def paged_attn_triton_decode(
     if qc is not None:
         k_scales, v_scales, qck, qcv = qc
         h32 = _get_h32(q.device)
+        k_cache_u8 = k_cache.view(torch.uint8) if qck == 8 else k_cache
+        v_cache_u8 = v_cache.view(torch.uint8) if qcv == 8 else v_cache
     else:
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
+        k_cache_u8 = k_cache
+        v_cache_u8 = v_cache
 
     if block_n is None:
         block_n = max(16, 8192 // head_dim)   # K + V tiles in smem across num_stages
@@ -1164,10 +1245,11 @@ def paged_attn_triton_decode(
             )
 
         _paged_attn_decode_split_kernel[(programs, num_splits)](
-            q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
+            q, k_cache, v_cache, k_cache_u8, v_cache_u8,
+            block_table, cache_seqlens, out, partial_o, partial_ml,
             k_scales, v_scales, h32,
             split_len, num_pages_per_seq, num_splits, sinks,
-            qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
+            qck, qcv, _q8_direct, q_len, kv_append_len, n_q_heads, n_kv_heads,
             page_size, head_dim, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
             num_splits == 1, has_sinks, block_m, block_h, block_rows, block_n,
