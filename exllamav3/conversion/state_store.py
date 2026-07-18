@@ -56,7 +56,7 @@ def ram_available_bytes() -> int:
         pass
     try:
         return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (ValueError, OSError):
+    except (AttributeError, ValueError, OSError):   # os.sysconf does not exist on Windows
         return 16 << 30  # conservative fallback; store() degrades gracefully anyway
 
 
