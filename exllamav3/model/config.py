@@ -42,9 +42,12 @@ class InferParams:
         # follows the int8 kernel's per-arch K cap (Hopper takes K = 6 as well, issue #242), unless
         # EXL3_MGEMM_K_THRESHOLD pins it explicitly
         K_thr = self.mgemm_K_threshold
-        if K_thr and not self.mgemm_K_env and device is not None and device.type == "cuda" and device.index is not None:
-            from ..ext import exllamav3_ext as ext
-            K_thr = ext.exl3_gemv_int8_max_k(device.index) + 1
+        if K_thr and not self.mgemm_K_env and device is not None:
+            import torch
+            device = torch.device(device)
+            if device.type == "cuda" and device.index is not None:
+                from ..ext import exllamav3_ext as ext
+                K_thr = ext.exl3_gemv_int8_max_k(device.index) + 1
         return K >= K_thr or (self.mgemm_n_threshold > 0 and out_features < self.mgemm_n_threshold)
 
 
