@@ -804,6 +804,45 @@ class PromptFormat_minimax(PromptFormat):
         return "<think>", "</think>"
 
 
+class PromptFormat_hy3(PromptFormat):
+    description = "Hy3"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = "<｜hy_begin_of_sentence:opensource｜>"
+        if system_prompt:
+            context += system_prompt
+        context += "<｜reasoning_mode:opensource｜>reasoning_effort:"
+        context += "low" if think else "no_think"
+        for (u, a) in messages:
+            context += "<｜hy_User:opensource｜>"
+            context += u
+            context += "<｜hy_Assistant:opensource｜>"
+            if a is not None:
+                context += "<think:opensource></think:opensource>"
+                context += a
+                context += "<｜hy_eos:opensource｜>"
+            elif not think:
+                context += "<think:opensource></think:opensource>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list
+
+    def thinktag(self):
+        return "<think:opensource>", "</think:opensource>"
+
+
 class PromptFormat_gptoss(PromptFormat):
     description = "GPT-OSS"
 
@@ -875,5 +914,6 @@ prompt_formats = {
     "seed": PromptFormat_seed,
     "apertus": PromptFormat_apertus,
     "minimax": PromptFormat_minimax,
-    "gptoss": PromptFormat_gptoss
+    "gptoss": PromptFormat_gptoss,
+    "hy3": PromptFormat_hy3,
 }
