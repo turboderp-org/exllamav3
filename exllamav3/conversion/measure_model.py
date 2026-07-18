@@ -7,7 +7,6 @@ from .calibration_data import get_default_calibration
 from .state_store import TieredStateStore, auto_kldiv_batch, ram_available_bytes
 import json
 import torch.nn.functional as F
-import math
 from collections import defaultdict
 
 col_default = "\u001b[0m"
@@ -193,7 +192,7 @@ def main(args, job_state):
     init_states_ref = torch.cat(init_states_ref, dim = 0)
 
     # Plan memory. Snapshots fill otherwise-idle VRAM first, spill to system RAM second,
-    # and only reach swap if both are genuinely exhausted. All budgets are autodetected;
+    # and only reach swap if both are exhausted. All budgets are autodetected;
     # -ms optionally caps the combined budget manually. NOTE: the true working set is
     # targets_per_pass * NUM_CANDIDATES * state_size (one snapshot per candidate per
     # target), and the last module additionally materializes a [rows*cols, vocab] fp16
@@ -220,6 +219,12 @@ def main(args, job_state):
         budget = vram_budget + ram_budget
     # A single module's targets must always fit in one pass
     budget = max(budget, max(len(t) for t in targets_per_layer) * num_cand * state_size + 2 * state_size)
+    if budget > vram_budget + ram_budget:
+        print(
+            f" !! {col_red}Minimum working set ({budget / 1024**3:.1f} GB for one module's snapshots) exceeds "
+            f"detected memory ({(vram_budget + ram_budget) / 1024**3:.1f} GB VRAM + RAM); "
+            f"the run will proceed but expect heavy swapping{col_default}"
+        )
     print(
         f" -- State budget: {vram_budget / 1024**3:.1f} GB VRAM + {ram_budget / 1024**3:.1f} GB RAM"
         f" (reserving {reserve / 1024**3:.1f} GB VRAM for module loads + output-layer logits)"

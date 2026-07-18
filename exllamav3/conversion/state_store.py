@@ -20,7 +20,7 @@ Motivation (measured on gpt-oss-120b, 36L/128-expert MoE, 96 GB GPU / 123 GB RAM
 The store keeps snapshots in VRAM while ``free - size > reserve`` holds (checked live,
 per store, so module loads and transients are automatically respected), spilling to
 pageable system RAM otherwise. If RAM is exhausted the OS pages to swap — degraded but
-alive, and only reachable after both real tiers are genuinely full.
+alive, and only reachable after both real tiers are full.
 
 Correctness notes:
 
