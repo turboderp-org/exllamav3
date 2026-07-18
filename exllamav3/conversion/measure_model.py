@@ -1,11 +1,12 @@
 import argparse
+import os
 import torch
 from .. import Config, Model, Tokenizer
 from ..util.progress import ProgressBar
 from .calibration_data import get_default_calibration
+from .state_store import TieredStateStore, auto_kldiv_batch, ram_available_bytes
 import json
 import torch.nn.functional as F
-import math
 from collections import defaultdict
 
 col_default = "\u001b[0m"
@@ -28,7 +29,7 @@ parser.add_argument("-cr", "--cal_rows", type = int, default = 10, help = "Calib
 parser.add_argument("-cc", "--cal_cols", type = int, default = 1024, help = "Calibration data size, columns, default: 1024")
 # parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use, e.g. --devices 0,1,2")
 parser.add_argument("-d", "--device", type = int, default = 0, help = "Device index")
-parser.add_argument("-ms", "--max_sys", type = float, default = 8, help = "Max system memory for state data, in GB")
+parser.add_argument("-ms", "--max_sys", type = float, default = None, help = "Optional manual cap on the total state-data budget (VRAM + RAM combined), in GB. Default: autodetect")
 
 def prepare(args) -> (dict, dict, bool, str):
     if not args.in_dir:
@@ -78,8 +79,8 @@ def prepare_state(args, job_state, config, model, tokenizer):
 def kldiv(s, ref):
     r = ref.view(-1, ref.shape[-1])
     s = s.view(-1, s.shape[-1])
-    bsz, _ = s.shape
-    max_batch = 512
+    bsz, vocab = s.shape
+    max_batch = auto_kldiv_batch(vocab)
     kld = 0
     for i in range(0, bsz, max_batch):
         ref_probs = torch.softmax(r[i : i+max_batch, ...].to(s.device), dim = -1, dtype = torch.float)
@@ -190,19 +191,57 @@ def main(args, job_state):
     init_states_ref = prepare_state(args, job_state, config_ref, model_ref, tokenizer)
     init_states_ref = torch.cat(init_states_ref, dim = 0)
 
-    # Chunk to limit system RAM
+    # Plan memory. Snapshots fill otherwise-idle VRAM first, spill to system RAM second,
+    # and only reach swap if both are exhausted. All budgets are autodetected;
+    # -ms optionally caps the combined budget manually. NOTE: the true working set is
+    # targets_per_pass * NUM_CANDIDATES * state_size (one snapshot per candidate per
+    # target), and the last module additionally materializes a [rows*cols, vocab] fp16
+    # logits tensor in VRAM per forward — both are accounted for below.
     print(f" -- Total optimized params: {total_targets}")
     state_size = config_ref.hidden_size * init_states_ref.numel() * 4
-    r_sys = int(args["max_sys"] * 1024**3) - state_size * 2
-    t_sys_cand = total_targets * state_size
-    num_chunks = int(math.ceil(t_sys_cand / r_sys))
+    vocab_size = getattr(config_ref, "vocab_size", None) or tokenizer.actual_vocab_size
+    head_transient = init_states_ref.numel() * vocab_size * 2
+
+    def _model_bytes(d):
+        return sum(
+            os.path.getsize(os.path.join(d, f))
+            for f in os.listdir(d) if f.endswith(".safetensors")
+        )
+    module_estimate = int(sum(_model_bytes(d) for d in [dir_ref] + dir_q) / len(model_ref.modules) * 1.5)
+    reserve = head_transient + module_estimate + (4 << 30)
+    store = TieredStateStore(device, reserve_bytes = reserve)
+    free_vram, _ = torch.cuda.mem_get_info(device)
+    vram_budget = max(0, free_vram - reserve)
+    ram_budget = max(0, int(ram_available_bytes() * 0.85) - head_transient)
+    if args["max_sys"] is not None:
+        budget = int(args["max_sys"] * 1024**3)
+    else:
+        budget = vram_budget + ram_budget
+    # A single module's targets must always fit in one pass
+    budget = max(budget, max(len(t) for t in targets_per_layer) * num_cand * state_size + 2 * state_size)
+    if budget > vram_budget + ram_budget:
+        print(
+            f" !! {col_red}Minimum working set ({budget / 1024**3:.1f} GB for one module's snapshots) exceeds "
+            f"detected memory ({(vram_budget + ram_budget) / 1024**3:.1f} GB VRAM + RAM); "
+            f"the run will proceed but expect heavy swapping{col_default}"
+        )
+    print(
+        f" -- State budget: {vram_budget / 1024**3:.1f} GB VRAM + {ram_budget / 1024**3:.1f} GB RAM"
+        f" (reserving {reserve / 1024**3:.1f} GB VRAM for module loads + output-layer logits)"
+        + ("" if args["max_sys"] is None else f"; capped at {budget / 1024**3:.1f} GB by -ms")
+    )
+    # Pack modules into passes greedily against the real working-set cost per module
     tpl = targets_per_layer
-    lpc = int(math.ceil(len(tpl) / num_chunks))
     tpl_chunks = []
-    for i in range(0, len(tpl), lpc):
-        tpl_c = [(t if i <= j < i + lpc else []) for j, t in enumerate(tpl)]
-        if any(t for t in tpl_c):
-            tpl_chunks.append(tpl_c)
+    chunk_start, chunk_bytes = 0, 2 * state_size
+    for j in range(len(tpl)):
+        need = len(tpl[j]) * num_cand * state_size
+        if chunk_bytes + need > budget and any(tpl[i] for i in range(chunk_start, j)):
+            tpl_chunks.append([(tt if chunk_start <= i < j else []) for i, tt in enumerate(tpl)])
+            chunk_start, chunk_bytes = j, 2 * state_size
+        chunk_bytes += need
+    if any(tpl[i] for i in range(chunk_start, len(tpl))):
+        tpl_chunks.append([(tt if chunk_start <= i else []) for i, tt in enumerate(tpl)])
 
     all_cand_groups = []
     all_cand_costs = [[] for _ in range(num_cand)]
@@ -245,9 +284,9 @@ def main(args, job_state):
 
                 # Reference forward pass
                 params = {"activate_all_experts": True, "attn_mode": "flash_attn_nc"}
-                s = module.prepare_for_device(states_ref, params)
+                s = module.prepare_for_device(store.load(states_ref), params)
                 s = module.forward(s, params)
-                new_states_ref = s.cpu()
+                new_states_ref = store.store(s)
                 del s
                 torch.cuda.empty_cache()
                 pb.update(pb_prog)
@@ -276,13 +315,13 @@ def main(args, job_state):
 
                 # Advance base state
                 params = {"activate_all_experts": True, "attn_mode": "flash_attn_nc"}
-                s = modules[0].prepare_for_device(states_q, params)
+                s = modules[0].prepare_for_device(store.load(states_q), params)
                 s = modules[0].forward(s, params)
                 if last_fwd:
                     base_kld = kldiv(s, new_states_ref)
                     new_states_q = None
                 else:
-                    new_states_q = s.cpu()
+                    new_states_q = store.store(s)
                 del s
                 torch.cuda.empty_cache()
                 pb.update(pb_prog)
@@ -296,13 +335,13 @@ def main(args, job_state):
                     for i in range(len(cand_states[k])):
                         states_c = cand_states[k][i]
                         params = {"activate_all_experts": True, "attn_mode": "flash_attn_nc"}
-                        s = modules[0].prepare_for_device(states_c, params)
+                        s = modules[0].prepare_for_device(store.load(states_c), params)
                         s = modules[0].forward(s, params)
                         if last_fwd:
                             cand_kld[k][i] += kldiv(s, new_states_ref) - base_kld
                             cand_states[k][i] = None
                         else:
-                            cand_states[k][i] = s.cpu()
+                            cand_states[k][i] = store.store(s)
                         del s
                         torch.cuda.empty_cache()
                         pb.update(pb_prog)
@@ -327,12 +366,12 @@ def main(args, job_state):
                             "attn_mode": "flash_attn_nc",
                             "ovr": {key : model_q[k + 1].find_module(key) for key in t}
                         }
-                        s = modules[0].prepare_for_device(states_q, params)
+                        s = modules[0].prepare_for_device(store.load(states_q), params)
                         s = modules[0].forward(s, params)
                         if last_fwd:
                             cand_kld[k][i] = kldiv(s, new_states_ref) - base_kld
                         else:
-                            cand_states[k].append(s.cpu())
+                            cand_states[k].append(store.store(s))
                         del s
                         torch.cuda.empty_cache()
                         pb.update(pb_prog)
@@ -428,4 +467,5 @@ def main(args, job_state):
         f.write(json.dumps(results, indent = 4))
 
     # Done
+    print(f" -- {store.stats()}")
     print(" -- Done")
