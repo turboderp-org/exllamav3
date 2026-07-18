@@ -30,6 +30,14 @@ while building the path raise.
 
 bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "1") != "0"
 
+# EXL3_BC_ATTN_TRACE=1: print build/decline per module/layer (activation check for A/B tests)
+_bc_trace = os.environ.get("EXL3_BC_ATTN_TRACE", "0") != "0"
+
+def _trace_build(m, result, kind):
+    if _bc_trace:
+        print(f" -- BC-{kind}: {'built' if result is not None else 'DECLINED'}"
+              f" layer {getattr(m, 'layer_idx', '?')} device {m.device}")
+
 MAX_BSZ = 8
 MAX_QLEN = 16
 MAX_R = MAX_BSZ * MAX_QLEN
@@ -57,10 +65,12 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
     return k
 
 
-def _get_sm_count(device: torch.device) -> int:
-    if device.index not in _sm_count:
-        _sm_count[device.index] = torch.cuda.get_device_properties(device).multi_processor_count
-    return _sm_count[device.index]
+def _get_sm_count(device: torch.device | int) -> int:
+    # TP shards store their device as a plain index
+    idx = device.index if hasattr(device, "index") else device
+    if idx not in _sm_count:
+        _sm_count[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return _sm_count[idx]
 
 
 class BCAttn:
@@ -86,7 +96,8 @@ class BCAttn:
     def __init__(self, module, cache_k, cache_v, k_scales = None, v_scales = None,
                  k_bits = 0, v_bits = 0):
         self.module = module
-        self.device = module.device
+        # TP shards store their device as a plain index; normalize for .index consumers
+        self.device = torch.device(module.device) if isinstance(module.device, int) else module.device
         self.head_dim = module.head_dim
         self.num_q_heads = module.num_q_heads
         self.num_kv_heads = module.num_kv_heads
@@ -345,7 +356,10 @@ def _module_eligible(m):
             (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None) or
             BCAttn._fp16_gate_weight(m.g_proj) is not None) and
         (m.v_norm is None or (type(m.v_norm).__name__ == "RMSNorm" and not m.v_norm.span_heads)) and
-        not m.tp_reduce and not m.has_split_cache and not getattr(m, "tp_span_heads_norm", False) and
+        # TP shards are eligible: the shard owns its split cache layers directly (the opaque cache
+        # handle is resolved before bc_attn_step) and the output all-reduce runs after the captured
+        # block returns. Span-heads norms stay declined (cross-rank norm inside the block)
+        not getattr(m, "tp_span_heads_norm", False) and
         (m.q_norm is None or m.q_norm_tensor is not None) and
         _is_pow2(m.head_dim) and m.head_dim <= 512 and
         m.num_q_heads % m.num_kv_heads == 0 and
@@ -380,10 +394,13 @@ def build_bc_swa(module, layer_state):
         k_states.device == torch.device(m.device) and
         m.kv_state_size % PAGE_SIZE == 0
     ):
+        _trace_build(m, None, "swa")
         return None
     k_pages = k_states.view(-1, PAGE_SIZE, m.num_kv_heads, m.head_dim)
     v_pages = v_states.view(-1, PAGE_SIZE, m.num_kv_heads, m.head_dim)
-    return BCAttn(m, k_pages, v_pages)
+    bca = BCAttn(m, k_pages, v_pages)
+    _trace_build(m, bca, "swa")
+    return bca
 
 
 def build_bc_attn(module, layer):
@@ -403,7 +420,11 @@ def build_bc_attn(module, layer):
             layer.k is not None and layer.k.device == torch.device(m.device)
         ))
     ):
+        _trace_build(m, None, "attn")
         return None
     if isinstance(layer, CacheLayer_quant):
-        return BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits)
-    return BCAttn(m, layer.k, layer.v)
+        bca = BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits)
+    else:
+        bca = BCAttn(m, layer.k, layer.v)
+    _trace_build(m, bca, "attn")
+    return bca

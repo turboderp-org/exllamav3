@@ -24,6 +24,7 @@ __global__ void pg_barrier_kernel
 void pg_barrier
 (
     uintptr_t ctx,
+    uintptr_t ctx_dev,
     std::vector<uintptr_t> devices,
     int this_device,
     at::Tensor& abort_flag
@@ -38,7 +39,7 @@ void pg_barrier
 
     pg_barrier_kernel<<<1, 1, 0, stream>>>
     (
-        (PGContext*) ctx,  // Shared, pinned
+        (PGContext*) ctx_dev,  // Shared, pinned (device alias)
         device_mask,
         this_device,
         devices[0],

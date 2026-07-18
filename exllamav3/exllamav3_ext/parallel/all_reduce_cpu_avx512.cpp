@@ -116,7 +116,7 @@ void bf16_add_inplace_avx512
 // Replaces the memcpy + accumulate pattern when exactly two contributions
 // arrive before a third. Assumes count % 64 == 0.
 AVX512_TARGET
-static void bf16_add_twosrc_avx512
+void bf16_add_twosrc_avx512
 (
     uint16_t* __restrict dst,
     const uint16_t* __restrict src_a,
@@ -146,6 +146,101 @@ static void bf16_add_twosrc_avx512
     }
 }
 
+// FP16 wire versions: hardware widen/narrow (EVEX vcvtph2ps/vcvtps2ph, AVX512F), FP32 add,
+// round-to-nearest-even. Convert-port bound (~2x the bf16 integer path per add) but exact wire
+AVX512_TARGET
+static inline void do32_fp16_avx512(uint16_t* __restrict ap, const uint16_t* __restrict bp)
+{
+    __m512i va16 = _mm512_loadu_si512((const __m512i*)ap);
+    __m512i vb16 = _mm512_loadu_si512((const __m512i*)bp);
+    __m512 a_lo = _mm512_cvtph_ps(_mm512_castsi512_si256(va16));
+    __m512 a_hi = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(va16, 1));
+    __m512 b_lo = _mm512_cvtph_ps(_mm512_castsi512_si256(vb16));
+    __m512 b_hi = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(vb16, 1));
+    __m512 s_lo = _mm512_add_ps(a_lo, b_lo);
+    __m512 s_hi = _mm512_add_ps(a_hi, b_hi);
+    __m256i o_lo = _mm512_cvtps_ph(s_lo, _MM_FROUND_TO_NEAREST_INT);
+    __m256i o_hi = _mm512_cvtps_ph(s_hi, _MM_FROUND_TO_NEAREST_INT);
+    __m512i result = _mm512_inserti64x4(_mm512_castsi256_si512(o_lo), o_hi, 1);
+    _mm512_storeu_si512((__m512i*)ap, result);
+}
+
+AVX512_TARGET
+static inline void do32_fp16_avx512_fused(uint16_t* __restrict dst,
+                                          const uint16_t* __restrict src_a,
+                                          const uint16_t* __restrict src_b)
+{
+    __m512i va16 = _mm512_loadu_si512((const __m512i*)src_a);
+    __m512i vb16 = _mm512_loadu_si512((const __m512i*)src_b);
+    __m512 a_lo = _mm512_cvtph_ps(_mm512_castsi512_si256(va16));
+    __m512 a_hi = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(va16, 1));
+    __m512 b_lo = _mm512_cvtph_ps(_mm512_castsi512_si256(vb16));
+    __m512 b_hi = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(vb16, 1));
+    __m512 s_lo = _mm512_add_ps(a_lo, b_lo);
+    __m512 s_hi = _mm512_add_ps(a_hi, b_hi);
+    __m256i o_lo = _mm512_cvtps_ph(s_lo, _MM_FROUND_TO_NEAREST_INT);
+    __m256i o_hi = _mm512_cvtps_ph(s_hi, _MM_FROUND_TO_NEAREST_INT);
+    __m512i result = _mm512_inserti64x4(_mm512_castsi256_si512(o_lo), o_hi, 1);
+    _mm512_storeu_si512((__m512i*)dst, result);
+}
+
+// A += B (FP16), in-place. Assumes count % 64 == 0.
+AVX512_TARGET
+void fp16_add_inplace_avx512
+(
+    uint16_t* __restrict a,
+    const uint16_t* __restrict b,
+    size_t count
+)
+{
+    size_t i = 0;
+    for (; i + 128 <= count; i += 128)
+    {
+        _mm_prefetch((const char*)(a + i + 128), _MM_HINT_T0);
+        _mm_prefetch((const char*)(a + i + 160), _MM_HINT_T0);
+        _mm_prefetch((const char*)(b + i + 128), _MM_HINT_T0);
+        _mm_prefetch((const char*)(b + i + 160), _MM_HINT_T0);
+        do32_fp16_avx512(a + i,       b + i);
+        do32_fp16_avx512(a + i + 32,  b + i + 32);
+        do32_fp16_avx512(a + i + 64,  b + i + 64);
+        do32_fp16_avx512(a + i + 96,  b + i + 96);
+    }
+    for (; i < count; i += 64)
+    {
+        do32_fp16_avx512(a + i,      b + i);
+        do32_fp16_avx512(a + i + 32, b + i + 32);
+    }
+}
+
+// dst = src_a + src_b (FP16), fused two-source add. Assumes count % 64 == 0.
+AVX512_TARGET
+void fp16_add_twosrc_avx512
+(
+    uint16_t* __restrict dst,
+    const uint16_t* __restrict src_a,
+    const uint16_t* __restrict src_b,
+    size_t count
+)
+{
+    size_t i = 0;
+    for (; i + 128 <= count; i += 128)
+    {
+        _mm_prefetch((const char*)(src_a + i + 128), _MM_HINT_T0);
+        _mm_prefetch((const char*)(src_a + i + 160), _MM_HINT_T0);
+        _mm_prefetch((const char*)(src_b + i + 128), _MM_HINT_T0);
+        _mm_prefetch((const char*)(src_b + i + 160), _MM_HINT_T0);
+        do32_fp16_avx512_fused(dst + i,       src_a + i,       src_b + i);
+        do32_fp16_avx512_fused(dst + i + 32,  src_a + i + 32,  src_b + i + 32);
+        do32_fp16_avx512_fused(dst + i + 64,  src_a + i + 64,  src_b + i + 64);
+        do32_fp16_avx512_fused(dst + i + 96,  src_a + i + 96,  src_b + i + 96);
+    }
+    for (; i < count; i += 64)
+    {
+        do32_fp16_avx512_fused(dst + i,      src_a + i,      src_b + i);
+        do32_fp16_avx512_fused(dst + i + 32, src_a + i + 32, src_b + i + 32);
+    }
+}
+
 // Fast path enable for AVX-512
 AVX512_TARGET
 void enable_fast_fp_avx512()
@@ -161,6 +256,7 @@ void perform_cpu_reduce_avx512
     PGContext* ctx,
     size_t data_size,
     uint32_t device_mask,
+    uint32_t wire_dtype,
     uint8_t* shbuf_ptr,
     size_t shbuf_size
 )
@@ -176,6 +272,20 @@ void perform_cpu_reduce_avx512
 
     int num_chunks = (int) CEIL_DIVIDE(data_size, CPUREDUCE_CHUNK_SIZE);
     size_t rem_data_size = data_size;
+    // Single-chunk jobs come from the split kernels (per-device flags); multi-chunk jobs from
+    // the striped bandwidth kernel (per-(device, block) flags). Must match the launch choice
+    const bool multi = num_chunks > 1;
+
+    // Accumulate threads: one per participating rank by default (the add work per chunk scales
+    // with contributor count and a single thread's ~31 GB/s wire rate cannot cover a PCIe5 link
+    // or 3+ ranks), capped by the pool size. EXL3_TP_REDUCE_THREADS overrides
+    static const int env_threads = [] { const char* e = getenv("EXL3_TP_REDUCE_THREADS"); return e ? atoi(e) : 0; }();
+    int acc_threads = 1;
+    if (multi)
+    {
+        acc_threads = env_threads > 0 ? env_threads : __builtin_popcount(device_mask);
+        acc_threads = MAX(acc_threads, 1);
+    }
 
     // Sync
     atomic_ref<uint32_t> stage_(&ctx->cpusum_stage_cpu);
@@ -185,10 +295,34 @@ void perform_cpu_reduce_avx512
     // Timeout
     const auto start = std::chrono::high_resolution_clock::now();
 
+    int chunk_idx = 0;
     while (num_chunks)
     {
         size_t stage_size = MIN(rem_data_size, CPUREDUCE_CHUNK_SIZE);
         rem_data_size = MAX(rem_data_size - stage_size, 0);
+
+        // Accumulator ring throttle (elastic kernel has no lockstep bounding the CPU's lead):
+        // reuse the acc slot only after every device's recv blocks consumed its previous tenant
+        if (multi && chunk_idx >= (int)max_buf_stages)
+        {
+            uint32_t recv_target = ((stage - max_buf_stages) & 0x7fffffffu) + 1u;
+            int throttle_spin = 0;
+            while (!cpusum_recv_ready(ctx, device_mask, recv_target))
+            {
+                _mm_pause();
+                if (++throttle_spin > 10000)
+                {
+                    throttle_spin = 0;
+                    const auto now = std::chrono::high_resolution_clock::now();
+                    const std::chrono::duration<double, std::milli> elapsed = now - start;
+                    if (elapsed > std::chrono::duration<double, std::milli>(45000.0))
+                    {
+                        printf(" ## CPU reduce process timeout (recv throttle)\n");
+                        TORCH_CHECK(false, "CPU reduce process timeout");
+                    }
+                }
+            }
+        }
 
         uint32_t rem_devices = device_mask;
         uint8_t* first_src = nullptr;  // Track first contribution for fused add
@@ -200,16 +334,12 @@ void perform_cpu_reduce_avx512
             {
                 if (!(rem_devices & (1 << device))) continue;
 
-                atomic_ref<uint32_t> device_stage_(&ctx->cpusum_stage_device[device * REDUCE_STAGE_STRIDE]);
-                uint32_t device_stage = device_stage_.load_acquire();
-                uint32_t no_contrib = device_stage & 0x80000000u;
-                device_stage &= 0x7fffffffu;
-
-                if (device_stage != stage)
+                bool no_contrib;
+                if (cpusum_device_arrived(ctx, device, stage, multi, &no_contrib))
                 {
                     rem_devices &= ~(1 << device);
 
-                    if (no_contrib == 0)
+                    if (!no_contrib)
                     {
                         uint8_t* src = host_ptr(device, stage);
                         uint8_t* dst = host_ptr(MAX_DEVICES, stage);
@@ -223,21 +353,28 @@ void perform_cpu_reduce_avx512
                         else if (first_src != dst)
                         {
                             // Second contribution: fused add of first + second -> dst
-                            bf16_add_twosrc_avx512(
+                            cpu_reduce_parallel(
+                                wire_dtype == REDUCE_WIRE_FP16 ? fp16_add_twosrc_avx512 : bf16_add_twosrc_avx512,
+                                nullptr,
                                 (uint16_t*) dst,
                                 (uint16_t*) first_src,
                                 (uint16_t*) src,
-                                elem_count
+                                elem_count,
+                                acc_threads
                             );
                             first_src = dst;  // dst now holds accumulated data
                         }
                         else
                         {
                             // Third+ contribution: accumulate into dst
-                            bf16_add_inplace_avx512(
+                            cpu_reduce_parallel(
+                                nullptr,
+                                wire_dtype == REDUCE_WIRE_FP16 ? fp16_add_inplace_avx512 : bf16_add_inplace_avx512,
                                 (uint16_t*) dst,
+                                nullptr,
                                 (uint16_t*) src,
-                                elem_count
+                                elem_count,
+                                acc_threads
                             );
                         }
                     }
@@ -273,5 +410,6 @@ void perform_cpu_reduce_avx512
         stage_.store_release(stage);
 
         num_chunks--;
+        chunk_idx++;
     }
 }

@@ -3,7 +3,7 @@
 Quick and dirty and probably not very accurate prompt templates for a couple of models
 """
 
-def format_prompt(prompt_format, sp, p):
+def format_prompt(prompt_format, sp, p, no_think = False):
 
     match prompt_format:
 
@@ -38,7 +38,8 @@ def format_prompt(prompt_format, sp, p):
                 f"{sp}<|im_end|>\n"
                 f"<|im_start|>user\n"
                 f"{p}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
+                f"<|im_start|>assistant\n" +
+                (f"<think>\n\n</think>" if no_think else "")
             )
 
         case "gemma":

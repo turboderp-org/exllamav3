@@ -11,6 +11,7 @@
 
 inline __device__ float gumbel(float x)
 {
+    x = fminf(x, 0.99999994f);  // Largest float32 < 1.0
     return -__logf(fmaxf(-__logf(fmaxf(x, 1e-20)), 1e-20));
 }
 

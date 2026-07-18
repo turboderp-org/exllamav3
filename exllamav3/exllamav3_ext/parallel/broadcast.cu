@@ -104,6 +104,10 @@ void pg_broadcast_kernel
         {
             produce_next_stage();
             local_stage++;
+
+            // All warps must finish staging before thread 0 publishes the counter; the release store only
+            // orders the issuing thread's own prior writes
+            __syncthreads();
             stg_release_sys_u32(broadcast_stages_ptr + this_device, local_stage);
 
             // Wait for all consumers to be at most NUM_BROADCAST_STAGES - 2 behind. After last stage, wait for
@@ -314,11 +318,12 @@ void pg_broadcast_ll_kernel
 void pg_broadcast
 (
     uintptr_t ctx,
+    uintptr_t ctx_dev,
     std::vector<uintptr_t> devices,
     int this_device,
     int src_device,
     at::Tensor& tensor,
-    uintptr_t shbuf,
+    uintptr_t shbuf_dev,
     size_t shbuf_size,
     at::Tensor& abort_flag
 )
@@ -328,7 +333,7 @@ void pg_broadcast
     pg_check_timeout(ctx);
 
     uint8_t* data_ptr = (uint8_t*) tensor.data_ptr();
-    uint8_t* shbuf_ptr = (uint8_t*) shbuf;
+    uint8_t* shbuf_ptr = (uint8_t*) shbuf_dev;
     size_t data_size = tensor.numel() * tensor.element_size();
     TORCH_CHECK(data_size % 2 == 0, "data_size must be multiple of 2");
     TORCH_CHECK(((uintptr_t) data_ptr & 1) == 0, "data_ptr must be aligned to 2 bytes");
@@ -338,7 +343,7 @@ void pg_broadcast
     for (int i : devices) device_mask |= (1 << i);
 
     #define ARGS \
-        (PGContext*) ctx, \
+        (PGContext*) ctx_dev, \
         device_mask, \
         this_device, \
         src_device, \
@@ -374,11 +379,12 @@ void pg_broadcast
 void pg_broadcast_ll
 (
     uintptr_t ctx,
+    uintptr_t ctx_dev,
     std::vector<uintptr_t> devices,
     int this_device,
     int src_device,
     at::Tensor& tensor,
-    uintptr_t shbuf,
+    uintptr_t shbuf_dev,
     size_t shbuf_size,
     at::Tensor& abort_flag
 )
@@ -388,7 +394,7 @@ void pg_broadcast_ll
     pg_check_timeout(ctx);
 
     uint8_t* data_ptr = (uint8_t*) tensor.data_ptr();
-    uint8_t* shbuf_ptr = (uint8_t*) shbuf;
+    uint8_t* shbuf_ptr = (uint8_t*) shbuf_dev;
     size_t data_size = tensor.numel() * tensor.element_size();
     TORCH_CHECK(data_size % 2 == 0, "data_size must be multiple of 2");
     TORCH_CHECK(((uintptr_t) data_ptr & 1) == 0, "data_ptr must be aligned to 2 bytes");
@@ -398,7 +404,7 @@ void pg_broadcast_ll
     for (int i : devices) device_mask |= (1 << i);
 
     #define ARGS \
-        (PGContext*) ctx, \
+        (PGContext*) ctx_dev, \
         device_mask, \
         this_device, \
         src_device, \

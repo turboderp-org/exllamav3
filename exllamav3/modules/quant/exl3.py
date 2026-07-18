@@ -140,7 +140,11 @@ class LinearEXL3:
         masks = (1 << torch.arange(16)).to(bitfield.device)
         expanded = (bitfield.unsqueeze(-1) & masks) > 0
         expanded = expanded.flatten()
-        expanded = torch.where(expanded, torch.tensor(-1.0, dtype = torch.float16), torch.tensor(1.0, dtype = torch.float16))
+        # NOT torch.where with CPU scalar tensors: that path misses the device guard when the
+        # condition lives on a non-current device (observed on torch 2.11.0+cu130) — the kernel
+        # launches on the current device's context, faults there, silently zero-fills the output
+        # and leaves every other device in the process unusable. Map bool -> {-1, +1} arithmetically
+        expanded = 1.0 - expanded.to(torch.float16) * 2.0
         return expanded.contiguous().to(device)
 
 

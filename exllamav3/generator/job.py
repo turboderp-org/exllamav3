@@ -7,6 +7,7 @@ from ..constants import PAGE_SIZE
 import numpy as np
 from .pagetable import Sequence, tensor_hash_checksum, random_hash
 from .filter import Filter
+import math
 import random
 import time
 from ..ext import exllamav3_ext as ext
@@ -245,6 +246,7 @@ class Job:
             self.banned_strings_utf32_offsets = None
 
         self.checkpoint = None
+        self.checkpoint_rewound = False
 
         # Metrics
         self.time_enqueue = None
@@ -256,6 +258,9 @@ class Job:
         self.time_generate = rq_state.get("time_generate", 0.0)
         self.accepted_draft_tokens = 0
         self.rejected_draft_tokens = 0
+        self.draft_ema = rq_state.get("draft_ema")
+        self.draft_skip_count = 0
+        self.draft_stats = []
         self.cached_pages = 0
         self.cached_tokens = 0
         self.is_finished = False
@@ -719,6 +724,9 @@ class Job:
                     "held_logits": self.held_logits.clone(1),
                     "explored_tokens": [next_token.item()],
                 }
+                # Keep the nearest recurrent stash warm in the LRU cache in case this hold ends in a rewind
+                if self.recurrent_state is not None:
+                    self.find_recurrent_stash(self.sequences[0].kv_position - 1)
             else:
                 self.checkpoint["offset"] += 1
                 if self.checkpoint["offset"] == 1:
@@ -728,13 +736,42 @@ class Job:
             assert self.checkpoint is not None
             offset = self.checkpoint["offset"]
             self.new_tokens -= offset
+
+            # The attention cache rewinds by truncation, but recurrent states advance destructively. SWA states
+            # can roll back in place within their stored window; other states are restored from the most recent
+            # page-aligned checkpoint at or before the rewind position (or reset, if none survives in the cache)
+            # and prefill then replays the gap, since it re-processes complete pages whenever the state position
+            # is behind the K/V position.
+            replay_from = None
+            if self.recurrent_state is not None:
+                target = self.sequences[0].kv_position - offset
+                # During draft verification the state runs ahead of the accepted K/V position, so rewind by the
+                # state's actual distance from the target rather than by the checkpoint offset
+                rw = self.recurrent_state.position - target
+                if rw <= self.recurrent_state.rollback_capacity():
+                    self.recurrent_state.rewind(rw)
+                else:
+                    stashed = self.find_recurrent_stash(target)
+                    self.recurrent_state.free()
+                    if stashed is not None:
+                        replay_from = stashed["position"]
+                        self.recurrent_state = self.generator.cache.new_from_stashed(stashed, replay_from)
+                    else:
+                        replay_from = 0
+                        self.recurrent_state = self.generator.cache.get_new_state()
+                    self.last_recurrent_checkpoint_pos = replay_from or None
+
             for seq in self.sequences:
                 p_page = seq.kv_position // PAGE_SIZE
                 seq.kv_position -= offset
                 seq.sequence_ids.truncate(len(seq.sequence_ids) - offset)
                 n_page = seq.kv_position // PAGE_SIZE
-                for pi in range(n_page, p_page + 1):
+                for pi in range(n_page, len(seq.allocated_pages)):
                     page = seq.allocated_pages[pi]
+                    # Pages beyond the last accepted position can hold pre-written draft tokens from an abandoned
+                    # verification window; roll those back too, stopping at the write frontier
+                    if pi > p_page and page.kv_position == 0:
+                        break
                     page.can_revert = False
                     if page.kv_position == PAGE_SIZE:
                         page.update_hash(random_hash())
@@ -742,6 +779,18 @@ class Job:
                         page.kv_position = seq.kv_position - pi * PAGE_SIZE
                     else:
                         page.kv_position = 0
+                # Pages between the replay position and the rewind target keep their metadata: their contents are
+                # re-processed by prefill (which ignores page completeness while the state position trails the K/V
+                # position) and rewritten with identical values, and they may include shared prompt-cache pages
+                if replay_from is not None:
+                    seq.kv_position = replay_from
+                    seq.prefill_complete = False
+
+            # An MTP draft carry refers to the pre-rewind context; drop it so drafting pauses until the next
+            # target forward (or replay prefill) provides a fresh one. Signal the generator that any in-flight
+            # draft verification window must be abandoned.
+            self.mtp_last_hidden = None
+            self.checkpoint_rewound = True
             off_tokens = self.held_tokens.slice(len(self.checkpoint["held_tokens"]), None)
             off_text = self.held_text[len(self.checkpoint["held_text"]):]
             self.held_text = self.checkpoint["held_text"]
@@ -842,7 +891,8 @@ class Job:
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
             "rq_new_tokens": self.new_tokens - 1,
-            "sam": self.sam
+            "sam": self.sam,
+            "draft_ema": self.draft_ema,
         }
 
         serial_number = self.serial_number
@@ -900,8 +950,19 @@ class Job:
             self.max_rq_tokens = self.max_new_tokens + 1
 
         # Compatibility checks
-        assert not self.banned_strings or self.generator.recurrent_cache is None, \
-            "Cannot use banned strings on recurrent model"
+        if self.banned_strings and self.generator.recurrent_cache is not None:
+            # SWA states rewind in place, but only within their guaranteed rollback window (one page). Since the
+            # matched text is tokenized by the model and its boundaries are ambiguous, require a margin below that
+            # limit for the reference tokenization of each banned string. States without in-place rollback rewind
+            # by restoring a past checkpoint and replaying, which has no length limit.
+            guaranteed = getattr(self.generator.cache.recurrent_state_cls, "guaranteed_rollback", 0)
+            if guaranteed:
+                max_ref_tokens = guaranteed - 8
+                for s in self.banned_strings:
+                    ref_tokens = self.generator.tokenizer.encode(s).shape[-1]
+                    assert ref_tokens <= max_ref_tokens, \
+                        f"Banned string tokenizes to {ref_tokens} tokens, exceeding the maximum of " \
+                        f"{max_ref_tokens} supported by this model's recurrent state rollback: {s!r}"
 
         # Hash full pages of input IDs
         all_unique_hashes = set()
@@ -1292,6 +1353,10 @@ class Job:
         Store the current recurrent state if the sequence is at a checkpoint boundary.
         """
         seq = self.sequences[0]
+
+        if seq.kv_position == 0:
+            return
+
         if self.is_checkpoint_boundary(interval) and \
             self.last_recurrent_checkpoint_pos != seq.kv_position:
             assert seq.kv_position % PAGE_SIZE == 0
@@ -1307,10 +1372,58 @@ class Job:
             self.last_recurrent_checkpoint_pos = seq.kv_position
 
 
+    def find_recurrent_stash(self, target_pos: int):
+        """
+        Return the most recent page-aligned recurrent state stash at or before target_pos, refreshing its LRU
+        position in the recurrent cache, or None if no eligible stash remains.
+        """
+        seq = self.sequences[0]
+        rc = self.generator.recurrent_cache
+        for pi in range(target_pos // PAGE_SIZE - 1, -1, -1):
+            stashed = rc.get_stashed(seq.allocated_pages[pi].phash)
+            if stashed is not None and stashed["position"] == (pi + 1) * PAGE_SIZE:
+                return stashed
+        return None
+
+
     def free_recurrent_state(self):
         if self.recurrent_state is not None:
             self.recurrent_state.free()
             self.recurrent_state = None
+
+
+    def draft_target(self, max_tokens: int, skip_ema: float = 0.0, probe_interval: int = 16) -> int:
+        """
+        Number of draft tokens this job wants for the next verification window, based on recent acceptance.
+        Optimistic before any window has been measured. With a skip threshold, an EMA below it requests no
+        drafting at all (0), except for a small probe window every probe_interval rounds — skipped rounds
+        produce no acceptance signal, so the probe is the only way the average can recover.
+        """
+        if self.draft_ema is None:
+            return max_tokens
+        if skip_ema > 0.0 and self.draft_ema < skip_ema:
+            self.draft_skip_count += 1
+            if self.draft_skip_count < probe_interval:
+                return 0
+            self.draft_skip_count = 0
+            return min(2, max_tokens)
+        self.draft_skip_count = 0
+        return max(1, min(max_tokens, math.ceil(self.draft_ema)))
+
+
+    def update_draft_ema(self, accepted: int, window: int, alpha_up: float, alpha_down: float):
+        """
+        Update the moving average of accepted draft tokens. Acceptance is censored by the window size, so a fully
+        accepted window counts as one more than observed, letting the window grow again while the output stays
+        predictable. Asymmetric weights let the window climb into a predictable stretch faster than it decays on
+        isolated rejections.
+        """
+        a = accepted + 1 if accepted >= window else accepted
+        if self.draft_ema is None:
+            self.draft_ema = float(a)
+        else:
+            alpha = alpha_up if a > self.draft_ema else alpha_down
+            self.draft_ema = alpha * a + (1.0 - alpha) * self.draft_ema
 
 
     def get_ngram_draft(self, draft_length: int):
@@ -1325,7 +1438,7 @@ class Job:
 
         # Grab continuation after longest match or return empty seq
         if end - beg >= self.generator.ngram_match_min:
-            draft = seq[:, end : end + self.generator.num_draft_tokens]
+            draft = seq[:, end : end + draft_length]
         else:
             draft = torch.empty((1, 0), dtype = torch.long)
 

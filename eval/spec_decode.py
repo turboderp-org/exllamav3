@@ -40,7 +40,7 @@ prompt_files = [
 ]
 
 
-def measure(generator, tokenizer, sampler, max_new_tokens):
+def measure(generator, tokenizer, sampler, max_new_tokens, stats_sink = None):
     path = os.path.dirname(os.path.abspath(__file__))
     all_results = {}
 
@@ -103,6 +103,13 @@ def measure(generator, tokenizer, sampler, max_new_tokens):
             "acc_rate": acc_rate,
         })
 
+        if stats_sink is not None and job.draft_stats:
+            stats_sink.append({
+                "category": category,
+                "file": filename,
+                "stats": job.draft_stats,  # (position, window, accepted, ema) per verification round
+            })
+
     aggregated = {
         category: (
             sum(m["gen_tps"] * m["new_tokens"] for m in cat_results) /
@@ -113,12 +120,56 @@ def measure(generator, tokenizer, sampler, max_new_tokens):
     return aggregated
 
 
+def plot_stats(stats_sink):
+    """
+    Show accepted draft tokens per verification round vs generation position, with the EMA and chosen window
+    overlaid, one panel per trace.
+    """
+    import matplotlib.pyplot as plt
+
+    n = len(stats_sink)
+    fig, axes = plt.subplots(n, 1, figsize = (14, min(3.2 * n, 18)), squeeze = False)
+    axes = axes[:, 0]
+
+    for ax, trace in zip(axes, stats_sink):
+        stats = trace["stats"]
+        pos      = [s[0] for s in stats]
+        window   = [s[1] for s in stats]
+        accepted = [s[2] for s in stats]
+        ema      = [s[3] for s in stats]
+
+        ax.scatter(pos, accepted, s = 6, color = "tab:blue", alpha = 0.45, label = "accepted / window", zorder = 3)
+        ax.step(pos, window, where = "post", color = "tab:red", lw = 1.0, alpha = 0.8, label = "window (chosen)")
+        if any(e is not None for e in ema):
+            ax.plot(pos, ema, color = "tab:green", lw = 1.4, label = "EMA")
+        ax.set_title(f"{trace['category']} — {trace['file']}", fontsize = 10)
+        ax.set_ylabel("draft tokens")
+        ax.set_ylim(-0.4, max(window) + 1.4)
+        ax.grid(alpha = 0.25)
+        ax.legend(loc = "upper right", fontsize = 8)
+
+    axes[-1].set_xlabel("generation position (tokens)")
+    fig.tight_layout()
+    plt.show()
+
+
 @torch.inference_mode()
 def main(args):
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(
         args,
-        min_draft_len = args.ngram_draft_length
+        min_draft_len = args.s_ngram_draft_length
     )
+
+    # Optionlly limit scope
+    if sw := args.single_workload:
+        global prompt_files
+        if sw.endswith("*"):
+            sw = sw[:-1]
+            prompt_files = [p for p in prompt_files if p[0].lower().startswith(sw.lower())]
+        else:
+            prompt_files = [p for p in prompt_files if p[0].lower() == sw.lower()]
+
+    stats_sink = [] if (args.draft_stats or args.plot_stats) else None
 
     # Baseline
     result_baseline = None
@@ -134,16 +185,19 @@ def main(args):
     # N-gram draft
     result_ngram = None
     result_ngram_temp = None
-    if args.ngram_match_min:
+    if args.s_ngram_match_min:
         generator = Generator(
             model = model,
             cache = cache,
             tokenizer = tokenizer,
-            ngram_match_min = args.ngram_match_min,
-            num_draft_tokens = args.ngram_draft_length,
+            ngram_match_min = args.s_ngram_match_min,
+            num_draft_tokens = args.s_ngram_draft_length,
+            dynamic_draft_tokens = args.dynamic_draft,
+            dynamic_draft_skip_ema = args.draft_skip_ema,
+            record_draft_stats = stats_sink is not None,
             max_chunk_size = 4096,
         )
-        result_ngram = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens)
+        result_ngram = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens, stats_sink)
         if args.temperature:
             result_ngram_temp = measure(generator, tokenizer, TopPSampler(0.9, 1), args.max_new_tokens)
 
@@ -158,9 +212,12 @@ def main(args):
             draft_cache = draft_cache,
             tokenizer = tokenizer,
             num_draft_tokens = args.num_draft_tokens,
+            dynamic_draft_tokens = args.dynamic_draft,
+            dynamic_draft_skip_ema = args.draft_skip_ema,
+            record_draft_stats = stats_sink is not None,
             max_chunk_size = 4096,
         )
-        result_draft = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens)
+        result_draft = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens, stats_sink)
         if args.temperature:
             result_draft_temp = measure(generator, tokenizer, TopPSampler(0.9, 1), args.max_new_tokens)
 
@@ -211,6 +268,17 @@ def main(args):
     print(tabulate(rows, headers = headers, tablefmt = "pipe", colalign=("left", *["right"] * (len(headers) - 1)),))
     print()
 
+    if args.draft_stats and stats_sink:
+        with open(args.draft_stats, "w") as f:
+            json.dump(stats_sink, f)
+        print(f"Draft stats written to {args.draft_stats}")
+
+    if args.plot_stats:
+        if not stats_sink:
+            print("No draft stats recorded, nothing to plot")
+        else:
+            plot_stats(stats_sink)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
@@ -222,9 +290,12 @@ if __name__ == "__main__":
         default_autosplit_max_batch_size = 1,
     )
     parser.add_argument("-nbl", "--no_baseline", action = "store_true", help = "Skip baseline measurement")
-    parser.add_argument("-ngram_min", "--ngram_match_min", type = int, help = "N-gram minimum match length, default = 0 (disabled)", default = 0)
-    parser.add_argument("-ngram_len", "--ngram_draft_length", type = int, help = "N-gram draft length, default = 4", default = 4)
+    parser.add_argument("-ngram_min", "--s_ngram_match_min", type = int, help = "N-gram minimum match length, default = 0 (disabled)", default = 0)
+    parser.add_argument("-ngram_len", "--s_ngram_draft_length", type = int, help = "N-gram draft length, default = 4", default = 4)
     parser.add_argument("-tokens", "--max_new_tokens", type = int, help = "Max sampled tokens per round", default = 1024)
     parser.add_argument("-temp", "--temperature", action = "store_true", help = "Also sample with temperature")
+    parser.add_argument("-single", "--single_workload", type = str, help = "Limit to single workload", default = None)
+    parser.add_argument("-dstats", "--draft_stats", type = str, help = "Write per-round (position, window, accepted, ema) records to JSON file", default = None)
+    parser.add_argument("-plot", "--plot_stats", action = "store_true", help = "Plot per-round draft stats in a matplotlib window after the run")
     _args = parser.parse_args()
     main(_args)

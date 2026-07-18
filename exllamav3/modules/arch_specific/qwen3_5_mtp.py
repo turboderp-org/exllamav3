@@ -25,6 +25,7 @@ class Qwen3_5MTPInputLayer(Module):
         out_dtype: torch.dtype | None = torch.float,
         qmap: str | None = None,
         qbits_key = "mtp_bits",
+        constant_bias: float = 1.0,
     ):
         super().__init__(config, key, None)
         self.module_name = "Qwen3_5MTPInputLayer"
@@ -42,14 +43,14 @@ class Qwen3_5MTPInputLayer(Module):
             config = config,
             key = f"{key_pre_fc_norm_hidden}",
             rms_norm_eps = rms_norm_eps,
-            constant_bias = 1.0,
+            constant_bias = constant_bias,
             out_dtype = torch.half,
         )
         self.pre_fc_norm_embedding = RMSNorm(
             config = config,
             key = f"{key_pre_fc_norm_embedding}",
             rms_norm_eps = rms_norm_eps,
-            constant_bias = 1.0,
+            constant_bias = constant_bias,
             out_dtype = torch.half,
         )
 
