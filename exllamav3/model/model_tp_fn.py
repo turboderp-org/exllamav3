@@ -249,6 +249,7 @@ def mp_model_forward(
         "positions",
         "position_ids",
         "recurrent_slots",
+        "inv_freq",
     ]:
         p = params.get(tensor_param)
         if p is not None:
