@@ -295,8 +295,6 @@ if __name__ == "__main__":
     parser.add_argument("-tokens", "--max_new_tokens", type = int, help = "Max sampled tokens per round", default = 1024)
     parser.add_argument("-temp", "--temperature", action = "store_true", help = "Also sample with temperature")
     parser.add_argument("-single", "--single_workload", type = str, help = "Limit to single workload", default = None)
-    parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
-    parser.add_argument("-dskip", "--draft_skip_ema", type = float, help = "Skip drafting while EMA below this threshold (0 = disabled)", default = 0.0)
     parser.add_argument("-dstats", "--draft_stats", type = str, help = "Write per-round (position, window, accepted, ema) records to JSON file", default = None)
     parser.add_argument("-plot", "--plot_stats", action = "store_true", help = "Plot per-round draft stats in a matplotlib window after the run")
     _args = parser.parse_args()

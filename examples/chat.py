@@ -77,6 +77,8 @@ def main(args):
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
         ngram_match_min = args.ngram_match_min,
+        dynamic_draft_tokens = args.dynamic_draft,
+        dynamic_draft_skip_ema = args.draft_skip_ema,
     )
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
     if config.eos_token_id_list and all(config.eos_token_id_list):

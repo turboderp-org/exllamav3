@@ -99,6 +99,8 @@ def add_args(
         parser.add_argument("-ndt", "--num_draft_tokens", type = int, help = "Number of draft tokens (default: draft model default, else 4)", default = None)
         parser.add_argument("-mtp", "--mtp", action = "store_true", help = "Use MTP drafting")
         parser.add_argument("-ngram", "--ngram_match_min", type = int, help = "N-gram draft minimum match length, default = 0 (disabled)", default = 0)
+        parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
+        parser.add_argument("-dskip", "--draft_skip_ema", type = float, help = "Skip drafting while EMA below this threshold (0 = disabled, default: 0.3)", default = 0.3)
 
 
 def get_arg_sampler(args):
