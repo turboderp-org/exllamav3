@@ -283,7 +283,12 @@ void perform_cpu_reduce_avx512
     int acc_threads = 1;
     if (multi)
     {
-        acc_threads = env_threads > 0 ? env_threads : __builtin_popcount(device_mask);
+        #ifdef __linux__
+            int num_ranks = __builtin_popcount(device_mask);
+        #else
+            int num_ranks = (int) __popcnt(device_mask);
+        #endif
+        acc_threads = env_threads > 0 ? env_threads : num_ranks;
         acc_threads = MAX(acc_threads, 1);
     }
 

@@ -1,4 +1,5 @@
 name: Build Wheels & Release
+run-name: Build Wheels & Release (${{ inputs.target }}, release=${{ inputs.release }})
 
 on:
   workflow_dispatch:
@@ -8,75 +9,84 @@ on:
         default: '0'
         required: true
         type: string
+      target:
+        description: 'Build target'
+        default: 'all'
+        required: true
+        type: choice
+        options:
+          - all
+          - windows
+          - cu132
+          - sdist
 
 permissions:
   contents: write
 
 jobs:
+  # The wheel matrix is generated here rather than declared statically on build_wheels because
+  # the `target` filter needs matrix values in a condition, and the matrix context is not
+  # available in job-level `if` expressions.
+  define_matrix:
+    name: Define build matrix
+    runs-on: ubuntu-22.04
+    if: inputs.target != 'sdist'
+    outputs:
+      matrix: ${{ steps.set_matrix.outputs.matrix }}
+    steps:
+      - name: Define matrix
+        id: set_matrix
+        shell: python
+        run: |
+          import itertools
+          import json
+          import os
+
+          target = "${{ inputs.target }}"
+
+          oses = ["ubuntu-22.04", "windows-2022"]
+          pyvers = ["3.10", "3.11", "3.12", "3.13.3", "3.14"]
+          torches = ["2.7.0", "2.8.0", "2.9.0", "2.10.0", "2.11.0"]
+          cudaarch = "8.0 8.6 8.9 9.0 10.0 12.0+PTX"
+
+          combos = []
+
+          # CUDA 12.8 wheels: full OS x Python x Torch product
+          for os_, pyver, torch in itertools.product(oses, pyvers, torches):
+              # No Torch 2.11 wheels for Python 3.10/3.11
+              if torch == "2.11.0" and pyver in ("3.10", "3.11"):
+                  continue
+              # Python 3.14 only builds Torch 2.9+
+              if pyver == "3.14" and torch in ("2.7.0", "2.8.0"):
+                  continue
+              combos.append(dict(os = os_, pyver = pyver, cuda = "12.8.1", rocm = "", torch = torch, cudaarch = cudaarch))
+
+          # CUDA 13.2 wheels are only built for Python 3.12+ with Torch 2.11
+          for os_, pyver in itertools.product(oses, ["3.12", "3.13.3", "3.14"]):
+              combos.append(dict(os = os_, pyver = pyver, cuda = "13.2.0", rocm = "", torch = "2.11.0", cudaarch = cudaarch))
+
+          if target == "windows":
+              combos = [c for c in combos if c["os"] == "windows-2022"]
+          elif target == "cu132":
+              combos = [c for c in combos if c["cuda"] == "13.2.0"]
+
+          print(f"{len(combos)} jobs:")
+          for c in combos:
+              print(f"  {c['os']} P{c['pyver']} CUDA {c['cuda']} T{c['torch']}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": combos}) + "\n")
+
   build_wheels:
     name: ${{ matrix.os }} P${{ matrix.pyver }} CUDA ${{ matrix.cuda }} T${{ matrix.torch }}
+    needs: define_matrix
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: pwsh
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-2022]
-        pyver: ['3.10', '3.11', '3.12', '3.13.3', '3.14']
-        cuda: ['12.8.1']
-        rocm: ['']
-        torch: ['2.7.0', '2.8.0', '2.9.0', '2.10.0', '2.11.0']
-        cudaarch: ['8.0 8.6 8.9 9.0 10.0 12.0+PTX']
-        include:
-          # CUDA 13.2 wheels are only built for Python 3.13/3.14 with Torch 2.11.
-          - os: ubuntu-22.04
-            pyver: '3.12'
-            cuda: '13.2.0'
-            rocm: ''
-            torch: '2.11.0'
-            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
-          - os: windows-2022
-            pyver: '3.12'
-            cuda: '13.2.0'
-            rocm: ''
-            torch: '2.11.0'
-            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
-          - os: ubuntu-22.04
-            pyver: '3.13.3'
-            cuda: '13.2.0'
-            rocm: ''
-            torch: '2.11.0'
-            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
-          - os: windows-2022
-            pyver: '3.13.3'
-            cuda: '13.2.0'
-            rocm: ''
-            torch: '2.11.0'
-            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
-          - os: ubuntu-22.04
-            pyver: '3.14'
-            cuda: '13.2.0'
-            rocm: ''
-            torch: '2.11.0'
-            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
-          - os: windows-2022
-            pyver: '3.14'
-            cuda: '13.2.0'
-            rocm: ''
-            torch: '2.11.0'
-            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
-        exclude:
-          # No Torch 2.11 wheels for Python 3.10/3.11.
-          - pyver: '3.10'
-            torch: '2.11.0'
-          - pyver: '3.11'
-            torch: '2.11.0'
-          # Python 3.14 only builds Torch 2.9+.
-          - pyver: '3.14'
-            torch: '2.7.0'
-          - pyver: '3.14'
-            torch: '2.8.0'
+      matrix: ${{ fromJSON(needs.define_matrix.outputs.matrix) }}
 
     steps:
       - name: Free Disk Space
@@ -434,6 +444,7 @@ jobs:
 
   build_sdist:
     name: sdist
+    if: inputs.target == 'all' || inputs.target == 'sdist'
     runs-on: ubuntu-22.04
     defaults:
       run:
