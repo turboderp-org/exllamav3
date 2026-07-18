@@ -108,7 +108,24 @@ def create_q_strategy(
 
     # Target
     max_bits = int(bpw * float(sum_numel))
-    order = sorted(target_groups.values(), key = lambda x: max(y.priority for y in x), reverse = True)
+
+    # Promotion order: group priority first, then distance to the nearer end of the forward pass.
+    # End layers contribute disproportionately to end-to-end error
+    stack_max = {}
+    group_meta = []
+    for idx, (gkey, tlist) in enumerate(target_groups.items()):
+        m = re.search(r"\.(\d+)\.", gkey)
+        stack, layer = (gkey[:m.start()], int(m.group(1))) if m else (None, -1)
+        if stack is not None:
+            stack_max[stack] = max(stack_max.get(stack, -1), layer)
+        group_meta.append((tlist, stack, layer, idx))
+
+    def group_order_key(meta):
+        tlist, stack, layer, idx = meta
+        dist = 0 if stack is None else min(layer, stack_max[stack] - layer)
+        return (-max(t.priority for t in tlist), dist, layer, idx)
+
+    order = [meta[0] for meta in sorted(group_meta, key = group_order_key)]
 
     # Bump with priorities target met
     while sum_bits < max_bits:
