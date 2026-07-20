@@ -9,17 +9,22 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <immintrin.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <mutex>
+#include <pthread.h>
+#include <sched.h>
 #include <string>
 #include <thread>
 #include <vector>
 
 #ifndef __linux__
 #include <intrin.h>
+#include <windows.h>
 #endif
 
 // CPU MoE expert GEMM for mul1 EXL3 tensors.
@@ -865,6 +870,90 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
 
 typedef void (*PoolFn)(void* ctx, int worker, int num_workers);
 
+// Physical-core-first CPU ordering: one logical CPU per distinct physical core, SMT siblings
+// appended after. Without this, spawned std::thread workers are placed wherever the scheduler
+// puts them, which on an SMT host can silently collide two workers onto one physical core.
+// EXL3_MOE_CPU_PIN=0 disables.
+//
+// Linux: entries are plain logical CPU indices (as taken by CPU_SET). Windows: entries encode
+// (processor group << 16) | bit-within-group, decoded by Pool::pin_self -- SetThreadAffinityMask
+// only addresses the calling thread's current group, so systems with more than 64 logical
+// processors (multiple processor groups) need the group-aware SetThreadGroupAffinity instead.
+// UNVERIFIED: no Windows toolchain was available to compile-test this branch; check it (e.g. via
+// EXL3_MOE_CPU_PROF timing before/after, or Task Manager's per-core view during a CPU-offloaded
+// pass) before relying on it on a real system, particularly one with multiple processor groups.
+#ifdef __linux__
+inline std::vector<int> physical_core_order()
+{
+    std::vector<int> order;
+    std::map<std::pair<int, int>, int> seen;
+    std::vector<int> smt_siblings;
+    const int ncpu = static_cast<int>(std::thread::hardware_concurrency());
+    for (int cpu = 0; cpu < ncpu; ++cpu)
+    {
+        auto read_int = [&](const char* file) -> int {
+            std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/" + file);
+            int v = -1;
+            f >> v;
+            return v;
+        };
+        const int core_id = read_int("topology/core_id");
+        const int pkg_id = read_int("topology/physical_package_id");
+        if (core_id < 0) { order.push_back(cpu); continue; }   // topology unreadable: fall back
+        auto key = std::make_pair(pkg_id, core_id);
+        if (seen.find(key) == seen.end()) { seen[key] = cpu; order.push_back(cpu); }
+        else smt_siblings.push_back(cpu);
+    }
+    order.insert(order.end(), smt_siblings.begin(), smt_siblings.end());
+    return order;
+}
+#else
+inline std::vector<int> physical_core_order()
+{
+    std::vector<int> order, smt_siblings;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len == 0) return order;
+    std::vector<char> buf(len);
+    auto* first_rec = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data());
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, first_rec, &len)) return order;
+    size_t off = 0;
+    while (off < len)
+    {
+        auto* rec = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + off);
+        if (rec->Relationship == RelationProcessorCore)
+        {
+            bool first = true;
+            for (WORD g = 0; g < rec->Processor.GroupCount; ++g)
+            {
+                const GROUP_AFFINITY& ga = rec->Processor.GroupMask[g];
+                for (int bit = 0; bit < 64; ++bit)
+                {
+                    if (ga.Mask & (KAFFINITY(1) << bit))
+                    {
+                        const int enc = (static_cast<int>(ga.Group) << 16) | bit;
+                        if (first) { order.push_back(enc); first = false; }
+                        else smt_siblings.push_back(enc);
+                    }
+                }
+            }
+        }
+        off += rec->Size;
+    }
+    order.insert(order.end(), smt_siblings.begin(), smt_siblings.end());
+    return order;
+}
+#endif
+
+inline bool pin_threads_enabled()
+{
+    static const bool v = [] {
+        const char* e = std::getenv("EXL3_MOE_CPU_PIN");
+        return !(e && *e == '0');
+    }();
+    return v;
+}
+
 struct Pool
 {
     int spawned = 0;
@@ -873,9 +962,28 @@ struct Pool
     std::atomic<PoolFn> fn{nullptr};
     void* ctx = nullptr;
     int num_workers = 1;
+    std::vector<int> core_order;
+
+    void pin_self(int idx)
+    {
+        if (core_order.empty()) return;
+        const int enc = core_order[idx % core_order.size()];
+#ifdef __linux__
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(enc, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+        GROUP_AFFINITY ga{};
+        ga.Group = static_cast<WORD>(enc >> 16);
+        ga.Mask = KAFFINITY(1) << (enc & 0xffff);
+        SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr);
+#endif
+    }
 
     void worker_loop(int idx)
     {
+        pin_self(idx);
         uint64_t seen = 0;
         int idle = 0;
         while (true) {
@@ -903,12 +1011,14 @@ struct Pool
 
     void ensure(int n)
     {
+        if (pin_threads_enabled() && core_order.empty()) core_order = physical_core_order();
         while (spawned < n - 1)
         {
             std::thread(&Pool::worker_loop, this, spawned + 1).detach();
             ++spawned;
         }
         num_workers = n;
+        pin_self(0);   // worker 0 is the calling thread itself, never goes through worker_loop
     }
 
     // Run fn on workers 0..n-1; returns when all are done (implicit barrier)

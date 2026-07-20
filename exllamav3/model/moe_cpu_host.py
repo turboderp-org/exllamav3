@@ -446,8 +446,19 @@ class MoeCpuHost:
             spec = self.specs[layer_idx]
             h = y.shape[1]
             out = torch.empty((y.shape[0], h), dtype = torch.float, device = y.device)
-            jobs, rtmp = self._issue_compute(layer_idx, y, selected_experts, routing_weights, spec)
-            self._collect_compute(jobs, out, rtmp, h)
+            if os.environ.get("EXL3_MOE_SUBMIT_PROF"):
+                if not hasattr(self, "_prof_ev"):
+                    self._prof_ev = []
+                ev0 = torch.cuda.Event(enable_timing = True)
+                ev1 = torch.cuda.Event(enable_timing = True)
+                ev0.record()
+                jobs, rtmp = self._issue_compute(layer_idx, y, selected_experts, routing_weights, spec)
+                self._collect_compute(jobs, out, rtmp, h)
+                ev1.record()
+                self._prof_ev.append((ev0, ev1))
+            else:
+                jobs, rtmp = self._issue_compute(layer_idx, y, selected_experts, routing_weights, spec)
+                self._collect_compute(jobs, out, rtmp, h)
         return out
 
     def _issue_compute(self, layer_idx, y, selected_experts, routing_weights, spec):

@@ -213,6 +213,21 @@ streamed batch.
 Accumulate per-phase wall time in the CPU compute pool and report every 512 jobs. Enabled once
 per worker at startup.
 
+### `EXL3_MOE_CPU_PIN` (default: `1`)
+
+Pin each worker thread (and the worker's own main thread) to a distinct physical CPU core,
+SMT siblings last, instead of leaving placement to the OS scheduler. On an SMT host, unpinned
+placement is a real source of run-to-run throughput variance — two workers can land on the same
+physical core (contending for its execution resources) on one run and not the next; measured on
+a 24-core/48-thread SMT2 box, this swung matrix-decode throughput 61–105 GB/s run to run,
+pinned flat at ~105 GB/s (88% of the box's measured 24-thread DRAM read bandwidth). Set to `0`
+to disable, e.g. on a shared/multi-tenant host where fixed placement may fight the scheduler's
+own balancing across other processes. Falls back to no pinning if the CPU topology can't be
+read. Implemented for both Linux (`pthread_setaffinity_np` against `/sys/devices/system/cpu`)
+and Windows (`SetThreadGroupAffinity` against `GetLogicalProcessorInformationEx`, handling
+multiple processor groups on >64-logical-processor systems); the Windows path has not been
+compile- or run-tested, so treat it cautiously until confirmed on real hardware.
+
 ## Multi-GPU
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)
