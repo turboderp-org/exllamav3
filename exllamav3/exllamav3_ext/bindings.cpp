@@ -23,6 +23,8 @@
 #include "quant/exl3_gemm.cuh"
 #include "quant/exl3_gemv.cuh"
 #include "quant/exl3_gemv_int8.cuh"
+#include "cpu/moe_mul1.h"
+#include "cpu/moe_handoff.h"
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -107,6 +109,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
+    m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
+    m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");
+    m.def("exl3_moe_cpu_forward", &exl3_moe_cpu_forward, "exl3_moe_cpu_forward",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("exl3_moe_cpu_has_avx2", &exl3_moe_cpu_has_avx2, "exl3_moe_cpu_has_avx2");
+    m.def("exl3_moe_flag_write", &exl3_moe_flag_write, "exl3_moe_flag_write");
+    m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
+    m.def("exl3_moe_cpu_set_memops", &exl3_moe_cpu_set_memops, "exl3_moe_cpu_set_memops");
+    m.def("exl3_moe_cpu_set_prof", &exl3_moe_cpu_set_prof, "exl3_moe_cpu_set_prof");
+    m.def("exl3_moe_cpu_worker_run", &exl3_moe_cpu_worker_run, "exl3_moe_cpu_worker_run",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
     m.def("hgemm", &hgemm, "hgemm");
     m.def("rope", &rope, "rope");

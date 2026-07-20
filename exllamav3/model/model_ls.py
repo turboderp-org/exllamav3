@@ -42,6 +42,8 @@ class Model_LSMixin(ABC):
                 module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
                 if defer:
                     config.stc.end_deferred_load()
+                for h in getattr(config, "moe_cpu_hosts", {}).values():
+                    h.commit_module(module.key)
                 progress.update(idx + 1)
 
 
@@ -77,6 +79,9 @@ class Model_LSMixin(ABC):
         prev_load_device = None
         touched_devices = []
         params = self.default_load_params(max_chunk_size)
+        # The measuring forwards below exist to observe VRAM allocation; modules with CPU-side
+        # compute (CPU-offloaded experts) can skip the host work when they see this flag
+        params["autosplit_measure"] = True
 
         # Simulate cached/recurrent path while loading with cache
         cl = [m for m in self if m.caps.get("kv_cache")]
@@ -166,7 +171,11 @@ class Model_LSMixin(ABC):
                         # Dereference extra dummy tensors
                         extra_dummy_out_states = None
 
-                        # We're good
+                        # We're good. For CPU-offloaded MoE layers, wait for the worker process
+                        # to finish loading this module's expert weights before advancing, so
+                        # load progress stays honest and rollbacks can't outrun the child
+                        for h in getattr(config, "moe_cpu_hosts", {}).values():
+                            h.commit_module(module.key)
                         fail = False
                         progress.update(idx + 1)
 
@@ -221,6 +230,8 @@ class Model_LSMixin(ABC):
         x: torch.Tensor,
         params: dict,
     ):
+        for h in getattr(self.config, "moe_cpu_hosts", {}).values():
+            h.begin_pass()
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
             pf = (idx, instance) == self.last_kv_module_idx_instance
@@ -238,6 +249,8 @@ class Model_LSMixin(ABC):
         x: torch.Tensor,
         params: dict,
     ):
+        for h in getattr(self.config, "moe_cpu_hosts", {}).values():
+            h.begin_pass()
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
             if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):

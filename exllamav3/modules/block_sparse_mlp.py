@@ -508,6 +508,7 @@ class BlockSparseMLP(Module):
         self.register_submodule(self.routed_post_norm)
 
         self.bc = None
+        self.cpu_offload = False
         self.bc_sh_exp = False
         self.fused_mode_buffers = None
 
@@ -523,6 +524,114 @@ class BlockSparseMLP(Module):
             return [s, [g + u, d]]
         else:
             return [[g + u, d]]
+
+
+    def load_cpu_offload(self, device: torch.Device, **kwargs) -> bool:
+        """
+        Experimental CPU expert offload: register the layer with the persistent CPU MoE worker
+        (which loads the expert weights itself, concurrently with GPU loading) and load
+        everything else (router, norms, shared experts) on the GPU as usual. Eligibility here
+        uses header metadata only; the parent never fetches expert data. Returns False without
+        side effects when the layer is ineligible (non-mul1 codebook, K > 8, or mixed per-expert
+        biases), in which case the caller falls back to the normal path.
+        """
+        stc = self.config.stc
+        cpu = torch.device("cpu")
+        experts = self.gates + self.ups + self.downs
+
+        # Eligibility probe on the first expert of each projection before fetching bulk data
+        probe = ([self.gates[0]] if self.gated else []) + [self.ups[0], self.downs[0]]
+        for l in probe:
+            if stc.get_tensor(l.key + ".mul1", cpu, optional = True) is None:
+                print(f" !! {self.key}: experts are not mul1, CPU offload skipped")
+                return False
+
+        def hdr_shape(l):
+            return stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
+        for l in probe:
+            if hdr_shape(l)[-1] // 16 > 8:
+                print(f" !! {self.key}: K > 8, CPU offload skipped")
+                return False
+        def bias_keys(ls):
+            has = [(l.key + ".bias") in stc.tensor_file_map for l in ls]
+            if any(has) and not all(has):
+                print(f" !! {self.key}: mixed expert biases, CPU offload skipped")
+                return None
+            return all(has)
+        checks = [bias_keys(ls) for ls in ([self.gates] if self.gated else []) + [self.ups, self.downs]]
+        if any(c is None for c in checks):
+            return False
+
+        self.device = torch.device(device)
+        expert_set = set(experts)
+        for module in self.modules:
+            if module not in expert_set:
+                module.load(device, **kwargs)
+        if self.e_score_correction_bias_key:
+            for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
+                self.e_score_correction_bias = self.config.stc.get_tensor(
+                    f"{self.key}.{k}", self.device, optional = True, float2half = True)
+                if self.e_score_correction_bias is not None:
+                    break
+        if self.per_expert_scale_key:
+            self.per_expert_scale = self.config.stc.get_tensor(
+                f"{self.key}.{self.per_expert_scale_key}", self.device, optional = True, allow_bf16 = True)
+        self.load_routing(**kwargs)
+
+        from ..model.moe_cpu_host import MoeCpuHost
+        # One worker per component: an MTP head shares the config but loads after the main
+        # model's worker has started, so it gets its own child (which loads only its own
+        # layers from the same checkpoint)
+        comp = getattr(self.config.infer_params, "moe_cpu_component", "text")
+        hosts = getattr(self.config, "moe_cpu_hosts", None)
+        if hosts is None:
+            hosts = {}
+            self.config.moe_cpu_hosts = hosts
+        host = hosts.get(comp)
+        if host is None:
+            host = MoeCpuHost(self.config)
+            hosts[comp] = host
+        self.cpu_host = host
+        self.cpu_component = comp
+        def dims_of(l):
+            s = stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
+            return (s[0] * 16, s[1] * 16, s[2] // 16)
+        gd = dims_of(self.gates[0]) if self.gated else None
+        ud = dims_of(self.ups[0])
+        dd = dims_of(self.downs[0])
+        hi, ho = ud[0], dd[1]
+
+        # Small per-expert tensors resident on the GPU for the streamed-prefill dequant path
+        # (lists, not stacks: the fetches may be deferred and fill in place)
+        def fetch_aux(ls, suffix, optional = False):
+            out = [stc.get_tensor(l.key + suffix, self.device, optional = optional,
+                                  float2half = True) for l in ls]
+            return out if not optional or out[0] is not None else None
+        aux = dict(
+            suh_u = fetch_aux(self.ups, ".suh"), svh_u = fetch_aux(self.ups, ".svh"),
+            suh_d = fetch_aux(self.downs, ".suh"), svh_d = fetch_aux(self.downs, ".svh"),
+            bias_u = fetch_aux(self.ups, ".bias", True),
+            bias_d = fetch_aux(self.downs, ".bias", True),
+        )
+        if self.gated:
+            aux["suh_g"] = fetch_aux(self.gates, ".suh")
+            aux["svh_g"] = fetch_aux(self.gates, ".svh")
+            aux["bias_g"] = fetch_aux(self.gates, ".bias", True)
+
+        self.cpu_layer_idx = host.register_layer(
+            self.key,
+            [l.key for l in self.gates] if self.gated else [],
+            [l.key for l in self.ups],
+            [l.key for l in self.downs],
+            {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn],
+            float(self.act_limit or 0.0),
+            hi, ho, self.num_experts_per_tok,
+            proj_dims = dict(g = gd, u = ud, d = dd),
+            aux = aux,
+        )
+        self.cpu_offload = True
+        print(f" -- CPU-offloaded experts (worker): {self.key}")
+        return True
 
 
     def load_local(self, **kwargs):
@@ -782,6 +891,20 @@ class BlockSparseMLP(Module):
 
     @override
     def load(self, device: torch.Device, **kwargs):
+        ip = self.config.infer_params
+        comp = getattr(ip, "moe_cpu_component", "text")
+        budget = getattr(ip, "moe_cpu_offload", 0) if comp == "text" \
+            else getattr(ip, "draft_moe_cpu_offload", 0)
+        if (
+            budget > 0 and
+            ip.moe_cpu_offload_assigned.get(comp, 0) < budget and
+            device is not None and torch.device(device).type == "cuda" and
+            (self.num_local_experts is None or self.num_local_experts == self.num_experts) and
+            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2")
+        ):
+            if self.load_cpu_offload(device, **kwargs):
+                ip.moe_cpu_offload_assigned[comp] = ip.moe_cpu_offload_assigned.get(comp, 0) + 1
+                return
         super().load(device, **kwargs)
 
         if self.e_score_correction_bias_key:
@@ -808,6 +931,17 @@ class BlockSparseMLP(Module):
 
     @override
     def unload(self):
+        if self.cpu_offload:
+            host = getattr(self, "cpu_host", None)
+            if host is not None:
+                host.unregister()
+            # Release this layer's slot in the component's offload budget so a reload of the
+            # same config can claim it again
+            asn = self.config.infer_params.moe_cpu_offload_assigned
+            comp = getattr(self, "cpu_component", "text")
+            if isinstance(asn, dict) and asn.get(comp, 0) > 0:
+                asn[comp] -= 1
+        self.cpu_offload = False
         self.bc = None
         self.fused_mode_buffers = None
         if self.multi_gate is not None:
@@ -872,8 +1006,19 @@ class BlockSparseMLP(Module):
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
 
+        # Experimental CPU expert offload via the persistent worker. The autosplit measuring
+        # forward only observes VRAM allocation, which the CPU compute cannot affect, so it
+        # skips the (slow, full-chunk) host pass and just allocates the output
+        if self.cpu_offload:
+            if params.get("autosplit_measure"):
+                final_hidden_states = torch.zeros_like(y, dtype = torch.float).reshape(x.shape)
+            else:
+                final_hidden_states = self.cpu_host.submit_prefill(
+                    self.cpu_layer_idx, y, selected_experts, routing_weights
+                ).reshape(x.shape)
+
         # Empty slice
-        if self.intermediate_size == 0 or self.num_local_experts == 0:
+        elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros_like(x, dtype = torch.float)
 
         # Torch/C++/fused path

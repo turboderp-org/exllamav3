@@ -110,9 +110,42 @@ class Cleanupper:
             self.atexit_fns.remove(fn)
 
     def _shutdown(self):
-        for fn in self.atexit_fns:
-            fn()
-        self.atexit_fns = []
+        # Snapshot first: hooks commonly unregister themselves when called, and mutating the
+        # list mid-iteration would skip the next entry
+        fns, self.atexit_fns = self.atexit_fns, []
+        for fn in fns:
+            try:
+                fn()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
+
+def install_parent_death_signal() -> bool:
+    """
+    On Linux, ask the kernel to terminate this worker if its direct parent dies.
+    This is a best-effort safety net for cases where Python shutdown hooks do not
+    get a chance to clean up spawned workers.
+    """
+    import sys, os
+    if sys.platform != "linux":
+        return False
+
+    import ctypes
+    import signal
+
+    PR_SET_PDEATHSIG = 1
+    parent_pid = os.getppid()
+
+    libc = ctypes.CDLL("libc.so.6", use_errno = True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM) != 0:
+        return False
+
+    # Race check: the parent may have exited before PDEATHSIG was installed.
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    return True
 
 
 def set_process_priority_and_affinity():

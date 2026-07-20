@@ -13,30 +13,7 @@ from ..util import log_tp, set_t0
 _no_fwd_barrier = os.environ.get("EXL3_TP_NO_FWD_BARRIER", "1") != "0"
 
 
-def install_parent_death_signal() -> bool:
-    """
-    On Linux, ask the kernel to terminate this worker if its direct parent dies.
-    This is a best-effort safety net for cases where Python shutdown hooks do not
-    get a chance to clean up spawned TP workers.
-    """
-    if sys.platform != "linux":
-        return False
-
-    import ctypes
-    import signal
-
-    PR_SET_PDEATHSIG = 1
-    parent_pid = os.getppid()
-
-    libc = ctypes.CDLL("libc.so.6", use_errno = True)
-    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM) != 0:
-        return False
-
-    # Race check: the parent may have exited before PDEATHSIG was installed.
-    if os.getppid() != parent_pid:
-        os.kill(os.getpid(), signal.SIGTERM)
-
-    return True
+from ..util.misc import install_parent_death_signal
 
 
 def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict, master: bool = False):

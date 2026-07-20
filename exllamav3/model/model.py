@@ -167,6 +167,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             f"{config.architecture} does not define a '{component}' component model"
 
         model = config.model_classes[component](config, **kwargs)
+        model.component = component
 
         # Compile layer map after model is constructed (before any caches are attached)
         model.prepare_layer_map()
@@ -348,6 +349,10 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         free_mem()
 
+        # Route CPU-offloaded MoE layers to this component's own worker and budget (an MTP head
+        # shares the config but loads after the main model's worker has already started)
+        self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
+
         assert not (bool(reserve_per_device) and bool(use_per_device)), \
             "Cannot specify both memory usage and memory reserve."
 
@@ -469,6 +474,13 @@ class Model(Model_TPMixin, Model_LSMixin):
         kwargs["generator"] = False
         f = self.load_gen(*args, **kwargs)
         for _ in f: pass
+
+        # CPU-offloaded MoE experts: make sure the worker processes are up before the first
+        # forward (spawned during module loading when the offload count is exact, so the child's
+        # weight loading overlaps the parent's; started here otherwise). ensure_started is
+        # idempotent, so already-running workers of other components are unaffected
+        for host in getattr(self.config, "moe_cpu_hosts", {}).values():
+            host.ensure_started()
 
 
     def get_load_metrics(self):
