@@ -990,7 +990,8 @@ struct Pool
             const uint64_t g = gen.load(std::memory_order_acquire);
             if (g == seen)
             {
-                if (++idle < 8192) { cpu_pause(); continue; }
+                // Matches the outer job-ring poll's threshold (moe_handoff.cu)
+                if (++idle < 65536) { cpu_pause(); continue; }
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
                 continue;
             }
