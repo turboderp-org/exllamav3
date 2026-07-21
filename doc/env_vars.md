@@ -76,9 +76,8 @@ and unfused configurations.
 Highest bitrate K the int8 GEMV path accepts; above it the regular fp16 kernel runs instead.
 The default is 6 on Hopper and Blackwell and 5 elsewhere: Ampere is DRAM-bound from K = 6 up,
 where the int8 path's reduced per-weight compute no longer helps (and Ada is marginal there),
-but on Hopper (H200 measurements in issue #242) and Blackwell (5090: +7–19% per call at K = 6)
-the fp16 kernel is throughput-bound at K = 6 as well. Values up to 8 can be forced to test the
-crossover on unmeasured parts; the MGEMM unfusing threshold below follows this cap
+but on Hopper the fp16 kernel is throughput-bound at K = 6 as well. Values up to 8 can be forced
+to test the crossover on unmeasured parts; the MGEMM unfusing threshold below follows this cap
 automatically.
 
 ### `EXL3_MGEMM_K_THRESHOLD` (default: per-arch), `EXL3_MGEMM_N_THRESHOLD` (default: `8192`)
@@ -119,11 +118,10 @@ CPU, expert weights resident in system RAM, freeing the VRAM those layers' exper
 used. Layer-split mode only; requires mul1-codebook experts, K ≤ 8, and uniform per-expert
 biases (all or none — ineligible layers fall back to the GPU as usual). A spawned worker process
 per model component (main / draft / MTP) owns its own expert weights and a job ring in pinned
-shared memory; the
-parent's forward pass never blocks on the CPU. During prefill, hot experts additionally stream
-their weights to the GPU and run there (via the fused kernel or per-expert dequant, by size)
-while the CPU works the remaining tail — see `-mclt`/`-dmclt` below for thread configuration,
-and the knobs below for tuning the split.
+shared memory; the parent's forward pass never blocks on the CPU. During prefill, hot experts
+additionally stream their weights to the GPU and run there (via the fused kernel or per-expert
+dequant, by size) while the CPU works the remaining tail — see `-mclt`/`-dmclt` below for 
+thread configuration, and the knobs below for tuning the split.
 
 These knobs are collected in `exllamav3/model/moe_cpu_host.py`'s `MoeCpuTuning` class (read once
 from the environment at import); for a same-process sweep, mutate fields on the module-level
@@ -213,6 +211,25 @@ streamed batch.
 Accumulate per-phase wall time in the CPU compute pool and report every 512 jobs. Enabled once
 per worker at startup.
 
+### `EXL3_MOE_ARENA_DEBUG` (default: `0`)
+
+Print each hugepage-arena chunk allocation (size, running total) as the CPU worker loads expert
+weights, and confirmation when the end-of-load `MADV_COLLAPSE` pass (see
+`EXL3_MOE_ARENA_HUGEPAGE`) is issued. The worker copies loaded expert tensors into a small
+number of large (1 GiB) anonymous mappings instead of leaving them as many separate small
+(sub-2MB) allocations — confirmed via `/proc/<pid>/smaps` that the latter cannot be backed by
+transparent huge pages even under system-wide THP=always, since each is its own VMA.
+
+### `EXL3_MOE_ARENA_HUGEPAGE` (default: `1`)
+
+Whether to attempt hugepage promotion for the arena chunks described above. This is done as a
+single `MADV_COLLAPSE` (Linux 6.1+) pass over each chunk *after* all expert weights for every
+offloaded layer have been loaded — deliberately not via a live `MADV_HUGEPAGE` hint during the
+per-layer writes: on hosts where `/sys/kernel/mm/transparent_hugepage/defrag` is `madvise`, that
+hint makes the kernel do *synchronous* compaction on first touch of a hinted region once
+easily-compactable free memory runs low, which turns into multi-second stalls per offloaded
+layer partway through a large model's load. Set to `0` to skip hugepage promotion entirely.
+
 ### `EXL3_MOE_CPU_PIN` (default: `1`)
 
 Pin each worker thread (and the worker's own main thread) to a distinct physical CPU core,
@@ -223,10 +240,7 @@ a 24-core/48-thread SMT2 box, this swung matrix-decode throughput 61–105 GB/s 
 pinned flat at ~105 GB/s (88% of the box's measured 24-thread DRAM read bandwidth). Set to `0`
 to disable, e.g. on a shared/multi-tenant host where fixed placement may fight the scheduler's
 own balancing across other processes. Falls back to no pinning if the CPU topology can't be
-read. Implemented for both Linux (`pthread_setaffinity_np` against `/sys/devices/system/cpu`)
-and Windows (`SetThreadGroupAffinity` against `GetLogicalProcessorInformationEx`, handling
-multiple processor groups on >64-logical-processor systems); the Windows path has not been
-compile- or run-tested, so treat it cautiously until confirmed on real hardware.
+read.
 
 ## Multi-GPU
 

@@ -80,6 +80,10 @@ class MoeCpuTuning:
         self.num_wslots = min(int(os.environ.get("EXL3_MOE_CPU_WSLOTS", 2)), MOE_MAX_WSLOTS)
         self.wslot_size = int(os.environ.get("EXL3_MOE_CPU_WSLOT_MB", 32)) * 1024 * 1024
         self.stage_threads = int(os.environ.get("EXL3_MOE_CPU_STAGE_THREADS", 4))
+        # madvise(MADV_HUGEPAGE) on the expert-weight arena chunks: with defrag=madvise (the
+        # common default), the kernel does SYNCHRONOUS compaction on first touch of a hinted
+        # region once easily-compactable free memory runs low, which can stall loading badly
+        self.arena_hugepage = os.environ.get("EXL3_MOE_ARENA_HUGEPAGE", "1") != "0"
 
         # --- GPU-streaming prefill ---
         self.stream_t_explicit = "EXL3_MOE_STREAM_T" in os.environ
@@ -99,12 +103,79 @@ TUNING = MoeCpuTuning()
 ext.exl3_moe_cpu_set_memops(TUNING.memops)
 
 
+class _HugeArena:
+    """
+    Growable pool of large (default 1 GiB) anonymous mmap chunks that expert weights are copied
+    into, so hugepage promotion (see promote_hugepages) has few, large regions to work with
+    instead of thousands of separate small (sub-2MB) loader allocations
+    """
+    CHUNK_BYTES = 1 << 30   # 1 GiB
+
+    def __init__(self):
+        self.chunks = []
+        self.cur = None
+        self.cur_off = 0
+
+    def _new_chunk(self, min_bytes):
+        import mmap, os
+        size = max(self.CHUNK_BYTES, (min_bytes + (2 << 20) - 1) & ~((2 << 20) - 1))
+        m = mmap.mmap(-1, size, mmap.MAP_PRIVATE, mmap.PROT_READ | mmap.PROT_WRITE)
+        self.chunks.append(m)
+        self.cur = m
+        self.cur_off = 0
+        if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
+            total = sum(len(c) for c in self.chunks)
+            print(f" -- arena: new chunk {size/1e6:.1f} MB, {len(self.chunks)} chunks, "
+                  f"{total/1e9:.3f} GB total", flush = True)
+
+    def promote_hugepages(self):
+        """One-shot MADV_COLLAPSE (Linux 6.1+) over each chunk, meant to run once after all
+        expert weights are loaded. Deliberately NOT done via a live MADV_HUGEPAGE hint during the
+        per-tensor writes in rehome(): with the common defrag=madvise policy, that hint makes the
+        kernel do SYNCHRONOUS compaction on every first touch of a hinted region once easily-
+        compactable free memory runs low, which turned into multi-second stalls per offloaded
+        layer partway through a large model's load. A single explicit collapse pass after
+        loading gets the same steady-state throughput benefit without blocking incremental
+        per-layer progress. Best-effort: silently leaves chunks at 4K pages if collapse fails or
+        the kernel doesn't support it."""
+        import mmap, os
+        if not TUNING.arena_hugepage:
+            return
+        collapse = getattr(mmap, "MADV_COLLAPSE", 25)
+        for c in self.chunks:
+            try:
+                c.madvise(collapse)
+            except Exception:
+                pass
+        if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
+            print(f" -- arena: MADV_COLLAPSE issued on {len(self.chunks)} chunks", flush = True)
+
+    def rehome(self, tensor):
+        """Copy `tensor` into the arena and return a same-dtype/shape view over the copy. The
+        arena outlives every tensor it hands out (held for the process lifetime), so the
+        returned view stays valid."""
+        import torch
+        if tensor is None or tensor.numel() == 0:
+            return tensor
+        nbytes = tensor.numel() * tensor.element_size()
+        aligned = (nbytes + 63) & ~63
+        if self.cur is None or self.cur_off + aligned > len(self.cur):
+            self._new_chunk(aligned)
+        off = self.cur_off
+        self.cur_off += aligned
+        buf = memoryview(self.cur)[off : off + nbytes]
+        dst = torch.frombuffer(buf, dtype = torch.uint8)
+        dst.copy_(tensor.contiguous().view(torch.uint8).reshape(-1))
+        return dst.view(tensor.dtype).view(tensor.shape)
+
+
 def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
     """
     Child entry point: receives ("layer", spec) messages, loading each layer's expert tensors
     (deferred, multithreaded) and acking, until ("start", shm_name, layout) switches it into the
     worker loop. Errors are reported over the pipe before exiting.
     """
+    import ctypes
     import signal
     import traceback
     import torch  # noqa: F401
@@ -121,6 +192,7 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
     try:
         stc = SafetensorsCollection(model_dir)
         cpu = torch.device("cpu")
+        arena = _HugeArena()
 
         def fetch(keys):
             out = []
@@ -131,6 +203,10 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
                 bias = stc.get_tensor(k + ".bias", cpu, optional = True, float2half = True)
                 out.append((trellis, suh, svh, bias))
             return out
+
+        def rehome_all(ts):
+            return [(arena.rehome(t[0]), arena.rehome(t[1]), arena.rehome(t[2]), arena.rehome(t[3]))
+                   for t in ts]
 
         def biases(ts):
             return [t[3] for t in ts] if ts and ts[0][3] is not None else []
@@ -144,6 +220,9 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
                 u = fetch(spec["up_keys"])
                 d = fetch(spec["down_keys"])
                 stc.end_deferred_load()
+                # Copy into the hugepage-backed arena now that the deferred reads have actually
+                # populated these tensors
+                g, u, d = rehome_all(g), rehome_all(u), rehome_all(d)
                 cext.exl3_moe_cpu_make_layer(
                     [t[0] for t in g], [t[1] for t in g], [t[2] for t in g],
                     [t[0] for t in u], [t[1] for t in u], [t[2] for t in u],
@@ -151,12 +230,20 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
                     biases(g), biases(u), biases(d),
                     spec["activation"], spec["act_limit"],
                 )
+                # Reclaim this layer's now-discarded loader tensors immediately (rehome_all copied
+                # everything into the arena)
+                try:
+                    ctypes.CDLL(None).malloc_trim(0)
+                except Exception:
+                    pass
                 conn.send(("ok",))
             elif msg[0] == "start":
                 shm_name, layout = msg[1], msg[2]
                 break
             elif msg[0] == "quit":
                 return
+
+        arena.promote_hugepages()
 
         stc.close()
         shm = shared_memory.SharedMemory(name = shm_name)
