@@ -11,6 +11,7 @@ namespace py = pybind11;
 
 #define MAX_EXPERTS 512
 #define TEMP_ROWS_GRAPH 32  // must match TEMP_ROWS_GRAPH in BlockSparseMLP.py
+// MAX_BSZN comes from mlp.h (included above); must match MAX_BSZN in BlockSparseMLP.py
 
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     int bsz,
@@ -81,6 +82,11 @@ struct BC_BlockSparseMLP
     c10::optional<at::Tensor> y_pad;
     c10::optional<at::Tensor> out_trim;
 
+    // Static scratch for the num_tokens > 1 gathered input (each of num_tokens*top_k slots holds
+    // a copy of its token's row); sized [MAX_BSZN * top_k, Hi] Python-side. Unused (num_tokens==1
+    // keeps the zero-copy y.unsqueeze(0)/y_pad broadcast path)
+    at::Tensor a_gather;
+
     int max_experts_per_token;
     int max_tokens_per_expert;
     std::vector<at::Tensor> interm_g_single;
@@ -90,8 +96,14 @@ struct BC_BlockSparseMLP
 
     bool use_mgemm;
 
-    Graph graph_bsz1;
+    // graph_bszN[bsz - 1] covers bsz 1..MAX_BSZN (bsz==1 keeps the original zero-copy behavior
+    // internally; replaces the old single-instance graph_bsz1)
+    Graph graph_bszN[MAX_BSZN];
     Graph graph_single[TEMP_ROWS_GRAPH];
+    // Lazily-built per num_tokens (index num_tokens - 1); only entries for num_tokens >= 2 are
+    // populated. Depends only on (num_tokens, top_k), never on routing outcome, so built once and
+    // reused for every subsequent call at that bsz
+    std::vector<at::Tensor> flat_token_cache;
 
     BC_BlockSparseMLP
     (
@@ -140,6 +152,7 @@ struct BC_BlockSparseMLP
         at::Tensor _gu_trellis_ptr,
         at::Tensor _gu_suh_ptr,
         at::Tensor _gu_svh_ptr,
+        at::Tensor _a_gather,
         c10::optional<at::Tensor> _gate_bias_ptrs,
         c10::optional<at::Tensor> _up_bias_ptrs,
         c10::optional<at::Tensor> _down_bias_ptrs,
@@ -148,15 +161,17 @@ struct BC_BlockSparseMLP
         bool _act_relu2 = false
     );
 
-    void run_bsz1_gr
+    void run_bszN_gr
     (
-        const at::Tensor& y,
+        const at::Tensor& A_in,
+        const at::Tensor& x_dense,
         at::Tensor& selected_experts,
         at::Tensor& routing_weights,
+        int num_tokens,
         Graph* graph
     );
 
-    void run_bsz1
+    void run_bszN
     (
         const at::Tensor& y,
         at::Tensor& selected_experts,

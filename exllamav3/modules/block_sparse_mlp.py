@@ -17,6 +17,7 @@ from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 
 TEMP_ROWS_FUSED = 128
 TEMP_ROWS_GRAPH = 32
+MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
 @dataclass
 class RoutingCFG:
@@ -703,31 +704,42 @@ class BlockSparseMLP(Module):
         I = self.intermediate_size_padded
         device = self.device
 
-        temp_hidden = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH * 2, Hi), torch.half, "moe1_temp_hidden")
-        temp_interm = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH * 2, I), self.interm_dtype, "moe1_temp_interm")
-        temp_activa = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH, I), torch.half, "moe1_temp_activa")
-        temp_output = g_tensor_cache.get(device, (TEMP_ROWS_GRAPH, Ho), torch.float, "moe1_temp_output")
+        # bszn_rows bounds the multi-row graph path (BC_BlockSparseMLP.run_bszN, bsz 1..MAX_BSZN,
+        # bszm = num_tokens * numex slots); buffers grow to whichever of that or the single-expert
+        # graph loop's TEMP_ROWS_GRAPH requirement is larger, sharing the one cache entry per name
+        # (g_tensor_cache is exact-shape-keyed and never evicts -- growing a differently-shaped
+        # second entry under the same name would silently double memory forever)
+        bszn_rows = MAX_BSZN * numex
 
-        yh = temp_hidden[:numex].view(numex, 1, Hi)
-        interm_g = temp_interm[:numex].view(numex, 1, I)
-        interm_u = temp_interm[numex:numex*2].view(numex, 1, I)
-        interm_a = temp_activa[:numex].view(numex, 1, I)
+        temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
+        temp_interm = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
+        temp_activa = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), I), torch.half, "moe1_temp_activa")
+        temp_output = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), Ho), torch.float, "moe1_temp_output")
+
+        yh = temp_hidden[:bszn_rows].view(bszn_rows, 1, Hi)
+        interm_g = temp_interm[:bszn_rows].view(bszn_rows, 1, I)
+        interm_u = temp_interm[bszn_rows:bszn_rows*2].view(bszn_rows, 1, I)
+        interm_a = temp_activa[:bszn_rows].view(bszn_rows, 1, I)
         yh2 = temp_hidden
         interm_gu = temp_interm
         interm_a2 = temp_activa
-        out_d = temp_output[:numex].view(numex, 1, Ho)
+        out_d = temp_output[:bszn_rows].view(bszn_rows, 1, Ho)
         out_d2 = temp_output
+
+        # Static scratch for the num_tokens > 1 gathered input (BC_BlockSparseMLP.run_bszN); each
+        # of num_tokens*numex slots holds a copy of its token's row, built via index_select
+        a_gather = g_tensor_cache.get(device, (bszn_rows, Hi), torch.half, "moe1_a_gather")
 
         # Expert interval for split module (-1, -1) indicate no split
         mine, maxe = self.routing_first, self.routing_last
         if mine is None or maxe - mine == self.num_experts:
             mine, maxe = -1, -1
 
-        # Exact-width bsz-1 output when the down projection is padded (the BC graph copies the
-        # trimmed columns out of the padded reduction)
+        # Exact-width output when the down projection is padded (the BC graph copies the trimmed
+        # columns out of the padded reduction); sized for up to MAX_BSZN rows
         out_trim = None
         if Ho != H:
-            out_trim = g_tensor_cache.get(device, (1, H), torch.float, "moe1_out_trim")
+            out_trim = g_tensor_cache.get(device, (MAX_BSZN, H), torch.float, "moe1_out_trim")
 
         cfg = ExpertsCFG(
             yh = yh,
@@ -759,7 +771,7 @@ class BlockSparseMLP(Module):
             ):
                 self.bc_sh_exp = True
                 sh_exp_bc = self.shared_experts.bc
-                sh_exp_t = torch.empty((1, 1, H), dtype = torch.float, device = self.device)
+                sh_exp_t = torch.empty((1, MAX_BSZN, H), dtype = torch.float, device = self.device)
                 if self.shared_gate:
                     assert self.shared_gate.quant_type == "fp16"
                     sh_gate_bc = self.shared_gate.inner.bc
@@ -794,7 +806,7 @@ class BlockSparseMLP(Module):
             down_bias_ptrs = _bias_ptrs(self.downs)
             y_pad = None
             if Hi != H:
-                y_pad = g_tensor_cache.get(device, (1, Hi), torch.half, "moe1_y_pad")
+                y_pad = g_tensor_cache.get(device, (MAX_BSZN, Hi), torch.half, "moe1_y_pad")
                 y_pad.zero_()
 
             # Bound class for graph, dq and fused-bsz1 paths (gateless: the up module stands in
@@ -846,6 +858,7 @@ class BlockSparseMLP(Module):
                 gu_trellis_ptr,
                 gu_suh_ptr,
                 gu_svh_ptr,
+                a_gather,
                 gate_bias_ptrs,
                 up_bias_ptrs,
                 down_bias_ptrs,
@@ -977,6 +990,18 @@ class BlockSparseMLP(Module):
         bsz = y.shape[0]
         bc_sh_exp = False
 
+        # Eligibility for the multi-row CUDA-graph path (bsz 1..MAX_BSZN): computed up front so
+        # it can override the f_threshold-based routing below (bsz>=f_threshold would otherwise
+        # always fall through to the exl3_moe/dense path first, capping this tier's reach at
+        # f_threshold-1 instead of MAX_BSZN). bsz==1 is unrestricted (original bsz-1 path); bsz>1
+        # additionally requires no TP expert-range sharding (the kernel's compaction path doesn't
+        # preserve fixed per-token slot groups) -- shared experts are supported at any bsz via
+        # BC_GatedMLP's own multi-row graph (see mlp.py)
+        bszn_eligible = (
+            self.bc is not None and bsz <= MAX_BSZN and
+            (bsz == 1 or self.experts_cfg.min_expert == -1)
+        )
+
         # Routing
         if self.router_pre_norm:
             z = self.router_pre_norm.forward(y, params, out_dtype = torch.half)
@@ -1023,9 +1048,9 @@ class BlockSparseMLP(Module):
 
         # Torch/C++/fused path
         elif (
-            bsz >= self.f_threshold or not self.is_quantized or
+            (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
             self.config.infer_params.no_reconstruct or
-            not (self.support_quant_paths or (bsz == 1 and self.bc is not None))
+            not (self.support_quant_paths or bszn_eligible)
         ):
             final_hidden_states = torch.zeros_like(y, dtype = torch.float)
 
@@ -1179,7 +1204,23 @@ class BlockSparseMLP(Module):
 
             final_hidden_states = final_hidden_states.reshape(x.shape)
 
-        # Fused path, few tokens
+        # Multi-row CUDA-graph path (bsz 1..MAX_BSZN): a single cooperative mgemm call per
+        # projection across all bsz*top_k assignment slots (no sort/dedup -- overlap between
+        # tokens this small is rare and not worth the argsort/bincount host-sync cost that the
+        # fused/exl3_moe path pays), captured as one CUDA graph per bsz and replayed with only a
+        # few tensor pointers patched. Shared experts (if present) run through their own
+        # multi-row BC_GatedMLP graph, fused into the same capture. bsz > 1 additionally requires
+        # no TP expert-range sharding (the kernel's compaction path doesn't preserve fixed
+        # per-token slot groups); bsz == 1 is unrestricted
+        elif bszn_eligible:
+            self.bc.run_bszN(y, selected_experts, routing_weights)
+            if self.experts_cfg.out_trim is not None:
+                final_hidden_states = self.experts_cfg.out_trim[:bsz].view(x.shape)
+            else:
+                final_hidden_states = self.experts_cfg.out_d[:bsz, ...].view(x.shape)
+            bc_sh_exp = self.bc_sh_exp
+
+        # Per-token mgemm loop: fallback for TP-sharded / shared-experts models at bsz 2..f_threshold-1
         elif bsz > 1:
 
             final_hidden_states = torch.empty_like(y, dtype = torch.float)
@@ -1213,7 +1254,8 @@ class BlockSparseMLP(Module):
                         self.multi_gate.mul1,
                         mine,
                         maxe,
-                        0
+                        0,
+                        1
                     )
 
                 # Up
@@ -1232,7 +1274,8 @@ class BlockSparseMLP(Module):
                     self.multi_up.mul1,
                     mine,
                     maxe,
-                    0
+                    0,
+                    1
                 )
 
                 # Activation (gateless: relu_mul(u, u, a) = relu2(u))
@@ -1257,22 +1300,14 @@ class BlockSparseMLP(Module):
                     self.multi_down.mul1,
                     mine,
                     maxe,
-                    0
+                    0,
+                    1
                 )
 
                 t = cfg.out_d[0]
                 final_hidden_states[i:i+1] = t
 
             final_hidden_states = final_hidden_states.view(x.shape)
-
-        # Bsz 1
-        elif self.bc is not None:
-            self.bc.run_bsz1(y, selected_experts, routing_weights)
-            if self.experts_cfg.out_trim is not None:
-                final_hidden_states = self.experts_cfg.out_trim.view(x.shape)
-            else:
-                final_hidden_states = self.experts_cfg.out_d[:1, ...].view(x.shape)
-            bc_sh_exp = self.bc_sh_exp
 
         else:
             y = y.unsqueeze(0)
@@ -1295,7 +1330,8 @@ class BlockSparseMLP(Module):
                     self.multi_gate.mul1,
                     cfg.min_expert,
                     cfg.max_expert,
-                    0
+                    0,
+                    1
                 )
 
             # Up
@@ -1314,7 +1350,8 @@ class BlockSparseMLP(Module):
                 self.multi_up.mul1,
                 cfg.min_expert,
                 cfg.max_expert,
-                0
+                0,
+                1
             )
 
             # Activation (gateless: relu_mul(u, u, a) = relu2(u))
@@ -1338,7 +1375,8 @@ class BlockSparseMLP(Module):
                 self.multi_down.mul1,
                 cfg.min_expert,
                 cfg.max_expert,
-                0
+                0,
+                1
             )
 
             final_hidden_states = cfg.out_d[:1, ...].view(x.shape)

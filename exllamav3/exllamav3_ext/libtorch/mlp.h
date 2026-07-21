@@ -8,15 +8,21 @@ namespace py = pybind11;
 #include "linear.h"
 #include "../graph.cuh"
 
+#define MAX_BSZN 8   // must match MAX_BSZN in blocksparse_mlp.h / BlockSparseMLP.py
+
 // Gate and up projections run as one fused MGEMM when the pointer tables are given, otherwise
-// as two separate GEMV/GEMM calls through the gate/up BC handles (the unfused configuration the
-// int8-activation GEMV path prefers for wide matrices)
+// as two separate GEMV/GEMM calls -- for num_tokens > 1 these go directly through exl3_gemm_gr
+// using this class's OWN scratch (down_xh) rather than gate/up/down's BC_LinearEXL3::run_gr,
+// which hard-refuses graphing above bsz 1 and whose own xh scratch is a single globally-shared
+// cache entry (reused by every quantized Linear layer of the same shape) -- growing that would
+// affect the whole model's dense-layer path, not just this one
 
 struct BC_GatedMLP
 {
     at::Tensor guh;
     at::Tensor gu;
     at::Tensor a;
+    at::Tensor down_xh;
     c10::optional<at::Tensor> gu_ptrs_trellis;
     c10::optional<at::Tensor> gu_ptrs_suh;
     c10::optional<at::Tensor> gu_ptrs_svh;
@@ -31,13 +37,25 @@ struct BC_GatedMLP
     std::shared_ptr<BC_LinearEXL3> down;
     float act_limit;
 
-    Graph graph_bsz1;
+    // graph_bszN[num_tokens - 1] covers num_tokens 1..MAX_BSZN (num_tokens==1 behaves exactly as
+    // the original dedicated bsz-1 path)
+    Graph graph_bszN[MAX_BSZN];
+
+    // guh/gu hold TWO slots (gate, up) side by side; the fused mgemm kernel addresses slot j at
+    // raw offset j*size_m*size_k from the base pointer, which only lines up with a slice of the
+    // (2, MAX_BSZN, width) static buffer when num_tokens == MAX_BSZN (slicing dim 1 leaves dim
+    // 0's stride at MAX_BSZN*width, not num_tokens*width, corrupting the slot-1 address for any
+    // other num_tokens). Lazily-allocated, exactly (2, num_tokens, width)-shaped buffers per
+    // num_tokens sidestep this -- same pattern as BC_BlockSparseMLP's flat_token_cache
+    std::vector<at::Tensor> guh_cache;
+    std::vector<at::Tensor> gu_cache;
 
     BC_GatedMLP
     (
         at::Tensor _guh,
         at::Tensor _gu,
         at::Tensor _a,
+        at::Tensor _down_xh,
         c10::optional<at::Tensor> _gu_ptrs_trellis,
         c10::optional<at::Tensor> _gu_ptrs_suh,
         c10::optional<at::Tensor> _gu_ptrs_svh,
@@ -55,6 +73,7 @@ struct BC_GatedMLP
         guh                 (std::move(_guh)),
         gu                  (std::move(_gu)),
         a                   (std::move(_a)),
+        down_xh             (std::move(_down_xh)),
         gu_ptrs_trellis     (std::move(_gu_ptrs_trellis)),
         gu_ptrs_suh         (std::move(_gu_ptrs_suh)),
         gu_ptrs_svh         (std::move(_gu_ptrs_svh)),
@@ -70,16 +89,19 @@ struct BC_GatedMLP
         act_limit           (_act_limit)
     {
         TORCH_CHECK(gu_ptrs_trellis.has_value() || (gate && up), "BC_GatedMLP: need fused mgemm tensors or gate/up handles");
+        guh_cache.resize(MAX_BSZN);
+        gu_cache.resize(MAX_BSZN);
     }
 
-    void run_bsz1_gr
+    void run_bszN_gr
     (
         const at::Tensor& x,
         at::Tensor& d,
+        int num_tokens,
         Graph* graph
     );
 
-    void run_bsz1
+    void run_bszN
     (
         const at::Tensor& x,
         at::Tensor& d

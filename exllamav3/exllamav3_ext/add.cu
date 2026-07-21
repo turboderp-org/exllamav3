@@ -216,28 +216,33 @@ __global__ void moe_bias_add_weighted_kernel
     const uintptr_t* __restrict__ bias_ptrs,
     const int64_t* __restrict__ sel,
     const half* __restrict__ weights,
-    const int num_sel,
+    const int num_sel,      // experts per token (top_k); grid.y = token
     const int width,
     const int min_expert,
-    const int max_expert
+    const int max_expert,
+    const int out_stride    // row stride of out, in elements
 )
 {
     int col = blockIdx.x * C2D_THREADS + threadIdx.x;
+    int t = blockIdx.y;
     if (col >= width) return;
-    float acc = out[col];
+    const int64_t* sel_t = sel + (int64_t) t * num_sel;
+    const half* weights_t = weights + (int64_t) t * num_sel;
+    float* out_t = out + (int64_t) t * out_stride;
+    float acc = out_t[col];
     for (int k = 0; k < num_sel; ++k)
     {
         // Foreign experts contribute on their own rank only
-        int64_t e = sel[k];
+        int64_t e = sel_t[k];
         if (min_expert >= 0)
         {
             if (e < min_expert || e >= max_expert) continue;
             e -= min_expert;
         }
         const half* b = (const half*) bias_ptrs[e];
-        acc += __half2float(weights[k]) * __half2float(b[col]);
+        acc += __half2float(weights_t[k]) * __half2float(b[col]);
     }
-    out[col] = acc;
+    out_t[col] = acc;
 }
 
 void moe_bias_add_gr
@@ -296,9 +301,13 @@ void moe_bias_add_weighted_gr
     TORCH_CHECK_DTYPE(out, kFloat);
     TORCH_CHECK_DTYPE(sel, kLong);
     TORCH_CHECK_DTYPE(weights, kHalf);
-    int num_sel = (int) sel.numel();
+    // sel/weights are [num_tokens, experts_per_token]; out has a row per token (row 0 only when
+    // num_tokens == 1, the legacy/bsz-1 case -- unchanged behavior there)
+    int num_tokens = (int) sel.size(0);
+    int num_sel = (int) sel.size(-1);
     int width = (int) out.size(-1);
-    dim3 grid(CEIL_DIVIDE(width, C2D_THREADS));
+    int out_stride = (int) out.stride(0);
+    dim3 grid(CEIL_DIVIDE(width, C2D_THREADS), num_tokens);
 
     moe_bias_add_weighted_kernel<<<grid, C2D_THREADS, 0, stream>>>
     (
@@ -309,7 +318,8 @@ void moe_bias_add_weighted_gr
         num_sel,
         width,
         min_expert,
-        max_expert
+        max_expert,
+        out_stride
     );
     if (graph)
     {

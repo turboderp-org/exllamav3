@@ -397,11 +397,16 @@ int exl3_mgemm_gr
     int min_index,
     int max_index,
     int force_num_sms,
-    Graph* graph
+    Graph* graph,
+    int num_tokens
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK(num_tokens == 1 || min_index < 0,
+        "exl3_mgemm: multi-token reduction (num_tokens > 1) is not compatible with expert-range "
+        "filtering (min_index >= 0); TP-sharded experts must use num_tokens == 1");
 
     TORCH_CHECK_DTYPE(A, kHalf);
     TORCH_CHECK_DTYPE(B, kLong);
@@ -489,7 +494,8 @@ int exl3_mgemm_gr
         (void*)& bszm_in,
         (void*)& bszm_out,
         (void*)& min_index,
-        (void*)& max_index
+        (void*)& max_index,
+        (void*)& num_tokens
     };
 
     auto add_graph_args = [&](void* kernel_ptr)
@@ -613,7 +619,8 @@ int exl3_mgemm
     uint32_t mul1_mult,
     int min_index,
     int max_index,
-    int force_num_sms
+    int force_num_sms,
+    int num_tokens
 )
 {
     return exl3_mgemm_gr
@@ -633,6 +640,7 @@ int exl3_mgemm
         min_index,
         max_index,
         force_num_sms,
-        nullptr
+        nullptr,
+        num_tokens
     );
 }

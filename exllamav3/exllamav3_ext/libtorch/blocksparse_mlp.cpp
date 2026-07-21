@@ -64,27 +64,53 @@ std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     }
 }
 
-void BC_BlockSparseMLP::run_bsz1_gr
+void BC_BlockSparseMLP::run_bszN_gr
 (
-    const at::Tensor& y,
+    const at::Tensor& A_in,
+    const at::Tensor& x_dense,
     at::Tensor& selected_experts,
     at::Tensor& routing_weights,
+    int num_tokens,
     Graph* graph
 )
 {
     //py::gil_scoped_release _;
 
-    // Padded hidden dim: stage the input through the zero-padded static (the pad columns are
-    // zeroed python-side at construction and never written)
+    int numex = (int) selected_experts.size(-1);
+    int bszm = num_tokens * numex;
+
+    // num_tokens == 1: original bsz=1 behavior -- zero-copy broadcast (the kernel's bszm_in==1
+    // fast path), with the padded-hidden-dim staging captured as part of the graph. num_tokens >
+    // 1: A_in is already the gathered (and padded, if applicable) [bszm, 1, Hi] input, built
+    // eagerly outside (see run_bszN) since it depends on a real per-call gather, not just a view
     at::Tensor yi;
-    if (y_pad)
+    if (num_tokens == 1)
     {
-        at::Tensor yp = y_pad.value();
-        copy2d_gr(y, yp, graph);
-        yi = yp.unsqueeze(0);
+        if (y_pad)
+        {
+            // y_pad is sized [MAX_BSZN, Hi] to also serve the num_tokens > 1 gather staging in
+            // run_bszN; only row 0 is used here
+            at::Tensor yp = y_pad.value().slice(0, 0, 1);
+            copy2d_gr(A_in, yp, graph);
+            yi = yp.unsqueeze(0);
+        }
+        else
+            yi = A_in.unsqueeze(0);
     }
     else
-        yi = y.unsqueeze(0);
+        yi = A_in;
+
+    at::Tensor yh_n       = yh.slice(0, 0, bszm);
+    at::Tensor interm_g_n = interm_g.slice(0, 0, bszm);
+    at::Tensor interm_u_n = interm_u.slice(0, 0, bszm);
+    at::Tensor interm_a_n = interm_a.slice(0, 0, bszm);
+    at::Tensor out_d_n    = out_d.slice(0, 0, bszm);
+
+    // exl3_mgemm's indices/weights arguments want a flat (1, bszm) view (num_tokens == 1: already
+    // that shape, reshape is a no-op view); the bias-add kernels want the natural
+    // (num_tokens, top_k) shape -- both view the same storage, so patched pointers stay identical
+    at::Tensor sel_idx = selected_experts.reshape({1, -1});
+    at::Tensor w_idx    = routing_weights.reshape({1, -1});
 
     if (gated)
     {
@@ -92,11 +118,11 @@ void BC_BlockSparseMLP::run_bsz1_gr
         (
             yi,
             gate_ptrs_trellis,
-            interm_g,
+            interm_g_n,
             gate_ptrs_suh,
-            yh,
+            yh_n,
             gate_ptrs_svh,
-            selected_experts,
+            sel_idx,
             {},
             gate_K,
             -1,
@@ -105,21 +131,22 @@ void BC_BlockSparseMLP::run_bsz1_gr
             min_expert,
             max_expert,
             0,
-            graph
+            graph,
+            num_tokens
         );
         if (gate_bias_ptrs)
-            moe_bias_add_gr(interm_g, gate_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
+            moe_bias_add_gr(interm_g_n, gate_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
     }
 
     exl3_mgemm_gr
     (
         yi,
         up_ptrs_trellis,
-        interm_u,
+        interm_u_n,
         up_ptrs_suh,
-        yh,
+        yh_n,
         up_ptrs_svh,
-        selected_experts,
+        sel_idx,
         {},
         up_K,
         -1,
@@ -128,36 +155,37 @@ void BC_BlockSparseMLP::run_bsz1_gr
         min_expert,
         max_expert,
         0,
-        graph
+        graph,
+        num_tokens
     );
 
     if (up_bias_ptrs)
-        moe_bias_add_gr(interm_u, up_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
+        moe_bias_add_gr(interm_u_n, up_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
 
     if (!gated)
         // relu(u) * u = relu^2(u), the non-gated activation
-        relu_mul_gr(interm_u, interm_u, interm_a, act_limit, graph);
+        relu_mul_gr(interm_u_n, interm_u_n, interm_a_n, act_limit, graph);
     else if (act_silu)
-        silu_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
+        silu_mul_gr(interm_g_n, interm_u_n, interm_a_n, act_limit, graph);
     else if (act_gelu)
-        gelu_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
+        gelu_mul_gr(interm_g_n, interm_u_n, interm_a_n, act_limit, graph);
     else if (act_silu_oai)
-        silu_oai_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
+        silu_oai_mul_gr(interm_g_n, interm_u_n, interm_a_n, act_limit, graph);
     else if (act_relu2)
-        relu2_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
+        relu2_mul_gr(interm_g_n, interm_u_n, interm_a_n, act_limit, graph);
 
     // A_had must not alias A: the kernel stages the rotated input in A_had, and the autotuner
-    // relaunches the (otherwise idempotent) kernel on the first call. interm_g is free here
+    // relaunches the (otherwise idempotent) kernel on the first call. interm_g_n is free here
     exl3_mgemm_gr
     (
-        interm_a,
+        interm_a_n,
         down_ptrs_trellis,
-        out_d,
+        out_d_n,
         down_ptrs_suh,
-        interm_g,
+        interm_g_n,
         down_ptrs_svh,
-        selected_experts,
-        routing_weights,
+        sel_idx,
+        w_idx,
         down_K,
         -1,
         down_mcg,
@@ -165,61 +193,117 @@ void BC_BlockSparseMLP::run_bsz1_gr
         min_expert,
         max_expert,
         0,
-        graph
+        graph,
+        num_tokens
     );
     if (down_bias_ptrs)
-        moe_bias_add_weighted_gr(out_d, down_bias_ptrs.value(), selected_experts, routing_weights, min_expert, max_expert, graph);
+        moe_bias_add_weighted_gr(out_d_n, down_bias_ptrs.value(), selected_experts, routing_weights, min_expert, max_expert, graph);
     if (out_trim)
     {
-        // Exact-width copy out of the padded down result (row 0 holds the weighted reduction)
-        at::Tensor src = out_d.select(0, 0);
-        at::Tensor dst = out_trim.value();
+        // Exact-width copy out of the padded down result (rows 0..num_tokens-1 hold the weighted
+        // reductions)
+        at::Tensor src = out_d_n.slice(0, 0, num_tokens).squeeze(1);
+        at::Tensor dst = out_trim.value().slice(0, 0, num_tokens);
         copy2d_gr(src, dst, graph);
     }
 
     if (shared_experts)
     {
-        shared_experts->run_bsz1_gr(yi, out_d_sh.value(), graph);
+        // x_dense is the natural (ungathered) [1, num_tokens, Hi] view -- distinct from yi/A_in,
+        // which for num_tokens > 1 holds the per-slot GATHERED (duplicated) routed-expert input
+        at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
+        shared_experts->run_bszN_gr(x_dense, out_d_sh_n, num_tokens, graph);
         if (shared_gate)
         {
-            add_sigmoid_gate_proj_gr(out_d_sh.value(), yi, out_d, shared_gate->weight, graph);
+            add_sigmoid_gate_proj_gr(out_d_sh_n, x_dense, out_d_n, shared_gate->weight, graph);
         }
         else
         {
-            add_gr(out_d, out_d_sh.value(), out_d, graph);
+            add_gr(out_d_n, out_d_sh_n, out_d_n, graph);
         }
     }
 }
 
-void BC_BlockSparseMLP::run_bsz1
+void BC_BlockSparseMLP::run_bszN
 (
     const at::Tensor& y,
     at::Tensor& selected_experts,
     at::Tensor& routing_weights
 )
 {
+    int num_tokens = (int) y.size(0);
+    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MAX_BSZN, "run_bszN: bsz out of supported range");
+    int graphidx = num_tokens - 1;
+    int numex = (int) selected_experts.size(-1);
+
     c10::cuda::CUDAGuard device_guard(y.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    if (graph_bsz1.disabled || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
+    // num_tokens > 1: build the gathered input eagerly (not graphed -- this is a real per-call
+    // op, unlike the bsz=1 zero-copy broadcast). flat_token depends only on (num_tokens, numex),
+    // never on routing outcome, so it's built once per num_tokens and cached. x_dense is the
+    // natural (ungathered) [1, num_tokens, Hi] view, used only for the shared-experts merge (the
+    // constructor already requires y_pad to be absent whenever shared_experts is present, so no
+    // padded-dim handling is needed there)
+    at::Tensor A_in;
+    at::Tensor x_dense;
+    if (num_tokens == 1)
     {
-        run_bsz1_gr(y, selected_experts, routing_weights, nullptr);
-        graph_bsz1.ready_to_record = true;
+        A_in = y;
+        x_dense = y.unsqueeze(0);
     }
     else
     {
-        if (!graph_bsz1.ready)
+        int bszm = num_tokens * numex;
+        at::Tensor& flat_token = flat_token_cache[graphidx];
+        if (!flat_token.defined())
         {
-            graph_bsz1.capture_begin();
-            run_bsz1_gr(y, selected_experts, routing_weights, &graph_bsz1);
-            graph_bsz1.capture_end();
+            flat_token = at::arange(num_tokens, at::TensorOptions().dtype(at::kLong).device(y.device()))
+                .unsqueeze(1).expand({num_tokens, numex}).reshape({num_tokens * numex}).contiguous();
         }
 
-        // Padded hidden dim: y feeds the staging copy at the head of the graph and the mgemms
-        // read the (static) padded buffer
-        void* yptr = y_pad ? y_pad.value().data_ptr() : (void*) y.data_ptr();
-        auto args = std::vector<PPTR>();
+        at::Tensor gather_src = y;
         if (y_pad)
+        {
+            at::Tensor yp_n = y_pad.value().slice(0, 0, num_tokens);
+            yp_n.slice(1, 0, y.size(1)).copy_(y);
+            gather_src = yp_n;
+        }
+        x_dense = gather_src.unsqueeze(0);
+
+        at::Tensor gathered = gather_src.index_select(0, flat_token);
+        at::Tensor ag_n = a_gather.slice(0, 0, bszm);
+        ag_n.slice(1, 0, gathered.size(1)).copy_(gathered);
+        A_in = ag_n.view({bszm, 1, ag_n.size(1)});
+    }
+
+    Graph& g = graph_bszN[graphidx];
+
+    if (g.disabled || (!g.ready && !g.ready_to_record))
+    {
+        run_bszN_gr(A_in, x_dense, selected_experts, routing_weights, num_tokens, nullptr);
+        g.ready_to_record = true;
+    }
+    else
+    {
+        if (!g.ready)
+        {
+            g.capture_begin();
+            run_bszN_gr(A_in, x_dense, selected_experts, routing_weights, num_tokens, &g);
+            g.capture_end();
+        }
+
+        // Padded hidden dim at num_tokens == 1: y feeds the staging copy at the head of the graph
+        // and the mgemms read the (static) padded buffer. At num_tokens > 1, A_in already points
+        // at the (static, per-slot) gathered buffer -- built fresh above, but at the same address
+        // every call, so no patching is strictly needed there, though patching it anyway keeps
+        // this code path uniform across num_tokens
+        void* yptr = (num_tokens == 1 && y_pad) ? y_pad.value().data_ptr() : (void*) A_in.data_ptr();
+        // Distinct from yptr: shared_experts consumes the natural (ungathered) view, not the
+        // routed experts' per-slot gathered input
+        void* x_dense_ptr = (void*) x_dense.data_ptr();
+        auto args = std::vector<PPTR>();
+        if (num_tokens == 1 && y_pad)
             args.push_back(PPTR(GP_copy2d_src, (void*) y.data_ptr()));
 
         if (gated)
@@ -258,8 +342,8 @@ void BC_BlockSparseMLP::run_bsz1
             args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
             args.push_back(PPTR(GP_end,                         nullptr));
             if (down_bias_ptrs) patch_bias();
-            args.push_back(PPTR(GP_mgemm_A,                     (void*) y.data_ptr()));
-            args.push_back(PPTR(GP_add_sigmoid_gate_proj_y,     (void*) y.data_ptr()));
+            args.push_back(PPTR(GP_mgemm_A,                     x_dense_ptr));
+            args.push_back(PPTR(GP_add_sigmoid_gate_proj_y,     x_dense_ptr));
             args.push_back(PPTR(GP_add_sigmoid_gate_proj_z,     (void*) out_d.data_ptr()));
         }
         else if (shared_experts)
@@ -268,7 +352,7 @@ void BC_BlockSparseMLP::run_bsz1
             args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
             args.push_back(PPTR(GP_end,                         nullptr));
             if (down_bias_ptrs) patch_bias();
-            args.push_back(PPTR(GP_mgemm_A,                     (void*) y.data_ptr()));
+            args.push_back(PPTR(GP_mgemm_A,                     x_dense_ptr));
             args.push_back(PPTR(GP_add_x,                       (void*) out_d.data_ptr()));
             args.push_back(PPTR(GP_add_z,                       (void*) out_d.data_ptr()));
         }
@@ -280,7 +364,7 @@ void BC_BlockSparseMLP::run_bsz1
             if (down_bias_ptrs) patch_bias();
         }
 
-        graph_bsz1.launch(args, stream);
+        g.launch(args, stream);
     }
 }
 
@@ -331,6 +415,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     at::Tensor _gu_trellis_ptr,
     at::Tensor _gu_suh_ptr,
     at::Tensor _gu_svh_ptr,
+    at::Tensor _a_gather,
     c10::optional<at::Tensor> _gate_bias_ptrs,
     c10::optional<at::Tensor> _up_bias_ptrs,
     c10::optional<at::Tensor> _down_bias_ptrs,
@@ -388,8 +473,11 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         up_bias_ptrs        (std::move(_up_bias_ptrs)),
         down_bias_ptrs      (std::move(_down_bias_ptrs)),
         y_pad               (std::move(_y_pad)),
-        out_trim            (std::move(_out_trim))
+        out_trim            (std::move(_out_trim)),
+        a_gather            (std::move(_a_gather))
 {
+    flat_token_cache.resize(MAX_BSZN);
+
     // Non-gated experts (NemotronH): python passes an empty gates vector (the gate pointer
     // tables are unused placeholders) and act_relu2; the gate GEMMs are skipped throughout
     gated = !gates.empty();
@@ -434,40 +522,6 @@ void BC_BlockSparseMLP::run_single_expert_gr
     at::Tensor ai = interm_a2.slice(0, 0, bsz);
     at::Tensor oi = out_d2.slice(0, 0, bsz);
 
-//    if (use_mgemm)
-//    {
-//        at::Tensor yb = y.unsqueeze(0);
-//        at::Tensor gui = interm_gu.slice(0, 0, bsz * 2).view({2, bsz, interm_gu.size(1)});
-//        at::Tensor yh2i = yh2.slice(0, 0, 2).view({2, 1, yh2.size(1)});
-//
-//        exl3_mgemm
-//        (
-//            yb,
-//            gu_trellis_ptr[expert_idx],
-//            gui,
-//            gu_suh_ptr[expert_idx],
-//            yh2,
-//            gu_svh_ptr[expert_idx],
-//            c10::nullopt,
-//            c10::nullopt,
-//            gate_K,
-//            -1,
-//            gate_mcg,
-//            gate_mul1,
-//            -1,
-//            -1,
-//            0
-//        );
-//
-//        at::Tensor gi = gui[0];
-//        at::Tensor ui = gui[1];
-//
-//        if (act_silu)
-//            silu_mul(gi, ui, ai, act_limit);
-//        else if (act_gelu)
-//            gelu_mul(gi, ui, ai, act_limit);
-//    }
-//    else
     {
         at::Tensor gi = interm_gu.slice(0, 0, bsz);
         at::Tensor ui = interm_gu.slice(0, bsz, bsz * 2);

@@ -11,22 +11,39 @@
 
 using namespace torch::indexing;
 
-void BC_GatedMLP::run_bsz1_gr
+void BC_GatedMLP::run_bszN_gr
 (
     const at::Tensor& x,
     at::Tensor& d,
+    int num_tokens,
     Graph* graph
 )
 {
+    // guh/gu hold 2 slots (gate, up); slicing the static (2, MAX_BSZN, width) buffers along dim 1
+    // would leave dim 0's stride at MAX_BSZN*width instead of num_tokens*width, corrupting the
+    // fused mgemm kernel's raw j*size_m*size_k slot addressing for any num_tokens != MAX_BSZN --
+    // use exactly-shaped, lazily-cached buffers instead (a/down_xh have no such issue: their slot
+    // dim is size 1, so slicing the token dim -- the true leading dim there -- stays contiguous)
+    at::Tensor& guh_n_ref = guh_cache[num_tokens - 1];
+    if (!guh_n_ref.defined())
+        guh_n_ref = at::empty({2, num_tokens, guh.size(2)}, guh.options());
+    at::Tensor& gu_n_ref = gu_cache[num_tokens - 1];
+    if (!gu_n_ref.defined())
+        gu_n_ref = at::empty({2, num_tokens, gu.size(2)}, gu.options());
+    at::Tensor guh_n     = guh_n_ref;
+    at::Tensor gu_n      = gu_n_ref;
+    at::Tensor a_n       = a.slice(1, 0, num_tokens);
+    at::Tensor down_xh_n = down_xh.slice(1, 0, num_tokens);
+
     if (gu_ptrs_trellis)
     {
         exl3_mgemm_gr
         (
             x,
             gu_ptrs_trellis.value(),
-            gu,
+            gu_n,
             gu_ptrs_suh.value(),
-            guh,
+            guh_n,
             gu_ptrs_svh.value(),
             {},
             {},
@@ -37,51 +54,69 @@ void BC_GatedMLP::run_bsz1_gr
             -1,
             -1,
             0,
-            graph
+            graph,
+            1   // mgemm's reduction-group param, unused here (no weights -> no reduction runs);
+                // bszm=2 is the gate/up slot pair, unrelated to num_tokens (carried via size_m)
         );
     }
     else
     {
-        at::Tensor g2 = gu.select(0, 0);
-        at::Tensor u2 = gu.select(0, 1);
-        gate->run_gr(x, g2, graph);
-        up->run_gr(x, u2, graph);
+        // num_tokens > 1 bypasses BC_LinearEXL3::run_gr (which hard-refuses graphing above bsz 1
+        // and whose own xh scratch is a single global cache entry shared by every quantized
+        // Linear layer of the same shape) -- call exl3_gemm_gr directly with this class's own
+        // scratch instead, for every num_tokens including 1
+        at::Tensor g2 = gu_n.select(0, 0);
+        at::Tensor u2 = gu_n.select(0, 1);
+        at::Tensor gate_xh = guh_n.select(0, 0);
+        at::Tensor up_xh   = guh_n.select(0, 1);
+        exl3_gemm_gr(x, gate->trellis, g2, gate->suh, gate_xh, gate->svh, -1, gate->mcg, gate->mul1, 0, graph);
+        exl3_gemm_gr(x, up->trellis, u2, up->suh, up_xh, up->svh, -1, up->mcg, up->mul1, 0, graph);
+        if (gate->bias) add_gr(g2, gate->bias.value(), g2, graph);
+        if (up->bias) add_gr(u2, up->bias.value(), u2, graph);
     }
 
-    at::Tensor g = gu.select(0, 0).unsqueeze(0);
-    at::Tensor u = gu.select(0, 1).unsqueeze(0);
+    at::Tensor g = gu_n.select(0, 0).unsqueeze(0);
+    at::Tensor u = gu_n.select(0, 1).unsqueeze(0);
 
     if (act_silu)
-        silu_mul_gr(g, u, a, act_limit, graph);
+        silu_mul_gr(g, u, a_n, act_limit, graph);
     else if (act_gelu)
-        gelu_mul_gr(g, u, a, act_limit, graph);
+        gelu_mul_gr(g, u, a_n, act_limit, graph);
     else if (act_relu2)
-        relu2_mul_gr(g, u, a, act_limit, graph);
+        relu2_mul_gr(g, u, a_n, act_limit, graph);
 
-    down->run_gr(a, d, graph);
+    exl3_gemm_gr(a_n, down->trellis, d, down->suh, down_xh_n, down->svh, -1, down->mcg, down->mul1, 0, graph);
+    if (down->bias)
+        add_gr(d, down->bias.value(), d, graph);
 }
 
-void BC_GatedMLP::run_bsz1
+void BC_GatedMLP::run_bszN
 (
     const at::Tensor& x,
     at::Tensor& d
 )
 {
+    int num_tokens = (int) x.numel() / (int) x.size(-1);
+    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MAX_BSZN, "run_bszN: bsz out of supported range");
+    int graphidx = num_tokens - 1;
+
     c10::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    if (graph_bsz1.disabled || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
+    Graph& g = graph_bszN[graphidx];
+
+    if (g.disabled || (!g.ready && !g.ready_to_record))
     {
-        run_bsz1_gr(x, d, nullptr);
-        graph_bsz1.ready_to_record = true;
+        run_bszN_gr(x, d, num_tokens, nullptr);
+        g.ready_to_record = true;
     }
     else
     {
-        if (!graph_bsz1.ready)
+        if (!g.ready)
         {
-            graph_bsz1.capture_begin();
-            run_bsz1_gr(x, d, &graph_bsz1);
-            graph_bsz1.capture_end();
+            g.capture_begin();
+            run_bszN_gr(x, d, num_tokens, &g);
+            g.capture_end();
         }
 
         std::vector<PPTR> args;
@@ -91,13 +126,14 @@ void BC_GatedMLP::run_bsz1
         }
         else
         {
+            at::Tensor gu_n = gu_cache[num_tokens - 1];
             // The gate/up GEMMs record their own GP_gemm_C sites ahead of the down projection's;
             // patch them with their (static) values so the site walk stays aligned and the final
             // GP_gemm_C entry binds to the down projection
             args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
-            args.emplace_back(GP_gemm_C, (void*) gu.select(0, 0).data_ptr());
+            args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 0).data_ptr());
             args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
-            args.emplace_back(GP_gemm_C, (void*) gu.select(0, 1).data_ptr());
+            args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 1).data_ptr());
         }
         args.emplace_back(GP_gemm_C, (void*) d.data_ptr());
         if (down->bias)
@@ -106,7 +142,7 @@ void BC_GatedMLP::run_bsz1
             args.emplace_back(GP_add_z, (void*) d.data_ptr());
         }
 
-        graph_bsz1.launch(args, stream);
+        g.launch(args, stream);
     }
 }
 

@@ -4,6 +4,7 @@ py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
         at::Tensor,
         at::Tensor,
         at::Tensor,
+        at::Tensor,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
@@ -21,6 +22,7 @@ py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
     py::arg("guh"),
     py::arg("gu"),
     py::arg("a"),
+    py::arg("down_xh"),
     py::arg("gu_ptrs_trellis"),
     py::arg("gu_ptrs_suh"),
     py::arg("gu_ptrs_svh"),
@@ -35,7 +37,7 @@ py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
     py::arg("down"),
     py::arg("act_limit")
 )
-.def("run_bsz1", &BC_GatedMLP::run_bsz1);
+.def("run_bszN", &BC_GatedMLP::run_bszN);
 
 py::class_<BC_MLP, std::shared_ptr<BC_MLP>>(m, "BC_MLP").def
 (
