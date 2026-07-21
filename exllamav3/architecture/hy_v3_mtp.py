@@ -34,7 +34,7 @@ class HyV3MTPModel(Model):
         # bias) and DeepSeek-V3 style tensor names
         self.input_layer = Qwen3_5MTPInputLayer(
             config = config,
-            key = f"{key_prefix}.layers.{first_mtp_layer}",
+            key = f"{key_prefix}.layers.{first_mtp_layer}.input",
             key_pre_fc_norm_hidden = f"{key_prefix}.layers.{first_mtp_layer}.hnorm",
             key_pre_fc_norm_embedding = f"{key_prefix}.layers.{first_mtp_layer}.enorm",
             key_fc = f"{key_prefix}.layers.{first_mtp_layer}.eh_proj",
