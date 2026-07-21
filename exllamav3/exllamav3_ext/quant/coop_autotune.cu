@@ -23,7 +23,7 @@
 namespace
 {
 
-constexpr uint64_t COOP_AUTOTUNE_VERSION = 1;
+constexpr uint64_t COOP_AUTOTUNE_VERSION = 3;
 constexpr char DISK_CACHE_MAGIC[8] = { 'E', 'X', '3', 'A', 'T', 'U', 'N', 'E' };
 constexpr uint32_t DISK_CACHE_FORMAT = 1;
 
@@ -303,6 +303,44 @@ void set_kernel_attr_once(void* kernel, size_t smem)
     attr_set.insert(key);
 }
 
+std::mutex thrash_mutex;
+std::map<int, std::pair<void*, size_t>> thrash_buffers;
+
+// Candidates in one autotune session share the same input tensors, so back-to-back timed launches
+// keep each other's operands mutually warm in L2 regardless of production's actual scattered,
+// per-token-random expert access pattern.
+void thrash_l2(cudaStream_t stream)
+{
+    int device;
+    cuda_check(cudaGetDevice(&device));
+
+    void* buf;
+    size_t size;
+    {
+        std::lock_guard<std::mutex> lock(thrash_mutex);
+        auto it = thrash_buffers.find(device);
+        if (it == thrash_buffers.end())
+        {
+            int l2_bytes = 0;
+            cuda_check(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, device));
+            // 2x the reported L2 capacity to reliably evict prior residents regardless of
+            // associativity/replacement-policy quirks; generous fallback if the query fails
+            size_t alloc_size = (size_t) (l2_bytes > 0 ? l2_bytes : 64 * 1024 * 1024) * 2;
+            void* ptr;
+            cuda_check(cudaMalloc(&ptr, alloc_size));
+            thrash_buffers[device] = { ptr, alloc_size };
+            buf = ptr;
+            size = alloc_size;
+        }
+        else
+        {
+            buf = it->second.first;
+            size = it->second.second;
+        }
+    }
+    cuda_check(cudaMemsetAsync(buf, 0, size, stream));
+}
+
 float trimmed_mean(std::vector<float>& samples)
 {
     TORCH_CHECK(!samples.empty(), "CoopKernelAutotuner: no timing samples");
@@ -333,6 +371,7 @@ void measure_candidate_sample
     cudaEvent_t end
 )
 {
+    thrash_l2(stream);
     cuda_check(cudaEventRecord(start, stream));
     for (int i = 0; i < repeats; ++i)
     {
@@ -480,28 +519,28 @@ CoopAutotuneLaunch tune
     cuda_check(cudaEventCreate(&start));
     cuda_check(cudaEventCreate(&end));
 
-    int repeats = 10;
-    if (numel_B > 1e6) repeats = 6;
-    if (numel_B > 1e7) repeats = 5;
+    int repeats = 8;
+    if (numel_B > 1e6) repeats = 5;
+    if (numel_B > 1e7) repeats = 4;
     if (numel_B > 1e8) repeats = 3;
     if (numel_B > 2e8) repeats = 2;
     int max_rounds = 32;
-    if (numel_B > 1e6) max_rounds = 16;
-    if (numel_B > 1e7) max_rounds = 10;
+    if (numel_B > 1e6) max_rounds = 12;
+    if (numel_B > 1e7) max_rounds = 8;
     if (numel_B > 1e8) max_rounds = 5;
     if (numel_B > 2e8) max_rounds = 2;
-    int max_cands = 8;
+    int max_cands = 7;
     if (numel_B > 1e6) max_cands = 5;
     if (numel_B > 1e7) max_cands = 4;
     if (numel_B > 1e8) max_cands = 3;
     if (numel_B > 2e8) max_cands = 2;
 
     if (candidates.size() > 1 && max_cands > 4)
-        measure_stage(candidates, kernel_args, smem, stream, MIN(8, max_rounds), repeats, MIN(8, max_cands), start, end);
+        measure_stage(candidates, kernel_args, smem, stream, MIN(2, max_rounds), repeats, MIN(6, max_cands), start, end);
     if (candidates.size() > 1 && max_cands > 1)
-        measure_stage(candidates, kernel_args, smem, stream, MIN(40, max_rounds), repeats, MIN(4, max_cands), start, end);
+        measure_stage(candidates, kernel_args, smem, stream, MIN(8, max_rounds), repeats, MIN(3, max_cands), start, end);
     if (candidates.size() > 1)
-        measure_stage(candidates, kernel_args, smem, stream, MIN(64, max_rounds), repeats, 1, start, end);
+        measure_stage(candidates, kernel_args, smem, stream, MIN(14, max_rounds), repeats, 1, start, end);
 
     cuda_check(cudaEventDestroy(start));
     cuda_check(cudaEventDestroy(end));
