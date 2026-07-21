@@ -7,6 +7,7 @@
 #include "util.cuh"
 #include "compat.cuh"
 #include "graph.cuh"
+#include "gdn.cuh"
 #include <cmath>
 
 using bfloat16 = __nv_bfloat16;
@@ -843,7 +844,6 @@ void cuda_recurrent_gated_delta_rule_gr
 {
     const at::cuda::OptionalCUDAGuard device_guard(mixed_qkv.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
-    TORCH_CHECK(!graph || !history, "cuda_recurrent_gated_delta_rule: history mode is not graph-capturable");
     TORCH_CHECK(!graph || slots.has_value(), "cuda_recurrent_gated_delta_rule: graph capture requires slots");
 
     int bsz = mixed_qkv.size(0);
@@ -949,16 +949,16 @@ void cuda_recurrent_gated_delta_rule_gr
     {
         if (k_head_dim == 128 && v_head_dim == 128)
         {
-            if (v_split == 4) cuda_recurrent_gated_delta_rule_kernel_128<true, 4><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
-            else              cuda_recurrent_gated_delta_rule_kernel_128<true, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 4>)
+            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 1>)
         }
         else if (threads.x <= 128)
         {
-            if (v_split == 4) cuda_recurrent_gated_delta_rule_kernel<128, true, 4><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
-            else              cuda_recurrent_gated_delta_rule_kernel<128, true, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, true, 4>)
+            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, true, 1>)
         }
         else if (threads.x <= 256)
-                              cuda_recurrent_gated_delta_rule_kernel<256, true, 1><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+                              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<256, true, 1>)
         else TORCH_CHECK(false, "Max head dim exceeded");
     }
     #undef LAUNCH_RULE
@@ -987,16 +987,18 @@ void cuda_recurrent_gated_delta_rule
         num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, nullptr);
 }
 
-// Mamba2 bsz-1 decode helper for the BC graph: reads the in_proj output [z, xBC, dt] (float,
-// b = s = 1, so the conv-layout "transpose" of xBC is free) and writes the bf16 conv input
-// plus the discretized dt/g tensors. All pointers are statics; nothing is patched
+// Mamba2 decode helper for the BC graph: reads the in_proj output [z, xBC, dt] (float, row
+// stride N >= v_dim + F + dt_first + H) and writes the bf16 conv input (transposed to the conv
+// layout [B,F,S], like gated_delta_net_fused_op_3_kernel's out_mixed_qkv), the discretized dt/g
+// tensors, and a genuinely contiguous copy of the gate (z) slice. All pointers are statics
 
 __global__ void mamba2_fused_op_kernel
 (
-    const float* __restrict__ in_proj_out,      // [1, 1, v_dim + F + dt_first + H + ... (+ padding)]
-    bfloat16* __restrict__ out_xbc,             // [1, F, 1]
-    bfloat16* __restrict__ out_dt,              // [1, 1, H]
-    float* __restrict__ out_g,                  // [1, 1, H]
+    const float* __restrict__ in_proj_out,      // [BS, N], N >= v_dim + F + dt_first + H
+    bfloat16* __restrict__ out_xbc,             // [B, F, S]
+    bfloat16* __restrict__ out_dt,              // [BS, H]
+    float* __restrict__ out_g,                  // [BS, H]
+    float* __restrict__ out_z_gate,             // [BS, v_dim], contiguous copy of proj[.., :v_dim]
     const float* __restrict__ dt_bias,          // [H]
     const float* __restrict__ a_log,            // [H]
     const int v_dim,
@@ -1004,29 +1006,53 @@ __global__ void mamba2_fused_op_kernel
     const int H,
     const int dt_first,                         // rank's head offset into the (replicated) dt section
     const float dt_min,
-    const float dt_max
+    const float dt_max,
+    const int BS,
+    const int S,
+    const int N
 )
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < F)
-        out_xbc[idx] = trunc_bf16(in_proj_out[v_dim + idx]);
+    int cast_elems = BS * F;
+
+    if (idx < cast_elems)
+    {
+        int f = idx % F;
+        int row = idx / F;                      // b * S + s
+        int b = row / S;
+        int s = row % S;
+        out_xbc[((size_t) b * F + f) * S + s] = trunc_bf16(in_proj_out[(size_t) row * N + v_dim + f]);
+    }
     else
     {
-        idx -= F;
-        if (idx >= H) return;
-        float dtv = softplus(in_proj_out[v_dim + F + dt_first + idx] + dt_bias[idx]);
-        dtv = fminf(fmaxf(dtv, dt_min), dt_max);
-        out_g[idx] = -__expf(a_log[idx]) * dtv;
-        out_dt[idx] = trunc_bf16(dtv);
+        idx -= cast_elems;
+        if (idx < BS * H)
+        {
+            int h = idx % H;
+            int row = idx / H;
+            float dtv = softplus(in_proj_out[(size_t) row * N + v_dim + F + dt_first + h] + dt_bias[h]);
+            dtv = fminf(fmaxf(dtv, dt_min), dt_max);
+            out_g[(size_t) row * H + h] = -__expf(a_log[h]) * dtv;
+            out_dt[(size_t) row * H + h] = trunc_bf16(dtv);
+        }
+        else
+        {
+            idx -= BS * H;
+            if (idx >= BS * v_dim) return;
+            int z = idx % v_dim;
+            int row = idx / v_dim;
+            out_z_gate[(size_t) row * v_dim + z] = in_proj_out[(size_t) row * N + z];
+        }
     }
 }
 
 void mamba2_fused_op_gr
 (
-    const at::Tensor& proj,         // [1,1,>= v_dim + F + dt_first + H] float
-    at::Tensor& xbc,                // out [1, F, 1] bfloat16
-    at::Tensor& dt,                 // out [1, 1, H] bfloat16
-    at::Tensor& g,                  // out [1, 1, H] float
+    const at::Tensor& proj,         // [B,S,N], N >= v_dim + F + dt_first + H, float
+    at::Tensor& xbc,                // out [B, F, S] bfloat16
+    at::Tensor& dt,                 // out [B, S, H] bfloat16
+    at::Tensor& g,                  // out [B, S, H] float
+    at::Tensor& z_gate,             // out [B, S, v_dim] float, contiguous
     const at::Tensor& dt_bias,      // [H] float
     const at::Tensor& a_log,        // [H] float
     int v_dim,
@@ -1043,16 +1069,21 @@ void mamba2_fused_op_gr
     TORCH_CHECK_DTYPE(xbc, kBFloat16);
     TORCH_CHECK_DTYPE(dt, kBFloat16);
     TORCH_CHECK_DTYPE(g, kFloat);
+    TORCH_CHECK_DTYPE(z_gate, kFloat);
     TORCH_CHECK_DTYPE(dt_bias, kFloat);
     TORCH_CHECK_DTYPE(a_log, kFloat);
 
-    int F = xbc.numel();
-    int H = dt.numel();
-    TORCH_CHECK(proj.size(0) == 1 && proj.size(1) == 1, "mamba2_fused_op: bsz-1, seqlen-1 only");
-    TORCH_CHECK(proj.size(2) >= v_dim + F + dt_first + H, "mamba2_fused_op: proj too narrow");
-    TORCH_CHECK(dt_bias.numel() == H && a_log.numel() == H && g.numel() == H, "mamba2_fused_op: bad H");
+    int B = proj.size(0);
+    int S = proj.size(1);
+    int N = proj.size(2);
+    int F = xbc.numel() / (B * S);
+    int H = dt.numel() / (B * S);
+    TORCH_CHECK(N >= v_dim + F + dt_first + H, "mamba2_fused_op: proj too narrow");
+    TORCH_CHECK(dt_bias.numel() == H && a_log.numel() == H && g.numel() == B * S * H, "mamba2_fused_op: bad H");
+    TORCH_CHECK(z_gate.numel() == B * S * v_dim, "mamba2_fused_op: bad z_gate size");
 
-    int total = F + H;
+    int BS = B * S;
+    int total = BS * (F + H + v_dim);
     int blocks = CEIL_DIVIDE(total, FUSED_OP_3_THREADS);
 
     mamba2_fused_op_kernel<<<blocks, FUSED_OP_3_THREADS, 0, stream>>>
@@ -1061,6 +1092,7 @@ void mamba2_fused_op_gr
         (bfloat16*) xbc.data_ptr(),
         (bfloat16*) dt.data_ptr(),
         (float*) g.data_ptr(),
+        (float*) z_gate.data_ptr(),
         (const float*) dt_bias.data_ptr(),
         (const float*) a_log.data_ptr(),
         v_dim,
@@ -1068,7 +1100,10 @@ void mamba2_fused_op_gr
         H,
         dt_first,
         dt_min,
-        dt_max
+        dt_max,
+        BS,
+        S,
+        N
     );
 
     cuda_check(cudaPeekAtLastError());
@@ -1101,7 +1136,6 @@ void cuda_recurrent_mamba2_gr
 {
     const at::cuda::OptionalCUDAGuard device_guard(mixed_xbc.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
-    TORCH_CHECK(!graph || !history, "cuda_recurrent_mamba2: history mode is not graph-capturable");
     TORCH_CHECK(!graph || slots.has_value(), "cuda_recurrent_mamba2: graph capture requires slots");
 
     int bsz = mixed_xbc.size(0);
@@ -1194,8 +1228,8 @@ void cuda_recurrent_mamba2_gr
     }
     else
     {
-        if (threads.x <= 128)      cuda_recurrent_gated_delta_rule_kernel<128, true, 1, true><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
-        else if (threads.x <= 256) cuda_recurrent_gated_delta_rule_kernel<256, true, 1, true><<<blocks, threads, 0, stream>>>(KERNEL_ARGS);
+        if (threads.x <= 128)      LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, true, 1, true>)
+        else if (threads.x <= 256) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<256, true, 1, true>)
         else TORCH_CHECK(false, "Max head dim exceeded");
     }
     #undef LAUNCH_RULE
@@ -1551,10 +1585,10 @@ void gated_delta_net_fused_op_3_gr
 __global__ __launch_bounds__(BA_GEMV_WARPS * 32)
 void gdn_ba_gemv_kernel
 (
-    const half* __restrict__ x,                 // [k]
+    const half* __restrict__ x,                 // [rows, k]
     const half* __restrict__ w_t,               // [n, k]
     const half* __restrict__ bias,              // [n] or null
-    float* __restrict__ y,                      // [n]
+    float* __restrict__ y,                      // [rows, n]
     const int k,
     const int n
 )
@@ -1563,8 +1597,9 @@ void gdn_ba_gemv_kernel
     int lane = threadIdx.x % 32;
     int row = blockIdx.x * BA_GEMV_WARPS + warp;
     if (row >= n) return;
+    int r = blockIdx.y;
 
-    const half2* x2 = (const half2*) x;
+    const half2* x2 = (const half2*) (x + (size_t) r * k);
     const half2* w2 = (const half2*) (w_t + (size_t) row * k);
 
     float sum = 0.0f;
@@ -1582,16 +1617,16 @@ void gdn_ba_gemv_kernel
     if (lane == 0)
     {
         if (bias) sum += __half2float(bias[row]);
-        y[row] = sum;
+        y[(size_t) r * n + row] = sum;
     }
 }
 
 void gdn_ba_gemv_gr
 (
-    const at::Tensor& x,            // [.., k] half
+    const at::Tensor& x,            // [rows, k] half
     const at::Tensor& w_t,          // [n, k] half
     const c10::optional<at::Tensor>& bias,  // [n] half
-    at::Tensor& y,                  // [.., n] float
+    at::Tensor& y,                  // [rows, n] float
     Graph* graph
 )
 {
@@ -1605,14 +1640,14 @@ void gdn_ba_gemv_gr
 
     int k = x.size(-1);
     int n = w_t.size(0);
-    TORCH_CHECK(x.numel() == k, "gdn_ba_gemv: only a single input row is supported");
+    int rows = (int) (x.numel() / k);
     TORCH_CHECK(w_t.dim() == 2 && w_t.size(1) == k, "w_t must be [n, k]");
-    TORCH_CHECK(y.numel() == n, "y must be [.., n]");
+    TORCH_CHECK(y.numel() == (int64_t) rows * n, "y must be [rows, n]");
     TORCH_CHECK(k % 2 == 0, "k must be even");
     TORCH_CHECK(x.is_contiguous() && w_t.is_contiguous() && y.is_contiguous(), "tensors must be contiguous");
 
     const half* bias_ptr = (const half*) OPTPTR(bias);
-    int blocks = CEIL_DIVIDE(n, BA_GEMV_WARPS);
+    dim3 blocks(CEIL_DIVIDE(n, BA_GEMV_WARPS), rows);
 
     gdn_ba_gemv_kernel<<<blocks, BA_GEMV_WARPS * 32, 0, stream>>>
     (

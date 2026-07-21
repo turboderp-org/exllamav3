@@ -19,6 +19,9 @@ from ..cache.recurrent import (
     new_checkpoint_handle,
 )
 from ..util import profile_opt
+from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
+
+
 def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
     """Split a batch of recurrent-layer states into (conv_jobs, state_jobs) for the batched
     rewind kernels, plus a device index (all layers of one cache live on the same device). Only
@@ -608,7 +611,7 @@ class GatedDeltaNet(Module):
             # Merge the small unquantized b/a projections into a single fp16 GEMV. The weights may
             # not be materialized yet (deferred load), so only allocate here — the BC keeps a
             # reference — and copy the actual values in on the first forward pass
-            nv = self.num_v_heads
+            nv, hv = self.num_v_heads, self.v_head_dim
             self.ba_weight_t = torch.empty((2 * nv, self.hidden_size), dtype = torch.half, device = device)
             has_bias = (
                 self.b_proj.inner.get_bias_tensor() is not None or
@@ -617,22 +620,7 @@ class GatedDeltaNet(Module):
             self.ba_bias = torch.empty((2 * nv,), dtype = torch.half, device = device) if has_bias else None
             self.ba_weight_filled = False
 
-            f = self.fdim_qkv
-            nv, hv = self.num_v_heads, self.v_head_dim
-            self.bsz1_pa_args = [
-                (device, (1, 1, f), torch.float, "s_qkv"),
-                (device, (1, 1, nv, hv), torch.float, "s_z"),
-                (device, (1, 1, 2 * nv), torch.float, "s_ba"),
-                (device, (1, 1, nv), torch.bfloat16, "s_beta"),
-                (device, (1, 1, nv), torch.float, "s_g"),
-                (device, (1, f, 1), torch.bfloat16, "s_mqkv"),
-                (device, (1, 1, f), torch.bfloat16, "s_conv"),
-                (device, (1, 1, nv, hv), torch.bfloat16, "s_cao"),
-                (device, (1, 1, nv * hv), torch.half, "s_caof"),
-            ]
-
             self.bc = ext.BC_GatedDeltaNetSplit(
-                *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
                 self.qkv_proj.inner.bc,
                 self.z_proj.inner.bc,
                 self.o_proj.inner.bc,
@@ -736,6 +724,32 @@ class GatedDeltaNet(Module):
         return mixed_qkv, z, b, a
 
 
+    def _bc_configure_slot(self, bsz: int, seqlen: int, history: bool):
+        """Allocate (or fetch, if already cached at this exact shape) the per-(bsz, seqlen)
+        statics for the BC_GatedDeltaNetSplit graph slot and hand them to C++. Called at most
+        once per (bsz, seqlen, history) combination per layer instance"""
+        device = self.device
+        f = self.fdim_qkv
+        nv, hv = self.num_v_heads, self.v_head_dim
+        qkv             = g_tensor_cache.get(device, (bsz, seqlen, f), torch.float, "s_qkv")
+        z               = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.float, "s_z")
+        ba              = g_tensor_cache.get(device, (bsz, seqlen, 2 * nv), torch.float, "s_ba")
+        beta            = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta")
+        g               = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.float, "s_g")
+        mixed_qkv       = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "s_mqkv")
+        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv")
+        core_attn_out   = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.bfloat16, "s_cao")
+        core_attn_out_f = g_tensor_cache.get(device, (bsz, seqlen, nv * hv), torch.half, "s_caof")
+        qkv_xh = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_qkv_xh")
+        z_xh   = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_z_xh")
+        o_xh   = g_tensor_cache.get(device, (bsz, seqlen, nv * hv), torch.half, "s_o_xh")
+        self.bc.configure_slot(
+            bsz, seqlen, history,
+            qkv, z, ba, beta, g, mixed_qkv, conv_out, core_attn_out, core_attn_out_f,
+            qkv_xh, z_xh, o_xh,
+        )
+
+
     @override
     def forward(
         self,
@@ -798,15 +812,19 @@ class GatedDeltaNet(Module):
                 self.ba_bias.copy_(torch.cat([b_bias, a_bias]))
             self.ba_weight_filled = True
 
-        # Fused C++ path for single-token decode with split projections. Runs the entire layer
-        # in one call, replayed through an internal CUDA graph from the third invocation on
+        # Fused C++ path for decode with split projections, generalized over (bsz, seqlen) up to
+        # (_BC_MAX_BSZ, _BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs
+        # the entire layer in one call, replayed through an internal CUDA graph per (bsz, seqlen,
+        # history) shape from the third invocation of that shape on
         if (
-            self.bc_split and bsz == 1 and seqlen == 1 and
-            save_state and not save_history and
-            recurrent_slots is not None
+            self.bc_split and save_state and
+            recurrent_slots is not None and
+            1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN
         ):
+            if self.bc.needs_configure(bsz, seqlen, save_history):
+                self._bc_configure_slot(bsz, seqlen, save_history)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
-            self.bc.run_bsz1(x, y, conv_state, recurrent_state, recurrent_slots)
+            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
             if self.tp_reduce:
                 params["backend"].all_reduce(y)
             return to2(y, out_dtype, self.out_dtype)

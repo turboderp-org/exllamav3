@@ -9,6 +9,7 @@ from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
 from .gated_delta_net import GDNLayerState
 from .gated_delta_net_fn import causal_conv1d_update
+from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
 
 try:
     from fla.ops.simple_gla import chunk_simple_gla
@@ -200,7 +201,11 @@ class Mamba2(Module):
         self.layer_state_cls = GDNLayerState
 
         self.bc = None
-        self.bsz1_pa_args = []
+        self.bc_k_in = None
+        self.bc_n_in = None
+        self.bc_n_out = None
+        self.bc_padded_in = False
+        self.bc_padded_out = False
         self.derived_filled = False
 
         # TP: rank's head offset into the replicated dt section of the in_proj output
@@ -241,45 +246,16 @@ class Mamba2(Module):
         )
 
         if is_quantized:
-            f = self.fdim_qkv
-            hd = self.v_head_dim
             k_in = self.in_proj.in_features       # padded widths of the quantized projections
             n_in = self.in_proj.out_features
             n_out = self.o_proj.out_features
-            o_dtype = self.out_dtype or torch.half
-
-            self.bsz1_pa_args = [
-                (device, (1, 1, n_in), torch.float, "m2_proj"),
-                (device, (1, f, 1), torch.bfloat16, "m2_mx"),
-                (device, (1, 1, nh), torch.bfloat16, "m2_dt"),
-                (device, (1, 1, nh), torch.float, "m2_g"),
-                (device, (1, 1, f), torch.bfloat16, "m2_co"),
-                (device, (1, 1, nh, hd), torch.bfloat16, "m2_ca"),
-                (device, (1, 1, nh * hd), torch.half, "m2_caf"),
-            ]
-            proj, mixed_xbc, dt, g, conv_out, core, core_f = \
-                (g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args)
-
-            # Zero-padded staging statics for padded projection dims; the pad columns are never
-            # written after this
-            xp = None
-            if k_in != self.hidden_size:
-                xp = g_tensor_cache.get(device, (1, k_in), torch.half, "m2_xp")
-                xp.zero_()
-            yp = None
-            if n_out != self.hidden_size:
-                yp = g_tensor_cache.get(device, (1, n_out), o_dtype, "m2_yp")
+            self.bc_k_in = k_in
+            self.bc_n_in = n_in
+            self.bc_n_out = n_out
+            self.bc_padded_in = k_in != self.hidden_size
+            self.bc_padded_out = n_out != self.hidden_size
 
             self.bc = ext.BC_Mamba2(
-                xp = xp,
-                proj = proj,
-                mixed_xbc = mixed_xbc,
-                dt = dt,
-                g = g,
-                conv_out = conv_out,
-                core_attn_out = core,
-                core_attn_out_f = core_f,
-                yp = yp,
                 in_proj = self.in_proj.inner.bc,
                 o_proj = self.o_proj.inner.bc,
                 dt_bias = self.dt_bias_f,
@@ -295,6 +271,8 @@ class Mamba2(Module):
                 conv1d_weight = self.conv1d_weight_flat,
                 conv1d_bias = self.conv1d_bias,
                 norm = self.norm.bc,
+                padded_in = self.bc_padded_in,
+                padded_out = self.bc_padded_out,
                 dt_first = self.tp_dt_first,
             )
 
@@ -315,7 +293,11 @@ class Mamba2(Module):
     @override
     def unload(self):
         self.bc = None
-        self.bsz1_pa_args = []
+        self.bc_k_in = None
+        self.bc_n_in = None
+        self.bc_n_out = None
+        self.bc_padded_in = False
+        self.bc_padded_out = False
         self.derived_filled = False
         self.a_log = None
         self.dt_bias = None
@@ -329,6 +311,45 @@ class Mamba2(Module):
         for cl in self.recurrent_layers:
             cl.free()
         super().unload()
+
+
+    def _bc_configure_slot(self, bsz: int, seqlen: int, history: bool):
+        """Allocate (or fetch, if already cached at this exact shape) the per-(bsz, seqlen)
+        statics for the BC_Mamba2 graph slot and hand them to C++. Called at most once per
+        (bsz, seqlen, history) combination per layer instance"""
+        device = self.device
+        nh = self.num_v_heads
+        hd = self.v_head_dim
+        f = self.fdim_qkv
+        o_dtype = self.out_dtype or torch.half
+        R = bsz * seqlen
+
+        proj            = g_tensor_cache.get(device, (bsz, seqlen, self.bc_n_in), torch.float, "m2_proj")
+        mixed_xbc       = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "m2_mx")
+        dt              = g_tensor_cache.get(device, (bsz, seqlen, nh), torch.bfloat16, "m2_dt")
+        g               = g_tensor_cache.get(device, (bsz, seqlen, nh), torch.float, "m2_g")
+        z_gate          = g_tensor_cache.get(device, (bsz, seqlen, nh * hd), torch.float, "m2_zgate")
+        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "m2_co")
+        core_attn_out   = g_tensor_cache.get(device, (bsz, seqlen, nh, hd), torch.bfloat16, "m2_ca")
+        core_attn_out_f = g_tensor_cache.get(device, (bsz, seqlen, nh * hd), torch.half, "m2_caf")
+        in_xh = g_tensor_cache.get(device, (bsz, seqlen, self.bc_k_in), torch.half, "m2_in_xh")
+        o_xh  = g_tensor_cache.get(device, (bsz, seqlen, nh * hd), torch.half, "m2_o_xh")
+
+        # Zero-padded staging statics for padded projection dims; the pad columns are never
+        # written after the initial zero() here
+        xp = None
+        if self.bc_padded_in:
+            xp = g_tensor_cache.get(device, (R, self.bc_k_in), torch.half, "m2_xp")
+            xp.zero_()
+        yp = None
+        if self.bc_padded_out:
+            yp = g_tensor_cache.get(device, (R, self.bc_n_out), o_dtype, "m2_yp")
+
+        self.bc.configure_slot(
+            bsz, seqlen, history,
+            xp, proj, mixed_xbc, dt, g, z_gate, conv_out, core_attn_out, core_attn_out_f, yp,
+            in_xh, o_xh,
+        )
 
 
     @override
@@ -374,16 +395,20 @@ class Mamba2(Module):
             save_state = False
             save_history = False  # no SD without prior state, for simplicity
 
-        # Fused C++ path for single-token decode. Runs the entire layer in one call, replayed
-        # through an internal CUDA graph from the third invocation on
+        # Fused C++ path for decode, generalized over (bsz, seqlen) up to (_BC_MAX_BSZ,
+        # _BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs the entire
+        # layer in one call, replayed through an internal CUDA graph per (bsz, seqlen, history)
+        # shape from the third invocation of that shape on
         if (
-            self.bc is not None and bsz == 1 and seqlen == 1 and
-            save_state and not save_history and
+            self.bc is not None and save_state and
             recurrent_slots is not None and
-            x.dtype == torch.float16 and x.is_contiguous()
+            x.dtype == torch.float16 and x.is_contiguous() and
+            1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN
         ):
+            if self.bc.needs_configure(bsz, seqlen, save_history):
+                self._bc_configure_slot(bsz, seqlen, save_history)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
-            self.bc.run_bsz1(x, y, conv_state, recurrent_state, recurrent_slots)
+            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
             if self.tp_reduce:
                 params["backend"].all_reduce(y)
             return to2(y, out_dtype, self.out_dtype)
