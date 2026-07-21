@@ -146,6 +146,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
     m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
 
+    py::class_<ConvRewindJob>(m, "ConvRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int, int, int>());
+    py::class_<StateRewindJob>(m, "StateRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int64_t>());
+    m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
+
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
     m.def("gumbel_noise_f16", &gumbel_noise_f16, "gumbel_noise_f16");

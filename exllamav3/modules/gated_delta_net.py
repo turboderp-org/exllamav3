@@ -19,13 +19,43 @@ from ..cache.recurrent import (
     new_checkpoint_handle,
 )
 from ..util import profile_opt
+def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
+    """Split a batch of recurrent-layer states into (conv_jobs, state_jobs) for the batched
+    rewind kernels, plus a device index (all layers of one cache live on the same device). Only
+    GDNLayerState instances (GDN and Mamba2 alike) are batched; any other recurrent-state type
+    sharing the same cache (e.g. SWA, short-conv) falls back to its own .rewind() call, unchanged."""
+    conv_jobs = []
+    state_jobs = []
+    device_index = None
+    for l in layers:
+        if isinstance(l, GDNLayerState):
+            if device_index is None:
+                # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
+                # torch.device, so normalize rather than assume a .index attribute
+                device_index = torch.device(l.device).index
+            cj = l.rewind_conv_job(slot, last_history, num_tokens)
+            if cj is not None:
+                conv_jobs.append(cj)
+            sj = l.rewind_state_job(slot, last_history, num_tokens)
+            if sj is not None:
+                state_jobs.append(sj)
+        else:
+            l.rewind(slot, last_history, num_tokens)
+    return conv_jobs, state_jobs, device_index
+
+
+def _dispatch_rewind_jobs(conv_jobs, state_jobs, device_index):
+    if conv_jobs:
+        ext.batched_conv_rewind(conv_jobs, device_index)
+    if state_jobs:
+        ext.batched_state_rewind(state_jobs, device_index)
 
 
 def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
     recurrent_modules = local_context["recurrent_modules"]
-    for module in recurrent_modules:
-        l = module.tp_recurrent_lookup[cache_id]
-        l.rewind(slot, last_history, num_tokens)
+    layers = [module.tp_recurrent_lookup[cache_id] for module in recurrent_modules]
+    conv_jobs, state_jobs, device_index = _collect_rewind_jobs(layers, slot, last_history, num_tokens)
+    _dispatch_rewind_jobs(conv_jobs, state_jobs, device_index)
 
 
 class GDNState:
@@ -72,8 +102,10 @@ class GDNState:
 
     def rewind(self, num_tokens: int):
         if not self.cache.model.loaded_tp:
-            for l in self.cache.get_all_recurrent_layers().values():
-                l.rewind(self.slot, self.last_history, num_tokens)
+            conv_jobs, state_jobs, device_index = _collect_rewind_jobs(
+                self.cache.get_all_recurrent_layers().values(), self.slot, self.last_history, num_tokens
+            )
+            _dispatch_rewind_jobs(conv_jobs, state_jobs, device_index)
         else:
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_rewind, (id(self.cache), self.slot, self.last_history, num_tokens))
         self.position -= num_tokens
@@ -205,6 +237,34 @@ class GDNLayerState:
             c_state_rewind = self.conv_state[slot, :, p - cdim : p]
             temp = c_state_rewind.clone()
             c_state.copy_(temp)
+
+
+    def rewind_conv_job(self, slot: int, last_history: int, num_tokens: int):
+        """Job descriptor for the batched conv-state rewind kernel (ext.batched_conv_rewind),
+        computed without performing any copy. Same gating condition as rewind()'s conv branch."""
+        if last_history == 0:
+            return None
+        cdim = self.module.conv_kernel_size
+        p = self.conv_state.shape[-1] - num_tokens
+        return ext.ConvRewindJob(
+            self.conv_state[slot, 0, p - cdim].data_ptr(),
+            self.conv_state[slot, 0, 0].data_ptr(),
+            self.conv_state.shape[1],
+            cdim,
+            self.conv_state.stride(1),
+        )
+
+
+    def rewind_state_job(self, slot: int, last_history: int, num_tokens: int):
+        """Job descriptor for the batched recurrent-state rewind kernel (ext.batched_state_rewind),
+        computed without performing any copy. Same gating condition as rewind()'s state branch."""
+        if num_tokens == 0:
+            return None
+        return ext.StateRewindJob(
+            self.recurrent_state[slot, last_history + 1 - num_tokens].data_ptr(),
+            self.recurrent_state[slot, 0].data_ptr(),
+            self.recurrent_state[slot, 0].numel(),
+        )
 
 
     def stash(self, slot, position: int = 0):

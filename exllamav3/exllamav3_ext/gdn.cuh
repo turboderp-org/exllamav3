@@ -1,3 +1,8 @@
+#pragma once
+
+#include <cstdint>
+#include <vector>
+
 class Graph;
 
 void gated_delta_net_fused_op
@@ -71,13 +76,15 @@ void mamba2_dt_op
     float dt_max
 );
 
-// Mamba2 bsz-1 BC helper: bf16 conv input + discretized dt/g from the in_proj output [z, xBC, dt]
+// Mamba2 BC helper: bf16 conv input + discretized dt/g + a contiguous gate copy, from the
+// in_proj output [z, xBC, dt]
 void mamba2_fused_op_gr
 (
-    const at::Tensor& proj,         // [1,1,>= v_dim + F + dt_first + H] float
-    at::Tensor& xbc,                // out [1, F, 1] bfloat16
-    at::Tensor& dt,                 // out [1, 1, H] bfloat16
-    at::Tensor& g,                  // out [1, 1, H] float
+    const at::Tensor& proj,         // [B,S,>= v_dim + F + dt_first + H] float
+    at::Tensor& xbc,                // out [B, F, S] bfloat16
+    at::Tensor& dt,                 // out [B, S, H] bfloat16
+    at::Tensor& g,                  // out [B, S, H] float
+    at::Tensor& z_gate,             // out [B, S, v_dim] float, contiguous
     const at::Tensor& dt_bias,      // [H] float
     const at::Tensor& a_log,        // [H] float
     int v_dim,
@@ -180,3 +187,38 @@ void gdn_ba_gemv_gr
     at::Tensor& y,                  // [.., n] float
     Graph* graph
 );
+
+// Batched recurrent-state rewind (speculative decoding draft rejection/commit)
+
+// conv_state shift: conv_state[slot, :, :cdim] <- conv_state[slot, :, p-cdim:p]. `dim` independent
+// per-channel copies of `cdim` elements, `stride` elements apart in both src and dst (same
+// tensor, same per-channel stride). src/dst can overlap when num_tokens < conv_kernel_size.
+struct ConvRewindJob
+{
+    uintptr_t src;
+    uintptr_t dst;
+    int dim;
+    int cdim;
+    int stride;
+
+    ConvRewindJob() = default;
+    ConvRewindJob(uintptr_t _src, uintptr_t _dst, int _dim, int _cdim, int _stride) :
+        src(_src), dst(_dst), dim(_dim), cdim(_cdim), stride(_stride) {}
+};
+
+// recurrent_state rewind: recurrent_state[slot, 0] <- recurrent_state[slot, last_history+1-num_tokens].
+// Flat fp32 copy of num_elements contiguous elements; src/dst never overlap (num_tokens >= 1
+// forces the source history index to differ from destination index 0).
+struct StateRewindJob
+{
+    uintptr_t src;
+    uintptr_t dst;
+    int64_t num_elements;
+
+    StateRewindJob() = default;
+    StateRewindJob(uintptr_t _src, uintptr_t _dst, int64_t _num_elements) :
+        src(_src), dst(_dst), num_elements(_num_elements) {}
+};
+
+void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
+void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_index);

@@ -1642,3 +1642,106 @@ void gdn_ba_gemv
 {
     gdn_ba_gemv_gr(x, w_t, bias, y, nullptr);
 }
+
+// Batched rewind kernels: collapse the per-recurrent-layer rewind loop (speculative decoding
+// draft rejection/commit) into a couple of launches instead of one launch per layer
+
+#define REWIND_MAX_JOBS 64
+#define REWIND_CONV_THREADS 256
+#define REWIND_STATE_THREADS 256
+
+struct ConvRewindJobBatch { ConvRewindJob jobs[REWIND_MAX_JOBS]; int num_jobs; };
+struct StateRewindJobBatch { StateRewindJob jobs[REWIND_MAX_JOBS]; int num_jobs; };
+
+// conv_state[slot, :, :cdim] <- conv_state[slot, :, p-cdim:p], one thread per channel. Reads its
+// (up to CONV1D_MAX_K) elements into registers before writing any of them back, so the copy is
+// safe even when src/dst windows overlap (num_tokens < conv_kernel_size) -- no synchronization
+// needed since channels are independent and a single thread's read-then-write is self-ordered.
+__global__ __launch_bounds__(REWIND_CONV_THREADS)
+void batched_conv_rewind_kernel(ConvRewindJobBatch batch)
+{
+    int job_idx = blockIdx.y;
+    if (job_idx >= batch.num_jobs) return;
+    ConvRewindJob j = batch.jobs[job_idx];
+
+    int d = blockIdx.x * REWIND_CONV_THREADS + threadIdx.x;
+    if (d >= j.dim) return;
+
+    const bfloat16* s = (const bfloat16*) j.src + (size_t) d * j.stride;
+    bfloat16* t = (bfloat16*) j.dst + (size_t) d * j.stride;
+
+    bfloat16 reg[CONV1D_MAX_K];
+    #pragma unroll
+    for (int k = 0; k < CONV1D_MAX_K; ++k)
+        if (k < j.cdim) reg[k] = s[k];
+    #pragma unroll
+    for (int k = 0; k < CONV1D_MAX_K; ++k)
+        if (k < j.cdim) t[k] = reg[k];
+}
+
+// recurrent_state[slot, 0] <- recurrent_state[slot, last_history+1-num_tokens], flat fp32 copy,
+// vectorized as float4. Source and destination never overlap for this one (see ConvRewindJob
+// comment in gdn.cuh), so no read-before-write ordering concern here at all.
+__global__ __launch_bounds__(REWIND_STATE_THREADS)
+void batched_state_rewind_kernel(StateRewindJobBatch batch)
+{
+    int job_idx = blockIdx.y;
+    if (job_idx >= batch.num_jobs) return;
+    StateRewindJob j = batch.jobs[job_idx];
+
+    int64_t i4 = (int64_t) blockIdx.x * REWIND_STATE_THREADS + threadIdx.x;
+    int64_t n4 = j.num_elements / 4;
+    if (i4 >= n4) return;
+
+    ((float4*) j.dst)[i4] = ((const float4*) j.src)[i4];
+}
+
+void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index)
+{
+    if (jobs.empty()) return;
+    c10::cuda::CUDAGuard device_guard((c10::DeviceIndex) device_index);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    for (size_t base = 0; base < jobs.size(); base += REWIND_MAX_JOBS)
+    {
+        int n = (int) MIN(jobs.size() - base, (size_t) REWIND_MAX_JOBS);
+        ConvRewindJobBatch batch;
+        batch.num_jobs = n;
+        int max_dim = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            batch.jobs[i] = jobs[base + i];
+            TORCH_CHECK(batch.jobs[i].cdim <= CONV1D_MAX_K, "batched_conv_rewind: cdim exceeds CONV1D_MAX_K");
+            max_dim = MAX(max_dim, batch.jobs[i].dim);
+        }
+
+        dim3 blocks(CEIL_DIVIDE(max_dim, REWIND_CONV_THREADS), n);
+        batched_conv_rewind_kernel<<<blocks, REWIND_CONV_THREADS, 0, stream>>>(batch);
+        cuda_check(cudaPeekAtLastError());
+    }
+}
+
+void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_index)
+{
+    if (jobs.empty()) return;
+    c10::cuda::CUDAGuard device_guard((c10::DeviceIndex) device_index);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    for (size_t base = 0; base < jobs.size(); base += REWIND_MAX_JOBS)
+    {
+        int n = (int) MIN(jobs.size() - base, (size_t) REWIND_MAX_JOBS);
+        StateRewindJobBatch batch;
+        batch.num_jobs = n;
+        int64_t max_elems = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            batch.jobs[i] = jobs[base + i];
+            TORCH_CHECK(batch.jobs[i].num_elements % 4 == 0, "batched_state_rewind: num_elements must be a multiple of 4");
+            max_elems = MAX(max_elems, batch.jobs[i].num_elements);
+        }
+
+        dim3 blocks(CEIL_DIVIDE((int)(max_elems / 4), REWIND_STATE_THREADS), n);
+        batched_state_rewind_kernel<<<blocks, REWIND_STATE_THREADS, 0, stream>>>(batch);
+        cuda_check(cudaPeekAtLastError());
+    }
+}
