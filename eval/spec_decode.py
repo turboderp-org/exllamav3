@@ -142,7 +142,7 @@ def plot_stats(stats_sink):
         ax.step(pos, window, where = "post", color = "tab:red", lw = 1.0, alpha = 0.8, label = "window (chosen)")
         if any(e is not None for e in ema):
             ax.plot(pos, ema, color = "tab:green", lw = 1.4, label = "EMA")
-        ax.set_title(f"{trace['category']} — {trace['file']}", fontsize = 10)
+        ax.set_title(f"{trace['category']} - {trace['file']}", fontsize = 10)
         ax.set_ylabel("draft tokens")
         ax.set_ylim(-0.4, max(window) + 1.4)
         ax.grid(alpha = 0.25)
@@ -151,6 +151,24 @@ def plot_stats(stats_sink):
     axes[-1].set_xlabel("generation position (tokens)")
     fig.tight_layout()
     plt.show()
+
+
+def print_stats(stats_sink):
+    headers = [
+        f"{col_yellow}from_pos{col_default}",
+        f"{col_yellow}window{col_default}",
+        f"{col_yellow}accepted{col_default}",
+        f"{col_yellow}ema{col_default}",
+    ]
+    for trace in stats_sink:
+        print(f"\n{trace['category']} - {trace['file']}\n")
+        rows = [[r[0] - r[2], r[1], r[2], r[3]] for r in trace["stats"]]
+        if all(r[3] is None for r in rows):
+            h = headers[:3]
+            rows = [r[:3] for r in rows]
+        else:
+            h = headers
+        print(tabulate(rows, headers = h, tablefmt = "pipe", colalign = ("right",) * len(h)))
 
 
 @torch.inference_mode()
@@ -169,7 +187,7 @@ def main(args):
         else:
             prompt_files = [p for p in prompt_files if p[0].lower() == sw.lower()]
 
-    stats_sink = [] if (args.draft_stats or args.plot_stats) else None
+    stats_sink = [] if (args.draft_stats or args.plot_stats or args.print_stats) else None
 
     # Baseline
     result_baseline = None
@@ -279,6 +297,12 @@ def main(args):
         else:
             plot_stats(stats_sink)
 
+    if args.print_stats:
+        if not stats_sink:
+            print("No draft stats recorded, nothing to plot")
+        else:
+            print_stats(stats_sink)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
@@ -297,5 +321,6 @@ if __name__ == "__main__":
     parser.add_argument("-single", "--single_workload", type = str, help = "Limit to single workload", default = None)
     parser.add_argument("-dstats", "--draft_stats", type = str, help = "Write per-round (position, window, accepted, ema) records to JSON file", default = None)
     parser.add_argument("-plot", "--plot_stats", action = "store_true", help = "Plot per-round draft stats in a matplotlib window after the run")
+    parser.add_argument("-print", "--print_stats", action = "store_true", help = "Print per-round draft stats to the console after the run")
     _args = parser.parse_args()
     main(_args)
