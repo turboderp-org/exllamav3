@@ -168,8 +168,11 @@ class Tokenizer:
         if self.unk_token_id == self.pad_token_id:
             self.unk_token = self.pad_token
 
-        # Make sure extended vocab contains control tokens, but avoid empty pieces
-        if self.unk_token:
+        # Make sure extended vocab contains control tokens, but avoid empty pieces. The unk piece
+        # can be declared in tokenizer.json's model section without existing in the vocab (Laguna
+        # declares "[UNK]" while the actual vocab uses another piece), leaving unk_token_id
+        # unresolved -- skip it rather than register a None ID
+        if self.unk_token and self.unk_token_id is not None:
             self.extended_piece_to_id[self.unk_token] = self.unk_token_id
             self.extended_id_to_piece[self.unk_token_id] = self.unk_token
         if self.bos_token:
