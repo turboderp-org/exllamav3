@@ -131,19 +131,25 @@ class BCAttn:
         self.o_dtype = module.o_proj.inner.default_out_dtype
         self.use_k_as_v = getattr(module, "use_k_as_v", False)
 
-        # 0 = none, 2 = full (o *= sigmoid(g)), 3 = interleaved q/g projection. Headwise gates
-        # (fp16 projection through cublas, no patchable sites) are rejected by the builders
+        # 0 = none, 1 = headwise (one gate per head, always an unquantized fp16 projection, run
+        # as a captured cublas gemm over the staged input; sigmoid or softplus by gate_softplus),
+        # 2 = full (o *= sigmoid(g)), 3 = interleaved q/g projection
         if getattr(module, "interleaved_gate", False):
             self.gate_mode = 3
         elif module.g_proj is not None:
-            self.gate_mode = 2
+            self.gate_mode = 1 if getattr(module, "headwise_gate", False) else 2
         else:
             self.gate_mode = 0
+        self.gate_softplus = getattr(module, "gate_softplus", False)
 
-        # Unquantized full gate (older quants store g_proj in fp16): runs as a captured cublas
-        # gemm over the statically staged input instead of an exl3 kernel
+        # Unquantized gate weight: the headwise gate is always fp16 (too narrow to quantize);
+        # a full gate is fp16 only in older quants that stored g_proj unquantized. Either runs
+        # as a captured cublas gemm over the statically staged input instead of an exl3 kernel
         self.g_weight = None
-        if self.gate_mode == 2 and mqg is None and not self._has_bc(module.g_proj):
+        if self.gate_mode == 1:
+            self.g_weight = self._fp16_gate_weight(module.g_proj)
+            assert self.g_weight is not None, "BC_Attention: headwise gate requires an fp16 g_proj"
+        elif self.gate_mode == 2 and mqg is None and not self._has_bc(module.g_proj):
             self.g_weight = self._fp16_gate_weight(module.g_proj)
 
         self.bc = ext.BC_Attention(
@@ -165,6 +171,7 @@ class BCAttn:
             o_proj = module.o_proj.inner.bc,
             use_k_as_v = self.use_k_as_v,
             gate_mode = self.gate_mode,
+            gate_softplus = self.gate_softplus,
             g_proj = module.g_proj.inner.bc if (self.gate_mode == 2 and self._has_bc(module.g_proj)) else None,
             g_weight = self.g_weight,
             qg_ptrs_trellis = mqg.ptrs_trellis if mqg is not None else None,
@@ -286,7 +293,10 @@ class BCAttn:
             q = gate_a[0].view(bsz, q_len, qh, hd)
         else:
             q = g_tensor_cache.get(dev, (bsz, q_len, qh, hd), torch.half, "bca_q")
-            if self.gate_mode == 3:
+            if self.gate_mode == 1:
+                # Headwise gate: one fp16 value per head
+                gate_a = g_tensor_cache.get(dev, (R, qh), torch.half, "bca_gh")
+            elif self.gate_mode == 3:
                 gate_a = g_tensor_cache.get(dev, (R, 2 * qh * hd), torch.half, "bca_qgi")
                 gate_b = g_tensor_cache.get(dev, (R, qh * hd), torch.half, "bca_g")
         kv = g_tensor_cache.get(dev, (2, R, kvh * hd), torch.half, "bca_kv")
@@ -347,9 +357,10 @@ def _module_eligible(m):
         # NoPE is supported (the rope stage is skipped), but the head norms run inside the rope
         # kernel, so a norm-only module without rope has nowhere to apply them
         (m.rope is not None or m.q_norm is None) and
-        # Gates: interleaved and full are graphed; headwise (fp16 gate projection through
-        # cublas, no patchable sites) is not
-        not m.headwise_gate and
+        # Gates: interleaved, full and headwise are all graphed; the headwise (always-fp16)
+        # projection runs as a captured cublas gemm over the statically staged input, so it
+        # needs a weight that passes the fp16-gate checks
+        (not m.headwise_gate or BCAttn._fp16_gate_weight(m.g_proj) is not None) and
         not getattr(m, "ve_gate", False) and
         (not getattr(m, "interleaved_gate", False) or m.head_dim % 8 == 0) and
         (not m.full_gate or m.g_proj is None or m.multi_qg is not None or

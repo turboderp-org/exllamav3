@@ -57,12 +57,13 @@ struct BC_Attention
     // V shares the K projection output (copied to a static before norm + RoPE touch K)
     bool use_k_as_v;
 
-    // Output gate: 0 = none, 2 = full (o *= sigmoid(g), g from its own projection or the fused
-    // q+g mgemm), 3 = interleaved (q_proj emits q/g interleaved per head). Headwise (1) is not
-    // supported: its fp16 gate projection runs through cublas, which has no patchable sites
-    // (the full-gate cublas path works because x is staged through a static, so the captured
-    // node's operands never change)
+    // Output gate: 0 = none, 1 = headwise (g_proj emits one gate per head, broadcast across
+    // head_dim; always an unquantized fp16 projection, so it runs as a captured cublas gemm over
+    // the statically staged input, like the fp16 full gate), 2 = full (o *= act(g), g from its
+    // own projection or the fused q+g mgemm), 3 = interleaved (q_proj emits q/g interleaved per
+    // head). gate_softplus selects softplus instead of sigmoid for the headwise gate (Laguna)
     int gate_mode;
+    bool gate_softplus;
     std::shared_ptr<BC_LinearEXL3> g_proj;
     c10::optional<at::Tensor> g_weight;   // unquantized full gate: fp16 (hidden, qh*hd)
     c10::optional<at::Tensor> qg_ptrs_trellis;
@@ -154,6 +155,7 @@ struct BC_Attention
         std::shared_ptr<BC_LinearEXL3> o_proj,
         bool use_k_as_v,
         int gate_mode,
+        bool gate_softplus,
         std::shared_ptr<BC_LinearEXL3> g_proj,
         c10::optional<at::Tensor> g_weight,
         c10::optional<at::Tensor> qg_ptrs_trellis,

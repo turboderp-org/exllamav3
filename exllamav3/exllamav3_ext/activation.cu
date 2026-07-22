@@ -613,6 +613,52 @@ void mul_sigmoid_broadcast_
     mul_sigmoid_broadcast__gr(x, y, nullptr);
 }
 
+// x *= softplus(y), where x is [B, S, H, D] and y is [B, S, H] (Laguna attention gate)
+
+void mul_softplus_broadcast__gr
+(
+    at::Tensor& x,
+    const at::Tensor& y,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK_DTYPE(y, kHalf);
+    TORCH_CHECK(x.dim() == 4, "x must be [B, S, H, D]");
+    TORCH_CHECK(y.dim() == 3, "y must be [B, S, H]");
+    TORCH_CHECK(x.size(0) == y.size(0), "x and y have incompatible shapes");
+    TORCH_CHECK(x.size(1) == y.size(1), "x and y have incompatible shapes");
+    TORCH_CHECK(x.size(2) == y.size(2), "x and y have incompatible shapes");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(y.is_contiguous(), "y must be contiguous");
+    TORCH_CHECK(x.size(3) % 2 == 0, "x.size(3) must be even");
+
+    size_t numel = x.numel();
+    size_t dim = x.size(3);
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    mul_softplus_broadcast_kernel_h<<<blocks, NUM_THREADS, 0, stream>>>
+    (
+        (half*) x.data_ptr(),
+        (const half*) y.data_ptr(),
+        numel,
+        dim
+    );
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+void mul_softplus_broadcast_
+(
+    at::Tensor& x,
+    const at::Tensor& y
+)
+{
+    mul_softplus_broadcast__gr(x, y, nullptr);
+}
+
 // x * sigmoid(y @ w) + z -> z
 
 void add_sigmoid_gate_proj_gr

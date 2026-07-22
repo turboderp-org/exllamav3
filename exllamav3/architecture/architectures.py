@@ -5,6 +5,7 @@ from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
 from .dflash import DFlashModel
+from .dflash_laguna import DFlashLagunaModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
 from .ernie4_5_moe import Ernie4_5MoEModel
@@ -21,6 +22,7 @@ from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
+from .laguna import LagunaModel
 from .lfm2_moe import Lfm2MoeModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
@@ -61,6 +63,7 @@ ARCHITECTURES = {
         Cohere2Model,
         DeciLMModel,
         DFlashModel,
+        DFlashLagunaModel,
         Dots1Model,
         Ernie4_5Model,
         Ernie4_5MoEModel,
@@ -79,6 +82,7 @@ ARCHITECTURES = {
         HyV3Model,
         HyperClovaxModel,
         IQuestCoderModel,
+        LagunaModel,
         Lfm2MoeModel,
         LlamaModel,
         MiMoModel,

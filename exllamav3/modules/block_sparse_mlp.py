@@ -246,6 +246,7 @@ class BlockSparseMLP(Module):
         activation_fn: str = "silu",
         act_limit: float = 0.0,
         interm_dtype: torch.dtype = None,
+        interm_div: float = 1.0,
         router_type: str = "std",
         routing_gate: Linear | None = None,
         shared_gate: Linear | None = None,
@@ -274,6 +275,11 @@ class BlockSparseMLP(Module):
         super().__init__(config, key, None)
 
         self.interm_dtype = interm_dtype
+        self.interm_div = interm_div
+        if interm_div != 1.0:
+            assert router_type in ("dots", "ds3"), \
+                "interm_div requires a router type that folds routed_scaling_factor into the routing weights"
+            routed_scaling_factor = (routed_scaling_factor if routed_scaling_factor is not None else 1.0) * interm_div
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
         self.intermediate_size_padded = (intermediate_size + 127) // 128 * 128
@@ -406,6 +412,7 @@ class BlockSparseMLP(Module):
                     frange_dim = frange_dim,
                     qgroup = key + ".block_gud",
                     qbits_key = qbits_key,
+                    weight_scale = 1.0 / interm_div,
                 )
                 down = Linear(
                     config = config,

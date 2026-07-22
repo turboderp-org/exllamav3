@@ -164,6 +164,19 @@ void mul_sigmoid_broadcast__gr
     Graph* graph
 );
 
+void mul_softplus_broadcast_
+(
+    at::Tensor& x,
+    const at::Tensor& y
+);
+
+void mul_softplus_broadcast__gr
+(
+    at::Tensor& x,
+    const at::Tensor& y,
+    Graph* graph
+);
+
 void add_sigmoid_gate_proj_gr
 (
     const at::Tensor& x,

@@ -22,6 +22,8 @@ class DFlashInputLayer(Module):
         native_draft_len: int,
         out_dtype: torch.dtype | None = torch.float,
         qmap: str | None = None,
+        key_aux_norms: str | None = None,
+        num_aux_norms: int = 0,
     ):
         super().__init__(config, key, None)
         self.module_name = "DFlashInputLayer"
@@ -51,6 +53,20 @@ class DFlashInputLayer(Module):
 
         self.register_submodule(self.proj)
         self.register_submodule(self.norm)
+
+        # Per-tap norms (Laguna DFlash): each captured target hidden state is RMS-normed
+        # individually before the taps are concatenated and projected by fc
+        self.aux_norms = []
+        if key_aux_norms is not None:
+            for i in range(num_aux_norms):
+                aux_norm = RMSNorm(
+                    config = config,
+                    key = f"{key_aux_norms}.{i}",
+                    rms_norm_eps = rms_norm_eps,
+                    out_dtype = torch.half,
+                )
+                self.aux_norms.append(aux_norm)
+                self.register_submodule(aux_norm)
 
         self.mask_token_id = mask_token_id
 

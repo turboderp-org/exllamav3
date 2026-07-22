@@ -892,6 +892,42 @@ class PromptFormat_gptoss(PromptFormat):
         # Harmony channels are structural output, not think tags.
         return None, None
 
+class PromptFormat_laguna(PromptFormat):
+    description = "Laguna 2.1"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = "〈|EOS|〉"
+        if system_prompt:
+            context += "<system>"
+            context += system_prompt
+            context += "</system>\n"
+        for (u, a) in messages:
+            context += "<user>"
+            context += u
+            context += "</user>\n"
+            context += "<assistant>"
+            if a is not None:
+                context += a
+                context += "</assistant>\n"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list
+
+    def thinktag(self):
+        return "<think>", "</think>"
+
 
 prompt_formats = {
     "raw": PromptFormat_raw,
@@ -916,4 +952,5 @@ prompt_formats = {
     "minimax": PromptFormat_minimax,
     "gptoss": PromptFormat_gptoss,
     "hy3": PromptFormat_hy3,
+    "laguna": PromptFormat_laguna,
 }

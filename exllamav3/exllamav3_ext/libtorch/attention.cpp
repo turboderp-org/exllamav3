@@ -33,6 +33,7 @@ BC_Attention::BC_Attention
     std::shared_ptr<BC_LinearEXL3> _o_proj,
     bool _use_k_as_v,
     int _gate_mode,
+    bool _gate_softplus,
     std::shared_ptr<BC_LinearEXL3> _g_proj,
     c10::optional<at::Tensor> _g_weight,
     c10::optional<at::Tensor> _qg_ptrs_trellis,
@@ -85,6 +86,7 @@ BC_Attention::BC_Attention
     o_proj              (_o_proj),
     use_k_as_v          (_use_k_as_v),
     gate_mode           (_gate_mode),
+    gate_softplus       (_gate_softplus),
     g_proj              (_g_proj),
     g_weight            (std::move(_g_weight)),
     qg_ptrs_trellis     (std::move(_qg_ptrs_trellis)),
@@ -117,8 +119,9 @@ BC_Attention::BC_Attention
     xh                  (std::move(_xh)),
     h32                 (std::move(_h32))
 {
-    TORCH_CHECK(gate_mode == 0 || gate_mode == 2 || gate_mode == 3, "BC_Attention: unsupported gate mode");
-    TORCH_CHECK(!g_weight || (gate_mode == 2 && !qg_ptrs_trellis && !g_proj), "BC_Attention: fp16 gate weight requires full gate mode without a quantized g projection");
+    TORCH_CHECK(gate_mode >= 0 && gate_mode <= 3, "BC_Attention: unsupported gate mode");
+    TORCH_CHECK(gate_mode != 1 || (g_weight && !qg_ptrs_trellis && !g_proj), "BC_Attention: headwise gate requires an fp16 gate weight");
+    TORCH_CHECK(!g_weight || gate_mode == 1 || (gate_mode == 2 && !qg_ptrs_trellis && !g_proj), "BC_Attention: fp16 gate weight requires full gate mode without a quantized g projection");
     slots.resize(MAX_BSZ * MAX_QLEN);
 }
 
@@ -195,7 +198,14 @@ void BC_Attention::configure_slot
     s.o4 = s.o.view({bsz, q_len, num_q_heads, head_dim});
 
     int n_q = num_q_heads * head_dim;
-    if (gate_mode == 2)
+    if (gate_mode == 1)
+    {
+        // Headwise gate: one fp16 value per head, from the captured cublas gemm over the staged
+        // input
+        TORCH_CHECK(gate_a, "BC_Attention: headwise gate requires the g static");
+        s.g2 = s.gate_a.view({R, num_q_heads});
+    }
+    else if (gate_mode == 2)
     {
         // Full gate: q aliases qg[0] (python passes q as that slice); mgemm writes qg whole
         TORCH_CHECK(gate_a, "BC_Attention: full gate requires the qg static");
@@ -290,7 +300,12 @@ void BC_Attention::run_gr
         exl3_gemm_gr(x2, q_proj->trellis, s.q2, q_proj->suh, xh_q, q_proj->svh, -1, q_proj->mcg, q_proj->mul1, 0, graph);
         if (q_proj->bias)
             add_gr(s.q2, q_proj->bias.value(), s.q2, graph);
-        if (gate_mode == 2)
+        if (gate_mode == 1)
+        {
+            TORCH_CHECK(g_weight, "BC_Attention: headwise gate requires the fp16 gate weight");
+            hgemm_gr(x2, g_weight.value(), s.g2, graph);
+        }
+        else if (gate_mode == 2)
         {
             if (g_weight)
             {
@@ -462,7 +477,16 @@ void BC_Attention::run_gr
     }
 
     // Output gate
-    if (gate_mode == 2 || gate_mode == 3)
+    if (gate_mode == 1)
+    {
+        // Headwise: one gate value per head, broadcast across head_dim
+        at::Tensor g3 = s.g2.view({bsz, q_len, num_q_heads});
+        if (gate_softplus)
+            mul_softplus_broadcast__gr(s.o4, g3, graph);
+        else
+            mul_sigmoid_broadcast__gr(s.o4, g3, graph);
+    }
+    else if (gate_mode == 2 || gate_mode == 3)
         mul_sigmoid__gr(s.o2, s.g2, graph);
 
     // Output projection. With a padded hidden dim the GEMM writes the padded static (N of the

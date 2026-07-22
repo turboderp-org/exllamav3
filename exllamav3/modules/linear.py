@@ -56,6 +56,7 @@ class Linear(Module):
         out_dtype: torch.dtype | None = None,
         allow_input_padding: bool = False,
         post_scale: float = 1.0,
+        weight_scale: float = 1.0,
         transposed_load: bool = True,
         transpose_fused_weights: bool = True,
         ftranspose_after_load: bool = True,
@@ -86,6 +87,7 @@ class Linear(Module):
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
         self.out_dtype = out_dtype
         self.post_scale = post_scale
+        self.weight_scale = weight_scale
         self.transposed_load = transposed_load
         self.transpose_fused_weights = transpose_fused_weights
         self.ftranspose_after_load = ftranspose_after_load
@@ -169,13 +171,17 @@ class Linear(Module):
                 scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                 scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                 assert scale is None or scale_inv is None
-                no_defer = scale is not None or scale_inv is not None
+                no_defer = scale is not None or scale_inv is not None or self.weight_scale != 1.0
                 weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
-                bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
+                bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer)
                 if scale is not None:
                     weight = self.apply_fp8_scales_(weight, scale)
                 elif scale_inv is not None:
                     weight = self.apply_fp8_scales_inv_(weight, scale_inv)
+                if self.weight_scale != 1.0:
+                    weight = (weight.float() * self.weight_scale).to(weight.dtype)
+                    if bias is not None:
+                        bias = (bias.float() * self.weight_scale).to(bias.dtype)
 
             self.inner = LinearFP16(
                 self.in_features,
@@ -217,6 +223,8 @@ class Linear(Module):
                 weight = weight.T.contiguous()
             # pad_out expects (in_features, out_features) orientation
             weight = self.pad_out(weight)
+            if self.weight_scale != 1.0:
+                weight = (weight.float() * self.weight_scale).to(weight.dtype)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
@@ -265,6 +273,10 @@ class Linear(Module):
             weight = weight.T.contiguous()
             weight = self.pad_out(weight)
             bias = self.pad_out(bias)
+            if self.weight_scale != 1.0:
+                weight = (weight.float() * self.weight_scale).to(weight.dtype)
+                if bias is not None:
+                    bias = (bias.float() * self.weight_scale).to(bias.dtype)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,

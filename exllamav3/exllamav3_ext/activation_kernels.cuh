@@ -335,6 +335,37 @@ void mul_sigmoid_broadcast_kernel_h
     ((half2*) x)[idx] = x2;
 }
 
+// Numerically stable softplus, computed in fp32: softplus(x) = max(x, 0) + log1p(exp(-|x|)).
+// fp16 exp overflows at x ~ 11 where softplus is already ~x, and the reference implementations
+// (Laguna attention gate) compute softplus(g.float()), so the gate value is evaluated in float
+// and only the final product rounds to fp16
+__device__ __forceinline__ float _softplus(float x)
+{
+    return fmaxf(x, 0.0f) + log1pf(__expf(-fabsf(x)));
+}
+
+__global__ __launch_bounds__(NUM_THREADS)
+void mul_softplus_broadcast_kernel_h
+(
+    half* __restrict__ x,
+    const half* __restrict__ y,
+    const size_t numel,
+    const size_t dim
+)
+{
+    size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
+    if (idx >= numel / 2) return;
+
+    size_t x_idx = idx * 2;
+    size_t y_idx = x_idx / dim;
+    half2 x2 = ((half2*) x)[idx];
+    float g = _softplus(__half2float(y[y_idx]));
+    float2 xf = __half22float2(x2);
+    xf.x *= g;
+    xf.y *= g;
+    ((half2*) x)[idx] = __float22half2_rn(xf);
+}
+
 // x * sigmoid(y @ w) + z -> z,
 // x: (bsz, dim)
 // y: (bsz, dim)
