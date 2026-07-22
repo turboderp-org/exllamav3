@@ -220,7 +220,12 @@ class TransformerBlock(Module):
             s = params.get("export_states")
             if not s:
                 s = params["export_states"] = []
-            s.append(x.half())
+            if x.dtype == torch.half:
+                s.append(x.clamp_(-65504.0, 65504.0))
+            else:
+                x_ = x.half()
+                x_.clamp_(-65504.0, 65504.0)
+                s.append(x_)
 
         if self.backout_lambda is not None:
             x = self._apply_backout(x, params)
