@@ -88,8 +88,9 @@ class Generator:
             accepted draft tokens per verification window, and the next window is sized just above it (bounded by
             [1, num_draft_tokens], so num_draft_tokens acts as the ceiling). A fully accepted window counts as one
             more than observed, since acceptance is censored by the window size; this lets the window grow again
-            when the output becomes predictable. Applies to draft-model, MTP and n-gram drafting; DFlash drafts
-            in fixed blocks and is unaffected.
+            when the output becomes predictable. DFlash draft models still run at their fixed diffusion block
+            size; the window truncates the drafted block before verification (whose cost does scale with draft
+            length), and a window of 0 skips the drafter forward entirely.
 
         :param dynamic_draft_alpha_up:
             EMA weight of the most recent verification window when it raises the average. Asymmetric with
@@ -163,8 +164,7 @@ class Generator:
             self.num_draft_tokens = 0
 
         self.ngram_match_min = ngram_match_min
-        is_dflash = draft_model is not None and draft_model.caps.get("dflash_draft", False)
-        self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0 and not is_dflash
+        self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.dynamic_draft_alpha_up = dynamic_draft_alpha_up
         self.dynamic_draft_alpha_down = dynamic_draft_alpha_down
         self.dynamic_draft_skip_ema = dynamic_draft_skip_ema
@@ -619,6 +619,11 @@ class Generator:
         if batch_size == 0:
             return None
 
+        # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
+        window = self.draft_window()
+        if window == 0:
+            return None
+
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
         block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
@@ -659,8 +664,8 @@ class Generator:
 
         # Crop out the first token after sampling to keep batch contiguous for lm_head
         new_ids = new_ids[:, 1:]
-        self.draft_ids_pinned[:batch_size, :self.num_draft_tokens].copy_(new_ids[:batch_size, :self.num_draft_tokens])
-        return self.draft_ids_pinned
+        self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
+        return self.draft_ids_pinned[:, :window]
 
 
     def iterate_ngram_gen(self, results: list):
