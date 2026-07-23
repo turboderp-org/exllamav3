@@ -25,8 +25,8 @@ extra_cuda_cflags = [
 ]
 
 if windows:
-    extra_cflags += ["/Ox", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN"]
-    extra_cuda_cflags += ["-DWIN32_LEAN_AND_MEAN", "-Xcompiler=/Zc:preprocessor"]
+    extra_cflags += ["/Ox", "/std:c++20", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN"]
+    extra_cuda_cflags += ["-std=c++20", "-DWIN32_LEAN_AND_MEAN", "-Xcompiler=/Zc:preprocessor"]
     if ext_debug:
         extra_cflags += ["/Zi"]
         extra_cuda_cflags += []
