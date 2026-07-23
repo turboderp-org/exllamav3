@@ -340,15 +340,21 @@ class Linear(Module):
         if not self.is_exl3_storage(key):
             return False
         self.used_alt_key = key == self.alt_key
-        scale = self.config.stc.get_tensor(key + ".scale", self.device, optional = True)
-        su = self.config.stc.get_tensor(key + ".su", self.device, optional = True, no_defer = True)
-        suh = self.config.stc.get_tensor(key + ".suh", self.device, optional = True)
-        sv = self.config.stc.get_tensor(key + ".sv", self.device, optional = True, no_defer = True)
-        svh = self.config.stc.get_tensor(key + ".svh", self.device, optional = True)
-        trellis = self.config.stc.get_tensor(key + ".trellis", self.device)
-        mcg = self.config.stc.get_tensor(key + ".mcg", "cpu", optional = True)
-        mul1 = self.config.stc.get_tensor(key + ".mul1", "cpu", optional = True)
-        bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
+        # Probe the header before fetching: most formats ship only a subset of these tensors,
+        # and the misses otherwise add up to a significant share of bulk-load Python overhead
+        stc = self.config.stc
+        def opt(subkey, device, **kwargs):
+            k = key + subkey
+            return stc.get_tensor(k, device, optional = True, **kwargs) if stc.has_tensor(k) else None
+        scale = opt(".scale", self.device)
+        su = opt(".su", self.device, no_defer = True)
+        suh = opt(".suh", self.device)
+        sv = opt(".sv", self.device, no_defer = True)
+        svh = opt(".svh", self.device)
+        trellis = stc.get_tensor(key + ".trellis", self.device)
+        mcg = opt(".mcg", "cpu")
+        mul1 = opt(".mul1", "cpu")
+        bias = opt(".bias", self.device)
         self.inner = LinearEXL3(
             self.config,
             self.in_features,
