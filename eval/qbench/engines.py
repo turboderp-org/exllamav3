@@ -338,8 +338,16 @@ class TransformersBackend:
         group = shape[1] // scale.shape[1]
         if zp_name in self.tensor_index:
             zp = self._read_shard(zp_name)
-            if zp.dtype == torch.int32:  # packed like the weights, offset-binary
-                zp = ((zp.unsqueeze(-1) >> shifts) & mask).flatten(1)[:, :scale.shape[1]]
+            if zp.dtype == torch.int32:
+                # Packed offset-binary like the weights, but the packing axis differs by
+                # tensor: zero points are [out, groups] packed along whichever dim makes the
+                # int32 count fit (observed: along out, unlike the weights)
+                per_word = 32 // bits
+                z = (zp.unsqueeze(-1) >> shifts) & mask
+                if zp.shape[0] * per_word == shape[0]:      # packed along dim 0 (out)
+                    zp = z.permute(0, 2, 1).reshape(-1, zp.shape[1])[:shape[0]]
+                else:                                       # packed along dim 1 (groups)
+                    zp = z.flatten(1)[:, :scale.shape[1]]
                 zp = zp - (1 << (bits - 1))
             q = q - zp.repeat_interleave(group, dim = 1)
         return q.to(torch.float32) * scale.repeat_interleave(group, dim = 1)
