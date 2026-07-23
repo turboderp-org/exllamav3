@@ -1,0 +1,68 @@
+# Example project file for qbench.py
+# All paths are either absolute or will be treated as relative to the project YAML file (this thing)
+
+# Title for plots
+title: Llama 3.1 8B (example)
+
+test_data:
+    # Choices: wiki2, openwebtext
+    source: wiki2
+    rows: 10
+    length: 2048
+    stride: 2048
+
+tokenizer:
+    # Directory containing HF tokenizer, usually the HF reference model
+    source: hf_model/
+    # (Loosely) apply model's chat template to all test rows
+    template: true
+
+logit_cache:
+    # Directory to store reference model logits for test data split defined above
+    dir: _logit_cache/
+    # Size in GB of the logit cache. Oldest files are evicted first when this limit is exceeded
+    max_size_gb: 50
+
+models:
+-   label: HF BF16
+    # Group name is arbitrary. Only 'reference' group is special, defining which model to use as the ground truth
+    # for KL-div computation and baseline ppl. Usually this would be the HF checkpoint
+    group: reference
+    # Choices: transformers, exllamav3, llamacpp
+    engine: transformers
+    source: hf_model/
+
+-   label: 3.00 bpw
+    group: EXL3
+    engine: exllamav3
+    source: exl3/3.00bpw/
+
+-   label: 4.00 bpw
+    group: EXL3
+    engine: exllamav3
+    source: exl3/4.00bpw/
+
+-   label: Q4_K_M
+    group: GGUF
+    engine: llamacpp
+    source: gguf/llama3.1-8b-Q4_K_M.gguf
+
+-   label: Q4_K_L
+    group: GGUF
+    engine: llamacpp
+    source: gguf/llama3.1-8b-Q5_K_L.gguf
+
+# Output files, each entry is optional
+output:
+    # Perplexity plot, including reference baseline
+    plot_ppl: qb_ppl.png
+    # Same as above, but X axis is total VRAM allocated for weights (decoder layers + lm_head)
+    plot_ppl_vram: qb_ppl_vram.png
+    # KL-div plot, versus reference
+    plot_kld: qb_kld.png
+    plot_kld_vram: qb_kld_vram.png
+    # Detailed results in JSON format
+    results: qb_results.json
+    # KL-div median/mean plot with noise floor and interquartile spread
+    plot_kld_spread: qb_kld_spread.png
+    plot_kld_spread_vram: qb_kld_spread_vram.png
