@@ -169,6 +169,14 @@ class TransformersBackend:
                 self.model = AutoModelForCausalLM.from_config(config, dtype = dtype, trust_remote_code = trc)
             self.model.eval()
 
+            # The streamed head skips the CausalLM wrapper's forward, so post-head transforms
+            # it would apply must be replicated (gemma-style logit softcapping)
+            text_config = getattr(config, "text_config", None) or config
+            self.logit_softcap = (
+                getattr(text_config, "final_logit_softcapping", None)
+                or getattr(config, "final_logit_softcapping", None)
+            )
+
             # Shard index: module-side tensor name -> (file, checkpoint tensor name). Checkpoint
             # layouts may differ from the module tree: transformers v5 declares per-model
             # conversions (renamings, and per-expert -> fused-experts merges) which
@@ -237,6 +245,17 @@ class TransformersBackend:
                 for k, b in m._buffers.items():
                     if b is not None and not b.is_meta:
                         m._buffers[k] = b.to(device)
+
+            # Persistent buffers stored in the checkpoint (e.g. gemma4's per-layer scalars) are
+            # not covered by parameter streaming; they are small, so load them up front. Missing
+            # them is silent and catastrophic - the module keeps its init value
+            for bn, _ in self.model.named_buffers():
+                if bn in self.tensor_index:
+                    t = self._read_shard(bn)
+                    t = t.to(device, dtype) if t.is_floating_point() else t.to(device)
+                    owner_name, _, leaf = bn.rpartition(".")
+                    owner = self.model.get_submodule(owner_name) if owner_name else self.model
+                    owner._buffers[leaf] = t
 
             self.prefix = {id(m): n for n, m in self.model.named_modules()}
             # Tied-head fallback: the output embedding's weight is not in the shards when tied
@@ -456,14 +475,26 @@ class TransformersBackend:
         embed = self.model.get_input_embeddings()
         head = self.model.get_output_embeddings()
 
-        # Hook the embedding, every decoder layer, and any other direct child of the base model
-        # that carries weights (final norm etc.); the head is streamed manually below
-        hook_modules = [embed] + list(layers)
-        for child in base.children():
-            if child is embed or child is layers:
-                continue
-            if any(True for _ in child.parameters()):
-                hook_modules.append(child)
+        # Hook the embedding, every decoder layer, and every other weight-carrying module found
+        # by walking the base tree - recursing into containers that hold the special modules
+        # (multimodal wrappers nest the text stack one level down) instead of hooking them
+        # wholesale, so per-layer streaming is preserved. The head is streamed manually below
+        special = {id(embed)} | {id(m) for m in layers}
+        def contains_special(m):
+            return any(id(x) in special for x in m.modules())
+        extra = []
+        def walk(m):
+            for child in m.children():
+                if id(child) in special:
+                    continue
+                if not any(True for _ in child.parameters()):
+                    continue
+                if contains_special(child):
+                    walk(child)
+                else:
+                    extra.append(child)
+        walk(base)
+        hook_modules = [embed] + list(layers) + extra
 
         pb_state = {"n": 0}
         pb = ProgressBar("Streaming", len(hook_modules) + 1)
@@ -490,7 +521,10 @@ class TransformersBackend:
                 hidden = base(input_ids = ids.to(self.device), use_cache = False).last_hidden_state
                 self._materialize(head)
                 for r in range(ids.shape[0]):
-                    callback(r, head(hidden[r:r + 1]))
+                    logits = head(hidden[r:r + 1])
+                    if self.logit_softcap:
+                        logits = torch.tanh(logits / self.logit_softcap) * self.logit_softcap
+                    callback(r, logits)
                 self._dematerialize(head)
                 pb.update(len(hook_modules) + 1)
         finally:

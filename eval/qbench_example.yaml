@@ -24,30 +24,34 @@ logit_cache:
     max_size_gb: 50
 
 models:
--   label: HF BF16
+  - label: HF BF16
     # Group name is arbitrary. Only 'reference' group is special, defining which model to use as the ground truth
     # for KL-div computation and baseline ppl. Usually this would be the HF checkpoint
     group: reference
     # Choices: transformers, exllamav3, llamacpp
     engine: transformers
     source: hf_model/
+    options:
+      # Load HF model layer by layer
+      streaming: true
 
--   label: 3.00 bpw
+
+  - label: 3.00 bpw
     group: EXL3
     engine: exllamav3
     source: exl3/3.00bpw/
 
--   label: 4.00 bpw
+  - label: 4.00 bpw
     group: EXL3
     engine: exllamav3
     source: exl3/4.00bpw/
 
--   label: Q4_K_M
+  - label: Q4_K_M
     group: GGUF
     engine: llamacpp
     source: gguf/llama3.1-8b-Q4_K_M.gguf
 
--   label: Q4_K_L
+  - label: Q4_K_L
     group: GGUF
     engine: llamacpp
     source: gguf/llama3.1-8b-Q5_K_L.gguf
