@@ -1,8 +1,0 @@
-{
-    "tokenize_fn": "transformers",
-    "tokenizer_dir": "/mnt/str/models/llama3.2-1b-instruct/hf/",
-    "dataset": "wiki2",
-    "eval_stride": 512,
-    "eval_len": 2048,
-    "max_rows": 20
-}

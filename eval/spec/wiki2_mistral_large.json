@@ -1,8 +1,0 @@
-{
-    "tokenize_fn": "transformers",
-    "tokenizer_dir": "/mnt/str/eval_models/mistral-7b-instruct-v0.3/hf/",
-    "dataset": "wiki2",
-    "eval_stride": 512,
-    "eval_len": 2048,
-    "max_rows": 100
-}
