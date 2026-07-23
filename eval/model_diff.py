@@ -170,6 +170,8 @@ def main(args):
         logprob_count = [0, 0]
         kl_div_sum_ab = 0
         kl_div_sum_ba = 0
+        kl_ab_toks = []      # per-token KLD (A, B), for median/quantile statistics
+        conf_b_toks = []     # reference top-token probability per token, for bucketed KLD
         topk_hits_sum = [[0] * topk_max, [0] * topk_max]
         topk_hits_count = [[0] * topk_max, [0] * topk_max]
         topk_agreement_sum = [0] * topk_max
@@ -256,8 +258,17 @@ def main(args):
                         topk_agreement_count[t] += top_slice_a.shape[0]
 
                     kl_vocab_size = min(vocab_size, x[0].shape[-1], x[1].shape[-1])
-                    kl_div_sum_ab += compute_kl_div(x[0], x[1], kl_vocab_size).mean().item()
+                    kl_ab = compute_kl_div(x[0], x[1], kl_vocab_size)
+                    kl_div_sum_ab += kl_ab.mean().item()
                     kl_div_sum_ba += compute_kl_div(x[1], x[0], kl_vocab_size).mean().item()
+
+                    # Per-token KLD and reference confidence. The mean KLD is dominated by
+                    # tokens where the reference itself is undecided
+                    kl_ab_toks.append(kl_ab.flatten().float().cpu())
+                    logits_b2 = x[1].view(-1, x[1].shape[-1])
+                    for cf_a in range(0, logits_b2.shape[0], 256):
+                        cf = logits_b2[cf_a:cf_a + 256, :kl_vocab_size].float()
+                        conf_b_toks.append((cf.max(dim = -1).values - cf.logsumexp(dim = -1)).exp().cpu())
 
         # Print error
         if not logits_layer:
@@ -319,6 +330,22 @@ def main(args):
     # KLD, either way around
     print(f" -- KL divergence (A, B): {kl_div_ab:11.8f}")
     print(f" -- KL divergence (B, A): {kl_div_ba:11.8f}")
+
+    # Robust per-token statistics
+    kl_ab_all = torch.cat(kl_ab_toks)
+    conf_b_all = torch.cat(conf_b_toks)
+    print(f" -- KL divergence (A, B), per-token: median {kl_ab_all.median().item():.8f}   p90 {kl_ab_all.quantile(0.9).item():.8f}")
+    print(f" -- KL divergence (A, B), by reference confidence:")
+    for c_lo, c_hi in [(0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 0.95), (0.95, 1.01)]:
+        mask = (conf_b_all >= c_lo) & (conf_b_all < c_hi)
+        n = mask.sum().item()
+        if n == 0:
+            continue
+        kb = kl_ab_all[mask]
+        print(
+            f"      B top-prob [{c_lo:4.2f}, {min(c_hi, 1.0):4.2f}): {100 * n / conf_b_all.numel():5.1f}% of tokens"
+            f"   mean {kb.mean().item():.6f}   median {kb.median().item():.6f}"
+        )
 
     return kl_div_ab
 
