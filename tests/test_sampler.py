@@ -504,6 +504,41 @@ def test_fused_eager_parity(dim: tuple):
     assert mismatches == 0
 
 
+@torch.inference_mode()
+def test_argmax_sorted():
+    """
+    Stacks ending in Argmax normally collapse to the fused step. An explicit sort, XTC, or a
+    disabled fused sampler reaches the eager path, where Argmax has to map a sorted position back
+    to a token ID per row.
+    """
+    logits = torch.tensor(
+        [[2.0, 1.0, 0.0, -1.0],
+         [0.0, 3.0, 1.0, 2.0]],
+        dtype = torch.float,
+        device = device
+    )
+
+    enabled = sampler_custom.fused_sampler_enable
+    try:
+        sampler_custom.fused_sampler_enable = False
+        cases = [
+            ([SS_Argmax()], [0, 1]),
+            ([SS_Sort(), SS_Argmax()], [0, 1]),
+            ([SS_TopK(3), SS_Argmax()], [0, 1]),
+            ([SS_MinP(0.1), SS_Argmax()], [0, 1]),
+            # Two tokens per row clear the threshold, and scaling the more likely one drops it
+            # below the one XTC keeps
+            ([SS_XTC(1.0, 0.1), SS_Argmax()], [1, 3]),
+            # The same scaling at a low probability is too small to reorder them
+            ([SS_XTC(0.05, 0.1), SS_Argmax()], [0, 1]),
+        ]
+        for steps, expected in cases:
+            sample = CustomSampler(steps).forward(logits, rand_u32 = 0)
+            assert sample.tolist() == expected, (steps, sample.tolist(), expected)
+    finally:
+        sampler_custom.fused_sampler_enable = enabled
+
+
 @pytest.mark.parametrize("dim", dims)
 @torch.inference_mode()
 def test_ban_tokens(dim: tuple):

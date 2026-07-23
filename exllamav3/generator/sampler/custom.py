@@ -101,10 +101,10 @@ class SS_Argmax(SS_Base):
                 state.sample = torch.argmax(state.probs, dim = -1)
             case SS.LOGITS_S:
                 temp = torch.argmax(state.logits, dim = -1)
-                state.sample = state.indices[temp]
+                state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
             case SS.PROBS_S | SS.PROBS_N_S:
                 temp = torch.argmax(state.probs, dim = -1)
-                state.sample = state.indices[temp]
+                state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
         state.state = SS.DONE
 
 
