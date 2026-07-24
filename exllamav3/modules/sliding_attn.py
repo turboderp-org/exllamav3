@@ -230,6 +230,8 @@ class SWALayerState:
         b = min(self.module.kv_state_size, position)
         a = max(0, b - self.module.sliding_window)
         k, v = stashed
+        self.k_state[slot].zero_()
+        self.v_state[slot].zero_()
         self.k_state[slot, a:b].copy_(k)
         self.v_state[slot, a:b].copy_(v)
 
