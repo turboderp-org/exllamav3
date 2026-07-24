@@ -206,11 +206,21 @@ class TransformersBackend:
                         a, b = v["data_offsets"]
                         self.tensor_nbytes[k] = b - a
 
+            # Conversion mappings may be registered under the composite model_type or, for
+            # ConditionalGeneration wrappers whose CausalLM class is the inner text model, under
+            # text_config.model_type (e.g. qwen3_5's model.language_model.* strip lives under
+            # qwen3_5_text only)
+            model_types = [config.model_type]
+            if getattr(config, "text_config", None) is not None:
+                tmt = getattr(config.text_config, "model_type", None)
+                if tmt and tmt not in model_types:
+                    model_types.append(tmt)
+
             renames = []          # (source substring, target substring)
             self.converters = []  # (target pattern, [source patterns], [ops])
             try:
                 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
-                for conv in get_checkpoint_conversion_mapping(config.model_type) or []:
+                for conv in [c for mt in model_types for c in (get_checkpoint_conversion_mapping(mt) or [])]:
                     sources = getattr(conv, "source_patterns", None)
                     targets = getattr(conv, "target_patterns", None)
                     ops = getattr(conv, "operations", None)
@@ -239,6 +249,14 @@ class TransformersBackend:
                         mod_name = mod_name.replace(src, tgt)
                 if mod_name != ck_name:
                     self.tensor_index[mod_name] = (fn, ck_name)
+
+            # Generic fallback for composite checkpoints whose model doesn't declare the
+            # container strip in its conversion mapping: alias the text stack into the CausalLM
+            # namespace (declared renames take precedence via setdefault)
+            for ck_name, fn in raw_map.items():
+                if ck_name.startswith("model.language_model."):
+                    alias = "model." + ck_name[len("model.language_model."):]
+                    self.tensor_index.setdefault(alias, (fn, ck_name))
 
             # Real (init-valued) buffers up front on the compute device
             for m in self.model.modules():
