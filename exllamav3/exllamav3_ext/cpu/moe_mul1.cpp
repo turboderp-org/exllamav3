@@ -16,14 +16,19 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
-#include <pthread.h>
-#include <sched.h>
 #include <string>
 #include <thread>
 #include <vector>
 
+
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 #ifndef __linux__
 #include <intrin.h>
+#define NOMINMAX
 #include <windows.h>
 #endif
 
