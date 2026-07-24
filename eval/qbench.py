@@ -52,7 +52,7 @@ from qbench.measure import (
     print_stats,
     save_reference_row,
 )
-from qbench.plot import plot_kld_spread, plot_scatter
+from qbench.plot import plot_kld_hist, plot_kld_hist_combined, plot_kld_spread, plot_scatter
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
@@ -133,11 +133,16 @@ def main(args):
             floor_results = stats.results()
             floor_results.update(backend.info)
             cache.save_results(floor_results_key, floor_results)
+            cache.save_kl(floor_results_key, stats.kl_vector())
             backend.close()
         print_stats("Noise floor", floor_results)
         all_results.append({"label": "Noise floor", "group": "noise_floor", **floor_results})
+        floor_kl = cache.load_kl(floor_results_key)
+    else:
+        floor_kl = None
 
     # ------ Quantized models
+    model_kl_keys = []  # (label, group, results_key) in project order, for the histogram plot
     for mspec in models:
         if mspec is ref:
             continue
@@ -150,9 +155,12 @@ def main(args):
             res = stats.results()
             res.update(backend.info)
             cache.save_results(results_key, res)
+            cache.save_kl(results_key, stats.kl_vector())
             backend.close()
         print_stats(mspec["label"], res)
         all_results.append({"label": mspec["label"], "group": mspec["group"], **res})
+        if "kld" in res:
+            model_kl_keys.append((mspec["label"], mspec["group"], results_key))
 
     cache.trim(protect = {ref_store})
 
@@ -233,6 +241,60 @@ def main(args):
                 vram = spread_vram,
             )
             print(f" -- Saved plot: {output[spread_key]}")
+
+    # Histogram plot outputs accept a plain path or {file, ...options}
+    def hist_spec(key):
+        v = output.get(key)
+        if isinstance(v, dict):
+            return v.get("file"), v
+        return v, {}
+
+    hist_specs = {k: hist_spec(k) for k in ("plot_kld_hist", "plot_kld_hist_combined")}
+    if any(path for path, _ in hist_specs.values()):
+        if floor_kl is None:
+            print(" -- histogram plots require the noise floor pass (noise_floor: true, non-llamacpp reference)")
+        else:
+            hist_entries = []
+            for label, group, results_key in model_kl_keys:
+                kl = cache.load_kl(results_key)
+                if kl is None:
+                    print(f" -- histogram plots: no per-token KLD cached for {label}, skipping")
+                    continue
+                hist_entries.append({"label": label, "group": group, "kl": kl, "floor_kl": floor_kl})
+
+            path, _ = hist_specs["plot_kld_hist"]
+            if path and hist_entries:
+                plot_kld_hist(
+                    hist_entries,
+                    project.get("title", "qbench"),
+                    dataset_subtitle(project),
+                    output.get("dark", True),
+                    path,
+                    caption = output.get("caption", True),
+                )
+                print(f" -- Saved plot: {path}")
+
+            path, opts = hist_specs["plot_kld_hist_combined"]
+            if path and hist_entries:
+                entries = hist_entries
+                if opts.get("labels"):
+                    want = [str(w) for w in opts["labels"]]
+                    entries = [e for e in hist_entries if e["label"] in want]
+                    for w in want:
+                        if not any(e["label"] == w for e in hist_entries):
+                            print(f" -- plot_kld_hist_combined: no model labeled {w!r}, skipping it")
+                if entries:
+                    plot_kld_hist_combined(
+                        entries,
+                        project.get("title", "qbench"),
+                        dataset_subtitle(project),
+                        output.get("dark", True),
+                        path,
+                        caption = output.get("caption", True),
+                        x_log = opts.get("x_log", True),
+                        y_log = opts.get("y_log", True),
+                    )
+                    print(f" -- Saved plot: {path}")
 
     if output.get("interactive"):
         print(" -- output.interactive is not implemented yet")

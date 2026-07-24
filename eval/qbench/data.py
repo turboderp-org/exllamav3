@@ -75,9 +75,18 @@ def resolve_project_paths(project: dict, project_file: str):
         m["source"] = resolve(m["source"])
     output = project.get("output", {})
     for key in ("plot_ppl", "plot_kld", "plot_ppl_vram", "plot_kld_vram", "plot_kld_spread",
-                "plot_kld_spread_vram", "results", "interactive"):
-        if output.get(key):
-            output[key] = resolve(output[key])
+                "plot_kld_spread_vram", "plot_kld_hist", "plot_kld_hist_combined",
+                "results", "interactive"):
+        v = output.get(key)
+        if not v:
+            continue
+        # Plot outputs may be a plain path or a dict with a "file" member plus plot options
+        # (e.g. plot_kld_hist_combined: {file, x_log, y_log, labels})
+        if isinstance(v, dict):
+            if v.get("file"):
+                v["file"] = resolve(v["file"])
+        else:
+            output[key] = resolve(v)
 
 
 class QCache:
@@ -111,6 +120,25 @@ class QCache:
     def save_results(self, key, results: dict):
         with open(self.results_file(key), "w") as f:
             json.dump(results, f, indent = 2)
+
+    # Per-token KLD sidecar next to each results JSON (fp16, ~2 bytes/token): lets the
+    # histogram outputs pair tokens across passes ((model KLD - floor KLD) per token) without
+    # keeping full logits around. Not counted against max_size_gb (tiny, and results JSONs
+    # aren't either)
+    def kl_file(self, key):
+        return os.path.join(self.root, f"kl_{key}.safetensors")
+
+    def save_kl(self, key, kl: torch.Tensor | None):
+        if kl is not None:
+            save_tensors(self.kl_file(key), {"kl": kl.half().cpu()})
+
+    def load_kl(self, key) -> torch.Tensor | None:
+        if not os.path.exists(self.kl_file(key)):
+            return None
+        try:
+            return load_tensor(self.kl_file(key), "kl")
+        except Exception:
+            return None
 
     def trim(self, protect: set):
         dirs = []

@@ -14,6 +14,7 @@ import matplotlib.transforms as mtransforms
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import torch
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1013,6 +1014,348 @@ def plot_kld_spread(results: list, title: str, subtitle: str, dark: bool, plot_f
         text = caption if isinstance(caption, str) else default_spread_caption(floor)
         fig.text(
             0.09, 0.094,
+            "\n".join(textwrap.wrap(text, width = 158)),
+            ha = "left", va = "top", fontsize = 10.5, linespacing = 1.45,
+            color = colors["muted"],
+        )
+
+    fig.savefig(plot_file, dpi = 160)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------------------------
+# (KLD - noise floor) histogram grid
+
+def default_hist_caption() -> str:
+    return (
+        "Distribution over all scored tokens of the per-token KL divergence minus the reference's self-noise-floor divergence at the same token. "
+        "Zero (dashed line) means the quantized model diverges from the reference no more than a bf16-rounding-scale perturbation of the reference "
+        "itself does; mass to the right of it is divergence attributable to quantization. Each panel is trimmed to its own p1–p99 range "
+        "(100 bins, log count scale); the dotted line marks the median."
+    )
+
+
+def _drape(y: np.ndarray, g: float, max_iters: int = 5000) -> np.ndarray:
+    """
+    Relax a flexible line dropped over the profile y under a constant downward force: the
+    discrete hanging-chain equilibrium y[i] = max(y_data[i], (y[i-1] + y[i+1]) / 2 - g),
+    iterated to a fixpoint. Peaks are contact points (preserved exactly); valleys narrower
+    than ~sqrt(8 * depth / g) bins are bridged by catenary sag; wide valleys sag all the way
+    down to the data. g is the sag per bin^2, in units of y (log10-counts here).
+    """
+    d = y.astype(np.float64)
+    y = d.copy()
+    for _ in range(max_iters):
+        y_new = y.copy()
+        y_new[1:-1] = np.maximum(d[1:-1], 0.5 * (y[:-2] + y[2:]) - g)
+        if np.max(np.abs(y_new - y)) < 1e-5:
+            return y_new
+        y = y_new
+    return y
+
+
+def default_hist_combined_caption(x_log: bool, y_log: bool) -> str:
+    x_desc = (
+        "uniform on the log x axis (zero at the left edge)"
+        if x_log else "uniform on the linear x axis"
+    )
+    return (
+        f"Per-token KL divergence against the unquantized reference, histogram per model: 120 shared bins, {x_desc}. "
+        "The dotted gray line is the noise floor: the divergence of the reference against itself under bf16-rounding-scale "
+        "perturbation."
+    )
+
+
+def plot_kld_hist_combined(
+    entries: list, title: str, subtitle: str, dark: bool, plot_file: str,
+    caption: str | bool = True, x_log: bool = True, y_log: bool = False,
+):
+    """
+    All models' per-token raw KLD histograms as draped lines on one chart, group-colored,
+    with leader-labeled peaks, plus the noise floor's own distribution as a dotted reference.
+    x_log selects a from-zero log x axis (symlog with the linear sliver below the smallest
+    trimmed value; bins uniform in the transform) vs linear; y_log selects log vs linear
+    counts (the drape runs in whichever space is displayed, so the smoothing looks the same
+    either way).
+    """
+    _set_theme(dark)
+    plt.rcParams["figure.figsize"] = (14, 10.6)
+    fig, ax = plt.subplots()
+    fig.subplots_adjust(left = 0.075, right = 0.975, top = 0.895, bottom = 0.10 if caption is False else 0.185)
+    colors = _text_colors(dark)
+    palette = make_palette({e["group"] for e in entries})
+    palette["noise_floor"] = colors["floor"]  # for the floor reference line's label/leader
+
+    floor = entries[0]["floor_kl"].float()
+
+    # Per-model p1-p99 trim of the raw per-token KLD, and the same for the noise floor's own
+    # distribution (the dotted reference whose peak marks the floor scale)
+    trimmed = []
+    for e in entries:
+        kl = e["kl"].float()
+        d = kl[torch.isfinite(kl)].clamp(min = 0.0).numpy()
+        if d.size == 0:
+            continue
+        lo, hi = np.percentile(d, [1, 99])
+        trimmed.append((e, d[(d >= lo) & (d <= hi)]))
+    if not trimmed:
+        plt.close(fig)
+        return
+
+    ffin = floor[torch.isfinite(floor)].clamp(min = 0.0).numpy()
+    flo, fhi = np.percentile(ffin, [1, 99])
+    floor_d = ffin[(ffin >= flo) & (ffin <= fhi)]
+
+    gmin = min(min(d.min() for _, d in trimmed), floor_d.min())
+    gmax = max(max(d.max() for _, d in trimmed), floor_d.max())
+
+    if x_log:
+        # From-zero log axis: symlog whose linear segment is a sliver below the smallest
+        # trimmed value, so effectively everything sits in the log region and the axis still
+        # starts at exactly 0
+        linthresh = max(gmin, gmax * 1e-7, 1e-9)
+
+        def fwd(x):
+            return np.sign(x) * np.log10(1.0 + np.abs(x) / linthresh)
+
+        def inv(t):
+            return np.sign(t) * linthresh * (10.0 ** np.abs(t) - 1.0)
+    else:
+        def fwd(x):
+            return x
+
+        def inv(t):
+            return t
+
+    # Shared bins from zero, uniform in (transformed) x, so every line is drawn against the
+    # same grid and bin width is constant on screen
+    n_bins = 120
+    edges = inv(np.linspace(0.0, fwd(gmax), n_bins + 1))
+    centers = inv(0.5 * (fwd(edges[:-1]) + fwd(edges[1:])))
+
+    # First pass: bin counts per model (the linear-y drape stiffness scales to the global peak)
+    profiles = []
+    for e, d in trimmed:
+        counts, _ = np.histogram(d, bins = edges)
+        nz = np.nonzero(counts)[0]
+        if nz.size:
+            profiles.append((e, counts, nz[0], nz[-1] + 1))
+    if not profiles:
+        plt.close(fig)
+        return
+    floor_counts, _ = np.histogram(floor_d, bins = edges)
+    max_count = max(
+        max(int(c[a:b].max()) for _, c, a, b in profiles),
+        int(floor_counts.max()) if floor_counts.size else 0,
+    )
+
+    def shape_line(counts, a, b):
+        """3-tap denoise then the drape, in display space (see the model loop comment)"""
+        if y_log:
+            y = np.log10(np.clip(counts[a:b], 0.6, None))
+        else:
+            y = counts[a:b].astype(np.float64)
+        if y.size > 2:
+            y = np.convolve(np.pad(y, 1, mode = "edge"), [0.2, 0.6, 0.2], mode = "valid")
+        y = _drape(y, g = 0.025 if y_log else 0.01 * max_count)
+        return 10.0 ** y if y_log else y
+
+    rows, anchors_xy, line_records = [], [], []
+    peak_top = 1.0
+
+    # The floor reference line does not participate in the y limit (its narrow distribution
+    # makes a tall peak that would squash the model curves, especially on a linear y axis);
+    # it may clip at the top, its position and spread are what matter. Label anchor is
+    # clamped into view below
+    floor_anchor = None
+    fnz = np.nonzero(floor_counts)[0]
+    if fnz.size:
+        fa, fb = fnz[0], fnz[-1] + 1
+        fy = shape_line(floor_counts, fa, fb)
+        ax.plot(centers[fa:fb], fy, color = colors["floor"], linewidth = 1.8, linestyle = ":",
+                alpha = 0.95, zorder = 2)
+        fpeak = int(np.argmax(fy))
+        floor_anchor = (centers[fa:fb][fpeak], float(fy[fpeak]))
+        for i in range(0, fb - fa, 3):
+            line_records.append({"group": "noise floor", "x": centers[fa + i], "y": fy[i]})
+
+    for e, counts, a, b in profiles:
+        color = palette[e["group"]]
+        # The drape runs in display space: log10 counts on a log y axis (g in decades), raw
+        # counts on a linear one (g relative to the chart's full height). A light 3-tap
+        # smoothing first, so the chain rests on denoised peaks rather than on every
+        # single-count spike
+        y = shape_line(counts, a, b)
+        ax.plot(centers[a:b], y, color = color, linewidth = 2.0, alpha = 0.95, zorder = 3,
+                solid_joinstyle = "round")
+        peak = int(np.argmax(y))
+        peak_top = max(peak_top, float(y[peak]))
+        rows.append({"group": e["group"], "point_label": e["label"], "x": centers[a:b][peak], "y": y[peak]})
+        anchors_xy.append((centers[a:b][peak], y[peak]))
+        for i in range(0, b - a, 3):
+            line_records.append({"group": f"{e['group']} {e['label']}", "x": centers[a + i], "y": y[i]})
+
+    if x_log:
+        ax.set_xscale("symlog", linthresh = linthresh, linscale = 1.0)
+        ax.set_xlim(0.0, gmax * 1.6)
+        # The locator can drop a decade tick below linthresh, colliding with the 0 label
+        ax.set_xticks([t for t in ax.get_xticks() if t == 0 or t >= linthresh * 0.99])
+    else:
+        ax.set_xlim(0.0, gmax * 1.05)
+    if y_log:
+        ax.set_yscale("log")
+        y_top = peak_top * 2.6
+        ax.set_ylim(0.8, y_top)
+    else:
+        y_top = peak_top * 1.22
+        ax.set_ylim(0.0, y_top)
+
+    if floor_anchor is not None:
+        fx, fy_a = floor_anchor
+        rows.append({"group": "noise_floor", "point_label": "noise floor", "x": fx, "y": min(fy_a, y_top * 0.85)})
+        anchors_xy.append((fx, min(fy_a, y_top * 0.85)))
+
+    ax.set_xlabel("per-token KL divergence" + (" (log)" if x_log else ""))
+    ax.set_ylabel("tokens per bin")
+    ax.xaxis.label.set_size(14)
+    ax.yaxis.label.set_size(14)
+    ax.tick_params(axis = "both", which = "both", labelsize = 12, colors = colors["tick"])
+
+    handles = [
+        Line2D([0], [0], color = palette[g], linewidth = 2.2, label = g)
+        for g in sorted({e["group"] for e, _ in trimmed})
+    ]
+    handles.append(Line2D([0], [0], color = colors["floor"], linewidth = 1.8, linestyle = ":", label = "noise floor"))
+    ax.legend(handles = handles, loc = "upper right", frameon = False, fontsize = 12)
+
+    if subtitle:
+        ax.set_title(title, pad = 42)
+        ax.text(
+            0.5, 1.025, subtitle, transform = ax.transAxes, ha = "center", va = "bottom",
+            fontsize = 13, color = colors["muted"],
+        )
+    else:
+        ax.set_title(title, pad = 22)
+    sns.despine(ax = ax, left = True, bottom = True)
+
+    # Leader-labeled peaks via the shared layout engine, avoiding every drawn line
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    anchors = [ax.transData.transform(p) for p in anchors_xy]
+    texts = []
+    for r in rows:
+        texts.append(ax.text(
+            r["x"], r["y"], r["point_label"],
+            color = palette[r["group"]], fontsize = 10, fontweight = "bold",
+            ha = "center", va = "center",
+            bbox = {"boxstyle": "round,pad=0.25", "facecolor": ax.get_facecolor(),
+                    "edgecolor": "none", "alpha": 0.75},
+            zorder = 6,
+        ))
+    fig.canvas.draw()
+    sizes = [tuple(t.get_window_extent(renderer).padded(2).size) for t in texts]
+    line_df = pd.DataFrame(line_records).sort_values(["group", "x", "y"])
+    best_centers = _layout_labels(fig, ax, rows, anchors, sizes, line_df)
+    for t, center, anchor, r in zip(texts, best_centers, anchors, rows):
+        t.set_position(ax.transData.inverted().transform(center))
+        _draw_leader(ax, anchor, center, palette[r["group"]])
+
+    if caption is not False:
+        text = caption if isinstance(caption, str) else default_hist_combined_caption(x_log, y_log)
+        fig.text(
+            0.075, 0.094,
+            "\n".join(textwrap.wrap(text, width = 158)),
+            ha = "left", va = "top", fontsize = 10.5, linespacing = 1.45,
+            color = colors["muted"],
+        )
+
+    fig.savefig(plot_file, dpi = 160)
+    plt.close(fig)
+
+
+def plot_kld_hist(entries: list, title: str, subtitle: str, dark: bool, plot_file: str, caption: str | bool = True):
+    """
+    One histogram panel per quantized model of the token-paired excess divergence
+    (per-token KLD minus the noise floor's per-token KLD). entries: dicts with label, group,
+    kl (per-token tensor) and floor_kl (per-token tensor, same token order).
+    """
+    _set_theme(dark)
+    colors = _text_colors(dark)
+    palette = make_palette({e["group"] for e in entries})
+
+    n = len(entries)
+    ncols = min(3, n)
+    nrows = -(-n // ncols)
+    top_in = 1.30
+    # Bottom band holds the last row's tick+axis labels (~0.85 in) plus the caption paragraph
+    bottom_in = 1.55 if caption is not False else 0.70
+    panel_in, gap_in = 2.5, 0.55
+    fig_h = top_in + bottom_in + nrows * panel_in + (nrows - 1) * gap_in
+    fig, axes = plt.subplots(nrows, ncols, figsize = (14, fig_h), squeeze = False)
+    fig.subplots_adjust(
+        left = 0.065, right = 0.985,
+        top = 1 - top_in / fig_h, bottom = bottom_in / fig_h,
+        hspace = gap_in / panel_in, wspace = 0.16,
+    )
+
+    for i, e in enumerate(entries):
+        ax = axes[i // ncols][i % ncols]
+        color = palette[e["group"]]
+
+        kl = e["kl"].float()
+        fl = e["floor_kl"].float()
+        m = torch.isfinite(kl) & torch.isfinite(fl)
+        d = (kl[m] - fl[m]).numpy()
+        if d.size == 0:
+            ax.set_axis_off()
+            continue
+        lo, hi = np.percentile(d, [1, 99])
+        if hi <= lo:
+            hi = lo + 1e-6
+        ax.hist(
+            d, bins = 100, range = (lo, hi),
+            color = color, alpha = 0.9, linewidth = 0, log = True, zorder = 3,
+        )
+        med = float(np.median(d))
+        ax.axvline(0.0, color = colors["floor"], linewidth = 1.4, linestyle = "--", zorder = 2)
+        if lo <= med <= hi:
+            ax.axvline(med, color = color, linewidth = 1.6, linestyle = ":", zorder = 4)
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(bottom = 0.7)
+
+        pill = dict(boxstyle = "round,pad=0.3", fc = plt.rcParams["axes.facecolor"], ec = "none", alpha = 0.8)
+        ax.text(
+            0.03, 0.955, f"{e['group']} {e['label']}",
+            transform = ax.transAxes, ha = "left", va = "top",
+            fontsize = 12, color = color, zorder = 5, bbox = pill,
+        )
+        ax.text(
+            0.97, 0.955, f"median {med:+.4f}",
+            transform = ax.transAxes, ha = "right", va = "top",
+            fontsize = 10.5, color = colors["value"], zorder = 5, bbox = pill,
+        )
+
+        ax.tick_params(axis = "both", which = "both", labelsize = 9.5, colors = colors["tick"])
+        if i // ncols == nrows - 1 or i + ncols >= n:
+            ax.set_xlabel("per-token KLD − noise floor", fontsize = 11)
+        if i % ncols == 0:
+            ax.set_ylabel("tokens", fontsize = 11)
+        sns.despine(ax = ax, left = True, bottom = True)
+
+    for j in range(n, nrows * ncols):
+        axes[j // ncols][j % ncols].set_axis_off()
+
+    fig.suptitle(title, y = 1 - 0.28 / fig_h, fontsize = 19)
+    if subtitle:
+        fig.text(
+            0.5, 1 - 0.62 / fig_h, subtitle,
+            ha = "center", va = "top", fontsize = 13, color = colors["muted"],
+        )
+
+    if caption is not False:
+        text = caption if isinstance(caption, str) else default_hist_caption()
+        fig.text(
+            0.065, (bottom_in - 0.85) / fig_h,
             "\n".join(textwrap.wrap(text, width = 158)),
             ha = "left", va = "top", fontsize = 10.5, linespacing = 1.45,
             color = colors["muted"],

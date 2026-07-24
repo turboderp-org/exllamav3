@@ -19,8 +19,9 @@ CONF_BUCKETS = [(0.00, 0.25), (0.25, 0.50), (0.50, 0.75), (0.75, 0.95), (0.95, 1
 
 # Bumped when the per-model measurement set changes; invalidates cached KLD results without
 # invalidating the (expensive) cached reference logits. v3: bpw convention unified across
-# engines (biases/router gates excluded, tied-head fallback).
-METRICS_VERSION = 3
+# engines (biases/router gates excluded, tied-head fallback). v4: per-token KLD vectors saved
+# as a sidecar so histograms of (KLD - noise floor) can pair tokens across passes.
+METRICS_VERSION = 4
 
 
 class DiffStats:
@@ -63,6 +64,11 @@ class DiffStats:
     def load_conf(self):
         conf = load_tensor(os.path.join(self.ref_store, "conf.safetensors"), "conf")
         self.conf_toks = [conf.flatten().float()]
+
+    def kl_vector(self) -> torch.Tensor | None:
+        """Per-token KLD over all rows in test order (non-finite values included), for the
+        (KLD - noise floor) histogram, which pairs tokens across passes"""
+        return torch.cat(self.kl_toks) if self.kl_toks else None
 
     def results(self) -> dict:
         res = {}

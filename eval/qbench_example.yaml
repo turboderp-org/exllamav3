@@ -5,23 +5,23 @@
 title: Llama 3.1 8B (example)
 
 test_data:
-    # Choices: wiki2, openwebtext
-    source: wiki2
-    rows: 10
-    length: 2048
-    stride: 2048
+  # Choices: wiki2, openwebtext
+  source: wiki2
+  rows: 10
+  length: 2048
+  stride: 2048
 
 tokenizer:
-    # Directory containing HF tokenizer, usually the HF reference model
-    source: hf_model/
-    # (Loosely) apply model's chat template to all test rows
-    template: true
+  # Directory containing HF tokenizer, usually the HF reference model
+  source: hf_model/
+  # (Loosely) apply model's chat template to all test rows
+  template: true
 
 logit_cache:
-    # Directory to store reference model logits for test data split defined above
-    dir: _logit_cache/
-    # Size in GB of the logit cache. Oldest files are evicted first when this limit is exceeded
-    max_size_gb: 50
+  # Directory to store reference model logits for test data split defined above
+  dir: _logit_cache/
+  # Size in GB of the logit cache. Oldest files are evicted first when this limit is exceeded
+  max_size_gb: 50
 
 models:
   - label: HF BF16
@@ -58,15 +58,24 @@ models:
 
 # Output files, each entry is optional
 output:
-    # Perplexity plot, including reference baseline
-    plot_ppl: qb_ppl.png
-    # Same as above, but X axis is total VRAM allocated for weights (decoder layers + lm_head)
-    plot_ppl_vram: qb_ppl_vram.png
-    # KL-div plot, versus reference
-    plot_kld: qb_kld.png
-    plot_kld_vram: qb_kld_vram.png
-    # Detailed results in JSON format
-    results: qb_results.json
-    # KL-div median/mean plot with noise floor and interquartile spread
-    plot_kld_spread: qb_kld_spread.png
-    plot_kld_spread_vram: qb_kld_spread_vram.png
+  # Perplexity plot, including reference baseline
+  plot_ppl: qb_ppl.png
+  # Same as above, but X axis is total VRAM allocated for weights (decoder layers + lm_head)
+  plot_ppl_vram: qb_ppl_vram.png
+  # KL-div plot, versus reference
+  plot_kld: qb_kld.png
+  plot_kld_vram: qb_kld_vram.png
+  # Detailed results in JSON format
+  results: qb_results.json
+  # KL-div median/mean plot with noise floor and interquartile spread
+  plot_kld_spread: qb_kld_spread.png
+  plot_kld_spread_vram: qb_kld_spread_vram.png
+  # Histogram plots of KLD per token for each model
+  plot_kld_hist: qb_kld_hist.png
+  # Combined histogram. Logarithmic x-axis only is default, and by default all of the above models are included
+  # which is very busy on this plot.
+  plot_kld_hist_combined:
+    file: qb_kld_hist_combined.png
+    x_log: true
+    y_log: false
+    labels: [ 4.00 bpw, Q4_K_M ]
