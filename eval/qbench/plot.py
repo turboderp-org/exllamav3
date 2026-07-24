@@ -52,6 +52,37 @@ def _text_colors(dark):
     }
 
 
+def _cat_marker():
+    from matplotlib.path import Path as MplPath
+    verts = []
+    # skull: the long way around the bottom, from the left ear base to the right ear base
+    for a in np.linspace(150, 390, 40):
+        r = np.radians(a)
+        verts.append((np.cos(r), np.sin(r)))
+    # right ear: base at 30°, tip at 52°, back to the circle at 74°
+    verts.append((1.8 * np.cos(np.radians(52)), 1.8 * np.sin(np.radians(52))))
+    verts.append((np.cos(np.radians(74)), np.sin(np.radians(74))))
+    # forehead between the ears
+    for a in np.linspace(74, 106, 6):
+        r = np.radians(a)
+        verts.append((np.cos(r), np.sin(r)))
+    # left ear: base at 106°, tip at 128°, back at 150° (closes to the start)
+    verts.append((1.8 * np.cos(np.radians(128)), 1.8 * np.sin(np.radians(128))))
+    verts.append((np.cos(np.radians(150)), np.sin(np.radians(150))))
+    return MplPath(verts, closed = True)
+
+
+CAT_MARKER = _cat_marker()
+
+
+def group_marker(group):
+    return CAT_MARKER if group == "EXL3" else "o"
+
+
+def group_marker_size(group, base):
+    return base * 1.35 if group == "EXL3" else base
+
+
 def make_palette(groups):
     """Fixed hue per group name; reserved slots for common formats, remainder in stable order"""
     cols = sns.color_palette("tab10", n_colors = 10)
@@ -702,18 +733,18 @@ def plot_scatter(results, args, ref_line = None):
             legend = False,
         )
 
-    sns.scatterplot(
-        data = df,
-        x = "x",
-        y = "y",
-        hue = "group",
-        palette = palette,
-        hue_order = groups,
-        s = 86,
-        edgecolor = "white",
-        linewidth = 0.8,
-        ax = ax,
-    )
+    # One scatter call per group so each can carry its own marker (EXL3 gets the cat)
+    for group in groups:
+        gdf = df[df["group"] == group]
+        ax.scatter(
+            gdf["x"], gdf["y"],
+            color = palette[group],
+            marker = group_marker(group),
+            s = group_marker_size(group, 86) if group == "EXL3" else 86,
+            edgecolor = "white",
+            linewidth = 0.8,
+            zorder = 3,
+        )
 
     handles = [
         Line2D(
@@ -722,8 +753,8 @@ def plot_scatter(results, args, ref_line = None):
             color = palette[group],
             linestyle = ":",
             linewidth = 1.8,
-            marker = "o",
-            markersize = 7,
+            marker = group_marker(group),
+            markersize = group_marker_size(group, 7),
             markerfacecolor = palette[group],
             markeredgecolor = "white",
             markeredgewidth = 0.8,
@@ -885,7 +916,8 @@ def plot_kld_spread(results: list, title: str, subtitle: str, dark: bool, plot_f
         )
         ax.plot(
             xs, [r["kld_median"] for r in rs],
-            color = color, linewidth = 2.2, marker = "o", markersize = 8,
+            color = color, linewidth = 2.2,
+            marker = group_marker(g), markersize = group_marker_size(g, 8),
             markeredgecolor = "white", markeredgewidth = 0.8,
             label = f"{g} (median, p25–p75)", zorder = 4,
         )
