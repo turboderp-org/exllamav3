@@ -292,7 +292,7 @@ def main(args):
                         path,
                         caption = output.get("caption", True),
                         x_log = opts.get("x_log", True),
-                        y_log = opts.get("y_log", True),
+                        y_log = opts.get("y_log", False),
                     )
                     print(f" -- Saved plot: {path}")
 

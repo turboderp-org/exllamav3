@@ -1056,13 +1056,13 @@ def _drape(y: np.ndarray, g: float, max_iters: int = 5000) -> np.ndarray:
 
 def default_hist_combined_caption(x_log: bool, y_log: bool) -> str:
     x_desc = (
-        "uniform on the log x axis (zero at the left edge)"
+        "uniform on the log x axis"
         if x_log else "uniform on the linear x axis"
     )
     return (
-        f"Per-token KL divergence against the unquantized reference, histogram per model: 120 shared bins, {x_desc}. "
-        "The dotted gray line is the noise floor: the divergence of the reference against itself under bf16-rounding-scale "
-        "perturbation."
+        f"Per-token KL divergence against the unquantized reference, histogram per model: 120 shared bins, {x_desc}, "
+        "cropped to the models' p1–p99 range. The dotted gray line is the noise floor: the divergence of the reference "
+        "against itself under bf16-rounding-scale perturbation; its lower tail may run off the left edge."
     )
 
 
@@ -1073,10 +1073,10 @@ def plot_kld_hist_combined(
     """
     All models' per-token raw KLD histograms as draped lines on one chart, group-colored,
     with leader-labeled peaks, plus the noise floor's own distribution as a dotted reference.
-    x_log selects a from-zero log x axis (symlog with the linear sliver below the smallest
-    trimmed value; bins uniform in the transform) vs linear; y_log selects log vs linear
-    counts (the drape runs in whichever space is displayed, so the smoothing looks the same
-    either way).
+    The x range is cropped to the models' trimmed data; the floor reference may clip off the
+    left edge (its lower tail carries no information). x_log selects a log x axis (bins
+    uniform in the transform) vs linear; y_log selects log vs linear counts (the drape runs
+    in whichever space is displayed, so the smoothing looks the same either way).
     """
     _set_theme(dark)
     plt.rcParams["figure.figsize"] = (14, 10.6)
@@ -1106,20 +1106,17 @@ def plot_kld_hist_combined(
     flo, fhi = np.percentile(ffin, [1, 99])
     floor_d = ffin[(ffin >= flo) & (ffin <= fhi)]
 
-    gmin = min(min(d.min() for _, d in trimmed), floor_d.min())
-    gmax = max(max(d.max() for _, d in trimmed), floor_d.max())
+    # Bounds from the MODELS only: everything left of their range is uninteresting (the
+    # floor's lower tail), so the axis crops there and the floor line clips off the edge
+    gmin = max(min(d.min() for _, d in trimmed), 1e-9)
+    gmax = max(d.max() for _, d in trimmed)
 
     if x_log:
-        # From-zero log axis: symlog whose linear segment is a sliver below the smallest
-        # trimmed value, so effectively everything sits in the log region and the axis still
-        # starts at exactly 0
-        linthresh = max(gmin, gmax * 1e-7, 1e-9)
-
         def fwd(x):
-            return np.sign(x) * np.log10(1.0 + np.abs(x) / linthresh)
+            return np.log10(np.maximum(x, 1e-12))
 
         def inv(t):
-            return np.sign(t) * linthresh * (10.0 ** np.abs(t) - 1.0)
+            return 10.0 ** t
     else:
         def fwd(x):
             return x
@@ -1127,10 +1124,12 @@ def plot_kld_hist_combined(
         def inv(t):
             return t
 
-    # Shared bins from zero, uniform in (transformed) x, so every line is drawn against the
-    # same grid and bin width is constant on screen
+    # Shared bins over the cropped range, uniform in (transformed) x, so every line is drawn
+    # against the same grid and bin width is constant on screen. Data outside the range
+    # (the floor's tails, other models' out-of-crop mass) simply isn't binned
     n_bins = 120
-    edges = inv(np.linspace(0.0, fwd(gmax), n_bins + 1))
+    t0 = fwd(gmin) if x_log else 0.0
+    edges = inv(np.linspace(t0, fwd(gmax), n_bins + 1))
     centers = inv(0.5 * (fwd(edges[:-1]) + fwd(edges[1:])))
 
     # First pass: bin counts per model (the linear-y drape stiffness scales to the global peak)
@@ -1196,10 +1195,8 @@ def plot_kld_hist_combined(
             line_records.append({"group": f"{e['group']} {e['label']}", "x": centers[a + i], "y": y[i]})
 
     if x_log:
-        ax.set_xscale("symlog", linthresh = linthresh, linscale = 1.0)
-        ax.set_xlim(0.0, gmax * 1.6)
-        # The locator can drop a decade tick below linthresh, colliding with the 0 label
-        ax.set_xticks([t for t in ax.get_xticks() if t == 0 or t >= linthresh * 0.99])
+        ax.set_xscale("log")
+        ax.set_xlim(gmin, gmax * 1.6)
     else:
         ax.set_xlim(0.0, gmax * 1.05)
     if y_log:
