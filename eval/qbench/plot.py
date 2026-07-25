@@ -679,7 +679,7 @@ def plot_scatter(results, args, ref_line = None):
         r"bits per weight (excl. embeddings and output head)"
     )
     y_label = (
-        r"KL divergence, $D_{\mathrm{KL}}(p_{\mathrm{FP}} \parallel p_{\mathrm{quant}})$" if args.kld else
+        r"mean KL divergence, $D_{\mathrm{KL}}(p_{\mathrm{FP}} \parallel p_{\mathrm{quant}})$" if args.kld else
         r"perplexity"
     )
 

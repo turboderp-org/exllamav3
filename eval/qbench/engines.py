@@ -147,23 +147,37 @@ class TransformersBackend:
             # Quantized checkpoints are dequantized on the fly by _get_tensor; the skeleton is
             # built unquantized (plain Linear modules), so the quantization config must not
             # reach from_config. Supported: compressed-tensors pack-quantized (AWQ-style int
-            # groups) and ModelOpt mixed FP8 / NVFP4. ModelOpt evaluation is weight-only: the
-            # deployed stack's static fp8 activation quant (input_scale) and fp8 kv cache are
-            # not emulated, so results are the checkpoint's weight fidelity under bf16 compute
+            # groups), compressed-tensors mixed-precision / nvfp4-pack-quantized /
+            # float-quantized (llm-compressor FP8-channel + NVFP4 mixes), and ModelOpt mixed
+            # FP8 / NVFP4. Evaluation is weight-only in all cases: the deployed stacks'
+            # activation quant (static or dynamic fp8/fp4) and fp8 kv cache are not emulated,
+            # so results are the checkpoint's weight fidelity under bf16 compute
             self.ct_bits = None
-            self.modelopt_quant = False
+            self.dequant_scaled = False
             qcfg = getattr(config, "quantization_config", None)
             if qcfg is not None:
-                qm = qcfg.get("quant_method") if isinstance(qcfg, dict) else getattr(qcfg, "quant_method", None)
+                def q_get(key, default = None):
+                    return qcfg.get(key, default) if isinstance(qcfg, dict) else getattr(qcfg, key, default)
+                qm = q_get("quant_method")
                 if qm == "compressed-tensors":
-                    fmt = qcfg.get("format") if isinstance(qcfg, dict) else getattr(qcfg, "format", None)
-                    assert fmt == "pack-quantized", \
+                    fmt = q_get("format")
+                    assert fmt in ("pack-quantized", "mixed-precision", "nvfp4-pack-quantized", "float-quantized"), \
                         f"Unsupported compressed-tensors format: {fmt}"
-                    groups = qcfg.get("config_groups", {})
-                    weights = next(iter(groups.values()))["weights"] if groups else {}
-                    self.ct_bits = weights.get("num_bits", 4)
+                    # ct_bits only drives the int pack-quantized decode; the actual scheme per
+                    # tensor is decided by its sidecars (weight_global_scale -> nvfp4,
+                    # weight_scale next to a plain weight -> fp8-channel)
+                    self.ct_bits = 4
+                    for g in (q_get("config_groups", {}) or {}).values():
+                        w = (g.get("weights") if isinstance(g, dict) else getattr(g, "weights", None)) or {}
+                        if isinstance(w, dict) and w.get("type", "int") == "int":
+                            self.ct_bits = w.get("num_bits", 4)
+                    self.dequant_scaled = True
                 elif qm == "modelopt":
-                    self.modelopt_quant = True
+                    self.dequant_scaled = True
+                elif qm == "fp8":
+                    # AutoFP8/DeepSeek-style: fp8-e4m3 weights with blockwise (typically
+                    # 128x128) weight_scale_inv, unquantized modules stay plain bf16
+                    self.dequant_scaled = True
                 else:
                     raise ValueError(f"Streaming does not support this quantization_config: {qm}")
                 delattr(config, "quantization_config")
@@ -351,7 +365,8 @@ class TransformersBackend:
 
     # ------ streaming machinery
 
-    CT_SUFFIXES = ("weight_packed", "weight_scale", "weight_zero_point", "weight_shape", "weight_g_idx")
+    CT_SUFFIXES = ("weight_packed", "weight_scale", "weight_zero_point", "weight_shape", "weight_g_idx",
+                   "weight_global_scale", "input_global_scale")
 
     def _read_shard(self, name):
         fn, ck_name = self.tensor_index[name]
@@ -397,11 +412,22 @@ class TransformersBackend:
     # fp4 e2m1 magnitudes for codes 0-7; codes 8-15 mirror negative (sign is the msb)
     NVFP4_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 
-    def _dequant_modelopt(self, name):
-        """Dequantize a ModelOpt weight: NVFP4 (uint8-packed e2m1 nibble pairs low-first,
-        fp8-e4m3 scale per group, fp32 global scale) when weight_scale_2 exists, else FP8
-        (e4m3 values, per-tensor scale). Validated against the bf16 originals."""
+    def _dequant_scaled(self, name):
+        """Dequantize a weight stored under its plain name with a weight_scale sidecar:
+        ModelOpt NVFP4 (uint8-packed e2m1 nibble pairs low-first, fp8-e4m3 scale per group,
+        fp32 global scale) when weight_scale_2 exists, else FP8 (e4m3 values; per-tensor
+        scalar for ModelOpt, [out, 1] channel scale for compressed-tensors float-quantized).
+        FP8 with blockwise weight_scale_inv (DeepSeek-style 128x128 blocks; despite the name,
+        dequantization MULTIPLIES by it) is handled first. All conventions validated against
+        the bf16 originals."""
         w = self._read_shard(name)
+        if f"{name}_scale_inv" in self.tensor_index:
+            si = self._read_shard(f"{name}_scale_inv").float()
+            bs0 = (w.shape[0] + si.shape[0] - 1) // si.shape[0]
+            bs1 = (w.shape[1] + si.shape[1] - 1) // si.shape[1]
+            ex = si.repeat_interleave(bs0, dim = 0)[:w.shape[0], :] \
+                   .repeat_interleave(bs1, dim = 1)[:, :w.shape[1]]
+            return w.float() * ex
         scale = self._read_shard(f"{name}_scale").float()
         if scale.ndim == 1:
             scale = scale.unsqueeze(1)
@@ -412,6 +438,17 @@ class TransformersBackend:
             return self.NVFP4_LUT[q] * scale.repeat_interleave(group, dim = 1) * ws2
         return w.float() * scale
 
+    def _dequant_ct_nvfp4(self, stem):
+        """Dequantize a compressed-tensors nvfp4-pack-quantized weight: uint8-packed e2m1
+        nibble pairs low-first, fp8-e4m3 scale per group, and a global scale the stored
+        per-group scales are DIVIDED by (it maps them into fp8 range at quantization time)"""
+        packed = self._read_shard(f"{stem}.weight_packed")
+        scale = self._read_shard(f"{stem}.weight_scale").float()
+        gs = self._read_shard(f"{stem}.weight_global_scale").float()
+        q = torch.stack([(packed & 0xF).long(), (packed >> 4).long()], dim = -1).flatten(1)
+        group = q.shape[1] // scale.shape[1]
+        return self.NVFP4_LUT[q] * scale.repeat_interleave(group, dim = 1) / gs
+
     def _stored_bits(self, name):
         """Actual stored size in the checkpoint for a module-side tensor name, including any
         quantization metadata; None if the name cannot be resolved"""
@@ -421,7 +458,7 @@ class TransformersBackend:
             if name.endswith(".weight"):
                 # ModelOpt-style scale sidecars stored next to the weight itself
                 stem = name[:-len(".weight")]
-                for s in ("weight_scale", "weight_scale_2", "input_scale"):
+                for s in ("weight_scale", "weight_scale_2", "weight_scale_inv", "input_scale", "input_global_scale"):
                     if f"{stem}.{s}" in self.tensor_index:
                         total += 8 * self._nbytes(f"{stem}.{s}")
             return total
@@ -449,18 +486,21 @@ class TransformersBackend:
     def _get_tensor(self, name):
         import re
         if name in self.tensor_index:
-            # ModelOpt keeps the quantized tensor under the plain .weight name; the scale
-            # sidecar marks it as needing dequant
-            if self.modelopt_quant and name.endswith(".weight") and f"{name}_scale" in self.tensor_index:
-                return self._dequant_modelopt(name)
+            # ModelOpt, ct-float-quantized and fp8 keep the quantized tensor under the plain
+            # .weight name; the scale sidecar marks it as needing dequant
+            if self.dequant_scaled and name.endswith(".weight") and (
+                    f"{name}_scale" in self.tensor_index or f"{name}_scale_inv" in self.tensor_index):
+                return self._dequant_scaled(name)
             return self._read_shard(name)
         if name == self.head_weight_name and self.embed_weight_name in self.tensor_index:
             return self._read_shard(self.embed_weight_name)  # tied embeddings
 
-        # compressed-tensors pack-quantized weight
+        # compressed-tensors packed weight: nvfp4 when a global scale exists, int otherwise
         if name.endswith(".weight"):
             stem = name[:-len(".weight")]
             if f"{stem}.weight_packed" in self.tensor_index:
+                if f"{stem}.weight_global_scale" in self.tensor_index:
+                    return self._dequant_ct_nvfp4(stem)
                 return self._dequant_ct(stem)
 
         # Merge-type conversion (fused MoE experts): gather the per-expert source tensors for

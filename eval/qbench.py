@@ -254,13 +254,19 @@ def main(args):
         if floor_kl is None:
             print(" -- histogram plots require the noise floor pass (noise_floor: true, non-llamacpp reference)")
         else:
+            # A label reused across groups (e.g. two checkpoints both labeled "NVFP4") is
+            # displayed by its group name instead, which is unique per entry in practice
+            label_groups = {}
+            for label, group, _ in model_kl_keys:
+                label_groups.setdefault(label, set()).add(group)
             hist_entries = []
             for label, group, results_key in model_kl_keys:
                 kl = cache.load_kl(results_key)
                 if kl is None:
                     print(f" -- histogram plots: no per-token KLD cached for {label}, skipping")
                     continue
-                hist_entries.append({"label": label, "group": group, "kl": kl, "floor_kl": floor_kl})
+                display = group if len(label_groups[label]) > 1 else label
+                hist_entries.append({"label": display, "group": group, "kl": kl, "floor_kl": floor_kl})
 
             path, _ = hist_specs["plot_kld_hist"]
             if path and hist_entries:
@@ -278,10 +284,12 @@ def main(args):
             if path and hist_entries:
                 entries = hist_entries
                 if opts.get("labels"):
+                    # Match on display label or group, so entries disambiguated by group can be
+                    # selected by either name
                     want = [str(w) for w in opts["labels"]]
-                    entries = [e for e in hist_entries if e["label"] in want]
+                    entries = [e for e in hist_entries if e["label"] in want or e["group"] in want]
                     for w in want:
-                        if not any(e["label"] == w for e in hist_entries):
+                        if not any(w in (e["label"], e["group"]) for e in hist_entries):
                             print(f" -- plot_kld_hist_combined: no model labeled {w!r}, skipping it")
                 if entries:
                     plot_kld_hist_combined(
