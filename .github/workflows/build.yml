@@ -17,6 +17,7 @@ on:
         options:
           - all
           - windows
+          - windows_smoke
           - cu132
           - sdist
 
@@ -67,6 +68,13 @@ jobs:
 
           if target == "windows":
               combos = [c for c in combos if c["os"] == "windows-2022"]
+          elif target == "windows_smoke":
+              # Single Windows compile check: one modern combo, one CUDA arch (the wheel is a
+              # build-validation artifact, never released, so arch coverage doesn't matter and
+              # dropping it cuts most of the nvcc time). Upload steps skip this target
+              # regardless of the release input.
+              combos = [dict(os = "windows-2022", pyver = "3.12", cuda = "12.8.1", rocm = "",
+                             torch = "2.11.0", cudaarch = "8.6")]
           elif target == "cu132":
               combos = [c for c in combos if c["cuda"] == "13.2.0"]
 
@@ -433,7 +441,7 @@ jobs:
           python verify_wheel_metadata.py
 
       - name: Upload wheel files to GitHub release
-        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
+        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1' && inputs.target != 'windows_smoke'
         uses: svenstaro/upload-release-action@2.6.1
         with:
           file: ./dist/*.whl
@@ -441,6 +449,15 @@ jobs:
           file_glob: true
           overwrite: true
           release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}
+
+      # Smoke builds never publish; the wheel lands as a workflow artifact instead so it can
+      # still be pulled onto a Windows machine for a manual import/functional check
+      - name: Upload wheel as workflow artifact (smoke build)
+        if: inputs.target == 'windows_smoke'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-wheel-py${{ matrix.pyver }}-cu${{ matrix.cuda }}-torch${{ matrix.torch }}
+          path: dist/*.whl
 
   build_sdist:
     name: sdist

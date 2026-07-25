@@ -25,8 +25,13 @@ extra_cuda_cflags = [
 ]
 
 if windows:
-    extra_cflags += ["/Ox", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN"]
-    extra_cuda_cflags += ["-DWIN32_LEAN_AND_MEAN", "-Xcompiler=/Zc:preprocessor"]
+    # NOMINMAX: windows.h otherwise defines min/max function-like macros that break every
+    # std::min/std::max call site parsed after it (WIN32_LEAN_AND_MEAN does not suppress them).
+    # Defined globally so it holds regardless of include order in any TU.
+    # No -std flags here: torch's cpp_extension appends its own (unconditionally on the Windows
+    # nvcc path), and a second -std argument is a fatal nvcc error, not an override.
+    extra_cflags += ["/Ox", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN", "/DNOMINMAX"]
+    extra_cuda_cflags += ["-DWIN32_LEAN_AND_MEAN", "-DNOMINMAX", "-Xcompiler=/Zc:preprocessor"]
     if ext_debug:
         extra_cflags += ["/Zi"]
         extra_cuda_cflags += []

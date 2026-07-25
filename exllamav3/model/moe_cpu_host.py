@@ -119,7 +119,13 @@ class _HugeArena:
     def _new_chunk(self, min_bytes):
         import mmap, os
         size = max(self.CHUNK_BYTES, (min_bytes + (2 << 20) - 1) & ~((2 << 20) - 1))
-        m = mmap.mmap(-1, size, mmap.MAP_PRIVATE, mmap.PROT_READ | mmap.PROT_WRITE)
+        if os.name == "nt":
+            # mmap.MAP_PRIVATE / mmap.PROT_* don't exist on Windows; an anonymous mapping is
+            # writable by default there. Hugepage promotion doesn't apply (promote_hugepages
+            # is already a no-op via its try/except), the arena still serves its pooling role
+            m = mmap.mmap(-1, size)
+        else:
+            m = mmap.mmap(-1, size, mmap.MAP_PRIVATE, mmap.PROT_READ | mmap.PROT_WRITE)
         self.chunks.append(m)
         self.cur = m
         self.cur_off = 0

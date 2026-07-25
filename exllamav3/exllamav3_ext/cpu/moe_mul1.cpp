@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <bit>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -16,13 +15,16 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
-#include <pthread.h>
-#include <sched.h>
 #include <string>
 #include <thread>
 #include <vector>
 
-#ifndef __linux__
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#else
+// min/max macro suppression is handled globally (-DNOMINMAX in setup.py): this TU uses
+// std::min/max/clamp throughout
 #include <intrin.h>
 #include <windows.h>
 #endif
@@ -763,12 +765,34 @@ Isa detect_isa()
     else
         hw = Isa::Scalar;
 #else
-    int info[4];
-    __cpuidex(info, 7, 0);
-    const bool avx512 = (info[1] & (1 << 16)) && (info[1] & (1 << 30)) && (info[1] & (1 << 31));
-    const bool vnni = (info[2] & (1 << 11)) != 0;
-    const bool avx2 = (info[1] & (1 << 5)) != 0;
-    hw = (avx512 && vnni) ? Isa::Vnni : (avx2 ? Isa::Avx2 : Isa::Scalar);
+    // __builtin_cpu_supports checks OS state-saving internally; this branch must do it by hand:
+    // CPUID feature bits report hardware capability only, so without OSXSAVE + XCR0 checks a
+    // hypervisor/OS that doesn't context-switch YMM/ZMM state would pass detection and fault at
+    // the first vector instruction. FMA (leaf 1) mirrors the Linux branch's avx2+fma gate.
+    int l0[4];
+    __cpuid(l0, 0);
+    if (l0[0] < 7)
+    {
+        hw = Isa::Scalar;
+    }
+    else
+    {
+        int l1[4];
+        __cpuid(l1, 1);
+        const bool osxsave = (l1[2] & (1u << 27)) != 0;
+        const bool fma = (l1[2] & (1u << 12)) != 0;
+        const uint64_t xcr0 = osxsave ? _xgetbv(0) : 0;
+        const bool ymm_os = (xcr0 & 0x06) == 0x06;          // XMM + YMM state
+        const bool zmm_os = (xcr0 & 0xe6) == 0xe6;          // + opmask, ZMM_Hi256, Hi16_ZMM
+        int info[4];
+        __cpuidex(info, 7, 0);
+        const bool avx512 = (info[1] & (1u << 16)) && (info[1] & (1u << 30)) && (info[1] & (1u << 31));
+        const bool vnni = (info[2] & (1u << 11)) != 0;
+        const bool avx2 = (info[1] & (1u << 5)) != 0;
+        hw = (avx512 && vnni && zmm_os) ? Isa::Vnni
+           : (avx2 && fma && ymm_os)    ? Isa::Avx2
+           :                              Isa::Scalar;
+    }
 #endif
 
     // EXL3_MOE_CPU_MAX_ISA=scalar|avx2|vnni: cap detection at a lower tier for testing (e.g.
