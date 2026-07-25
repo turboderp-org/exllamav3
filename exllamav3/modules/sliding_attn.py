@@ -191,8 +191,8 @@ class SWALayerState:
 
 
     def alloc(self, device):
-        self.k_state = torch.empty_like(self.k_state, device = device)
-        self.v_state = torch.empty_like(self.v_state, device = device)
+        self.k_state = torch.zeros_like(self.k_state, device = device)
+        self.v_state = torch.zeros_like(self.v_state, device = device)
         self.device = device
 
 
