@@ -143,6 +143,13 @@ def main(args, job_state):
     print(f"    Architecture: {config_ref.architecture}")
     model_ref = Model.from_config(config_ref)
     model_q = [Model.from_config(c) for c in config_q]
+    if any(m.caps.get("forward_side_channel") for m in [model_ref] + model_q):
+        print(
+            f" !! {col_red}Error: this architecture passes side-channel state between modules "
+            f"during the forward pass (e.g. per-layer embeddings or cross-layer KV sharing), "
+            f"which this tool's per-module streaming does not support.{col_default}"
+        )
+        raise SystemExit(1)
     print(f" -- Created model instances:")
     r_layout = model_ref.get_layout_tree(4)
     print(r_layout)

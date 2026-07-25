@@ -23,6 +23,9 @@ from ..modules.arch_specific.gemma4 import (
     Gemma4VisionPatchEmbedder,
     Gemma4VisionPooler,
     Gemma4UnifiedVisionEmbedder,
+    Gemma4PerLayerTokenEmbedding,
+    Gemma4PerLayerProjection,
+    Gemma4PerLayerInject,
 )
 from ..modules.attn import prepare_for_attn
 from ..tokenizer import MMEmbedding, Tokenizer
@@ -93,9 +96,29 @@ class Gemma4Config(Config):
         self.attn_logit_softcapping = self.read_cfg(float, "text_config->attn_logit_softcapping", 0.0)
         self.final_logit_softcapping = self.read_cfg(float, "text_config->final_logit_softcapping", 0.0)
 
+        # Per-layer embeddings (E4B and similar)
         self.hidden_size_per_layer_input = self.read_cfg(int, "text_config->hidden_size_per_layer_input", 0)
-        if self.hidden_size_per_layer_input:
-            raise NotImplementedError("Gemma4 per-layer inputs are not implemented yet")
+        self.vocab_size_per_layer_input = self.read_cfg(int, "text_config->vocab_size_per_layer_input", self.vocab_size)
+
+        # Cross-layer KV sharing (E4B and similar): the last num_kv_shared_layers layers have no K/V
+        # projections and reuse the KV state of the last preceding non-shared layer of the same type
+        self.num_kv_shared_layers = self.read_cfg(int, "text_config->num_kv_shared_layers", 0)
+        if self.num_kv_shared_layers > 0:
+            self.first_kv_shared_layer_idx = self.num_hidden_layers - self.num_kv_shared_layers
+        else:
+            self.first_kv_shared_layer_idx = self.num_hidden_layers
+        self.kv_shared_source_idx = []
+        for idx, layer_type in enumerate(self.layer_types):
+            if idx < self.first_kv_shared_layer_idx:
+                self.kv_shared_source_idx.append(None)
+            else:
+                sources = [
+                    j for j in range(self.first_kv_shared_layer_idx)
+                    if self.layer_types[j] == layer_type
+                ]
+                assert len(sources), \
+                    f"No KV source layer found for shared layer {idx} of type {layer_type}"
+                self.kv_shared_source_idx.append(sources[-1])
 
         self.enable_moe_block = self.read_cfg(bool, "text_config->enable_moe_block", False)
         self.num_experts = self.read_cfg(int, "text_config->num_experts", 0)
@@ -202,24 +225,59 @@ class Gemma4TextModel(Model):
         **kwargs
     ):
         super().__init__(config, **kwargs)
+
+        # TODO: Cross-layer KV sharing is not implemented for the recurrent SWA state path yet, so
+        #       sliding layers fall back to regular paged attention when KV sharing is active
+        if config.num_kv_shared_layers > 0:
+            swa_full = True
         self.swa_full = swa_full
 
         use_moe = config.enable_moe_block
+        use_ple = config.hidden_size_per_layer_input > 0
 
-        self.modules += [
-            Embedding(
+        self.embedding_module = Embedding(
+            config = config,
+            key = f"{key_prefix}.embed_tokens",
+            vocab_size = config.vocab_size,
+            hidden_size = config.hidden_size,
+            multiplier = torch.tensor(config.hidden_size ** 0.5, dtype = torch.bfloat16).float().item()
+        )
+        self.modules += [self.embedding_module]
+
+        self.ple_tok_module = None
+        self.ple_proj_module = None
+        if use_ple:
+            # The embedding module stays loaded during conversion: per_layer_quant_preamble
+            # recomputes the per-layer inputs from input IDs for every quantized module, and the
+            # context component of PLE is derived from the input embeddings
+            self.embedding_module.caps["retain_during_quant"] = True
+            self.ple_tok_module = Gemma4PerLayerTokenEmbedding(
                 config = config,
-                key = f"{key_prefix}.embed_tokens",
-                vocab_size = config.vocab_size,
-                hidden_size = config.hidden_size,
-                multiplier = torch.tensor(config.hidden_size ** 0.5, dtype = torch.bfloat16).float().item()
+                key = f"{key_prefix}.embed_tokens_per_layer",
+                vocab_size = config.vocab_size_per_layer_input,
+                num_layers = config.num_hidden_layers,
+                ple_dim = config.hidden_size_per_layer_input,
             )
-        ]
+            self.ple_proj_module = Gemma4PerLayerProjection(
+                config = config,
+                key = f"{key_prefix}.per_layer_model_projection",
+                key_norm = f"{key_prefix}.per_layer_projection_norm",
+                hidden_size = config.hidden_size,
+                num_layers = config.num_hidden_layers,
+                ple_dim = config.hidden_size_per_layer_input,
+                rms_norm_eps = config.rms_norm_eps,
+            )
+            self.modules += [self.ple_tok_module, self.ple_proj_module]
 
         self.first_block_idx = len(self.modules)
+        self.last_kv_block_idx = None
 
+        attn_modules = []
         for idx in range(config.num_hidden_layers):
             layer_is_full = config.layer_types[idx] == "full_attention"
+            kv_source_idx = config.kv_shared_source_idx[idx]
+            kv_source = attn_modules[kv_source_idx] if kv_source_idx is not None else None
+            store_shared_kv = idx in config.kv_shared_source_idx
 
             if swa_full or config.swa_pattern[idx] <= 0:
                 attn = Attention(
@@ -233,10 +291,10 @@ class Gemma4TextModel(Model):
                     rope_settings = config.rope_settings_global if layer_is_full else config.rope_settings_local,
                     logit_softcapping = config.attn_logit_softcapping,
                     sliding_window = config.swa_pattern[idx],
-                    use_k_as_v = layer_is_full and config.attention_k_eq_v,
+                    use_k_as_v = kv_source is None and layer_is_full and config.attention_k_eq_v,
                     key_q = "q_proj",
-                    key_k = "k_proj",
-                    key_v = "v_proj",
+                    key_k = "k_proj" if kv_source is None else None,
+                    key_v = "v_proj" if kv_source is None else None,
                     key_o = "o_proj",
                     qmap = "block.attn",
                     sm_scale = 1.0,
@@ -249,16 +307,20 @@ class Gemma4TextModel(Model):
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.self_attn.k_norm",
                         rms_norm_eps = config.rms_norm_eps,
-                    ),
+                    ) if kv_source is None else None,
                     v_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.self_attn.v_norm",
                         rms_norm_eps = config.rms_norm_eps,
                         unweighted = True,
-                    ),
+                    ) if kv_source is None else None,
                     select_hq_bits = 2 if use_moe else 0,
+                    kv_source = kv_source,
+                    store_shared_kv = store_shared_kv,
                 )
             else:
+                assert kv_source is None and not store_shared_kv, \
+                    "Cross-layer KV sharing is not implemented for SlidingAttention"
                 attn = SlidingAttention(
                     config = config,
                     key = f"{key_prefix}.layers.{idx}.self_attn",
@@ -294,6 +356,8 @@ class Gemma4TextModel(Model):
                     ),
                     select_hq_bits = 2 if use_moe else 0,
                 )
+
+            attn_modules.append(attn)
 
             mlp = GatedMLP(
                 config = config,
@@ -390,11 +454,23 @@ class Gemma4TextModel(Model):
                     rms_norm_eps = config.rms_norm_eps,
                     out_dtype = torch.float,
                 ),
+                ple = Gemma4PerLayerInject(
+                    config = config,
+                    key = f"{key_prefix}.layers.{idx}",
+                    layer_idx = idx,
+                    hidden_size = config.hidden_size,
+                    ple_dim = config.hidden_size_per_layer_input,
+                    rms_norm_eps = config.rms_norm_eps,
+                ) if use_ple else None,
             )
 
             self.modules.append(block)
+            if kv_source is None:
+                self.last_kv_block_idx = len(self.modules) - 1
 
-        self.last_kv_module_idx = len(self.modules) - 1
+        # Layers that reuse shared KV never write to the cache, so prefill can stop at the last
+        # block whose attention layer produces KV state
+        self.last_kv_module_idx = self.last_kv_block_idx
 
         self.modules += [
             RMSNorm(
@@ -422,9 +498,21 @@ class Gemma4TextModel(Model):
             self.calibration_all_experts = True
 
         self.caps.update({
-            "supports_tp": True,
+            # TP is not implemented for per-layer embeddings or cross-layer KV sharing (E4B)
+            "supports_tp": not use_ple and config.num_kv_shared_layers == 0,
             "atomic_mm_prefill": config.use_bidirectional_attention == "vision",
         })
+
+        if use_ple or config.num_kv_shared_layers > 0:
+            self.caps.update({
+                # Modules exchange state through params during the forward pass (per-layer inputs,
+                # shared K/V). Conversion supports this via per_layer_quant_preamble and
+                # quant_preserve, but neither the side-channel state nor the calibration input IDs
+                # survive a conversion checkpoint, so resuming is not possible. Tools that stream
+                # modules with per-module params (e.g. measure_model) are not supported at all
+                "can_resume_quant": False,
+                "forward_side_channel": True,
+            })
 
         # SWA layers are recurrent, optionally. Checkpoints are expensive so default to a longer interval
         self.recurrent_state_cls = None
@@ -438,10 +526,28 @@ class Gemma4TextModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        if self.config.hidden_size_per_layer_input:
+            params["g4_input_ids"] = input_ids
         _prepare_noncausal_mm_spans(input_ids, params)
         if not self.swa_full:
             prepare_for_recurrence(input_ids, params, self)
         return prepare_for_attn(input_ids, params)
+
+
+    @override
+    def per_layer_quant_preamble(self, params: dict):
+        # Conversion rebuilds params for every module pass; recompute the combined per-layer
+        # inputs from the calibration input IDs (the embedding and PLE modules are retained in
+        # memory throughout conversion). Shared K/V from layers that set store_shared_kv is
+        # carried across modules by the quant_preserve mechanism instead
+        if self.ple_proj_module is None or self.ple_proj_module.device is None:
+            return
+        if self.embedding_module.device is None or self.ple_tok_module.device is None:
+            return
+        x = self.embedding_module.forward(params["input_ids"], params)
+        x = self.ple_tok_module.forward(x, params)
+        x = self.ple_proj_module.prepare_for_device(x, params)
+        self.ple_proj_module.forward(x, params)
 
 
     @override

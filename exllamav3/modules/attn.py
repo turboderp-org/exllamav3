@@ -183,7 +183,9 @@ class Attention(Module):
         gate_softplus: bool = False,
         tp_split_norm: bool = True,
         select_hq_bits: int = 0,
-        qbits_key: str = "bits"
+        qbits_key: str = "bits",
+        kv_source: "Attention | None" = None,
+        store_shared_kv: bool = False,
     ):
         super().__init__(config, key, None)
 
@@ -212,6 +214,15 @@ class Attention(Module):
             "Attn: gate_softplus is only implemented for the headwise gate"
         self.key_sinks = key_sinks
         self.sinks = None
+
+        # Cross-layer KV sharing (Gemma4 E4B): a layer with kv_source set has no K/V projections of its
+        # own; it reuses the post-norm, post-RoPE K/V that the source layer stashed in params during the
+        # current forward pass, and (in cached mode) reads/appends via the source layer's cache index. A
+        # layer with store_shared_kv set stashes its K/V for downstream sharing layers.
+        self.kv_source = kv_source
+        self.store_shared_kv = store_shared_kv
+        assert kv_source is None or (key_k is None and key_v is None and k_proj is None and v_proj is None), \
+            "Attention layer with kv_source cannot also have K/V projections"
 
         if post_rope_norm:
             assert q_norm is None and k_norm is None, \
@@ -317,7 +328,7 @@ class Attention(Module):
 
         # Register q/k norms
         if q_norm:
-            assert k_norm, "Must have both Q and K norms, or neither"
+            assert k_norm or self.kv_source is not None, "Must have both Q and K norms, or neither"
             self.q_norm = q_norm
             self.k_norm = k_norm
             self.register_submodule(self.q_norm)
@@ -325,7 +336,7 @@ class Attention(Module):
             if isinstance(q_norm, RMSNorm):
                 self.norm_eps = q_norm.rms_norm_eps
                 self.norm_constant_bias = q_norm.constant_bias
-                assert self.norm_eps == k_norm.rms_norm_eps
+                assert k_norm is None or self.norm_eps == k_norm.rms_norm_eps
             else:
                 self.norm_eps = q_norm.layernorm_eps
                 self.norm_constant_bias = 0.0
@@ -370,9 +381,10 @@ class Attention(Module):
                 self.g_proj = None
                 self.headwise_gate = False
 
-        self.caps.update({
-            "kv_cache": True
-        })
+        if self.kv_source is None:
+            self.caps.update({
+                "kv_cache": True
+            })
 
         self.cache_layers = []
         self.tp_cache_lookup = {}
@@ -401,9 +413,11 @@ class Attention(Module):
     @override
     def optimizer_targets(self):
         q = self.q_proj.optimizer_targets()
-        k = self.k_proj.optimizer_targets()
-        v = self.v_proj.optimizer_targets()
         o = self.o_proj.optimizer_targets()
+        if self.kv_source is not None:
+            return [[q, o]]
+        k = self.k_proj.optimizer_targets()
+        v = self.v_proj.optimizer_targets() if self.v_proj is not None else []
         return [[q, k + v, o]]
 
 
@@ -431,6 +445,7 @@ class Attention(Module):
         if (
             not self.config.infer_params.no_reconstruct and
             not self.use_k_as_v and
+            self.kv_source is None and
             device != torch.device("cpu") and
             self.k_proj.quant_type == "exl3" and
             self.v_proj is not None and
@@ -472,7 +487,7 @@ class Attention(Module):
             self.prealloc_qg_1 = g_tensor_cache.get(device, (2, 1, self.num_q_heads * self.head_dim), torch.half, "qg_1")
 
         # Head norm
-        if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
+        if self.q_norm and self.k_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
             self.q_norm_tensor = self.q_norm.weight.data
             self.k_norm_tensor = self.k_norm.weight.data
 
@@ -600,6 +615,10 @@ class Attention(Module):
             )
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
+
+        if self.kv_source is not None:
+            q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
+            return q, None, None, g
 
         if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
@@ -743,7 +762,8 @@ class Attention(Module):
                 q, k = self.apply_qk_norms_tp(q, k, params)
             elif not self.rope or self.q_norm_tensor is None:
                 q = self.q_norm.forward(q, params, out_dtype = torch.half)
-                k = self.k_norm.forward(k, params, out_dtype = torch.half)
+                if self.k_norm is not None:
+                    k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
             q, k = self.rope.apply(
@@ -760,11 +780,33 @@ class Attention(Module):
                 self.post_rope_norm
             )
 
-        if simulate_kv_quant:
+        if simulate_kv_quant and k is not None:
             # (k_bits, v_bits) or (k_bits, v_bits, compand_a)
             sq_ca = simulate_kv_quant[2] if len(simulate_kv_quant) > 2 else 0.0
             _sim_kvq_inplace(k, simulate_kv_quant[0], sq_ca)
             _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
+
+        if self.store_shared_kv:
+            params[f"g4_shared_kv.{self.layer_idx}"] = (k, v)
+            if "quant_preserve" in params:
+                # Conversion rebuilds params per module; carry the shared K/V forward to the
+                # consumer layers' capture/forward passes. Kept on device: ~16 MB per calibration
+                # row for Gemma4 E4B
+                params["quant_preserve"][f"g4_shared_kv.{self.layer_idx}"] = (k, v)
+        if self.kv_source is not None:
+            # Without a cache there is no history, so moving the source K/V is sufficient for
+            # correctness when a layer split puts the source on another device
+            shared = params.get(f"g4_shared_kv.{self.kv_source.layer_idx}")
+            if shared is None:
+                raise RuntimeError(
+                    f"Layer {self.layer_idx} expects shared K/V from layer {self.kv_source.layer_idx}, "
+                    f"but none was stashed in this forward pass. The source layer must run before "
+                    f"this layer within the same forward pass (or its state must be carried over "
+                    f"via quant_preserve during conversion)."
+                )
+            k, v = shared
+            k = k.to(q.device)
+            v = v.to(q.device)
 
         o = attn_dispatch(
             q = q,
@@ -842,8 +884,11 @@ class Attention(Module):
 
         # Graph-captured C++ path for the whole decode attention block (causality is baked
         # into the slot kernels, so non-causal callers like the DFlash draft graph too)
+        # Layers that produce or consume shared KV take the regular python path: the consumer
+        # needs the producer's K/V stashed in params, which the graph-captured path bypasses
         if (
             _bc_attn_enable and non_causal_spans is None and
+            self.kv_source is None and not self.store_shared_kv and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens)
@@ -863,7 +908,8 @@ class Attention(Module):
                 q, k = self.apply_qk_norms_tp(q, k, params)
             elif not self.rope or self.q_norm_tensor is None:
                 q = self.q_norm.forward(q, params, out_dtype = torch.half)
-                k = self.k_norm.forward(k, params, out_dtype = torch.half)
+                if self.k_norm is not None:
+                    k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
             q, k = self.rope.apply(
@@ -880,18 +926,43 @@ class Attention(Module):
                 self.post_rope_norm
             )
 
-        if simulate_kv_quant:
+        if simulate_kv_quant and k is not None:
             # (k_bits, v_bits) or (k_bits, v_bits, compand_a)
             sq_ca = simulate_kv_quant[2] if len(simulate_kv_quant) > 2 else 0.0
             _sim_kvq_inplace(k, simulate_kv_quant[0], sq_ca)
             _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
+
+        if self.store_shared_kv:
+            params[f"g4_shared_kv.{self.layer_idx}"] = (k, v)
+            if "quant_preserve" in params:
+                params["quant_preserve"][f"g4_shared_kv.{self.layer_idx}"] = (k, v)
+        if self.kv_source is not None:
+            # Reuse the source layer's K/V for the current tokens and attend through the source
+            # layer's cache. The dispatch re-appends the same rows the source layer already wrote,
+            # which is idempotent, so no special-casing of the cache update is needed
+            shared = params.get(f"g4_shared_kv.{self.kv_source.layer_idx}")
+            if shared is None:
+                raise RuntimeError(
+                    f"Layer {self.layer_idx} expects shared K/V from layer {self.kv_source.layer_idx}, "
+                    f"but none was stashed in this forward pass."
+                )
+            k, v = shared
+            if k.device != q.device:
+                # The source layer's paged cache history lives on the source device and cannot be
+                # migrated per token, so cached attention requires co-location
+                raise RuntimeError(
+                    f"KV-sharing layer {self.layer_idx} (device {q.device}) is on a different device "
+                    f"than its source layer {self.kv_source.layer_idx} (device {k.device}). Cached "
+                    f"inference requires KV-sharing layers to be on the same device as their source "
+                    f"layer; adjust the model split accordingly."
+                )
 
         o = attn_dispatch(
             q = q,
             k = k,
             v = v,
             cache = cache,
-            cache_idx = self.layer_idx,
+            cache_idx = self.layer_idx if self.kv_source is None else self.kv_source.layer_idx,
             cache_instance = params.get("layer_instance"),
             block_table = block_table,
             cache_seqlens = cache_seqlens,
@@ -915,6 +986,8 @@ class Attention(Module):
 
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
+        assert self.kv_source is None and not self.store_shared_kv, \
+            "TP is not implemented for models with cross-layer KV sharing"
         storage = 0
         storage += self.q_proj.storage_size()
         storage += self.k_proj.storage_size()

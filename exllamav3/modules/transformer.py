@@ -22,6 +22,7 @@ class TransformerBlock(Module):
         mlp_norm: RMSNorm | LayerNorm | None = None,
         mlp: MLP | GatedMLP | BlockSparseMLP | None = None,
         mlp_post_norm: RMSNorm | LayerNorm | None = None,
+        ple: Module | None = None,
         backout_extract: bool = False,
         backout_lambda: float | None = None,
         key_layer_scalar: str | None = None,
@@ -43,6 +44,7 @@ class TransformerBlock(Module):
         self.mlp_norm = mlp_norm
         self.mlp = mlp
         self.mlp_post_norm = mlp_post_norm
+        self.ple = ple
         self.backout_extract = backout_extract
         self.backout_lambda = backout_lambda
         self.qbits_key = qbits_key
@@ -63,6 +65,7 @@ class TransformerBlock(Module):
         self.register_submodule(self.mlp_norm)
         self.register_submodule(self.mlp)
         self.register_submodule(self.mlp_post_norm)
+        self.register_submodule(self.ple)
 
         self.num_slices = mlp.num_slices if mlp else 1
 
@@ -216,6 +219,11 @@ class TransformerBlock(Module):
             else:
                 x += y
 
+        # Per-layer embedding injection (Gemma4 E4B): applied to the residual stream after the MLP,
+        # before the layer scalar
+        if self.ple is not None:
+            x = self.ple.forward(x, params)
+
         if export_state:
             s = params.get("export_states")
             if not s:
@@ -245,6 +253,7 @@ class TransformerBlock(Module):
 
     def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
+        assert self.ple is None, "TP export of TransformerBlock with per-layer embeddings is not implemented"
 
         def _export(child):
             nonlocal producer
