@@ -91,6 +91,8 @@ class Gemma4Config(Config):
 
         self.assert_cfg(str, "text_config->hidden_activation", "gelu_pytorch_tanh", True)
         self.intermediate_size = self.read_cfg(int, "text_config->intermediate_size", no_default)
+        # E2B and similar: KV-shared layers have a double-width MLP
+        self.use_double_wide_mlp = self.read_cfg(bool, "text_config->use_double_wide_mlp", False)
 
         self.rms_norm_eps = self.read_cfg(float, "text_config->rms_norm_eps", no_default)
         self.attn_logit_softcapping = self.read_cfg(float, "text_config->attn_logit_softcapping", 0.0)
@@ -359,11 +361,14 @@ class Gemma4TextModel(Model):
 
             attn_modules.append(attn)
 
+            layer_intermediate_size = config.intermediate_size * \
+                (2 if config.use_double_wide_mlp and kv_source is not None else 1)
+
             mlp = GatedMLP(
                 config = config,
                 key = f"{key_prefix}.layers.{idx}.mlp",
                 hidden_size = config.hidden_size,
-                intermediate_size = config.intermediate_size,
+                intermediate_size = layer_intermediate_size,
                 key_up = "up_proj",
                 key_gate = "gate_proj",
                 key_down = "down_proj",
