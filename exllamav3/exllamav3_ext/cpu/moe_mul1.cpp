@@ -453,15 +453,16 @@ void vnni_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
     const int tiles_n = mat.n / 16;
     constexpr int packed_size = 16 * bits;
     constexpr int words32 = bits * 256 / 32;
-    constexpr auto ld_mask = [](int lo) -> __mmask16
+    // The remaining-word count is computed at the call sites: MSVC rejects reading even a
+    // constexpr local inside a capture-less lambda (C3493), unlike GCC/clang
+    constexpr auto ld_mask = [](int n) -> __mmask16
     {
-        const int n = words32 - lo;
         return n >= 16 ? 0xffffu : (n <= 0 ? 0x0000u : static_cast<__mmask16>((1u << n) - 1u));
     };
-    constexpr __mmask16 mask0 = ld_mask(0);
-    constexpr __mmask16 mask1 = ld_mask(16);
-    constexpr __mmask16 mask2 = ld_mask(32);
-    constexpr __mmask16 mask3 = ld_mask(48);
+    constexpr __mmask16 mask0 = ld_mask(words32 - 0);
+    constexpr __mmask16 mask1 = ld_mask(words32 - 16);
+    constexpr __mmask16 mask2 = ld_mask(words32 - 32);
+    constexpr __mmask16 mask3 = ld_mask(words32 - 48);
 
     __m512i acc[band][MAX_M];
     for (int b = 0; b < band; ++b)
