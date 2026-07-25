@@ -205,7 +205,12 @@ def get_test_ids(project: dict, cache: QCache):
 
     prefix_len = 0
     if tok.get("template"):
-        ids = prepend_hf_chat_context(tokenizer, ids)
+        # template: true wraps rows after a bare generation prompt; template: assistant embeds
+        # them as an unterminated assistant message (in-distribution for structured formats
+        # like gpt-oss harmony, equivalent otherwise)
+        mode = "assistant" if tok.get("template") == "assistant" else "generation"
+        ids = prepend_hf_chat_context(tokenizer, ids, mode = mode,
+                                      prompt = tok.get("prompt", "Say something."))
         prefix_len = ids.shape[-1] - length
 
     save_tensors(tokens_file, {"ids": ids, "prefix_len": torch.tensor([prefix_len])})
@@ -216,6 +221,8 @@ def dataset_subtitle(project: dict) -> str:
     td = project["test_data"]
     name = DATASETS[td["source"].lower()]["display_name"]
     st = f"{name}, {td['rows']} × {td['length']} tokens"
-    if project["tokenizer"].get("template"):
+    if project["tokenizer"].get("template") == "assistant":
+        st += ", assistant-framed"
+    elif project["tokenizer"].get("template"):
         st += ", formatted"
     return st

@@ -848,21 +848,22 @@ def plot(results, args):
 # ---------------------------------------------------------------------------------------------
 # KLD spread chart
 
-def default_spread_caption(floor) -> str:
+def default_spread_caption(floor, ref_desc = "bf16") -> str:
+    ref_name = "unquantized" if ref_desc == "bf16" else ref_desc
     cap = (
-        "Per-token KL divergence between each quantized model and the unquantized reference. The solid line follows the median token, with a shaded "
+        f"Per-token KL divergence between each quantized model and the {ref_name} reference. The solid line follows the median token, with a shaded "
         "p25–p75 band; the dotted line is the mean, running above the median when divergence is heavy-tailed, "
         "concentrating in tokens where the reference itself is undecided."
     )
     if floor is not None:
         cap += (
-            " Gray dotted lines mark the reference's self-noise floor: the divergence the bf16 model shows against itself when perturbed at the scale "
-            "of its own rounding error. The right-hand scale expresses divergence as a multiple of that floor."
+            f" Gray dotted lines mark the reference's self-noise floor: the divergence the {ref_desc} reference shows against itself when perturbed at the scale "
+            "of bf16 rounding error. The right-hand scale expresses divergence as a multiple of that floor."
         )
     return cap
 
 
-def plot_kld_spread(results: list, title: str, subtitle: str, dark: bool, plot_file: str, caption: str | bool = True, vram: bool = False):
+def plot_kld_spread(results: list, title: str, subtitle: str, dark: bool, plot_file: str, caption: str | bool = True, vram: bool = False, ref_desc: str = "bf16"):
     """
     KLD vs bpw with the per-token spread: solid median line with a shaded p25-p75 band per group
     (log scale - the spread covers orders of magnitude), the mean as a faint dotted line, and
@@ -1011,7 +1012,7 @@ def plot_kld_spread(results: list, title: str, subtitle: str, dark: bool, plot_f
     _add_spread_point_labels(fig, ax, label_rows, line_df, dark, palette, extra_obstacles)
 
     if caption is not False:
-        text = caption if isinstance(caption, str) else default_spread_caption(floor)
+        text = caption if isinstance(caption, str) else default_spread_caption(floor, ref_desc)
         fig.text(
             0.09, 0.094,
             "\n".join(textwrap.wrap(text, width = 158)),
@@ -1026,10 +1027,10 @@ def plot_kld_spread(results: list, title: str, subtitle: str, dark: bool, plot_f
 # ---------------------------------------------------------------------------------------------
 # (KLD - noise floor) histogram grid
 
-def default_hist_caption() -> str:
+def default_hist_caption(ref_desc = "bf16") -> str:
     return (
         "Distribution over all scored tokens of the per-token KL divergence minus the reference's self-noise-floor divergence at the same token. "
-        "Zero (dashed line) means the quantized model diverges from the reference no more than a bf16-rounding-scale perturbation of the reference "
+        f"Zero (dashed line) means the quantized model diverges from the {ref_desc} reference no more than a bf16-rounding-scale perturbation of the reference "
         "itself does; mass to the right of it is divergence attributable to quantization. Each panel is trimmed to its own p1–p99 range "
         "(100 bins, log count scale); the dotted line marks the median."
     )
@@ -1054,13 +1055,14 @@ def _drape(y: np.ndarray, g: float, max_iters: int = 5000) -> np.ndarray:
     return y
 
 
-def default_hist_combined_caption(x_log: bool, y_log: bool) -> str:
+def default_hist_combined_caption(x_log: bool, y_log: bool, ref_desc = "bf16") -> str:
     x_desc = (
         "uniform on the log x axis"
         if x_log else "uniform on the linear x axis"
     )
+    ref_name = "unquantized" if ref_desc == "bf16" else ref_desc
     return (
-        f"Per-token KL divergence against the unquantized reference, histogram per model: 120 shared bins, {x_desc}, "
+        f"Per-token KL divergence against the {ref_name} reference, histogram per model: 120 shared bins, {x_desc}, "
         "cropped to the models' p1–p99 range. The dotted gray line is the noise floor: the divergence of the reference "
         "against itself under bf16-rounding-scale perturbation; its lower tail may run off the left edge."
     )
@@ -1068,7 +1070,7 @@ def default_hist_combined_caption(x_log: bool, y_log: bool) -> str:
 
 def plot_kld_hist_combined(
     entries: list, title: str, subtitle: str, dark: bool, plot_file: str,
-    caption: str | bool = True, x_log: bool = True, y_log: bool = False,
+    caption: str | bool = True, x_log: bool = True, y_log: bool = False, ref_desc: str = "bf16",
 ):
     """
     All models' per-token raw KLD histograms as draped lines on one chart, group-colored,
@@ -1258,7 +1260,7 @@ def plot_kld_hist_combined(
         _draw_leader(ax, anchor, center, palette[r["group"]])
 
     if caption is not False:
-        text = caption if isinstance(caption, str) else default_hist_combined_caption(x_log, y_log)
+        text = caption if isinstance(caption, str) else default_hist_combined_caption(x_log, y_log, ref_desc)
         fig.text(
             0.075, 0.094,
             "\n".join(textwrap.wrap(text, width = 158)),
@@ -1270,7 +1272,7 @@ def plot_kld_hist_combined(
     plt.close(fig)
 
 
-def plot_kld_hist(entries: list, title: str, subtitle: str, dark: bool, plot_file: str, caption: str | bool = True):
+def plot_kld_hist(entries: list, title: str, subtitle: str, dark: bool, plot_file: str, caption: str | bool = True, ref_desc: str = "bf16"):
     """
     One histogram panel per quantized model of the token-paired excess divergence
     (per-token KLD minus the noise floor's per-token KLD). entries: dicts with label, group,
@@ -1350,7 +1352,7 @@ def plot_kld_hist(entries: list, title: str, subtitle: str, dark: bool, plot_fil
         )
 
     if caption is not False:
-        text = caption if isinstance(caption, str) else default_hist_caption()
+        text = caption if isinstance(caption, str) else default_hist_caption(ref_desc)
         fig.text(
             0.065, (bottom_in - 0.85) / fig_h,
             "\n".join(textwrap.wrap(text, width = 158)),

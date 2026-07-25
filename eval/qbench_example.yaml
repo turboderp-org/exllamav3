@@ -14,7 +14,7 @@ test_data:
 tokenizer:
   # Directory containing HF tokenizer, usually the HF reference model
   source: hf_model/
-  # (Loosely) apply model's chat template to all test rows
+  # (Loosely) apply model's chat template to all test rows, or use assistant-framing. Choices: true/false/assistant
   template: true
 
 logit_cache:

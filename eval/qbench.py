@@ -166,6 +166,12 @@ def main(args):
 
     # ------ Output
     output = project.get("output", {})
+
+    # reference_quant: names the reference's own native quantization (e.g. "mxfp4" for
+    # gpt-oss) so chart captions say "bf16/mxfp4 reference" instead of implying an
+    # unquantized bf16 baseline
+    ref_quant = project.get("reference_quant")
+    ref_desc = f"bf16/{ref_quant}" if ref_quant else "bf16"
     if output.get("results"):
         with open(output["results"], "w") as f:
             json.dump(all_results, f, indent = 2)
@@ -239,6 +245,7 @@ def main(args):
                 output[spread_key],
                 caption = output.get("caption", True),
                 vram = spread_vram,
+                ref_desc = ref_desc,
             )
             print(f" -- Saved plot: {output[spread_key]}")
 
@@ -277,6 +284,7 @@ def main(args):
                     output.get("dark", True),
                     path,
                     caption = output.get("caption", True),
+                    ref_desc = ref_desc,
                 )
                 print(f" -- Saved plot: {path}")
 
@@ -301,6 +309,7 @@ def main(args):
                         caption = output.get("caption", True),
                         x_log = opts.get("x_log", True),
                         y_log = opts.get("y_log", False),
+                        ref_desc = ref_desc,
                     )
                     print(f" -- Saved plot: {path}")
 

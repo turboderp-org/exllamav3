@@ -178,6 +178,10 @@ class TransformersBackend:
                     # AutoFP8/DeepSeek-style: fp8-e4m3 weights with blockwise (typically
                     # 128x128) weight_scale_inv, unquantized modules stay plain bf16
                     self.dequant_scaled = True
+                elif qm == "mxfp4":
+                    # gpt-oss-style: MoE expert tensors stored as <name>_blocks (packed fp4
+                    # e2m1 pairs) + <name>_scales (e8m0); resolved per-tensor by sidecar
+                    pass
                 else:
                     raise ValueError(f"Streaming does not support this quantization_config: {qm}")
                 delattr(config, "quantization_config")
@@ -315,6 +319,8 @@ class TransformersBackend:
         sum_bits = sum_numel = head_bits = head_numel = 0
         embed_bits = embed_numel = 0
         for name, p in self.model.named_parameters():
+            if name.endswith(".bias") or name.endswith("_bias"):
+                continue
             bits = None
             if self.streaming:
                 bits = self._stored_bits(name)
@@ -467,6 +473,8 @@ class TransformersBackend:
             bits = [8 * self._nbytes(f"{stem}.{s}") for s in self.CT_SUFFIXES if f"{stem}.{s}" in self.tensor_index]
             if bits:
                 return sum(bits)
+        if f"{name}_blocks" in self.tensor_index:
+            return 8 * (self._nbytes(f"{name}_blocks") + self._nbytes(f"{name}_scales"))
         if name == self.head_weight_name and self.embed_weight_name in self.tensor_index:
             return 8 * self._nbytes(self.embed_weight_name)
         for target, sources, ops in self.converters:
@@ -494,6 +502,14 @@ class TransformersBackend:
             return self._read_shard(name)
         if name == self.head_weight_name and self.embed_weight_name in self.tensor_index:
             return self._read_shard(self.embed_weight_name)  # tied embeddings
+
+        # gpt-oss-style MXFP4 (<name>_blocks + <name>_scales, e.g. mlp.experts.gate_up_proj):
+        # transformers' own converter handles the fp4-pair unpack, e8m0 ldexp and the transpose
+        # into module orientation
+        if f"{name}_blocks" in self.tensor_index:
+            from transformers.integrations.mxfp4 import convert_moe_packed_tensors
+            return convert_moe_packed_tensors(
+                self._read_shard(f"{name}_blocks"), self._read_shard(f"{name}_scales"))
 
         # compressed-tensors packed weight: nvfp4 when a global scale exists, int otherwise
         if name.endswith(".weight"):

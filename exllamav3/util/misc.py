@@ -247,16 +247,35 @@ def parse_int_list(
     return result
 
 
-def prepend_hf_chat_context(tokenizer, tokens: torch.Tensor):
-    prefix = tokenizer.hf_chat_template(
-        [
-            {"role": "system", "content": ""},
-            {"role": "user", "content": "Say something."},
-        ],
-        add_special_tokens = True,
-        add_generation_prompt = True,
-        return_tensors = "pt"
-    )
+def prepend_hf_chat_context(tokenizer, tokens: torch.Tensor, mode: str = "generation",
+                            prompt: str = "Say something."):
+    """
+    mode "generation": context ends at the bare generation prompt (e.g. "<|start|>assistant"),
+    so appended raw text sits where a role/channel header belongs -- badly out of distribution
+    for structured-format models (gpt-oss harmony expects "<|channel|>" next with near
+    certainty). mode "assistant": renders an unterminated empty assistant message instead
+    (continue_final_message), so the appended text lands at message-content position (gpt-oss:
+    "...assistant<|channel|>final<|message|>"); equivalent to "generation" for plain templates.
+    """
+    messages = [
+        {"role": "system", "content": ""},
+        {"role": "user", "content": prompt},
+    ]
+    if mode == "assistant":
+        prefix = tokenizer.hf_chat_template(
+            messages + [{"role": "assistant", "content": ""}],
+            add_special_tokens = True,
+            add_generation_prompt = False,
+            continue_final_message = True,
+            return_tensors = "pt"
+        )
+    else:
+        prefix = tokenizer.hf_chat_template(
+            messages,
+            add_special_tokens = True,
+            add_generation_prompt = True,
+            return_tensors = "pt"
+        )
     prefix = prefix.repeat(tokens.shape[0], 1)
     tokens = torch.cat((prefix, tokens), dim = -1)
     return tokens
