@@ -69,7 +69,10 @@ def resolve_project_paths(project: dict, project_file: str):
     base = os.path.dirname(os.path.abspath(project_file))
     def resolve(p):
         return p if os.path.isabs(p) else os.path.normpath(os.path.join(base, p))
-    project["tokenizer"]["source"] = resolve(project["tokenizer"]["source"])
+    if project.get("tokenizer"):
+        project["tokenizer"]["source"] = resolve(project["tokenizer"]["source"])
+    if project.get("test_trace"):
+        project["test_trace"] = resolve(project["test_trace"])
     project["logit_cache"]["dir"] = resolve(project["logit_cache"]["dir"])
     for m in project["models"]:
         m["source"] = resolve(m["source"])
@@ -165,6 +168,35 @@ class QCache:
             total -= size
 
 
+def get_test_rows(project: dict, cache: QCache):
+    """
+    Test rows as (ids [rows, max_len] right-padded, ranges, vocab_size_or_None): per row,
+    metrics run over logits positions [a, b). From `test_trace` (a qbench_prompts.py trace:
+    variable-length (context, response) pairs, scored only on the sampled response positions -
+    padding beyond b is causally inert), or from the classic test_data/tokenizer spec (uniform
+    rows, scored from the chat-context prefix onward).
+    """
+    if project.get("test_trace"):
+        with open(project["test_trace"], "r") as f:
+            trace = json.load(f)
+        rows = trace["rows"]
+        assert rows, "test_trace contains no rows"
+        max_len = max(len(r["input_ids"]) + len(r["response_ids"]) for r in rows)
+        ids = torch.zeros((len(rows), max_len), dtype = torch.long)
+        ranges = []
+        for i, r in enumerate(rows):
+            seq = r["input_ids"] + r["response_ids"]
+            ids[i, :len(seq)] = torch.tensor(seq, dtype = torch.long)
+            p = len(r["input_ids"])
+            # logits at [p-1, p+R) predict exactly the R sampled tokens (plus the final
+            # next-token distribution, mirroring the classic mode's inclusive end)
+            ranges.append((p - 1, len(seq)))
+        return ids, ranges, trace.get("vocab_size")
+
+    ids, prefix_len = get_test_ids(project, cache)
+    return ids, [(prefix_len, ids.shape[-1])] * ids.shape[0], None
+
+
 def get_test_ids(project: dict, cache: QCache):
     """
     Tokenized test rows, cached by (dataset spec, tokenizer, template flag). Returns
@@ -218,6 +250,11 @@ def get_test_ids(project: dict, cache: QCache):
 
 
 def dataset_subtitle(project: dict) -> str:
+    if project.get("test_trace"):
+        with open(project["test_trace"], "r") as f:
+            meta = json.load(f).get("meta", {})
+        return (f"self-generated in-domain trace, {meta.get('input_tokens', 0):,} input + "
+                f"{meta.get('output_tokens', 0):,} output tokens")
     td = project["test_data"]
     name = DATASETS[td["source"].lower()]["display_name"]
     st = f"{name}, {td['rows']} × {td['length']} tokens"

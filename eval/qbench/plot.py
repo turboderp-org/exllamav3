@@ -1110,7 +1110,12 @@ def plot_kld_hist_combined(
 
     # Bounds from the MODELS only: everything left of their range is uninteresting (the
     # floor's lower tail), so the axis crops there and the floor line clips off the edge
-    gmin = max(min(d.min() for _, d in trimmed), 1e-9)
+    # Left edge from the smallest POSITIVE value: exact-zero tokens are common (and the fp16
+    # KLD sidecars flush everything below ~6e-8 to zero anyway), so a min() over raw values
+    # collapses to the 1e-9 fallback and opens a structurally empty band on a log axis between
+    # 1e-9 and the smallest representable positive value
+    pos_mins = [float(d[d > 0].min()) for _, d in trimmed if bool((d > 0).any())]
+    gmin = max(min(pos_mins) if pos_mins else 1e-9, 1e-9)
     gmax = max(d.max() for _, d in trimmed)
 
     if x_log:

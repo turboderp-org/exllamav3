@@ -17,6 +17,9 @@ tokenizer:
   # (Loosely) apply model's chat template to all test rows, or use assistant-framing. Choices: true/false/assistant
   template: true
 
+# Set `test_trace` and omit `test_data` and `tokenizer` to use an in-domain testset produced by qbench_prompts.py
+#test_trace: qbench_prompts.json
+
 logit_cache:
   # Directory to store reference model logits for test data split defined above
   dir: _logit_cache/

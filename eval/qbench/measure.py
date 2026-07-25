@@ -28,9 +28,9 @@ class DiffStats:
     """Accumulates ppl over the model's own logits, and (if a reference store is given) KLD vs
     the reference, per-token, bucketed by the reference's top-token probability."""
 
-    def __init__(self, ids: torch.Tensor, prefix_len: int, vocab_size: int, ref_store: str | None):
+    def __init__(self, ids: torch.Tensor, ranges: list, vocab_size: int, ref_store: str | None):
         self.ids = ids
-        self.prefix_len = prefix_len
+        self.ranges = ranges          # per row: (a, b) - score logits positions [a, b)
         self.vocab_size = vocab_size
         self.ref_store = ref_store
         self.logprob_sum = 0.0
@@ -40,12 +40,13 @@ class DiffStats:
         self.conf_toks = []
 
     def __call__(self, r: int, logits: torch.Tensor):
-        logits = logits[:, self.prefix_len:, :].float()
+        a, b = self.ranges[r]
+        logits = logits[:, a:b, :].float()
         logits.clamp_(min = -200.0)
 
         # ppl on own logits. Non-finite positions (a model NaN-ing on some input, e.g. fp16
         # overflow in a backend) are excluded and counted rather than poisoning the aggregate
-        targets = self.ids[r, self.prefix_len + 1:].view(1, -1).to(logits.device)
+        targets = self.ids[r, a + 1:b].view(1, -1).to(logits.device)
         lp = compute_target_log_probs(logits[:, :-1, :], targets, min(self.vocab_size, logits.shape[-1]))
         finite = torch.isfinite(lp)
         self.logprob_sum += lp[finite].sum().item()
@@ -108,8 +109,8 @@ class DiffStats:
         return res
 
 
-def save_reference_row(store_dir: str, r: int, logits: torch.Tensor, prefix_len: int, conf_rows: list):
-    logits = logits[:, prefix_len:, :].float()
+def save_reference_row(store_dir: str, r: int, logits: torch.Tensor, rng: tuple, conf_rows: list):
+    logits = logits[:, rng[0]:rng[1], :].float()
     logits.clamp_(min = -200.0)
     # reference top-token probability per position, for the confidence buckets
     l2 = logits.squeeze(0)

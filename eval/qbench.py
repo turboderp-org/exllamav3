@@ -38,7 +38,7 @@ Relative paths in the project file resolve against the project file's directory.
 from qbench.data import (
     QCache,
     dataset_subtitle,
-    get_test_ids,
+    get_test_rows,
     resolve_project_paths,
     save_tensors,
     sha_key,
@@ -66,12 +66,18 @@ def main(args):
     device = torch.device("cuda", args.device)
     cache = QCache(project["logit_cache"])
 
-    ids, prefix_len = get_test_ids(project, cache)
+    ids, ranges, trace_vocab = get_test_rows(project, cache)
     max_len = ids.shape[-1] + 64
-    data_key = sha_key({"v": 1, "test_data": project["test_data"], "tokenizer": project["tokenizer"]})
-
-    from exllamav3 import Config as Exl3Config, Tokenizer as Exl3Tokenizer
-    vocab_size = Exl3Tokenizer.from_config(Exl3Config.from_directory(project["tokenizer"]["source"])).actual_vocab_size
+    if project.get("test_trace"):
+        data_key = sha_key({"v": 1, "test_trace": os.path.basename(project["test_trace"]),
+                            "stamp": source_stamp(project["test_trace"]),
+                            "shape": list(ids.shape)})
+        vocab_size = trace_vocab
+        assert vocab_size, "test_trace file is missing vocab_size"
+    else:
+        data_key = sha_key({"v": 1, "test_data": project["test_data"], "tokenizer": project["tokenizer"]})
+        from exllamav3 import Config as Exl3Config, Tokenizer as Exl3Tokenizer
+        vocab_size = Exl3Tokenizer.from_config(Exl3Config.from_directory(project["tokenizer"]["source"])).actual_vocab_size
 
     models = project["models"]
     refs = [m for m in models if m.get("group") == "reference"]
@@ -106,15 +112,15 @@ def main(args):
     if ref_results is None or not os.path.exists(ref_meta):
         os.makedirs(ref_store, exist_ok = True)
         backend = open_backend(ref, max_len, device)
-        stats = DiffStats(ids, prefix_len, vocab_size, None)
+        stats = DiffStats(ids, ranges, vocab_size, None)
         conf_rows = []
         def ref_callback(r, logits):
             stats(r, logits)
-            save_reference_row(ref_store, r, logits, prefix_len, conf_rows)
+            save_reference_row(ref_store, r, logits, ranges[r], conf_rows)
         backend.run(ids, ref_callback)
         save_tensors(os.path.join(ref_store, "conf.safetensors"), {"conf": torch.cat(conf_rows).half()})
         with open(ref_meta, "w") as f:
-            json.dump({"rows": ids.shape[0], "prefix_len": prefix_len}, f)
+            json.dump({"rows": ids.shape[0], "ranges": [list(r) for r in ranges]}, f)
         ref_results = stats.results()
         ref_results.update(backend.info)
         cache.save_results(ref_results_key, ref_results)
@@ -128,7 +134,7 @@ def main(args):
         floor_results = cache.load_results(floor_results_key)
         if floor_results is None:
             backend = open_backend(ref, max_len, device)
-            stats = DiffStats(ids, prefix_len, vocab_size, ref_store)
+            stats = DiffStats(ids, ranges, vocab_size, ref_store)
             backend.run(ids, stats, noise_eps = BF16_ROUNDING_EPS)
             floor_results = stats.results()
             floor_results.update(backend.info)
@@ -150,7 +156,7 @@ def main(args):
         res = cache.load_results(results_key)
         if res is None:
             backend = open_backend(mspec, max_len, device)
-            stats = DiffStats(ids, prefix_len, vocab_size, ref_store)
+            stats = DiffStats(ids, ranges, vocab_size, ref_store)
             backend.run(ids, stats)
             res = stats.results()
             res.update(backend.info)
