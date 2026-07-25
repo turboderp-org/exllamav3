@@ -454,7 +454,7 @@ class SS_TopK(SS_Base):
 class SS_TopP(SS_Base):
     """
     Identify the smallest set of top tokens with a cumulative probability greater than P, mask out all
-    remainig tokens
+    remaining tokens
     """
     def __init__(self, top_p: float):
         self.top_p = top_p
