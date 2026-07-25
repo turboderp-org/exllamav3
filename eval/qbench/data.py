@@ -48,6 +48,12 @@ def source_stamp(path: str):
                 if f.endswith((".safetensors", ".gguf", ".json", ".py"))
             ]
             return max((int(os.path.getmtime(f)) for f in files), default = 0)
+        if path.endswith(".gguf"):
+            from .engines import gguf_shards
+            try:
+                return max(int(os.path.getmtime(f)) for f in gguf_shards(path))
+            except AssertionError:
+                pass  # missing shards surface when the model is opened, not here
         return int(os.path.getmtime(path))
     except OSError:
         return 0

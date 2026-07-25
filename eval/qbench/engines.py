@@ -662,23 +662,34 @@ class TransformersBackend:
         free_mem()
 
 
-class LlamaCppBackend:
-    """llama-cpp-python with logits_all; storage info from the GGUF tensor table"""
+def gguf_shards(source: str) -> list:
+    """All files of a split GGUF ("...-00001-of-00003.gguf" naming); [source] when unsplit"""
+    import re
+    m = re.match(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", source)
+    if not m:
+        return [source]
+    base, _, n = m.group(1), m.group(2), int(m.group(3))
+    shards = [f"{base}-{i:05d}-of-{n:05d}.gguf" for i in range(1, n + 1)]
+    missing = [s for s in shards if not os.path.exists(s)]
+    assert not missing, f"Split GGUF is missing shards: {missing}"
+    return shards
 
-    def __init__(self, source: str, max_len: int, device: torch.device, options: dict):
-        import llama_cpp
-        from llama_cpp import Llama
-        from gguf import GGUFReader
-        self.device = device
 
-        # Norms/biases are < 2 dims; router gates excluded by name; token_embd serves as the
-        # head fallback for tied models, overridden by output.weight when present
-        reader = GGUFReader(source)
-        sum_bits = sum_numel = head_bits = head_numel = 0
+def gguf_storage_info(source: str) -> dict:
+    """bpw/vram accounting over the full tensor table, spanning all shards of a split GGUF.
+    Norms/biases are < 2 dims; router gates excluded by name; token_embd serves as the head
+    fallback for tied models, overridden by output.weight when present in any shard"""
+    from gguf import GGUFReader
+    sum_bits = sum_numel = head_bits = head_numel = 0
+    head_is_fallback = True
+    for shard in gguf_shards(source):
+        reader = GGUFReader(shard)
         for t in reader.tensors:
-            if (t.name == "token_embd.weight" and head_numel == 0) or t.name == "output.weight":
+            if t.name == "output.weight" or (t.name == "token_embd.weight" and head_is_fallback):
                 head_bits = t.n_bytes * 8
                 head_numel = t.n_elements
+                if t.name == "output.weight":
+                    head_is_fallback = False
             elif (
                 t.name.endswith(".weight")
                 and t.name != "token_embd.weight"
@@ -687,12 +698,22 @@ class LlamaCppBackend:
             ):
                 sum_bits += t.n_bytes * 8
                 sum_numel += t.n_elements
-        self.info = {
-            "bpw_layer": sum_bits / max(sum_numel, 1),
-            "bpw_head": head_bits / max(head_numel, 1),
-            "vram_gb": (sum_bits + head_bits) / 8 / 1024 ** 3,
-        }
         del reader
+    return {
+        "bpw_layer": sum_bits / max(sum_numel, 1),
+        "bpw_head": head_bits / max(head_numel, 1),
+        "vram_gb": (sum_bits + head_bits) / 8 / 1024 ** 3,
+    }
+
+
+class LlamaCppBackend:
+    """llama-cpp-python with logits_all; storage info from the GGUF tensor table"""
+
+    def __init__(self, source: str, max_len: int, device: torch.device, options: dict):
+        import llama_cpp
+        from llama_cpp import Llama
+        self.device = device
+        self.info = gguf_storage_info(source)
         split_modes = {
             "layer": llama_cpp.LLAMA_SPLIT_MODE_LAYER,
             "row": llama_cpp.LLAMA_SPLIT_MODE_ROW,
