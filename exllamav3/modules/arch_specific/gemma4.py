@@ -397,9 +397,12 @@ class Gemma4PerLayerProjection(Module):
             "retain_during_quant": True,
         })
 
-        # TODO: PLE projections (this one plus the per-layer gate/projection pairs) are kept
-        #       unquantized for now, ~83M params / ~165 MB at fp16 for E4B. Giving them a qmap is
-        #       pending an evaluation of the accuracy/size tradeoff.
+        # The PLE projections (this one plus the per-layer gate/projection pairs, ~83M params /
+        # ~165 MB at fp16 for E4B) are deliberately kept unquantized. Measured on E4B at 4.0 bpw,
+        # giving them qmaps roughly doubled KL vs the bf16 reference (mean 0.034 -> 0.061, top-1
+        # 90.5% -> 87.9%) while saving only ~1% of file size: the per-layer gates feed the
+        # residual stream directly and their errors compound across all layers, and the extra
+        # tensors dilute the bit budget for the attention/MLP weights.
         self.proj = Linear(
             config = config,
             key = key,
