@@ -144,24 +144,29 @@ class TransformersBackend:
             trc = options.get("trust_remote_code", True)
             config = AutoConfig.from_pretrained(source, trust_remote_code = trc)
 
-            # compressed-tensors (llm-compressor) pack-quantized checkpoints are dequantized on
-            # the fly by _get_tensor; the skeleton is built unquantized (plain Linear modules),
-            # so the quantization config must not reach from_config
+            # Quantized checkpoints are dequantized on the fly by _get_tensor; the skeleton is
+            # built unquantized (plain Linear modules), so the quantization config must not
+            # reach from_config. Supported: compressed-tensors pack-quantized (AWQ-style int
+            # groups) and ModelOpt mixed FP8 / NVFP4. ModelOpt evaluation is weight-only: the
+            # deployed stack's static fp8 activation quant (input_scale) and fp8 kv cache are
+            # not emulated, so results are the checkpoint's weight fidelity under bf16 compute
             self.ct_bits = None
+            self.modelopt_quant = False
             qcfg = getattr(config, "quantization_config", None)
             if qcfg is not None:
-                if isinstance(qcfg, dict) and qcfg.get("quant_method") == "compressed-tensors":
-                    assert qcfg.get("format") == "pack-quantized", \
-                        f"Unsupported compressed-tensors format: {qcfg.get('format')}"
+                qm = qcfg.get("quant_method") if isinstance(qcfg, dict) else getattr(qcfg, "quant_method", None)
+                if qm == "compressed-tensors":
+                    fmt = qcfg.get("format") if isinstance(qcfg, dict) else getattr(qcfg, "format", None)
+                    assert fmt == "pack-quantized", \
+                        f"Unsupported compressed-tensors format: {fmt}"
                     groups = qcfg.get("config_groups", {})
                     weights = next(iter(groups.values()))["weights"] if groups else {}
                     self.ct_bits = weights.get("num_bits", 4)
-                    delattr(config, "quantization_config")
+                elif qm == "modelopt":
+                    self.modelopt_quant = True
                 else:
-                    raise ValueError(
-                        f"Streaming does not support this quantization_config: "
-                        f"{qcfg.get('quant_method') if isinstance(qcfg, dict) else type(qcfg)}"
-                    )
+                    raise ValueError(f"Streaming does not support this quantization_config: {qm}")
+                delattr(config, "quantization_config")
 
             # include_buffers = False keeps non-persistent buffers (rope inv_freq etc., which
             # are not in the shards) materialized with their init values
@@ -389,12 +394,37 @@ class TransformersBackend:
             q = q - zp.repeat_interleave(group, dim = 1)
         return q.to(torch.float32) * scale.repeat_interleave(group, dim = 1)
 
+    # fp4 e2m1 magnitudes for codes 0-7; codes 8-15 mirror negative (sign is the msb)
+    NVFP4_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+
+    def _dequant_modelopt(self, name):
+        """Dequantize a ModelOpt weight: NVFP4 (uint8-packed e2m1 nibble pairs low-first,
+        fp8-e4m3 scale per group, fp32 global scale) when weight_scale_2 exists, else FP8
+        (e4m3 values, per-tensor scale). Validated against the bf16 originals."""
+        w = self._read_shard(name)
+        scale = self._read_shard(f"{name}_scale").float()
+        if scale.ndim == 1:
+            scale = scale.unsqueeze(1)
+        if f"{name}_scale_2" in self.tensor_index:
+            ws2 = self._read_shard(f"{name}_scale_2").float()
+            q = torch.stack([(w & 0xF).long(), (w >> 4).long()], dim = -1).flatten(1)
+            group = q.shape[1] // scale.shape[1]
+            return self.NVFP4_LUT[q] * scale.repeat_interleave(group, dim = 1) * ws2
+        return w.float() * scale
+
     def _stored_bits(self, name):
         """Actual stored size in the checkpoint for a module-side tensor name, including any
         quantization metadata; None if the name cannot be resolved"""
         import re
         if name in self.tensor_index:
-            return 8 * self._nbytes(name)
+            total = 8 * self._nbytes(name)
+            if name.endswith(".weight"):
+                # ModelOpt-style scale sidecars stored next to the weight itself
+                stem = name[:-len(".weight")]
+                for s in ("weight_scale", "weight_scale_2", "input_scale"):
+                    if f"{stem}.{s}" in self.tensor_index:
+                        total += 8 * self._nbytes(f"{stem}.{s}")
+            return total
         if name.endswith(".weight"):
             stem = name[:-len(".weight")]
             bits = [8 * self._nbytes(f"{stem}.{s}") for s in self.CT_SUFFIXES if f"{stem}.{s}" in self.tensor_index]
@@ -419,6 +449,10 @@ class TransformersBackend:
     def _get_tensor(self, name):
         import re
         if name in self.tensor_index:
+            # ModelOpt keeps the quantized tensor under the plain .weight name; the scale
+            # sidecar marks it as needing dequant
+            if self.modelopt_quant and name.endswith(".weight") and f"{name}_scale" in self.tensor_index:
+                return self._dequant_modelopt(name)
             return self._read_shard(name)
         if name == self.head_weight_name and self.embed_weight_name in self.tensor_index:
             return self._read_shard(self.embed_weight_name)  # tied embeddings
