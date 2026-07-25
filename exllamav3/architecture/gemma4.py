@@ -227,11 +227,6 @@ class Gemma4TextModel(Model):
         **kwargs
     ):
         super().__init__(config, **kwargs)
-
-        # TODO: Cross-layer KV sharing is not implemented for the recurrent SWA state path yet, so
-        #       sliding layers fall back to regular paged attention when KV sharing is active
-        if config.num_kv_shared_layers > 0:
-            swa_full = True
         self.swa_full = swa_full
 
         use_moe = config.enable_moe_block
@@ -321,8 +316,6 @@ class Gemma4TextModel(Model):
                     store_shared_kv = store_shared_kv,
                 )
             else:
-                assert kv_source is None and not store_shared_kv, \
-                    "Cross-layer KV sharing is not implemented for SlidingAttention"
                 attn = SlidingAttention(
                     config = config,
                     key = f"{key_prefix}.layers.{idx}.self_attn",
@@ -335,8 +328,8 @@ class Gemma4TextModel(Model):
                     logit_softcapping = config.attn_logit_softcapping,
                     sliding_window = config.swa_pattern[idx],
                     key_q = "q_proj",
-                    key_k = "k_proj",
-                    key_v = "v_proj",
+                    key_k = "k_proj" if kv_source is None else None,
+                    key_v = "v_proj" if kv_source is None else None,
                     key_o = "o_proj",
                     qmap = "block.attn",
                     sm_scale = 1.0,
@@ -349,14 +342,16 @@ class Gemma4TextModel(Model):
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.self_attn.k_norm",
                         rms_norm_eps = config.rms_norm_eps,
-                    ),
+                    ) if kv_source is None else None,
                     v_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.self_attn.v_norm",
                         rms_norm_eps = config.rms_norm_eps,
                         unweighted = True,
-                    ),
+                    ) if kv_source is None else None,
                     select_hq_bits = 2 if use_moe else 0,
+                    kv_source = kv_source,
+                    store_shared_kv = store_shared_kv,
                 )
 
             attn_modules.append(attn)

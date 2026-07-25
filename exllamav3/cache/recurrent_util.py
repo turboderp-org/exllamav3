@@ -64,6 +64,12 @@ def prepare_for_recurrence(input_ids: torch.Tensor, params: dict, model) -> torc
 
 
 def advance_recurrent_states(input_ids: torch.Tensor, params: dict, model):
+    # Layers whose state is read by later layers within the same forward pass (cross-layer KV
+    # sharing) defer their destructive state updates to this point. Positions have not advanced
+    # yet, so the update sees the same state bookkeeping it would have inline
+    for fn in params.pop("deferred_state_updates", []):
+        fn()
+
     rs = params.get("recurrent_states")
     history = params.get("recurrent_history")
     if rs:

@@ -272,6 +272,8 @@ class SlidingAttention(Module):
         full_gate: bool = False,
         gate_softplus: bool = False,
         select_hq_bits: int = 0,
+        kv_source: "SlidingAttention | None" = None,
+        store_shared_kv: bool = False,
     ):
         super().__init__(config, key, None)
         assert sliding_window > 0
@@ -320,6 +322,16 @@ class SlidingAttention(Module):
         self.g_proj = None
         self.key_sinks = key_sinks
         self.sinks = None
+
+        # Cross-layer KV sharing (Gemma4 E4B/E2B): a layer with kv_source set has no K/V projections
+        # or recurrent state of its own; it attends read-only over the source layer's ring-buffer
+        # state and the K/V the source stashed in params during the current forward pass. A layer
+        # with store_shared_kv set stashes its K/V and attention view, and defers its destructive
+        # state update until after the sharing layers have attended (see advance_recurrent_states)
+        self.kv_source = kv_source
+        self.store_shared_kv = store_shared_kv
+        assert kv_source is None or (key_k is None and key_v is None and k_proj is None and v_proj is None), \
+            "SlidingAttention layer with kv_source cannot also have K/V projections"
 
         if post_rope_norm:
             assert q_norm is None and k_norm is None, \
@@ -376,7 +388,7 @@ class SlidingAttention(Module):
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
         else:
-            assert k_proj and v_proj
+            assert (k_proj and v_proj) or self.kv_source is not None
             self.k_proj = k_proj
             self.v_proj = v_proj
             self.register_submodule(self.k_proj)
@@ -403,7 +415,7 @@ class SlidingAttention(Module):
 
         # Register q/k norms
         if q_norm:
-            assert k_norm, "Must have both Q and K norms, or neither"
+            assert k_norm or self.kv_source is not None, "Must have both Q and K norms, or neither"
             self.q_norm = q_norm
             self.k_norm = k_norm
             self.register_submodule(self.q_norm)
@@ -411,7 +423,7 @@ class SlidingAttention(Module):
             if isinstance(q_norm, RMSNorm):
                 self.norm_eps = q_norm.rms_norm_eps
                 self.norm_constant_bias = q_norm.constant_bias
-                assert self.norm_eps == k_norm.rms_norm_eps
+                assert k_norm is None or self.norm_eps == k_norm.rms_norm_eps
             else:
                 self.norm_eps = q_norm.layernorm_eps
                 self.norm_constant_bias = 0.0
@@ -453,19 +465,22 @@ class SlidingAttention(Module):
                 self.g_proj = None
                 self.headwise_gate = False
 
-        self.caps.update({
-            "recurrent_cache": True,
-            "sliding_window_overp": sliding_window_overp
-        })
+        if self.kv_source is None:
+            self.caps.update({
+                "recurrent_cache": True,
+                "sliding_window_overp": sliding_window_overp
+            })
         self.layer_state_cls = SWALayerState
 
 
     @override
     def optimizer_targets(self):
         q = self.q_proj.optimizer_targets()
+        o = self.o_proj.optimizer_targets()
+        if self.kv_source is not None:
+            return [[q, o]]
         k = self.k_proj.optimizer_targets()
         v = self.v_proj.optimizer_targets()
-        o = self.o_proj.optimizer_targets()
         return [[q, k + v, o]]
 
 
@@ -492,6 +507,7 @@ class SlidingAttention(Module):
         # Test if K and V proj can be fused
         if (
             not self.config.infer_params.no_reconstruct and
+            self.kv_source is None and
             device != torch.device("cpu") and
             self.k_proj.quant_type == "exl3" and
             self.v_proj.quant_type == "exl3" and
@@ -531,7 +547,7 @@ class SlidingAttention(Module):
             self.prealloc_qg_1 = g_tensor_cache.get(device, (2, 1, self.num_q_heads * self.head_dim), torch.half, "qg_1")
 
         # Head norm
-        if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
+        if self.q_norm and self.k_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
             self.q_norm_tensor = self.q_norm.weight.data
             self.k_norm_tensor = self.k_norm.weight.data
 
@@ -643,6 +659,10 @@ class SlidingAttention(Module):
             )
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
+
+        if self.kv_source is not None:
+            q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
+            return q, None, None, g
 
         if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
@@ -769,7 +789,8 @@ class SlidingAttention(Module):
         if self.q_norm:
             if not self.rope or self.q_norm_tensor is None:
                 q = self.q_norm.forward(q, params, out_dtype = torch.half)
-                k = self.k_norm.forward(k, params, out_dtype = torch.half)
+                if self.k_norm is not None:
+                    k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
             q, k = self.rope.apply(
@@ -785,6 +806,25 @@ class SlidingAttention(Module):
                 inv_freq,
                 self.post_rope_norm
             )
+
+        if self.store_shared_kv:
+            params[f"g4_shared_kv.{self.layer_idx}"] = (k, v)
+            if "quant_preserve" in params:
+                params["quant_preserve"][f"g4_shared_kv.{self.layer_idx}"] = (k, v)
+        if self.kv_source is not None:
+            # Without a cache there is no history, so the source layer's K/V for the current
+            # tokens is the complete context
+            shared = params.get(f"g4_shared_kv.{self.kv_source.layer_idx}")
+            if shared is None:
+                raise RuntimeError(
+                    f"Layer {self.layer_idx} expects shared K/V from layer {self.kv_source.layer_idx}, "
+                    f"but none was stashed in this forward pass. The source layer must run before "
+                    f"this layer within the same forward pass (or its state must be carried over "
+                    f"via quant_preserve during conversion)."
+                )
+            k, v = shared
+            k = k.to(q.device)
+            v = v.to(q.device)
 
         o = paged_attn_triton_prefill(
             q, None, None, None, None, None, None,
@@ -821,8 +861,11 @@ class SlidingAttention(Module):
         non_causal_spans = params.get("non_causal_spans")
 
         # Graph-captured C++ path for the whole decode step
+        # Layers that produce or consume shared KV take the regular python path: the consumer
+        # needs the source layer's stashed K/V and attention view, which the graph bypasses
         if (
             _bc_attn_enable and causal and non_causal_spans is None and
+            self.kv_source is None and not self.store_shared_kv and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
             rsg = params.get("recurrent_states")
@@ -836,7 +879,8 @@ class SlidingAttention(Module):
         if self.q_norm:
             if not self.rope or self.q_norm_tensor is None:
                 q = self.q_norm.forward(q, params, out_dtype = torch.half)
-                k = self.k_norm.forward(k, params, out_dtype = torch.half)
+                if self.k_norm is not None:
+                    k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
             q, k = self.rope.apply(
@@ -853,114 +897,92 @@ class SlidingAttention(Module):
                 self.post_rope_norm
             )
 
-        # Recurrent state: a short contiguous fp16 K/V span per sequence, viewed as a paged
-        # cache (kv_state_size is a multiple of the page size) so the batch runs as one kernel
-        # call with per-row block tables and sequence lengths
-        rsg = params.get("recurrent_states")
-        assert rsg is not None, "SlidingAttention.forward() called in flash_attn mode with no recurrent states"
-        layer_instance = (self.layer_idx, params.get("layer_instance", 0))
-        if rsg[0].exported:
-            rsl = self.tp_recurrent_lookup[rsg[0].cache]
-        else:
-            rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
-        k_states, v_states = rsl.get_state_tensors()
-
-        S = self.kv_state_size
-        pps = S // PAGE_SIZE
-        k_pages = k_states.view(-1, PAGE_SIZE, self.num_kv_heads, self.head_dim)
-        v_pages = v_states.view(-1, PAGE_SIZE, self.num_kv_heads, self.head_dim)
-        sw = self.sliding_window
-
-        def pad(z):
-            return (z + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
-
-        if seqlen <= 16 and not non_causal_spans:
-            # Decode: append into the state (shifting it left first on the rare step where the
-            # window run reaches the end of the buffer) and attend over the pages
-            bt, cache_seqlens = self._decode_state_prep(rsg, k_states, v_states, seqlen)
-
-            o = paged_attn_triton_decode(
-                q, k, v, k_pages, v_pages, bt, cache_seqlens,
-                causal = causal,
-                softmax_scale = self.sm_scale,
-                window_size = (sw, 0),
-                softcap = self.logit_softcapping,
-                sinks = self.sinks,
-                max_kv_len = S,
-            )
+        if self.kv_source is not None:
+            # Attend read-only over the source layer's state and stashed K/V; this layer has no
+            # ring buffer of its own and never writes or shifts the source's
+            o = self._shared_swa_attend(q, params, causal, non_causal_spans)
 
         else:
-            # Prefill: attend over [hot window of the state || new K/V], reading the new tokens
-            # straight from the projection output (nothing staged, the state is untouched until
-            # after), then rebase the state onto the tail
-            hots, wposs = [], []
-            for rs in rsg:
-                cache_pos = rs.position - rs.window_beg
-                cache_wpos = max(cache_pos - sw, 0) // PAGE_SIZE * PAGE_SIZE
-                wposs.append(cache_wpos)
-                hots.append(cache_pos - cache_wpos)
+            # Recurrent state: a short contiguous fp16 K/V span per sequence, viewed as a paged
+            # cache (kv_state_size is a multiple of the page size) so the batch runs as one kernel
+            # call with per-row block tables and sequence lengths
+            rsg = params.get("recurrent_states")
+            assert rsg is not None, "SlidingAttention.forward() called in flash_attn mode with no recurrent states"
+            layer_instance = (self.layer_idx, params.get("layer_instance", 0))
+            if rsg[0].exported:
+                rsl = self.tp_recurrent_lookup[rsg[0].cache]
+            else:
+                rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+            k_states, v_states = rsl.get_state_tensors()
 
-            bt = torch.tensor(
-                [[rs.slot * pps + wposs[i] // PAGE_SIZE + j for j in range(pps)] for i, rs in enumerate(rsg)],
-                dtype = torch.int32, device = self.device
-            )
-            cache_seqlens = torch.tensor(hots, dtype = torch.int32).to(self.device, non_blocking = True)
+            S = self.kv_state_size
+            pps = S // PAGE_SIZE
+            k_pages = k_states.view(-1, PAGE_SIZE, self.num_kv_heads, self.head_dim)
+            v_pages = v_states.view(-1, PAGE_SIZE, self.num_kv_heads, self.head_dim)
+            sw = self.sliding_window
 
-            if not non_causal_spans:
-                o = paged_attn_triton_prefill(
-                    q, None, None, k_pages, v_pages, bt, cache_seqlens,
+            if seqlen <= 16 and not non_causal_spans:
+                # Decode: append into the state (shifting it left first on the rare step where the
+                # window run reaches the end of the buffer) and attend over the pages
+                bt, cache_seqlens = self._decode_state_prep(rsg, k_states, v_states, seqlen)
+
+                if self.store_shared_kv:
+                    # Sharing layers replay this call with their own Q; the kernel re-appending
+                    # the same K/V rows at the same positions is idempotent, and the state prep
+                    # (with its destructive shift) already ran exactly once, above
+                    params[f"g4_shared_swa.{self.layer_idx}"] = {
+                        "mode": "decode", "k": k, "v": v, "k_pages": k_pages, "v_pages": v_pages,
+                        "bt": bt, "cache_seqlens": cache_seqlens,
+                    }
+
+                o = paged_attn_triton_decode(
+                    q, k, v, k_pages, v_pages, bt, cache_seqlens,
                     causal = causal,
                     softmax_scale = self.sm_scale,
                     window_size = (sw, 0),
                     softcap = self.logit_softcapping,
                     sinks = self.sinks,
-                    k_new = k,
-                    v_new = v,
+                    max_kv_len = S,
                 )
-            else:
-                # Spans tile the chunk; each attends over the state plus the new tokens up to its
-                # own end, bidirectionally within itself when flagged non-causal
-                o = []
-                for span in non_causal_spans:
-                    a, b, c = span[:3]
-                    # pre-chunk extent of a re-fed span suffix: widen the left window as if the
-                    # whole span were in the chunk
-                    pre = span[3] if len(span) > 3 else 0
-                    l = b - a
-                    o_ = paged_attn_triton_prefill(
-                        q[:, a : b].contiguous(), None, None, k_pages, v_pages, bt, cache_seqlens,
-                        causal = not c,
-                        softmax_scale = self.sm_scale,
-                        window_size = (max(sw, l + pre), l - 1) if c else (sw, 0),
-                        softcap = self.logit_softcapping,
-                        sinks = self.sinks,
-                        k_new = k[:, : b].contiguous(),
-                        v_new = v[:, : b].contiguous(),
-                    )
-                    o.append(o_)
-                o = torch.cat(o, dim = 1)
 
-            # State update: keep the last window (page-aligned base) of [old || new] per row
-            for i, rs in enumerate(rsg):
-                cache_pos = rs.position - rs.window_beg
-                if cache_pos + seqlen <= S:
-                    k_states[rs.slot, cache_pos : cache_pos + seqlen].copy_(k[i])
-                    v_states[rs.slot, cache_pos : cache_pos + seqlen].copy_(v[i])
-                    rs.wshift = 0
+            else:
+                # Prefill: attend over [hot window of the state || new K/V], reading the new tokens
+                # straight from the projection output (nothing staged, the state is untouched until
+                # after), then rebase the state onto the tail
+                hots, wposs = [], []
+                for rs in rsg:
+                    cache_pos = rs.position - rs.window_beg
+                    cache_wpos = max(cache_pos - sw, 0) // PAGE_SIZE * PAGE_SIZE
+                    wposs.append(cache_wpos)
+                    hots.append(cache_pos - cache_wpos)
+
+                bt = torch.tensor(
+                    [[rs.slot * pps + wposs[i] // PAGE_SIZE + j for j in range(pps)] for i, rs in enumerate(rsg)],
+                    dtype = torch.int32, device = self.device
+                )
+                cache_seqlens = torch.tensor(hots, dtype = torch.int32).to(self.device, non_blocking = True)
+
+                if self.store_shared_kv:
+                    params[f"g4_shared_swa.{self.layer_idx}"] = {
+                        "mode": "prefill", "k": k, "v": v, "k_pages": k_pages, "v_pages": v_pages,
+                        "bt": bt, "cache_seqlens": cache_seqlens,
+                    }
+
+                o = self._swa_prefill_attend(
+                    q, k, v, k_pages, v_pages, bt, cache_seqlens, causal, non_causal_spans
+                )
+
+                if self.store_shared_kv:
+                    # The state update rebases the ring buffer in place, which would corrupt the
+                    # view the sharing layers attend over; defer it until the forward pass ends
+                    # (advance_recurrent_states applies it before positions advance)
+                    params.setdefault("deferred_state_updates", []).append(
+                        lambda: self._apply_prefill_state_update(
+                            rsg, k_states, v_states, k, v, wposs, hots, seqlen
+                        )
+                    )
                 else:
-                    cache_wpos, cache_hot = wposs[i], hots[i]
-                    shift = pad(cache_hot + seqlen) - S
-                    rs.wshift = shift + cache_wpos
-                    n_keep = cache_hot - shift
-                    if n_keep > 0:
-                        k_states[rs.slot, :n_keep].copy_(k_states[rs.slot, cache_wpos + shift : cache_wpos + cache_hot].clone())
-                        v_states[rs.slot, :n_keep].copy_(v_states[rs.slot, cache_wpos + shift : cache_wpos + cache_hot].clone())
-                        k_states[rs.slot, n_keep : n_keep + seqlen].copy_(k[i])
-                        v_states[rs.slot, n_keep : n_keep + seqlen].copy_(v[i])
-                    else:
-                        skip = shift - cache_hot
-                        k_states[rs.slot, : seqlen - skip].copy_(k[i, skip:])
-                        v_states[rs.slot, : seqlen - skip].copy_(v[i, skip:])
+                    self._apply_prefill_state_update(rsg, k_states, v_states, k, v, wposs, hots, seqlen)
 
         if self.headwise_gate:
             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
@@ -972,7 +994,132 @@ class SlidingAttention(Module):
         return o
 
 
+    def _swa_prefill_attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
+        bt: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        causal: bool,
+        non_causal_spans: list | None,
+    ):
+        """Prefill attention over [hot window of the state || new K/V], without touching the state."""
+        sw = self.sliding_window
+
+        if not non_causal_spans:
+            return paged_attn_triton_prefill(
+                q, None, None, k_pages, v_pages, bt, cache_seqlens,
+                causal = causal,
+                softmax_scale = self.sm_scale,
+                window_size = (sw, 0),
+                softcap = self.logit_softcapping,
+                sinks = self.sinks,
+                k_new = k,
+                v_new = v,
+            )
+
+        # Spans tile the chunk; each attends over the state plus the new tokens up to its
+        # own end, bidirectionally within itself when flagged non-causal
+        o = []
+        for span in non_causal_spans:
+            a, b, c = span[:3]
+            # pre-chunk extent of a re-fed span suffix: widen the left window as if the
+            # whole span were in the chunk
+            pre = span[3] if len(span) > 3 else 0
+            l = b - a
+            o_ = paged_attn_triton_prefill(
+                q[:, a : b].contiguous(), None, None, k_pages, v_pages, bt, cache_seqlens,
+                causal = not c,
+                softmax_scale = self.sm_scale,
+                window_size = (max(sw, l + pre), l - 1) if c else (sw, 0),
+                softcap = self.logit_softcapping,
+                sinks = self.sinks,
+                k_new = k[:, : b].contiguous(),
+                v_new = v[:, : b].contiguous(),
+            )
+            o.append(o_)
+        return torch.cat(o, dim = 1)
+
+
+    def _apply_prefill_state_update(self, rsg, k_states, v_states, k, v, wposs, hots, seqlen):
+        """State update: keep the last window (page-aligned base) of [old || new] per row."""
+        S = self.kv_state_size
+
+        def pad(z):
+            return (z + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+
+        for i, rs in enumerate(rsg):
+            cache_pos = rs.position - rs.window_beg
+            if cache_pos + seqlen <= S:
+                k_states[rs.slot, cache_pos : cache_pos + seqlen].copy_(k[i])
+                v_states[rs.slot, cache_pos : cache_pos + seqlen].copy_(v[i])
+                rs.wshift = 0
+            else:
+                cache_wpos, cache_hot = wposs[i], hots[i]
+                shift = pad(cache_hot + seqlen) - S
+                rs.wshift = shift + cache_wpos
+                n_keep = cache_hot - shift
+                if n_keep > 0:
+                    k_states[rs.slot, :n_keep].copy_(k_states[rs.slot, cache_wpos + shift : cache_wpos + cache_hot].clone())
+                    v_states[rs.slot, :n_keep].copy_(v_states[rs.slot, cache_wpos + shift : cache_wpos + cache_hot].clone())
+                    k_states[rs.slot, n_keep : n_keep + seqlen].copy_(k[i])
+                    v_states[rs.slot, n_keep : n_keep + seqlen].copy_(v[i])
+                else:
+                    skip = shift - cache_hot
+                    k_states[rs.slot, : seqlen - skip].copy_(k[i, skip:])
+                    v_states[rs.slot, : seqlen - skip].copy_(v[i, skip:])
+
+
+    def _shared_swa_attend(
+        self,
+        q: torch.Tensor,
+        params: dict,
+        causal: bool,
+        non_causal_spans: list | None,
+    ):
+        """Read-only attention for a KV-sharing layer over the source layer's state and stashed K/V."""
+        stash = params.get(f"g4_shared_swa.{self.kv_source.layer_idx}")
+        if stash is None:
+            raise RuntimeError(
+                f"Layer {self.layer_idx} expects shared K/V from layer {self.kv_source.layer_idx}, "
+                f"but none was stashed in this forward pass. The source layer must run before "
+                f"this layer within the same forward pass."
+            )
+        k, v = stash["k"], stash["v"]
+        if k.device != q.device:
+            # The source layer's ring-buffer state lives on the source device and cannot be
+            # migrated per step, so recurrent attention requires co-location
+            raise RuntimeError(
+                f"KV-sharing layer {self.layer_idx} (device {q.device}) is on a different device "
+                f"than its source layer {self.kv_source.layer_idx} (device {k.device}). Recurrent "
+                f"inference requires KV-sharing layers to be on the same device as their source "
+                f"layer; adjust the model split accordingly."
+            )
+
+        if stash["mode"] == "decode":
+            # Re-appending the source layer's rows at the same positions is idempotent
+            return paged_attn_triton_decode(
+                q, k, v, stash["k_pages"], stash["v_pages"], stash["bt"], stash["cache_seqlens"],
+                causal = causal,
+                softmax_scale = self.sm_scale,
+                window_size = (self.sliding_window, 0),
+                softcap = self.logit_softcapping,
+                sinks = self.sinks,
+                max_kv_len = self.kv_state_size,
+            )
+        else:
+            return self._swa_prefill_attend(
+                q, k, v, stash["k_pages"], stash["v_pages"], stash["bt"], stash["cache_seqlens"],
+                causal, non_causal_spans
+            )
+
+
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
+        assert self.kv_source is None and not self.store_shared_kv, \
+            "TP is not implemented for models with cross-layer KV sharing"
         storage = 0
         storage += self.q_proj.storage_size()
         storage += self.k_proj.storage_size()
@@ -1019,6 +1166,8 @@ class SlidingAttention(Module):
 
     def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
+        assert self.kv_source is None and not self.store_shared_kv, \
+            "TP is not implemented for models with cross-layer KV sharing"
         assert not (self.q_norm is not None and isinstance(self.q_norm, RMSNorm) and self.q_norm.span_heads), \
             "TP export of SlidingAttention with span_heads norms is not implemented"
 
