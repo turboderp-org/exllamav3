@@ -1230,7 +1230,7 @@ def plot_kld_hist_combined(
         for g in sorted({e["group"] for e, _ in trimmed})
     ]
     handles.append(Line2D([0], [0], color = colors["floor"], linewidth = 1.8, linestyle = ":", label = "noise floor"))
-    ax.legend(handles = handles, loc = "upper right", frameon = False, fontsize = 12)
+    ax.legend(handles = handles, loc = "upper left", frameon = False, fontsize = 12)
 
     if subtitle:
         ax.set_title(title, pad = 42)

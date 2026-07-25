@@ -78,6 +78,10 @@ CONVERSATIONS = [
 
 TEMPLATE_VARS = dict(enable_thinking = True, reasoning_effort = "high")
 
+col_default = "\u001b[0m"
+col_yellow = "\u001b[33;1m"
+col_blue = "\u001b[34;1m"
+
 
 def clean_response_for_context(tokenizer, response_ids: torch.Tensor) -> str:
     """Previous-turn assistant content for re-templating: reasoning segments dropped the way a
@@ -124,6 +128,7 @@ def main(args):
                     input_ids = input_ids,
                     max_new_tokens = args.max_new_tokens,
                     stop_conditions = config.eos_token_id_list,
+                    decode_special_tokens = True,
                 )
                 generator.enqueue(job)
                 chunks = []
@@ -131,6 +136,9 @@ def main(args):
                     for result in generator.iterate():
                         if result["stage"] == "streaming" and "token_ids" in result:
                             chunks.append(result["token_ids"])
+                            text = result["text"]
+                            print(text, end = "")
+                print(f"\n{col_blue}---------------------------------------------------------------{col_default}\n")
                 response_ids = torch.cat(chunks, dim = -1)[0] if chunks else torch.empty(0, dtype = torch.long)
                 if response_ids.numel() == 0:
                     messages.pop()
