@@ -124,16 +124,17 @@ class QCache:
         with open(self.results_file(key), "w") as f:
             json.dump(results, f, indent = 2)
 
-    # Per-token KLD sidecar next to each results JSON (fp16, ~2 bytes/token): lets the
+    # Per-token KLD sidecar next to each results JSON (fp32, ~4 bytes/token): lets the
     # histogram outputs pair tokens across passes ((model KLD - floor KLD) per token) without
-    # keeping full logits around. Not counted against max_size_gb (tiny, and results JSONs
-    # aren't either)
+    # keeping full logits around. fp32 rather than fp16: sub-6e-8 KLDs (common on in-domain
+    # trace data, where quants often reproduce the reference near-exactly) flush to zero in
+    # fp16, censoring the left tail of the distribution. Not counted against max_size_gb
     def kl_file(self, key):
         return os.path.join(self.root, f"kl_{key}.safetensors")
 
     def save_kl(self, key, kl: torch.Tensor | None):
         if kl is not None:
-            save_tensors(self.kl_file(key), {"kl": kl.half().cpu()})
+            save_tensors(self.kl_file(key), {"kl": kl.float().cpu()})
 
     def load_kl(self, key) -> torch.Tensor | None:
         if not os.path.exists(self.kl_file(key)):

@@ -20,8 +20,10 @@ CONF_BUCKETS = [(0.00, 0.25), (0.25, 0.50), (0.50, 0.75), (0.75, 0.95), (0.95, 1
 # Bumped when the per-model measurement set changes; invalidates cached KLD results without
 # invalidating the (expensive) cached reference logits. v3: bpw convention unified across
 # engines (biases/router gates excluded, tied-head fallback). v4: per-token KLD vectors saved
-# as a sidecar so histograms of (KLD - noise floor) can pair tokens across passes.
-METRICS_VERSION = 4
+# as a sidecar so histograms of (KLD - noise floor) can pair tokens across passes. v5: sidecars
+# stored fp32 (fp16 flushed sub-6e-8 KLDs to zero, censoring the near-exact-reproduction tail
+# that in-domain trace data surfaces).
+METRICS_VERSION = 5
 
 
 class DiffStats:
