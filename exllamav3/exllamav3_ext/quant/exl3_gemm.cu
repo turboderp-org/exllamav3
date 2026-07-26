@@ -429,7 +429,7 @@ int exl3_mgemm_gr
     int bszm_out = C.size(0);
     int bszm = MAX(bszm_in, bszm_out);
 
-    const long* indices_ptr = (const long*) OPTPTR(indices);
+    const int64_t* indices_ptr = (const int64_t*) OPTPTR(indices);
     const half* weights_ptr = (const half*) OPTPTR(weights);
 
     if (indices)
