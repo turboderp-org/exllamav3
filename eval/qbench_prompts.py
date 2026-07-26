@@ -132,13 +132,19 @@ def main(args):
                 )
                 generator.enqueue(job)
                 chunks = []
+                total_temp = total_out
+                text_temp = ""
                 while generator.num_remaining_jobs():
                     for result in generator.iterate():
                         if result["stage"] == "streaming" and "token_ids" in result:
                             chunks.append(result["token_ids"])
+                            total_temp += result["token_ids"].shape[-1]
                             text = result["text"]
-                            print(text, end = "")
-                print(f"\n{col_blue}---------------------------------------------------------------{col_default}\n")
+                            text_temp += text
+                            if "\n" in text:
+                                print(text_temp, end = "")
+                                text_temp = ""
+                                pb.update(min(total_temp, args.min_tokens))
                 response_ids = torch.cat(chunks, dim = -1)[0] if chunks else torch.empty(0, dtype = torch.long)
                 if response_ids.numel() == 0:
                     messages.pop()
@@ -156,6 +162,10 @@ def main(args):
                     "role": "assistant",
                     "content": clean_response_for_context(tokenizer, response_ids),
                 })
+                print(f"\n{col_blue}---------------------------------------------------------------{col_default}\n")
+                print(f"Input tokens:  {col_yellow}{total_in:6,}{col_default}")
+                print(f"Output tokens: {col_yellow}{total_out:6,}{col_default}")
+                print(f"\n{col_blue}---------------------------------------------------------------{col_default}\n")
 
     out = {
         "model": args.model_dir,
