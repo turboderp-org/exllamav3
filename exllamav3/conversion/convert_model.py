@@ -4,6 +4,7 @@ import time
 import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear
+from ..modules.linear import convert_exl3_group
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem
@@ -46,6 +47,7 @@ parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
 parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "When possible, use new parallel mode for small tensors (MoE layers especially)")
+parser.add_argument("--max_module", type = int, help = "End quantization after this many modules, includes embedding and norm layers (for debug purposes)", default = None)
 
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--out_scales", type = str, default = "always", help = "Enable out channel scales (always/never/auto, default: always)")
@@ -188,6 +190,7 @@ def prepare(args) -> (dict, dict, bool, str):
     in_args["image_dump"] = args.image_dump
     in_args["verbose"] = args.verbose
     in_args["apply_out_scales"] = {"always": True, "never": False, "auto": None}[args.out_scales]
+    in_args["max_module"] = args.max_module
 
     if args.resume:
         job_state = load_dict("ckpt/job.json", in_args)
@@ -273,9 +276,117 @@ def get_state_error(x, ref):
      return err.item(), cos, sq
 
 
+def make_quant_args(args, idx, K, devices, device_ratios = None):
+    quant_args = {
+        "seed": idx,
+        "K": K,
+        "devices": devices,
+        "device_ratios": device_ratios,
+        "apply_out_scales": args["apply_out_scales"],
+    }
+    if args["codebook"] == "mcg":
+        quant_args.update({"mcg": True})
+    elif args["codebook"] == "mul1":
+        quant_args.update({"mul1": True})
+    return quant_args
+
+
+def print_quantized_linear(config, linear, quant_args, proxy_err, time_str = ""):
+    flags = "o" if quant_args["apply_out_scales"] else "."
+    flags += "f" if quant_args["q_fallback"] else "."
+    proxy_err_str = (
+        "(zero)  " if quant_args["zeros"] else
+        "(big)   " if proxy_err >= 9.9 else
+        f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
+        "(OoM)   "
+    )
+    proxy_err_label = "proxy_err" if not quant_args["q_fallback"] else "rmse     "
+    print(
+        f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
+        f"  bpw: {quant_args['K']:5.2f}"
+        f"  {proxy_err_label}: {proxy_err_str}"
+        f"  {flags}"
+        f"  g_sc: {quant_args['g_scale']:.6f}"
+        f"{time_str}",
+        flush = True
+    )
+
+
+def group_quant_linears(linears, strategy, capture_H, max_cat_cols = 32768, max_stack = 16):
+    """
+    Partition linears into groups for batched quantization. Tensors sharing a Hessian (same qmap) at the same
+    bitrate concatenate along out_features; leftover same-shape, same-bitrate tensors with individual Hessians
+    (block-sparse down projections) stack with per-tensor L. Group sizes are capped so the LDLQ work buffers
+    stay modest. Returns a list of groups; singleton groups take the plain per-tensor path.
+    """
+    if capture_H is None:
+        return [[linear] for linear in linears]
+
+    groups = []
+    shared = {}
+    for linear in linears:
+        K = strategy[linear.key]
+        if K == 16 or linear.qmap not in capture_H:
+            groups.append([linear])
+        else:
+            shared.setdefault((linear.qmap, K, linear.in_features), []).append(linear)
+
+    loners = {}
+    for (qmap, K, k), ls in shared.items():
+        if len(ls) == 1:
+            linear = ls[0]
+            loners.setdefault((linear.in_features, linear.out_features, K), []).append(linear)
+            continue
+        # Shared-Hessian group: chunk by total column count
+        cap = max(ls[0].out_features, min(max_cat_cols, int(3.5e8) // k))
+        chunk, cols = [], 0
+        for linear in ls:
+            if chunk and cols + linear.out_features > cap:
+                groups.append(chunk)
+                chunk, cols = [], 0
+            chunk.append(linear)
+            cols += linear.out_features
+        if chunk:
+            groups.append(chunk)
+
+    for (k, n, K), ls in loners.items():
+        # Same-shape stacking group: chunk by batch size
+        cap = max(1, min(max_stack, int(3.5e8) // (k * n)))
+        for i in range(0, len(ls), cap):
+            groups.append(ls[i : i + cap])
+
+    return groups
+
+
+def group_label(group):
+    prefix = os.path.commonprefix([linear.key for linear in group])
+    return f"{prefix}* ({len(group)} tensors)"
+
+
 def quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state):
 
-    for linear in linears:
+    allow_grouping = state is not None and not args["image_dump"] and not args["verbose"]
+    groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None)
+
+    for group in groups:
+        if len(group) > 1:
+            quant_args_list = [make_quant_args(args, idx, strategy[l.key], devices, device_ratios) for l in group]
+            with Timer() as t:
+                proxy_errs = convert_exl3_group(
+                    group,
+                    [capture_H[l.qmap] for l in group],
+                    quant_args_list,
+                    progress_str = f" -- <step>: {group_label(group)}",
+                )
+                for linear in group:
+                    assert isinstance(linear.inner, LinearEXL3)
+                    linear.inner.swap_cpu()
+            time_str = f"  [{t.interval / len(group):4.2f} s]"
+            for linear, quant_args, proxy_err in zip(group, quant_args_list, proxy_errs):
+                print_quantized_linear(config, linear, quant_args, proxy_err, time_str)
+            continue
+
+        linear = group[0]
         if strategy[linear.key] == 16:
             print(
                 f" -- Unquantized: {linear.key:{config.stc.max_key_len() + 6}}"
@@ -283,17 +394,7 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                 flush = True
             )
         else:
-            quant_args = {
-                "seed": idx,
-                "K": strategy[linear.key],
-                "devices": devices,
-                "device_ratios": device_ratios,
-                "apply_out_scales": args["apply_out_scales"],
-            }
-            if args["codebook"] == "mcg":
-                quant_args.update({"mcg": True})
-            elif args["codebook"] == "mul1":
-                quant_args.update({"mul1": True})
+            quant_args = make_quant_args(args, idx, strategy[linear.key], devices, device_ratios)
 
             with Timer() as t:
                 sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
@@ -307,32 +408,18 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                 )
                 assert isinstance(linear.inner, LinearEXL3)
                 linear.inner.swap_cpu()
-            flags = "o" if quant_args["apply_out_scales"] else "."
-            flags += "f" if quant_args["q_fallback"] else "."
-            proxy_err_str = (
-                "(zero)  " if quant_args["zeros"] else
-                "(big)   " if proxy_err >= 9.9 else
-                f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
-                "(OoM)   "
-            )
-            proxy_err_label = "proxy_err" if not quant_args["q_fallback"] else "rmse     "
-            print(
-                f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
-                f"  bpw: {quant_args['K']:5.2f}"
-                f"  {proxy_err_label}: {proxy_err_str}"
-                f"  {flags}"
-                f"  g_sc: {quant_args['g_scale']:.6f}"
-                f"  [{t.interval:4.2f} s]",
-                flush = True
-            )
+            print_quantized_linear(config, linear, quant_args, proxy_err, f"  [{t.interval:4.2f} s]")
 
 
 def quantize_linears_parallel(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state):
     assert not args["image_dump"], "Parallel mode is incompatible with --image_dump"
     global curr_progress, max_progress
 
-    # Split workload
-    all_dev_linears = [[] for _ in devices]
+    allow_grouping = state is not None and not args["verbose"]
+    groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None)
+
+    # Split workload by group
+    all_dev_groups = [[] for _ in devices]
 
     tot_numel = sum(linear.weights_numel() for linear in linears)
     if device_ratios is None:
@@ -341,32 +428,39 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
         tot_split = sum(device_ratios)
         dev_numel = [tot_numel * r // tot_split for _, r in zip(devices, device_ratios)]
 
-    for linear in linears:
-        l_numel = linear.weights_numel()
-        fit = [d_numel - l_numel for d_numel in dev_numel]
+    for group in groups:
+        g_numel = sum(linear.weights_numel() for linear in group)
+        fit = [d_numel - g_numel for d_numel in dev_numel]
         bestfit = max(range(len(fit)), key = lambda x: fit[x])
-        dev_numel[bestfit] -= l_numel
-        all_dev_linears[bestfit].append(linear)
+        dev_numel[bestfit] -= g_numel
+        all_dev_groups[bestfit].append(group)
 
     with progress_lock:
         curr_progress = 0
         max_progress = len(linears)
 
     # Worker thread
-    def work_thread(device_idx, dev_linears):
+    def work_thread(device_idx, dev_groups):
         global curr_progress
 
-        for linear in dev_linears:
-            quant_args_local = {
-                "seed": idx,
-                "K": strategy[linear.key],
-                "devices": [device_idx],
-                "apply_out_scales": args["apply_out_scales"],
-            }
-            if args["codebook"] == "mcg":
-                quant_args_local.update({"mcg": True})
-            elif args["codebook"] == "mul1":
-                quant_args_local.update({"mul1": True})
+        for group in dev_groups:
+            if len(group) > 1:
+                quant_args_list = [make_quant_args(args, idx, strategy[l.key], [device_idx]) for l in group]
+                proxy_errs = convert_exl3_group(
+                    group,
+                    [capture_H[l.qmap] for l in group],
+                    quant_args_list,
+                )
+                for linear, quant_args_local, proxy_err in zip(group, quant_args_list, proxy_errs):
+                    assert isinstance(linear.inner, LinearEXL3)
+                    linear.inner.swap_cpu()
+                    print_quantized_linear(config, linear, quant_args_local, proxy_err)
+                    with progress_lock:
+                        curr_progress += 1
+                continue
+
+            linear = group[0]
+            quant_args_local = make_quant_args(args, idx, strategy[linear.key], [device_idx])
 
             proxy_err = linear.convert_exl3(
                 capture_H[linear.qmap] if state else linear.init_H_data(False),
@@ -378,30 +472,15 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
             assert isinstance(linear.inner, LinearEXL3)
             linear.inner.swap_cpu()
 
-            flags_local = "o" if quant_args_local["apply_out_scales"] else "."
-            flags_local += "f" if quant_args_local["q_fallback"] else "."
-            proxy_err_str_local = (
-                "(zero)  " if quant_args_local["zeros"] else
-                "(big)   " if proxy_err >= 9.9 else
-                f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
-                "(OoM)   "
-            )
-            proxy_err_label_local = "proxy_err" if not quant_args_local["q_fallback"] else "rmse     "
-            print(
-                f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
-                f"  bpw: {quant_args_local['K']:5.2f}"
-                f"  {proxy_err_label_local}: {proxy_err_str_local}"
-                f"  {flags_local}"
-                f"  g_sc: {quant_args_local['g_scale']:.6f}"
-            )
+            print_quantized_linear(config, linear, quant_args_local, proxy_err)
             with progress_lock:
                 curr_progress += 1
 
     # Launch
     threads = []
     for i, device_idx in enumerate(devices):
-        if len(all_dev_linears[i]):
-            t = threading.Thread(target = work_thread, args = (device_idx, all_dev_linears[i]))
+        if len(all_dev_groups[i]):
+            t = threading.Thread(target = work_thread, args = (device_idx, all_dev_groups[i]))
             t.daemon = True
             threads.append(t)
     for t in threads:
@@ -423,6 +502,222 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
 
     for t in threads:
         t.join(timeout = 0.1)
+
+
+def calibration_row_shards(num_rows, devices, device_ratios):
+    """
+    Split calibration row indices into one contiguous shard per device, proportional to device_ratios if given.
+    Row 0..num_ref_states-1 land in the first device's shard whenever it is non-empty, which keeps the reference
+    states on the primary device.
+    """
+    w = device_ratios if device_ratios else [1] * len(devices)
+    tot = sum(w)
+    counts = [num_rows * r // tot for r in w]
+    counts[0] += num_rows - sum(counts)
+    shards, start = [], 0
+    for c in counts:
+        shards.append(range(start, start + c))
+        start += c
+    return shards
+
+
+def load_parallel_calib_modules(replica_models, idx, devices, load_slice, source = None):
+    """
+    Load replicas of module idx onto secondary devices for parallel calibration passes. Returns the list of
+    replica modules, or None if replication is unavailable (caller falls back to the serial path).
+    """
+    if not replica_models:
+        return None
+    replicas = []
+    try:
+        for rm, dev in zip(replica_models, devices[1:]):
+            rep = rm.modules[idx]
+            rep.load(torch.device(dev), load_slice = load_slice, **({"source": source} if source is not None else {}))
+            replicas.append(rep)
+        return replicas
+    except Exception as e:
+        print(f" !! Parallel calibration disabled for module {idx}: {e}")
+        for rep in replicas:
+            rep.unload()
+        free_mem()
+        return None
+
+
+def run_row_workers(title, num_rows, workers, progress_count):
+    """
+    Run one worker thread per device with a shared progress bar, mirroring the interrupt handling of
+    quantize_linears_parallel. Worker exceptions are collected and re-raised.
+    """
+    errors = []
+    def guard(fn):
+        def inner():
+            try:
+                fn()
+            except Exception as e:
+                errors.append(e)
+        return inner
+    threads = [threading.Thread(target = guard(w), daemon = True) for w in workers]
+    for t in threads:
+        t.start()
+    try:
+        with ProgressBar(title, num_rows) as progress:
+            while any(t.is_alive() for t in threads):
+                progress.update(progress_count[0])
+                time.sleep(0.05)
+            progress.update(progress_count[0])
+    except KeyboardInterrupt:
+        # TODO: This is too hacky (same as quantize_linears_parallel)
+        from signal import pthread_kill, SIGTSTP, SIGKILL
+        for t in threads:
+            pthread_kill(t.ident, SIGTSTP)
+            pthread_kill(t.ident, SIGKILL)
+        print("Aborted.")
+        sys.exit()
+    for t in threads:
+        t.join(timeout = 0.1)
+    if errors:
+        raise errors[0]
+
+
+def capture_module_parallel(
+    model,
+    modules,
+    devices,
+    device_ratios,
+    state,
+    original_input_ids,
+    get_preserve,
+    put_preserve,
+    slicing,
+    current_slice,
+    title,
+):
+    """
+    Run the Hessian-capture forward pass with calibration rows split across devices, each device forwarding its
+    shard through its own replica of the module. Per-device capture dicts are merged by summing H (the proxy is
+    a plain sum over token batches), counts and inf/nan counters onto the primary device.
+    """
+    shards = calibration_row_shards(len(state), devices, device_ratios)
+    captures = [{} for _ in modules]
+    ref_map = {}
+    lock = threading.Lock()
+    progress_count = [0]
+
+    def make_worker(t_idx):
+        def worker():
+            module = modules[t_idx]
+            for i in shards[t_idx]:
+                params = {
+                    "attn_mode": "flash_attn_nc",
+                    "capture": captures[t_idx],
+                    "activate_all_experts": model.calibration_all_experts,
+                    "input_ids": original_input_ids[i],
+                }
+                if slicing:
+                    params["q_mlp_slice"] = current_slice
+                get_preserve(i, params)
+                model.per_layer_quant_preamble(params)
+                rs = module.prepare_for_device(state[i], params)
+                rs = module.forward(rs, params)
+                put_preserve(i, params)
+                if i < num_ref_states:
+                    if model.calibration_all_experts:
+                        # Do not activate all experts for reference state, for error measurement
+                        params = {
+                            "attn_mode": "flash_attn_nc",
+                            "input_ids": original_input_ids[i],
+                        }
+                        if slicing:
+                            params["q_mlp_slice"] = current_slice
+                        get_preserve(i, params)
+                        model.per_layer_quant_preamble(params)
+                        rs = module.prepare_for_device(state[i], params)
+                        rs = module.forward(rs, params)
+                        put_preserve(i, params)
+                    with lock:
+                        ref_map[i] = rs.cpu()
+                rs = None
+                with lock:
+                    progress_count[0] += 1
+            torch.cuda.synchronize(torch.device(devices[t_idx]))
+        return worker
+
+    run_row_workers(title, len(state), [make_worker(i) for i in range(len(modules))], progress_count)
+
+    # Merge secondary capture dicts into the primary one
+    capture_H = captures[0]
+    device = torch.device(devices[0])
+    for cap in captures[1:]:
+        for qmap, hd in cap.items():
+            if qmap not in capture_H:
+                hd["H"] = hd["H"].to(device)
+                hd["inf_nan"] = hd["inf_nan"].to(device)
+                hd["device"] = device
+                capture_H[qmap] = hd
+            else:
+                m = capture_H[qmap]
+                m["H"] += hd["H"].to(device)
+                m["count"] += hd["count"]
+                m["num_total"] += hd["num_total"]
+                m["inf_nan"] += hd["inf_nan"].to(device)
+        cap.clear()
+
+    ref_states = [ref_map[i] for i in sorted(ref_map.keys())]
+    return capture_H, ref_states
+
+
+def advance_state_parallel(
+    model,
+    modules,
+    devices,
+    device_ratios,
+    state,
+    original_input_ids,
+    get_preserve,
+    put_preserve,
+    ref_states,
+    have_linears,
+    is_last_module,
+    title,
+):
+    """
+    Advance the calibration state through the (re-quantized) module with rows split across devices. Returns
+    summed rfn/cos/sqnr over the reference rows.
+    """
+    shards = calibration_row_shards(len(state), devices, device_ratios)
+    lock = threading.Lock()
+    progress_count = [0]
+    sums = [0.0, 0.0, 0.0]
+
+    def make_worker(t_idx):
+        def worker():
+            module = modules[t_idx]
+            for i in shards[t_idx]:
+                params = {
+                    "attn_mode": "flash_attn_nc",
+                    "input_ids": original_input_ids[i],
+                }
+                state[i] = module.prepare_for_device(state[i], params)
+                if i < num_ref_states or not is_last_module:
+                    get_preserve(i, params)
+                    model.per_layer_quant_preamble(params)
+                    state[i] = module.forward(state[i], params).cpu()
+                    put_preserve(i, params)
+                if i < num_ref_states and have_linears:
+                    ref = ref_states[i].to(state[i].device)
+                    rfn, cos, sq = get_state_error(state[i], ref)
+                    ref_states[i] = None
+                    with lock:
+                        sums[0] += rfn
+                        sums[1] += cos
+                        sums[2] += sq
+                with lock:
+                    progress_count[0] += 1
+            torch.cuda.synchronize(torch.device(devices[t_idx]))
+        return worker
+
+    run_row_workers(title, len(state), [make_worker(i) for i in range(len(modules))], progress_count)
+    return sums[0], sums[1], sums[2]
 
 
 def image_dump(args, linears):
@@ -544,6 +839,17 @@ def main(args, job_state):
     print(print_strategy(strategy))
     print(f" -- Final bitrate (excluding head): {final_bpw:4.2f}" + (" (--hq enabled)" if hq else ""))
 
+    # With multiple devices, run the capture and state-advance forward passes with calibration rows split
+    # across replicas of the current module, one per device. Calibration rows are independent and the H proxy
+    # is a plain sum over token batches, so shards merge exactly. Models with a custom per-layer preamble
+    # (module state prepared on the primary device) fall back to the serial path.
+    parallel_calib = (
+        state is not None and
+        len(devices) > 1 and
+        type(model).per_layer_quant_preamble is Model.per_layer_quant_preamble
+    )
+    replica_models = [Model.from_config(config) for _ in devices[1:]] if parallel_calib else []
+
     # Iterate over modules
     for idx, module in enumerate(model.modules):
 
@@ -554,6 +860,10 @@ def main(args, job_state):
         # If resuming, skip along to checkpoint index
         if idx < job_state["next_module_idx"]:
             continue
+
+        if args["max_module"] is not None and idx > args["max_module"]:
+            print(" !! --max_module reached, stopping job")
+            sys.exit()
 
         # Collect output tensors
         q_tensors = {}
@@ -583,40 +893,62 @@ def main(args, job_state):
                 # are activated to ensure all down projections capture at least some calibration data. When the
                 # state is advanced later, only selected experts will be used.
                 if state is not None:
-                    with ProgressBar(f" -- Capturing: {module.key}" + slice_str, len(state)) as progress:
-                        capture_H = {}
-                        ref_states = []
-                        for i in range(len(state)):
-                            progress.update(i)
-                            params = {
-                                "attn_mode": "flash_attn_nc",
-                                "capture": capture_H,
-                                "activate_all_experts": model.calibration_all_experts,
-                                "input_ids": original_input_ids[i],
-                            }
-                            if slicing:
-                                 params["q_mlp_slice"] = current_slice
-                            get_preserve(i, params)
-                            model.per_layer_quant_preamble(params)
-                            rs = module.prepare_for_device(state[i], params)
-                            rs = module.forward(rs, params)
-                            put_preserve(i, params)
-                            if i < num_ref_states:
-                                if model.calibration_all_experts:
-                                    # Do not activate all experts for reference state, for error measurement
-                                    params = {
-                                        "attn_mode": "flash_attn_nc",
-                                        "input_ids": original_input_ids[i],
-                                    }
-                                    if slicing:
-                                        params["q_mlp_slice"] = current_slice
-                                    get_preserve(i, params)
-                                    model.per_layer_quant_preamble(params)
-                                    rs = module.prepare_for_device(state[i], params)
-                                    rs = module.forward(rs, params)
-                                    put_preserve(i, params)
-                                ref_states.append(rs.cpu())
-                            rs = None
+                    capture_replicas = None
+                    if parallel_calib and not module.caps.get("prefer_cpu"):
+                        capture_replicas = load_parallel_calib_modules(
+                            replica_models, idx, devices, current_slice if slicing else None)
+                    if capture_replicas is not None:
+                        capture_H, ref_states = capture_module_parallel(
+                            model,
+                            [module] + capture_replicas,
+                            devices,
+                            device_ratios,
+                            state,
+                            original_input_ids,
+                            get_preserve,
+                            put_preserve,
+                            slicing,
+                            current_slice,
+                            f" -- Capturing: {module.key}" + slice_str,
+                        )
+                        for rep in capture_replicas:
+                            rep.unload()
+                        free_mem()
+                    else:
+                        with ProgressBar(f" -- Capturing: {module.key}" + slice_str, len(state)) as progress:
+                            capture_H = {}
+                            ref_states = []
+                            for i in range(len(state)):
+                                progress.update(i)
+                                params = {
+                                    "attn_mode": "flash_attn_nc",
+                                    "capture": capture_H,
+                                    "activate_all_experts": model.calibration_all_experts,
+                                    "input_ids": original_input_ids[i],
+                                }
+                                if slicing:
+                                     params["q_mlp_slice"] = current_slice
+                                get_preserve(i, params)
+                                model.per_layer_quant_preamble(params)
+                                rs = module.prepare_for_device(state[i], params)
+                                rs = module.forward(rs, params)
+                                put_preserve(i, params)
+                                if i < num_ref_states:
+                                    if model.calibration_all_experts:
+                                        # Do not activate all experts for reference state, for error measurement
+                                        params = {
+                                            "attn_mode": "flash_attn_nc",
+                                            "input_ids": original_input_ids[i],
+                                        }
+                                        if slicing:
+                                            params["q_mlp_slice"] = current_slice
+                                        get_preserve(i, params)
+                                        model.per_layer_quant_preamble(params)
+                                        rs = module.prepare_for_device(state[i], params)
+                                        rs = module.forward(rs, params)
+                                        put_preserve(i, params)
+                                    ref_states.append(rs.cpu())
+                                rs = None
                     print(f" -- Captured: {module.key}" + slice_str, flush = True)
 
                     # More feedback
@@ -688,6 +1020,10 @@ def main(args, job_state):
             torch.device("cpu") if module.caps.get("prefer_cpu") else device,
             source = q_tensors
         )
+        advance_replicas = None
+        if state is not None and parallel_calib and not module.caps.get("prefer_cpu"):
+            advance_replicas = load_parallel_calib_modules(
+                replica_models, idx, devices, None, source = q_tensors)
         config.stc.set_new_tensors(None)
         del q_tensors
 
@@ -696,26 +1032,45 @@ def main(args, job_state):
         cos_error = 0
         sqnr_ = 0
         if state is not None:
-            with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
-                for i in range(len(state)):
-                    progress.update(i)
-                    params = {
-                        "attn_mode": "flash_attn_nc",
-                        "input_ids": original_input_ids[i],
-                    }
-                    state[i] = module.prepare_for_device(state[i], params)
-                    if i < num_ref_states or idx < len(model.modules) - 1:
-                        get_preserve(i, params)
-                        model.per_layer_quant_preamble(params)
-                        state[i] = module.forward(state[i], params).cpu()
-                        put_preserve(i, params)
-                    if i < num_ref_states and len(linears):
-                        ref_states[i] = ref_states[i].to(state[i].device)
-                        rfn, cos, sq = get_state_error(state[i], ref_states[i])
-                        error += rfn
-                        cos_error += cos
-                        sqnr_ += sq
-                        ref_states[i] = None
+            if advance_replicas is not None:
+                error, cos_error, sqnr_ = advance_state_parallel(
+                    model,
+                    [module] + advance_replicas,
+                    devices,
+                    device_ratios,
+                    state,
+                    original_input_ids,
+                    get_preserve,
+                    put_preserve,
+                    ref_states,
+                    len(linears) > 0,
+                    idx >= len(model.modules) - 1,
+                    f" -- Forward pass: {module.key}",
+                )
+                for rep in advance_replicas:
+                    rep.unload()
+                free_mem()
+            else:
+                with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
+                    for i in range(len(state)):
+                        progress.update(i)
+                        params = {
+                            "attn_mode": "flash_attn_nc",
+                            "input_ids": original_input_ids[i],
+                        }
+                        state[i] = module.prepare_for_device(state[i], params)
+                        if i < num_ref_states or idx < len(model.modules) - 1:
+                            get_preserve(i, params)
+                            model.per_layer_quant_preamble(params)
+                            state[i] = module.forward(state[i], params).cpu()
+                            put_preserve(i, params)
+                        if i < num_ref_states and len(linears):
+                            ref_states[i] = ref_states[i].to(state[i].device)
+                            rfn, cos, sq = get_state_error(state[i], ref_states[i])
+                            error += rfn
+                            cos_error += cos
+                            sqnr_ += sq
+                            ref_states[i] = None
             error /= num_ref_states
             cos_error /= num_ref_states
             sqnr_ /= num_ref_states

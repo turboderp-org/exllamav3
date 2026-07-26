@@ -6,7 +6,7 @@ import numpy as np
 from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
-from .quant.exl3_lib import quantize_exl3
+from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 
@@ -726,3 +726,51 @@ class Linear(Module):
         assert unit == "channels"
         split = (True, first, last) if first is not None else None
         return Linear.tp_import_split(local_context, exported, plan, split)
+
+
+def convert_exl3_group(
+    linears: list,
+    H_datas: list[dict],
+    quant_args_list: list[dict],
+    progress_str: str | None = None,
+):
+    """
+    Convert a group of Linear modules to EXL3 in one batched quantization pass (see quantize_exl3_batch for
+    the grouping requirements: shared Hessian with equal in_features, or same-shape tensors with individual
+    Hessians, all at the same bitrate).
+
+    :return:
+        list of proxy errors, one per module; each module's quant_args dict in quant_args_list is updated
+        the same way Linear.convert_exl3 updates its quant_args
+    """
+    weights = []
+    biases = []
+    for linear in linears:
+        assert isinstance(linear.inner, LinearFP16), \
+            "Inner layer is already quant type"
+        weights.append(linear.inner.get_weight_tensor().float())
+        biases.append(linear.inner.get_bias_tensor())
+        linear.inner = None
+
+    results = quantize_exl3_batch(weights, H_datas, quant_args_list, progress_str)
+
+    proxy_errs = []
+    for linear, bias, (proxy_err, out_tensors) in zip(linears, biases, results):
+        linear.inner = LinearEXL3(
+            linear.config,
+            linear.in_features,
+            linear.out_features,
+            out_tensors.get("scale"),
+            out_tensors.get("su"),
+            out_tensors.get("sv"),
+            out_tensors.get("suh"),
+            out_tensors.get("svh"),
+            out_tensors.get("trellis"),
+            out_tensors.get("mcg"),
+            out_tensors.get("mul1"),
+            bias,
+            linear.out_dtype,
+            key = linear.key
+        )
+        proxy_errs.append(proxy_err)
+    return proxy_errs

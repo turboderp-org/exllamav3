@@ -115,6 +115,12 @@ static void pool_worker_main(int thread_idx)
         uint8_t* ring = pinned_pool + (size_t) thread_idx * STLOADER_SLOTS_PER_THREAD * STLOADER_SLOT_SIZE;
         cudaError_t cr;
 
+        // The drain loop below leaves the thread's current device on the last synced stream's
+        // device without updating the tracker, so it cannot be trusted across batches. Force the
+        // first run of each batch to set the device, keeping tracker and context in sync inside
+        // the loop (events are created on the current device but tagged with the tracker)
+        cur_device = -1;
+
         size_t run_i;
         while (!batch_failed.load(std::memory_order_acquire) && (run_i = batch_next_run.fetch_add(1)) < runs->size())
         {
@@ -190,7 +196,18 @@ static void pool_worker_main(int thread_idx)
                 event_device[cur_slot] = cur_device;
             }
             cr = cudaEventRecord(events[cur_slot], stream);
-            if (cr != cudaSuccess) { batch_fail(std::string("stloader: event record failed: ") + cudaGetErrorString(cr)); break; }
+            if (cr != cudaSuccess)
+            {
+                int actual_dev = -2;
+                cudaGetDevice(&actual_dev);
+                batch_fail(std::string("stloader: event record failed: ") + cudaGetErrorString(cr) +
+                    " (cur_device=" + std::to_string(cur_device) +
+                    " actual=" + std::to_string(actual_dev) +
+                    " event_device=" + std::to_string(event_device[cur_slot]) +
+                    " job_device=" + std::to_string(job0.device_id) +
+                    " slot=" + std::to_string(cur_slot) + ")");
+                break;
+            }
             pending[cur_slot] = true;
             cur_slot = (cur_slot + 1) % STLOADER_SLOTS_PER_THREAD;
         }
