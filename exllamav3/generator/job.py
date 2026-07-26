@@ -695,18 +695,19 @@ class Job:
         if filter_eos_condition:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "end_filter")
 
-        # Hold text if it contains an incomplete character
-        if self.held_text.endswith("�") and self.held_text.count("�") < 5:
+        # Hold text if it ends in an incomplete character
+        if self.held_text.endswith("�"):
             test_decode = self.generator.tokenizer.decode(
                 self.held_tokens.torch(),
                 decode_special_tokens = self.decode_special_tokens
             )[0]
-            if not "�" in test_decode:
-                self.held_text = test_decode
-            else:
-                # Don't hold forever if a broken generation yields a replacement character but never completes
-                # the Unicode symbol
-                return emit(results, emit_held = (len(test_decode) > self.stop_string_max_length + 20))
+            if test_decode.endswith("�") and len(test_decode) <= self.stop_string_max_length + 20:
+                # The trailing character may still be completed by upcoming tokens; keep holding, but not
+                # forever, in case a broken generation never completes the character
+                return emit(results)
+            # Tail is complete: adopt the full decode as the held text. Any remaining replacement characters
+            # are interior, representing invalid bytes that no later token can repair
+            self.held_text = test_decode
 
         # Hold text as long as it contains part of a banned string
         def unset_checkpoint():
