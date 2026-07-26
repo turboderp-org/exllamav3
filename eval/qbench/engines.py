@@ -266,7 +266,10 @@ class TransformersBackend:
                 self.tensor_index[ck_name] = (fn, ck_name)
                 mod_name = ck_name
                 for src, tgt in renames:
-                    if src.startswith("^") or "(" in src:
+                    # Conversion sources are regex fragments; escaped literals ("mlp\.gate")
+                    # must go through re.sub too, or they can never match anything (hy_v3's
+                    # router/shared/bias renames are exactly this shape)
+                    if src.startswith("^") or "(" in src or "\\" in src:
                         mod_name = re.sub(src, tgt, mod_name)
                     elif src in mod_name:
                         mod_name = mod_name.replace(src, tgt)
