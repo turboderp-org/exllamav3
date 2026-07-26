@@ -12,6 +12,17 @@
 #include "../add.cuh"
 #include "../activation.cuh"
 #include "../norm.cuh"
+#include <cstdlib>
+#include <cstring>
+
+static bool env_flag(const char* name)
+{
+    const char* v = getenv(name);
+    return v && *v && strcmp(v, "0") != 0;
+}
+
+static const bool bc_attn_eager = env_flag("EXL3_BC_ATTN_EAGER");
+static const bool bc_attn_eager_gate = env_flag("EXL3_BC_ATTN_EAGER_GATE");
 
 BC_Attention::BC_Attention
 (
@@ -300,10 +311,13 @@ void BC_Attention::run_gr
         exl3_gemm_gr(x2, q_proj->trellis, s.q2, q_proj->suh, xh_q, q_proj->svh, -1, q_proj->mcg, q_proj->mul1, 0, graph);
         if (q_proj->bias)
             add_gr(s.q2, q_proj->bias.value(), s.q2, graph);
+        // EXL3_BC_ATTN_EAGER_GATE
+        bool skip_gate_gemm = bc_attn_eager_gate && graph && hs == hidden_size;
         if (gate_mode == 1)
         {
             TORCH_CHECK(g_weight, "BC_Attention: headwise gate requires the fp16 gate weight");
-            hgemm_gr(x2, g_weight.value(), s.g2, graph);
+            if (!skip_gate_gemm)
+                hgemm_gr(x2, g_weight.value(), s.g2, graph);
         }
         else if (gate_mode == 2)
         {
@@ -311,7 +325,8 @@ void BC_Attention::run_gr
             {
                 // Unquantized gate: cublas gemm over the staged (static) input, output static,
                 // weight static -- nothing to patch at replay
-                hgemm_gr(x2, g_weight.value(), s.g2, graph);
+                if (!skip_gate_gemm)
+                    hgemm_gr(x2, g_weight.value(), s.g2, graph);
             }
             else
             {
@@ -527,7 +542,7 @@ void BC_Attention::run
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
     // captured, then launched below like every later run, with only the I/O pointers patched
-    if (s.runs == 0)
+    if (s.runs == 0 || bc_attn_eager)
     {
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, nullptr);
         s.runs = 1;
@@ -627,5 +642,13 @@ void BC_Attention::run
     }
     if (padded)
         params.emplace_back(GP_copy2d_dst, (void*) y.data_ptr());
+
+    // EXL3_BC_ATTN_EAGER_GATE
+    if (bc_attn_eager_gate && !padded && g_weight && (gate_mode == 1 || (gate_mode == 2 && !use_qg_mgemm)))
+    {
+        at::Tensor x2 = x.view({R, hidden_size});
+        hgemm_gr(x2, g_weight.value(), s.g2, nullptr);
+    }
+
     s.graph->launch(params, stream);
 }
