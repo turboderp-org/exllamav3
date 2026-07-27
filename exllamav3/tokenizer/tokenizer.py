@@ -101,6 +101,16 @@ class Tokenizer:
         self.extended_id_to_piece = {v: k for k, v in self.extended_piece_to_id.items()}
         self.unspecial_id_to_piece = {v: k for k, v in self.unspecial_piece_to_id.items()}
 
+        # Special added tokens the underlying tokenizer doesn't know (declared in
+        # tokenizer_config.json or added_tokens.json but missing from tokenizer.json's
+        # added_tokens): these can't be matched by the wrapped tokenizer during encoding, so
+        # encode_part splits them out explicitly when encoding with special tokens enabled
+        self.missing_special_piece_to_id = {
+            p: i for p, i in self.extended_piece_to_id.items()
+            if p not in self.unspecial_piece_to_id and self.tokenizer.token_to_id(p) is None
+        }
+        self.missing_special_delimiters = None
+
         # Get control token IDs
         ut = self.tokenizer.model.unk_token
         self.unk_token_id = None if ut is None else self.tokenizer.token_to_id(ut)
@@ -241,7 +251,7 @@ class Tokenizer:
         return tid
 
     # Encode string with added, unspecial tokens
-    def encode_part(self, text: str, special: bool) -> list[int]:
+    def encode_part_base(self, text: str, special: bool) -> list[int]:
         if not self.unspecial_piece_to_id:
             return self.tokenizer.encode(text, add_special_tokens = special).ids
 
@@ -256,6 +266,28 @@ class Tokenizer:
         while i < len(split):
             if split[i] != "": encoded += self.tokenizer.encode(split[i], add_special_tokens = special).ids
             if i + 1 < len(split): encoded += [self.unspecial_piece_to_id[split[i + 1]]]
+            i += 2
+
+        return encoded
+
+    def encode_part(self, text: str, special: bool) -> list[int]:
+        # Special tokens declared in tokenizer_config.json but absent from tokenizer.json (the
+        # underlying tokenizer cannot match what it doesn't know) are split out here when
+        # encoding with special tokens enabled, and mapped through the extended vocabulary
+        if not special or not self.missing_special_piece_to_id:
+            return self.encode_part_base(text, special)
+
+        if self.missing_special_delimiters is None:
+            self.missing_special_delimiters = re.compile(
+                "(" + "|".join(map(re.escape, self.missing_special_piece_to_id.keys())) + ")")
+
+        split = self.missing_special_delimiters.split(text)
+        encoded = []
+
+        i = 0
+        while i < len(split):
+            if split[i] != "": encoded += self.encode_part_base(split[i], special)
+            if i + 1 < len(split): encoded += [self.missing_special_piece_to_id[split[i + 1]]]
             i += 2
 
         return encoded
