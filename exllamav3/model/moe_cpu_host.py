@@ -10,6 +10,7 @@ from ..util.misc import Cleanupper, install_parent_death_signal
 from .model_tp_cuda import (
     cuda_host_register,
     cuda_host_unregister,
+    cuda_host_get_device_pointer,
     CUDA_HOST_REGISTER_PORTABLE,
     CUDA_HOST_REGISTER_MAPPED,
 )
@@ -193,6 +194,15 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
     # orchestrated by the parent (quit flag) or the kernel (PDEATHSIG), never by SIGINT
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     ipds()
+
+    if os.name == "nt":
+        # Hold 1 ms timer resolution for this process (per-process since Windows 10 2004): the
+        # worker's poll loops back off to 50 us sleeps, which otherwise round up to the default
+        # 15.6 ms quantum -- one quantum per job-ring poll miss lands directly on token latency
+        try:
+            ctypes.WinDLL("winmm").timeBeginPeriod(1)
+        except Exception:
+            pass
 
     shm = None
     try:
@@ -425,6 +435,10 @@ class MoeCpuHost:
         self.base_ptr = buf.ctypes.data
         cuda_host_register(self.base_ptr, size,
                            flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED)
+        # GPU-visible alias of the registered buffer: equal to base_ptr under UVA (Linux
+        # desktop), but a distinct address under WDDM (Windows), where the host VA is not a
+        # valid device pointer
+        self.gpu_base_ptr = cuda_host_get_device_pointer(self.base_ptr)
 
         u32 = np.frombuffer(self.shm.buf, dtype = np.uint32)
         self.v_quit = u32[0:1]
@@ -448,8 +462,8 @@ class MoeCpuHost:
                 sel = view(off_sel, self.cap_rows * max_topk, torch.int32).view(self.cap_rows, max_topk),
                 w = view(off_w, self.cap_rows * max_topk, torch.half).view(self.cap_rows, max_topk),
                 out = view(off_out, self.cap_rows * max_ho, torch.float).view(self.cap_rows, max_ho),
-                data_ready = self.base_ptr + MOE_SLOT_FLAGS_OFFSET + s * 64,
-                done = self.base_ptr + MOE_SLOT_FLAGS_OFFSET + 64 * MOE_MAX_SLOTS + s * 64,
+                data_ready = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + s * 64,
+                done = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + 64 * MOE_MAX_SLOTS + s * 64,
             ))
 
         # Weight-staging views, flags and streams for GPU-streamed prefill
@@ -458,7 +472,7 @@ class MoeCpuHost:
             self.wviews.append(torch.frombuffer(
                 self.shm.buf, dtype = torch.int16, count = self.wslot_size // 2,
                 offset = self.layout["wstage_off"] + s * self.wslot_size))
-        fl = self.base_ptr + MOE_SLOT_FLAGS_OFFSET + 2 * 64 * MOE_MAX_SLOTS
+        fl = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + 2 * 64 * MOE_MAX_SLOTS
         self.stage_done_addr = [fl + s * 64 for s in range(MOE_MAX_WSLOTS)]
         self.pinned_free_addr = [fl + 64 * MOE_MAX_WSLOTS + s * 64 for s in range(MOE_MAX_WSLOTS)]
         self.v_stage_tail = u32[MOE_STAGE_TAIL_OFFSET // 4 : MOE_STAGE_TAIL_OFFSET // 4 + 1]
@@ -549,6 +563,15 @@ class MoeCpuHost:
                 self._collect_compute(jobs, out, rtmp, h)
                 ev1.record()
                 self._prof_ev.append((ev0, ev1))
+                if len(self._prof_ev) >= 64:
+                    done_ms = [a.elapsed_time(b) for a, b in self._prof_ev[:-1] if b.query()]
+                    if done_ms:
+                        done_ms.sort()
+                        print(f" -- submit prof ({len(done_ms)} brackets, stream ms): "
+                              f"med {done_ms[len(done_ms) // 2]:.3f} "
+                              f"p90 {done_ms[int(len(done_ms) * 0.9)]:.3f} "
+                              f"max {done_ms[-1]:.3f}", flush = True)
+                    self._prof_ev = self._prof_ev[-1:]
             else:
                 jobs, rtmp = self._issue_compute(layer_idx, y, selected_experts, routing_weights, spec)
                 self._collect_compute(jobs, out, rtmp, h)
@@ -605,7 +628,7 @@ class MoeCpuHost:
             # have been issued from a different device's stream
             if self.slot_last_seq[slot_idx]:
                 ext.exl3_moe_flag_wait(slot["done"], self.slot_last_seq[slot_idx],
-                                       self.base_ptr + 128)
+                                       self.gpu_base_ptr + 128)
             slot["x"][:n].copy_(y_pad[a:b], non_blocking = True)
             slot["sel"][:n].copy_(sel32[a:b], non_blocking = True)
             slot["w"][:n].copy_(routing_weights[a:b], non_blocking = True)
@@ -619,7 +642,7 @@ class MoeCpuHost:
         GPU. Caller holds the device guard."""
         for seq, slot_idx, a, b, n in jobs:
             slot = self.slots[slot_idx]
-            ext.exl3_moe_flag_wait(slot["done"], seq, self.base_ptr + 128)
+            ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
             if rtmp is None:
                 out[a:b].copy_(slot["out"][:n], non_blocking = True)
             else:
@@ -793,7 +816,7 @@ class MoeCpuHost:
         exp_b = spec["expert_bytes"]
         per_slot = min(self.wslot_size // exp_b, self.batch_experts)
         gated = pd.get("g") is not None
-        abort = self.base_ptr + 128
+        abort = self.gpu_base_ptr + 128
         copy_stream = st["copy_stream"]
 
         # Mid-tier experts (count <= fused_t) run through the fused MoE kernel per staged batch;

@@ -264,6 +264,14 @@ void exl3_moe_cpu_worker_run
     const size_t off_w = align64(off_sel + size_t(cap_rows) * max_topk * 4);
     const size_t off_out = align64(off_w + size_t(cap_rows) * max_topk * 2);
 
+    // Handoff profiling (EXL3_MOE_HANDOFF_PROF): per-job wall times for the three segments the
+    // worker can observe -- idle gap since the previous job, spin-on-data_ready, and compute
+    const bool hprof = getenv("EXL3_MOE_HANDOFF_PROF") != nullptr;
+    double hp_gap = 0.0, hp_spin = 0.0, hp_comp = 0.0;
+    double hp_gap_mx = 0.0, hp_spin_mx = 0.0, hp_comp_mx = 0.0;
+    long hp_jobs = 0;
+    auto hp_prev_end = std::chrono::steady_clock::now();
+
     store_release_u32(ready, 1);
 
     uint32_t head = load_acquire_u32(jobs_head);
@@ -290,6 +298,8 @@ void exl3_moe_cpu_worker_run
         head++;
         store_release_u32(jobs_head, head);
 
+        const auto hp_t0 = std::chrono::steady_clock::now();
+
         // Wait for the GPU to publish the staged inputs for this seq
         uint32_t* drdy = data_ready + size_t(job.slot) * 16;
         while ((int32_t)(load_acquire_u32(drdy) - job.seq) < 0)
@@ -297,6 +307,8 @@ void exl3_moe_cpu_worker_run
             if (load_acquire_u32(quit)) goto out;
             cpu_pause_();
         }
+
+        const auto hp_t1 = std::chrono::steady_clock::now();
 
         {
             uint8_t* slot = data + size_t(job.slot) * slot_size;
@@ -313,6 +325,29 @@ void exl3_moe_cpu_worker_run
         }
 
         store_release_u32(done + size_t(job.slot) * 16, job.seq);
+
+        if (hprof)
+        {
+            const auto hp_t2 = std::chrono::steady_clock::now();
+            auto ms = [](auto a, auto b)
+                { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            const double g = ms(hp_prev_end, hp_t0), s = ms(hp_t0, hp_t1), c = ms(hp_t1, hp_t2);
+            hp_gap += g; hp_spin += s; hp_comp += c;
+            if (g > hp_gap_mx) hp_gap_mx = g;
+            if (s > hp_spin_mx) hp_spin_mx = s;
+            if (c > hp_comp_mx) hp_comp_mx = c;
+            hp_prev_end = hp_t2;
+            if (++hp_jobs % 64 == 0)
+            {
+                printf(" -- handoff prof (%ld jobs, ms/job avg|max): gap %.3f|%.3f "
+                       "spin %.3f|%.3f compute %.3f|%.3f\n",
+                       hp_jobs, hp_gap / 64, hp_gap_mx, hp_spin / 64, hp_spin_mx,
+                       hp_comp / 64, hp_comp_mx);
+                fflush(stdout);
+                hp_gap = hp_spin = hp_comp = 0.0;
+                hp_gap_mx = hp_spin_mx = hp_comp_mx = 0.0;
+            }
+        }
     }
     out:;
     stager.join();

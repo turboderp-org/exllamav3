@@ -242,6 +242,10 @@ to disable, e.g. on a shared/multi-tenant host where fixed placement may fight t
 own balancing across other processes. Falls back to no pinning if the CPU topology can't be
 read.
 
+### `EXL3_MOE_HANDOFF_PROF` (default: unset)
+
+Enable GPU/CPU handoff profiling, for debug purposes. 
+
 ## Multi-GPU
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)

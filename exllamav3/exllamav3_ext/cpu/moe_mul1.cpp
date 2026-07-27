@@ -27,6 +27,7 @@
 // std::min/max/clamp throughout
 #include <intrin.h>
 #include <windows.h>
+#pragma comment(lib, "Synchronization.lib")   // WaitOnAddress / WakeByAddressAll (Pool)
 #endif
 
 // CPU MoE expert GEMM for mul1 EXL3 tensors.
@@ -1017,7 +1018,15 @@ struct Pool
             {
                 // Matches the outer job-ring poll's threshold (moe_handoff.cu)
                 if (++idle < 65536) { cpu_pause(); continue; }
+#ifdef __linux__
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
+#else
+                // Never a timed nap here: Windows rounds short sleeps up to the timer quantum
+                // (default 15.6 ms), and the run() barrier turns one late waker into everyone
+                // oversleeping the next phase dispatc
+                uint64_t cmp = seen;
+                WaitOnAddress(&gen, &cmp, sizeof(uint64_t), INFINITE);
+#endif
                 continue;
             }
             idle = 0;
@@ -1056,6 +1065,9 @@ struct Pool
         fn.store(f, std::memory_order_relaxed);
         const uint64_t d0 = done.load(std::memory_order_acquire);
         gen.fetch_add(1, std::memory_order_release);
+#ifndef __linux__
+        WakeByAddressAll(&gen);
+#endif
         f(c, 0, n);
         while (static_cast<int64_t>(done.load(std::memory_order_acquire) - d0) < n - 1)
             cpu_pause();
