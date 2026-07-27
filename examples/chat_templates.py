@@ -929,6 +929,39 @@ class PromptFormat_laguna(PromptFormat):
         return "<think>", "</think>"
 
 
+class PromptFormat_kimi(PromptFormat):
+    description = "Moonshot ChatML variant used by Kimi K2, Moonlight etc."
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += f"<|im_system|>system<|im_middle|>{system_prompt}<|im_end|>"
+        for (u, a) in messages:
+            context += f"<|im_user|>user<|im_middle|>{u}<|im_end|>"
+            context += f"<|im_assistant|>assistant<|im_middle|>"
+            if a is not None: context += f"{a}<|im_end|>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list + [
+            tokenizer.single_id("<|im_end|>")
+        ]
+
+
 prompt_formats = {
     "raw": PromptFormat_raw,
     "llama3": PromptFormat_llama3,
@@ -953,4 +986,5 @@ prompt_formats = {
     "gptoss": PromptFormat_gptoss,
     "hy3": PromptFormat_hy3,
     "laguna": PromptFormat_laguna,
+    "kimi": PromptFormat_kimi,
 }
