@@ -97,8 +97,11 @@ else:
     if windows:
         # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break
         #       older cu128 builds
-        extra_cflags += ["/Ox", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN"]
-        extra_cuda_cflags += ["-DWIN32_LEAN_AND_MEAN", "-Xcompiler=/Zc:preprocessor"]
+        # NOMINMAX: windows.h otherwise defines min/max function-like macros that break every
+        # std::min/std::max call site parsed after it (WIN32_LEAN_AND_MEAN does not suppress them).
+        # Defined globally so it holds regardless of include order in any TU (mirrors setup.py).
+        extra_cflags += ["/Ox", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN", "/DNOMINMAX"]
+        extra_cuda_cflags += ["-DWIN32_LEAN_AND_MEAN", "-DNOMINMAX", "-Xcompiler=/Zc:preprocessor"]
         if ext_debug:
             extra_cflags += ["/Zi"]
             extra_cuda_cflags += []
