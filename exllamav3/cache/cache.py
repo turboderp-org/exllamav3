@@ -143,9 +143,15 @@ class Cache:
         self.num_layers = len(cl)
         self.layers = {}
         for attn in cl:
+            # Attention variants with a different cache geometry (MLA stores one latent plus one
+            # shared rope key instead of per-head K/V) map the requested layer type to their own
+            layer_type, layer_kwargs = (
+                attn.cache_layer_type(self.layer_type, kwargs)
+                if hasattr(attn, "cache_layer_type") else (self.layer_type, kwargs)
+            )
             for instance in self.model.get_layer_instances(attn.layer_idx):
                 self.layers[instance] = \
-                    self.layer_type(self.config, attn, id(self), self.max_num_tokens, **kwargs)
+                    layer_type(self.config, attn, id(self), self.max_num_tokens, **layer_kwargs)
 
         # Attach recurrent (SWA/linear-attn) layers
         self.num_slots = max_batch_size

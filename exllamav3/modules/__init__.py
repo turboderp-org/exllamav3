@@ -6,6 +6,7 @@ from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .embedding import Embedding
 from .attn import Attention
+from .mla_attn import MLAttention
 from .sliding_attn import SlidingAttention, SWAState, SWALayerState
 from .gated_delta_net import GatedDeltaNet, GDNState, GDNLayerState
 from .mamba2 import Mamba2
