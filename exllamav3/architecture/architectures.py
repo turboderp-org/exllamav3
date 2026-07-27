@@ -4,6 +4,7 @@ from .apertus import ApertusModel
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
+from .deepseek_v3 import DeepseekV3Model
 from .dflash import DFlashModel
 from .dflash_laguna import DFlashLagunaModel
 from .dots1 import Dots1Model
@@ -62,6 +63,7 @@ ARCHITECTURES = {
         CohereModel,
         Cohere2Model,
         DeciLMModel,
+        DeepseekV3Model,
         DFlashModel,
         DFlashLagunaModel,
         Dots1Model,
