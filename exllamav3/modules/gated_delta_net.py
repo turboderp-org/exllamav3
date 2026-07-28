@@ -23,19 +23,20 @@ from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QL
 
 
 def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
-    """Split a batch of recurrent-layer states into (conv_jobs, state_jobs) for the batched
-    rewind kernels, plus a device index (all layers of one cache live on the same device). Only
-    GDNLayerState instances (GDN and Mamba2 alike) are batched; any other recurrent-state type
-    sharing the same cache (e.g. SWA, short-conv) falls back to its own .rewind() call, unchanged."""
-    conv_jobs = []
-    state_jobs = []
-    device_index = None
+    """Split a batch of recurrent-layer states into per-device (conv_jobs, state_jobs) for the
+    batched rewind kernels. With layer-split loading a single cache's GDN layers span multiple
+    devices, so jobs must be grouped by the device each layer's state actually lives on --
+    launching them all under one device index dereferences foreign pointers (illegal memory
+    access on any multi-GPU split). Only GDNLayerState instances (GDN and Mamba2 alike) are
+    batched; any other recurrent-state type sharing the same cache (e.g. SWA, short-conv)
+    falls back to its own .rewind() call, unchanged."""
+    jobs_by_device = {}
     for l in layers:
         if isinstance(l, GDNLayerState):
-            if device_index is None:
-                # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
-                # torch.device, so normalize rather than assume a .index attribute
-                device_index = torch.device(l.device).index
+            # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
+            # torch.device, so normalize rather than assume a .index attribute
+            device_index = torch.device(l.device).index
+            conv_jobs, state_jobs = jobs_by_device.setdefault(device_index, ([], []))
             cj = l.rewind_conv_job(slot, last_history, num_tokens)
             if cj is not None:
                 conv_jobs.append(cj)
@@ -44,21 +45,21 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
                 state_jobs.append(sj)
         else:
             l.rewind(slot, last_history, num_tokens)
-    return conv_jobs, state_jobs, device_index
+    return jobs_by_device
 
 
-def _dispatch_rewind_jobs(conv_jobs, state_jobs, device_index):
-    if conv_jobs:
-        ext.batched_conv_rewind(conv_jobs, device_index)
-    if state_jobs:
-        ext.batched_state_rewind(state_jobs, device_index)
+def _dispatch_rewind_jobs(jobs_by_device):
+    for device_index, (conv_jobs, state_jobs) in jobs_by_device.items():
+        if conv_jobs:
+            ext.batched_conv_rewind(conv_jobs, device_index)
+        if state_jobs:
+            ext.batched_state_rewind(state_jobs, device_index)
 
 
 def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
     recurrent_modules = local_context["recurrent_modules"]
     layers = [module.tp_recurrent_lookup[cache_id] for module in recurrent_modules]
-    conv_jobs, state_jobs, device_index = _collect_rewind_jobs(layers, slot, last_history, num_tokens)
-    _dispatch_rewind_jobs(conv_jobs, state_jobs, device_index)
+    _dispatch_rewind_jobs(_collect_rewind_jobs(layers, slot, last_history, num_tokens))
 
 
 class GDNState:
@@ -105,10 +106,9 @@ class GDNState:
 
     def rewind(self, num_tokens: int):
         if not self.cache.model.loaded_tp:
-            conv_jobs, state_jobs, device_index = _collect_rewind_jobs(
+            _dispatch_rewind_jobs(_collect_rewind_jobs(
                 self.cache.get_all_recurrent_layers().values(), self.slot, self.last_history, num_tokens
-            )
-            _dispatch_rewind_jobs(conv_jobs, state_jobs, device_index)
+            ))
         else:
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_rewind, (id(self.cache), self.slot, self.last_history, num_tokens))
         self.position -= num_tokens
