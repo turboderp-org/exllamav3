@@ -66,6 +66,7 @@ class DeepseekV3Config(Config):
         self.rope_settings = self.read_rope_settings_default(
             RopeStyle.GPTJ,
             override_head_dim = self.qk_rope_head_dim,
+            yarn_mscale_ratio = True,
         )
 
         # Absorption does not change the scores, so the softmax scale follows the unabsorbed head

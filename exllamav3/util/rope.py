@@ -28,6 +28,10 @@ class RopeSettings:
     llama_4_scaling_beta: float = 0.0
     override_type: str | None = None
     rotate_dims: int = 1
+    # DeepSeek-style YaRN: attn_factor = get_mscale(f, mscale) / get_mscale(f, mscale_all_dim),
+    # paired with the architecture folding mscale_all_dim into sm_scale. Off by default because
+    # non-DeepSeek configs (Mistral) carry the same keys as inert defaults
+    yarn_mscale_ratio: bool = False
 
     def print(self):
         print(f" -- RoPE settings")
@@ -229,8 +233,18 @@ class RoPE:
                 return 0.1 * mscale * math.log(scale) + 1.0
             mscale = rs.rope_scaling.get("mscale")
             mscale_all_dim = rs.rope_scaling.get("mscale_all_dim")
-            if mscale and mscale_all_dim:
+            if rs.yarn_mscale_ratio and mscale and mscale_all_dim:
+                # DeepSeek-family semantics, opted into by the architecture: sin/cos get the
+                # mscale/mscale_all_dim ratio while the arch folds mscale_all_dim into sm_scale.
+                # Only meaningful together with that sm_scale adjustment, so it cannot be inferred
+                # from the presence of the config keys alone: Mistral yarn configs carry
+                # mscale = mscale_all_dim = 1.0 as inert defaults, and taking the ratio there
+                # (as HF transformers does) silently drops the YaRN attention factor
                 attn_factor = get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)
+            elif rs.rope_scaling.get("llama_4_scaling_beta"):
+                # Position-dependent attention scaling supersedes the static YaRN factor
+                # (Ministral-3: ppl 6.81 with 1.0 vs 7.38 with the paper formula)
+                attn_factor = 1.0
             else:
                 attn_factor = get_mscale(factor)
         beta_fast = rs.rope_scaling.get("beta_fast", 32)
