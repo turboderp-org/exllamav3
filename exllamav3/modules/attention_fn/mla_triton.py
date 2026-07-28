@@ -40,8 +40,27 @@ these kernels stay CUDA-graph-safe.
 """
 
 import math
+import os
 
 import torch
+
+# Debug aid: synchronize and error-check after every MLA kernel launch, so an async illegal
+# memory access is attributed to the kernel that caused it instead of a later sync point
+_debug_sync = os.environ.get("EXL3_MLA_DEBUG_SYNC", "0") != "0"
+
+# Temporary debug overrides for the qc decode config (unset = tuned defaults)
+_qc_bn_override = int(os.environ.get("EXL3_MLA_QC_BN", "0") or "0")
+_qc_trans_override = os.environ.get("EXL3_MLA_QC_TRANS")
+
+def _dbg_sync(tag, device):
+    # NOTE: must sync the device the kernel launched on -- torch.cuda.synchronize() without an
+    # argument syncs the ambient current device, which in a multi-device layer split is usually
+    # NOT the layer's device, and the attribution becomes meaningless
+    if _debug_sync:
+        try:
+            torch.cuda.synchronize(device)
+        except Exception as e:
+            raise RuntimeError(f"MLA debug sync failed after {tag} on {device}: {e}") from e
 
 try:
     import triton
@@ -452,6 +471,7 @@ def mla_kv_append(
             block_table.shape[1], length, page_size, D_c, D_r,
             num_warps = 4, num_stages = 2,
         )
+    _dbg_sync("mla_kv_append", ckv_new.device)
 
 
 def mla_kv_quant_append(
@@ -492,7 +512,9 @@ def mla_kv_quant_append(
             scratch[key] = buf
     tmp_q, tmp_s = buf
 
+    _dbg_sync(f"upstream-of-append rows={rows} (not an MLA kernel)", ckv_new.device)
     ext.quant_cache_cont(ckv_new.reshape(rows, D_c).contiguous(), tmp_q, tmp_s, 0.0)
+    _dbg_sync(f"quant_cache_cont rows={rows} bits={bits}", ckv_new.device)
     with torch.cuda.device(ckv_new.device):
         _mla_kv_quant_scatter_kernel[(rows,)](
             tmp_q, tmp_s, kpe_new.reshape(rows, D_r).contiguous(),
@@ -501,6 +523,7 @@ def mla_kv_quant_append(
             w_tot, triton.next_power_of_2(w_tot), groups, D_r,
             num_warps = 2, num_stages = 2,
         )
+    _dbg_sync("mla_kv_quant_scatter", ckv_new.device)
 
 
 def mla_attn_triton_decode(
@@ -536,6 +559,8 @@ def mla_attn_triton_decode(
         ckv_scales, qc_bits = qc
         assert ckv_cache.shape[-1] == D_c // 32 * qc_bits
         h32 = _get_h32(q_lat.device)
+        if _qc_trans_override is not None:
+            qc_trans = _qc_trans_override != "0"
     else:
         ckv_scales, qc_bits, h32 = q_lat, 0, q_lat
 
@@ -555,7 +580,7 @@ def mla_attn_triton_decode(
         # qc: one big expanded tile per iteration, no pipelining (the expansion is ALU work the
         # scheduler overlaps anyway); swept best on Ampere/Ada/Blackwell at 512-wide latents.
         # fp16: smaller tiles, deeper pipeline
-        block_n = (32 if D_c <= 512 else 16) if qc is None else 64
+        block_n = (32 if D_c <= 512 else 16) if qc is None else (_qc_bn_override or 64)
     if num_stages is None:
         num_stages = 3 if qc is None else 1
     if num_warps is None:
@@ -590,6 +615,9 @@ def mla_attn_triton_decode(
     else:
         partial_o = partial_ml = q_lat
 
+    if _debug_sync:
+        _dbg_sync("upstream-of-decode (not an MLA kernel)", q_lat.device)
+        _dbg_snap = (cache_seqlens.cpu().tolist(), block_table.cpu())
     with torch.cuda.device(q_lat.device):
         _mla_decode_split_kernel[(programs, num_splits)](
             q_lat, q_pe, ckv_cache, kpe_cache, ckv_scales, h32, block_table, cache_seqlens, out,
@@ -600,12 +628,38 @@ def mla_attn_triton_decode(
             block_m, block_h, block_rows, block_n,
             num_warps = num_warps, num_stages = num_stages,
         )
+        try:
+            _dbg_sync("mla_decode_split", q_lat.device)
+        except RuntimeError:
+            print(f" !! mla_decode_split fault: grid=({programs},{num_splits}) bsz={bsz} q_len={q_len} "
+                  f"H={n_q_heads} D_c={D_c} D_r={D_r} qc_bits={qc_bits} qc_trans={qc_trans} "
+                  f"block m/h/rows/n={block_m}/{block_h}/{block_rows}/{block_n} "
+                  f"split_len={split_len} npps={num_pages_per_seq} max_k_len={max_k_len} "
+                  f"warps={num_warps} stages={num_stages} dev={q_lat.device} "
+                  f"pre_app={pre_appended_len} causal={causal} "
+                  f"cache={tuple(ckv_cache.shape)} kpe={tuple(kpe_cache.shape)} "
+                  f"bt={tuple(block_table.shape)} out={tuple(out.shape)}")
+            # The device context is poisoned, but host-side copies made BEFORE the launch may
+            # still be readable on some driver states; try to dump the invariants
+            try:
+                sl, bt = _dbg_snap
+                print(f" !! seqlens={sl} (+pre_app={pre_appended_len}; capacity npps*ps={num_pages_per_seq * page_size})")
+                print(f" !! bt min={int(bt.min())} max={int(bt.max())} total_pages={ckv_cache.shape[0]}")
+                print(f" !! invariant seqlen: {all(x + pre_appended_len <= num_pages_per_seq * page_size for x in sl)}")
+                used = [bt[i, : (sl[i] + pre_appended_len + page_size - 1) // page_size] for i in range(bsz)]
+                print(f" !! used-page ids in range: "
+                      f"{all(int(u.min()) >= 0 and int(u.max()) < ckv_cache.shape[0] for u in used if u.numel())}")
+                print(f" !! used pages per row: {[u.tolist() for u in used]}")
+            except Exception as e2:
+                print(f" !! dump failed: {e2}")
+            raise
         if num_splits > 1:
             _mla_decode_combine_kernel[(programs,)](
                 partial_o, partial_ml, out, h32, num_splits,
                 qc_bits, bsz, q_len, n_q_heads, D_c, block_m, block_h, block_rows,
                 num_warps = 4, num_stages = 1,
             )
+            _dbg_sync("mla_decode_combine", q_lat.device)
     return out
 
 
@@ -662,4 +716,5 @@ def mla_attn_triton_prefill(
             bool(causal), block_m, block_n,
             num_warps = num_warps, num_stages = num_stages,
         )
+    _dbg_sync("mla_prefill", q_lat.device)
     return out

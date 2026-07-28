@@ -280,29 +280,44 @@ class MLAttention(Module):
         H = self.num_q_heads
         R = bsz * seqlen
 
+        from .attention_fn.mla_triton import _dbg_sync
+
         # Queries
+        _dbg_sync("attend-entry (upstream modules)", x.device)
         q = self.project_q(x, params).view(R, H, self.qk_head_dim)
+        _dbg_sync("project_q", x.device)
         q_nope = q[:, :, :self.qk_nope_head_dim]
         q_pe = q[:, :, self.qk_nope_head_dim:].reshape(bsz, seqlen, H, self.qk_rope_head_dim)
 
         # Latent K/V. The normalized latent is what gets cached, matching the reference order
         # (kv_a_layernorm is applied before kv_b_proj would be)
         ckv_kpe = self.kv_a_proj_with_mqa.forward(x, params)
+        _dbg_sync("kv_a_proj", x.device)
         ckv = self.kv_a_layernorm.forward(
             ckv_kpe[..., :self.kv_lora_rank].contiguous(), params, out_dtype = torch.half
         )
         k_pe = ckv_kpe[..., self.kv_lora_rank:].reshape(bsz, seqlen, 1, self.qk_rope_head_dim).contiguous()
+        _dbg_sync("kv_a_layernorm+slice", x.device)
 
         if self.rope is not None:
             q_pe, k_pe = self.rope.apply(
                 q_pe, k_pe, position, positions, position_ids, True,
                 None, None, self.norm_eps, 0.0, inv_freq, False,
             )
+            _dbg_sync("rope", x.device)
 
         # Absorb W_UK into the queries: (H, R, nope) x (H, nope, kv_lora) -> (H, R, kv_lora).
-        # q_nope is a strided view; bmm takes it as a batched GEMM without a copy
-        q_lat = torch.bmm(q_nope.permute(1, 0, 2), self.w_uk)
+        #
+        # The A operand is materialized contiguous rather than passed as the strided view: on
+        # SM120, cuBLAS routes the strided-batched fp16 GEMM to an nvjet TMA kernel
+        # (nvjet_sm120_hsh_mma_*_tmaAB) that intermittently MMU-faults on the strided view.
+        # Caught with cuda-gdb after presenting as flaky illegal-memory-access crashes whose
+        # incidence depended on cache quantization width and device split (allocation layout
+        # deciding whether the wild access lands in mapped pool memory). The copy is small
+        # (R x H x nope fp16) and the unfold bmm below already has a contiguous A
+        q_lat = torch.bmm(q_nope.permute(1, 0, 2).contiguous(), self.w_uk)
         q_pe_hm = q_pe.reshape(R, H, self.qk_rope_head_dim).permute(1, 0, 2).contiguous()
+        _dbg_sync("absorb-bmm", x.device)
 
         append(ckv, k_pe)
 
@@ -316,6 +331,16 @@ class MLAttention(Module):
             qc = qc,
             **extra,
         )
+
+        from .attention_fn.mla_triton import _debug_sync
+        if _debug_sync:
+            # NaN/Inf in the attention output would reach the MoE router of the next block, and a
+            # top-k over non-finite logits can select garbage expert ids -> wild pointer loads
+            if not torch.isfinite(o_lat).all():
+                bad = (~torch.isfinite(o_lat)).sum().item()
+                raise RuntimeError(
+                    f"MLA debug: non-finite attention output, layer {self.layer_idx}, "
+                    f"{bad}/{o_lat.numel()} elements, bsz={bsz} seqlen={seqlen} dev={o_lat.device}")
 
         # Unfold W_UV: (H, R, kv_lora) x (H, kv_lora, v_head) -> (H, R, v_head)
         o = torch.bmm(o_lat, self.w_uv)
