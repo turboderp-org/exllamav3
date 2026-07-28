@@ -1220,7 +1220,7 @@ class Job:
                             "target_hidden": shifted_hidden,
                             "attn_mode": "flash_attn",
                             "block_table": seq.block_index_tensor,
-                            "cache": self.generator.draft_cache,
+                            "cache": self.generator.draft_cache.caches[idx],
                             "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
                             "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
                         }
