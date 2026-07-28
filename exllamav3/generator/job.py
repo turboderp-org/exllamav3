@@ -565,6 +565,10 @@ class Job:
         ):
             nonlocal requeue_now
 
+            # A finished job never requeues (Generator would prefer requeue over EOS if both signals coincide)
+            if emit_eos:
+                requeue_now = False
+
             r = {
                 "job": self,
                 "stage": "streaming",
