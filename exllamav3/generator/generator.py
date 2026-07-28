@@ -166,7 +166,7 @@ class Generator:
             else:
                 # Wrap the drafter for simplicity later on
                 self.draft_model = DraftStackModel(self.draft_model)
-                self.draft_cache = CacheStack(self.cache)
+                self.draft_cache = CacheStack(self.draft_cache)
                 self.num_drafters = 1
         if ngram_match_min:
             self.num_draft_tokens += num_draft_tokens if num_draft_tokens is not None else 4
@@ -201,7 +201,7 @@ class Generator:
         # Buffers
         if draft_model or ngram_match_min:
             self.draft_input_ids_pinned = torch.empty(
-                (max_batch_size, self.num_drafters, 1),
+                (max_batch_size, 1),
                 dtype = torch.long,
                 pin_memory = False
             )
@@ -413,16 +413,18 @@ class Generator:
         if self.draft_model or self.ngram_match_min:
             ngram_idx = 1
             for idx, dm in enumerate(self.draft_model.draft_models):
+                cache = self.draft_cache.caches[idx]
                 if idx in self.dflash_draft:
-                    self.iterate_draftmodel_dflash_gen(results, dm, idx)
+                    self.iterate_draftmodel_dflash_gen(results, dm, cache, idx)
                 elif idx in self.mtp_draft:
-                    self.iterate_draftmodel_mtp_gen(results, dm, idx)
+                    self.iterate_draftmodel_mtp_gen(results, dm, cache, idx)
                 elif idx in self.reg_draft:
-                    self.iterate_draftmodel_gen(results, dm, idx)
+                    self.iterate_draftmodel_gen(results, dm, cache, idx)
                 ngram_idx += 1
             if self.ngram_match_min:
                 draft_tokens = self.iterate_ngram_gen(results, ngram_idx)
-            self.iterate_gen(results, self.draft_ids_pinned[:, :, :self.draft_window()].reshape(self.max_batch_size, -1))
+            draft_ids = self.draft_ids_pinned[:, :, :].reshape(self.draft_ids_pinned.shape[0], -1)
+            self.iterate_gen(results, draft_ids)
 
         # Regular generation
         else:
@@ -472,7 +474,7 @@ class Generator:
         return w
 
 
-    def iterate_draftmodel_gen(self, results: list, model: Model, drafter: int = 0):
+    def iterate_draftmodel_gen(self, results: list, model: Model, cache: Cache, drafter: int = 0):
 
         # Get shape of active batch
         batch_size = 0
@@ -512,7 +514,7 @@ class Generator:
                 job.time_first_token = time.time()
             job_ids = job.get_input_ids_list()
             input_ids_list += job_ids
-        batch_ids = self.draft_input_ids_pinned[:batch_size, drafter, :]
+        batch_ids = self.draft_input_ids_pinned[:batch_size, :]
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
 
         # Greedy sample batched draft tokens
@@ -525,7 +527,7 @@ class Generator:
                 params = {
                     "attn_mode": "flash_attn",
                     "block_table": block_index,
-                    "cache": self.draft_cache,
+                    "cache": cache,
                     "cache_seqlens": cache_seqlens,
                 }
             )
@@ -539,13 +541,13 @@ class Generator:
             params = {
                 "attn_mode": "flash_attn",
                 "block_table": block_index,
-                "cache": self.draft_cache,
+                "cache": cache,
                 "cache_seqlens": cache_seqlens
             }
         )
 
 
-    def iterate_draftmodel_mtp_gen(self, results: list, model: Model, drafter: int = 0):
+    def iterate_draftmodel_mtp_gen(self, results: list, model: Model, cache: Cache, drafter: int = 0):
 
         # Get shape of active batch
         batch_size = 0
@@ -586,7 +588,7 @@ class Generator:
             job_ids = job.get_input_ids_list()
             input_ids_list += job_ids
             mtp_hidden_list.append(job.mtp_last_hidden)
-        batch_ids = self.draft_input_ids_pinned[:batch_size, drafter, :]
+        batch_ids = self.draft_input_ids_pinned[:batch_size, :]
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
 
@@ -599,7 +601,7 @@ class Generator:
                 "target_hidden": temp_hidden,
                 "attn_mode": "flash_attn",
                 "block_table": block_index,
-                "cache": self.draft_cache,
+                "cache": cache,
                 "cache_seqlens": cache_seqlens,
             }
             batch_state = model.forward(batch_ids, params)
@@ -612,7 +614,7 @@ class Generator:
             temp_hidden = batch_state
 
     # TODO: Refactor, share code with other draft fns
-    def iterate_draftmodel_dflash_gen(self, results: list, model: Model, drafter: int = 0):
+    def iterate_draftmodel_dflash_gen(self, results: list, model: Model, cache: Cache, drafter: int = 0):
 
         # Get shape of active batch
         batch_size = 0
@@ -662,7 +664,7 @@ class Generator:
         params = {
             "attn_mode": "flash_attn",
             "block_table": block_index,
-            "cache": self.draft_cache,
+            "cache": cache,
             "cache_seqlens": cache_seqlens,
         }
         out_state = model.forward(
@@ -1040,51 +1042,53 @@ class Generator:
         # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         if self.dflash_draft:
-            self.draft_model.update_kv_from_target(
-                target_hidden = p_export_states,
-                cache = self.draft_cache,
-                lengths = accepted_lengths,
-                params = {
-                    "block_table": block_index,
-                    "cache_seqlens": p_cache_seqlens,
-                }
-            )
+            for idx in self.dflash_draft:
+                self.draft_model.draft_models[idx].update_kv_from_target(
+                    target_hidden = p_export_states,
+                    cache = self.draft_cache.caches[idx],
+                    lengths = accepted_lengths,
+                    params = {
+                        "block_table": block_index,
+                        "cache_seqlens": p_cache_seqlens,
+                    }
+                )
 
         # Accept new target_hidden if MTP. MTP draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         if self.mtp_draft:
-            target_hidden = p_export_states[-1]
-            accepted_idx = 0
-            for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
-                if a_idx == b_idx:
-                    continue
-                accepted_length = accepted_lengths[accepted_idx]
-                accepted_idx += 1
+            for idx in self.mtp_draft:
+                target_hidden = p_export_states[-1]
+                accepted_idx = 0
+                for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+                    if a_idx == b_idx:
+                        continue
+                    accepted_length = accepted_lengths[accepted_idx]
+                    accepted_idx += 1
 
-                # A banned-string rewind invalidated this job's carry; leave it unset so drafting pauses until the
-                # next target forward provides a fresh one, and don't propagate hidden states from the abandoned
-                # window into the draft cache
-                if id(job) in rewound_jobs:
-                    continue
+                    # A banned-string rewind invalidated this job's carry; leave it unset so drafting pauses until the
+                    # next target forward provides a fresh one, and don't propagate hidden states from the abandoned
+                    # window into the draft cache
+                    if id(job) in rewound_jobs:
+                        continue
 
-                # Position K was drafted from the last target state already. Replace accepted
-                # speculative positions K+1..K+A-1 with the corresponding target-state inputs.
-                if accepted_length > 1:
-                    self.draft_model.prefill(
-                        batch_ids[a_idx:b_idx, 1:accepted_length],
-                        {
-                            "attn_mode": "flash_attn",
-                            "block_table": block_index[a_idx:b_idx],
-                            "cache": self.draft_cache,
-                            "cache_seqlens": p_cache_seqlens[a_idx:b_idx] + 1,
-                            "target_hidden": target_hidden[a_idx:b_idx, :accepted_length - 1, :],
-                        },
-                    )
+                    # Position K was drafted from the last target state already. Replace accepted
+                    # speculative positions K+1..K+A-1 with the corresponding target-state inputs.
+                    if accepted_length > 1:
+                        self.draft_model.draft_models[idx].prefill(
+                            batch_ids[a_idx:b_idx, 1:accepted_length],
+                            {
+                                "attn_mode": "flash_attn",
+                                "block_table": block_index[a_idx:b_idx],
+                                "cache": self.draft_cache.caches[idx],
+                                "cache_seqlens": p_cache_seqlens[a_idx:b_idx] + 1,
+                                "target_hidden": target_hidden[a_idx:b_idx, :accepted_length - 1, :],
+                            },
+                        )
 
-                # The next unprocessed token is paired with the preceding target hidden state.
-                job.mtp_last_hidden = target_hidden[
-                    a_idx:b_idx, accepted_length - 1:accepted_length, :
-                ].clone()
+                    # The next unprocessed token is paired with the preceding target hidden state.
+                    job.mtp_last_hidden = target_hidden[
+                        a_idx:b_idx, accepted_length - 1:accepted_length, :
+                    ].clone()
 
         # Release pages for completed jobs. Finished and requeued jobs no longer need their active page references.
         # Requeued recurrent jobs may stash the last checkpoint first so the next queued job can resume from cached

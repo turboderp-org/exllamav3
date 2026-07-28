@@ -9,3 +9,4 @@ class DraftStackModel(Model):
         assert not any(isinstance(m, DraftStackModel) for m in self.draft_models), \
             "Cannot nest draft model stacks."
         self.caps["stack_draft"] = True
+        self.draft_verifier_params = {k: v for m in self.draft_models for k, v in m.draft_verifier_params.items()}
