@@ -1213,18 +1213,19 @@ class Job:
                     self.mtp_last_hidden = seq.mtp_carry_hidden
                 else:
                     shifted_hidden = None
-                for idx in self.generator.mtp_draft + self.generator.reg_draft:
-                    self.generator.draft_model.draft_models[idx].prefill(
-                        input_ids = prefill_ids,
-                        params = {
-                            "target_hidden": shifted_hidden,
-                            "attn_mode": "flash_attn",
-                            "block_table": seq.block_index_tensor,
-                            "cache": self.generator.draft_cache.caches[idx],
-                            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                            "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
-                        }
-                    )
+                if self.generator.mtp_draft or self.generator.reg_draft:
+                    for idx in self.generator.mtp_draft + self.generator.reg_draft:
+                        self.generator.draft_model.draft_models[idx].prefill(
+                            input_ids = prefill_ids,
+                            params = {
+                                "target_hidden": shifted_hidden,
+                                "attn_mode": "flash_attn",
+                                "block_table": seq.block_index_tensor,
+                                "cache": self.generator.draft_cache.caches[idx],
+                                "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                                "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
+                            }
+                        )
 
                 # Atomic MM prefill may have extended the forward pass past prefill_end, advancing any
                 # recurrent state beyond the chunk boundary. The extension is processed again by the

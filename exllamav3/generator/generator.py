@@ -149,8 +149,6 @@ class Generator:
         self.num_drafters = 0
         self.num_draft_tokens = 0
         if draft_model is not None:
-            assert not ngram_match_min, \
-                "Cannot use both draft model and n-gram draft."
             assert draft_cache is not None, \
                 "Must supply cache for draft model"
             assert draft_cache.max_num_tokens == cache.max_num_tokens, \
@@ -412,15 +410,16 @@ class Generator:
         # Generation with draft model / ngram
         if self.draft_model or self.ngram_match_min:
             ngram_idx = 1
-            for idx, dm in enumerate(self.draft_model.draft_models):
-                cache = self.draft_cache.caches[idx]
-                if idx in self.dflash_draft:
-                    self.iterate_draftmodel_dflash_gen(results, dm, cache, idx)
-                elif idx in self.mtp_draft:
-                    self.iterate_draftmodel_mtp_gen(results, dm, cache, idx)
-                elif idx in self.reg_draft:
-                    self.iterate_draftmodel_gen(results, dm, cache, idx)
-                ngram_idx += 1
+            if self.draft_model:
+                for idx, dm in enumerate(self.draft_model.draft_models):
+                    cache = self.draft_cache.caches[idx]
+                    if idx in self.dflash_draft:
+                        self.iterate_draftmodel_dflash_gen(results, dm, cache, idx)
+                    elif idx in self.mtp_draft:
+                        self.iterate_draftmodel_mtp_gen(results, dm, cache, idx)
+                    elif idx in self.reg_draft:
+                        self.iterate_draftmodel_gen(results, dm, cache, idx)
+                    ngram_idx += 1
             if self.ngram_match_min:
                 draft_tokens = self.iterate_ngram_gen(results, ngram_idx)
             draft_ids = self.draft_ids_pinned[:, :, :].reshape(self.draft_ids_pinned.shape[0], -1)
@@ -675,6 +674,7 @@ class Generator:
 
         # Crop out the first token after sampling to keep batch contiguous for lm_head
         new_ids = new_ids[:, 1:]
+        window = min(window, new_ids.shape[1])
         self.draft_ids_pinned[:batch_size, drafter, :window].copy_(new_ids[:batch_size, :window])
 
 
