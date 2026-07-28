@@ -240,6 +240,7 @@ class Generator:
         self.recurrent_checkpoint_interval_pp = ceil_span(recurrent_checkpoint_interval_pp, self.max_chunk_size)
 
         # Drafting mode
+        self.dflash_draft, self.mtp_draft, self.reg_draft = False, False, False
         if draft_model is not None:
             assert isinstance(draft_cache, CacheStack), \
                 "A draft stack must have a cache stack of equal length."
@@ -735,7 +736,7 @@ class Generator:
         if batch_size == 0:
             return
         if draft_tokens is not None:
-            max_seq_len += draft_tokens.shape[-1] * draft_tokens.shape[-2]
+            max_seq_len += draft_tokens.shape[-1]
 
         # Create block index table for batch
         # The model sees a compact batch, so build per-row mappings from logical page positions to physical cache
