@@ -52,6 +52,41 @@ void quant_cache_cont
     cuda_check(cudaPeekAtLastError());
 }
 
+// Graph-capturable variant: launches on the capture stream during capture. Every operand is a
+// static in the BC decode graphs, so the captured node needs no parameter patching
+void quant_cache_cont_gr
+(
+    const at::Tensor& in,
+    const at::Tensor& out,
+    const at::Tensor& out_scales,
+    float compand_a,
+    Graph* graph
+)
+{
+    if (!graph)
+        return quant_cache_cont(in, out, out_scales, compand_a);
+
+    const at::cuda::OptionalCUDAGuard device_guard(in.device());
+    cudaStream_t stream = graph->capture_stream;
+
+    int bsz = in.numel() / 32;
+    int head_dim = in.size(-1);
+    int head_blocks = head_dim / 32;
+    int bits = out.size(-1) / head_blocks;
+    TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
+
+    int num_blocks = CEIL_DIVIDE(bsz, MAX_WARPS * 4);
+    quant_cache_cont_kernel_instances[bits - 2]<<<num_blocks, MAX_WARPS * 32, 0, stream>>>
+    (
+        (const half*) in.data_ptr(),
+        (uint32_t*) out.data_ptr(),
+        (half*) out_scales.data_ptr(),
+        bsz,
+        compand_a
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
 /*
 Dequantize contiguous tensor
 

@@ -52,6 +52,12 @@ class DeepseekV3Config(Config):
         self.routed_scaling_factor = self.read_cfg(float, "routed_scaling_factor", 1.0)
         self.n_group = self.read_cfg(int, "n_group", 1)
         self.topk_group = self.read_cfg(int, "topk_group", 1)
+        # The dots routing path ignores expert groups, which is only correct when there is a
+        # single group. Group-limited configs (DeepSeek-V3 671B etc.) need a grouped routing
+        # kernel before they can be supported
+        assert self.n_group in (None, 1) and self.topk_group in (None, 1), \
+            f"Group-limited expert routing (n_group = {self.n_group}, topk_group = " \
+            f"{self.topk_group}) is not supported"
         self.assert_cfg(str, "scoring_func", "sigmoid", True)
         self.assert_cfg(str, "topk_method", "noaux_tc", True)
 

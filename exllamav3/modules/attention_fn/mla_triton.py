@@ -171,6 +171,8 @@ if has_triton:
         num_splits,          # runtime: the grid may be launched wider; extra splits idle
         QC: tl.constexpr,    # latent cache bits (2-8), 0 = fp16
         QC_TRANS: tl.constexpr,  # 0: expand both orientations; 1: expand V once, trans for K^T
+        Q_PE_TM: tl.constexpr,   # q_pe layout: 0 = head-major (H, R, D_r), 1 = token-major
+                                 # (R, H, D_r) as staged by the BC graph (no permute stage)
         bsz: tl.constexpr,
         q_len: tl.constexpr,
         pre_appended_len: tl.constexpr,
@@ -208,7 +210,11 @@ if has_triton:
         q_row = row_h * (bsz * q_len) + batch * q_len + row_q
         q_c = tl.load(q_lat + q_row[:, None] * D_c + offs_c[None, :],
                       mask = valid_row[:, None], other = 0.0)
-        q_r = tl.load(q_pe + q_row[:, None] * D_r + offs_r[None, :],
+        if Q_PE_TM:
+            qpe_row = (batch * q_len + row_q) * n_q_heads + row_h
+        else:
+            qpe_row = q_row
+        q_r = tl.load(q_pe + qpe_row[:, None] * D_r + offs_r[None, :],
                       mask = valid_row[:, None], other = 0.0)
         if QC > 0:
             # Packed values live in the rotated domain; rotating q here keeps the score dot exact
@@ -500,6 +506,7 @@ if has_triton:
         R,                  # runtime
         n_q_heads: tl.constexpr,
         QK_DIM: tl.constexpr,
+        Q_STRIDE: tl.constexpr,   # row stride of q; > H * QK_DIM when the projection is padded
         D_nope: tl.constexpr,
         NOPE_PAD: tl.constexpr,   # next pow2 of D_nope (192 for GLM-style heads)
         D_c: tl.constexpr,
@@ -520,7 +527,7 @@ if has_triton:
         valid_k = offs_k < D_nope
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-        q_t = tl.load(q + (offs_m[:, None] * n_q_heads + head) * QK_DIM + offs_k[None, :],
+        q_t = tl.load(q + offs_m[:, None] * Q_STRIDE + head * QK_DIM + offs_k[None, :],
                       mask = valid_m[:, None] & valid_k[None, :], other = 0.0)
         # W_UK_h^T columns live at flat[:, head*D_nope : (head+1)*D_nope]; the dot wants (K, N)
         w_t = tl.load(w_uk_flat + offs_n[:, None] * (n_q_heads * D_nope) + head * D_nope + offs_k[None, :],
@@ -560,6 +567,44 @@ if has_triton:
             acc = tl.dot(o_t, w_t, acc = acc)
         tl.store(out + (offs_m[:, None] * n_q_heads + head) * D_v + offs_v[None, :],
                  acc.to(tl.float16), mask = valid_m[:, None])
+
+
+    @triton.jit
+    def _mla_stage_kernel(
+        q_full,             # (R, >= H * QK_DIM) fp16 q projection output
+        ckv_kpe,            # (R, >= D_c + D_r) fp16 kv_a projection output
+        kv_norm_w,          # (D_c,) kv_a_layernorm weight
+        q_pe,               # out: (R, H, D_r) fp16 token-major rope queries
+        ckv,                # out: (R, D_c) fp16 normalized latent (append input)
+        kpe,                # out: (R, D_r) fp16 rope key (append input, pre-rope)
+        eps: tl.constexpr,
+        n_q_heads: tl.constexpr,
+        QK_DIM: tl.constexpr,
+        Q_STRIDE: tl.constexpr,    # q_full row stride (the projection's padded width)
+        CKV_STRIDE: tl.constexpr,  # ckv_kpe row stride (576 pads to 640 in EXL3)
+        D_nope: tl.constexpr,
+        D_c: tl.constexpr,     # must be a power of 2 (tl.arange)
+        D_r: tl.constexpr,
+    ):
+        """Staging between the projections and the rope/attention kernels for the graph-captured
+        decode path: applies kv_a_layernorm to the latent, splits off the rope key and gathers
+        the rope columns of every query head into a dense token-major tensor. One program per
+        row; every operand is a static, so the captured node needs no patching."""
+        row = tl.program_id(0)
+
+        offs_c = tl.arange(0, D_c)
+        x = tl.load(ckv_kpe + row * CKV_STRIDE + offs_c).to(tl.float32)
+        rmf = 1.0 / tl.sqrt(tl.sum(x * x) / D_c + eps)
+        w = tl.load(kv_norm_w + offs_c).to(tl.float32)
+        tl.store(ckv + row * D_c + offs_c, (x * w * rmf).to(tl.float16))
+
+        offs_r = tl.arange(0, D_r)
+        tl.store(kpe + row * D_r + offs_r,
+                 tl.load(ckv_kpe + row * CKV_STRIDE + D_c + offs_r))
+
+        for h in range(n_q_heads):
+            v = tl.load(q_full + row * Q_STRIDE + h * QK_DIM + D_nope + offs_r)
+            tl.store(q_pe + (row * n_q_heads + h) * D_r + offs_r, v)
 
 
     @triton.jit(do_not_specialize = [
@@ -842,7 +887,7 @@ def mla_attn_triton_decode(
             q_lat, q_pe, ckv_cache, kpe_cache, ckv_scales, h32, block_table, cache_seqlens, out,
             partial_o, partial_ml,
             split_len, num_pages_per_seq, num_splits,
-            qc_bits, bool(qc_trans), bsz, q_len, pre_appended_len, n_q_heads, page_size, D_c, D_r, float(softmax_scale),
+            qc_bits, bool(qc_trans), False, bsz, q_len, pre_appended_len, n_q_heads, page_size, D_c, D_r, float(softmax_scale),
             bool(causal), num_splits == 1,
             block_m, block_h, block_rows, block_n,
             num_warps = num_warps, num_stages = num_stages,
@@ -892,7 +937,7 @@ def mla_absorb(q: torch.Tensor, w_uk_flat: torch.Tensor, n_q_heads: int, qk_nope
     with torch.cuda.device(q.device):
         _mla_absorb_kernel[(triton.cdiv(R, block_m), D_c // 128, H)](
             q, w_uk_flat, out, R,
-            H, qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim), D_c,
+            H, qk_dim, H * qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim), D_c,
             block_m, 128,
             num_warps = 4, num_stages = 2,
         )

@@ -11,6 +11,15 @@ void quant_cache_cont
     float compand_a
 );
 
+void quant_cache_cont_gr
+(
+    const at::Tensor& in,
+    const at::Tensor& out,
+    const at::Tensor& out_scales,
+    float compand_a,
+    Graph* graph
+);
+
 void dequant_cache_cont
 (
     const at::Tensor& in,

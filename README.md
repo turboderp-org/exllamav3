@@ -25,7 +25,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Command-A**, **Command-R7B**, **Command-R+** etc. (Cohere2ForCausalLM)
 - **DeciLM**, **Nemotron** (DeciLMForCausalLM)
 - **Deepseek V3** (DeepseekV3ForCausalLM)
-- **dots.llm1** (Dots1ForCausalLM)
+- **dots.llm1** (Dots1ForCausalLM) (`n_group>1` currently not supported)
 - **ERNIE 4.5** (Ernie4_5_ForCausalLM, Ernie4_5_MoeForCausalLM)
 - **EXAONE 4.0** (Exaone4ForCausalLM)
 - **Gemma 2** (Gemma2ForCausalLM)

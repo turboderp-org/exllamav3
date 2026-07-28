@@ -14,6 +14,7 @@ from .attention_fn.mla_triton import (
     mla_unfold,
     has_triton,
 )
+from .attention_fn.bc_attn import MAX_BSZ as _bc_max_bsz
 import os
 
 # Prefill strategy: "mha" (default) up-projects past tiles from the compressed cache and attends
@@ -250,6 +251,7 @@ class MLAttention(Module):
         self.w_uk_flat = None
         self.w_uv_flat = None
         self._scratch = {}
+        self.dispatch_cache = {}
 
 
     @override
@@ -396,6 +398,16 @@ class MLAttention(Module):
         layer = cache if not hasattr(cache, "layers") else \
             cache.layers[self.layer_idx, params.get("layer_instance") or 0]
 
+        # Graph-captured C++ path for the whole decode block (projections through o_proj as one
+        # replayed CUDA graph). Falls back to the dispatch path for unsupported configurations
+        if (
+            seqlen <= MAX_DECODE_QLEN and bsz <= _bc_max_bsz and
+            params.get("causal", True) and params.get("inv_freq") is None
+        ):
+            y = self.bc_mla_step(x, params, layer, block_table, cache_seqlens)
+            if y is not None:
+                return y
+
         from ..cache import CacheLayer_MLA_quant
         if isinstance(layer, CacheLayer_MLA_quant):
             # Packed latent feeds the kernels directly (online dequant, rotated domain); the rope
@@ -421,6 +433,24 @@ class MLAttention(Module):
                 layer.update_kv_direct(cache_seqlens, block_table, ckv, k_pe, seqlen),
             qc = qc,
             host_seqlens = host_seqlens,
+        )
+
+
+    def bc_mla_step(self, x, params, layer, block_table, cache_seqlens):
+        """Graph-captured decode block, or None when the module/cache-layer pair is not
+        supported (caller falls back to the dispatch path)."""
+        key = ("bcm", id(layer))
+        bcm = self.dispatch_cache.get(key)
+        if bcm is None:
+            from .attention_fn.bc_mla import build_bc_mla
+            bcm = self.dispatch_cache[key] = (build_bc_mla(self, layer) or False)
+        if bcm is False:
+            return None
+        position = params.get("position", 0)
+        positions = get_for_device(params, "positions", self.device, None)
+        position_ids = get_for_device(params, "position_ids", self.device, None)
+        return bcm.step(
+            x.contiguous(), cache_seqlens, block_table, position, positions, position_ids
         )
 
 
