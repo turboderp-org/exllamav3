@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import webbrowser
 from exllamav3 import Generator, Job, model_init
+from exllamav3.constants import PAGE_SIZE
 from chat_templates import *
 from chat_util import *
 from chat_io import *
@@ -67,6 +68,15 @@ def main(args):
     # Load model
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
     context_length = cache.max_num_tokens
+
+    # Limit max_response_tokens if cache_size is too small
+    if max_response_tokens > context_length // 2:
+        max_response_tokens = context_length // 2
+        print_error(
+            f" !! --max_response_tokens {args.max_response_tokens} leaves no room in the cache "
+            f"({context_length} tokens) for the system prompt and user messages. Reducing max response "
+            f"tokens to {max_response_tokens}."
+        )
 
     # Generator
     generator = Generator(
@@ -417,11 +427,29 @@ def main(args):
             exp_len_ = ids_.shape[-1] + max_response_tokens + 1
             return ids_, exp_len_
 
+        def fits(_exp_len):
+            # The job occupies whole cache pages
+            return (_exp_len + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE <= context_length
+
         ids, exp_len = get_input_ids(prefix)
-        if exp_len > context_length:
-            while exp_len > context_length - 2 * max_response_tokens:
+        if not fits(exp_len):
+            # Drop about a third of the cache for hysteresis, then round by round in case that isn't
+            # enough for a long user prompt
+            start_len = ids.shape[-1]
+            while len(context) > 1 and start_len - ids.shape[-1] < context_length // 3:
                 context = context[1:]
                 ids, exp_len = get_input_ids(prefix)
+            while not fits(exp_len) and len(context) > 1:
+                context = context[1:]
+                ids, exp_len = get_input_ids(prefix)
+            if not fits(exp_len):
+                print_error(
+                    f" !! Prompt needs {exp_len} tokens of cache (including {max_response_tokens} "
+                    f"reserved for the response) but only {context_length} are available. Increase "
+                    f"--cache_size or reduce --max_response_tokens."
+                )
+                context = context[:-1]
+                continue
 
         last_input_ids = ids.clone()
 
