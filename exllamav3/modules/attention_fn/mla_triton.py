@@ -44,6 +44,8 @@ import os
 
 import torch
 
+from ...util.tensor import g_tensor_cache
+
 # Debug aid: synchronize and error-check after every MLA kernel launch, so an async illegal
 # memory access is attributed to the kernel that caused it instead of a later sync point
 _debug_sync = os.environ.get("EXL3_MLA_DEBUG_SYNC", "0") != "0"
@@ -76,7 +78,7 @@ if has_triton:
 
     from .triton_paged import _qc_load_kt, _qc_load_v, _rot_h32
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
     def _mla_kv_quant_scatter_kernel(
         tmp_q,               # (rows, N_G * BITS) int32, packed by quant_cache_cont
         tmp_s,               # (rows, N_G) fp16 group scales
@@ -87,7 +89,7 @@ if has_triton:
         block_table,
         cache_seqlens,
         num_pages_per_seq,
-        append_len: tl.constexpr,
+        append_len,          # runtime: chunk lengths vary freely without recompiling
         page_size: tl.constexpr,
         W_TOT: tl.constexpr,     # N_G * BITS packed words per row
         W_PAD: tl.constexpr,     # next pow2 (tl.arange needs it; W_TOT = 48/80/96/112 for odd widths)
@@ -116,7 +118,7 @@ if has_triton:
         tl.store(kpe_cache + tok * D_r + r, tl.load(kpe_new + row * D_r + r))
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
     def _mla_kv_update_kernel(
         ckv_new,             # (bsz, len, D_c)
         kpe_new,             # (bsz, len, D_r)
@@ -125,7 +127,7 @@ if has_triton:
         block_table,
         cache_seqlens,
         num_pages_per_seq,
-        append_len: tl.constexpr,
+        append_len,          # runtime: chunk lengths vary freely without recompiling
         page_size: tl.constexpr,
         D_c: tl.constexpr,
         D_r: tl.constexpr,
@@ -151,7 +153,7 @@ if has_triton:
                  tl.load(kpe_new + row * D_r + offs_r))
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ["split_len", "num_pages_per_seq", "num_splits"])
     def _mla_decode_split_kernel(
         q_lat,               # (H, bsz * q_len, D_c) absorbed queries, head-major
         q_pe,                # (H, bsz * q_len, D_r)
@@ -284,7 +286,7 @@ if has_triton:
                 tl.store(partial_ml + ml_base + rows * 2 + 1, l)
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ["num_splits"])
     def _mla_decode_combine_kernel(
         partial_o,
         partial_ml,
@@ -337,7 +339,7 @@ if has_triton:
         tl.store(out + q_row[:, None] * D_c + offs_c[None, :], out_tile, mask = valid_row[:, None])
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ["num_pages_per_seq", "q_len", "n_rows"])
     def _mla_prefill_kernel(
         q_lat,
         q_pe,
@@ -442,6 +444,230 @@ if has_triton:
         tl.store(out + q_row[:, None] * D_c + offs_c[None, :], out_tile, mask = valid_row[:, None])
 
 
+    @triton.jit(do_not_specialize = ["tile_start", "tile_len", "num_pages_per_seq", "batch"])
+    def _mla_gather_tile_kernel(
+        ckv_cache,           # fp16 latent pages, or packed int32 when QC > 0
+        kpe_cache,           # fp16 rope pages
+        ckv_scales,
+        h32,
+        block_table,
+        out_ckv,             # (tile_len, D_c) fp16, plain latent domain
+        out_kpe,             # (tile_len, D_r) fp16
+        tile_start,          # runtime: absolute kv index of the tile's first row
+        tile_len,            # runtime
+        num_pages_per_seq,   # runtime
+        batch,               # runtime
+        QC: tl.constexpr,
+        page_size: tl.constexpr,
+        D_c: tl.constexpr,
+        D_r: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+    ):
+        """Gather one contiguous tile of past latent + rope rows out of the paged cache, with
+        online dequantization (and the inverse H32 rotation -- the packed values live in the
+        rotated domain) when the cache is quantized. Feeds the up-projection GEMMs of the
+        MHA-form prefill path."""
+        pid = tl.program_id(0)
+        r = pid * BLOCK_R + tl.arange(0, BLOCK_R)
+        in_range = r < tile_len
+        pos = tile_start + r
+        page = pos // page_size
+        off = pos - page * page_size
+        phys = tl.load(block_table + batch * num_pages_per_seq + page, mask = in_range, other = 0)
+        tok = phys * page_size + off
+
+        offs_c = tl.arange(0, D_c)
+        if QC > 0:
+            tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
+            # h32 is symmetric orthonormal, so the same multiply that rotates also unrotates
+            tile = _rot_h32(tile, h32, BLOCK_R, D_c)
+        else:
+            tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
+                           mask = in_range[:, None], other = 0.0)
+        tl.store(out_ckv + r[:, None] * D_c + offs_c[None, :], tile, mask = in_range[:, None])
+
+        offs_r2 = tl.arange(0, D_r)
+        kpe = tl.load(kpe_cache + tok[:, None] * D_r + offs_r2[None, :],
+                      mask = in_range[:, None], other = 0.0)
+        tl.store(out_kpe + r[:, None] * D_r + offs_r2[None, :], kpe, mask = in_range[:, None])
+
+
+    @triton.jit(do_not_specialize = ["R"])
+    def _mla_absorb_kernel(
+        q,                  # (R, H, QK_DIM) fp16 token-major; nope part read per head
+        w_uk_flat,          # (D_c, H * D_nope) fp16
+        out,                # (H, R, D_c) fp16 head-major (the decode kernels' q layout)
+        R,                  # runtime
+        n_q_heads: tl.constexpr,
+        QK_DIM: tl.constexpr,
+        D_nope: tl.constexpr,
+        NOPE_PAD: tl.constexpr,   # next pow2 of D_nope (192 for GLM-style heads)
+        D_c: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Per-head absorb q_lat_h = q_nope_h @ W_UK_h, reading W_UK straight out of the flat
+        (D_c, H*D_nope) layout the MHA prefill uses -- one stored form serves both paths, and no
+        cuBLAS batched GEMM (with its contiguity demands and the SM120 nvjet TMA fault) is
+        involved anywhere in the MLA module."""
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        head = tl.program_id(2)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        valid_m = offs_m < R
+        offs_k = tl.arange(0, NOPE_PAD)
+        valid_k = offs_k < D_nope
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        q_t = tl.load(q + (offs_m[:, None] * n_q_heads + head) * QK_DIM + offs_k[None, :],
+                      mask = valid_m[:, None] & valid_k[None, :], other = 0.0)
+        # W_UK_h^T columns live at flat[:, head*D_nope : (head+1)*D_nope]; the dot wants (K, N)
+        w_t = tl.load(w_uk_flat + offs_n[:, None] * (n_q_heads * D_nope) + head * D_nope + offs_k[None, :],
+                      mask = valid_k[None, :], other = 0.0)
+        acc = tl.dot(q_t, tl.trans(w_t))
+        tl.store(out + (head * R + offs_m[:, None]) * D_c + offs_n[None, :],
+                 acc.to(tl.float16), mask = valid_m[:, None])
+
+
+    @triton.jit(do_not_specialize = ["R"])
+    def _mla_unfold_kernel(
+        o_lat,              # (H, R, D_c) fp16 head-major latent attention output
+        w_uv_flat,          # (D_c, H * D_v) fp16
+        out,                # (R, H, D_v) fp16 token-major (direct o_proj input)
+        R,                  # runtime
+        n_q_heads: tl.constexpr,
+        D_c: tl.constexpr,
+        D_v: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Per-head unfold o_h = o_lat_h @ W_UV_h from the flat layout, emitting token-major
+        output so o_proj consumes it without a permute."""
+        pid_m = tl.program_id(0)
+        head = tl.program_id(1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        valid_m = offs_m < R
+        offs_v = tl.arange(0, D_v)
+
+        acc = tl.zeros((BLOCK_M, D_v), tl.float32)
+        for k0 in range(0, D_c, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            o_t = tl.load(o_lat + (head * R + offs_m[:, None]) * D_c + offs_k[None, :],
+                          mask = valid_m[:, None], other = 0.0)
+            w_t = tl.load(w_uv_flat + offs_k[:, None] * (n_q_heads * D_v) + head * D_v + offs_v[None, :])
+            acc = tl.dot(o_t, w_t, acc = acc)
+        tl.store(out + (offs_m[:, None] * n_q_heads + head) * D_v + offs_v[None, :],
+                 acc.to(tl.float16), mask = valid_m[:, None])
+
+
+    @triton.jit(do_not_specialize = [
+        "q_row0", "s_len", "tile_start", "tile_len", "past0",
+        "tile_init", "tile_final", "tile_masked",
+    ])
+    def _mla_prefill_mha_kernel(
+        q,                  # (R, H, QK_DIM) fp16, token-major: [nope | pe] per head
+        k_nope,             # (TS, H * D_nope) fp16, up-projected tile
+        v,                  # (TS, H * D_v) fp16, up-projected tile
+        k_pe,               # (TS, D_r) fp16, shared by all heads
+        state_m,            # (H, S) fp32 running max, carried across tile launches
+        state_l,            # (H, S) fp32 running denominator
+        state_acc,          # (H, S, D_v) fp32 running numerator
+        out,                # (R, H, D_v) fp16, token-major
+        q_row0,             # runtime: first q row of this batch item within R
+        s_len,              # runtime: q rows for this batch item
+        tile_start,         # runtime: absolute kv index of the tile's first row
+        tile_len,           # runtime
+        past0,              # runtime: total_kv - s_len (absolute position of q row 0)
+        tile_init,          # runtime: first tile -- initialize the running state
+        tile_final,         # runtime: last tile -- normalize and emit fp16 output
+        tile_masked,        # runtime: tile crosses the causal boundary
+        n_q_heads: tl.constexpr,
+        QK_DIM: tl.constexpr,
+        D_nope: tl.constexpr,
+        D_r: tl.constexpr,
+        D_v: tl.constexpr,
+        scale: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """MHA-form prefill over one up-projected past tile. The compressed cache stays the
+        source of truth; each tile of it is expanded to per-head K/V once per chunk, and this
+        kernel attends over the expansion -- ~2.8x fewer FLOPs per (query, past token) than
+        absorbed-form attention, because the contraction widths are the true head dims rather
+        than the latent width. The softmax state lives in global memory between tile launches
+        (same-stream ordering makes the read-modify-write safe), so no combine pass is needed.
+
+        The tile-position flags are RUNTIME values, deliberately: one compiled kernel serves
+        every tile at every chunk depth, so warming any single-tile prefill warms the whole
+        prefill path (perf.py's warmup, and the generator's first long prompt, rely on kernel
+        specialization being independent of past_len)."""
+        pid_m = tl.program_id(0)
+        head = tl.program_id(1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        valid_m = offs_m < s_len
+        q_abs = past0 + offs_m
+
+        offs_nope = tl.arange(0, D_nope)
+        offs_r = tl.arange(0, D_r)
+        offs_v = tl.arange(0, D_v)
+
+        qb = q + ((q_row0 + offs_m[:, None]) * n_q_heads + head) * QK_DIM
+        q_n = tl.load(qb + offs_nope[None, :], mask = valid_m[:, None], other = 0.0)
+        q_p = tl.load(qb + D_nope + offs_r[None, :], mask = valid_m[:, None], other = 0.0)
+
+        sb = head * s_len + offs_m
+        if tile_init != 0:
+            m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+            l = tl.full((BLOCK_M,), 0.0, tl.float32)
+            acc = tl.zeros((BLOCK_M, D_v), tl.float32)
+        else:
+            m = tl.load(state_m + sb, mask = valid_m, other = -float("inf"))
+            l = tl.load(state_l + sb, mask = valid_m, other = 0.0)
+            acc = tl.load(state_acc + sb[:, None] * D_v + offs_v[None, :],
+                          mask = valid_m[:, None], other = 0.0)
+
+        for n0 in range(0, tile_len, BLOCK_N):
+            offs_n = n0 + tl.arange(0, BLOCK_N)
+            in_r = offs_n < tile_len
+
+            kt = tl.load(k_nope + offs_n[None, :] * (n_q_heads * D_nope) + head * D_nope + offs_nope[:, None],
+                         mask = in_r[None, :], other = 0.0)
+            kt_pe = tl.load(k_pe + offs_n[None, :] * D_r + offs_r[:, None],
+                            mask = in_r[None, :], other = 0.0)
+
+            scores = tl.dot(q_n, kt)
+            scores = tl.dot(q_p, kt_pe, acc = scores) * scale
+
+            valid = valid_m[:, None] & in_r[None, :]
+            if tile_masked != 0:
+                valid = valid & ((tile_start + offs_n)[None, :] <= q_abs[:, None])
+            scores = tl.where(valid, scores, -float("inf"))
+
+            m_new = tl.maximum(m, tl.max(scores, axis = 1))
+            m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
+            p = tl.exp(scores - m_exp[:, None])
+            p = tl.where(valid, p, 0.0)
+            alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
+            l = l * alpha + tl.sum(p, axis = 1)
+
+            v_t = tl.load(v + offs_n[:, None] * (n_q_heads * D_v) + head * D_v + offs_v[None, :],
+                          mask = in_r[:, None], other = 0.0)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v_t.dtype), v_t)
+            m = m_new
+
+        if tile_final != 0:
+            out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
+            ob = out + ((q_row0 + offs_m[:, None]) * n_q_heads + head) * D_v
+            tl.store(ob + offs_v[None, :], out_tile, mask = valid_m[:, None])
+        else:
+            tl.store(state_m + sb, m, mask = valid_m)
+            tl.store(state_l + sb, l, mask = valid_m)
+            tl.store(state_acc + sb[:, None] * D_v + offs_v[None, :], acc, mask = valid_m[:, None])
+
+
 _sm_count = {}
 
 
@@ -501,16 +727,8 @@ def mla_kv_quant_append(
     groups = D_c // 32
     w_tot = groups * bits
 
-    key = (rows, bits, groups, D_r)
-    buf = scratch.get(key) if scratch is not None else None
-    if buf is None:
-        buf = (
-            torch.empty((rows, w_tot), dtype = torch.int, device = ckv_new.device),
-            torch.empty((rows, groups), dtype = torch.half, device = ckv_new.device),
-        )
-        if scratch is not None:
-            scratch[key] = buf
-    tmp_q, tmp_s = buf
+    tmp_q = g_tensor_cache.get(ckv_new.device, (rows, w_tot), torch.int, "mla_qtmp")
+    tmp_s = g_tensor_cache.get(ckv_new.device, (rows, groups), torch.half, "mla_stmp")
 
     _dbg_sync(f"upstream-of-append rows={rows} (not an MLA kernel)", ckv_new.device)
     ext.quant_cache_cont(ckv_new.reshape(rows, D_c).contiguous(), tmp_q, tmp_s, 0.0)
@@ -601,10 +819,7 @@ def mla_attn_triton_decode(
     if num_splits > 1:
         n_o = programs * num_splits * block_rows * D_c
         n_ml = programs * num_splits * block_rows * 2
-        if scratch is None:
-            partial_o = torch.empty(n_o, dtype = torch.float32, device = q_lat.device)
-            partial_ml = torch.empty(n_ml, dtype = torch.float32, device = q_lat.device)
-        else:
+        if scratch is not None:
             buf = scratch.get(n_o)
             if buf is None:
                 buf = scratch[n_o] = (
@@ -612,6 +827,10 @@ def mla_attn_triton_decode(
                     torch.empty(n_ml, dtype = torch.float32, device = q_lat.device),
                 )
             partial_o, partial_ml = buf
+        else:
+            # Shared across layers on the device (sequential use on one stream)
+            partial_o = g_tensor_cache.get(q_lat.device, (n_o,), torch.float, "mla_dec_po")
+            partial_ml = g_tensor_cache.get(q_lat.device, (n_ml,), torch.float, "mla_dec_ml")
     else:
         partial_o = partial_ml = q_lat
 
@@ -660,6 +879,132 @@ def mla_attn_triton_decode(
                 num_warps = 4, num_stages = 1,
             )
             _dbg_sync("mla_decode_combine", q_lat.device)
+    return out
+
+
+def mla_absorb(q: torch.Tensor, w_uk_flat: torch.Tensor, n_q_heads: int, qk_nope_head_dim: int):
+    """(R, H, qk_head_dim) token-major queries -> (H, R, kv_lora_rank) head-major absorbed
+    queries, W_UK read from the flat layout."""
+    R, H, qk_dim = q.shape
+    D_c = w_uk_flat.shape[0]
+    out = torch.empty((H, R, D_c), dtype = torch.half, device = q.device)
+    block_m = min(64, triton.next_power_of_2(max(R, 16)))
+    with torch.cuda.device(q.device):
+        _mla_absorb_kernel[(triton.cdiv(R, block_m), D_c // 128, H)](
+            q, w_uk_flat, out, R,
+            H, qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim), D_c,
+            block_m, 128,
+            num_warps = 4, num_stages = 2,
+        )
+    _dbg_sync("mla_absorb", q.device)
+    return out
+
+
+def mla_unfold(o_lat: torch.Tensor, w_uv_flat: torch.Tensor, v_head_dim: int):
+    """(H, R, kv_lora_rank) head-major latent output -> (R, H, v_head_dim) token-major."""
+    H, R, D_c = o_lat.shape
+    out = torch.empty((R, H, v_head_dim), dtype = torch.half, device = o_lat.device)
+    block_m = min(64, triton.next_power_of_2(max(R, 16)))
+    with torch.cuda.device(o_lat.device):
+        _mla_unfold_kernel[(triton.cdiv(R, block_m), H)](
+            o_lat, w_uv_flat, out, R,
+            H, D_c, v_head_dim,
+            block_m, 128,
+            num_warps = 4, num_stages = 2,
+        )
+    _dbg_sync("mla_unfold", o_lat.device)
+    return out
+
+
+def mla_attn_triton_prefill_mha(
+    q: torch.Tensor,            # (R, H, qk_head_dim) fp16, token-major, R = bsz * q_len
+    w_uk_flat: torch.Tensor,    # (D_c, H * D_nope) fp16
+    w_uv_flat: torch.Tensor,    # (D_c, H * D_v) fp16
+    ckv_cache: torch.Tensor,    # fp16 pages or packed int32
+    kpe_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    host_seqlens: list,         # per-batch PRE-append lengths (host ints; prefill is not graphed)
+    bsz: int,
+    q_len: int,
+    v_head_dim: int,
+    qk_nope_head_dim: int,
+    softmax_scale: float,
+    pre_appended_len: int = 0,
+    qc: tuple | None = None,
+    scratch: dict | None = None,
+    tile_size: int = 4096,
+    block_m: int = 128,
+    block_n: int = 64,
+    num_warps: int = 8,
+    num_stages: int = 2,
+) -> torch.Tensor:
+    """MHA-form prefill: the past is up-projected from the compressed cache in tiles (gather +
+    dequant, then two plain GEMMs against the flattened kv_b halves), and a per-tile kernel
+    attends with running softmax state. Returns (R, H, v_head_dim) fp16 token-major, the
+    direct o_proj input; neither absorb nor unfold bmm is involved on this path."""
+    R, H, qk_dim = q.shape
+    assert R == bsz * q_len
+    D_c = w_uk_flat.shape[0]
+    D_r = qk_dim - qk_nope_head_dim
+    page_size = kpe_cache.shape[1]
+    dev = q.device
+
+    if qc is not None:
+        from .triton_paged import _get_h32
+        ckv_scales, qc_bits = qc
+        h32 = _get_h32(dev)
+    else:
+        ckv_scales, qc_bits, h32 = q, 0, q
+
+    # Workspace is bounded by (tile_size, chunk length), NOT by context length, and shared
+    # across layers on the same device via g_tensor_cache. Layers run sequentially on the
+    # device's stream, so one set of buffers serves all of them (the BC-attention statics
+    # pattern). Only ONE tile of up-projected K/V ever exists at a time
+    def sbuf(key, shape, dtype):
+        if scratch is not None:
+            buf = scratch.get(key)
+            if buf is None or buf.shape != torch.Size(shape):
+                buf = scratch[key] = torch.empty(shape, dtype = dtype, device = dev)
+            return buf
+        return g_tensor_cache.get(dev, shape, dtype, "mla_" + key)
+
+    ts = tile_size
+    ckv_t = sbuf("mha_ckv", (ts, D_c), torch.half)
+    kpe_t = sbuf("mha_kpe", (ts, D_r), torch.half)
+    k_nope_t = sbuf("mha_kn", (ts, H * qk_nope_head_dim), torch.half)
+    v_t = sbuf("mha_v", (ts, H * v_head_dim), torch.half)
+    state_m = sbuf("mha_m", (H, q_len), torch.float)
+    state_l = sbuf("mha_l", (H, q_len), torch.float)
+    state_acc = sbuf("mha_acc", (H, q_len, v_head_dim), torch.float)
+    out = torch.empty((R, H, v_head_dim), dtype = torch.half, device = dev)
+
+    npps = block_table.shape[1]
+    with torch.cuda.device(dev):
+        for b in range(bsz):
+            total = int(host_seqlens[b]) + pre_appended_len
+            past0 = total - q_len
+            tiles = [(a, min(a + ts, total)) for a in range(0, total, ts)]
+            for ti, (a, e) in enumerate(tiles):
+                tl_len = e - a
+                _mla_gather_tile_kernel[(triton.cdiv(tl_len, 64),)](
+                    ckv_cache, kpe_cache, ckv_scales, h32, block_table,
+                    ckv_t, kpe_t, a, tl_len, npps, b,
+                    qc_bits, page_size, D_c, D_r, 64,
+                    num_warps = 4, num_stages = 2,
+                )
+                # Up-projection as two plain contiguous GEMMs (never the strided-batched form)
+                torch.mm(ckv_t[:tl_len], w_uk_flat, out = k_nope_t[:tl_len])
+                torch.mm(ckv_t[:tl_len], w_uv_flat, out = v_t[:tl_len])
+                _mla_prefill_mha_kernel[(triton.cdiv(q_len, block_m), H)](
+                    q, k_nope_t, v_t, kpe_t,
+                    state_m, state_l, state_acc, out,
+                    b * q_len, q_len, a, tl_len, past0,
+                    int(ti == 0), int(ti == len(tiles) - 1), int(e - 1 > past0),
+                    H, qk_dim, qk_nope_head_dim, D_r, v_head_dim, float(softmax_scale),
+                    block_m, block_n,
+                    num_warps = num_warps, num_stages = num_stages,
+                )
+    _dbg_sync("mla_prefill_mha", dev)
     return out
 
 

@@ -258,8 +258,12 @@ class CacheLayer_MLA_quant(CacheLayer):
         mla_kv_quant_append(
             k.reshape(k.shape[0], length, self.kv_lora_rank),
             v.reshape(v.shape[0], length, self.qk_rope_head_dim),
-            self.qk, self.sk, self.v, block_table, cache_seqlens,
-            self.bits, scratch = self._scratch,
+            self.qk,
+            self.sk,
+            self.v,
+            block_table,
+            cache_seqlens,
+            self.bits,
         )
 
 

@@ -9,8 +9,17 @@ from ..model.model_tp_alloc import TPAllocation
 from .attention_fn.mla_triton import (
     mla_attn_triton_decode,
     mla_attn_triton_prefill,
+    mla_attn_triton_prefill_mha,
+    mla_absorb,
+    mla_unfold,
     has_triton,
 )
+import os
+
+# Prefill strategy: "mha" (default) up-projects past tiles from the compressed cache and attends
+# in MHA form. ~2.8x fewer FLOPs than running the absorbed form over the whole context. "absorbed"
+# restores the single-kernel absorbed prefill for A/B testing
+_prefill_mode = os.environ.get("EXL3_MLA_PREFILL", "mha")
 
 # Query lengths at or below this use the flash-decoding kernel (kv split across programs);
 # above it, the long-query kernel (q split across programs) wins
@@ -22,8 +31,8 @@ class MLAttention(Module):
     Multi-head latent attention (DeepSeek-V2/V3, Kimi-Linear).
 
     Attention runs in absorbed form end to end. The cache holds only the compressed latent and the
-    shared RoPE key -- 576 values per token, against 81920 for the equivalent expanded K/V of a
-    128-head model -- and per-head K and V are never materialized, in prefill or decode. What makes
+    shared RoPE key: 576 values per token, against 81920 for the equivalent expanded K/V of a
+    128-head model. Per-head K and V are never materialized, in prefill or decode. What makes
     that possible is folding the kv_b up-projection into the query and the output instead:
 
         scores = (q_nope @ W_UK) . c_kv  +  q_pe . k_pe
@@ -34,8 +43,8 @@ class MLAttention(Module):
 
     W_UK and W_UV stay unquantized. They are pure weight streaming (measured at 76-81% of memory
     peak), the absorb is a bmm rather than a GEMM so the exl3 kernels do not apply, and folding
-    W_UK into q_b_proj instead would triple that projection -- strictly worse than the 33 MB per
-    layer this costs on a 128-head model.
+    W_UK into q_b_proj instead would triple that projection (strictly worse than the 33 MB per
+    layer this costs on a 128-head model.)
     """
 
     def __init__(
@@ -156,17 +165,19 @@ class MLAttention(Module):
         self.has_split_cache = False
         self.dispatch_cache = {}
 
-        # Absorption matrices, split out of kv_b_proj at load
-        self.w_uk = None    # (H, qk_nope_head_dim, kv_lora_rank)
-        self.w_uv = None    # (H, kv_lora_rank, v_head_dim)
-        self.kv_b = None
+        # kv_b_proj, stored ONLY in the flattened (kv_lora_rank, H * dim) form: the prefill
+        # up-projection GEMMs consume it directly, and the decode absorb/unfold run as Triton
+        # kernels that read per-head column blocks out of the same layout - one resident copy
+        # serves every path, and no cuBLAS batched GEMM is involved anywhere in the module
+        self.w_uk_flat = None   # (kv_lora_rank, H * qk_nope_head_dim)
+        self.w_uv_flat = None   # (kv_lora_rank, H * v_head_dim)
         self._scratch = {}
 
 
     def cache_layer_type(self, default, kwargs: dict):
         """MLA stores a latent instead of per-head K/V, so it overrides the cache layer the Cache
         was constructed with. A quantized cache request maps to the packed-latent layer: k_bits
-        sets the latent width, the shared rope key stays fp16 (v_bits is accepted but unused --
+        sets the latent width, the shared rope key stays fp16 (v_bits is accepted but unused -
         there is no separate V)."""
         from ..cache import CacheLayer_fp16, CacheLayer_MLA_fp16, CacheLayer_quant, CacheLayer_MLA_quant
         if issubclass(default, CacheLayer_quant):
@@ -195,18 +206,18 @@ class MLAttention(Module):
         if self.rope_settings:
             self.rope = RoPE(device, self.rope_settings)
 
-        # kv_b_proj maps the latent to per-head K-nope and V. Absorbed attention never applies it
-        # directly; it folds the two halves into the query and the output instead
+        # kv_b_proj maps the latent to per-head K-nope and V. Attention never applies it as that
+        # GEMM; the halves fold into the query/output (decode) or up-project past tiles (prefill)
         w = self.config.stc.get_tensor(f"{self.key}.{self.key_kv_b}.weight", device, no_defer = True)
         assert w.shape == (self.num_q_heads * (self.qk_nope_head_dim + self.v_head_dim),
                            self.kv_lora_rank), \
             f"{self.key}.{self.key_kv_b}: unexpected shape {tuple(w.shape)}"
-        w = w.view(self.num_q_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
-        # score = q_nope . (W_kb c) = (q_nope @ W_kb) . c
-        self.w_uk = w[:, :self.qk_nope_head_dim, :].contiguous().half()
-        # o = W_vb (sum_k p_k c_k) = o_lat @ W_vb^T
-        self.w_uv = w[:, self.qk_nope_head_dim:, :].transpose(1, 2).contiguous().half()
-        self.kv_b = w.contiguous()
+        H, nope, v, D_c = self.num_q_heads, self.qk_nope_head_dim, self.v_head_dim, self.kv_lora_rank
+        w = w.view(H, nope + v, D_c)
+        self.w_uk_flat = torch.empty((D_c, H * nope), dtype = torch.half, device = device)
+        self.w_uk_flat.view(D_c, H, nope).copy_(w[:, :nope, :].permute(2, 0, 1))
+        self.w_uv_flat = torch.empty((D_c, H * v), dtype = torch.half, device = device)
+        self.w_uv_flat.view(D_c, H, v).copy_(w[:, nope:, :].permute(2, 0, 1))
 
 
     @override
@@ -217,12 +228,16 @@ class MLAttention(Module):
 
     @override
     def get_tensors(self):
-        # Unquantized, so it has to be carried into the converted model verbatim
+        # kv_b stays unquantized, so it is carried into the converted model; reconstruct the
+        # checkpoint layout from the flats (bf16 -> fp16 is value-exact at weight magnitudes)
         t = {}
-        if self.kv_b is not None:
-            t[f"{self.key}.{self.key_kv_b}.weight"] = self.kv_b.view(
-                self.num_q_heads * (self.qk_nope_head_dim + self.v_head_dim), self.kv_lora_rank
-            ).contiguous()
+        if self.w_uk_flat is not None:
+            H, nope, v = self.num_q_heads, self.qk_nope_head_dim, self.v_head_dim
+            D_c = self.kv_lora_rank
+            uk = self.w_uk_flat.view(D_c, H, nope).permute(1, 2, 0)
+            uv = self.w_uv_flat.view(D_c, H, v).permute(1, 2, 0)
+            t[f"{self.key}.{self.key_kv_b}.weight"] = \
+                torch.cat([uk, uv], dim = 1).reshape(H * (nope + v), D_c).contiguous()
         return t
 
 
@@ -232,9 +247,8 @@ class MLAttention(Module):
         for cl in self.cache_layers:
             cl.free()
         self.rope = None
-        self.w_uk = None
-        self.w_uv = None
-        self.kv_b = None
+        self.w_uk_flat = None
+        self.w_uv_flat = None
         self._scratch = {}
 
 
@@ -268,7 +282,7 @@ class MLAttention(Module):
 
 
     def _attend(self, x, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, cache_seqlens,
-                append, qc = None):
+                append, qc = None, host_seqlens = None):
         """Projections, absorption, attention and o_proj, shared by the cached and cache-less
         paths. `append` writes the new latent/rope rows into the supplied page tensors."""
         position = params.get("position", 0)
@@ -306,23 +320,38 @@ class MLAttention(Module):
             )
             _dbg_sync("rope", x.device)
 
-        # Absorb W_UK into the queries: (H, R, nope) x (H, nope, kv_lora) -> (H, R, kv_lora).
-        #
-        # The A operand is materialized contiguous rather than passed as the strided view: on
-        # SM120, cuBLAS routes the strided-batched fp16 GEMM to an nvjet TMA kernel
-        # (nvjet_sm120_hsh_mma_*_tmaAB) that intermittently MMU-faults on the strided view.
-        # Caught with cuda-gdb after presenting as flaky illegal-memory-access crashes whose
-        # incidence depended on cache quantization width and device split (allocation layout
-        # deciding whether the wild access lands in mapped pool memory). The copy is small
-        # (R x H x nope fp16) and the unfold bmm below already has a contiguous A
-        q_lat = torch.bmm(q_nope.permute(1, 0, 2).contiguous(), self.w_uk)
-        q_pe_hm = q_pe.reshape(R, H, self.qk_rope_head_dim).permute(1, 0, 2).contiguous()
-        _dbg_sync("absorb-bmm", x.device)
+        use_mha = seqlen > MAX_DECODE_QLEN and _prefill_mode == "mha" and causal
+        if not use_mha:
+            # Absorb W_UK into the queries, per head, straight from the flat layout. This runs as
+            # a Triton kernel rather than a cuBLAS batched GEMM: the strided-batched fp16 form
+            # made cuBLAS pick an SM120 nvjet TMA kernel that intermittently MMU-faults (caught
+            # with cuda-gdb after presenting as flaky illegal-memory-access crashes whose
+            # incidence tracked allocation layout), and the kernel reads any strides for free
+            q_lat = mla_absorb(q.view(R, H, self.qk_head_dim), self.w_uk_flat, H, self.qk_nope_head_dim)
+            q_pe_hm = q_pe.reshape(R, H, self.qk_rope_head_dim).permute(1, 0, 2).contiguous()
 
         append(ckv, k_pe)
 
+        if use_mha:
+            # MHA-form prefill: everything (past and current chunk) is read back from the cache
+            # and attended over per-head up-projections. RoPE produced q_pe as a copy (the strided
+            # slice cannot reshape into a view), so fold it back into q's pe columns for the
+            # kernel's packed [nope | pe] per-head rows
+            q = q.view(R, H, self.qk_head_dim)
+            q[:, :, self.qk_nope_head_dim:] = q_pe.reshape(R, H, self.qk_rope_head_dim)
+            o = mla_attn_triton_prefill_mha(
+                q,
+                self.w_uk_flat, self.w_uv_flat,
+                ckv_cache, kpe_cache, block_table, host_seqlens,
+                bsz, seqlen, self.v_head_dim, self.qk_nope_head_dim, self.sm_scale,
+                pre_appended_len = seqlen,
+                qc = qc,
+            )
+            o = o.reshape(bsz, seqlen, H * self.v_head_dim)
+            return self.o_proj.forward(o, params)
+
         kernel = mla_attn_triton_decode if seqlen <= MAX_DECODE_QLEN else mla_attn_triton_prefill
-        extra = dict(scratch = self._scratch) if seqlen <= MAX_DECODE_QLEN else {}
+        extra = {}
         o_lat = kernel(
             q_lat, q_pe_hm, ckv_cache, kpe_cache, block_table, cache_seqlens,
             bsz = bsz, q_len = seqlen,
@@ -342,9 +371,10 @@ class MLAttention(Module):
                     f"MLA debug: non-finite attention output, layer {self.layer_idx}, "
                     f"{bad}/{o_lat.numel()} elements, bsz={bsz} seqlen={seqlen} dev={o_lat.device}")
 
-        # Unfold W_UV: (H, R, kv_lora) x (H, kv_lora, v_head) -> (H, R, v_head)
-        o = torch.bmm(o_lat, self.w_uv)
-        o = o.permute(1, 0, 2).reshape(bsz, seqlen, H * self.v_head_dim)
+        # Unfold W_UV per head from the flat layout; the kernel emits token-major output, so it
+        # feeds o_proj without a permute
+        o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
+        o = o.reshape(bsz, seqlen, H * self.v_head_dim)
         return self.o_proj.forward(o, params)
 
 
@@ -376,11 +406,21 @@ class MLAttention(Module):
             ckv_cache, kpe_cache = layer.get_kv(cache_seqlens, block_table)
             qc = None
 
+        # Host-side lengths for the tiled prefill (one device sync per forward, shared across
+        # layers via the params dict; prefill is not a graphed path)
+        if seqlen > MAX_DECODE_QLEN:
+            host_seqlens = params.get("_mla_host_seqlens")
+            if host_seqlens is None:
+                host_seqlens = params["_mla_host_seqlens"] = cache_seqlens.cpu().tolist()
+        else:
+            host_seqlens = None
+
         return self._attend(
             x, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, cache_seqlens,
             append = lambda ckv, k_pe:
                 layer.update_kv_direct(cache_seqlens, block_table, ckv, k_pe, seqlen),
             qc = qc,
+            host_seqlens = host_seqlens,
         )
 
 
@@ -418,6 +458,7 @@ class MLAttention(Module):
                     k_pe.reshape(bsz, seqlen, self.qk_rope_head_dim),
                     ckv_cache, kpe_cache, block_table, cache_seqlens,
                 ),
+            host_seqlens = [0] * bsz,
         )
 
 

@@ -441,3 +441,83 @@ def test_mla_quant_cache_vs_reference(bits, tol):
     err = rel_err(out, ref)
     print(f"  Q{bits} vs reference: rel err {err:.3e}")
     assert err < tol, f"Q{bits}: rel err {err:.3e}"
+
+
+def test_mla_prefill_mode_equivalence():
+    """The MHA-form prefill (up-projected past tiles) and the absorbed prefill must agree; they
+    compute the same attention in different factorizations."""
+    import exllamav3.modules.mla_attn as M
+    module, t, key = build(H = 8, q_lora = 256, seed = 31)
+    bsz, S = 2, 600
+    x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.5).half()
+    bt = torch.arange(4 * bsz, dtype = torch.int32, device = device).view(bsz, 4)
+    saved = M._prefill_mode
+    try:
+        M._prefill_mode = "mha"
+        o_mha = run_module(module, x, make_cache(module, 4 * PAGE_SIZE * bsz), bt)
+        M._prefill_mode = "absorbed"
+        o_abs = run_module(module, x, make_cache(module, 4 * PAGE_SIZE * bsz), bt)
+    finally:
+        M._prefill_mode = saved
+    assert rel_err(o_mha, o_abs) < 2e-3, f"mha vs absorbed: {rel_err(o_mha, o_abs):.3e}"
+
+
+@pytest.mark.parametrize("bits", [0, 4, 8])
+def test_mla_gather_tile(bits):
+    """The tile gather kernel must reproduce the exact latent/rope rows the cache holds (via
+    dequant_cache_cont for the packed case, including the inverse H32 rotation)."""
+    from exllamav3.modules.attention_fn.mla_triton import (
+        _mla_gather_tile_kernel, mla_kv_append, mla_kv_quant_append,
+    )
+    from exllamav3.modules.attention_fn.triton_paged import _get_h32
+    import triton
+    torch.manual_seed(bits + 41)
+    D_c, D_r, PS = 512, 64, PAGE_SIZE
+    kv_len, npages = 900, 4
+    dev = torch.device(device)
+    bt = torch.randperm(npages, dtype = torch.int32, device = dev).view(1, npages)
+    zero = torch.zeros((1,), dtype = torch.int32, device = dev)
+    ckv_rows = (torch.randn((1, kv_len, D_c), device = dev) * 0.1).half()
+    kpe_rows = (torch.randn((1, kv_len, D_r), device = dev) * 0.1).half()
+
+    if bits == 0:
+        ck = torch.zeros((npages, PS, 1, D_c), dtype = torch.half, device = dev)
+        kp = torch.zeros((npages, PS, 1, D_r), dtype = torch.half, device = dev)
+        mla_kv_append(ckv_rows, kpe_rows, ck, kp, bt, zero)
+        want = ckv_rows[0]
+        sk, h32, qbits = ck, ck, 0
+    else:
+        groups = D_c // 32
+        ck = torch.zeros((npages, PS, groups * bits), dtype = torch.int, device = dev)
+        sk = torch.zeros((npages, PS, groups), dtype = torch.half, device = dev)
+        kp = torch.zeros((npages, PS, 1, D_r), dtype = torch.half, device = dev)
+        mla_kv_quant_append(ckv_rows, kpe_rows, ck, sk, kp, bt, zero, bits)
+        tmp_q = torch.empty((kv_len, groups * bits), dtype = torch.int, device = dev)
+        tmp_s = torch.empty((kv_len, groups), dtype = torch.half, device = dev)
+        ext.quant_cache_cont(ckv_rows[0].contiguous(), tmp_q, tmp_s, 0.0)
+        want = torch.empty((kv_len, D_c), dtype = torch.half, device = dev)
+        ext.dequant_cache_cont(tmp_q, tmp_s, want, 0.0)
+        h32, qbits = _get_h32(dev), bits
+
+    a, e = 100, 800   # tile crossing page boundaries
+    out_c = torch.empty((e - a, D_c), dtype = torch.half, device = dev)
+    out_r = torch.empty((e - a, D_r), dtype = torch.half, device = dev)
+    _mla_gather_tile_kernel[(triton.cdiv(e - a, 64),)](
+        ck, kp, sk, h32, bt, out_c, out_r, a, e - a, npages, 0,
+        qbits, PS, D_c, D_r, 64, num_warps = 4, num_stages = 2,
+    )
+    err_c = (out_c.float() - want[a:e].float()).abs().max().item()
+    err_r = (out_r.float() - kpe_rows[0, a:e].float()).abs().max().item()
+    tol = 1e-3 if bits else 0.0   # unrotation is a small fp16 dot; fp16 gather must be exact
+    assert err_c <= tol, f"latent gather err {err_c:.3e}"
+    assert err_r == 0.0, f"kpe gather err {err_r:.3e}"
+
+
+def test_mla_kv_b_export_roundtrip():
+    """get_tensors must reconstruct kv_b_proj.weight in the exact checkpoint layout from the
+    flat storage (the conversion pipeline carries it into quantized models verbatim)."""
+    module, t, key = build(H = 8, seed = 51)
+    got = module.get_tensors()[f"{key}.kv_b_proj.weight"]
+    want = t[f"{key}.kv_b_proj.weight"]
+    assert got.shape == want.shape
+    assert torch.equal(got.cpu().half(), want.cpu().half()), "kv_b reconstruction differs"
