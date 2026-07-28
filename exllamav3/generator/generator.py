@@ -241,17 +241,17 @@ class Generator:
 
         # Drafting mode
         self.dflash_draft, self.mtp_draft, self.reg_draft = False, False, False
-        if draft_model is not None:
-            assert isinstance(draft_cache, CacheStack), \
+        if self.draft_model is not None:
+            assert isinstance(self.draft_cache, CacheStack), \
                 "A draft stack must have a cache stack of equal length."
-            assert len(draft_model.draft_models) == len(draft_cache.caches), \
+            assert len(self.draft_model.draft_models) == len(self.draft_cache.caches), \
                 "The draft stack is not the same length as the cache stack."
-            for m in draft_model.draft_models:
+            for m in self.draft_model.draft_models:
                 if m.caps.get("attach_target"):
-                    m.attach_to("model")
-            self.dflash_draft = [m.caps.get("dflash_draft", False) for m in draft_model.draft_models]
-            self.mtp_draft = [m.caps.get("mtp_draft", False) for m in draft_model.draft_models]
-            self.reg_draft = [not self.dflash_draft[i] and not self.mtp_draft[i] for (i, m) in enumerate(draft_model.draft_models)]
+                    m.attach_to(model)
+            self.dflash_draft = [i for i, m in enumerate(self.draft_model.draft_models) if m.caps.get("dflash_draft", False)]
+            self.mtp_draft = [i for i, m in enumerate(self.draft_model.draft_models) if m.caps.get("mtp_draft", False)]
+            self.reg_draft = [i for (i, m) in enumerate(self.draft_model.draft_models) if i not in self.dflash_draft and i not in self.mtp_draft]
 
 
     def num_remaining_jobs(self):
@@ -412,13 +412,13 @@ class Generator:
         # Generation with draft model / ngram
         if self.draft_model or self.ngram_match_min:
             ngram_idx = 1
-            for idx, model in enumerate(self.draft_model.draft_models):
-                if self.dflash_draft[idx]:
-                    self.iterate_draftmodel_dflash_gen(results, idx)
-                elif self.mtp_draft[idx]:
-                    self.iterate_draftmodel_mtp_gen(results, idx)
-                elif self.reg_draft[idx]:
-                    self.iterate_draftmodel_gen(results, idx)
+            for idx, dm in enumerate(self.draft_model.draft_models):
+                if idx in self.dflash_draft:
+                    self.iterate_draftmodel_dflash_gen(results, dm, idx)
+                elif idx in self.mtp_draft:
+                    self.iterate_draftmodel_mtp_gen(results, dm, idx)
+                elif idx in self.reg_draft:
+                    self.iterate_draftmodel_gen(results, dm, idx)
                 ngram_idx += 1
             if self.ngram_match_min:
                 draft_tokens = self.iterate_ngram_gen(results, ngram_idx)
@@ -612,7 +612,7 @@ class Generator:
             temp_hidden = batch_state
 
     # TODO: Refactor, share code with other draft fns
-    def iterate_draftmodel_dflash_gen(self, results: list, drafter: int = 0):
+    def iterate_draftmodel_dflash_gen(self, results: list, model: Model, drafter: int = 0):
 
         # Get shape of active batch
         batch_size = 0

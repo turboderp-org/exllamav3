@@ -1182,7 +1182,9 @@ class Job:
                     "mm_span_prefix": mm_span_prefix,
                 }
                 if self.generator.draft_model:
-                    params.update(self.generator.draft_model.draft_verifier_params)
+                    for m in self.generator.draft_model.draft_models:
+                        params.update(m.draft_verifier_params)
+                    
                 if self.generator.mtp_draft:
                     # MTP needs the target's post-final-norm state for every prompt token.
                     # Normal prefill stops at the last cache-writing layer, before final norm.
@@ -1192,26 +1194,27 @@ class Job:
                     self.generator.model.prefill(input_ids = prefill_ids, params = params)
 
                 if self.generator.dflash_draft:
-                    self.generator.draft_model.update_kv_from_target(
-                        target_hidden = params.get("export_states"),
-                        cache = self.generator.draft_cache,
-                        params = {
-                            "block_table": seq.block_index_tensor,
-                            "cache_seqlens": params["cache_seqlens"],
-                        }
-                    )
-                elif self.generator.draft_model:
-                    if self.generator.mtp_draft:
-                        target_hidden = params.get("export_states")[-1]
-                        carry_hidden = seq.mtp_carry_hidden
-                        if carry_hidden is None:
-                            carry_hidden = torch.zeros_like(target_hidden[:, :1, :])
-                        shifted_hidden = torch.cat((carry_hidden, target_hidden[:, :-1, :]), dim = 1)
-                        seq.mtp_carry_hidden = target_hidden[:, -1:, :].clone()
-                        self.mtp_last_hidden = seq.mtp_carry_hidden
-                    else:
-                        shifted_hidden = None
-                    self.generator.draft_model.prefill(
+                    for idx in self.generator.dflash_draft:
+                        self.generator.draft_model.draft_models[idx].update_kv_from_target(
+                            target_hidden = params.get("export_states"),
+                            cache = self.generator.draft_cache.caches[idx],
+                            params = {
+                                "block_table": seq.block_index_tensor,
+                                "cache_seqlens": params["cache_seqlens"],
+                            }
+                        )
+                if self.generator.mtp_draft:
+                    target_hidden = params.get("export_states")[-1]
+                    carry_hidden = seq.mtp_carry_hidden
+                    if carry_hidden is None:
+                        carry_hidden = torch.zeros_like(target_hidden[:, :1, :])
+                    shifted_hidden = torch.cat((carry_hidden, target_hidden[:, :-1, :]), dim = 1)
+                    seq.mtp_carry_hidden = target_hidden[:, -1:, :].clone()
+                    self.mtp_last_hidden = seq.mtp_carry_hidden
+                else:
+                    shifted_hidden = None
+                for idx in self.generator.mtp_draft + self.generator.reg_draft:
+                    self.generator.draft_model.draft_models[idx].prefill(
                         input_ids = prefill_ids,
                         params = {
                             "target_hidden": shifted_hidden,
