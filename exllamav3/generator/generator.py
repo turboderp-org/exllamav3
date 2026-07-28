@@ -952,7 +952,7 @@ class Generator:
                     # uses the full sequence generated so far as its next prompt. Unconsumed draft positions must
                     # be rejected here so the recurrent state and page positions match the accepted sequence
                     # before the requeue stash.
-                    if len(job.sequences) == 1 and rq:
+                    if len(job.sequences) == 1 and rq and not eos:
                         if draft_tokens is not None:
                             rejected = reject_remainder(job, j, i, batch_states)
                         requeuing_jobs.append(job)
