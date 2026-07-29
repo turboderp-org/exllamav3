@@ -1382,6 +1382,7 @@ def _paged_attn_prefill_kernel(
     HAS_WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    WIDE_INDEX: tl.constexpr,  # int64 q/out/partial index math (element offsets past 2^31)
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -1401,8 +1402,12 @@ def _paged_attn_prefill_kernel(
     valid_row = offs_m < q_len
 
     # q/out element offsets reach q_len * n_q_heads * head_dim, past int32 at ~64k rows for
-    # 32-head/256-dim geometry: widen the row term
-    row64 = (batch * q_len + offs_m[:, None]).to(tl.int64)
+    # 32-head/256-dim geometry: widen the row term. Conditional on the wrapper detecting a
+    # tensor past the boundary, so common geometries keep pure int32 index math
+    if WIDE_INDEX:
+        row64 = (batch * q_len + offs_m[:, None]).to(tl.int64)
+    else:
+        row64 = batch * q_len + offs_m[:, None]
     q_ptrs = q + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
     q_tile = tl.load(q_ptrs, mask = valid_row[:, None], other = 0.0)
     if QCK > 0:
@@ -1513,7 +1518,10 @@ def _paged_attn_prefill_kernel(
 
     if IS_SPLIT:
         # partial_o offsets reach programs * num_splits * BLOCK_M * head_dim: widen
-        pid_lin = ((pid_m * tl.num_programs(1) + bh) * num_splits + split).to(tl.int64)
+        if WIDE_INDEX:
+            pid_lin = ((pid_m * tl.num_programs(1) + bh) * num_splits + split).to(tl.int64)
+        else:
+            pid_lin = (pid_m * tl.num_programs(1) + bh) * num_splits + split
         po_base = pid_lin * BLOCK_M * head_dim
         tl.store(partial_o + po_base + tl.arange(0, BLOCK_M)[:, None] * head_dim + offs_d[None, :], acc)
         ml_base = pid_lin * BLOCK_M * 2
@@ -1547,6 +1555,7 @@ def _paged_attn_prefill_combine_kernel(
     q_len,               # runtime: only masks and address math
     n_q_heads: tl.constexpr,
     head_dim: tl.constexpr,
+    WIDE_INDEX: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -1558,7 +1567,10 @@ def _paged_attn_prefill_combine_kernel(
     offs_d = tl.arange(0, head_dim)
     rows = tl.arange(0, BLOCK_M)
     # same int32 overflow considerations as the prefill kernel: partial and out offsets widen
-    pid_lin = ((pid_m * tl.num_programs(1) + bh) * num_splits).to(tl.int64)
+    if WIDE_INDEX:
+        pid_lin = ((pid_m * tl.num_programs(1) + bh) * num_splits).to(tl.int64)
+    else:
+        pid_lin = (pid_m * tl.num_programs(1) + bh) * num_splits
 
     m_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     for sp in range(num_splits):
@@ -1586,7 +1598,10 @@ def _paged_attn_prefill_combine_kernel(
     out_tile = acc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
     if QCV > 0:
         out_tile = _rot_h32(out_tile, h32, BLOCK_M, head_dim)
-    row64 = (batch * q_len + offs_m[:, None]).to(tl.int64)
+    if WIDE_INDEX:
+        row64 = (batch * q_len + offs_m[:, None]).to(tl.int64)
+    else:
+        row64 = batch * q_len + offs_m[:, None]
     out_ptrs = out + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
     tl.store(out_ptrs, out_tile, mask = (offs_m[:, None] < q_len))
 
@@ -1830,6 +1845,12 @@ def paged_attn_triton_prefill(
             )
 
         grid = (q_blocks, bsz * n_q_heads, num_splits)
+        # int64 index math only when an element offset can actually cross 2^31 (q/out, or the
+        # fp32 partial buffer); common geometries keep pure int32 codegen
+        wide_index = max(
+            bsz * q_len * n_q_heads * head_dim,
+            q_blocks * bsz * n_q_heads * num_splits * block_m * head_dim,
+        ) >= 1 << 31
         def launch(ns):
             _paged_attn_prefill_kernel[grid](
                 q, k_cache, v_cache, block_table, cache_seqlens, out,
@@ -1840,7 +1861,7 @@ def paged_attn_triton_prefill(
                 num_pages_per_seq, page_size, head_dim, float(softmax_scale),
                 bool(causal), int(window_left), int(window_right),
                 window_left >= 0, window_right >= 0, float(softcap or 0.0),
-                has_sinks, block_m, block_n,
+                has_sinks, wide_index, block_m, block_n,
                 num_warps=num_warps, num_stages=ns,
             )
 
@@ -1862,7 +1883,7 @@ def paged_attn_triton_prefill(
         if num_splits > 1:
             _paged_attn_prefill_combine_kernel[(q_blocks, bsz * n_q_heads)](
                 partial_o, partial_ml, out, h32, sinks,
-                num_splits, qcv, has_sinks, q_len, n_q_heads, head_dim, block_m,
+                num_splits, qcv, has_sinks, q_len, n_q_heads, head_dim, wide_index, block_m,
                 num_warps=8, num_stages=1,
             )
     return out
