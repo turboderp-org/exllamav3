@@ -708,6 +708,22 @@ def fn_triton_paged_attn_longq(args: AttnArgs) -> torch.Tensor | None:
 
 _h32_cache = {}
 
+# EXL3_QC_STAGING selects how quantized caches feed the attention kernels:
+#   0 = no staging: online dequant inside the prefill and decode kernels. Lowest memory (no
+#       staging scratch is ever allocated or reserved during autosplit) but prefill pays the
+#       in-kernel expansion cost (~6-26% on the kernel depending on bitrate)
+#   1 = prefill staging (default): prefill dequantizes the referenced cache window once into a
+#       shared fp16 scratch sized for the full cache at bsz 1 and runs the fp16 kernel over it;
+#       decode stays online. The scratch is allocated on first use -- the autosplit measuring
+#       pass triggers it, so the space is reserved at load time
+#   2 = full staging: dispatch-path debug mode; whole layers are dequantized into full-size
+#       fp16 temporaries before attention (get_kv). Only affects decode if EXL3_BC_ATTN=0
+_qc_staging = int(os.environ.get("EXL3_QC_STAGING", "1"))
+
+# Query-length threshold for the prefill staging pass at EXL3_QC_STAGING=1: below it the direct
+# path reads less gmem (short trailing chunks over long contexts, low bitrates)
+_qc_prefill_two_pass_min_q = int(os.environ.get("EXL3_QC_PF_TWO_PASS_MIN_Q", "256"))
+
 def _get_h32(device):
     if device not in _h32_cache:
         h = torch.ones(1, 1, dtype = torch.float32)
@@ -1702,6 +1718,37 @@ def paged_attn_triton_prefill(
     if qc is not None:
         k_scales, v_scales, qck, qcv = qc
         h32 = _get_h32(q.device)
+
+        # Two-pass quantized-cache prefill: dequantize the referenced window once into a compact
+        # fp16 scratch and run the fp16 kernel over it. In-kernel dequant re-expands every kv
+        # tile once per (q block x sibling q head) -- measured 6-26% slower than fp16 depending
+        # on bitrate, unrecoverable by tile/stage tuning -- while the one-shot dequant pass costs
+        # ~2% of the kernel and the fp16 kernel runs at full speed. Compute-bound chunks only;
+        # short query batches stay on the direct path, which reads less gmem
+        # (causal only: VLM span chunks fan out into several wrapper calls over the same window,
+        # which would repeat the dequant pass per span -- those keep the direct path. The scratch
+        # is sized for the whole cache pool, not the current block-table span: one stable
+        # allocation that the autosplit measuring pass reserves at load time, valid for any
+        # bsz-1 window; batched windows that pad beyond the pool fall back to the direct path)
+        pool_pages = k_cache.shape[0]
+        if (_qc_staging == 1 and q_len >= _qc_prefill_two_pass_min_q
+                and new_kv_mode == 0 and k is None and causal
+                and bsz * block_table.shape[1] <= pool_pages):
+            from ...ext import exllamav3_ext as ext
+            from ...util.tensor import g_tensor_cache
+            npps_w = block_table.shape[1]
+            n_kvh = n_kv_heads_override
+            kd = g_tensor_cache.get(q.device, (pool_pages, page_size, n_kvh, head_dim), torch.half, "qc_pf_k")
+            vd = g_tensor_cache.get(q.device, (pool_pages, page_size, n_kvh, head_dim), torch.half, "qc_pf_v")
+            ext.dequant_cache_paged_window(
+                k_cache, k_scales, kd, v_cache, v_scales, vd,
+                cache_seqlens, block_table, page_size, kv_append_len, 0.0,
+            )
+            k_cache, v_cache = kd, vd
+            block_table = torch.arange(bsz * npps_w, dtype = torch.int32, device = q.device).view(bsz, npps_w)
+            qc = None
+            k_scales, v_scales, qck, qcv = q, q, 0, 0
+            h32 = q
     else:
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q

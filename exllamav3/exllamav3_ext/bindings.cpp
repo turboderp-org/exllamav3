@@ -177,6 +177,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dequant_cache_cont", &dequant_cache_cont, "dequant_cache_cont");
     m.def("quant_cache_paged", &quant_cache_paged, "quant_cache_paged");
     m.def("dequant_cache_paged", &dequant_cache_paged, "dequant_cache_paged");
+    m.def("dequant_cache_paged_window", &dequant_cache_paged_window, "dequant_cache_paged_window");
 
     m.def("count_inf_nan", &count_inf_nan, "count_inf_nan");
     m.def("histogram", &histogram, "histogram");

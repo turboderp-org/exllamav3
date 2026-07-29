@@ -11,12 +11,14 @@ time. Either way, set them before loading a model.
 
 ### `EXL3_BC_ATTN` (default: `1`)
 
-Graph-captured C++ decode attention. For decode steps (bsz ≤ 4, q_len ≤ 16) the whole attention
+Graph-captured C++ decode attention. For decode steps (bsz ≤ 8, q_len ≤ 16) the whole attention
 block — q/k/v projections, fused head norm + RoPE, cache append, flash-decoding attention and
 o_proj — runs as a single C++ call, captured as one CUDA graph per (bsz, q_len) shape and
 replayed with only the input/output/position/block-table pointers patched. Removes effectively
 all Python host time from the attention block; the largest gains are on host-bound setups
-(small or hybrid models, fast GPUs, contended CPUs).
+(small or hybrid models, fast GPUs, contended CPUs). The same flag covers the equivalent path
+for MLA layers (BC_MLAttention: q projections, latent projection and staging, partial RoPE,
+W_UK absorption, cache append, absorbed flash-decoding, W_UV unfold and o_proj as one graph).
 
 Module or cache configurations the path does not support (TP, headwise gates, LayerNorm or
 span-heads head norms, non-EXL3 projections, compander-enabled quant cache, ...) fall back to
@@ -29,13 +31,47 @@ Print one line per attention module/cache-layer pair when the graph-captured dec
 built or declined (module key, device). Activation check for A/B tests: a benchmark comparing
 `EXL3_BC_ATTN` settings is only meaningful if the enabled run actually built the path.
 
-### `EXL3_QC_ATTN` (default: `1`)
+### `EXL3_QC_STAGING` (default: `1`)
 
-Quantized-cache direct attention: packed K/V cache tensors feed the attention kernels directly,
-with new K/V quantized into the cache before attention and dequantization fused into the kernel
-loads. Set to `0` to fall back to the legacy path (dequantize the cache into full-size fp16
-temporaries, then attend), which costs both time and the peak VRAM for the temporaries. Only
+How quantized K/V caches feed the attention kernels (replaces the former `EXL3_QC_ATTN`). Only
 affects quantized caches.
+
+- `0` — no staging: packed cache tensors feed the prefill and decode kernels directly, with
+  dequantization fused into the kernel loads. Lowest memory: no staging scratch is ever
+  allocated, and nothing extra is reserved during autosplit loading. Prefill pays for the
+  in-kernel expansion (roughly 5–25% on the attention kernel depending on bitrate and GPU),
+  which every kv tile repeats once per query block and sibling query head.
+- `1` — prefill staging (default): prefill chunks of 256+ tokens dequantize the referenced
+  cache window once into a shared fp16 scratch and run the fp16 kernel over it, putting
+  quantized-cache prefill within ~1–3% of fp16. Decode stays on the direct path. The scratch is
+  sized for the full cache at batch size 1 (`2 * max_num_tokens * num_kv_heads * head_dim`
+  fp16 elements, shared across layers per device) and is allocated by the autosplit measuring
+  pass, so the space is reserved at load time rather than discovered at the first long prefill.
+  For very large caches this reservation is the tradeoff to weigh against `0` (e.g. ~4 GB at
+  1M tokens with 8 kv heads of dim 128).
+- `2` — full staging: legacy dequantize-then-attend path; whole cache layers are expanded into
+  full-size fp16 temporaries before attention. Debug/A-B mode (same effect as the former
+  `EXL3_QC_ATTN=0`); only affects decode if `EXL3_BC_ATTN` is also disabled, since the graphed
+  decode path reads the packed cache directly.
+
+### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`)
+
+Query-length threshold for the prefill staging pass at `EXL3_QC_STAGING=1`. Chunks shorter than
+this keep the direct path, which reads less global memory (relevant for short trailing chunks
+over long contexts at low cache bitrates). Tuning/testing knob.
+
+### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
+
+Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, the best of
+{1, 2} is measured once per (shape family, device) at first use; a nonzero value pins it,
+skipping the measurement. Only relevant where the direct path still runs (`EXL3_QC_STAGING=0`,
+or short chunks below the threshold above).
+
+### `EXL3_MLA_PREFILL` (default: `mha`)
+
+Prefill strategy for MLA layers: `mha` up-projects past latent tiles from the compressed cache
+and attends in MHA form (~2.8× fewer FLOPs per query-past pair); `absorbed` restores the
+single-kernel absorbed-form prefill for A/B testing.
 
 ### `EXL3_PREFER_FA2` (default: `0`)
 
