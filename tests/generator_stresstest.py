@@ -225,6 +225,8 @@ def main(args):
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
         show_visualizer = args.visualize_cache,
+        cpu_cache_size = int(args.cpu_cache_size * 1024**3),
+        recurrent_cache_size = int(args.recurrent_cache_size * 1024**3),
     )
 
     bpw_layer, bpw_head, _ = model.get_storage_info()
@@ -234,6 +236,13 @@ def main(args):
     print()
 
     run_stress_test(args, generator, tokenizer)
+
+    print()
+    print(f" -- Page table metrics: {generator.pagetable.metrics}")
+    if generator.cpu_page_cache is not None:
+        cpc = generator.cpu_page_cache
+        print(f" -- CPU cache metrics: {cpc.metrics}")
+        print(f" -- CPU cache pages: {len(cpc)} / {cpc.max_slots} ({cpc.slot_size / 1024**2:.2f} MB/page)")
 
 
 def validate_args(parser, args):

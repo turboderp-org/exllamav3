@@ -89,6 +89,8 @@ def main(args):
         ngram_match_min = args.ngram_match_min,
         dynamic_draft_tokens = args.dynamic_draft,
         dynamic_draft_skip_ema = args.draft_skip_ema,
+        cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
+        recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
     )
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
     if config.eos_token_id_list and all(config.eos_token_id_list):
@@ -145,9 +147,11 @@ def main(args):
                         "/cc <n>            Copy nth-last code block to clipboard",
                         "/clear             Clear context",
                         "/e                 Edit and resume last model response",
+                        "/gm                Generator metrics",
                         "/load              Load stored session from ~/chat_py_session.json",
                         "/load <filename>   Load stored session from file",
                         "/mli               Toggle multiline input",
+                        "/ppt               Print page table",
                         "/probs             Set number of probs recorded (0 to disable), adds overhead",
                         "/python            Extract and run the longest code block in a bwrap sandbox",
                         "/r                 Rewind and repeat last prompt",
@@ -248,6 +252,21 @@ def main(args):
                     except KeyboardInterrupt:
                         print_info("Exiting")
                         break
+
+                # Generator metrics
+                case "/gm":
+                    m = f"Page table: {generator.pagetable.metrics}"
+                    if generator.cpu_page_cache is not None:
+                        cpc = generator.cpu_page_cache
+                        m += f"\nCPU cache: {cpc.metrics}"
+                        m += f"\nCPU cache pages: {len(cpc)} / {cpc.max_slots} ({cpc.slot_size / 1024 ** 2:.2f} MB/page)"
+                    print_info(m)
+                    continue
+
+                # Page table/cache
+                case "/ppt":
+                    print_info(generator.pagetable.dump_page_list())
+                    continue
 
                 # Edit system prompt
                 case "/sp":

@@ -35,6 +35,11 @@ def _randomhash():
 tensor_hash_checksum = _tensor_blake2b_checksum
 random_hash = _randomhash
 
+def is_content_hash(h: bytes) -> bool:
+    # Random (placeholder) hashes are counter values whose top eight bytes stay zero; a blake2b content
+    # hash matches that pattern with vanishing probability
+    return h[:8] != bytes(8)
+
 
 @dataclass
 class CachePage:
@@ -76,6 +81,28 @@ class CachePage:
             f"phash: ..{str(self.phash)[8:24]}.., prev_hash: ..{str(self.prev_hash)[8:24]}.., "
             f"kvp {self.kv_position}"
         )
+
+    # Format page for debug output (steady state only)
+    def format(self):
+        pagetable = self.pagetable
+        tokenizer = pagetable.generator.tokenizer
+        f = f"{self.page_index:3}"
+        if self.prev_hash is None:
+            f += f" - prev: rt "
+        else:
+            prev_page = self.pagetable.referenced_pages.get(self.prev_hash) or self.pagetable.unreferenced_pages.get(self.prev_hash)
+            if prev_page:
+                f += f" - prev: {prev_page.page_index:3}"
+            else:
+                f += f" - prev:    "
+        f += f" - kvpr: {self.kv_position:3}"
+        text = repr(tokenizer.decode(self.sequence[0, :self.kv_position], decode_special_tokens = True))
+        if len(text) <= 100:
+            f += " " + text + " " * (100 - len(text))
+        else:
+            f += " " + text[:47] + " .... " + text[-47:]
+        f += f" - ser: {self.access_serial:5}"
+        return f
 
     # Copy page state so page can be reverted
     def backup(self):
@@ -241,16 +268,20 @@ class Sequence:
 
         # If recurrent model, find logest recurrent prefix
         recurrent_pages = None
+        restore_limit = None
         if recurrent_cache is not None:
             recurrent_pages = []
             for pi, ph in enumerate(page_hashes):
                 rs = recurrent_cache.get(ph)
                 if rs:
                     recurrent_pages.append(pi)
+            # CPU-tier restores past the last checkpoint can't advance the resume point; replay prefill
+            # rewrites those pages anyway
+            restore_limit = (max(recurrent_pages) + 1) if recurrent_pages else 0
 
         # Allocate pages in KV cache, limit prefix caching to available recurrent states
         self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
-            pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes)
+            pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes, restore_limit)
 
         # Prepare block index
         self.build_block_index_tensor()
@@ -299,6 +330,10 @@ class PageTable:
         # kept for comparison/debug
         self.eviction_policy = "tree"
 
+        # Optional second-tier page cache in system memory (CPUPageCache), set by the Generator. Complete pages
+        # are pushed there on eviction and restored from there on allocation
+        self.cpu_tier = None
+
         # Cheap always-on counters for cache efficiency analysis
         self.metrics = {
             "evictions": 0,               # unreferenced pages repurposed for new sequences
@@ -306,6 +341,7 @@ class PageTable:
             "stashes_stranded": 0,        # live evictions that anchored a recurrent checkpoint, making it unusable
             "alloc_pages": 0,             # pages claimed by starting jobs
             "alloc_cached_pages": 0,      # of those, reused as part of a resumable cached prefix
+            "alloc_tier_pages": 0,        # of those, restored from the CPU tier rather than found in VRAM
             "alloc_kv_only_pages": 0,     # cached KV pages not resumable because no recurrent stash covers them
         }
 
@@ -343,19 +379,8 @@ class PageTable:
         self.last_defrag_serial = self.access_serial
 
 
-    def print_page_list(self, short: bool = True):
-        for cp in self.all_pages:
-            if cp.phash in self.referenced_pages:
-                assert cp.ref_count > 0
-                ref = str(cp.ref_count) if cp.ref_count < 10 else "+"
-            elif cp.phash in self.unreferenced_pages:
-                assert cp.ref_count == 0
-                ref = "."
-            else:
-                ref = "#"
-            if short: print(ref, end = "")
-            else: print(str(cp) + f", ref {ref}")
-        print()
+    def dump_page_list(self, short: bool = True):
+        return "\n".join([cp.format() for cp in self.all_pages])
 
 
     def build_eviction_order(self, protected_hashes: set | None = None) -> deque:
@@ -470,21 +495,34 @@ class PageTable:
         return deque(order)
 
 
-    def evict(self, page: CachePage):
+    def evict(self, page: CachePage, protect: set | None = None):
         """
-        Notification that an unreferenced page is about to be repurposed and its current identity destroyed. At
-        this point page.phash/page.sequence still describe the dying contents and the K/V data is still intact in
-        the cache tensors at page.page_index, making this the hook point for pushing evicted pages to a future
-        second-tier page cache in system memory. Note that a page taken for new generation output may still be
-        reverted unwritten, so a tiered cache can receive pushes for pages that survive; deduplication by hash
+        An unreferenced page is about to be repurposed and its current identity destroyed. At this point
+        page.phash/page.sequence still describe the dying contents and the K/V data is still intact in the cache
+        tensors at page.page_index, so complete hashed pages are pushed to the CPU tier here (asynchronously, but
+        stream-ordered before anything that could overwrite them). A page taken for new generation output may
+        still be reverted unwritten, so the tier can receive pushes for pages that survive; deduplication by hash
         makes that harmless.
         """
         self.metrics["evictions"] += 1
-        if page.kv_position == PAGE_SIZE:
+        if page.kv_position == PAGE_SIZE and is_content_hash(page.phash):
             self.metrics["evictions_live"] += 1
-            rc = self.generator.recurrent_cache
-            if rc is not None and page.phash in rc:
-                self.metrics["stashes_stranded"] += 1
+            if self.cpu_tier is not None:
+                self.cpu_tier.store(page, self.access_serial, protect)
+            else:
+                rc = self.generator.recurrent_cache
+                if rc is not None and page.phash in rc:
+                    self.metrics["stashes_stranded"] += 1
+
+
+    def get_live_page(self, phash: bytes) -> CachePage | None:
+        """
+        Return the complete page currently holding phash, if any.
+        """
+        page = self.referenced_pages.get(phash) or self.unreferenced_pages.get(phash)
+        if page is not None and page.kv_position == PAGE_SIZE:
+            return page
+        return None
 
 
     def allocate_pages(
@@ -492,16 +530,21 @@ class PageTable:
         page_hashes: list,
         new_unique_pages: int,
         recurrent_pages: list[int] | None,
-        protected_hashes: set | None = None
+        protected_hashes: set | None = None,
+        restore_limit: int | None = None
     ):
         """
         Allocate physical cache pages for one sequence.
 
         Existing full prompt pages are resolved by hash first, reusing referenced pages for shared prefixes or
-        unreferenced pages for prompt-cache hits. Missing pages, plus unique pages needed for new generation, are
-        taken from unreferenced pages in the order given by build_eviction_order. For hybrid recurrent/KV models,
-        recurrent_pages marks which hashed pages also have stashed recurrent checkpoints; the usable cached prefix
-        is capped to the longest page prefix that has both valid K/V pages and the matching recurrent state.
+        unreferenced pages for prompt-cache hits. A page hash missing from VRAM but present in the CPU tier is
+        restored into the allocated page instead of leaving it for prefill; restore_limit optionally caps how many
+        leading pages this is attempted for (recurrent models gain nothing from restoring pages past the last
+        usable checkpoint, since replay prefill rewrites them anyway). Remaining misses, plus unique pages needed
+        for new generation, are taken from unreferenced pages in the order given by build_eviction_order. For
+        hybrid recurrent/KV models, recurrent_pages marks which hashed pages also have stashed recurrent
+        checkpoints; the usable cached prefix is capped to the longest page prefix that has both valid K/V pages
+        and the matching recurrent state.
         """
         allocated_pages = []
         available_pages = None
@@ -516,7 +559,7 @@ class PageTable:
                 while available_pages[0].ref_count:
                     available_pages.popleft()
             page = available_pages.popleft()
-            self.evict(page)
+            self.evict(page, protected_hashes)
             return page
 
         # Allocate whole pages
@@ -536,10 +579,23 @@ class PageTable:
                     up.add_ref(self.access_serial)
                     allocated_pages.append(up)
 
-                # No matching page, allocate the best eviction candidate
+                # No matching page, allocate the best eviction candidate. If the missing page is stored in the
+                # CPU tier, restore it into the new page; the eviction above may itself push to the tier, and in
+                # the (protected against, but possible) event that this dropped the entry we were after, the page
+                # simply falls through to normal prefill.
                 else:
                     op = next_evictable()
                     op.add_ref_clear(self.access_serial, h)
+                    if (
+                        self.cpu_tier is not None and
+                        (restore_limit is None or lp < restore_limit) and
+                        h in self.cpu_tier
+                    ):
+                        entry = self.cpu_tier.fetch(h, op.page_index, self.access_serial)
+                        op.sequence.copy_(entry["tokens"])
+                        op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
+                        op.kv_position = PAGE_SIZE
+                        self.metrics["alloc_tier_pages"] += 1
                     allocated_pages.append(op)
 
         # Allocate unique pages
@@ -601,20 +657,26 @@ class PageTable:
 
     def is_resumable(self, phash: bytes) -> bool:
         """
-        Whether a job claiming a prompt that ends in the page identified by phash could resume from it: the page
-        must exist, be complete, and have an unbroken chain of complete pages down to its root. This is the anchor
-        condition for a recurrent checkpoint stashed under phash.
+        Whether a job claiming a prompt that ends in the page identified by phash could resume from it: an
+        unbroken chain of pages down to the root, each either complete in VRAM or restorable from the CPU tier.
+        This is the anchor condition for a recurrent checkpoint stashed under phash.
         """
-        page = self.referenced_pages.get(phash) or self.unreferenced_pages.get(phash)
+        h = phash
         steps = 0
-        while page is not None and page.kv_position == PAGE_SIZE:
-            if page.prev_hash is None:
-                return True
-            page = self.referenced_pages.get(page.prev_hash) or self.unreferenced_pages.get(page.prev_hash)
-            steps += 1
-            if steps > self.max_pages:
+        while True:
+            page = self.get_live_page(h)
+            if page is not None:
+                prev = page.prev_hash
+            elif self.cpu_tier is not None and h in self.cpu_tier:
+                prev = self.cpu_tier.entries[h]["prev_hash"]
+            else:
                 return False
-        return False
+            if prev is None:
+                return True
+            h = prev
+            steps += 1
+            if steps > self.max_pages + (len(self.cpu_tier) if self.cpu_tier is not None else 0):
+                return False
 
 
     def audit_recurrent_sync(self, recurrent_cache) -> dict:
@@ -635,30 +697,40 @@ class PageTable:
             if p.kv_position == PAGE_SIZE:
                 complete[p.phash] = p
 
+        def prev_of(h):
+            # A chain link is intact if the page is complete in VRAM or restorable from the CPU tier
+            p = complete.get(h)
+            if p is not None:
+                return True, p.prev_hash
+            if self.cpu_tier is not None and h in self.cpu_tier:
+                return True, self.cpu_tier.entries[h]["prev_hash"]
+            return False, None
+
         chain_ok = {}
-        def chain_complete(page):
-            # Walk to the root, verifying every ancestor is present and complete
+        def chain_complete(h):
+            # Walk to the root, verifying every ancestor is present
             walk = []
             walked = set()
             ok = True
             while True:
-                r = chain_ok.get(id(page))
+                r = chain_ok.get(h)
                 if r is not None:
                     ok = r
                     break
-                if id(page) in walked:
+                if h in walked:
                     ok = False
                     break
-                walk.append(page)
-                walked.add(id(page))
-                if page.prev_hash is None:
-                    break
-                page = complete.get(page.prev_hash)
-                if page is None:
+                walk.append(h)
+                walked.add(h)
+                present, prev = prev_of(h)
+                if not present:
                     ok = False
                     break
-            for p in walk:
-                chain_ok[id(p)] = ok
+                if prev is None:
+                    break
+                h = prev
+            for hh in walk:
+                chain_ok[hh] = ok
             return ok
 
         anchored_pages = set()
@@ -666,14 +738,19 @@ class PageTable:
         stash_bytes_anchored, stash_bytes_stranded = 0, 0
         for h, stash in recurrent_cache.items():
             size = stash.get("checkpoint_size", 0)
-            p = complete.get(h)
-            if p is not None and chain_complete(p):
+            if chain_complete(h):
                 stashes_anchored += 1
                 stash_bytes_anchored += size
-                # Pages on the path from an anchored stash to the root are resumable
-                while p is not None and id(p) not in anchored_pages:
-                    anchored_pages.add(id(p))
-                    p = complete.get(p.prev_hash) if p.prev_hash is not None else None
+                # VRAM pages on the path from an anchored stash to the root are resumable (the chain is known
+                # intact here, so the walk terminates at the root)
+                hh = h
+                while hh is not None:
+                    p = complete.get(hh)
+                    if p is not None:
+                        if id(p) in anchored_pages:
+                            break
+                        anchored_pages.add(id(p))
+                    _, hh = prev_of(hh)
             else:
                 stashes_stranded += 1
                 stash_bytes_stranded += size

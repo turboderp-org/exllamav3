@@ -102,6 +102,8 @@ def main(args):
         tokenizer,
         show_visualizer = args.visualize_cache,
         max_batch_size = args.max_batch_size,
+        cpu_cache_size = int(args.cpu_cache_size * 1024**3),
+        recurrent_cache_size = int(args.recurrent_cache_size * 1024**3),
     )
     bpw_layer, bpw_head, vram_bits = model.get_storage_info()
 
