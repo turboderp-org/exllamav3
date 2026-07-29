@@ -1400,7 +1400,10 @@ def _paged_attn_prefill_kernel(
     offs_d = tl.arange(0, head_dim)
     valid_row = offs_m < q_len
 
-    q_ptrs = q + (((batch * q_len + offs_m[:, None]) * n_q_heads + q_head) * head_dim + offs_d[None, :])
+    # q/out element offsets reach q_len * n_q_heads * head_dim, past int32 at ~64k rows for
+    # 32-head/256-dim geometry: widen the row term
+    row64 = (batch * q_len + offs_m[:, None]).to(tl.int64)
+    q_ptrs = q + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
     q_tile = tl.load(q_ptrs, mask = valid_row[:, None], other = 0.0)
     if QCK > 0:
         q_tile = _rot_h32(q_tile, h32, BLOCK_M, head_dim)
@@ -1509,7 +1512,8 @@ def _paged_attn_prefill_kernel(
         )
 
     if IS_SPLIT:
-        pid_lin = (pid_m * tl.num_programs(1) + bh) * num_splits + split
+        # partial_o offsets reach programs * num_splits * BLOCK_M * head_dim: widen
+        pid_lin = ((pid_m * tl.num_programs(1) + bh) * num_splits + split).to(tl.int64)
         po_base = pid_lin * BLOCK_M * head_dim
         tl.store(partial_o + po_base + tl.arange(0, BLOCK_M)[:, None] * head_dim + offs_d[None, :], acc)
         ml_base = pid_lin * BLOCK_M * 2
@@ -1526,7 +1530,7 @@ def _paged_attn_prefill_kernel(
         out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
         if QCV > 0:
             out_tile = _rot_h32(out_tile, h32, BLOCK_M, head_dim)
-        out_ptrs = out + (((batch * q_len + offs_m[:, None]) * n_q_heads + q_head) * head_dim + offs_d[None, :])
+        out_ptrs = out + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
         tl.store(out_ptrs, out_tile, mask = valid_row[:, None])
 
 
@@ -1553,7 +1557,8 @@ def _paged_attn_prefill_combine_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, head_dim)
     rows = tl.arange(0, BLOCK_M)
-    pid_lin = (pid_m * tl.num_programs(1) + bh) * num_splits
+    # same int32 overflow considerations as the prefill kernel: partial and out offsets widen
+    pid_lin = ((pid_m * tl.num_programs(1) + bh) * num_splits).to(tl.int64)
 
     m_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     for sp in range(num_splits):
@@ -1581,7 +1586,8 @@ def _paged_attn_prefill_combine_kernel(
     out_tile = acc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
     if QCV > 0:
         out_tile = _rot_h32(out_tile, h32, BLOCK_M, head_dim)
-    out_ptrs = out + (((batch * q_len + offs_m[:, None]) * n_q_heads + q_head) * head_dim + offs_d[None, :])
+    row64 = (batch * q_len + offs_m[:, None]).to(tl.int64)
+    out_ptrs = out + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
     tl.store(out_ptrs, out_tile, mask = (offs_m[:, None] < q_len))
 
 
@@ -1792,13 +1798,20 @@ def paged_attn_triton_prefill(
             _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
         sms = _decode_sm_count[dev]
         num_splits = 1
-        if bound_kv >= 8192:
+        if bound_kv >= 8192 and programs:
             best = None
             for cand in (1, 2, 3, 4, 5, 6, 8):
                 cost = math.ceil(programs * cand / sms) / cand + 0.03 * (cand - 1)
                 if best is None or cost < best[0]:
                     best = (cost, cand)
             num_splits = best[1]
+            # Splitting fixes grid quantization when programs are few; at large program counts
+            # the ceil-noise in the cost model can still pick a high split count whose fp32
+            # partial buffer is enormous (64k q_len x 32 heads: ~2 GB per split). The gain there
+            # is negligible by construction, so bound the buffer rather than trust the penalty
+            max_partial_bytes = 128 * 1024 * 1024
+            max_splits = max(1, max_partial_bytes // (programs * block_m * head_dim * 4))
+            num_splits = min(num_splits, max_splits)
 
     if num_splits > 1:
         partial_o = torch.empty(programs * num_splits * block_m * head_dim, dtype = torch.float32, device = q.device)
