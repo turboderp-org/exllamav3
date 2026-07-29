@@ -1,5 +1,6 @@
 from __future__ import annotations
 from functools import lru_cache
+import heapq
 import torch
 import hashlib
 from dataclasses import dataclass
@@ -230,6 +231,7 @@ class Sequence:
         self,
         pagetable: PageTable,
         recurrent_cache: None | RecurrentCache,
+        protected_hashes: set | None = None,
     ):
         if self.max_cached_pages is None:
             page_hashes = self.page_hashes
@@ -248,7 +250,7 @@ class Sequence:
 
         # Allocate pages in KV cache, limit prefix caching to available recurrent states
         self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
-            pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages)
+            pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes)
 
         # Prepare block index
         self.build_block_index_tensor()
@@ -278,9 +280,9 @@ class PageTable:
         share K/V storage during batched inference. Hash collisions are deliberately treated as impossible in
         practice for this purpose; checking full token contents on every lookup would cost more than the vanishing
         collision risk justifies. When a page becomes unreferenced after inference it remains indexed by its hash,
-        so later jobs can revive it for prompt-cache reuse until eviction or defragmentation overwrites it. Current
-        eviction is based on page age/access order, which keeps the bookkeeping simple but is the main place to
-        improve if future work needs a higher cache hit ratio.
+        so later jobs can revive it for prompt-cache reuse until eviction or defragmentation overwrites it.
+        Eviction consumes empty and orphaned pages first, then prunes cached sequences tail-first, least recently
+        used sequence first (see build_eviction_order).
         """
         self.generator = generator
         self.cache = cache
@@ -292,6 +294,20 @@ class PageTable:
         self.all_pages = []
         self.reset_page_table()
         self.last_defrag_serial = self.max_pages
+
+        # "tree" = prune cached sequences tail-first, oldest first; "lru" = legacy oldest-page-first policy,
+        # kept for comparison/debug
+        self.eviction_policy = "tree"
+
+        # Cheap always-on counters for cache efficiency analysis
+        self.metrics = {
+            "evictions": 0,               # unreferenced pages repurposed for new sequences
+            "evictions_live": 0,          # of those, complete hashed pages (i.e. lost prompt-cache entries)
+            "stashes_stranded": 0,        # live evictions that anchored a recurrent checkpoint, making it unusable
+            "alloc_pages": 0,             # pages claimed by starting jobs
+            "alloc_cached_pages": 0,      # of those, reused as part of a resumable cached prefix
+            "alloc_kv_only_pages": 0,     # cached KV pages not resumable because no recurrent stash covers them
+        }
 
 
     def reset_page_table(self):
@@ -342,23 +358,166 @@ class PageTable:
         print()
 
 
+    def build_eviction_order(self, protected_hashes: set | None = None) -> deque:
+        """
+        Order the currently unreferenced pages by eviction priority, least valuable first:
+
+          1. Empty pages (kv_position == 0), oldest first: they hold no reusable K/V.
+          2. Orphaned trees: chains whose ancestry is broken (prev_hash no longer resolves to a live page).
+             Individual pages remain reachable by exact hash lookup, but the broken chain makes them the least
+             valuable intact data in the cache.
+          3. Rooted trees, i.e. complete cached sequences.
+
+        Trees are consumed one at a time, least recently used root first; since any reuse of a cached prefix
+        refreshes the root's access serial, root age reflects the recency of the whole tree. Within a tree, pages
+        are pruned leaf-first, oldest leaf first, so a cached sequence is eaten from its tail and the longest
+        possible prefix survives. When one job reclaims pages from a paused long sequence, the paused job loses
+        only as many trailing pages as were actually taken; under the old oldest-page-first policy the root was
+        typically taken first, making the entire chain unrecoverable and forcing a full prefill on resume.
+
+        Pages whose hash appears in protected_hashes are pages the current allocation is itself about to claim,
+        and are excluded so that serving early cache misses cannot cannibalize later hits of the same sequence.
+        Anything the tree walk cannot emit (pages below a referenced or protected ancestor, in principle hash
+        cycles) is appended at the end, protected pages dead last, so allocation never starves while unreferenced
+        pages exist.
+        """
+        if protected_hashes is None:
+            protected_hashes = set()
+
+        if self.eviction_policy == "lru":
+            order = [p for p in self.unreferenced_pages.values() if p.phash not in protected_hashes]
+            order.sort(key = lambda p: p.access_serial)
+            order += sorted(
+                (p for p in self.unreferenced_pages.values() if p.phash in protected_hashes),
+                key = lambda p: p.access_serial
+            )
+            return deque(order)
+
+        order = []
+        emitted = set()
+
+        # Class 1: empty pages
+        empty = [
+            p for p in self.unreferenced_pages.values()
+            if p.kv_position == 0 and p.phash not in protected_hashes
+        ]
+        empty.sort(key = lambda p: p.access_serial)
+        for p in empty:
+            order.append(p)
+            emitted.add(id(p))
+
+        # Link pages into trees. Referenced pages participate as (non-evictable) internal nodes so that the
+        # unreferenced extensions of a live prefix are still pruned tail-first.
+        page_index = {}
+        for p in self.all_pages:
+            p.children = []
+            page_index[p.phash] = p
+
+        roots = []
+        orphan_roots = []
+        parent_of = {}
+        for p in self.all_pages:
+            if p.prev_hash is None:
+                roots.append(p)
+                continue
+            parent = page_index.get(p.prev_hash)
+            if parent is None or parent is p:
+                orphan_roots.append(p)
+            else:
+                parent.children.append(p)
+                parent_of[id(p)] = parent
+
+        roots.sort(key = lambda p: p.access_serial)
+        orphan_roots.sort(key = lambda p: p.access_serial)
+
+        def prune(root):
+            # Emit the tree's evictable pages in the order given by repeatedly removing the oldest current leaf.
+            # A page that cannot be evicted (referenced or protected) blocks its ancestors, since evicting an
+            # ancestor would orphan a chain that is still in use.
+            remaining = {}
+            heap = []
+            stack = [root]
+            while stack:
+                p = stack.pop()
+                remaining[id(p)] = len(p.children)
+                if not p.children:
+                    heapq.heappush(heap, (p.access_serial, p.page_index, p))
+                stack.extend(p.children)
+            while heap:
+                _, _, p = heapq.heappop(heap)
+                if id(p) not in emitted:
+                    if p.ref_count > 0 or p.phash in protected_hashes:
+                        continue
+                    order.append(p)
+                    emitted.add(id(p))
+                parent = parent_of.get(id(p))
+                if parent is not None:
+                    remaining[id(parent)] -= 1
+                    if remaining[id(parent)] == 0:
+                        heapq.heappush(heap, (parent.access_serial, parent.page_index, parent))
+
+        # Classes 2 and 3
+        for root in orphan_roots:
+            prune(root)
+        for root in roots:
+            prune(root)
+
+        # Last resort
+        leftovers = [p for p in self.unreferenced_pages.values() if id(p) not in emitted]
+        leftovers.sort(key = lambda p: (p.phash in protected_hashes, p.access_serial))
+        order += leftovers
+
+        return deque(order)
+
+
+    def evict(self, page: CachePage):
+        """
+        Notification that an unreferenced page is about to be repurposed and its current identity destroyed. At
+        this point page.phash/page.sequence still describe the dying contents and the K/V data is still intact in
+        the cache tensors at page.page_index, making this the hook point for pushing evicted pages to a future
+        second-tier page cache in system memory. Note that a page taken for new generation output may still be
+        reverted unwritten, so a tiered cache can receive pushes for pages that survive; deduplication by hash
+        makes that harmless.
+        """
+        self.metrics["evictions"] += 1
+        if page.kv_position == PAGE_SIZE:
+            self.metrics["evictions_live"] += 1
+            rc = self.generator.recurrent_cache
+            if rc is not None and page.phash in rc:
+                self.metrics["stashes_stranded"] += 1
+
+
     def allocate_pages(
         self,
         page_hashes: list,
         new_unique_pages: int,
-        recurrent_pages: list[int] | None
+        recurrent_pages: list[int] | None,
+        protected_hashes: set | None = None
     ):
         """
         Allocate physical cache pages for one sequence.
 
         Existing full prompt pages are resolved by hash first, reusing referenced pages for shared prefixes or
         unreferenced pages for prompt-cache hits. Missing pages, plus unique pages needed for new generation, are
-        taken from the oldest unreferenced pages. For hybrid recurrent/KV models, recurrent_pages marks which
-        hashed pages also have stashed recurrent checkpoints; the usable cached prefix is capped to the longest
-        page prefix that has both valid K/V pages and the matching recurrent state.
+        taken from unreferenced pages in the order given by build_eviction_order. For hybrid recurrent/KV models,
+        recurrent_pages marks which hashed pages also have stashed recurrent checkpoints; the usable cached prefix
+        is capped to the longest page prefix that has both valid K/V pages and the matching recurrent state.
         """
         allocated_pages = []
         available_pages = None
+
+        def next_evictable():
+            # Deferred so allocations served entirely by hash matches never build the eviction order. Pages
+            # claimed by hash after the order was built are skipped by their reference count.
+            nonlocal available_pages
+            if available_pages is None:
+                available_pages = self.build_eviction_order(protected_hashes)
+            else:
+                while available_pages[0].ref_count:
+                    available_pages.popleft()
+            page = available_pages.popleft()
+            self.evict(page)
+            return page
 
         # Allocate whole pages
         for lp, h in enumerate(page_hashes):
@@ -377,39 +536,26 @@ class PageTable:
                     up.add_ref(self.access_serial)
                     allocated_pages.append(up)
 
-                # No matching pages
+                # No matching page, allocate the best eviction candidate
                 else:
-
-                    # Get list of unreferenced pages in order of oldest to newest
-                    if available_pages is None:
-                        available_pages = list(self.unreferenced_pages.values())
-                        available_pages.sort(key = lambda x: x.access_serial)
-                        available_pages = deque(available_pages)
-                    else:
-                        while available_pages[0].ref_count:
-                            available_pages.popleft()
-
-                    # Allocate oldest unreferenced page
-                    op = available_pages.popleft()
+                    op = next_evictable()
                     op.add_ref_clear(self.access_serial, h)
                     allocated_pages.append(op)
 
         # Allocate unique pages
+        prev = allocated_pages[-1] if allocated_pages else None
         for npi in range(new_unique_pages):
             self.access_serial += 1
-
-            # Get list of unreferenced pages in order of oldest to newest
-            if available_pages is None:
-                available_pages = list(self.unreferenced_pages.values())
-                available_pages.sort(key = lambda x: x.access_serial)
-                available_pages = deque(available_pages)
-            else:
-                while available_pages[0].ref_count:
-                    available_pages.popleft()
-
-            op = available_pages.popleft()
+            op = next_evictable()
             op.add_ref_unique(self.access_serial)
+            # Link the first fresh page to a complete cached prefix. Normally the link is written when the
+            # preceding page completes during generation, but when a requeued job resumes on a fully cached
+            # prompt that moment lies in the previous round, and without the link every requeue round would
+            # start a new root, fragmenting the sequence's chain for eviction and defragmentation purposes.
+            if prev is not None and prev.kv_position == PAGE_SIZE:
+                op.prev_hash = prev.phash
             allocated_pages.append(op)
+            prev = op
 
         # List prefilled pages
         cached_pages = 0
@@ -427,7 +573,11 @@ class PageTable:
                     max_recur = rp + 1
             # for cpi in range(max_recur, cached_pages):
             #     allocated_pages[cpi].make_unique()
+            self.metrics["alloc_kv_only_pages"] += cached_pages - max_recur
             cached_pages = max_recur
+
+        self.metrics["alloc_pages"] += len(allocated_pages)
+        self.metrics["alloc_cached_pages"] += cached_pages
 
         # Advance cache over prefilled pages
         kv_position = cached_pages * PAGE_SIZE
@@ -449,12 +599,104 @@ class PageTable:
         return len(self.unreferenced_pages)
 
 
+    def is_resumable(self, phash: bytes) -> bool:
+        """
+        Whether a job claiming a prompt that ends in the page identified by phash could resume from it: the page
+        must exist, be complete, and have an unbroken chain of complete pages down to its root. This is the anchor
+        condition for a recurrent checkpoint stashed under phash.
+        """
+        page = self.referenced_pages.get(phash) or self.unreferenced_pages.get(phash)
+        steps = 0
+        while page is not None and page.kv_position == PAGE_SIZE:
+            if page.prev_hash is None:
+                return True
+            page = self.referenced_pages.get(page.prev_hash) or self.unreferenced_pages.get(page.prev_hash)
+            steps += 1
+            if steps > self.max_pages:
+                return False
+        return False
+
+
+    def audit_recurrent_sync(self, recurrent_cache) -> dict:
+        """
+        Measure two-way staleness between the KV page cache and the recurrent checkpoint cache on hybrid models.
+
+        A stash keyed by page hash h is usable only if a job with a matching prompt can claim complete KV pages
+        for the entire chain up to and including h ("anchored"); if any ancestor page was evicted, the stash is
+        stranded and occupies system RAM without ever being restorable. Conversely, a complete KV page is only
+        worth keeping on a hybrid model if some anchored stash exists at or below it in its subtree: prefill must
+        replay all tokens past the resume point to advance the recurrent state, rewriting the KV data anyway.
+
+        Returns counts and byte sizes for both kinds of stranded entry. Read-only; intended for periodic
+        instrumentation and to evaluate a two-way pruning pass.
+        """
+        complete = {}
+        for p in self.all_pages:
+            if p.kv_position == PAGE_SIZE:
+                complete[p.phash] = p
+
+        chain_ok = {}
+        def chain_complete(page):
+            # Walk to the root, verifying every ancestor is present and complete
+            walk = []
+            walked = set()
+            ok = True
+            while True:
+                r = chain_ok.get(id(page))
+                if r is not None:
+                    ok = r
+                    break
+                if id(page) in walked:
+                    ok = False
+                    break
+                walk.append(page)
+                walked.add(id(page))
+                if page.prev_hash is None:
+                    break
+                page = complete.get(page.prev_hash)
+                if page is None:
+                    ok = False
+                    break
+            for p in walk:
+                chain_ok[id(p)] = ok
+            return ok
+
+        anchored_pages = set()
+        stashes_anchored, stashes_stranded = 0, 0
+        stash_bytes_anchored, stash_bytes_stranded = 0, 0
+        for h, stash in recurrent_cache.items():
+            size = stash.get("checkpoint_size", 0)
+            p = complete.get(h)
+            if p is not None and chain_complete(p):
+                stashes_anchored += 1
+                stash_bytes_anchored += size
+                # Pages on the path from an anchored stash to the root are resumable
+                while p is not None and id(p) not in anchored_pages:
+                    anchored_pages.add(id(p))
+                    p = complete.get(p.prev_hash) if p.prev_hash is not None else None
+            else:
+                stashes_stranded += 1
+                stash_bytes_stranded += size
+
+        kv_pages_complete = len(complete)
+        kv_pages_resumable = len(anchored_pages)
+
+        return {
+            "stashes_anchored": stashes_anchored,
+            "stashes_stranded": stashes_stranded,
+            "stash_bytes_anchored": stash_bytes_anchored,
+            "stash_bytes_stranded": stash_bytes_stranded,
+            "kv_pages_complete": kv_pages_complete,
+            # Complete KV pages above the deepest anchored stash of their chain; on a hybrid model these are
+            # rewritten by replay prefill and save nothing
+            "kv_pages_unresumable": kv_pages_complete - kv_pages_resumable,
+        }
+
+
     def validate_pagetable(self, active_jobs):
 
         def p_assert(exp):
-            # assert exp
-            if not exp:
-                xx = 0
+            assert exp, "Page table validation failed"
 
         # Check page collections
         ids = set()
