@@ -93,7 +93,10 @@ class CPUPageCache:
         }
 
         # Eviction ages measure the retention window the configured capacity actually provides under live
-        # traffic; a young minimum means pages are dropped before their conversations return
+        # traffic: seconds since the evicted entry was LAST USED (pushed, deduplicated or restored), not
+        # since it was created, so an entry that was needed recently but still lost the LRU race reads as a
+        # young age. A young minimum means pages are dropped before their conversations return. Monotonic
+        # clock, so wall-clock adjustments cannot produce invalid ages.
         self.evicted_age_sum = 0.0
         self.evicted_age_min_window = None
 
@@ -190,7 +193,7 @@ class CPUPageCache:
             e = self.entries.pop(h, None)
             if e is not None:
                 self.metrics["evictions"] += 1
-                age = time.time() - e["stored_at"]
+                age = time.monotonic() - e["last_access"]
                 self.evicted_age_sum += age
                 if self.evicted_age_min_window is None or age < self.evicted_age_min_window:
                     self.evicted_age_min_window = age
@@ -256,6 +259,7 @@ class CPUPageCache:
         e = self.entries.get(page.phash)
         if e is not None:
             e["access_serial"] = serial
+            e["last_access"] = time.monotonic()
             self.metrics["dedup_hits"] += 1
             return
         slot = self._new_slot(protect)
@@ -266,7 +270,7 @@ class CPUPageCache:
             "prev_hash": page.prev_hash,
             "access_serial": serial,
             "tokens": page.sequence.clone(),
-            "stored_at": time.time(),
+            "last_access": time.monotonic(),
         }
         self.metrics["pushes"] += 1
 
@@ -279,6 +283,7 @@ class CPUPageCache:
         """
         e = self.entries[phash]
         e["access_serial"] = serial
+        e["last_access"] = time.monotonic()
         for v, (t, _, _, _) in zip(self.slot_views[e["slot"]], self.segments):
             t[page_index].copy_(v, non_blocking = True)
         self.metrics["restores"] += 1

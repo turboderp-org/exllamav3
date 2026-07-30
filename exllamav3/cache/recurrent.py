@@ -22,9 +22,13 @@ class RecurrentCache(OrderedDict):
             "stash_pruned": 0,              # stranded checkpoints dropped by prune_stranded()
         }
 
-        # Eviction ages measure the retention window this budget provides under live traffic; a young
-        # minimum means checkpoints are being discarded before their conversations return. Only restorable
-        # (LRU) evictions are recorded: dropping a stranded checkpoint frees dead weight, not retention.
+        # Eviction ages measure the retention window this budget provides under live traffic: seconds since
+        # the evicted checkpoint was LAST USED (stashed, refreshed or restored), not since it was created - a
+        # long-lived but recently-needed checkpoint evicted under churn must read as a young age, or the
+        # metric hides exactly the "conversations return faster than the budget retains them" condition it
+        # exists to reveal. A young minimum means checkpoints are being discarded before their conversations
+        # return. Only restorable (LRU) evictions are recorded: dropping a stranded checkpoint frees dead
+        # weight, not retention. Monotonic clock, so wall-clock adjustments cannot produce invalid ages.
         self.evicted_count = 0
         self.evicted_age_sum = 0.0
         self.evicted_age_min_window = None
@@ -60,7 +64,9 @@ class RecurrentCache(OrderedDict):
         """
         if key in self:
             self.move_to_end(key)
-            return self[key]
+            stashed = self[key]
+            stashed["last_access"] = time.monotonic()
+            return stashed
         return default
 
 
@@ -70,9 +76,10 @@ class RecurrentCache(OrderedDict):
         """
         if key in self:
             self.move_to_end(key)
+            self[key]["last_access"] = time.monotonic()
         else:
             stashed_state = state.stash()
-            stashed_state["stash_time"] = time.time()
+            stashed_state["last_access"] = time.monotonic()
             state_size = stashed_state["checkpoint_size"]
             while self.update_total_size() + state_size > self.max_size:
                 assert self.current_size >= 0, "Not enough space in cache for single state"
@@ -98,8 +105,8 @@ class RecurrentCache(OrderedDict):
                         if page is not None and page.kv_position == PAGE_SIZE:
                             self.metrics["stash_evictions_live_kv"] += 1
                     # Retention-window accounting and the evicted-key memory cover only this restorable
-                    # (LRU pressure) path; see __init__
-                    age = time.time() - popped.get("stash_time", time.time())
+                    # (LRU pressure) path; see __init__. Age is measured from last use, not creation.
+                    age = time.monotonic() - popped.get("last_access", time.monotonic())
                     self.evicted_count += 1
                     self.evicted_age_sum += age
                     if self.evicted_age_min_window is None or age < self.evicted_age_min_window:

@@ -71,6 +71,44 @@ def test_evicted_tracking():
     assert rc.stats()["evicted_age_min_window"] is None, "window reset must clear the age minimum"
 
 
+def test_eviction_age_reflects_last_access():
+    """
+    Eviction age must measure time since the entry was LAST USED, not since insertion: under churn, LRU can
+    evict an entry that was needed moments ago, and reporting its full lifetime would hide exactly the
+    "conversations return faster than the budget retains them" condition the metric exists to reveal.
+    """
+    import exllamav3.cache.recurrent as rec
+    from types import SimpleNamespace
+
+    class _Dummy:
+        loaded_tp = False
+
+    class _DummyState:
+        def __init__(self, position):
+            self.position = position
+        def stash(self):
+            return {"position": self.position, "checkpoint_size": 8}
+
+    now = [0.0]
+    orig_time = rec.time
+    rec.time = SimpleNamespace(monotonic = lambda: now[0])
+    try:
+        rc = rec.RecurrentCache(_Dummy(), max_size = 20)   # fits two 8-byte checkpoints
+        rc.put(b"a", _DummyState(1))
+        rc.put(b"b", _DummyState(2))
+        now[0] = 100.0
+        rc.get_stashed(b"a")                               # refresh a; LRU order is now b, a
+        rc.get_stashed(b"b")                               # refresh b; LRU order is now a, b
+        now[0] = 101.0
+        rc.put(b"c", _DummyState(3))                       # evicts a, which was last used at t = 100
+        assert rc.evicted_count == 1
+        assert abs(rc.evicted_age_min_window - 1.0) < 1e-6, \
+            f"age must be measured from last use, not insertion " \
+            f"(expected 1.0, got {rc.evicted_age_min_window})"
+    finally:
+        rec.time = orig_time
+
+
 def make_long_prompt(tokenizer, seed_text, target_pages):
     text = seed_text
     filler = (
