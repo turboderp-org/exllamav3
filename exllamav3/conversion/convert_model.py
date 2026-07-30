@@ -283,6 +283,7 @@ def make_quant_args(args, idx, K, devices, device_ratios = None):
         "devices": devices,
         "device_ratios": device_ratios,
         "apply_out_scales": args["apply_out_scales"],
+        "debug_dir": os.path.join(args["work_dir"], "debug"),
     }
     if args["codebook"] == "mcg":
         quant_args.update({"mcg": True})

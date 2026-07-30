@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import math
+import os
 from ....ext import exllamav3_ext as ext
 from ....util.progress import ProgressBar
 from ....util.memory import free_mem, list_gpu_tensors
@@ -295,7 +296,30 @@ def blockwise_preapply_had_r_(x: torch.Tensor, had_dim):
         x[:, start:end] = block_transformed
 
 
-def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool):
+def save_failed_cholesky(H: torch.Tensor, quant_args: dict, debug_info: dict | None):
+    """Dump a Hessian that failed to decompose, before any retry damping is added, so the
+    failure can be studied offline. H arrives sign-flipped and Hadamard-transformed with the
+    base sigma_reg damping applied; su (in the dump) and the block Hadamard are orthogonal, so
+    the captured matrix is exactly recoverable by applying the inverse transforms."""
+    debug_dir = quant_args.get("debug_dir")
+    if not debug_dir:
+        return
+    try:
+        os.makedirs(debug_dir, exist_ok = True)
+        key = (debug_info or {}).get("key") or "unknown"
+        path = os.path.join(debug_dir, f"cholesky_fail_{key}.pt")
+        torch.save({
+            "H": H.detach().cpu().clone(),
+            "sigma_reg": quant_args.get("sigma_reg", 0.025),
+            **{k: (v.detach().cpu().clone() if isinstance(v, torch.Tensor) else v)
+               for k, v in (debug_info or {}).items()},
+        }, path)
+        print(f" !! Saved failing Hessian to {path}")
+    except Exception as e:
+        print(f" !! Failed to save Hessian debug dump: {e}")
+
+
+def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool, debug_info: dict | None = None):
 
     n, _ = H.shape
     assert (n % b == 0)
@@ -318,6 +342,10 @@ def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool):
 
         except torch._C._LinAlgError as e:
             num_cholesky_retries += 1
+            if num_cholesky_retries == 1:
+                # Capture the matrix as it first failed (retry damping has never actually
+                # recovered a failing decomposition, so the initial state is the interesting one)
+                save_failed_cholesky(H, quant_args, debug_info)
             if num_cholesky_retries > 10:
                 print(" ## Cholesky decomp. failed, number of retries exceeded")
                 raise e
@@ -774,7 +802,13 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         if q_fallback:
             L = None
         else:
-            L, H = block_ldl(H, 16, quant_args, verbose)
+            L, H = block_ldl(H, 16, quant_args, verbose, debug_info = {
+                "key": H_data.get("first_key"),
+                "count": H_data.get("count"),
+                "num_total": H_data.get("num_total"),
+                "inf_nan": H_data.get("inf_nan"),
+                "su": su,
+            })
             dr = torch.arange(k)
             L[dr, dr] = 0
 
