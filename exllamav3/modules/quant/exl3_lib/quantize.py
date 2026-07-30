@@ -773,8 +773,19 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
             diag_mean = 0.0
         else:
             H /= count
-            diag_mean = torch.diag(H).mean()
-            q_fallback = diag_mean.item() < 1e-20
+            diag_mean = torch.diag(H).mean().item()
+            # A non-finite Hessian (e.g. fp16 activation overflow reaching the capture) cannot
+            # be repaired by damping, and NaN would also defeat the < comparison below and turn
+            # the whole diagonal non-finite through the regularization term
+            if not math.isfinite(diag_mean):
+                inf_nan = H_data.get("inf_nan")
+                counts = f" (captured {inf_nan[0].item():,} inf, {inf_nan[1].item():,} NaN activation values)" \
+                    if inf_nan is not None else ""
+                print(f" !! Non-finite Hessian for {H_data.get('first_key')}, using uncalibrated fallback{counts}")
+                q_fallback = True
+                diag_mean = 0.0
+            else:
+                q_fallback = diag_mean < 1e-20
 
         # Regularize diagonal
         H.diagonal().add_(quant_args.get("sigma_reg", 0.025) * diag_mean)
