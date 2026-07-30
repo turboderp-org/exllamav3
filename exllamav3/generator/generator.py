@@ -187,6 +187,10 @@ class Generator:
         self.job_serial = 0
         self.pending_jobs = []
         self.active_jobs = []
+        # Completed recurrent jobs remain here for one iteration after their EOS result is returned. Holding their
+        # pages and recurrent slots until the next entry to iterate() keeps the large tail-stash copy out of the
+        # result-delivery path without allowing another job to overwrite the source state in the meantime.
+        self.deferred_completed_jobs = []
 
         # Filter threads
         self.filter_pool = ThreadPoolExecutor(max_workers = 16)
@@ -257,7 +261,7 @@ class Generator:
 
 
     def num_remaining_jobs(self):
-        return len(self.pending_jobs) + len(self.active_jobs)
+        return len(self.pending_jobs) + len(self.active_jobs) + len(self.deferred_completed_jobs)
 
     def num_active_jobs(self):
         return len(self.active_jobs)
@@ -266,16 +270,46 @@ class Generator:
         return len(self.pending_jobs)
 
 
+    def has_deferred_cleanup(self):
+        return bool(self.deferred_completed_jobs)
+
+
+    @torch.inference_mode
+    def cleanup_completed_jobs(self):
+        """
+        Stash and release jobs whose EOS events were returned by the previous iterate() call.
+
+        Runs under inference mode: the state rewind and stash copies mutate inference tensors, and this
+        method is reachable from enqueue(), which unlike iterate() has no inference-mode decorator of its own.
+
+        Tail stashes use reusable pinned staging buffers. The staging transfer and host clone finish before the
+        recurrent slot is released, so a newly activated job cannot overwrite a slot while D2H is reading it.
+        """
+        if not self.deferred_completed_jobs:
+            return
+        while self.deferred_completed_jobs:
+            job = self.deferred_completed_jobs.pop(0)
+            try:
+                if self.recurrent_cache is not None:
+                    job.stash_recurrent_tail(self.recurrent_cache, pinned_staging = True)
+            finally:
+                # A failed host copy makes the generator iteration fail, but must not strand the GPU state slot.
+                job.deallocate_pages()
+        if not self.pending_jobs and not self.active_jobs:
+            self.on_queue_drained()
+
+
     def clear_queue(self):
         """
         Abort all active and pending jobs
         """
 
         num_jobs = self.num_remaining_jobs()
-        for job in self.active_jobs + self.pending_jobs:
+        for job in self.active_jobs + self.pending_jobs + self.deferred_completed_jobs:
             job.deallocate_pages()
         self.active_jobs.clear()
         self.pending_jobs.clear()
+        self.deferred_completed_jobs.clear()
         if num_jobs and not self.num_remaining_jobs():
             self.on_queue_drained()
 
@@ -297,6 +331,10 @@ class Generator:
         returns:
             int: (List of) unique serial number(s) for job(s)
         """
+
+        # A caller may stop driving iterate() as soon as it receives EOS. Clean up that completed job here before
+        # accepting a follow-up request, so the deferred state cannot occupy a recurrent slot indefinitely.
+        self.cleanup_completed_jobs()
 
         if isinstance(job, list):
             serials = []
@@ -330,6 +368,9 @@ class Generator:
         elif job in self.active_jobs:
             job.deallocate_pages()
             self.active_jobs.remove(job)
+        elif job in self.deferred_completed_jobs:
+            job.deallocate_pages()
+            self.deferred_completed_jobs.remove(job)
         if num_jobs and not self.num_remaining_jobs():
             self.on_queue_drained()
 
@@ -399,6 +440,10 @@ class Generator:
                 "logits": torch.Tensor  - shape (1, n, vocab_size)
             }
         """
+
+        # Completion-tail stashes from the previous call happen only after that call's EOS results were returned.
+        # This also releases the held recurrent slots and page references before new jobs are activated.
+        self.cleanup_completed_jobs()
 
         results = []
         self.iterate_start_jobs(results)
@@ -1107,15 +1152,20 @@ class Generator:
                     a_idx:b_idx, accepted_length - 1:accepted_length, :
                 ].clone()
 
-        # Release pages for completed jobs. Finished and requeued jobs no longer need their active page references.
-        # Requeued recurrent jobs may stash the last checkpoint first so the next queued job can resume from cached
-        # recurrent state.
-        num_jobs = self.num_remaining_jobs()
-        for job in completed_jobs + requeuing_jobs:
-            if job in requeuing_jobs and self.recurrent_cache is not None:
+        # Requeued jobs stash and release immediately because their replacement needs the checkpoint now. Completed
+        # recurrent jobs leave active_jobs immediately but retain their state/page references until the next
+        # iterate() entry, after this call's EOS events have been returned to the caller.
+        for job in requeuing_jobs:
+            if self.recurrent_cache is not None:
                 job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
             job.deallocate_pages()
             self.active_jobs.remove(job)
+        for job in completed_jobs:
+            self.active_jobs.remove(job)
+            if self.recurrent_cache is None:
+                job.deallocate_pages()
+            else:
+                self.deferred_completed_jobs.append(job)
 
         # Requeue jobs. Puts replacement jobs at the front so long generations continue promptly after they yield
         # their cache pages.
@@ -1123,8 +1173,8 @@ class Generator:
             rq_job = job.prepare_for_requeue()
             self.pending_jobs.insert(0, rq_job)
 
-        # Defrag. Physical page indices can only be compacted when no active block tables are using them.
-        if num_jobs and not self.num_remaining_jobs():
+        # Defrag. Recurrent completions still hold page references until the deferred cleanup pass.
+        if not self.num_remaining_jobs():
             self.on_queue_drained()
 
 

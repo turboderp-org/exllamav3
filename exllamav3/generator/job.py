@@ -1382,6 +1382,46 @@ class Job:
             self.last_recurrent_checkpoint_pos = seq.kv_position
 
 
+    def stash_recurrent_tail(self, cache, pinned_staging: bool = False):
+        """
+        On normal job completion, stash the recurrent state at the last full page of forwarded tokens, so a
+        follow-up request extending this sequence resumes within about a page of its end instead of at the last
+        interval checkpoint. The state is rewound in place to the page boundary; ring-cursor-aware stashing
+        (SWAState.stash) serializes it correctly at any decode alignment. States without in-place rollback
+        (e.g. GDN) keep the default checkpoint behavior.
+        """
+        if self.recurrent_state is None or len(self.sequences) != 1:
+            return
+        if not getattr(type(self.recurrent_state), "guaranteed_rollback", 0):
+            return
+        if self.generator.model.loaded_tp:
+            return
+        seq = self.sequences[0]
+        # The final sampled token's K/V is never forwarded; when it exactly completes a page, target the
+        # previous boundary instead (a rewind of PAGE_SIZE - 1, within the guaranteed rollback window)
+        boundary = len(seq.sequence_ids) // PAGE_SIZE * PAGE_SIZE
+        if len(seq.sequence_ids) == boundary:
+            boundary -= PAGE_SIZE
+        if boundary <= 0:
+            return
+        # last_recurrent_checkpoint_pos == boundary is deliberately NOT a shortcut here: the shared
+        # RecurrentCache may have evicted that entry since it was written, and put() on a still-present key
+        # only refreshes its LRU position without copying
+        last_page = boundary // PAGE_SIZE - 1
+        if last_page >= len(seq.allocated_pages):
+            return
+        page = seq.allocated_pages[last_page]
+        if page.kv_position != PAGE_SIZE or page.phash[:8] == bytes(8):
+            return
+        rewind = self.recurrent_state.position - boundary
+        if rewind < 0 or rewind > self.recurrent_state.rollback_capacity():
+            return
+        if rewind:
+            self.recurrent_state.rewind(rewind)
+        self.last_recurrent_checkpoint_pos = boundary
+        cache.put(page.phash, self.recurrent_state, pinned_staging = pinned_staging)
+
+
     def find_recurrent_stash(self, target_pos: int):
         """
         Return the most recent page-aligned recurrent state stash at or before target_pos, refreshing its LRU

@@ -1,5 +1,68 @@
 from collections import OrderedDict
+import torch
 from ..constants import PAGE_SIZE
+
+
+def stage_tensors_pinned(owner, tensors):
+    """
+    Copy tensors into reusable pinned host buffers. The caller must synchronize the source device streams before
+    reading or cloning the returned buffers.
+    """
+    single = isinstance(tensors, torch.Tensor)
+    tensors = (tensors,) if single else tensors
+    staging = getattr(owner, "_pinned_stash_staging", None)
+    if staging is None or len(staging) != len(tensors) or any(
+        b.shape != t.shape or b.dtype != t.dtype for b, t in zip(staging, tensors)
+    ):
+        staging = tuple(
+            torch.empty(t.shape, dtype = t.dtype, device = "cpu", pin_memory = True)
+            for t in tensors
+        )
+        owner._pinned_stash_staging = staging
+    for buffer, tensor in zip(staging, tensors):
+        buffer.copy_(tensor, non_blocking = True)
+    return staging[0] if single else staging
+
+
+def clone_staged_tensors(tensors):
+    """
+    Move a completed pinned staging copy into ordinary pageable storage owned by a recurrent-cache entry.
+    """
+    single = isinstance(tensors, torch.Tensor)
+    tensors = (tensors,) if single else tensors
+    cloned = tuple(
+        torch.empty(t.shape, dtype = t.dtype, device = "cpu").copy_(t)
+        for t in tensors
+    )
+    return cloned[0] if single else cloned
+
+
+def stash_recurrent_layers(cache, slot: int, position: int = 0, pinned_staging: bool = False, cursor: int | None = None):
+    """
+    Stash all recurrent layers for one state slot. For the completion-tail path, enqueue D2H copies for every
+    layer into reusable pinned buffers, synchronize once per source device, then clone the staged values into the
+    pageable tensors retained by RecurrentCache. cursor carries the SWA ring's true content extent; state types
+    without a ring ignore it.
+    """
+    layers = cache.get_all_recurrent_layers()
+    if not pinned_staging:
+        return {key: layer.stash(slot, position, cursor = cursor) for key, layer in layers.items()}
+
+    staged = {
+        key: layer.stash(slot, position, pinned_staging = True, cursor = cursor)
+        for key, layer in layers.items()
+    }
+    devices = {
+        device
+        for layer in layers.values()
+        if getattr(layer, "device", None) is not None
+        for device in (torch.device(layer.device),)
+        if device.type == "cuda"
+    }
+    for device in devices:
+        torch.cuda.current_stream(device).synchronize()
+    return {key: clone_staged_tensors(value) for key, value in staged.items()}
+
 
 class RecurrentCache(OrderedDict):
     def __init__(
@@ -32,14 +95,14 @@ class RecurrentCache(OrderedDict):
         return default
 
 
-    def put(self, key, state):
+    def put(self, key, state, pinned_staging: bool = False):
         """
         Add state to cache
         """
         if key in self:
             self.move_to_end(key)
         else:
-            stashed_state = state.stash()
+            stashed_state = state.stash(pinned_staging = True) if pinned_staging else state.stash()
             state_size = stashed_state["checkpoint_size"]
             while self.update_total_size() + state_size > self.max_size:
                 assert self.current_size >= 0, "Not enough space in cache for single state"

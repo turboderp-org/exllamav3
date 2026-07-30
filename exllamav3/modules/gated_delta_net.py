@@ -17,6 +17,8 @@ from ..cache.recurrent import (
     mp_cache_recurrent_unstash,
     mp_cache_recurrent_clear,
     new_checkpoint_handle,
+    stage_tensors_pinned,
+    stash_recurrent_layers,
 )
 from ..util import profile_opt
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
@@ -121,14 +123,17 @@ class GDNState:
         return 0
 
 
-    def stash(self):
+    def stash(self, pinned_staging: bool = False):
         stashed = {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size
         }
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot)
+            stashed.update(stash_recurrent_layers(
+                self.cache,
+                self.slot,
+                pinned_staging = pinned_staging,
+            ))
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot))
@@ -187,6 +192,7 @@ class GDNLayerState:
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
+        self._pinned_stash_staging = None
 
 
     def get_checkpoint_size(self):
@@ -211,6 +217,7 @@ class GDNLayerState:
     def free(self):
         self.conv_state = torch.empty_like(self.conv_state, device = "meta")
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = "meta")
+        self._pinned_stash_staging = None
         self.device = None
 
 
@@ -270,12 +277,15 @@ class GDNLayerState:
         )
 
 
-    def stash(self, slot, position: int = 0):
+    def stash(self, slot, position: int = 0, pinned_staging: bool = False, cursor: int | None = None):
         cdim = self.module.conv_kernel_size
-        return (
-            self.recurrent_state[slot, :1].cpu(),
-            self.conv_state[slot, :, :cdim].cpu()
+        tensors = (
+            self.recurrent_state[slot, :1],
+            self.conv_state[slot, :, :cdim],
         )
+        if pinned_staging:
+            return stage_tensors_pinned(self, tensors)
+        return tuple(t.cpu() for t in tensors)
 
 
     def unstash(self, slot, stashed, position: int = 0):

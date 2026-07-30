@@ -25,7 +25,12 @@ class AsyncGenerator:
                 # is notified by enqueue() or close(), so this background task does not spin between requests.
                 async with self.condition:
                     # Wake when the first job arrives or when close() has cancelled the iteration task.
-                    await self.condition.wait_for(lambda: len(self.jobs) > 0 or self.iteration_task.cancelled())
+                    await self.condition.wait_for(
+                        lambda:
+                            len(self.jobs) > 0 or
+                            self.generator.has_deferred_cleanup() or
+                            self.iteration_task.cancelled()
+                    )
 
                 # Drive exactly one synchronous generator step and fan out any returned events to the owning
                 # AsyncJob queues. Missing jobs can happen if a job was cancelled after iterate() started.
@@ -58,6 +63,14 @@ class AsyncGenerator:
             for async_job in self.jobs.values():
                 async_job.put_result(e)
             self.jobs.clear()
+            # Release the dead generator's held resources (deferred completions retain pages and recurrent
+            # slots). Strictly best-effort and strictly after error delivery: cleanup deallocates and
+            # defragments, either of which can fail again after a CUDA/generator failure, and a second
+            # exception here must not escape and leave consumers waiting forever.
+            try:
+                self.generator.clear_queue()
+            except Exception:
+                pass
 
     def enqueue(self, job: AsyncJob):
         # The iteration task died on a generator exception; surface it to the new job's consumer immediately
@@ -88,11 +101,15 @@ class AsyncGenerator:
             await self.iteration_task
         except asyncio.CancelledError:
             pass
-
-        # Wake any consumers still parked on job queues; no more results will be produced
-        for async_job in self.jobs.values():
-            async_job.put_result(_CANCELLED_SENTINEL)
-        self.jobs.clear()
+        try:
+            self.generator.clear_queue()
+        finally:
+            # Wake any consumers still parked on job queues; no more results will be produced. Guaranteed even
+            # if cleanup fails (it deallocates and defragments, both fallible after a generator failure), so a
+            # failing close() cannot leave consumers waiting forever.
+            for async_job in self.jobs.values():
+                async_job.put_result(_CANCELLED_SENTINEL)
+            self.jobs.clear()
 
     async def cancel(self, job: AsyncJob):
         # Remove the underlying Job from the synchronous generator first so no new tokens are produced, then drop

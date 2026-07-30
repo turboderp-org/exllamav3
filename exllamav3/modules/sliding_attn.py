@@ -15,6 +15,8 @@ from ..cache.recurrent import (
     mp_cache_recurrent_stash,
     mp_cache_recurrent_unstash,
     new_checkpoint_handle,
+    stage_tensors_pinned,
+    stash_recurrent_layers,
 )
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
@@ -89,15 +91,27 @@ class SWAState:
         return self.position - self.window_beg
 
 
-    def stash(self):
+    def stash(self, pinned_staging: bool = False):
         stashed = {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size,
             "window_beg": self.window_beg,
         }
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot, self.position)
+            # The live ring is left-aligned with write cursor position - window_beg. Slicing relative to the
+            # cursor makes stashing valid at any decode-time alignment, not just the exactly-full ring that
+            # page-aligned prefill checkpoints produce. The stash itself keeps the canonical layout unstash
+            # expects, so window_beg is rebased to match (all SWA layers must share one kv_state_size).
+            layers = self.cache.get_all_recurrent_layers()
+            state_size = next(iter(layers.values())).module.kv_state_size
+            stashed["window_beg"] = self.position - min(self.position, state_size)
+            stashed.update(stash_recurrent_layers(
+                self.cache,
+                self.slot,
+                self.position,
+                pinned_staging,
+                cursor = self.position - self.window_beg,
+            ))
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, self.position))
@@ -166,6 +180,7 @@ class SWALayerState:
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
+        self._pinned_stash_staging = None
 
 
     def get_checkpoint_size(self):
@@ -199,6 +214,7 @@ class SWALayerState:
     def free(self):
         self.k_state = torch.empty_like(self.k_state, device = "meta")
         self.v_state = torch.empty_like(self.v_state, device = "meta")
+        self._pinned_stash_staging = None
         self.device = None
 
 
@@ -217,13 +233,18 @@ class SWALayerState:
         pass
 
 
-    def stash(self, slot, position):
-        b = min(self.module.kv_state_size, position)
+    def stash(self, slot, position, pinned_staging: bool = False, cursor: int | None = None):
+        # cursor is the ring's true content extent (position - window_beg); without it, fall back to assuming
+        # an exactly-full ring, which only page-aligned prefill checkpoints guarantee
+        b = min(self.module.kv_state_size, position) if cursor is None else cursor
         a = max(0, b - self.module.sliding_window)
-        return (
-            self.k_state[slot, a:b].cpu(),
-            self.v_state[slot, a:b].cpu()
+        tensors = (
+            self.k_state[slot, a:b],
+            self.v_state[slot, a:b],
         )
+        if pinned_staging:
+            return stage_tensors_pinned(self, tensors)
+        return tuple(t.cpu() for t in tensors)
 
 
     def unstash(self, slot, stashed, position):

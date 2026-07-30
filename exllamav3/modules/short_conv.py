@@ -12,6 +12,8 @@ from ..cache.recurrent import (
     mp_cache_recurrent_unstash,
     mp_cache_recurrent_clear,
     new_checkpoint_handle,
+    stage_tensors_pinned,
+    stash_recurrent_layers,
 )
 
 
@@ -81,14 +83,17 @@ class ShortConvState:
         return 0
 
 
-    def stash(self):
+    def stash(self, pinned_staging: bool = False):
         stashed = {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size
         }
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
-                stashed[k] = l.stash(self.slot)
+            stashed.update(stash_recurrent_layers(
+                self.cache,
+                self.slot,
+                pinned_staging = pinned_staging,
+            ))
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot))
@@ -142,6 +147,7 @@ class ShortConvLayerState:
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
+        self._pinned_stash_staging = None
 
 
     def get_checkpoint_size(self):
@@ -160,6 +166,7 @@ class ShortConvLayerState:
 
     def free(self):
         self.conv_state = torch.empty_like(self.conv_state, device = "meta")
+        self._pinned_stash_staging = None
         self.device = None
 
 
@@ -183,9 +190,10 @@ class ShortConvLayerState:
             c_state.copy_(temp)
 
 
-    def stash(self, slot, position: int = 0):
+    def stash(self, slot, position: int = 0, pinned_staging: bool = False, cursor: int | None = None):
         cdim = self.module.conv_kernel_size
-        return self.conv_state[slot, :, :cdim].cpu()
+        tensor = self.conv_state[slot, :, :cdim]
+        return stage_tensors_pinned(self, tensor) if pinned_staging else tensor.cpu()
 
 
     def unstash(self, slot, stashed, position: int = 0):
