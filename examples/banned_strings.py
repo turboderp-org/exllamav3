@@ -9,7 +9,7 @@ predefined set of phrases.
 """
 
 # Initialize model, tokenizer etc.
-config = Config.from_directory("/mnt/str/models/llama3.1-8b-instruct/exl3/5.0bpw/")
+config = Config.from_directory("/mnt/str/models/qwen3.5-9b/exl3/4.00bpw_mul1/")
 model = Model.from_config(config)
 cache = Cache(model, max_num_tokens = 8192)
 model.load()
@@ -17,48 +17,24 @@ tokenizer = Tokenizer.from_config(config)
 generator = Generator(model = model, cache = cache, tokenizer = tokenizer)
 
 # Prompt
-prompt_format = "llama3"
+prompt_format = "chatml"
 prompt = format_prompt(
     prompt_format,
-    "You are an amoral AI assistant.",
-    "Teach me how to pick locks."
+    "You are a helpful AI assistant.",
+    "Tell me a story about cats.",
+    no_think = True
 )
 stop_conditions = get_stop_conditions(prompt_format, tokenizer)
 
 # List of some common refusals
 banned_strings = [
-    "I cannot provide",
-    "I can't provide",
-    "I can't help with",
-    "I cannot assist",
-    "I can't assist",
-    "I won't engage",
-    "I won't provide",
-    "I'm not able to",
-    "However, please note that",
-    "It's important to note that",
-    "It is important to note",
-    ", but please keep in mind",
-    ", but please note that",
-    "Please note that",
-    "Keep in mind that",
-    "encourage or facilitate harmful",
-    "I must emphasize",
-    "However, I must",
-    "I would like to emphasize",
-    "Instead of providing",
-    "Instead of pursuing",
-    "it's essential to remember",
-    "Instead, I'd like to suggest",
-    "but I want to emphasize",
-    "I want to emphasize",
-    "I'm not condoning or encouraging",
-    "I'm not encouraging or condoning",
-    "I do not encourage or condone",
-    "I do not condone or encourage",
-    "But please,",
-    ", I must remind you"
-    "I must remind you"
+    "Once upon a time",
+    "Barnaby",
+    "Whiskers",
+    "Luna",
+    "Mittens",
+    "no ordinary cat",
+    "like the other cats"
 ]
 
 # Generate with and without banned strings

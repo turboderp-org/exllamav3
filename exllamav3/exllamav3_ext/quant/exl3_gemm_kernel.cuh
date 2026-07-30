@@ -240,39 +240,48 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     if (B_weights)
         grid.sync();
 
-    // Final reduction
+    // Final reduction: each of the num_tokens groups of (bszm / num_tokens) contiguous slots is
+    // summed into its own output row (row t for group t), instead of always collapsing into row
+    // 0. num_tokens == 1 (the legacy single-token case) reduces to exactly the original
+    // single-row behavior. Groups MUST be processed in increasing t order per column: row t is
+    // only ever read by group floor(t / stride), which is <= t, so it has already been fully
+    // read (and, if that group's index equals t, is only then correctly overwritten) by the time
+    // group t's own write happens.
     if (B_weights && blockIdx.z == 0)
     {
         int total_warps = size_m * size_n / 32;
         int warps_grid = gridDim.x * blockDim.x / 32;
         int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
         int this_lane = threadIdx.x % 32;
+        int stride = bszm / num_tokens;
 
         for(; this_warp < total_warps; this_warp += warps_grid)
         {
-            if constexpr (c_fp32)
+            for (int t = 0; t < num_tokens; ++t)
             {
-                float* C__ = ((float*) C) + this_warp * 32 + this_lane;
-                float* C___ = C__;
-                float sum = 0.0f;
-                for (int j = 0; j < bszm; ++j)
+                int col = this_warp * 32 + this_lane;
+                if constexpr (c_fp32)
                 {
-                    sum += *C___;
-                    C___ += size_m * size_n;
+                    float* C___ = ((float*) C) + t * stride * size_m * size_n + col;
+                    float sum = 0.0f;
+                    for (int j = 0; j < stride; ++j)
+                    {
+                        sum += *C___;
+                        C___ += size_m * size_n;
+                    }
+                    ((float*) C)[t * size_m * size_n + col] = sum;
                 }
-                *C__ = sum;
-            }
-            else
-            {
-                half* C__ = ((half*) C) + this_warp * 32 + this_lane;
-                half* C___ = C__;
-                half sum = {};
-                for (int j = 0; j < bszm; ++j)
+                else
                 {
-                    sum = __hadd(sum, *C___);
-                    C___ += size_m * size_n;
+                    half* C___ = ((half*) C) + t * stride * size_m * size_n + col;
+                    half sum = {};
+                    for (int j = 0; j < stride; ++j)
+                    {
+                        sum = __hadd(sum, *C___);
+                        C___ += size_m * size_n;
+                    }
+                    ((half*) C)[t * size_m * size_n + col] = sum;
                 }
-                *C__ = sum;
             }
         }
     }

@@ -113,6 +113,10 @@ void reconstruct_slice
 
     int rows = packed.size(0);
     int packed_cols = packed.size(1);
+
+    if (unpacked.numel() == 0)
+        return;
+
     TORCH_CHECK(unpacked.size(1) % 128 == 0, "unpacked N dimension must be divisible by 128");
     TORCH_CHECK(n_offset % 128 == 0, "n_offset must be divisible by 128");
     TORCH_CHECK(n_offset >= 0, "n_offset must be non-negative");

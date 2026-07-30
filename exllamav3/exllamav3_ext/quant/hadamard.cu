@@ -16,8 +16,8 @@ void had_hf_r_128_kernel
     const float r_scale
 )
 {
-    input_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
-    output_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    input_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    output_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
     had_hf_r_128_inner<pre_scale, post_scale>(input_ptr, output_ptr, scale, r_scale);
 }
 
@@ -31,8 +31,8 @@ void had_ff_r_128_kernel
     const float r_scale
 )
 {
-    input_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
-    output_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    input_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    output_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
     had_ff_r_128_inner<pre_scale, post_scale>(input_ptr, output_ptr, scale, r_scale);
 }
 
@@ -49,12 +49,12 @@ void had_hf_r_128_dual_kernel
     const float r_scale
 )
 {
-    input1_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
-    output1_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    input1_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    output1_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
     had_hf_r_128_inner<pre_scale, post_scale>(input1_ptr, output1_ptr, scale_1, r_scale);
 
-    input2_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
-    output2_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    input2_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    output2_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
     had_hf_r_128_inner<pre_scale, post_scale>(input2_ptr, output2_ptr, scale_2, r_scale);
 }
 
@@ -71,12 +71,12 @@ void had_ff_r_128_dual_kernel
     const float r_scale
 )
 {
-    input1_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
-    output1_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    input1_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    output1_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
     had_ff_r_128_inner<pre_scale, post_scale>(input1_ptr, output1_ptr, scale_1, r_scale);
 
-    input2_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
-    output2_ptr += gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    input2_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    output2_ptr += (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
     had_ff_r_128_inner<pre_scale, post_scale>(input2_ptr, output2_ptr, scale_2, r_scale);
 }
 

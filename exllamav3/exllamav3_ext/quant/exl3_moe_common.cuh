@@ -5,6 +5,7 @@
 
 #define MOE_ACT_SILU 0
 #define MOE_ACT_GELU 1
+#define MOE_ACT_RELU2_NOGATE 2  // non-gated relu2 (NemotronH): gate GEMM and staging skipped
 
 #define MOE_SMS_PER_EXPERT 8       // default/minimum group width, also sets max concurrency (buffer count)
 #define MOE_MAX_SMS_PER_EXPERT 32  // widest expert group when few experts are active

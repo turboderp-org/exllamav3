@@ -45,7 +45,9 @@ void gated_rms_norm
     at::Tensor y,
     at::Tensor g,
     float epsilon,
-    float constant_bias
+    float constant_bias,
+    int w_groups = 1,
+    bool gate_first = false
 );
 
 void gated_rms_norm_gr
@@ -56,5 +58,7 @@ void gated_rms_norm_gr
     at::Tensor g,
     float epsilon,
     float constant_bias,
-    Graph* graph
+    Graph* graph,
+    int w_groups = 1,
+    bool gate_first = false
 );

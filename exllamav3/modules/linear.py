@@ -6,7 +6,7 @@ import numpy as np
 from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
-from .quant.exl3_lib import quantize_exl3
+from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 
@@ -56,6 +56,7 @@ class Linear(Module):
         out_dtype: torch.dtype | None = None,
         allow_input_padding: bool = False,
         post_scale: float = 1.0,
+        weight_scale: float = 1.0,
         transposed_load: bool = True,
         transpose_fused_weights: bool = True,
         ftranspose_after_load: bool = True,
@@ -86,6 +87,7 @@ class Linear(Module):
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
         self.out_dtype = out_dtype
         self.post_scale = post_scale
+        self.weight_scale = weight_scale
         self.transposed_load = transposed_load
         self.transpose_fused_weights = transpose_fused_weights
         self.ftranspose_after_load = ftranspose_after_load
@@ -169,13 +171,17 @@ class Linear(Module):
                 scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                 scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                 assert scale is None or scale_inv is None
-                no_defer = scale is not None or scale_inv is not None
+                no_defer = scale is not None or scale_inv is not None or self.weight_scale != 1.0
                 weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
-                bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
+                bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer)
                 if scale is not None:
                     weight = self.apply_fp8_scales_(weight, scale)
                 elif scale_inv is not None:
                     weight = self.apply_fp8_scales_inv_(weight, scale_inv)
+                if self.weight_scale != 1.0:
+                    weight = (weight.float() * self.weight_scale).to(weight.dtype)
+                    if bias is not None:
+                        bias = (bias.float() * self.weight_scale).to(bias.dtype)
 
             self.inner = LinearFP16(
                 self.in_features,
@@ -217,6 +223,8 @@ class Linear(Module):
                 weight = weight.T.contiguous()
             # pad_out expects (in_features, out_features) orientation
             weight = self.pad_out(weight)
+            if self.weight_scale != 1.0:
+                weight = (weight.float() * self.weight_scale).to(weight.dtype)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
@@ -265,6 +273,10 @@ class Linear(Module):
             weight = weight.T.contiguous()
             weight = self.pad_out(weight)
             bias = self.pad_out(bias)
+            if self.weight_scale != 1.0:
+                weight = (weight.float() * self.weight_scale).to(weight.dtype)
+                if bias is not None:
+                    bias = (bias.float() * self.weight_scale).to(bias.dtype)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
@@ -328,15 +340,21 @@ class Linear(Module):
         if not self.is_exl3_storage(key):
             return False
         self.used_alt_key = key == self.alt_key
-        scale = self.config.stc.get_tensor(key + ".scale", self.device, optional = True)
-        su = self.config.stc.get_tensor(key + ".su", self.device, optional = True, no_defer = True)
-        suh = self.config.stc.get_tensor(key + ".suh", self.device, optional = True)
-        sv = self.config.stc.get_tensor(key + ".sv", self.device, optional = True, no_defer = True)
-        svh = self.config.stc.get_tensor(key + ".svh", self.device, optional = True)
-        trellis = self.config.stc.get_tensor(key + ".trellis", self.device)
-        mcg = self.config.stc.get_tensor(key + ".mcg", "cpu", optional = True)
-        mul1 = self.config.stc.get_tensor(key + ".mul1", "cpu", optional = True)
-        bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
+        # Probe the header before fetching: most formats ship only a subset of these tensors,
+        # and the misses otherwise add up to a significant share of bulk-load Python overhead
+        stc = self.config.stc
+        def opt(subkey, device, **kwargs):
+            k = key + subkey
+            return stc.get_tensor(k, device, optional = True, **kwargs) if stc.has_tensor(k) else None
+        scale = opt(".scale", self.device)
+        su = opt(".su", self.device, no_defer = True)
+        suh = opt(".suh", self.device)
+        sv = opt(".sv", self.device, no_defer = True)
+        svh = opt(".svh", self.device)
+        trellis = stc.get_tensor(key + ".trellis", self.device)
+        mcg = opt(".mcg", "cpu")
+        mul1 = opt(".mul1", "cpu")
+        bias = opt(".bias", self.device)
         self.inner = LinearEXL3(
             self.config,
             self.in_features,
@@ -489,6 +507,10 @@ class Linear(Module):
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
 
+        if self.out_features == 0:
+            dtype = out_dtype or self.out_dtype or torch.half
+            return x.new_empty((*x.shape[:-1], 0), dtype = dtype)
+
         # When in_features is padded past the incoming activation width (dims not a multiple of
         # pad_to, e.g. gpt-oss hidden_size 2880), zero-extend the input. The padded weight rows
         # are zeros, so this is exact; H capture below sees the padded width, keeping the
@@ -620,7 +642,12 @@ class Linear(Module):
         module.device = device
         module.inner = exported["inner"]["cls"].tp_import_split(local_context, exported["inner"], plan, split)
         module.quant_type = module.inner.quant_type
-        module._adopt_inner_dims(exported)
+        if split is not None:
+            split_out, first, _ = split
+            module._adopt_inner_dims(exported, out_first = first if split_out else None,
+                                     in_first = first if not split_out else None)
+        else:
+            module._adopt_inner_dims(exported)
         return module
 
     @staticmethod
@@ -636,25 +663,59 @@ class Linear(Module):
         module._adopt_inner_dims(exported)
         return module
 
-    def _adopt_inner_dims(self, exported: dict):
+    @staticmethod
+    def tp_import_split_n(local_context, exported, plan, splits):
+        # N-range output split (Mamba2 in_proj: [z | x | B | C | dt] sections split by state
+        # group, with the dt section replicated). The ranges select only real (unpadded) columns,
+        # so the local slice is exact by construction: no output trim, no padded-out bookkeeping
+        device = local_context["device"]
+        module = Linear(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+        module.inner = exported["inner"]["cls"].tp_import_split_n(local_context, exported["inner"], plan, splits)
+        module.quant_type = module.inner.quant_type
+        module.in_features = module.inner.in_features
+        module.out_features = module.inner.out_features
+        exp_in = exported["kwargs"]["in_features"]
+        unp_in, _ = exported.get("unpadded", (exp_in, None))
+        module.in_features_unpadded = unp_in if module.in_features == exp_in else module.in_features
+        module.out_features_unpadded = module.out_features
+        module.trim_padded_out = False
+        module.is_sliced = True
+        return module
+
+    def _adopt_inner_dims(self, exported: dict, in_first: int | None = None, out_first: int | None = None):
         # The exported kwargs carry the full unsplit (padded) dims; forward() sizes its input padding and
         # output trim against the wrapper dims, so they must track the local slice. A dim the split left
-        # whole keeps its true unpadded value (padded models pad the hidden dims, which are never split);
-        # splitting a padded dim across ranks has no defined trim semantics, so it must not happen
+        # whole keeps its true unpadded value (padded models pad the hidden dims, which are never split).
+        # Splitting a padded dim is fine when the slice offset is known: slices below the pad boundary
+        # are exact, and the slice containing it has (unpadded - first) real columns (e.g. an lm_head
+        # with a padded vocab split across ranks -- the pad columns ride in the tail slice like they do
+        # on a single device)
         exp_in, exp_out = exported["kwargs"]["in_features"], exported["kwargs"]["out_features"]
         unp_in, unp_out = exported.get("unpadded", (exp_in, exp_out))
         self.in_features = self.inner.in_features
         self.out_features = self.inner.out_features
         if self.in_features == exp_in:
             self.in_features_unpadded = unp_in
-        else:
-            assert exp_in == unp_in, f"{self.key}: cannot split the padded input dim across TP ranks"
+        elif exp_in == unp_in:
             self.in_features_unpadded = self.in_features
+        else:
+            assert in_first is not None, f"{self.key}: cannot split the padded input dim without the slice offset"
+            self.in_features_unpadded = max(0, min(unp_in - in_first, self.in_features))
         if self.out_features == exp_out:
             self.out_features_unpadded = unp_out
-        else:
-            assert exp_out == unp_out, f"{self.key}: cannot split the padded output dim across TP ranks"
+        elif exp_out == unp_out:
             self.out_features_unpadded = self.out_features
+        else:
+            assert out_first is not None, f"{self.key}: cannot split the padded output dim without the slice offset"
+            self.out_features_unpadded = max(0, min(unp_out - out_first, self.out_features))
+            # A load-bearing output trim (projections back into the residual stream) has no
+            # defined per-slice gather semantics; no current model splits such a dim
+            assert not self.trim_padded_out or self.out_features_unpadded == self.out_features, \
+                f"{self.key}: cannot split a padded output dim that requires trimming"
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
 
 
@@ -665,3 +726,51 @@ class Linear(Module):
         assert unit == "channels"
         split = (True, first, last) if first is not None else None
         return Linear.tp_import_split(local_context, exported, plan, split)
+
+
+def convert_exl3_group(
+    linears: list,
+    H_datas: list[dict],
+    quant_args_list: list[dict],
+    progress_str: str | None = None,
+):
+    """
+    Convert a group of Linear modules to EXL3 in one batched quantization pass (see quantize_exl3_batch for
+    the grouping requirements: shared Hessian with equal in_features, or same-shape tensors with individual
+    Hessians, all at the same bitrate).
+
+    :return:
+        list of proxy errors, one per module; each module's quant_args dict in quant_args_list is updated
+        the same way Linear.convert_exl3 updates its quant_args
+    """
+    weights = []
+    biases = []
+    for linear in linears:
+        assert isinstance(linear.inner, LinearFP16), \
+            "Inner layer is already quant type"
+        weights.append(linear.inner.get_weight_tensor().float())
+        biases.append(linear.inner.get_bias_tensor())
+        linear.inner = None
+
+    results = quantize_exl3_batch(weights, H_datas, quant_args_list, progress_str)
+
+    proxy_errs = []
+    for linear, bias, (proxy_err, out_tensors) in zip(linears, biases, results):
+        linear.inner = LinearEXL3(
+            linear.config,
+            linear.in_features,
+            linear.out_features,
+            out_tensors.get("scale"),
+            out_tensors.get("su"),
+            out_tensors.get("sv"),
+            out_tensors.get("suh"),
+            out_tensors.get("svh"),
+            out_tensors.get("trellis"),
+            out_tensors.get("mcg"),
+            out_tensors.get("mul1"),
+            bias,
+            linear.out_dtype,
+            key = linear.key
+        )
+        proxy_errs.append(proxy_err)
+    return proxy_errs

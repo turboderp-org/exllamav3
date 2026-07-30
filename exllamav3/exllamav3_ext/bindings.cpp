@@ -22,6 +22,9 @@
 #include "quant/hadamard.cuh"
 #include "quant/exl3_gemm.cuh"
 #include "quant/exl3_gemv.cuh"
+#include "quant/exl3_gemv_int8.cuh"
+#include "cpu/moe_mul1.h"
+#include "cpu/moe_handoff.h"
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -31,6 +34,7 @@
 #include "generator/sampling_basic.cuh"
 #include "generator/sampling_extra.cuh"
 #include "generator/gumbel.cuh"
+#include "generator/sampling_fused.cuh"
 #include "generator/rep_pen.cuh"
 #include "generator/cache.cuh"
 
@@ -46,6 +50,7 @@
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/attention.h"
+#include "libtorch/mla_attention.h"
 #include "libtorch/linear.h"
 #include "libtorch/gated_rmsnorm.h"
 #include "libtorch/mlp.h"
@@ -104,6 +109,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
+    m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
+    m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
+    m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");
+    m.def("exl3_moe_cpu_forward", &exl3_moe_cpu_forward, "exl3_moe_cpu_forward",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("exl3_moe_cpu_has_avx2", &exl3_moe_cpu_has_avx2, "exl3_moe_cpu_has_avx2");
+    m.def("exl3_moe_flag_write", &exl3_moe_flag_write, "exl3_moe_flag_write");
+    m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
+    m.def("exl3_moe_cpu_set_memops", &exl3_moe_cpu_set_memops, "exl3_moe_cpu_set_memops");
+    m.def("exl3_moe_cpu_set_prof", &exl3_moe_cpu_set_prof, "exl3_moe_cpu_set_prof");
+    m.def("exl3_moe_cpu_worker_run", &exl3_moe_cpu_worker_run, "exl3_moe_cpu_worker_run",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
     m.def("hgemm", &hgemm, "hgemm");
     m.def("rope", &rope, "rope");
@@ -112,25 +130,39 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");
     m.def("gelu_mul", &gelu_mul, "gelu_mul");
     m.def("relu2_mul", &relu2_mul, "relu2_mul");
+    m.def("relu_mul", &relu_mul, "relu_mul");
     m.def("xielu", &xielu, "xielu");
     m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
     m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
     m.def("deinterleave_qg", &deinterleave_qg, "deinterleave_qg");
     m.def("mul_sigmoid_broadcast_", &mul_sigmoid_broadcast_, "mul_sigmoid_broadcast_");
+    m.def("mul_softplus_broadcast_", &mul_softplus_broadcast_, "mul_softplus_broadcast_");
     m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
     m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
     m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
+    m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
+    m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
     m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
     m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
+
+    py::class_<ConvRewindJob>(m, "ConvRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int, int, int>());
+    py::class_<StateRewindJob>(m, "StateRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int64_t>());
+    m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
     m.def("gumbel_noise_f16", &gumbel_noise_f16, "gumbel_noise_f16");
     m.def("gumbel_noise_f32", &gumbel_noise_f32, "gumbel_noise_f32");
     m.def("gumbel_noise_log", &gumbel_noise_log, "gumbel_noise_log");
+    m.def("fused_sampler", &fused_sampler, "fused_sampler");
+    m.attr("FUSED_SAMPLER_MAX_BLOCKS") = FUSED_SAMPLER_MAX_BLOCKS;
+    m.attr("FUSED_SAMPLER_HIST_STRIDE") = FUSED_SAMPLER_HIST_STRIDE;
     m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
     m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
     m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
@@ -145,6 +177,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dequant_cache_cont", &dequant_cache_cont, "dequant_cache_cont");
     m.def("quant_cache_paged", &quant_cache_paged, "quant_cache_paged");
     m.def("dequant_cache_paged", &dequant_cache_paged, "dequant_cache_paged");
+    m.def("dequant_cache_paged_window", &dequant_cache_paged_window, "dequant_cache_paged_window");
 
     m.def("count_inf_nan", &count_inf_nan, "count_inf_nan");
     m.def("histogram", &histogram, "histogram");
@@ -160,6 +193,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
     #include "libtorch/attention_bc.h"
+    #include "libtorch/mla_attention_bc.h"
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"

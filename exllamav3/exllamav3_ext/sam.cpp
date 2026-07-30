@@ -77,9 +77,15 @@ std::pair<int64_t, int64_t> BC_SAM::accept_tensor(const at::Tensor& tokens)
     if (tokens.dim() == 2)
         TORCH_CHECK(tokens.size(0) == 1, "2D tokens must have bsz 1");
 
-    size_t len = tokens.size(-1);
+    // The sequence shrinks when the job rewinds (banned-string suppression); a suffix automaton cannot
+    // un-accept tokens, so rebuild it from the truncated sequence. Without this the unsigned length
+    // difference below underflows and the loop reads far out of bounds.
+    int64_t total = tokens.size(-1);
+    if (total < length())
+        reset(total);
+
     size_t offset = length();
-    len -= offset;
+    size_t len = (size_t) total - offset;
     if (len < 1) return { -1, -1 };
 
     const int64_t* tokens_ptr = (const int64_t*) tokens.data_ptr();

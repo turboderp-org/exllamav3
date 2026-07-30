@@ -54,7 +54,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("-i", "--in_dir", type = str, default = None, help = "Input model directory")
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
     _args = parser.parse_args()

@@ -15,6 +15,7 @@
 #define ACT_GELU 1
 #define ACT_RELU2 2
 #define ACT_SILU_OAI 3
+#define ACT_RELU 4
 
 #include "activation_kernels.cuh"
 
@@ -331,6 +332,85 @@ void relu2_mul
     relu2_mul_gr(x, y, z, act_limit, nullptr);
 }
 
+// relu(x) * y -> z. With x == y this computes relu^2(y) exactly, which is how the non-gated
+// MoE paths (NemotronH) apply their activation through the same (g, u, a) call shape
+
+void relu_mul_gr
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    bool float_input = x.dtype() == at::kFloat;
+    if (float_input)
+    {
+        TORCH_CHECK_DTYPE(y, kFloat);
+    }
+    else
+    {
+        TORCH_CHECK_DTYPE(x, kHalf);
+        TORCH_CHECK_DTYPE(y, kHalf);
+    }
+
+    TORCH_CHECK_DTYPE(z, kHalf);
+
+    size_t numel = x.numel();
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    if (float_input)
+    {
+        act_mul_kernel_f<ACT_RELU><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const float*) x.data_ptr(),
+            (const float*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            act_limit,
+            numel
+        );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU>, GP_relu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU>, GP_relu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU>, GP_relu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_f<ACT_RELU>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
+    }
+    else
+    {
+        act_mul_kernel_h<ACT_RELU><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const half*) x.data_ptr(),
+            (const half*) y.data_ptr(),
+            (half*) z.data_ptr(),
+            act_limit,
+            numel
+        );
+
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU>, GP_relu_mul_x, 0);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU>, GP_relu_mul_y, 1);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU>, GP_relu_mul_z, 2);
+        if (graph) graph->record_param((void*) &act_mul_kernel_h<ACT_RELU>, GP_end, 0);
+
+        cuda_check(cudaPeekAtLastError());
+    }
+}
+
+void relu_mul
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit
+)
+{
+    relu_mul_gr(x, y, z, act_limit, nullptr);
+}
+
 // xielu(x, alpha_p, alpha_n) -> z
 // alpha_p and alpha_n must be CPU tensors
 
@@ -531,6 +611,52 @@ void mul_sigmoid_broadcast_
 )
 {
     mul_sigmoid_broadcast__gr(x, y, nullptr);
+}
+
+// x *= softplus(y), where x is [B, S, H, D] and y is [B, S, H] (Laguna attention gate)
+
+void mul_softplus_broadcast__gr
+(
+    at::Tensor& x,
+    const at::Tensor& y,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK_DTYPE(y, kHalf);
+    TORCH_CHECK(x.dim() == 4, "x must be [B, S, H, D]");
+    TORCH_CHECK(y.dim() == 3, "y must be [B, S, H]");
+    TORCH_CHECK(x.size(0) == y.size(0), "x and y have incompatible shapes");
+    TORCH_CHECK(x.size(1) == y.size(1), "x and y have incompatible shapes");
+    TORCH_CHECK(x.size(2) == y.size(2), "x and y have incompatible shapes");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(y.is_contiguous(), "y must be contiguous");
+    TORCH_CHECK(x.size(3) % 2 == 0, "x.size(3) must be even");
+
+    size_t numel = x.numel();
+    size_t dim = x.size(3);
+    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
+    mul_softplus_broadcast_kernel_h<<<blocks, NUM_THREADS, 0, stream>>>
+    (
+        (half*) x.data_ptr(),
+        (const half*) y.data_ptr(),
+        numel,
+        dim
+    );
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+void mul_softplus_broadcast_
+(
+    at::Tensor& x,
+    const at::Tensor& y
+)
+{
+    mul_softplus_broadcast__gr(x, y, nullptr);
 }
 
 // x * sigmoid(y @ w) + z -> z

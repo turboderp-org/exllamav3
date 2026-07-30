@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import re
+import math
 from dataclasses import dataclass
 import torch
 import os, glob
 import numpy as np
 import json
-from ..util import Timer, cuda_sync_active
+from ..util import Timer
 from ..ext import exllamav3_ext as ext
 from functools import cached_property
 import time
 
-MAX_DEFERRED_LOAD_CHUNK = 2*1024**2
+MAX_DEFERRED_LOAD_CHUNK = 4*1024**2
 
 def convert_dtype(dt: str):
     if dt == "I32": return torch.int, np.int32, 4
@@ -283,6 +284,19 @@ class SafetensorsCollection:
         fidx: int = None,
     ) -> torch.Tensor | None:
 
+        # Misses first (optional probes for absent tensors are a large share of all calls during
+        # a bulk load, so the miss path stays minimal)
+        if key not in self.tensor_file_map:
+            if self.new_tensors and key in self.new_tensors:
+                tensor = self.new_tensors[key].to(device if device is not None else "cpu")
+                if transpose:
+                    tensor = tensor.T.contiguous()
+                return tensor
+            if not optional:
+                raise ValueError(f"Required tensor {key} not found in any *.safetensors file in {self.directory}")
+            else:
+                return None
+
         if device is None:
             device = torch.device("cpu")
 
@@ -295,12 +309,6 @@ class SafetensorsCollection:
                 tensor = tensor.T.contiguous()
             return tensor
 
-        if not key in self.tensor_file_map:
-            if not optional:
-                raise ValueError(f"Required tensor {key} not found in any *.safetensors file in {self.directory}")
-            else:
-                return None
-
         filename = self.tensor_file_map[key]
         header = self.file_headers[filename]
         h = header[key]
@@ -310,14 +318,14 @@ class SafetensorsCollection:
         beg, end = h["data_offsets"]
         bytesize = end - beg
         shape = h["shape"]
-        numel = np.prod(shape)
+        numel = math.prod(shape)
         assert numel * esize == bytesize, \
             f"Incorrect size of {key} in {filename}"
 
         if fidx is not None:
             assert shape[0] > fidx, f"Batch tensor {key} has shape {shape}, index {fidx} is out of bounds"
             shape = shape[1:]
-            numel = np.prod(shape)
+            numel = math.prod(shape)
             beg += esize * numel * fidx
             end = beg + esize * numel
             bytesize = end - beg
@@ -382,8 +390,8 @@ class SafetensorsCollection:
                             raise e
                     tensor = torch.empty(shape, dtype = dtype, device = device)
                     assert tensor.is_contiguous()
-                    if device != "cpu":
-                        cuda_sync_active()
+                    # No sync needed here: the loader engine synchronizes the target device
+                    # before writing from its own streams
                     ext.stloader_read(
                         h,
                         offset + beg,
@@ -481,56 +489,62 @@ class SafetensorsCollection:
 
             def make_workload(l):
                 wl = []
+                append = wl.append
+                job = ext.TensorLoadJob
+                handles = self.handles
+                chunk = MAX_DEFERRED_LOAD_CHUNK
                 for w in l:
-                    if w["temp_tensor"] is not None:
-                        dst = w["temp_tensor"].data_ptr()
-                    else:
-                        # Not transposing, padding or converting fp32->fp16, load directly
-                        dst = w["dest_tensor"].data_ptr()
+                    temp = w["temp_tensor"]
+                    # Without transpose, padding or fp32->fp16 conversion, load directly
+                    dst = (temp if temp is not None else w["dest_tensor"]).data_ptr()
                     bytesize = w["bytesize"]
+                    if bytesize == 0:
+                        continue
                     src = w["file_offset"]
-                    while bytesize > 0:
-                        j = ext.TensorLoadJob(
-                            self.handles[w["filename"]],
-                            src,
-                            min(bytesize, MAX_DEFERRED_LOAD_CHUNK),
-                            dst,
-                            w["bf16_to_fp16"],
-                            w["fp32_to_fp16"],
-                            w["cuda"],
-                            w["device_id"]
-                        )
-                        src += MAX_DEFERRED_LOAD_CHUNK
-                        dst += MAX_DEFERRED_LOAD_CHUNK
-                        bytesize -= MAX_DEFERRED_LOAD_CHUNK
-                        wl.append(j)
+                    h = handles[w["filename"]]
+                    bf16 = w["bf16_to_fp16"]
+                    fp32 = w["fp32_to_fp16"]
+                    cuda = w["cuda"]
+                    dev = w["device_id"]
+                    while bytesize > chunk:
+                        append(job(h, src, chunk, dst, bf16, fp32, cuda, dev))
+                        src += chunk
+                        dst += chunk
+                        bytesize -= chunk
+                    append(job(h, src, bytesize, dst, bf16, fp32, cuda, dev))
                 return wl
 
-            for filename, loads in cpu_loads.items():
-                loads = sorted(loads, key = lambda c: -c["bytesize"])
+            # Jobs are sorted by file offset so reads are sequential and the C++ loader can
+            # coalesce adjacent tensors/chunks into single reads. All files go in one pass to
+            # avoid a join barrier per file.
+            def flatten(loads_by_file):
+                flat = []
+                for filename, loads in loads_by_file.items():
+                    flat += sorted(loads, key = lambda c: c["file_offset"])
+                return flat
+
+            def finalize(loads):
+                for w in loads:
+                    if w["temp_tensor"] is not None:
+                        src = w["temp_tensor"]
+                        if w["transpose"]:
+                            src = src.T
+                        unpadded_idx = tuple(slice(0, s) for s in src.shape)
+                        w["dest_tensor"][unpadded_idx].copy_(src)
+
+            if cpu_loads:
+                loads = flatten(cpu_loads)
                 workload = make_workload(loads)
                 self.metrics.total_chunks += len(workload)
                 ext.stloader_deferred_cpu(workload)
-                for w in loads:
-                    if w["temp_tensor"] is not None:
-                        src = w["temp_tensor"]
-                        if w["transpose"]:
-                            src = src.T
-                        unpadded_idx = tuple(slice(0, s) for s in src.shape)
-                        w["dest_tensor"][unpadded_idx].copy_(src)
+                finalize(loads)
 
-            for filename, loads in cuda_loads.items():
-                loads = sorted(loads, key = lambda c: -c["bytesize"])
+            if cuda_loads:
+                loads = flatten(cuda_loads)
                 workload = make_workload(loads)
                 self.metrics.total_chunks += len(workload)
                 ext.stloader_deferred_cuda(workload, MAX_DEFERRED_LOAD_CHUNK)
-                for w in loads:
-                    if w["temp_tensor"] is not None:
-                        src = w["temp_tensor"]
-                        if w["transpose"]:
-                            src = src.T
-                        unpadded_idx = tuple(slice(0, s) for s in src.shape)
-                        w["dest_tensor"][unpadded_idx].copy_(src)
+                finalize(loads)
 
         self.metrics.time_elapsed += timer.interval
         self.metrics.deferred_passes += 1

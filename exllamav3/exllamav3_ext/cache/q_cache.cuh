@@ -11,6 +11,15 @@ void quant_cache_cont
     float compand_a
 );
 
+void quant_cache_cont_gr
+(
+    const at::Tensor& in,
+    const at::Tensor& out,
+    const at::Tensor& out_scales,
+    float compand_a,
+    Graph* graph
+);
+
 void dequant_cache_cont
 (
     const at::Tensor& in,
@@ -50,6 +59,21 @@ void quant_cache_paged
     int seq_len,
     float compand_a,
     bool in_contiguous
+);
+
+void dequant_cache_paged_window
+(
+    const at::Tensor& k_in,
+    const at::Tensor& k_in_scales,
+    const at::Tensor& k_out,
+    const at::Tensor& v_in,
+    const at::Tensor& v_in_scales,
+    const at::Tensor& v_out,
+    const at::Tensor& cache_seqlens,
+    const at::Tensor& block_table,
+    int page_size,
+    int bonus_len,
+    float compand_a
 );
 
 void dequant_cache_paged

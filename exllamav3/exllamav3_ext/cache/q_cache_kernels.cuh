@@ -356,13 +356,16 @@ void dequant_cache_paged_kernel
     const int groups_per_token,
     const int chunks_per_token,     // ceil(groups_per_token / 4)
     const int sliding_window,
-    const float compand_a
+    const float compand_a,
+    const int compact_out,          // write pages densely at (batch * pages_per_seq + page)
+                                    // instead of the source physical index (window scratch)
+    const int bonus_len             // rows past cache_seqlens to include (pre-appended chunk)
 )
 {
     int batch_idx = blockIdx.y;
     int chunk_id = blockDim.x / 32 * (blockIdx.x * ITER_PER_TB) + (threadIdx.x >> 5);
     int d_chunks = blockDim.x / 32;
-    int max_token_idx = cache_seqlens[batch_idx];
+    int max_token_idx = cache_seqlens[batch_idx] + bonus_len;
     const uint32_t* b_block_table = block_table + batch_idx * pages_per_seq;
 
     // Skip all whole blocks prior to the sliding window
@@ -385,9 +388,12 @@ void dequant_cache_paged_kernel
         int mapped_page = b_block_table[page_idx];
         int token_pos = mapped_page * CQ_PAGE_SIZE + (token_idx % CQ_PAGE_SIZE);
         int base = token_pos * groups_per_token + g0;
+        int out_pos = compact_out ? (batch_idx * pages_per_seq + page_idx) * CQ_PAGE_SIZE
+            + (token_idx % CQ_PAGE_SIZE) : token_pos;
+        int base_out = out_pos * groups_per_token + g0;
 
-        dequant_block_x4<k_bits>(k_in + base * k_bits, k_in_scales + base, k_out + base * 32, active, compand_a);
-        dequant_block_x4<v_bits>(v_in + base * v_bits, v_in_scales + base, v_out + base * 32, active, compand_a);
+        dequant_block_x4<k_bits>(k_in + base * k_bits, k_in_scales + base, k_out + base_out * 32, active, compand_a);
+        dequant_block_x4<v_bits>(v_in + base * v_bits, v_in_scales + base, v_out + base_out * 32, active, compand_a);
 
         chunk_id += d_chunks;
     }

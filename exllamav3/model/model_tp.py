@@ -1,6 +1,7 @@
 from __future__ import annotations
 import multiprocessing
 from multiprocessing import Process, Pipe
+from multiprocessing.reduction import ForkingPickler
 from ..util import find_free_port
 from .model_tp_alloc import TPAllocator
 import os
@@ -27,6 +28,13 @@ class Model_TPMixin:
         self.tp_output_device = None
         self.tp_producer = None
         self.tp_backend = None
+        # Devices whose per-forward None acks are still in flight (see forward_tp), and a strong
+        # reference to the dispatched args for that pass: pickling CPU tensors (e.g. exported
+        # recurrent-state handles) moves their storages into torch shared-memory segments that
+        # only live as long as the sender-side objects, and the children may not have read the
+        # command yet when forward_tp returns
+        self.tp_pending_acks = []
+        self.tp_pending_refs = None
 
     def create_tp_context(self, tp_backend: str):
         """
@@ -121,6 +129,12 @@ class Model_TPMixin:
         """
         log_tp(None, "Destroying TP context")
 
+        # Collect any deferred forward acks so quit commands aren't interleaved with stale results
+        try:
+            self.tp_drain_acks()
+        except Exception:
+            log_tp(None, "Exception draining deferred acks during destroy")
+
         # Destroy process group in child processes
         for device, (parent_conn, child) in \
                 zip(list(range(len(self.mp_parent_conn))) + [-1], zip(self.mp_parent_conn, self.mp_children)):
@@ -163,10 +177,28 @@ class Model_TPMixin:
         log_tp(None, "Destroyed TP context")
 
 
+    def tp_drain_acks(self):
+        """
+        Collect deferred per-forward acks from child workers before touching the pipes or the shared
+        input arena again. forward_tp/prefill_tp leave the child ranks' end-of-pass None results in
+        flight so the main process can launch sampling work on the output device while the children
+        finish their module walks; the acks must be in before the next dispatch reuses the pipes and
+        before prepare_inputs_for_tp resets the arena the stragglers may still be reading from.
+        Child exceptions from the deferred pass surface here.
+        """
+        pending, self.tp_pending_acks = self.tp_pending_acks, []
+        for device in pending:
+            r = self.tp_worker_result(device)
+            assert r is None, "TP logic error"
+        # All children have consumed the deferred pass's command; shared storages may be released
+        self.tp_pending_refs = None
+
+
     def tp_worker_dispatch_single(self, device, fn, args):
         """
         Dispatch single function call to child and get return value
         """
+        self.tp_drain_acks()
         conn = self.mp_parent_conn[device]
         conn.send((fn, args))
         if conn.poll(DISPATCH_TIMEOUT):
@@ -182,6 +214,7 @@ class Model_TPMixin:
         """
         Dispatch function call to child
         """
+        self.tp_drain_acks()
         conn = self.mp_parent_conn[device]
         conn.send((fn, args))
 
@@ -209,6 +242,7 @@ class Model_TPMixin:
         device. That ordering matters because dispatching to the pseudo-worker executes the function immediately and
         can block on TP collectives; spawned workers must already have received the same command before that happens.
         """
+        self.tp_drain_acks()
         for idx, device in enumerate(active_devices):
             d_args = args
             if dev_args is not None:
@@ -502,12 +536,17 @@ class Model_TPMixin:
         reserve = {}
         if "cache" in params:
             params["cache"] = id(params["cache"])
-        # Share memory of any additional CPU tensors
+        # Share memory of any additional CPU tensors. Everything tensor-shaped must go through
+        # the arena: CPU tensors pickled over the pipes become torch shared-memory segments with
+        # fragile cross-process lifetimes (the recurrent_slots tensor used to crash GDN models
+        # this way once forward acks became deferred)
         for tensor_param in [
             "block_table",
             "cache_seqlens",
             "positions",
             "position_ids",
+            "recurrent_slots",
+            "inv_freq",
         ]:
             p = params.get(tensor_param)
             if p is not None:
@@ -549,20 +588,24 @@ class Model_TPMixin:
         x, reserve = self.prepare_inputs_for_tp(x, params)
         # active_devices order sends work to spawned CUDA workers first and the main-process output device last.
         # mp_model_forward enters backend barriers, so dispatching the synchronous pseudo-worker early would block
-        # before the other ranks had even received this forward command.
+        # before the other ranks had even received this forward command. Child ranks all receive the same
+        # command, pickled once and sent as raw bytes (Connection.send is dumps + send_bytes, so this is
+        # wire-identical) — per-rank pickling of the params dict was part of the dispatch stagger.
+        args = (x, params, last_kv_module_idx, True, None)
+        msg = ForkingPickler.dumps((mp_model_forward, args))
         for device in self.active_devices:
-            self.tp_worker_dispatch(device, mp_model_forward, (
-                x,
-                params,
-                last_kv_module_idx,
-                True,
-                None
-            ))
-        for device in self.active_devices:
-            r = self.tp_worker_result(device)
-            assert r is None, "TP logic error"
-
-        self.tp_worker_result(-1)
+            if device == self.tp_output_device:
+                self.tp_worker_dispatch(device, mp_model_forward, args)
+            else:
+                self.mp_parent_conn[device].send_bytes(msg)
+        # Same deferred-ack scheme as forward_tp: only the inline pseudo-worker's result is
+        # consumed here, child acks drain at the next dispatch
+        r = self.tp_worker_result(self.tp_output_device)
+        assert r is None, "TP logic error"
+        self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
+        self.tp_pending_acks.append(-1)
+        # See forward_tp: the exported recurrent-state handles must outlive the deferred acks
+        self.tp_pending_refs = (args, params.get("recurrent_states"))
         self.restore_tp_params(params, reserve)
         return None
 
@@ -579,24 +622,27 @@ class Model_TPMixin:
         x, reserve = self.prepare_inputs_for_tp(x, params)
         # Keep the output-device pseudo-worker last for the same reason as prefill_tp(): its send() path executes
         # immediately in the main process and may block inside TP collectives until child workers arrive.
+        # Shared pre-pickled command bytes for child ranks, as in prefill_tp
+        args = (x, params, last_kv_module_idx, False, None)
+        msg = ForkingPickler.dumps((mp_model_forward, args))
         for device in self.active_devices:
-            self.tp_worker_dispatch(device, mp_model_forward, (
-                x,
-                params,
-                last_kv_module_idx,
-                False,
-                None
-            ))
-        return_tensors = []
-        for device in self.active_devices:
-            r = self.tp_worker_result(device)
-            if r is not None:
-                return_tensors.append(r)
-        assert len(return_tensors) == 1, "TP logic error"
-
-        self.tp_worker_result(-1)
+            if device == self.tp_output_device:
+                self.tp_worker_dispatch(device, mp_model_forward, args)
+            else:
+                self.mp_parent_conn[device].send_bytes(msg)
+        # The output-device pseudo-worker ran inline during the dispatch loop above, so its result
+        # is already buffered. The child ranks' None acks (and the CPU helper's) are left in flight
+        # and drained at the next dispatch, letting the caller queue sampling work on the output
+        # device while the child processes finish their module walks
+        out = self.tp_worker_result(self.tp_output_device)
+        assert out is not None, "TP logic error"
+        self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
+        self.tp_pending_acks.append(-1)
+        # Pin the exported recurrent-state handles too: restore_tp_params swaps them out of the
+        # params dict in place, so holding args alone would not keep their shared storages alive
+        self.tp_pending_refs = (args, params.get("recurrent_states"))
         self.restore_tp_params(params, reserve)
-        return return_tensors[0]
+        return out
 
 
     def tp_rotate_cache_pages(self, cache_id: int, all_rotations: torch.Tensor):

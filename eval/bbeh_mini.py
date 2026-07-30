@@ -253,7 +253,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description = "Run BigBench Extra Hard evaluation (mini sample set)")
+    parser = argparse.ArgumentParser(description = "Run BigBench Extra Hard evaluation (mini sample set)", allow_abbrev = False)
     model_init.add_args(
         parser,
         add_sampling_args = True,

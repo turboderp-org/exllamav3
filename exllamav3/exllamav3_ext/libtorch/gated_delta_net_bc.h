@@ -55,15 +55,6 @@ py::class_<BC_GatedDeltaNet, std::shared_ptr<BC_GatedDeltaNet>>(m, "BC_GatedDelt
 py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC_GatedDeltaNetSplit").def
 (
     py::init<
-        at::Tensor,
-        at::Tensor,
-        at::Tensor,
-        at::Tensor,
-        at::Tensor,
-        at::Tensor,
-        at::Tensor,
-        at::Tensor,
-        at::Tensor,
         std::shared_ptr<BC_LinearEXL3>,
         std::shared_ptr<BC_LinearEXL3>,
         std::shared_ptr<BC_LinearEXL3>,
@@ -80,15 +71,6 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
         std::shared_ptr<BC_GatedRMSNorm>,
         float
     >(),
-    py::arg("qkv"),
-    py::arg("z"),
-    py::arg("ba"),
-    py::arg("beta"),
-    py::arg("g"),
-    py::arg("mixed_qkv"),
-    py::arg("conv_out"),
-    py::arg("core_attn_out"),
-    py::arg("core_attn_out_f"),
     py::arg("qkv_proj"),
     py::arg("z_proj"),
     py::arg("o_proj"),
@@ -105,4 +87,83 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
     py::arg("norm"),
     py::arg("beta_scale")
 )
-.def("run_bsz1", &BC_GatedDeltaNetSplit::run_bsz1);
+.def("needs_configure", &BC_GatedDeltaNetSplit::needs_configure)
+.def("configure_slot", &BC_GatedDeltaNetSplit::configure_slot,
+    py::arg("bsz"),
+    py::arg("seqlen"),
+    py::arg("history"),
+    py::arg("qkv"),
+    py::arg("z"),
+    py::arg("ba"),
+    py::arg("beta"),
+    py::arg("g"),
+    py::arg("mixed_qkv"),
+    py::arg("conv_out"),
+    py::arg("core_attn_out"),
+    py::arg("core_attn_out_f"),
+    py::arg("qkv_xh"),
+    py::arg("z_xh"),
+    py::arg("o_xh")
+)
+.def("run_bszN", &BC_GatedDeltaNetSplit::run_bszN);
+
+py::class_<BC_Mamba2, std::shared_ptr<BC_Mamba2>>(m, "BC_Mamba2").def
+(
+    py::init<
+        std::shared_ptr<BC_LinearEXL3>,
+        std::shared_ptr<BC_LinearEXL3>,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        float,
+        float,
+        int,
+        int,
+        int,
+        int,
+        int,
+        at::Tensor,
+        c10::optional<at::Tensor>,
+        std::shared_ptr<BC_GatedRMSNorm>,
+        bool,
+        bool,
+        int
+    >(),
+    py::arg("in_proj"),
+    py::arg("o_proj"),
+    py::arg("dt_bias"),
+    py::arg("a_log"),
+    py::arg("d_skip"),
+    py::arg("dt_min"),
+    py::arg("dt_max"),
+    py::arg("num_k_heads"),
+    py::arg("num_v_heads"),
+    py::arg("k_head_dim"),
+    py::arg("v_head_dim"),
+    py::arg("hidden_size"),
+    py::arg("conv1d_weight"),
+    py::arg("conv1d_bias"),
+    py::arg("norm"),
+    py::arg("padded_in"),
+    py::arg("padded_out"),
+    py::arg("dt_first") = 0
+)
+.def("needs_configure", &BC_Mamba2::needs_configure)
+.def("configure_slot", &BC_Mamba2::configure_slot,
+    py::arg("bsz"),
+    py::arg("seqlen"),
+    py::arg("history"),
+    py::arg("xp"),
+    py::arg("proj"),
+    py::arg("mixed_xbc"),
+    py::arg("dt"),
+    py::arg("g"),
+    py::arg("z_gate"),
+    py::arg("conv_out"),
+    py::arg("core_attn_out"),
+    py::arg("core_attn_out_f"),
+    py::arg("yp"),
+    py::arg("in_xh"),
+    py::arg("o_xh")
+)
+.def("run_bszN", &BC_Mamba2::run_bszN);

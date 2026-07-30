@@ -181,7 +181,7 @@ def main():
         model,
         max_num_tokens = cache_size,
         max_batch_size = len(instructions),
-        max_history = draft_model.caps.get("default_draft_size") if draft_model else 0,
+        max_history = draft_model.caps.get("default_draft_size", 4) if draft_model else 0,
     )
 
     # Load model

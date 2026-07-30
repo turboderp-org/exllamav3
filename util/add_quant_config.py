@@ -13,7 +13,7 @@ def main(args):
         print(f"Created {filename}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     _args = parser.parse_args()
     main(_args)

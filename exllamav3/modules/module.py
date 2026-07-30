@@ -79,7 +79,10 @@ class Module(ABC):
             if no_p2p_copy:
                 x = x.cpu().to(self.device)
             else:
-                x = x.to(self.device)
+                # Pinned CPU sources (e.g. the generator's staged input IDs) upload without
+                # blocking the host; the copy is stream-ordered ahead of the consuming kernels
+                nb = x.device.type == "cpu" and x.is_pinned()
+                x = x.to(self.device, non_blocking = nb)
         return x
 
     def get_qmaps(self):

@@ -46,11 +46,13 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
         at::Tensor,
         at::Tensor,
         at::Tensor,
+        at::Tensor,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
-        c10::optional<at::Tensor>
+        c10::optional<at::Tensor>,
+        bool
     >(),
     py::arg("yh2"),
     py::arg("yh"),
@@ -97,12 +99,14 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
     py::arg("gu_trellis_ptr"),
     py::arg("gu_suh_ptr"),
     py::arg("gu_svh_ptr"),
+    py::arg("a_gather"),
     py::arg("gate_bias_ptrs") = py::none(),
     py::arg("up_bias_ptrs") = py::none(),
     py::arg("down_bias_ptrs") = py::none(),
     py::arg("y_pad") = py::none(),
-    py::arg("out_trim") = py::none()
+    py::arg("out_trim") = py::none(),
+    py::arg("act_relu2") = false
 )
-.def("run_bsz1", &BC_BlockSparseMLP::run_bsz1)
+.def("run_bszN", &BC_BlockSparseMLP::run_bszN)
 .def("run_single_expert", &BC_BlockSparseMLP::run_single_expert)
 .def("run_single_expert_dq", &BC_BlockSparseMLP::run_single_expert_dq);

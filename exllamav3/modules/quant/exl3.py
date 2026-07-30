@@ -140,7 +140,11 @@ class LinearEXL3:
         masks = (1 << torch.arange(16)).to(bitfield.device)
         expanded = (bitfield.unsqueeze(-1) & masks) > 0
         expanded = expanded.flatten()
-        expanded = torch.where(expanded, torch.tensor(-1.0, dtype = torch.float16), torch.tensor(1.0, dtype = torch.float16))
+        # NOT torch.where with CPU scalar tensors: that path misses the device guard when the
+        # condition lives on a non-current device (observed on torch 2.11.0+cu130) — the kernel
+        # launches on the current device's context, faults there, silently zero-fills the output
+        # and leaves every other device in the process unusable. Map bool -> {-1, +1} arithmetically
+        expanded = 1.0 - expanded.to(torch.float16) * 2.0
         return expanded.contiguous().to(device)
 
 
@@ -291,6 +295,11 @@ class LinearEXL3:
 
     @staticmethod
     def tp_import_split_3(local_context, exported, plan, split_0, split_1, split_2, dbg = False):
+        return LinearEXL3.tp_import_split_n(local_context, exported, plan, [split_0, split_1, split_2], dbg)
+
+
+    @staticmethod
+    def tp_import_split_n(local_context, exported, plan, splits, dbg = False):
         consumer = local_context["consumer"]
         device = local_context["device"]
         id_suh = exported["suh"]
@@ -306,7 +315,7 @@ class LinearEXL3:
         in_features = 0
         out_features = 0
 
-        for split in [split_0, split_1, split_2]:
+        for split in splits:
             assert split is not None
             split_out, first, last = split
             assert split_out

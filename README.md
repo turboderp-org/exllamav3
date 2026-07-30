@@ -16,10 +16,6 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
 
 The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://github.com/theroyallab/tabbyAPI/), which provides an OpenAI-compatible API for local or remote inference, with extended features like HF model downloading, embedding model support and support for HF Jinja2 chat templates.
 
-### ⚠️ Important
-
-- **Gemma4** does not currently support tensor/expert parallelism.
-
 ## Architecture support
 
 - **AFM** (ArceeForCausalLM)
@@ -28,7 +24,8 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Command-R** etc. (CohereForCausalLM)
 - **Command-A**, **Command-R7B**, **Command-R+** etc. (Cohere2ForCausalLM)
 - **DeciLM**, **Nemotron** (DeciLMForCausalLM)
-- **dots.llm1** (Dots1ForCausalLM)
+- **Deepseek V3** (DeepseekV3ForCausalLM)
+- **dots.llm1** (Dots1ForCausalLM) (`n_group>1` currently not supported)
 - **ERNIE 4.5** (Ernie4_5_ForCausalLM, Ernie4_5_MoeForCausalLM)
 - **EXAONE 4.0** (Exaone4ForCausalLM)
 - **Gemma 2** (Gemma2ForCausalLM)
@@ -36,8 +33,11 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Gemma 4** (Gemma4ForConditionalGeneration, Gemma4UnifiedForConditionalGeneration) *- multimodal* (E2B/E4B currently not supported)
 - **GLM 4**, **GLM 4.5**, **GLM 4.5-Air**, **GLM 4.6** (Glm4ForCausalLM, Glm4MoeForCausalLM)
 - **GLM 4.1V**, **GLM 4.5V** (Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration) *- multimodal*
+- **GPT-OSS** (GptOssForCausalLM)
 - **HyperCLOVAX** (HyperCLOVAXForCausalLM, HCXVisionV2ForCausalLM) *- multimodal*
+- **Hy3** (HYV3ForCausalLM)
 - **IQuest-Coder** (IQuestCoderForCausalLM)
+- **Laguna 2.1** (LagunaForCausalLM)
 - **LFM 2.5** (Lfm2MoeForCausalLM)
 - **Llama**, **Llama 2**, **Llama 3**, **Llama 3.1-Nemotron** etc. (LlamaForCausalLM)
 - **MiMo-RL** (MiMoForCausalLM)
@@ -45,6 +45,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Mistral**, **Ministral 3**, **Devstral 2** etc. (MistralForCausalLM, Mistral3ForConditionalGeneration) *- multimodal*
 - **Mixtral** (MixtralForCausalLM)
 - **NanoChat** (NanoChatForCausalLM)
+- **NemotronH, Nemotron-3** (NemotronHForCausalLM)
 - **Olmo 3.1** (Olmo3ForCausalLM)
 - **Olmo-Hybrid** (OlmoHybridForCausalLM)
 - **Phi3**, **Phi4** (Phi3ForCausalLM)

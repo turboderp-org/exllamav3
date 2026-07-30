@@ -54,7 +54,7 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
             if (mod_256) return 3;
             return 2;
 
-        // case CC_HOPPER:
+        case CC_HOPPER:
         case CC_BLACKWELL:
             if ((K == 4 || K == 2) && !multi)
             {

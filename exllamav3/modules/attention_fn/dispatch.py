@@ -6,6 +6,7 @@ from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
 from .triton_paged import (
+    _qc_staging,
     fn_triton_paged_attn,
     fn_triton_paged_attn_longq,
     fn_triton_paged_attn_decode,
@@ -42,9 +43,10 @@ _fns_qc: list[AttnFn] = [
     fn_triton_paged_attn_prefill_qc,
 ]
 
-# Quantized caches feed the attention kernels directly (online dequant, no full-size fp16
-# temporaries). EXL3_QC_ATTN=0 restores the dequantize-then-attend path for A/B testing
-_qc_attn = os.environ.get("EXL3_QC_ATTN", "1") != "0"
+# Quantized caches feed the attention kernels directly (online dequant or prefill staging by
+# EXL3_QC_STAGING level, see triton_paged); level 2 restores the dequantize-then-attend path
+# with full-size fp16 temporaries for A/B testing
+_qc_attn = _qc_staging < 2
 
 _fns_fa2: list[AttnFn] = [
     fn_flash_attn_with_kvcache,

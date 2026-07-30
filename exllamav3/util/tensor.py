@@ -134,24 +134,33 @@ def get_for_device(
         cache = {}
         input_dict["dev_cache"] = cache
 
-    cache_key = (key, device)
-    dv = cache.get(cache_key, no_default)
-    if dv is no_default:
-        # Tensors marked _static_dev_cache = True are never mutated in place and keep persistent
-        # per-device copies (stored on the tensor itself) across forward passes
-        static = getattr(v, "_static_dev_cache", False)
-        if static:
-            scache = v.__dict__.get("_static_dev_copies")
-            if scache is None:
-                scache = {}
-                v._static_dev_copies = scache
-            dv = scache.get(device)
-            if dv is None:
-                dv = v.to(device)
-                scache[device] = dv
-        else:
+    # Key by tensor identity so the same tensor under two params keys (e.g. positions aliasing
+    # cache_seqlens) uploads only once per device. The cache entry keeps the source tensor
+    # alive so its id cannot be recycled within the lifetime of the dict
+    cache_key = (id(v), device)
+    hit = cache.get(cache_key)
+    if hit is not None:
+        return hit[1]
+
+    # Tensors marked _static_dev_cache = True are never mutated in place and keep persistent
+    # per-device copies (stored on the tensor itself) across forward passes
+    if getattr(v, "_static_dev_cache", False):
+        scache = v.__dict__.get("_static_dev_copies")
+        if scache is None:
+            scache = {}
+            v._static_dev_copies = scache
+        dv = scache.get(device)
+        if dv is None:
             dv = v.to(device)
-        cache[cache_key] = dv
+            scache[device] = dv
+    else:
+        # Pinned sources upload asynchronously: the copy is stream-ordered ahead of the kernels
+        # that consume it, so the host never stalls. Callers that reuse pinned staging buffers
+        # must not refill them until a sync point (the generator syncs every iteration when
+        # collecting sampled tokens)
+        nb = v.device.type == "cpu" and v.is_pinned()
+        dv = v.to(device, non_blocking = nb)
+    cache[cache_key] = (v, dv)
     return dv
 
 

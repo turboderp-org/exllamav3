@@ -1,4 +1,5 @@
 import math
+import os
 
 import torch
 
@@ -37,7 +38,8 @@ def _paged_kv_update_kernel(
     block_table,
     cache_seqlens,
     num_pages_per_seq,   # runtime: block-table width can grow without recompiling
-    kv_append_len: tl.constexpr,
+    kv_append_len,       # runtime: append length varies per prefill chunk (bc_attn still bakes
+                         # it as a constexpr through its explicit ASTSource signature)
     n_kv_heads: tl.constexpr,
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
@@ -71,17 +73,19 @@ def _paged_attn_splitdv_kernel(
     cache_seqlens,
     out,
     sinks,
-    q_len: tl.constexpr,
-    kv_append_len: tl.constexpr,
+    q_len,               # runtime: only used in masks and address math
+    kv_append_len,       # runtime
     n_q_heads: tl.constexpr,
     n_kv_heads: tl.constexpr,
-    num_pages_per_seq: tl.constexpr,
+    num_pages_per_seq,   # runtime: block-table width can grow without recompiling
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
     scale: tl.constexpr,
     CAUSAL: tl.constexpr,
-    WINDOW_LEFT: tl.constexpr,
-    WINDOW_RIGHT: tl.constexpr,
+    WINDOW_LEFT,         # runtime: span-dependent for non-causal (VLM) spans
+    WINDOW_RIGHT,        # runtime
+    HAS_WINDOW_LEFT: tl.constexpr,
+    HAS_WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
     HAS_SINKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -132,9 +136,9 @@ def _paged_attn_splitdv_kernel(
         valid = (offs_m[:, None] < q_len) & (offs_n[None, :] < total_k_len)
         if CAUSAL:
             valid = valid & (offs_n[None, :] <= q_abs[:, None])
-        if WINDOW_LEFT >= 0:
+        if HAS_WINDOW_LEFT:
             valid = valid & (offs_n[None, :] >= q_abs[:, None] - WINDOW_LEFT)
-        if WINDOW_RIGHT >= 0:
+        if HAS_WINDOW_RIGHT:
             valid = valid & (offs_n[None, :] <= q_abs[:, None] + WINDOW_RIGHT)
         scores = tl.where(valid, scores, -float("inf"))
 
@@ -177,17 +181,19 @@ def _paged_attn_longq_grouped_kernel(
     cache_seqlens,
     out,
     sinks,
-    q_len: tl.constexpr,
-    kv_append_len: tl.constexpr,
+    q_len,               # runtime: only used in masks and address math
+    kv_append_len,       # runtime
     n_q_heads: tl.constexpr,
     n_kv_heads: tl.constexpr,
-    num_pages_per_seq: tl.constexpr,
+    num_pages_per_seq,   # runtime: block-table width can grow without recompiling
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
     scale: tl.constexpr,
     CAUSAL: tl.constexpr,
-    WINDOW_LEFT: tl.constexpr,
-    WINDOW_RIGHT: tl.constexpr,
+    WINDOW_LEFT,         # runtime: span-dependent for non-causal (VLM) spans
+    WINDOW_RIGHT,        # runtime
+    HAS_WINDOW_LEFT: tl.constexpr,
+    HAS_WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
     HAS_SINKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -248,9 +254,9 @@ def _paged_attn_longq_grouped_kernel(
         valid = valid_row[:, None] & (offs_n[None, :] < total_k_len)
         if CAUSAL:
             valid = valid & (offs_n[None, :] <= q_abs[:, None])
-        if WINDOW_LEFT >= 0:
+        if HAS_WINDOW_LEFT:
             valid = valid & (offs_n[None, :] >= q_abs[:, None] - WINDOW_LEFT)
-        if WINDOW_RIGHT >= 0:
+        if HAS_WINDOW_RIGHT:
             valid = valid & (offs_n[None, :] <= q_abs[:, None] + WINDOW_RIGHT)
         scores = tl.where(valid, scores, -float("inf"))
 
@@ -467,6 +473,8 @@ def paged_attn_triton(
             bool(causal),
             int(window_left),
             int(window_right),
+            window_left >= 0,
+            window_right >= 0,
             float(softcap or 0.0),
             has_sinks,
             block_m,
@@ -616,6 +624,8 @@ def paged_attn_triton_longq(
             bool(causal),
             int(window_left),
             int(window_right),
+            window_left >= 0,
+            window_right >= 0,
             float(softcap or 0.0),
             has_sinks,
             block_m,
@@ -697,6 +707,22 @@ def fn_triton_paged_attn_longq(args: AttnArgs) -> torch.Tensor | None:
 # are rotated once per program with a 32x32 tl.dot against Hs = H32 / sqrt(32) (involutory).
 
 _h32_cache = {}
+
+# EXL3_QC_STAGING selects how quantized caches feed the attention kernels:
+#   0 = no staging: online dequant inside the prefill and decode kernels. Lowest memory (no
+#       staging scratch is ever allocated or reserved during autosplit) but prefill pays the
+#       in-kernel expansion cost (~6-26% on the kernel depending on bitrate)
+#   1 = prefill staging (default): prefill dequantizes the referenced cache window once into a
+#       shared fp16 scratch sized for the full cache at bsz 1 and runs the fp16 kernel over it;
+#       decode stays online. The scratch is allocated on first use -- the autosplit measuring
+#       pass triggers it, so the space is reserved at load time
+#   2 = full staging: dispatch-path debug mode; whole layers are dequantized into full-size
+#       fp16 temporaries before attention (get_kv). Only affects decode if EXL3_BC_ATTN=0
+_qc_staging = int(os.environ.get("EXL3_QC_STAGING", "1"))
+
+# Query-length threshold for the prefill staging pass at EXL3_QC_STAGING=1: below it the direct
+# path reads less gmem (short trailing chunks over long contexts, low bitrates)
+_qc_prefill_two_pass_min_q = int(os.environ.get("EXL3_QC_PF_TWO_PASS_MIN_Q", "256"))
 
 def _get_h32(device):
     if device not in _h32_cache:
@@ -1221,8 +1247,10 @@ def _paged_attn_prefill_inner(
     QCK: tl.constexpr,
     QCV: tl.constexpr,
     CAUSAL: tl.constexpr,
-    WINDOW_LEFT: tl.constexpr,
-    WINDOW_RIGHT: tl.constexpr,
+    WINDOW_LEFT,         # runtime: span-dependent for non-causal (VLM) spans
+    WINDOW_RIGHT,        # runtime
+    HAS_WINDOW_LEFT: tl.constexpr,
+    HAS_WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
     MASKED: tl.constexpr,
     SRC_NEW: tl.constexpr,
@@ -1275,9 +1303,9 @@ def _paged_attn_prefill_inner(
             valid = valid_row[:, None] & (offs_n[None, :] < n_end)
             if CAUSAL:
                 valid = valid & (offs_n[None, :] <= q_abs[:, None])
-            if WINDOW_LEFT >= 0:
+            if HAS_WINDOW_LEFT:
                 valid = valid & (offs_n[None, :] >= q_abs[:, None] - WINDOW_LEFT)
-            if WINDOW_RIGHT >= 0:
+            if HAS_WINDOW_RIGHT:
                 valid = valid & (offs_n[None, :] <= q_abs[:, None] + WINDOW_RIGHT)
             scores = tl.where(valid, scores, -float("inf"))
 
@@ -1333,22 +1361,25 @@ def _paged_attn_prefill_kernel(
     k_new,
     v_new,
     sinks,
-    num_splits: tl.constexpr,
+    num_splits,          # runtime: only enters the split-span arithmetic; IS_SPLIT gates the code
+    IS_SPLIT: tl.constexpr,   # num_splits > 1: store partials for the combine pass
     NEW_KV: tl.constexpr,     # 0: all kv in cache; 1: kv >= cache_seqlens[b] read from k_new/v_new;
                               # 2: like 1 but the cache is known empty (keeps the maskless split)
     QCK: tl.constexpr,
     QCV: tl.constexpr,
-    q_len: tl.constexpr,
-    kv_append_len: tl.constexpr,
+    q_len,               # runtime: chunk length varies per job; only masks and address math
+    kv_append_len,       # runtime
     n_q_heads: tl.constexpr,
     n_kv_heads: tl.constexpr,
-    num_pages_per_seq: tl.constexpr,
+    num_pages_per_seq,   # runtime: block-table width can grow without recompiling
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
     scale: tl.constexpr,
     CAUSAL: tl.constexpr,
-    WINDOW_LEFT: tl.constexpr,
-    WINDOW_RIGHT: tl.constexpr,
+    WINDOW_LEFT,         # runtime: span-dependent for non-causal (VLM) spans
+    WINDOW_RIGHT,        # runtime
+    HAS_WINDOW_LEFT: tl.constexpr,
+    HAS_WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
     HAS_SINKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -1395,10 +1426,10 @@ def _paged_attn_prefill_kernel(
     else:
         n_hi = total_k_len
     n_lo = 0
-    if WINDOW_LEFT >= 0:
+    if HAS_WINDOW_LEFT:
         n_lo = tl.maximum(0, q_abs_min - WINDOW_LEFT)
         n_lo = (n_lo // BLOCK_N) * BLOCK_N
-    if num_splits > 1:
+    if IS_SPLIT:
         span = tl.cdiv(tl.cdiv(n_hi - n_lo, num_splits), BLOCK_N) * BLOCK_N
         s_lo = n_lo + split * span
         s_hi = tl.minimum(s_lo + span, n_hi)
@@ -1423,61 +1454,61 @@ def _paged_attn_prefill_kernel(
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, tl.minimum(s_hi, past), q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
             True, False, BLOCK_N,
         )
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, tl.maximum(s_lo, past), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+            n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
             True, True, BLOCK_N,
         )
     elif NEW_KV == 2:
         # Cache known empty: same structure as the cache path, reading the contiguous source
-        if CAUSAL and WINDOW_LEFT < 0 and WINDOW_RIGHT < 0:
+        if CAUSAL and not HAS_WINDOW_LEFT and not HAS_WINDOW_RIGHT:
             n_full = tl.maximum(((q_abs_min + 1) // BLOCK_N) * BLOCK_N, 0)
             acc, m, l = _paged_attn_prefill_inner(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
                 offs_n_base, s_lo, tl.minimum(n_full, s_hi), q_abs, valid_row, qk_scale_log2e, total_k_len,
-                n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+                n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
                 False, True, BLOCK_N,
             )
             acc, m, l = _paged_attn_prefill_inner(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
                 offs_n_base, tl.maximum(n_full, s_lo), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
-                n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+                n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
                 True, True, BLOCK_N,
             )
         else:
             acc, m, l = _paged_attn_prefill_inner(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
                 offs_n_base, s_lo, s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
-                n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+                n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
                 True, True, BLOCK_N,
             )
-    elif CAUSAL and WINDOW_LEFT < 0 and WINDOW_RIGHT < 0:
+    elif CAUSAL and not HAS_WINDOW_LEFT and not HAS_WINDOW_RIGHT:
         n_full = tl.maximum(((q_abs_min + 1) // BLOCK_N) * BLOCK_N, 0)
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, tl.minimum(n_full, s_hi), q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
             False, False, BLOCK_N,
         )
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, tl.maximum(n_full, s_lo), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
             True, False, BLOCK_N,
         )
     else:
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, SOFTCAP,
+            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
             True, False, BLOCK_N,
         )
 
-    if num_splits > 1:
+    if IS_SPLIT:
         pid_lin = (pid_m * tl.num_programs(1) + bh) * num_splits + split
         po_base = pid_lin * BLOCK_M * head_dim
         tl.store(partial_o + po_base + tl.arange(0, BLOCK_M)[:, None] * head_dim + offs_d[None, :], acc)
@@ -1506,10 +1537,10 @@ def _paged_attn_prefill_combine_kernel(
     out,
     h32,
     sinks,
-    num_splits: tl.constexpr,
+    num_splits,          # runtime: loop bound
     QCV: tl.constexpr,
     HAS_SINKS: tl.constexpr,
-    q_len: tl.constexpr,
+    q_len,               # runtime: only masks and address math
     n_q_heads: tl.constexpr,
     head_dim: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -1552,6 +1583,36 @@ def _paged_attn_prefill_combine_kernel(
         out_tile = _rot_h32(out_tile, h32, BLOCK_M, head_dim)
     out_ptrs = out + (((batch * q_len + offs_m[:, None]) * n_q_heads + q_head) * head_dim + offs_d[None, :])
     tl.store(out_ptrs, out_tile, mask = (offs_m[:, None] < q_len))
+
+
+# Pipeline-stage pick for the quantized-cache prefill kernel: the in-loop dequant leaves the
+# kernel near the register cliff, and which side of it a given (bits, head_dim, arch) point
+# lands on flips between one and two stages (measured spans -75%..+85% with no usable static
+# rule, and 4090/5090 disagree per point). Measure both once per kernel family -- the key is
+# all launch constants, so this settles after one prefill per family -- and cache the winner.
+# EXL3_QC_PREFILL_NS=1/2 forces a stage count for A/B testing (read once at import)
+_qc_prefill_ns_cache = {}
+_qc_prefill_ns_env = int(os.environ.get("EXL3_QC_PREFILL_NS", "0") or "0")
+
+def _pick_qc_prefill_num_stages(key, launch):
+    num_stages = _qc_prefill_ns_cache.get(key)
+    if num_stages is not None:
+        return num_stages
+    best = None
+    for cand in (2, 1):
+        launch(cand)  # compile + warm up
+        start = torch.cuda.Event(enable_timing = True)
+        end = torch.cuda.Event(enable_timing = True)
+        start.record()
+        for _ in range(3):
+            launch(cand)
+        end.record()
+        end.synchronize()
+        t = start.elapsed_time(end)
+        if best is None or t < best[0]:
+            best = (t, cand)
+    _qc_prefill_ns_cache[key] = best[1]
+    return best[1]
 
 
 def paged_attn_triton_prefill(
@@ -1657,6 +1718,37 @@ def paged_attn_triton_prefill(
     if qc is not None:
         k_scales, v_scales, qck, qcv = qc
         h32 = _get_h32(q.device)
+
+        # Two-pass quantized-cache prefill: dequantize the referenced window once into a compact
+        # fp16 scratch and run the fp16 kernel over it. In-kernel dequant re-expands every kv
+        # tile once per (q block x sibling q head) -- measured 6-26% slower than fp16 depending
+        # on bitrate, unrecoverable by tile/stage tuning -- while the one-shot dequant pass costs
+        # ~2% of the kernel and the fp16 kernel runs at full speed. Compute-bound chunks only;
+        # short query batches stay on the direct path, which reads less gmem
+        # (causal only: VLM span chunks fan out into several wrapper calls over the same window,
+        # which would repeat the dequant pass per span -- those keep the direct path. The scratch
+        # is sized for the whole cache pool, not the current block-table span: one stable
+        # allocation that the autosplit measuring pass reserves at load time, valid for any
+        # bsz-1 window; batched windows that pad beyond the pool fall back to the direct path)
+        pool_pages = k_cache.shape[0]
+        if (_qc_staging == 1 and q_len >= _qc_prefill_two_pass_min_q
+                and new_kv_mode == 0 and k is None and causal
+                and bsz * block_table.shape[1] <= pool_pages):
+            from ...ext import exllamav3_ext as ext
+            from ...util.tensor import g_tensor_cache
+            npps_w = block_table.shape[1]
+            n_kvh = n_kv_heads_override
+            kd = g_tensor_cache.get(q.device, (pool_pages, page_size, n_kvh, head_dim), torch.half, "qc_pf_k")
+            vd = g_tensor_cache.get(q.device, (pool_pages, page_size, n_kvh, head_dim), torch.half, "qc_pf_v")
+            ext.dequant_cache_paged_window(
+                k_cache, k_scales, kd, v_cache, v_scales, vd,
+                cache_seqlens, block_table, page_size, kv_append_len, 0.0,
+            )
+            k_cache, v_cache = kd, vd
+            block_table = torch.arange(bsz * npps_w, dtype = torch.int32, device = q.device).view(bsz, npps_w)
+            qc = None
+            k_scales, v_scales, qck, qcv = q, q, 0, 0
+            h32 = q
     else:
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
@@ -1670,6 +1762,7 @@ def paged_attn_triton_prefill(
         cfg = (64, 32, 8, 2)
     else:
         cfg = (32, 16, 4, 2)
+    num_stages_forced = num_stages is not None
     block_m = block_m or cfg[0]
     block_n = block_n or cfg[1]
     num_warps = num_warps or cfg[2]
@@ -1678,7 +1771,7 @@ def paged_attn_triton_prefill(
         # compact plane tiles stage fewer smem bytes than fp16: wider kv tiles pay off. Wide
         # bit widths at large head_dim overstep the ~99 KB smem budget with the non-causal loop
         # structure (measured boundary: head_dim >= 256 with k_bits + v_bits >= 13), so halve
-        # the kv tile there
+        # the kv tile there. num_stages is picked per family below
         block_n = max(16, min(128, 16384 // head_dim))
         if head_dim >= 256 and qck + qcv >= 13 and block_n > 16:
             block_n //= 2
@@ -1724,17 +1817,35 @@ def paged_attn_triton_prefill(
             )
 
         grid = (q_blocks, bsz * n_q_heads, num_splits)
-        _paged_attn_prefill_kernel[grid](
-            q, k_cache, v_cache, block_table, cache_seqlens, out,
-            partial_o, partial_ml, k_scales, v_scales, h32,
-            k_new if new_kv_mode else q, v_new if new_kv_mode else q, sinks,
-            num_splits, new_kv_mode, qck, qcv,
-            q_len, kv_append_len, n_q_heads, n_kv_heads,
-            num_pages_per_seq, page_size, head_dim, float(softmax_scale),
-            bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            has_sinks, block_m, block_n,
-            num_warps=num_warps, num_stages=num_stages,
-        )
+        def launch(ns):
+            _paged_attn_prefill_kernel[grid](
+                q, k_cache, v_cache, block_table, cache_seqlens, out,
+                partial_o, partial_ml, k_scales, v_scales, h32,
+                k_new if new_kv_mode else q, v_new if new_kv_mode else q, sinks,
+                num_splits, num_splits > 1, new_kv_mode, qck, qcv,
+                q_len, kv_append_len, n_q_heads, n_kv_heads,
+                num_pages_per_seq, page_size, head_dim, float(softmax_scale),
+                bool(causal), int(window_left), int(window_right),
+                window_left >= 0, window_right >= 0, float(softcap or 0.0),
+                has_sinks, block_m, block_n,
+                num_warps=num_warps, num_stages=ns,
+            )
+
+        if qc is not None and not num_stages_forced:
+            if _qc_prefill_ns_env:
+                num_stages = _qc_prefill_ns_env
+            else:
+                key = (q.device.index, head_dim, qck, qcv, block_m, block_n, num_warps,
+                       bool(causal), window_left >= 0, window_right >= 0, has_sinks)
+                num_stages = _qc_prefill_ns_cache.get(key)
+                if num_stages is None:
+                    if q_len >= 256:
+                        # both candidates write the same output, so the timing launches are
+                        # real work; the final launch below is one redundant pass, once ever
+                        num_stages = _pick_qc_prefill_num_stages(key, launch)
+                    else:
+                        num_stages = cfg[3]  # too small to rank reliably; don't cache
+        launch(num_stages)
         if num_splits > 1:
             _paged_attn_prefill_combine_kernel[(q_blocks, bsz * n_q_heads)](
                 partial_o, partial_ml, out, h32, sinks,

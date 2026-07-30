@@ -44,7 +44,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("model_dir", type = str, help = "Path to model directory")
     add_bool_template_arg(
         parser,

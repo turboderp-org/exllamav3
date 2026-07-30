@@ -468,7 +468,9 @@ void gated_rms_norm_kernel
     const float epsilon,
     const int rows,
     const int dim,
-    float constant_bias
+    float constant_bias,
+    const int w_groups,         // weight spans w_groups rows, cycled by row index (Mamba2 group norm)
+    const bool gate_first       // apply silu(g) before the norm instead of after (Mamba2 style)
 )
 {
     constexpr bool output_fp32 = std::is_same_v<output_t, float>;
@@ -482,6 +484,7 @@ void gated_rms_norm_kernel
     int row = blockIdx.x;
 
     int columns = dim / 4;
+    const weight_t* w_row = w + (size_t) (row % w_groups) * dim;
 
     // Compute sum of squares
     float sum = 0.0f;
@@ -489,6 +492,16 @@ void gated_rms_norm_kernel
     {
         float4 x4;
         read_bfloat164(x4, ((const bfloat164*) (x + row * dim)) + column);
+        if (gate_first)
+        {
+            float4 g4;
+            if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row * dim)) + column);
+            else                       read_bfloat164(g4, ((const bfloat164*) (g + row * dim)) + column);
+            x4.x *= _silu(g4.x);
+            x4.y *= _silu(g4.y);
+            x4.z *= _silu(g4.z);
+            x4.w *= _silu(g4.w);
+        }
         sum = sum_sq4(sum, x4);
     }
     sum = reduce<num_threads>(sum, warp_id, lane_id);
@@ -504,8 +517,8 @@ void gated_rms_norm_kernel
         float4 g4;
 
         read_bfloat164(x4, ((const bfloat164*) (x + row * dim)) + column);
-        if constexpr (weight_bf16) read_bfloat164(w4, ((const bfloat164*) w) + column);
-        else                       read_float4   (w4, ((const float4*)    w) + column);
+        if constexpr (weight_bf16) read_bfloat164(w4, ((const bfloat164*) w_row) + column);
+        else                       read_float4   (w4, ((const float4*)    w_row) + column);
         if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row * dim)) + column);
         else                       read_bfloat164(g4, ((const bfloat164*) (g + row * dim)) + column);
 
@@ -517,12 +530,24 @@ void gated_rms_norm_kernel
             w4.w += constant_bias;
         }
 
-        apply4(x4, w4, rmf);
+        if (gate_first)
+        {
+            x4.x *= _silu(g4.x);
+            x4.y *= _silu(g4.y);
+            x4.z *= _silu(g4.z);
+            x4.w *= _silu(g4.w);
 
-        x4.x *= _silu(g4.x);
-        x4.y *= _silu(g4.y);
-        x4.z *= _silu(g4.z);
-        x4.w *= _silu(g4.w);
+            apply4(x4, w4, rmf);
+        }
+        else
+        {
+            apply4(x4, w4, rmf);
+
+            x4.x *= _silu(g4.x);
+            x4.y *= _silu(g4.y);
+            x4.z *= _silu(g4.z);
+            x4.w *= _silu(g4.w);
+        }
 
         if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row * dim)) + column);
         if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row * dim)) + column);
@@ -533,6 +558,9 @@ void gated_rms_norm_kernel
 /*
 Compute RMSNorm: y = x * w / sqrt(row_mean(x * x) + epsilon) * silu(g)
 - bfloat16 input only, half/float output
+- w_groups > 1: w holds w_groups weight rows of size dim, selected by (row % w_groups). Used for
+  Mamba2 group norm where the norm spans dim channels but the weight covers the full inner dim
+- gate_first: y = norm(x * silu(g)) * w instead of norm(x) * w * silu(g) (Mamba2 style)
 */
 void gated_rms_norm_gr
 (
@@ -542,14 +570,24 @@ void gated_rms_norm_gr
     at::Tensor g,
     float epsilon,
     float constant_bias,
-    Graph* graph
+    Graph* graph,
+    int w_groups,
+    bool gate_first
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DIV(x, -1, 4);
-    TORCH_CHECK_SHAPES(x, -1, w, 0, 1);
+    if (w_groups == 1)
+    {
+        TORCH_CHECK_SHAPES(x, -1, w, 0, 1);
+    }
+    else
+    {
+        TORCH_CHECK(w.numel() == (int64_t) w_groups * x.size(-1),
+                    "gated_rms_norm: w must have w_groups * dim elements");
+    }
     TORCH_CHECK_SHAPES_FULL(x, g);
 
     int rows = 1;
@@ -578,7 +616,9 @@ void gated_rms_norm_gr
             epsilon,                                                                            \
             rows,                                                                               \
             dim,                                                                                \
-            constant_bias                                                                       \
+            constant_bias,                                                                      \
+            w_groups,                                                                           \
+            gate_first                                                                          \
         );
 
     //      x_type_____________  w_type_____________  y_type_______  g_type_____________  small  num_threads
@@ -612,8 +652,10 @@ void gated_rms_norm
     at::Tensor y,
     at::Tensor g,
     float epsilon,
-    float constant_bias
+    float constant_bias,
+    int w_groups,
+    bool gate_first
 )
 {
-    gated_rms_norm_gr(x, w, y, g, epsilon, constant_bias, nullptr);
+    gated_rms_norm_gr(x, w, y, g, epsilon, constant_bias, nullptr, w_groups, gate_first);
 }

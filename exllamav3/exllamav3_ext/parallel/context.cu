@@ -23,6 +23,12 @@ void pg_init_context(uintptr_t ctx)
         ctx_ptr->gather_stage_produced[i] = 0;
         ctx_ptr->gather_stage_consumed[i] = 0;
         ctx_ptr->cpusum_stage_device[i * REDUCE_STAGE_STRIDE] = 0;
+        ctx_ptr->cpusum_stage_recv[i * REDUCE_STAGE_STRIDE] = 0;
+        for (int j = 0; j < CPUREDUCE_MB_BLOCKS; ++j)
+        {
+            ctx_ptr->cpusum_stage_device_mb[(i * CPUREDUCE_MB_BLOCKS + j) * REDUCE_STAGE_STRIDE] = 0;
+            ctx_ptr->cpusum_stage_recv_mb[(i * CPUREDUCE_MB_BLOCKS + j) * REDUCE_STAGE_STRIDE] = 0;
+        }
     }
 
     ctx_ptr->reduce_jobs_head = 0;

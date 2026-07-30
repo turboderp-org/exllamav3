@@ -341,7 +341,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-d", "--device", type = int, help = "CUDA device index", default = 0)
     parser.add_argument("-r", "--rows", type = int, help = "Number of rows", default = 10)

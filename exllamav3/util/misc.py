@@ -110,9 +110,42 @@ class Cleanupper:
             self.atexit_fns.remove(fn)
 
     def _shutdown(self):
-        for fn in self.atexit_fns:
-            fn()
-        self.atexit_fns = []
+        # Snapshot first: hooks commonly unregister themselves when called, and mutating the
+        # list mid-iteration would skip the next entry
+        fns, self.atexit_fns = self.atexit_fns, []
+        for fn in fns:
+            try:
+                fn()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
+
+def install_parent_death_signal() -> bool:
+    """
+    On Linux, ask the kernel to terminate this worker if its direct parent dies.
+    This is a best-effort safety net for cases where Python shutdown hooks do not
+    get a chance to clean up spawned workers.
+    """
+    import sys, os
+    if sys.platform != "linux":
+        return False
+
+    import ctypes
+    import signal
+
+    PR_SET_PDEATHSIG = 1
+    parent_pid = os.getppid()
+
+    libc = ctypes.CDLL("libc.so.6", use_errno = True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM) != 0:
+        return False
+
+    # Race check: the parent may have exited before PDEATHSIG was installed.
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    return True
 
 
 def set_process_priority_and_affinity():
@@ -214,16 +247,35 @@ def parse_int_list(
     return result
 
 
-def prepend_hf_chat_context(tokenizer, tokens: torch.Tensor):
-    prefix = tokenizer.hf_chat_template(
-        [
-            {"role": "system", "content": ""},
-            {"role": "user", "content": "Say something."},
-        ],
-        add_special_tokens = True,
-        add_generation_prompt = True,
-        return_tensors = "pt"
-    )
+def prepend_hf_chat_context(tokenizer, tokens: torch.Tensor, mode: str = "generation",
+                            prompt: str = "Say something."):
+    """
+    mode "generation": context ends at the bare generation prompt (e.g. "<|start|>assistant"),
+    so appended raw text sits where a role/channel header belongs -- badly out of distribution
+    for structured-format models (gpt-oss harmony expects "<|channel|>" next with near
+    certainty). mode "assistant": renders an unterminated empty assistant message instead
+    (continue_final_message), so the appended text lands at message-content position (gpt-oss:
+    "...assistant<|channel|>final<|message|>"); equivalent to "generation" for plain templates.
+    """
+    messages = [
+        {"role": "system", "content": ""},
+        {"role": "user", "content": prompt},
+    ]
+    if mode == "assistant":
+        prefix = tokenizer.hf_chat_template(
+            messages + [{"role": "assistant", "content": ""}],
+            add_special_tokens = True,
+            add_generation_prompt = False,
+            continue_final_message = True,
+            return_tensors = "pt"
+        )
+    else:
+        prefix = tokenizer.hf_chat_template(
+            messages,
+            add_special_tokens = True,
+            add_generation_prompt = True,
+            return_tensors = "pt"
+        )
     prefix = prefix.repeat(tokens.shape[0], 1)
     tokens = torch.cat((prefix, tokens), dim = -1)
     return tokens

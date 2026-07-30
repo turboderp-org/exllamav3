@@ -19,7 +19,7 @@ col_white = "\u001b[37;1m"
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
-parser = argparse.ArgumentParser()
+parser = argparse.ArgumentParser(allow_abbrev = False)
 parser.add_argument("-i", "--in_dir", nargs = "+", type = str, default = None, help = "Input (model) directories")
 parser.add_argument("-r", "--ref_dir", type = str, default = None, help = "Reference unquantized model")
 parser.add_argument("-l", "--level", type = int, default = 2, help = "Optimization level, 0-3, default: 2 (recommended)")

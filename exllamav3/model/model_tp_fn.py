@@ -2,6 +2,7 @@ import torch
 import traceback
 import os
 import sys
+import time
 from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
@@ -9,31 +10,10 @@ from .model_tp_backend import TPBackendNCCL, TPBackendNative
 from ..tokenizer.mm_embedding import recv_embeddings
 from ..util import log_tp, set_t0
 
+_no_fwd_barrier = os.environ.get("EXL3_TP_NO_FWD_BARRIER", "1") != "0"
 
-def install_parent_death_signal() -> bool:
-    """
-    On Linux, ask the kernel to terminate this worker if its direct parent dies.
-    This is a best-effort safety net for cases where Python shutdown hooks do not
-    get a chance to clean up spawned TP workers.
-    """
-    if sys.platform != "linux":
-        return False
 
-    import ctypes
-    import signal
-
-    PR_SET_PDEATHSIG = 1
-    parent_pid = os.getppid()
-
-    libc = ctypes.CDLL("libc.so.6", use_errno = True)
-    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM) != 0:
-        return False
-
-    # Race check: the parent may have exited before PDEATHSIG was installed.
-    if os.getppid() != parent_pid:
-        os.kill(os.getpid(), signal.SIGTERM)
-
-    return True
+from ..util.misc import install_parent_death_signal
 
 
 def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict, master: bool = False):
@@ -96,12 +76,23 @@ def mp_model_worker(
     if install_parent_death_signal():
         log_tp(device, f"Installed parent death signal")
 
+    # EXL3_TP_SPIN_RECV=<ms>: after finishing a command, poll the pipe hot for this many ms before
+    # falling back to a blocking recv. A blocking recv pays scheduler wake latency (tens to hundreds
+    # of us depending on C-states) at the start of every forward pass; during decode the next command
+    # arrives within a few ms of the previous ack, so a short spin window catches it with zero wake
+    # cost, at the price of one busy core per rank for the window
+    spin_recv_s = float(os.environ.get("EXL3_TP_SPIN_RECV", "0")) / 1e3
+
     with torch.inference_mode():
         local_context = init_pg(device, active_devices, output_device, backend_args)
         local_context["inf_consumer"] = SMConsumer(producer, device = device, pin_memory = True)
 
         # Dispatch loop
         while True:
+            if spin_recv_s > 0 and not conn.poll(0):
+                deadline = time.monotonic() + spin_recv_s
+                while not conn.poll(0) and time.monotonic() < deadline:
+                    pass
             msg = conn.recv()
             if msg == "quit":
                 log_tp(device, f"Child worker exiting")
@@ -220,7 +211,11 @@ def mp_model_forward(
     Forward pass for parallel slice of a model
     """
     backend = local_context["backend"]
-    backend.fwd_barrier()
+    # The pass-start barrier aligns all rank streams before the first collective. The collectives
+    # are individually ordered by their stage counters, so this is not required for correctness;
+    # EXL3_TP_NO_FWD_BARRIER=1 skips it (experimental) to save one spin kernel per rank per pass
+    if not _no_fwd_barrier:
+        backend.fwd_barrier()
 
     modules = local_context["modules"] if single_idx is None else [local_context["modules"][single_idx]]
     consumer = local_context["inf_consumer"]
@@ -230,6 +225,8 @@ def mp_model_forward(
         "cache_seqlens",
         "positions",
         "position_ids",
+        "recurrent_slots",
+        "inv_freq",
     ]:
         p = params.get(tensor_param)
         if p is not None:

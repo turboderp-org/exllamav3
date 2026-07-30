@@ -30,7 +30,15 @@ while building the path raise.
 
 bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "1") != "0"
 
-MAX_BSZ = 4
+# EXL3_BC_ATTN_TRACE=1: print build/decline per module/layer (activation check for A/B tests)
+_bc_trace = os.environ.get("EXL3_BC_ATTN_TRACE", "0") != "0"
+
+def _trace_build(m, result, kind):
+    if _bc_trace:
+        print(f" -- BC-{kind}: {'built' if result is not None else 'DECLINED'}"
+              f" layer {getattr(m, 'layer_idx', '?')} device {m.device}")
+
+MAX_BSZ = 8
 MAX_QLEN = 16
 MAX_R = MAX_BSZ * MAX_QLEN
 
@@ -57,10 +65,12 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
     return k
 
 
-def _get_sm_count(device: torch.device) -> int:
-    if device.index not in _sm_count:
-        _sm_count[device.index] = torch.cuda.get_device_properties(device).multi_processor_count
-    return _sm_count[device.index]
+def _get_sm_count(device: torch.device | int) -> int:
+    # TP shards store their device as a plain index
+    idx = device.index if hasattr(device, "index") else device
+    if idx not in _sm_count:
+        _sm_count[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return _sm_count[idx]
 
 
 class BCAttn:
@@ -72,10 +82,22 @@ class BCAttn:
     def _has_bc(proj):
         return proj is not None and proj.quant_type == "exl3" and proj.inner.bc is not None
 
+    @staticmethod
+    def _fp16_gate_weight(proj):
+        """Weight of an unquantized full-gate projection the graph can run through cublas
+        (input staged through a static, so the captured node needs no patching), or None."""
+        if proj is None or proj.quant_type != "fp16":
+            return None
+        w = proj.inner.weight
+        if w.dtype != torch.half or not w.is_contiguous() or proj.inner.bias is not None:
+            return None
+        return w
+
     def __init__(self, module, cache_k, cache_v, k_scales = None, v_scales = None,
                  k_bits = 0, v_bits = 0):
         self.module = module
-        self.device = module.device
+        # TP shards store their device as a plain index; normalize for .index consumers
+        self.device = torch.device(module.device) if isinstance(module.device, int) else module.device
         self.head_dim = module.head_dim
         self.num_q_heads = module.num_q_heads
         self.num_kv_heads = module.num_kv_heads
@@ -109,14 +131,26 @@ class BCAttn:
         self.o_dtype = module.o_proj.inner.default_out_dtype
         self.use_k_as_v = getattr(module, "use_k_as_v", False)
 
-        # 0 = none, 2 = full (o *= sigmoid(g)), 3 = interleaved q/g projection. Headwise gates
-        # (fp16 projection through cublas, no patchable sites) are rejected by the builders
+        # 0 = none, 1 = headwise (one gate per head, always an unquantized fp16 projection, run
+        # as a captured cublas gemm over the staged input; sigmoid or softplus by gate_softplus),
+        # 2 = full (o *= sigmoid(g)), 3 = interleaved q/g projection
         if getattr(module, "interleaved_gate", False):
             self.gate_mode = 3
         elif module.g_proj is not None:
-            self.gate_mode = 2
+            self.gate_mode = 1 if getattr(module, "headwise_gate", False) else 2
         else:
             self.gate_mode = 0
+        self.gate_softplus = getattr(module, "gate_softplus", False)
+
+        # Unquantized gate weight: the headwise gate is always fp16 (too narrow to quantize);
+        # a full gate is fp16 only in older quants that stored g_proj unquantized. Either runs
+        # as a captured cublas gemm over the statically staged input instead of an exl3 kernel
+        self.g_weight = None
+        if self.gate_mode == 1:
+            self.g_weight = self._fp16_gate_weight(module.g_proj)
+            assert self.g_weight is not None, "BC_Attention: headwise gate requires an fp16 g_proj"
+        elif self.gate_mode == 2 and mqg is None and not self._has_bc(module.g_proj):
+            self.g_weight = self._fp16_gate_weight(module.g_proj)
 
         self.bc = ext.BC_Attention(
             num_q_heads = self.num_q_heads,
@@ -137,7 +171,9 @@ class BCAttn:
             o_proj = module.o_proj.inner.bc,
             use_k_as_v = self.use_k_as_v,
             gate_mode = self.gate_mode,
+            gate_softplus = self.gate_softplus,
             g_proj = module.g_proj.inner.bc if (self.gate_mode == 2 and self._has_bc(module.g_proj)) else None,
+            g_weight = self.g_weight,
             qg_ptrs_trellis = mqg.ptrs_trellis if mqg is not None else None,
             qg_ptrs_suh = mqg.ptrs_suh if mqg is not None else None,
             qg_ptrs_svh = mqg.ptrs_svh if mqg is not None else None,
@@ -153,13 +189,14 @@ class BCAttn:
             v_norm_eps = module.v_norm.rms_norm_eps if module.v_norm is not None else 1e-6,
             v_norm_constant_bias = module.v_norm.constant_bias if module.v_norm is not None else 0.0,
             v_norm_constant_scale = module.v_norm.constant_scale if module.v_norm is not None else 1.0,
-            inv_freq = rope.inv_freq,
-            rope_style = int(rope.rope_settings.rope_style),
-            attn_factor = rope.attn_factor,
-            l4_scaling_beta = rope.llama_4_scaling_beta,
-            l4_scaling_original = rope.llama_4_scaling_original,
+            # NoPE (rope is None): the rope stage is omitted from the graph
+            inv_freq = rope.inv_freq if rope is not None else None,
+            rope_style = int(rope.rope_settings.rope_style) if rope is not None else 0,
+            attn_factor = rope.attn_factor if rope is not None else 1.0,
+            l4_scaling_beta = rope.llama_4_scaling_beta if rope is not None else 0.0,
+            l4_scaling_original = rope.llama_4_scaling_original if rope is not None else 0,
             post_rope_norm = module.post_rope_norm,
-            rotate_dims = rope.rope_settings.rotate_dims,
+            rotate_dims = rope.rope_settings.rotate_dims if rope is not None else 0,
             quant_cache = self.quant,
             cache_k = self.cache_k,
             cache_v = self.cache_v,
@@ -256,7 +293,10 @@ class BCAttn:
             q = gate_a[0].view(bsz, q_len, qh, hd)
         else:
             q = g_tensor_cache.get(dev, (bsz, q_len, qh, hd), torch.half, "bca_q")
-            if self.gate_mode == 3:
+            if self.gate_mode == 1:
+                # Headwise gate: one fp16 value per head
+                gate_a = g_tensor_cache.get(dev, (R, qh), torch.half, "bca_gh")
+            elif self.gate_mode == 3:
                 gate_a = g_tensor_cache.get(dev, (R, 2 * qh * hd), torch.half, "bca_qgi")
                 gate_b = g_tensor_cache.get(dev, (R, qh * hd), torch.half, "bca_g")
         kv = g_tensor_cache.get(dev, (2, R, kvh * hd), torch.half, "bca_kv")
@@ -266,12 +306,14 @@ class BCAttn:
 
         # Padded hidden dim: zero-padded input staging and padded o_proj output. The pad columns
         # of xp are zeroed here and never written afterwards (the graph copies only the exact
-        # hidden width into it)
+        # hidden width into it). An fp16 gate also stages the input (static operand for the
+        # captured cublas node), without the padded output
         xp, yp = None, None
-        if self.hidden_padded != self.hidden_size:
+        if self.hidden_padded != self.hidden_size or self.g_weight is not None:
             xp = g_tensor_cache.get(dev, (R, self.hidden_padded), torch.half, "bca_xp")
-            yp = g_tensor_cache.get(dev, (R, self.hidden_padded), self.o_dtype or torch.half, "bca_yp")
             xp.zero_()
+        if self.hidden_padded != self.hidden_size:
+            yp = g_tensor_cache.get(dev, (R, self.hidden_padded), self.o_dtype or torch.half, "bca_yp")
 
         self.bc.configure_slot(
             bsz, q_len,
@@ -312,17 +354,23 @@ def _module_eligible(m):
     """Module-level requirements shared by the global-attention and SWA builders."""
     return (
         bc_attn_enable and
-        m.rope is not None and
-        m.rope_settings is not None and
-        # Gates: interleaved and full are graphed; headwise (fp16 gate projection through
-        # cublas, no patchable sites) is not
-        not m.headwise_gate and
+        # NoPE is supported (the rope stage is skipped), but the head norms run inside the rope
+        # kernel, so a norm-only module without rope has nowhere to apply them
+        (m.rope is not None or m.q_norm is None) and
+        # Gates: interleaved, full and headwise are all graphed; the headwise (always-fp16)
+        # projection runs as a captured cublas gemm over the statically staged input, so it
+        # needs a weight that passes the fp16-gate checks
+        (not m.headwise_gate or BCAttn._fp16_gate_weight(m.g_proj) is not None) and
         not getattr(m, "ve_gate", False) and
         (not getattr(m, "interleaved_gate", False) or m.head_dim % 8 == 0) and
         (not m.full_gate or m.g_proj is None or m.multi_qg is not None or
-            (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None)) and
+            (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None) or
+            BCAttn._fp16_gate_weight(m.g_proj) is not None) and
         (m.v_norm is None or (type(m.v_norm).__name__ == "RMSNorm" and not m.v_norm.span_heads)) and
-        not m.tp_reduce and not m.has_split_cache and not getattr(m, "tp_span_heads_norm", False) and
+        # TP shards are eligible: the shard owns its split cache layers directly (the opaque cache
+        # handle is resolved before bc_attn_step) and the output all-reduce runs after the captured
+        # block returns. Span-heads norms stay declined (cross-rank norm inside the block)
+        not getattr(m, "tp_span_heads_norm", False) and
         (m.q_norm is None or m.q_norm_tensor is not None) and
         _is_pow2(m.head_dim) and m.head_dim <= 512 and
         m.num_q_heads % m.num_kv_heads == 0 and
@@ -357,10 +405,13 @@ def build_bc_swa(module, layer_state):
         k_states.device == torch.device(m.device) and
         m.kv_state_size % PAGE_SIZE == 0
     ):
+        _trace_build(m, None, "swa")
         return None
     k_pages = k_states.view(-1, PAGE_SIZE, m.num_kv_heads, m.head_dim)
     v_pages = v_states.view(-1, PAGE_SIZE, m.num_kv_heads, m.head_dim)
-    return BCAttn(m, k_pages, v_pages)
+    bca = BCAttn(m, k_pages, v_pages)
+    _trace_build(m, bca, "swa")
+    return bca
 
 
 def build_bc_attn(module, layer):
@@ -380,7 +431,11 @@ def build_bc_attn(module, layer):
             layer.k is not None and layer.k.device == torch.device(m.device)
         ))
     ):
+        _trace_build(m, None, "attn")
         return None
     if isinstance(layer, CacheLayer_quant):
-        return BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits)
-    return BCAttn(m, layer.k, layer.v)
+        bca = BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits)
+    else:
+        bca = BCAttn(m, layer.k, layer.v)
+    _trace_build(m, bca, "attn")
+    return bca

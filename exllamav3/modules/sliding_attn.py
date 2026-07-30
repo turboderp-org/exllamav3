@@ -7,7 +7,7 @@ from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
-from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa
+from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..cache import Cache
@@ -37,6 +37,11 @@ class SWAExportedState:
 class SWAState:
 
     exported = False
+
+    # The state ring stores at least one page of history before the attention window at all times (kv_state_size
+    # rounds window + overprocessing up to whole pages), so in-place rollback of at least this many tokens is
+    # always possible
+    guaranteed_rollback = PAGE_SIZE
 
     def __init__(
         self,
@@ -74,6 +79,14 @@ class SWAState:
         assert num_tokens <= self.position - self.window_beg
         self.position -= num_tokens
         self.last_history = 0
+
+
+    def rollback_capacity(self):
+        """
+        Number of tokens the state can rewind in place. K/V for all positions from window_beg are still stored in
+        the ring, so rewinding is just moving the position back; overwritten future slots don't matter.
+        """
+        return self.position - self.window_beg
 
 
     def stash(self):
@@ -178,8 +191,8 @@ class SWALayerState:
 
 
     def alloc(self, device):
-        self.k_state = torch.empty_like(self.k_state, device = device)
-        self.v_state = torch.empty_like(self.v_state, device = device)
+        self.k_state = torch.zeros_like(self.k_state, device = device)
+        self.v_state = torch.zeros_like(self.v_state, device = device)
         self.device = device
 
 
@@ -217,6 +230,8 @@ class SWALayerState:
         b = min(self.module.kv_state_size, position)
         a = max(0, b - self.module.sliding_window)
         k, v = stashed
+        self.k_state[slot].zero_()
+        self.v_state[slot].zero_()
         self.k_state[slot, a:b].copy_(k)
         self.v_state[slot, a:b].copy_(v)
 
@@ -255,10 +270,13 @@ class SlidingAttention(Module):
         g_proj: Linear | Module | None = None,
         post_rope_norm: bool = False,
         full_gate: bool = False,
+        gate_softplus: bool = False,
         select_hq_bits: int = 0,
     ):
         super().__init__(config, key, None)
         assert sliding_window > 0
+        assert not gate_softplus or not full_gate, \
+            "SlidingAttention: gate_softplus is only implemented for the headwise gate"
 
         self.q_priority = 2 + select_hq_bits
         self.layer_idx = layer_idx
@@ -280,6 +298,7 @@ class SlidingAttention(Module):
         self.logit_softcapping = logit_softcapping
         self.post_rope_norm = post_rope_norm
         self.full_gate = full_gate
+        self.gate_softplus = gate_softplus
         self.bt_cache = {}
 
         # Set before the zero-heads early return: forward()/unload() and the TP import touch these
@@ -483,6 +502,7 @@ class SlidingAttention(Module):
             self.config.infer_params.use_mgemm(
                 self.k_proj.inner.K, self.k_proj.out_features,
                 self.k_proj.inner.mul1 and self.v_proj.inner.mul1,
+                device,
             )
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
@@ -503,6 +523,7 @@ class SlidingAttention(Module):
             self.config.infer_params.use_mgemm(
                 self.q_proj.inner.K, self.q_proj.out_features,
                 self.q_proj.inner.mul1 and self.g_proj.inner.mul1,
+                device,
             )
         ):
             self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
@@ -617,7 +638,8 @@ class SlidingAttention(Module):
                 self.multi_qg.mul1,
                 -1,
                 -1,
-                0
+                0,
+                1
             )
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
@@ -649,7 +671,8 @@ class SlidingAttention(Module):
                 self.multi_kv.mul1,
                 -1,
                 -1,
-                0
+                0,
+                1
             )
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
@@ -774,7 +797,9 @@ class SlidingAttention(Module):
             v_new = v,
         )
 
-        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        if self.headwise_gate:
+            if self.gate_softplus: o *= torch.nn.functional.softplus(g.float()).to(o.dtype).unsqueeze(-1)
+            else: o *= g.sigmoid().unsqueeze(-1)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate: o *= g.sigmoid()
         o = self.project_o(o, bsz, seqlen, params)
@@ -798,7 +823,7 @@ class SlidingAttention(Module):
         # Graph-captured C++ path for the whole decode step
         if (
             _bc_attn_enable and causal and non_causal_spans is None and
-            bsz <= 4 and seqlen <= 16
+            bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
             rsg = params.get("recurrent_states")
             if rsg is not None:
@@ -937,7 +962,9 @@ class SlidingAttention(Module):
                         k_states[rs.slot, : seqlen - skip].copy_(k[i, skip:])
                         v_states[rs.slot, : seqlen - skip].copy_(v[i, skip:])
 
-        if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
+        if self.headwise_gate:
+            if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
+            else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate: ext.mul_sigmoid_(o, g)
 

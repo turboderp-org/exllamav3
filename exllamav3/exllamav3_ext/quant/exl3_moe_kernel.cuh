@@ -79,7 +79,9 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         const half* exp_down_suh = down_suh[expert_idx];
         const half* exp_down_svh = down_svh[expert_idx];
 
-        // Gather + input hadamard for g, u
+        // Gather + input hadamard for g, u. Non-gated mode skips the g staging (and the g GEMM
+        // below); the activation synthesizes the gate lane from u
+        const bool gated = act_function != MOE_ACT_RELU2_NOGATE;
         auto had_gather_gu_in = [&]()
         {
             const int warps_per_token = hidden_dim / 128;
@@ -90,13 +92,14 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                 int token_idx = top_x[warp_idx / warps_per_token];
                 int token_off = warp_idx % warps_per_token;
                 const half* in_ptr = hidden_state + token_idx * hidden_dim + token_off * 128;
-                had_hf_r_128_inner<true, false>
-                (
-                    in_ptr,
-                    temp_state_g + 128 * warp_idx,
-                    exp_gate_suh + 128 * token_off,
-                    0.088388347648f
-                );
+                if (gated)
+                    had_hf_r_128_inner<true, false>
+                    (
+                        in_ptr,
+                        temp_state_g + 128 * warp_idx,
+                        exp_gate_suh + 128 * token_off,
+                        0.088388347648f
+                    );
                 had_hf_r_128_inner<true, false>
                 (
                     in_ptr,
@@ -153,7 +156,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             }
         };
 
-        gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
+        if (gated)
+            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
         gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
         group_barrier(group_idx, group_size, barrier_counters_sense);
 

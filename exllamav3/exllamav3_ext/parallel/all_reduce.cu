@@ -155,10 +155,12 @@ void pg_all_reduce_kernel
                         // Advance
                         stage_recv++;
                     }
+
+                    // All warps must finish reading their slots before thread 0 frees them for the producer
+                    __syncthreads();
+
                     if (t == 0)
                     {
-                        // __threadfence_system();
-                        // __syncthreads();
                         stg_release_sys_u32(ctx->reduce_stage_consumed + this_rank, stage_recv);
                     }
                 }
@@ -192,9 +194,12 @@ void pg_all_reduce_kernel
                         stage_send++;
                     }
 
+                    // All warps must finish staging before thread 0 publishes the counter; the release store only
+                    // orders thread 0's own prior writes
+                    __syncthreads();
+
                     if (t == 0)
                     {
-                        // __threadfence_system();
                         stg_release_sys_u32(ctx->reduce_stage_produced + this_rank, stage_send);
                     }
                 }
@@ -230,11 +235,12 @@ void pg_all_reduce_kernel
 void pg_all_reduce
 (
     uintptr_t ctx,
+    uintptr_t ctx_dev,
     std::vector<uintptr_t> devices,
     int this_device,
     int master_device,
     at::Tensor& tensor,
-    uintptr_t shbuf,
+    uintptr_t shbuf_dev,
     size_t shbuf_size,
     at::Tensor& abort_flag
 )
@@ -244,7 +250,7 @@ void pg_all_reduce
     pg_check_timeout(ctx);
 
     uint8_t* data_ptr = (uint8_t*) tensor.data_ptr();
-    uint8_t* shbuf_ptr = (uint8_t*) shbuf;
+    uint8_t* shbuf_ptr = (uint8_t*) shbuf_dev;
     size_t data_size = tensor.numel() * tensor.element_size();
     TORCH_CHECK(data_size % 16 == 0, "data_size must be multiple of 16");
 
@@ -258,7 +264,7 @@ void pg_all_reduce
     uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
     void* kernelArgs[] =
     {
-        (void*)& ctx,
+        (void*)& ctx_dev,
         (void*)& device_mask,
         (void*)& this_device,
         (void*)& master_device,

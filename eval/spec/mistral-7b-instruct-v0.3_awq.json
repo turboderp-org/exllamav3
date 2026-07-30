@@ -1,8 +1,0 @@
-[
-    {
-        "model_dir": "/mnt/str/eval_models/mistral-7b-instruct-v0.3/awq/4bit/",
-        "load_fn": "transformers_auto",
-        "fwd_fn": "transformers",
-        "label": "AWQ 4bit"
-    }
-]

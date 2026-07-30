@@ -87,6 +87,18 @@ __device__ __forceinline__ half2 _relu2(half2 x)
 }
 
 
+__device__ __forceinline__ float _relu(float x)
+{
+    return fmaxf(0.0f, x);
+}
+
+
+__device__ __forceinline__ half2 _relu(half2 x)
+{
+    return __hmax2(x, __float2half2_rn(0.0f));
+}
+
+
 __device__ __forceinline__ float _xielu(float x, float alpha_p, float alpha_n)
 {
     const float eps = -9.9838e-07;  // -1e-6 with BF16 rounding error
@@ -160,6 +172,8 @@ void act_mul_kernel_h
         x2 = _gelu(x2);
     else if constexpr (activation_type == ACT_RELU2)
         x2 = _relu2(x2);
+    else if constexpr (activation_type == ACT_RELU)
+        x2 = _relu(x2);
 
     if (act_limit != 0.0f)
     {
@@ -213,6 +227,11 @@ void act_mul_kernel_f
     {
         x2.x = _relu2(x2.x);
         x2.y = _relu2(x2.y);
+    }
+    else if constexpr (activation_type == ACT_RELU)
+    {
+        x2.x = _relu(x2.x);
+        x2.y = _relu(x2.y);
     }
 
     if (act_limit != 0.0f)
@@ -314,6 +333,37 @@ void mul_sigmoid_broadcast_kernel_h
     half2 y2 = __half2half2(y[y_idx]);
     x2 = __hmul2(x2, _sigmoid(y2));
     ((half2*) x)[idx] = x2;
+}
+
+// Numerically stable softplus, computed in fp32: softplus(x) = max(x, 0) + log1p(exp(-|x|)).
+// fp16 exp overflows at x ~ 11 where softplus is already ~x, and the reference implementations
+// (Laguna attention gate) compute softplus(g.float()), so the gate value is evaluated in float
+// and only the final product rounds to fp16
+__device__ __forceinline__ float _softplus(float x)
+{
+    return fmaxf(x, 0.0f) + log1pf(__expf(-fabsf(x)));
+}
+
+__global__ __launch_bounds__(NUM_THREADS)
+void mul_softplus_broadcast_kernel_h
+(
+    half* __restrict__ x,
+    const half* __restrict__ y,
+    const size_t numel,
+    const size_t dim
+)
+{
+    size_t idx = (blockIdx.x * NUM_THREADS + threadIdx.x);
+    if (idx >= numel / 2) return;
+
+    size_t x_idx = idx * 2;
+    size_t y_idx = x_idx / dim;
+    half2 x2 = ((half2*) x)[idx];
+    float g = _softplus(__half2float(y[y_idx]));
+    float2 xf = __half22float2(x2);
+    xf.x *= g;
+    xf.y *= g;
+    ((half2*) x)[idx] = __float22half2_rn(xf);
 }
 
 // x * sigmoid(y @ w) + z -> z,

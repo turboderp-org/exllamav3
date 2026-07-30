@@ -6,6 +6,7 @@
 #include "../util.h"
 #include "../util.cuh"
 #include "../quant/exl3_gemm.cuh"
+#include "../hgemm.cuh"
 #include "../rope.cuh"
 #include "../cache/q_cache.cuh"
 #include "../add.cuh"
@@ -32,7 +33,9 @@ BC_Attention::BC_Attention
     std::shared_ptr<BC_LinearEXL3> _o_proj,
     bool _use_k_as_v,
     int _gate_mode,
+    bool _gate_softplus,
     std::shared_ptr<BC_LinearEXL3> _g_proj,
+    c10::optional<at::Tensor> _g_weight,
     c10::optional<at::Tensor> _qg_ptrs_trellis,
     c10::optional<at::Tensor> _qg_ptrs_suh,
     c10::optional<at::Tensor> _qg_ptrs_svh,
@@ -48,7 +51,7 @@ BC_Attention::BC_Attention
     float _v_norm_eps,
     float _v_norm_constant_bias,
     float _v_norm_constant_scale,
-    at::Tensor _inv_freq,
+    c10::optional<at::Tensor> _inv_freq,
     int _rope_style,
     float _attn_factor,
     float _l4_scaling_beta,
@@ -83,7 +86,9 @@ BC_Attention::BC_Attention
     o_proj              (_o_proj),
     use_k_as_v          (_use_k_as_v),
     gate_mode           (_gate_mode),
+    gate_softplus       (_gate_softplus),
     g_proj              (_g_proj),
+    g_weight            (std::move(_g_weight)),
     qg_ptrs_trellis     (std::move(_qg_ptrs_trellis)),
     qg_ptrs_suh         (std::move(_qg_ptrs_suh)),
     qg_ptrs_svh         (std::move(_qg_ptrs_svh)),
@@ -114,7 +119,9 @@ BC_Attention::BC_Attention
     xh                  (std::move(_xh)),
     h32                 (std::move(_h32))
 {
-    TORCH_CHECK(gate_mode == 0 || gate_mode == 2 || gate_mode == 3, "BC_Attention: unsupported gate mode");
+    TORCH_CHECK(gate_mode >= 0 && gate_mode <= 3, "BC_Attention: unsupported gate mode");
+    TORCH_CHECK(gate_mode != 1 || (g_weight && !qg_ptrs_trellis && !g_proj), "BC_Attention: headwise gate requires an fp16 gate weight");
+    TORCH_CHECK(!g_weight || gate_mode == 1 || (gate_mode == 2 && !qg_ptrs_trellis && !g_proj), "BC_Attention: fp16 gate weight requires full gate mode without a quantized g projection");
     slots.resize(MAX_BSZ * MAX_QLEN);
 }
 
@@ -160,15 +167,22 @@ void BC_Attention::configure_slot
     s.block_n = block_n;
     s.splits_cap = splits_cap;
 
+    if (hidden_size_padded != hidden_size || g_weight)
+    {
+        // Zero-padded staging for the projection input (also required for an fp16 gate: the
+        // captured cublas node reads a static input). The pad columns of xp are zeroed
+        // python-side at configure and never written after
+        TORCH_CHECK(xp, "BC_Attention: padded hidden size or fp16 gate requires the xp static");
+        s.xp = xp.value();
+        TORCH_CHECK(s.xp.is_contiguous(), "BC_Attention: statics must be contiguous");
+        TORCH_CHECK(s.xp.size(0) >= R && s.xp.size(1) == hidden_size_padded, "BC_Attention: bad xp shape");
+    }
     if (hidden_size_padded != hidden_size)
     {
-        // Zero-padded staging for the projection input and padded o_proj output. The pad
-        // columns of xp are zeroed python-side at configure and never written after
-        TORCH_CHECK(xp && yp, "BC_Attention: padded hidden size requires xp/yp statics");
-        s.xp = xp.value();
+        // Padded o_proj output, trimmed to the exact width at the end of the graph
+        TORCH_CHECK(yp, "BC_Attention: padded hidden size requires the yp static");
         s.yp = yp.value();
-        TORCH_CHECK(s.xp.is_contiguous() && s.yp.is_contiguous(), "BC_Attention: statics must be contiguous");
-        TORCH_CHECK(s.xp.size(0) >= R && s.xp.size(1) == hidden_size_padded, "BC_Attention: bad xp shape");
+        TORCH_CHECK(s.yp.is_contiguous(), "BC_Attention: statics must be contiguous");
         TORCH_CHECK(s.yp.size(0) >= R && s.yp.size(1) == hidden_size_padded, "BC_Attention: bad yp shape");
     }
 
@@ -184,7 +198,14 @@ void BC_Attention::configure_slot
     s.o4 = s.o.view({bsz, q_len, num_q_heads, head_dim});
 
     int n_q = num_q_heads * head_dim;
-    if (gate_mode == 2)
+    if (gate_mode == 1)
+    {
+        // Headwise gate: one fp16 value per head, from the captured cublas gemm over the staged
+        // input
+        TORCH_CHECK(gate_a, "BC_Attention: headwise gate requires the g static");
+        s.g2 = s.gate_a.view({R, num_q_heads});
+    }
+    else if (gate_mode == 2)
     {
         // Full gate: q aliases qg[0] (python passes q as that slice); mgemm writes qg whole
         TORCH_CHECK(gate_a, "BC_Attention: full gate requires the qg static");
@@ -247,9 +268,10 @@ void BC_Attention::run_gr
     at::Tensor x2 = x.view({R, hidden_size});
 
     // Padded hidden dim: stage the input through the zero-padded static; everything downstream
-    // works at the padded width (the projections' actual K)
+    // works at the padded width (the projections' actual K). An fp16 gate also stages: the
+    // gate gemm is a captured cublas node with no patchable sites, so its input must be static
     const int hs = hidden_size_padded;
-    if (hs != hidden_size)
+    if (hs != hidden_size || g_weight)
     {
         at::Tensor xp2 = s.xp.narrow(0, 0, R);
         copy2d_gr(x2, xp2, graph);
@@ -278,12 +300,26 @@ void BC_Attention::run_gr
         exl3_gemm_gr(x2, q_proj->trellis, s.q2, q_proj->suh, xh_q, q_proj->svh, -1, q_proj->mcg, q_proj->mul1, 0, graph);
         if (q_proj->bias)
             add_gr(s.q2, q_proj->bias.value(), s.q2, graph);
-        if (gate_mode == 2)
+        if (gate_mode == 1)
         {
-            TORCH_CHECK(g_proj, "BC_Attention: full gate without fused qg needs a g projection");
-            exl3_gemm_gr(x2, g_proj->trellis, s.g2, g_proj->suh, xh_q, g_proj->svh, -1, g_proj->mcg, g_proj->mul1, 0, graph);
-            if (g_proj->bias)
-                add_gr(s.g2, g_proj->bias.value(), s.g2, graph);
+            TORCH_CHECK(g_weight, "BC_Attention: headwise gate requires the fp16 gate weight");
+            hgemm_gr(x2, g_weight.value(), s.g2, graph);
+        }
+        else if (gate_mode == 2)
+        {
+            if (g_weight)
+            {
+                // Unquantized gate: cublas gemm over the staged (static) input, output static,
+                // weight static -- nothing to patch at replay
+                hgemm_gr(x2, g_weight.value(), s.g2, graph);
+            }
+            else
+            {
+                TORCH_CHECK(g_proj, "BC_Attention: full gate without fused qg needs a g projection");
+                exl3_gemm_gr(x2, g_proj->trellis, s.g2, g_proj->suh, xh_q, g_proj->svh, -1, g_proj->mcg, g_proj->mul1, 0, graph);
+                if (g_proj->bias)
+                    add_gr(s.g2, g_proj->bias.value(), s.g2, graph);
+            }
         }
     }
 
@@ -340,12 +376,18 @@ void BC_Attention::run_gr
 
     // Fused head norm + RoPE, in place on the statics. All position sources and inv_freq are
     // patched per call; the kernel branches on the pointers at runtime, so one graph covers the
-    // scalar/positions/position_ids modes
-    c10::optional<at::Tensor> out_k4 = s.k4;
-    const at::Tensor& ivf = inv_freq_override ? inv_freq_override.value() : inv_freq;
-    rope_gr(s.q4, s.q4, s.k4, out_k4, ivf, (uint32_t) position, positions, position_ids, rope_style,
-            attn_factor, q_norm, k_norm, norm_eps, norm_constant_bias, l4_scaling_beta,
-            l4_scaling_original, post_rope_norm, rotate_dims, graph);
+    // scalar/positions/position_ids modes. NoPE modules (no inv_freq, and by eligibility no
+    // fused head norms either) skip the stage entirely; whether the stage exists must be
+    // constant between capture and replay, so it keys on the member alone
+    TORCH_CHECK(inv_freq || !inv_freq_override, "BC_Attention: inv_freq override on a NoPE module");
+    if (inv_freq)
+    {
+        c10::optional<at::Tensor> out_k4 = s.k4;
+        const at::Tensor& ivf = inv_freq_override ? inv_freq_override.value() : inv_freq.value();
+        rope_gr(s.q4, s.q4, s.k4, out_k4, ivf, (uint32_t) position, positions, position_ids, rope_style,
+                attn_factor, q_norm, k_norm, norm_eps, norm_constant_bias, l4_scaling_beta,
+                l4_scaling_original, post_rope_norm, rotate_dims, graph);
+    }
 
     // Cache append (before attention: the split kernel counts the new tokens as part of the
     // sequence and reads them back from the cache)
@@ -435,7 +477,16 @@ void BC_Attention::run_gr
     }
 
     // Output gate
-    if (gate_mode == 2 || gate_mode == 3)
+    if (gate_mode == 1)
+    {
+        // Headwise: one gate value per head, broadcast across head_dim
+        at::Tensor g3 = s.g2.view({bsz, q_len, num_q_heads});
+        if (gate_softplus)
+            mul_softplus_broadcast__gr(s.o4, g3, graph);
+        else
+            mul_sigmoid_broadcast__gr(s.o4, g3, graph);
+    }
+    else if (gate_mode == 2 || gate_mode == 3)
         mul_sigmoid__gr(s.o2, s.g2, graph);
 
     // Output projection. With a padded hidden dim the GEMM writes the padded static (N of the
@@ -498,20 +549,21 @@ void BC_Attention::run
     std::vector<PPTR> params;
     params.reserve(20);
 
-    // Padded hidden dim: x feeds the staging copy at the head of the graph and the projections
-    // read the (static) padded buffer; unpadded, the projections read x directly
+    // Padded hidden dim or fp16 gate: x feeds the staging copy at the head of the graph and the
+    // projections read the (static) buffer; otherwise the projections read x directly
     bool padded = hidden_size_padded != hidden_size;
-    void* xptr = padded ? s.xp.data_ptr() : (void*) x.data_ptr();
-    if (padded)
+    bool staged = padded || g_weight.has_value();
+    void* xptr = staged ? s.xp.data_ptr() : (void*) x.data_ptr();
+    if (staged)
         params.emplace_back(GP_copy2d_src, (void*) x.data_ptr());
 
-    // Q / gate projections
+    // Q / gate projections (an fp16 gate is a cublas node with no patchable sites)
     if (use_qg_mgemm)
         params.emplace_back(GP_mgemm_A, xptr);
     else
     {
         params.emplace_back(GP_gemm_A, xptr);
-        if (gate_mode == 2)
+        if (gate_mode == 2 && !g_weight)
             params.emplace_back(GP_gemm_A, xptr);
     }
 
@@ -531,14 +583,17 @@ void BC_Attention::run
     }
 
     // RoPE: which position source is active is a runtime branch in the kernel, so nulls are
-    // patched like any other value
-    const at::Tensor& ivf = inv_freq_override ? inv_freq_override.value() : inv_freq;
-    int pid_stride = (position_ids && position_ids.value().dim() == 3) ? rotate_dims : 1;
-    params.emplace_back(GP_rope_inv_freq, (void*) ivf.data_ptr());
-    params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
-    params.emplace_back(GP_rope_positions, positions ? (void*) positions.value().data_ptr() : nullptr);
-    params.emplace_back(GP_rope_position_ids, position_ids ? (void*) position_ids.value().data_ptr() : nullptr);
-    params.emplace_back(GP_rope_pid_stride, (void*) (uintptr_t) pid_stride);
+    // patched like any other value. NoPE graphs contain no rope node
+    if (inv_freq)
+    {
+        const at::Tensor& ivf = inv_freq_override ? inv_freq_override.value() : inv_freq.value();
+        int pid_stride = (position_ids && position_ids.value().dim() == 3) ? rotate_dims : 1;
+        params.emplace_back(GP_rope_inv_freq, (void*) ivf.data_ptr());
+        params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
+        params.emplace_back(GP_rope_positions, positions ? (void*) positions.value().data_ptr() : nullptr);
+        params.emplace_back(GP_rope_position_ids, position_ids ? (void*) position_ids.value().data_ptr() : nullptr);
+        params.emplace_back(GP_rope_pid_stride, (void*) (uintptr_t) pid_stride);
+    }
 
     // Cache append and attention: the block-table geometry and split configuration are runtime
     // kernel arguments, patched per call like the pointers, so context growth never recaptures

@@ -4,7 +4,9 @@ from .apertus import ApertusModel
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
+from .deepseek_v3 import DeepseekV3Model
 from .dflash import DFlashModel
+from .dflash_laguna import DFlashLagunaModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
 from .ernie4_5_moe import Ernie4_5MoEModel
@@ -18,8 +20,10 @@ from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
 from .gpt_oss import GptOssModel
 from .hcxvisionv2 import HCXVisionV2Model
+from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
+from .laguna import LagunaModel
 from .lfm2_moe import Lfm2MoeModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
@@ -29,6 +33,7 @@ from .mistral import MistralModel
 from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
 from .nanochat import NanoChatModel
+from .nemotronh import NemotronHModel
 from .olmo3 import Olmo3Model
 from .olmohybrid import OlmoHybridModel
 from .phi3 import Phi3Model
@@ -58,7 +63,9 @@ ARCHITECTURES = {
         CohereModel,
         Cohere2Model,
         DeciLMModel,
+        DeepseekV3Model,
         DFlashModel,
+        DFlashLagunaModel,
         Dots1Model,
         Ernie4_5Model,
         Ernie4_5MoEModel,
@@ -74,8 +81,10 @@ ARCHITECTURES = {
         Glm4VMoeModel,
         GptOssModel,
         HCXVisionV2Model,
+        HyV3Model,
         HyperClovaxModel,
         IQuestCoderModel,
+        LagunaModel,
         Lfm2MoeModel,
         LlamaModel,
         MiMoModel,
@@ -85,6 +94,7 @@ ARCHITECTURES = {
         Mistral3Model,
         MixtralModel,
         NanoChatModel,
+        NemotronHModel,
         Olmo3Model,
         OlmoHybridModel,
         Phi3Model,

@@ -52,6 +52,41 @@ void quant_cache_cont
     cuda_check(cudaPeekAtLastError());
 }
 
+// Graph-capturable variant: launches on the capture stream during capture. Every operand is a
+// static in the BC decode graphs, so the captured node needs no parameter patching
+void quant_cache_cont_gr
+(
+    const at::Tensor& in,
+    const at::Tensor& out,
+    const at::Tensor& out_scales,
+    float compand_a,
+    Graph* graph
+)
+{
+    if (!graph)
+        return quant_cache_cont(in, out, out_scales, compand_a);
+
+    const at::cuda::OptionalCUDAGuard device_guard(in.device());
+    cudaStream_t stream = graph->capture_stream;
+
+    int bsz = in.numel() / 32;
+    int head_dim = in.size(-1);
+    int head_blocks = head_dim / 32;
+    int bits = out.size(-1) / head_blocks;
+    TORCH_CHECK(2 <= bits && bits <= 8, "no kernel for K/V bitrate");
+
+    int num_blocks = CEIL_DIVIDE(bsz, MAX_WARPS * 4);
+    quant_cache_cont_kernel_instances[bits - 2]<<<num_blocks, MAX_WARPS * 32, 0, stream>>>
+    (
+        (const half*) in.data_ptr(),
+        (uint32_t*) out.data_ptr(),
+        (half*) out_scales.data_ptr(),
+        bsz,
+        compand_a
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
 /*
 Dequantize contiguous tensor
 
@@ -304,7 +339,97 @@ void dequant_cache_paged
         groups_per_token,
         chunks_per_token,
         sliding_window,
-        compand_a
+        compand_a,
+        0,
+        0
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+/*
+Dequantize the referenced window of a paged quant cache into a compact fp16 scratch: page p of
+batch row b lands at physical page (b * pages_per_seq + p) of the output, so the scratch only
+needs to cover the block table's span rather than the whole cache pool. bonus_len rows past
+cache_seqlens are included (the pre-appended chunk during prefill). Used by the two-pass
+quantized-cache prefill path; attention then runs the fp16 kernel over the scratch with an
+identity block table.
+*/
+
+void dequant_cache_paged_window
+(
+    const at::Tensor& k_in,
+    const at::Tensor& k_in_scales,
+    const at::Tensor& k_out,
+    const at::Tensor& v_in,
+    const at::Tensor& v_in_scales,
+    const at::Tensor& v_out,
+    const at::Tensor& cache_seqlens,
+    const at::Tensor& block_table,
+    int page_size,
+    int bonus_len,
+    float compand_a
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(k_in.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(k_in, kInt);
+    TORCH_CHECK_DTYPE(k_in_scales, kHalf);
+    TORCH_CHECK_DTYPE(k_out, kHalf);
+    TORCH_CHECK_DTYPE(v_in, kInt);
+    TORCH_CHECK_DTYPE(v_in_scales, kHalf);
+    TORCH_CHECK_DTYPE(v_out, kHalf);
+    TORCH_CHECK_SHAPES_FULL(k_in_scales, v_in_scales);
+    TORCH_CHECK_SHAPES_FULL(k_out, v_out);
+    TORCH_CHECK(page_size == CQ_PAGE_SIZE, "Page size mismatch");
+
+    int dim;
+    if (k_out.dim() == 4)
+        dim = k_out.size(2) * k_out.size(3);
+    else if (k_out.dim() == 3)
+        dim = k_out.size(2);
+    else
+        TORCH_CHECK(false, "paged cache must be 3D or 4D")
+
+    int groups_per_token = dim / 32;
+    TORCH_CHECK(dim == 32 * groups_per_token, "dim must be a multiple of 32");
+    int chunks_per_token = CEIL_DIVIDE(groups_per_token, 4);
+
+    int bsz = block_table.size(0);
+    int pages_per_seq = block_table.size(1);
+    TORCH_CHECK(k_out.size(0) >= (int64_t) bsz * pages_per_seq, "scratch too small for block table span");
+    int chunks_per_seq = pages_per_seq * page_size * chunks_per_token;
+
+    int num_blocks = CEIL_DIVIDE(chunks_per_seq, MAX_WARPS);
+    int num_tb = CEIL_DIVIDE(num_blocks, ITER_PER_TB);
+
+    int num_threads = MIN(32 * chunks_per_seq, 32 * MAX_WARPS);
+    dim3 blocks(num_tb, bsz);
+    dim3 threads(num_threads);
+
+    TORCH_CHECK(k_in.dim() == 3 && v_in.dim() == 3, "paged q.cache must have shape (num_pages, page_size, dim // 32 * bitrate)")
+    int k_bits = k_in.size(2) / groups_per_token;
+    int v_bits = v_in.size(2) / groups_per_token;
+
+    TORCH_CHECK(2 <= k_bits && k_bits <= 8 && 2 <= v_bits && v_bits <= 8, "no kernel for K/V bitrate");
+
+    dequant_cache_paged_kernel_instances[k_bits - 2][v_bits - 2]<<<blocks, threads, 0, stream>>>
+    (
+        (const uint32_t*) k_in.data_ptr(),
+        (const half*) k_in_scales.data_ptr(),
+        (half*) k_out.data_ptr(),
+        (const uint32_t*) v_in.data_ptr(),
+        (const half*) v_in_scales.data_ptr(),
+        (half*) v_out.data_ptr(),
+        (const uint32_t*) cache_seqlens.data_ptr(),
+        (const uint32_t*) block_table.data_ptr(),
+        pages_per_seq,
+        groups_per_token,
+        chunks_per_token,
+        -1,
+        compand_a,
+        1,
+        bonus_len
     );
     cuda_check(cudaPeekAtLastError());
 }

@@ -107,6 +107,9 @@ class PromptFormat_chatml(PromptFormat):
     def add_bos(self):
         return False
 
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
     def stop_conditions(self, tokenizer):
         return [
             tokenizer.eos_token_id,
@@ -801,6 +804,45 @@ class PromptFormat_minimax(PromptFormat):
         return "<think>", "</think>"
 
 
+class PromptFormat_hy3(PromptFormat):
+    description = "Hy3"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = "<｜hy_begin_of_sentence:opensource｜>"
+        if system_prompt:
+            context += system_prompt
+        context += "<｜reasoning_mode:opensource｜>reasoning_effort:"
+        context += "low" if think else "no_think"
+        for (u, a) in messages:
+            context += "<｜hy_User:opensource｜>"
+            context += u
+            context += "<｜hy_Assistant:opensource｜>"
+            if a is not None:
+                context += "<think:opensource></think:opensource>"
+                context += a
+                context += "<｜hy_eos:opensource｜>"
+            elif not think:
+                context += "<think:opensource></think:opensource>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list
+
+    def thinktag(self):
+        return "<think:opensource>", "</think:opensource>"
+
+
 class PromptFormat_gptoss(PromptFormat):
     description = "GPT-OSS"
 
@@ -850,6 +892,110 @@ class PromptFormat_gptoss(PromptFormat):
         # Harmony channels are structural output, not think tags.
         return None, None
 
+class PromptFormat_laguna(PromptFormat):
+    description = "Laguna 2.1"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = "〈|EOS|〉"
+        if system_prompt:
+            context += "<system>"
+            context += system_prompt
+            context += "</system>\n"
+        for (u, a) in messages:
+            context += "<user>"
+            context += u
+            context += "</user>\n"
+            context += "<assistant>"
+            if a is not None:
+                context += a
+                context += "</assistant>\n"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list
+
+    def thinktag(self):
+        return "<think>", "</think>"
+
+
+class PromptFormat_kimi(PromptFormat):
+    description = "Moonshot ChatML variant used by Kimi K2, Moonlight etc."
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += f"<|im_system|>system<|im_middle|>{system_prompt}<|im_end|>"
+        for (u, a) in messages:
+            context += f"<|im_user|>user<|im_middle|>{u}<|im_end|>"
+            context += f"<|im_assistant|>assistant<|im_middle|>"
+            if a is not None: context += f"{a}<|im_end|>"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list + [
+            tokenizer.single_id("<|im_end|>")
+        ]
+
+
+class PromptFormat_deepseek(PromptFormat):
+    description = "Deepseek"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        context = ""
+        if system_prompt:
+            context += f"<|begin▁of▁sentence|>{system_prompt}"
+        for (u, a) in messages:
+            context += f"<|User|>{u}"
+            context += f"<|Assistant|>"
+            if not think:
+                context += f"<|end_of_thought|>"
+            if a is not None: context += f"{a}"
+        return context
+
+    def add_bos(self):
+        return False
+
+    def thinktag(self):
+        return "<think>\n", "</think>"
+
+    def stop_conditions(self, tokenizer):
+        return tokenizer.config.eos_token_id_list + [
+            tokenizer.single_id("<|User|>")
+        ]
+
 
 prompt_formats = {
     "raw": PromptFormat_raw,
@@ -872,5 +1018,9 @@ prompt_formats = {
     "seed": PromptFormat_seed,
     "apertus": PromptFormat_apertus,
     "minimax": PromptFormat_minimax,
-    "gptoss": PromptFormat_gptoss
+    "gptoss": PromptFormat_gptoss,
+    "hy3": PromptFormat_hy3,
+    "laguna": PromptFormat_laguna,
+    "kimi": PromptFormat_kimi,
+    "deepseek": PromptFormat_deepseek,
 }

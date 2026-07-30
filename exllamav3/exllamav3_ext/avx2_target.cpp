@@ -17,3 +17,18 @@ bool is_avx2_supported()
     // else printf("AVX2 not supported\n");
     return avx2_supported;
 }
+bool is_f16c_supported()
+{
+    static bool f16c_check = false;
+    static bool f16c_supported = false;
+    if (f16c_check) return f16c_supported;
+    #ifdef __linux__
+        f16c_supported = __builtin_cpu_supports("f16c");
+    #else
+        int cpuInfo[4];
+        __cpuidex(cpuInfo, 1, 0);
+        f16c_supported = (cpuInfo[2] & (1 << 29)) != 0;
+    #endif
+    f16c_check = true;
+    return f16c_supported;
+}

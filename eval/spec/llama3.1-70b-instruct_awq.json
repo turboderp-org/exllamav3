@@ -1,8 +1,0 @@
-[
-    {
-        "model_dir": "/mnt/str/eval_models/llama3.1-70b-instruct/awq/4bit",
-        "load_fn": "transformers_auto",
-        "fwd_fn": "transformers",
-        "label": "AWQ 4bit"
-    }
-]

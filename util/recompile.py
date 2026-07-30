@@ -67,7 +67,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("-i", "--in_dir", type = str, default = None, help = "Input model directory")
     parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Output directory")
     parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in MB, default: 8192", default = 8192)
