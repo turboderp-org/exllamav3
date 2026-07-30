@@ -21,6 +21,11 @@ from ..util import profile_opt
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
 @lru_cache(100)
 def _strings_to_utf32(strings: tuple[str]) -> tuple[np.ndarray, np.ndarray] | None:
+    # An empty string occupies no range in the packed buffer, and the matcher has no terminator to
+    # stop it at: it would scan off the end of the buffer and can report a partial match that never
+    # resolves, holding output indefinitely. An empty needle cannot match anything meaningful in
+    # any case, so drop it here, where every caller passes through
+    strings = tuple(s for s in strings if s)
     if not strings: return bytearray(), None
 
     encoded_strings = [s.encode("utf-32-le") for s in strings]
