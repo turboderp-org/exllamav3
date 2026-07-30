@@ -170,10 +170,46 @@ class CPUPageCache:
         assert self.max_slots >= 2, \
             f"CPU page cache of {max_size} bytes is smaller than two pages ({page_bytes} bytes per page)."
 
-        # Per-rank pools are committed up front for the full slot count (pinning happens in the workers, in
-        # parallel across ranks); the local slabs below stay lazily allocated as before
-        for model, cache_id, pool_id in self.tp_caches:
-            model.tp_host_cache_alloc(cache_id, pool_id, self.max_slots)
+        # Everything from the first worker-side pool allocation to finalizer registration is transactional:
+        # no finalizer exists yet, so a failure part-way (e.g. host memory exhausted while pinning a second
+        # cache's pools, or the local slab thread failing to start) must roll back here or already-pinned
+        # worker pools and an orphaned pinning thread would survive until model teardown.
+        attempted_pools = []
+        try:
+            # Per-rank pools are committed up front for the full slot count (pinning happens in the workers,
+            # in parallel across ranks); the local slabs below stay lazily allocated as before
+            for model, cache_id, pool_id in self.tp_caches:
+                # Record the pool before dispatch. A failed fan-out can still have allocated this ID on some
+                # ranks, and freeing a missing ID is harmless.
+                attempted_pools.append((model, pool_id))
+                model.tp_host_cache_alloc(cache_id, pool_id, self.max_slots)
+            self._init_tail()
+        except BaseException as exc:
+            if getattr(self, "_alloc_state", None) is not None:
+                self._alloc_state.stop()
+            cleanup_errors = []
+            for model, pool_id in attempted_pools:
+                try:
+                    model.tp_host_cache_free_deferred(pool_id)
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+            # Constructor rollback runs in main-line control flow, not GC context, so release the queued pools
+            # immediately. tp_host_cache_alloc() drains every rank before raising on an allocation failure,
+            # leaving the command pipes synchronized for this cleanup dispatch.
+            for model, _ in attempted_pools:
+                try:
+                    model.tp_host_cache_process_frees()
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+            if cleanup_errors and hasattr(exc, "add_note"):
+                exc.add_note(
+                    "CPU page cache rollback also encountered cleanup errors: " +
+                    "; ".join(repr(e) for e in cleanup_errors)
+                )
+            raise
+
+
+    def _init_tail(self):
         self._slots_used = 0  # slots handed out when no local slabs exist to count
 
         self.pagetable = None
@@ -225,7 +261,8 @@ class CPUPageCache:
     def close(self):
         """
         Deterministically release this tier's background resources: stop the slab-pinning worker and queue
-        any worker-side TP pools for release in the rank processes. Idempotent; runs automatically when the
+        any worker-side TP pools for release in the rank processes. Idempotent, terminal (subsequent store()
+        and fetch() raise rather than dispatch against released pools), and runs automatically when the
         object is collected.
         """
         self._finalizer()
@@ -364,6 +401,8 @@ class CPUPageCache:
         Copy a dying page's cache state into the tier (device-to-host, async on the current stream). Duplicate
         hashes only refresh the entry's recency.
         """
+        if not self._finalizer.alive:
+            raise RuntimeError("CPU page cache tier is closed.")
         e = self.entries.get(page.phash)
         if e is not None:
             e["access_serial"] = serial
@@ -391,6 +430,8 @@ class CPUPageCache:
         The entry remains in the tier; the restored copy may well be evicted again before this one goes stale.
         Returns the entry so the caller can restore page metadata (token IDs).
         """
+        if not self._finalizer.alive:
+            raise RuntimeError("CPU page cache tier is closed.")
         e = self.entries[phash]
         e["access_serial"] = serial
         if self.segments:

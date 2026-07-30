@@ -670,9 +670,27 @@ class Model_TPMixin:
     def tp_host_cache_alloc(self, cache_id: int, pool_id: int, num_slots: int):
         """
         Allocate per-rank pinned host pools for a TP host page store. The rank pools jointly hold num_slots
-        pages of the full (unsharded) cache.
+        pages of the full (unsharded) cache. The worker function returns allocation errors as ordinary status
+        values so every rank's reply is drained before an error is raised. If any rank fails, remove this pool
+        ID everywhere before returning control to the caller.
         """
-        self.tp_worker_dispatch_wait_multi(self.active_devices, mp_host_cache_alloc, (cache_id, pool_id, num_slots))
+        results = self.tp_worker_dispatch_wait_multi(
+            self.active_devices,
+            mp_host_cache_alloc,
+            (cache_id, pool_id, num_slots),
+        )
+        errors = [r for r in results if r is not None]
+        if errors:
+            self.tp_worker_dispatch_wait_multi(
+                self.active_devices,
+                mp_host_cache_free,
+                (pool_id,),
+            )
+            detail = "; ".join(
+                f"device {e['device']}: {e['type']}: {e['message']}"
+                for e in errors
+            )
+            raise RuntimeError(f"Failed to allocate TP host-cache pool {pool_id}: {detail}")
 
 
     def tp_host_cache_free_deferred(self, pool_id: int):
@@ -693,8 +711,9 @@ class Model_TPMixin:
         even when no live host store remains.
         """
         while self.tp_pending_host_cache_frees:
-            pool_id = self.tp_pending_host_cache_frees.pop()
+            pool_id = self.tp_pending_host_cache_frees[-1]
             self.tp_worker_dispatch_wait_multi(self.active_devices, mp_host_cache_free, (pool_id,))
+            self.tp_pending_host_cache_frees.pop()
 
 
     def tp_host_cache_store(self, pool_id: int, slot: int, page_index: int):

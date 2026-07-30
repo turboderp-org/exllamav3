@@ -415,12 +415,26 @@ def mp_host_cache_alloc(
     a given page, each covering only its own shard. Pools are keyed by the store's unique pool_id, not the
     cache_id: two HostPageStore generations can briefly coexist over the same cache (a finalizer deferred
     by cyclic GC outliving its replacement), and a stale free must only ever remove its own dead pool.
+
+    Returns None on success or a serializable error description on failure instead of raising. This lets the
+    parent drain every rank's reply before freeing any successful rank's copy of the pool and surfacing the
+    aggregate allocation failure.
     """
+    host_cache_pools = local_context.setdefault("host_cache_pools", {})
     pools = []
-    for t in _host_cache_shard_tensors(local_context, cache_id):
-        pool = torch.empty((num_slots, *t.shape[1:]), dtype = t.dtype, pin_memory = True)
-        pools.append((t, pool))
-    local_context.setdefault("host_cache_pools", {})[pool_id] = pools
+    host_cache_pools[pool_id] = pools
+    try:
+        for t in _host_cache_shard_tensors(local_context, cache_id):
+            pool = torch.empty((num_slots, *t.shape[1:]), dtype = t.dtype, pin_memory = True)
+            pools.append((t, pool))
+    except Exception as exc:
+        host_cache_pools.pop(pool_id, None)
+        return {
+            "device": local_context.get("device"),
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+    return None
 
 
 def mp_host_cache_free(
