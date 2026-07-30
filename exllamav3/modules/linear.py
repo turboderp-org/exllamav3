@@ -490,6 +490,14 @@ class Linear(Module):
             dim = x.shape[-1]
             x = x.view((rows, dim)).to(torch.float, copy = True)  # TODO: Why copy here?
 
+            # fp16 activation overflow (+-inf) would poison entire rows/columns of H through the
+            # accumulation, and no diagonal damping can repair non-finite entries afterwards.
+            # Drop the affected rows; the inf_nan counter above still reports them
+            finite = torch.isfinite(x).all(dim = 1)
+            if not finite.all():
+                x = x[finite]
+                rows = x.shape[0]
+
             params["capture"][self.qmap]["H"].addmm_(x.T, x)
             params["capture"][self.qmap]["count"] += rows
 
