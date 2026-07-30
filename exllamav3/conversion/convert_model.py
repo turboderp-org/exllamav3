@@ -768,6 +768,35 @@ def image_dump(args, linears):
             save_tensor_image(w, os.path.join(args["work_dir"], filename))
 
 
+# Per-layer host allocation churn (fp32 weight copies, H/L stashes, q_tensors, state rows)
+# leaves freed memory stranded in glibc's per-thread arenas, where RSS ratchets up over a long
+# job even though nothing is referenced. Explicitly return what can be returned after each
+# module; no-op where glibc is unavailable
+_libc = None
+def malloc_trim():
+    global _libc
+    if _libc is False:
+        return
+    try:
+        if _libc is None:
+            import ctypes
+            _libc = ctypes.CDLL("libc.so.6")
+        _libc.malloc_trim(0)
+    except Exception:
+        _libc = False
+
+
+def host_rss_str():
+    """Resident set size of this process, for the per-module feedback line (empty string where
+    /proc is unavailable)."""
+    try:
+        with open("/proc/self/statm") as f:
+            rss_pages = int(f.read().split()[1])
+        return f"  rss: {rss_pages * os.sysconf('SC_PAGE_SIZE') / 1024**3:.2f} GB"
+    except Exception:
+        return ""
+
+
 def feedback_module(state, module, config, final_bpw, error, cos_error, sqnr_, module_time):
     if state:
         print(
@@ -776,14 +805,16 @@ def feedback_module(state, module, config, final_bpw, error, cos_error, sqnr_, m
             (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
             f"  cos: {cos_error:.6f}"
             f"  sqnr: {sqnr_:.6f}"
-            f"  [{module_time:.2f} s]",
+            f"  [{module_time:.2f} s]" +
+            host_rss_str(),
             flush = True
         )
     else:
         print(
             f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
             (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"  no_weights") +
-            f"  [{module_time:.2f} s]",
+            f"  [{module_time:.2f} s]" +
+            host_rss_str(),
             flush = True
         )
 
@@ -1145,7 +1176,9 @@ def main(args, job_state):
                 sqnr_ /= n
                 check_bad_rows(bad_rows, len(state))
 
-        # Feedback after module
+        # Feedback after module. Trim first so the reported RSS reflects what the job actually
+        # retains, not what the allocator happens to be holding
+        malloc_trim()
         module_time = time.time() - start_module_time
         feedback_module(state, module, config, final_bpw, error, cos_error, sqnr_, module_time)
         feedback_eta(idx, model, module_time)
@@ -1230,6 +1263,7 @@ def main(args, job_state):
             final_bpw = num_bits / module.weights_numel() if module.weights_numel() else None
 
             # Feedback after module
+            malloc_trim()
             module_time = time.time() - start_module_time
             feedback_module(state, module, config, final_bpw, 0, 0, 0, module_time)
 
