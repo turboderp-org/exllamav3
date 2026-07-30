@@ -105,13 +105,18 @@ class SWAState:
             layers = self.cache.get_all_recurrent_layers()
             state_size = next(iter(layers.values())).module.kv_state_size
             stashed["window_beg"] = self.position - min(self.position, state_size)
-            stashed.update(stash_recurrent_layers(
+            result = stash_recurrent_layers(
                 self.cache,
                 self.slot,
                 self.position,
                 pinned_staging,
                 cursor = self.position - self.window_beg,
-            ))
+            )
+            if pinned_staging:
+                staged, events = result
+                stashed.update(staged)
+                return stashed, events
+            stashed.update(result)
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, self.position))

@@ -157,6 +157,8 @@ class Cache:
         self.num_slots = max_batch_size
         self.max_history = max_history
         self.free_list = deque(range(self.num_slots))
+        # Slots whose release is gated on side-stream stash events: (slot, [events]), oldest first
+        self.pending_slot_releases = []
         self.recurrent_state_cls = model.recurrent_state_cls
 
         rl = self.model.get_recurrent_layers()
@@ -321,7 +323,7 @@ class Cache:
         """
         Allocate a new, empty state
         """
-        assert len(self.free_list) > 0, "Cannot create new state: no available slots"
+        self._ensure_free_slot()
         handle = self.free_list.popleft()
         return self.recurrent_state_cls(
             self,
@@ -336,7 +338,7 @@ class Cache:
         Allocate a new state for given position, for testing/benchmarking purposes. If position > 0 this will
         not be a valid recurrent state for the model.
         """
-        assert len(self.free_list) > 0, "Cannot create new state: no available slots"
+        self._ensure_free_slot()
         handle = self.free_list.popleft()
         return self.recurrent_state_cls(
             self,
@@ -351,7 +353,10 @@ class Cache:
         """
         Allocate a new state from a stashed state
         """
-        assert len(self.free_list) > 0, "Cannot create new state: no available slots"
+        # Entries written through the pinned-staging path may still be finalizing on a background worker
+        from .recurrent import wait_stash_ready
+        wait_stash_ready(stashed_state)
+        self._ensure_free_slot()
         handle = self.free_list.popleft()
         return self.recurrent_state_cls(
             self,
@@ -367,6 +372,48 @@ class Cache:
         Return state to the pool
         """
         self.free_list.appendleft(state.slot)
+
+
+    def release_state_deferred(self, state, events):
+        """
+        Return the state's slot to the pool only once the given CUDA events have fired. Until then, side
+        streams are still reading the slot's tensors for a tail stash, and a new job claiming the slot would
+        overwrite them mid-copy. Reclaimed by reclaim_slots (polled) or _ensure_free_slot (blocking).
+        """
+        self.pending_slot_releases.append((state.slot, events))
+
+
+    def reclaim_slots(self, wait_all = False):
+        """
+        Move deferred slots whose stash events have fired back to the free pool. With wait_all, synchronize
+        every pending event (teardown).
+        """
+        remaining = []
+        for slot, events in self.pending_slot_releases:
+            if wait_all:
+                for ev in events:
+                    ev.synchronize()
+                ready = True
+            else:
+                ready = all(ev.query() for ev in events)
+            if ready:
+                self.free_list.appendleft(slot)
+            else:
+                remaining.append((slot, events))
+        self.pending_slot_releases = remaining
+
+
+    def _ensure_free_slot(self):
+        # Backpressure: with every slot either live or awaiting stash events, block on the oldest pending
+        # release (bounded by one side-stream D2H) rather than failing the allocation
+        if not self.free_list:
+            self.reclaim_slots()
+        if not self.free_list and self.pending_slot_releases:
+            slot, events = self.pending_slot_releases.pop(0)
+            for ev in events:
+                ev.synchronize()
+            self.free_list.appendleft(slot)
+        assert len(self.free_list) > 0, "Cannot create new state: no available slots"
 
 
     def get_recurrent_layer(

@@ -89,11 +89,16 @@ class ShortConvState:
             "checkpoint_size": self.checkpoint_size
         }
         if not self.cache.model.loaded_tp:
-            stashed.update(stash_recurrent_layers(
+            result = stash_recurrent_layers(
                 self.cache,
                 self.slot,
                 pinned_staging = pinned_staging,
-            ))
+            )
+            if pinned_staging:
+                staged, events = result
+                stashed.update(staged)
+                return stashed, events
+            stashed.update(result)
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot))

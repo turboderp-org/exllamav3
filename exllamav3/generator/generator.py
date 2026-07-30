@@ -282,9 +282,12 @@ class Generator:
         Runs under inference mode: the state rewind and stash copies mutate inference tensors, and this
         method is reachable from enqueue(), which unlike iterate() has no inference-mode decorator of its own.
 
-        Tail stashes use reusable pinned staging buffers. The staging transfer and host clone finish before the
-        recurrent slot is released, so a newly activated job cannot overwrite a slot while D2H is reading it.
+        Tail stashes stage D2H on side streams gated by CUDA events; the recurrent slot's release is deferred
+        until those events fire (Cache.release_state_deferred), so a newly activated job cannot overwrite a
+        slot while a side stream is still reading it.
         """
+        # Return any deferred slots whose stash events have fired to the free pool (cheap event polls)
+        self.cache.reclaim_slots()
         if not self.deferred_completed_jobs:
             return
         while self.deferred_completed_jobs:
@@ -310,6 +313,9 @@ class Generator:
         self.active_jobs.clear()
         self.pending_jobs.clear()
         self.deferred_completed_jobs.clear()
+        if self.recurrent_cache is not None:
+            self.recurrent_cache.drain()
+        self.cache.reclaim_slots(wait_all = True)
         if num_jobs and not self.num_remaining_jobs():
             self.on_queue_drained()
 

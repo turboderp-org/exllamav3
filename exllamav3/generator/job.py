@@ -287,6 +287,9 @@ class Job:
         # Recurrent state
         self.recurrent_state = None
         self.last_recurrent_checkpoint_pos = None
+        # Set when a completion tail stash staged this state's slot on side streams: the slot's release is
+        # gated on these events (Cache.release_state_deferred)
+        self._stash_release_events = None
 
         # Loop detector
         self.loop_detector = None
@@ -1419,7 +1422,9 @@ class Job:
         if rewind:
             self.recurrent_state.rewind(rewind)
         self.last_recurrent_checkpoint_pos = boundary
-        cache.put(page.phash, self.recurrent_state, pinned_staging = pinned_staging)
+        events = cache.put(page.phash, self.recurrent_state, pinned_staging = pinned_staging)
+        if events:
+            self._stash_release_events = events
 
 
     def find_recurrent_stash(self, target_pos: int):
@@ -1438,7 +1443,13 @@ class Job:
 
     def free_recurrent_state(self):
         if self.recurrent_state is not None:
-            self.recurrent_state.free()
+            if self._stash_release_events:
+                # Side streams are still reading this slot for the tail stash; the pool reclaims it once
+                # the events fire
+                self.generator.cache.release_state_deferred(self.recurrent_state, self._stash_release_events)
+                self._stash_release_events = None
+            else:
+                self.recurrent_state.free()
             self.recurrent_state = None
 
 
