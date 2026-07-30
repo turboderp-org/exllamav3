@@ -285,9 +285,11 @@ class Job:
         self.alt_rope_freqs = None
         self.alt_rope_offset = 0
 
-        # Pinned buffer for IDs during sampling
+        # Pinned buffer for IDs during sampling, and its device-resident copy for the current step
         self.current_pinned_ids = None
         self.pinned_ids = None  # Lazy alloc
+        self.current_device_ids = None
+        self.pinned_ids_valid = 0  # Leading tokens of pinned_ids known to match sequence_ids
 
         # Recurrent state
         self.recurrent_state = None
@@ -440,7 +442,7 @@ class Job:
 
         next_token = self.sampler.forward(
             logits,
-            self.current_pinned_ids,
+            self.current_device_ids,
             self.rng.randint(0, (1<<32)-1),
             self.generator.tokenizer,
             logit_mask = self.device_logit_mask
@@ -775,6 +777,7 @@ class Job:
                 p_page = seq.kv_position // PAGE_SIZE
                 seq.kv_position -= offset
                 seq.sequence_ids.truncate(len(seq.sequence_ids) - offset)
+                self.pinned_ids_valid = min(self.pinned_ids_valid, len(seq.sequence_ids))
                 n_page = seq.kv_position // PAGE_SIZE
                 for pi in range(n_page, len(seq.allocated_pages)):
                     page = seq.allocated_pages[pi]
@@ -1324,11 +1327,20 @@ class Job:
     def prepare_sampling_past_ids(self):
         if not self.sampler.reqs_past_ids:
             return
+        n = len(self.sequences[0].sequence_ids)
         if self.pinned_ids is None:
             max_ids = max(len(seq.sequence_ids) for seq in self.sequences) + self.max_new_tokens + 8
             self.pinned_ids = torch.empty((1, max_ids), dtype = torch.long, pin_memory = True)
-        self.current_pinned_ids = self.pinned_ids[:, :len(self.sequences[0].sequence_ids)]
-        self.current_pinned_ids.copy_(self.sequences[0].sequence_ids.torch())
+            self.pinned_ids_valid = 0
+        # The sequence only grows by appending or shrinks by truncation (which clamps the
+        # watermark), so the buffer is valid below the watermark and only the tail is staged
+        if self.pinned_ids_valid < n:
+            self.pinned_ids[:, self.pinned_ids_valid : n].copy_(
+                self.sequences[0].sequence_ids.torch_slice(self.pinned_ids_valid, n)
+            )
+            self.pinned_ids_valid = n
+        self.current_pinned_ids = self.pinned_ids[:, :n]
+        self.current_device_ids = self.current_pinned_ids.to(self.logits_device, non_blocking = True)
 
 
     def activate(self):
