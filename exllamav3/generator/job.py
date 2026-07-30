@@ -149,6 +149,8 @@ class Job:
         else:
             self.is_requeued = True
             self.rq_new_tokens = rq_state["rq_new_tokens"]
+        self.rq_first_prompt_tokens = rq_state.get("first_prompt_tokens")
+        self.rq_first_cached_tokens = rq_state.get("first_cached_tokens")
 
         self.generator = None
         self.pagetable = None
@@ -898,6 +900,12 @@ class Job:
             "rq_new_tokens": self.new_tokens - 1,
             "sam": self.sam,
             "draft_ema": self.draft_ema,
+            # Cache-stats identity of the ORIGINAL arriving request: later segments' prompts include text
+            # this job generated itself, which is trivially self-cached and would inflate the hit ratio
+            "first_prompt_tokens": self.rq_first_prompt_tokens if self.is_requeued
+                else sum(len(s.input_ids) for s in self.sequences) // max(len(self.sequences), 1),
+            "first_cached_tokens": self.rq_first_cached_tokens if self.is_requeued
+                else (self.cached_pages * PAGE_SIZE + self.cached_tokens) // max(len(self.sequences), 1),
         }
 
         serial_number = self.serial_number

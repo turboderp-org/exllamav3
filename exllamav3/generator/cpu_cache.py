@@ -1,6 +1,7 @@
 from __future__ import annotations
 import heapq
 import threading
+import time
 import torch
 from collections import deque
 from ..constants import PAGE_SIZE
@@ -86,9 +87,15 @@ class CPUPageCache:
             "pushes": 0,        # pages copied to the tier on GPU eviction
             "dedup_hits": 0,    # pushes skipped because the page was already stored
             "restores": 0,      # pages copied back into the GPU cache at allocation
+            "misses": 0,        # restorable allocation positions that had no tier entry (see PageTable)
             "evictions": 0,     # tier entries dropped to make room
             "cold_allocs": 0,   # pushes that had to pin a slab synchronously (spare pool was empty)
         }
+
+        # Eviction ages measure the retention window the configured capacity actually provides under live
+        # traffic; a young minimum means pages are dropped before their conversations return
+        self.evicted_age_sum = 0.0
+        self.evicted_age_min_window = None
 
         # Transfers run at PCIe speed, but pinning host memory only manages ~2.5 GB/s and serializes with copy
         # submission on the driver, so the full configured capacity is pinned up front by a background thread
@@ -102,6 +109,20 @@ class CPUPageCache:
 
     def attach(self, pagetable):
         self.pagetable = pagetable
+
+
+    def stats(self, reset_window: bool = False) -> dict:
+        s = {
+            "slots": self.max_slots,
+            "entries": len(self.entries),
+            "slot_bytes": self.slot_size,
+            "evicted_age_sum": self.evicted_age_sum,
+            "evicted_age_min_window": self.evicted_age_min_window,
+        }
+        s.update(self.metrics)
+        if reset_window:
+            self.evicted_age_min_window = None
+        return s
 
 
     def __contains__(self, phash: bytes):
@@ -169,6 +190,10 @@ class CPUPageCache:
             e = self.entries.pop(h, None)
             if e is not None:
                 self.metrics["evictions"] += 1
+                age = time.time() - e["stored_at"]
+                self.evicted_age_sum += age
+                if self.evicted_age_min_window is None or age < self.evicted_age_min_window:
+                    self.evicted_age_min_window = age
                 return e["slot"]
 
 
@@ -241,6 +266,7 @@ class CPUPageCache:
             "prev_hash": page.prev_hash,
             "access_serial": serial,
             "tokens": page.sequence.clone(),
+            "stored_at": time.time(),
         }
         self.metrics["pushes"] += 1
 

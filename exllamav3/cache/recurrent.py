@@ -1,4 +1,5 @@
 from collections import OrderedDict
+import time
 from ..constants import PAGE_SIZE
 
 class RecurrentCache(OrderedDict):
@@ -21,6 +22,37 @@ class RecurrentCache(OrderedDict):
             "stash_pruned": 0,              # stranded checkpoints dropped by prune_stranded()
         }
 
+        # Eviction ages measure the retention window this budget provides under live traffic; a young
+        # minimum means checkpoints are being discarded before their conversations return. Only restorable
+        # (LRU) evictions are recorded: dropping a stranded checkpoint frees dead weight, not retention.
+        self.evicted_count = 0
+        self.evicted_age_sum = 0.0
+        self.evicted_age_min_window = None
+        # Bounded memory of recently LRU-evicted keys, so restore-time misses can distinguish "checkpoint
+        # was evicted" (budget problem) from "checkpoint never existed or was stranded" (interval, state
+        # policy or KV eviction — more recurrent memory cannot help). ~10k keys of 16 bytes.
+        self._evicted_keys = OrderedDict()
+        self._evicted_keys_max = 10000
+
+
+    def was_evicted(self, key) -> bool:
+        return key in self._evicted_keys
+
+
+    def stats(self, reset_window: bool = False) -> dict:
+        s = {
+            "entries": len(self),
+            "bytes_used": self.current_size,
+            "bytes_max": self.max_size,
+            "evicted_count": self.evicted_count,
+            "evicted_age_sum": self.evicted_age_sum,
+            "evicted_age_min_window": self.evicted_age_min_window,
+        }
+        s.update(self.metrics)
+        if reset_window:
+            self.evicted_age_min_window = None
+        return s
+
 
     def get_stashed(self, key, default = None):
         """
@@ -40,6 +72,7 @@ class RecurrentCache(OrderedDict):
             self.move_to_end(key)
         else:
             stashed_state = state.stash()
+            stashed_state["stash_time"] = time.time()
             state_size = stashed_state["checkpoint_size"]
             while self.update_total_size() + state_size > self.max_size:
                 assert self.current_size >= 0, "Not enough space in cache for single state"
@@ -64,12 +97,23 @@ class RecurrentCache(OrderedDict):
                         page = pt.referenced_pages.get(popped_key) or pt.unreferenced_pages.get(popped_key)
                         if page is not None and page.kv_position == PAGE_SIZE:
                             self.metrics["stash_evictions_live_kv"] += 1
+                    # Retention-window accounting and the evicted-key memory cover only this restorable
+                    # (LRU pressure) path; see __init__
+                    age = time.time() - popped.get("stash_time", time.time())
+                    self.evicted_count += 1
+                    self.evicted_age_sum += age
+                    if self.evicted_age_min_window is None or age < self.evicted_age_min_window:
+                        self.evicted_age_min_window = age
+                    self._evicted_keys[popped_key] = None
+                    while len(self._evicted_keys) > self._evicted_keys_max:
+                        self._evicted_keys.popitem(last = False)
 
                 self.metrics["stash_evictions"] += 1
                 if self.model.loaded_tp:
                     self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
 
             self[key] = stashed_state
+            self._evicted_keys.pop(key, None)
             self.update_total_size()
 
 

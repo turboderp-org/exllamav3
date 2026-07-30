@@ -343,6 +343,13 @@ class PageTable:
             "alloc_cached_pages": 0,      # of those, reused as part of a resumable cached prefix
             "alloc_tier_pages": 0,        # of those, restored from the CPU tier rather than found in VRAM
             "alloc_kv_only_pages": 0,     # cached KV pages not resumable because no recurrent stash covers them
+            # Allocations whose K/V sat in the CPU tier but could not be restored for want of a recurrent
+            # checkpoint. capped_evicted: a checkpoint that would have unlocked the restore existed and was
+            # evicted - direct evidence the recurrent cache budget is undersized relative to the tier.
+            # uncovered: no such checkpoint was ever created (checkpoint interval, non-rollback state types)
+            # - more recurrent memory cannot help.
+            "recurrent_capped_evicted": 0,
+            "recurrent_uncovered": 0,
         }
 
 
@@ -562,7 +569,10 @@ class PageTable:
             self.evict(page, protected_hashes)
             return page
 
-        # Allocate whole pages
+        # Allocate whole pages. contiguous tracks whether every page so far extends a complete cached prefix
+        # from position 0: reuse statistics only count positions inside that prefix, since pages beyond the
+        # first miss are rewritten by prefill regardless of what the tiers hold.
+        contiguous = True
         for lp, h in enumerate(page_hashes):
             self.access_serial += 1
 
@@ -571,6 +581,7 @@ class PageTable:
             if rp:
                 rp.add_ref(self.access_serial)
                 allocated_pages.append(rp)
+                contiguous = contiguous and rp.kv_position == PAGE_SIZE
 
             # If possible, reuse an unreferenced page with matching hash
             else:
@@ -578,6 +589,7 @@ class PageTable:
                 if up:
                     up.add_ref(self.access_serial)
                     allocated_pages.append(up)
+                    contiguous = contiguous and up.kv_position == PAGE_SIZE
 
                 # No matching page, allocate the best eviction candidate. If the missing page is stored in the
                 # CPU tier, restore it into the new page; the eviction above may itself push to the tier, and in
@@ -596,6 +608,36 @@ class PageTable:
                         op.prev_hash = page_hashes[lp - 1] if lp > 0 else None
                         op.kv_position = PAGE_SIZE
                         self.metrics["alloc_tier_pages"] += 1
+                    elif self.cpu_tier is not None and contiguous:
+                        if restore_limit is None or lp < restore_limit:
+                            # A restorable position missed both VRAM and the tier: the tier's retention
+                            # window ends before this conversation returned (or it was never stored)
+                            self.cpu_tier.metrics["misses"] += 1
+                        elif recurrent_pages is not None and h in self.cpu_tier:
+                            # K/V for this page is in the tier but the restore is capped for want of a
+                            # recurrent checkpoint. A checkpoint at a later position q unlocks restoring
+                            # through q only if every page from here through q is still available (live in
+                            # VRAM or held by the tier), so scan the remaining hashes only while that K/V
+                            # chain holds: an evicted checkpoint key inside the reachable span is a
+                            # recurrent-budget signal; a span that ends first (K/V retention gap) or holds
+                            # no evicted key (checkpoint never existed: interval, non-rollback state types)
+                            # cannot be fixed with more recurrent memory and counts as uncovered.
+                            rc = self.generator.recurrent_cache
+                            capped = False
+                            if rc is not None:
+                                for ph in page_hashes[lp:]:
+                                    if self.get_live_page(ph) is None and ph not in self.cpu_tier:
+                                        break
+                                    if rc.was_evicted(ph):
+                                        capped = True
+                                        break
+                            if capped:
+                                self.metrics["recurrent_capped_evicted"] += 1
+                            else:
+                                self.metrics["recurrent_uncovered"] += 1
+                        contiguous = False
+                    else:
+                        contiguous = False
                     allocated_pages.append(op)
 
         # Allocate unique pages

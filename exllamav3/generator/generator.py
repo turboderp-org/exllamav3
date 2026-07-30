@@ -6,7 +6,7 @@ from ..cache.recurrent import RecurrentCache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
-from .pagetable import PageTable
+from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .job import Job
 from .filter import Filter
@@ -241,6 +241,13 @@ class Generator:
         if recurrent_checkpoint_interval is None:
             recurrent_checkpoint_interval = model.caps.get("default_recurrent_checkpoint_interval", 2048)
 
+        # Cumulative request statistics for get_cache_stats
+        self.stats_requests = 0
+        self.stats_prompt_tokens = 0
+        self.stats_cached_tokens = 0
+        self.stats_prefill_time = 0.0
+        self.stats_cached_ratio_min_window = None
+
         assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval % PAGE_SIZE == 0, \
             "checkpoint interval must be a multiple of the page size (256)"
         def ceil_span(a, b):
@@ -264,6 +271,47 @@ class Generator:
 
     def num_pending_jobs(self):
         return len(self.pending_jobs)
+
+
+    def get_cache_stats(self, reset_window: bool = False) -> dict:
+        """
+        Snapshot of cache and prefix-reuse statistics, intended for periodic production logging to guide
+        cache_size / cpu_cache_size / recurrent_cache_size tuning. Counters are cumulative; callers compute
+        deltas between snapshots. Fields suffixed _window are minima observed since the last snapshot taken
+        with reset_window = True. Ages and times are in seconds.
+
+        On hybrid recurrent models the single most actionable signal is gpu_cache.recurrent_capped_evicted:
+        it counts allocations whose K/V was available in the CPU tier but whose unlocking recurrent
+        checkpoint had been EVICTED, i.e. the recurrent cache budget is undersized relative to the tier and
+        warm resumes are silently degrading to prefill. recurrent_uncovered counts allocations where no such
+        checkpoint ever existed (checkpoint interval, non-rollback state types) - a policy property, not a
+        sizing one.
+        """
+        pt = self.pagetable
+        retired_valid = sum(
+            1 for p in pt.unreferenced_pages.values()
+            if p.kv_position == PAGE_SIZE and is_content_hash(p.phash)
+        )
+        stats = {
+            "requests": {
+                "completed": self.stats_requests,
+                "prompt_tokens": self.stats_prompt_tokens,
+                "cached_tokens": self.stats_cached_tokens,
+                "cached_ratio_min_window": self.stats_cached_ratio_min_window,
+                "prefill_time_sum": self.stats_prefill_time,
+            },
+            "gpu_cache": {
+                "pages": pt.max_pages,
+                "referenced": len(pt.referenced_pages),
+                "retired_valid": retired_valid,
+                **pt.metrics,
+            },
+            "cpu_cache": self.cpu_page_cache.stats(reset_window) if self.cpu_page_cache is not None else None,
+            "recurrent_cache": self.recurrent_cache.stats(reset_window) if self.recurrent_cache is not None else None,
+        }
+        if reset_window:
+            self.stats_cached_ratio_min_window = None
+        return stats
 
 
     def clear_queue(self):
@@ -1111,6 +1159,25 @@ class Generator:
         # Requeued recurrent jobs may stash the last checkpoint first so the next queued job can resume from cached
         # recurrent state.
         num_jobs = self.num_remaining_jobs()
+        for job in completed_jobs:
+            # Request-level reuse accounting. Requeued jobs report the ORIGINAL arriving request (carried
+            # through rq_state): later segments' prompts contain text the job generated itself, which is
+            # trivially self-cached and would inflate the hit ratio. CFG jobs average across their sequences.
+            ns = max(len(job.sequences), 1)
+            if job.is_requeued and job.rq_first_prompt_tokens is not None:
+                prompt_tokens = job.rq_first_prompt_tokens
+                cached = job.rq_first_cached_tokens or 0
+            else:
+                prompt_tokens = sum(len(s.input_ids) for s in job.sequences) // ns
+                cached = (job.cached_pages * PAGE_SIZE + job.cached_tokens) // ns
+            self.stats_requests += 1
+            self.stats_prompt_tokens += prompt_tokens
+            self.stats_cached_tokens += cached
+            ratio = cached / prompt_tokens if prompt_tokens else 1.0
+            if self.stats_cached_ratio_min_window is None or ratio < self.stats_cached_ratio_min_window:
+                self.stats_cached_ratio_min_window = ratio
+            self.stats_prefill_time += job.time_prefill
+
         for job in completed_jobs + requeuing_jobs:
             if job in requeuing_jobs and self.recurrent_cache is not None:
                 job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
