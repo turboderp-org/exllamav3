@@ -5,6 +5,7 @@ import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear
 from ..modules.linear import convert_exl3_group
+from ..modules.quant.exl3_lib.quantize import auto_split
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem
@@ -444,6 +445,9 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
     def work_thread(device_idx, dev_groups):
         global curr_progress
 
+        t0 = time.time()
+        work_numel = sum(l.weights_numel() for g in dev_groups for l in g)
+
         for group in dev_groups:
             if len(group) > 1:
                 quant_args_list = [make_quant_args(args, idx, strategy[l.key], [device_idx]) for l in group]
@@ -476,6 +480,11 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
             print_quantized_linear(config, linear, quant_args_local, proxy_err)
             with progress_lock:
                 curr_progress += 1
+
+        # The device is idle from here until the slowest thread finishes; its measured speed
+        # steers the next module's split
+        torch.cuda.synchronize(torch.device(device_idx))
+        auto_split.report("quant_thread", device_idx, work_numel, time.time() - t0)
 
     # Launch
     threads = []
@@ -525,7 +534,7 @@ def calibration_row_shards(num_rows, devices, device_ratios):
     """
     w = device_ratios if device_ratios else [1] * len(devices)
     tot = sum(w)
-    counts = [num_rows * r // tot for r in w]
+    counts = [int(num_rows * r / tot) for r in w]   # ratios may be learned floats
     counts[0] += num_rows - sum(counts)
     shards, start = [], 0
     for c in counts:
@@ -620,6 +629,8 @@ def capture_module_parallel(
     def make_worker(t_idx):
         def worker():
             module = modules[t_idx]
+            t0 = time.time()
+            done_rows = 0
             for i in shards[t_idx]:
                 if i in bad_rows:
                     with lock:
@@ -660,9 +671,11 @@ def capture_module_parallel(
                             bad_rows.add(i)
                         print(f" !! Non-finite reference state in calibration row {i}, excluding row")
                 rs = None
+                done_rows += 1
                 with lock:
                     progress_count[0] += 1
             torch.cuda.synchronize(torch.device(devices[t_idx]))
+            auto_split.report("calib", devices[t_idx], done_rows, time.time() - t0)
         return worker
 
     run_row_workers(title, len(state), [make_worker(i) for i in range(len(modules))], progress_count)
@@ -717,6 +730,8 @@ def advance_state_parallel(
     def make_worker(t_idx):
         def worker():
             module = modules[t_idx]
+            t0 = time.time()
+            done_rows = 0
             for i in shards[t_idx]:
                 if i in bad_rows:
                     with lock:
@@ -749,9 +764,11 @@ def advance_state_parallel(
                         sums[1] += cos
                         sums[2] += sq
                         sums[3] += 1
+                done_rows += 1
                 with lock:
                     progress_count[0] += 1
             torch.cuda.synchronize(torch.device(devices[t_idx]))
+            auto_split.report("calib", devices[t_idx], done_rows, time.time() - t0)
         return worker
 
     run_row_workers(title, len(state), [make_worker(i) for i in range(len(modules))], progress_count)
@@ -866,6 +883,33 @@ def main(args, job_state):
     else:
         device_ratios = None
 
+    # Without explicit --device_ratios, split workloads start even and adapt: each split
+    # workload reports per-device busy times, and subsequent modules divide work in proportion
+    # to the measured speeds (see AutoSplit). Workload kinds are tracked separately since
+    # per-unit costs differ between quantization and calibration forwards
+    def eff_ratios(kind):
+        if device_ratios is not None or len(devices) == 1:
+            return device_ratios
+        return auto_split.ratios(kind, devices)
+
+    last_auto_split = [None]
+    def report_auto_split():
+        if device_ratios is not None or len(devices) == 1:
+            return
+        parts = []
+        for kind, label in (("quant_thread", "quant"), ("quant_tiles", "tiles"), ("calib", "calib")):
+            if not auto_split.has_measured(kind, devices):
+                continue
+            r = auto_split.ratios(kind, devices)
+            if r:
+                tot = sum(r)
+                parts.append(label + " " + ":".join(f"{100 * x / tot:.0f}" for x in r))
+        if parts:
+            line = ", ".join(parts)
+            if line != last_auto_split[0]:
+                last_auto_split[0] = line
+                print(f" -- Auto device split: {line}")
+
     last_checkpoint_time = time.time()
 
     # Get model
@@ -979,7 +1023,7 @@ def main(args, job_state):
                             model,
                             [module] + capture_replicas,
                             devices,
-                            device_ratios,
+                            eff_ratios("calib"),
                             state,
                             original_input_ids,
                             get_preserve,
@@ -1075,9 +1119,9 @@ def main(args, job_state):
                 len(linears) >= len(devices) and
                 all(b <= 8 for _, b in strategy.items())
             ):
-                quantize_linears_parallel(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state)
+                quantize_linears_parallel(args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), capture_H, state)
             else:
-                quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state)
+                quantize_linears_single(args, linears, config, strategy, idx, devices, eff_ratios("quant_tiles"), capture_H, state)
 
             # Collect converted module tensors
             for m in module:
@@ -1121,7 +1165,7 @@ def main(args, job_state):
                     model,
                     [module] + advance_replicas,
                     devices,
-                    device_ratios,
+                    eff_ratios("calib"),
                     state,
                     original_input_ids,
                     get_preserve,
@@ -1181,6 +1225,7 @@ def main(args, job_state):
         malloc_trim()
         module_time = time.time() - start_module_time
         feedback_module(state, module, config, final_bpw, error, cos_error, sqnr_, module_time)
+        report_auto_split()
         feedback_eta(idx, model, module_time)
 
         # Unload current module
@@ -1241,9 +1286,9 @@ def main(args, job_state):
                 len(linears) >= len(devices) and
                 all(b <= 8 for _, b in strategy.items())
             ):
-                quantize_linears_parallel(args, linears, config, strategy, idx, devices, device_ratios, None, None)
+                quantize_linears_parallel(args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), None, None)
             else:
-                quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, None, None)
+                quantize_linears_single(args, linears, config, strategy, idx, devices, eff_ratios("quant_tiles"), None, None)
 
             # Collect converted module tensors
             for m in module:
