@@ -4,6 +4,7 @@ import threading
 import torch
 from collections import deque
 from ..constants import PAGE_SIZE
+from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 
 
 def _align(n: int, a: int) -> int:
@@ -82,12 +83,18 @@ class CPUPageCache:
         self._order_pops = 0
         self._order_rebuild = max(64, self.max_slots // 8)
 
+        # Multimodal taint verdicts by page hash (see mm_tainted). Verdicts are content-addressed and never
+        # stale; the cap only bounds memory, and clearing costs one O(chain) rebuild on the next store
+        self._taint_memo = {}
+        self._taint_memo_cap = 65536
+
         self.metrics = {
             "pushes": 0,        # pages copied to the tier on GPU eviction
             "dedup_hits": 0,    # pushes skipped because the page was already stored
             "restores": 0,      # pages copied back into the GPU cache at allocation
             "evictions": 0,     # tier entries dropped to make room
             "cold_allocs": 0,   # pushes that had to pin a slab synchronously (spare pool was empty)
+            "mm_rejects": 0,    # pushes declined because the page's K/V depends on multimodal embeddings
         }
 
         # Transfers run at PCIe speed, but pinning host memory only manages ~2.5 GB/s and serializes with copy
@@ -223,11 +230,66 @@ class CPUPageCache:
         self._order_pops = 0
 
 
+    def mm_tainted(self, page) -> bool:
+        """
+        Whether a page's K/V state depends on multimodal embeddings. MM tokens are embedding indices rather
+        than content, and through attention they influence the K/V of every later page in the sequence, so the
+        chained token-ID hash cannot verify any page downstream of one. A page is tainted if its own tokens
+        contain an MM index or if any ancestor's do. Ancestry is walked through complete VRAM pages and ends
+        clean at the chain root or at a tier entry (entries are only stored untainted, so their ancestry is
+        already verified); a chain that cannot be followed counts as tainted.
+
+        Verdicts are memoized by page hash: the chained hash commits to every token ID from the root down, so
+        taint is a pure function of the hash and a cached verdict can never go stale. This makes tearing down
+        an N-page chain O(N) rather than O(N^2): eviction is leaf-first, so the first (deepest) store walks to
+        the root and memoizes the whole path, and each later store hits the memo immediately. Verdicts from an
+        unfollowable chain are conservative, state-dependent and never cached.
+        """
+        memo = self._taint_memo
+        path = []
+        while True:
+            verdict = memo.get(page.phash)
+            if verdict is not None:
+                break
+            if bool((page.sequence >= FIRST_MM_EMBEDDING_INDEX).any()):
+                path.append(page.phash)
+                verdict = True
+                break
+            path.append(page.phash)
+            if page.prev_hash is None:
+                verdict = False
+                break
+            if page.prev_hash in self.entries:
+                verdict = False
+                break
+            if self.pagetable is None:
+                return True
+            page = self.pagetable.get_live_page(page.prev_hash)
+            if page is None:
+                return True
+            if len(path) > self.pagetable.max_pages:
+                return True
+        if len(memo) + len(path) > self._taint_memo_cap:
+            memo.clear()
+        for h in path:
+            memo[h] = verdict
+        return verdict
+
+
     def store(self, page, serial: int, protect: set | None = None):
         """
         Copy a dying page's cache state into the tier (device-to-host, async on the current stream). Duplicate
         hashes only refresh the entry's recency.
+
+        Pages whose K/V depends on multimodal embeddings are not stored (see mm_tainted): their hashes key on
+        embedding indices, not on image content. Freshly encoded embeddings always draw new indices from the
+        global allocator, so a re-uploaded identical image can never hit such an entry, while deserialized
+        embeddings (MMEmbedding(imp)) carry externally assigned indices that this tier cannot verify against
+        its longer retention window. The entries are dead weight at best and a stale K/V hit at worst.
         """
+        if self.mm_tainted(page):
+            self.metrics["mm_rejects"] += 1
+            return
         e = self.entries.get(page.phash)
         if e is not None:
             e["access_serial"] = serial
