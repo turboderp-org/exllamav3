@@ -35,6 +35,12 @@ class Model_TPMixin:
         # command yet when forward_tp returns
         self.tp_pending_acks = []
         self.tp_pending_refs = None
+        # Host-cache pools whose HostPageStore was garbage-collected; freed in workers by
+        # tp_host_cache_process_frees, which live HostPageStore code calls from main-line control flow.
+        # __del__ may run at any GC point - even between a fan-out's individual sends, when a child rank can
+        # already be blocked in a collective - so it must never touch the pipes itself, and nothing on the
+        # drain/dispatch path may process this queue.
+        self.tp_pending_host_cache_frees = []
 
     def create_tp_context(self, tp_backend: str):
         """
@@ -168,6 +174,8 @@ class Model_TPMixin:
         self.mp_children = []
         self.mp_parent_conn = []
         self.mp_child_conn = []
+        # Worker processes are gone, and with them any pools still queued for release
+        self.tp_pending_host_cache_frees = []
 
         self.tp_producer.close()
         self.tp_producer = None
@@ -583,6 +591,10 @@ class Model_TPMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
+        # Quiet top-level boundary: release pools of any garbage-collected host store before fanning out.
+        # Without this, an application that drops its last host-cached generator but keeps forwarding
+        # through this model would pin the dead pools until model unload.
+        self.tp_host_cache_process_frees()
         self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
         x, reserve = self.prepare_inputs_for_tp(x, params)
@@ -617,6 +629,8 @@ class Model_TPMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
+        # See prefill_tp: free dead host-cache pools at this quiet boundary
+        self.tp_host_cache_process_frees()
         self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
         x, reserve = self.prepare_inputs_for_tp(x, params)
@@ -643,6 +657,60 @@ class Model_TPMixin:
         self.tp_pending_refs = (args, params.get("recurrent_states"))
         self.restore_tp_params(params, reserve)
         return out
+
+
+    def tp_host_cache_page_bytes(self, cache_id: int) -> int:
+        """
+        Total bytes of one cache page summed across every rank's shard of the given cache.
+        """
+        r = self.tp_worker_dispatch_wait_multi(self.active_devices, mp_host_cache_page_bytes, (cache_id,))
+        return sum(r)
+
+
+    def tp_host_cache_alloc(self, cache_id: int, pool_id: int, num_slots: int):
+        """
+        Allocate per-rank pinned host pools for a TP host page store. The rank pools jointly hold num_slots
+        pages of the full (unsharded) cache.
+        """
+        self.tp_worker_dispatch_wait_multi(self.active_devices, mp_host_cache_alloc, (cache_id, pool_id, num_slots))
+
+
+    def tp_host_cache_free_deferred(self, pool_id: int):
+        """
+        Queue the per-rank pinned host pools of a dying host page store for release. Safe to call from
+        __del__/GC context: this only appends to a list. The actual worker dispatch happens at the next
+        call to tp_host_cache_process_frees from main-line control flow - a live HostPageStore's
+        alloc/store/restore, or the top of the next forward/prefill fan-out.
+        """
+        self.tp_pending_host_cache_frees.append(pool_id)
+
+
+    def tp_host_cache_process_frees(self):
+        """
+        Release any queued dead pools. Callers guarantee main-line context (no fan-out partially dispatched,
+        no rank inside a collective): HostPageStore invokes this before its own alloc/store/restore
+        dispatches, and forward_tp/prefill_tp invoke it before fanning out, so dead pools are released
+        even when no live host store remains.
+        """
+        while self.tp_pending_host_cache_frees:
+            pool_id = self.tp_pending_host_cache_frees.pop()
+            self.tp_worker_dispatch_wait_multi(self.active_devices, mp_host_cache_free, (pool_id,))
+
+
+    def tp_host_cache_store(self, pool_id: int, slot: int, page_index: int):
+        """
+        Offload one GPU cache page (all ranks' shards) into host pool slot. active_devices keeps the
+        output-device pseudo-worker last, so spawned workers receive the command before the main process
+        blocks in the synchronous pseudo-worker call.
+        """
+        self.tp_dispatch_all(mp_host_cache_store, (pool_id, slot, page_index))
+
+
+    def tp_host_cache_restore(self, pool_id: int, slot: int, page_index: int):
+        """
+        Restore one page from host pool slot into the given GPU page across all ranks.
+        """
+        self.tp_dispatch_all(mp_host_cache_restore, (pool_id, slot, page_index))
 
 
     def tp_rotate_cache_pages(self, cache_id: int, all_rotations: torch.Tensor):

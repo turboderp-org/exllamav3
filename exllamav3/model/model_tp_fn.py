@@ -378,6 +378,90 @@ def mp_rotate_cache_pages(
         ext.cache_rotate(cache, all_rotations, buffer)
 
 
+def _host_cache_shard_tensors(local_context: dict, cache_id: int):
+    """
+    This rank's shard of a TP-split cache, as a flat tensor list in deterministic module order. Ranks
+    holding no KV heads for a module contribute nothing for it.
+    """
+    tensors = []
+    for module in local_context["kv_modules"]:
+        cache_layer = module.tp_cache_lookup[cache_id]
+        for t in cache_layer.get_tensors():
+            if t is not None:
+                tensors.append(t)
+    return tensors
+
+
+def mp_host_cache_page_bytes(
+    local_context: dict,
+    cache_id: int
+):
+    """
+    Size in bytes of one cache page across this rank's shard of the given cache. The main process sums
+    the per-rank sizes to compute how many page slots a host_cache_size budget provides.
+    """
+    return sum(t[0].numel() * t.element_size() for t in _host_cache_shard_tensors(local_context, cache_id))
+
+
+def mp_host_cache_alloc(
+    local_context: dict,
+    cache_id: int,
+    pool_id: int,
+    num_slots: int
+):
+    """
+    Allocate this rank's pinned host pools for a TP host page store: one pool per shard cache tensor,
+    mirroring its per-page shape. Slot indices are global; every rank stores/restores the same slot for
+    a given page, each covering only its own shard. Pools are keyed by the store's unique pool_id, not the
+    cache_id: two HostPageStore generations can briefly coexist over the same cache (a finalizer deferred
+    by cyclic GC outliving its replacement), and a stale free must only ever remove its own dead pool.
+    """
+    pools = []
+    for t in _host_cache_shard_tensors(local_context, cache_id):
+        pool = torch.empty((num_slots, *t.shape[1:]), dtype = t.dtype, pin_memory = True)
+        pools.append((t, pool))
+    local_context.setdefault("host_cache_pools", {})[pool_id] = pools
+
+
+def mp_host_cache_free(
+    local_context: dict,
+    pool_id: int
+):
+    """
+    Release this rank's pinned host pools for the given store. The stream still holding queued copies keeps
+    the tensors alive until they complete; nothing reads the pools afterwards.
+    """
+    local_context.get("host_cache_pools", {}).pop(pool_id, None)
+
+
+def mp_host_cache_store(
+    local_context: dict,
+    pool_id: int,
+    slot: int,
+    page_index: int
+):
+    """
+    Offload this rank's shard of one GPU cache page into host pool slot. Enqueued on the rank's current
+    stream, which also carries its forward passes, so stream order alone protects the page contents until
+    the copy completes (same discipline as the non-TP HostPageStore).
+    """
+    for t, pool in local_context["host_cache_pools"][pool_id]:
+        pool[slot].copy_(t[page_index], non_blocking = True)
+
+
+def mp_host_cache_restore(
+    local_context: dict,
+    pool_id: int,
+    slot: int,
+    page_index: int
+):
+    """
+    Copy this rank's shard of a stored page from host pool slot back into the given GPU page.
+    """
+    for t, pool in local_context["host_cache_pools"][pool_id]:
+        t[page_index].copy_(pool[slot], non_blocking = True)
+
+
 class PseudoParentConn:
     """
     Standin for a Pipe to dispatch functions on the main device rather than a dedicated child process running

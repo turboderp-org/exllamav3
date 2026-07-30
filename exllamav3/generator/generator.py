@@ -122,7 +122,8 @@ class Generator:
         :param cpu_cache_size:
             Size in bytes of a second-tier page cache in pinned system memory, 0 (default) to disable. Complete
             K/V pages evicted from the GPU cache are stored there and restored on prompt-cache hits instead of
-            being recomputed by prefill. Not currently supported in tensor-parallel mode
+            being recomputed by prefill. With tensor-parallel loading, each TP rank pins host memory for its
+            own cache shard; the budget covers the total across ranks
 
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
@@ -212,9 +213,6 @@ class Generator:
         # CPU page cache tier
         self.cpu_page_cache = None
         if cpu_cache_size:
-            # TODO: Add TP support for CPU cache
-            assert not model.loaded_tp, \
-                "CPU page cache tier is not currently supported in tensor-parallel mode."
             tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
             self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
             self.cpu_page_cache.attach(self.pagetable)
