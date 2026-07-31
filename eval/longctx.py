@@ -27,7 +27,9 @@ def main(args):
         draft_model = draft_model,
         draft_cache = draft_cache,
         show_visualizer = args.visualize_cache,
-        max_chunk_size = 2048
+        max_chunk_size = 2048,
+        cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
+        recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
     )
     bpw_layer, bpw_head, vram_bits = model.get_storage_info()
 

@@ -81,7 +81,7 @@ class TopPSampler(CustomSampler):
 
 class ComboSampler(CustomSampler):
     """
-    Single class with an argument for each sampling step
+    Single class with an argument for common sampling steps
     """
     def __init__(
         self,

@@ -44,7 +44,9 @@ def main(args):
         max_batch_size = 1024,
         tokenizer = tokenizer,
         max_q_size = 1,
-        show_visualizer = args.visualize_cache
+        show_visualizer = args.visualize_cache,
+        cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
+        recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
     )
 
     # Sampling

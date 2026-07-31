@@ -36,7 +36,7 @@ class InferParams:
         # ("text" for the main model; other components, e.g. an MTP head sharing this config, use
         # the draft budget), and each component gets its own worker process so late-loading
         # components never race an already-started worker
-        self.moe_cpu_offload = 0
+        self.moe_cpu_offload = int(os.environ.get("EXL3_MOE_CPU_OFFLOAD", 0))
         self.draft_moe_cpu_offload = 0
         self.moe_cpu_offload_assigned = {}
         self.moe_cpu_component = "text"

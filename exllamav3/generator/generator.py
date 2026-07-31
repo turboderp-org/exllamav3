@@ -7,6 +7,7 @@ from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
 from .pagetable import PageTable
+from .cpu_cache import CPUPageCache
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +33,7 @@ class Generator:
         num_draft_tokens: int | None = None,
         show_visualizer: bool = False,
         enable_defrag: bool = True,
+        cpu_cache_size: int = 0,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
@@ -116,6 +118,11 @@ class Generator:
 
         :param enable_defrag:
             Defragment cache periodically
+
+        :param cpu_cache_size:
+            Size in bytes of a second-tier page cache in pinned system memory, 0 (default) to disable. Complete
+            K/V pages evicted from the GPU cache are stored there and restored on prompt-cache hits instead of
+            being recomputed by prefill. Not currently supported in tensor-parallel mode
 
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
@@ -202,6 +209,17 @@ class Generator:
                 pin_memory = False
             )
 
+        # CPU page cache tier
+        self.cpu_page_cache = None
+        if cpu_cache_size:
+            # TODO: Add TP support for CPU cache
+            assert not model.loaded_tp, \
+                "CPU page cache tier is not currently supported in tensor-parallel mode."
+            tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
+            self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
+            self.cpu_page_cache.attach(self.pagetable)
+            self.pagetable.cpu_tier = self.cpu_page_cache
+
         # Visualizer
         if show_visualizer:
             self.visualizer = CacheVisualizer(self.pagetable.max_pages)
@@ -215,6 +233,7 @@ class Generator:
         self.recurrent_cache_size = recurrent_cache_size
         if self.model.caps.get("recurrent_states"):
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
+            self.recurrent_cache.pagetable = self.pagetable
             # Limit batch size if cache has recurrent states
             self.max_batch_size = min(self.max_batch_size, cache.num_slots)
         else:
@@ -258,7 +277,7 @@ class Generator:
         self.active_jobs.clear()
         self.pending_jobs.clear()
         if num_jobs and not self.num_remaining_jobs():
-            self.pagetable.defrag()
+            self.on_queue_drained()
 
 
     def enqueue(
@@ -312,7 +331,7 @@ class Generator:
             job.deallocate_pages()
             self.active_jobs.remove(job)
         if num_jobs and not self.num_remaining_jobs():
-            self.pagetable.defrag()
+            self.on_queue_drained()
 
 
     @torch.inference_mode
@@ -419,6 +438,16 @@ class Generator:
 
         # Finished iteration
         return results
+
+
+    def on_queue_drained(self):
+        """
+        Idle-transition housekeeping: drop recurrent checkpoints stranded by KV eviction, then defragment the
+        page table (both need/prefer a moment with no active block tables).
+        """
+        if self.recurrent_cache is not None:
+            self.recurrent_cache.prune_stranded()
+        self.pagetable.defrag()
 
 
     def recurrent_checkpoint(self):
@@ -1096,7 +1125,7 @@ class Generator:
 
         # Defrag. Physical page indices can only be compacted when no active block tables are using them.
         if num_jobs and not self.num_remaining_jobs():
-            self.pagetable.defrag()
+            self.on_queue_drained()
 
 
     def iterate_start_jobs(self, results: list):

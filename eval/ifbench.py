@@ -62,6 +62,8 @@ def main(args):
         max_batch_size = args.max_batch_size,
         tokenizer = tokenizer,
         show_visualizer = args.visualize_cache,
+        cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
+        recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
     )
     sampler = model_init.get_arg_sampler(args)
 

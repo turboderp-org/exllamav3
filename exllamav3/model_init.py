@@ -12,6 +12,8 @@ def add_args(
     parser: ArgumentParser,
     cache: bool = True,
     default_cache_size = 8192,
+    default_recurrent_cache_size = 4.0,
+    default_cpu_cache_size = 0.0,
     add_sampling_args: bool = False,
     default_sampling_args: dict = None,
     default_autosplit_max_batch_size: int = 1,
@@ -28,6 +30,12 @@ def add_args(
 
     :param default_cache_size:
         Default value for -cs / --cache_size argument
+
+    :param default_recurrent_cache_size:
+        Default value for -rcs / --recurrent_cache_size argument
+
+    :param default_cpu_cache_size:
+        Default value for -ccs / --cpu_cache_size argument
 
     :param add_sampling_args:
         bool, add sampling arguments
@@ -94,6 +102,8 @@ def add_args(
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
         parser.add_argument("-cca", "--cache_compand_a", type = float, help = "Compand a value for simulated cache, default: 0.0", default = 0.0)
+        parser.add_argument("-ccs", "--cpu_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_cpu_cache_size}", default = default_cpu_cache_size)
+        parser.add_argument("-rcs", "--recurrent_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_recurrent_cache_size}", default = default_recurrent_cache_size)
 
     if add_draft_model_args:
         parser.add_argument("-dm", "--draft_model_dir", type = str, help = "Path to draft model directory", default = None)

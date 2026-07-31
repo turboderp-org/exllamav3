@@ -1282,9 +1282,14 @@ class Job:
         recurrent models this also creates or restores the recurrent state corresponding to the cached prefix.
         """
 
+        # Pages matching any of the job's own prompt hashes must not be taken to serve this same allocation's
+        # cache misses (e.g. when resuming a partially evicted sequence, the misses at the front must not
+        # cannibalize the surviving pages further along the chain)
+        protected_hashes = set(self.all_unique_hashes)
+
         for seq in self.sequences:
             allocated_pages, cached_pages, non_sequential_pages, stashed_recurrent_state = \
-                seq.allocate_pages(self.pagetable, self.generator.recurrent_cache)
+                seq.allocate_pages(self.pagetable, self.generator.recurrent_cache, protected_hashes)
 
             self.recurrent_state = None
             if self.generator.recurrent_cache is not None:

@@ -163,6 +163,10 @@ These knobs are collected in `exllamav3/model/moe_cpu_host.py`'s `MoeCpuTuning` 
 from the environment at import); for a same-process sweep, mutate fields on the module-level
 `TUNING` singleton before constructing a model instead of setting env vars.
 
+### `EXL3_MOE_CPU_OFFLOAD` (default: `0`)
+
+Fallback value for when `-mcl` is not set.
+
 ### `-mclt` / `--moe_cpu_threads`, `-dmclt` / `--draft_moe_cpu_threads` (CLI, not env)
 
 Worker thread count, set per component via `config.infer_params.moe_cpu_threads` /

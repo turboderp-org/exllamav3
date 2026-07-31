@@ -10,6 +10,7 @@ from ...util.tensor import buffered_arange
 import random
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 from ...util import profile_opt
 import torch.nn.functional as F
 
@@ -100,10 +101,10 @@ class SS_Argmax(SS_Base):
                 state.sample = torch.argmax(state.probs, dim = -1)
             case SS.LOGITS_S:
                 temp = torch.argmax(state.logits, dim = -1)
-                state.sample = state.indices[temp]
+                state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
             case SS.PROBS_S | SS.PROBS_N_S:
                 temp = torch.argmax(state.probs, dim = -1)
-                state.sample = state.indices[temp]
+                state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
         state.state = SS.DONE
 
 
@@ -453,7 +454,7 @@ class SS_TopK(SS_Base):
 class SS_TopP(SS_Base):
     """
     Identify the smallest set of top tokens with a cumulative probability greater than P, mask out all
-    remainig tokens
+    remaining tokens
     """
     def __init__(self, top_p: float):
         self.top_p = top_p
@@ -518,6 +519,161 @@ class SS_MinP(SS_Base):
 
     def alt(self):
         if self.min_p == 0.0:
+            return SS_NoOp()
+        return None
+
+
+class TokenMask:
+    """
+    Boolean mask over the vocabulary selecting a fixed set of token IDs with per device and
+    vocabulary size caching.
+    """
+    def __init__(self, token_ids):
+        self.token_ids = sorted({int(t) for t in token_ids})
+        self.masks = {}
+
+    def get(self, dim: int, device: torch.device) -> torch.Tensor:
+        key = (dim, device)
+        mask = self.masks.get(key)
+        if mask is None:
+            mask = torch.zeros((dim,), dtype = torch.bool, device = device)
+            # IDs outside the vocabulary would be out of bounds for the mask
+            ids = [t for t in self.token_ids if 0 <= t < dim]
+            if ids:
+                mask[torch.tensor(ids, dtype = torch.long, device = device)] = True
+            self.masks[key] = mask
+        return mask
+
+
+class SS_BanTokens(SS_Base):
+    """
+    Mask out a fixed set of token IDs
+    """
+    def __init__(self, token_ids: list[int]):
+        self.mask = TokenMask(token_ids)
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.INIT:
+                state.logits = state.in_logits.to(torch.float, copy = True)
+                state.logits.masked_fill_(self.mask.get(state.dim, state.logits.device), -float("inf"))
+                state.state = SS.LOGITS
+            case SS.LOGITS:
+                state.logits.masked_fill_(self.mask.get(state.dim, state.logits.device), -float("inf"))
+            case SS.LOGITS_S:
+                mask = self.mask.get(state.dim, state.logits.device)
+                state.logits.masked_fill_(mask[state.indices], -float("inf"))
+            case SS.PROBS | SS.PROBS_N:
+                state.probs.masked_fill_(self.mask.get(state.dim, state.probs.device), 0.0)
+                state.state = SS.PROBS
+            case SS.PROBS_S | SS.PROBS_N_S:
+                mask = self.mask.get(state.dim, state.probs.device)
+                state.probs.masked_fill_(mask[state.indices], 0.0)
+                state.state = SS.PROBS_S
+
+    def alt(self):
+        if not self.mask.token_ids:
+            return SS_NoOp()
+        return None
+
+
+@lru_cache(10)
+def xtc_default_protected_token_ids(tokenizer: Tokenizer) -> frozenset[int]:
+    """
+    Default set of token IDs for SS_XTC to leave in place, being every piece containing a newline
+    plus every extended token. Matches ExLlamaV2Sampler.get_default_xtc_mask_tokens in exllamav2.
+    """
+    pieces = tokenizer.get_id_to_piece_list(include_special_tokens = True)
+    protected = {t for t, piece in enumerate(pieces) if "\n" in piece}
+    protected.update(tokenizer.extended_id_to_piece.keys())
+    return frozenset(protected)
+
+
+class SS_XTC(SS_Base):
+    """
+    Exclude Top Choices. Of the tokens reaching the threshold probability, all but the least likely
+    one are excluded with probability p. Protected token IDs are held out of consideration.
+
+    The step averages the two outcomes of the exclusion, weighted by p. A categorical final step
+    then samples from exactly the distribution a random exclusion would give, while SS_Argmax
+    returns a fixed token where a random exclusion would alternate between two.
+
+    Matches xtc_cpu in exllamav2. The original XTC sampler and llama.cpp draw the outcome once per
+    sampler call and truncate the distribution.
+    """
+    def __init__(
+        self,
+        probability: float,
+        threshold: float,
+        protected_token_ids: frozenset[int] | list[int] | None = None,
+        tokenizer: Tokenizer | None = None,
+    ):
+        """
+        :param probability:
+            Probability of the exclusion happening. 0.0 disables the step, 1.0 makes it always happen
+        :param threshold:
+            Minimum probability for a token to be considered for exclusion. Values above 0.5 make the step
+            a no-op, since at most one token can exceed half the total probability
+        :param protected_token_ids:
+            Token IDs removed from the candidate set before the exclusion is chosen
+        :param tokenizer:
+            Used to derive a default set of protected IDs when protected_token_ids is None. Ignored if
+            protected_token_ids is given. The default set comes from xtc_default_protected_token_ids and
+            covers every token whose piece contains a newline plus every token in Tokenizer.extended_id_to_piece
+        """
+        self.probability = probability
+        self.threshold = threshold
+        assert 0.0 <= probability <= 1.0
+        assert 0.0 <= threshold <= 1.0
+        if protected_token_ids is None and tokenizer is not None:
+            protected_token_ids = xtc_default_protected_token_ids(tokenizer)
+        self.protected = TokenMask(protected_token_ids) if protected_token_ids else None
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.PROBS_N_S:
+                pass
+            case _:
+                raise ValueError("Sampling logic error")
+
+        # The probabilities are normalized and sorted descending, so at most 1/threshold of them
+        # can reach the threshold and those are the first ones
+        k = state.dim if self.threshold <= 0.0 else min(state.dim, int(1.0 / self.threshold) + 1)
+        probs = state.probs[:, :k]
+
+        qualifies = probs >= self.threshold
+        if self.protected is not None:
+            protected = self.protected.get(state.dim, probs.device)
+            qualifies &= ~protected[state.indices[:, :k]]
+
+        # Sorted descending, so the last qualifying position in a row is its least likely one
+        counts = qualifies.sum(dim = -1, keepdim = True)
+        excluded = qualifies & (qualifies.cumsum(dim = -1) < counts)
+
+        # Averaged over the two outcomes of the roll, an excluded token is scaled by (1 - p) and
+        # every other token by (1 + p * m / (1 - m)), for excluded mass m. Multiplying only the
+        # excluded tokens, by the ratio of those two factors, is proportional to that average and
+        # leaves the result unnormalized
+        x_mass = (probs * excluded).sum(dim = -1, keepdim = True)
+        scale = (1.0 - self.probability) / (1.0 + self.probability * x_mass / (1.0 - x_mass))
+        probs *= torch.where(excluded, scale, torch.ones_like(scale))
+        state.state = SS.PROBS_S
+
+    def prep(self, in_state: SS):
+        match in_state:
+            case SS.PROBS_N:
+                return [SS_Sort]
+            case SS.INIT | SS.LOGITS | SS.PROBS:
+                return [SS_Normalize, SS_Sort]
+            case SS.LOGITS_S | SS.PROBS_S:
+                return [SS_Normalize]
+            case _:
+                return None
+
+    def alt(self):
+        # Two tokens cannot both exceed half the total probability, so above that threshold there
+        # is never more than one token to choose between
+        if self.probability == 0.0 or self.threshold > 0.5:
             return SS_NoOp()
         return None
 
@@ -733,8 +889,10 @@ class CustomSampler(Sampler):
         super().__init__()
 
         # Simplify the stack (identity steps become no-ops), then collapse an eligible tail
-        # into the fused kernel step. Leading penalty steps are kept as-is; they feed fp32
-        # logits to the fused step. Ineligible stacks fall through to the step-by-step path.
+        # into the fused kernel step. Leading penalty and ban steps are kept as-is; they feed
+        # fp32 logits to the fused step, which already accepts -inf entries from the logit mask
+        # and the padded vocabulary region. Ineligible stacks fall through to the step-by-step
+        # path.
         simplified = []
         for step in steps:
             self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
@@ -749,7 +907,7 @@ class CustomSampler(Sampler):
         fused_tail = None
         if fused_sampler_enable:
             i = 0
-            while i < len(simplified) and type(simplified[i]) in (SS_RepP, SS_PresFreqP):
+            while i < len(simplified) and type(simplified[i]) in (SS_RepP, SS_PresFreqP, SS_BanTokens):
                 i += 1
             fused_tail = _match_fused_tail(simplified[i:])
             if fused_tail is not None:
