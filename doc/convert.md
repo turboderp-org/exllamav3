@@ -82,14 +82,14 @@ python convert.py -i /mnt/models/llama3.1-70b-instruct \
                   -d 0,1,2
 ```
 
-Convert a model on the first three devices, using CUDA:2 as the primary device and distributing 3/12, 4/12 and 5/12 of the workload to CUDA:2, CUDA:0 and CUDA:1, respectively. Also keep attention etc. in higher precision with `-eb`. Final model size will be slightly larger than the 4.00 bpw requested in this example, but since this is an MoE model, the increase will be on the order of 0.05 - 0.1 bpw:
+Convert a model on the first three devices, using CUDA:2 as the primary device and distributing 3/12, 4/12 and 5/12 of the workload to CUDA:2, CUDA:0 and CUDA:1, respectively. Also keep attention etc. in higher precision with `-hq`. Final model size will be slightly larger than the 4.00 bpw requested in this example, but since this is an MoE model, the increase will be on the order of 0.05 - 0.1 bpw:
 
 ```sh
 python convert.py -i /mnt/models/qwen3.5-35b-a3b \
                   -o /mnt/models/qwen3.5-35b-a3b-4.00bpw-plus \
                   -w /mnt/temp/exl3 \
                   -b 4.00 \
-                  -eb \
+                  -hq \
                   -d 2,0,1 \
                   -dr 3,4,5
 ```
