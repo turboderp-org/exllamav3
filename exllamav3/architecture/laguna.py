@@ -196,7 +196,7 @@ class LagunaModel(Model):
                                 key_gate = "gate_proj",
                                 key_down = "down_proj",
                                 qmap = "block.mlp",
-                                interm_dtype = torch.half,
+                                interm_dtype = torch.float,
                                 out_dtype = torch.float,
                                 select_hq_bits = 2,
                             ),
