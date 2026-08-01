@@ -154,11 +154,16 @@ class CPUPageCache:
 
     def _evict_one(self, protect: set | None):
         assert self.entries, "CPU page cache has no entries to evict (logic error)"
+        # Counts entries passed over because the allocation in progress claimed them. It deliberately survives
+        # an order rebuild: it is the termination condition, not a property of the current snapshot, and
+        # resetting it there livelocks whenever the protect set outlasts the rebuild interval. A restore
+        # protects every page of the chain it is bringing back, which on a long prompt is hundreds of pages
+        # against a rebuild interval of max_slots/8, so the loop would defer, rebuild, forget it had deferred,
+        # and spin on a full cache forever.
         deferred = 0
         while True:
             if not self._order or self._order_pops >= self._order_rebuild:
                 self._build_order()
-                deferred = 0
             h = self._order.popleft()
             self._order_pops += 1
             # Entries claimed by the allocation in progress are skipped unless everything is protected
