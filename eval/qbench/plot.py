@@ -84,18 +84,35 @@ def group_marker_size(group, base):
     return base * 1.35 if group == "EXL3" else base
 
 
+GROUP_COLORS = [
+    "#f9d02d",  # 0: gold        - reserved for EXL3
+    "#3fc6f2",  # 1: sky blue    - reserved for AWQ
+    "#ab472d",  # 2: terracotta  - reserved for GGUF
+    "#1820e8",  # 3: deep blue
+    "#d98a72",  # 4: salmon
+    "#4685c7",  # 5: mid blue
+    "#c2d989",  # 6: sage
+    "#fc4f1f",  # 7: orange red
+]
+
 def make_palette(groups):
-    """Fixed hue per group name; reserved slots for common formats, remainder in stable order"""
-    cols = sns.color_palette("tab10", n_colors = 10)
-    fixed_cols = {"AWQ": 0, "EXL3": 1, "GGUF": 2}
-    unused = [i for i in range(len(cols)) if i not in fixed_cols.values()]
+    """Fixed color per group name; reserved slots for common formats, remainder
+    walks the CVD-optimized ladder in stable (sorted) order."""
+    fixed_cols = {"EXL3": 0, "AWQ": 1, "GGUF": 2}
+    unused = [i for i in range(len(GROUP_COLORS)) if i not in fixed_cols.values()]
     palette = {}
     for g in sorted(groups):
         if g in fixed_cols:
-            palette[g] = cols[fixed_cols[g]]
+            palette[g] = GROUP_COLORS[fixed_cols[g]]
     for g in sorted(groups):
         if g not in fixed_cols:
-            palette[g] = cols[unused.pop(0)]
+            if not unused:
+                raise ValueError(
+                    f"make_palette: {len(groups)} groups but only "
+                    f"{len(GROUP_COLORS)} slots; extend GROUP_COLORS "
+                    f"(re-run build_ladder.py with a larger K)"
+                )
+            palette[g] = GROUP_COLORS[unused.pop(0)]
     return palette
 
 
