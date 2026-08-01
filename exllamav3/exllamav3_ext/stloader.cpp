@@ -68,20 +68,112 @@ static void batch_fail(std::string msg)
     batch_failed.store(true, std::memory_order_release);
 }
 
-// Read a contiguous file range into buf with the platform's positioned-read primitive. Returns
-// false and sets errnum on failure.
-static bool read_range(FILE* file, size_t file_offset, size_t bytesize, uint8_t* buf, int& errnum)
+// Read a contiguous file range into buf with the platform's positioned-read primitive. Short reads
+// are legal (interrupted or networked I/O can return less than asked for) and are retried, so only
+// a hard error or a genuine end of file fails the read. Returns false on failure, setting either
+// errnum or eof; a truncated file or an out-of-range header offset lands on eof, which would
+// otherwise surface as a read error with a stale (often zero) errno.
+static bool read_range(FILE* file, size_t file_offset, size_t bytesize, uint8_t* buf, int& errnum, bool& eof)
 {
-    #ifdef __linux__
-        ssize_t br = pread(fileno(file), buf, bytesize, file_offset);
-        if (br != (ssize_t) bytesize) { errnum = errno; return false; }
-    #else
-        int sr = _fseeki64(file, static_cast<__int64>(file_offset), SEEK_SET);
-        if (sr) { errnum = errno; return false; }
-        size_t br = fread(buf, 1, bytesize, file);
-        if (br != bytesize) { errnum = errno; return false; }
-    #endif
+    errnum = 0;
+    eof = false;
+    size_t done = 0;
+
+    while (done < bytesize)
+    {
+        size_t got;
+
+        #ifdef __linux__
+            ssize_t br = pread(fileno(file), buf + done, bytesize - done, (off_t) (file_offset + done));
+            if (br < 0)
+            {
+                if (errno == EINTR) continue;
+                errnum = errno;
+                return false;
+            }
+            got = (size_t) br;
+        #else
+            if (_fseeki64(file, static_cast<__int64>(file_offset + done), SEEK_SET))
+            {
+                errnum = errno;
+                return false;
+            }
+            got = fread(buf + done, 1, bytesize - done, file);
+            if (got == 0 && ferror(file))
+            {
+                errnum = errno;
+                return false;
+            }
+        #endif
+
+        if (got == 0)
+        {
+            eof = true;
+            return false;
+        }
+
+        done += got;
+    }
+
     return true;
+}
+
+// Message for a failed read_range(), distinguishing a real I/O error from a range that runs past
+// the end of the file
+static std::string read_error(size_t file_offset, size_t bytesize, int errnum, bool eof)
+{
+    if (eof)
+        return "stloader: unexpected end of file reading " + std::to_string(bytesize) +
+               " bytes at offset " + std::to_string(file_offset) +
+               " (file is truncated, or header offsets are out of range)";
+    return std::string("stloader: error reading file: ") + std::strerror(errnum) +
+           " (errno=" + std::to_string(errnum) + ")";
+}
+
+// First error out of a set of CPU read workers, kept whole rather than reduced to an errno so the
+// offset and EOF context survive the thread that produced it
+struct ReadError
+{
+    std::mutex mtx;
+    std::atomic<bool> failed { false };
+    std::string msg;
+
+    void set(std::string m)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (msg.empty()) msg = std::move(m);
+        failed.store(true, std::memory_order_release);
+    }
+
+    bool is_failed() const { return failed.load(std::memory_order_acquire); }
+};
+
+// Jobs carry a raw destination pointer and are indexed per worker into their handle vector, so
+// both have to be sound before any worker touches them. Called with the GIL held, before the
+// engine starts, since the workers themselves must not throw.
+static void validate_jobs(std::vector<TensorLoadJob> const& jobs)
+{
+    for (size_t i = 0; i < jobs.size(); ++i)
+    {
+        const TensorLoadJob& job = jobs[i];
+        TORCH_CHECK(
+            job.handles.size() >= (size_t) STLOADER_THREADS,
+            "stloader: job ", i, " has ", job.handles.size(), " file handles, need ", STLOADER_THREADS
+        );
+        TORCH_CHECK(
+            job.bytesize <= job.dest_size,
+            "stloader: job ", i, " would write ", job.bytesize, " bytes to a destination of ",
+            job.dest_size, " bytes"
+        );
+        TORCH_CHECK(
+            job.destination || !job.bytesize,
+            "stloader: job ", i, " has null destination"
+        );
+        TORCH_CHECK(
+            !job.bf16_to_fp16 || job.bytesize % 2 == 0,
+            "stloader: job ", i, " converts bf16 but has odd length ", job.bytesize
+        );
+    }
 }
 
 // Worker loop: cycle through the thread's ring of pinned slots. Wait on the slot's event (only
@@ -138,10 +230,10 @@ static void pool_worker_main(int thread_idx)
 
             FILE* file = reinterpret_cast<FILE*>(job0.handles[thread_idx]);
             int errnum = 0;
-            if (!read_range(file, run.file_base, run.span, buf, errnum))
+            bool eof = false;
+            if (!read_range(file, run.file_base, run.span, buf, errnum, eof))
             {
-                batch_fail(std::string("stloader: error reading file: ") + std::strerror(errnum) +
-                           " (errno=" + std::to_string(errnum) + ")");
+                batch_fail(read_error(run.file_base, run.span, errnum, eof));
                 break;
             }
 
@@ -364,6 +456,12 @@ void stloader_read
     TORCH_CHECK(target.is_contiguous(), "target must be contiguous");
     TORCH_CHECK(target.nbytes() >= size, "target too small for requested read");
 
+    // Handles are indexed per worker, one open FILE* each
+    TORCH_CHECK(
+        handles.size() >= (size_t) STLOADER_THREADS,
+        "stloader: got ", handles.size(), " file handles, need ", STLOADER_THREADS
+    );
+
     // CUDA target: chunk into jobs and run through the pinned-ring engine. Runs are capped
     // below slot size here so a single medium-size tensor still spreads across the worker pool
     if (!device.is_cpu())
@@ -379,6 +477,7 @@ void stloader_read
                 offset + pos,
                 chunk,
                 reinterpret_cast<uintptr_t>(dst + pos),
+                target.nbytes() - pos,
                 false,
                 false,
                 true,
@@ -396,8 +495,7 @@ void stloader_read
     // CPU target: threaded strided reads directly into the destination buffer
     uint8_t* load_buffer = (uint8_t*) target.data_ptr();
 
-    volatile bool load_failed = false;
-    volatile int load_errnum = 0;
+    ReadError error;
 
     Py_BEGIN_ALLOW_THREADS
 
@@ -405,16 +503,16 @@ void stloader_read
     {
         FILE* file = reinterpret_cast<FILE*>(handles[thread_idx]);
 
-        while (pos_a < size && !load_failed)
+        while (pos_a < size && !error.is_failed())
         {
             size_t pos_b = pos_a + STLOADER_BLOCK_SIZE;
             if (pos_b > size) pos_b = size;
 
             int errnum = 0;
-            if (!read_range(file, offset + pos_a, pos_b - pos_a, load_buffer + pos_a, errnum))
+            bool eof = false;
+            if (!read_range(file, offset + pos_a, pos_b - pos_a, load_buffer + pos_a, errnum, eof))
             {
-                load_errnum = errnum;
-                load_failed = true;
+                error.set(read_error(offset + pos_a, pos_b - pos_a, errnum, eof));
                 return;
             }
 
@@ -430,12 +528,7 @@ void stloader_read
 
     Py_END_ALLOW_THREADS
 
-    if (load_failed)
-        TORCH_CHECK
-        (
-            false, " ## Error reading file: ", std::strerror(load_errnum),
-            " (errno=", load_errnum, ")"
-        );
+    TORCH_CHECK(!error.is_failed(), error.msg);
 }
 
 std::vector<uintptr_t> stloader_open_file(const char* filename)
@@ -477,25 +570,26 @@ void stloader_close_file(std::vector<uintptr_t> handles)
 
 void stloader_deferred_cpu(std::vector<TensorLoadJob> const& jobs)
 {
-    volatile bool load_failed = false;
-    volatile int load_errnum = 0;
+    validate_jobs(jobs);
+
+    ReadError error;
 
     Py_BEGIN_ALLOW_THREADS
 
     auto load_worker = [&] (int base_index)
     {
         size_t index = base_index;
-        while (index < jobs.size() && !load_failed)
+        while (index < jobs.size() && !error.is_failed())
         {
             TensorLoadJob const& job = jobs[index];
             FILE* file = reinterpret_cast<FILE*>(job.handles[base_index]);
             uint8_t* dest = reinterpret_cast<uint8_t*>(job.destination);
 
             int errnum = 0;
-            if (!read_range(file, job.file_offset, job.bytesize, dest, errnum))
+            bool eof = false;
+            if (!read_range(file, job.file_offset, job.bytesize, dest, errnum, eof))
             {
-                load_errnum = errnum;
-                load_failed = true;
+                error.set(read_error(job.file_offset, job.bytesize, errnum, eof));
                 return;
             }
 
@@ -514,18 +608,20 @@ void stloader_deferred_cpu(std::vector<TensorLoadJob> const& jobs)
 
     Py_END_ALLOW_THREADS
 
-    if (load_failed)
-        TORCH_CHECK
-        (
-            false, " ## Error reading file: ", std::strerror(load_errnum),
-            " (errno=", load_errnum, ")"
-        );
+    TORCH_CHECK(!error.is_failed(), error.msg);
 }
 
 // TODO: GPUDirect option
 void stloader_deferred_cuda(std::vector<TensorLoadJob> const& jobs, size_t max_chunk_size)
 {
     TORCH_CHECK(max_chunk_size <= STLOADER_SLOT_SIZE, "stloader: max_chunk_size exceeds staging slot size");
+
+    // Chunk boundaries must not split a bf16 element, since conversion runs per job over
+    // bytesize/2 elements (see the static_asserts in stloader.h)
+    TORCH_CHECK(max_chunk_size % 2 == 0, "stloader: max_chunk_size must be even");
+
+    validate_jobs(jobs);
+
     std::string err;
     Py_BEGIN_ALLOW_THREADS
     err = stloader_cuda_engine(jobs, STLOADER_SLOT_SIZE);

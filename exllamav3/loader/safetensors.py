@@ -13,25 +13,134 @@ from functools import cached_property
 import time
 
 MAX_DEFERRED_LOAD_CHUNK = 4*1024**2
+if MAX_DEFERRED_LOAD_CHUNK % 2:
+    raise ValueError("MAX_DEFERRED_LOAD_CHUNK must be even")
+
+# The safetensors format puts no limit on the header, but the reference implementation caps it at
+# 100 MB. The length is read straight off disk, so it has to be bounded before it reaches fp.read().
+MAX_HEADER_SIZE = 100 * 1024**2
+
 
 def convert_dtype(dt: str):
+    """
+    Map safetensors dtype tag to (torch dtype, numpy dtype, element size in bytes).
+
+    The numpy dtype is None for types numpy cannot represent (bf16, fp8). Nothing currently uses
+    the field, and a same-width stand-in would silently reinterpret the bits rather than convert
+    them, so it is left unset instead.
+    """
     if dt == "I32": return torch.int, np.int32, 4
     elif dt == "I16": return torch.short, np.int16, 2
     elif dt == "F16": return torch.float16, np.float16, 2
-    elif dt == "BF16": return torch.bfloat16, np.float16, 2
+    elif dt == "BF16": return torch.bfloat16, None, 2
     elif dt == "F32": return torch.float, np.float32, 4
-    elif dt == "F8_E4M3": return torch.float8_e4m3fn, np.int8, 1
+    elif dt == "F8_E4M3": return torch.float8_e4m3fn, None, 1
     elif dt == "U8": return torch.uint8, np.uint8, 1
     else:
         raise ValueError(f"Unknown dtype {dt}")
 
 
+def validate_header(header: dict, filename: str, data_offset: int, file_size: int):
+    """
+    Check every entry in a safetensors header before any of it is used to size an allocation or to
+    seek in the file. Shapes and offsets are attacker-controlled if the model is, and they end up
+    as raw pointers and lengths in the C++ loader, so nothing here is assumed to be sane.
+
+    Entries with a dtype the loader doesn't handle are structurally validated but not size-checked;
+    checkpoints routinely carry buffers in dtypes exllamav3 never reads (I64 and friends), and
+    those only need to fail if something actually asks for them.
+    """
+    metadata = header.get("__metadata__")
+    if metadata is not None and not (
+        isinstance(metadata, dict) and
+        all(isinstance(k, str) and isinstance(v, str) for k, v in metadata.items())
+    ):
+        raise ValueError(f"Invalid __metadata__ in {filename}: must be a string -> string map")
+
+    # bool is an int subclass, and a shape or offset of True would sail through arithmetic
+    def is_int(x):
+        return isinstance(x, int) and not isinstance(x, bool)
+
+    for key, h in header.items():
+        if key == "__metadata__":
+            continue
+
+        if not isinstance(h, dict):
+            raise ValueError(f"Invalid entry for {key} in {filename}: must be a JSON object")
+
+        shape = h.get("shape")
+        if not (isinstance(shape, list) and all(is_int(s) and s >= 0 for s in shape)):
+            raise ValueError(f"Invalid shape for {key} in {filename}: {shape}")
+
+        offsets = h.get("data_offsets")
+        if not (isinstance(offsets, list) and len(offsets) == 2 and all(is_int(o) for o in offsets)):
+            raise ValueError(f"Invalid data_offsets for {key} in {filename}: {offsets}")
+
+        beg, end = offsets
+        if not 0 <= beg <= end:
+            raise ValueError(f"Invalid data_offsets for {key} in {filename}: {offsets}")
+
+        if data_offset + end > file_size:
+            raise ValueError(
+                f"Tensor {key} in {filename} extends past end of file: needs "
+                f"{data_offset + end} bytes, file is {file_size} bytes"
+            )
+
+        try:
+            _, _, esize = convert_dtype(h.get("dtype"))
+        except ValueError:
+            continue
+
+        # Ties the declared byte range to the tensor that will be allocated for it. Without this a
+        # header can ask for a large read into a small tensor.
+        expected = math.prod(shape) * esize
+        if end - beg != expected:
+            raise ValueError(
+                f"Size mismatch for {key} in {filename}: data_offsets span {end - beg} bytes, "
+                f"shape {shape} of {h['dtype']} is {expected} bytes"
+            )
+
+
 def read_header(filename: str, tensor_name_fixes: dict | None) -> dict:
+    file_size = os.path.getsize(filename)
+    if file_size < 8:
+        raise ValueError(f"{filename} is too small to be a safetensors file")
+
     with open(filename, "rb") as fp:
-        header_size = np.fromfile(fp, dtype = np.int64, count = 1).item()
+        header_size = int(np.frombuffer(fp.read(8), dtype = np.int64)[0])
+
+        # header_size is a signed 64-bit value straight off disk. Negative would turn the read
+        # below into "read the whole file", and an absurd positive value into one huge allocation,
+        # so it is bounded before it is used.
+        if not 0 < header_size <= MAX_HEADER_SIZE:
+            raise ValueError(
+                f"Invalid safetensors header size in {filename}: {header_size} "
+                f"(must be 1..{MAX_HEADER_SIZE})"
+            )
+        if 8 + header_size > file_size:
+            raise ValueError(
+                f"Truncated safetensors header in {filename}: header claims {header_size} bytes, "
+                f"file is {file_size} bytes"
+            )
+
         header_json = fp.read(header_size)
-        header = json.loads(header_json.decode("utf-8"))
-        header["_header_offset"] = fp.tell()
+
+    # fp.read() can come up short without raising, which would shift the data offset below and
+    # silently misplace every tensor in the file. json.loads then pins the content length from the
+    # other side: it rejects both a truncated object and trailing bytes past the end of the JSON.
+    if len(header_json) != header_size:
+        raise ValueError(
+            f"Truncated safetensors header in {filename}: wanted {header_size} bytes, "
+            f"got {len(header_json)}"
+        )
+
+    header = json.loads(header_json.decode("utf-8"))
+    if not isinstance(header, dict):
+        raise ValueError(f"Invalid safetensors header in {filename}: not a JSON object")
+
+    data_offset = 8 + header_size
+    validate_header(header, filename, data_offset, file_size)
+
     if tensor_name_fixes:
         bad_keys = []
         for k, v in header.items():
@@ -41,6 +150,10 @@ def read_header(filename: str, tensor_name_fixes: dict | None) -> dict:
         for k, k_, v in bad_keys:
             del header[k]
             header[k_] = v
+
+    # Set last, so neither a tensor of the same name nor a rename rule ending in it can land on
+    # the key the data offset is read back from
+    header["_header_offset"] = data_offset
     return header
 
 
@@ -319,11 +432,19 @@ class SafetensorsCollection:
         bytesize = end - beg
         shape = h["shape"]
         numel = math.prod(shape)
-        assert numel * esize == bytesize, \
-            f"Incorrect size of {key} in {filename}"
+
+        # Guaranteed by validate_header(), but this is the last thing standing between the header
+        # and a raw pointer in the C++ loader, and it is not on any hot path, so it stays a real
+        # check rather than an assertion that -O would strip
+        if numel * esize != bytesize:
+            raise ValueError(
+                f"Incorrect size of {key} in {filename}: shape {shape} of {h['dtype']} is "
+                f"{numel * esize} bytes, data_offsets span {bytesize} bytes"
+            )
 
         if fidx is not None:
-            assert shape[0] > fidx, f"Batch tensor {key} has shape {shape}, index {fidx} is out of bounds"
+            if not 0 <= fidx < (shape[0] if shape else 0):
+                raise ValueError(f"Batch tensor {key} has shape {shape}, index {fidx} is out of bounds")
             shape = shape[1:]
             numel = math.prod(shape)
             beg += esize * numel * fidx
@@ -496,10 +617,19 @@ class SafetensorsCollection:
                 for w in l:
                     temp = w["temp_tensor"]
                     # Without transpose, padding or fp32->fp16 conversion, load directly
-                    dst = (temp if temp is not None else w["dest_tensor"]).data_ptr()
+                    dest = temp if temp is not None else w["dest_tensor"]
+                    dst = dest.data_ptr()
                     bytesize = w["bytesize"]
                     if bytesize == 0:
                         continue
+                    # Jobs reach C++ as a bare pointer, so the room at that pointer travels with
+                    # them; cap tracks what is left of it as the chunk loop walks dst forward
+                    cap = dest.numel() * dest.element_size()
+                    if bytesize > cap:
+                        raise ValueError(
+                            f"Load of {bytesize} bytes into a {cap}-byte tensor "
+                            f"({w['filename']} @ {w['file_offset']})"
+                        )
                     src = w["file_offset"]
                     h = handles[w["filename"]]
                     bf16 = w["bf16_to_fp16"]
@@ -507,11 +637,12 @@ class SafetensorsCollection:
                     cuda = w["cuda"]
                     dev = w["device_id"]
                     while bytesize > chunk:
-                        append(job(h, src, chunk, dst, bf16, fp32, cuda, dev))
+                        append(job(h, src, chunk, dst, cap, bf16, fp32, cuda, dev))
                         src += chunk
                         dst += chunk
+                        cap -= chunk
                         bytesize -= chunk
-                    append(job(h, src, bytesize, dst, bf16, fp32, cuda, dev))
+                    append(job(h, src, bytesize, dst, cap, bf16, fp32, cuda, dev))
                 return wl
 
             # Jobs are sorted by file offset so reads are sequential and the C++ loader can

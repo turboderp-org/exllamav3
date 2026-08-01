@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import math
+import os
 from ....ext import exllamav3_ext as ext
 from ....util.progress import ProgressBar
 from ....util.memory import free_mem, list_gpu_tensors
@@ -97,6 +98,63 @@ def get_quant_stream(device):
     return torch.cuda.Stream(device = device)
 
 
+@lru_cache
+def arch_prior_speed(device: int) -> float:
+    """Initial relative quant-throughput guess by architecture, used to seed device splits
+    before any measurements exist. From measured conversion throughput: Ampere lands at about
+    half of Ada, which is about 80% of Blackwell (Hopper assumed equal to Blackwell); anything
+    older is pessimistically assumed half of Ampere."""
+    major, minor = torch.cuda.get_device_capability(device)
+    if major >= 9: return 5.0                        # Hopper, Blackwell
+    if major == 8: return 4.0 if minor == 9 else 2.0  # Ada / Ampere
+    return 1.0
+
+
+class AutoSplit:
+    """Learned per-device speed ratios for heterogeneous multi-GPU conversion splits. Each
+    workload kind (parallel-quant threads, calibration row workers, tile fan-out slices) is
+    tracked separately, since their per-unit costs differ; within a kind, only the ratios
+    between devices matter. Speeds are EMA-damped so one noisy module (JIT warmup, thermal
+    excursions) doesn't swing the split. Until every active device has a measurement for the
+    kind, the split falls back to the per-architecture prior."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.speeds = {}   # kind -> {device: ema work/sec}
+
+    def report(self, kind: str, device: int, work: float, elapsed_s: float):
+        if work <= 0 or elapsed_s < 0.05:
+            return
+        s = work / elapsed_s
+        with self.lock:
+            d = self.speeds.setdefault(kind, {})
+            prev = d.get(device)
+            d[device] = s if prev is None else 0.7 * prev + 0.3 * s
+
+    def ratios(self, kind: str, devices: list) -> list:
+        with self.lock:
+            d = self.speeds.get(kind)
+            if d is not None and all(dev in d for dev in devices):
+                return [d[dev] for dev in devices]
+        # Incomplete measurements: architecture priors (mixing measured speeds with unit-less
+        # priors would skew the split, so it is one or the other)
+        return [arch_prior_speed(dev) for dev in devices]
+
+    def has_measured(self, kind: str, devices: list) -> bool:
+        with self.lock:
+            d = self.speeds.get(kind)
+            return d is not None and all(dev in d for dev in devices)
+
+auto_split = AutoSplit()
+
+# Pending timing events from the last measured quantize_tiles_multigpu call, and per-device
+# accumulators: single calls are ~ms-scale, so busy time is aggregated over many calls and
+# reported to the auto split once enough has been observed
+_tiles_calls = 0
+_tiles_timing = None
+_tiles_acc = {}   # device -> [tiles, seconds]
+
+
 pinned_tiles: torch.Tensor | None = None
 pinned_q_tiles: torch.Tensor | None = None
 pinned_q_idx: torch.Tensor | None = None
@@ -149,6 +207,30 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
             split_sizes[i] += split_sizes[i + 1]
             split_sizes[i + 1] = 0
 
+    # Harvest the previous measured call's per-device busy times (the events have long
+    # completed by the next call) into the accumulators, and report once every device has
+    # enough observed time for a meaningful speed. Per-device event pairs, since elapsed_time
+    # cannot cross devices; a new measured call is fenced periodically
+    global _tiles_calls, _tiles_timing
+    if _tiles_timing is not None:
+        p_devs, p_sizes, p_starts, p_ends = _tiles_timing
+        if all(e.query() for e in p_ends):
+            for dv, sz, e0, e1 in zip(p_devs, p_sizes, p_starts, p_ends):
+                acc = _tiles_acc.setdefault(dv, [0, 0.0])
+                acc[0] += sz
+                acc[1] += e0.elapsed_time(e1) / 1000
+            _tiles_timing = None
+            if all(_tiles_acc.get(dv, (0, 0.0))[1] > 0.25 for dv in devices):
+                for dv in devices:
+                    acc = _tiles_acc.pop(dv)
+                    auto_split.report("quant_tiles", dv, acc[0], acc[1])
+    _tiles_calls += 1
+    measure = (
+        _tiles_timing is None and _tiles_calls % 4 == 0 and
+        all(s > 0 for s in split_sizes) and tiles.shape[0] >= 256
+    )
+    m_starts = []
+
     pin_split_tiles = torch.split(pin_tiles, split_sizes)
     pin_split_q_tiles = torch.split(pin_q_tiles, split_sizes)
     pin_split_q_idx = torch.split(pin_q_idx, split_sizes)
@@ -162,6 +244,11 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
             # Wait for input in host memory
             if i > 0:
                 stream.wait_event(copy_input_event)
+
+            if measure:
+                e0 = torch.cuda.Event(enable_timing = True)
+                e0.record(stream)
+                m_starts.append(e0)
 
             if split_sizes[i] > 0:
 
@@ -194,9 +281,12 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
                 pin_split_q_idx[i].copy_(dev_q_idx, non_blocking = True)
 
             # Finished slice
-            evt = torch.cuda.Event(blocking = False)
+            evt = torch.cuda.Event(blocking = False, enable_timing = measure)
             slice_done_events.append(evt)
             evt.record(stream)
+
+    if measure:
+        _tiles_timing = (list(devices), list(split_sizes), m_starts, slice_done_events)
 
     # Copy pinned buffers to original device
     with torch.cuda.stream(main_stream):
@@ -295,7 +385,30 @@ def blockwise_preapply_had_r_(x: torch.Tensor, had_dim):
         x[:, start:end] = block_transformed
 
 
-def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool):
+def save_failed_cholesky(H: torch.Tensor, quant_args: dict, debug_info: dict | None):
+    """Dump a Hessian that failed to decompose, before any retry damping is added, so the
+    failure can be studied offline. H arrives sign-flipped and Hadamard-transformed with the
+    base sigma_reg damping applied; su (in the dump) and the block Hadamard are orthogonal, so
+    the captured matrix is exactly recoverable by applying the inverse transforms."""
+    debug_dir = quant_args.get("debug_dir")
+    if not debug_dir:
+        return
+    try:
+        os.makedirs(debug_dir, exist_ok = True)
+        key = (debug_info or {}).get("key") or "unknown"
+        path = os.path.join(debug_dir, f"cholesky_fail_{key}.pt")
+        torch.save({
+            "H": H.detach().cpu().clone(),
+            "sigma_reg": quant_args.get("sigma_reg", 0.025),
+            **{k: (v.detach().cpu().clone() if isinstance(v, torch.Tensor) else v)
+               for k, v in (debug_info or {}).items()},
+        }, path)
+        print(f" !! Saved failing Hessian to {path}")
+    except Exception as e:
+        print(f" !! Failed to save Hessian debug dump: {e}")
+
+
+def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool, debug_info: dict | None = None):
 
     n, _ = H.shape
     assert (n % b == 0)
@@ -318,6 +431,10 @@ def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool):
 
         except torch._C._LinAlgError as e:
             num_cholesky_retries += 1
+            if num_cholesky_retries == 1:
+                # Capture the matrix as it first failed (retry damping has never actually
+                # recovered a failing decomposition, so the initial state is the interesting one)
+                save_failed_cholesky(H, quant_args, debug_info)
             if num_cholesky_retries > 10:
                 print(" ## Cholesky decomp. failed, number of retries exceeded")
                 raise e
@@ -745,8 +862,19 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
             diag_mean = 0.0
         else:
             H /= count
-            diag_mean = torch.diag(H).mean()
-            q_fallback = diag_mean.item() < 1e-20
+            diag_mean = torch.diag(H).mean().item()
+            # A non-finite Hessian (e.g. fp16 activation overflow reaching the capture) cannot
+            # be repaired by damping, and NaN would also defeat the < comparison below and turn
+            # the whole diagonal non-finite through the regularization term
+            if not math.isfinite(diag_mean):
+                inf_nan = H_data.get("inf_nan")
+                counts = f" (captured {inf_nan[0].item():,} inf, {inf_nan[1].item():,} NaN activation values)" \
+                    if inf_nan is not None else ""
+                print(f" !! Non-finite Hessian for {H_data.get('first_key')}, using uncalibrated fallback{counts}")
+                q_fallback = True
+                diag_mean = 0.0
+            else:
+                q_fallback = diag_mean < 1e-20
 
         # Regularize diagonal
         H.diagonal().add_(quant_args.get("sigma_reg", 0.025) * diag_mean)
@@ -774,7 +902,13 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         if q_fallback:
             L = None
         else:
-            L, H = block_ldl(H, 16, quant_args, verbose)
+            L, H = block_ldl(H, 16, quant_args, verbose, debug_info = {
+                "key": H_data.get("first_key"),
+                "count": H_data.get("count"),
+                "num_total": H_data.get("num_total"),
+                "inf_nan": H_data.get("inf_nan"),
+                "su": su,
+            })
             dr = torch.arange(k)
             L[dr, dr] = 0
 

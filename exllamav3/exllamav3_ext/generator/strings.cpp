@@ -27,12 +27,15 @@ int partial_strings_match
 
     info = strings.request();
     uint32_t* strings_utf32 = static_cast<uint32_t*>(info.ptr);
+    int s_total = info.size / 4;
 
     for (int i = 0; i < num_strings; ++i)
     {
         int beg = offsets_int[i] / 4;
         int s_len = offsets_int[i + 1] / 4 - beg;
         uint32_t* s = strings_utf32 + beg;
+
+        if (s_len <= 0 || beg + s_len > s_total) continue;
 
         int a = 0;
         int b = 0;

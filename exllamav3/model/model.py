@@ -367,6 +367,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             assert not tensor_p, \
                 "Cannot use tensor_p when loading to single device."
             self._load_single(progressbar, device, self.config, self.modules, verbose)
+            self.output_device = self.modules[-1].device
 
         # Use/reserve
         else:
