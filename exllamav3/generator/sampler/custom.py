@@ -577,6 +577,63 @@ class SS_BanTokens(SS_Base):
         return None
 
 
+class LogitBias:
+    """
+    Additive per-token logit bias vector with per (vocab size, device) caching. Token IDs outside
+    the vocabulary are ignored.
+    """
+    def __init__(self, logit_bias: dict[int, float]):
+        # keep finite biases and -inf (a hard ban); drop 0, nan and any value that
+        # overflows float32 to +inf (which would poison softmax and crash sampling).
+        # The bound is checked in float32 since the bias vector is float32; -inf and
+        # large negatives fall through as bans.
+        f32_max = torch.finfo(torch.float32).max
+        self.logit_bias = {
+            int(t): float(v) for t, v in logit_bias.items()
+            if float(v) != 0.0 and float(v) == float(v) and float(v) <= f32_max
+        }
+        self.vectors = {}
+
+    def get(self, dim: int, device: torch.device) -> torch.Tensor:
+        key = (dim, device)
+        vector = self.vectors.get(key)
+        if vector is None:
+            vector = torch.zeros((dim,), dtype = torch.float, device = device)
+            items = [(t, v) for t, v in self.logit_bias.items() if 0 <= t < dim]
+            if items:
+                ids = torch.tensor([t for t, _ in items], dtype = torch.long, device = device)
+                vals = torch.tensor([v for _, v in items], dtype = torch.float, device = device)
+                vector[ids] = vals
+            self.vectors[key] = vector
+        return vector
+
+
+class SS_LogitBias(SS_Base):
+    """
+    Add a fixed per-token bias to the logits, OAI style (the logit_bias sampler parameter). Must be
+    among the first steps in the sampler chain, before the logits are transformed. A bias of
+    -inf bans a token; zero, nan and +inf biases are ignored.
+    """
+    def __init__(self, logit_bias: dict[int, float]):
+        self.bias = LogitBias(logit_bias)
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.INIT:
+                state.logits = state.in_logits.to(torch.float, copy = True)
+                state.logits += self.bias.get(state.dim, state.logits.device)
+            case SS.LOGITS:
+                state.logits += self.bias.get(state.dim, state.logits.device)
+            case _:
+                raise ValueError("Sampling logic error")
+        state.state = SS.LOGITS
+
+    def alt(self):
+        if not self.bias.logit_bias:
+            return SS_NoOp()
+        return None
+
+
 @lru_cache(10)
 def xtc_default_protected_token_ids(tokenizer: Tokenizer) -> frozenset[int]:
     """
@@ -907,7 +964,7 @@ class CustomSampler(Sampler):
         fused_tail = None
         if fused_sampler_enable:
             i = 0
-            while i < len(simplified) and type(simplified[i]) in (SS_RepP, SS_PresFreqP, SS_BanTokens):
+            while i < len(simplified) and type(simplified[i]) in (SS_RepP, SS_PresFreqP, SS_BanTokens, SS_LogitBias):
                 i += 1
             fused_tail = _match_fused_tail(simplified[i:])
             if fused_tail is not None:
