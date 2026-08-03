@@ -113,8 +113,12 @@ def measure_generate(args, model, cache, warmup = False):
 @torch.inference_mode()
 def main(args):
 
-    assert args.max_length <= args.cache_size, \
-        "max_length cannot exceed cache size"
+    if args.max_length % 256 != 0:
+        args.max_length = args.max_length // 256 * 256
+
+    if args.max_length > args.cache_size:
+        args.max_length = args.cache_size
+        print(f" !! max_length cannot exceed cache size, limiting to {args.max_length}")
 
     model, config, cache, tokenizer = model_init.init(args, max_chunk_size = args.chunk_size)
     bpw_layer, bpw_head, vram_bits = model.get_storage_info()
@@ -132,13 +136,14 @@ def main(args):
         prefill_results = measure_prefill(args, model, cache)
         print()
 
-    # Test generation
-    if not args.skip_warmup:
-        for _ in range(1):
-            measure_generate(args, model, cache, warmup = True)
-    print(f"{col_yellow}Generation{col_default}")
-    generate_results = measure_generate(args, model, cache)
-    print()
+    if not args.skip_gen:
+        # Test generation
+        if not args.skip_warmup:
+            for _ in range(1):
+                measure_generate(args, model, cache, warmup = True)
+        print(f"{col_yellow}Generation{col_default}")
+        generate_results = measure_generate(args, model, cache)
+        print()
 
 
 if __name__ == "__main__":
@@ -151,6 +156,7 @@ if __name__ == "__main__":
     parser.add_argument("-max_length", "--max_length", type = int, help = "Max context length to measure (default: 32768)", default = 32768)
     parser.add_argument("-chunk_size", "--chunk_size", type = int, help = "Max chunk size (default: 4096)", default = 4096)
     parser.add_argument("-spf", "--skip_prefill", action = "store_true", help = "Skip measuring prefill speed")
+    parser.add_argument("-sg", "--skip_gen", action = "store_true", help = "Skip measuring generaition speed")
     parser.add_argument("-swu", "--skip_warmup", action = "store_true", help = "Skip warmup passes")
     parser.add_argument("-short", "--short_prefill", action = "store_true", help = "Test short-prefill/batch throughput")
     _args = parser.parse_args()
