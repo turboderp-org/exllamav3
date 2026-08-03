@@ -1262,8 +1262,7 @@ class BlockSparseMLP(Module):
                         mine,
                         maxe,
                         0,
-                        1
-                    )
+                        1, None, None)
 
                 # Up
                 ext.exl3_mgemm(
@@ -1282,8 +1281,7 @@ class BlockSparseMLP(Module):
                     mine,
                     maxe,
                     0,
-                    1
-                )
+                    1, None, None)
 
                 # Activation (gateless: relu_mul(u, u, a) = relu2(u))
                 act_g = cfg.interm_g if self.gated else cfg.interm_u
@@ -1308,8 +1306,7 @@ class BlockSparseMLP(Module):
                     mine,
                     maxe,
                     0,
-                    1
-                )
+                    1, None, None)
 
                 t = cfg.out_d[0]
                 final_hidden_states[i:i+1] = t
@@ -1338,8 +1335,7 @@ class BlockSparseMLP(Module):
                     cfg.min_expert,
                     cfg.max_expert,
                     0,
-                    1
-                )
+                    1, None, None)
 
             # Up
             ext.exl3_mgemm(
@@ -1358,8 +1354,7 @@ class BlockSparseMLP(Module):
                 cfg.min_expert,
                 cfg.max_expert,
                 0,
-                1
-            )
+                1, None, None)
 
             # Activation (gateless: relu_mul(u, u, a) = relu2(u))
             act_g = cfg.interm_g if self.gated else cfg.interm_u
@@ -1383,8 +1378,7 @@ class BlockSparseMLP(Module):
                 cfg.min_expert,
                 cfg.max_expert,
                 0,
-                1
-            )
+                1, None, None)
 
             final_hidden_states = cfg.out_d[:1, ...].view(x.shape)
 

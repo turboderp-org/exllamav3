@@ -639,8 +639,7 @@ class SlidingAttention(Module):
                 -1,
                 -1,
                 0,
-                1
-            )
+                1, None, None)
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
@@ -672,8 +671,7 @@ class SlidingAttention(Module):
                 -1,
                 -1,
                 0,
-                1
-            )
+                1, None, None)
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
 

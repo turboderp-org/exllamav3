@@ -4,8 +4,7 @@
 #include <cstdint>
 
 // Host-memory registration, used by the tensor-parallel shared arena and by the CPU expert
-// offload segment. These are thin wrappers over cudart, called from the extension so they always
-// bind the same CUDA runtime the rest of the extension (and torch) is already using.
+// offload segment
 
 void cuda_host_register(uintptr_t ptr, size_t nbytes, unsigned int flags);
 void cuda_host_unregister(uintptr_t ptr);
