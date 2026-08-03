@@ -835,7 +835,8 @@ class DSV4Attention(Module):
                 params,
                 rsg[i],
                 rsg[i].cache.get_recurrent_layer(layer_instance),
-                out_dtype)
+                out_dtype,
+                copy_static = bsz > 1)
             for i in range(bsz)
         ]
         return torch.cat(outs, dim = 0) if bsz > 1 else outs[0]
@@ -847,7 +848,8 @@ class DSV4Attention(Module):
         params,
         rs,
         rsl,
-        out_dtype
+        out_dtype,
+        copy_static = False
     ):
         _, seq, _ = x.shape
 
@@ -863,7 +865,9 @@ class DSV4Attention(Module):
             if bcd:
                 y = bcd.run(x, rs, rsl)
                 if y is not None:
-                    return y
+                    # y is a shared static, overwritten by the next slot's replay; batch
+                    # rows are assembled only after all slots have run
+                    return y.clone() if copy_static else y
         device = x.device
         pos0 = rs.position
         slot = rs.slot
