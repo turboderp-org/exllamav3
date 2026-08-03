@@ -33,7 +33,7 @@ does.
 
 - **-d / --devices *list***: Comma-separated list of GPU device IDs to use during quantization. By default only the first visible device (device 0) is used. Adding more devices can speed up quantization if there is sufficient PCIe bandwidth between them. This does not affect memory usage on the first GPU, and very little memory is used on the others, since only the most compute intensive operation (trellis encoding) is distributed.
 
-- **-dr / --device_ratios *list***: Ratio as comma-separated list. Determines how the encoding workload is distributed when using multiple devices. This is useful if using GPUs with dissimilar compute performance, to prevent slower GPUs from becoming bottlenecks. Ratios are relative, i.e. `1,1,3` is the same ratio as `3,3,9`.
+- **-dr / --device_ratios *list***: Ratio as comma-separated list. Determines how the encoding workload is distributed when using multiple devices. This is useful if using GPUs with dissimilar compute performance, to prevent slower GPUs from becoming bottlenecks. Ratios are relative, i.e. `1,1,3` is the same ratio as `3,3,9`. Recommendation is to omit this argument; by default, ratios are autotuned to maximize usage across GPUs.
 
 - **-pm / --parallel_mode**: Fully parallelize quantization across multiple GPUs when possible. By default, multi-GPU quantization works by splitting the trellis encoding workload across multiple devices. For models with many small tensors (especially MoE models) this is inefficient since the resulting tile slices end up being too small for efficient batched encoding. This mode prefers distributing one linear layer to each GPU at a time, allowing larger encoding batches and more overall throughput. This mode is still somewhat experimental but will likely become the default soon.     
 
@@ -82,7 +82,7 @@ python convert.py -i /mnt/models/llama3.1-70b-instruct \
                   -d 0,1,2
 ```
 
-Convert a model on the first three devices, using CUDA:2 as the primary device and distributing 3/12, 4/12 and 5/12 of the workload to CUDA:2, CUDA:0 and CUDA:1, respectively. Also keep attention etc. in higher precision with `-eb`. Final model size will be slightly larger than the 4.00 bpw requested in this example, but since this is an MoE model, the increase will be on the order of 0.05 - 0.1 bpw:
+Convert a model on the first three devices, using CUDA:2 as the primary device. Also keep attention etc. in higher precision with `-eb`. Final model size will be slightly larger than the 4.00 bpw requested in this example, but since this is an MoE model, the increase will be on the order of 0.05 - 0.1 bpw:
 
 ```sh
 python convert.py -i /mnt/models/qwen3.5-35b-a3b \
@@ -90,8 +90,5 @@ python convert.py -i /mnt/models/qwen3.5-35b-a3b \
                   -w /mnt/temp/exl3 \
                   -b 4.00 \
                   -eb \
-                  -d 2,0,1 \
-                  -dr 3,4,5
+                  -d 2,0,1
 ```
- 
-For dialing in the optimal ratio, monitor GPU usage while quantizing. Usage should periodically jump to 100% for at least one device, and ideally you want the other devices close to that as well, while they are active. Increasing the relative split for a device should increase the relative usage as well.
