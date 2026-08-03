@@ -7,10 +7,6 @@
 #include "util.cuh"
 #include "reduction.cuh"
 
-#define ROPESTYLE_NONE 0
-#define ROPESTYLE_GPTJ 1
-#define ROPESTYLE_NEOX 2
-#define ROPESTYLE_NANOCHAT 3
 #define MAX_NUM_THREADS 1024
 #define MAX_ROTATE_DIMS 4
 
@@ -31,6 +27,8 @@ void rope_kernel
     const int num_heads_q,
     const int num_heads_k,
     const int head_dim,
+    const int q_head_stride,
+    const int k_head_stride,
     const int partial_head_dim,
     const int position,
     const uint32_t* __restrict__ positions,
@@ -46,7 +44,8 @@ void rope_kernel
     const int llama_4_scaling_original,
     bool post_rope_norm,
     int position_ids_stride,
-    int rotate_dims
+    int rotate_dims,
+    int rotate_offset
 )
 {
     int batch = blockIdx.y;
@@ -113,21 +112,26 @@ void rope_kernel
     int head_dim_pad = (head_dim + 63) / 64 * 64;
 
     // Loop over heads
-    for (int head_idx = threadIdx.y; head_idx < num_heads_q + num_heads_k; head_idx += blockDim.y)
+    // Heads are distributed over gridDim.z as well as blockDim.y: at decode (seq 1, bsz 1)
+    // the per-token grid is otherwise a single block walking every head serially between
+    // block-wide barriers
+    for (int head_idx = blockIdx.z * blockDim.y + threadIdx.y;
+         head_idx < num_heads_q + num_heads_k;
+         head_idx += gridDim.z * blockDim.y)
     {
         const half* g_head_in_ptr;
         half* g_head_out_ptr;
         const void* norm_weight;
         if (head_idx < num_heads_q)
         {
-            g_head_in_ptr = q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * head_dim;
-            g_head_out_ptr = out_q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * head_dim;
+            g_head_in_ptr = q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * q_head_stride;
+            g_head_out_ptr = out_q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * q_head_stride;
             norm_weight = q_norm;
         }
         else if (head_idx < num_heads_q + num_heads_k)
         {
-            g_head_in_ptr = k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * head_dim;
-            g_head_out_ptr = out_k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * head_dim;
+            g_head_in_ptr = k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * k_head_stride;
+            g_head_out_ptr = out_k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * k_head_stride;
             norm_weight = k_norm;
         }
 
@@ -153,7 +157,7 @@ void rope_kernel
         {
             for (int rdim = 0; rdim < rotate_dims; ++rdim)
             {
-                int offset = partial_head_dim * rdim;
+                int offset = rotate_offset + partial_head_dim * rdim;
                 if (t < partial_head_dim / 2)
                 {
                     float sin = sin_cache[rdim];
@@ -322,6 +326,7 @@ void rope_gr
     int llama_4_scaling_original,
     bool post_rope_norm,
     int rotate_dims,
+    int rotate_offset,
     Graph* graph
 )
 {
@@ -331,12 +336,18 @@ void rope_gr
     int bsz = q.size(0);
     int seq_len = q.size(1);
     int num_heads_q = q.size(2);
+    int q_head_stride = q.stride(2);
+    int k_head_stride = k.has_value() ? (int) k.value().stride(2) : 0;
+    TORCH_CHECK(q.stride(3) == 1, "rope: q innermost dim must be dense");
+    TORCH_CHECK(out_q.strides() == q.strides(), "rope: out_q must share q's layout");
     int num_heads_k = 0;
     int head_dim = q.size(3);
     int partial_head_dim = inv_freq.size(-1) * 2;
     int inv_freq_stride = 0;
     TORCH_CHECK(rotate_dims > 0 && rotate_dims <= MAX_ROTATE_DIMS, "rotate_dims out of range");
     TORCH_CHECK(rotate_dims == 1 || head_dim == partial_head_dim * rotate_dims, "rotate_dims is inconsistent with inv_freq and head_dim");
+    TORCH_CHECK(rotate_offset >= 0 && rotate_offset + partial_head_dim * rotate_dims <= head_dim,
+                "rotate_offset out of range");
 
     const half* q_ptr = (half*) q.data_ptr();
     half* out_q_ptr = (half*) out_q.data_ptr();
@@ -403,23 +414,27 @@ void rope_gr
             TORCH_CHECK(k_norm.value().dtype() == q_norm.value().dtype(), "q_norm and k_norm must be same dtype");
     }
 
-    dim3 blocks(seq_len, bsz);
     int warps = CEIL_DIVIDE(head_dim / 2, 32);
     int thr = warps * 32;
     int parallel_heads = MIN((MAX_NUM_THREADS / thr), num_heads_q + num_heads_k);
+    // Enough z-blocks that each covers one head-group iteration; scale down when the
+    // token-level grid already fills the device
+    int head_groups = CEIL_DIVIDE(num_heads_q + num_heads_k, parallel_heads);
+    if (seq_len * bsz >= 32) head_groups = 1;
+    dim3 blocks(seq_len, bsz, head_groups);
     dim3 threads(thr, parallel_heads);
 
     #define ARGS q_ptr, out_q_ptr, k_ptr, out_k_ptr, inv_freq_ptr, bsz, \
-                 seq_len, num_heads_q, num_heads_k, head_dim, partial_head_dim, position, positions_ptr, \
+                 seq_len, num_heads_q, num_heads_k, head_dim, q_head_stride, k_head_stride, partial_head_dim, position, positions_ptr, \
                  position_ids_ptr, attn_factor, q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table, \
-                 inv_freq_stride, llama_4_scaling_beta, llama_4_scaling_original, post_rope_norm, position_ids_stride, rotate_dims
+                 inv_freq_stride, llama_4_scaling_beta, llama_4_scaling_original, post_rope_norm, position_ids_stride, rotate_dims, rotate_offset
 
-    // Pointer form of ARGS for cudaLaunchKernel; positions_ptr sits at index 12 (the
+    // Pointer form of ARGS for cudaLaunchKernel; positions_ptr sits at index 14 (the
     // GP_rope_positions record site)
     #define ARGPTRS &q_ptr, &out_q_ptr, &k_ptr, &out_k_ptr, &inv_freq_ptr, &bsz, \
-                 &seq_len, &num_heads_q, &num_heads_k, &head_dim, &partial_head_dim, &position, &positions_ptr, \
+                 &seq_len, &num_heads_q, &num_heads_k, &head_dim, &q_head_stride, &k_head_stride, &partial_head_dim, &position, &positions_ptr, \
                  &position_ids_ptr, &attn_factor, &q_norm_ptr, &k_norm_ptr, &norm_eps, &norm_constant_bias, &inv_freq_table, \
-                 &inv_freq_stride, &llama_4_scaling_beta, &llama_4_scaling_original, &post_rope_norm, &position_ids_stride, &rotate_dims
+                 &inv_freq_stride, &llama_4_scaling_beta, &llama_4_scaling_original, &post_rope_norm, &position_ids_stride, &rotate_dims, &rotate_offset
 
     void* kernel_ptr = nullptr;
     if (norm_fp16)
@@ -444,10 +459,10 @@ void rope_gr
         // All position sources are patchable: the kernel branches on the pointers' null-ness at
         // runtime, so one captured graph serves scalar/positions/position_ids modes alike
         graph->record_param(kernel_ptr, GP_rope_inv_freq, 4);
-        graph->record_param(kernel_ptr, GP_rope_position, 11, 4);
-        graph->record_param(kernel_ptr, GP_rope_positions, 12);
-        graph->record_param(kernel_ptr, GP_rope_position_ids, 13);
-        graph->record_param(kernel_ptr, GP_rope_pid_stride, 24, 4);
+        graph->record_param(kernel_ptr, GP_rope_position, 13, 4);
+        graph->record_param(kernel_ptr, GP_rope_positions, 14);
+        graph->record_param(kernel_ptr, GP_rope_position_ids, 15);
+        graph->record_param(kernel_ptr, GP_rope_pid_stride, 26, 4);
         graph->record_param(kernel_ptr, GP_end, 0);
     }
 
@@ -476,12 +491,13 @@ void rope
     float llama_4_scaling_beta,
     int llama_4_scaling_original,
     bool post_rope_norm,
-    int rotate_dims
+    int rotate_dims,
+    int rotate_offset
 )
 {
     rope_gr(q, out_q, k, out_k, inv_freq, position, positions, position_ids, rope_mode,
             attn_factor, q_norm, k_norm, norm_eps, norm_constant_bias, llama_4_scaling_beta,
-            llama_4_scaling_original, post_rope_norm, rotate_dims, nullptr);
+            llama_4_scaling_original, post_rope_norm, rotate_dims, rotate_offset, nullptr);
 }
 
 

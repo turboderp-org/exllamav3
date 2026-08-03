@@ -481,7 +481,8 @@ class RoPE:
             self.llama_4_scaling_beta,
             self.llama_4_scaling_original,
             post_rope_norm,
-            self.rope_settings.rotate_dims
+            self.rope_settings.rotate_dims,
+            0,
         )
             
         if squeeze:

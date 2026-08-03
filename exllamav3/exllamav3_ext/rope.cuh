@@ -3,6 +3,11 @@
 #include <ATen/Tensor.h>
 #include "graph.cuh"
 
+#define ROPESTYLE_NONE 0
+#define ROPESTYLE_GPTJ 1
+#define ROPESTYLE_NEOX 2
+#define ROPESTYLE_NANOCHAT 3
+
 void rope_gr
 (
     const at::Tensor& q,
@@ -23,6 +28,7 @@ void rope_gr
     int llama_4_scaling_original,
     bool post_rope_norm,
     int rotate_dims,
+    int rotate_offset,
     Graph* graph
 );
 
@@ -45,7 +51,8 @@ void rope
     float llama_4_scaling_beta,
     int llama_4_scaling_original,
     bool post_rope_norm,
-    int rotate_dims
+    int rotate_dims,
+    int rotate_offset
 );
 
 int64_t gen_mrope_pos_ids

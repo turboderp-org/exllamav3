@@ -386,7 +386,7 @@ void BC_Attention::run_gr
         const at::Tensor& ivf = inv_freq_override ? inv_freq_override.value() : inv_freq.value();
         rope_gr(s.q4, s.q4, s.k4, out_k4, ivf, (uint32_t) position, positions, position_ids, rope_style,
                 attn_factor, q_norm, k_norm, norm_eps, norm_constant_bias, l4_scaling_beta,
-                l4_scaling_original, post_rope_norm, rotate_dims, graph);
+                l4_scaling_original, post_rope_norm, rotate_dims, 0, graph);
     }
 
     // Cache append (before attention: the split kernel counts the new tokens as part of the
