@@ -184,7 +184,8 @@ def inspect_state(args, state):
     print(f"{col_blue}Hidden states{col_default}")
     print("─────────────")
     stats(args, state)
-    histogram(args, state)
+    if not args.no_histogram:
+        histogram(args, state)
 
 
 def inspect_module(args, module):
@@ -282,6 +283,9 @@ def main(args):
         eval_ids = prepend_hf_chat_context(tokenizer, eval_ids)
     state = eval_ids
 
+    params = {}
+    state = model.prepare_inputs(state, params)
+
     # Streaming forward pass
     for idx, module in enumerate(model.modules):
 
@@ -301,7 +305,6 @@ def main(args):
         # Forward pass
         print(f" -- Forward pass")
         print()
-        params = {}
         state = module.prepare_for_device(state, params)
         state = module.forward(state, params)
         if (args.from_layer is None or idx >= args.from_layer) and (args.to_layer is None or idx < args.to_layer):
@@ -346,6 +349,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type = int, help = "CUDA device index", default = 0)
     parser.add_argument("-r", "--rows", type = int, help = "Number of rows", default = 10)
     parser.add_argument("-hb", "--histogram_bins", type = int, help = "Histogram bins", default = 160)
+    parser.add_argument("-nh", "--no_histogram", action = "store_true", help = "Disable histogram")
     parser.add_argument("-bos", "--bos", action = "store_true", help = "Add BOS token on each row")
     parser.add_argument("-skip", "--skip_tokens", type = int, help = "Skip tokens at start of context", default = 0)
     parser.add_argument("-fl", "--from_layer", type = int, help = "From layer", default = None)
