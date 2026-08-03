@@ -83,7 +83,8 @@ class Exl3Backend:
 
                 logits_layer = idx == len(modules) - 1
                 for r in range(len(states)):
-                    params = {}
+                    # Hash-MoE layers (DeepSeek-V4) route by token id; provide the row's ids
+                    params = {"input_ids": ids[r:r + 1]}
                     x = module.prepare_for_device(states[r], params)
                     x = module.forward(x, params)
                     if noise_eps and idx < len(modules) - 2 and x.is_floating_point():
@@ -275,6 +276,13 @@ class TransformersBackend:
                         mod_name = mod_name.replace(src, tgt)
                 if mod_name != ck_name:
                     self.tensor_index[mod_name] = (fn, ck_name)
+                # Some conversion mappings (deepseek_v4) declare targets in the bare
+                # base-model namespace and rely on the loader to add base_model_prefix;
+                # alias the prefixed form so module-side lookups resolve. setdefault: real
+                # top-level names (lm_head) must not be shadowed
+                base_prefix = getattr(self.model, "base_model_prefix", "")
+                if base_prefix:
+                    self.tensor_index.setdefault(f"{base_prefix}.{mod_name}", (fn, ck_name))
 
             # Generic fallback for composite checkpoints whose model doesn't declare the
             # container strip in its conversion mapping: alias the text stack into the CausalLM
@@ -296,7 +304,10 @@ class TransformersBackend:
             for bn, _ in self.model.named_buffers():
                 if bn in self.tensor_index:
                     t = self._read_shard(bn)
-                    t = t.to(device, dtype) if t.is_floating_point() else t.to(device)
+                    if t.is_floating_point() and t.dtype != torch.float32:
+                        t = t.to(device, dtype)
+                    else:
+                        t = t.to(device)
                     owner_name, _, leaf = bn.rpartition(".")
                     owner = self.model.get_submodule(owner_name) if owner_name else self.model
                     owner._buffers[leaf] = t
@@ -421,17 +432,36 @@ class TransformersBackend:
     # fp4 e2m1 magnitudes for codes 0-7; codes 8-15 mirror negative (sign is the msb)
     NVFP4_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 
+    def _scale_float(self, s):
+        """Scale sidecar to fp32. E8M0 exponent bytes (DeepSeek-V4 ue8m0, stored as uint8 or
+        torch.float8_e8m0fnu) decode as 2^(byte - 127); everything else casts directly."""
+        e8m0 = getattr(torch, "float8_e8m0fnu", None)
+        if s.dtype == torch.uint8 or (e8m0 is not None and s.dtype == e8m0):
+            return (s.view(torch.uint8).float() - 127.0).exp2()
+        return s.float()
+
     def _dequant_scaled(self, name):
         """Dequantize a weight stored under its plain name with a weight_scale sidecar:
         ModelOpt NVFP4 (uint8-packed e2m1 nibble pairs low-first, fp8-e4m3 scale per group,
         fp32 global scale) when weight_scale_2 exists, else FP8 (e4m3 values; per-tensor
         scalar for ModelOpt, [out, 1] channel scale for compressed-tensors float-quantized).
         FP8 with blockwise weight_scale_inv (DeepSeek-style 128x128 blocks; despite the name,
-        dequantization MULTIPLIES by it) is handled first. All conventions validated against
-        the bf16 originals."""
+        dequantization MULTIPLIES by it) is handled first, as is the equivalent DeepSeek-V4
+        "<stem>.scale" sidecar convention (fp8 128x128 grid on dense weights, [out, in/32]
+        e8m0 grid on int8-packed fp4 expert weights; block shape derives from the grid).
+        All conventions validated against the bf16 originals."""
         w = self._read_shard(name)
+        if w.dtype == torch.int8:
+            # DeepSeek-V4 fp4 experts: two e2m1 values per byte, low nibble first
+            u8 = w.view(torch.uint8)
+            lut = self.NVFP4_LUT.to(w.device)
+            w = torch.stack([lut[(u8 & 0x0F).long()], lut[(u8 >> 4).long()]], dim = -1).flatten(1)
+        si = None
         if f"{name}_scale_inv" in self.tensor_index:
-            si = self._read_shard(f"{name}_scale_inv").float()
+            si = self._scale_float(self._read_shard(f"{name}_scale_inv"))
+        elif name.endswith(".weight") and f"{name[:-len('.weight')]}.scale" in self.tensor_index:
+            si = self._scale_float(self._read_shard(f"{name[:-len('.weight')]}.scale"))
+        if si is not None:
             bs0 = (w.shape[0] + si.shape[0] - 1) // si.shape[0]
             bs1 = (w.shape[1] + si.shape[1] - 1) // si.shape[1]
             ex = si.repeat_interleave(bs0, dim = 0)[:w.shape[0], :] \
@@ -467,7 +497,7 @@ class TransformersBackend:
             if name.endswith(".weight"):
                 # ModelOpt-style scale sidecars stored next to the weight itself
                 stem = name[:-len(".weight")]
-                for s in ("weight_scale", "weight_scale_2", "weight_scale_inv", "input_scale", "input_global_scale"):
+                for s in ("weight_scale", "weight_scale_2", "weight_scale_inv", "input_scale", "input_global_scale", "scale"):
                     if f"{stem}.{s}" in self.tensor_index:
                         total += 8 * self._nbytes(f"{stem}.{s}")
             return total
@@ -500,7 +530,8 @@ class TransformersBackend:
             # ModelOpt, ct-float-quantized and fp8 keep the quantized tensor under the plain
             # .weight name; the scale sidecar marks it as needing dequant
             if self.dequant_scaled and name.endswith(".weight") and (
-                    f"{name}_scale" in self.tensor_index or f"{name}_scale_inv" in self.tensor_index):
+                    f"{name}_scale" in self.tensor_index or f"{name}_scale_inv" in self.tensor_index
+                    or f"{name[:-len('.weight')]}.scale" in self.tensor_index):
                 return self._dequant_scaled(name)
             return self._read_shard(name)
         if name == self.head_weight_name and self.embed_weight_name in self.tensor_index:
@@ -562,12 +593,30 @@ class TransformersBackend:
 
         raise KeyError(f"{name} not found in checkpoint shards")
 
+    def _plain_fp32(self, name):
+        """True for tensors stored fp32 and read verbatim (no dequant): these are exactly the
+        ones from_pretrained's _keep_in_fp32_modules lists keep in fp32 (hc mixers, sinks,
+        position biases, norms), so the streamed skeleton must too or mHC/routing amplify the
+        bf16 rounding into a visible reference deviation."""
+        if name not in self.tensor_index:
+            return False
+        if f"{name}_scale" in self.tensor_index or f"{name}_scale_inv" in self.tensor_index:
+            return False
+        if name.endswith(".weight") and f"{name[:-len('.weight')]}.scale" in self.tensor_index:
+            return False
+        return True
+
     def _materialize(self, module):
         prefix = self.prefix[id(module)]
         sd = {}
         for pn, _ in module.named_parameters():
             full = f"{prefix}.{pn}" if prefix else pn
-            sd[pn] = self._get_tensor(full).to(self.device, self.dtype)
+            t = self._get_tensor(full)
+            if t.is_floating_point() and not (t.dtype == torch.float32 and self._plain_fp32(full)):
+                t = t.to(self.device, self.dtype)
+            else:
+                t = t.to(self.device)
+            sd[pn] = t
         module.load_state_dict(sd, strict = False, assign = True)
         for pn, p in module.named_parameters():
             if p.is_meta:
