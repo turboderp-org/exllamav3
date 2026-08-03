@@ -220,25 +220,12 @@ def _sqrtsp_scores(cfg, y):
 
 def routing_sqrtsp(bsz, cfg, y, params):
     """DeepSeek-V4 router: sqrt(softplus(logits)) affinity, noaux_tc bias for selection only,
-    weights normalized over the selected set, times routed_scaling_factor. bsz 1 uses the
-    nogroup top-k kernel with the sqrtsp activation; larger batches are torch-composed."""
-    if bsz == 1 and not params.get("activate_all_experts"):
-        if cfg.gate_tensor_t is None:
-            cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
-        ext.routing_ds3_nogroup(
-            y,
-            cfg.gate_tensor,
-            cfg.router_logits_bsz1,
-            cfg.e_score_correction_bias,
-            cfg.selected_experts_bsz1,
-            cfg.routing_weights_bsz1,
-            cfg.routed_scaling_factor,
-            cfg.gate_tensor_t,
-            ROUTING_ACT_SQRTSP,
-        )
-        return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
-    scores = _sqrtsp_scores(cfg, y)
+    weights normalized over the selected set, times routed_scaling_factor. The nogroup top-k
+    kernel serves every batch size (one block per row); bsz 1 reuses the cached output
+    buffers, larger batches allocate per call. activate_all_experts (conversion) stays
+    torch-composed."""
     if params.get("activate_all_experts"):
+        scores = _sqrtsp_scores(cfg, y)
         routing_weights = scores / (scores.sum(dim = -1, keepdim = True) + 1e-20)
         routing_weights = (routing_weights * cfg.routed_scaling_factor).half()
         selected_experts = (
@@ -246,12 +233,28 @@ def routing_sqrtsp(bsz, cfg, y, params):
             .repeat((bsz, 1))
         )
         return selected_experts, routing_weights
-    biased = scores + cfg.e_score_correction_bias.float().unsqueeze(0) \
-        if cfg.e_score_correction_bias is not None else scores
-    selected_experts = torch.topk(biased, cfg.num_experts_per_tok, dim = -1, sorted = False).indices
-    routing_weights = scores.gather(1, selected_experts)
-    routing_weights = routing_weights / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
-    return selected_experts, (routing_weights * cfg.routed_scaling_factor).half()
+    if cfg.gate_tensor_t is None:
+        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+    if bsz == 1:
+        router_logits = cfg.router_logits_bsz1
+        selected_experts = cfg.selected_experts_bsz1
+        routing_weights = cfg.routing_weights_bsz1
+    else:
+        router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
+        selected_experts = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.long, device = y.device)
+        routing_weights = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device)
+    ext.routing_ds3_nogroup(
+        y,
+        cfg.gate_tensor,
+        router_logits,
+        cfg.e_score_correction_bias,
+        selected_experts,
+        routing_weights,
+        cfg.routed_scaling_factor,
+        cfg.gate_tensor_t,
+        ROUTING_ACT_SQRTSP,
+    )
+    return selected_experts, routing_weights
 
 
 def routing_sqrtsp_hash(bsz, cfg, y, params):
@@ -267,24 +270,25 @@ def routing_sqrtsp_hash(bsz, cfg, y, params):
     assert input_ids.shape[0] == bsz, \
         f"hash routing: {bsz} hidden rows but {input_ids.shape[0]} input ids"
     selected_experts = cfg.tid2eid[input_ids].to(y.device).long()
+    if cfg.gate_tensor_t is None:
+        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
     if bsz == 1:
-        if cfg.gate_tensor_t is None:
-            cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
-        ext.routing_sel_norm(
-            y,
-            cfg.gate_tensor,
-            cfg.router_logits_bsz1,
-            selected_experts,
-            cfg.routing_weights_bsz1,
-            cfg.routed_scaling_factor,
-            cfg.gate_tensor_t,
-            ROUTING_ACT_SQRTSP,
-        )
-        return selected_experts, cfg.routing_weights_bsz1
-    scores = _sqrtsp_scores(cfg, y)
-    routing_weights = scores.gather(1, selected_experts)
-    routing_weights = routing_weights / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
-    return selected_experts, (routing_weights * cfg.routed_scaling_factor).half()
+        routing_weights = cfg.routing_weights_bsz1
+        router_logits = cfg.router_logits_bsz1
+    else:
+        router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
+        routing_weights = torch.empty(selected_experts.shape, dtype = torch.half, device = y.device)
+    ext.routing_sel_norm(
+        y,
+        cfg.gate_tensor,
+        router_logits,
+        selected_experts,
+        routing_weights,
+        cfg.routed_scaling_factor,
+        cfg.gate_tensor_t,
+        ROUTING_ACT_SQRTSP,
+    )
+    return selected_experts, routing_weights
 
 
 @dataclass
