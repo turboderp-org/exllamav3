@@ -670,6 +670,9 @@ class BlockSparseMLP(Module):
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}", self.device, optional = True, allow_bf16 = True)
+        if self.tid2eid_key:
+            self.tid2eid = self.config.stc.get_tensor(
+                f"{self.key}.{self.tid2eid_key}", self.device, no_defer = True)
         self.load_routing(**kwargs)
 
         from ..model.moe_cpu_host import MoeCpuHost
