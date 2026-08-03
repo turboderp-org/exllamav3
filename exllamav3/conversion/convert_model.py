@@ -259,13 +259,15 @@ def prepare_state(args, job_state, config, model, tokenizer):
     if idx == 0:
         print(f" -- Preparing input state")
         state = get_default_calibration(args, tokenizer)
+        original_input_ids = None
     else:
         if idx < len(model.modules):
             print(f" -- Resuming at: {model.modules[idx].key}")
         else:
             print(f" -- Resuming after: {model.modules[idx - 1].key}")
         state = load_tensor("ckpt/state.safetensors", args)
-    return state
+        original_input_ids = load_tensor("ckpt/original_input_ids.safetensors", args)
+    return state, original_input_ids
 
 
 def get_state_error(x, ref):
@@ -925,12 +927,13 @@ def main(args, job_state):
 
     # Get initial state or resume state
     if use_reference_state:
-        state = prepare_state(args, job_state, config, model, tokenizer)
-        original_input_ids = (
-            state.copy()
-            if job_state["next_module_idx"] == 0 else
-            [{} for _ in range(len(state))]
-        )
+        state, original_input_ids = prepare_state(args, job_state, config, model, tokenizer)
+        if original_input_ids is None:
+            original_input_ids = (
+                state.copy()
+                if job_state["next_module_idx"] == 0 else
+                [{} for _ in range(len(state))]
+            )
         quant_preserves = [{} for _ in range(len(state))]
         # Rows whose hidden state (or unquantized reference) has gone non-finite are excluded
         # from all further capture, state advancement and error measurement. Persisted through
@@ -1245,6 +1248,7 @@ def main(args, job_state):
             job_state["bad_rows"] = sorted(bad_rows)
             save_dict("ckpt_new/job.json", job_state, args)
             save_tensor(state, "ckpt_new/state.safetensors", args)
+            save_tensor(original_input_ids, "ckpt_new/original_input_ids.safetensors", args)
             if os.path.exists(ckpt_dir_old):
                 shutil.rmtree(ckpt_dir_old)
             os.rename(ckpt_dir, ckpt_dir_old)
