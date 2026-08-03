@@ -30,6 +30,9 @@ def convert_dtype(dt: str):
     them, so it is left unset instead.
     """
     if dt == "I32": return torch.int, np.int32, 4
+    elif dt == "I64": return torch.long, np.int64, 8
+    elif dt == "I8": return torch.int8, np.int8, 1
+    elif dt == "F8_E8M0": return torch.uint8, None, 1
     elif dt == "I16": return torch.short, np.int16, 2
     elif dt == "F16": return torch.float16, np.float16, 2
     elif dt == "BF16": return torch.bfloat16, None, 2
