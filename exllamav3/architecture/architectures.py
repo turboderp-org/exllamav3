@@ -5,6 +5,7 @@ from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
 from .deepseek_v3 import DeepseekV3Model
+from .deepseek_v4 import DeepseekV4Model
 from .dflash import DFlashModel
 from .dflash_laguna import DFlashLagunaModel
 from .dots1 import Dots1Model
@@ -64,6 +65,7 @@ ARCHITECTURES = {
         Cohere2Model,
         DeciLMModel,
         DeepseekV3Model,
+        DeepseekV4Model,
         DFlashModel,
         DFlashLagunaModel,
         Dots1Model,
