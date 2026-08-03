@@ -85,6 +85,13 @@ enum GraphedParams
     GP_copy2d_src,
     GP_copy2d_dst,
 
+    GP_dsa_qpos,
+    GP_dsa_win_floor,
+    GP_dsa_ring_beg,
+    GP_dsa_pool_len,
+    GP_dsa_T,
+    GP_dsa_bound_max,
+
     GP_moe_bias_add_sel,
     GP_moe_bias_add_weighted_sel,
     GP_moe_bias_add_weighted_weights

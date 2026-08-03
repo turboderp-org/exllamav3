@@ -56,6 +56,10 @@
 #include "libtorch/gated_rmsnorm.h"
 #include "libtorch/mlp.h"
 #include "libtorch/blocksparse_mlp.h"
+#include "libtorch/dsv4_compressor.h"
+#include "libtorch/dsv4_attn.h"
+#include "dsv4_compress.cuh"
+#include "dsa_topk.cuh"
 #include "hc_mix.cuh"
 
 #include "attention.cuh"
@@ -84,6 +88,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
+    m.def("routing_sel_norm", &routing_sel_norm, "routing_sel_norm");
+    m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
+    m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
+    m.def("dsa_topk", &dsa_topk, "dsa_topk");
     m.def("hc_mix", &hc_mix, "hc_mix");
     m.def("hc_head", &hc_head, "hc_head");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
@@ -209,5 +217,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
+    #include "libtorch/dsv4_compressor_bc.h"
+    #include "libtorch/dsv4_attn_bc.h"
     #include "sam_bc.h"
 }
