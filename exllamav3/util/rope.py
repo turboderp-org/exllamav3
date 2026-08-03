@@ -45,6 +45,60 @@ class RopeSettings:
         print(f"    rope_style: {self.rope_style.name}")
         print(f"    llama_4_scaling_beta: {self.llama_4_scaling_beta}")
 
+
+def yarn_inv_freq(
+    dim: int,
+    base: float,
+    device,
+    rope_scaling: dict | None = None,
+    factor: float | None = None,
+    original_max_position_embeddings: int | None = None,
+) -> torch.Tensor:
+    """
+    Inverse frequency table for one rope family: plain 1 / base^(2i/dim) when rope_scaling
+    is absent or not yarn, else the HF _compute_yarn_parameters interpolation ramp.
+    Frequency table ONLY -- the yarn attention factor is the caller's concern:
+    RoPE._rope_params_yarn resolves and applies it (legacy HF semantics, including the
+    max_position-derived factor override it passes in explicitly), while DeepSeek-V4 pins
+    it to 1.0 by never applying one and calls this with the raw config dict per rope
+    family (main theta unscaled, compress theta yarn-ramped).
+    factor / original_max_position_embeddings override the dict values when given.
+    """
+    pos_freqs = base ** (torch.arange(0, dim, 2, device = device).float() / dim)
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    is_yarn = rope_scaling is not None and \
+        rope_scaling.get("type", rope_scaling.get("rope_type", "default")) == "yarn"
+    if not is_yarn and factor is None:
+        return inv_freq_extrapolation
+    sc = rope_scaling or {}
+    if factor is None:
+        factor = float(sc["factor"])
+    if original_max_position_embeddings is None:
+        original_max_position_embeddings = int(sc["original_max_position_embeddings"])
+    beta_fast = float(sc.get("beta_fast", 32))
+    beta_slow = float(sc.get("beta_slow", 1))
+    truncate = sc.get("truncate", True)
+
+    def find_correction_dim(num_rotations):
+        return (dim * math.log(original_max_position_embeddings / (num_rotations * 2 * math.pi))) \
+            / (2 * math.log(base))
+
+    low = find_correction_dim(beta_fast)
+    high = find_correction_dim(beta_slow)
+    if truncate:
+        low = math.floor(low)
+        high = math.ceil(high)
+    low, high = max(low, 0), min(high, dim - 1)
+    if low == high:
+        high += 0.001
+    linear_func = (torch.arange(dim // 2, dtype = torch.float32, device = device) - low) / (high - low)
+    inv_freq_extrapolation_factor = 1 - torch.clamp(linear_func, 0, 1).float()
+    inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+    inv_freq = inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
+    inv_freq += inv_freq_extrapolation * inv_freq_extrapolation_factor
+    return inv_freq
+
+
 def _rotate_half_neox(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
@@ -247,34 +301,15 @@ class RoPE:
                 attn_factor = 1.0
             else:
                 attn_factor = get_mscale(factor)
-        beta_fast = rs.rope_scaling.get("beta_fast", 32)
-        beta_slow = rs.rope_scaling.get("beta_slow", 1)
         self.llama_4_scaling_beta = rs.rope_scaling.get("llama_4_scaling_beta", 0.0)
         self.llama_4_scaling_original = original_max_position_embeddings
-        def find_correction_dim(_num_rotations, _dim, _base, _max_position_embeddings):
-            return (_dim * math.log(_max_position_embeddings / (_num_rotations * 2 * math.pi))) / (2 * math.log(_base))
-        truncate = rs.rope_scaling.get("truncate", True)
-        def find_correction_range(_low_rot, _high_rot, _dim, _base, _max_position_embeddings):
-            _low = find_correction_dim(_low_rot, _dim, _base, _max_position_embeddings)
-            _high = find_correction_dim(_high_rot, _dim, _base, _max_position_embeddings)
-            if truncate:
-                _low = math.floor(_low)
-                _high = math.ceil(_high)
-            return max(_low, 0), min(_high, dim - 1)
-        def linear_ramp_factor(_min, _max, _dim):
-            if _min == _max:
-                _max += 0.001
-            linear_func = (torch.arange(_dim, dtype = torch.float32, device = self.device) - _min) / (_max - _min)
-            ramp_func = torch.clamp(linear_func, 0, 1)
-            return ramp_func
-        pos_freqs = base ** (torch.arange(0, dim, 2, device = self.device).float() / dim)
-        inv_freq_extrapolation = 1.0 / pos_freqs
-        inv_freq_interpolation = 1.0 / (factor * pos_freqs)
-        low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_max_position_embeddings)
-        inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, dim // 2).float()
-        inv_freq = inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
-        inv_freq += inv_freq_extrapolation * inv_freq_extrapolation_factor
-        self.inv_freq, self.attn_factor = inv_freq, attn_factor
+        self.inv_freq = yarn_inv_freq(
+            dim, base, self.device,
+            rope_scaling = rs.rope_scaling,
+            factor = factor,
+            original_max_position_embeddings = original_max_position_embeddings,
+        )
+        self.attn_factor = attn_factor
 
 
     def _rope_params_longrope(self):
