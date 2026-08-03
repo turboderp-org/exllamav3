@@ -346,7 +346,7 @@ class Linear(Module):
         def opt(subkey, device, **kwargs):
             k = key + subkey
             return stc.get_tensor(k, device, optional = True, **kwargs) if stc.has_tensor(k) else None
-        scale = opt(".scale", self.device)
+        scale = None  # opt(".scale", self.device)
         su = opt(".su", self.device, no_defer = True)
         suh = opt(".suh", self.device)
         sv = opt(".sv", self.device, no_defer = True)
