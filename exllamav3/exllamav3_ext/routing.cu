@@ -20,6 +20,25 @@ float sigmoid_stable_hf(float xf)
     return (xf >= 0.0f) ? 1.0f - base : base;
 }
 
+// Score activations for the nogroup top-k kernels. Both are strictly increasing, so sorting
+// by the raw logit when there is no selection bias remains valid for either
+#define ROUTING_ACT_SIGMOID 0
+#define ROUTING_ACT_SQRTSP 1
+
+template <int ACT>
+__device__ __forceinline__
+float routing_act(float xf)
+{
+    if constexpr (ACT == ROUTING_ACT_SQRTSP)
+    {
+        // sqrt(softplus(x)), matching torch F.softplus(beta = 1, threshold = 20)
+        float sp = xf > 20.0f ? xf : log1pf(__expf(xf));
+        return sqrtf(sp);
+    }
+    else
+        return sigmoid_stable_hf(xf);
+}
+
 
 __device__ __forceinline__
 void warp_reduce_best_f32(float& key, float& payload, int& idx)
@@ -193,6 +212,7 @@ void routing_gemv
 }
 
 
+template <int ACT>
 __launch_bounds__(MAX_NUM_EXPERTS)
 __global__ void routing_ds3_nogroup_topk_kernel
 (
@@ -223,9 +243,9 @@ __global__ void routing_ds3_nogroup_topk_kernel
     int* sh_idx = reinterpret_cast<int*>(sh_payload + num_warps * K);
 
     float logit = mask ? __half2float(scores[t]) : -1.0e30f;
-    float sig = bias && mask ? sigmoid_stable_hf(logit) : 0.0f;
-    float key = mask ? (bias ? sig + __half2float(bias[t]) : logit) : -1.0e30f;
-    float payload = bias ? sig : logit;
+    float act = bias && mask ? routing_act<ACT>(logit) : 0.0f;
+    float key = mask ? (bias ? act + __half2float(bias[t]) : logit) : -1.0e30f;
+    float payload = bias ? act : logit;
     int idx = mask ? t : -1;
 
     for (int k = 0; k < K; ++k)
@@ -295,7 +315,7 @@ __global__ void routing_ds3_nogroup_topk_kernel
 
             if (lane_id == k)
             {
-                sh_payload[k] = bias ? best_payload : sigmoid_stable_hf(best_payload);
+                sh_payload[k] = bias ? best_payload : routing_act<ACT>(best_payload);
                 sh_idx[k] = best_idx;
             }
 
@@ -315,6 +335,7 @@ __global__ void routing_ds3_nogroup_topk_kernel
 }
 
 
+template <int ACT>
 __launch_bounds__(MAX_NUM_EXPERTS)
 __global__ void routing_ds3_nogroup_kernel
 (
@@ -347,9 +368,9 @@ __global__ void routing_ds3_nogroup_kernel
     int* perm = reinterpret_cast<int*>(sh_idx + K_ * num_warps);
     float* reduce = reinterpret_cast<float*>(perm + 32 * num_warps);
 
-    // Input sigmoid
+    // Input activation
     int idx = mask ? t : -1;  // output index
-    float v = mask ? sigmoid_stable_hf(__half2float(scores[t])) : 0.0f;  // sort key
+    float v = mask ? routing_act<ACT>(__half2float(scores[t])) : 0.0f;  // sort key
     float o = v;  // output weight
 
     // Add bias and shift sigmoid(logits) to be non-negative before radix sort
@@ -687,6 +708,7 @@ bias: Pre-topk bias, float16, shape (1, num_experts)
 topk_indices: int64, shape (bsz, k)
 topk_weights: float16, shape (bsz, k)
 routed_scaling_factor: float32
+act_fn: score activation, ROUTING_ACT_SIGMOID (DS3/dots) or ROUTING_ACT_SQRTSP (DSv4)
 */
 
 void routing_ds3_nogroup
@@ -698,7 +720,8 @@ void routing_ds3_nogroup
     at::Tensor topk_indices,
     at::Tensor topk_weights,
     const float scaling_factor,
-    const c10::optional<at::Tensor>& gate_t
+    const c10::optional<at::Tensor>& gate_t,
+    const int act_fn
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
@@ -732,7 +755,10 @@ void routing_ds3_nogroup
 
     // The iterative top-K kernel beats the radix-sort kernel at every measured size
     size_t shmem = num_warps * K * (2 * sizeof(float) + sizeof(int));
-    routing_ds3_nogroup_topk_kernel<<<bsz, num_threads, shmem, stream>>>
+    auto kernel = act_fn == ROUTING_ACT_SQRTSP ?
+        routing_ds3_nogroup_topk_kernel<ROUTING_ACT_SQRTSP> :
+        routing_ds3_nogroup_topk_kernel<ROUTING_ACT_SIGMOID>;
+    kernel<<<bsz, num_threads, shmem, stream>>>
     (
         (const half*) scores.data_ptr(),
         (const half*) OPTPTR(bias),
@@ -754,7 +780,8 @@ void routing_ds3_nogroup_logits
     at::Tensor topk_indices,
     at::Tensor topk_weights,
     const float scaling_factor,
-    const bool use_topk
+    const bool use_topk,
+    const int act_fn
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
@@ -783,7 +810,10 @@ void routing_ds3_nogroup_logits
     if (use_topk)
     {
         size_t shmem = num_warps * K * (2 * sizeof(float) + sizeof(int));
-        routing_ds3_nogroup_topk_kernel<<<bsz, num_threads, shmem, stream>>>
+        auto kernel = act_fn == ROUTING_ACT_SQRTSP ?
+            routing_ds3_nogroup_topk_kernel<ROUTING_ACT_SQRTSP> :
+            routing_ds3_nogroup_topk_kernel<ROUTING_ACT_SIGMOID>;
+        kernel<<<bsz, num_threads, shmem, stream>>>
         (
             (const half*) scores.data_ptr(),
             (const half*) OPTPTR(bias),
@@ -801,7 +831,10 @@ void routing_ds3_nogroup_logits
         size_t shmem = num_warps * K_ * (2 * sizeof(float) + sizeof(int))
                      + num_threads * sizeof(int)
                      + num_warps * sizeof(float);
-        routing_ds3_nogroup_kernel<<<bsz, num_threads, shmem, stream>>>
+        auto kernel = act_fn == ROUTING_ACT_SQRTSP ?
+            routing_ds3_nogroup_kernel<ROUTING_ACT_SQRTSP> :
+            routing_ds3_nogroup_kernel<ROUTING_ACT_SIGMOID>;
+        kernel<<<bsz, num_threads, shmem, stream>>>
         (
             (const half*) scores.data_ptr(),
             (const half*) OPTPTR(bias),
@@ -814,6 +847,94 @@ void routing_ds3_nogroup_logits
         );
     }
 
+    cuda_check(cudaPeekAtLastError());
+}
+
+
+/*
+Routing weights for externally-selected experts (e.g. DSv4 hash-MoE, where selection is a
+frozen token-id -> experts table): scores = hidden @ gate, then weights = normalized
+activated scores gathered at `selected`, times scaling_factor. Selection order is preserved.
+
+hidden: Input hidden states, float16, shape (bsz, hidden_dim)
+gate: Router gate matrix, float16, shape (hidden_dim, num_experts)
+scores: Output routing logits buffer, float16, shape (bsz, num_experts)
+selected: Expert indices, int64, shape (bsz, k)
+weights: Output, float16, shape (bsz, k)
+*/
+
+__global__ void routing_sel_norm_kernel
+(
+    const half* __restrict__ scores,
+    const int64_t* __restrict__ selected,
+    half* __restrict__ weights,
+    const float scaling_factor,
+    const int num_experts,
+    const int K,
+    const int act_fn
+)
+{
+    int row = blockIdx.x;
+    int lane = threadIdx.x;
+
+    float o = 0.0f;
+    if (lane < K)
+    {
+        int e = (int) selected[row * K + lane];
+        float logit = __half2float(scores[row * num_experts + e]);
+        o = act_fn == ROUTING_ACT_SQRTSP ?
+            routing_act<ROUTING_ACT_SQRTSP>(logit) :
+            routing_act<ROUTING_ACT_SIGMOID>(logit);
+    }
+
+    float sum = warp_reduce_sum_first_k(o, K) + 1e-20f;
+    if (lane < K)
+        weights[row * K + lane] = __float2half_rn(o * scaling_factor / sum);
+}
+
+void routing_sel_norm
+(
+    const at::Tensor& hidden,
+    const at::Tensor& gate,
+    at::Tensor scores,
+    const at::Tensor& selected,
+    at::Tensor weights,
+    const float scaling_factor,
+    const c10::optional<at::Tensor>& gate_t,
+    const int act_fn
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(scores.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    routing_gemv(hidden, gate, gate_t, scores, stream);
+
+    TORCH_CHECK_DTYPE(hidden, kHalf);
+    TORCH_CHECK_DTYPE(gate, kHalf);
+    TORCH_CHECK_DTYPE(scores, kHalf);
+    TORCH_CHECK_DTYPE(selected, kLong);
+    TORCH_CHECK_DTYPE(weights, kHalf);
+    TORCH_CHECK_SHAPES(hidden, -1, gate, 0, 1);
+    TORCH_CHECK_SHAPES(gate, 1, scores, -1, 1);
+    TORCH_CHECK_SHAPES(scores, 0, selected, 0, 1);
+    TORCH_CHECK_SHAPES(scores, 0, weights, 0, 1);
+    TORCH_CHECK_SHAPES(selected, 1, weights, 1, 1);
+
+    int bsz = scores.size(0);
+    int num_experts = scores.size(1);
+    int K = selected.size(1);
+    TORCH_CHECK(K <= 32, "routing_sel_norm: K > 32");
+
+    routing_sel_norm_kernel<<<bsz, 32, 0, stream>>>
+    (
+        (const half*) scores.data_ptr(),
+        (const int64_t*) selected.data_ptr(),
+        (half*) weights.data_ptr(),
+        scaling_factor,
+        num_experts,
+        K,
+        act_fn
+    );
     cuda_check(cudaPeekAtLastError());
 }
 

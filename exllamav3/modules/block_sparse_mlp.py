@@ -19,6 +19,10 @@ TEMP_ROWS_FUSED = 128
 TEMP_ROWS_GRAPH = 32
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
+# Score activations for the nogroup routing kernels (must match routing.cu)
+ROUTING_ACT_SIGMOID = 0
+ROUTING_ACT_SQRTSP = 1
+
 @dataclass
 class RoutingCFG:
     gate_tensor: torch.Tensor
@@ -34,6 +38,7 @@ class RoutingCFG:
     topk_group: int | None
     per_expert_scale: torch.Tensor | None
     router_bias: torch.Tensor | None = None
+    tid2eid: torch.Tensor | None = None
 
 @dataclass
 class FusedBuffers:
@@ -173,6 +178,7 @@ def routing_dots(bsz, cfg, y, params):
             cfg.routing_weights_bsz1,
             cfg.routed_scaling_factor,
             cfg.gate_tensor_t,
+            ROUTING_ACT_SIGMOID,
         )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
 
@@ -202,8 +208,83 @@ def routing_dots(bsz, cfg, y, params):
                 routing_weights,
                 cfg.routed_scaling_factor,
                 None,
+                ROUTING_ACT_SIGMOID,
             )
         return selected_experts, routing_weights
+
+
+def _sqrtsp_scores(cfg, y):
+    logits = torch.matmul(y.float(), cfg.gate_tensor.float())
+    return F.softplus(logits).sqrt()
+
+
+def routing_sqrtsp(bsz, cfg, y, params):
+    """DeepSeek-V4 router: sqrt(softplus(logits)) affinity, noaux_tc bias for selection only,
+    weights normalized over the selected set, times routed_scaling_factor. bsz 1 uses the
+    nogroup top-k kernel with the sqrtsp activation; larger batches are torch-composed."""
+    if bsz == 1 and not params.get("activate_all_experts"):
+        if cfg.gate_tensor_t is None:
+            cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+        ext.routing_ds3_nogroup(
+            y,
+            cfg.gate_tensor,
+            cfg.router_logits_bsz1,
+            cfg.e_score_correction_bias,
+            cfg.selected_experts_bsz1,
+            cfg.routing_weights_bsz1,
+            cfg.routed_scaling_factor,
+            cfg.gate_tensor_t,
+            ROUTING_ACT_SQRTSP,
+        )
+        return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+    scores = _sqrtsp_scores(cfg, y)
+    if params.get("activate_all_experts"):
+        routing_weights = scores / (scores.sum(dim = -1, keepdim = True) + 1e-20)
+        routing_weights = (routing_weights * cfg.routed_scaling_factor).half()
+        selected_experts = (
+            torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
+            .repeat((bsz, 1))
+        )
+        return selected_experts, routing_weights
+    biased = scores + cfg.e_score_correction_bias.float().unsqueeze(0) \
+        if cfg.e_score_correction_bias is not None else scores
+    selected_experts = torch.topk(biased, cfg.num_experts_per_tok, dim = -1, sorted = False).indices
+    routing_weights = scores.gather(1, selected_experts)
+    routing_weights = routing_weights / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
+    return selected_experts, (routing_weights * cfg.routed_scaling_factor).half()
+
+
+def routing_sqrtsp_hash(bsz, cfg, y, params):
+    """DeepSeek-V4 hash-MoE bootstrap: expert indices come from the frozen tid2eid table
+    indexed by the current tokens (params["input_ids"], flattened row-major); the learned
+    gate still weights the selected experts."""
+    if params.get("activate_all_experts"):
+        return routing_sqrtsp(bsz, cfg, y, params)
+    # One device copy of the ids per forward via the params cache, shared by every hash
+    # layer on that device; batch dims flatten row-major, matching the hidden-state rows
+    from .attn import get_for_device
+    input_ids = get_for_device(params, "input_ids", cfg.tid2eid.device).reshape(-1)
+    assert input_ids.shape[0] == bsz, \
+        f"hash routing: {bsz} hidden rows but {input_ids.shape[0]} input ids"
+    selected_experts = cfg.tid2eid[input_ids].to(y.device).long()
+    if bsz == 1:
+        if cfg.gate_tensor_t is None:
+            cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+        ext.routing_sel_norm(
+            y,
+            cfg.gate_tensor,
+            cfg.router_logits_bsz1,
+            selected_experts,
+            cfg.routing_weights_bsz1,
+            cfg.routed_scaling_factor,
+            cfg.gate_tensor_t,
+            ROUTING_ACT_SQRTSP,
+        )
+        return selected_experts, cfg.routing_weights_bsz1
+    scores = _sqrtsp_scores(cfg, y)
+    routing_weights = scores.gather(1, selected_experts)
+    routing_weights = routing_weights / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
+    return selected_experts, (routing_weights * cfg.routed_scaling_factor).half()
 
 
 @dataclass
@@ -240,6 +321,7 @@ class BlockSparseMLP(Module):
         key_routing_gate: str | None = None,
         key_shared_gate: str | None = None,
         key_e_score_bias: str | None = "gate.e_score_correction_bias",
+        key_tid2eid: str | None = None,
         key_per_expert_scale: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
@@ -490,6 +572,8 @@ class BlockSparseMLP(Module):
 
         self.e_score_correction_bias = None
         self.e_score_correction_bias_key = key_e_score_bias
+        self.tid2eid = None
+        self.tid2eid_key = key_tid2eid
         self.per_expert_scale = None
         self.per_expert_scale_key = key_per_expert_scale
 
@@ -502,6 +586,8 @@ class BlockSparseMLP(Module):
             case "std_bias": self.routing_fn = routing_std_bias
             case "ds3": self.routing_fn = routing_ds3
             case "dots": self.routing_fn = routing_dots
+            case "sqrtsp": self.routing_fn = routing_sqrtsp
+            case "sqrtsp_hash": self.routing_fn = routing_sqrtsp_hash
             case _: raise ValueError(f"Unknown router type {router_type}")
 
         self.tp_reduce = False
@@ -902,6 +988,7 @@ class BlockSparseMLP(Module):
             routing_weights_bsz1 = routing_weights_bsz1,
             selected_experts_bsz1 = selected_experts_bsz1,
             e_score_correction_bias = self.e_score_correction_bias,
+            tid2eid = self.tid2eid,
             routed_scaling_factor = self.routed_scaling_factor,
             n_group = self.n_group,
             topk_group = self.topk_group,
@@ -937,6 +1024,12 @@ class BlockSparseMLP(Module):
                 )
                 if self.e_score_correction_bias is not None:
                     break
+        if self.tid2eid_key:
+            self.tid2eid = self.config.stc.get_tensor(
+                f"{self.key}.{self.tid2eid_key}",
+                self.device,
+                no_defer = True,
+            )
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}",
@@ -976,6 +1069,7 @@ class BlockSparseMLP(Module):
         self.routing_cfg = None
         self.experts_cfg = None
         self.e_score_correction_bias = None
+        self.tid2eid = None
         self.per_expert_scale = None
         self.bcast_sel_bsz1 = None
         self.bcast_weights_bsz1 = None
@@ -1433,6 +1527,8 @@ class BlockSparseMLP(Module):
         t = super().get_tensors()
         if self.e_score_correction_bias is not None:
             t[f"{self.key}.{self.e_score_correction_bias_key}"] = self.e_score_correction_bias.contiguous()
+        if self.tid2eid is not None:
+            t[f"{self.key}.{self.tid2eid_key}"] = self.tid2eid.contiguous()
         if self.per_expert_scale is not None:
             t[f"{self.key}.{self.per_expert_scale_key}"] = self.per_expert_scale.contiguous()
         return t
