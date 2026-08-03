@@ -12,6 +12,7 @@ from .gated_delta_net import GatedDeltaNet, GDNState, GDNLayerState
 from .mamba2 import Mamba2
 from .short_conv import ShortConv, ShortConvState, ShortConvLayerState
 from .gated_rmsnorm import GatedRMSNorm
+from .hyperconnections import HyperConnection, ExpandStreams, HyperHead
 from .transformer import TransformerBlock, ParallelDecoderBlock
 from .conv import Conv
 from .pos_embedding import PosEmbedding

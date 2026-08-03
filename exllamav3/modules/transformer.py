@@ -4,6 +4,7 @@ import torch
 from ..util.tensor import to2, get_for_device
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
+from .hyperconnections import HyperConnection
 from ..util import profile_opt
 
 class TransformerBlock(Module):
@@ -22,6 +23,8 @@ class TransformerBlock(Module):
         mlp_norm: RMSNorm | LayerNorm | None = None,
         mlp: MLP | GatedMLP | BlockSparseMLP | None = None,
         mlp_post_norm: RMSNorm | LayerNorm | None = None,
+        attn_hc: HyperConnection | None = None,
+        mlp_hc: HyperConnection | None = None,
         backout_extract: bool = False,
         backout_lambda: float | None = None,
         key_layer_scalar: str | None = None,
@@ -43,6 +46,8 @@ class TransformerBlock(Module):
         self.mlp_norm = mlp_norm
         self.mlp = mlp
         self.mlp_post_norm = mlp_post_norm
+        self.attn_hc = attn_hc
+        self.mlp_hc = mlp_hc
         self.backout_extract = backout_extract
         self.backout_lambda = backout_lambda
         self.qbits_key = qbits_key
@@ -56,10 +61,23 @@ class TransformerBlock(Module):
         self.attn_resid_scalar = None
         self.mlp_resid_scalar = None
 
+        # Hyperconnection sites (mHC): the block's residual is (bsz, seq, hc_mult, hidden)
+        # fp32 streams, mixed at each sublayer site instead of the plain residual add
+        if attn_hc is not None or mlp_hc is not None:
+            assert attn_hc is not None and mlp_hc is not None, \
+                "hyperconnections require both attn_hc and mlp_hc"
+            assert all(v is None for v in (
+                ve_gate, resid_lambda, x0_lambda, attn_post_norm, mlp_post_norm,
+                backout_lambda, key_layer_scalar, key_attn_resid_scalar, key_mlp_resid_scalar,
+            )) and not backout_extract, \
+                "hyperconnections cannot combine with residual scalars/post-norms/backout/ve_gate"
+
         self.register_submodule(self.ve_gate)
+        self.register_submodule(self.attn_hc)
         self.register_submodule(self.attn_norm)
         self.register_submodule(self.attn)
         self.register_submodule(self.attn_post_norm)
+        self.register_submodule(self.mlp_hc)
         self.register_submodule(self.mlp_norm)
         self.register_submodule(self.mlp)
         self.register_submodule(self.mlp_post_norm)
@@ -184,7 +202,12 @@ class TransformerBlock(Module):
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
 
         if self.attn:
-            if self.attn_norm:
+            if self.attn_hc:
+                hc_post, hc_comb, y = self.attn_hc.mix(x, params)
+                y = y.half()
+                if self.attn_norm:
+                    y = self.attn_norm.forward(y, params, out_dtype = torch.half)
+            elif self.attn_norm:
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
@@ -193,7 +216,9 @@ class TransformerBlock(Module):
                 return x
             if self.attn_resid_scalar is not None:
                 y *= self.attn_resid_scalar
-            if self.attn_post_norm:
+            if self.attn_hc:
+                x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
+            elif self.attn_post_norm:
                 self.attn_post_norm.forward(y, params, residual = x)
             elif self.mlp is not None and self.mlp_norm is not None and self.mlp_norm.can_fuse_residual(x, y):
                 y_resid = y
@@ -201,17 +226,25 @@ class TransformerBlock(Module):
                 x += y
 
         if self.mlp:
-            params["residual"] = x
-            if y_resid is not None:
-                y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
-            elif self.mlp_norm:
-                y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
+            if self.mlp_hc:
+                hc_post, hc_comb, y = self.mlp_hc.mix(x, params)
+                y = y.half()
+                if self.mlp_norm:
+                    y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
             else:
-                y = x.half()
+                params["residual"] = x
+                if y_resid is not None:
+                    y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
+                elif self.mlp_norm:
+                    y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
+                else:
+                    y = x.half()
             y = self.mlp.forward(y, params)
             if self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
-            if self.mlp_post_norm:
+            if self.mlp_hc:
+                x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
+            elif self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)
             else:
                 x += y
@@ -220,10 +253,13 @@ class TransformerBlock(Module):
             s = params.get("export_states")
             if not s:
                 s = params["export_states"] = []
-            if x.dtype == torch.half:
-                s.append(x.clamp_(-65504.0, 65504.0))
+            # With hyperconnections the residual is a stream stack; export the stream mean as
+            # the collapsed hidden state (streams start as broadcast copies of the embedding)
+            x_ = x.mean(dim = 2) if self.attn_hc else x
+            if x_.dtype == torch.half:
+                s.append(x_.clamp_(-65504.0, 65504.0))
             else:
-                x_ = x.half()
+                x_ = x_.half()
                 x_.clamp_(-65504.0, 65504.0)
                 s.append(x_)
 
@@ -261,9 +297,11 @@ class TransformerBlock(Module):
                 "key_mlp_resid_scalar": self.key_mlp_resid_scalar,
             },
             **{name: _export(getattr(self, name, None)) for name in (
+                "attn_hc",
                 "attn_norm",
                 "attn",
                 "attn_post_norm",
+                "mlp_hc",
                 "mlp_norm",
                 "mlp",
                 "mlp_post_norm",
@@ -289,9 +327,11 @@ class TransformerBlock(Module):
         module = TransformerBlock(
             config = None,
             **exported["kwargs"],
+            attn_hc = _import("attn_hc"),
             attn_norm = _import("attn_norm"),
             attn = _import("attn"),
             attn_post_norm = _import("attn_post_norm"),
+            mlp_hc = _import("mlp_hc"),
             mlp_norm = _import("mlp_norm"),
             mlp = _import("mlp"),
             mlp_post_norm = _import("mlp_post_norm"),
