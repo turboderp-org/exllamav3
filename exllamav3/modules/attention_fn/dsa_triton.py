@@ -816,7 +816,7 @@ def dsa_indexer_scores(
     dbg_pages = -(-k_idx.shape[0] // epp) if dbg else 0
     S_stride = triton.cdiv(max(T, 1), block_n) * block_n
     if scores is None:
-        scores = g_tensor_cache.get(q_idx.device, (R, S_stride), torch.half, "dsa_idx_scores")
+        scores = torch.empty((R, S_stride), dtype = torch.half, device = q_idx.device)
     with torch.cuda.device(q_idx.device):
         if R <= 4:
             # Few-query (decode) shape: heads as the MMA M dim, one dot per key tile --
