@@ -102,8 +102,8 @@ uint64_t mgemm_autotune_hash
         h ^= v;
         h *= 1099511628211ull;
     };
-    mix((uint64_t) bszm_in);
-    mix((uint64_t) bszm_out);
+    mix((uint64_t) MIN(bszm_in, 24));
+    mix((uint64_t) MIN(bszm_out, 24));
     return h;
 }
 
