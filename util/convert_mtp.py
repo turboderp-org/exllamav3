@@ -87,6 +87,7 @@ def main(args):
         assert module.num_slices <= 1
         start_module_time = time.time()
 
+        module_bytes_before = dsize(q_tensors)
         print(f" -- Loading unquantized module: {module.key}")
         module.load(torch.device("cpu" if module.caps.get("prefer_cpu") else args.device))
         for m in module:
@@ -112,8 +113,8 @@ def main(args):
         module.unload()
         config.stc.close()
 
-        # Output final bpw for layer
-        num_bytes = dsize(q_tensors)
+        # Output final bpw for layer (bytes added by THIS module; q_tensors is cumulative)
+        num_bytes = dsize(q_tensors) - module_bytes_before
         num_bits = num_bytes * 8
         final_bpw = num_bits / module.weights_numel() if module.weights_numel() else None
 

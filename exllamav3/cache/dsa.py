@@ -340,3 +340,67 @@ class DSV4LayerState:
                 "max_batch_size": self.max_batch_size,
             },
         }
+
+
+class CacheLayer_dspark(CacheLayer):
+    """
+    Paged storage for one DSpark drafter block's main-kv rows: one (head_dim,) fp16 row per
+    TARGET position, derived from the trunk's tap states by update_kv_from_target. Rides
+    the standard page table (rows for position p live at block_table[p // PAGE_SIZE],
+    p % PAGE_SIZE), so draft and target cache layouts stay aligned for free. The drafter
+    only ever reads the trailing attention window.
+    """
+
+    def __init__(
+        self,
+        config,
+        attention,
+        cache_id: int,
+        max_num_tokens: int,
+        **kwargs
+    ):
+        super().__init__(config, attention, cache_id, max_num_tokens)
+        assert max_num_tokens % PAGE_SIZE == 0
+        self.num_pages = max_num_tokens // PAGE_SIZE
+        self.width = attention.head_dim
+        self.kv = None
+        self.device = None
+
+    def alloc(self, device: torch.device):
+        self.device = device
+        self.kv = torch.zeros((self.num_pages, PAGE_SIZE, self.width), dtype = torch.half,
+                              device = device)
+
+    def free(self):
+        self.device = None
+        self.kv = None
+
+    def get_kv(self, cache_seqlens, block_table, sliding_window = -1):
+        return self.kv, None
+
+    def update_kv(self, cache_seqlens, block_table, k, v, length):
+        pass
+
+    def update_kv_direct(self, cache_seqlens, block_table, k, v, length):
+        pass
+
+    def write_rows(self, rows: torch.Tensor, cache_seqlens, block_table):
+        """rows (bsz, s, width) fp16; write at positions cache_seqlens[r] .. + s per row.
+        cache_seqlens and block_table are device tensors (paged scatter kernel)."""
+        from ..ext import exllamav3_ext as ext
+        ext.dspark_write_rows(rows.contiguous(), self.kv, block_table, cache_seqlens)
+
+    def copy_page(self, source, from_page: int, to_page: int, num_tokens: int):
+        self.kv[to_page, :num_tokens].copy_(source.kv[from_page, :num_tokens], non_blocking = True)
+
+    def get_tensors(self):
+        return [self.kv]
+
+    def storage_size(self):
+        return self.num_pages * PAGE_SIZE * self.width * torch.half.itemsize
+
+    def overhead_size(self):
+        return 0
+
+    def tp_export(self, plan):
+        raise NotImplementedError("Tensor-parallel loading is not supported for DSpark layers")

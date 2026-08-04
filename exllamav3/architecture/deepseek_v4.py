@@ -7,6 +7,7 @@ from ..modules import Embedding, RMSNorm, Linear, GatedMLP, BlockSparseMLP, Tran
     HyperConnection, ExpandStreams, HyperHead
 from ..modules.dsv4 import DSV4Attention
 from ..modules.attn import prepare_for_attn
+from .deepseek_v4_mtp import DeepseekV4MTPModel
 
 # DeepSeek-V4: hybrid sparse attention (sliding / CSA / HCA per compress_ratios), mHC
 # hyper-connection residual streams, hash-MoE bootstrap layers, sqrt-softplus routing.
@@ -26,7 +27,7 @@ class DeepseekV4Config(Config):
     ):
         super().__init__(
             directory,
-            {"text": DeepseekV4Model},
+            {"text": DeepseekV4Model, "mtp": DeepseekV4MTPModel},
             **kwargs
         )
 
@@ -80,6 +81,26 @@ class DeepseekV4Config(Config):
         self.rope_scaling = self.read_cfg(dict, "rope_scaling", None)
 
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
+
+        # DSpark drafter (mtp.* namespace). num_nextn_predict_layers is unreliable
+        # (V4-Flash ships 1 alongside three mtp blocks); the compress_ratios tail past the
+        # trunk layers describes the MTP blocks. The component only exists when the
+        # checkpoint actually carries the tensors
+        self.dspark_block_size = self.read_cfg(int, "dspark_block_size", 0)
+        self.dspark_noise_token_id = self.read_cfg(int, "dspark_noise_token_id", 0)
+        self.dspark_markov_rank = self.read_cfg(int, "dspark_markov_rank", 256)
+        self.dspark_target_layer_ids = self.read_cfg(list, "dspark_target_layer_ids", [])
+        # Generator drafter convention (dflash flow): block_size counts the seed position
+        self.block_size = self.dspark_block_size + 1
+        if ratios is not None and len(ratios) > self.num_hidden_layers:
+            self.num_mtp_layers = len(ratios) - self.num_hidden_layers
+            self.mtp_layer_types = [_RATIO_TO_TYPE[r] for r in ratios[self.num_hidden_layers:]]
+        else:
+            self.num_mtp_layers = 0
+            self.mtp_layer_types = []
+        if self.num_mtp_layers == 0 or not any(
+            self.stc.has_tensor(f"mtp.0.attn.wkv.{t}") for t in ("weight", "trellis")):
+            del self.model_classes["mtp"]
 
 
 class DeepseekV4Model(Model):

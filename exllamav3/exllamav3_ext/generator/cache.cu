@@ -89,6 +89,57 @@ void cache_rotate
 constexpr int kPageSize = 256;
 constexpr int kThreads = 256;
 
+__global__ void dspark_write_rows_kernel
+(
+    const half* __restrict__ rows,       // (bsz, s, w)
+    half* __restrict__ kv,               // (pages, kPageSize, w)
+    const int* __restrict__ block_table, // (bsz, npr)
+    const int* __restrict__ seqlens,     // (bsz,)
+    const int s,
+    const int w,
+    const int npr
+)
+{
+    int b = blockIdx.y;
+    int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t) s * w) return;
+    int r = (int) (i / w);
+    int c = (int) (i % w);
+    int pos = seqlens[b] + r;
+    int page = block_table[b * npr + pos / kPageSize];
+    kv[((int64_t) page * kPageSize + pos % kPageSize) * w + c] =
+        rows[((int64_t) b * s + r) * w + c];
+}
+
+void dspark_write_rows
+(
+    const at::Tensor& rows,
+    at::Tensor kv,
+    const at::Tensor& block_table,
+    const at::Tensor& cache_seqlens
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(rows.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(rows, kHalf);
+    TORCH_CHECK_DTYPE(kv, kHalf);
+    TORCH_CHECK_DTYPE(block_table, kInt);
+    TORCH_CHECK_DTYPE(cache_seqlens, kInt);
+    int bsz = (int) rows.size(0);
+    int s = (int) rows.size(1);
+    int w = (int) rows.size(2);
+    int64_t total = (int64_t) s * w;
+    dspark_write_rows_kernel<<<dim3(CEIL_DIVIDE(total, kThreads), bsz), kThreads, 0, stream>>>
+    (
+        (const half*) rows.data_ptr(),
+        (half*) kv.data_ptr(),
+        (const int*) block_table.data_ptr(),
+        (const int*) cache_seqlens.data_ptr(),
+        s, w, (int) block_table.size(1)
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
 __global__ void paged_kv_update_vec8_kernel
 (
     const half* __restrict__ k,

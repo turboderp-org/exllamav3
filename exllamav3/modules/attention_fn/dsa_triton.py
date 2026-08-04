@@ -90,6 +90,10 @@ if has_triton:
         BLOCK_W: tl.constexpr,         # window tile; smaller than BLOCK_N (two-source smem)
         DEBUG_BOUNDS: tl.constexpr = 0,
         DEBUG_PAGES: tl.constexpr = 0,
+        NC_BLOCK: tl.constexpr = 0,    # DSpark draft mode: every row sees the SAME range
+                                       # [win_floor, q_pos0 + R) (window history ++ whole
+                                       # chunk, non-causal); history rows are PAGED, read
+                                       # via block_table at absolute-position pages
     ):
         """One program per (query row, head block); heads are the MMA M dim. Consecutive
         programs cover one query's head blocks so gathers stay L2-resident. Two KV phases:
@@ -126,14 +130,24 @@ if has_triton:
         # come from this chunk's kv rows, older rows from the ring at abs - ring_beg
         if HAS_WINDOW:
             q_abs = q_pos0 + row
+            if NC_BLOCK:
+                top = q_pos0 + R - 1
+            else:
+                top = q_abs
             for n0 in tl.range(0, win_len, BLOCK_W, num_stages = 1):
                 offs_j = n0 + tl.arange(0, BLOCK_W)
-                abs_pos = q_abs - offs_j
+                abs_pos = top - offs_j
                 in_range = (offs_j < win_len) & (abs_pos >= win_floor)
                 mc = in_range & (abs_pos >= q_pos0)
                 mr = in_range & (abs_pos < q_pos0)
                 idx_c = tl.where(mc, abs_pos - q_pos0, 0)
-                idx_r = tl.where(mr, abs_pos - ring_beg, 0)
+                if NC_BLOCK:
+                    ap = tl.where(mr, abs_pos, 0)
+                    w_phys = tl.load(block_table + row * num_pages_per_row + ap // page_size,
+                                     mask = mr, other = 0)
+                    idx_r = w_phys * page_size + ap % page_size
+                else:
+                    idx_r = tl.where(mr, abs_pos - ring_beg, 0)
                 vc = tl.load(kv_chunk + idx_c[:, None] * D + offs_c[None, :],
                              mask = mc[:, None] & valid_c[None, :], other = 0.0) \
                    + tl.load(ring + idx_r[:, None] * D + offs_c[None, :],
@@ -637,6 +651,8 @@ def dsa_attn(
     num_stages = 3,
     page_size = 256,         # pool entries per block-table page (PAGE_SIZE // m for the
                              # paged pools; 256 with an identity table for contiguous pools)
+    nc_block = False,        # DSpark draft mode: non-causal chunk + paged window history
+                             # (single job per call; forces the one-shot kernel)
     multirow = None,         # batched jobs: dict(q_pos, win_floor, ring_beg, pool_len,
                              # k_len (B,) i32; slot_ids (B,) i32; ring_stride int; seq int)
                              # -- scalar args of the same names are ignored, ring is the
@@ -692,6 +708,8 @@ def dsa_attn(
         num_stages = min(num_stages, 2)
         block_h = min(block_h, 16)
     dbg_pages = -(-(pool_c.numel() // max(D_c, 1)) // max(page_size, 1)) if dsa_debug_bounds else 0
+    if nc_block:
+        n_splits = 1
     if multirow is not None:
         n_splits = n_splits or 8
     if n_splits == 0:
@@ -763,6 +781,7 @@ def dsa_attn(
             HPG = hpg,
             BLOCK_H = block_h, BLOCK_N = block_n, BLOCK_W = 16,
             DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
+            NC_BLOCK = 1 if nc_block else 0,
             num_warps = num_warps, num_stages = num_stages,
         )
     return out

@@ -18,3 +18,11 @@ void paged_kv_cache_update
     at::Tensor& block_table,
     at::Tensor& cache_seqlens
 );
+
+void dspark_write_rows
+(
+    const at::Tensor& rows,
+    at::Tensor kv,
+    const at::Tensor& block_table,
+    const at::Tensor& cache_seqlens
+);

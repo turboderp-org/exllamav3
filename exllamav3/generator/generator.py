@@ -691,6 +691,14 @@ class Generator:
         )
         new_ids = self.draft_model.sample_from_state(out_state, params)
 
+        # Draft models with a confidence head cap the usable draft length per round;
+        # 0 means no draft position cleared the threshold, so skip drafting entirely
+        conf_len = params.get("draft_confidence_len")
+        if conf_len is not None:
+            if conf_len == 0:
+                return None
+            window = min(window, conf_len)
+
         # Crop out the first token after sampling to keep batch contiguous for lm_head
         new_ids = new_ids[:, 1:]
         self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
