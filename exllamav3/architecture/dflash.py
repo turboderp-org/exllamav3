@@ -56,7 +56,7 @@ class DFlashConfig(Config):
         self.mask_token_id = self.read_cfg(int, "dflash_config->mask_token_id", no_default)
         self.target_layer_ids = self.read_cfg(list, "dflash_config->target_layer_ids", no_default)
         self.target_layer_ids = [i + 1 for i in self.target_layer_ids]
-        self.block_size = self.read_cfg(int, "block_size", no_default)
+        self.block_size = self.read_cfg(int, ["block_size", "dflash_config->block_size"], no_default)
 
         # RoPE
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
