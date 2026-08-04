@@ -91,6 +91,7 @@ def main(args):
         dynamic_draft_skip_ema = args.draft_skip_ema,
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
         recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
+        show_visualizer = args.visualize_cache,
     )
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
     if config.eos_token_id_list and all(config.eos_token_id_list):
@@ -152,7 +153,8 @@ def main(args):
                         "/load              Load stored session from ~/chat_py_session.json",
                         "/load <filename>   Load stored session from file",
                         "/mli               Toggle multiline input",
-                        "/n <num> <prompt>  Generate <num> completions to <prompt> (streams first completion)"       
+                        "/n <num> <prompt>  Generate <num> completions to <prompt> (streams first completion)",
+                        "/nihs <num>        Insert an approximately <num> token long needle-in-haystack prompt",
                         "/ppt               Print page table",
                         "/probs             Set number of probs recorded (0 to disable), adds overhead",
                         "/python            Extract and run the longest code block in a bwrap sandbox",
@@ -430,9 +432,22 @@ def main(args):
                         print_error("Invalid argument")
                     continue
 
+                # Multiple completions test
                 case "/n":
                     num_completions = int(c[1]) if len(c) > 1 else "0"
                     user_prompt = " ".join(c[2:])
+
+                # Needle in haystack prompt
+                case "/nihs":
+                    if len(c) != 2 or not c[1].isnumeric() or int(c[1]) < 1:
+                        print_error("Usage: /nihs <num tokens>")
+                        continue
+                    target_tokens = int(c[1])
+                    if target_tokens > context_length:
+                        print_error(f"Requested length exceeds the {context_length}-token cache size")
+                        continue
+                    user_prompt, ref_value, best_tokens = make_haystack_prompt(target_tokens, tokenizer)
+                    print_info(f"Generated {best_tokens}-token needle-in-haystack prompt, reference answer: {ref_value}")
 
                 case _:
                     print_error(f"Unknown command: {c[0]}")
@@ -631,5 +646,6 @@ if __name__ == "__main__":
     parser.add_argument("-ups", "--updates-per-second", type = int, help = "Max number of console updates per second (markdown console), default: 30", default = 30)
     parser.add_argument("-lw", "--loop_window", type = int, help = "Loop detection window in tokens, default = 300", default = 300)
     parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
+    parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     _args = parser.parse_args()
     main(_args)

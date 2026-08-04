@@ -3,6 +3,7 @@ import re
 import pyperclip
 import json
 import random
+import string
 from exllamav3.util.file import disk_lru_cache
 
 def copy_last_codeblock(text: str, num) -> str | None:
@@ -129,3 +130,52 @@ def sample_question(source: str):
         return None
     questions = bench_sources[source]()
     return random.choice(questions)
+
+
+def make_haystack_prompt(target_tokens, tokenizer):
+    lorem = (
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod "
+        "tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, "
+        "quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo "
+        "consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse "
+        "cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non "
+        "proident, sunt in culpa qui officia deserunt mollit anim id est laborum.\n\n"
+    )
+    ref_value = "".join(random.choices(string.ascii_letters + string.digits, k = 16))
+    needle_position = random.uniform(0.1, 0.9)
+
+    def make_nihs_prompt(num_chars):
+        haystack = (lorem * (num_chars // len(lorem) + 1))[:num_chars]
+        pos = int(len(haystack) * needle_position)
+        return (
+            haystack[:pos] +
+            f"\n\nThe reference value is: {ref_value}\n\n" +
+            haystack[pos:] +
+            "\n\nWhat is the reference value mentioned in the text?"
+        )
+
+    def prompt_token_count(prompt):
+        return tokenizer.encode(
+            prompt,
+            add_bos = False,
+            encode_special_tokens = True,
+        ).shape[-1]
+
+    # Find the character count whose tokenized prompt is nearest to the target.
+    lo, hi = 0, max(1, target_tokens * 8)
+    best_prompt = make_nihs_prompt(0)
+    best_tokens = prompt_token_count(best_prompt)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = make_nihs_prompt(mid)
+        candidate_tokens = prompt_token_count(candidate)
+        if abs(candidate_tokens - target_tokens) < abs(best_tokens - target_tokens):
+            best_prompt, best_tokens = candidate, candidate_tokens
+        if candidate_tokens < target_tokens:
+            lo = mid + 1
+        elif candidate_tokens > target_tokens:
+            hi = mid - 1
+        else:
+            break
+
+    return best_prompt, ref_value, best_tokens
