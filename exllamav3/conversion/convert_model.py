@@ -47,7 +47,7 @@ parser.add_argument("-d", "--devices", type = str, default = "0", help = "List o
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
 parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
-parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "When possible, use new parallel mode for small tensors (MoE layers especially)")
+parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Deprecated (no-op): parallel mode is now the default; layers with fewer tensors than devices fall back to tile splitting")
 parser.add_argument("--max_module", type = int, help = "End quantization after this many modules, includes embedding and norm layers (for debug purposes)", default = None)
 
 group = parser.add_mutually_exclusive_group()
@@ -183,7 +183,6 @@ def prepare(args) -> (dict, dict, bool, str):
         ("devices", True, None),
         ("device_ratios", True, None),
         ("codebook", True, "mul1"),
-        ("parallel_mode", True, False),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -367,6 +366,21 @@ def group_label(group):
     return f"{prefix}* ({len(group)} tensors)"
 
 
+def _tile_split_devices(numel, devices, device_ratios):
+    """Cap the device count for tile-splitting one tensor: shredding a small tensor
+    across many GPUs leaves shards too thin for a meaningful global-scale search
+    (observed as g_sc collapsing to the search floor and proxy_err blowing up). Require
+    ~1M weights per participating device, preferring the fastest devices."""
+    max_dev = max(1, min(len(devices), numel // (1 << 20)))
+    if max_dev >= len(devices):
+        return devices, device_ratios
+    if device_ratios is not None:
+        order = sorted(range(len(devices)), key = lambda i: -device_ratios[i])[:max_dev]
+        order.sort()
+        return [devices[i] for i in order], [device_ratios[i] for i in order]
+    return devices[:max_dev], None
+
+
 def quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state):
 
     allow_grouping = state is not None and not args["image_dump"] and not args["verbose"]
@@ -374,7 +388,13 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
 
     for group in groups:
         if len(group) > 1:
-            quant_args_list = [make_quant_args(args, idx, strategy[l.key], devices, device_ratios) for l in group]
+            quant_args_list = [
+                make_quant_args(
+                    args,
+                    idx,
+                    strategy[l.key],
+                    *_tile_split_devices(l.weights_numel(), devices, device_ratios)
+                ) for l in group]
             with Timer() as t:
                 proxy_errs = convert_exl3_group(
                     group,
@@ -398,7 +418,12 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                 flush = True
             )
         else:
-            quant_args = make_quant_args(args, idx, strategy[linear.key], devices, device_ratios)
+            quant_args = make_quant_args(
+                args,
+                idx,
+                strategy[linear.key],
+                *_tile_split_devices(linear.weights_numel(), devices, device_ratios)
+            )
 
             with Timer() as t:
                 sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
@@ -1116,9 +1141,10 @@ def main(args, job_state):
             for linear in linears:
                 linear.inner.swap_cpu()
 
-            # Quantize
+            # Quantize: one linear per device in parallel when the layer has enough
+            # tensors to occupy every device, else tile-split each tensor across devices
+            # (single large tensors, e.g. lm_head)
             if (
-                args["parallel_mode"] and
                 len(linears) >= len(devices) and
                 all(b <= 8 for _, b in strategy.items())
             ):
@@ -1284,9 +1310,8 @@ def main(args, job_state):
             for linear in linears:
                 linear.inner.swap_cpu()
 
-            # Quantize
+            # Quantize (same dispatch as the main loop)
             if (
-                args["parallel_mode"] and
                 len(linears) >= len(devices) and
                 all(b <= 8 for _, b in strategy.items())
             ):

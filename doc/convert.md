@@ -35,7 +35,7 @@ does.
 
 - **-dr / --device_ratios *list***: Ratio as comma-separated list. Determines how the encoding workload is distributed when using multiple devices. This is useful if using GPUs with dissimilar compute performance, to prevent slower GPUs from becoming bottlenecks. Ratios are relative, i.e. `1,1,3` is the same ratio as `3,3,9`. Recommendation is to omit this argument; by default, ratios are autotuned to maximize usage across GPUs.
 
-- **-pm / --parallel_mode**: Fully parallelize quantization across multiple GPUs when possible. By default, multi-GPU quantization works by splitting the trellis encoding workload across multiple devices. For models with many small tensors (especially MoE models) this is inefficient since the resulting tile slices end up being too small for efficient batched encoding. This mode prefers distributing one linear layer to each GPU at a time, allowing larger encoding batches and more overall throughput. This mode is still somewhat experimental but will likely become the default soon.     
+- **-pm / --parallel_mode**: Deprecated (no-op). Parallel mode is now the default: multi-GPU quantization distributes one linear layer to each GPU at a time whenever a layer has at least as many tensors as there are devices. Layers with fewer tensors than devices (e.g. the lm_head, alone in its layer) fall back to splitting the trellis encoding workload across devices, with small tensors capped to as many devices as they can feed (~1M weights per device).
 
 #### Debug stuff (ignore these)
 
