@@ -21,7 +21,9 @@ void BC_DSV4Compressor::run_gr
     const c10::optional<at::Tensor>& position_tensor,
     const c10::optional<at::Tensor>& mg_c,
     Graph* graph,
-    bool proj_precomputed
+    bool proj_precomputed,
+    const c10::optional<at::Tensor>& pool_bt,
+    int pool_epp
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -73,7 +75,8 @@ void BC_DSV4Compressor::run_gr
     }
 
     dsv4_compress_gr(kv, gate, ring_kv, ring_gate, ovl, ape, norm_w, rms_norm_eps,
-                     inv_freq, dest_a, dest_b, position, position_tensor, m, graph);
+                     inv_freq, dest_a, dest_b, position, position_tensor, m, graph,
+                     {}, pool_bt, pool_epp);
 }
 
 void BC_DSV4Compressor::run
@@ -86,8 +89,11 @@ void BC_DSV4Compressor::run
     c10::optional<at::Tensor>& dest_b,
     int position,
     const c10::optional<at::Tensor>& position_tensor,
-    const c10::optional<at::Tensor>& mg_c
+    const c10::optional<at::Tensor>& mg_c,
+    const c10::optional<at::Tensor>& pool_bt,
+    int pool_epp
 )
 {
-    run_gr(x, ring_kv, ring_gate, ovl, dest_a, dest_b, position, position_tensor, mg_c, nullptr);
+    run_gr(x, ring_kv, ring_gate, ovl, dest_a, dest_b, position, position_tensor, mg_c,
+           nullptr, false, pool_bt, pool_epp);
 }

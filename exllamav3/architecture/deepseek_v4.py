@@ -81,11 +81,6 @@ class DeepseekV4Config(Config):
 
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
 
-        # Budget for the per-slot DSA pools (compressed KV + indexer keys), in raw tokens.
-        # Sizes DSV4LayerState.pool_capacity = max_dsa_tokens // compress_rate per slot.
-        # Overridable via Config.from_directory(..., max_dsa_tokens = N).
-        self.max_dsa_tokens = int(kwargs.get("max_dsa_tokens", 131072))
-
 
 class DeepseekV4Model(Model):
     config_class = DeepseekV4Config

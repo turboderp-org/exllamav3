@@ -18,12 +18,14 @@ void cache_rotate_kernel
     const size_t rotate_len
 )
 {
-    // Chunk for current CTA
-    size_t block_size = CEIL_DIVIDE(page_size, gridDim.x);
+    // Chunk for current CTA. Chunks must stay 16-byte aligned for the uint4 copies:
+    // round the split up to 16 (small pages, e.g. DSA HCA pools at 1792 B, would otherwise
+    // give misaligned per-CTA offsets; trailing CTAs just idle)
+    size_t block_size = CEIL_DIVIDE(CEIL_DIVIDE(page_size, gridDim.x), 16) * 16;
     size_t block_beg = blockIdx.x * block_size;
     size_t block_end = MIN(block_beg + block_size, page_size);
+    if (block_end <= block_beg) return;
     block_size = block_end - block_beg;
-    if (block_size <= 0) return;
 
     // Rotate pages
     for (int i = 0; i < rotate_len; ++i)
@@ -71,6 +73,7 @@ void cache_rotate
     size_t rotate_len = order.size(0) / 2;
 
     TORCH_CHECK(temp.nbytes() == page_size, "temp tensor incorrect size");
+    TORCH_CHECK(page_size % 16 == 0, "cache_rotate: page size must be a multiple of 16 bytes");
 
     cache_rotate_kernel<<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>
     (
@@ -80,6 +83,7 @@ void cache_rotate
         page_size,
         rotate_len
     );
+    cuda_check(cudaPeekAtLastError());
 }
 
 constexpr int kPageSize = 256;

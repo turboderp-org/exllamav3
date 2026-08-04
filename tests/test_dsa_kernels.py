@@ -176,9 +176,9 @@ def check_topk(device, R, T, k, mode, seed):
             scores[r, idx] = torch.randn(n, device = device).half()
     K_pad = -(-k // 32) * 32
     out = torch.empty((R, K_pad), dtype = torch.int32, device = device)
-    ext.dsa_topk(scores, out, k)
+    ext.dsa_topk(scores, out, k, None, 0)
     out2 = torch.empty_like(out)
-    ext.dsa_topk(scores, out2, k)
+    ext.dsa_topk(scores, out2, k, None, 0)
     det = torch.equal(out, out2)
 
     ok = det

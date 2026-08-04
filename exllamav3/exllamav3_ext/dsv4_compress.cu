@@ -66,14 +66,42 @@ void dsv4_compress_windows_kernel
     const int hd,
     const int rd,
     const int Wa,
-    const bool overlap
+    const bool overlap,
+    const int* __restrict__ slot_ids,    // batched: (B,) state slot per job, else nullptr
+    const int ring_stride,               // batched: per-slot strides in elements
+    const int ovl_stride,
+    const int da_stride,
+    const int db_stride,
+    const int* __restrict__ pool_bt,     // paged pools: block table (one row per job), else nullptr
+    const int bt_stride,                 // paged pools, batched: block table row stride
+    const int epp                        // paged pools: entries per page
 )
 {
     extern __shared__ float sh[];        // comp[hd] + reduce[hd / 32]
     float* sh_comp = sh;
     float* sh_red = sh + hd;
 
-    int pos0 = pos_ptr ? *pos_ptr : pos_base;
+    // Batched mode: grid.y = job; chunk rows are job-sliced, state buffers slot-indexed,
+    // position read per job. Single-job launches have grid.y = 1 and null slot_ids.
+    // Pool destinations are shared paged tensors addressed via the per-job block table
+    // when pool_bt is given, per-slot strided otherwise (contiguous scratch)
+    const int job = blockIdx.y;
+    if (slot_ids)
+    {
+        int slot = slot_ids[job];
+        kv_new += (size_t) job * seq * W;
+        gate_new += (size_t) job * seq * W;
+        ring_kv += (size_t) slot * ring_stride;
+        ring_gate += (size_t) slot * ring_stride;
+        if (ovl) ovl += (size_t) slot * ovl_stride;
+        if (!pool_bt)
+        {
+            dest_a += (size_t) slot * da_stride;
+            if (dest_b) dest_b += (size_t) slot * db_stride;
+        }
+    }
+    if (pool_bt) pool_bt += (size_t) job * bt_stride;
+    int pos0 = pos_ptr ? pos_ptr[job] : pos_base;
     int ec0 = pos0 / m;
     int nw = (pos0 + seq) / m - ec0;
 
@@ -171,6 +199,8 @@ void dsv4_compress_windows_kernel
     }
 
     size_t drow = (size_t) (ec0 + w);
+    if (pool_bt)
+        drow = (size_t) pool_bt[drow / epp] * epp + drow % epp;
     if (!dest_b || c < Wa)
         dest_a[drow * Wa + c] = __float2half_rn(out);
     else
@@ -216,10 +246,21 @@ void dsv4_compress_store_kernel
     const int seq,
     const int buf_rows,
     const int W,
-    const int j0                         // first chunk row to store (seq - buf_rows clamp)
+    const int j0,                        // first chunk row to store (seq - buf_rows clamp)
+    const int* __restrict__ slot_ids,
+    const int ring_stride
 )
 {
-    int pos0 = pos_ptr ? *pos_ptr : pos_base;
+    const int job = blockIdx.y;
+    if (slot_ids)
+    {
+        int slot = slot_ids[job];
+        kv_new += (size_t) job * seq * W;
+        gate_new += (size_t) job * seq * W;
+        ring_kv += (size_t) slot * ring_stride;
+        ring_gate += (size_t) slot * ring_stride;
+    }
+    int pos0 = pos_ptr ? pos_ptr[job] : pos_base;
     size_t i = (size_t) blockIdx.x * NUM_THREADS_STORE + threadIdx.x;
     size_t total = (size_t) (seq - j0) * W;
     if (i >= total) return;
@@ -246,10 +287,18 @@ void dsv4_ring_append_kernel
     const int* __restrict__ ring_beg_ptr,
     const int seq,
     const int D,
-    const int ring_rows
+    const int ring_rows,
+    const int* __restrict__ slot_ids,
+    const int ring_stride
 )
 {
-    int offset = *pos_ptr - *ring_beg_ptr;
+    const int job = blockIdx.y;
+    if (slot_ids)
+    {
+        kv += (size_t) job * seq * D;
+        ring += (size_t) slot_ids[job] * ring_stride;
+    }
+    int offset = pos_ptr[job] - ring_beg_ptr[job];
     size_t i = (size_t) blockIdx.x * NUM_THREADS_STORE + threadIdx.x;
     size_t total = (size_t) seq * D;
     if (i >= total) return;
@@ -266,7 +315,8 @@ void dsv4_ring_append_gr
     at::Tensor& ring,
     const at::Tensor& pos,
     const at::Tensor& ring_beg,
-    Graph* graph
+    Graph* graph,
+    const c10::optional<at::Tensor>& slot_ids
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(kv.device());
@@ -278,12 +328,24 @@ void dsv4_ring_append_gr
     TORCH_CHECK_SHAPES(kv, -1, ring, -1, 1);
     int seq = kv.size(0);
     int D = kv.size(-1);
+    const int* slot_ids_ptr = nullptr;
+    int batch = 1, ring_stride = 0, ring_rows = (int) ring.size(0);
+    if (slot_ids)
+    {
+        TORCH_CHECK_DTYPE(slot_ids.value(), kInt);
+        slot_ids_ptr = (const int*) slot_ids.value().data_ptr();
+        batch = (int) slot_ids.value().size(0);
+        seq /= batch;
+        ring_rows = (int) ring.size(1);
+        ring_stride = ring_rows * D;
+    }
     size_t total = (size_t) seq * D;
-    dsv4_ring_append_kernel<<<CEIL_DIVIDE(total, NUM_THREADS_STORE), NUM_THREADS_STORE, 0, stream>>>
+    dsv4_ring_append_kernel<<<dim3(CEIL_DIVIDE(total, NUM_THREADS_STORE), batch), NUM_THREADS_STORE, 0, stream>>>
     (
         (const half*) kv.data_ptr(), (half*) ring.data_ptr(),
         (const int*) pos.data_ptr(), (const int*) ring_beg.data_ptr(),
-        seq, D, (int) ring.size(0)
+        seq, D, ring_rows,
+        slot_ids_ptr, ring_stride
     );
     cuda_check(cudaPeekAtLastError());
 }
@@ -293,10 +355,11 @@ void dsv4_ring_append
     const at::Tensor& kv,
     at::Tensor ring,
     const at::Tensor& pos,
-    const at::Tensor& ring_beg
+    const at::Tensor& ring_beg,
+    const c10::optional<at::Tensor>& slot_ids
 )
 {
-    dsv4_ring_append_gr(kv, ring, pos, ring_beg, nullptr);
+    dsv4_ring_append_gr(kv, ring, pos, ring_beg, nullptr, slot_ids);
 }
 
 void dsv4_compress_gr
@@ -315,7 +378,10 @@ void dsv4_compress_gr
     int position,
     const c10::optional<at::Tensor>& position_tensor,
     int m,
-    Graph* graph
+    Graph* graph,
+    const c10::optional<at::Tensor>& slot_ids,
+    const c10::optional<at::Tensor>& pool_bt,
+    int pool_epp
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(kv_new.device());
@@ -336,7 +402,7 @@ void dsv4_compress_gr
 
     int seq = kv_new.size(0);
     int W = kv_new.size(-1);
-    int buf_rows = ring_kv.size(0);
+    int buf_rows = slot_ids ? (int) ring_kv.size(1) : (int) ring_kv.size(0);
     int Wa = dest_a.size(-1);
     int hd = Wa + (dest_b ? dest_b.value().size(-1) : 0);
     int rd = inv_freq.size(0) * 2;
@@ -345,11 +411,13 @@ void dsv4_compress_gr
     TORCH_CHECK(norm_w.size(0) == hd, "dsv4_compress: norm weight size mismatch");
     TORCH_CHECK(rd % 2 == 0 && rd <= hd && hd <= 1024, "dsv4_compress: bad dims");
     TORCH_CHECK(!overlap || ovl, "dsv4_compress: overlapping mode requires snapshot ring");
-    int ovl_depth = ovl ? ovl.value().size(0) : 1;
+    int ovl_depth = ovl ? (int) ovl.value().size(slot_ids ? 1 : 0) : 1;
     if (ovl)
     {
         TORCH_CHECK_DTYPE(ovl.value(), kFloat);
-        TORCH_CHECK(ovl.value().size(2) == m && ovl.value().size(3) == hd, "dsv4_compress: snapshot ring shape mismatch");
+        int mdim = slot_ids ? 3 : 2;
+        TORCH_CHECK(ovl.value().size(mdim) == m && ovl.value().size(mdim + 1) == hd,
+                    "dsv4_compress: snapshot ring shape mismatch");
     }
 
     const int* pos_ptr = nullptr;
@@ -359,6 +427,40 @@ void dsv4_compress_gr
         pos_ptr = (const int*) position_tensor.value().data_ptr();
     }
 
+    const int* slot_ids_ptr = nullptr;
+    int batch = 1;
+    int ring_stride = 0, ovl_stride = 0, da_stride = 0, db_stride = 0;
+    if (slot_ids)
+    {
+        TORCH_CHECK_DTYPE(slot_ids.value(), kInt);
+        TORCH_CHECK(pos_ptr, "dsv4_compress: batched mode requires position_tensor");
+        slot_ids_ptr = (const int*) slot_ids.value().data_ptr();
+        batch = (int) slot_ids.value().size(0);
+        seq /= batch;                       // kv_new is (B * seq, W)
+        ring_stride = buf_rows * W;
+        ovl_stride = ovl ? (int) (ovl.value().numel() / ovl.value().size(0)) : 0;
+        if (!pool_bt)
+        {
+            da_stride = (int) (dest_a.numel() / dest_a.size(0));
+            db_stride = dest_b ? (int) (dest_b.value().numel() / dest_b.value().size(0)) : 0;
+        }
+    }
+
+    const int* pool_bt_ptr = nullptr;
+    int bt_stride = 0;
+    if (pool_bt)
+    {
+        TORCH_CHECK_DTYPE(pool_bt.value(), kInt);
+        TORCH_CHECK(pool_epp > 0, "dsv4_compress: paged mode requires pool_epp");
+        pool_bt_ptr = (const int*) pool_bt.value().data_ptr();
+        if (slot_ids)
+        {
+            TORCH_CHECK(pool_bt.value().dim() == 2 && pool_bt.value().size(0) == batch,
+                        "dsv4_compress: batched mode requires one block table row per job");
+            bt_stride = (int) pool_bt.value().size(1);
+        }
+    }
+
     int nw = (position + seq) / m - position / m;
     int grid_w = pos_ptr ? seq / m + 1 : nw;
 
@@ -366,7 +468,7 @@ void dsv4_compress_gr
     {
         int threads = CEIL_DIVIDE(hd, 32) * 32;
         size_t shmem = (hd + threads / 32) * sizeof(float);
-        dsv4_compress_windows_kernel<<<grid_w, threads, shmem, stream>>>
+        dsv4_compress_windows_kernel<<<dim3(grid_w, batch), threads, shmem, stream>>>
         (
             (const half*) kv_new.data_ptr(),
             (const half*) gate_new.data_ptr(),
@@ -382,14 +484,16 @@ void dsv4_compress_gr
             pos_ptr,
             position,
             seq, m, buf_rows, ovl_depth, W, hd, rd, Wa,
-            overlap
+            overlap,
+            slot_ids_ptr, ring_stride, ovl_stride, da_stride, db_stride,
+            pool_bt_ptr, bt_stride, pool_epp
         );
         cuda_check(cudaPeekAtLastError());
     }
 
     int j0 = seq > buf_rows ? seq - buf_rows : 0;
     size_t total = (size_t) (seq - j0) * W;
-    dsv4_compress_store_kernel<<<CEIL_DIVIDE(total, NUM_THREADS_STORE), NUM_THREADS_STORE, 0, stream>>>
+    dsv4_compress_store_kernel<<<dim3(CEIL_DIVIDE(total, NUM_THREADS_STORE), batch), NUM_THREADS_STORE, 0, stream>>>
     (
         (const half*) kv_new.data_ptr(),
         (const half*) gate_new.data_ptr(),
@@ -397,7 +501,8 @@ void dsv4_compress_gr
         (half*) ring_gate.data_ptr(),
         pos_ptr,
         position,
-        seq, buf_rows, W, j0
+        seq, buf_rows, W, j0,
+        slot_ids_ptr, ring_stride
     );
     cuda_check(cudaPeekAtLastError());
 }
@@ -418,7 +523,10 @@ void dsv4_compress
     c10::optional<at::Tensor> dest_b,
     int position,
     const c10::optional<at::Tensor>& position_tensor,
-    int m
+    int m,
+    const c10::optional<at::Tensor>& slot_ids,
+    const c10::optional<at::Tensor>& pool_bt,
+    int pool_epp
 )
 {
     dsv4_compress_gr
@@ -437,6 +545,9 @@ void dsv4_compress
         position,
         position_tensor,
         m,
-        nullptr
+        nullptr,
+        slot_ids,
+        pool_bt,
+        pool_epp
     );
 }

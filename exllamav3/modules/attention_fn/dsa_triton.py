@@ -27,8 +27,15 @@ The lightning-indexer scoring kernel is shared as-is between raw-token (V3.2) an
 (V4 CSA) keys -- only the key tensor differs.
 """
 
+import os
 import torch
 from ...util.tensor import g_tensor_cache
+
+# EXL3_DSA_DEBUG_BOUNDS=1: compile the JIT DSA kernels with device-side bounds asserts on
+# every block-table page read and gathered pool index (names the kernel and traps at the
+# bad index instead of faulting downstream). Triton only emits device_assert when kernels
+# compile in debug mode, so force TRITON_DEBUG before any compilation
+dsa_debug_bounds = os.environ.get("EXL3_DSA_DEBUG_BOUNDS", "0") != "0"
 
 try:
     import triton
@@ -43,7 +50,7 @@ if has_triton:
     @triton.jit(do_not_specialize = [
         "k_len", "win_len", "pool_len", "num_pages_per_row", "q_pos0", "R",
         "win_floor", "ring_beg",
-    ])
+    ], debug = dsa_debug_bounds)
     def _dsa_attn_kernel(
         q,                   # (R, H, D_c + D_r) fp16 token-major, rope slice pre-rotated
         ring,                # (ring_rows, D_c + D_r) fp16: rows at abs < q_pos0, linearly
@@ -81,6 +88,8 @@ if has_triton:
         BLOCK_H: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_W: tl.constexpr,         # window tile; smaller than BLOCK_N (two-source smem)
+        DEBUG_BOUNDS: tl.constexpr = 0,
+        DEBUG_PAGES: tl.constexpr = 0,
     ):
         """One program per (query row, head block); heads are the MMA M dim. Consecutive
         programs cover one query's head blocks so gathers stay L2-resident. Two KV phases:
@@ -163,6 +172,9 @@ if has_triton:
             idx_s = tl.where(in_range, idx, 0)
             page = idx_s // page_size
             phys = tl.load(block_table + row * num_pages_per_row + page, mask = in_range, other = 0)
+            if DEBUG_BOUNDS:
+                tl.device_assert(tl.where(in_range, idx_s < pool_len, True), "dsa_attn: entry idx >= pool_len")
+                tl.device_assert(tl.where(in_range, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_attn: pool page OOB")
             tok = phys * page_size + idx_s % page_size
             vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
                          mask = in_range[:, None] & valid_c[None, :], other = 0.0)
@@ -210,8 +222,8 @@ if has_triton:
 
     @triton.jit(do_not_specialize = [
         "k_len", "win_len", "pool_len", "num_pages_per_row", "q_pos0",
-        "win_floor", "ring_beg",
-    ])
+        "win_floor", "ring_beg", "ring_stride",
+    ], debug = dsa_debug_bounds)
     def _dsa_attn_split_kernel(
         q,                   # (R, H, D_c + D_r) fp16
         ring,                # (ring_rows, D) fp16, rows at abs - ring_beg
@@ -229,6 +241,8 @@ if has_triton:
         q_pos0,
         win_floor,
         ring_beg,
+        slot_ids,            # MULTIROW: (B,) i32 ring slot per job (else ignored, pass 0)
+        ring_stride,         # MULTIROW: ring slot stride in elements
         H: tl.constexpr,
         page_size: tl.constexpr,
         D_c: tl.constexpr,
@@ -242,6 +256,10 @@ if has_triton:
         BLOCK_H: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_W: tl.constexpr,
+        SEQ: tl.constexpr = 1,
+        MULTIROW: tl.constexpr = 0,
+        DEBUG_BOUNDS: tl.constexpr = 0,
+        DEBUG_PAGES: tl.constexpr = 0,
     ):
         """Flash-decoding split phase: each program covers one (query row, head block) and a
         contiguous slice of that row's VIRTUAL key sequence [window keys ++ pool entries],
@@ -252,6 +270,26 @@ if has_triton:
         n_splits = tl.num_programs(1)
         h_blocks: tl.constexpr = (H + BLOCK_H - 1) // BLOCK_H
         row = pid // h_blocks
+
+        # MULTIROW: rows are B jobs x SEQ; the position/window/ring state args are per-job
+        # i32 arrays, the ring is the stacked (slots, rows, D) tensor addressed by slot, and
+        # the block table holds one row per JOB (paged pools)
+        if MULTIROW:
+            job = row // SEQ
+            loc = row % SEQ
+            q_pos0 = tl.load(q_pos0 + job)
+            win_floor = tl.load(win_floor + job)
+            ring_beg = tl.load(ring_beg + job)
+            pool_len = tl.load(pool_len + job)
+            k_len = tl.load(k_len + job)
+            slot = tl.load(slot_ids + job)
+            ring = ring + slot.to(tl.int64) * ring_stride
+            bt_row = job
+            cbase = job * SEQ
+        else:
+            loc = row
+            cbase = 0
+            bt_row = row
 
         offs_h = (pid % h_blocks) * BLOCK_H + tl.arange(0, BLOCK_H)
         valid_h = offs_h < H
@@ -266,7 +304,7 @@ if has_triton:
 
         # This row's virtual key range for this split
         if DENSE_POOL:
-            n_pool = tl.minimum((q_pos0 + row + 1) // compress_rate, pool_len)
+            n_pool = tl.minimum((q_pos0 + loc + 1) // compress_rate, pool_len)
         else:
             n_pool = k_len
         n_win = win_len if HAS_WINDOW else 0
@@ -281,7 +319,7 @@ if has_triton:
         acc_r = tl.zeros((BLOCK_H, D_r), tl.float32)
 
         if HAS_WINDOW:
-            q_abs = q_pos0 + row
+            q_abs = q_pos0 + loc
             w1 = tl.minimum(j1, n_win)
             for n0 in tl.range(j0, w1, BLOCK_W, num_stages = 1):
                 offs_j = n0 + tl.arange(0, BLOCK_W)
@@ -289,7 +327,7 @@ if has_triton:
                 in_range = (offs_j < w1) & (abs_pos >= win_floor)
                 mc = in_range & (abs_pos >= q_pos0)
                 mr = in_range & (abs_pos < q_pos0)
-                idx_c = tl.where(mc, abs_pos - q_pos0, 0)
+                idx_c = tl.where(mc, cbase + abs_pos - q_pos0, 0)
                 idx_r = tl.where(mr, abs_pos - ring_beg, 0)
                 vc = tl.load(kv_chunk + idx_c[:, None] * D + offs_c[None, :],
                              mask = mc[:, None] & valid_c[None, :], other = 0.0) \
@@ -324,7 +362,10 @@ if has_triton:
             in_range = idx >= 0
             idx_s = tl.where(in_range, idx, 0)
             page = idx_s // page_size
-            phys = tl.load(block_table + row * num_pages_per_row + page, mask = in_range, other = 0)
+            phys = tl.load(block_table + bt_row * num_pages_per_row + page, mask = in_range, other = 0)
+            if DEBUG_BOUNDS:
+                tl.device_assert(tl.where(in_range, idx_s < pool_len, True), "dsa_split: entry idx >= pool_len")
+                tl.device_assert(tl.where(in_range, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_split: pool page OOB")
             tok = phys * page_size + idx_s % page_size
             vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
                          mask = in_range[:, None] & valid_c[None, :], other = 0.0)
@@ -371,6 +412,8 @@ if has_triton:
         HPG: tl.constexpr,
         BLOCK_H: tl.constexpr,
         BLOCK_D: tl.constexpr,       # even; D_c is even so rope pairs never straddle tiles
+        SEQ: tl.constexpr = 1,
+        MULTIROW: tl.constexpr = 0,  # q_pos0 is a per-job i32 array when set
     ):
         """Combine phase: merge the split partials (sink folded in as one more partial),
         normalize, de-rotate (identity rotation, theta = 0, below the rope columns) and
@@ -418,7 +461,11 @@ if has_triton:
             in_rope = col_e >= D_c
             fr = tl.load(derot_inv_freq + tl.where(in_rope, (col_e - D_c) // 2, 0),
                          mask = in_rope, other = 0.0)
-            theta = fr * (q_pos0 + row)
+            if MULTIROW:
+                qp = tl.load(q_pos0 + row // SEQ) + row % SEQ
+            else:
+                qp = q_pos0 + row
+            theta = fr * qp
             cos = tl.cos(theta)[None, :]
             sin = tl.sin(theta)[None, :]
             o_e, o_o = tl.split(tl.reshape(o, (BLOCK_H, BLOCK_D // 2, 2)))
@@ -431,17 +478,19 @@ if has_triton:
         tl.store(out + base_h[:, None] + offs_d[None, :], o.to(tl.float16),
                  mask = valid_h[:, None] & valid_d[None, :])
 
-    @triton.jit(do_not_specialize = ["T", "R", "q_pos0", "bound_max"])
+    @triton.jit(do_not_specialize = ["T", "R", "q_pos0", "bound_max"],
+                debug = dsa_debug_bounds)
     def _dsa_indexer_kernel(
         q_idx,               # (R, H_i, D_i) fp16, rope applied
         w,                   # (R, H_i) fp16 raw head weights (scales folded into `scale`)
-        k_idx,               # (T, D_i) fp16 indexer keys (contiguous pool), rope applied
+        k_idx,               # (T, D_i) fp16 indexer keys, rope applied; paged when EPP > 0
         scores,              # (R, S_stride) fp16 out
         T,                   # runtime: valid keys
         R,                   # runtime: valid query rows
         q_pos0,              # runtime: absolute position of query row 0
         bound_max,           # runtime: entry count clamp; bound[r] =
                              #   min((q_pos0 + r + 1) // compress_rate, bound_max)
+        block_table,         # EPP > 0: (npr,) i32 page table of the (single) job
         H_i: tl.constexpr,
         D_i: tl.constexpr,
         S_stride: tl.constexpr,
@@ -449,6 +498,9 @@ if has_triton:
         scale: tl.constexpr,             # D_i ** -0.5 * H_i ** -0.5
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        EPP: tl.constexpr = 0,           # pool entries per page; 0 = contiguous k_idx
+        DEBUG_BOUNDS: tl.constexpr = 0,
+        DEBUG_PAGES: tl.constexpr = 0,
     ):
         """Lightning-indexer scoring: scores[r, s] = sum_h w[r, h] * relu(q[r, h] . k[s]) * scale.
         GEMM-shaped with a per-head ReLU epilogue; the head loop runs H_i full MMA dots against
@@ -462,7 +514,14 @@ if has_triton:
         valid_m = offs_m < R
         valid_n = offs_n < T
 
-        kt = tl.load(k_idx + offs_n[None, :] * D_i + offs_d[:, None],
+        if EPP > 0:
+            phys = tl.load(block_table + offs_n // EPP, mask = valid_n, other = 0)
+            if DEBUG_BOUNDS:
+                tl.device_assert(tl.where(valid_n, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_indexer: pool page OOB")
+            k_rows = phys * EPP + offs_n % EPP
+        else:
+            k_rows = offs_n
+        kt = tl.load(k_idx + k_rows[None, :] * D_i + offs_d[:, None],
                      mask = valid_n[None, :], other = 0.0)
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
@@ -480,16 +539,19 @@ if has_triton:
                  mask = valid_m[:, None] & valid_n[None, :])
 
 
-    @triton.jit(do_not_specialize = ["T", "R", "q_pos0", "bound_max"])
+    @triton.jit(do_not_specialize = ["T", "R", "q_pos0", "bound_max", "num_pages_per_row"],
+                debug = dsa_debug_bounds)
     def _dsa_indexer_fewq_kernel(
         q_idx,               # (R, H_i, D_i) fp16, rope applied
         w,                   # (R, H_i) fp16 raw head weights
-        k_idx,               # (T, D_i) fp16 indexer keys, rope applied
+        k_idx,               # (T, D_i) fp16 indexer keys, rope applied; paged when EPP > 0
         scores,              # (R, S_stride) fp16 out
         T,
         R,
         q_pos0,
         bound_max,
+        block_table,         # EPP > 0: i32 page table, one row per job (row 0 if not MULTIROW)
+        num_pages_per_row,   # EPP > 0, MULTIROW: block table row stride
         H_i: tl.constexpr,
         H_pad: tl.constexpr,
         D_i: tl.constexpr,
@@ -497,12 +559,26 @@ if has_triton:
         compress_rate: tl.constexpr,
         scale: tl.constexpr,             # D_i ** -0.5 * H_i ** -0.5
         BLOCK_N: tl.constexpr,
+        SEQ: tl.constexpr = 1,
+        MULTIROW: tl.constexpr = 0,      # T/q_pos0/bound_max are per-job i32 arrays
+        EPP: tl.constexpr = 0,           # pool entries per page; 0 = contiguous k_idx
+        DEBUG_BOUNDS: tl.constexpr = 0,
+        DEBUG_PAGES: tl.constexpr = 0,
     ):
         """Few-query variant (decode): one program per (query row, key tile) with HEADS as
         the MMA M dim. A single dot replaces the head loop, which is a serial latency chain
         when the row tile is nearly empty."""
         r = tl.program_id(0)
         pid_n = tl.program_id(1)
+        if MULTIROW:
+            job = r // SEQ
+            loc = r % SEQ
+            T = tl.load(T + job)
+            q_pos0 = tl.load(q_pos0 + job)
+            bound_max = tl.load(bound_max + job)
+            block_table = block_table + job * num_pages_per_row
+        else:
+            loc = r
         # In a captured graph the grid is sized for the FULL score buffer (pool capacity)
         # with T patched per replay; tiles past T retire immediately (their region of the
         # scores buffer holds the required -inf from the one-time fill)
@@ -516,13 +592,20 @@ if has_triton:
 
         qh = tl.load(q_idx + (r * H_i + offs_h)[:, None] * D_i + offs_d[None, :],
                      mask = valid_h[:, None], other = 0.0)                     # (H_pad, D)
-        kt = tl.load(k_idx + offs_n[None, :] * D_i + offs_d[:, None],
+        if EPP > 0:
+            phys = tl.load(block_table + offs_n // EPP, mask = valid_n, other = 0)
+            if DEBUG_BOUNDS:
+                tl.device_assert(tl.where(valid_n, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_fewq: pool page OOB")
+            k_rows = phys * EPP + offs_n % EPP
+        else:
+            k_rows = offs_n
+        kt = tl.load(k_idx + k_rows[None, :] * D_i + offs_d[:, None],
                      mask = valid_n[None, :], other = 0.0)                     # (D, N)
         logits = tl.dot(qh, kt)                                                # (H_pad, N)
         wh = tl.load(w + r * H_i + offs_h, mask = valid_h, other = 0.0)
         acc = tl.sum(tl.maximum(logits, 0.0) * wh[:, None].to(tl.float32), axis = 0) * scale
 
-        bound = tl.minimum((q_pos0 + r + 1) // compress_rate, bound_max)
+        bound = tl.minimum((q_pos0 + loc + 1) // compress_rate, bound_max)
         acc = tl.where(offs_n < bound, acc, -float("inf"))
         tl.store(scores + r * S_stride + offs_n, acc.to(tl.float16), mask = valid_n)
 
@@ -551,8 +634,14 @@ def dsa_attn(
     block_h = 32,
     block_n = 32,
     num_warps = 4,
-    num_stages = 3,   # fits with the reduced window tile (BLOCK_W); 3 stages needed for the
-                      # gathered pool phase at prefill
+    num_stages = 3,
+    page_size = 256,         # pool entries per block-table page (PAGE_SIZE // m for the
+                             # paged pools; 256 with an identity table for contiguous pools)
+    multirow = None,         # batched jobs: dict(q_pos, win_floor, ring_beg, pool_len,
+                             # k_len (B,) i32; slot_ids (B,) i32; ring_stride int; seq int)
+                             # -- scalar args of the same names are ignored, ring is the
+                             # stacked (slots, rows, D) tensor, block_table holds one row
+                             # per JOB, R = B * seq
 ):
     """Core DSA attention over [sliding ring ++ pool entries], V IS K. Gathered mode when
     `indices` is given, dense-pool mode otherwise (per-query causal entry bound). With
@@ -596,6 +685,15 @@ def dsa_attn(
     # A single-row block table is shared by every query row (contiguous per-slot pools):
     # stride 0 makes the kernel's bt[row * npr + page] hit row 0 for all rows
     npr = block_table.shape[1] if block_table.shape[0] > 1 else 0
+    dbg = 1 if dsa_debug_bounds else 0
+    if dsa_debug_bounds:
+        # Debug codegen inflates the one-shot kernel's smem footprint past 99 KB devices;
+        # halve the head tile (perf is irrelevant with asserts on)
+        num_stages = min(num_stages, 2)
+        block_h = min(block_h, 16)
+    dbg_pages = -(-(pool_c.numel() // max(D_c, 1)) // max(page_size, 1)) if dsa_debug_bounds else 0
+    if multirow is not None:
+        n_splits = n_splits or 8
     if n_splits == 0:
         if R <= 8:
             est = (win_len if has_window else 0) + \
@@ -615,23 +713,36 @@ def dsa_attn(
                                    torch.float, "dsa_ws_ml")
         ws_acc = g_tensor_cache.get(q.device, (R * hb * n_splits * block_h * D_out,),
                                     torch.float, "dsa_ws_acc")
+        if multirow is not None:
+            mr = multirow
+            a_klen, a_pool = mr["k_len"], mr["pool_len"]
+            a_qpos, a_floor, a_beg = mr["q_pos"], mr["win_floor"], mr["ring_beg"]
+            a_slots, a_rstride, a_seq = mr["slot_ids"], mr["ring_stride"], mr["seq"]
+            npr = block_table.shape[1]     # one block-table row per job
+        else:
+            a_klen, a_pool, a_qpos, a_floor, a_beg = k_len, pool_len, q_pos0, win_floor, ring_beg
+            a_slots, a_rstride, a_seq = 0, 0, 1
         with torch.cuda.device(q.device):
             _dsa_attn_split_kernel[(R * hb, n_splits)](
                 q, ring, kv_chunk, pool_c.reshape(-1, D_c), pool_r.reshape(-1, D_r),
                 block_table, indices, ws_ml, ws_acc,
-                k_len, win_len, pool_len, npr, q_pos0, win_floor, ring_beg,
-                H = H, page_size = 256, D_c = D_c, D_c_pad = triton.next_power_of_2(D_c),
+                a_klen, win_len, a_pool, npr, a_qpos, a_floor, a_beg,
+                a_slots, a_rstride,
+                H = H, page_size = page_size, D_c = D_c, D_c_pad = triton.next_power_of_2(D_c),
                 D_r = D_r, K_pad = K_pad, compress_rate = compress_rate, scale = scale,
                 HAS_WINDOW = has_window, DENSE_POOL = dense_pool,
                 BLOCK_H = block_h, BLOCK_N = block_n, BLOCK_W = 16,
+                SEQ = a_seq, MULTIROW = multirow is not None,
+                DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
                 num_warps = num_warps, num_stages = 2,
             )
             _dsa_attn_combine_kernel[(R * hb, triton.cdiv(D, 128))](
                 ws_ml, ws_acc, sinks_t, derot_t, out,
-                q_pos0, R, n_splits,
+                a_qpos, R, n_splits,
                 H = H, D_c = D_c, D_r = D_r,
                 HAS_SINKS = has_sinks, DEROTATE = derotate, HPG = hpg,
                 BLOCK_H = block_h, BLOCK_D = 128,
+                SEQ = a_seq, MULTIROW = multirow is not None,
                 num_warps = 4, num_stages = 2,
             )
         return out
@@ -642,7 +753,7 @@ def dsa_attn(
             q, ring, kv_chunk, pool_c.reshape(-1, D_c), pool_r.reshape(-1, D_r),
             block_table, indices, sinks_t, derot_t, out,
             k_len, win_len, pool_len, npr, q_pos0, R, win_floor, ring_beg,
-            H = H, page_size = 256, D_c = D_c, D_c_pad = triton.next_power_of_2(D_c),
+            H = H, page_size = page_size, D_c = D_c, D_c_pad = triton.next_power_of_2(D_c),
             D_r = D_r, K_pad = K_pad, compress_rate = compress_rate,
             scale = scale,
             HAS_WINDOW = has_window,
@@ -651,6 +762,7 @@ def dsa_attn(
             DEROTATE = derotate,
             HPG = hpg,
             BLOCK_H = block_h, BLOCK_N = block_n, BLOCK_W = 16,
+            DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
             num_warps = num_warps, num_stages = num_stages,
         )
     return out
@@ -659,7 +771,8 @@ def dsa_attn(
 def dsa_indexer_scores(
     q_idx,                   # (R, H_i, D_i) fp16, rope applied
     weights,                 # (R, H_i) fp16 raw head weights (H_i ** -0.5 folded in-kernel)
-    k_idx,                   # (T, D_i) fp16 contiguous key pool, rope applied
+    k_idx,                   # (T, D_i) fp16 key pool, rope applied; contiguous rows, or the
+                             # flat paged pool when block_table is given
     q_pos0,                  # absolute position of query row 0
     compress_rate,
     bound_max,               # entry count clamp (valid pool entries)
@@ -668,11 +781,20 @@ def dsa_indexer_scores(
     block_n = 128,
     num_warps = 8,
     num_stages = 2,
+    block_table = None,      # (npr,) or (1, npr) i32 page table of the (single) job
+    epp = 0,                 # pool entries per page (paged mode)
 ):
     """Indexer scores (R, T) fp16 with -inf past each query's causal entry bound
     min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk."""
     R, H_i, D_i = q_idx.shape
-    T = k_idx.shape[0]
+    T = bound_max
+    if block_table is None:
+        T = k_idx.shape[0]
+        bt, epp = 0, 0
+    else:
+        bt = block_table.reshape(-1)
+    dbg = 1 if (dsa_debug_bounds and epp) else 0
+    dbg_pages = -(-k_idx.shape[0] // epp) if dbg else 0
     S_stride = triton.cdiv(max(T, 1), block_n) * block_n
     if scores is None:
         scores = g_tensor_cache.get(q_idx.device, (R, S_stride), torch.half, "dsa_idx_scores")
@@ -682,20 +804,22 @@ def dsa_indexer_scores(
             # the query-tiled kernel degenerates to a serial head loop over padding here
             grid = (R, triton.cdiv(max(T, 1), block_n))
             _dsa_indexer_fewq_kernel[grid](
-                q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max,
+                q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt, 0,
                 H_i = H_i, H_pad = max(triton.next_power_of_2(H_i), 16), D_i = D_i,
                 S_stride = S_stride, compress_rate = compress_rate,
                 scale = D_i ** -0.5 * H_i ** -0.5,
-                BLOCK_N = block_n,
+                BLOCK_N = block_n, EPP = epp,
+                DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
                 num_warps = num_warps, num_stages = num_stages,
             )
         else:
             grid = (triton.cdiv(R, block_m), triton.cdiv(max(T, 1), block_n))
             _dsa_indexer_kernel[grid](
-                q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max,
+                q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt,
                 H_i = H_i, D_i = D_i, S_stride = S_stride, compress_rate = compress_rate,
                 scale = D_i ** -0.5 * H_i ** -0.5,
-                BLOCK_M = block_m, BLOCK_N = block_n,
+                BLOCK_M = block_m, BLOCK_N = block_n, EPP = epp,
+                DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
                 num_warps = num_warps, num_stages = num_stages,
             )
     return scores[:, :T]

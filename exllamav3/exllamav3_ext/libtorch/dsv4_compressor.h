@@ -91,7 +91,9 @@ struct BC_DSV4Compressor
         const c10::optional<at::Tensor>& mg_c,          // (2, seq, W) preallocated scratch
                                                         // (graph capture: no allocations)
         class Graph* graph,
-        bool proj_precomputed = false                   // kv/gate already in mg_c (fan mgemm)
+        bool proj_precomputed = false,                  // kv/gate already in mg_c (fan mgemm)
+        const c10::optional<at::Tensor>& pool_bt = {},  // paged pools: job's block table row
+        int pool_epp = 0
     );
 
     void run
@@ -104,6 +106,8 @@ struct BC_DSV4Compressor
         c10::optional<at::Tensor>& dest_b,
         int position,
         const c10::optional<at::Tensor>& position_tensor,
-        const c10::optional<at::Tensor>& mg_c
+        const c10::optional<at::Tensor>& mg_c,
+        const c10::optional<at::Tensor>& pool_bt,
+        int pool_epp
     );
 };

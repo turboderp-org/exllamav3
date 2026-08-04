@@ -75,12 +75,17 @@ void dsa_topk_kernel
 (
     const half* __restrict__ scores,     // (R, s_stride), -inf past each row's causal bound
     int* __restrict__ out,               // (R, k_pad) int32, -1 padded
-    const int T,
+    int T,
     const int s_stride,
     const int k,
-    const int k_pad
+    const int k_pad,
+    const int* __restrict__ t_ptr,       // device T override (graph modes)
+    const int t_seq                      // > 0: t_ptr is per-JOB, T = t_ptr[row / t_seq]
+                                         // (rows only scan their own causal region, so no
+                                         // -inf backfill of the score buffer is needed)
 )
 {
+    if (t_ptr) T = t_seq > 0 ? t_ptr[blockIdx.x / t_seq] : *t_ptr;
     constexpr uint16_t KEY_NEG_INF = 0x03ff;   // topk_key(0xfc00)
 
     const half* row_s = scores + (size_t) blockIdx.x * s_stride;
@@ -271,7 +276,9 @@ void dsa_topk_gr
     const at::Tensor& scores,            // (R, T) half, possibly a view with row stride
     at::Tensor& indices,                 // (R, k_pad) int32 out
     int k,
-    Graph* graph
+    Graph* graph,
+    const c10::optional<at::Tensor>& t_ptr,
+    int t_seq
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
@@ -287,6 +294,7 @@ void dsa_topk_gr
     int k_pad = indices.size(1);
     TORCH_CHECK(indices.size(0) == R && k <= k_pad, "dsa_topk: output shape mismatch");
 
+    const int* t_ptr_ = t_ptr ? (const int*) t_ptr.value().data_ptr() : nullptr;
     bool vec = scores.stride(0) % 8 == 0 && ((uintptr_t) scores.data_ptr()) % 16 == 0;
     void* kfn = vec ? (void*) dsa_topk_kernel<true> : (void*) dsa_topk_kernel<false>;
     if (vec)
@@ -294,18 +302,19 @@ void dsa_topk_gr
         (
             (const half*) scores.data_ptr(),
             (int*) indices.data_ptr(),
-            T, (int) scores.stride(0), k, k_pad
+            T, (int) scores.stride(0), k, k_pad, t_ptr_, t_seq
         );
     else
         dsa_topk_kernel<false><<<R, TOPK_THREADS, 0, stream>>>
         (
             (const half*) scores.data_ptr(),
             (int*) indices.data_ptr(),
-            T, (int) scores.stride(0), k, k_pad
+            T, (int) scores.stride(0), k, k_pad, t_ptr_, t_seq
         );
     cuda_check(cudaPeekAtLastError());
 
-    if (graph)
+    // With a device-side T there is nothing to patch per replay
+    if (graph && !t_ptr_)
     {
         graph->record_param(kfn, GP_dsa_T, 2, 4);
         graph->record_param(kfn, GP_end, 0);
@@ -316,8 +325,10 @@ void dsa_topk
 (
     const at::Tensor& scores,
     at::Tensor indices,
-    int64_t k
+    int64_t k,
+    const c10::optional<at::Tensor>& t_ptr,
+    int64_t t_seq
 )
 {
-    dsa_topk_gr(scores, indices, (int) k, nullptr);
+    dsa_topk_gr(scores, indices, (int) k, nullptr, t_ptr, (int) t_seq);
 }

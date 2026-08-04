@@ -52,13 +52,26 @@ def _is_pow2(n: int) -> bool:
 
 def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                     num_warps: int, num_stages: int):
-    key = (device.index, fn.__name__, tuple(sorted(constexprs.items())), num_warps, num_stages)
+    key = (device.index, fn.__name__, tuple(sorted(constexprs.items())), num_warps, num_stages,
+           tuple(sorted(signature.items())))
     k = _kernel_cache.get(key)
     if k is None:
         import triton
         from triton.compiler import ASTSource
+        # A ":16" suffix on a signature entry declares the argument 16-byte divisible
+        # (pointer alignment / scalar divisibility), matching the JIT's specialization --
+        # without it the AOT kernel loses vectorized global loads (~1.5x on
+        # bandwidth-heavy kernels). Every launch MUST then honor the alignment
+        attrs = {}
+        sig = {}
+        for name, ty in signature.items():
+            if isinstance(ty, str) and ty.endswith(":16"):
+                sig[name] = ty[:-3]
+                attrs[(fn.arg_names.index(name),)] = [["tt.divisibility", 16]]
+            else:
+                sig[name] = ty
         with torch.cuda.device(device):
-            src = ASTSource(fn = fn, signature = signature, constexprs = constexprs)
+            src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
             ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
             k = ext.TritonKernel(ck.asm["cubin"], ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k

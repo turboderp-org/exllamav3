@@ -10,12 +10,20 @@ from .linear import Linear
 from .rmsnorm import RMSNorm
 from ..ext import exllamav3_ext as ext
 from ..util.rope import RopeStyle, yarn_inv_freq
-from ..util.tensor import g_tensor_cache
+from ..util.tensor import g_tensor_cache, get_for_device
 from .quant.exl3 import LinearEXL3
-from ..cache.dsa import DSV4LayerState
+from ..cache.dsa import DSV4LayerState, CacheLayer_dsa
 from .multilinear import MultiLinear
-from .attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores
-from .attention_fn.bc_dsa import bc_dsa_enable, build_bc_dsa
+from .attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores, dsa_debug_bounds
+from .attention_fn.bc_dsa import bc_dsa_enable, build_bc_dsa, build_bc_dsa_batch
+
+# Multi-job decode via the batched path: one projection pass, one MULTIROW attention
+# call and one grouped o_proj over all rows (per-slot state addressed through slot-id /
+# per-job position arrays in-kernel). EXL3_DSV4_BATCH_EAGER=0 restores the loop
+dsv4_batch_eager = os.environ.get("EXL3_DSV4_BATCH_EAGER", "1") != "0"
+# Capture the batched step as one CUDA graph per (cache layer, B, S) after two warmup
+# runs; EXL3_DSV4_BATCH_GRAPH=0 keeps the eager batched chain
+dsv4_batch_graph = os.environ.get("EXL3_DSV4_BATCH_GRAPH", "1") != "0"
 from ..constants import PAGE_SIZE
 
 # Reference: transformers models/deepseek_v4 (paper §2)
@@ -207,7 +215,8 @@ class DSV4Compressor:
         self.fused_norm_w = None
 
 
-    def forward_fused(self, x, params, buf_kv, buf_gate, ovl, dest_a, dest_b, position):
+    def forward_fused(self, x, params, buf_kv, buf_gate, ovl, dest_a, dest_b, position,
+                      pool_bt = None, pool_epp = 0):
         """Cached-path forward (bsz 1): project + window-pool + norm + rope, writing emitted
         entries straight into the per-slot pools and updating the ring/snapshot state. One
         C++ transition via the BC companion when the chunk fits its scratch, else the two
@@ -220,14 +229,15 @@ class DSV4Compressor:
         use_bc = self.bc is not None and seq <= self.BC_MAX_QLEN and \
             not any(k in params for k in ("capture", "quant_preserve", "ovr", "reconstruct"))
         if use_bc:
-            self.bc.run(x[0], buf_kv, buf_gate, ovl, dest_a, dest_b, position, None, None)
+            self.bc.run(x[0], buf_kv, buf_gate, ovl, dest_a, dest_b, position, None, None,
+                        pool_bt, pool_epp)
         else:
             kv = self.wkv.forward(x, params)[0]
             gate = self.wgate.forward(x, params)[0]
             ext.dsv4_compress(
                 kv, gate, buf_kv, buf_gate, ovl, self.ape, self.fused_norm_w,
                 self.norm.rms_norm_eps, self.fused_inv_freq, dest_a, dest_b, position,
-                None, self.compress_rate,
+                None, self.compress_rate, None, pool_bt, pool_epp,
             )
 
 
@@ -491,12 +501,25 @@ class DSV4Attention(Module):
         self.q_fan = None
         self.x_fan_ready = False
         self._fan_scratch = {}
+        self._bgraph_state = {}
 
-        # Recurrent-state cache pattern (SWA/GDN): per-slot rings and pools, no paged KV
+        # Hybrid cache pattern: fixed-size per-slot recurrent state (SWA ring, compressor
+        # sub-window buffers, overlap snapshots) plus, for CSA/HCA layers, paged pools that
+        # alias the token page table (CacheLayer_dsa)
         self.caps.update({"recurrent_cache": True})
         self.layer_state_cls = DSV4LayerState
         self.recurrent_layers = []
         self.tp_recurrent_lookup = {}
+        self.cache_layers = []
+        if self.layer_type in ("csa", "hca"):
+            self.caps.update({"kv_cache": True})
+
+
+    def cache_layer_type(self, default, kwargs: dict):
+        """DSA pools are always CacheLayer_dsa regardless of the requested transformer cache
+        layer type; a quantized Cache quantizes only its transformer/MLA layers (pools stay
+        fp16 in v1, like recurrent state)."""
+        return CacheLayer_dsa, {}
 
 
     @override
@@ -524,11 +547,15 @@ class DSV4Attention(Module):
             self.indexer.ape = stc.get_tensor(f"{self.indexer.key}.ape", device, no_defer = True).float().contiguous()
         for rl in self.recurrent_layers:
             rl.alloc(device)
+        for cl in self.cache_layers:
+            cl.alloc(device)
 
 
     @override
     def unload(self):
         super().unload()
+        for cl in self.cache_layers:
+            cl.free()
         self.sinks = None
         if self.compressor is not None:
             self.compressor.ape = None
@@ -543,6 +570,9 @@ class DSV4Attention(Module):
         self.q_fan = None
         self.x_fan_ready = False
         self._fan_scratch = {}
+        self._bgraph_state = {}
+        self._bc_dsa_batch = {}
+        self._bc_dsa = {}
         self.wo_a_multi = None
         self.woa_indices = None
         self.woa_multi_ready = False
@@ -640,6 +670,29 @@ class DSV4Attention(Module):
         self.q_fan = mk_fan([self.q_b, self.idx_wq_b]) if self.indexer is not None else None
         self._fan_scratch = {}
 
+        from .multilinear import MultiLinear
+        self.qb_multi = self.wob_multi = None
+        self._one_idx = None
+        try:
+            if self.q_fan is None and self.q_b.quant_type == "exl3":
+                self.qb_multi = MultiLinear(self.device, [self.q_b])
+            if self.wo_b.quant_type == "exl3":
+                self.wob_multi = MultiLinear(self.device, [self.wo_b])
+            self._one_idx = torch.zeros((1, 1), dtype = torch.long, device = device)
+        except AssertionError:
+            self.qb_multi = self.wob_multi = None
+
+
+    def _mgemm1(self, mu, x2, out_dtype, tag):
+        """Single-matrix exl3_mgemm (one 'expert'): capture-safe multi-row linear for the
+        graphed batched body. x2 (1, R, k) -> (1, R, n)."""
+        R = x2.shape[1]
+        C = g_tensor_cache.get(x2.device, (1, R, mu.out_features), out_dtype, tag + "_c")
+        ah = g_tensor_cache.get(x2.device, (1, R, x2.shape[-1]), torch.half, tag)
+        ext.exl3_mgemm(
+            x2, mu.ptrs_trellis, C, mu.ptrs_suh, ah, mu.ptrs_svh,
+            self._one_idx, None, mu.K, -1, mu.mcg, mu.mul1, -1, -1, 0, 1, None, None)
+        return C
 
     def _fan_outs(self, fan, tag, seq, shapes):
         """Per-(seq) fan output scratch + pointer array, cached (g_tensor_cache reuses the
@@ -670,7 +723,7 @@ class DSV4Attention(Module):
             self.wo_a_multi = None    # mixed K/format across slices: per-slice loop
 
 
-    def _project_o_grouped(self, o, params, out_dtype):
+    def _project_o_grouped(self, o, params, out_dtype, mgemm_out = False):
         """
         Grouped output projection: o (G, bsz, seq, hpg * head_dim) fp16 contiguous,
         rope slice already de-rotated. Short rows: ONE exl3_mgemm over the G slices (each
@@ -691,7 +744,9 @@ class DSV4Attention(Module):
             mu = self.wo_a_multi
             A = o[:, 0]                                   # (G, seq, hpg * head_dim)
             ah = g_tensor_cache.get(o.device, tuple(A.shape), torch.half, "dsv4_woa_had")
-            C = torch.empty((G, seq, mu.out_features), dtype = torch.half, device = o.device)
+            C = g_tensor_cache.get(o.device, (G, seq, mu.out_features), torch.half,
+                                   "dsv4_woa_c") if mgemm_out else \
+                torch.empty((G, seq, mu.out_features), dtype = torch.half, device = o.device)
             ext.exl3_mgemm(
                 A, mu.ptrs_trellis, C, mu.ptrs_suh, ah, mu.ptrs_svh,
                 self.woa_indices, None, mu.K, -1, mu.mcg, mu.mul1,
@@ -699,8 +754,17 @@ class DSV4Attention(Module):
             )
             if seq == 1:
                 o2 = C.view(1, 1, G * mu.out_features)
+            elif mgemm_out:
+                o2 = g_tensor_cache.get(o.device, (seq, G * mu.out_features), torch.half,
+                                        "dsv4_woa_t")
+                o2.view(seq, G, mu.out_features).copy_(C.transpose(0, 1))
+                o2 = o2.unsqueeze(0)
             else:
                 o2 = C.permute(1, 0, 2).reshape(seq, G * mu.out_features).unsqueeze(0)
+            if mgemm_out and self.wob_multi is not None and seq <= 32:
+                return self._mgemm1(self.wob_multi, o2.contiguous(),
+                                    out_dtype or self.out_dtype,
+                                    f"dsv4_wob1_L{self.layer_idx}")
             return self.wo_b.forward(o2, params, out_dtype = out_dtype or self.out_dtype)
 
         o = torch.cat([self.wo_a[g].forward(o[g], params) for g in range(self.o_groups)], dim = -1)
@@ -799,7 +863,9 @@ class DSV4Attention(Module):
         idx_pool,
         ec,
         pos0,
-        q_idx_pre = None
+        q_idx_pre = None,
+        block_table = None,
+        epp = 0,
     ):
         """Lightning-indexer scoring + top-k selection over the indexer key pool (ec valid
         rows). The indexer query rope uses the compress table at the query positions == this
@@ -813,33 +879,337 @@ class DSV4Attention(Module):
             q_idx = self.idx_wq_b.forward(q_res, params).view(1, seq, self.index_n_heads, self.index_head_dim).contiguous()
         _ext_rope(q_idx[..., -self.rope_head_dim:], self.inv_freq_compress, position = pos0)
         wts = self.idx_weights.forward(x, params)
-        scores = dsa_indexer_scores(q_idx[0], wts[0], idx_pool, pos0, self.compress_rate, ec)
+        scores = dsa_indexer_scores(q_idx[0], wts[0], idx_pool, pos0, self.compress_rate, ec,
+                                    block_table = block_table, epp = epp)
         k = min(self.index_topk, ec)
         K_pad = -(-k // 32) * 32
         indices = torch.empty((seq, K_pad), dtype = torch.int32, device = x.device)
-        ext.dsa_topk(scores, indices, k)
+        ext.dsa_topk(scores, indices, k, None, 0)
         return indices, k
 
 
     def _forward_cached(self, x, params, out_dtype):
-        """attn_mode flash_attn: kernel-based path over the per-job ring/pool state. Batch
-        rows are processed per sequence (v1); each row appends to its slot's ring and pools,
-        then attends over [sliding ring ++ selected/dense pool entries] via dsa_attn."""
+        """attn_mode flash_attn: kernel-based path over the per-job ring state and the paged
+        pools. Each batch row appends to its slot's ring and, through its block-table row,
+        to its pool pages, then attends over [sliding ring ++ selected/dense pool entries]
+        via dsa_attn. Block-table rows correspond 1:1 to batch rows (generator batches and
+        batch_shape identity tables alike)."""
         rsg = params["recurrent_states"]
         bsz = x.shape[0]
         assert len(rsg) >= bsz
         layer_instance = (self.layer_idx, params.get("layer_instance", 0))
-        outs = [
-            self._forward_cached_one(
-                x[i:i + 1],
-                params,
-                rsg[i],
-                rsg[i].cache.get_recurrent_layer(layer_instance),
-                out_dtype,
-                copy_static = bsz > 1)
-            for i in range(bsz)
-        ]
-        return torch.cat(outs, dim = 0) if bsz > 1 else outs[0]
+        kl = bt = None
+        if self.compressor is not None:
+            kl = rsg[0].cache.layers[layer_instance]
+            if "block_table" in params:
+                bt = get_for_device(params, "block_table", self.device)
+            else:
+                # Direct-forward use without a page table (tests/benchmarks): slot-
+                # partitioned identity, one row per batch row via each state's slot
+                sbt = kl.slot_bt(rsg[0].cache.num_slots)
+                bt = sbt[[rsg[i].slot for i in range(bsz)]]
+            if dsa_debug_bounds:
+                bmax, bmin = int(bt.max()), int(bt.min())
+                assert 0 <= bmin and bmax < kl.num_pages, \
+                    f"DSA block table content OOB: [{bmin}, {bmax}] vs {kl.num_pages} pages " \
+                    f"(layer {self.layer_idx})"
+        if bsz == 1:
+            return self._forward_cached_one(
+                x, params, rsg[0], rsg[0].cache.get_recurrent_layer(layer_instance), out_dtype,
+                kl = kl, bt_row = bt[:1] if bt is not None else None)
+        if not dsv4_batch_eager:
+            # Per-job loop: each job dispatches into its per-slot whole-step graph (or the
+            # eager core). Measured faster than the batched-eager path below at bsz 2-8 --
+            # graph replays beat batched GEMVs + per-job eager cores. The batched path is
+            # the capture substrate for the planned bszN whole-batch graphs
+            outs = [
+                self._forward_cached_one(
+                    x[i:i + 1], params, rsg[i],
+                    rsg[i].cache.get_recurrent_layer(layer_instance),
+                    out_dtype, copy_static = True,
+                    kl = kl, bt_row = bt[i:i + 1] if bt is not None else None)
+                for i in range(bsz)
+            ]
+            return torch.cat(outs, dim = 0)
+        return self._forward_cached_batch(x, params, rsg, layer_instance, out_dtype, kl, bt)
+
+
+    def _forward_cached_batch(self, x, params, rsg, layer_instance, out_dtype, kl, bt):
+        """Multi-job cached path: the projections that don't touch per-slot state (x fan or
+        Linears, q_norm, q_b / q-fan, fused-norm rope with per-job base positions) run ONCE
+        over all rows, the per-slot attention core (ring/pools/indexer/attention) runs per
+        job on row slices, and the grouped o_proj runs once over the collected outputs.
+        Falls back to the per-job loop when the rows can't share a projection pass."""
+        B, S, _ = x.shape
+        eligible = (
+            S <= 16 and x.dtype == torch.half and x.is_contiguous()
+            and not any(k in params for k in ("capture", "quant_preserve", "ovr", "reconstruct"))
+        )
+        if not eligible:
+            outs = [
+                self._forward_cached_one(x[i:i + 1], params, rsg[i],
+                                         rsg[i].cache.get_recurrent_layer(layer_instance),
+                                         out_dtype, copy_static = True,
+                                         kl = kl, bt_row = bt[i:i + 1] if bt is not None else None)
+                for i in range(B)
+            ]
+            return torch.cat(outs, dim = 0)
+
+        device = x.device
+        R = B * S
+        rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+        for rs in rsg[1:B]:
+            assert rs.cache.get_recurrent_layer(layer_instance) is rsl, \
+                "batched DSA path requires all jobs in one cache"
+        m = self.compress_rate if self.compressor is not None else 1
+        w = self.sliding_window
+        kp = -(-self.index_topk // 32) * 32 if self.indexer is not None else 32
+
+        # Host prepass (never captured): ring shifts BEFORE attention (the body then
+        # addresses the post-shift ring via the effective ring_beg; appends are in-body,
+        # after attention reads), then the per-job state rows into a pinned staging write
+        pos_l, floor_l, beg_l, ec_l, slot_l = [], [], [], [], []
+        for i in range(B):
+            rs = rsg[i]
+            pos0 = rs.position
+            slot = rs.slot
+            offset = pos0 - rs.window_beg
+            shift = 0
+            if offset + S > rsl.ring_rows:
+                need = offset + S - rsl.ring_rows
+                shift = -(-need // PAGE_SIZE) * PAGE_SIZE
+                ring_j = rsl.ring[slot]
+                ring_j[:rsl.ring_rows - shift].copy_(ring_j[shift:].clone())
+                rs.wshift = shift
+            ec = (pos0 + S) // m if self.compressor is not None else 0
+            assert self.compressor is None or ec <= bt.shape[1] * kl.epp, \
+                f"DSA pool overflow: entry {ec} beyond block table ({bt.shape[1]} pages)"
+            pos_l.append(pos0)
+            floor_l.append(pos0 - min(w - 1, offset, pos0))
+            beg_l.append(rs.window_beg + shift)
+            ec_l.append(ec)
+            slot_l.append(slot)
+
+        # Whole-batch BC graph (house pattern): all per-job state device-driven through the
+        # owner's (6, MAX_B) array and block-table static, the input pointer is the only
+        # patched parameter. Declines (no fan / non-exl3 projections) fall through to the
+        # eager batched body below
+        if dsv4_batch_graph and B <= 8 and S <= 16 and R <= 32:
+            if not hasattr(self, "_bc_dsa_batch"):
+                self._bc_dsa_batch = {}
+            bcd = self._bc_dsa_batch.get(id(rsl))
+            if bcd is None:
+                bcd = build_bc_dsa_batch(self, rsl, kl)
+                self._bc_dsa_batch[id(rsl)] = bcd if bcd is not None else False
+            if bcd:
+                return bcd.run(x, B, S, pos_l, floor_l, beg_l, ec_l, slot_l, bt)
+
+        # Eager batched body (capture reference / fallback): per-job state in a device
+        # array, same kernels as the graphs
+        gkey = (id(rsl), B, S)
+        st = self._bgraph_state.get(gkey)
+        if st is None:
+            st = dict(
+                # Pinned staging is a RING: the host may run several steps ahead of the
+                # GPU, so a single pin would be rewritten while a previous step's async
+                # H2D from it is still queued
+                pins = [torch.empty((6, B), dtype = torch.int32, pin_memory = True)
+                        for _ in range(8)],
+                pin_i = 0,
+                arr = torch.empty((6, B), dtype = torch.int32, device = device),
+                bt_st = torch.zeros((B, kl.num_pages), dtype = torch.int32, device = device)
+                    if kl is not None else None,
+            )
+            self._bgraph_state[gkey] = st
+        pin = st["pins"][st["pin_i"]]
+        st["pin_i"] = (st["pin_i"] + 1) % len(st["pins"])
+        pin.copy_(torch.tensor([pos_l, floor_l, beg_l, ec_l, slot_l, [kp] * B],
+                               dtype = torch.int32))
+        st["arr"].copy_(pin, non_blocking = True)
+        if kl is not None:
+            npr = min(bt.shape[1], kl.num_pages)
+            st["bt_st"][:, :npr].copy_(bt[:B, :npr])
+        return self._batch_body(x, st["arr"], B, S, R, rsl, kl, st["bt_st"], m, w, kp,
+                                params, out_dtype)
+
+    def _batch_body(self, x, arr, B, S, R, rsl, kl, bt_st, m, w, kp, params, out_dtype):
+        """Eager batched step, the capture reference for BC_DSV4BatchAttention: everything
+        is device-driven (per-job state from `arr`, slot/block-table indirection
+        in-kernel)."""
+        from .attention_fn.dsa_triton import dsa_attn, _dsa_indexer_fewq_kernel
+        import triton
+        device = x.device
+        a_pos, a_floor, a_beg, a_ec, a_slots, a_klen = arr.unbind(0)
+
+        q_res, q, kv, comp_kv, comp_gate, idx_kv, idx_gate, q_idx = \
+            self._project_batch(x, params, None, a_pos = a_pos)
+
+        indices = None
+        if self.compressor is not None:
+            comp, idx = self.compressor, self.indexer
+            ext.dsv4_compress(
+                comp_kv, comp_gate, rsl.comp_buf_kv, rsl.comp_buf_gate,
+                rsl.comp_ovl, comp.ape, comp.fused_norm_w, comp.norm.rms_norm_eps,
+                comp.fused_inv_freq, kl.pool_c.view(-1, kl.D_c), kl.pool_r.view(-1, kl.D_r),
+                0, a_pos, m, a_slots, bt_st, kl.epp)
+            if self.layer_type == "csa":
+                ext.dsv4_compress(
+                    idx_kv, idx_gate, rsl.idx_buf_kv, rsl.idx_buf_gate,
+                    rsl.idx_ovl, idx.ape, idx.fused_norm_w, idx.norm.rms_norm_eps,
+                    idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None,
+                    0, a_pos, m, a_slots, bt_st, kl.epp)
+
+        if self.compressor is not None and self.layer_type == "csa":
+            if True:
+                # Unified selection for ALL rows: for jobs still under index_topk the
+                # bounded top-k IS the causal identity set (ascending) -- no dense/gathered
+                # regime split
+                Hi, Di = self.index_n_heads, self.index_head_dim
+                qi = q_idx.view(B, S, Hi, Di)
+                ext.rope(
+                    qi[..., -self.rope_head_dim:], qi[..., -self.rope_head_dim:],
+                    None, None, self.inv_freq_compress, 0, a_pos, None,
+                    int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, False, 1, 0)
+                wts = g_tensor_cache.get(device, (R, Hi), torch.half, "dsv4_b_wts")
+                self.idx_weights.inner.bc.run(x.view(R, -1), wts)
+                s_max = -(-kl.capacity // 128) * 128
+                scores = g_tensor_cache.get(device, (R, s_max), torch.half, "dsv4_b_scores")
+                with torch.cuda.device(device):
+                    _dsa_indexer_fewq_kernel[(R, triton.cdiv(s_max, 128))](
+                        qi.view(R, Hi, Di), wts.view(R, Hi), kl.pool_idx.view(-1, Di),
+                        scores, a_ec, R, a_pos, a_ec, bt_st,
+                        bt_st.stride(0),
+                        H_i = Hi, H_pad = max(triton.next_power_of_2(Hi), 16), D_i = Di,
+                        S_stride = s_max, compress_rate = m,
+                        scale = Di ** -0.5 * Hi ** -0.5, BLOCK_N = 128,
+                        SEQ = S, MULTIROW = 1, EPP = kl.epp,
+                        DEBUG_BOUNDS = 1 if dsa_debug_bounds else 0,
+                        DEBUG_PAGES = kl.num_pages if dsa_debug_bounds else 0,
+                        num_warps = 8, num_stages = 2)
+                indices = g_tensor_cache.get(device, (R, kp), torch.int32, "dsv4_b_idx")
+                # Per-row scan bound from the state array: each row reads only its own
+                # causal region, so the score buffer needs no -inf backfill
+                ext.dsa_topk(scores, indices, self.index_topk, a_ec, S)
+
+        # Paged pools: the split kernel reads one block-table row per job from the fixed
+        # (B, num_pages) static
+        if self.compressor is not None:
+            bt = bt_st
+            epp = kl.epp
+            pool_c = kl.pool_c.view(-1, self.head_dim - self.rope_head_dim)
+            pool_r = kl.pool_r.view(-1, self.rope_head_dim)
+        else:
+            epp = 256
+            pool_c = g_tensor_cache.get(device, (1, self.head_dim - self.rope_head_dim),
+                                        torch.half, "dsv4_b_pc0")
+            pool_r = g_tensor_cache.get(device, (1, self.rope_head_dim), torch.half, "dsv4_b_pr0")
+            bt = g_tensor_cache.get(device, (1, 1), torch.int32, "dsv4_b_bt0")
+
+        hpg = self.num_q_heads // self.o_groups
+        out = dsa_attn(
+            q.view(R, self.num_q_heads, self.head_dim).half().contiguous(),
+            pool_c, pool_r, bt, sinks = self.sinks,
+            ring = rsl.ring, kv_chunk = kv.reshape(R, self.head_dim),
+            win_len = w, indices = indices,
+            compress_rate = m, scale = self.sm_scale,
+            derot_inv_freq = self._rope_type_neg(), groups = self.o_groups,
+            page_size = epp,
+            out = g_tensor_cache.get(device, (self.o_groups, R, hpg * self.head_dim),
+                                     torch.half, "dsv4_b_out"),
+            multirow = dict(
+                q_pos = a_pos, win_floor = a_floor, ring_beg = a_beg, pool_len = a_ec,
+                k_len = a_klen, slot_ids = a_slots,
+                ring_stride = rsl.ring_rows * self.head_dim, seq = S,
+            ),
+        )
+
+        # Ring appends (shift already applied in the prepass): batched, slot-indexed
+        ext.dsv4_ring_append(kv.reshape(R, self.head_dim), rsl.ring, a_pos, a_beg, a_slots)
+        return self._project_o_grouped(out.unsqueeze(1), params, out_dtype,
+                                       mgemm_out = True).view(B, S, -1)
+
+    def _project_batch(self, x, params, rsg, a_pos = None):
+        """One projection pass over all B * S rows for the batched cached path. Returns
+        (q_res (1, R, q_lora), q (B, S, H, hd) roped, kv (B, S, 1, hd) roped+normed,
+        comp_kv/gate (R, Wc), idx_kv/gate (R, Wi), q_idx (1, R, Hi * Di) or None), or None
+        to decline (mixed-format fans handle their own decline; plain Linears always work)."""
+        B, S, _ = x.shape
+        rows = B * S
+        if not self.x_fan_ready:
+            self._build_x_fan()
+        xf = x.view(1, rows, -1)
+        comp_kv = comp_gate = idx_kv = idx_gate = q_idx = None
+        need_q_idx = self.indexer is not None
+
+        if self.x_fan is not None and rows <= 32:
+            f = self.x_fan
+            shapes = [(self.q_a.out_features,), (self.head_dim,)]
+            if self.compressor is not None:
+                shapes += [(self.compressor.wkv.out_features,)] * 2
+            if self.indexer is not None:
+                shapes += [(self.indexer.wkv.out_features,)] * 2
+            fouts, cptr, ahad = self._fan_outs(f, "x", rows, shapes)
+            ext.exl3_mgemm(
+                xf, f["trellis"], fouts[0].view(1, rows, -1), f["suh"], ahad, f["svh"],
+                f["idx"], None, f["K"], -1, f["mcg"], f["mul1"], -1, -1, 0, 1,
+                f["n"], cptr)
+            q_res = g_tensor_cache.get(x.device, (rows, self.q_a.out_features),
+                                       torch.half, "dsv4_b_qres")
+            ext.rms_norm(fouts[0], self.q_norm.weight, q_res, self.q_norm.rms_norm_eps,
+                         self.q_norm.constant_bias, self.q_norm.constant_scale,
+                         False, False)
+            q_res = q_res.view(1, rows, -1)
+            kv = fouts[1]
+            if self.compressor is not None:
+                comp_kv, comp_gate = fouts[2], fouts[3]
+            if self.indexer is not None:
+                idx_kv, idx_gate = fouts[4], fouts[5]
+        else:
+            q_res = self.q_norm.forward(self.q_a.forward(xf, params), params, out_dtype = torch.half)
+            kv = self.wkv.forward(xf, params)[0]
+            if self.compressor is not None:
+                if not self.compressor.fused_ready:
+                    self.compressor._build_fused()
+                comp_kv = self.compressor.wkv.forward(xf, params)[0]
+                comp_gate = self.compressor.wgate.forward(xf, params)[0]
+            if self.indexer is not None:
+                if not self.indexer.fused_ready:
+                    self.indexer._build_fused()
+                idx_kv = self.indexer.wkv.forward(xf, params)[0]
+                idx_gate = self.indexer.wgate.forward(xf, params)[0]
+
+        if need_q_idx and self.q_fan is not None and rows <= 32:
+            f2 = self.q_fan
+            o2, cptr2, ahad2 = self._fan_outs(f2, "q", rows, [
+                (self.num_q_heads * self.head_dim,),
+                (self.index_n_heads * self.index_head_dim,)
+            ])
+            ext.exl3_mgemm(
+                q_res, f2["trellis"], o2[0].view(1, rows, -1), f2["suh"], ahad2, f2["svh"],
+                f2["idx"], None, f2["K"], -1, f2["mcg"], f2["mul1"], -1, -1, 0, 1,
+                f2["n"], cptr2)
+            q = o2[0]
+            q_idx = o2[1].view(1, rows, -1)
+        elif self.qb_multi is not None and rows <= 32:
+            q = self._mgemm1(self.qb_multi, q_res, torch.half, "dsv4_qb1_ah")
+        else:
+            q = self.q_b.forward(q_res, params)
+            if need_q_idx:
+                q_idx = self.idx_wq_b.forward(q_res, params)
+
+        q = q.view(B, S, self.num_q_heads, self.head_dim)
+        kv = kv.view(B, S, 1, self.head_dim)
+        positions = a_pos if a_pos is not None else \
+            torch.tensor([rs.position for rs in rsg[:B]], dtype = torch.int32,
+                         device = x.device)
+        ext.rope(
+            q, q, kv, kv,
+            self._rope_type(), 0, positions, None,
+            int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
+            self.rms_norm_eps, 0.0, 0.0, 0, False, 1,
+            self.head_dim - self.rope_head_dim,
+        )
+        return q_res, q, kv, comp_kv, comp_gate, idx_kv, idx_gate, q_idx
 
 
     def _forward_cached_one(
@@ -849,21 +1219,27 @@ class DSV4Attention(Module):
         rs,
         rsl,
         out_dtype,
-        copy_static = False
+        copy_static = False,
+        pre = None,
+        return_o = False,
+        kl = None,
+        bt_row = None,           # (1, npr) i32 device block-table row of this job
     ):
         _, seq, _ = x.shape
 
-        # Whole-step graph path (EXL3_BC_DSA=1)
-        if bc_dsa_enable and seq <= 16 and x.dtype == torch.half and x.is_contiguous():
+        # Whole-step graph path (EXL3_BC_DSA=1); not used when the batched path already
+        # projected this job's rows (pre)
+        if pre is None and \
+                bc_dsa_enable and seq <= 16 and x.dtype == torch.half and x.is_contiguous():
             if not hasattr(self, "_bc_dsa"):
                 self._bc_dsa = {}
             key = (id(rsl), rs.slot)
             bcd = self._bc_dsa.get(key)
             if bcd is None:
-                bcd = build_bc_dsa(self, rs, rsl)
+                bcd = build_bc_dsa(self, rs, rsl, kl)
                 self._bc_dsa[key] = bcd if bcd is not None else False
             if bcd:
-                y = bcd.run(x, rs, rsl)
+                y = bcd.run(x, rs, rsl, bt_row)
                 if y is not None:
                     # y is a shared static, overwritten by the next slot's replay; batch
                     # rows are assembled only after all slots have run
@@ -881,7 +1257,14 @@ class DSV4Attention(Module):
         topk_regime = self.indexer is not None and ec > self.index_topk
         q_idx_pre = None
         fouts = None
-        if use_fan:
+        if pre is not None:
+            # Batched path already ran the shared projection pass (rope applied, per-job
+            # positions); the compress section consumes the row slices directly
+            q_res, q, kv = pre["q_res"], pre["q"], pre["kv"]
+            fouts = [None, None, pre["comp_kv"], pre["comp_gate"], pre["idx_kv"], pre["idx_gate"]]
+            q_idx_pre = pre["q_idx"]
+            use_fan = True
+        elif use_fan:
 
             # One per-matrix-N mgemm covers the whole x-side projection fan (q_a, wkv and
             # both compressors' kv/gate); a second one pairs q_b with idx_wq_b over q_res
@@ -941,75 +1324,56 @@ class DSV4Attention(Module):
 
         # Window sources for the kernel: this chunk's kv rows plus prior rows read from the
         # ring at abs - window_beg; the kernel derives all per-query addressing from the
-        # positions, so no temp/index tensors are built. The attention reads only rows below
-        # pos0 from the ring, so the ring update below can happen in either order
+        # positions, so no temp/index tensors are built. The ring itself is updated AFTER
+        # attention: the shift/rebase branches move rows the kernel reads in place
         w = self.sliding_window
         n_prev = min(w - 1, pos0 - rs.window_beg, pos0)
         win_floor = pos0 - n_prev
         ring = rsl.ring[slot]
         ring_beg = rs.window_beg
 
-        # Ring update: keep the trailing window resident for the next forward. In-place append
-        # while the chunk fits; SWA-style page shift for small appends near the ring end; a
-        # window rebase for chunks that overflow the ring outright. All layers compute the
-        # same wshift for the same forward, so setting it is idempotent
-        offset = pos0 - rs.window_beg
-        pos_end = pos0 + seq
-        if offset + seq <= rsl.ring_rows:
-            ring[offset : offset + seq].copy_(kv[0])
-        elif seq < PAGE_SIZE:
-            need = offset + seq - rsl.ring_rows
-            shift = -(-need // PAGE_SIZE) * PAGE_SIZE
-            ring[:rsl.ring_rows - shift].copy_(ring[shift:].clone())
-            rs.wshift = shift
-            ring[offset - shift : offset - shift + seq].copy_(kv[0])
-        else:
-            new_beg = max(pos_end - (w - 1), 0) // PAGE_SIZE * PAGE_SIZE
-            n_keep = pos_end - new_beg
-            n_from_kv = min(n_keep, seq)
-            n_from_ring = n_keep - n_from_kv          # rows below pos0 still needed
-            assert 0 < n_keep <= rsl.ring_rows
-            if n_from_ring > 0:
-                src0 = pos0 - n_from_ring - ring_beg
-                ring[:n_from_ring].copy_(ring[src0 : src0 + n_from_ring].clone())
-            ring[n_from_ring : n_keep].copy_(kv[0, seq - n_from_kv:])
-            rs.wshift = new_beg - rs.window_beg
-
         indices = None
         k_len = 0
         pool_len = 0
         dense_m = 1
+        epp = 256
         if self.compressor is not None:
             m = self.compress_rate
             dense_m = m
-            assert ec <= rsl.pool_capacity, \
-                f"DSA pool overflow: {ec} > {rsl.pool_capacity} (raise max_dsa_tokens)"
+            epp = kl.epp
+            assert ec <= bt_row.shape[1] * epp, \
+                f"DSA pool overflow: entry {ec} beyond block table ({bt_row.shape[1]} pages)"
 
             # Fused compressor step: projections + window pooling + norm + rope, entries
-            # written straight into the per-slot pools, ring/snapshot state updated. With
-            # the fan the projections are already done: feed the compress kernels directly
+            # written into the paged pools through the job's block table, ring/snapshot
+            # state updated. With the fan the projections are already done: feed the
+            # compress kernels directly
+            pool_c_flat = kl.pool_c.view(-1, kl.D_c)
+            pool_r_flat = kl.pool_r.view(-1, kl.D_r)
             if use_fan:
                 comp = self.compressor
                 ext.dsv4_compress(
                     fouts[2], fouts[3], rsl.comp_buf_kv[slot], rsl.comp_buf_gate[slot],
                     rsl.comp_ovl[slot] if rsl.comp_ovl is not None else None,
                     comp.ape, comp.fused_norm_w, comp.norm.rms_norm_eps, comp.fused_inv_freq,
-                    rsl.pool_c[slot], rsl.pool_r[slot], pos0, None, m)
+                    pool_c_flat, pool_r_flat, pos0, None, m, None, bt_row, epp)
                 if self.layer_type == "csa":
                     idx = self.indexer
                     ext.dsv4_compress(
                         fouts[4], fouts[5], rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
                         rsl.idx_ovl[slot], idx.ape, idx.fused_norm_w, idx.norm.rms_norm_eps,
-                        idx.fused_inv_freq, rsl.pool_idx[slot], None, pos0, None, m)
+                        idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None, pos0,
+                        None, m, None, bt_row, epp)
             else:
                 self.compressor.forward_fused(
                     x, params, rsl.comp_buf_kv[slot], rsl.comp_buf_gate[slot],
                     rsl.comp_ovl[slot] if rsl.comp_ovl is not None else None,
-                    rsl.pool_c[slot], rsl.pool_r[slot], pos0)
+                    pool_c_flat, pool_r_flat, pos0, bt_row, epp)
                 if self.layer_type == "csa":
                     self.indexer.forward_fused(
                         x, params, rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
-                        rsl.idx_ovl[slot], rsl.pool_idx[slot], None, pos0)
+                        rsl.idx_ovl[slot], kl.pool_idx.view(-1, kl.D_i), None, pos0,
+                        bt_row, epp)
             pool_len = ec
 
             # Selection is only non-trivial once the pool exceeds index_topk: below that,
@@ -1017,15 +1381,12 @@ class DSV4Attention(Module):
             # mode. Indexer scoring chain is skipped (key pool is still maintained for later)
             if topk_regime:
                 indices, k_len = self._indexer_topk(
-                    x, params, q_res, rsl.pool_idx[slot, :ec], ec, pos0, q_idx_pre)
+                    x, params, q_res, kl.pool_idx.view(-1, kl.D_i), ec, pos0, q_idx_pre,
+                    block_table = bt_row, epp = epp)
 
         if self.compressor is not None:
-            pool_c, pool_r = rsl.pool_c[slot], rsl.pool_r[slot]
-            bt = rsl._identity_bt
-            if bt is None or bt.device != device:
-                bt = torch.arange(rsl.pool_capacity // PAGE_SIZE, dtype = torch.int32,
-                                  device = device).unsqueeze(0)
-                rsl._identity_bt = bt
+            pool_c, pool_r = kl.pool_c, kl.pool_r
+            bt = bt_row
         else:
             pool_c = x.new_empty((1, self.head_dim - self.rope_head_dim), dtype = torch.half)
             pool_r = x.new_empty((1, self.rope_head_dim), dtype = torch.half)
@@ -1041,6 +1402,7 @@ class DSV4Attention(Module):
             indices = indices, k_len = k_len, pool_len = pool_len, q_pos0 = pos0,
             compress_rate = dense_m, scale = self.sm_scale,
             derot_inv_freq = self._rope_type_neg(), groups = self.o_groups,
+            page_size = epp,
             out = torch.empty((self.o_groups, seq, hpg * self.head_dim), dtype = torch.half, device = device),
         )
 
@@ -1072,5 +1434,7 @@ class DSV4Attention(Module):
             ring[n_from_ring : n_keep].copy_(kv[0, seq - n_from_kv:])
             rs.wshift = new_beg - rs.window_beg
 
+        if return_o:
+            return out
         return self._project_o_grouped(out.unsqueeze(1), params, out_dtype)
 

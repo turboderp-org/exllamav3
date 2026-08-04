@@ -23,7 +23,10 @@ void dsv4_compress_gr
     int position,
     const c10::optional<at::Tensor>& position_tensor,
     int m,
-    Graph* graph
+    Graph* graph,
+    const c10::optional<at::Tensor>& slot_ids = {},
+    const c10::optional<at::Tensor>& pool_bt = {},
+    int pool_epp = 0
 );
 
 void dsv4_compress
@@ -41,7 +44,10 @@ void dsv4_compress
     c10::optional<at::Tensor> dest_b,
     int position,
     const c10::optional<at::Tensor>& position_tensor,
-    int m
+    int m,
+    const c10::optional<at::Tensor>& slot_ids,
+    const c10::optional<at::Tensor>& pool_bt,
+    int pool_epp
 );
 
 void dsv4_ring_append_gr
@@ -50,7 +56,8 @@ void dsv4_ring_append_gr
     at::Tensor& ring,
     const at::Tensor& pos,
     const at::Tensor& ring_beg,
-    Graph* graph
+    Graph* graph,
+    const c10::optional<at::Tensor>& slot_ids = {}
 );
 
 void dsv4_ring_append
@@ -58,5 +65,6 @@ void dsv4_ring_append
     const at::Tensor& kv,
     at::Tensor ring,
     const at::Tensor& pos,
-    const at::Tensor& ring_beg
+    const at::Tensor& ring_beg,
+    const c10::optional<at::Tensor>& slot_ids
 );

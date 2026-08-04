@@ -401,3 +401,13 @@ installed CUDA toolkit.
 
 Standard PyTorch variable; overrides the compute architectures the extension is built for. When
 unset, ExLlamaV3 derives the list from the GPUs present in the system.
+
+## `EXL3_DSA_DEBUG_BOUNDS`
+
+When set to `1`, the JIT DSA attention/indexer kernels compile with device-side bounds
+asserts on every block-table page read and gathered pool index, and the DSA module range-
+checks block-table contents on the host each forward. A violation traps at the faulting
+kernel with the kernel name, source line and bad index instead of corrupting memory or
+faulting asynchronously downstream. Debug tool for paged-pool issues; significant JIT
+overhead (forces Triton debug mode globally), leave unset in production. AOT/BC graph
+kernels are unaffected (compiled with asserts off).

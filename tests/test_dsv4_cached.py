@@ -84,7 +84,7 @@ def main():
     out_dir = "/tmp/dsv4_tiny_cached"
     make_checkpoint(out_dir, seed = 13)
 
-    config = Config.from_directory(out_dir, max_dsa_tokens = 4096)
+    config = Config.from_directory(out_dir)
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens = 4096, max_batch_size = 2)
     model.load(device)

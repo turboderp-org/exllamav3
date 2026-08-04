@@ -1,34 +1,134 @@
 from __future__ import annotations
 import torch
 from ..constants import PAGE_SIZE
-from .cache import Cache
+from .cache import Cache, CacheLayer
 
 """
-Per-job cache state for DSA (DeepSeek-V4-style hybrid sparse attention) layers.
+Cache state for DSA (DeepSeek-V4-style hybrid sparse attention) layers, split along the
+framework's paged/recurrent line:
 
-Design principle: every piece of compressor bookkeeping is derivable from absolute position:
- 
- - entry_count = position // m
- - buffer fill = position % m
- - overlap exists iff entry_count >= 1
- 
-The layer state holds only fixed-shape per-slot tensors and rewind is pure cursor arithmetic:
+ - The compressed pool, rope pool and indexer-key pool are PAGED cache layers
+   (CacheLayer_dsa): append-only, entry-indexed by position // m, immutable once written --
+   semantically a KV cache growing at rate 1/m. Pool entries alias the token page table:
+   token page i holds entries [i * epp, (i + 1) * epp), epp = PAGE_SIZE // m, addressed
+   through the job's ordinary block table. Capacity therefore follows the Cache's
+   max_num_tokens budget exactly (any mix of jobs fits iff total tokens fit), and prefix
+   sharing, eviction, defragmentation and the CPU tier apply to pool pages for free.
 
- - SWA ring: shifting linear buffer of raw roped K=V rows, page-aligned window_beg carried
-   on the job state (identical mechanism to SWALayerState; window + overprovision slack
-   gives guaranteed_rollback = PAGE_SIZE).
- - Compressed pool / indexer-key pool: append-only per-slot tensors indexed by entry number.
-   Rewind is free.
- - Compressor sub-window buffers: rings of the last (PAGE_SIZE + m) PROJECTED (kv, gate)
-   rows, indexed by absolute token position % ring size. Rewind = cursor move; the rows for
-   the new partial window are still present for any rollback <= PAGE_SIZE.
- - CSA overlap (previous window's Ca slice): ring of the last few window-boundary snapshots
-   indexed by (entry number - 1) % depth, depth sized for PAGE_SIZE worth of windows.
+ - Everything else is fixed-shape per-slot recurrent state (DSV4LayerState), with all
+   compressor bookkeeping derived from absolute position (entry_count = position // m,
+   buffer fill = position % m, overlap exists iff entry_count >= 1), so rewind is pure
+   cursor arithmetic:
 
-Pools are sized by the Cache's max_num_tokens budget: capacity = max_num_tokens // m entries
-per slot. Memory example, V4-Flash at max_num_tokens 131072, one slot: CSA layer pool 32768 x
-1KB = 32 MiB + indexer pool 8 MiB + rings ~2 MiB; HCA layer ~1.5 MiB; x active slots.
+    - SWA ring: shifting linear buffer of raw roped K=V rows, page-aligned window_beg
+      carried on the job state (identical mechanism to SWALayerState; window +
+      overprovision slack gives guaranteed_rollback = PAGE_SIZE).
+    - Compressor sub-window buffers: rings of the last (PAGE_SIZE + m) PROJECTED (kv, gate)
+      rows, indexed by absolute token position % ring size. Rewind = cursor move; the rows
+      for the new partial window are still present for any rollback <= PAGE_SIZE.
+    - CSA overlap (previous window's Ca slice): ring of the last few window-boundary
+      snapshots indexed by (entry number - 1) % depth, depth sized for PAGE_SIZE worth of
+      windows.
+
+Checkpoints (stash) carry only the recurrent residue; pool persistence across
+pause/resume is governed by the same page-anchoring logic as K/V pages on hybrid
+recurrent models.
 """
+
+
+class CacheLayer_dsa(CacheLayer):
+    """
+    Paged pool storage for one CSA/HCA DSAttention layer: pool_c (compressed KV, nope part),
+    pool_r (rope part) and, for CSA, pool_idx (indexer keys), each shaped
+    (num_pages, PAGE_SIZE // m, D) so that one token page holds the pool entries produced by
+    exactly that page's tokens. Tensors are page-major, so the defragmenter's rotation and
+    the CPU tier's per-page slabs apply unchanged. Pools are always fp16 in v1; a quantized
+    Cache quantizes only its transformer/MLA layers, like recurrent state.
+    """
+
+    def __init__(
+        self,
+        config: Config | None,
+        attention,
+        cache_id: int,
+        max_num_tokens: int,
+        **kwargs
+    ):
+        super().__init__(config, attention, cache_id, max_num_tokens)
+        assert max_num_tokens % PAGE_SIZE == 0, \
+            f"max_num_tokens must be a multiple of {PAGE_SIZE}."
+        m = attention.compress_rate
+        assert m and PAGE_SIZE % m == 0, f"compress_rate {m} must divide {PAGE_SIZE}"
+        self.compress_rate = m
+        self.epp = PAGE_SIZE // m
+        self.num_pages = max_num_tokens // PAGE_SIZE
+        self.capacity = self.num_pages * self.epp
+        D = attention.head_dim
+        D_r = attention.rope_head_dim
+        self.D_c = D - D_r
+        self.D_r = D_r
+        self.D_i = attention.index_head_dim if attention.layer_type == "csa" else 0
+        self.pool_c = None
+        self.pool_r = None
+        self.pool_idx = None
+        self.device = None
+        self._slot_bt = None
+
+    def alloc(self, device: torch.device):
+        self.device = device
+        self.pool_c = torch.zeros((self.num_pages, self.epp, self.D_c), dtype = torch.half, device = device)
+        self.pool_r = torch.zeros((self.num_pages, self.epp, self.D_r), dtype = torch.half, device = device)
+        if self.D_i:
+            self.pool_idx = torch.zeros((self.num_pages, self.epp, self.D_i), dtype = torch.half, device = device)
+
+    def free(self):
+        self.device = None
+        self.pool_c = self.pool_r = self.pool_idx = None
+        self._slot_bt = None
+
+    def get_kv(self, cache_seqlens, block_table, sliding_window = -1):
+        return None, None
+
+    def update_kv(self, cache_seqlens, block_table, k, v, length):
+        pass
+
+    def update_kv_direct(self, cache_seqlens, block_table, k, v, length):
+        pass
+
+    def copy_page(self, source: CacheLayer_dsa, from_page: int, to_page: int, num_tokens: int):
+        ne = min(num_tokens // self.compress_rate, self.epp)
+        if ne <= 0:
+            return
+        self.pool_c[to_page, :ne].copy_(source.pool_c[from_page, :ne], non_blocking = True)
+        self.pool_r[to_page, :ne].copy_(source.pool_r[from_page, :ne], non_blocking = True)
+        if self.pool_idx is not None:
+            self.pool_idx[to_page, :ne].copy_(source.pool_idx[from_page, :ne], non_blocking = True)
+
+    def get_tensors(self):
+        return [t for t in [self.pool_c, self.pool_r, self.pool_idx] if t is not None]
+
+    def storage_size(self):
+        n = self.num_pages * self.epp * (self.D_c + self.D_r + self.D_i)
+        return n * torch.half.itemsize
+
+    def overhead_size(self):
+        return 0
+
+    def slot_bt(self, num_slots: int) -> torch.Tensor:
+        """
+        Slot-partitioned identity block table for direct-forward use without a page table
+        (tests, benchmarks): slot s owns pages [s * pps, (s + 1) * pps),
+        pps = num_pages // num_slots, reproducing isolated per-slot pool semantics.
+        """
+        if self._slot_bt is None or self._slot_bt.shape[0] != num_slots:
+            pps = self.num_pages // num_slots
+            assert pps > 0, "CacheLayer_dsa: cache too small for slot-partitioned fallback"
+            self._slot_bt = torch.arange(num_slots * pps, dtype = torch.int32,
+                                         device = self.device).view(num_slots, pps)
+        return self._slot_bt
+
+    def tp_export(self, plan):
+        raise NotImplementedError("Tensor-parallel loading is not supported for DSA layers")
 
 
 class DSV4State:
@@ -39,6 +139,8 @@ class DSV4State:
 
     exported = False
     guaranteed_rollback = PAGE_SIZE
+
+    _serial = 0    # distinguishes successive jobs on the same slot (BC block-table refresh)
 
     def __init__(
         self,
@@ -52,6 +154,8 @@ class DSV4State:
         assert test_state or position == 0 or stashed is not None
         self.cache = cache
         self.slot = slot
+        self.serial = DSV4State._serial
+        DSV4State._serial += 1
         self.position = position
         self.last_history = 0
         self.window_beg = position // PAGE_SIZE * PAGE_SIZE
@@ -103,10 +207,10 @@ class DSV4State:
 
 
 class DSV4LayerState:
-    """Per-layer, per-cache state tensors for one DSAttention module. Allocated on meta at
-    construction, materialized by the module's load. Component set depends on layer type:
-    every layer has the SWA ring; CSA/HCA add pools and compressor rings; CSA adds the
-    indexer pool/rings and overlap snapshots."""
+    """Per-layer, per-cache recurrent state tensors for one DSAttention module. Allocated on
+    meta at construction, materialized by the module's load. Component set depends on layer
+    type: every layer has the SWA ring; CSA/HCA add compressor sub-window rings; CSA adds
+    the indexer rings and overlap snapshots. The pools live in the paged CacheLayer_dsa."""
 
     def __init__(self, module, max_batch_size: int, max_history: int, cache_id: int):
         self.module = module
@@ -128,20 +232,12 @@ class DSV4LayerState:
         self.D_r = D_r
         self.ring = mk(B, self.ring_rows, D)
 
-        self.pool_capacity = 0
-        self.pool_c = self.pool_r = self.pool_idx = None
         self.comp_buf_kv = self.comp_buf_gate = None
         self.idx_buf_kv = self.idx_buf_gate = None
         self.comp_ovl = self.idx_ovl = None
-        self._identity_bt = None
 
         if self.layer_type in ("csa", "hca"):
             m = module.compress_rate
-            cap = -(-module.config.max_dsa_tokens // m)
-            cap = -(-cap // PAGE_SIZE) * PAGE_SIZE
-            self.pool_capacity = cap
-            self.pool_c = mk(B, cap, self.D_c)
-            self.pool_r = mk(B, cap, D_r)
             w = module.compressor.wkv.out_features_unpadded
             self.buf_rows = PAGE_SIZE + m
             self.comp_buf_kv = mk(B, self.buf_rows, w)
@@ -152,7 +248,6 @@ class DSV4LayerState:
                 self.ovl_depth = PAGE_SIZE // m + 2
                 self.comp_ovl = mk(B, self.ovl_depth, 2, m, D, dtype = torch.float)
                 D_i = module.index_head_dim
-                self.pool_idx = mk(B, cap, D_i)
                 wi = module.indexer.wkv.out_features_unpadded
                 self.idx_buf_kv = mk(B, self.buf_rows, wi)
                 self.idx_buf_gate = mk(B, self.buf_rows, wi)
@@ -161,14 +256,14 @@ class DSV4LayerState:
 
     def _tensors(self):
         return [t for t in [
-            self.ring, self.pool_c, self.pool_r, self.pool_idx,
+            self.ring,
             self.comp_buf_kv, self.comp_buf_gate, self.idx_buf_kv, self.idx_buf_gate,
             self.comp_ovl, self.idx_ovl,
         ] if t is not None]
 
 
     def _set_tensors(self, ts):
-        names = ["ring", "pool_c", "pool_r", "pool_idx", "comp_buf_kv", "comp_buf_gate",
+        names = ["ring", "comp_buf_kv", "comp_buf_gate",
                  "idx_buf_kv", "idx_buf_gate", "comp_ovl", "idx_ovl"]
         it = iter(ts)
         for n in names:
@@ -177,8 +272,8 @@ class DSV4LayerState:
 
 
     def get_checkpoint_size(self):
-        # Window slice + buffers + overlaps + pools at capacity (upper bound; actual stash
-        # sizes shrink with position)
+        # Window slice + buffers + overlaps (upper bound; the ring slice shrinks below the
+        # window at low positions). Pools are paged cache state and not part of checkpoints
         n = self.window * self.module.head_dim * 2
         for t in self._tensors()[1:]:
             n += t[0].numel() * t.element_size()
@@ -209,16 +304,11 @@ class DSV4LayerState:
 
 
     def stash(self, slot, position):
-        m = self.module.compress_rate or 1
         out = [self.ring[slot, :min(self.ring_rows, position)].cpu()]
-        if self.pool_c is not None:
-            ec = position // m
-            out.append(self.pool_c[slot, :ec].cpu())
-            out.append(self.pool_r[slot, :ec].cpu())
+        if self.comp_buf_kv is not None:
             out.append(self.comp_buf_kv[slot].cpu())
             out.append(self.comp_buf_gate[slot].cpu())
-            if self.pool_idx is not None:
-                out.append(self.pool_idx[slot, :ec].cpu())
+            if self.idx_buf_kv is not None:
                 out.append(self.idx_buf_kv[slot].cpu())
                 out.append(self.idx_buf_gate[slot].cpu())
                 out.append(self.comp_ovl[slot].cpu())
@@ -231,15 +321,10 @@ class DSV4LayerState:
         ring = next(it)
         self.ring[slot].zero_()  # never leave stale rows below the restored window
         self.ring[slot, :ring.shape[0]].copy_(ring)
-        if self.pool_c is not None:
-            m = self.module.compress_rate
-            ec = position // m
-            self.pool_c[slot, :ec].copy_(next(it))
-            self.pool_r[slot, :ec].copy_(next(it))
+        if self.comp_buf_kv is not None:
             self.comp_buf_kv[slot].copy_(next(it))
             self.comp_buf_gate[slot].copy_(next(it))
-            if self.pool_idx is not None:
-                self.pool_idx[slot, :ec].copy_(next(it))
+            if self.idx_buf_kv is not None:
                 self.idx_buf_kv[slot].copy_(next(it))
                 self.idx_buf_gate[slot].copy_(next(it))
                 self.comp_ovl[slot].copy_(next(it))
