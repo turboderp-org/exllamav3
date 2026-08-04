@@ -200,7 +200,7 @@ class DeepseekV4MTPModel(Model):
 
         # Draft length gate: keep the longest prefix with sigmoid(confidence) >= threshold
         import os
-        self.draft_conf_threshold = float(os.environ.get("EXL3_DSPARK_CONF", "0.3"))
+        self.draft_conf_threshold = float(os.environ.get("EXL3_DSPARK_CONF", "0.5"))
         self._conf_stats = [] if os.environ.get("EXL3_DSPARK_CONF_STATS") else None
 
         self.logit_layer_idx = None
