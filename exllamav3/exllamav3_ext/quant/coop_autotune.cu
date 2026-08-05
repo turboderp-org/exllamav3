@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 
@@ -303,42 +304,58 @@ void set_kernel_attr_once(void* kernel, size_t smem)
     attr_set.insert(key);
 }
 
-std::mutex thrash_mutex;
-std::map<int, std::pair<void*, size_t>> thrash_buffers;
-
 // Candidates in one autotune session share the same input tensors, so back-to-back timed launches
 // keep each other's operands mutually warm in L2 regardless of production's actual scattered,
-// per-token-random expert access pattern.
-void thrash_l2(cudaStream_t stream)
+// per-token-random expert access pattern. The buffer lives only for the duration of one tuning
+// session and is allocated through the Torch caching allocator: a raw cudaMalloc would fail
+// whenever Torch has the device's VRAM reserved in its pool, even with plenty of it free.
+struct ThrashBuffer
+{
+    at::Tensor tensor;
+    void* ptr = nullptr;
+    size_t size = 0;
+};
+
+ThrashBuffer alloc_thrash_buffer()
 {
     int device;
     cuda_check(cudaGetDevice(&device));
 
-    void* buf;
-    size_t size;
+    int l2_bytes = 0;
+    cuda_check(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, device));
+    size_t base = (size_t) (l2_bytes > 0 ? l2_bytes : 64 * 1024 * 1024);
+
+    // 2x the reported L2 capacity to reliably evict prior residents regardless of
+    // associativity/replacement-policy quirks; fall back to 1x, then to no thrashing at all,
+    // if the device is too full (a warm-cache-biased tune beats an OOM crash)
+    for (size_t size : { base * 2, base })
     {
-        std::lock_guard<std::mutex> lock(thrash_mutex);
-        auto it = thrash_buffers.find(device);
-        if (it == thrash_buffers.end())
+        try
         {
-            int l2_bytes = 0;
-            cuda_check(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, device));
-            // 2x the reported L2 capacity to reliably evict prior residents regardless of
-            // associativity/replacement-policy quirks; generous fallback if the query fails
-            size_t alloc_size = (size_t) (l2_bytes > 0 ? l2_bytes : 64 * 1024 * 1024) * 2;
-            void* ptr;
-            cuda_check(cudaMalloc(&ptr, alloc_size));
-            thrash_buffers[device] = { ptr, alloc_size };
-            buf = ptr;
-            size = alloc_size;
+            ThrashBuffer buf;
+            buf.tensor = at::empty
+            (
+                { (int64_t) size },
+                at::TensorOptions().dtype(at::kByte).device(at::kCUDA, device)
+            );
+            buf.ptr = buf.tensor.data_ptr();
+            buf.size = size;
+            return buf;
         }
-        else
-        {
-            buf = it->second.first;
-            size = it->second.second;
-        }
+        catch (const c10::Error&) {}
     }
-    cuda_check(cudaMemsetAsync(buf, 0, size, stream));
+    TORCH_WARN
+    (
+        "CoopKernelAutotuner: could not allocate an L2 thrash buffer on device ", device,
+        "; timing candidates with warm cache"
+    );
+    return {};
+}
+
+void thrash_l2(const ThrashBuffer& buf, cudaStream_t stream)
+{
+    if (!buf.ptr) return;
+    cuda_check(cudaMemsetAsync(buf.ptr, 0, buf.size, stream));
 }
 
 float trimmed_mean(std::vector<float>& samples)
@@ -368,10 +385,11 @@ void measure_candidate_sample
     cudaStream_t stream,
     int repeats,
     cudaEvent_t start,
-    cudaEvent_t end
+    cudaEvent_t end,
+    const ThrashBuffer& thrash_buf
 )
 {
-    thrash_l2(stream);
+    thrash_l2(thrash_buf, stream);
     cuda_check(cudaEventRecord(start, stream));
     for (int i = 0; i < repeats; ++i)
     {
@@ -420,7 +438,8 @@ void measure_stage
     int repeats,
     size_t keep,
     cudaEvent_t start,
-    cudaEvent_t end
+    cudaEvent_t end,
+    const ThrashBuffer& thrash_buf
 )
 {
     TORCH_CHECK(!candidates.empty(), "CoopKernelAutotuner: no candidates in stage");
@@ -464,7 +483,8 @@ void measure_stage
                 stream,
                 repeats,
                 start,
-                end
+                end,
+                thrash_buf
             );
             pos = (pos + step) % n;
         }
@@ -514,6 +534,9 @@ CoopAutotuneLaunch tune
     }
     TORCH_CHECK(!candidates.empty(), "CoopKernelAutotuner: no candidates");
 
+    // One buffer for the whole session, freed (back to the Torch pool) when tune() returns
+    ThrashBuffer thrash_buf = alloc_thrash_buffer();
+
     cudaEvent_t start;
     cudaEvent_t end;
     cuda_check(cudaEventCreate(&start));
@@ -536,11 +559,11 @@ CoopAutotuneLaunch tune
     if (numel_B > 2e8) max_cands = 2;
 
     if (candidates.size() > 1 && max_cands > 4)
-        measure_stage(candidates, kernel_args, smem, stream, MIN(2, max_rounds), repeats, MIN(6, max_cands), start, end);
+        measure_stage(candidates, kernel_args, smem, stream, MIN(2, max_rounds), repeats, MIN(6, max_cands), start, end, thrash_buf);
     if (candidates.size() > 1 && max_cands > 1)
-        measure_stage(candidates, kernel_args, smem, stream, MIN(8, max_rounds), repeats, MIN(3, max_cands), start, end);
+        measure_stage(candidates, kernel_args, smem, stream, MIN(8, max_rounds), repeats, MIN(3, max_cands), start, end, thrash_buf);
     if (candidates.size() > 1)
-        measure_stage(candidates, kernel_args, smem, stream, MIN(14, max_rounds), repeats, 1, start, end);
+        measure_stage(candidates, kernel_args, smem, stream, MIN(14, max_rounds), repeats, 1, start, end, thrash_buf);
 
     cuda_check(cudaEventDestroy(start));
     cuda_check(cudaEventDestroy(end));
