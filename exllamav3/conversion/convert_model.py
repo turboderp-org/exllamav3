@@ -472,46 +472,47 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
     def work_thread(device_idx, dev_groups):
         global curr_progress
 
-        t0 = time.time()
-        work_numel = sum(l.weights_numel() for g in dev_groups for l in g)
+        with torch.inference_mode():
+            t0 = time.time()
+            work_numel = sum(l.weights_numel() for g in dev_groups for l in g)
 
-        for group in dev_groups:
-            if len(group) > 1:
-                quant_args_list = [make_quant_args(args, idx, strategy[l.key], [device_idx]) for l in group]
-                proxy_errs = convert_exl3_group(
-                    group,
-                    [capture_H[l.qmap] for l in group],
-                    quant_args_list,
+            for group in dev_groups:
+                if len(group) > 1:
+                    quant_args_list = [make_quant_args(args, idx, strategy[l.key], [device_idx]) for l in group]
+                    proxy_errs = convert_exl3_group(
+                        group,
+                        [capture_H[l.qmap] for l in group],
+                        quant_args_list,
+                    )
+                    for linear, quant_args_local, proxy_err in zip(group, quant_args_list, proxy_errs):
+                        assert isinstance(linear.inner, LinearEXL3)
+                        linear.inner.swap_cpu()
+                        print_quantized_linear(config, linear, quant_args_local, proxy_err)
+                        with progress_lock:
+                            curr_progress += 1
+                    continue
+
+                linear = group[0]
+                quant_args_local = make_quant_args(args, idx, strategy[linear.key], [device_idx])
+
+                proxy_err = linear.convert_exl3(
+                    capture_H[linear.qmap] if state else linear.init_H_data(False),
+                    quant_args = quant_args_local,
+                    verbose = args["verbose"],
+                    save_reg = False,
+                    override_swap_device = device_idx
                 )
-                for linear, quant_args_local, proxy_err in zip(group, quant_args_list, proxy_errs):
-                    assert isinstance(linear.inner, LinearEXL3)
-                    linear.inner.swap_cpu()
-                    print_quantized_linear(config, linear, quant_args_local, proxy_err)
-                    with progress_lock:
-                        curr_progress += 1
-                continue
+                assert isinstance(linear.inner, LinearEXL3)
+                linear.inner.swap_cpu()
 
-            linear = group[0]
-            quant_args_local = make_quant_args(args, idx, strategy[linear.key], [device_idx])
+                print_quantized_linear(config, linear, quant_args_local, proxy_err)
+                with progress_lock:
+                    curr_progress += 1
 
-            proxy_err = linear.convert_exl3(
-                capture_H[linear.qmap] if state else linear.init_H_data(False),
-                quant_args = quant_args_local,
-                verbose = args["verbose"],
-                save_reg = False,
-                override_swap_device = device_idx
-            )
-            assert isinstance(linear.inner, LinearEXL3)
-            linear.inner.swap_cpu()
-
-            print_quantized_linear(config, linear, quant_args_local, proxy_err)
-            with progress_lock:
-                curr_progress += 1
-
-        # The device is idle from here until the slowest thread finishes; its measured speed
-        # steers the next module's split
-        torch.cuda.synchronize(torch.device(device_idx))
-        auto_split.report("quant_thread", device_idx, work_numel, time.time() - t0)
+            # The device is idle from here until the slowest thread finishes; its measured speed
+            # steers the next module's split
+            torch.cuda.synchronize(torch.device(device_idx))
+            auto_split.report("quant_thread", device_idx, work_numel, time.time() - t0)
 
     # Launch
     threads = []
@@ -601,7 +602,8 @@ def run_row_workers(title, num_rows, workers, progress_count):
     def guard(fn):
         def inner():
             try:
-                fn()
+                with torch.inference_mode():
+                    fn()
             except Exception as e:
                 errors.append(e)
         return inner
