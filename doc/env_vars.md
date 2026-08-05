@@ -268,10 +268,25 @@ only a small amount of shared-memory overprovisioning, not runtime.
 
 ### `EXL3_MOE_CPU_MAX_ISA` (default: unset, auto-detect)
 
-Caps the CPU kernel's runtime ISA detection at `scalar`, `avx2`, or `vnni`/`avx512`, for testing
-a lower-tier kernel path on hardware that supports better. Never upgrades past what the CPU
-actually supports; unrecognized values are ignored. Read once per process (parent and worker
-independently), so it must be set before either is started.
+Caps the CPU kernel's runtime ISA detection at `scalar`, `avx2`, `vnni`/`avx512`, or `vbmi`,
+for testing a lower-tier kernel path on hardware that supports better. The `vbmi` tier
+(AVX512-VBMI byte-gather state extraction, Zen 4+ / Ice Lake+; Cascade/Cooper Lake have VNNI
+without VBMI and stay on the `vnni` tier) is 15-70% faster than the dword scheme depending on
+bitrate. Never upgrades past what the CPU actually supports; unrecognized values are ignored.
+Read once per process (parent and worker independently), so it must be set before either is
+started. Note that capping below `vbmi` also disables the swizzled weight layout (see
+`EXL3_MOE_CPU_SWIZZLE`).
+
+### `EXL3_MOE_CPU_SWIZZLE` (default: `1`)
+
+Repack the CPU worker's expert trellis copies into a band-contiguous ("swizzled") layout at
+load, so each GEMV band streams sequentially from DRAM instead of in short strided runs
+(+45-75% cold decode GEMV throughput measured on a 7960X, reaching the sequential-read
+roofline). Only takes effect when the `vbmi` kernel tier is active, whose byte-gather
+extraction leaves the register headroom for the wide bands the swizzled layout wants at
+m > 1; K8 tensors always stay in the native layout (they route to the dword kernel). The
+GPU-streaming prefill path un-swizzles during staging, so staged bytes reaching the GPU
+dequant are unaffected. Set to `0` to keep the native layout.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 

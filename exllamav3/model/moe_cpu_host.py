@@ -85,6 +85,10 @@ class MoeCpuTuning:
         # common default), the kernel does SYNCHRONOUS compaction on first touch of a hinted
         # region once easily-compactable free memory runs low, which can stall loading badly
         self.arena_hugepage = os.environ.get("EXL3_MOE_ARENA_HUGEPAGE", "1") != "0"
+        # Band-contiguous ("swizzled") expert trellis layout: repacked at arena rehome so each
+        # 8-tile output band streams sequentially from DRAM. Only applied when the VBMI kernel
+        # tier is active. EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
+        self.swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
 
         # --- GPU-streaming prefill ---
         self.stream_t_explicit = "EXL3_MOE_STREAM_T" in os.environ
@@ -157,10 +161,15 @@ class _HugeArena:
         if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
             print(f" -- arena: MADV_COLLAPSE issued on {len(self.chunks)} chunks", flush = True)
 
-    def rehome(self, tensor):
+    def rehome(self, tensor, band_swizzle = False):
         """Copy `tensor` into the arena and return a same-dtype/shape view over the copy. The
         arena outlives every tensor it hands out (held for the process lifetime), so the
-        returned view stays valid."""
+        returned view stays valid.
+
+        band_swizzle: repack a [k/16, n/16, 16K] trellis tensor band-contiguous during the
+        copy -- physical order becomes (group n/128, k-tile, member, tile), one strided copy_.
+        The returned view keeps the original logical shape; only the byte order differs
+        (consumed by the swz-aware kernels in moe_mul1.cpp)."""
         import torch
         if tensor is None or tensor.numel() == 0:
             return tensor
@@ -172,7 +181,12 @@ class _HugeArena:
         self.cur_off += aligned
         buf = memoryview(self.cur)[off : off + nbytes]
         dst = torch.frombuffer(buf, dtype = torch.uint8)
-        dst.copy_(tensor.contiguous().view(torch.uint8).reshape(-1))
+        if band_swizzle:
+            tk, tn, ps = tensor.shape
+            dst.view(tensor.dtype).view(tn // 8, tk, 8, ps) \
+               .copy_(tensor.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3))
+        else:
+            dst.copy_(tensor.contiguous().view(torch.uint8).reshape(-1))
         return dst.view(tensor.dtype).view(tensor.shape)
 
 
@@ -220,8 +234,14 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
                 out.append((trellis, suh, svh, bias))
             return out
 
+        # Swizzle the trellis copies band-contiguous when the VBMI kernel tier will consume them
+        swz = TUNING.swizzle and cext.exl3_moe_cpu_has_avx512_vbmi()
+
+        def rehome_trellis(t):
+            return arena.rehome(t, band_swizzle = swz and t.shape[2] // 16 != 8)
+
         def rehome_all(ts):
-            return [(arena.rehome(t[0]), arena.rehome(t[1]), arena.rehome(t[2]), arena.rehome(t[3]))
+            return [(rehome_trellis(t[0]), arena.rehome(t[1]), arena.rehome(t[2]), arena.rehome(t[3]))
                    for t in ts]
 
         def biases(ts):
@@ -245,6 +265,7 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
                     [t[0] for t in d], [t[1] for t in d], [t[2] for t in d],
                     biases(g), biases(u), biases(d),
                     spec["activation"], spec["act_limit"],
+                    1 if swz else 0,
                 )
                 # Reclaim this layer's now-discarded loader tensors immediately (rehome_all copied
                 # everything into the arena)
@@ -496,8 +517,9 @@ class MoeCpuHost:
         self.started = True
         self._flags_u32 = u32
         self._start_watchdog()
-        kern = "avx512-vnni" if ext.exl3_moe_cpu_has_avx512_vnni() else \
-               ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar")
+        kern = "avx512-vbmi" if ext.exl3_moe_cpu_has_avx512_vbmi() else \
+               ("avx512-vnni" if ext.exl3_moe_cpu_has_avx512_vnni() else \
+               ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar"))
         print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
 
     def _start_watchdog(self):
