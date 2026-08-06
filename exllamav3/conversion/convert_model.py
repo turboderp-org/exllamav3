@@ -8,7 +8,7 @@ from ..modules.linear import convert_exl3_group
 from ..modules.quant.exl3_lib.quantize import auto_split
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
-from ..util.memory import free_mem
+from ..util.memory import free_mem, malloc_trim
 from ..util import Timer, human_time
 from ..util.tensor import save_tensor_image
 from ..util.measures import cosine_error, sqnr
@@ -812,24 +812,6 @@ def image_dump(args, linears):
             w = linear.inner.get_weight_tensor()
             assert w.dim() == 2
             save_tensor_image(w, os.path.join(args["work_dir"], filename))
-
-
-# Per-layer host allocation churn (fp32 weight copies, H/L stashes, q_tensors, state rows)
-# leaves freed memory stranded in glibc's per-thread arenas, where RSS ratchets up over a long
-# job even though nothing is referenced. Explicitly return what can be returned after each
-# module; no-op where glibc is unavailable
-_libc = None
-def malloc_trim():
-    global _libc
-    if _libc is False:
-        return
-    try:
-        if _libc is None:
-            import ctypes
-            _libc = ctypes.CDLL("libc.so.6")
-        _libc.malloc_trim(0)
-    except Exception:
-        _libc = False
 
 
 def host_rss_str():

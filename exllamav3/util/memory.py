@@ -58,6 +58,25 @@ def free_mem():
     torch.cuda.empty_cache()
 
 
+# Host-allocation churn (recurrent checkpoint stashes, per-layer fp32 copies during
+# conversion, ...) leaves freed memory stranded in glibc's arenas: interleaved lifetimes
+# fragment the heap and RSS ratchets up even though nothing is referenced. malloc_trim
+# returns what can be returned
+_libc = None
+
+def malloc_trim():
+    global _libc
+    if _libc is False:
+        return
+    try:
+        if _libc is None:
+            import ctypes
+            _libc = ctypes.CDLL("libc.so.6")
+        _libc.malloc_trim(0)
+    except Exception:
+        _libc = False
+
+
 def list_gpu_tensors(min_size: int = 1, cuda_only: bool = True):
     """
     Search the current process for referenced CUDA tensors and list them.

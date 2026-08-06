@@ -6,6 +6,7 @@ from ..cache.recurrent import RecurrentCache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
+from ..util.memory import malloc_trim
 from .pagetable import PageTable
 from .cpu_cache import CPUPageCache
 from .job import Job
@@ -443,11 +444,14 @@ class Generator:
     def on_queue_drained(self):
         """
         Idle-transition housekeeping: drop recurrent checkpoints stranded by KV eviction, then defragment the
-        page table (both need/prefer a moment with no active block tables).
+        page table (both need/prefer a moment with no active block tables), and return whatever host memory
+        glibc is retaining from stash/offload churn (issue #277) — sub-threshold residue would otherwise sit
+        in the arenas for the whole idle period.
         """
         if self.recurrent_cache is not None:
             self.recurrent_cache.prune_stranded()
         self.pagetable.defrag()
+        malloc_trim()
 
 
     def recurrent_checkpoint(self):
