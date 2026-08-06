@@ -31,6 +31,23 @@ class ExpandStreams(Module):
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         return x.float().unsqueeze(2).expand(-1, -1, self.hc_mult, -1).contiguous()
 
+    def tp_export(self, plan, producer):
+        # Stateless stream broadcast; the residual (and its stream stack) is replicated
+        return {
+            "cls": ExpandStreams,
+            "kwargs": {
+                "key": self.key,
+                "hc_mult": self.hc_mult,
+            },
+            "device": self.device,
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        module = ExpandStreams(config = None, **exported["kwargs"])
+        module.device = local_context["device"]
+        return module
+
 
 class HyperConnection(Module):
     """mHC mixer for one sublayer site. Owns raw fp32 tensors {key}_fn ((2 + H) * H rows,
@@ -243,6 +260,32 @@ class HyperHead(Module):
     @override
     def optimizer_targets(self):
         return []
+
+    def tp_export(self, plan, producer):
+        # Stream collapse runs on the replicated stream stack: plain replication
+        return {
+            "cls": HyperHead,
+            "kwargs": {
+                "key": self.key,
+                "hc_mult": self.hc_mult,
+                "rms_norm_eps": self.rms_eps,
+                "hc_eps": self.hc_eps,
+            },
+            "fn": producer.send(self.fn),
+            "base": producer.send(self.base),
+            "scale": producer.send(self.scale),
+            "device": self.device,
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        consumer = local_context["consumer"]
+        module = HyperHead(config = None, **exported["kwargs"])
+        module.fn = consumer.recv(exported["fn"], cuda = True)
+        module.base = consumer.recv(exported["base"], cuda = True)
+        module.scale = consumer.recv(exported["scale"], cuda = True)
+        module.device = local_context["device"]
+        return module
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):

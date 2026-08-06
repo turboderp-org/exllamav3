@@ -5,6 +5,7 @@ import torch
 import os
 import torch.nn.functional as F
 from ..model.config import Config
+from ..model.model_tp_alloc import TPAllocation
 from .module import Module
 from .linear import Linear
 from .rmsnorm import RMSNorm
@@ -111,6 +112,9 @@ class DSV4Compressor:
         overlapping,
         qmap,
         select_hq_bits,
+        wkv: Linear | None = None,
+        wgate: Linear | None = None,
+        norm: RMSNorm | None = None,
     ):
         cfg = attn.config
         proj_width = 2 * head_dim if overlapping else head_dim
@@ -119,15 +123,15 @@ class DSV4Compressor:
         self.compress_rate = compress_rate
         self.overlapping = overlapping
         self.key = key
-        self.wkv = Linear(
+        self.wkv = wkv if wkv is not None else Linear(
             cfg, f"{key}.wkv", attn.hidden_size, proj_width, qmap = qmap, out_dtype = torch.half, trim_padded_out = True,
             select_hq_bits = select_hq_bits,
         )
-        self.wgate = Linear(
+        self.wgate = wgate if wgate is not None else Linear(
             cfg, f"{key}.wgate", attn.hidden_size, proj_width, qmap = qmap, out_dtype = torch.half, trim_padded_out = True,
             select_hq_bits = select_hq_bits,
         )
-        self.norm = RMSNorm(cfg, f"{key}.norm", attn.rms_norm_eps)
+        self.norm = norm if norm is not None else RMSNorm(cfg, f"{key}.norm", attn.rms_norm_eps)
         self.ape = None  # (compress_rate, proj_width) fp32, loaded by DSV4Attention.load
         self.bc = None   # BC_DSV4Compressor companion (cached path), built lazily
         self.fused_ready = False
@@ -297,6 +301,41 @@ class DSV4Compressor:
         return [self.wkv, self.wgate, self.norm]
 
 
+    def tp_export(self, plan, producer):
+        # The compressor produces headless shared pool entries: fully replicated per rank
+        return {
+            "args": {
+                "key": self.key,
+                "head_dim": self.head_dim,
+                "compress_rate": self.compress_rate,
+                "overlapping": self.overlapping,
+            },
+            "wkv": self.wkv.tp_export(plan, producer),
+            "wgate": self.wgate.tp_export(plan, producer),
+            "norm": self.norm.tp_export(plan, producer),
+            "ape": producer.send(self.ape),
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan, attn):
+        consumer = local_context["consumer"]
+        def _imp(name):
+            e = exported[name]
+            return e["cls"].tp_import(local_context, e, plan)
+        comp = DSV4Compressor(
+            attn,
+            qmap = None,
+            select_hq_bits = 0,
+            wkv = _imp("wkv"),
+            wgate = _imp("wgate"),
+            norm = _imp("norm"),
+            **exported["args"],
+        )
+        comp.ape = consumer.recv(exported["ape"], cuda = True)
+        return comp
+
+
 class DSV4Attention(Module):
 
     def __init__(
@@ -325,6 +364,16 @@ class DSV4Attention(Module):
         out_dtype: torch.dtype | None = None,
         qbits_key: str = "bits",
         select_hq_bits: int = 0,
+        q_a: Linear | None = None,
+        q_norm: RMSNorm | None = None,
+        q_b: Linear | None = None,
+        wkv: Linear | None = None,
+        kv_norm: RMSNorm | None = None,
+        wo_a: list | None = None,
+        wo_b: Linear | None = None,
+        idx_wq_b: Linear | None = None,
+        idx_weights: Linear | None = None,
+        tp_defer_compressors: bool = False,
     ):
         super().__init__(config = config, key = key, qmap = None)
         self.q_priority = 2 + select_hq_bits
@@ -351,7 +400,40 @@ class DSV4Attention(Module):
         # For the model-level allocator conventions (not a KV cache module yet -- M2)
         self.num_kv_heads = 1
 
-        self.q_a = Linear(
+        # TP bookkeeping; set before the zero-width early return below (forward() and the
+        # TP import glue touch these on ranks that hold none of this layer's o_groups)
+        self.tp_reduce = False
+        self.tp_mode = False
+        self.has_split_cache = False
+        self.tp_recurrent_lookup = {}
+        self.tp_cache_lookup = {}
+        self.recurrent_layers = []
+        self.cache_layers = []
+        self.sinks = None  # (num_q_heads,) fp32
+        self.compressor = None
+        self.indexer = None
+        self.idx_wq_b = None
+        self.idx_weights = None
+        self.inv_freq_main = None
+        self.inv_freq_compress = None
+        self.wo_a_multi = None
+        self.woa_indices = None
+        self.woa_multi_ready = False
+        self.x_fan = None
+        self.q_fan = None
+        self.x_fan_ready = False
+        self._fan_scratch = {}
+        self._bgraph_state = {}
+
+        if num_q_heads == 0:
+            # Zero-width TP shard: no weights, no state, no caps (keeps the rank out of
+            # the child's kv/recurrent module lists); forward() contributes zeros
+            self.q_a = self.q_norm = self.q_b = self.wkv = self.kv_norm = None
+            self.wo_a = []
+            self.wo_b = None
+            return
+
+        self.q_a = q_a if q_a is not None else Linear(
             config,
             f"{key}.wq_a",
             hidden_size,
@@ -362,8 +444,8 @@ class DSV4Attention(Module):
             trim_padded_out = True,
             select_hq_bits = select_hq_bits,
         )
-        self.q_norm = RMSNorm(config, f"{key}.q_norm", rms_norm_eps)
-        self.q_b = Linear(
+        self.q_norm = q_norm if q_norm is not None else RMSNorm(config, f"{key}.q_norm", rms_norm_eps)
+        self.q_b = q_b if q_b is not None else Linear(
             config,
             f"{key}.wq_b",
             q_lora_rank,
@@ -374,7 +456,7 @@ class DSV4Attention(Module):
             trim_padded_out = True,
             select_hq_bits = select_hq_bits,
         )
-        self.wkv = Linear(
+        self.wkv = wkv if wkv is not None else Linear(
             config,
             f"{key}.wkv",
             hidden_size,
@@ -385,10 +467,10 @@ class DSV4Attention(Module):
             trim_padded_out = True,
             select_hq_bits = select_hq_bits,
         )
-        self.kv_norm = RMSNorm(config, f"{key}.kv_norm", rms_norm_eps)
+        self.kv_norm = kv_norm if kv_norm is not None else RMSNorm(config, f"{key}.kv_norm", rms_norm_eps)
 
         group_width = num_q_heads * head_dim // o_groups
-        self.wo_a = [
+        self.wo_a = wo_a if wo_a is not None else [
             Linear(
                 config,
                 f"{key}.wo_a.slice.{g}",
@@ -406,7 +488,7 @@ class DSV4Attention(Module):
             )
             for g in range(o_groups)
         ]
-        self.wo_b = Linear(
+        self.wo_b = wo_b if wo_b is not None else Linear(
             config,
             f"{key}.wo_b",
             o_groups * o_lora_rank,
@@ -417,13 +499,9 @@ class DSV4Attention(Module):
             trim_padded_out = True,
             select_hq_bits = select_hq_bits,
         )
-        self.sinks = None  # (num_q_heads,) fp32
-
-        self.compressor = None
-        self.indexer = None
-        self.idx_wq_b = None
-        self.idx_weights = None
-        if layer_type in ("csa", "hca"):
+        self.idx_wq_b = idx_wq_b
+        self.idx_weights = idx_weights
+        if layer_type in ("csa", "hca") and not tp_defer_compressors:
             self.compressor = DSV4Compressor(
                 self,
                 f"{key}.compressor",
@@ -433,7 +511,7 @@ class DSV4Attention(Module):
                 qmap = qmap,
                 select_hq_bits = select_hq_bits
             )
-        if layer_type == "csa":
+        if layer_type == "csa" and not tp_defer_compressors:
             self.indexer = DSV4Compressor(
                 self,
                 f"{key}.indexer.compressor",
@@ -443,6 +521,7 @@ class DSV4Attention(Module):
                 qmap = qmap,
                 select_hq_bits = select_hq_bits
             )
+        if layer_type == "csa" and self.idx_wq_b is None:
             self.idx_wq_b = Linear(
                 config,
                 f"{key}.indexer.wq_b",
@@ -601,6 +680,209 @@ class DSV4Attention(Module):
     @override
     def optimizer_targets(self):
         return [t for m in self.modules for t in m.optimizer_targets()]
+
+
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
+        # Split unit = o_group (hpg heads + one wo_a slice + o_lora_rank rows of wo_b):
+        # the grouped o_proj consumes whole 8-head slabs and the attention kernel stores
+        # output group-major, so groups are the natural quantum. Everything KV-side is
+        # shared-MQA and replicated per rank (q_a, wkv, norms, compressor, indexer, pools,
+        # rings); only q_b / wo_a / wo_b / sinks split
+        storage_split = self.q_b.storage_size() + self.wo_b.storage_size() + \
+            sum(l.storage_size() for l in self.wo_a)
+        storage_dev = self.q_a.storage_size() + self.wkv.storage_size()
+        for l in (self.idx_wq_b, self.idx_weights):
+            if l is not None:
+                storage_dev += l.storage_size()
+        for comp in (self.compressor, self.indexer):
+            if comp is not None:
+                storage_dev += comp.wkv.storage_size() + comp.wgate.storage_size()
+        for rl in self.recurrent_layers:
+            storage_dev += rl.storage_size()
+        for cl in self.cache_layers:
+            storage_dev += cl.storage_size()
+        overhead_d = self.hidden_size * (self.out_dtype or torch.half).itemsize
+        overhead_s = self.num_q_heads * self.head_dim * torch.half.itemsize  # q rows
+        overhead_s += self.o_groups * self.o_lora_rank * torch.half.itemsize  # o intermediates
+        recons = max(
+            self.q_a.recons_size(),
+            self.q_b.recons_size(),
+            self.wo_b.recons_size(),
+            max((l.recons_size() for l in self.wo_a), default = 0),
+        )
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = 1,
+            channel_unit = "heads",
+            storage_per_device = storage_dev,
+            storage_to_split = storage_split,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = self.o_groups,
+            limit_key = "attn",
+        )
+        return [tpa]
+
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            nonlocal producer
+            return child.tp_export(plan, producer) if child is not None else None
+
+        return {
+            "cls": DSV4Attention,
+            "kwargs": {
+                "key": self.key,
+                "layer_idx": self.layer_idx,
+                "layer_type": self.layer_type,
+                "hidden_size": self.hidden_size,
+                "head_dim": self.head_dim,
+                "rope_head_dim": self.rope_head_dim,
+                "q_lora_rank": self.q_a.out_features_unpadded,
+                "o_lora_rank": self.o_lora_rank,
+                "sliding_window": self.sliding_window,
+                "compress_rate": self.compress_rate,
+                "index_n_heads": self.index_n_heads,
+                "index_head_dim": self.index_head_dim,
+                "index_topk": self.index_topk,
+                "rope_theta": self.rope_theta,
+                "compress_rope_theta": self.compress_rope_theta,
+                "rope_scaling": self.rope_scaling,
+                "rms_norm_eps": self.rms_norm_eps,
+                "out_dtype": self.out_dtype,
+            },
+            "num_q_heads": self.num_q_heads,
+            "o_groups": self.o_groups,
+            **{name: _export(getattr(self, name, None)) for name in (
+                "q_a",
+                "q_norm",
+                "q_b",
+                "wkv",
+                "kv_norm",
+                "wo_b",
+                "idx_wq_b",
+                "idx_weights",
+            )},
+            "wo_a": [l.tp_export(plan, producer) for l in self.wo_a],
+            "sinks": producer.send(self.sinks),
+            "compressor": self.compressor.tp_export(plan, producer) if self.compressor is not None else None,
+            "indexer": self.indexer.tp_export(plan, producer) if self.indexer is not None else None,
+            "recurrent_layers": [rl.tp_export(plan) for rl in self.recurrent_layers],
+            "cache_layers": [cl.tp_export(plan) for cl in self.cache_layers],
+            "device": self.device,
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan, **kwargs):
+        kw = exported["kwargs"]
+        key = kw["key"]
+        head_dim = kw["head_dim"]
+        o_lora_rank = kw["o_lora_rank"]
+        full_heads = exported["num_q_heads"]
+        full_groups = exported["o_groups"]
+        hpg = full_heads // full_groups
+        device = local_context["device"]
+        first, last, unit = plan[key]
+        assert unit == "heads"
+        num_groups = last - first
+        num_q_heads = num_groups * hpg
+
+        # Column split of q_b by the local head range; row (input-dim) split of wo_b by
+        # the local group blocks -- the trailing all-reduce sums the partial products.
+        # Everything else is replicated (shared-KV MQA + headless compressor/indexer)
+        q_b_split = (True, first * hpg * head_dim, last * hpg * head_dim) \
+            if num_groups else None
+        wo_b_split = (False, first * o_lora_rank, last * o_lora_rank) \
+            if num_groups else None
+
+        def _import(name):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import(local_context, exported[name], plan) \
+                if num_groups and exported.get(name) else None
+
+        def _import_split(name, split):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import_split(local_context, exported[name], plan, split) \
+                if split and exported.get(name) else None
+
+        wo_a = [
+            e["cls"].tp_import(local_context, e, plan)
+            for e in exported["wo_a"][first : last]
+        ] if num_groups else []
+
+        module = DSV4Attention(
+            config = None,
+            **kw,
+            num_q_heads = num_q_heads,
+            o_groups = num_groups,
+            q_a = _import("q_a"),
+            q_norm = _import("q_norm"),
+            q_b = _import_split("q_b", q_b_split),
+            wkv = _import("wkv"),
+            kv_norm = _import("kv_norm"),
+            wo_a = wo_a,
+            wo_b = _import_split("wo_b", wo_b_split),
+            idx_wq_b = _import("idx_wq_b"),
+            idx_weights = _import("idx_weights"),
+            tp_defer_compressors = True,
+        )
+        module.tp_mode = True
+
+        if num_groups:
+            consumer = local_context["consumer"]
+            # Per-head sinks: each rank keeps its local head range
+            module.sinks = consumer.recv(
+                exported["sinks"], cuda = True, slice_dim = 0,
+                first = first * hpg, last = last * hpg,
+            )
+            if exported.get("compressor") is not None:
+                module.compressor = DSV4Compressor.tp_import(
+                    local_context, exported["compressor"], plan, module)
+            if exported.get("indexer") is not None:
+                module.indexer = DSV4Compressor.tp_import(
+                    local_context, exported["indexer"], plan, module)
+            for rl in exported["recurrent_layers"]:
+                rli = rl["cls"](module, **rl["args"])
+                module.recurrent_layers.append(rli)
+                module.tp_recurrent_lookup[rl["args"]["cache_id"]] = rli
+            if len(exported["cache_layers"]):
+                module.has_split_cache = True
+                for cl in exported["cache_layers"]:
+                    cli = cl["cls"](None, module, **cl["args"])
+                    module.cache_layers.append(cli)
+                    module.tp_cache_lookup[cl["args"]["cache_id"]] = cli
+
+        module.device = device
+        if not kwargs.get("skip_reduction"):
+            module.tp_reduce = True
+
+        module.load_local(device)
+        torch.cuda.synchronize()
+        return module
+
+
+    def load_local(self, device, **kwargs):
+        if self.num_q_heads == 0:
+            return
+        self.inv_freq_main = yarn_inv_freq(self.rope_head_dim, self.rope_theta, device)
+        self.inv_freq_compress = yarn_inv_freq(
+            self.rope_head_dim, self.compress_rope_theta, device, rope_scaling = self.rope_scaling)
+        self.inv_freq_main_neg = -self.inv_freq_main
+        self.inv_freq_compress_neg = -self.inv_freq_compress
+        self.kv_norm_w = self.kv_norm.weight.data
+        self.q_ones = torch.ones(self.head_dim, dtype = self.kv_norm_w.dtype, device = device)
+        if self.compressor is not None:
+            self.compressor.make_bc(self.inv_freq_compress)
+        if self.indexer is not None:
+            self.indexer.make_bc(self.inv_freq_compress)
+        for rl in self.recurrent_layers:
+            rl.alloc(device)
+        for cl in self.cache_layers:
+            cl.alloc(device)
 
 
     def _rope_type(self):
@@ -773,11 +1055,21 @@ class DSV4Attention(Module):
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
+        if self.num_q_heads == 0:
+            # Zero-width TP shard: contribute nothing, keep the collective aligned
+            y = torch.zeros_like(x, dtype = out_dtype or self.out_dtype)
+            if self.tp_reduce:
+                params["backend"].all_reduce(y, False)
+            return y
         mode = params.get("attn_mode", "flash_attn_nc")
         if mode == "flash_attn":
-            return self._forward_cached(x, params, out_dtype)
-        assert mode == "flash_attn_nc", f"DSV4Attention: unsupported attn_mode {mode}"
-        return self._forward_nc(x, params, out_dtype)
+            y = self._forward_cached(x, params, out_dtype)
+        else:
+            assert mode == "flash_attn_nc", f"DSV4Attention: unsupported attn_mode {mode}"
+            y = self._forward_nc(x, params, out_dtype)
+        if self.tp_reduce:
+            params["backend"].all_reduce(y)
+        return y
 
 
     def _forward_nc(self, x, params, out_dtype):
@@ -848,7 +1140,7 @@ class DSV4Attention(Module):
                 kv_chunk = kv[b].contiguous(), win_len = w, win_floor = position,
                 indices = indices, k_len = k_len, pool_len = T, q_pos0 = position,
                 compress_rate = m, scale = self.sm_scale,
-                derot_inv_freq = self._rope_type_neg(), groups = self.o_groups,
+                derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
                 out = torch.empty((self.o_groups, seq, hpg * hd), dtype = torch.half, device = device),
             )
             outs.append(self._project_o_grouped(out.unsqueeze(1), params, out_dtype))
@@ -900,12 +1192,16 @@ class DSV4Attention(Module):
         layer_instance = (self.layer_idx, params.get("layer_instance", 0))
         kl = bt = None
         if self.compressor is not None:
-            kl = rsg[0].cache.layers[layer_instance]
+            # In TP workers rs.cache is an opaque id; resolve to this rank's replicated
+            # pool layer before anything dereferences it
+            kl = self.tp_cache_lookup[rsg[0].cache] if self.tp_mode \
+                else rsg[0].cache.layers[layer_instance]
             if "block_table" in params:
                 bt = get_for_device(params, "block_table", self.device)
             else:
                 # Direct-forward use without a page table (tests/benchmarks): slot-
                 # partitioned identity, one row per batch row via each state's slot
+                assert not self.tp_mode, "DSV4Attention: TP forward requires a block table"
                 sbt = kl.slot_bt(rsg[0].cache.num_slots)
                 bt = sbt[[rsg[i].slot for i in range(bsz)]]
             if dsa_debug_bounds:
@@ -915,7 +1211,7 @@ class DSV4Attention(Module):
                     f"(layer {self.layer_idx})"
         if bsz == 1:
             return self._forward_cached_one(
-                x, params, rsg[0], rsg[0].cache.get_recurrent_layer(layer_instance), out_dtype,
+                x, params, rsg[0], self._get_rsl(rsg[0], layer_instance), out_dtype,
                 kl = kl, bt_row = bt[:1] if bt is not None else None)
         if not dsv4_batch_eager:
             # Per-job loop: each job dispatches into its per-slot whole-step graph (or the
@@ -925,13 +1221,21 @@ class DSV4Attention(Module):
             outs = [
                 self._forward_cached_one(
                     x[i:i + 1], params, rsg[i],
-                    rsg[i].cache.get_recurrent_layer(layer_instance),
+                    self._get_rsl(rsg[i], layer_instance),
                     out_dtype, copy_static = True,
                     kl = kl, bt_row = bt[i:i + 1] if bt is not None else None)
                 for i in range(bsz)
             ]
             return torch.cat(outs, dim = 0)
         return self._forward_cached_batch(x, params, rsg, layer_instance, out_dtype, kl, bt)
+
+
+    def _get_rsl(self, rs, layer_instance):
+        """Per-slot layer state: direct on the parent, via the id-keyed lookup in TP
+        workers (rs is a DSV4ExportedState there and rs.cache an opaque id)."""
+        if self.tp_mode:
+            return self.tp_recurrent_lookup[rs.cache]
+        return rs.cache.get_recurrent_layer(layer_instance)
 
 
     def _forward_cached_batch(self, x, params, rsg, layer_instance, out_dtype, kl, bt):
@@ -948,7 +1252,7 @@ class DSV4Attention(Module):
         if not eligible:
             outs = [
                 self._forward_cached_one(x[i:i + 1], params, rsg[i],
-                                         rsg[i].cache.get_recurrent_layer(layer_instance),
+                                         self._get_rsl(rsg[i], layer_instance),
                                          out_dtype, copy_static = True,
                                          kl = kl, bt_row = bt[i:i + 1] if bt is not None else None)
                 for i in range(B)
@@ -957,9 +1261,9 @@ class DSV4Attention(Module):
 
         device = x.device
         R = B * S
-        rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+        rsl = self._get_rsl(rsg[0], layer_instance)
         for rs in rsg[1:B]:
-            assert rs.cache.get_recurrent_layer(layer_instance) is rsl, \
+            assert self._get_rsl(rs, layer_instance) is rsl, \
                 "batched DSA path requires all jobs in one cache"
         m = self.compress_rate if self.compressor is not None else 1
         w = self.sliding_window
@@ -1112,7 +1416,7 @@ class DSV4Attention(Module):
             ring = rsl.ring, kv_chunk = kv.reshape(R, self.head_dim),
             win_len = w, indices = indices,
             compress_rate = m, scale = self.sm_scale,
-            derot_inv_freq = self._rope_type_neg(), groups = self.o_groups,
+            derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
             page_size = epp,
             out = g_tensor_cache.get(device, (self.o_groups, R, hpg * self.head_dim),
                                      torch.half, "dsv4_b_out"),
@@ -1401,7 +1705,7 @@ class DSV4Attention(Module):
             win_floor = win_floor, ring_beg = ring_beg,
             indices = indices, k_len = k_len, pool_len = pool_len, q_pos0 = pos0,
             compress_rate = dense_m, scale = self.sm_scale,
-            derot_inv_freq = self._rope_type_neg(), groups = self.o_groups,
+            derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
             page_size = epp,
             out = torch.empty((self.o_groups, seq, hpg * self.head_dim), dtype = torch.half, device = device),
         )

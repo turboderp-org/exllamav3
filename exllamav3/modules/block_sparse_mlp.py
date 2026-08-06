@@ -1601,7 +1601,11 @@ class BlockSparseMLP(Module):
                 "topk_group": self.topk_group,
                 "act_limit": self.act_limit,
                 "alt_residual_channel": self.alt_residual_channel,
+                "key_tid2eid": self.tid2eid_key,
             },
+            # Hash-MoE bootstrap layers (DeepSeek-V4): frozen token->experts table, needed
+            # wherever routing runs (the output device, like the routing gate)
+            "tid2eid": producer.send(self.tid2eid) if self.tid2eid is not None else None,
             "routing_gate": _export(self.routing_gate),
             "shared_gate": _export(self.shared_gate),
             "e_score_correction_bias": producer.send(self.e_score_correction_bias),
@@ -1697,6 +1701,8 @@ class BlockSparseMLP(Module):
         module.device = device
         module.e_score_correction_bias = consumer.recv(exported["e_score_correction_bias"], cuda = True)
         module.per_expert_scale = consumer.recv(exported["per_expert_scale"], cuda = True)
+        if exported.get("tid2eid") is not None and device == output_device:
+            module.tid2eid = consumer.recv(exported["tid2eid"], cuda = True)
         if unit == "channels" or num_local_experts > 0:
             module.load_local()
         if module.routing_gate is not None:

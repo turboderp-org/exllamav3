@@ -183,6 +183,7 @@ class DSparkInputLayer(Module):
         self.register_submodule(self.main_proj)
         self.register_submodule(self.main_norm)
         self.attached_model = None
+        self.own_embed = None   # set by attach when the target is TP (embedding not borrowable)
         self.caps.update({"x_cpu": True})
 
 
@@ -204,6 +205,7 @@ class DSparkInputLayer(Module):
         bsz, seqlen = x.shape
         noise = torch.full((bsz, self.block_size - 1), self.noise_token_id, dtype = torch.long)
         x = torch.cat((x.cpu(), noise), dim = -1)
-        x = self.attached_model().modules[0].forward(x, params)
+        embed = self.own_embed if self.own_embed is not None else self.attached_model().modules[0]
+        x = embed.forward(x, params)
         # mHC stream stack: broadcast copies of the embedding, fp32
         return x.float().unsqueeze(2).repeat(1, 1, self.hc_mult, 1)

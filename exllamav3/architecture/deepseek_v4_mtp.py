@@ -212,6 +212,11 @@ class DeepseekV4MTPModel(Model):
             "default_draft_size": config.dspark_block_size,
         })
         self.attached_model = None
+        # Private trunk embedding/head instances, loaded lazily by attach_to when the
+        # target is tensor-parallel (its own embedding and head then live in the rank
+        # worker processes and cannot be borrowed)
+        self.own_embed = None
+        self.own_head = None
         self.draft_verifier_params.update({
             "export_state_layers": set(config.dspark_target_layer_ids),
         })
@@ -223,6 +228,40 @@ class DeepseekV4MTPModel(Model):
     def attach_to(self, target):
         self.attached_model = weakref.ref(target)
         self.input_layer.attached_model = weakref.ref(target)
+        if getattr(target, "loaded_tp", False):
+            self._load_own_embed_head()
+
+
+    def _load_own_embed_head(self):
+        """Load private copies of the trunk's embedding (system RAM, prefer_cpu) and lm
+        head (drafter's device). Only needed when the target runs TP; keeping the local
+        head also keeps the sequential markov/argmax draft loop free of collectives."""
+        if self.own_head is not None:
+            return
+        cfg = self.config
+        embed = Embedding(
+            config = cfg,
+            key = "embed",
+            vocab_size = cfg.vocab_size,
+            hidden_size = cfg.hidden_size,
+        )
+        embed.load(torch.device("cpu"))
+        head_alt_key = None
+        if cfg.tie_word_embeddings and not cfg.stc.has_tensor("head"):
+            head_alt_key = "embed"
+        head = Linear(
+            config = cfg,
+            key = "head",
+            qbits_key = "head_bits",
+            alt_key = head_alt_key,
+            in_features = cfg.hidden_size,
+            out_features = cfg.vocab_size,
+            caps = {"logits_output": True},
+        )
+        head.load(self.modules[self.fwd_end_idx - 1].device)
+        self.own_embed = embed
+        self.own_head = head
+        self.input_layer.own_embed = embed
 
 
     @override
@@ -274,8 +313,11 @@ class DeepseekV4MTPModel(Model):
         with the markov bigram bias. Returns (bsz, block + 1) ids [seed, drafts...]; the
         generator crops the seed."""
         import torch.nn.functional as F
-        am = self.attached_model()
-        lm = am.modules[am.logit_layer_idx]
+        if self.own_head is not None:
+            lm = self.own_head
+        else:
+            am = self.attached_model()
+            lm = am.modules[am.logit_layer_idx]
         logits = lm.forward(lm.prepare_for_device(state, params), params).float()
         b, s, V = logits.shape
         # Sequential in the sampled chain but fully on-device: embedding gather + bias

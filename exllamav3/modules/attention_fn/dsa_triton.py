@@ -643,6 +643,8 @@ def dsa_attn(
     derot_inv_freq = None,   # (D_r // 2,) fp32: fuse eq. 26 output rotation at q_pos0 + row
                              # (pass the NEGATED frequency table for de-rotation)
     groups = 1,              # > 1: store output group-major (groups, R, (H // groups) * D)
+    group_major = None,      # force group-major layout even at groups == 1 (TP shard
+                             # holding a single o_group); default = (groups > 1)
     out = None,
     n_splits = 0,            # flash-decoding splits; 0 = auto (few queries -> split path)
     block_h = 32,
@@ -671,8 +673,10 @@ def dsa_attn(
         scale = D ** -0.5
     dense_pool = indices is None
     assert H % groups == 0
-    hpg = H // groups if groups > 1 else 0
-    out_shape = (groups, R, hpg * D) if groups > 1 else (R, H, D)
+    if group_major is None:
+        group_major = groups > 1
+    hpg = H // groups if group_major else 0
+    out_shape = (groups, R, hpg * D) if group_major else (R, H, D)
     if out is None:
         out = g_tensor_cache.get(q.device, out_shape, torch.half, "dsa_out")
     else:

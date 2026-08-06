@@ -1,7 +1,9 @@
 from __future__ import annotations
+from dataclasses import dataclass
 import torch
 from ..constants import PAGE_SIZE
 from .cache import Cache, CacheLayer
+from .recurrent import new_checkpoint_handle, mp_cache_recurrent_stash, mp_cache_recurrent_unstash
 
 """
 Cache state for DSA (DeepSeek-V4-style hybrid sparse attention) layers, split along the
@@ -128,7 +130,26 @@ class CacheLayer_dsa(CacheLayer):
         return self._slot_bt
 
     def tp_export(self, plan):
-        raise NotImplementedError("Tensor-parallel loading is not supported for DSA layers")
+        # Pools are shared-KV (MQA) state: replicated per rank, shapes derived from the
+        # (replicated) compressor fields of the shard module passed as `attention` on import
+        return {
+            "cls": CacheLayer_dsa,
+            "args": {
+                "cache_id": self.cache_id,
+                "max_num_tokens": self.max_num_tokens,
+            }
+        }
+
+
+@dataclass
+class DSV4ExportedState:
+    cache: int
+    slot: int
+    position: int
+    window_beg: int
+    serial: int
+    wshift: int = 0
+    last_history: int = 0
 
 
 class DSV4State:
@@ -191,15 +212,39 @@ class DSV4State:
             "window_beg": self.window_beg,
             "checkpoint_size": self.checkpoint_size,
         }
-        for k, l in self.cache.get_all_recurrent_layers().items():
-            stashed[k] = l.stash(self.slot, self.position)
+        if not self.cache.model.loaded_tp:
+            for k, l in self.cache.get_all_recurrent_layers().items():
+                stashed[k] = l.stash(self.slot, self.position)
+        else:
+            cp_handle = new_checkpoint_handle()
+            self.cache.model.tp_dispatch_all(
+                mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot, self.position))
+            stashed["tp_handle"] = cp_handle
         return stashed
 
     def unstash(self, stashed: dict):
         assert self.position == stashed["position"]
         self.window_beg = stashed["window_beg"]
-        for k, l in self.cache.get_all_recurrent_layers().items():
-            l.unstash(self.slot, stashed[k], self.position)
+        if not self.cache.model.loaded_tp:
+            for k, l in self.cache.get_all_recurrent_layers().items():
+                l.unstash(self.slot, stashed[k], self.position)
+        else:
+            cp_handle = stashed["tp_handle"]
+            self.cache.model.tp_dispatch_all(
+                mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot, self.position))
+
+    def tp_export(self):
+        return DSV4ExportedState(
+            cache = id(self.cache),
+            slot = self.slot,
+            position = self.position,
+            window_beg = self.window_beg,
+            serial = self.serial,
+        )
+
+    def tp_readback(self, exported: DSV4ExportedState):
+        # The forward decides the per-step ring shift; post_advance() applies it parent-side
+        self.wshift = exported.wshift
 
     def reset(self):
         self.position = 0
