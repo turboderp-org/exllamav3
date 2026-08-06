@@ -90,6 +90,11 @@ class ComboSampler(CustomSampler):
         pres_p: float = 0.0,
         rep_sustain_range: int = int(10e7),
         rep_decay_range: int = 0,
+        dry_multiplier: float = 0.0,
+        dry_base: float = 1.75,
+        dry_allowed_length: int = 2,
+        dry_range: int = 0,
+        dry_sequence_breakers: frozenset[int] | set[int] | list[int] | None = None,
         temperature: float = 1.0,
         min_p: float = 0.0,
         top_k: int = 0,
@@ -99,11 +104,14 @@ class ComboSampler(CustomSampler):
         adaptive_decay: float = 0.9,
         logit_bias: dict[int, float] | None = None,
     ):
-        # Steps with default parameters become no-ops
+        # Steps with default parameters become no-ops. dry_sequence_breakers takes token IDs
+        # (see dry_sequence_breaker_tokens); left as None, the default set is derived from the
+        # tokenizer at sampling time
         stack = [
             SS_LogitBias(logit_bias or {}),
             SS_RepP(rep_p, rep_sustain_range, rep_decay_range),
             SS_PresFreqP(pres_p, freq_p, rep_sustain_range, rep_decay_range),
+            SS_DRY(dry_multiplier, dry_base, dry_allowed_length, dry_range, dry_sequence_breakers),
         ]
 
         if temperature == 0.0 or top_k == 1:
