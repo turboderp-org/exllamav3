@@ -160,6 +160,8 @@ class DSV4State:
         self.last_history = 0
         self.window_beg = position // PAGE_SIZE * PAGE_SIZE
         self.wshift = 0
+        if stashed is not None:
+            self.unstash(stashed)
         self.checkpoint_size = sum(
             l.get_checkpoint_size() for l in cache.get_all_recurrent_layers().values()
         )
