@@ -52,6 +52,11 @@ struct BC_MLAttention
     float attn_factor;
     int rotate_dims;
 
+    // Llama-4 position scale on the full query (queries only, applied to q_full before the
+    // pe-gather/rope/absorb stages, matching the module's eager-path multiply); 0 = disabled
+    float l4_scaling_beta;
+    int l4_scaling_original;
+
     // kv_b flats: (D_c, H * qk_nope_head_dim) and (D_c, H * v_head_dim)
     at::Tensor w_uk_flat;
     at::Tensor w_uv_flat;
@@ -126,6 +131,8 @@ struct BC_MLAttention
         int rope_style,
         float attn_factor,
         int rotate_dims,
+        float l4_scaling_beta,
+        int l4_scaling_original,
         at::Tensor w_uk_flat,
         at::Tensor w_uv_flat,
         bool quant_cache,

@@ -70,29 +70,26 @@ void rope_kernel
     auto get_sincos = [&] (int rdim, float &sin, float &cos)
     {
         int pos = get_pos(rdim);
-        float local_attn_factor = attn_factor;
-
-        // Apply Llama 4 scaling
-        if (llama_4_scaling_beta > 0.0f)
-        {
-            float scaling = 1.0f + llama_4_scaling_beta * __logf(1.0f + (float)(pos / llama_4_scaling_original));
-            local_attn_factor *= scaling;
-        }
-
         if (!inv_freq_table)
         {
             float fr = inv_freq[t];
             float pf = __int2float_rn(pos);
-            sin = __sinf(fr * pf) * local_attn_factor;
-            cos = __cosf(fr * pf) * local_attn_factor;
+            sin = __sinf(fr * pf) * attn_factor;
+            cos = __cosf(fr * pf) * attn_factor;
         }
         else
         {
             float fr = inv_freq[batch * inv_freq_stride + pos * partial_head_dim / 2 + t];
-            sin = __sinf(fr) * local_attn_factor;
-            cos = __cosf(fr) * local_attn_factor;
+            sin = __sinf(fr) * attn_factor;
+            cos = __cosf(fr) * attn_factor;
         }
     };
+
+    // Llama 4 scaling: position-dependent scale on the full query head, queries only (the
+    // reference scales query_states after rope; keys enter the cache unscaled)
+    float l4_scaling = 1.0f;
+    if (llama_4_scaling_beta > 0.0f)
+        l4_scaling = 1.0f + llama_4_scaling_beta * __logf(1.0f + (float)(get_pos(0) / llama_4_scaling_original));
 
     float sin_cache[MAX_ROTATE_DIMS];
     float cos_cache[MAX_ROTATE_DIMS];
@@ -275,11 +272,25 @@ void rope_kernel
             __syncthreads();
         };
 
+        // Llama 4 scaling. Must be called by the whole block (blockDim.y walks q and k heads
+        // concurrently and the lambda syncs), so k heads scale by 1.0
+        auto apply_l4_scaling = [&] (float scaling)
+        {
+            if (t < head_dim / 2)
+            {
+                half2* tptr = ((half2*) sh_head) + t;
+                half2 v = *tptr;
+                *tptr = __floats2half2_rn(__low2float(v) * scaling, __high2float(v) * scaling);
+            }
+            __syncthreads();
+        };
+
         // Do the things
         load_head();
         if (q_norm) apply_norm();
         apply_rope();
         if (post_rope_norm) apply_norm_uw();
+        if (l4_scaling != 1.0f) apply_l4_scaling(head_idx < num_heads_q ? l4_scaling : 1.0f);
         store_head();
     }
 }
@@ -569,4 +580,96 @@ int64_t gen_mrope_pos_ids
     }
 
     return next_base_t;
+}
+
+// Llama-4 position-dependent attention scale on full query rows (Ministral/Mistral-4 family:
+// HF multiplies query_states by 1 + beta * ln(1 + pos // original_max) after rope, queries
+// only). The fused rope kernel covers full-rotation attention; MLA rotates only the q_pe
+// slice, so its graph path scales the whole (possibly padded) q row with this kernel instead,
+// before the pe-gather and absorb stages. The scale is rounded to fp16 first so the result
+// matches the module's eager-path (torch) multiply bitwise.
+
+__global__
+void l4_scale_q_kernel
+(
+    half* __restrict__ q,
+    const int seq_len,
+    const int row_width,
+    const int row_stride,
+    const int position,
+    const uint32_t* __restrict__ positions,
+    const uint32_t* __restrict__ position_ids,
+    const float llama_4_scaling_beta,
+    const int llama_4_scaling_original,
+    const int position_ids_stride
+)
+{
+    int row = blockIdx.y;
+    int batch = row / seq_len;
+    int token_pos = row % seq_len;
+    int pos = token_pos + position;
+    if (positions)
+        pos = token_pos + positions[batch];
+    else if (position_ids)
+        pos = position_ids[(batch * seq_len + token_pos) * position_ids_stride];
+
+    float scaling = 1.0f + llama_4_scaling_beta * __logf(1.0f + (float)(pos / llama_4_scaling_original));
+    scaling = __half2float(__float2half_rn(scaling));
+
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= row_width / 2) return;
+    half2* ptr = (half2*) (q + (int64_t) row * row_stride) + t;
+    half2 v = *ptr;
+    *ptr = __floats2half2_rn(__low2float(v) * scaling, __high2float(v) * scaling);
+}
+
+void l4_scale_q_gr
+(
+    at::Tensor& q,
+    int bsz,
+    int seq_len,
+    int row_width,
+    int row_stride,
+    uint32_t position,
+    const c10::optional<at::Tensor>& positions,
+    const c10::optional<at::Tensor>& position_ids,
+    float llama_4_scaling_beta,
+    int llama_4_scaling_original,
+    int position_ids_stride,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(q.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(q, kHalf);
+    TORCH_CHECK(row_width % 2 == 0 && row_stride % 2 == 0, "l4_scale_q: widths must be even");
+    TORCH_CHECK(row_width <= row_stride, "l4_scale_q: row_width exceeds row_stride");
+
+    void* q_ptr = (void*) q.data_ptr();
+    const uint32_t* positions_ptr = (const uint32_t*) OPTPTR(positions);
+    const uint32_t* position_ids_ptr = (const uint32_t*) OPTPTR(position_ids);
+    int ipos = (int) position;
+
+    int threads = 256;
+    dim3 blocks(CEIL_DIVIDE(row_width / 2, threads), bsz * seq_len);
+
+    void* kernel_ptr = (void*) l4_scale_q_kernel;
+    void* kernel_args[] =
+    {
+        &q_ptr, &seq_len, &row_width, &row_stride, &ipos, &positions_ptr, &position_ids_ptr,
+        &llama_4_scaling_beta, &llama_4_scaling_original, &position_ids_stride
+    };
+    cuda_check(cudaLaunchKernel(kernel_ptr, blocks, dim3(threads), kernel_args, 0, stream));
+
+    if (graph)
+    {
+        graph->record_param(kernel_ptr, GP_rope_position, 4, 4);
+        graph->record_param(kernel_ptr, GP_rope_positions, 5);
+        graph->record_param(kernel_ptr, GP_rope_position_ids, 6);
+        graph->record_param(kernel_ptr, GP_rope_pid_stride, 9, 4);
+        graph->record_param(kernel_ptr, GP_end, 0);
+    }
+
+    cuda_check(cudaPeekAtLastError());
 }

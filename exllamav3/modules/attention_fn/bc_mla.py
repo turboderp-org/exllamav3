@@ -91,6 +91,11 @@ class BCMLA:
             rope_style = int(rope.rope_settings.rope_style),
             attn_factor = rope.attn_factor,
             rotate_dims = rope.rope_settings.rotate_dims,
+            # The module zeroes the beta on its RoPE instance (the rope stage must not scale
+            # k_pe, and only sees the q_pe slice anyway); the graph applies the full-query
+            # scale as its own stage on q_full
+            l4_scaling_beta = m.l4_beta,
+            l4_scaling_original = m.l4_original,
             w_uk_flat = m.w_uk_flat,
             w_uv_flat = m.w_uv_flat,
             quant_cache = self.quant,
@@ -279,7 +284,6 @@ def build_bc_mla(module, layer):
     if not (
         bc_attn_enable and
         m.rope is not None and m.rope.rope_settings.rope_style != RopeStyle.NONE and
-        m.rope.llama_4_scaling_beta == 0.0 and
         # The staging/attention kernels index with tl.arange over these widths
         _is_pow2(D_c) and _is_pow2(D_r) and _is_pow2(D_v) and D_c % 128 == 0 and
         # Projections read x directly (no padded-input staging) and write the statics; the q and

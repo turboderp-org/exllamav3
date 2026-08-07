@@ -8,6 +8,22 @@
 #define ROPESTYLE_NEOX 2
 #define ROPESTYLE_NANOCHAT 3
 
+void l4_scale_q_gr
+(
+    at::Tensor& q,
+    int bsz,
+    int seq_len,
+    int row_width,
+    int row_stride,
+    uint32_t position,
+    const c10::optional<at::Tensor>& positions,
+    const c10::optional<at::Tensor>& position_ids,
+    float llama_4_scaling_beta,
+    int llama_4_scaling_original,
+    int position_ids_stride,
+    Graph* graph
+);
+
 void rope_gr
 (
     const at::Tensor& q,
