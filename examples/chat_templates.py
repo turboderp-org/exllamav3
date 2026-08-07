@@ -1031,7 +1031,7 @@ class PromptFormat_ds4(PromptFormat):
 
     def stop_conditions(self, tokenizer):
         return tokenizer.config.eos_token_id_list + [
-            tokenizer.single_id("<|User|>")
+            tokenizer.single_id("<｜User｜>")
         ]
 
 
