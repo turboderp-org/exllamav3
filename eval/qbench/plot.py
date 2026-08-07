@@ -87,11 +87,11 @@ def group_marker_size(group, base):
 GROUP_COLORS = [
     "#f9d02d",  # 0: gold        - reserved for EXL3
     "#3fc6f2",  # 1: sky blue    - reserved for AWQ
-    "#ab472d",  # 2: terracotta  - reserved for GGUF
-    "#1820e8",  # 3: deep blue
-    "#d98a72",  # 4: salmon
-    "#4685c7",  # 5: mid blue
-    "#c2d989",  # 6: sage
+    "#c2d989",  # 2: sage        - reserved for GGUF
+    "#d98a72",  # 3: salmon
+    "#4685c7",  # 4: mid blue
+    "#ab472d",  # 5: terracotta
+    "#1820e8",  # 6: deep blue
     "#fc4f1f",  # 7: orange red
 ]
 
