@@ -70,29 +70,26 @@ void rope_kernel
     auto get_sincos = [&] (int rdim, float &sin, float &cos)
     {
         int pos = get_pos(rdim);
-        float local_attn_factor = attn_factor;
-
-        // Apply Llama 4 scaling
-        if (llama_4_scaling_beta > 0.0f)
-        {
-            float scaling = 1.0f + llama_4_scaling_beta * __logf(1.0f + (float)(pos / llama_4_scaling_original));
-            local_attn_factor *= scaling;
-        }
-
         if (!inv_freq_table)
         {
             float fr = inv_freq[t];
             float pf = __int2float_rn(pos);
-            sin = __sinf(fr * pf) * local_attn_factor;
-            cos = __cosf(fr * pf) * local_attn_factor;
+            sin = __sinf(fr * pf) * attn_factor;
+            cos = __cosf(fr * pf) * attn_factor;
         }
         else
         {
             float fr = inv_freq[batch * inv_freq_stride + pos * partial_head_dim / 2 + t];
-            sin = __sinf(fr) * local_attn_factor;
-            cos = __cosf(fr) * local_attn_factor;
+            sin = __sinf(fr) * attn_factor;
+            cos = __cosf(fr) * attn_factor;
         }
     };
+
+    // Llama 4 scaling: position-dependent scale on the full query head, queries only (the
+    // reference scales query_states after rope; keys enter the cache unscaled)
+    float l4_scaling = 1.0f;
+    if (llama_4_scaling_beta > 0.0f)
+        l4_scaling = 1.0f + llama_4_scaling_beta * __logf(1.0f + (float)(get_pos(0) / llama_4_scaling_original));
 
     float sin_cache[MAX_ROTATE_DIMS];
     float cos_cache[MAX_ROTATE_DIMS];
@@ -275,11 +272,25 @@ void rope_kernel
             __syncthreads();
         };
 
+        // Llama 4 scaling. Must be called by the whole block (blockDim.y walks q and k heads
+        // concurrently and the lambda syncs), so k heads scale by 1.0
+        auto apply_l4_scaling = [&] (float scaling)
+        {
+            if (t < head_dim / 2)
+            {
+                half2* tptr = ((half2*) sh_head) + t;
+                half2 v = *tptr;
+                *tptr = __floats2half2_rn(__low2float(v) * scaling, __high2float(v) * scaling);
+            }
+            __syncthreads();
+        };
+
         // Do the things
         load_head();
         if (q_norm) apply_norm();
         apply_rope();
         if (post_rope_norm) apply_norm_uw();
+        if (l4_scaling != 1.0f) apply_l4_scaling(head_idx < num_heads_q ? l4_scaling : 1.0f);
         store_head();
     }
 }
