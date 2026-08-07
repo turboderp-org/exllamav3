@@ -556,6 +556,16 @@ class TransformersBackend:
                 total += sum(8 * self._nbytes(k) for k in self.tensor_index if pat.match(k))
             if total:
                 return total
+        fm = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", name)
+        if fm:
+            prefix, kind = fm.group(1), fm.group(2)
+            parts = ("down",) if kind == "down_proj" else ("gate", "up")
+            pat = re.compile(
+                "^" + re.escape(prefix) + r"\.\d+\.(" + "|".join(parts) +
+                r")_proj\.weight(_packed|_scale|_scale_inv|_zero_point|_shape|_g_idx)?$")
+            total = sum(8 * self._nbytes(k) for k in self.tensor_index if pat.match(k))
+            if total:
+                return total
         return None
 
     def _get_tensor(self, name):
@@ -588,6 +598,26 @@ class TransformersBackend:
                 if f"{stem}.weight_global_scale" in self.tensor_index:
                     return self._dequant_ct_nvfp4(stem)
                 return self._dequant_ct(stem)
+
+        # Per-expert checkpoints vs fused-expert module trees (mistral4 AWQ/compressed-tensors:
+        # experts.{i}.{gate,up,down}_proj vs experts.gate_up_proj) with no declared conversion
+        # mapping: stack the per-expert tensors, resolving each recursively so quantized
+        # formats dequantize on the way in. Module orientation is (E, out, in), gate rows first
+        fm = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", name)
+        if fm:
+            prefix, kind = fm.group(1), fm.group(2)
+            probe = "down" if kind == "down_proj" else "gate"
+            e = 0
+            while (f"{prefix}.{e}.{probe}_proj.weight" in self.tensor_index or
+                   f"{prefix}.{e}.{probe}_proj.weight_packed" in self.tensor_index):
+                e += 1
+            if e:
+                if kind == "down_proj":
+                    return torch.stack([self._get_tensor(f"{prefix}.{i}.down_proj.weight") for i in range(e)])
+                return torch.stack([
+                    torch.cat([self._get_tensor(f"{prefix}.{i}.gate_proj.weight"),
+                               self._get_tensor(f"{prefix}.{i}.up_proj.weight")], dim = 0)
+                    for i in range(e)])
 
         # Merge-type conversion (fused MoE experts): gather the per-expert source tensors for
         # this prefix, stack each source group (MergeModulelist), then concatenate groups
