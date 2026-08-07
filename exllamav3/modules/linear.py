@@ -247,6 +247,16 @@ class Linear(Module):
                 no_defer = True,
                 fidx = self.fidx
             )
+            if weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                # fp8 batch tensor (Mistral-Small-4): per-expert scalar scale stored as
+                # {fkey}_scale_inv with the expert on the first dim
+                scale_inv = self.config.stc.get_tensor(
+                    self.fkey + "_scale_inv", self.device, optional = True, no_defer = True, fidx = self.fidx
+                )
+                weight = weight.float()
+                if scale_inv is not None:
+                    weight = weight * scale_inv.float().reshape(-1)[0]
+                weight = weight.half()
             if self.frange is not None:
                 if self.frange_dim == 0:
                     weight = weight[self.frange[0] : self.frange[1]].contiguous()

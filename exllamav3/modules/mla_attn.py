@@ -219,6 +219,22 @@ class MLAttention(Module):
         # kv_b_proj maps the latent to per-head K-nope and V. Attention never applies it as that
         # GEMM; the halves fold into the query/output (decode) or up-project past tiles (prefill)
         w = self.config.stc.get_tensor(f"{self.key}.{self.key_kv_b}.weight", device, no_defer = True)
+        if w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # fp8 checkpoint: this tensor is read raw rather than through a Linear, so apply the
+            # inverse weight scale here (scalar per-tensor or block grid)
+            si = self.config.stc.get_tensor(
+                f"{self.key}.{self.key_kv_b}.weight_scale_inv", device, optional = True, no_defer = True
+            )
+            wf = w.float()
+            if si is not None:
+                si = si.float()
+                if si.dim() == 2:
+                    r, c = wf.shape
+                    sr, sc = si.shape
+                    wf = (wf.view(sr, r // sr, sc, c // sc) * si.view(sr, 1, sc, 1)).view(r, c)
+                else:
+                    wf = wf * si
+            w = wf.half()
         assert w.shape == (self.num_q_heads * (self.qk_nope_head_dim + self.v_head_dim),
                            self.kv_lora_rank), \
             f"{self.key}.{self.key_kv_b}: unexpected shape {tuple(w.shape)}"
