@@ -259,6 +259,9 @@ class PromptFormat_mistral3(PromptFormat):
 
     def format(self, system_prompt, messages, think):
         context = f"[SYSTEM_PROMPT]{system_prompt}[/SYSTEM_PROMPT]"
+        context += \
+            """[MODEL_SETTINGS]{"reasoning_effort": "{high}"}[/MODEL_SETTINGS]""" if think else \
+            """[MODEL_SETTINGS]{"reasoning_effort": "{none}"}[/MODEL_SETTINGS]"""
         for (u, a) in messages:
             context += f"[INST]{u}[/INST]"
             if a is not None: context += f"{a}"
@@ -272,7 +275,10 @@ class PromptFormat_mistral3(PromptFormat):
             tokenizer.eos_token_id
         ]
 
+    def thinktag(self):
+        return "[THINK]", "[/THINK]"
 
+    
 class PromptFormat_gemma(PromptFormat):
     description = "Gemma"
 
