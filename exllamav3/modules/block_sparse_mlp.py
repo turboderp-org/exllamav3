@@ -362,10 +362,12 @@ class BlockSparseMLP(Module):
 
         self.interm_dtype = interm_dtype
         self.interm_div = interm_div
+        self.router_type = router_type
         if interm_div != 1.0:
-            assert router_type in ("dots", "ds3"), \
-                "interm_div requires a router type that folds routed_scaling_factor into the routing weights"
-            routed_scaling_factor = (routed_scaling_factor if routed_scaling_factor is not None else 1.0) * interm_div
+            assert router_type in ("dots", "ds3", "std"), \
+                "interm_div requires a router type that can fold the compensation into the routing weights"
+            if router_type != "std":
+                routed_scaling_factor = (routed_scaling_factor if routed_scaling_factor is not None else 1.0) * interm_div
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
         self.intermediate_size_padded = (intermediate_size + 127) // 128 * 128
@@ -980,6 +982,16 @@ class BlockSparseMLP(Module):
 
 
     def load_routing(self, **kwargs):
+
+        if self.interm_div != 1.0 and self.router_type == "std":
+            # std routing has no scaling factor; fold the interm_div compensation into the
+            # per-expert scale, which routing_std applies after top-k normalization. Both the
+            # GPU and CPU-offload load paths come through here, and unload clears the tensor
+            if self.per_expert_scale is None:
+                self.per_expert_scale = torch.full(
+                    (self.num_experts,), self.interm_div, dtype = torch.bfloat16, device = self.device)
+            else:
+                self.per_expert_scale = (self.per_expert_scale.float() * self.interm_div).to(torch.bfloat16)
 
         router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
         routing_weights_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.half, device = self.device)
