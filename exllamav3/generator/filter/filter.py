@@ -131,8 +131,11 @@ class Filter:
 
     def get_next_logit_mask(self) -> torch.Tensor:
         """
-        Return boolean mask of valid tokens for the current state as CPU tensor. Assume self.is_completed() is
-        False
+        Return a mask of valid tokens for the current state as a CPU tensor: either a dense additive
+        half tensor of shape (1, vocab_size) with 0 for allowed tokens and -inf for masked tokens, or
+        a packed int32 bitmask of shape (1, ceil(vocab / 32)) where bit (i & 31) of word (i >> 5) set
+        means token i is allowed. Tokens at or beyond the mask width count as masked out in either
+        format. Assume self.is_completed() is False
         """
         raise NotImplementedError()
 

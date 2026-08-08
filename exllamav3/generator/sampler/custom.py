@@ -243,9 +243,11 @@ class SS_Fused(SS_Base):
                 self.histograms[ws_key] = histogram
 
         state.sample = state.empty_sample()
+        mask_is_bits = state.fused_mask is not None and state.fused_mask.dtype == torch.int32
         ext.fused_sampler(
             logits,
-            state.fused_mask,
+            None if mask_is_bits else state.fused_mask,
+            state.fused_mask if mask_is_bits else None,
             state.sample,
             workspace,
             state.fused_dim or state.dim,
@@ -1010,6 +1012,13 @@ class CustomSampler(Sampler):
         dim = logits.shape[-1]
         bsz = logits.numel() // dim
 
+        # The mask may be a dense additive half tensor or a packed int32 bitmask with 32 tokens
+        # per word (bit clear = masked out), as produced by e.g. LLGuidanceFilter
+        mask_is_bits = logit_mask is not None and logit_mask.dtype == torch.int32
+        mask_width = None
+        if logit_mask is not None:
+            mask_width = logit_mask.shape[-1] * 32 if mask_is_bits else logit_mask.shape[-1]
+
         # For a fully fused stack the mask is applied inside the kernel; a mask narrower than
         # the logits bounds the scan instead of being padded with -inf. Same for the padded
         # vocab region, which the in-place fill above has already masked.
@@ -1018,10 +1027,10 @@ class CustomSampler(Sampler):
         if (
             self.fused_only and
             (logit_mask is None or (
-                logit_mask.dtype == torch.half and
+                (logit_mask.dtype == torch.half or mask_is_bits) and
                 logit_mask.is_contiguous() and
                 (logit_mask.shape[0] == 1 or
-                    (logit_mask.shape[0] == bsz and logit_mask.shape[-1] == dim))
+                    (logit_mask.shape[0] == bsz and (mask_is_bits or logit_mask.shape[-1] == dim)))
             ))
         ):
             fused_dim = dim
@@ -1029,7 +1038,13 @@ class CustomSampler(Sampler):
                 fused_dim = min(fused_dim, tokenizer.actual_vocab_size)
             if logit_mask is not None:
                 fused_mask = logit_mask.view(logit_mask.shape[0], -1)
-                fused_dim = min(fused_dim, fused_mask.shape[-1])
+                fused_dim = min(fused_dim, mask_width)
+
+        # Apply packed bitmask with a masked copy (out of place, like the additive path below)
+        elif mask_is_bits:
+            masked = torch.empty_like(logits.view(bsz, dim))
+            ext.apply_logit_bitmask(logits.view(bsz, dim), masked, logit_mask)
+            logits = masked
 
         # Apply logit mask/bias tensor
         elif logit_mask is not None:

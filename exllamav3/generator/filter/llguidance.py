@@ -98,6 +98,7 @@ class LLGuidanceFilter(Filter):
         self._consume_prefix = consume_prefix
         self._consumed = 0
         self._bitmask = np.empty(((self._ll_tokenizer.vocab_size + 31) // 32,), dtype = np.int32)
+        self._bitmask_torch = torch.from_numpy(self._bitmask).unsqueeze(0)
         self._start()
 
     def _start(self):
@@ -143,15 +144,13 @@ class LLGuidanceFilter(Filter):
         return True
 
     def get_next_logit_mask(self) -> torch.Tensor:
+        # Returned as the packed int32 bitmask llguidance computes natively (32 tokens per word,
+        # bit clear = masked out). The buffer is reused for the next mask once the job has
+        # consumed this one, like the pinned mask buffers downstream.
         bm = self._bitmask
         self._matcher.unsafe_compute_mask_ptr(bm.ctypes.data, bm.size * bm.itemsize)
         self._check_error()
-        bits = np.unpackbits(bm.view(np.uint8), bitorder = "little")
-        n = min(self._ll_tokenizer.vocab_size, self.vocab_size)
-        # 0 for allowed tokens, -inf for disallowed and padding
-        mask = torch.full((1, self.vocab_size), float("-inf"), dtype = self.logits_dtype)
-        mask[0, :n][torch.from_numpy(bits[:n]).bool()] = 0.0
-        return mask
+        return self._bitmask_torch
 
     def is_completed(self) -> bool:
         return self._matcher.is_stopped()
