@@ -113,7 +113,6 @@ class SS_Sample(SS_Base):
     Final sampling step: categorical sampling, randomly sample from (truncated and/or modified) distribution
     """
     def run(self, state: SamplingState):
-        # TODO: Fused Gumbel noise + argmax kernel
         match state.state:
             case SS.INIT:
                 state.logits = torch.empty_like(state.in_logits)

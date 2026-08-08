@@ -530,7 +530,6 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                 progress.update(curr_progress)
                 time.sleep(0.1)
     except KeyboardInterrupt as e:
-        # TODO: This is too hacky
         from signal import pthread_kill, SIGTSTP, SIGKILL
         for t in threads:
             pthread_kill(t.ident, SIGTSTP)
@@ -617,7 +616,6 @@ def run_row_workers(title, num_rows, workers, progress_count):
                 time.sleep(0.05)
             progress.update(progress_count[0])
     except KeyboardInterrupt:
-        # TODO: This is too hacky (same as quantize_linears_parallel)
         from signal import pthread_kill, SIGTSTP, SIGKILL
         for t in threads:
             pthread_kill(t.ident, SIGTSTP)
@@ -879,7 +877,6 @@ def clear_temp_files(args):
 
 @torch.inference_mode()
 def main(args, job_state):
-    # TODO: Refactor this, split into functions
     global max_progress, curr_progress, timed_blocks
 
     torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)

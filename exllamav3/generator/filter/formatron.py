@@ -102,7 +102,6 @@ class FormatronFilter(Filter):
             self._zeros = torch.zeros((self.vocab_size,), dtype = self.logits_dtype, device = "cpu")
         mask = self._formatter.mask_logits(self._zeros).unsqueeze(0)
         # mask_logits() sometimes modifies in-place, so create a new zeros tensor in that case
-        # TODO: See if it's possible to get bit mask from Formatron instead (then apply with custom kernel)
         if mask.untyped_storage().data_ptr() == self._zeros.untyped_storage().data_ptr():
             self._zeros = None
         # self._debug(mask)
