@@ -2,7 +2,9 @@ import torch
 import traceback
 import os
 import sys
+import threading
 import time
+from collections import deque
 from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
@@ -26,6 +28,7 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
         "kv_modules": [],
         "recurrent_modules": [],
         "recurrent_cache": {},
+        "cpu_page_cache": None,
         "rank": rank,
         "world_size": world_size,
         "output_rank": output_rank,
@@ -377,6 +380,112 @@ def mp_rotate_cache_pages(
     for cache in cache_tensors:
         buffer = get_buffer(cache[0].shape, cache.device, cache.dtype)
         ext.cache_rotate(cache, all_rotations, buffer)
+
+
+# CPU page cache in TP mode. The main process owns the page table, the slot table and the eviction policy but
+# holds no cache tensors, so it names a slot by index and every rank keeps its own shard of that slot here. A
+# slot is one whole page image of this rank's shard, across every attached cache, in one pinned buffer per
+# cache tensor.
+
+class RankSlotPool:
+    """
+    This rank's half (or third, or...) of the CPU page cache: one set of host buffers per slot index.
+
+    Pinning host memory manages only ~2.5 GB/s and serializes with copy submission on the driver, so buffers
+    are pinned ahead of demand by a background thread, mirroring what the single-process cache does. A store
+    that outruns the thread pins synchronously and says so, since that stall lands on the generator's own
+    dispatch path.
+    """
+
+    def __init__(self, cache_tensors: list, max_slots: int):
+        self.shapes = [(t.shape[1:], t.dtype) for t in cache_tensors]
+        self.max_slots = max_slots
+        self.slots = {}
+        self.cold_allocs = 0
+        self.pageable = False
+
+        self._spare = deque()
+        self._spare_cond = threading.Condition()
+        self._alloc_thread = threading.Thread(target = self._alloc_worker, daemon = True)
+        self._alloc_thread.start()
+
+
+    def _make_buffers(self):
+        try:
+            return [torch.empty(shape, dtype = dtype, pin_memory = True) for shape, dtype in self.shapes]
+        except RuntimeError:
+            # Out of lockable memory on this rank. Pageable buffers still work, at roughly half the transfer
+            # bandwidth, which beats failing the store outright
+            self.pageable = True
+            return [torch.empty(shape, dtype = dtype) for shape, dtype in self.shapes]
+
+
+    def _alloc_worker(self):
+        while True:
+            with self._spare_cond:
+                while len(self.slots) + len(self._spare) >= self.max_slots:
+                    self._spare_cond.wait()
+            buffers = self._make_buffers()  # slow part, outside the lock
+            with self._spare_cond:
+                self._spare.append(buffers)
+
+
+    def get(self, slot: int):
+        buffers = self.slots.get(slot)
+        if buffers is not None:
+            return buffers
+        with self._spare_cond:
+            if self._spare:
+                buffers = self._spare.popleft()
+                self.slots[slot] = buffers
+                self._spare_cond.notify()
+                return buffers
+        buffers = self._make_buffers()
+        self.cold_allocs += 1
+        with self._spare_cond:
+            self.slots[slot] = buffers
+            self._spare_cond.notify()
+        return buffers
+
+
+def mp_cpu_cache_tensors(local_context: dict, cache_ids: list[int]):
+    cache_tensors = []
+    for cache_id in cache_ids:
+        for module in local_context["kv_modules"]:
+            cache_tensors += [t for t in module.tp_cache_lookup[cache_id].get_tensors() if t is not None]
+    return cache_tensors
+
+
+def mp_cpu_cache_init(local_context: dict, cache_ids: list[int], max_slots: int):
+    """
+    Size of one page of this rank's cache shard in bytes, and the slot pool to hold those pages. Called with
+    max_slots = 0 to size the slot before the main process knows how many will fit.
+    """
+    cache_tensors = mp_cpu_cache_tensors(local_context, cache_ids)
+    if max_slots:
+        local_context["cpu_page_cache"] = RankSlotPool(cache_tensors, max_slots)
+    return sum(t[0].numel() * t.element_size() for t in cache_tensors)
+
+
+def mp_cpu_cache_store(local_context: dict, cache_ids: list[int], slot: int, page_index: int):
+    """
+    Copy this rank's shard of a page into the buffers held for slot (device-to-host, async on the current
+    stream). Reusing a slot overwrites it in place, which is how the main process recycles an evicted entry.
+    """
+    pool = local_context["cpu_page_cache"]
+    buffers = pool.get(slot)
+    for buffer, tensor in zip(buffers, mp_cpu_cache_tensors(local_context, cache_ids)):
+        buffer.copy_(tensor[page_index], non_blocking = True)
+    return pool.cold_allocs
+
+
+def mp_cpu_cache_fetch(local_context: dict, cache_ids: list[int], slot: int, page_index: int):
+    """
+    Copy a stored page back into this rank's shard of a page slot (host-to-device, async on the current stream)
+    """
+    buffers = local_context["cpu_page_cache"].slots[slot]
+    for buffer, tensor in zip(buffers, mp_cpu_cache_tensors(local_context, cache_ids)):
+        tensor[page_index].copy_(buffer, non_blocking = True)
 
 
 class PseudoParentConn:

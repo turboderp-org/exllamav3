@@ -213,11 +213,8 @@ class Generator:
         # CPU page cache tier
         self.cpu_page_cache = None
         if cpu_cache_size:
-            # TODO: Add TP support for CPU cache
-            assert not model.loaded_tp, \
-                "CPU page cache tier is not currently supported in tensor-parallel mode."
             tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
-            self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
+            self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size, model)
             self.cpu_page_cache.attach(self.pagetable)
             self.pagetable.cpu_tier = self.cpu_page_cache
 
