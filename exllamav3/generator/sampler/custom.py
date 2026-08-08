@@ -113,7 +113,6 @@ class SS_Sample(SS_Base):
     Final sampling step: categorical sampling, randomly sample from (truncated and/or modified) distribution
     """
     def run(self, state: SamplingState):
-        # TODO: Fused Gumbel noise + argmax kernel
         match state.state:
             case SS.INIT:
                 state.logits = torch.empty_like(state.in_logits)
@@ -244,9 +243,11 @@ class SS_Fused(SS_Base):
                 self.histograms[ws_key] = histogram
 
         state.sample = state.empty_sample()
+        mask_is_bits = state.fused_mask is not None and state.fused_mask.dtype == torch.int32
         ext.fused_sampler(
             logits,
-            state.fused_mask,
+            None if mask_is_bits else state.fused_mask,
+            state.fused_mask if mask_is_bits else None,
             state.sample,
             workspace,
             state.fused_dim or state.dim,
@@ -573,6 +574,63 @@ class SS_BanTokens(SS_Base):
 
     def alt(self):
         if not self.mask.token_ids:
+            return SS_NoOp()
+        return None
+
+
+class LogitBias:
+    """
+    Additive per-token logit bias vector with per (vocab size, device) caching. Token IDs outside
+    the vocabulary are ignored.
+    """
+    def __init__(self, logit_bias: dict[int, float]):
+        # keep finite biases and -inf (a hard ban); drop 0, nan and any value that
+        # overflows float32 to +inf (which would poison softmax and crash sampling).
+        # The bound is checked in float32 since the bias vector is float32; -inf and
+        # large negatives fall through as bans.
+        f32_max = torch.finfo(torch.float32).max
+        self.logit_bias = {
+            int(t): float(v) for t, v in logit_bias.items()
+            if float(v) != 0.0 and float(v) == float(v) and float(v) <= f32_max
+        }
+        self.vectors = {}
+
+    def get(self, dim: int, device: torch.device) -> torch.Tensor:
+        key = (dim, device)
+        vector = self.vectors.get(key)
+        if vector is None:
+            vector = torch.zeros((dim,), dtype = torch.float, device = device)
+            items = [(t, v) for t, v in self.logit_bias.items() if 0 <= t < dim]
+            if items:
+                ids = torch.tensor([t for t, _ in items], dtype = torch.long, device = device)
+                vals = torch.tensor([v for _, v in items], dtype = torch.float, device = device)
+                vector[ids] = vals
+            self.vectors[key] = vector
+        return vector
+
+
+class SS_LogitBias(SS_Base):
+    """
+    Add a fixed per-token bias to the logits, OAI style (the logit_bias sampler parameter). Must be
+    among the first steps in the sampler chain, before the logits are transformed. A bias of
+    -inf bans a token; zero, nan and +inf biases are ignored.
+    """
+    def __init__(self, logit_bias: dict[int, float]):
+        self.bias = LogitBias(logit_bias)
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.INIT:
+                state.logits = state.in_logits.to(torch.float, copy = True)
+                state.logits += self.bias.get(state.dim, state.logits.device)
+            case SS.LOGITS:
+                state.logits += self.bias.get(state.dim, state.logits.device)
+            case _:
+                raise ValueError("Sampling logic error")
+        state.state = SS.LOGITS
+
+    def alt(self):
+        if not self.bias.logit_bias:
             return SS_NoOp()
         return None
 
@@ -907,7 +965,7 @@ class CustomSampler(Sampler):
         fused_tail = None
         if fused_sampler_enable:
             i = 0
-            while i < len(simplified) and type(simplified[i]) in (SS_RepP, SS_PresFreqP, SS_BanTokens):
+            while i < len(simplified) and type(simplified[i]) in (SS_RepP, SS_PresFreqP, SS_BanTokens, SS_LogitBias):
                 i += 1
             fused_tail = _match_fused_tail(simplified[i:])
             if fused_tail is not None:
@@ -954,6 +1012,13 @@ class CustomSampler(Sampler):
         dim = logits.shape[-1]
         bsz = logits.numel() // dim
 
+        # The mask may be a dense additive half tensor or a packed int32 bitmask with 32 tokens
+        # per word (bit clear = masked out), as produced by e.g. LLGuidanceFilter
+        mask_is_bits = logit_mask is not None and logit_mask.dtype == torch.int32
+        mask_width = None
+        if logit_mask is not None:
+            mask_width = logit_mask.shape[-1] * 32 if mask_is_bits else logit_mask.shape[-1]
+
         # For a fully fused stack the mask is applied inside the kernel; a mask narrower than
         # the logits bounds the scan instead of being padded with -inf. Same for the padded
         # vocab region, which the in-place fill above has already masked.
@@ -962,10 +1027,10 @@ class CustomSampler(Sampler):
         if (
             self.fused_only and
             (logit_mask is None or (
-                logit_mask.dtype == torch.half and
+                (logit_mask.dtype == torch.half or mask_is_bits) and
                 logit_mask.is_contiguous() and
                 (logit_mask.shape[0] == 1 or
-                    (logit_mask.shape[0] == bsz and logit_mask.shape[-1] == dim))
+                    (logit_mask.shape[0] == bsz and (mask_is_bits or logit_mask.shape[-1] == dim)))
             ))
         ):
             fused_dim = dim
@@ -973,7 +1038,13 @@ class CustomSampler(Sampler):
                 fused_dim = min(fused_dim, tokenizer.actual_vocab_size)
             if logit_mask is not None:
                 fused_mask = logit_mask.view(logit_mask.shape[0], -1)
-                fused_dim = min(fused_dim, fused_mask.shape[-1])
+                fused_dim = min(fused_dim, mask_width)
+
+        # Apply packed bitmask with a masked copy (out of place, like the additive path below)
+        elif mask_is_bits:
+            masked = torch.empty_like(logits.view(bsz, dim))
+            ext.apply_logit_bitmask(logits.view(bsz, dim), masked, logit_mask)
+            logits = masked
 
         # Apply logit mask/bias tensor
         elif logit_mask is not None:

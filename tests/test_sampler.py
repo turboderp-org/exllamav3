@@ -221,6 +221,38 @@ custom_test_cases = [
         "input": [[2.0, 1.0, 0.0, -1.0]],
         "expect_probs": [[0.169081, 0.236883, 0.087144, 0.032059]],
     },
+    {
+        # logit_bias adds a per-token value to the logits; out-of-range IDs are ignored and the
+        # two batch rows share the same bias vector
+        "name": "logit_bias",
+        "sampler": CustomSampler([
+            SS_LogitBias({1: 5.0, 3: -2.0, 100: 9.0}),
+            SS_Sample_mn()
+        ]),
+        "input": [[1.0, 1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0, 0.0]],
+        "expect_logits": [[1.0, 6.0, 1.0, -1.0, 1.0], [0.0, 5.0, 0.0, -2.0, 0.0]],
+    },
+    {
+        # logit_bias with -inf bans a token, matching a hard mask
+        "name": "logit_bias ban",
+        "sampler": CustomSampler([
+            SS_LogitBias({2: -float("inf")})
+        ]),
+        "input": [[1.0, 2.0, 3.0, 4.0]],
+        "expect_logits": [[1.0, 2.0, ni, 4.0]],
+    },
+    {
+        # logit_bias after another logits step exercises the SS.LOGITS branch; zero and
+        # non-finite bias values are dropped, so token 0 (nan) and token 3 (0.0) are unchanged
+        "name": "logit_bias, after ban_tokens",
+        "sampler": CustomSampler([
+            SS_BanTokens([2]),
+            SS_LogitBias({0: float("nan"), 1: 4.0, 3: float("inf")})
+        ]),
+        "input": [[1.0, 1.0, 1.0, 1.0]],
+        # nan and +inf biases are dropped (tokens 0 and 3 unchanged); 4.0 adds to token 1
+        "expect_logits": [[1.0, 5.0, ni, 1.0]],
+    },
 ]
 
 
@@ -374,6 +406,10 @@ def test_fused_collapse():
     assert fused_mode(CustomSampler([
         SS_BanTokens([1, 2]), SS_Temperature(0.8), SS_MinP(0.05), SS_Sample()
     ])) == SS_Fused.MODE_SAMPLE_MINP
+    # A leading logit_bias step also keeps a fused tail
+    assert fused_mode(ComboSampler(
+        temperature = 0.8, min_p = 0.05, logit_bias = {1: 5.0}
+    )) == SS_Fused.MODE_SAMPLE_MINP
     # Reference/multinomial nodes and non-canonical filter orders stay on the eager path
     assert fused_mode(CustomSampler([SS_MinP(0.1), SS_Sample_mn()])) is None
     assert fused_mode(CustomSampler([SS_TopP(0.9), SS_MinP(0.1), SS_Temperature(0.8), SS_Sample()])) is None

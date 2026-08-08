@@ -190,7 +190,14 @@ class TransformersBackend:
             # include_buffers = False keeps non-persistent buffers (rope inv_freq etc., which
             # are not in the shards) materialized with their init values
             with init_empty_weights(include_buffers = False):
-                self.model = AutoModelForCausalLM.from_config(config, dtype = dtype, trust_remote_code = trc)
+                try:
+                    self.model = AutoModelForCausalLM.from_config(config, dtype = dtype, trust_remote_code = trc)
+                except ValueError:
+                    # Multimodal wrappers not registered under CausalLM (Mistral3/Mistral4):
+                    # the ConditionalGeneration class computes text-only logits fine, and the
+                    # never-forwarded vision tower simply stays on meta
+                    from transformers import AutoModelForImageTextToText
+                    self.model = AutoModelForImageTextToText.from_config(config, dtype = dtype, trust_remote_code = trc)
             self.model.eval()
 
             # The streamed head skips the CausalLM wrapper's forward, so post-head transforms
@@ -292,6 +299,16 @@ class TransformersBackend:
                     alias = "model." + ck_name[len("model.language_model."):]
                     self.tensor_index.setdefault(alias, (fn, ck_name))
 
+            # Wrappers nesting a bare text model under language_model keep the text model's own
+            # base prefix in the checkpoint ("language_model.model.*", old-style Mistral3/4);
+            # from_pretrained strips it when nesting, so alias the stripped form of every
+            # resolved name too
+            for mod_name in list(self.tensor_index.keys()):
+                if ".language_model.model." in mod_name:
+                    self.tensor_index.setdefault(
+                        mod_name.replace(".language_model.model.", ".language_model.", 1),
+                        self.tensor_index[mod_name])
+
             # Real (init-valued) buffers up front on the compute device
             for m in self.model.modules():
                 for k, b in m._buffers.items():
@@ -319,12 +336,21 @@ class TransformersBackend:
             self.head_weight_name = f"{self.prefix[id(head)]}.weight" if head is not None else None
             self.embed_weight_name = f"{self.prefix[id(embed)]}.weight"
         else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                source,
-                dtype = dtype,
-                device_map = options.get("device_map", "auto"),
-                trust_remote_code = options.get("trust_remote_code", True),
-            )
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    source,
+                    dtype = dtype,
+                    device_map = options.get("device_map", "auto"),
+                    trust_remote_code = options.get("trust_remote_code", True),
+                )
+            except ValueError:
+                from transformers import AutoModelForImageTextToText
+                self.model = AutoModelForImageTextToText.from_pretrained(
+                    source,
+                    dtype = dtype,
+                    device_map = options.get("device_map", "auto"),
+                    trust_remote_code = options.get("trust_remote_code", True),
+                )
             self.model.eval()
 
         # Biases and norms are 1D (excluded by the ndim test); router gates excluded by name.
@@ -462,11 +488,15 @@ class TransformersBackend:
         elif name.endswith(".weight") and f"{name[:-len('.weight')]}.scale" in self.tensor_index:
             si = self._scale_float(self._read_shard(f"{name[:-len('.weight')]}.scale"))
         if si is not None:
-            bs0 = (w.shape[0] + si.shape[0] - 1) // si.shape[0]
-            bs1 = (w.shape[1] + si.shape[1] - 1) // si.shape[1]
-            ex = si.repeat_interleave(bs0, dim = 0)[:w.shape[0], :] \
-                   .repeat_interleave(bs1, dim = 1)[:, :w.shape[1]]
-            return w.float() * ex
+            # Block grid of any rank: per-tensor scalar (Mistral-Small-4 dense weights),
+            # per-expert [E, 1, 1] on fused 3D expert stacks, or the 2D 128x128 DeepSeek grid
+            if si.ndim > 0:
+                assert si.ndim == w.ndim, f"{name}: scale rank {si.ndim} vs weight rank {w.ndim}"
+                for d in range(w.ndim):
+                    if si.shape[d] != w.shape[d]:
+                        bs = (w.shape[d] + si.shape[d] - 1) // si.shape[d]
+                        si = si.repeat_interleave(bs, dim = d).narrow(d, 0, w.shape[d])
+            return w.float() * si
         scale = self._read_shard(f"{name}_scale").float()
         if scale.ndim == 1:
             scale = scale.unsqueeze(1)
@@ -500,6 +530,10 @@ class TransformersBackend:
                 for s in ("weight_scale", "weight_scale_2", "weight_scale_inv", "input_scale", "input_global_scale", "scale"):
                     if f"{stem}.{s}" in self.tensor_index:
                         total += 8 * self._nbytes(f"{stem}.{s}")
+            # Underscore sidecars on suffix-less fused tensors (fp8 expert stacks)
+            for s in ("_scale", "_scale_inv"):
+                if f"{name}{s}" in self.tensor_index:
+                    total += 8 * self._nbytes(f"{name}{s}")
             return total
         if name.endswith(".weight"):
             stem = name[:-len(".weight")]
@@ -522,16 +556,28 @@ class TransformersBackend:
                 total += sum(8 * self._nbytes(k) for k in self.tensor_index if pat.match(k))
             if total:
                 return total
+        fm = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", name)
+        if fm:
+            prefix, kind = fm.group(1), fm.group(2)
+            parts = ("down",) if kind == "down_proj" else ("gate", "up")
+            pat = re.compile(
+                "^" + re.escape(prefix) + r"\.\d+\.(" + "|".join(parts) +
+                r")_proj\.weight(_packed|_scale|_scale_inv|_zero_point|_shape|_g_idx)?$")
+            total = sum(8 * self._nbytes(k) for k in self.tensor_index if pat.match(k))
+            if total:
+                return total
         return None
 
     def _get_tensor(self, name):
         import re
         if name in self.tensor_index:
             # ModelOpt, ct-float-quantized and fp8 keep the quantized tensor under the plain
-            # .weight name; the scale sidecar marks it as needing dequant
-            if self.dequant_scaled and name.endswith(".weight") and (
+            # .weight name; the scale sidecar marks it as needing dequant. Fused fp8 expert
+            # tensors (Mistral-Small-4 experts.gate_up_proj etc.) carry the same _scale_inv
+            # sidecar without a .weight suffix
+            if self.dequant_scaled and (
                     f"{name}_scale" in self.tensor_index or f"{name}_scale_inv" in self.tensor_index
-                    or f"{name[:-len('.weight')]}.scale" in self.tensor_index):
+                    or (name.endswith(".weight") and f"{name[:-len('.weight')]}.scale" in self.tensor_index)):
                 return self._dequant_scaled(name)
             return self._read_shard(name)
         if name == self.head_weight_name and self.embed_weight_name in self.tensor_index:
@@ -552,6 +598,26 @@ class TransformersBackend:
                 if f"{stem}.weight_global_scale" in self.tensor_index:
                     return self._dequant_ct_nvfp4(stem)
                 return self._dequant_ct(stem)
+
+        # Per-expert checkpoints vs fused-expert module trees (mistral4 AWQ/compressed-tensors:
+        # experts.{i}.{gate,up,down}_proj vs experts.gate_up_proj) with no declared conversion
+        # mapping: stack the per-expert tensors, resolving each recursively so quantized
+        # formats dequantize on the way in. Module orientation is (E, out, in), gate rows first
+        fm = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", name)
+        if fm:
+            prefix, kind = fm.group(1), fm.group(2)
+            probe = "down" if kind == "down_proj" else "gate"
+            e = 0
+            while (f"{prefix}.{e}.{probe}_proj.weight" in self.tensor_index or
+                   f"{prefix}.{e}.{probe}_proj.weight_packed" in self.tensor_index):
+                e += 1
+            if e:
+                if kind == "down_proj":
+                    return torch.stack([self._get_tensor(f"{prefix}.{i}.down_proj.weight") for i in range(e)])
+                return torch.stack([
+                    torch.cat([self._get_tensor(f"{prefix}.{i}.gate_proj.weight"),
+                               self._get_tensor(f"{prefix}.{i}.up_proj.weight")], dim = 0)
+                    for i in range(e)])
 
         # Merge-type conversion (fused MoE experts): gather the per-expert source tensors for
         # this prefix, stack each source group (MergeModulelist), then concatenate groups

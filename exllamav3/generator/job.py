@@ -240,8 +240,6 @@ class Job:
 
         # Banned strings
         if banned_strings:
-            assert filters is None or len(filters) == 0, \
-                "Cannot combine banned strings with filters"
             self.banned_strings = [s.lower() for s in banned_strings]
             self.banned_strings_utf32_buffer, self.banned_strings_utf32_offsets = \
                 _strings_to_utf32(tuple(self.banned_strings))
@@ -277,6 +275,7 @@ class Job:
         self.filter_futures = []
         self.logit_masks = []
         self.pinned_logit_mask = None
+        self.pinned_logit_bitmask = None
         self.device_logit_mask = None
         self.logits_device = None
 
@@ -320,6 +319,28 @@ class Job:
                 pin_memory = True
             )
         return self.pinned_logit_mask
+
+
+    def get_pinned_logit_bitmask(self):
+        # padded_vocab_size is a multiple of 32, so the packed mask width is exact
+        if self.pinned_logit_bitmask is None:
+            self.pinned_logit_bitmask = torch.empty(
+                (1, self.generator.padded_vocab_size // 32),
+                dtype = torch.int32,
+                device = "cpu",
+                pin_memory = True
+            )
+        return self.pinned_logit_bitmask
+
+
+    def _expand_bitmask(self, bitmask: torch.Tensor) -> torch.Tensor:
+        # Expand a packed int32 bitmask to a dense additive half mask, for combining with dense
+        # masks from other filters on the same job
+        bits = np.unpackbits(bitmask.view(-1).numpy().view(np.uint8), bitorder = "little")
+        n = min(bits.shape[-1], self.generator.padded_vocab_size)
+        mask = torch.full((1, self.generator.padded_vocab_size), float("-inf"), dtype = torch.half)
+        mask[0, :n][torch.from_numpy(bits[:n]).bool()] = 0.0
+        return mask
 
 
     def __repr__(self):
@@ -376,24 +397,46 @@ class Job:
         logit_mask = None
         healing = self.prefix_token is not None and self.new_tokens == -1
 
-        # Finish filters and compile logit mask, but delay to avoid conflict with token healing
+        # Finish filters and compile logit mask, but delay to avoid conflict with token healing.
+        # Filter masks are either dense additive half tensors or packed int32 bitmasks (32
+        # tokens per word, bit clear = masked out). An all-bitmask set stays packed all the way
+        # to the sampling kernels; a bitmask is only expanded when it has to combine with a
+        # dense mask from another filter.
         if not healing:
             f_idx = 0
+            f_masks = []
             for f in self.filters:
                 if not f.is_active:
                     continue
                 if f.use_background_worker():
-                    f_mask = self.filter_futures[f_idx].result()
+                    f_masks.append(self.filter_futures[f_idx].result())
                 else:
-                    f_mask = self.logit_masks[f_idx]
-                if logit_mask is None:
-                    logit_mask = self.get_pinned_logit_mask()
-                    logit_mask.copy_(f_mask)
-                else:
-                    logit_mask += f_mask
+                    f_masks.append(self.logit_masks[f_idx])
                 f_idx += 1
             self.filter_futures.clear()
             self.logit_masks.clear()
+
+            all_bits = all(m.dtype == torch.int32 for m in f_masks)
+            if f_masks and all_bits:
+                logit_mask = self.get_pinned_logit_bitmask()
+                for i, m in enumerate(f_masks):
+                    w = min(m.shape[-1], logit_mask.shape[-1])
+                    if i == 0:
+                        logit_mask[:, :w].copy_(m[:, :w])
+                    else:
+                        logit_mask[:, :w] &= m[:, :w]
+                    # Tokens beyond a narrower mask count as masked out, matching the -inf
+                    # padding semantics of the dense path
+                    logit_mask[:, w:] = 0
+            else:
+                for m in f_masks:
+                    if m.dtype == torch.int32:
+                        m = self._expand_bitmask(m)
+                    if logit_mask is None:
+                        logit_mask = self.get_pinned_logit_mask()
+                        logit_mask.copy_(m)
+                    else:
+                        logit_mask += m
 
         # Add individually blocked tokens to mask
         blocked_tokens = []
@@ -405,7 +448,12 @@ class Job:
             if logit_mask is None:
                 logit_mask = self.get_pinned_logit_mask()
                 logit_mask.zero_()
-            logit_mask[:, blocked_tokens] = float("-inf")
+            if logit_mask.dtype == torch.int32:
+                bits = logit_mask.view(-1).numpy().view(np.uint32)
+                for t in blocked_tokens:
+                    bits[t >> 5] &= ~np.uint32(1 << (t & 31))
+            else:
+                logit_mask[:, blocked_tokens] = float("-inf")
 
         # Mask out all but allowed tokens (token healing)
         allowed_tokens = []
@@ -492,15 +540,7 @@ class Job:
         filter_eos_condition = False
         if self.new_tokens >= 0:
             for f in self.filters:
-                if not f.is_active and next_token_i == f.trigger_token:
-                    f.is_active = True
-                    f.reset()
-                elif f.is_active:
-                    f.accept_token(next_token_i)
-                    if f.is_completed():
-                        f.is_active = False
-                        if f.eos_after_completed:
-                            filter_eos_condition = True
+                filter_eos_condition |= f.feed(next_token_i)
 
         # Accept token
         self.new_tokens += 1
@@ -748,6 +788,11 @@ class Job:
             assert self.checkpoint is not None
             offset = self.checkpoint["offset"]
             self.new_tokens -= offset
+
+            # Roll back filter state over the rewound tokens (every token counted in the offset was
+            # fed to the filters when it was sampled)
+            for f in self.filters:
+                f.rewind(offset)
 
             # The attention cache rewinds by truncation, but recurrent states advance destructively. SWA states
             # can roll back in place within their stored window; other states are restored from the most recent

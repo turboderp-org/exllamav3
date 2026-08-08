@@ -43,7 +43,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Llama**, **Llama 2**, **Llama 3**, **Llama 3.1-Nemotron** etc. (LlamaForCausalLM)
 - **MiMo-RL** (MiMoForCausalLM)
 - **MiniMax-M2** (MiniMaxM2ForCausalLM)
-- **Mistral**, **Ministral 3**, **Devstral 2** etc. (MistralForCausalLM, Mistral3ForConditionalGeneration) *- multimodal*
+- **Mistral**, **Ministral 3**, **Devstral 2**, **Mistral-4** etc. (MistralForCausalLM, Mistral3ForConditionalGeneration) *- multimodal*
 - **Mixtral** (MixtralForCausalLM)
 - **NanoChat** (NanoChatForCausalLM)
 - **NemotronH, Nemotron-3** (NemotronHForCausalLM)

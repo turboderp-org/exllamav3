@@ -18,6 +18,7 @@ void fused_sampler
 (
     const at::Tensor& logits,
     const c10::optional<at::Tensor>& logit_mask,
+    const c10::optional<at::Tensor>& logit_bitmask,
     at::Tensor& out,
     at::Tensor& workspace,
     int size,
@@ -30,4 +31,11 @@ void fused_sampler
     float top_p,
     float inv_temp_filter,
     const c10::optional<at::Tensor>& histogram
+);
+
+void apply_logit_bitmask
+(
+    const at::Tensor& logits_in,
+    at::Tensor& logits_out,
+    const at::Tensor& bitmask
 );

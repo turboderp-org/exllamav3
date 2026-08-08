@@ -7,6 +7,9 @@ from pydantic import conlist
 from typing import Literal, Optional
 from formatron.extractor import NonterminalExtractor
 
+# Example kept for completeness since Formatron is still supported, but since the dependency is no longer
+# maintained, it is recommended to use the LLGuidance filter instead (constrained_generation_llg.py)
+
 def get_superhero_filter(tokenizer) -> list[Filter]:
 
     class SuperheroAppearance(ClassSchema):

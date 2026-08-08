@@ -91,6 +91,9 @@ class MLAttention(Module):
         self.q_lora_rank = q_lora_rank
         self.rope_settings = rope_settings
         self.rope = None
+        # Llama-4 position scale (Mistral-Small-4): set in load_local from the RoPE instance
+        self.l4_beta = 0.0
+        self.l4_original = 1
         self.out_dtype = out_dtype
         self.key_kv_b = key_kv_b
         self.norm_eps = rms_norm_eps
@@ -206,10 +209,32 @@ class MLAttention(Module):
 
         if self.rope_settings:
             self.rope = RoPE(device, self.rope_settings)
+            # The Llama-4 scale multiplies the FULL query post-rope (HF semantics, q only). Only
+            # the q_pe/k_pe slices pass through the rope kernel here, which would miss q_nope, so
+            # take the beta out of the kernel and scale the whole query in _attend instead
+            self.l4_beta = self.rope.llama_4_scaling_beta
+            self.l4_original = self.rope.llama_4_scaling_original
+            self.rope.llama_4_scaling_beta = 0.0
 
         # kv_b_proj maps the latent to per-head K-nope and V. Attention never applies it as that
         # GEMM; the halves fold into the query/output (decode) or up-project past tiles (prefill)
         w = self.config.stc.get_tensor(f"{self.key}.{self.key_kv_b}.weight", device, no_defer = True)
+        if w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # fp8 checkpoint: this tensor is read raw rather than through a Linear, so apply the
+            # inverse weight scale here (scalar per-tensor or block grid)
+            si = self.config.stc.get_tensor(
+                f"{self.key}.{self.key_kv_b}.weight_scale_inv", device, optional = True, no_defer = True
+            )
+            wf = w.float()
+            if si is not None:
+                si = si.float()
+                if si.dim() == 2:
+                    r, c = wf.shape
+                    sr, sc = si.shape
+                    wf = (wf.view(sr, r // sr, sc, c // sc) * si.view(sr, 1, sc, 1)).view(r, c)
+                else:
+                    wf = wf * si
+            w = wf.half()
         assert w.shape == (self.num_q_heads * (self.qk_nope_head_dim + self.v_head_dim),
                            self.kv_lora_rank), \
             f"{self.key}.{self.key_kv_b}: unexpected shape {tuple(w.shape)}"
@@ -283,6 +308,19 @@ class MLAttention(Module):
         return q
 
 
+    def _l4_scale(self, bsz, seqlen, position, positions, position_ids, device) -> torch.Tensor:
+        """Llama-4 query scale, 1 + beta * ln(1 + pos // original_max), as (R, 1, 1) fp16.
+        Position resolution mirrors the rope kernel: position_ids > positions > position."""
+        if position_ids is not None:
+            pos = position_ids.view(bsz, -1)[:, :seqlen].float()
+        elif positions is not None:
+            pos = positions.view(bsz, 1).float() + torch.arange(seqlen, device = device, dtype = torch.float)
+        else:
+            pos = (position + torch.arange(seqlen, device = device, dtype = torch.float)).expand(bsz, seqlen)
+        scale = 1.0 + self.l4_beta * torch.log1p(torch.floor(pos / self.l4_original))
+        return scale.to(torch.half).reshape(bsz * seqlen, 1, 1)
+
+
     def _attend(self, x, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, cache_seqlens,
                 append, qc = None, host_seqlens = None):
         """Projections, absorption, attention and o_proj, shared by the cached and cache-less
@@ -301,6 +339,10 @@ class MLAttention(Module):
         # Queries
         _dbg_sync("attend-entry (upstream modules)", x.device)
         q = self.project_q(x, params).view(R, H, self.qk_head_dim)
+        if self.l4_beta:
+            # Whole query (nope + pe), before the split so the absorbed and MHA paths both
+            # inherit it; a per-token scalar commutes with the rotation
+            q *= self._l4_scale(bsz, seqlen, position, positions, position_ids, x.device)
         _dbg_sync("project_q", x.device)
         q_nope = q[:, :, :self.qk_nope_head_dim]
         q_pe = q[:, :, self.qk_nope_head_dim:].reshape(bsz, seqlen, H, self.qk_rope_head_dim)

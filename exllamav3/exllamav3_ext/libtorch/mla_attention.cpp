@@ -31,6 +31,8 @@ BC_MLAttention::BC_MLAttention
     int _rope_style,
     float _attn_factor,
     int _rotate_dims,
+    float _l4_scaling_beta,
+    int _l4_scaling_original,
     at::Tensor _w_uk_flat,
     at::Tensor _w_uv_flat,
     bool _quant_cache,
@@ -60,6 +62,8 @@ BC_MLAttention::BC_MLAttention
     rope_style          (_rope_style),
     attn_factor         (_attn_factor),
     rotate_dims         (_rotate_dims),
+    l4_scaling_beta     (_l4_scaling_beta),
+    l4_scaling_original (_l4_scaling_original),
     w_uk_flat           (std::move(_w_uk_flat)),
     w_uv_flat           (std::move(_w_uv_flat)),
     quant_cache         (_quant_cache),
@@ -201,6 +205,17 @@ void BC_MLAttention::run_gr
     {
         at::Tensor xh_x = xh_flat.narrow(0, 0, (int64_t) R * hidden_size).view({R, hidden_size});
         exl3_gemm_gr(x2, q_proj->trellis, s.q_full, q_proj->suh, xh_x, q_proj->svh, -1, q_proj->mcg, q_proj->mul1, 0, graph);
+    }
+
+    // Llama-4 position scale on the full query (Mistral-Small-4): one per-token scalar over
+    // all heads, nope and rope halves alike, before the pe-gather/rope/absorb stages consume
+    // q_full
+    if (l4_scaling_beta > 0.0f)
+    {
+        int pid_stride = (position_ids && position_ids.value().dim() == 3) ? rotate_dims : 1;
+        l4_scale_q_gr(s.q_full, bsz, q_len, num_q_heads * qk_head_dim, (int) s.q_full.size(1),
+                      (uint32_t) position, positions, position_ids, l4_scaling_beta,
+                      l4_scaling_original, pid_stride, graph);
     }
 
     // Latent projection
@@ -413,11 +428,21 @@ void BC_MLAttention::run
     params.emplace_back(GP_gemm_A, (void*) x.data_ptr());
     if (q_a_proj)
         params.emplace_back(GP_gemm_A, (void*) s.q_a.data_ptr());
+
+    int pid_stride = (position_ids && position_ids.value().dim() == 3) ? rotate_dims : 1;
+    if (l4_scaling_beta > 0.0f)
+    {
+        params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
+        params.emplace_back(GP_rope_positions, positions ? (void*) positions.value().data_ptr() : nullptr);
+        params.emplace_back(GP_rope_position_ids, position_ids ? (void*) position_ids.value().data_ptr() : nullptr);
+        params.emplace_back(GP_rope_pid_stride, (void*) (uintptr_t) pid_stride);
+    }
+
+    // Latent projection
     params.emplace_back(GP_gemm_A, (void*) x.data_ptr());
 
-    // RoPE position sources; which one is active is a runtime branch in the kernel
+    // RoPE position sources
     {
-        int pid_stride = (position_ids && position_ids.value().dim() == 3) ? rotate_dims : 1;
         params.emplace_back(GP_rope_inv_freq, (void*) inv_freq.data_ptr());
         params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
         params.emplace_back(GP_rope_positions, positions ? (void*) positions.value().data_ptr() : nullptr);
