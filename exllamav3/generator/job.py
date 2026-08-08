@@ -240,8 +240,6 @@ class Job:
 
         # Banned strings
         if banned_strings:
-            assert filters is None or len(filters) == 0, \
-                "Cannot combine banned strings with filters"
             self.banned_strings = [s.lower() for s in banned_strings]
             self.banned_strings_utf32_buffer, self.banned_strings_utf32_offsets = \
                 _strings_to_utf32(tuple(self.banned_strings))
@@ -492,15 +490,7 @@ class Job:
         filter_eos_condition = False
         if self.new_tokens >= 0:
             for f in self.filters:
-                if not f.is_active and next_token_i == f.trigger_token:
-                    f.is_active = True
-                    f.reset()
-                elif f.is_active:
-                    f.accept_token(next_token_i)
-                    if f.is_completed():
-                        f.is_active = False
-                        if f.eos_after_completed:
-                            filter_eos_condition = True
+                filter_eos_condition |= f.feed(next_token_i)
 
         # Accept token
         self.new_tokens += 1
@@ -748,6 +738,11 @@ class Job:
             assert self.checkpoint is not None
             offset = self.checkpoint["offset"]
             self.new_tokens -= offset
+
+            # Roll back filter state over the rewound tokens (every token counted in the offset was
+            # fed to the filters when it was sampled)
+            for f in self.filters:
+                f.rewind(offset)
 
             # The attention cache rewinds by truncation, but recurrent states advance destructively. SWA states
             # can roll back in place within their stored window; other states are restored from the most recent

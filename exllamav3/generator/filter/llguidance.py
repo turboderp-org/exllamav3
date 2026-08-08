@@ -96,6 +96,7 @@ class LLGuidanceFilter(Filter):
 
         self._matcher = LLMatcher(self._ll_tokenizer, self._grammar)
         self._consume_prefix = consume_prefix
+        self._consumed = 0
         self._bitmask = np.empty(((self._ll_tokenizer.vocab_size + 31) // 32,), dtype = np.int32)
         self._start()
 
@@ -110,14 +111,36 @@ class LLGuidanceFilter(Filter):
             raise RuntimeError(f"llguidance matcher error: {self._matcher.get_error()}")
 
     def reset(self):
-        self._matcher.reset()
+        # A matcher error state survives reset(), so recover by recreating the matcher (cheap, the
+        # compiled grammar is reused)
+        if self._matcher.is_error():
+            self._matcher = LLMatcher(self._ll_tokenizer, self._grammar)
+        else:
+            self._matcher.reset()
+        self._consumed = 0
         self._start()
 
     def accept_token(self, token: int):
         if self._matcher.is_stopped():
             return
-        self._matcher.consume_token(token)
+        if self._matcher.consume_token(token):
+            self._consumed += 1
         self._check_error()
+
+    def rollback_tokens(self, num_tokens: int) -> bool:
+        # Tokens consumed on an already-stopped matcher are not recorded in its rollback history, so
+        # only roll back tokens known to have been consumed; anything else falls back to the journal
+        # replay in Filter.rewind(). Rolling back more tokens than the matcher consumed would leave
+        # it in an unrecoverable error state.
+        if num_tokens > self._consumed:
+            return False
+        self._matcher.rollback(num_tokens)
+        if self._matcher.is_error():
+            self._matcher = LLMatcher(self._ll_tokenizer, self._grammar)
+            self._consumed = 0
+            return False
+        self._consumed -= num_tokens
+        return True
 
     def get_next_logit_mask(self) -> torch.Tensor:
         bm = self._bitmask
