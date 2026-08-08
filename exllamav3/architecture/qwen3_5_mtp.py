@@ -3,16 +3,10 @@ from typing_extensions import override
 import torch
 import weakref
 
-from ..cache import Cache
-from ..ext import exllamav3_ext as ext
-from ..model.config import Config, no_default
 from ..model.model import Model
-from ..util.rope import RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear, BlockSparseMLP
 from ..modules.arch_specific.qwen3_5_mtp import Qwen3_5MTPInputLayer
 from ..modules.attn import prepare_for_attn
-from ..modules.module import no_p2p_copy
-from ..util.tensor import get_for_device
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:

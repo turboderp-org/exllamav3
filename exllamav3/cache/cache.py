@@ -1,7 +1,7 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import Type
+from typing import Type, List
 import torch
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -378,3 +378,15 @@ class Cache:
 
     def get_all_recurrent_layers(self):
         return self.recurrent_layers
+
+class CacheStack:
+    def __init__(self, *caches: Cache):
+        """
+            Creates a stack of caches, primarily used for draft models.
+        """
+        self.caches = caches
+        assert len(self.caches) > 0, \
+            "Must have at least one cache in the cache stack."
+        assert len({c.max_num_tokens for c in self.caches if c is not None}) <= 1, \
+            "All draft caches must have the same size."
+        self.max_num_tokens = self.caches[0].max_num_tokens
