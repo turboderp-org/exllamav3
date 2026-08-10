@@ -62,22 +62,34 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
         total_size += size
         out_map[-1].append(module)
 
-    # Additional tensors. Skip any that the walked modules already produced: fp16 tensors
-    # copied through by a module match by name in the compiled qtensors, and .weight/.bias
-    # belonging to a quantized Linear are superseded by its EXL3 tensors
+    # Additional tensors. Skip any that the walked modules already emit: a tensor under a walked
+    # module's key prefix and present in the compiled qtensors is copied through by that module,
+    # and .weight/.bias belonging to a walked Linear are superseded by its EXL3 tensors. Presence
+    # in a qtensors file alone is NOT enough: modules collect output tensors by key prefix, so a
+    # tensor saved outside its module's prefix (e.g. the DFlash fc norm) still relies on the
+    # extras fallback
     covered_linears = set()
+    module_prefixes = []
     for module in walked_modules:
+        module_prefixes.append(module.key + ".")
         for m in module:
             if isinstance(m, Linear):
                 covered_linears.add(m.key + ".weight")
                 covered_linears.add(m.key + ".bias")
+
+    def under_module_prefix(key):
+        return any(key.startswith(p) for p in module_prefixes)
 
     extra_tensors = {}
     for _, cls in config.model_classes.items():
         extra_tensors.update(cls.get_additional_compiled_tensors(config))
     skipped = 0
     for key in list(extra_tensors.keys()):
-        produced = qtensors_stc.has_tensor(key) if not args.get("model_stc") else False
+        produced = (
+            not args.get("model_stc")
+            and under_module_prefix(key)
+            and qtensors_stc.has_tensor(key)
+        )
         if produced or key in covered_linears:
             del extra_tensors[key]
             skipped += 1
