@@ -33,6 +33,7 @@ from .ministral3 import Ministral3Model
 from .mistral import MistralModel
 from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
+from .muse_glimmer import MuseGlimmerTextModel
 from .nanochat import NanoChatModel
 from .nemotronh import NemotronHModel
 from .olmo3 import Olmo3Model
@@ -95,6 +96,7 @@ ARCHITECTURES = {
         MistralModel,
         Mistral3Model,
         MixtralModel,
+        MuseGlimmerTextModel,
         NanoChatModel,
         NemotronHModel,
         Olmo3Model,
