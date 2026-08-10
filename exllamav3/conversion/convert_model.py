@@ -36,6 +36,7 @@ parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in
 parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
 parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bits per weight, output (head) layer, default: 6")
 parser.add_argument("-mb", "--mtp_bits", type = int, default = None, help = "Bits per weight, MTP layers, default: 4")
+parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: 16")
 parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
@@ -174,7 +175,8 @@ def prepare(args) -> (dict, dict, bool, str):
         ("shard_size", True, 8192),
         ("bits", False, None),
         ("head_bits", False, 6),
-        ("mtp_bits", False, 4),
+        ("mtp_bits", True, 4),
+        ("vision_bits", True, 16),
         ("hq", False, False),
         ("cal_rows", False, 250),
         ("cal_cols", False, 2048),
@@ -242,6 +244,16 @@ def get_base_model(args):
     if mtp_model:
         print(f" -- Created MTP model instance:")
         print(mtp_model.get_layout_tree(4))
+    vision_bits = args.get("vision_bits", 16)
+    assert vision_bits == 16 or 1 <= vision_bits <= 8, \
+        f" ## --vision_bits must be 1-8, or 16 to store the vision model unquantized"
+    if vision_bits != 16 and "vision" not in config.model_classes:
+        print(f" !! Warning, --vision_bits given but model has no vision component, ignoring")
+        vision_bits = 16
+    vision_model = model.from_config(config, component = "vision") if vision_bits != 16 else None
+    if vision_model:
+        print(f" -- Created vision model instance (quantizing to {vision_bits} bpw):")
+        print(vision_model.get_layout_tree(4))
     if use_reference_state:
         tokenizer = Tokenizer.from_config(config)
         print(f" -- Loaded tokenizer")
@@ -250,7 +262,7 @@ def get_base_model(args):
         tokenizer = None
     if hasattr(config, "rope_settings"):
         config.rope_settings.print()
-    return config, model, mtp_model, tokenizer, use_reference_state
+    return config, model, mtp_model, vision_model, tokenizer, use_reference_state
 
 
 def prepare_state(args, job_state, config, model, tokenizer):
@@ -921,7 +933,7 @@ def main(args, job_state):
     last_checkpoint_time = time.time()
 
     # Get model
-    config, model, mtp_model, tokenizer, use_reference_state = get_base_model(args)
+    config, model, mtp_model, vision_model, tokenizer, use_reference_state = get_base_model(args)
 
     # Check caps
     can_resume_quant = model.caps.get("can_resume_quant", use_reference_state)
@@ -962,7 +974,10 @@ def main(args, job_state):
     # Get quantization strategy for model @bitrate
     print(" -- Deciding quantization strategy")
     hq = args["hq"]
-    strategy, final_bpw = create_q_strategy(model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq)
+    strategy, final_bpw = create_q_strategy(
+        model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
+        vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
+    )
     args["final_bits"] = round(final_bpw, 2)
     print(" -- Quantization strategy, summary:")
     print(print_strategy(strategy))
@@ -1262,11 +1277,11 @@ def main(args, job_state):
             os.rename(ckpt_dir_new, ckpt_dir)
             last_checkpoint_time = time.time()
 
-    # Quantize additional modules
-    if mtp_model:
-        print(" -- Quantizing MTP tensors")
+    # Quantize additional modules (uncalibrated side models: MTP head, vision tower)
+    def quantize_side_model(side_model, title):
+        print(f" -- Quantizing {title} tensors")
 
-        for idx, module in enumerate(mtp_model.modules):
+        for idx, module in enumerate(side_model.modules):
             assert module.num_slices <= 1
             start_module_time = time.time()
 
@@ -1326,8 +1341,13 @@ def main(args, job_state):
             module.unload()
             del q_tensors
 
+    if mtp_model:
+        quantize_side_model(mtp_model, "MTP")
+    if vision_model:
+        quantize_side_model(vision_model, "vision model")
+
     # Compile model
-    compile_model(args, model, config, tokenizer, mtp_model)
+    compile_model(args, model, config, tokenizer, mtp_model, vision_model)
 
     # All done
     print(" -- All done")
