@@ -204,8 +204,11 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
                 "original_quantization_config": orig_qcfg
             })
 
-    if args.get("vision_bits", 16) != 16:
+    if vision_model and args.get("vision_bits", 16) != 16:
         qcfg["vision_bits"] = args["vision_bits"]
+
+    if mtp_model:
+        qcfg["mtp_bits"] = args["mtp_bits"]
 
     update_config(config_dict)
     config_dict["quantization_config"] = qcfg
