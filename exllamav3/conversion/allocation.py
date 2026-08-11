@@ -36,6 +36,8 @@ def create_q_strategy(
     head_bpw: int,
     mtp_bpw: int,
     hq: bool,
+    vision_model: Model = None,
+    vision_bpw: int = None,
 ) -> (dict, float):
     """
     Build the per-module quantization bitrate strategy for a converted model.
@@ -58,11 +60,22 @@ def create_q_strategy(
     target_groups = {}
 
     # Collect and initialize targets
-    def _add(module: Module, priority: int):
+    def _add(module: Module, priority: int, fixed_bpw: int = None):
         priority = max(priority, module.q_priority)
         nonlocal sum_numel, sum_bits, targets, aux_targets
         if isinstance(module, Linear) and module.qmap is not None:
-            if module.qbits_key == "bits":
+            if fixed_bpw is not None:
+                # Uncalibrated side model (vision tower): every eligible Linear gets the same
+                # fixed bitrate outside the main budget
+                numel = module.weights_numel()
+                aux_targets[module.key] = QTarget(
+                    numel = numel,
+                    target_bpw = fixed_bpw,
+                    min_bpw = fixed_bpw,
+                    priority = priority
+                )
+
+            elif module.qbits_key == "bits":
                 numel = module.weights_numel()
                 sum_numel += numel
                 sum_bits += numel * base_bpw
@@ -98,13 +111,16 @@ def create_q_strategy(
             else:
                 raise ValueError("Logic error in create_q_strategy")
         for sm in module.modules:
-            _add(sm, priority)
+            _add(sm, priority, fixed_bpw)
 
     modules = model.modules
     if mtp_model:
         modules = modules + mtp_model.modules
     for m in modules:
         _add(m, 0)
+    if vision_model:
+        for m in vision_model.modules:
+            _add(m, 0, fixed_bpw = vision_bpw)
 
     # Target
     max_bits = int(bpw * float(sum_numel))

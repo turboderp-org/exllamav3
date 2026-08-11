@@ -343,6 +343,7 @@ class SlidingAttention(Module):
                 frange = frange_q,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                trim_padded_out = True,
             )
             self.register_submodule(self.q_proj)
         else:
@@ -361,6 +362,7 @@ class SlidingAttention(Module):
                 frange = frange_k,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                trim_padded_out = True,
             )
             self.v_proj = Linear(
                 config,
@@ -372,6 +374,7 @@ class SlidingAttention(Module):
                 frange = frange_v,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                trim_padded_out = True,
             )
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
@@ -532,8 +535,15 @@ class SlidingAttention(Module):
 
         # Head norm
         if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
-            self.q_norm_tensor = self.q_norm.weight.data
-            self.k_norm_tensor = self.k_norm.weight.data
+            if self.q_norm.unweighted:
+                # Unweighted head norm == weighted norm with all-ones scale; synthesize the weight so
+                # the fused rope+norm kernel and the BC graph path still apply
+                ones = torch.ones(self.head_dim, dtype = torch.half, device = device)
+                self.q_norm_tensor = ones
+                self.k_norm_tensor = ones
+            else:
+                self.q_norm_tensor = self.q_norm.weight.data
+                self.k_norm_tensor = self.k_norm.weight.data
 
 
 

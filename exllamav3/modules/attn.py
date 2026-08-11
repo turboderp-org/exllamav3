@@ -473,8 +473,13 @@ class Attention(Module):
 
         # Head norm
         if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
-            self.q_norm_tensor = self.q_norm.weight.data
-            self.k_norm_tensor = self.k_norm.weight.data
+            if self.q_norm.unweighted:
+                ones = torch.ones(self.head_dim, dtype = torch.half, device = device)
+                self.q_norm_tensor = ones
+                self.k_norm_tensor = ones
+            else:
+                self.q_norm_tensor = self.q_norm.weight.data
+                self.k_norm_tensor = self.k_norm.weight.data
 
 
     @override

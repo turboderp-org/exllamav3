@@ -213,13 +213,22 @@ class Streamer_rich:
 
 
 class Streamer_harmony:
-    """Render each Harmony output channel as a separate Markdown block."""
+    """Render each Harmony output channel as a separate Markdown block. Defaults to the GPT-OSS
+    tags; other harmony-like formats override them via the `tags` dict (PromptFormat.harmony_tags):
+
+        channel_tag:    opens a channel header
+        message_tag:    ends the header, starts the message content
+        end_tag:        ends a message within the turn (the final stop token is never streamed)
+        prime:          text virtually prepended to the parser state, for formats whose first
+                        channel header arrives without its opening tag (not added to all_text)
+        channel_prefix: stripped from the displayed channel name
+    """
 
     channel_tag = "<|channel|>"
     message_tag = "<|message|>"
     end_tag = "<|end|>"
 
-    def __init__(self, args, bot_name, think_tag, end_think_tag, updates_per_second, think):
+    def __init__(self, args, bot_name, think_tag, end_think_tag, updates_per_second, think, tags = None):
         self.all_text = ""
         self.updates_per_second = updates_per_second
         self.last_update = time.time()
@@ -227,6 +236,13 @@ class Streamer_harmony:
         self.channel = None
         self.channel_text = ""
         self.live = None
+        self.channel_prefix = ""
+        if tags:
+            self.channel_tag = tags["channel_tag"]
+            self.message_tag = tags["message_tag"]
+            self.end_tag = tags["end_tag"]
+            self.channel_prefix = tags.get("channel_prefix", "")
+            self.buffer = tags.get("prime", "")
 
     def __enter__(self):
         print()
@@ -246,7 +262,10 @@ class Streamer_harmony:
         self.channel_text = ""
 
     def _begin_channel(self, channel):
-        self.channel = channel.strip()
+        channel = channel.strip()
+        if self.channel_prefix and channel.startswith(self.channel_prefix):
+            channel = channel[len(self.channel_prefix):]
+        self.channel = channel
         print(col_bot + self.channel + col_default + ":")
         print()
         self.live = MarkdownConsoleStream()

@@ -201,11 +201,17 @@ class TransformersBackend:
             self.model.eval()
 
             # The streamed head skips the CausalLM wrapper's forward, so post-head transforms
-            # it would apply must be replicated (gemma-style logit softcapping)
+            # it would apply must be replicated (gemma-style logit softcapping, and MuseGlimmer's
+            # output_multiplier pre-scale, applied BEFORE the softcap)
             text_config = getattr(config, "text_config", None) or config
             self.logit_softcap = (
                 getattr(text_config, "final_logit_softcapping", None)
                 or getattr(config, "final_logit_softcapping", None)
+            )
+            self.logit_multiplier = (
+                getattr(text_config, "output_multiplier", None)
+                or getattr(config, "output_multiplier", None)
+                or 1.0
             )
 
             # Shard index: module-side tensor name -> (file, checkpoint tensor name). Checkpoint
@@ -355,12 +361,47 @@ class TransformersBackend:
 
         # Biases and norms are 1D (excluded by the ndim test); router gates excluded by name.
         # In streaming mode, bits come from the checkpoint's actual stored bytes (including
-        # quantization metadata like scales), so quantized formats report their true bitrate
+        # quantization metadata like scales), so quantized formats report their true bitrate.
+        # Packed sub-byte formats (compressed-tensors nvfp4/int-pack, GPTQ/AWQ qweight) store
+        # several weights per element: translate the packed numel to the true weight count, and
+        # count scale/zero-point tensors as bits belonging to the owning weight, not as weights
+        qcfg = getattr(self.model.config, "quantization_config", None)
+        if qcfg is not None and not isinstance(qcfg, dict):
+            qcfg = getattr(qcfg, "to_dict", lambda: {})()
+        qcfg = qcfg or {}
+        pack_num_bits = qcfg.get("bits")
+        for g in (qcfg.get("config_groups") or {}).values():
+            nb = isinstance(g, dict) and (g.get("weights") or {}).get("num_bits")
+            if nb: pack_num_bits = nb
+        qmeta_suffixes = (
+            "_scale", "_scale_2", "_scale_inv", "_global_scale", "_zero_point", "_shape",
+            "_g_idx", ".qzeros", ".scales", ".g_idx",
+        )
+
         sum_bits = sum_numel = head_bits = head_numel = 0
         embed_bits = embed_numel = 0
-        for name, p in self.model.named_parameters():
+        seen = set()
+        named = list(self.model.named_parameters())
+        if qcfg:
+            # Quantized loaders may register packed tensors as buffers
+            named += [nb for nb in self.model.named_buffers() if nb[0] not in {n for n, _ in named}]
+        for name, p in named:
+            if name in seen:
+                continue
+            seen.add(name)
             if name.endswith(".bias") or name.endswith("_bias"):
                 continue
+            # Multimodal encoder stacks don't contribute to text logits; the exllamav3 engine
+            # walks only the text component, so exclude them here for a comparable bpw_layer
+            if any(k in name for k in ("vision", "visual", "mm_projector", "multi_modal", "audio_tower")):
+                continue
+            is_qmeta = any(name.endswith(s) for s in qmeta_suffixes)
+            if (name.endswith("_packed") or name.endswith(".qweight")) and pack_num_bits:
+                numel = p.numel() * (p.element_size() * 8 // pack_num_bits)
+            elif is_qmeta:
+                numel = 0
+            else:
+                numel = p.numel()
             bits = None
             if self.streaming:
                 bits = self._stored_bits(name)
@@ -368,14 +409,14 @@ class TransformersBackend:
                 bits = p.numel() * p.element_size() * 8
             if "embed" in name:
                 embed_bits += bits
-                embed_numel += p.numel()
+                embed_numel += numel
                 continue
             if "lm_head" in name or "output" == name.split(".")[0]:
                 head_bits += bits
-                head_numel += p.numel()
-            elif p.ndim >= 2 and not any(k in name for k in HF_ROUTER_KEYS):
+                head_numel += numel
+            elif (p.ndim >= 2 or is_qmeta) and not any(k in name for k in HF_ROUTER_KEYS):
                 sum_bits += bits
-                sum_numel += p.numel()
+                sum_numel += numel
         if head_numel == 0:
             # Tied embeddings: the head is served by the embedding matrix
             head_bits, head_numel = embed_bits, embed_numel
@@ -748,6 +789,8 @@ class TransformersBackend:
                 self._materialize(head)
                 for r in range(ids.shape[0]):
                     logits = head(hidden[r:r + 1])
+                    if self.logit_multiplier != 1.0:
+                        logits = logits * self.logit_multiplier
                     if self.logit_softcap:
                         logits = torch.tanh(logits / self.logit_softcap) * self.logit_softcap
                     callback(r, logits)

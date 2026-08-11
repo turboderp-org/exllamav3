@@ -55,6 +55,7 @@ class Linear(Module):
         first_out_feature: int | None = None,
         out_dtype: torch.dtype | None = None,
         allow_input_padding: bool = False,
+        pre_scale: float = 1.0,
         post_scale: float = 1.0,
         weight_scale: float = 1.0,
         transposed_load: bool = True,
@@ -86,6 +87,7 @@ class Linear(Module):
         self.softcap = softcap
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
         self.out_dtype = out_dtype
+        self.pre_scale = pre_scale
         self.post_scale = post_scale
         self.weight_scale = weight_scale
         self.transposed_load = transposed_load
@@ -595,6 +597,8 @@ class Linear(Module):
         if lora_input is not None:
             self.apply_lora(lora_input, x)
 
+        if self.pre_scale != 1.0:
+            x *= self.pre_scale
         if self.softcap != 0.0:
             ext.softcap(x, x, self.softcap)
         if self.post_scale != 1.0:
@@ -680,6 +684,7 @@ class Linear(Module):
                 "full_out_features": self.full_out_features,
                 "first_in_feature": self.first_in_feature,
                 "first_out_feature": self.first_out_feature,
+                "pre_scale": self.pre_scale,
                 "post_scale": self.post_scale,
             },
             # Not constructor args: restored post-construction by _adopt_inner_dims for dims the

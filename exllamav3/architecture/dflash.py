@@ -19,14 +19,20 @@ from ..util.tensor import get_for_device
 class DFlashConfig(Config):
     arch_string = "DFlashDraftModel"
 
+    # Offset from the checkpoint's target_layer_ids to exllamav3 export indices (which denote the
+    # OUTPUT of layer j). The original DFlash release needs +1 (determined empirically); variants
+    # whose reference uses hidden_states[i + 1] (output of layer i) use raw ids
+    tap_shift = 1
+
     def __init__(
         self,
         directory: str,
+        model_classes: dict | None = None,
         **kwargs,
     ):
         super().__init__(
             directory,
-            {"text": DFlashModel},
+            model_classes or {"text": DFlashModel},
             **kwargs
         )
 
@@ -52,10 +58,11 @@ class DFlashConfig(Config):
         self.layer_types = self.read_cfg(list, "layer_types", ["full_attention"] * self.num_hidden_layers)
         self.sliding_window = self.read_cfg(int, "sliding_window", 2048)
 
-        # DFlash
-        self.mask_token_id = self.read_cfg(int, "dflash_config->mask_token_id", no_default)
-        self.target_layer_ids = self.read_cfg(list, "dflash_config->target_layer_ids", no_default)
-        self.target_layer_ids = [i + 1 for i in self.target_layer_ids]
+        # DFlash. Config keys live under dflash_config-> in the original release, at the top
+        # level in later ones (MuseGlimmerAssistant)
+        self.mask_token_id = self.read_cfg(int, ["dflash_config->mask_token_id", "mask_token_id"], no_default)
+        self.target_layer_ids = self.read_cfg(list, ["dflash_config->target_layer_ids", "target_layer_ids"], no_default)
+        self.target_layer_ids = [i + self.tap_shift for i in self.target_layer_ids]
         self.block_size = self.read_cfg(int, ["block_size", "dflash_config->block_size"], no_default)
 
         # RoPE
@@ -68,6 +75,10 @@ class DFlashConfig(Config):
 class DFlashModel(Model):
     config_class = DFlashConfig
 
+    # Encoder tensor keys; overridden by variants with a different namespace
+    key_fc = "fc"
+    key_fc_norm = "hidden_norm"
+
     def __init__(
         self,
         config: DFlashConfig,
@@ -77,8 +88,8 @@ class DFlashModel(Model):
 
         self.input_layer = DFlashInputLayer(
             config = config,
-            key = "fc",
-            key_norm = "hidden_norm",
+            key = self.key_fc,
+            key_norm = self.key_fc_norm,
             hidden_size = config.hidden_size,
             target_state_size = config.hidden_size * len(config.target_layer_ids),
             mask_token_id = config.mask_token_id,
@@ -266,6 +277,7 @@ class DFlashModel(Model):
             lm = self.attached_model().modules[ll]
             logits = lm.prepare_for_device(state, params)
             logits = lm.forward(logits, params)
+            logits = logits[..., :self.attached_model().config.vocab_size]
             return torch.argmax(logits, dim = -1)
         else:
             state = self.attached_model().tp_producer.send(state)
@@ -295,9 +307,9 @@ class DFlashModel(Model):
         raise NotImplementedError()
 
 
-    @staticmethod
+    @classmethod
     @override
-    def get_additional_compiled_tensors(config: DFlashConfig) -> dict:
-        # "hidden_norm" is stored in DFlashInputLayer but doesn't match the "fc" prefix
-        norm_weight = config.stc.list_tensors(prefix = "hidden_norm")
+    def get_additional_compiled_tensors(cls, config: DFlashConfig) -> dict:
+        # The fc norm is stored in DFlashInputLayer but doesn't match the fc module-key prefix
+        norm_weight = config.stc.list_tensors(prefix = cls.key_fc_norm)
         return norm_weight
