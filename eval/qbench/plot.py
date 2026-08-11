@@ -85,10 +85,10 @@ def group_marker_size(group, base):
 
 
 GROUP_COLORS = [
-    "#f9d02d",  # 0: gold        - reserved for EXL3
-    "#3fc6f2",  # 1: sky blue    - reserved for AWQ
-    "#c2d989",  # 2: sage        - reserved for GGUF
-    "#d98a72",  # 3: salmon
+    "#f9d02d",  # 0: gold
+    "#3fc6f2",  # 1: sky blue
+    "#c2d989",  # 2: sage
+    "#d92a72",  # 3: hot pink
     "#4685c7",  # 4: mid blue
     "#ab472d",  # 5: terracotta
     "#1820e8",  # 6: deep blue
@@ -98,7 +98,7 @@ GROUP_COLORS = [
 def make_palette(groups):
     """Fixed color per group name; reserved slots for common formats, remainder
     walks the CVD-optimized ladder in stable (sorted) order."""
-    fixed_cols = {"EXL3": 0, "AWQ": 1, "GGUF": 2}
+    fixed_cols = {"EXL3": 0, "AWQ": 1, "GGUF": 5, "GGUF-IQ": 4, "NVFP4": 3}
     unused = [i for i in range(len(GROUP_COLORS)) if i not in fixed_cols.values()]
     palette = {}
     for g in sorted(groups):
