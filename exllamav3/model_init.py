@@ -1,3 +1,5 @@
+from exllamav3.cache.cache import CacheStack
+from exllamav3.architecture.draft import DraftStackModel
 from types import SimpleNamespace
 
 from . import Model, Config, Cache, Tokenizer
@@ -185,15 +187,9 @@ def init(
     def printp(p: bool, s: str):
         if p: print(s)
 
-    return_draft = "draft_model_dir" in args
+    return_draft = "draft_model_dir" in args or "mtp" in args
     draft_model_dir = args.draft_model_dir if return_draft else None
-    if "mtp" in args:
-        assert not (args.mtp and draft_model_dir), "Cannot specify both --mtp and --draft_model_dir"
-        if args.mtp:
-            args.draft_model_dir = draft_model_dir = args.model_dir
-        use_mtp = draft_model_dir and Path(args.model_dir).resolve() == Path(draft_model_dir).resolve()
-    else:
-        use_mtp = False
+    use_mtp = True if "mtp" in args and args.mtp else False
 
     # Config
     config = Config.from_directory(args.model_dir, layer_map = args.layer_map)
@@ -209,14 +205,12 @@ def init(
         assert not args.tensor_parallel, "--draft_moe_cpu_layers currently requires layer-split mode"
         assert draft_model_dir, "--draft_moe_cpu_layers requires a draft model (or --mtp)"
     if use_mtp:
-        draft_config = config
-        # Shared config: the MTP head is a separate component with its own budget and worker
+        mtp_config = config
         config.infer_params.draft_moe_cpu_offload = dmcl
         if dmclt is not None:
             config.infer_params.draft_moe_cpu_threads = dmclt
-    elif draft_model_dir:
+    if draft_model_dir:
         draft_config = Config.from_directory(draft_model_dir)
-        # Separate config: the draft model's own text component takes the budget
         draft_config.infer_params.moe_cpu_offload = dmcl
         if dmclt is not None:
             draft_config.infer_params.moe_cpu_threads = dmclt
@@ -246,10 +240,15 @@ def init(
 
     # Model instance
     model = Model.from_config(config, swa_full = args.swa_full)
+    mtp_model = Model.from_config(
+        mtp_config,
+        swa_full = args.swa_full,
+        component = "mtp"
+    ) if use_mtp else None
     draft_model = Model.from_config(
         draft_config,
         swa_full = args.swa_full,
-        component = "mtp" if use_mtp else "text",
+        component = "text",
     ) if draft_model_dir else None
 
     # Cache
@@ -278,6 +277,13 @@ def init(
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
             )
+            mtp_cache = Cache(
+                mtp_model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_quant,
+                k_bits = k_bits,
+                v_bits = v_bits,
+            ) if use_mtp else None
             draft_cache = Cache(
                 draft_model,
                 max_num_tokens = args.cache_size,
@@ -293,6 +299,11 @@ def init(
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
             )
+            mtp_cache = Cache(
+                mtp_model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_fp16,
+            ) if use_mtp else None
             draft_cache = Cache(
                 draft_model,
                 max_num_tokens = args.cache_size,
@@ -300,6 +311,7 @@ def init(
             ) if draft_model_dir else None
     else:
         cache = None
+        mtp_cache = None
         draft_cache = None
 
     # Split
@@ -327,6 +339,18 @@ def init(
             tp_dev_limits[key] = value
     if len(tp_dev_limits) and not args.tensor_parallel:
         printp(not quiet, " !! Warning, parallelism are do not applied to layer-split model")
+
+    # Load mtp model
+    if use_mtp:
+        printp(not quiet, f" -- Loading {args.model_dir} (mtp)")
+        mtp_model.load(
+            use_per_device = split,
+            progressbar = progress,
+            verbose = args.load_verbose,
+            max_batch_size = args.autosplit_max_batch_size,
+            autosplit_no_forward = args.autosplit_no_forward,
+            **kwargs
+        )
 
     # Load draft model
     if draft_model_dir:
@@ -365,6 +389,13 @@ def init(
     # Metrics
     if args.load_metrics:
         config.stc.metrics.print()
+
+    if not draft_model and mtp_model:
+        draft_model = mtp_model
+        draft_cache = mtp_cache
+    elif draft_model and mtp_model:
+        draft_model = DraftStackModel(draft_model, mtp_model)
+        draft_cache = CacheStack(draft_cache, mtp_cache)
 
     if return_draft:
         return model, config, cache, tokenizer, draft_model, draft_config, draft_cache

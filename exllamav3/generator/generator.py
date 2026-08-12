@@ -1,7 +1,8 @@
 from __future__ import annotations
+from exllamav3.architecture.draft import DraftStackModel
 import torch
 from ..model.model import Model
-from ..cache.cache import Cache
+from ..cache.cache import Cache, CacheStack
 from ..cache.recurrent import RecurrentCache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
@@ -30,13 +31,13 @@ class Generator:
         max_chunk_size: int = 2048,
         max_q_size: int = 8,
         draft_model: Model | None = None,
-        draft_cache: Cache | None = None,
+        draft_cache: Cache | CacheStack | None = None,
         num_draft_tokens: int | None = None,
         show_visualizer: bool = False,
         enable_defrag: bool = True,
         cpu_cache_size: int = 0,
         recurrent_cache_size: int = 4 * 1024**3,
-        recurrent_checkpoint_interval: int = None,
+        recurrent_checkpoint_interval: int | None = None,
         recurrent_checkpoint_interval_pp: int = 32768,
         ngram_match_min: int = 0,
         dynamic_draft_tokens: bool = False,
@@ -153,9 +154,9 @@ class Generator:
         # Draft model
         self.draft_model = draft_model
         self.draft_cache = draft_cache
-        if draft_model:
-            assert not ngram_match_min, \
-                "Cannot use both draft model and n-gram draft."
+        self.num_drafters = 0
+        self.num_draft_tokens = 0
+        if draft_model is not None:
             assert draft_cache is not None, \
                 "Must supply cache for draft model"
             assert draft_cache.max_num_tokens == cache.max_num_tokens, \
@@ -163,13 +164,19 @@ class Generator:
             assert not draft_model.caps.get("recurrent_states"), \
                 "Speculative decoding with recurrent draft model not supported."
             if num_draft_tokens:
-                self.num_draft_tokens = num_draft_tokens
+                self.num_draft_tokens += num_draft_tokens
             else:
-                self.num_draft_tokens = draft_model.caps.get("default_draft_size", 4)
-        elif ngram_match_min:
-            self.num_draft_tokens = num_draft_tokens if num_draft_tokens is not None else 4
-        else:
-            self.num_draft_tokens = 0
+                self.num_draft_tokens += draft_model.caps.get("default_draft_size", 4)
+            if draft_model.caps.get("stack_draft", False):
+                self.num_drafters = len(draft_model.draft_models)
+            else:
+                # Wrap the drafter for simplicity later on
+                self.draft_model = DraftStackModel(self.draft_model)
+                self.draft_cache = CacheStack(self.draft_cache)
+                self.num_drafters = 1
+        if ngram_match_min:
+            self.num_draft_tokens += num_draft_tokens if num_draft_tokens is not None else 4
+            self.num_drafters += 1
 
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
@@ -205,7 +212,7 @@ class Generator:
                 pin_memory = False
             )
             self.draft_ids_pinned = torch.empty(
-                (max_batch_size, self.num_draft_tokens),
+                (max_batch_size, self.num_drafters, self.num_draft_tokens),
                 dtype = torch.long,
                 pin_memory = False
             )
@@ -251,10 +258,18 @@ class Generator:
         self.recurrent_checkpoint_interval_pp = ceil_span(recurrent_checkpoint_interval_pp, self.max_chunk_size)
 
         # Drafting mode
-        if draft_model is not None and draft_model.caps.get("attach_target"):
-            draft_model.attach_to(model)
-        self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
-        self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+        self.dflash_draft, self.mtp_draft, self.reg_draft = False, False, False
+        if self.draft_model is not None:
+            assert isinstance(self.draft_cache, CacheStack), \
+                "A draft stack must have a cache stack of equal length."
+            assert len(self.draft_model.draft_models) == len(self.draft_cache.caches), \
+                "The draft stack is not the same length as the cache stack."
+            for m in self.draft_model.draft_models:
+                if m.caps.get("attach_target"):
+                    m.attach_to(model)
+            self.dflash_draft = [i for i, m in enumerate(self.draft_model.draft_models) if m.caps.get("dflash_draft", False)]
+            self.mtp_draft = [i for i, m in enumerate(self.draft_model.draft_models) if m.caps.get("mtp_draft", False)]
+            self.reg_draft = [i for (i, m) in enumerate(self.draft_model.draft_models) if i not in self.dflash_draft and i not in self.mtp_draft]
 
 
     def num_remaining_jobs(self):
@@ -412,22 +427,23 @@ class Generator:
         if self.recurrent_cache is not None:
             self.recurrent_checkpoint()
 
-        # Generation with draft model
-        if self.draft_model:
-            if self.dflash_draft:
-                draft_tokens = self.iterate_draftmodel_dflash_gen(results)
-                self.iterate_gen(results, draft_tokens)
-            elif self.mtp_draft:
-                draft_tokens = self.iterate_draftmodel_mtp_gen(results)
-                self.iterate_gen(results, draft_tokens)
-            else:
-                draft_tokens = self.iterate_draftmodel_gen(results)
-                self.iterate_gen(results, draft_tokens)
-
-        # Generation with n-gram draft
-        elif self.ngram_match_min:
-            draft_tokens = self.iterate_ngram_gen(results)
-            self.iterate_gen(results, draft_tokens)
+        # Generation with draft model / ngram
+        if self.draft_model or self.ngram_match_min:
+            ngram_idx = 1
+            if self.draft_model:
+                for idx, dm in enumerate(self.draft_model.draft_models):
+                    cache = self.draft_cache.caches[idx]
+                    if idx in self.dflash_draft:
+                        self.iterate_draftmodel_dflash_gen(results, dm, cache, idx)
+                    elif idx in self.mtp_draft:
+                        self.iterate_draftmodel_mtp_gen(results, dm, cache, idx)
+                    elif idx in self.reg_draft:
+                        self.iterate_draftmodel_gen(results, dm, cache, idx)
+                    ngram_idx += 1
+            if self.ngram_match_min:
+                draft_tokens = self.iterate_ngram_gen(results, ngram_idx)
+            draft_ids = self.draft_ids_pinned[:, :, :].reshape(self.draft_ids_pinned.shape[0], -1)
+            self.iterate_gen(results, draft_ids)
 
         # Regular generation
         else:
@@ -490,7 +506,7 @@ class Generator:
         return w
 
 
-    def iterate_draftmodel_gen(self, results: list):
+    def iterate_draftmodel_gen(self, results: list, model: Model, cache: Cache, drafter: int = 0):
 
         # Get shape of active batch
         batch_size = 0
@@ -538,34 +554,32 @@ class Generator:
         if window == 0:
             return None
         for idx in range(window):
-            batch_logits = self.draft_model.forward(
+            batch_logits = model.forward(
                 input_ids = batch_ids,
                 params = {
                     "attn_mode": "flash_attn",
                     "block_table": block_index,
-                    "cache": self.draft_cache,
+                    "cache": cache,
                     "cache_seqlens": cache_seqlens,
                 }
             )
             new_ids = torch.argmax(batch_logits, dim = -1)
-            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
+            self.draft_ids_pinned[:batch_size, drafter, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
             cache_seqlens += 1
 
-        self.draft_model.prefill(
+        model.prefill(
             input_ids = batch_ids,
             params = {
                 "attn_mode": "flash_attn",
                 "block_table": block_index,
-                "cache": self.draft_cache,
+                "cache": cache,
                 "cache_seqlens": cache_seqlens
             }
         )
 
-        return self.draft_ids_pinned[:, :window]
 
-
-    def iterate_draftmodel_mtp_gen(self, results: list):
+    def iterate_draftmodel_mtp_gen(self, results: list, model: Model, cache: Cache, drafter: int = 0):
 
         # Get shape of active batch
         batch_size = 0
@@ -619,24 +633,20 @@ class Generator:
                 "target_hidden": temp_hidden,
                 "attn_mode": "flash_attn",
                 "block_table": block_index,
-                "cache": self.draft_cache,
+                "cache": cache,
                 "cache_seqlens": cache_seqlens,
             }
-            batch_state = self.draft_model.forward(batch_ids, params)
+            batch_state = model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
-            new_ids = self.draft_model.sample_from_state(batch_state, params)
-            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
+            new_ids = model.sample_from_state(batch_state, params)
+            self.draft_ids_pinned[:batch_size, drafter, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
             cache_seqlens += 1
             temp_hidden = batch_state
 
-
-        return self.draft_ids_pinned[:, :window]
-
-
     # TODO: Refactor, share code with other draft fns
-    def iterate_draftmodel_dflash_gen(self, results: list):
+    def iterate_draftmodel_dflash_gen(self, results: list, model: Model, cache: Cache, drafter: int = 0):
 
         # Get shape of active batch
         batch_size = 0
@@ -646,7 +656,7 @@ class Generator:
             max_seq_len = max(
                 max_seq_len,
                 job.get_max_seq_len() + self.num_draft_tokens + 1,
-                job.get_max_seq_len() + self.draft_model.config.block_size + 1
+                job.get_max_seq_len() + model.config.block_size + 1
             )
             batch_size += 1
         if batch_size == 0:
@@ -686,14 +696,14 @@ class Generator:
         params = {
             "attn_mode": "flash_attn",
             "block_table": block_index,
-            "cache": self.draft_cache,
+            "cache": cache,
             "cache_seqlens": cache_seqlens,
         }
-        out_state = self.draft_model.forward(
+        out_state = model.forward(
             input_ids = batch_ids,
             params = params,
         )
-        new_ids = self.draft_model.sample_from_state(out_state, params)
+        new_ids = model.sample_from_state(out_state, params)
 
         # Draft models with a confidence head cap the usable draft length per round;
         # 0 means no draft position cleared the threshold, so skip drafting entirely
@@ -705,11 +715,11 @@ class Generator:
 
         # Crop out the first token after sampling to keep batch contiguous for lm_head
         new_ids = new_ids[:, 1:]
-        self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
-        return self.draft_ids_pinned[:, :window]
+        window = min(window, new_ids.shape[1])
+        self.draft_ids_pinned[:batch_size, drafter, :window].copy_(new_ids[:batch_size, :window])
 
 
-    def iterate_ngram_gen(self, results: list):
+    def iterate_ngram_gen(self, results: list, drafter: int = 0):
 
         # Get shape of active batch
         batch_size = 0
@@ -738,7 +748,7 @@ class Generator:
 
         # Trim to minimum length in batch
         draft_ids = torch.cat([d[:, :min_len] for d in draft_ids], dim = 0)
-        return draft_ids
+        self.draft_ids_pinned[:batch_size, drafter, :min_len].copy_(draft_ids)
 
 
     def _staging(self, name, rows: int, width: int | None = None, dtype = torch.int32):
@@ -764,7 +774,7 @@ class Generator:
         max_seq_len = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
-            max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens)
+            max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens * self.num_drafters)
             batch_size += len(job.sequences)
         if batch_size == 0:
             return
@@ -1073,51 +1083,53 @@ class Generator:
         # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         if self.dflash_draft:
-            self.draft_model.update_kv_from_target(
-                target_hidden = p_export_states,
-                cache = self.draft_cache,
-                lengths = accepted_lengths,
-                params = {
-                    "block_table": block_index,
-                    "cache_seqlens": p_cache_seqlens,
-                }
-            )
+            for idx in self.dflash_draft:
+                self.draft_model.draft_models[idx].update_kv_from_target(
+                    target_hidden = p_export_states,
+                    cache = self.draft_cache.caches[idx],
+                    lengths = accepted_lengths,
+                    params = {
+                        "block_table": block_index,
+                        "cache_seqlens": p_cache_seqlens,
+                    }
+                )
 
         # Accept new target_hidden if MTP. MTP draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         if self.mtp_draft:
-            target_hidden = p_export_states[-1]
-            accepted_idx = 0
-            for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
-                if a_idx == b_idx:
-                    continue
-                accepted_length = accepted_lengths[accepted_idx]
-                accepted_idx += 1
+            for idx in self.mtp_draft:
+                target_hidden = p_export_states[-1]
+                accepted_idx = 0
+                for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+                    if a_idx == b_idx:
+                        continue
+                    accepted_length = accepted_lengths[accepted_idx]
+                    accepted_idx += 1
 
-                # A banned-string rewind invalidated this job's carry; leave it unset so drafting pauses until the
-                # next target forward provides a fresh one, and don't propagate hidden states from the abandoned
-                # window into the draft cache
-                if id(job) in rewound_jobs:
-                    continue
+                    # A banned-string rewind invalidated this job's carry; leave it unset so drafting pauses until the
+                    # next target forward provides a fresh one, and don't propagate hidden states from the abandoned
+                    # window into the draft cache
+                    if id(job) in rewound_jobs:
+                        continue
 
-                # Position K was drafted from the last target state already. Replace accepted
-                # speculative positions K+1..K+A-1 with the corresponding target-state inputs.
-                if accepted_length > 1:
-                    self.draft_model.prefill(
-                        batch_ids[a_idx:b_idx, 1:accepted_length],
-                        {
-                            "attn_mode": "flash_attn",
-                            "block_table": block_index[a_idx:b_idx],
-                            "cache": self.draft_cache,
-                            "cache_seqlens": p_cache_seqlens[a_idx:b_idx] + 1,
-                            "target_hidden": target_hidden[a_idx:b_idx, :accepted_length - 1, :],
-                        },
-                    )
+                    # Position K was drafted from the last target state already. Replace accepted
+                    # speculative positions K+1..K+A-1 with the corresponding target-state inputs.
+                    if accepted_length > 1:
+                        self.draft_model.draft_models[idx].prefill(
+                            batch_ids[a_idx:b_idx, 1:accepted_length],
+                            {
+                                "attn_mode": "flash_attn",
+                                "block_table": block_index[a_idx:b_idx],
+                                "cache": self.draft_cache.caches[idx],
+                                "cache_seqlens": p_cache_seqlens[a_idx:b_idx] + 1,
+                                "target_hidden": target_hidden[a_idx:b_idx, :accepted_length - 1, :],
+                            },
+                        )
 
-                # The next unprocessed token is paired with the preceding target hidden state.
-                job.mtp_last_hidden = target_hidden[
-                    a_idx:b_idx, accepted_length - 1:accepted_length, :
-                ].clone()
+                    # The next unprocessed token is paired with the preceding target hidden state.
+                    job.mtp_last_hidden = target_hidden[
+                        a_idx:b_idx, accepted_length - 1:accepted_length, :
+                    ].clone()
 
         # Release pages for completed jobs. Finished and requeued jobs no longer need their active page references.
         # Requeued recurrent jobs may stash the last checkpoint first so the next queued job can resume from cached
