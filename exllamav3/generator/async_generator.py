@@ -2,6 +2,7 @@ from __future__ import annotations
 from .generator import Generator
 from .job import Job
 import asyncio
+import torch
 
 # Sentinel pushed to an AsyncJob's queue on cancellation so a consumer parked in queue.get() wakes up and
 # exits, rather than waiting forever for results that will no longer be produced
@@ -145,6 +146,14 @@ class AsyncJob:
             yield result
             if result["eos"]:
                 break
+
+    def constrain_output_now(self, output: str | torch.Tensor):
+        """
+        Inject a fixed token string into the job's output stream; see Job.constrain_output_now. Safe to
+        call from any coroutine on the generator's event loop. Note that tokens already sampled by the
+        shared iteration task but still queued for this consumer precede the injection in the stream.
+        """
+        self.job.constrain_output_now(output)
 
     async def cancel(self):
         # Delegate cancellation to the wrapper so it can update both the sync generator queue and the async job map,
