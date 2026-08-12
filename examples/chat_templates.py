@@ -944,6 +944,7 @@ class PromptFormat_laguna(PromptFormat):
         return context
 
     def add_bos(self):
+        # format() already emits the (misleadingly named) BOS token 〈|EOS|〉 as a literal
         return False
 
     def stop_conditions(self, tokenizer):

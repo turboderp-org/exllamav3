@@ -252,8 +252,14 @@ class Tokenizer:
 
     # Encode string with added, unspecial tokens
     def encode_part_base(self, text: str, special: bool) -> list[int]:
+        # BOS/EOS insertion is owned by encode() (add_bos/add_eos), so the backend must never run
+        # its post-processor template: llama3-lineage tokenizer.json files carry a
+        # TemplateProcessing step that would prepend BOS regardless of add_bos. The
+        # encode_special_tokens flag instead maps to the backend's split-special-tokens mode,
+        # which encodes special-token strings in the input as plain text when the flag is False
+        self.tokenizer.encode_special_tokens = not special
         if not self.unspecial_piece_to_id:
-            return self.tokenizer.encode(text, add_special_tokens = special).ids
+            return self.tokenizer.encode(text, add_special_tokens = False).ids
 
         if self.unspecial_delimiters is None:
             self.unspecial_delimiters = re.compile(
@@ -264,7 +270,7 @@ class Tokenizer:
 
         i = 0
         while i < len(split):
-            if split[i] != "": encoded += self.tokenizer.encode(split[i], add_special_tokens = special).ids
+            if split[i] != "": encoded += self.tokenizer.encode(split[i], add_special_tokens = False).ids
             if i + 1 < len(split): encoded += [self.unspecial_piece_to_id[split[i + 1]]]
             i += 2
 
