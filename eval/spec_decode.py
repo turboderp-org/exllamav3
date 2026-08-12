@@ -90,39 +90,55 @@ def measure(generator, tokenizer, sampler, max_new_tokens, stats_sink = None):
         if "accepted_draft_tokens" in result:
             dacc = result["accepted_draft_tokens"]
             drej = result["rejected_draft_tokens"]
-            dtot = dacc + drej
-            acc_rate = dacc / dtot if dtot else 0
+            # Every verification round emits exactly one token that is not an accepted draft
+            # token (the bonus token or the mismatch)
+            rounds = new_tokens - dacc
         else:
-            acc_rate = None
+            dacc = None
+            drej = None
+            rounds = None
 
         if category not in all_results:
             all_results[category] = []
         all_results[category].append({
             "new_tokens": new_tokens,
             "gen_tps": gen_tps,
-            "acc_rate": acc_rate,
+            "dacc": dacc,
+            "drej": drej,
+            "rounds": rounds,
         })
 
         if stats_sink is not None and job.draft_stats:
             stats_sink.append({
                 "category": category,
                 "file": filename,
-                "stats": job.draft_stats,  # (position, window, accepted, ema) per verification round
+                "stats": job.draft_stats,  # (position, window, accepted) per verification round
             })
 
-    aggregated = {
-        category: (
+    aggregated = {}
+    for category, cat_results in all_results.items():
+        tps = (
             sum(m["gen_tps"] * m["new_tokens"] for m in cat_results) /
             sum(m["new_tokens"] for m in cat_results)
         )
-        for category, cat_results in all_results.items()
-    }
+        rounds = sum(m["rounds"] for m in cat_results if m["rounds"] is not None)
+        dacc = sum(m["dacc"] for m in cat_results if m["dacc"] is not None)
+        drej = sum(m["drej"] for m in cat_results if m["drej"] is not None)
+        aggregated[category] = {
+            "tps": tps,
+            # Per verification round (including rounds that drafted nothing): mean accepted
+            # draft tokens and mean drafted window. Every fed draft position is counted as
+            # either accepted or rejected, so fed = dacc + drej
+            "acc_len": dacc / rounds if rounds else None,
+            "draft_len": (dacc + drej) / rounds if rounds else None,
+            "acc_rate": dacc / (dacc + drej) if dacc + drej else None,
+        }
     return aggregated
 
 
 def plot_stats(stats_sink):
     """
-    Show accepted draft tokens per verification round vs generation position, with the EMA and chosen window
+    Show accepted draft tokens per verification round vs generation position, with the chosen window
     overlaid, one panel per trace.
     """
     import matplotlib.pyplot as plt
@@ -136,13 +152,13 @@ def plot_stats(stats_sink):
         pos      = [s[0] for s in stats]
         window   = [s[1] for s in stats]
         accepted = [s[2] for s in stats]
-        ema      = [s[3] for s in stats]
 
         ax.scatter(pos, accepted, s = 6, color = "tab:blue", alpha = 0.45, label = "accepted / window", zorder = 3)
         ax.step(pos, window, where = "post", color = "tab:red", lw = 1.0, alpha = 0.8, label = "window (chosen)")
-        if any(e is not None for e in ema):
-            ax.plot(pos, ema, color = "tab:green", lw = 1.4, label = "EMA")
-        ax.set_title(f"{trace['category']} - {trace['file']}", fontsize = 10)
+        mean_acc = sum(accepted) / len(accepted) if accepted else 0.0
+        mean_win = sum(window) / len(window) if window else 0.0
+        ax.set_title(f"{trace['category']} - {trace['file']} - "
+                     f"mean accepted {mean_acc:.2f} / window {mean_win:.2f} per round", fontsize = 10)
         ax.set_ylabel("draft tokens")
         ax.set_ylim(-0.4, max(window) + 1.4)
         ax.grid(alpha = 0.25)
@@ -158,17 +174,11 @@ def print_stats(stats_sink):
         f"{col_yellow}from_pos{col_default}",
         f"{col_yellow}window{col_default}",
         f"{col_yellow}accepted{col_default}",
-        f"{col_yellow}ema{col_default}",
     ]
     for trace in stats_sink:
         print(f"\n{trace['category']} - {trace['file']}\n")
-        rows = [[r[0] - r[2], r[1], r[2], r[3]] for r in trace["stats"]]
-        if all(r[3] is None for r in rows):
-            h = headers[:3]
-            rows = [r[:3] for r in rows]
-        else:
-            h = headers
-        print(tabulate(rows, headers = h, tablefmt = "pipe", colalign = ("right",) * len(h)))
+        rows = [[r[0] - r[2], r[1], r[2]] for r in trace["stats"]]
+        print(tabulate(rows, headers = headers, tablefmt = "pipe", colalign = ("right",) * len(headers)))
 
 
 @torch.inference_mode()
@@ -211,7 +221,7 @@ def main(args):
             ngram_match_min = args.s_ngram_match_min,
             num_draft_tokens = args.s_ngram_draft_length,
             dynamic_draft_tokens = args.dynamic_draft,
-            dynamic_draft_skip_ema = args.draft_skip_ema,
+            draft_confidence = args.draft_confidence,
             record_draft_stats = stats_sink is not None,
             max_chunk_size = 4096,
         )
@@ -229,9 +239,9 @@ def main(args):
             draft_model = draft_model,
             draft_cache = draft_cache,
             tokenizer = tokenizer,
-            num_draft_tokens = args.num_draft_tokens,
+        num_draft_tokens = args.num_draft_tokens,
+            draft_confidence = args.draft_confidence,
             dynamic_draft_tokens = args.dynamic_draft,
-            dynamic_draft_skip_ema = args.draft_skip_ema,
             record_draft_stats = stats_sink is not None,
             max_chunk_size = 4096,
         )
@@ -271,12 +281,15 @@ def main(args):
             if res_cat is not None:
                 speedup = None
                 if name == "Baseline":
-                    baseline = res_cat
+                    baseline = res_cat["tps"]
                 elif baseline is not None:
-                    speedup = res_cat / baseline
-                s = f"{col_magenta}{res_cat:.2f}{col_default} t/s"
+                    speedup = res_cat["tps"] / baseline
+                s = f"{col_magenta}{res_cat['tps']:.2f}{col_default} t/s"
                 if speedup is not None:
                     s += f", {col_green}{speedup:.2f}{col_default}x"
+                if res_cat["acc_len"] is not None:
+                    s += (f", {col_blue}{res_cat['acc_len']:.2f}{col_default}/"
+                          f"{col_blue}{res_cat['draft_len']:.2f}{col_default} acc/draft")
             else:
                 s = "-"
             row.append(s)
@@ -319,7 +332,7 @@ if __name__ == "__main__":
     parser.add_argument("-tokens", "--max_new_tokens", type = int, help = "Max sampled tokens per round", default = 1024)
     parser.add_argument("-temp", "--temperature", action = "store_true", help = "Also sample with temperature")
     parser.add_argument("-single", "--single_workload", type = str, help = "Limit to single workload", default = None)
-    parser.add_argument("-dstats", "--draft_stats", type = str, help = "Write per-round (position, window, accepted, ema) records to JSON file", default = None)
+    parser.add_argument("-dstats", "--draft_stats", type = str, help = "Write per-round (position, window, accepted) records to JSON file", default = None)
     parser.add_argument("-plot", "--plot_stats", action = "store_true", help = "Plot per-round draft stats in a matplotlib window after the run")
     parser.add_argument("-print", "--print_stats", action = "store_true", help = "Print per-round draft stats to the console after the run")
     _args = parser.parse_args()

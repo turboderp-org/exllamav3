@@ -90,7 +90,7 @@ def main(args):
         num_draft_tokens = args.num_draft_tokens,
         ngram_match_min = args.ngram_match_min,
         dynamic_draft_tokens = args.dynamic_draft,
-        dynamic_draft_skip_ema = args.draft_skip_ema,
+        draft_confidence = args.draft_confidence,
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
         recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
         show_visualizer = args.visualize_cache,

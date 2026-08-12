@@ -278,6 +278,13 @@ class DFlashModel(Model):
             logits = lm.prepare_for_device(state, params)
             logits = lm.forward(logits, params)
             logits = logits[..., :self.attached_model().config.vocab_size]
+            if params.get("export_draft_conf"):
+                # Per-position confidence for the generator's draft truncation: the argmax logit
+                # value separates converged from degenerate block positions far better than any
+                # distribution-shape statistic (the softcapped head is near-flat either way)
+                conf, ids = torch.max(logits, dim = -1)
+                params["draft_conf"] = conf
+                return ids
             return torch.argmax(logits, dim = -1)
         else:
             state = self.attached_model().tp_producer.send(state)
