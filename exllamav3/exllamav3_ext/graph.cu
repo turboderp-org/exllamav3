@@ -59,7 +59,9 @@ void Graph::capture_end()
 
     // Store copies of all node param structures
     node_params.resize(num_nodes);
+#if !defined(USE_ROCM)
     node_params_drv.resize(num_nodes);
+#endif
     node_is_driver.resize(num_nodes);
     node_needs_update.resize(num_nodes);
     for (int i = 0; i < num_nodes; ++i)
@@ -86,9 +88,13 @@ void Graph::capture_end()
             else
             {
                 (void) cudaGetLastError();
+#if !defined(USE_ROCM)
                 cuda_check_drv(CudaDrv::instance().graph_kernel_node_get_params((CUgraphNode) nodes[n], &node_params_drv[n]));
                 node_is_driver[n] = 1;
                 node_func = (void*) node_params_drv[n].func;
+#else
+                TORCH_CHECK(false, "hipGraphKernelNodeGetParams failed unexpectedly on ROCm");
+#endif
             }
 
             for(; c < graph_sites.size(); c++)
@@ -152,9 +158,12 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
                 int param_offset = std::get<2>(graph_node_sites[n]);
                 int param_size   = std::get<3>(graph_node_sites[n]);
 
-                void** kernel_params = node_is_driver[node_idx] ?
-                    node_params_drv[node_idx].kernelParams :
-                    node_params[node_idx].kernelParams;
+                void** kernel_params =
+#if !defined(USE_ROCM)
+                    node_is_driver[node_idx] ?
+                        node_params_drv[node_idx].kernelParams :
+#endif
+                        node_params[node_idx].kernelParams;
                 void* p_old_value = kernel_params[param_offset];
                 if (memcmp(p_old_value, &new_value, param_size))
                 {
@@ -173,9 +182,11 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
     for (int n = 0; n < nodes.size(); ++n)
     {
         if (!node_needs_update[n]) continue;
+#if !defined(USE_ROCM)
         if (node_is_driver[n])
             CudaDrv::instance().graph_exec_kernel_node_set_params((CUgraphExec) graph_exec, (CUgraphNode) nodes[n], &node_params_drv[n]);
         else
+#endif
             cudaGraphExecKernelNodeSetParams(graph_exec, nodes[n], &node_params[n]);
         node_needs_update[n] = false;
     }

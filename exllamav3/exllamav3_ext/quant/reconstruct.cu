@@ -4,7 +4,9 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "../util.h"
 #include "../util.cuh"
+#if !defined(USE_ROCM)
 #include "../ptx.cuh"
+#endif
 #include "exl3_dq.cuh"
 #include "hadamard_inner.cuh"
 
@@ -133,7 +135,8 @@ void reconstruct_slice
     if (mcg) cbi += 8;
     else if (mul1) cbi += 16;
 
-    reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+    auto reconstruct_kernel = reconstruct_kernel_instances[cbi];
+    reconstruct_kernel<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),
@@ -360,7 +363,8 @@ void reconstruct_had_slice
     if (mcg) cbi += 8;
     else if (mul1) cbi += 16;
 
-    reconstruct_had_kernel_instances[cbi]<<<gridDim, RH_THREADS, 0, stream>>>
+    auto reconstruct_had_kernel = reconstruct_had_kernel_instances[cbi];
+    reconstruct_had_kernel<<<gridDim, RH_THREADS, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),
