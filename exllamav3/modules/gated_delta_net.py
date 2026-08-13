@@ -689,7 +689,7 @@ class GatedDeltaNet(Module):
                 self.norm.bc,
                 self.beta_scale
             )
-            self.bc_split = True
+            self.bc_split = self.bc is not None
 
             # Sliced qkv+z bundle: both projections read x and are cut into equal-width column
             # slices run as one launch (SlicedMultiLinear); the graph object gets the tables, the
