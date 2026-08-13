@@ -100,8 +100,19 @@ def clean_response_for_context(tokenizer, response_ids: torch.Tensor) -> str:
 
 @torch.inference_mode()
 def main(args):
-    model, config, cache, tokenizer, *_ = model_init.init(args)
-    generator = Generator(model, cache, tokenizer, max_chunk_size = 2048)
+    model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
+    generator = Generator(
+        model = model,
+        cache = cache,
+        tokenizer = tokenizer,
+        draft_model = draft_model,
+        draft_cache = draft_cache,
+        num_draft_tokens = args.num_draft_tokens,
+        ngram_match_min = args.ngram_match_min,
+        dynamic_draft_tokens = args.dynamic_draft,
+        draft_confidence = args.draft_confidence,
+        max_chunk_size = 2048
+    )
 
     rows = []
     total_in = total_out = 0
@@ -181,7 +192,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
-    model_init.add_args(parser, default_cache_size = 32768)
+    model_init.add_args(parser, default_cache_size = 32768, add_draft_model_args = True)
     parser.add_argument("-o", "--output", type = str, required = True, help = "Output JSON file")
     parser.add_argument("--min_tokens", type = int, default = 20000, help = "Stop once this many response tokens are collected")
     parser.add_argument("--max_new_tokens", type = int, default = 4096, help = "Per-turn generation cap")
