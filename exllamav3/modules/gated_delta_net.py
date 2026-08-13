@@ -637,7 +637,7 @@ class GatedDeltaNet(Module):
                 self.norm.bc,
                 self.beta_scale
             )
-            self.bc_split = True
+            self.bc_split = self.bc is not None
 
 
     @override
