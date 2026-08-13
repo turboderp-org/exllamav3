@@ -7,8 +7,16 @@ import random
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
+# KV cache quantization kernels are excluded from the ROCm build
+pytestmark = pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="KV cache quantization not ported to ROCm"
+)
+
+import os
+_test_device = os.environ.get("EXL_TEST_DEVICE", "cuda:1")
 devices = [
-    "cuda:1"
+    _test_device
 ]
 
 page_size = 256

@@ -8,6 +8,8 @@
 #include "cuda_host.h"
 #include "hadamard.h"
 
+#if !defined(USE_ROCM)
+
 #include "norm.cuh"
 #include "hgemm.cuh"
 #include "rope.cuh"
@@ -66,6 +68,26 @@
 
 #include "sam.h"
 
+#else
+
+#include "hgemm.cuh"
+#include "rope.cuh"
+#include "gdn.cuh"
+#include "add.cuh"
+
+#include "quant/pack.cuh"
+#include "quant/reconstruct.cuh"
+#include "quant/hadamard.cuh"
+
+#include "generator/strings.h"
+#include "generator/sampling_basic.cuh"
+#include "generator/sampling_extra.cuh"
+#include "generator/gumbel.cuh"
+#include "generator/rep_pen.cuh"
+#include "generator/cache.cuh"
+
+#endif
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("stloader_read", &stloader_read, "stloader_read");
@@ -81,6 +103,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_host_get_device_pointer", &cuda_host_get_device_pointer, py::arg("ptr"));
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
 
+#if !defined(USE_ROCM)
     m.def("rms_norm", &rms_norm, "rms_norm");
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
@@ -223,4 +246,42 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/dsv4_compressor_bc.h"
     #include "libtorch/dsv4_attn_bc.h"
     #include "sam_bc.h"
+#else
+    m.def("had_paley", &had_paley, "had_paley");
+    m.def("had_paley2", &had_paley2, "had_paley2");
+
+    m.def("hgemm", &hgemm, "hgemm");
+    m.def("rope", &rope, "rope");
+    m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
+    m.def("reconstruct", &reconstruct, "reconstruct");
+    m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
+    m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
+    m.def("had_r_128", &had_r_128, "had_r_128");
+    m.def("pack_trellis", &pack_trellis, "pack_trellis");
+    m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
+    m.def("pack_signs", &pack_signs, "pack_signs");
+
+    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
+    m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
+    m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
+    m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
+    m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
+    m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
+    m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
+
+    m.def("argmax_sample", &argmax_sample, "argmax_sample");
+    m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
+    m.def("gumbel_noise_f16", &gumbel_noise_f16, "gumbel_noise_f16");
+    m.def("gumbel_noise_f32", &gumbel_noise_f32, "gumbel_noise_f32");
+    m.def("gumbel_noise_log", &gumbel_noise_log, "gumbel_noise_log");
+    m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
+    m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
+    m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
+
+    m.def("cache_rotate", &cache_rotate, "cache_rotate");
+    m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
+
+    m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
+    m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
+#endif
 }

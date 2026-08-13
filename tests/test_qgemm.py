@@ -19,8 +19,10 @@ test_keys = [
     ("lm_head", "model.norm"),
 ]
 
+import os
+_test_device = os.environ.get("EXL_TEST_DEVICE", "cuda:2")
 devices = [
-    "cuda:2"
+    _test_device
 ]
 
 batch_sizes = [1, 2, 8, 16, 17, 31, 32, 33, 256, 2048]

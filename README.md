@@ -127,6 +127,20 @@ Relevant env variables for building:
 - `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch will build/load it at runtime instead.
 
 
+### **Experimental** ROCm (AMD GPUs) support
+
+ROCm support is experimental and performance is significantly reduced compared to CUDA. Install ROCm PyTorch and the ROCm SDK from AMD's wheel index, then build with `ROCM_HOME` pointing at the SDK:
+
+```sh
+pip install rocm[libraries,devel] "torch[device-gfx1100]" --index-url https://repo.amd.com/rocm/whl-multi-arch/
+pip install -r requirements.txt
+python -m rocm_sdk init
+export ROCM_HOME="$(python -m rocm_sdk path --root)"
+pip install . --no-build-isolation
+```
+
+ROCm support is functional via PyTorch-native fallbacks for CUDA-specific kernels (tensor-core GEMM, cooperative groups, custom attention). Tested on gfx1100 (RX 7900 XTX).
+
 ## Conversion
 
 To convert a model to EXL3 format, use:

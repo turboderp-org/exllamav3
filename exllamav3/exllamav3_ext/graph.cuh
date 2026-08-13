@@ -8,6 +8,11 @@ namespace py = pybind11;
 #include <cuda_fp16.h>
 #include <cuda.h>
 
+// hipify doesn't map this type
+#if defined(USE_ROCM)
+using cudaKernelNodeParams = hipKernelNodeParams;
+#endif
+
 using PPTR = std::tuple<int, void*>;
 
 enum GraphedParams
@@ -114,7 +119,9 @@ public:
     std::vector<cudaKernelNodeParams> node_params;
     // Kernel nodes captured from driver-API launches (Triton cubins) cannot be read through the
     // runtime API ("invalid device function"); their params live here instead
+#if !defined(USE_ROCM)
     std::vector<CUDA_KERNEL_NODE_PARAMS> node_params_drv;
+#endif
     std::vector<char> node_is_driver;
     std::vector<void*> current_values;
     std::vector<bool> node_needs_update;

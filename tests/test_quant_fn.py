@@ -12,7 +12,7 @@ import math
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
-device = "cuda:2"
+import os; device = os.environ.get("EXL_TEST_DEVICE", "cuda:2")
 test_model = "/mnt/str/models/llama3.1-8b-instruct/hf/"
 test_keys = [
     "model.layers.0.self_attn.q_proj",

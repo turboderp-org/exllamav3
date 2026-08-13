@@ -7,7 +7,7 @@ import torch
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-device = "cuda:1"
+device = os.environ.get("EXL_TEST_DEVICE", "cuda:1")
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6):
