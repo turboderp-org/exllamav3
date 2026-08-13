@@ -87,12 +87,21 @@ else:
 
     # compiler flags
 
+    library_dir = os.path.dirname(os.path.abspath(__file__))
+    sources_dir = os.path.join(library_dir, extension_name)
+
     extra_cflags = []
-    extra_cuda_cflags = [
-        "-lineinfo", "-O3", "--use_fast_math",
-        "-Xcudafe", "--diag_suppress=177",
-        "-Xcudafe", "--diag_suppress=20012",
-    ]
+    extra_cuda_cflags = []
+
+    if torch.version.hip:
+        extra_cuda_cflags += ["-Ofast", "-DUSE_ROCM", "-Wno-register"]
+        extra_cflags += ["-DUSE_ROCM"]
+    else:
+        extra_cuda_cflags += [
+            "-lineinfo", "-O3", "--use_fast_math",
+            "-Xcudafe", "--diag_suppress=177",
+            "-Xcudafe", "--diag_suppress=20012",
+        ]
 
     if windows:
         # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break
@@ -119,7 +128,10 @@ else:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
 
     if verbose:
-        extra_cuda_cflags += ["--ptxas-options=-v"]
+        if torch.version.hip:
+            extra_cuda_cflags += ["-verbose"]
+        else:
+            extra_cuda_cflags += ["--ptxas-options=-v"]
 
     # linker flags
 
@@ -132,14 +144,9 @@ else:
 
     # sources
 
-    library_dir = os.path.dirname(os.path.abspath(__file__))
-    sources_dir = os.path.join(library_dir, extension_name)
-    sources = [
-        os.path.abspath(os.path.join(root, file))
-        for root, _, files in os.walk(sources_dir)
-        for file in files
-        if file.endswith(('.c', '.cpp', '.cu'))
-    ]
+    from .exllamav3_ext.build_config import get_sources as _get_sources
+    is_rocm = bool(torch.version.hip)
+    sources = _get_sources(sources_dir, is_rocm)
 
     # Load extension
 
@@ -153,3 +160,48 @@ else:
         extra_cuda_cflags = extra_cuda_cflags,
         extra_cflags = extra_cflags
     )
+
+
+# When a BC_* class is not compiled into the extension (e.g. on ROCm where the
+# libtorch/ sources are excluded), make attribute access return a callable that
+# yields None instead of raising AttributeError. This lets call sites write
+# ``self.bc = ext.BC_Mamba2(...)`` unconditionally — they get None on platforms
+# that lack the class, and the real object on platforms that have it.
+
+if torch.version.hip:
+    from .ext_fallbacks import _BCNone
+
+    _bc_none = _BCNone()
+
+    # BC_* constructors: return None when the class isn't compiled
+    for _name in [
+        'BC_Mamba2', 'BC_GatedDeltaNet', 'BC_GatedDeltaNetSplit',
+        'BC_MLP', 'BC_GatedMLP', 'BC_BlockSparseMLP',
+        'BC_Attention', 'BC_GatedRMSNorm',
+        'BC_LinearEXL3', 'BC_LinearFP16',
+        'BC_DSV4Compressor', 'BC_DSV4Attention', 'BC_DSV4BatchAttention',
+        'BC_MLAttention', 'BC_SAM',
+    ]:
+        if not hasattr(exllamav3_ext, _name):
+            setattr(exllamav3_ext, _name, _bc_none)
+
+    # C++ functions from excluded source files: replace with PyTorch implementations
+    from . import ext_fallbacks as _fb
+
+    for _name in [
+        'silu_mul', 'silu_oai_mul', 'gelu_mul', 'relu2_mul', 'relu_mul', 'xielu',
+        'mul_sigmoid_', 'mul_sigmoid_broadcast_', 'mul_softplus_broadcast_',
+        'add_sigmoid_gate', 'add_sigmoid_gate_proj', 'deinterleave_qg',
+        'rms_norm', 'rms_norm_res_in', 'gated_rms_norm',
+        'softcap',
+    ]:
+        if not hasattr(exllamav3_ext, _name):
+            setattr(exllamav3_ext, _name, getattr(_fb, _name))
+
+    # Constants and functions guarded by fused_sampler_enable in generator/sampler/custom.py.
+    # Disable the fused sampler path on ROCm by setting the flag and providing stub values.
+    if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_MAX_BLOCKS'):
+        setattr(exllamav3_ext, 'FUSED_SAMPLER_MAX_BLOCKS', 0)
+    if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE'):
+        setattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE', 0)
+    os.environ.setdefault('EXL3_FUSED_SAMPLER', '0')
