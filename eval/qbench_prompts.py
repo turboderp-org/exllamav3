@@ -76,7 +76,7 @@ CONVERSATIONS = [
       "Retell the same story as a series of terse logbook entries."]),
 ]
 
-TEMPLATE_VARS = dict(enable_thinking = True, reasoning_effort = "high")
+DEFAULT_TEMPLATE_VARS = dict(enable_thinking = True, reasoning_effort = "high")
 
 col_default = "\u001b[0m"
 col_yellow = "\u001b[33;1m"
@@ -113,6 +113,9 @@ def main(args):
         draft_confidence = args.draft_confidence,
         max_chunk_size = 2048
     )
+
+    TEMPLATE_VARS = DEFAULT_TEMPLATE_VARS.copy()
+    TEMPLATE_VARS.update(args.template_vars)
 
     rows = []
     total_in = total_out = 0
@@ -196,4 +199,5 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", type = str, required = True, help = "Output JSON file")
     parser.add_argument("--min_tokens", type = int, default = 20000, help = "Stop once this many response tokens are collected")
     parser.add_argument("--max_new_tokens", type = int, default = 4096, help = "Per-turn generation cap")
+    parser.add_argument("-tv", "--template_vars", type = json.loads, default = {}, help = 'JSON dict of chat template variables, merged over the defaults')
     main(parser.parse_args())
