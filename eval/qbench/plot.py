@@ -98,7 +98,7 @@ GROUP_COLORS = [
 def make_palette(groups):
     """Fixed color per group name; reserved slots for common formats, remainder
     walks the CVD-optimized ladder in stable (sorted) order."""
-    fixed_cols = {"EXL3": 0, "AWQ": 1, "GGUF": 5, "GGUF-IQ": 4, "NVFP4": 3}
+    fixed_cols = {"EXL3": 0, "AWQ": 1, "GGUF": 3, "GGUF-IQ": 4, "NVFP4": 5}
     unused = [i for i in range(len(GROUP_COLORS)) if i not in fixed_cols.values()]
     palette = {}
     for g in sorted(groups):
