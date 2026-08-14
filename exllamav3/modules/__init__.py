@@ -17,4 +17,3 @@ from .transformer import TransformerBlock, ParallelDecoderBlock
 from .conv import Conv
 from .pos_embedding import PosEmbedding
 from .gather import OutputGather
-from .value_embeddings import ValueEmbeddings

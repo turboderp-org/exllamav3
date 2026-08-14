@@ -174,11 +174,9 @@ class Attention(Module):
         o_proj: Linear | Module | None = None,
         g_proj: Linear | Module | None = None,
         interleaved_gate: bool = False,
-        ve_gate: bool = False,
         use_k_as_v: bool = False,
         transpose_qkv: bool = True,
         use_cu_seqlens: bool = False,
-        post_rope_norm: bool = False,
         full_gate: bool = False,
         gate_softplus: bool = False,
         tp_split_norm: bool = True,
@@ -201,9 +199,7 @@ class Attention(Module):
         self.sliding_window = sliding_window
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
-        self.ve_gate = ve_gate
         self.use_cu_seqlens = use_cu_seqlens
-        self.post_rope_norm = post_rope_norm
         self.tp_split_norm = tp_split_norm
         self.use_k_as_v = use_k_as_v
         self.full_gate = full_gate
@@ -212,10 +208,6 @@ class Attention(Module):
             "Attn: gate_softplus is only implemented for the headwise gate"
         self.key_sinks = key_sinks
         self.sinks = None
-
-        if post_rope_norm:
-            assert q_norm is None and k_norm is None, \
-                "Post-RoPE norm only supported without weights"
 
         if self.num_kv_heads == 0:
             return
@@ -735,11 +727,6 @@ class Attention(Module):
 
         q, k, v, g = self.project_qkv(x, params)
 
-        # Optional addend to V tensor (e.g. value embeddings)
-        if self.ve_gate:
-            v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
-            v.add_(v_addend)
-
         if self.q_norm:
             if self.tp_span_heads_norm:
                 # TP-aware path for span_heads=True
@@ -760,7 +747,6 @@ class Attention(Module):
                 self.norm_eps,
                 self.norm_constant_bias,
                 inv_freq,
-                self.post_rope_norm
             )
 
         if simulate_kv_quant:
@@ -855,11 +841,6 @@ class Attention(Module):
 
         q, k, v, g = self.project_qkv(x, params)
 
-        # Optional addend to V tensor (e.g. value embeddings)
-        if self.ve_gate:
-            v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
-            v.add_(v_addend)
-
         if self.q_norm:
             if self.tp_span_heads_norm:
                 # TP-aware path for span_heads=True
@@ -880,7 +861,6 @@ class Attention(Module):
                 self.norm_eps,
                 self.norm_constant_bias,
                 inv_freq,
-                self.post_rope_norm
             )
 
         if simulate_kv_quant:
@@ -989,7 +969,6 @@ class Attention(Module):
                 "out_dtype": self.out_dtype,
                 "sliding_window": self.sliding_window,
                 "logit_softcapping": self.logit_softcapping,
-                "post_rope_norm": self.post_rope_norm,
                 "tp_split_norm": self.tp_split_norm,
                 "use_k_as_v": self.use_k_as_v,
                 "interleaved_gate": self.interleaved_gate,

@@ -360,7 +360,7 @@ class MLAttention(Module):
         if self.rope is not None:
             q_pe, k_pe = self.rope.apply(
                 q_pe, k_pe, position, positions, position_ids, True,
-                None, None, self.norm_eps, 0.0, inv_freq, False,
+                None, None, self.norm_eps, 0.0, inv_freq,
             )
             _dbg_sync("rope", x.device)
 

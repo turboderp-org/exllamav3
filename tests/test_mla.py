@@ -137,7 +137,7 @@ def ref_forward(module, t, key, x, positions):
     if m.rope is not None:
         q_pe, k_pe = m.rope.apply(
             q_pe.half().contiguous(), k_pe.half().contiguous(),
-            0, positions, None, False, None, None, m.norm_eps, 0.0, None, False,
+            0, positions, None, False, None, None, m.norm_eps, 0.0, None,
         )
     q_pe, k_pe = q_pe.float(), k_pe.float()
 

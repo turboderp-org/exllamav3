@@ -684,7 +684,6 @@ def capture_module_parallel(
                 if slicing:
                     params["q_mlp_slice"] = current_slice
                 get_preserve(i, params)
-                model.per_layer_quant_preamble(params)
                 rs = module.prepare_for_device(state[i], params)
                 rs = module.forward(rs, params)
                 put_preserve(i, params)
@@ -698,7 +697,6 @@ def capture_module_parallel(
                         if slicing:
                             params["q_mlp_slice"] = current_slice
                         get_preserve(i, params)
-                        model.per_layer_quant_preamble(params)
                         rs = module.prepare_for_device(state[i], params)
                         rs = module.forward(rs, params)
                         put_preserve(i, params)
@@ -784,7 +782,6 @@ def advance_state_parallel(
                 row_bad = False
                 if i < num_ref_states or not is_last_module:
                     get_preserve(i, params)
-                    model.per_layer_quant_preamble(params)
                     rs = module.forward(state[i], params)
                     if not torch.isfinite(rs).all().item():
                         row_bad = True
@@ -985,12 +982,10 @@ def main(args, job_state):
 
     # With multiple devices, run the capture and state-advance forward passes with calibration rows split
     # across replicas of the current module, one per device. Calibration rows are independent and the H proxy
-    # is a plain sum over token batches, so shards merge exactly. Models with a custom per-layer preamble
-    # (module state prepared on the primary device) fall back to the serial path.
+    # is a plain sum over token batches, so shards merge exactly.
     parallel_calib = (
         state is not None and
-        len(devices) > 1 and
-        type(model).per_layer_quant_preamble is Model.per_layer_quant_preamble
+        len(devices) > 1
     )
     replica_models = [Model.from_config(config) for _ in devices[1:]] if parallel_calib else []
 
@@ -1077,7 +1072,6 @@ def main(args, job_state):
                                 if slicing:
                                      params["q_mlp_slice"] = current_slice
                                 get_preserve(i, params)
-                                model.per_layer_quant_preamble(params)
                                 rs = module.prepare_for_device(state[i], params)
                                 rs = module.forward(rs, params)
                                 put_preserve(i, params)
@@ -1091,7 +1085,6 @@ def main(args, job_state):
                                         if slicing:
                                             params["q_mlp_slice"] = current_slice
                                         get_preserve(i, params)
-                                        model.per_layer_quant_preamble(params)
                                         rs = module.prepare_for_device(state[i], params)
                                         rs = module.forward(rs, params)
                                         put_preserve(i, params)
@@ -1223,7 +1216,6 @@ def main(args, job_state):
                         state[i] = module.prepare_for_device(state[i], params)
                         if i < num_ref_states or idx < len(model.modules) - 1:
                             get_preserve(i, params)
-                            model.per_layer_quant_preamble(params)
                             rs = module.forward(state[i], params)
                             if not torch.isfinite(rs).all().item():
                                 bad_rows.add(i)

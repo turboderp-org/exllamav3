@@ -6,7 +6,6 @@
 #define ROPESTYLE_NONE 0
 #define ROPESTYLE_GPTJ 1
 #define ROPESTYLE_NEOX 2
-#define ROPESTYLE_NANOCHAT 3
 
 void l4_scale_q_gr
 (
@@ -42,7 +41,6 @@ void rope_gr
     float norm_constant_bias,
     float llama_4_scaling_beta,
     int llama_4_scaling_original,
-    bool post_rope_norm,
     int rotate_dims,
     int rotate_offset,
     Graph* graph
@@ -66,7 +64,6 @@ void rope
     float norm_constant_bias,
     float llama_4_scaling_beta,
     int llama_4_scaling_original,
-    bool post_rope_norm,
     int rotate_dims,
     int rotate_offset
 );

@@ -244,7 +244,7 @@ void BC_MLAttention::run_gr
     {
         c10::optional<at::Tensor> out_k = s.kpe4;
         rope_gr(s.q_pe4, s.q_pe4, s.kpe4, out_k, inv_freq, (uint32_t) position, positions, position_ids,
-                rope_style, attn_factor, c10::nullopt, c10::nullopt, norm_eps, 0.0f, 0.0f, 0, false,
+                rope_style, attn_factor, c10::nullopt, c10::nullopt, norm_eps, 0.0f, 0.0f, 0,
                 rotate_dims, 0, graph);
     }
 

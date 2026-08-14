@@ -56,7 +56,6 @@ BC_Attention::BC_Attention
     float _attn_factor,
     float _l4_scaling_beta,
     int _l4_scaling_original,
-    bool _post_rope_norm,
     int _rotate_dims,
     bool _quant_cache,
     at::Tensor _cache_k,
@@ -109,7 +108,6 @@ BC_Attention::BC_Attention
     attn_factor         (_attn_factor),
     l4_scaling_beta     (_l4_scaling_beta),
     l4_scaling_original (_l4_scaling_original),
-    post_rope_norm      (_post_rope_norm),
     rotate_dims         (_rotate_dims),
     quant_cache         (_quant_cache),
     cache_k             (std::move(_cache_k)),
@@ -386,7 +384,7 @@ void BC_Attention::run_gr
         const at::Tensor& ivf = inv_freq_override ? inv_freq_override.value() : inv_freq.value();
         rope_gr(s.q4, s.q4, s.k4, out_k4, ivf, (uint32_t) position, positions, position_ids, rope_style,
                 attn_factor, q_norm, k_norm, norm_eps, norm_constant_bias, l4_scaling_beta,
-                l4_scaling_original, post_rope_norm, rotate_dims, 0, graph);
+                l4_scaling_original, rotate_dims, 0, graph);
     }
 
     // Cache append (before attention: the split kernel counts the new tokens as part of the

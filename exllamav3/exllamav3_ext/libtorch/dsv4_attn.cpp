@@ -122,7 +122,7 @@ void BC_DSV4Attention::run_gr
         rope_gr
         (
             q4, q4, k_in, k_out, inv_freq, 0, positions, no_pid,
-            ROPESTYLE_GPTJ, 1.0f, qn, kn, rms_norm_eps, 0.0f, 0.0f, 0, false,
+            ROPESTYLE_GPTJ, 1.0f, qn, kn, rms_norm_eps, 0.0f, 0.0f, 0,
             1, D - rope_dim, graph
         );
     }
@@ -166,7 +166,7 @@ void BC_DSV4Attention::run_gr
             rope_gr
             (
                 qi_sl, qi_sl, no_k, no_ko, inv_freq, 0, positions, no_pid,
-                ROPESTYLE_GPTJ, 1.0f, no_n, no_n, 1e-6f, 0.0f, 0.0f, 0, false,
+                ROPESTYLE_GPTJ, 1.0f, no_n, no_n, 1e-6f, 0.0f, 0.0f, 0,
                 1, 0, graph
             );
         }
@@ -416,7 +416,7 @@ void BC_DSV4BatchAttention::run_gr(const at::Tensor& x, int B, int S, Slot& s, G
         rope_gr
         (
             q4, q4, k_in, k_out, inv_freq, 0, pos_opt, no_pid,
-            ROPESTYLE_GPTJ, 1.0f, qn, kn, rms_norm_eps, 0.0f, 0.0f, 0, false,
+            ROPESTYLE_GPTJ, 1.0f, qn, kn, rms_norm_eps, 0.0f, 0.0f, 0,
             1, D - rope_dim, graph
         );
     }
@@ -463,7 +463,7 @@ void BC_DSV4BatchAttention::run_gr(const at::Tensor& x, int B, int S, Slot& s, G
             rope_gr
             (
                 qi_sl, qi_sl, no_k, no_ko, inv_freq, 0, pos_opt, no_pid,
-                ROPESTYLE_GPTJ, 1.0f, no_n, no_n, 1e-6f, 0.0f, 0.0f, 0, false,
+                ROPESTYLE_GPTJ, 1.0f, no_n, no_n, 1e-6f, 0.0f, 0.0f, 0,
                 1, 0, graph
             );
         }

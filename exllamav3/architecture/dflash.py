@@ -259,7 +259,6 @@ class DFlashModel(Model):
                 layer.norm_eps,
                 layer.norm_constant_bias,
                 None,
-                False,
             )
 
             # Write k, v rows to the paged cache; quantized caches quantize them in place rather
