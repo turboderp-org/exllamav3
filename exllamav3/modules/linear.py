@@ -811,7 +811,9 @@ def convert_exl3_group(
     for linear in linears:
         assert isinstance(linear.inner, LinearFP16), \
             "Inner layer is already quant type"
-        weights.append(linear.inner.get_weight_tensor().float())
+        # Checkpoint precision, usually still swapped to CPU: quantize_exl3_batch stages the
+        # upload through pinned memory and casts to fp32 on the device
+        weights.append(linear.inner.get_weight_tensor())
         biases.append(linear.inner.get_bias_tensor())
         linear.inner = None
 

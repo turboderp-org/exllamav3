@@ -593,7 +593,15 @@ def load_parallel_calib_modules(replica_models, idx, devices, load_slice, source
     try:
         for rm, dev in zip(replica_models, devices[1:]):
             rep = rm.modules[idx]
-            rep.load(torch.device(dev), load_slice = load_slice, **({"source": source} if source is not None else {}))
+            if source is None and rep.can_defer_load():
+                rm.config.stc.begin_deferred_load()
+                try:
+                    rep.load(torch.device(dev), load_slice = load_slice)
+                finally:
+                    rm.config.stc.end_deferred_load()
+            else:
+                rep.load(torch.device(dev), load_slice = load_slice,
+                         **({"source": source} if source is not None else {}))
             replicas.append(rep)
         return replicas
     except Exception as e:
@@ -1016,10 +1024,22 @@ def main(args, job_state):
             # Load current module
             slice_str = f" (slice {current_slice + 1}/{module.num_slices})" if slicing else ""
             print(f" -- Loading unquantized module: {module.key}" + slice_str)
-            module.load(
-                torch.device("cpu") if module.caps.get("prefer_cpu") else device,
-                load_slice = current_slice if slicing else None
-            )
+            # Deferred mode batches every tensor of the module into coalesced, multithreaded
+            # engine reads; big sparse layers otherwise pay one synchronous round trip per
+            # expert tensor, which is latency-bound on slow/network storage. can_defer_load()
+            # excludes modules whose load derives copies from unfilled tensors (e.g. sliced
+            # Linears, whose LinearFP16 copies each slice out of its source at construction)
+            defer = module.can_defer_load()
+            if defer:
+                module.config.stc.begin_deferred_load()
+            try:
+                module.load(
+                    torch.device("cpu") if module.caps.get("prefer_cpu") else device,
+                    load_slice = current_slice if slicing else None
+                )
+            finally:
+                if defer:
+                    module.config.stc.end_deferred_load()
             for m in module:
                 if m.used_alt_key and not slicing:
                     print(f"     - Cloned {m.key} from {m.alt_key}")
@@ -1279,7 +1299,14 @@ def main(args, job_state):
 
             q_tensors = {}
             print(f" -- Loading unquantized module: {module.key}")
-            module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
+            defer = module.can_defer_load()
+            if defer:
+                module.config.stc.begin_deferred_load()
+            try:
+                module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
+            finally:
+                if defer:
+                    module.config.stc.end_deferred_load()
             for m in module:
                 if m.used_alt_key:
                     print(f"     - Cloned {m.key} from {m.alt_key}")
