@@ -200,7 +200,10 @@ class PromptFormat_glm(PromptFormat):
         )
 
     def format(self, system_prompt, messages, think):
-        context = f"[gMASK]<sop><|system|>\n{system_prompt}"
+        context = f"[gMASK]<sop>"
+        if think:
+            context += "<|system|>Reasoning Effort: High"
+        context += f"<|system|>{system_prompt}"
         for (u, a) in messages:
             context += f"<|user|>\n{u}"
             context += f"<|assistant|>"
