@@ -153,6 +153,58 @@ if has_triton:
                  tl.load(kpe_new + row * D_r + offs_r))
 
 
+    @triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
+    def _mla_plane_update_kernel(
+        rows_new,            # (bsz, len, D)
+        plane_cache,         # (pages, page_size, D)
+        block_table,
+        cache_seqlens,
+        num_pages_per_seq,
+        append_len,
+        page_size: tl.constexpr,
+        D: tl.constexpr,
+    ):
+        """Single-plane variant of _mla_kv_update_kernel, for the per-token indexer-key rows
+        of DSA-on-MLA layers (GLM-5.2)."""
+        row = tl.program_id(0)
+        batch = row // append_len
+        pos = row - batch * append_len
+
+        abs_pos = tl.load(cache_seqlens + batch) + pos
+        page = abs_pos // page_size
+        page_off = abs_pos - page * page_size
+        phys = tl.load(block_table + batch * num_pages_per_seq + page)
+        tok = phys * page_size + page_off
+
+        offs = tl.arange(0, D)
+        tl.store(plane_cache + tok * D + offs, tl.load(rows_new + row * D + offs))
+
+
+    @triton.jit(do_not_specialize = ["R"])
+    def _mla_idx_norm_kernel(
+        k_raw,               # (R, D) fp16
+        w,                   # (D,) fp16
+        b,                   # (D,) fp16
+        k_out,               # (R, D) fp16
+        R,
+        eps: tl.constexpr,
+        D: tl.constexpr,
+    ):
+        """Biased LayerNorm for the DSA indexer keys (GLM-5.2 k_norm), fp32 math. One program
+        per row; D is a power of two (128)."""
+        row = tl.program_id(0)
+        offs = tl.arange(0, D)
+        x = tl.load(k_raw + row * D + offs).to(tl.float32)
+        mean = tl.sum(x, axis = 0) / D
+        xc = x - mean
+        var = tl.sum(xc * xc, axis = 0) / D
+        xn = xc * tl.rsqrt(var + eps)
+        y = xn * tl.load(w + offs).to(tl.float32) + tl.load(b + offs).to(tl.float32)
+        tl.store(k_out + row * D + offs, y.to(tl.float16))
+
+
+
+
     @triton.jit(do_not_specialize = ["split_len", "num_pages_per_seq", "num_splits"])
     def _mla_decode_split_kernel(
         q_lat,               # (H, bsz * q_len, D_c) absorbed queries, head-major
@@ -631,6 +683,7 @@ if has_triton:
         n_q_heads: tl.constexpr,
         QK_DIM: tl.constexpr,
         D_nope: tl.constexpr,
+        D_nope_pad: tl.constexpr,   # next_power_of_2(D_nope); GLM-5.2 has D_nope 192
         D_r: tl.constexpr,
         D_v: tl.constexpr,
         scale: tl.constexpr,
@@ -655,12 +708,14 @@ if has_triton:
         valid_m = offs_m < s_len
         q_abs = past0 + offs_m
 
-        offs_nope = tl.arange(0, D_nope)
+        offs_nope = tl.arange(0, D_nope_pad)
+        nope_ok = offs_nope < D_nope
         offs_r = tl.arange(0, D_r)
         offs_v = tl.arange(0, D_v)
 
         qb = q + ((q_row0 + offs_m[:, None]) * n_q_heads + head) * QK_DIM
-        q_n = tl.load(qb + offs_nope[None, :], mask = valid_m[:, None], other = 0.0)
+        q_n = tl.load(qb + offs_nope[None, :],
+                      mask = valid_m[:, None] & nope_ok[None, :], other = 0.0)
         q_p = tl.load(qb + D_nope + offs_r[None, :], mask = valid_m[:, None], other = 0.0)
 
         sb = head * s_len + offs_m
@@ -679,7 +734,7 @@ if has_triton:
             in_r = offs_n < tile_len
 
             kt = tl.load(k_nope + offs_n[None, :] * (n_q_heads * D_nope) + head * D_nope + offs_nope[:, None],
-                         mask = in_r[None, :], other = 0.0)
+                         mask = in_r[None, :] & nope_ok[:, None], other = 0.0)
             kt_pe = tl.load(k_pe + offs_n[None, :] * D_r + offs_r[:, None],
                             mask = in_r[None, :], other = 0.0)
 
@@ -715,6 +770,10 @@ if has_triton:
 
 _sm_count = {}
 
+# Largest MHA-prefill q tile that fits in shared memory, probed per (device, dims); see
+# mla_attn_triton_prefill_mha
+_mha_block_m = {}
+
 
 def _get_sm_count(device: torch.device) -> int:
     idx = device.index if hasattr(device, "index") else device
@@ -743,6 +802,26 @@ def mla_kv_append(
             num_warps = 4, num_stages = 2,
         )
     _dbg_sync("mla_kv_append", ckv_new.device)
+
+
+def mla_plane_append(
+    rows_new: torch.Tensor,     # (bsz, length, D)
+    plane_cache: torch.Tensor,  # (pages, page_size, D) or any layout flattening to that
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+):
+    """Append per-token rows to a paged fp16 side plane (DSA indexer keys)."""
+    bsz, length, D = rows_new.shape
+    page_size = plane_cache.shape[1]
+    if length == 0:
+        return
+    with torch.cuda.device(rows_new.device):
+        _mla_plane_update_kernel[(bsz * length,)](
+            rows_new.contiguous(), plane_cache, block_table, cache_seqlens,
+            block_table.shape[1], length, page_size, D,
+            num_warps = 2, num_stages = 2,
+        )
+    _dbg_sync("mla_plane_append", rows_new.device)
 
 
 def mla_kv_quant_append(
@@ -994,6 +1073,11 @@ def mla_attn_triton_prefill_mha(
     page_size = kpe_cache.shape[1]
     dev = q.device
 
+    # 99KB-smem devices (SM120 / consumer Ampere+) cannot hold the default 128-row q tile at
+    # these head dims; probe once per (device, dims) and remember the largest tile that fits
+    fb_key = (dev.index, qk_dim, v_head_dim, block_m)
+    block_m = _mha_block_m.get(fb_key, block_m)
+
     if qc is not None:
         from .triton_paged import _get_h32
         ckv_scales, qc_bits = qc
@@ -1040,15 +1124,24 @@ def mla_attn_triton_prefill_mha(
                 # Up-projection as two plain contiguous GEMMs (never the strided-batched form)
                 torch.mm(ckv_t[:tl_len], w_uk_flat, out = k_nope_t[:tl_len])
                 torch.mm(ckv_t[:tl_len], w_uv_flat, out = v_t[:tl_len])
-                _mla_prefill_mha_kernel[(triton.cdiv(q_len, block_m), H)](
-                    q, k_nope_t, v_t, kpe_t,
-                    state_m, state_l, state_acc, out,
-                    b * q_len, q_len, a, tl_len, past0,
-                    int(ti == 0), int(ti == len(tiles) - 1), int(e - 1 > past0),
-                    H, qk_dim, qk_nope_head_dim, D_r, v_head_dim, float(softmax_scale),
-                    block_m, block_n,
-                    num_warps = num_warps, num_stages = num_stages,
-                )
+                while True:
+                    try:
+                        _mla_prefill_mha_kernel[(triton.cdiv(q_len, block_m), H)](
+                            q, k_nope_t, v_t, kpe_t,
+                            state_m, state_l, state_acc, out,
+                            b * q_len, q_len, a, tl_len, past0,
+                            int(ti == 0), int(ti == len(tiles) - 1), int(e - 1 > past0),
+                            H, qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim),
+                            D_r, v_head_dim, float(softmax_scale),
+                            block_m, block_n,
+                            num_warps = num_warps, num_stages = num_stages,
+                        )
+                        _mha_block_m[fb_key] = block_m
+                        break
+                    except triton.runtime.errors.OutOfResources:
+                        # Launch failed before running anything; a smaller q tile is safe
+                        assert block_m > 32, "MHA prefill kernel does not fit in shared memory"
+                        block_m //= 2
     _dbg_sync("mla_prefill_mha", dev)
     return out
 

@@ -46,14 +46,20 @@ class CacheLayer_MLA_fp16(CacheLayer):
             self.qk_rope_head_dim = attention.qk_rope_head_dim
             self.shape_c = (pages, PAGE_SIZE, 1, self.kv_lora_rank)
             self.shape_r = (pages, PAGE_SIZE, 1, self.qk_rope_head_dim)
+            # DSA-on-MLA layers with their own lightning indexer (GLM-5.2 "full" layers) keep a
+            # per-token indexer-key plane alongside the latent
+            idx_dim = getattr(attention, "idx_plane_dim", None)
+            self.shape_i = (pages, PAGE_SIZE, idx_dim) if idx_dim else None
         else:
             self.kv_lora_rank = None
             self.qk_rope_head_dim = None
             self.shape_c = None
             self.shape_r = None
+            self.shape_i = None
 
-        self.k = None    # latent, (pages, PAGE_SIZE, 1, kv_lora_rank)
-        self.v = None    # rope key, (pages, PAGE_SIZE, 1, qk_rope_head_dim)
+        self.k = None      # latent, (pages, PAGE_SIZE, 1, kv_lora_rank)
+        self.v = None      # rope key, (pages, PAGE_SIZE, 1, qk_rope_head_dim)
+        self.k_idx = None  # indexer keys, (pages, PAGE_SIZE, index_head_dim), roped
         self.device = None
 
 
@@ -62,6 +68,7 @@ class CacheLayer_MLA_fp16(CacheLayer):
         self.device = device
         self.k = torch.zeros(self.shape_c, dtype = torch.half, device = device) if self.shape_c else None
         self.v = torch.zeros(self.shape_r, dtype = torch.half, device = device) if self.shape_r else None
+        self.k_idx = torch.zeros(self.shape_i, dtype = torch.half, device = device) if self.shape_i else None
 
 
     @override
@@ -69,6 +76,7 @@ class CacheLayer_MLA_fp16(CacheLayer):
         self.device = None
         self.k = None
         self.v = None
+        self.k_idx = None
 
 
     @override
@@ -108,21 +116,38 @@ class CacheLayer_MLA_fp16(CacheLayer):
         )
 
 
+    def update_idx_direct(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor,
+                          k_idx: torch.Tensor, length: int):
+        """Append new indexer-key rows, shaped (bsz, length, index_head_dim), roped."""
+        from ..modules.attention_fn.mla_triton import mla_plane_append
+        mla_plane_append(
+            k_idx.reshape(k_idx.shape[0], length, self.shape_i[-1]),
+            self.k_idx, block_table, cache_seqlens,
+        )
+
+
+    def get_idx(self) -> torch.Tensor:
+        return self.k_idx
+
+
     @override
     def copy_page(self, source: CacheLayer_MLA_fp16, from_page: int, to_page: int, num_tokens: int):
         assert self.shape_c == source.shape_c and self.shape_r == source.shape_r
         self.k[to_page, :num_tokens, :, :].copy_(source.k[from_page, :num_tokens, :, :], non_blocking = True)
         self.v[to_page, :num_tokens, :, :].copy_(source.v[from_page, :num_tokens, :, :], non_blocking = True)
+        if self.k_idx is not None:
+            self.k_idx[to_page, :num_tokens, :].copy_(source.k_idx[from_page, :num_tokens, :], non_blocking = True)
 
 
     @override
     def get_tensors(self):
-        return [self.k, self.v]
+        return [t for t in [self.k, self.v, self.k_idx] if t is not None]
 
 
     @override
     def storage_size(self):
-        return (np.prod(self.shape_c) + np.prod(self.shape_r)) * torch.half.itemsize
+        return (np.prod(self.shape_c) + np.prod(self.shape_r) +
+                (np.prod(self.shape_i) if self.shape_i else 0)) * torch.half.itemsize
 
 
     @override
@@ -190,14 +215,18 @@ class CacheLayer_MLA_quant(CacheLayer):
             self.qshape = (pages, PAGE_SIZE, groups * k_bits)
             self.sshape = (pages, PAGE_SIZE, groups)
             self.shape_r = (pages, PAGE_SIZE, 1, self.qk_rope_head_dim)
+            idx_dim = getattr(attention, "idx_plane_dim", None)
+            self.shape_i = (pages, PAGE_SIZE, idx_dim) if idx_dim else None
         else:
             self.qshape = None
             self.sshape = None
             self.shape_r = None
+            self.shape_i = None
 
-        self.qk = None   # packed latent, int32
-        self.sk = None   # fp16 group scales
-        self.v = None    # rope key, fp16
+        self.qk = None     # packed latent, int32
+        self.sk = None     # fp16 group scales
+        self.v = None      # rope key, fp16
+        self.k_idx = None  # indexer keys, fp16, roped
         self.device = None
         self._scratch = {}
 
@@ -208,6 +237,7 @@ class CacheLayer_MLA_quant(CacheLayer):
         self.qk = torch.zeros(self.qshape, dtype = torch.int, device = device) if self.qshape else None
         self.sk = torch.zeros(self.sshape, dtype = torch.half, device = device) if self.sshape else None
         self.v = torch.zeros(self.shape_r, dtype = torch.half, device = device) if self.shape_r else None
+        self.k_idx = torch.zeros(self.shape_i, dtype = torch.half, device = device) if self.shape_i else None
 
 
     @override
@@ -216,6 +246,7 @@ class CacheLayer_MLA_quant(CacheLayer):
         self.qk = None
         self.sk = None
         self.v = None
+        self.k_idx = None
         self._scratch = {}
 
 
@@ -267,17 +298,33 @@ class CacheLayer_MLA_quant(CacheLayer):
         )
 
 
+    def update_idx_direct(self, cache_seqlens: torch.Tensor, block_table: torch.Tensor,
+                          k_idx: torch.Tensor, length: int):
+        """Append new indexer-key rows, shaped (bsz, length, index_head_dim), roped."""
+        from ..modules.attention_fn.mla_triton import mla_plane_append
+        mla_plane_append(
+            k_idx.reshape(k_idx.shape[0], length, self.shape_i[-1]),
+            self.k_idx, block_table, cache_seqlens,
+        )
+
+
+    def get_idx(self) -> torch.Tensor:
+        return self.k_idx
+
+
     @override
     def copy_page(self, source: CacheLayer_MLA_quant, from_page: int, to_page: int, num_tokens: int):
         assert self.qshape == source.qshape and self.shape_r == source.shape_r
         self.qk[to_page, :num_tokens, :].copy_(source.qk[from_page, :num_tokens, :], non_blocking = True)
         self.sk[to_page, :num_tokens, :].copy_(source.sk[from_page, :num_tokens, :], non_blocking = True)
         self.v[to_page, :num_tokens, :, :].copy_(source.v[from_page, :num_tokens, :, :], non_blocking = True)
+        if self.k_idx is not None:
+            self.k_idx[to_page, :num_tokens, :].copy_(source.k_idx[from_page, :num_tokens, :], non_blocking = True)
 
 
     @override
     def get_tensors(self):
-        return [self.qk, self.sk, self.v]
+        return [t for t in [self.qk, self.sk, self.v, self.k_idx] if t is not None]
 
 
     @override
@@ -285,7 +332,7 @@ class CacheLayer_MLA_quant(CacheLayer):
         return (
             np.prod(self.qshape) * torch.int.itemsize +
             np.prod(self.sshape) * torch.half.itemsize +
-            np.prod(self.shape_r) * torch.half.itemsize
+            (np.prod(self.shape_r) + (np.prod(self.shape_i) if self.shape_i else 0)) * torch.half.itemsize
         )
 
 

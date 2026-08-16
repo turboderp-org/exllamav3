@@ -23,6 +23,17 @@ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 ROUTING_ACT_SIGMOID = 0
 ROUTING_ACT_SQRTSP = 1
 
+def _esb_h(cfg):
+    """fp16 selection-bias copy for the CUDA top-k kernels, built lazily (load may be
+    deferred when the RoutingCFG is constructed). Mean-centered when the source is wider than
+    fp16: selection is invariant to a constant shift, and centering keeps fp16 rounding well
+    below the inter-expert score gaps even when the bias values are large (GLM-5.2 ~34.0)."""
+    if cfg.e_score_bias_h is None and cfg.e_score_correction_bias is not None:
+        esb = cfg.e_score_correction_bias
+        cfg.e_score_bias_h = esb if esb.dtype == torch.half else (esb - esb.mean()).half()
+    return cfg.e_score_bias_h
+
+
 @dataclass
 class RoutingCFG:
     gate_tensor: torch.Tensor
@@ -33,6 +44,7 @@ class RoutingCFG:
     routing_weights_bsz1: torch.Tensor
     selected_experts_bsz1: torch.Tensor
     e_score_correction_bias: torch.Tensor | None
+    e_score_bias_h: torch.Tensor | None   # lazy, see _esb_h
     routed_scaling_factor: float | None
     n_group: int | None
     topk_group: int | None
@@ -173,7 +185,7 @@ def routing_dots(bsz, cfg, y, params):
             y,
             cfg.gate_tensor,
             cfg.router_logits_bsz1,
-            cfg.e_score_correction_bias,
+            _esb_h(cfg),
             cfg.selected_experts_bsz1,
             cfg.routing_weights_bsz1,
             cfg.routed_scaling_factor,
@@ -186,11 +198,11 @@ def routing_dots(bsz, cfg, y, params):
         activate_all_experts = params.get("activate_all_experts")
         if activate_all_experts:
             router_logits = torch.matmul(y, cfg.gate_tensor)
-            routing_weights = router_logits.sigmoid()
+            routing_weights = router_logits.sigmoid().float()
             if cfg.e_score_correction_bias is not None:
-                routing_weights += cfg.e_score_correction_bias.unsqueeze(0)
+                routing_weights = routing_weights + cfg.e_score_correction_bias.unsqueeze(0).float()
             factor = cfg.routed_scaling_factor / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
-            routing_weights *= factor
+            routing_weights = (routing_weights * factor).half()
             selected_experts = (
                 torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
                 .repeat((bsz, 1))
@@ -203,7 +215,7 @@ def routing_dots(bsz, cfg, y, params):
                 y,
                 cfg.gate_tensor,
                 router_logits,
-                cfg.e_score_correction_bias,
+                _esb_h(cfg),
                 selected_experts,
                 routing_weights,
                 cfg.routed_scaling_factor,
@@ -247,7 +259,7 @@ def routing_sqrtsp(bsz, cfg, y, params):
         y,
         cfg.gate_tensor,
         router_logits,
-        cfg.e_score_correction_bias,
+        _esb_h(cfg),
         selected_experts,
         routing_weights,
         cfg.routed_scaling_factor,
@@ -669,9 +681,16 @@ class BlockSparseMLP(Module):
                 module.load(device, **kwargs)
         if self.e_score_correction_bias_key:
             for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
-                self.e_score_correction_bias = self.config.stc.get_tensor(
-                    f"{self.key}.{k}", self.device, optional = True, float2half = True)
-                if self.e_score_correction_bias is not None:
+                # Loaded in its checkpoint precision: GLM-5.2's bias sits near 34.0 where
+                # fp16 resolution (0.03) would swamp the inter-expert sigmoid score gaps. The
+                # kernels get a centered fp16 copy (see RoutingCFG.e_score_bias_h)
+                # no_defer: the fp32 working copy below is derived at load time, which a
+                # deferred (unfilled) tensor would corrupt
+                esb = self.config.stc.get_tensor(
+                    f"{self.key}.{k}", self.device, optional = True, allow_bf16 = True,
+                    no_defer = True)
+                if esb is not None:
+                    self.e_score_correction_bias = esb if esb.dtype == torch.half else esb.float()
                     break
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
@@ -1007,6 +1026,7 @@ class BlockSparseMLP(Module):
             routing_weights_bsz1 = routing_weights_bsz1,
             selected_experts_bsz1 = selected_experts_bsz1,
             e_score_correction_bias = self.e_score_correction_bias,
+            e_score_bias_h = None,
             tid2eid = self.tid2eid,
             routed_scaling_factor = self.routed_scaling_factor,
             n_group = self.n_group,
@@ -1035,13 +1055,15 @@ class BlockSparseMLP(Module):
 
         if self.e_score_correction_bias_key:
             for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
-                self.e_score_correction_bias = self.config.stc.get_tensor(
+                esb = self.config.stc.get_tensor(
                     f"{self.key}.{k}",
                     self.device,
                     optional = True,
-                    float2half = True,
+                    allow_bf16 = True,
+                    no_defer = True,
                 )
-                if self.e_score_correction_bias is not None:
+                if esb is not None:
+                    self.e_score_correction_bias = esb if esb.dtype == torch.half else esb.float()
                     break
         if self.tid2eid_key:
             self.tid2eid = self.config.stc.get_tensor(
