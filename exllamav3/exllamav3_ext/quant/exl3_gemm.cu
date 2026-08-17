@@ -365,19 +365,21 @@ or q = j otherwise. This supports the following modes:
   the kernel reads its first num_indices entries as q values. Negative indices
   skip that slot.
 - Weighted MoE reduction: weights is a float16 tensor parallel to indices.
-  Each transformed result is multiplied by weights[j], then all active C[j]
-  are summed into C[0]. C therefore also serves as per-expert scratch; only
-  C[0] is the reduced result.
+  Each transformed result is multiplied by weights[j], then the active C[j]
+  are summed per token: slots are split into num_tokens contiguous groups of
+  bszm / num_tokens and group t is summed into C[t]. C therefore also serves
+  as per-expert scratch; only C[0..num_tokens) are reduced results.
 - Expert-range filtering: with min_index >= 0, selections outside
-  [min_index, max_index) are removed and retained indices are rebased by
+  [min_index, max_index) are skipped and retained indices are rebased by
   min_index. This allows B/suh/svh to be local pointer tables for an expert
-  shard. Weights are compacted in the same order.
+  shard. Filtered slots keep their position, so A/C rows and weights line up
+  with indices exactly as they do without filtering.
 
 Without weights, every active C[j] is a separate output. The active slot count
 is max(a_batches, c_batches), capped to num_indices when indices is present.
 
 Limitations: k must be divisible by 16 and n by 128. Range filtering supports
-at most 128 slots (the kernel's index-compaction capacity).
+up to MGEMM_MAX_SLOTS slots.
 */
 
 int exl3_mgemm_gr
@@ -405,10 +407,6 @@ int exl3_mgemm_gr
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
-
-    TORCH_CHECK(num_tokens == 1 || min_index < 0,
-        "exl3_mgemm: multi-token reduction (num_tokens > 1) is not compatible with expert-range "
-        "filtering (min_index >= 0); TP-sharded experts must use num_tokens == 1");
 
     TORCH_CHECK_DTYPE(A, kHalf);
     TORCH_CHECK_DTYPE(B, kLong);
@@ -446,6 +444,9 @@ int exl3_mgemm_gr
         bszm_out = (int) c_ptrs.value().size(0);
     }
     int bszm = MAX(bszm_in, bszm_out);
+
+    TORCH_CHECK(min_index < 0 || bszm <= MGEMM_MAX_SLOTS,
+                "exl3_mgemm: too many slots for expert-range filtering");
 
     // The kernel writes one hadamard-transformed input slab PER MATRIX (A_had + j * m * k);
     // an undersized scratch is silent OOB corruption (found the hard way)
