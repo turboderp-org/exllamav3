@@ -1135,14 +1135,9 @@ class BlockSparseMLP(Module):
         # Eligibility for the multi-row CUDA-graph path (bsz 1..MAX_BSZN): computed up front so
         # it can override the f_threshold-based routing below (bsz>=f_threshold would otherwise
         # always fall through to the exl3_moe/dense path first, capping this tier's reach at
-        # f_threshold-1 instead of MAX_BSZN). bsz==1 is unrestricted (original bsz-1 path); bsz>1
-        # additionally requires no TP expert-range sharding (the kernel's compaction path doesn't
-        # preserve fixed per-token slot groups) -- shared experts are supported at any bsz via
-        # BC_GatedMLP's own multi-row graph (see mlp.py)
-        bszn_eligible = (
-            self.bc is not None and bsz <= MAX_BSZN and
-            (bsz == 1 or self.experts_cfg.min_expert == -1)
-        )
+        # f_threshold-1 instead of MAX_BSZN). TP expert-range sharding is supported at any bsz --
+        # shared experts are too, via BC_GatedMLP's own multi-row graph (see mlp.py)
+        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
 
         # Routing
         if self.router_pre_norm:
@@ -1351,9 +1346,7 @@ class BlockSparseMLP(Module):
         # tokens this small is rare and not worth the argsort/bincount host-sync cost that the
         # fused/exl3_moe path pays), captured as one CUDA graph per bsz and replayed with only a
         # few tensor pointers patched. Shared experts (if present) run through their own
-        # multi-row BC_GatedMLP graph, fused into the same capture. bsz > 1 additionally requires
-        # no TP expert-range sharding (the kernel's compaction path doesn't preserve fixed
-        # per-token slot groups); bsz == 1 is unrestricted
+        # multi-row BC_GatedMLP graph, fused into the same capture
         elif bszn_eligible:
             self.bc.run_bszN(y, selected_experts, routing_weights)
             if self.experts_cfg.out_trim is not None:
@@ -1362,7 +1355,7 @@ class BlockSparseMLP(Module):
                 final_hidden_states = self.experts_cfg.out_d[:bsz, ...].view(x.shape)
             bc_sh_exp = self.bc_sh_exp
 
-        # Per-token mgemm loop: fallback for TP-sharded / shared-experts models at bsz 2..f_threshold-1
+        # Per-token mgemm loop: fallback above the multi-row graph tier, bsz MAX_BSZN+1..f_threshold-1
         elif bsz > 1:
 
             final_hidden_states = torch.empty_like(y, dtype = torch.float)
