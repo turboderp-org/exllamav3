@@ -2,10 +2,10 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.misc import Timer, cuda_sync_active
+from exllamav3.util.file import disk_lru_cache
 from exllamav3 import model_init
 import torch
 import argparse
-from functools import lru_cache
 
 # ANSI codes
 ESC = "\u001b"
@@ -18,9 +18,54 @@ col_gray = "\u001b[37;1m"
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
-@lru_cache
-def cached_ids(length):
-    return torch.arange(length, dtype = torch.long).unsqueeze(0)
+@disk_lru_cache("_load_wikitext2_raw")
+def _load_wikitext2_raw() -> str:
+    """
+    Get raw wikitext2 test split exactly as used by perplexity.c (datasets version differs slightly on whitespace)
+    """
+
+    import tempfile, zipfile, pathlib, urllib.request
+
+    _WIKITEXT2_URL = "https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip"
+
+    cache_dir = pathlib.Path(tempfile.gettempdir()) / "llama_cpp_ppl_wikitext2"
+    cache_dir.mkdir(parents = True, exist_ok = True)
+
+    raw_path = cache_dir / "wikitext-2-raw" / "wiki.test.raw"
+    if not raw_path.exists():
+
+        zip_path = cache_dir / "wikitext-2-raw-v1.zip"
+        if not zip_path.exists():
+            print(f"Downloading WikiText-2 raw to {zip_path} ...")
+            urllib.request.urlretrieve(_WIKITEXT2_URL, str(zip_path))
+
+        with zipfile.ZipFile(str(zip_path), "r") as zf:
+            zf.extractall(str(cache_dir))
+
+        zip_path.unlink(missing_ok = True)
+        if not raw_path.exists():
+            raise FileNotFoundError(f"Failed to extract to {raw_path}.")
+
+    with open(raw_path, "r", encoding = "utf-8") as f:
+        return f.read()
+
+
+# Measurement token stream: raw tokenized wikitext2 (same cached text as ppl.py) rather than
+# a synthetic pattern, so data-dependent work sees realistic activations (MoE expert routing
+# especially)
+_workload_ids = None
+
+def load_workload_ids(tokenizer, needed):
+    global _workload_ids
+    ids = tokenizer.encode(_load_wikitext2_raw())
+    if ids.shape[-1] < needed:
+        ids = ids.repeat(1, -(-needed // ids.shape[-1]))
+    _workload_ids = ids
+
+
+def workload_ids(pos, length):
+    a = pos % max(_workload_ids.shape[-1] - length, 1)
+    return _workload_ids[:, a : a + length]
 
 
 def get_lengths(max_length):
@@ -61,7 +106,7 @@ def measure_prefill(args, model, cache, warmup = False):
                         "batch_shape": (1, max(length, 256)),
                         "recurrent_states": recurrent,
                     }
-                    model.prefill(cached_ids(end - start), params)
+                    model.prefill(workload_ids(start, end - start), params)
                 cuda_sync_active()
                 if is_recurrent:
                     recurrent[0].free()
@@ -95,7 +140,7 @@ def measure_generate(args, model, cache, warmup = False):
                         "batch_shape": (1, max(length + 256, 256)),
                         "recurrent_states": recurrent
                     }
-                    logits = model.forward(cached_ids(1), params)
+                    logits = model.forward(workload_ids(length + i, 1), params)
                     sample = torch.argmax(logits)
                     sample = sample.cpu()  # force sync
                     del logits
@@ -121,6 +166,7 @@ def main(args):
         print(f" !! max_length cannot exceed cache size, limiting to {args.max_length}")
 
     model, config, cache, tokenizer = model_init.init(args, max_chunk_size = args.chunk_size)
+    load_workload_ids(tokenizer, args.max_length + 512)
     bpw_layer, bpw_head, vram_bits = model.get_storage_info()
 
     print(f" -- Bitrate: {bpw_layer:.2f} bpw / {bpw_head:.2f} bpw (head)")
