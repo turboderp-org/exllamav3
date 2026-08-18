@@ -40,14 +40,20 @@ def set_memory_fraction_reserve(
     torch.cuda.set_per_process_memory_fraction(fraction, device = device)
 
 
-# Reserve all but byte amount on device
+# Allow byte amount to be used on device, PER LOAD: the budget is headroom for the load
+# being planned, on top of whatever this process already holds. set_per_process_memory_fraction
+# caps the process's CUMULATIVE reserved bytes, so the current reservation is added back —
+# otherwise a second component model (draft, vision tower) loaded with use_per_device would
+# have its budget silently reduced by the first component's footprint (same double-count the
+# reserve variant above corrects)
 def set_memory_fraction_use(
     use: int,
     device: int
 ):
     touch_device(device)
     total = torch.cuda.get_device_properties(device).total_memory
-    fraction = min(use / total, 1.0)
+    current = torch.cuda.memory_reserved(device)
+    fraction = min((current + use) / total, 1.0)
     torch.cuda.set_per_process_memory_fraction(fraction, device = device)
 
 

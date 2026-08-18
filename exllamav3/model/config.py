@@ -39,6 +39,11 @@ class InferParams:
         self.moe_cpu_offload = int(os.environ.get("EXL3_MOE_CPU_OFFLOAD", 0))
         self.draft_moe_cpu_offload = 0
         self.moe_cpu_offload_assigned = {}
+        # Experimental: per-layer expert split — run the TAIL N routed experts of every
+        # eligible block-sparse MoE layer on the CPU worker instead of whole layers, so the
+        # CPU GEMMs overlap each layer's own GPU expert compute. Mutually exclusive with
+        # moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts
+        self.moe_cpu_split = int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0))
         self.moe_cpu_component = "text"
         # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then cpu_count/2
         # (see moe_cpu_host.MoeCpuTuning)
