@@ -399,6 +399,11 @@ class Generator:
             }
         """
 
+        assert self.cache.initialized, \
+            "Cache tensors were never allocated. Construct the Cache BEFORE calling model.load()"
+        assert self.draft_cache is None or self.draft_cache.initialized, \
+            "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
+
         results = []
         self.iterate_start_jobs(results)
 
