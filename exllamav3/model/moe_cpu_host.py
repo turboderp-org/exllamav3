@@ -46,7 +46,7 @@ MOE_JOB_BYTES = (7 + MOE_JOB_MAX_EXPERTS + 1) * 4
 MOE_CTRL_JOBS_OFFSET = 384
 MOE_SLOT_FLAGS_OFFSET = MOE_CTRL_JOBS_OFFSET + MOE_JOB_RING * MOE_JOB_BYTES
 MOE_MAX_WSLOTS = 8
-MOE_FLAGS_SIZE = 2 * 64 * MOE_MAX_SLOTS + 2 * 64 * MOE_MAX_WSLOTS
+MOE_FLAGS_SIZE = 3 * 64 * MOE_MAX_SLOTS + 2 * 64 * MOE_MAX_WSLOTS
 MOE_STAGE_RING = 64
 MOE_STAGE_TAIL_OFFSET = MOE_SLOT_FLAGS_OFFSET + MOE_FLAGS_SIZE
 MOE_STAGE_HEAD_OFFSET = MOE_STAGE_TAIL_OFFSET + 64
@@ -247,6 +247,13 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
         def biases(ts):
             return [t[3] for t in ts] if ts and ts[0][3] is not None else []
 
+        # Per-layer, per-expert arena views retained for runtime expert installs (dynamic
+        # placement): the arena memory is what the compute kernels read, so an in-place copy
+        # into these views (with the same swizzle transform rehome applied) replaces an
+        # expert's weights. The parent quiesces (full sync, ring drained) before sending an
+        # install, so the workers never observe a torn write
+        layer_views = []
+
         while True:
             msg = conn.recv()
             if msg[0] == "layer":
@@ -267,6 +274,7 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
                     spec["activation"], spec["act_limit"],
                     1 if swz else 0,
                 )
+                layer_views.append((g, u, d))
                 # Reclaim this layer's now-discarded loader tensors immediately (rehome_all copied
                 # everything into the arena)
                 try:
@@ -286,13 +294,57 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
         shm = shared_memory.SharedMemory(name = shm_name)
         base = np.frombuffer(shm.buf, dtype = np.uint8).ctypes.data
         cext.exl3_moe_cpu_set_prof(layout.get("cpu_prof", False))
-        cext.exl3_moe_cpu_worker_run(
-            base,
-            layout["num_slots"], layout["slot_size"], layout["cap_rows"],
-            layout["max_hi"], layout["max_ho"], layout["max_topk"],
-            layout["wstage_off"], layout["num_wslots"], layout["wslot_size"],
-            threads, stage_threads,
+
+        def install(li, ei, keys):
+            """Replace expert ei of layer li with the checkpoint tensors at `keys` (one key
+            per projection, gate omitted for gateless layers), in place in the arena."""
+            views = layer_views[li]
+            projs = views if len(keys) == 3 else views[1:]
+            for key, plist in zip(keys, projs):
+                v_tr, v_suh, v_svh, v_bias = plist[ei]
+                new = stc.get_tensor(key + ".trellis", cpu)
+                assert new.shape == v_tr.shape, f"install shape mismatch: {key}"
+                if swz and v_tr.shape[2] // 16 != 8:
+                    tk, tn, ps = new.shape
+                    v_tr.view(tn // 8, tk, 8, ps) \
+                        .copy_(new.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3))
+                else:
+                    v_tr.copy_(new)
+                v_suh.copy_(stc.get_tensor(key + ".suh", cpu, float2half = True))
+                v_svh.copy_(stc.get_tensor(key + ".svh", cpu, float2half = True))
+                if v_bias is not None:
+                    v_bias.copy_(stc.get_tensor(key + ".bias", cpu, float2half = True))
+
+        # The compute loop runs on its own thread (worker_run releases the GIL); the main
+        # thread keeps serving the pipe for runtime installs
+        import threading
+        worker = threading.Thread(
+            target = cext.exl3_moe_cpu_worker_run,
+            args = (
+                base,
+                layout["num_slots"], layout["slot_size"], layout["cap_rows"],
+                layout["max_hi"], layout["max_ho"], layout["max_topk"],
+                layout["wstage_off"], layout["num_wslots"], layout["wslot_size"],
+                threads, stage_threads,
+            ),
+            daemon = True,
         )
+        worker.start()
+
+        while True:
+            try:
+                msg = conn.recv()
+            except EOFError:
+                break
+            if msg[0] == "install":
+                try:
+                    install(msg[1], msg[2], msg[3])
+                    conn.send(("ok",))
+                except Exception:
+                    conn.send(("err", traceback.format_exc()))
+            elif msg[0] == "quit":
+                break
+        worker.join(timeout = 2.0)
     except Exception:
         try:
             conn.send(("err", traceback.format_exc()))
@@ -311,6 +363,7 @@ class MoeCpuHost:
         self.model_dir = config.directory
         self.specs = []
         self.by_key = {}
+        self.live_layers = 0
         self.acked = 0
         self.started = False
         self.shm = None
@@ -374,8 +427,17 @@ class MoeCpuHost:
     def register_layer(self, key, gate_keys, up_keys, down_keys, activation, act_limit, hi, ho, topk,
                        proj_dims = None, aux = None):
         if key in self.by_key:
-            # Autosplit rollback retry: the child keeps its copy, reuse the index
-            return self.by_key[key]
+            # Autosplit rollback retry: the child keeps its copy, reuse the index, but take
+            # the re-fetched aux tensors: the retry runs on a different device, and the stored
+            # copies live on the one the layer just rolled back from. Streamed-prefill dequant
+            # builds raw pointer tables from these, so stale entries are device-A addresses
+            # handed to kernels on device B (illegal memory access on the first  multi-chunk
+            # prefill after a cross-device rollback)
+            idx = self.by_key[key]
+            self.live_layers += 1
+            if aux is not None:
+                self.aux[idx] = aux
+            return idx
         assert not self.started, "cannot register layers after the worker has started"
         self._spawn()
         spec = dict(
@@ -396,6 +458,7 @@ class MoeCpuHost:
             spec["proj_bytes"] = (gb, ub, db)
             spec["expert_bytes"] = gb + ub + db
         self.specs.append(spec)
+        self.live_layers += 1
         idx = len(self.specs) - 1
         self.by_key[key] = idx
         if aux is not None:
@@ -485,6 +548,7 @@ class MoeCpuHost:
                 out = view(off_out, self.cap_rows * max_ho, torch.float).view(self.cap_rows, max_ho),
                 data_ready = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + s * 64,
                 done = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + 64 * MOE_MAX_SLOTS + s * 64,
+                consumed = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + 2 * 64 * MOE_MAX_SLOTS + s * 64,
             ))
 
         # Weight-staging views, flags and streams for GPU-streamed prefill
@@ -493,7 +557,9 @@ class MoeCpuHost:
             self.wviews.append(torch.frombuffer(
                 self.shm.buf, dtype = torch.int16, count = self.wslot_size // 2,
                 offset = self.layout["wstage_off"] + s * self.wslot_size))
-        fl = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + 2 * 64 * MOE_MAX_SLOTS
+        # Wslot flag banks sit after data_ready/done/consumed (keep in sync with
+        # moe_handoff.h's layout comment and the watchdog unblock above)
+        fl = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + 3 * 64 * MOE_MAX_SLOTS
         self.stage_done_addr = [fl + s * 64 for s in range(MOE_MAX_WSLOTS)]
         self.pinned_free_addr = [fl + 64 * MOE_MAX_WSLOTS + s * 64 for s in range(MOE_MAX_WSLOTS)]
         self.v_stage_tail = u32[MOE_STAGE_TAIL_OFFSET // 4 : MOE_STAGE_TAIL_OFFSET // 4 + 1]
@@ -540,9 +606,11 @@ class MoeCpuHost:
                         u32 = self._flags_u32
                         seq, wseq = self.seq + 1, self.wseq + 1
                         done0 = MOE_SLOT_FLAGS_OFFSET + 64 * MOE_MAX_SLOTS
+                        cons0 = MOE_SLOT_FLAGS_OFFSET + 2 * 64 * MOE_MAX_SLOTS
                         for s in range(MOE_MAX_SLOTS):
                             u32[(done0 + s * 64) // 4] = seq
-                        fl = MOE_SLOT_FLAGS_OFFSET + 2 * 64 * MOE_MAX_SLOTS
+                            u32[(cons0 + s * 64) // 4] = seq
+                        fl = MOE_SLOT_FLAGS_OFFSET + 3 * 64 * MOE_MAX_SLOTS
                         for s in range(MOE_MAX_WSLOTS):
                             u32[(fl + s * 64) // 4] = wseq                          # stage_done
                             u32[(fl + 64 * MOE_MAX_WSLOTS + s * 64) // 4] = wseq    # pinned_free
@@ -581,7 +649,7 @@ class MoeCpuHost:
                 ev0 = torch.cuda.Event(enable_timing = True)
                 ev1 = torch.cuda.Event(enable_timing = True)
                 ev0.record()
-                jobs, rtmp = self._issue_compute(layer_idx, y, selected_experts, routing_weights, spec)
+                jobs, rtmp = self._issue_compute(layer_idx, y, selected_experts, routing_weights, spec, out, h)
                 self._collect_compute(jobs, out, rtmp, h)
                 ev1.record()
                 self._prof_ev.append((ev0, ev1))
@@ -595,28 +663,58 @@ class MoeCpuHost:
                               f"max {done_ms[-1]:.3f}", flush = True)
                     self._prof_ev = self._prof_ev[-1:]
             else:
-                jobs, rtmp = self._issue_compute(layer_idx, y, selected_experts, routing_weights, spec)
+                jobs, rtmp = self._issue_compute(layer_idx, y, selected_experts, routing_weights, spec, out, h)
                 self._collect_compute(jobs, out, rtmp, h)
         return out
 
-    def _issue_compute(self, layer_idx, y, selected_experts, routing_weights, spec):
+    def submit_issue(self, layer_idx, y, selected_experts, routing_weights):
         """
-        Stage inputs and publish one compute job per cap_rows chunk (descriptors, D2H copies and
-        data_ready flags only). Waits and readbacks are deferred to _collect_compute so other GPU
-        work can be enqueued in between. Caller holds the device guard.
+        Two-phase submit for the per-layer expert split: stage this layer's inputs and publish
+        the compute job(s) nwo, defer the stream-side waits and readbacks to submit_collect so
+        the caller can enqueue its own GPU expert work in between. That work then executes
+        concurrently with the worker instead of behind the flag wait.
+        """
+        with torch.cuda.device(y.device):
+            spec = self.specs[layer_idx]
+            h = y.shape[1]
+            out = torch.empty((y.shape[0], h), dtype = torch.float, device = y.device)
+            jobs, rtmp = self._issue_compute(layer_idx, y, selected_experts, routing_weights, spec, out, h)
+        return (jobs, rtmp, out, h, y.device)
+
+    def submit_collect(self, handle):
+        """Enqueue the deferred flag waits and readbacks; returns the (asynchronously
+        filled) output tensor. Never synchronizes the host."""
+        jobs, rtmp, out, h, dev = handle
+        with torch.cuda.device(dev):
+            self._collect_compute(jobs, out, rtmp, h)
+        return out
+
+    def _issue_compute(self, layer_idx, y, selected_experts, routing_weights, spec, out, h):
+        """
+        Stage inputs and publish one compute job per cap_rows chunk (descriptors, D2H copies
+        and data_ready flags only). Waits and readbacks are deferred to _collect_compute so
+        other GPU work can be enqueued in between. BUT! Only up to num_slots jobs deep: a
+        deeper batch inline-collects the (i - num_slots)-th job before reusing its slot.
+        Without the window, slot reuse inside one batch waits on a consumed flag whose write
+        (in the deferred collect) sits BEHIND the wait on the same stream (an in-stream
+        deadlock (second-prompt freeze)) and even under the old done-flag gating the
+        worker's next compute could overwrite a slot output the deferred readback had not
+        fetched yet. Caller holds device guard.
         """
         rows = y.shape[0]
-        h = y.shape[1]
+        h_ = y.shape[1]
         hi = spec["hi"]
         ho = spec["ho"]
         sel32 = selected_experts.to(torch.int32)
         # Zero-pad up to the quantized input width on the GPU so every D2H below is a contiguous
         # full-width block (see the assert in ensure_started for why this matters)
-        y_pad = torch.nn.functional.pad(y, (0, hi - h)) if hi != h else y
+        y_pad = torch.nn.functional.pad(y, (0, hi - h_)) if hi != h_ else y
         rtmp = torch.empty((min(self.cap_rows, rows), ho), dtype = torch.float, device = y.device) \
-            if ho != h else None
+            if ho != h_ else None
         jobs = []
         for a in range(0, rows, self.cap_rows):
+            if len(jobs) >= self.num_slots:
+                self._collect_one(jobs.pop(0), out, rtmp, h)
             b = min(a + self.cap_rows, rows)
             n = b - a
             slot_idx = self.next_slot
@@ -644,13 +742,12 @@ class MoeCpuHost:
             job[5] = 0    # MOE_JOB_KIND_COMPUTE
             self.v_jobs_tail[0] = tail + 1
 
-            # Serialize on the previous tenant having been fully consumed (the worker sets done
-            # only after writing its output). Unconditional: with waits deferred to collect, the
-            # ring can be issued deeper than the slot count, and the previous tenant may even
-            # have been issued from a different device's stream
+            # Serialize on the previous tenant's output having been read back (consumed flag,
+            # written by the collecting stream after its D2H), not merely computed (done flag):
+            # with offloaded layers spread over multiple devices, the previous tenant's collect
+            # may sit queued on a different stream than this issue
             if self.slot_last_seq[slot_idx]:
-                ext.exl3_moe_flag_wait(slot["done"], self.slot_last_seq[slot_idx],
-                                       self.gpu_base_ptr + 128)
+                ext.exl3_moe_flag_wait(slot["consumed"], self.slot_last_seq[slot_idx], self.gpu_base_ptr + 128)
             slot["x"][:n].copy_(y_pad[a:b], non_blocking = True)
             slot["sel"][:n].copy_(sel32[a:b], non_blocking = True)
             slot["w"][:n].copy_(routing_weights[a:b], non_blocking = True)
@@ -659,17 +756,25 @@ class MoeCpuHost:
             jobs.append((seq, slot_idx, a, b, n))
         return jobs, rtmp
 
+    def _collect_one(self, job, out, rtmp, h):
+        seq, slot_idx, a, b, n = job
+        slot = self.slots[slot_idx]
+        ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
+        if rtmp is None:
+            out[a:b].copy_(slot["out"][:n], non_blocking = True)
+        else:
+            rtmp[:n].copy_(slot["out"][:n], non_blocking = True)
+            out[a:b] = rtmp[:n, :h]
+        # Publish consumption AFTER the readback on this same stream: the slot's next tenant
+        # (possibly issuing from another device) gates on this
+        ext.exl3_moe_flag_write(slot["consumed"], seq)
+
     def _collect_compute(self, jobs, out, rtmp, h):
-        """Wait for each issued job and read its output back; the padded width is trimmed on the
-        GPU. Caller holds the device guard."""
-        for seq, slot_idx, a, b, n in jobs:
-            slot = self.slots[slot_idx]
-            ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
-            if rtmp is None:
-                out[a:b].copy_(slot["out"][:n], non_blocking = True)
-            else:
-                rtmp[:n].copy_(slot["out"][:n], non_blocking = True)
-                out[a:b] = rtmp[:n, :h]
+        """Wait for each still-pending job and read its output back; the padded width is
+        trimmed on the GPU. Jobs beyond the slot count were already collected inline by the
+        issue loop's sliding window. Caller holds the device guard."""
+        for job in jobs:
+            self._collect_one(job, out, rtmp, h)
 
     def _ensure_stream_state(self, device):
         key = torch.device(device).index or 0
@@ -753,6 +858,16 @@ class MoeCpuHost:
         uf = torch.nn.functional.relu(u.float())
         return (uf * uf).half()
 
+    def install_expert(self, layer_idx, local_idx, keys):
+        """Dynamic placement: replace worker expert `local_idx` of `layer_idx` with the
+        checkpoint tensors at `keys` (per-projection prefixes, gate first when gated). The
+        caller must have quiesced (full stream sync => job ring drained, worker idle) before
+        calling; blocks until the child acks the in-place arena copy."""
+        self.conn.send(("install", layer_idx, local_idx, keys))
+        msg = self.conn.recv()
+        if msg[0] != "ok":
+            raise RuntimeError(f"CPU MoE worker expert install failed: {msg[1] if len(msg) > 1 else msg}")
+
     def submit_prefill(self, layer_idx, y, selected_experts, routing_weights):
         """
         Split the routed-expert workload by per-expert token count: hot experts (count >=
@@ -830,7 +945,7 @@ class MoeCpuHost:
             out_t = torch.empty((n_tail, h), dtype = torch.float, device = y.device)
             tail_jobs, rtmp = self._issue_compute(
                 layer_idx, y.index_select(0, tidx), sel_tail.index_select(0, tidx),
-                routing_weights.index_select(0, tidx), spec)
+                routing_weights.index_select(0, tidx), spec, out_t, h)
 
         aux = self.aux[layer_idx]
         pd = spec["proj_dims"]
@@ -987,11 +1102,15 @@ class MoeCpuHost:
         return out
 
     def unregister(self):
-        # Called per offloaded layer on unload; shut down when the model releases the last one
-        if not self.specs:
+        # Called per offloaded layer on unload; shut down when the model releases the last
+        # one. A LIVE COUNT, not specs.pop(): register_layer hands out stable indices into
+        # specs (and returns cached indices on autosplit rollback retries), so removing
+        # entries desyncs every later layer's index and the ack bookkeeping — under tight
+        # autosplit budgets with split layers on every device this hung the load
+        if self.live_layers == 0:
             return
-        self.specs.pop()
-        if not self.specs:
+        self.live_layers -= 1
+        if self.live_layers == 0:
             self.shutdown()
 
     def shutdown(self):
@@ -999,6 +1118,10 @@ class MoeCpuHost:
             try:
                 if self.started and self.shm is not None:
                     self.v_quit[0] = 1
+                    # The child's main thread serves the pipe at runtime (expert installs);
+                    # the flag stops its compute thread, the message unblocks the recv loop
+                    if self.conn is not None:
+                        self.conn.send(("quit",))
                 elif self.conn is not None:
                     self.conn.send(("quit",))
                 self.proc.join(timeout = 5)
@@ -1010,6 +1133,13 @@ class MoeCpuHost:
             except Exception:
                 pass
             self.proc = None
+        # Full reset: a later re-registration must not resolve stale indices against a child
+        # that no longer exists
+        self.specs = []
+        self.by_key = {}
+        self.aux = {}
+        self.acked = 0
+        self.live_layers = 0
         cleanupper.unregister_atexit(self.shutdown)
         if self.conn is not None:
             try:

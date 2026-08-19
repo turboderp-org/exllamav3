@@ -26,6 +26,15 @@ void routing_ds3_nogroup_logits
     const int act_fn
 );
 
+void moe_split_map
+(
+    at::Tensor sel,
+    const at::Tensor& map,
+    at::Tensor hist,
+    at::Tensor sel_cpu,
+    const int64_t first_cpu_slot
+);
+
 void routing_sel_norm
 (
     const at::Tensor& hidden,

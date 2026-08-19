@@ -89,6 +89,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
     m.def("routing_sel_norm", &routing_sel_norm, "routing_sel_norm");
+    m.def("moe_split_map", &moe_split_map, "moe_split_map");
     m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
     m.def("dsa_topk", &dsa_topk, "dsa_topk");

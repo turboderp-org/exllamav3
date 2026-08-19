@@ -863,6 +863,62 @@ selected: Expert indices, int64, shape (bsz, k)
 weights: Output, float16, shape (bsz, k)
 */
 
+// Dynamic expert placement (CPU expert split): one pass over the selected-expert ids that
+// records hit counts, translates router ids to physical slots inplace (the bsz-1 routing
+// statics are read by captured graphs at baked addresses), and emits the worker-side
+// selection with GPU-resident picks replaced by the -1 sentinel. Replaces a 4-5 launch
+// torch chain per MoE layer per step, which measurably outweighed the placement benefit on
+// 40-layer models
+
+__global__ void moe_split_map_kernel
+(
+    int64_t* __restrict__ sel,           // (n,) router ids in, physical slots out
+    const int64_t* __restrict__ map,     // (E,) router id -> physical slot
+    float* __restrict__ hist,            // (E,) hit counts (router space)
+    int64_t* __restrict__ sel_cpu,       // (n,) out: worker slot if CPU-resident else -1
+    const int n,
+    const int first_cpu_slot
+)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int64_t r = sel[i];
+    atomicAdd(&hist[r], 1.0f);
+    int64_t p = map[r];
+    sel_cpu[i] = p >= first_cpu_slot ? p - first_cpu_slot : -1;
+    sel[i] = p;
+}
+
+void moe_split_map
+(
+    at::Tensor sel,
+    const at::Tensor& map,
+    at::Tensor hist,
+    at::Tensor sel_cpu,
+    const int64_t first_cpu_slot
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(sel.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(sel, kLong);
+    TORCH_CHECK_DTYPE(map, kLong);
+    TORCH_CHECK_DTYPE(hist, kFloat);
+    TORCH_CHECK_DTYPE(sel_cpu, kLong);
+    int n = (int) sel.numel();
+    TORCH_CHECK(sel_cpu.numel() >= n, "moe_split_map: sel_cpu too small");
+    int threads = n < 1024 ? n : 1024;
+    int blocks = (n + threads - 1) / threads;
+    moe_split_map_kernel<<<blocks, threads, 0, stream>>>
+    (
+        (int64_t*) sel.data_ptr(),
+        (const int64_t*) map.data_ptr(),
+        (float*) hist.data_ptr(),
+        (int64_t*) sel_cpu.data_ptr(),
+        n, (int) first_cpu_slot
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
 __global__ void routing_sel_norm_kernel
 (
     const half* __restrict__ scores,

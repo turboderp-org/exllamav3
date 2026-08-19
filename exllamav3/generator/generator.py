@@ -454,6 +454,11 @@ class Generator:
         if self.recurrent_cache is not None:
             self.recurrent_cache.prune_stranded()
         self.pagetable.defrag()
+        # Dynamic expert placement: apply any pending swap sweep now, between generations —
+        # a placement change perturbs the logits slightly (same expert, different device
+        # numerics) and must never land mid-stream
+        from ..modules.block_sparse_mlp_cpu import run_pending_swap_sweeps
+        run_pending_swap_sweeps(self.model.config.infer_params)
         malloc_trim()
 
 

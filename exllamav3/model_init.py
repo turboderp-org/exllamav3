@@ -56,6 +56,7 @@ def add_args(
 
     parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
     parser.add_argument("-mcl", "--moe_cpu_offload", type = int, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
+    parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
     parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else cpu_count/2)", default = None)
     parser.add_argument("-tpb", "--tp_backend", type = str, help = "Tensor-parallel backend, either 'native' (default) or 'nccl'", default = "native")
     parser.add_argument("-tp_attn", "--tp_max_parallelism_attn", type = int, help = "(TP) Maximum parallelism for attention layers", default = None)
@@ -199,6 +200,10 @@ def init(
     if getattr(args, "moe_cpu_offload", 0):
         assert not args.tensor_parallel, "--moe_cpu_offload currently requires layer-split mode"
         config.infer_params.moe_cpu_offload = args.moe_cpu_offload
+    if getattr(args, "moe_cpu_split", 0):
+        assert not args.tensor_parallel, "--moe_cpu_split currently requires layer-split mode"
+        assert not getattr(args, "moe_cpu_offload", 0), "--moe_cpu_split and --moe_cpu_offload are mutually exclusive"
+        config.infer_params.moe_cpu_split = args.moe_cpu_split
     if getattr(args, "moe_cpu_threads", None) is not None:
         config.infer_params.moe_cpu_threads = args.moe_cpu_threads
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
