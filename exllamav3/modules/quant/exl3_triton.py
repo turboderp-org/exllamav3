@@ -25,6 +25,8 @@ fall back to a generic staged-row tl.gather decode that covers all widths.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 try:
@@ -330,7 +332,12 @@ def _m1_splitk_plan(M: int, N: int, K_dim: int, K_bits: int) -> int:
     needs no environment variable.
     """
     import os
-    if M != 1 or K_bits != 4 or N > 32768 or N % 256 or K_dim % 256:
+    if M != 1 or K_bits not in (4, 6) or N % 256 or K_dim % 256:
+        return 1
+    # bits=4 splits linear-class shapes; bits=6 splits the linear-class b6
+    # shapes too (6bpw MLP: down 442 -> 559 GB/s) but NOT the lm_head stream
+    # (N=248320 loses at S=4: 628 vs 666 GB/s classic — already parallel)
+    if N > (16384 if K_bits == 6 else 32768):
         return 1
     k_tiles = K_dim // 16
     splits = 8 if k_tiles >= 512 else (4 if k_tiles >= 256 else 1)
@@ -505,6 +512,11 @@ def _exl3_gemm_early_prune(configs, named_args, **kwargs):
                         pool = ((32, 128), (32, 256), (64, 128))
                     else:
                         pool = ((128, 128), (64, 256), (64, 128))
+                elif bits == 6 and n <= 16384 and n % 256 == 0 and k % 256 == 0 and k // 16 >= 256:
+                    # Split-K-eligible bits=6 linear-class shape: BK128 stays
+                    # the winner for the b6 funnel decode (6bpw MLP split-4:
+                    # 559-570 GB/s vs 442-553 classic)
+                    pool = ((64, 128), (32, 128))
                 elif n <= 16384:
                     pool = ((32, 128), (32, 256))
                 else:
@@ -884,7 +896,7 @@ def _fused_dequant_gemm_kernel(
             acc3 = tl.zeros((2, 2, NN, 8, 2), dtype=tl.float32)
             for k_outer in range(n_outer):
                 for ki in tl.static_range(NK):
-                    ktb = k_outer * NK + ki
+                    ktb = k_base + k_outer * NK + ki
                     row = tu32_ptr + ktb * stride_tk_u32 + base_n
                     words2 = tl.reshape(tl.load(row + wbase), (NN, 16))
                     wone2 = tl.reshape(tl.load(row + wone), (NN, 16))
@@ -913,7 +925,13 @@ def _fused_dequant_gemm_kernel(
             h0 = s0 + s2v
             h1 = s1 + s3
             out = tl.permute(tl.join(h0, h1), (0, 2, 1))
-            tl.store(y_ptr + offs_n * stride_yn, tl.reshape(out, (BLOCK_N,)).to(y_ptr.dtype.element_ty), mask=mask_n)
+            if SPLITS == 1:
+                tl.store(y_ptr + offs_n * stride_yn, tl.reshape(out, (BLOCK_N,)).to(y_ptr.dtype.element_ty), mask=mask_n)
+            else:
+                # Split-K partial (see the bits=4 M1 path): fp32 row of the
+                # [SPLITS, N] buffer, summed + output-Hadamard by the reduce.
+                tl.store(y_ptr + pid_split * stride_ys + offs_n * stride_yn,
+                         tl.reshape(out, (BLOCK_N,)), mask=mask_n)
         else:
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             for k_outer in range(n_outer):
@@ -1383,9 +1401,10 @@ def exl3_gemm_triton(
     M, K_dim = x.shape
     N = y.shape[1]
 
-    # The split store exists only in the bits=4 M==1 fast branch; never let a
-    # split request reach any other path.
-    splits = splits if (M == 1 and K_bits == 4) else 1
+    # The split store exists only in the bits=4/6 M==1 fast branches; never
+    # let a split request reach any other path.
+    if not (M == 1 and K_bits in (4, 6)):
+        splits = 1
 
     grid = lambda meta: (
         triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]) * splits,

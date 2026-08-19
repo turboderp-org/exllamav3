@@ -317,11 +317,15 @@ def test_m1_splitk_plan():
     # Qualifying bits=4 starved-N shapes split by K depth
     assert _m1_splitk_plan(1, 2048, 4096, 4) == 4     # 256 k-tiles -> S=4
     assert _m1_splitk_plan(1, 2048, 8192, 4) == 8     # 512 k-tiles -> S=8
+    # bits=6 linear-class shapes split too; lm_head-class N stays classic
+    assert _m1_splitk_plan(1, 2048, 8192, 6) == 8
+    assert _m1_splitk_plan(1, 4096, 4096, 6) == 4
+    assert _m1_splitk_plan(1, 248320, 4096, 6) == 1   # huge N already parallel
     # Too-shallow K stays classic
     assert _m1_splitk_plan(1, 512, 1024, 4) == 1
-    # Other bit widths / batched rows never split; lm_head-class N stays classic
-    assert _m1_splitk_plan(1, 2048, 8192, 6) == 1
+    # Batched rows / other bit widths never split
     assert _m1_splitk_plan(16, 2048, 8192, 4) == 1
+    assert _m1_splitk_plan(1, 2048, 8192, 2) == 1
     assert _m1_splitk_plan(1, 248320, 4096, 4) == 1
     # Indivisible-by-256 shapes stay classic
     assert _m1_splitk_plan(1, 4224, 4096, 4) == 1     # 4224 % 256 != 0
@@ -344,6 +348,26 @@ def test_m1_splitk_linear_vs_reference(in_features, out_features, mcg, mul1):
     )
     y = linear_exl3_triton(
         x, trellis, suh, svh, 4, mcg, mul1,
+        in_features, out_features, dev, torch.half,
+    )
+    assert _rel_err(y, y_ref) < 2e-2
+
+
+@pytest.mark.parametrize("mcg,mul1", [(False, False), (True, True)])
+@pytest.mark.parametrize("in_features,out_features", SPLIT_SHAPES)
+def test_m1_splitk_b6_vs_reference(in_features, out_features, mcg, mul1):
+    """bits=6 M == 1 split-K route vs the C++ reference."""
+    dev = device()
+    torch.manual_seed(in_features * 17 + out_features)
+    trellis = make_trellis(in_features, out_features, 6, dev)
+    suh, svh = make_suh_svh(in_features, out_features, dev)
+    x = torch.randn(1, in_features, dtype=torch.half, device=dev) * 0.1
+
+    y_ref = reference_reconstruct_hgemm(
+        x, trellis, suh, svh, 6, mcg, mul1, in_features, out_features, dev
+    )
+    y = linear_exl3_triton(
+        x, trellis, suh, svh, 6, mcg, mul1,
         in_features, out_features, dev, torch.half,
     )
     assert _rel_err(y, y_ref) < 2e-2
@@ -407,12 +431,12 @@ def test_prune_n_bucket_pools():
     # Large-N b4 with shallow K stays on the classic large-N pool
     p = pool(1, 12288, 2048, 4)
     assert set(p) == {(128, 128), (64, 256), (64, 128)}
-    # bits=6 mid-N (MLP g/u of a 6bpw model): BN32 only (BN64/BN128 collapse)
+    # bits=6 mid-N (MLP of a 6bpw model): split-eligible, BK128 pool
     p = pool(1, 12288, 4096, 6)
-    assert set(p) == {(32, 128), (32, 256)}
-    # bits=6 small-N (down of a 6bpw model): same narrow pool
+    assert set(p) == {(64, 128), (32, 128)}
+    # bits=6 small-N (down of a 6bpw model): same split pool
     p = pool(1, 4096, 12288, 6)
-    assert set(p) == {(32, 128), (32, 256)}
+    assert set(p) == {(64, 128), (32, 128)}
     # bits=6 huge-N (lm_head stream): BN64/BK128 (685 GB/s winner) + BN32
     p = pool(1, 248320, 4096, 6)
     assert set(p) == {(64, 128), (32, 128)}
