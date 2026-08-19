@@ -27,6 +27,12 @@ _prefill_mode = os.environ.get("EXL3_MLA_PREFILL", "mha")
 # above it, the long-query kernel (q split across programs) wins
 MAX_DECODE_QLEN = 16
 
+# Width of one indexer-scoring tile (keys per kernel call) in the eager top-k path. Bounds
+# the score transient at (256 rows, tile) regardless of context length; must be a multiple
+# of the page size (256)
+_score_tile = int(os.environ.get("EXL3_DSA_SCORE_TILE", 32768))
+assert _score_tile % 256 == 0 and _score_tile > 0
+
 
 
 def _host_seqlens(params: dict, cache_seqlens: torch.Tensor) -> list:
@@ -425,27 +431,75 @@ class MLAttention(Module):
         t_max = max(host_seqlens) + seqlen
         k_pad = -(-min(self.index_topk, t_max) // 32) * 32
         indices = torch.empty((bsz * seqlen, k_pad), dtype = torch.int32, device = x.device)
-        # Row slabs bound the transient (rows, T) score matrix: at long context it is the one
-        # buffer that grows with the visible sequence, so a full prefill chunk's worth is
-        # deliberately never materialized at once. Selection is per-row, so slabbing changes
-        # nothing about membership
+        # Row slabs bound the transient score matrix in one direction, tiles over the visible
+        # context bound it in the other: nothing here scales with T, so the reference forward
+        # at load time is a true worst case for any later context length. Selection is
+        # per-row and per-tile top-k merge is exact (any global top-k member is in its own
+        # tile's top-k), so neither slabbing nor tiling changes membership
         slab = 256
+        t_tile = _score_tile
+        if idx_pool is not None:
+            # Tiles slice the block table whole pages at a time
+            epp = idx_pool.shape[1]
+            t_tile = max(epp, t_tile // epp * epp)
+        from ..util.tensor import g_tensor_cache
         for b in range(bsz):
             for r0 in range(0, seqlen, slab):
                 r1 = min(r0 + slab, seqlen)
+                rows = r1 - r0
                 pos0 = host_seqlens[b] + r0
                 t_slab = host_seqlens[b] + r1
-                if k_idx_chunk is not None:
-                    scores = dsa_indexer_scores(
-                        q_idx[b, r0:r1], w[b, r0:r1], k_idx_chunk[b], pos0, 1, t_slab,
+                k_sel = min(self.index_topk, t_slab)
+                out_slab = indices[b * seqlen + r0 : b * seqlen + r1]
+
+                def tile_scores(t0, t1, scores_out = None):
+                    if k_idx_chunk is not None:
+                        return dsa_indexer_scores(
+                            q_idx[b, r0:r1], w[b, r0:r1], k_idx_chunk[b][t0:t1],
+                            pos0 - t0, 1, t1 - t0, scores = scores_out,
+                        )
+                    epp = idx_pool.shape[1]
+                    bt = block_table[b]
+                    if t0:
+                        bt = bt[t0 // epp : -(-t1 // epp)]
+                    return dsa_indexer_scores(
+                        q_idx[b, r0:r1], w[b, r0:r1], idx_pool.view(-1, D_i),
+                        pos0 - t0, 1, t1 - t0, scores = scores_out,
+                        block_table = bt, epp = epp,
                     )
-                else:
-                    scores = dsa_indexer_scores(
-                        q_idx[b, r0:r1], w[b, r0:r1], idx_pool.view(-1, D_i), pos0, 1, t_slab,
-                        block_table = block_table[b], epp = idx_pool.shape[1],
-                    )
-                ext.dsa_topk(scores, indices[b * seqlen + r0 : b * seqlen + r1],
-                             min(self.index_topk, t_slab), None, 0)
+
+                dev = x.device
+                s_backing = g_tensor_cache.get(dev, (slab * t_tile,), torch.half, "dsa_stile")
+
+                if t_slab <= t_tile:
+                    s_stride = -(-t_slab // 128) * 128
+                    sc = tile_scores(0, t_slab, s_backing[: rows * s_stride].view(rows, s_stride))
+                    ext.dsa_topk(sc, out_slab, k_sel, None, 0)
+                    continue
+
+                # Tiled path: fixed-size score/index backings, running (score, index) top-k
+                # candidate set merged tile by tile
+                i_backing = g_tensor_cache.get(dev, (slab * k_pad,), torch.int32, "dsa_itile")
+                run_scr = torch.full((rows, k_sel), -float("inf"), dtype = torch.half, device = dev)
+                run_idx = torch.full((rows, k_sel), -1, dtype = torch.int32, device = dev)
+                for t0 in range(0, t_slab, t_tile):
+                    t1 = min(t0 + t_tile, t_slab)
+                    s_stride = -(-(t1 - t0) // 128) * 128
+                    sc = tile_scores(t0, t1, s_backing[: rows * s_stride].view(rows, s_stride))
+                    k_t = min(k_sel, t1 - t0)
+                    kp_t = -(-k_t // 32) * 32
+                    ti = i_backing[: rows * kp_t].view(rows, kp_t)
+                    ext.dsa_topk(sc, ti, k_t, None, 0)
+                    t_scr = sc.gather(1, ti.clamp_min(0).long())
+                    t_scr = t_scr.masked_fill(ti < 0, -float("inf"))
+                    t_idx = torch.where(ti >= 0, ti + t0, ti)
+                    cand_scr = torch.cat((run_scr, t_scr), dim = 1)
+                    cand_idx = torch.cat((run_idx, t_idx), dim = 1)
+                    run_scr, sel = cand_scr.topk(k_sel, dim = 1)
+                    run_idx = cand_idx.gather(1, sel)
+                out_slab.fill_(-1)
+                out_slab[:, :k_sel] = torch.where(
+                    run_scr > -float("inf"), run_idx, run_idx.new_full((), -1))
         return indices
 
 
@@ -622,7 +676,11 @@ class MLAttention(Module):
         R = bsz * seqlen
         D_r = self.qk_rope_head_dim
 
-        bt = block_table if seqlen == 1 else block_table.repeat_interleave(seqlen, dim = 0)
+        # A single-row block table is shared by every query row inside dsa_attn (stride-0
+        # lookup), so bsz 1 never materializes the (R, pages) expansion which would other-
+        # wise be the one sparse-path transient that grows with context (pages)
+        bt = block_table if bsz == 1 or seqlen == 1 \
+            else block_table.repeat_interleave(seqlen, dim = 0)
         o_lat = dsa_attn(
             q_lat, ckv_cache, kpe_cache, bt,
             indices = indices, k_len = indices.shape[1],

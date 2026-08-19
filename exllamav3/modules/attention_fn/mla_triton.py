@@ -935,14 +935,22 @@ def mla_attn_triton_decode(
         max_k_len = min(max_k_len, max_kv_len)
 
     programs = bsz * h_blocks
+    # Workspace is sized to the device cap, NOT the live split count: num_splits tracks
+    # max_k_len (context), and sizing the buffers to it would keep a new tensor-cache entry
+    # for every 4*block_n tokens of context growth (hundreds of MB of dead workspace over a
+    # long session). The kernels only touch the first programs * num_splits * block_rows
+    # rows of the cap-sized buffers
+    target = 2 * _get_sm_count(q_lat.device)
+    splits_cap = max(1, min(target // programs, 128))
     if num_splits is None:
-        target = 2 * _get_sm_count(q_lat.device)
-        num_splits = max(1, min(target // programs, triton.cdiv(max_k_len, 4 * block_n), 128))
+        num_splits = max(1, min(splits_cap, triton.cdiv(max_k_len, 4 * block_n)))
+    else:
+        splits_cap = max(splits_cap, num_splits)
     split_len = triton.cdiv(triton.cdiv(max_k_len, num_splits), block_n) * block_n
 
     if num_splits > 1:
-        n_o = programs * num_splits * block_rows * D_c
-        n_ml = programs * num_splits * block_rows * 2
+        n_o = programs * splits_cap * block_rows * D_c
+        n_ml = programs * splits_cap * block_rows * 2
         if scratch is not None:
             buf = scratch.get(n_o)
             if buf is None:
@@ -1102,9 +1110,11 @@ def mla_attn_triton_prefill_mha(
     kpe_t = sbuf("mha_kpe", (ts, D_r), torch.half)
     k_nope_t = sbuf("mha_kn", (ts, H * qk_nope_head_dim), torch.half)
     v_t = sbuf("mha_v", (ts, H * v_head_dim), torch.half)
-    state_m = sbuf("mha_m", (H, q_len), torch.float)
-    state_l = sbuf("mha_l", (H, q_len), torch.float)
-    state_acc = sbuf("mha_acc", (H, q_len, v_head_dim), torch.float)
+    qb = -(-q_len // 2048) * 2048
+    state_m = sbuf("mha_m", (H * qb,), torch.float)[: H * q_len].view(H, q_len)
+    state_l = sbuf("mha_l", (H * qb,), torch.float)[: H * q_len].view(H, q_len)
+    state_acc = sbuf("mha_acc", (H * qb * v_head_dim,), torch.float) \
+        [: H * q_len * v_head_dim].view(H, q_len, v_head_dim)
     out = torch.empty((R, H, v_head_dim), dtype = torch.half, device = dev)
 
     npps = block_table.shape[1]

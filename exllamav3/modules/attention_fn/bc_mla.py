@@ -247,22 +247,29 @@ class BCMLA:
             dict(n_q_heads = H, D_c = D_c, D_v = D_v, BLOCK_M = unfold_bm, BLOCK_K = 128),
             4, 2)
 
-        # Static intermediates, shared between layers with the same shapes on the same device
-        q_full = g_tensor_cache.get(dev, (R, self.w_q), torch.half, "bcm_qfull")
-        q_a = g_tensor_cache.get(dev, (R, self.q_lora_rank), torch.half, "bcm_qa") \
-            if self.q_lora_rank else None
-        ckv_kpe = g_tensor_cache.get(dev, (R, self.w_kv), torch.half, "bcm_ckvkpe")
-        ckv = g_tensor_cache.get(dev, (R, D_c), torch.half, "bcm_ckv")
-        kpe = g_tensor_cache.get(dev, (R, D_r), torch.half, "bcm_kpe")
-        q_pe = g_tensor_cache.get(dev, (R, H, D_r), torch.half, "bcm_qpe")
-        q_lat = g_tensor_cache.get(dev, (H, R, D_c), torch.half, "bcm_qlat")
-        o_lat = g_tensor_cache.get(dev, (H, R, D_c), torch.half, "bcm_olat")
-        o = g_tensor_cache.get(dev, (R, H * D_v), torch.half, "bcm_o")
-        partial_o = g_tensor_cache.get(dev, (programs * splits_cap * block_rows * D_c,), torch.float, "bcm_po")
-        partial_ml = g_tensor_cache.get(dev, (programs * splits_cap * block_rows * 2,), torch.float, "bcm_ml")
+        # Static intermediates, shared between layers on the same device. Bucketed flat
+        # backings sliced to shape: every (bsz, q_len) slot draws from the same per-tag
+        # allocations instead of keeping a fresh set per distinct R, so late-configured
+        # slots (odd prefill-tail lengths, new draft depths) do not grow the footprint
+        # beyond the largest slot's
+        def sbuf(tag, *shape, dtype = torch.half):
+            n = 1
+            for s in shape: n *= s
+            return g_tensor_cache.get_bucketed(dev, n, dtype, tag).view(*shape)
+        q_full = sbuf("bcm_qfull", R, self.w_q)
+        q_a = sbuf("bcm_qa", R, self.q_lora_rank) if self.q_lora_rank else None
+        ckv_kpe = sbuf("bcm_ckvkpe", R, self.w_kv)
+        ckv = sbuf("bcm_ckv", R, D_c)
+        kpe = sbuf("bcm_kpe", R, D_r)
+        q_pe = sbuf("bcm_qpe", R, H, D_r)
+        q_lat = sbuf("bcm_qlat", H, R, D_c)
+        o_lat = sbuf("bcm_olat", H, R, D_c)
+        o = sbuf("bcm_o", R, H * D_v)
+        partial_o = sbuf("bcm_po", programs * splits_cap * block_rows * D_c, dtype = torch.float)
+        partial_ml = sbuf("bcm_ml", programs * splits_cap * block_rows * 2, dtype = torch.float)
         if self.quant:
-            qtmp = g_tensor_cache.get(dev, (R, D_c // 32 * self.k_bits), torch.int, "bcm_qtmp")
-            stmp = g_tensor_cache.get(dev, (R, D_c // 32), torch.half, "bcm_stmp")
+            qtmp = sbuf("bcm_qtmp", R, D_c // 32 * self.k_bits, dtype = torch.int)
+            stmp = sbuf("bcm_stmp", R, D_c // 32)
         else:
             qtmp = stmp = None
 
@@ -302,15 +309,20 @@ class BCMLA:
         hb = -(-H // BLOCK_H)
         kp = -(-self.index_topk // 32) * 32
 
+        def sbuf(tag, *shape, dtype = torch.half):
+            n = 1
+            for s in shape: n *= s
+            return g_tensor_cache.get_bucketed(dev, n, dtype, tag).view(*shape)
+
         k_idx_norm = k_plane_append = k_fewq = None
         x_st = kidx = kidx_n = qidx = wts = scores = None
         fewq_gy = 0
         if full:
             Hi, Di = m.index_n_heads, m.index_head_dim
-            x_st = g_tensor_cache.get(dev, (R_pad, self.hidden_size), torch.half, "bcm_xst")
+            x_st = sbuf("bcm_xst", R_pad, self.hidden_size)
             x_st.zero_()
-            kidx = g_tensor_cache.get(dev, (R_pad, Di), torch.half, "bcm_kidxr")
-            kidx_n = g_tensor_cache.get(dev, (R, Di), torch.half, "bcm_kidxn")
+            kidx = sbuf("bcm_kidxr", R_pad, Di)
+            kidx_n = sbuf("bcm_kidxn", R, Di)
             k_idx_norm = _compile_kernel(dev, _mla_idx_norm_kernel,
                 {"k_raw": "*fp16", "w": "*fp16", "b": "*fp16", "k_out": "*fp16", "R": "i32"}
                 | {n: "constexpr" for n in ("eps", "D")},
@@ -326,14 +338,14 @@ class BCMLA:
         if regime == 1:
             if full:
                 Hi, Di = m.index_n_heads, m.index_head_dim
-                qidx = g_tensor_cache.get(dev, (R, Hi * Di), torch.half, "bcm_qidx")
-                wts = g_tensor_cache.get(dev, (R_pad, Hi), torch.half, "bcm_wts")
+                qidx = sbuf("bcm_qidx", R, Hi * Di)
+                wts = sbuf("bcm_wts", R_pad, Hi)
                 wts.zero_()
                 # Scoring covers the full plane capacity every step (bounds written -inf in
                 # kernel), so no stale scores survive from longer contexts
                 s_max = self.cache_kidx.view(-1, Di).shape[0]
                 assert s_max % 128 == 0
-                scores = g_tensor_cache.get(dev, (R, s_max), torch.half, "bcm_scores")
+                scores = sbuf("bcm_scores", R, s_max)
                 # The scoring kernel writes only [0, T); the warmup top-k scans the full
                 # static width, so the tail must hold -inf from this one-time fill (the
                 # captured graph patches the top-k scan width to T afterwards)
@@ -362,12 +374,12 @@ class BCMLA:
             # The indices static is deliberately SHARED between layers (one tag): layers run
             # in order on one stream, so a full layer's selection is in place when its shared
             # consumers gather through it, exactly like the eager params flow
-            indices = g_tensor_cache.get(dev, (R, kp), torch.int32, "bcm_dsa_idx")
+            indices = sbuf("bcm_dsa_idx", R, kp, dtype = torch.int32)
             if bsz > 1:
                 dsa_arr = g_tensor_cache.get(dev, (2, MAX_BSZ), torch.int32, "bcm_dsa_arr")
             # ws_acc rows are D_c wide: OUT_LATENT never accumulates the rope half
-            ws_ml = g_tensor_cache.get(dev, (R * hb * N_SPLITS * BLOCK_H * 2,), torch.float, "bcm_dsa_wsml")
-            ws_acc = g_tensor_cache.get(dev, (R * hb * N_SPLITS * BLOCK_H * D_c,), torch.float, "bcm_dsa_wsacc")
+            ws_ml = sbuf("bcm_dsa_wsml", R * hb * N_SPLITS * BLOCK_H * 2, dtype = torch.float)
+            ws_acc = sbuf("bcm_dsa_wsacc", R * hb * N_SPLITS * BLOCK_H * D_c, dtype = torch.float)
             self.slot_indices[(bsz, q_len)] = indices
 
             sig_s = {
