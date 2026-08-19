@@ -301,8 +301,119 @@ def test_had_r_128_triton_vs_cpp(dim, dtype):
 
 
 # ---------------------------------------------------------------------------
-# LinearEXL3.forward dispatch: EXL3_PREFER_TRITON_LINEAR=1 vs the reference
+# M == 1 split-K GEMV path (starved-N bits=4 shapes) and the N-bucketed
+# autotune pools
 # ---------------------------------------------------------------------------
+
+SPLIT_SHAPES = [
+    # (in_features, out_features): qualifying split-plan shapes
+    (4096, 2048),   # 256 k-tiles -> S=4
+    (8192, 2048),   # 512 k-tiles -> S=8
+]
+
+
+def test_m1_splitk_plan():
+    from exllamav3.modules.quant.exl3_triton import _m1_splitk_plan
+    # Qualifying bits=4 starved-N shapes split by K depth
+    assert _m1_splitk_plan(1, 2048, 4096, 4) == 4     # 256 k-tiles -> S=4
+    assert _m1_splitk_plan(1, 2048, 8192, 4) == 8     # 512 k-tiles -> S=8
+    # Too-shallow K stays classic
+    assert _m1_splitk_plan(1, 512, 1024, 4) == 1
+    # Other bit widths / batched rows / large N never split
+    assert _m1_splitk_plan(1, 2048, 8192, 6) == 1
+    assert _m1_splitk_plan(16, 2048, 8192, 4) == 1
+    assert _m1_splitk_plan(1, 12288, 4096, 4) == 1
+    # Indivisible-by-256 shapes stay classic
+    assert _m1_splitk_plan(1, 4224, 4096, 4) == 1     # 4224 % 256 != 0
+    assert _m1_splitk_plan(1, 4096, 4224, 4) == 1     # 4224 % 256 != 0
+
+
+@pytest.mark.parametrize("mcg,mul1", [(False, False), (True, True)])
+@pytest.mark.parametrize("in_features,out_features", SPLIT_SHAPES)
+def test_m1_splitk_linear_vs_reference(in_features, out_features, mcg, mul1):
+    """The M == 1 split-K route (partials + fused reduce/Hadamard) must match
+    the C++ reconstruct reference within the standard tolerance."""
+    dev = device()
+    torch.manual_seed(in_features * 31 + out_features)
+    trellis = make_trellis(in_features, out_features, 4, dev)
+    suh, svh = make_suh_svh(in_features, out_features, dev)
+    x = torch.randn(1, in_features, dtype=torch.half, device=dev) * 0.1
+
+    y_ref = reference_reconstruct_hgemm(
+        x, trellis, suh, svh, 4, mcg, mul1, in_features, out_features, dev
+    )
+    y = linear_exl3_triton(
+        x, trellis, suh, svh, 4, mcg, mul1,
+        in_features, out_features, dev, torch.half,
+    )
+    assert _rel_err(y, y_ref) < 2e-2
+
+
+@pytest.mark.parametrize("out_dtype", [torch.half, torch.float])
+def test_m1_splitk_vs_classic(out_dtype):
+    """Split path and classic path (EXL3_SPLITK=off) agree tightly; the only
+    differences are fp32 accumulation order and one skipped half rounding."""
+    import importlib
+    import exllamav3.modules.quant.exl3_triton as et
+    dev = device()
+    torch.manual_seed(99)
+    in_features, out_features = 4096, 1024
+    trellis = make_trellis(in_features, out_features, 4, dev)
+    suh, svh = make_suh_svh(in_features, out_features, dev)
+    x = torch.randn(1, in_features, dtype=torch.half, device=dev) * 0.1
+
+    y_split = linear_exl3_triton(
+        x, trellis, suh, svh, 4, False, False,
+        in_features, out_features, dev, out_dtype,
+    )
+    prev = os.environ.pop("EXL3_SPLITK", None)
+    os.environ["EXL3_SPLITK"] = "off"
+    try:
+        y_classic = et.linear_exl3_triton(
+            x, trellis, suh, svh, 4, False, False,
+            in_features, out_features, dev, out_dtype,
+        )
+    finally:
+        os.environ.pop("EXL3_SPLITK", None)
+        if prev is not None:
+            os.environ["EXL3_SPLITK"] = prev
+
+    d = (y_split.float() - y_classic.float()).abs().max().item()
+    assert d < 0.05, f"split vs classic max abs diff {d}"
+
+
+def test_prune_n_bucket_pools():
+    """The M=1 fast-path prune must return non-empty, floor-safe pools."""
+    from exllamav3.modules.quant.exl3_triton import (
+        _exl3_gemm_configs, _exl3_gemm_early_prune,
+    )
+    configs = _exl3_gemm_configs()
+
+    def pool(m, n, k, bits):
+        return sorted(
+            (c.kwargs["BLOCK_N"], c.kwargs["BLOCK_K"])
+            for c in _exl3_gemm_early_prune(configs, {"M": m, "N": n, "K_dim": k, "K_BITS": bits})
+        )
+
+    # Starved-N b4 non-split shape (K not divisible by 256)
+    p = pool(1, 4224, 4096, 4)
+    assert set(p) == {(32, 128), (32, 256), (64, 128)}
+    # Split-eligible starved-N b4 shape: widest windows only
+    p = pool(1, 4096, 12288, 4)
+    assert set(p) == {(32, 256), (64, 256)}
+    # Large-N b4 (gate/up class) never takes the split pool
+    p = pool(1, 12288, 4096, 4)
+    assert set(p) == {(128, 128), (64, 256), (64, 128)}
+    # bits=6 large-N keeps its preferred BN64/BK128
+    p = pool(1, 248320, 4096, 6)
+    assert set(p) == {(128, 128), (64, 256), (64, 128)}
+    # Non-divisible shapes fall back to the small-tile generic pool
+    p = pool(1, 4112, 4096, 4)
+    assert set(p) == {(16, 64)}
+    # M > 1 keeps the prefill configs untouched
+    p = _exl3_gemm_early_prune(configs, {"M": 128, "N": 4096, "K_dim": 4096, "K_BITS": 4})
+    assert len(p) == len(configs)
+
 
 @pytest.mark.parametrize("mcg,mul1", CB_VARIANTS)
 @pytest.mark.parametrize("in_features,out_features,K", SHAPES)
