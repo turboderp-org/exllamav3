@@ -751,6 +751,77 @@ class MLAttention(Module):
         )
 
 
+    def autosplit_extra_measure(self, params):
+        """
+        The (1, chunk)-at-context-0 pass this follows is NOT this module's memory worst case:
+        sparse DSA replaces the MHA prefill with a different transient set once the context
+        exceeds index_topk, and the BC decode slots allocate their statics only when a decode
+        shape first occurs.
+
+        Both are exercised here so an OoM lands where the loader advances to the next
+        device, rather than after deployment. Outputs are discarded; only allocation shapes
+        matter. The BC slots are configured but never run, so nothing is graph-captured at
+        load time and the end-of-load tensor-cache drop leaves no baked pointers behind.
+        """
+
+        if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
+            return
+        cache = params.get("cache")
+        if cache is None or self.device is None:
+            return
+        from ..cache import CacheLayer_MLA_quant, CacheLayer_MLA_fp16
+        layer = cache if not hasattr(cache, "layers") else \
+            cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+        quant = isinstance(layer, CacheLayer_MLA_quant)
+        if not quant and not isinstance(layer, CacheLayer_MLA_fp16):
+            return
+        chunk = params["batch_shape"][1]
+
+        # Decode statics: every buffer the (bsz <= MAX_BSZ, q_len <= 16) slot family can
+        # request, both regimes. Backings are bucketed and shared across slots and layers,
+        # so configuring the largest and smallest shapes bounds the whole family
+        key = ("bcm", id(layer))
+        bcm = self.dispatch_cache.get(key)
+        if bcm is None:
+            from .attention_fn.bc_mla import build_bc_mla
+            bcm = build_bc_mla(self, layer)
+        if bcm:
+            from .attention_fn.bc_attn import MAX_BSZ
+            regimes = (0, 1) if self.indexer_mode is not None and not quant else (0,)
+            for b, q in ((1, 1), (MAX_BSZ, MAX_DECODE_QLEN)):
+                for rg in regimes:
+                    bcm._configure(b, q, rg)
+
+        # Sparse prefill at maximum context (the sparse path only serves fp16-cache indexer
+        # layers). Synthetic state: every block-table entry aliases page 0, zeroed so the
+        # math stays finite
+        if self.indexer_mode is None or quant:
+            return
+        from ..constants import PAGE_SIZE
+        num_pages = layer.k.shape[0]
+        t_syn = num_pages * PAGE_SIZE - chunk
+        if t_syn + chunk <= self.index_topk:
+            return   # cache too small to ever reach the sparse regime
+        layer.k[0].zero_()
+        layer.v[0].zero_()
+        if self.idx_plane_dim:
+            layer.get_idx()[0].zero_()
+        p2 = {k2: v2 for k2, v2 in params.items() if k2 not in
+              ("dev_cache", "_mla_host_seqlens", "positions", "position_ids")}
+        p2["cache_seqlens"] = torch.tensor([t_syn], dtype = torch.int32)
+        p2["block_table"] = torch.zeros((1, num_pages), dtype = torch.int32)
+        p2["position"] = t_syn
+        # Selections thread from full to shared layers exactly as in a real forward, via
+        # the loader's shared params dict
+        ind = params.get("_as_dsa_indices")
+        if ind is not None:
+            p2["dsa_topk_indices"] = ind
+        x = torch.zeros((1, chunk, self.hidden_size), dtype = torch.half, device = self.device)
+        self.forward(x, p2)
+        if self.indexer_mode == "full":
+            params["_as_dsa_indices"] = p2.get("dsa_topk_indices")
+
+
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         raise NotImplementedError()
 

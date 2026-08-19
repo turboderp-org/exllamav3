@@ -159,6 +159,8 @@ class Model_LSMixin(ABC):
                         if self.caps.get("autosplit_load_fwd", True) and not autosplit_no_forward:
                             dummy_state = module.prepare_for_device(dummy_state, params)
                             dummy_state = module.forward(dummy_state, params)
+                            for sm in module:
+                                module.autosplit_extra_measure(params)
 
                         # Account for max_output_factor after last layer
                         extra_dummy_out_states = None
