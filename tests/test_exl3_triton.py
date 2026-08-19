@@ -319,10 +319,10 @@ def test_m1_splitk_plan():
     assert _m1_splitk_plan(1, 2048, 8192, 4) == 8     # 512 k-tiles -> S=8
     # Too-shallow K stays classic
     assert _m1_splitk_plan(1, 512, 1024, 4) == 1
-    # Other bit widths / batched rows / large N never split
+    # Other bit widths / batched rows never split; lm_head-class N stays classic
     assert _m1_splitk_plan(1, 2048, 8192, 6) == 1
     assert _m1_splitk_plan(16, 2048, 8192, 4) == 1
-    assert _m1_splitk_plan(1, 12288, 4096, 4) == 1
+    assert _m1_splitk_plan(1, 248320, 4096, 4) == 1
     # Indivisible-by-256 shapes stay classic
     assert _m1_splitk_plan(1, 4224, 4096, 4) == 1     # 4224 % 256 != 0
     assert _m1_splitk_plan(1, 4096, 4224, 4) == 1     # 4224 % 256 != 0
@@ -401,8 +401,11 @@ def test_prune_n_bucket_pools():
     # Split-eligible starved-N b4 shape: widest windows only
     p = pool(1, 4096, 12288, 4)
     assert set(p) == {(32, 256), (64, 256)}
-    # Large-N b4 (gate/up class) never takes the split pool
+    # Split-eligible large-N b4 shape (gate/up class, K deep enough)
     p = pool(1, 12288, 4096, 4)
+    assert set(p) == {(32, 256), (64, 256)}
+    # Large-N b4 with shallow K stays on the classic large-N pool
+    p = pool(1, 12288, 2048, 4)
     assert set(p) == {(128, 128), (64, 256), (64, 128)}
     # bits=6 mid-N (MLP g/u of a 6bpw model): BN32 only (BN64/BN128 collapse)
     p = pool(1, 12288, 4096, 6)

@@ -317,19 +317,20 @@ _SPLITK_BUFS: dict = {}
 def _m1_splitk_plan(M: int, N: int, K_dim: int, K_bits: int) -> int:
     """Number of K-splits for an M == 1 invocation, or 1 (classic path).
 
-    Split-K applies only where the bits=4 fast path is guaranteed for the
-    whole autotune pool (N and K divisible by 256 covers BLOCK_K up to 256),
-    the shape is CTA-starved at any pool tile (small N), and each split
-    still gets a meaningful K slice. EXL3_SPLITK=off (or =n) overrides for
-    experiments; default behavior needs no environment variable.
-
-    Splits scale with the K depth (measured on the MLP down_proj shapes,
-    L2-cold layer sweeps, composite GB/s incl. hadamards + reduce):
-    9B  N=4096  K=12288: 242 -> 445 (S=4) / 455 (S=8, BN32/BK256)
-    27B N=5120  K=17408: 239 -> 353 (S=4) / 385 (S=8, BN32/BK256)
+    Split-K applies where the bits=4 fast path is guaranteed for the whole
+    autotune pool (N and K divisible by 256 covers BLOCK_K up to 256) and
+    each split still gets a meaningful K slice. It helps CTA-starved shapes
+    (down_proj class, N=4096-5120) massively and large-N shapes (gate/up /
+    qkv-class, N=10240-17408) moderately: measured composite GB/s incl.
+    hadamards + reduce (RX 7900 XTX, L2-cold layer sweeps):
+      9B  down N=4096  K=12288: 242 -> 445 (S=4) / 455 (S=8, BN32/BK256)
+      27B down N=5120  K=17408: 239 -> 353 (S=4) / 385 (S=8)
+      27B g/u  N=17408 K=5120:  310 -> 378 (S=4, BN64/BK256)
+    EXL3_SPLITK=off (or =n) overrides for experiments; default behavior
+    needs no environment variable.
     """
     import os
-    if M != 1 or K_bits != 4 or N > 8192 or N % 256 or K_dim % 256:
+    if M != 1 or K_bits != 4 or N > 32768 or N % 256 or K_dim % 256:
         return 1
     k_tiles = K_dim // 16
     splits = 8 if k_tiles >= 512 else (4 if k_tiles >= 256 else 1)
@@ -492,7 +493,13 @@ def _exl3_gemm_early_prune(configs, named_args, **kwargs):
                 # the huge lm_head N=248320 (bits=6) BN64/BK128 wins (685 vs
                 # 667), so the large-N pool keeps it.
                 if bits == 4:
-                    if n <= 8192 and n % 256 == 0 and k % 256 == 0 and k // 16 >= 256:
+                    if n <= 32768 and n % 256 == 0 and k % 256 == 0 and k // 16 >= 256:
+                        # Split-K-eligible bits=4 shape (see _m1_splitk_plan):
+                        # the CTA count comes from the K splits, so the widest
+                        # windows win outright (down S=8: BN32/BK256 383-455
+                        # GB/s, BN64/BK256 386-452, vs 367-375 for the BK128
+                        # tiles; g/u N=17408 S=4: BN64/BK256 378 vs 354-358
+                        # for BN128).
                         pool = ((32, 256), (64, 256))
                     elif n <= 8192:
                         pool = ((32, 128), (32, 256), (64, 128))
