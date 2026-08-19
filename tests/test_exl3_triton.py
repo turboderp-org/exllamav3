@@ -404,9 +404,18 @@ def test_prune_n_bucket_pools():
     # Large-N b4 (gate/up class) never takes the split pool
     p = pool(1, 12288, 4096, 4)
     assert set(p) == {(128, 128), (64, 256), (64, 128)}
-    # bits=6 large-N keeps its preferred BN64/BK128
+    # bits=6 mid-N (MLP g/u of a 6bpw model): BN32 only (BN64/BN128 collapse)
+    p = pool(1, 12288, 4096, 6)
+    assert set(p) == {(32, 128), (32, 256)}
+    # bits=6 small-N (down of a 6bpw model): same narrow pool
+    p = pool(1, 4096, 12288, 6)
+    assert set(p) == {(32, 128), (32, 256)}
+    # bits=6 huge-N (lm_head stream): BN64/BK128 (685 GB/s winner) + BN32
     p = pool(1, 248320, 4096, 6)
-    assert set(p) == {(128, 128), (64, 256), (64, 128)}
+    assert set(p) == {(64, 128), (32, 128)}
+    # bits=2 pools follow the same narrow-tile rule
+    p = pool(1, 4096, 12288, 2)
+    assert set(p) == {(32, 128), (32, 256)}
     # Non-divisible shapes fall back to the small-tile generic pool
     p = pool(1, 4112, 4096, 4)
     assert set(p) == {(16, 64)}

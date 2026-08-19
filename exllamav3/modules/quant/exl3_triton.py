@@ -468,28 +468,40 @@ def _exl3_gemm_early_prune(configs, named_args, **kwargs):
             # to before it was added).
             out = [c for c in out if not (c.kwargs["BLOCK_N"] == 32 and c.kwargs["BLOCK_K"] == 32)]
             if fast_ok:
-                # N-bucketed decode pools (bits != 3). Small N (CTA-starved,
-                # e.g. MLP down_proj N=4096-5120 at BN128 = 32-40 CTAs): the
-                # BN32 tiles restore CTA count at equal staged bytes and were
-                # measured 251-280 GB/s where BN128/BK128 gives 239-244. Large
-                # N (gate/up, lm_head): BN128/BK128 plus the BN64 tiles
-                # (BN64/BK256 329-425 GB/s vs 321-410 for BN128 alone; the
-                # bits=6 lm_head stream prefers BN64/BK128, 685 vs 617 GB/s).
-                # BN64/BK128 stays in both pools: it is the weakest b4 member
-                # for starved-N shapes (235-239 GB/s, at/below the old pick)
-                # but the best tile for the bits=6 M1 stream and a pre-existing
-                # option for the rarer widths, so autotune keeps today's
-                # expected selections there.
-                if (bits == 4 and n <= 8192 and n % 256 == 0
-                        and k % 256 == 0 and k // 16 >= 256):
-                    # Split-K-eligible bits=4 shape (see _m1_splitk_plan): the
-                    # CTA count comes from the K splits, so the widest windows
-                    # win outright (measured at S=8: BN32/BK256 383-455 GB/s,
-                    # BN64/BK256 386-452, vs 367-375 for the BK128 tiles).
-                    pool = ((32, 256), (64, 256))
+                # N-bucketed decode pools (bits != 3), bucketed per width class:
+                #
+                # bits=4 (light M1 accumulator, [2,2,2,NN,8,4]): starved-N
+                # shapes (down_proj class, N<=8192 at BN128 = 32-40 CTAs)
+                # take BN32 tiles (measured 265-280 vs 242-244 GB/s for
+                # BN128/BK128); large N keeps BN128/BK128 and gains the
+                # BN64/BK256 deep-K tile (329-425 vs 321-410 GB/s). BN64/BK128
+                # stays in both pools (weakest b4 member for starved-N at
+                # 235-239 but needed nowhere else to regress).
+                #
+                # Split-K-eligible bits=4 shapes (see _m1_splitk_plan): the
+                # CTA count comes from the K splits, so the widest windows
+                # win outright (measured at S=8: BN32/BK256 383-455 GB/s,
+                # BN64/BK256 386-452, vs 367-375 for the BK128 tiles).
+                #
+                # Other widths (1,2,5,6,7,8) run the heavy-accumulator M1
+                # kernels (2-4 fp32 tensors of 256*NN elements per CTA, or
+                # the staged-gather generic path): per-CTA occupancy collapses
+                # at BN>=64 unless N is huge, so BN32 tiles win everywhere up
+                # to large N. Measured (bits=6, N=12288): BN32/BK128 554 vs
+                # BN64/BK128 203 GB/s; (bits=2, N=4096): 114 vs 34 GB/s; at
+                # the huge lm_head N=248320 (bits=6) BN64/BK128 wins (685 vs
+                # 667), so the large-N pool keeps it.
+                if bits == 4:
+                    if n <= 8192 and n % 256 == 0 and k % 256 == 0 and k // 16 >= 256:
+                        pool = ((32, 256), (64, 256))
+                    elif n <= 8192:
+                        pool = ((32, 128), (32, 256), (64, 128))
+                    else:
+                        pool = ((128, 128), (64, 256), (64, 128))
+                elif n <= 16384:
+                    pool = ((32, 128), (32, 256))
                 else:
-                    pool = (((32, 128), (32, 256), (64, 128)) if n <= 8192
-                            else ((128, 128), (64, 256), (64, 128)))
+                    pool = ((64, 128), (32, 128))
                 out = [c for c in out
                        if (c.kwargs["BLOCK_N"], c.kwargs["BLOCK_K"]) in pool]
                 return out if out else configs
