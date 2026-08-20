@@ -3,7 +3,7 @@ import torch
 import time
 import sys
 from .. import Config, Model, Tokenizer
-from ..modules import Linear
+from ..modules import Attention, Linear
 from ..modules.linear import convert_exl3_group
 from ..modules.quant.exl3_lib.quantize import auto_split
 from ..modules.quant import LinearFP16, LinearEXL3
@@ -16,6 +16,14 @@ from .calibration_data import get_default_calibration
 from .compile import compile_model, dsize
 from .allocation import create_q_strategy, print_strategy
 from ..loader.safetensors_alt import save_file, safe_open
+from .qkv_topology import (
+    QKVTopologyError,
+    apply_fused_strategy,
+    attention_descriptor,
+    install_fused_qkv,
+    load_topology_plan,
+    resolve_topology,
+)
 import os, shutil
 import json
 import threading
@@ -47,12 +55,18 @@ parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mo
 parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
-parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
+parser.add_argument("-cb", "--codebook", type = str, default = None, help = "Codebook: mul1 (default), mcg or 3inst")
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Deprecated (no-op): parallel mode is now the default; layers with fewer tensors than devices fall back to tile splitting")
 parser.add_argument("--max_module", type = int, help = "End quantization after this many modules, includes embedding and norm layers (for debug purposes)", default = None)
+parser.add_argument(
+    "--qkv_topology_plan",
+    type = str,
+    default = None,
+    help = "JSON exl3_qkv_topology/1 layer plan; unspecified full-attention layers remain split",
+)
 
 group = parser.add_mutually_exclusive_group()
-group.add_argument("--out_scales", type = str, default = "always", help = "Enable out channel scales (always/never/auto, default: always)")
+group.add_argument("--out_scales", type = str, default = None, help = "Enable out channel scales (always/never/auto, default: always)")
 
 parser.add_argument("--override_anyway", action = "store_true", help = "Allow resuming even when overriding settings that will break the existing job.")
 
@@ -134,7 +148,7 @@ def prepare(args) -> (dict, dict, bool, str):
         return None, None, False, "Specify either --in_dir to start a new job or --resume to resume an interrupted job"
     if not args.out_dir and not args.resume:
         return None, None, False, "Must specify --out_dir or --resume"
-    if args.codebook not in ["mcg", "mul1", "3inst"]:
+    if args.codebook is not None and args.codebook not in ["mcg", "mul1", "3inst"]:
         return None, None, False, "Codebook must be 'mcg', 'mul1' or '3inst'"
     if args.bits is not None and (args.bits > 8 or args.bits < 1):
         return None, None, False, "--bits must be between 1 and 8"
@@ -147,6 +161,13 @@ def prepare(args) -> (dict, dict, bool, str):
         in_args["work_dir"] = args.work_dir
 
     prepare_env(in_args)
+    requested_qkv_topology = load_topology_plan(args.qkv_topology_plan) if args.qkv_topology_plan else None
+    if args.resume:
+        stored_qkv_topology = in_args.get("qkv_topology_plan")
+        if requested_qkv_topology is not None and requested_qkv_topology != stored_qkv_topology:
+            raise ValueError(" ## Error: Cannot change --qkv_topology_plan while resuming a job")
+    else:
+        in_args["qkv_topology_plan"] = requested_qkv_topology
 
     def override(arg, can_override, default):
         if (arg not in args or vars(args)[arg] is None) and arg not in in_args:
@@ -191,7 +212,10 @@ def prepare(args) -> (dict, dict, bool, str):
     # Momentary args
     in_args["image_dump"] = args.image_dump
     in_args["verbose"] = args.verbose
-    in_args["apply_out_scales"] = {"always": True, "never": False, "auto": None}[args.out_scales]
+    if args.out_scales is not None:
+        in_args["apply_out_scales"] = {"always": True, "never": False, "auto": None}[args.out_scales]
+    elif "apply_out_scales" not in in_args:
+        in_args["apply_out_scales"] = True
     in_args["max_module"] = args.max_module
 
     if args.resume:
@@ -978,6 +1002,47 @@ def main(args, job_state):
         model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
         vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
     )
+    main_weight_numel = {
+        linear.key: linear.weights_numel()
+        for linear in model
+        if isinstance(linear, Linear) and linear.qmap is not None and linear.qbits_key == "bits"
+    }
+    qkv_models = [m for m in (model, mtp_model, vision_model) if m is not None]
+    qkv_attentions = [
+        attn
+        for qkv_model in qkv_models
+        for attn in qkv_model
+        if isinstance(attn, Attention)
+    ]
+    scale_policy = {True: "always", False: "never", None: "auto"}[args["apply_out_scales"]]
+    qkv_descriptors = [
+        attention_descriptor(attn, strategy, args["codebook"], scale_policy)
+        for attn in qkv_attentions
+    ]
+    unsupported = [attn.key for attn, descriptor in zip(qkv_attentions, qkv_descriptors) if descriptor is None]
+    if unsupported:
+        raise QKVTopologyError(
+            f"Topology metadata cannot describe full-attention layers with nonstandard QKV: {unsupported}"
+        )
+    qkv_topology = resolve_topology(qkv_descriptors, args.get("qkv_topology_plan"))
+    args["exl3_qkv_topology"] = qkv_topology
+    qkv_rows = {row["layer"]: row for row in qkv_topology["layers"]}
+    for attn in qkv_attentions:
+        row = qkv_rows[attn.key]
+        if row["variant"] == "fused_uniform":
+            component_keys = [getattr(attn, name).key for name in row["components"]]
+            if all(key in main_weight_numel for key in component_keys):
+                q = attn.q_proj
+                fused_out = (sum(row["output_splits"]) + 127) // 128 * 128
+                for key in component_keys:
+                    main_weight_numel.pop(key)
+                main_weight_numel[attn.key + ".qkv_proj"] = q.in_features * fused_out
+        apply_fused_strategy(attn, row, strategy)
+    main_numel = sum(main_weight_numel.values())
+    final_bpw = (
+        sum(main_weight_numel[key] * strategy[key] for key in main_weight_numel) / main_numel
+        if main_numel else 0
+    )
     args["final_bits"] = round(final_bpw, 2)
     print(" -- Quantization strategy, summary:")
     print(print_strategy(strategy))
@@ -1122,6 +1187,13 @@ def main(args, job_state):
                     for k, v in capture_H.items():
                         v["H_swap_device"] = v["H"].device
                         v["H"] = v["H"].cpu()
+
+            # The Hessian was captured through the original q/k/v modules. Only now replace
+            # selected blocks with one BF16-derived logical qkv_proj carrying that same qmap.
+            for attn in module:
+                row = qkv_rows.get(attn.key) if isinstance(attn, Attention) else None
+                if row is not None and row["variant"] == "fused_uniform" and attn.qkv_proj is None:
+                    install_fused_qkv(attn)
 
             # Get submodules to quantize
             linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]
@@ -1292,6 +1364,11 @@ def main(args, job_state):
                 if m.used_alt_key:
                     print(f"     - Cloned {m.key} from {m.alt_key}")
             module.config.stc.close()
+            for attn in module:
+                row = qkv_rows.get(attn.key) if isinstance(attn, Attention) else None
+                if row is not None and row["variant"] == "fused_uniform" and attn.qkv_proj is None:
+                    install_fused_qkv(attn)
+
 
             linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]
             for linear in linears:

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from ..util.rope import RopeSettings, RopeStyle
 from ..loader import SafetensorsCollection
 from ..util.file import read_dict, no_value, no_default
+from ..conversion.qkv_topology import topology_layer_map
 import uuid
 
 @dataclass
@@ -106,6 +107,9 @@ class Config(ABC):
         self.config_filename = os.path.join(directory, "config.json")
         with open(self.config_filename, encoding = "utf8") as f:
             self.config_dict = json.load(f)
+        quantization_config = self.config_dict.get("quantization_config", {})
+        self.qkv_topology_enabled = quantization_config.get("exl3_qkv_topology") is not None
+        self.qkv_topology = topology_layer_map(quantization_config.get("exl3_qkv_topology"))
 
         assert len(self.config_dict["architectures"]) == 1, \
             f"Multiple architectures defined in {self.config_filename}"

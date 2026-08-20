@@ -7,6 +7,7 @@ from ..loader.safetensors_alt import save_file
 from ..util.memory import free_mem
 from ..modules import Module, Linear
 from .quant_config import update_config, create_quantization_config_json
+from .qkv_topology import canonical_json, validate_payload_index
 
 def tsize(t):
     return t.nelement() * t.element_size()
@@ -26,6 +27,12 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
         work_dir = args["work_dir"]
         qtensors_dir = os.path.join(work_dir, "qtensors")
         qtensors_stc = SafetensorsCollection(qtensors_dir, tensor_name_fixes = config.get_tensor_name_fixes())
+    qkv_topology = args.get("exl3_qkv_topology")
+    qkv_safetensors_metadata = (
+        {"exl3_qkv_topology": canonical_json(qkv_topology)}
+        if qkv_topology is not None else
+        None
+    )
 
     # Prepare output directory
     if not os.path.exists(out_dir):
@@ -127,9 +134,15 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
             file_dict.update(tensors)
         for name in file_dict.keys():
             map_dict[name] = filename
-        save_file(file_dict, os.path.join(out_dir, filename))
+        save_file(
+            file_dict,
+            os.path.join(out_dir, filename),
+            metadata = qkv_safetensors_metadata,
+        )
         del file_dict
         free_mem()
+    if qkv_topology is not None:
+        validate_payload_index(map_dict, qkv_topology)
 
     # Copy non-tensor files
     print(f" -- Copying non-tensor files from {in_dir}")
@@ -169,6 +182,8 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
             },
             "weight_map": map_dict
         }
+        if qkv_topology is not None:
+            safetensors_index["metadata"]["exl3_qkv_topology"] = qkv_topology
         with open(os.path.join(out_dir, "model.safetensors.index.json"), "w") as f:
             f.write(json.dumps(safetensors_index, indent = 4))
 
@@ -215,6 +230,8 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
             qcfg.update({
                 "original_quantization_config": orig_qcfg
             })
+    if qkv_topology is not None:
+        qcfg["exl3_qkv_topology"] = qkv_topology
 
     if vision_model and args.get("vision_bits", 16) != 16:
         qcfg["vision_bits"] = args["vision_bits"]
