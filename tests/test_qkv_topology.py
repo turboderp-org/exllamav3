@@ -105,6 +105,34 @@ def test_qwen35_interleaved_gate_uses_actual_doubled_q_projection_width():
     assert topology["layers"][0]["output_splits"] == [12288, 1024, 1024]
 
 
+def test_fused_qkv_forward_deinterleaves_qwen_query_gate_payload():
+    attn = qwen35_attention("model.layers.3.self_attn")
+    x = torch.zeros((1, 2, 5120), dtype = torch.float32)
+    fused = torch.arange(2 * 14336, dtype = torch.float32).view(1, 2, 14336)
+
+    class FusedProjection:
+        @staticmethod
+        def forward(_x, _params):
+            return fused
+
+    attn.qkv_proj = FusedProjection()
+    attn.g_proj = None
+    attn.v_norm = None
+
+    q, k, v, g = attn.project_qkv(x, {})
+
+    assert q.shape == (1, 2, 24, 256)
+    assert g.shape == (1, 2, 6144)
+    assert k.shape == v.shape == (1, 2, 4, 256)
+    expected_q, expected_g = torch.chunk(
+        fused[..., :12288].view(1, 2, 24, 512), 2, dim = -1
+    )
+    assert torch.equal(q, expected_q)
+    assert torch.equal(g, expected_g.reshape(1, 2, 6144))
+
+
+
+
 def test_topology_setup_is_opt_in_and_does_not_scan_existing_models_without_a_plan():
     class ExistingModel:
         def __iter__(self):

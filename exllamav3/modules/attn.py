@@ -611,10 +611,21 @@ class Attention(Module):
         if self.qkv_proj is not None:
             qkv = self.qkv_proj.forward(x, params)
             q_width = self.num_q_heads * self.head_dim
+            qg_width = q_width * (2 if self.interleaved_gate else 1)
             kv_width = self.num_kv_heads * self.head_dim
-            q, k, v = torch.split(qkv, (q_width, kv_width, kv_width), dim = -1)
-            g = self.g_proj.forward(x, params) if self.g_proj is not None else None
-            q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
+            q, k, v = torch.split(qkv, (qg_width, kv_width, kv_width), dim = -1)
+            if self.interleaved_gate:
+                if self.head_dim % 8 == 0 and q.dtype == torch.half:
+                    qg = q
+                    q = torch.empty((bsz, q_len, self.num_q_heads, self.head_dim), dtype = torch.half, device = qg.device)
+                    g = torch.empty((bsz, q_len, q_width), dtype = torch.half, device = qg.device)
+                    ext.deinterleave_qg(qg, q, g, self.head_dim)
+                else:
+                    q, g = torch.chunk(q.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
+                    g = g.reshape(bsz, q_len, -1)
+            else:
+                g = self.g_proj.forward(x, params) if self.g_proj is not None else None
+                q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
             k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim)
             v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim)
             if self.v_norm is not None:
