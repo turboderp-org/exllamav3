@@ -40,6 +40,11 @@
 #define MOE_MAX_WSLOTS 8
 #define MOE_JOB_KIND_COMPUTE 0
 #define MOE_JOB_KIND_STAGE 1
+// GATED: issued by the fused-issue kernel, whose collect side reads the output only when at
+// least one selected expert was CPU-resident. The worker may skip the compute and the
+// output write entirely for an all-inactive job. Plain COMPUTE jobs must keep writing
+// (zeroing) the output, since their collect reads it back unconditionally
+#define MOE_JOB_KIND_COMPUTE_GATED 2
 
 // kind == STAGE: the worker memcpys `rows` experts' packed weights (ids in experts[]) of layer
 // `layer` into weight-staging slot `slot`, after waiting for the parent's pinned_free flag to

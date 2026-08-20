@@ -4,6 +4,10 @@ import os
 import torch
 from ..ext import exllamav3_ext as ext
 
+# Kernel-fused issue/collect for decode-size split jobs (EXL3_MOE_SPLIT_FUSED=0 restores the
+# cudaMemcpyAsync path for A/B testing)
+_split_fused = os.environ.get("EXL3_MOE_SPLIT_FUSED", "1") != "0"
+
 """
 Forward-path hooks are cpu_split_submit / cpu_offload_forward / cpu_split_combine, the
 load-path hooks cpu_maybe_offload_load / cpu_maybe_split_load / cpu_post_load, plus
@@ -175,29 +179,44 @@ class BlockSparseMLP_CPU:
         Expert ids ship in the worker's local range with -1 sentinels for GPU-resident
         picks."""
         if self._split_map is not None:
-            # Dynamic placement: run any due swap sweep first (fully quiesced), then one
-            # fused kernel records hit counts, translates router ids to physical slots IN
-            # PLACE (the bsz-1 routing statics are read by captured graphs at baked
-            # addresses) and emits the worker-side selection (router ids, -1 sentinel for
-            # GPU-resident picks -- the worker holds every expert). GPU paths mask slots
-            # >= first via the expert interval as usual
             self._split_swap_tick()
-            n = selected_experts.numel()
-            buf = self._split_selcpu_t
-            if buf is None or buf.numel() < n:
-                buf = self._split_selcpu_t = torch.empty(
-                    max(n, 64), dtype = torch.long, device = selected_experts.device)
-            sel_cpu = buf[:n].view(selected_experts.shape)
-            ext.moe_split_map(
-                selected_experts.view(-1), self._split_map, self._split_hist,
-                buf[:n], self.cpu_split_first)
-        else:
-            sel_cpu = (selected_experts - self.cpu_split_first).clamp_min(-1)
         if bsz < self.cpu_host.stream_min_rows:
+            # Fused fast path: one kernel does the map translate + staging writes straight
+            # into the pinned slot, skipping the whole activation payload (and, downstream,
+            # the worker compute and the readback) when no CPU expert was selected. Replaces
+            # three cudaMemcpyAsync launches, the int32 cast and the pad per layer per step
+            if _split_fused:
+                pending = self.cpu_host.submit_issue_fused(
+                    self.cpu_layer_idx, y, selected_experts, routing_weights,
+                    self._split_map,
+                    self._split_hist if self._split_map is not None else None,
+                    self.cpu_split_first)
+                if pending is not None:
+                    return None, ("fused", pending)
+            sel_cpu = self._split_translate(selected_experts)
             return None, self.cpu_host.submit_issue(
                 self.cpu_layer_idx, y, sel_cpu, routing_weights)
+        sel_cpu = self._split_translate(selected_experts)
         return self.cpu_host.submit_prefill(
             self.cpu_layer_idx, y, sel_cpu, routing_weights), None
+
+    def _split_translate(self, selected_experts):
+        """Copy-path selection translate: dynamic placement runs the map kernel (hit counts,
+        in-place physical-slot translate -- the bsz-1 routing statics are read by captured
+        graphs at baked addresses -- and the worker-side selection with -1 sentinels for
+        GPU-resident picks); the static split is a tail offset."""
+        if self._split_map is None:
+            return (selected_experts - self.cpu_split_first).clamp_min(-1)
+        n = selected_experts.numel()
+        buf = self._split_selcpu_t
+        if buf is None or buf.numel() < n:
+            buf = self._split_selcpu_t = torch.empty(
+                max(n, 64), dtype = torch.long, device = selected_experts.device)
+        sel_cpu = buf[:n].view(selected_experts.shape)
+        ext.moe_split_map(
+            selected_experts.view(-1), self._split_map, self._split_hist,
+            buf[:n], self.cpu_split_first)
+        return sel_cpu
 
     def cpu_offload_forward(self, x, y, selected_experts, routing_weights, params):
         """Whole-layer offload: the routed sum comes entirely from the worker. The autosplit
@@ -213,8 +232,13 @@ class BlockSparseMLP_CPU:
     def cpu_split_combine(self, final_hidden_states, cpu_partial, cpu_pending, x):
         """Fold the CPU tail partial into the routed sum (stream-ordered: the collect
         enqueues a flag wait ahead of the readback, so the add consumes the worker's output
-        exactly when it is ready)."""
+        exactly when it is ready). Fused handles add in place straight from the pinned slot
+        (or skip the readback entirely for a job with no CPU-resident picks)."""
         if cpu_pending is not None:
+            if isinstance(cpu_pending, tuple) and cpu_pending[0] == "fused":
+                f2 = final_hidden_states.view(-1, final_hidden_states.shape[-1])
+                self.cpu_host.submit_collect_fused(cpu_pending[1], f2)
+                return final_hidden_states
             cpu_partial = self.cpu_host.submit_collect(cpu_pending)
         if cpu_partial is not None:
             final_hidden_states = final_hidden_states + cpu_partial.view(x.shape)

@@ -541,15 +541,24 @@ class MoeCpuHost:
             def view(off, count, dtype):
                 return torch.frombuffer(self.shm.buf, dtype = dtype, count = count,
                                         offset = sbase + off)
+            # Device-visible aliases of the slot's data sections, for the fused issue/collect
+            # kernels' zero-copy accesses (same mapped registration as the flag words)
+            gpu_data = self.gpu_base_ptr + sbase
             self.slots.append(dict(
                 x = view(off_x, self.cap_rows * max_hi, torch.half).view(self.cap_rows, max_hi),
                 sel = view(off_sel, self.cap_rows * max_topk, torch.int32).view(self.cap_rows, max_topk),
                 w = view(off_w, self.cap_rows * max_topk, torch.half).view(self.cap_rows, max_topk),
                 out = view(off_out, self.cap_rows * max_ho, torch.float).view(self.cap_rows, max_ho),
+                x_dev = gpu_data + off_x,
+                sel_dev = gpu_data + off_sel,
+                w_dev = gpu_data + off_w,
+                out_dev = gpu_data + off_out,
                 data_ready = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + s * 64,
                 done = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + 64 * MOE_MAX_SLOTS + s * 64,
                 consumed = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + 2 * 64 * MOE_MAX_SLOTS + s * 64,
             ))
+        # Per-device empty-job gates for the fused kernels (issue writes, collect reads)
+        self.dev_count = {}
 
         # Weight-staging views, flags and streams for GPU-streamed prefill
         self.wviews = []
@@ -688,6 +697,79 @@ class MoeCpuHost:
         with torch.cuda.device(dev):
             self._collect_compute(jobs, out, rtmp, h)
         return out
+
+    def submit_issue_fused(self, layer_idx, y, selected_experts, routing_weights,
+                           split_map, split_hist, first_cpu):
+        """
+        Kernel-fused variant of submit_issue for decode-size jobs: ONE kernel launch stages
+        sel/x/w straight into the pinned slot with zero-copy stores (replacing the int32
+        cast, the zero-pad and three cudaMemcpyAsync launches), doubling as moe_split_map in
+        dynamic-placement mode (in-place sel translate + hit histogram). When no selected
+        expert is CPU-resident, the activation/weight payload is skipped entirely, the
+        worker skips the compute, and the fused collect skips the readback: an inactive
+        layer costs two flag memops and two near-empty kernels, and no PCIe payload.
+
+        Returns None if the job shape does not fit the single-slot fast path (caller falls
+        back to the copy path). selected_experts must hold RAW router ids here; translation
+        (dynamic map or static tail offset) happens inside the kernel.
+        """
+        rows = y.shape[0]
+        spec = self.specs[layer_idx]
+        if rows > self.cap_rows or not (y.is_contiguous() and routing_weights.is_contiguous()):
+            return None
+        h_ = y.shape[1]
+        hi = spec["hi"]
+        dev = y.device
+        with torch.cuda.device(dev):
+            counts = self.dev_count.get(dev)
+            if counts is None:
+                counts = self.dev_count[dev] = \
+                    torch.zeros((self.num_slots,), dtype = torch.int32, device = dev)
+            slot_idx = self.next_slot
+            self.next_slot = (self.next_slot + 1) % self.num_slots
+            self.seq += 1
+            seq = self.seq
+            slot = self.slots[slot_idx]
+
+            tail = int(self.v_jobs_tail[0])
+            if tail - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
+                import time
+                while tail - int(self.v_jobs_head[0]) >= MOE_JOB_RING - 4:
+                    if self.v_abort[0] or not self.proc.is_alive():
+                        raise RuntimeError("CPU MoE worker failed (ring stall)")
+                    time.sleep(0.0002)
+            job = self.v_jobs[tail % MOE_JOB_RING]
+            job[0] = seq
+            job[1] = layer_idx
+            job[2] = rows
+            job[3] = spec["topk"]
+            job[4] = slot_idx
+            job[5] = 2    # MOE_JOB_KIND_COMPUTE_GATED
+            self.v_jobs_tail[0] = tail + 1
+
+            if self.slot_last_seq[slot_idx]:
+                ext.exl3_moe_flag_wait(slot["consumed"], self.slot_last_seq[slot_idx],
+                                       self.gpu_base_ptr + 128)
+            ext.moe_split_issue(
+                selected_experts.view(-1), split_map, split_hist,
+                y, routing_weights,
+                slot["sel_dev"], slot["x_dev"], slot["w_dev"],
+                counts, slot_idx, hi, first_cpu,
+            )
+            ext.exl3_moe_flag_write(slot["data_ready"], seq)
+            self.slot_last_seq[slot_idx] = seq
+        return (seq, slot_idx, rows, h_, spec["ho"], dev, counts)
+
+    def submit_collect_fused(self, handle, final_2d):
+        """Fold the worker's partial into final_2d (rows, h) in place, straight from the
+        pinned slot, or, for a job the issue kernel recorded as empty, do nothing (no
+        PCIe reads). Never synchronizes the host."""
+        seq, slot_idx, rows, h_, ho, dev, counts = handle
+        slot = self.slots[slot_idx]
+        with torch.cuda.device(dev):
+            ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
+            ext.moe_split_collect_add(final_2d, slot["out_dev"], counts, slot_idx, ho)
+            ext.exl3_moe_flag_write(slot["consumed"], seq)
 
     def _issue_compute(self, layer_idx, y, selected_experts, routing_weights, spec, out, h):
         """

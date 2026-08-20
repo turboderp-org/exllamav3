@@ -312,16 +312,28 @@ void exl3_moe_cpu_worker_run
 
         {
             uint8_t* slot = data + size_t(job.slot) * slot_size;
-            exl3_moe_cpu_forward_raw(
-                static_cast<int64_t>(job.layer),
-                reinterpret_cast<const at::Half*>(slot + off_x),
-                reinterpret_cast<const int32_t*>(slot + off_sel),
-                reinterpret_cast<const at::Half*>(slot + off_w),
-                reinterpret_cast<float*>(slot + off_out),
-                static_cast<int>(job.rows),
-                static_cast<int>(job.topk),
-                static_cast<int>(threads)
-            );
+            bool run = true;
+            if (job.kind == MOE_JOB_KIND_COMPUTE_GATED)
+            {
+                // Fused-issue job: the collecting kernel reads the output only when some
+                // selected expert is CPU-resident, so an all-inactive job is a pure no-op
+                const int32_t* selp = reinterpret_cast<const int32_t*>(slot + off_sel);
+                const int total = (int) job.rows * (int) job.topk;
+                run = false;
+                for (int i = 0; i < total; ++i)
+                    if (selp[i] >= 0) { run = true; break; }
+            }
+            if (run)
+                exl3_moe_cpu_forward_raw(
+                    static_cast<int64_t>(job.layer),
+                    reinterpret_cast<const at::Half*>(slot + off_x),
+                    reinterpret_cast<const int32_t*>(slot + off_sel),
+                    reinterpret_cast<const at::Half*>(slot + off_w),
+                    reinterpret_cast<float*>(slot + off_out),
+                    static_cast<int>(job.rows),
+                    static_cast<int>(job.topk),
+                    static_cast<int>(threads)
+                );
         }
 
         store_release_u32(done + size_t(job.slot) * 16, job.seq);
