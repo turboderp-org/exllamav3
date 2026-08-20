@@ -6,9 +6,12 @@ from exllamav3.modules.attn import Attention
 from exllamav3.conversion.qkv_topology import (
     QKVTopologyError,
     SCHEMA,
+    attention_descriptor,
     concatenate_qkv_bf16,
+    resolve_target_topology,
     resolve_topology,
     split_qkv,
+    topology_layer_map,
     validate_payload_index,
 )
 
@@ -48,6 +51,110 @@ def mixed_plan():
             },
         ],
     }
+
+
+def qwen35_attention(layer):
+    return Attention(
+        NullConfig(),
+        layer,
+        0,
+        hidden_size = 5120,
+        head_dim = 256,
+        num_q_heads = 24,
+        num_kv_heads = 4,
+        rope_settings = None,
+        key_q = "q_proj",
+        key_k = "k_proj",
+        key_v = "v_proj",
+        key_o = "o_proj",
+        qmap = "block.attn",
+        interleaved_gate = True,
+    )
+
+
+def qkv_strategy(attn, K = 6):
+    return {
+        attn.q_proj.key: K,
+        attn.k_proj.key: K,
+        attn.v_proj.key: K,
+    }
+
+
+def fused_plan(layer, K = 6, codebook = "mul1"):
+    return {
+        "schema": SCHEMA,
+        "layers": [{
+            "layer": layer,
+            "variant": "fused_uniform",
+            "K": K,
+            "codebook": codebook,
+            "scale": "always",
+        }],
+    }
+
+
+def test_qwen35_interleaved_gate_uses_actual_doubled_q_projection_width():
+    attn = qwen35_attention("model.layers.3.self_attn")
+
+    descriptor_ = attention_descriptor(attn, qkv_strategy(attn), "mul1", "always")
+    topology = resolve_topology([descriptor_], fused_plan(attn.key))
+
+    assert {attn.q_proj.qmap, attn.k_proj.qmap, attn.v_proj.qmap} == {"block.attn.input"}
+    assert descriptor_["qmap"] == "block.attn.input"
+    assert [p["out_features"] for p in descriptor_["projections"]] == [12288, 1024, 1024]
+    assert topology["layers"][0]["output_splits"] == [12288, 1024, 1024]
+
+
+def test_topology_setup_is_opt_in_and_does_not_scan_existing_models_without_a_plan():
+    class ExistingModel:
+        def __iter__(self):
+            raise AssertionError("no-plan conversion must not inspect attention topology")
+
+    topology, attentions = resolve_target_topology(
+        ExistingModel(),
+        {},
+        "3inst",
+        "always",
+        None,
+    )
+
+    assert topology is None
+    assert attentions == ()
+
+
+@pytest.mark.parametrize(
+    ("K", "codebook", "message"),
+    [(2, "mul1", "between 3 and 8"), (6, "3inst", "codebook is invalid")],
+)
+def test_opted_in_split_metadata_rejects_incompatible_projection_domain(K, codebook, message):
+    attn = qwen35_attention("model.layers.3.self_attn")
+    plan = {"schema": SCHEMA, "layers": []}
+
+    with pytest.raises(QKVTopologyError, match = message):
+        resolve_target_topology(
+            [attn],
+            qkv_strategy(attn, K),
+            codebook,
+            "always",
+            plan,
+        )
+
+
+def test_target_topology_excludes_mtp_and_vision_side_models():
+    target = qwen35_attention("model.layers.3.self_attn")
+    mtp = qwen35_attention("mtp_model.layers.0.self_attn")
+    vision = qwen35_attention("visual.blocks.0.self_attn")
+
+    topology, attentions = resolve_target_topology(
+        [target],
+        qkv_strategy(target) | qkv_strategy(mtp) | qkv_strategy(vision),
+        "mul1",
+        "always",
+        fused_plan(target.key),
+    )
+
+    assert attentions == (target,)
+    assert [row["layer"] for row in topology["layers"]] == [target.key]
 
 
 def test_mixed_layer_map_is_sorted_complete_and_defaults_to_split():
@@ -153,6 +260,36 @@ def test_fused_uniform_requires_one_common_K_codebook_and_scale():
             [descriptor("model.layers.0.self_attn"), descriptor("model.layers.1.self_attn")],
             mismatched_codebook,
         )
+
+
+@pytest.mark.parametrize("K", [1, 2, 9, True])
+def test_plan_rejects_K_outside_compiled_qkv_domain(K):
+    plan = fused_plan("model.layers.0.self_attn", K = K)
+
+    with pytest.raises(QKVTopologyError, match = "between 3 and 8"):
+        resolve_topology([descriptor("model.layers.0.self_attn")], plan)
+
+
+@pytest.mark.parametrize("codebook", ["3inst", "unknown"])
+def test_plan_and_metadata_reject_codebooks_outside_compiled_qkv_domain(codebook):
+    layer = "model.layers.0.self_attn"
+    with pytest.raises(QKVTopologyError, match = "supported codebook"):
+        resolve_topology([descriptor(layer)], fused_plan(layer, codebook = codebook))
+
+    topology = resolve_topology([descriptor(layer)], fused_plan(layer))
+    topology["layers"][0]["projection"]["codebook"] = codebook
+    with pytest.raises(QKVTopologyError, match = "codebook is invalid"):
+        topology_layer_map(topology)
+
+
+@pytest.mark.parametrize("K", [1, 2, 9, True])
+def test_metadata_rejects_K_outside_compiled_qkv_domain(K):
+    layer = "model.layers.0.self_attn"
+    topology = resolve_topology([descriptor(layer)], fused_plan(layer))
+    topology["layers"][0]["projection"]["K"] = K
+
+    with pytest.raises(QKVTopologyError, match = "between 3 and 8"):
+        topology_layer_map(topology)
 
 
 def test_index_reconstruction_rejects_missing_or_duplicate_payloads():

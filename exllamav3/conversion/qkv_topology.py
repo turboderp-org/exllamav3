@@ -13,6 +13,7 @@ SCHEMA = "exl3_qkv_topology/1"
 COMPONENTS = ("q_proj", "k_proj", "v_proj")
 VARIANTS = ("split", "fused_uniform")
 SCALE_VALUES = ("always", "never", "auto")
+CODEBOOK_VALUES = ("mcg", "mul1")
 
 
 class QKVTopologyError(ValueError):
@@ -37,8 +38,8 @@ def load_topology_plan(path: str) -> dict:
 
 
 def _validate_K(K, where: str) -> int:
-    if isinstance(K, bool) or not isinstance(K, int) or not 1 <= K <= 8:
-        raise QKVTopologyError(f"{where} K must be one integer value between 1 and 8")
+    if isinstance(K, bool) or not isinstance(K, int) or not 3 <= K <= 8:
+        raise QKVTopologyError(f"{where} K must be one integer value between 3 and 8")
     return K
 
 
@@ -78,7 +79,7 @@ def _plan_rows(plan: dict | None) -> dict[str, dict]:
                 )
         else:
             _validate_K(row.get("K"), layer)
-            if row.get("codebook") not in ("mul1", "mcg", "3inst"):
+            if row.get("codebook") not in CODEBOOK_VALUES:
                 raise QKVTopologyError(f"Fused layer {layer} requires one supported codebook")
             _validate_scale(row.get("scale"), layer)
         result[layer] = row
@@ -87,7 +88,7 @@ def _plan_rows(plan: dict | None) -> dict[str, dict]:
 
 def attention_descriptor(attn: Attention, strategy: dict, codebook: str, scale: str) -> dict | None:
     from ..modules import Linear
-    if attn.interleaved_gate or attn.use_k_as_v:
+    if attn.use_k_as_v:
         return None
     projections = []
     for name in COMPONENTS:
@@ -150,6 +151,11 @@ def resolve_topology(
             "output_splits": [p["out_features"] for p in projection_rows],
         }
         if variant == "split":
+            for projection in projection_rows:
+                _validate_K(projection["K"], layer)
+                if projection["codebook"] not in CODEBOOK_VALUES:
+                    raise QKVTopologyError(f"Projection codebook is invalid for {layer}")
+                _validate_scale(projection["scale"], layer)
             common["projections"] = [
                 {k: p[k] for k in ("name", "K", "codebook", "scale")}
                 for p in projection_rows
@@ -169,6 +175,27 @@ def resolve_topology(
             }
         rows.append(common)
     return {"schema": SCHEMA, "layers": rows}
+
+
+def resolve_target_topology(
+    target_model: Iterable,
+    strategy: dict,
+    codebook: str,
+    scale: str,
+    plan: dict | None,
+) -> tuple[dict | None, tuple[Attention, ...]]:
+    if plan is None:
+        return None, ()
+
+    from ..modules import Attention
+    attentions = tuple(module for module in target_model if isinstance(module, Attention))
+    descriptors = tuple(attention_descriptor(attn, strategy, codebook, scale) for attn in attentions)
+    unsupported = [attn.key for attn, descriptor in zip(attentions, descriptors) if descriptor is None]
+    if unsupported:
+        raise QKVTopologyError(
+            f"Topology metadata cannot describe full-attention layers with nonstandard QKV: {unsupported}"
+        )
+    return resolve_topology(descriptors, plan), attentions
 
 
 def concatenate_qkv_bf16(weights: Iterable[torch.Tensor]) -> torch.Tensor:
@@ -225,8 +252,8 @@ def install_fused_qkv(attn: Attention) -> Linear:
     components = [getattr(attn, name, None) for name in COMPONENTS]
     if not all(isinstance(linear, Linear) for linear in components):
         raise QKVTopologyError(f"Attention layer {attn.key} is not a split full-attention QKV block")
-    if attn.use_k_as_v or attn.interleaved_gate:
-        raise QKVTopologyError(f"Attention layer {attn.key} cannot preserve ordinary q,k,v output order")
+    if attn.use_k_as_v:
+        raise QKVTopologyError(f"Attention layer {attn.key} cannot preserve independent q,k,v outputs")
     if any(not isinstance(linear.inner, LinearFP16) for linear in components):
         raise QKVTopologyError(f"Attention layer {attn.key} must be loaded from source before QKV fusion")
     if len({linear.qmap for linear in components}) != 1 or components[0].qmap is None:
@@ -333,7 +360,7 @@ def topology_layer_map(topology: dict | None) -> dict[str, dict]:
             if not isinstance(declaration, dict) or set(declaration) != projection_keys:
                 raise QKVTopologyError(f"Projection fields are invalid for {layer}")
             _validate_K(declaration["K"], layer)
-            if declaration["codebook"] not in ("mul1", "mcg", "3inst"):
+            if declaration["codebook"] not in CODEBOOK_VALUES:
                 raise QKVTopologyError(f"Projection codebook is invalid for {layer}")
             _validate_scale(declaration["scale"], layer)
         result[layer] = row
@@ -362,8 +389,8 @@ def validate_payload_index(tensor_keys: Iterable[str], topology: dict) -> None:
         for prefix, declaration in logical:
             if prefix + ".trellis" not in keys:
                 raise QKVTopologyError(f"Compiled payload is missing {prefix}.trellis")
-            marker = {"mul1": ".mul1", "mcg": ".mcg", "3inst": None}.get(declaration.get("codebook"))
-            if declaration.get("codebook") not in ("mul1", "mcg", "3inst"):
+            marker = {"mul1": ".mul1", "mcg": ".mcg"}.get(declaration.get("codebook"))
+            if declaration.get("codebook") not in CODEBOOK_VALUES:
                 raise QKVTopologyError(f"Compiled payload declares an unknown codebook for {prefix}")
             if marker is not None and prefix + marker not in keys:
                 raise QKVTopologyError(f"Compiled payload is missing codebook marker {prefix + marker}")

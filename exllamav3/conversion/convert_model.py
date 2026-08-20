@@ -17,12 +17,10 @@ from .compile import compile_model, dsize
 from .allocation import create_q_strategy, print_strategy
 from ..loader.safetensors_alt import save_file, safe_open
 from .qkv_topology import (
-    QKVTopologyError,
     apply_fused_strategy,
-    attention_descriptor,
     install_fused_qkv,
     load_topology_plan,
-    resolve_topology,
+    resolve_target_topology,
 )
 import os, shutil
 import json
@@ -1007,37 +1005,29 @@ def main(args, job_state):
         for linear in model
         if isinstance(linear, Linear) and linear.qmap is not None and linear.qbits_key == "bits"
     }
-    qkv_models = [m for m in (model, mtp_model, vision_model) if m is not None]
-    qkv_attentions = [
-        attn
-        for qkv_model in qkv_models
-        for attn in qkv_model
-        if isinstance(attn, Attention)
-    ]
     scale_policy = {True: "always", False: "never", None: "auto"}[args["apply_out_scales"]]
-    qkv_descriptors = [
-        attention_descriptor(attn, strategy, args["codebook"], scale_policy)
-        for attn in qkv_attentions
-    ]
-    unsupported = [attn.key for attn, descriptor in zip(qkv_attentions, qkv_descriptors) if descriptor is None]
-    if unsupported:
-        raise QKVTopologyError(
-            f"Topology metadata cannot describe full-attention layers with nonstandard QKV: {unsupported}"
-        )
-    qkv_topology = resolve_topology(qkv_descriptors, args.get("qkv_topology_plan"))
-    args["exl3_qkv_topology"] = qkv_topology
-    qkv_rows = {row["layer"]: row for row in qkv_topology["layers"]}
-    for attn in qkv_attentions:
-        row = qkv_rows[attn.key]
-        if row["variant"] == "fused_uniform":
-            component_keys = [getattr(attn, name).key for name in row["components"]]
-            if all(key in main_weight_numel for key in component_keys):
-                q = attn.q_proj
-                fused_out = (sum(row["output_splits"]) + 127) // 128 * 128
-                for key in component_keys:
-                    main_weight_numel.pop(key)
-                main_weight_numel[attn.key + ".qkv_proj"] = q.in_features * fused_out
-        apply_fused_strategy(attn, row, strategy)
+    qkv_topology, qkv_attentions = resolve_target_topology(
+        model,
+        strategy,
+        args["codebook"],
+        scale_policy,
+        args.get("qkv_topology_plan"),
+    )
+    qkv_rows = {}
+    if qkv_topology is not None:
+        args["exl3_qkv_topology"] = qkv_topology
+        qkv_rows = {row["layer"]: row for row in qkv_topology["layers"]}
+        for attn in qkv_attentions:
+            row = qkv_rows[attn.key]
+            if row["variant"] == "fused_uniform":
+                component_keys = [getattr(attn, name).key for name in row["components"]]
+                if all(key in main_weight_numel for key in component_keys):
+                    q = attn.q_proj
+                    fused_out = (sum(row["output_splits"]) + 127) // 128 * 128
+                    for key in component_keys:
+                        main_weight_numel.pop(key)
+                    main_weight_numel[attn.key + ".qkv_proj"] = q.in_features * fused_out
+            apply_fused_strategy(attn, row, strategy)
     main_numel = sum(main_weight_numel.values())
     final_bpw = (
         sum(main_weight_numel[key] * strategy[key] for key in main_weight_numel) / main_numel
