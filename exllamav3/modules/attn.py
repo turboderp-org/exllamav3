@@ -216,9 +216,19 @@ class Attention(Module):
         if post_rope_norm:
             assert q_norm is None and k_norm is None, \
                 "Post-RoPE norm only supported without weights"
+        self.qkv_proj = None
 
         if self.num_kv_heads == 0:
             return
+        topology_map = getattr(config, "qkv_topology", {})
+        topology_enabled = getattr(config, "qkv_topology_enabled", bool(topology_map))
+        if topology_enabled and key not in topology_map:
+            quantized_qkv = any(
+                config.stc.has_tensor(key + "." + name + ".trellis")
+                for name in ("q_proj", "k_proj", "v_proj", "qkv_proj")
+            )
+            if quantized_qkv:
+                raise ValueError(f"{key}: missing full-attention declaration in exl3_qkv_topology/1 metadata")
 
         # Create q, k, v projections
         if key_fused_qkv:
@@ -294,6 +304,42 @@ class Attention(Module):
                 self.register_submodule(self.k_proj)
                 if self.v_proj:
                     self.register_submodule(self.v_proj)
+
+        topology_row = topology_map.get(key)
+        if topology_row is not None:
+            expected_splits = [
+                self.q_proj.out_features_unpadded,
+                self.k_proj.out_features_unpadded,
+                self.v_proj.out_features_unpadded,
+            ]
+            if topology_row["output_splits"] != expected_splits:
+                raise ValueError(
+                    f"{key}: QKV topology output_splits {topology_row['output_splits']} "
+                    f"do not match architecture widths {expected_splits}"
+                )
+            if topology_row["variant"] == "fused_uniform":
+                if interleaved_gate or use_k_as_v or not all(
+                    isinstance(linear, Linear) for linear in (self.q_proj, self.k_proj, self.v_proj)
+                ):
+                    raise ValueError(f"{key}: fused_uniform topology requires independent q, k, v Linear projections")
+                split_ids = {id(self.q_proj), id(self.k_proj), id(self.v_proj)}
+                first = min(i for i, module in enumerate(self.modules) if id(module) in split_ids)
+                self.modules = [module for module in self.modules if id(module) not in split_ids]
+                self.qkv_proj = Linear(
+                    config,
+                    key + ".qkv_proj",
+                    hidden_size,
+                    sum(expected_splits),
+                    qmap = self.q_proj.qmap,
+                    select_hq_bits = select_hq_bits,
+                    qgroup = key + ".qkv",
+                    trim_padded_out = True,
+                    qbits_key = qbits_key,
+                )
+                self.modules.insert(first, self.qkv_proj)
+                self.q_proj = None
+                self.k_proj = None
+                self.v_proj = None
 
         # Create o proj
         if key_o:
@@ -400,6 +446,10 @@ class Attention(Module):
 
     @override
     def optimizer_targets(self):
+        if self.qkv_proj is not None:
+            qkv = self.qkv_proj.optimizer_targets()
+            o = self.o_proj.optimizer_targets()
+            return [[qkv, [], o]]
         q = self.q_proj.optimizer_targets()
         k = self.k_proj.optimizer_targets()
         v = self.v_proj.optimizer_targets()
@@ -429,6 +479,7 @@ class Attention(Module):
 
         # Test if K and V proj can be fused
         if (
+            self.qkv_proj is None and
             not self.config.infer_params.no_reconstruct and
             not self.use_k_as_v and
             device != torch.device("cpu") and
@@ -452,6 +503,7 @@ class Attention(Module):
 
         # Test if Q and G proj can be fused
         if (
+            self.qkv_proj is None and
             not self.config.infer_params.no_reconstruct and
             self.g_proj is not None and
             device != torch.device("cpu") and
@@ -556,6 +608,30 @@ class Attention(Module):
 
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
+        if self.qkv_proj is not None:
+            qkv = self.qkv_proj.forward(x, params)
+            q_width = self.num_q_heads * self.head_dim
+            qg_width = q_width * (2 if self.interleaved_gate else 1)
+            kv_width = self.num_kv_heads * self.head_dim
+            q, k, v = torch.split(qkv, (qg_width, kv_width, kv_width), dim = -1)
+            if self.interleaved_gate:
+                if self.head_dim % 8 == 0 and q.dtype == torch.half:
+                    qg = q.contiguous()
+                    q = torch.empty((bsz, q_len, self.num_q_heads, self.head_dim), dtype = torch.half, device = qg.device)
+                    g = torch.empty((bsz, q_len, q_width), dtype = torch.half, device = qg.device)
+                    ext.deinterleave_qg(qg, q, g, self.head_dim)
+                else:
+                    q, g = torch.chunk(q.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
+                    g = g.reshape(bsz, q_len, -1)
+            else:
+                g = self.g_proj.forward(x, params) if self.g_proj is not None else None
+                q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
+            k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim)
+            v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim)
+            if self.v_norm is not None:
+                v = self.v_norm.forward(v, params, out_dtype = torch.half)
+            return q, k, v, g
+
 
         if self.multi_qg is None or bsz * q_len > 32:
             q = self.q_proj.forward(x, params)
@@ -918,6 +994,8 @@ class Attention(Module):
 
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
+        if self.qkv_proj is not None:
+            raise ValueError(f"{self.key}: tensor parallelism is not supported for fused_uniform QKV topology")
         storage = 0
         storage += self.q_proj.storage_size()
         storage += self.k_proj.storage_size()
@@ -964,6 +1042,8 @@ class Attention(Module):
 
 
     def tp_export(self, plan, producer):
+        if self.qkv_proj is not None:
+            raise ValueError(f"{self.key}: tensor parallelism is not supported for fused_uniform QKV topology")
         assert self.device is not None, "Cannot export module for TP before loading."
 
         def _export(child):
