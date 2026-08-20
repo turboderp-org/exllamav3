@@ -616,7 +616,7 @@ class Attention(Module):
             q, k, v = torch.split(qkv, (qg_width, kv_width, kv_width), dim = -1)
             if self.interleaved_gate:
                 if self.head_dim % 8 == 0 and q.dtype == torch.half:
-                    qg = q
+                    qg = q.contiguous()
                     q = torch.empty((bsz, q_len, self.num_q_heads, self.head_dim), dtype = torch.half, device = qg.device)
                     g = torch.empty((bsz, q_len, q_width), dtype = torch.half, device = qg.device)
                     ext.deinterleave_qg(qg, q, g, self.head_dim)

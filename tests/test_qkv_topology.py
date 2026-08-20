@@ -1,5 +1,6 @@
 import pytest
 import torch
+import exllamav3.modules.attn as attn_module
 
 from exllamav3.model.config import NullConfig
 from exllamav3.modules.attn import Attention
@@ -129,6 +130,38 @@ def test_fused_qkv_forward_deinterleaves_qwen_query_gate_payload():
     )
     assert torch.equal(q, expected_q)
     assert torch.equal(g, expected_g.reshape(1, 2, 6144))
+
+
+def test_fused_qkv_fast_deinterleave_receives_contiguous_qg(monkeypatch):
+    attn = qwen35_attention("model.layers.3.self_attn")
+    x = torch.zeros((1, 2, 5120), dtype = torch.float16)
+    fused = torch.arange(2 * 14336, dtype = torch.float16).view(1, 2, 14336)
+
+    class FusedProjection:
+        @staticmethod
+        def forward(_x, _params):
+            return fused
+
+    def deinterleave(qg, q, g, head_dim):
+        assert qg.is_contiguous()
+        expected_q, expected_g = torch.chunk(
+            qg.view(1, 2, 24, head_dim * 2), 2, dim = -1
+        )
+        q.copy_(expected_q)
+        g.copy_(expected_g.reshape(1, 2, -1))
+
+    monkeypatch.setattr(attn_module.ext, "deinterleave_qg", deinterleave)
+    attn.qkv_proj = FusedProjection()
+    attn.g_proj = None
+    attn.v_norm = None
+
+    q, k, v, g = attn.project_qkv(x, {})
+
+    assert q.shape == (1, 2, 24, 256)
+    assert g.shape == (1, 2, 6144)
+    assert k.shape == v.shape == (1, 2, 4, 256)
+
+
 
 
 
