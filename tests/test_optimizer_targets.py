@@ -167,6 +167,7 @@ def test_qwen38_optimizer_topology_has_expected_unique_groups_and_linears() -> N
         else:
             assert layer_type == "full_attention"
             attn = attention_class()
+            attn.qkv_proj = None
             attn.q_proj = linear(f"{prefix}.attention.q")
             attn.k_proj = linear(f"{prefix}.attention.k")
             attn.v_proj = linear(f"{prefix}.attention.v")
