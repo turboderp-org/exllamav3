@@ -97,3 +97,26 @@ def get_default_calibration(args, tokenizer):
 
     # cal_data = torch.cat(cal_data, dim = 0)
     return cal_data
+
+
+def get_file_calibration(args, tokenizer):
+    """
+    Calibration rows from a packed token file (safetensors with an "input_ids" tensor of shape
+    (rows, cols)), e.g. a self-sampled in-domain trace from sc_trace.py. The file must have been
+    produced with the same tokenizer/model family; rows/cols are cropped to the requested
+    calibration size.
+    """
+    from safetensors.torch import load_file
+    packed = load_file(args["cal_data"])["input_ids"]
+    rows, columns = args["cal_rows"], args["cal_cols"]
+    if packed.shape[0] < rows or packed.shape[1] < columns:
+        raise ValueError(
+            f"Calibration file {args['cal_data']} is {packed.shape[0]} rows x {packed.shape[1]} "
+            f"tokens, need {rows} x {columns}"
+        )
+    if packed.max().item() >= tokenizer.actual_vocab_size:
+        raise ValueError(
+            f"Calibration file {args['cal_data']} contains token ids outside the model's vocab; "
+            f"was it produced with a different tokenizer?"
+        )
+    return [packed[i : i + 1, :columns].to(torch.long).contiguous() for i in range(rows)]

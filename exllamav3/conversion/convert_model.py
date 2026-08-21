@@ -12,9 +12,9 @@ from ..util.memory import free_mem, malloc_trim
 from ..util import Timer, human_time
 from ..util.tensor import save_tensor_image
 from ..util.measures import cosine_error, sqnr
-from .calibration_data import get_default_calibration
+from .calibration_data import get_default_calibration, get_file_calibration
 from .compile import compile_model, dsize
-from .allocation import create_q_strategy, print_strategy
+from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
@@ -34,11 +34,13 @@ parser.add_argument("-w", "--work_dir", type = str, default = None, help = "Work
 parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Output directory")
 parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in MB, default: 8192")
 parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
+parser.add_argument("-rcp", "--recipe", type = str, default = None, help = "Per-tensor bitrate recipe (YAML from sc_optimize.py), used in place of the budgeted allocation from --bits / --head_bits.")
 parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bits per weight, output (head) layer, default: 6")
 parser.add_argument("-mb", "--mtp_bits", type = int, default = None, help = "Bits per weight, MTP layers, default: 4")
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: 16")
 parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
+parser.add_argument("-cd", "--cal_data", type = str, default = None, help = "Calibration data file (safetensors with packed token rows, e.g. from sc_trace.py) used instead of the bundled corpus mix")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
 parser.add_argument("-cc", "--cal_cols", type = int, help = "Calibration data size, columns, default: 2048")
 parser.add_argument("-cpi", "--checkpoint_interval", type = int, default = 120, help = "Minimum checkpoint interval, in seconds")
@@ -140,6 +142,36 @@ def prepare(args) -> (dict, dict, bool, str):
         return None, None, False, "--bits must be between 1 and 8"
     if args.head_bits is not None and (args.head_bits > 8 or args.head_bits < 1) and args.head_bits != 16:
         return None, None, False, "--head_bits must be between 1 and 8, or 16"
+    if not args.resume and args.bits is None and not args.recipe:
+        return None, None, False, "Specify either --bits or --recipe"
+
+    # Per-tensor recipe: parsed up front so its bitrates can stand in for --bits/--head_bits.
+    # The tensor map is stored in the job args below, so a resumed job keeps quantizing to the
+    # strategy it started with even if the recipe file changes on disk
+    recipe_tensors = None
+    recipe_bits = None
+    recipe_head_bits = None
+    if args.recipe:
+        if not os.path.isfile(args.recipe):
+            return None, None, False, f"Recipe file not found: {args.recipe}"
+        import yaml
+        with open(args.recipe, "r", encoding = "utf8") as f:
+            recipe = yaml.safe_load(f)
+        recipe_tensors = recipe.get("tensors") if isinstance(recipe, dict) else None
+        if not isinstance(recipe_tensors, dict) or not recipe_tensors:
+            return None, None, False, "Recipe must contain a non-empty 'tensors' mapping"
+        bad = [k for k, v in recipe_tensors.items()
+               if not isinstance(v, int) or not (1 <= v <= 8 or v == 16)]
+        if bad:
+            return None, None, False, f"Recipe bitrates must be integers 1-8 or 16, bad keys e.g.: {bad[:5]}"
+        recipe_bits = recipe.get("achieved_bpw") or recipe.get("target_bpw")
+        if args.bits is None and recipe_bits is None:
+            return None, None, False, "Recipe has no target_bpw/achieved_bpw; pass --bits for reporting"
+        recipe_head_bits = recipe.get("head_bits")
+        if args.bits is not None:
+            print(" !! Warning: --recipe given, --bits is used for reporting only")
+        if args.hq:
+            print(" !! Warning: --hq has no effect with --recipe")
 
     in_args = { "work_dir": args.work_dir }
     if args.resume:
@@ -173,11 +205,13 @@ def prepare(args) -> (dict, dict, bool, str):
         ("in_dir", True, None),
         ("out_dir", True, None),
         ("shard_size", True, 8192),
-        ("bits", False, None),
-        ("head_bits", False, 6),
+        ("bits", False, recipe_bits),
+        ("recipe", False, ""),
+        ("head_bits", False, recipe_head_bits or 6),
         ("mtp_bits", True, 4),
         ("vision_bits", True, 16),
         ("hq", False, False),
+        ("cal_data", False, ""),
         ("cal_rows", False, 250),
         ("cal_cols", False, 2048),
         ("checkpoint_interval", True, None),
@@ -187,6 +221,10 @@ def prepare(args) -> (dict, dict, bool, str):
         ("codebook", True, "mul1"),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
+
+    # Recipe strategy travels with the job; a stored map from a resumed job wins over the file
+    if recipe_tensors is not None and "recipe_strategy" not in in_args:
+        in_args["recipe_strategy"] = recipe_tensors
 
     # Momentary args
     in_args["image_dump"] = args.image_dump
@@ -211,7 +249,11 @@ def prepare(args) -> (dict, dict, bool, str):
     print(f"    Output directory: {in_args['out_dir']}")
     print(f"    Working directory: {in_args['work_dir']}")
     print(f"    Calibration size: {in_args['cal_rows']} rows, {in_args['cal_cols']} columns")
+    if in_args.get("cal_data"):
+        print(f"    Calibration data: {in_args['cal_data']}")
     print(f"    Target bitrate: {in_args['bits']} (decoder), {in_args['head_bits']} (head)")
+    if in_args.get("recipe_strategy"):
+        print(f"    Recipe: {in_args.get('recipe')} ({len(in_args['recipe_strategy'])} tensors)")
     print(f"    Output scales: " + {True: "always", False: "never", None: "auto"}[in_args["apply_out_scales"]])
     print(f"    Codebook: {in_args['codebook']}")
 
@@ -269,7 +311,11 @@ def prepare_state(args, job_state, config, model, tokenizer):
     idx = job_state["next_module_idx"]
     if idx == 0:
         print(f" -- Preparing input state")
-        state = get_default_calibration(args, tokenizer)
+        if args.get("cal_data"):
+            print(f"    Calibration data: {args['cal_data']}")
+            state = get_file_calibration(args, tokenizer)
+        else:
+            state = get_default_calibration(args, tokenizer)
         original_input_ids = None
     else:
         if idx < len(model.modules):
@@ -979,10 +1025,17 @@ def main(args, job_state):
     # Get quantization strategy for model @bitrate
     print(" -- Deciding quantization strategy")
     hq = args["hq"]
-    strategy, final_bpw = create_q_strategy(
-        model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
-        vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
-    )
+    if args.get("recipe_strategy"):
+        print(f"    Applying recipe: {args.get('recipe')}")
+        strategy, final_bpw = create_q_strategy_from_recipe(
+            model, mtp_model, config, args["recipe_strategy"], args["head_bits"], args["mtp_bits"],
+            vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
+        )
+    else:
+        strategy, final_bpw = create_q_strategy(
+            model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
+            vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
+        )
     args["final_bits"] = round(final_bpw, 2)
     print(" -- Quantization strategy, summary:")
     print(print_strategy(strategy))
