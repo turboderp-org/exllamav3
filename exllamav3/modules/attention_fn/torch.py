@@ -3,6 +3,10 @@ from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
 from torch.nn.attention.bias import causal_lower_right
 import torch.nn.functional as F
 
+
+def _is_pow2(n: int) -> bool:
+    return (n & (n - 1)) == 0 and n > 0
+
 has_warned_sdpa_fallback = False
 def _warn_sdpa_fallback():
     global has_warned_sdpa_fallback
@@ -46,7 +50,9 @@ def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
     if (
         args.is_varlen() or
         not args.has_kv_cache() or
-        args.dim < 512 or
+        # Triton/FA2 require power-of-2 head dims, so this is the only backend for cached
+        # non-pow2 attention; pow2 < 512 stays on the faster Triton/FA2 paths
+        (args.dim < 512 and _is_pow2(args.dim)) or
         args.softcap != 0.0 or
         args.sinks is not None or
         args.is_swa()

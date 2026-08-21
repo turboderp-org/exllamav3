@@ -644,7 +644,9 @@ def fn_triton_paged_attn(args: AttnArgs) -> torch.Tensor | None:
         not has_triton or
         args.is_varlen() or
         not args.has_kv_cache() or
-        args.q_len > 256
+        args.q_len > 256 or
+        # paged_attn_triton raises on non-pow2 head dims: decline so dispatch falls through
+        not _is_power_of_2(args.dim)
     ):
         return None
 

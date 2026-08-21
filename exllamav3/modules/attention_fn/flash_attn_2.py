@@ -9,13 +9,19 @@ try:
 except (ModuleNotFoundError, ImportError):
     has_fa2 = False
 
+
+def _is_pow2(n: int) -> bool:
+    return (n & (n - 1)) == 0 and n > 0
+
+
 def fn_flash_attn_with_kvcache(args: AttnArgs) -> torch.Tensor | None:
     if (
         not has_fa2 or
         args.sinks is not None or
         args.is_varlen() or
         not args.has_kv_cache() or
-        args.dim > 256
+        args.dim > 256 or
+        not _is_pow2(args.dim)  # FA2 requires power-of-2 head dims
     ):
         return None
 
@@ -46,7 +52,8 @@ def fn_flash_attn_func(args: AttnArgs) -> torch.Tensor | None:
         args.is_varlen() or
         args.has_kv_cache() or
         args.dim > 256 or
-        args.non_causal_spans
+        args.non_causal_spans or
+        not _is_pow2(args.dim)  # FA2 requires power-of-2 head dims
     ):
         return None
 
@@ -69,7 +76,8 @@ def fn_flash_attn_varlen_func(args: AttnArgs) -> torch.Tensor | None:
         args.bsz > 1 or
         args.has_kv_cache() or
         args.dim > 256 or
-        args.non_causal_spans
+        args.non_causal_spans or
+        not _is_pow2(args.dim)  # FA2 requires power-of-2 head dims
     ):
         return None
 
