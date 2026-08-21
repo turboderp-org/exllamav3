@@ -77,7 +77,7 @@ CAT_MARKER = _cat_marker()
 
 
 def group_marker(group):
-    return CAT_MARKER if group == "EXL3" else "o"
+    return CAT_MARKER if group.startswith("EXL3") else "o"
 
 
 def group_marker_size(group, base):
@@ -93,12 +93,14 @@ GROUP_COLORS = [
     "#ab472d",  # 5: terracotta
     "#1820e8",  # 6: deep blue
     "#fc4f1f",  # 7: orange red
+    "#96f97b",  # 8: light green
+    "#c79fef",  # 9: lavender
 ]
 
 def make_palette(groups):
     """Fixed color per group name; reserved slots for common formats, remainder
     walks the CVD-optimized ladder in stable (sorted) order."""
-    fixed_cols = {"EXL3": 0, "AWQ": 1, "GGUF": 3, "GGUF-IQ": 4, "NVFP4": 5}
+    fixed_cols = {"EXL3": 0, "AWQ": 1, "GGUF": 2, "GGUF-IQ": 4, "NVFP4": 5, "EXL3-SC": 3}
     unused = [i for i in range(len(GROUP_COLORS)) if i not in fixed_cols.values()]
     palette = {}
     for g in sorted(groups):
@@ -570,7 +572,7 @@ def _add_point_labels(fig, ax, rows, line_df, dark, palette):
         score_text = ax.text(
             r["x"],
             r["y"],
-            f"{r['y']:.3f}",
+            f"{r['y']:.4f}",
             fontsize = 8.5,
             ha = "center",
             va = "top",
@@ -793,6 +795,8 @@ def plot_scatter(results, args, ref_line = None):
     ax.set_ylabel(y_label)
     ax.xaxis.label.set_size(14)
     ax.yaxis.label.set_size(14)
+    if getattr(args, "y_log", False):
+        ax.set_yscale("log")
     if args.kld:
         ax.yaxis.label.set_verticalalignment("bottom")
     colors = _text_colors(args.dark)
@@ -815,16 +819,24 @@ def plot_scatter(results, args, ref_line = None):
     ax.margins(x = 0.08, y = 0.12)
     sns.despine(ax = ax, left = True, bottom = True)
 
-    # Reference as a horizontal line, extending the y range to include it if needed
+    # Reference as a horizontal line, extending the y range to include it if needed (padding in
+    # log space when the y axis is logarithmic, where the floor line usually sits decades below
+    # the data)
     if ref_line is not None:
         y0, y1 = ax.get_ylim()
-        pad = (y1 - y0) * 0.06
-        if not (y0 + pad <= ref_line["value"] <= y1 - pad):
-            ax.set_ylim(min(y0, ref_line["value"] - pad), max(y1, ref_line["value"] + pad))
+        if getattr(args, "y_log", False) and ref_line["value"] > 0 and y0 > 0:
+            ly0, ly1, lv = math.log10(y0), math.log10(y1), math.log10(ref_line["value"])
+            lpad = (ly1 - ly0) * 0.06
+            if not (ly0 + lpad <= lv <= ly1 - lpad):
+                ax.set_ylim(10 ** min(ly0, lv - lpad), 10 ** max(ly1, lv + lpad))
+        else:
+            pad = (y1 - y0) * 0.06
+            if not (y0 + pad <= ref_line["value"] <= y1 - pad):
+                ax.set_ylim(min(y0, ref_line["value"] - pad), max(y1, ref_line["value"] + pad))
         x0, x1 = ax.get_xlim()
         ax.axhline(ref_line["value"], color = colors["floor"], linewidth = 2.2, linestyle = ":", zorder = 1)
         ax.annotate(
-            f"{ref_line['label']}: {ref_line['value']:.4f}",
+            f"{ref_line['label']}: {ref_line['value']:.5f}",
             (x0, ref_line["value"]),
             textcoords = "offset points", xytext = (6, 5),
             ha = "left", fontsize = 11, color = colors["floor"], zorder = 5,
@@ -845,7 +857,7 @@ def plot_scatter(results, args, ref_line = None):
         def on_add(sel):
             point = rows[sel.index]
             sel.annotation.set_text(
-                f"{point['label']}\n{x_label}: {point['x']:.3f}\n{y_label}: {point['y']:.4f}"
+                f"{point['label']}\n{x_label}: {point['x']:.4f}\n{y_label}: {point['y']:.5f}"
             )
     except (ImportError, StopIteration):
         pass
@@ -953,8 +965,8 @@ def plot_kld_spread(results: list, title: str, subtitle: str, dark: bool, plot_f
                 "point_label": r["label"],
                 "x": r[x_key],
                 "y": r["kld_median"],
-                "value": f"{r['kld_median']:.4f}",
-                "value2": f"{r['kld_median'] - floor['kld_median']:.4f}" if floor is not None else None,
+                "value": f"{r['kld_median']:.5f}",
+                "value2": f"{r['kld_median'] - floor['kld_median']:.5f}" if floor is not None else None,
             }
             label_rows.append(row)
 
@@ -967,13 +979,13 @@ def plot_kld_spread(results: list, title: str, subtitle: str, dark: bool, plot_f
         ax.axhline(floor["kld"], color = colors["floor"], linewidth = 1.0, linestyle = ":", alpha = 0.65, zorder = 1)
         floor_texts = [
             ax.annotate(
-                f"noise floor, median: {floor['kld_median']:.4f}",
+                f"noise floor, median: {floor['kld_median']:.5f}",
                 (x0, floor["kld_median"]),
                 textcoords = "offset points", xytext = (6, 5),
                 ha = "left", fontsize = 11, color = colors["floor"], zorder = 5,
             ),
             ax.annotate(
-                f"noise floor, mean: {floor['kld']:.4f}",
+                f"noise floor, mean: {floor['kld']:.5f}",
                 (x0, floor["kld"]),
                 textcoords = "offset points", xytext = (6, 5),
                 ha = "left", fontsize = 11, color = colors["floor"], alpha = 0.8, zorder = 5,
@@ -1351,7 +1363,7 @@ def plot_kld_hist(entries: list, title: str, subtitle: str, dark: bool, plot_fil
             fontsize = 12, color = color, zorder = 5, bbox = pill,
         )
         ax.text(
-            0.97, 0.955, f"median {med:+.4f}",
+            0.97, 0.955, f"median {med:+.5f}",
             transform = ax.transAxes, ha = "right", va = "top",
             fontsize = 10.5, color = colors["value"], zorder = 5, bbox = pill,
         )
