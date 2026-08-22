@@ -1476,8 +1476,9 @@ class _WeightStager:
         reuse_ev.synchronize()
         pin = buf[:nbytes].view(w.dtype).view(w.shape)
         pin.copy_(w)
-        dev_w = torch.empty(w.shape, dtype = w.dtype, device = self.device)
         with torch.cuda.stream(self.copy_stream):
+            # dev_w MUST be allocated on the copy stream.
+            dev_w = torch.empty(w.shape, dtype = w.dtype, device = self.device)
             dev_w.copy_(pin, non_blocking = True)
             reuse_ev.record(self.copy_stream)
         ev = torch.cuda.Event()
@@ -1489,6 +1490,9 @@ class _WeightStager:
         dev_w, ev = self.pending.pop(t)
         if ev is not None:
             torch.cuda.current_stream(self.device).wait_event(ev)
+            # The block belongs to the copy stream's pool; mark its use on the consuming stream
+            # so its eventual free isn't recycled under a later async upload
+            dev_w.record_stream(torch.cuda.current_stream(self.device))
         return dev_w.float() if dev_w.dtype != torch.float else dev_w
 
 
