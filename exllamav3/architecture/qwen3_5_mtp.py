@@ -10,13 +10,33 @@ from ..model.model import Model
 from ..util.rope import RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear, BlockSparseMLP
 from ..modules.arch_specific.qwen3_5_mtp import Qwen3_5MTPInputLayer
+from ..modules.quant.exl3 import LinearEXL3
 from ..modules.attn import prepare_for_attn
 from ..modules.module import no_p2p_copy
 from ..util.tensor import get_for_device
+from .mtp_hot_vocab import MTPHotVocabConfig
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
+
+
+def validate_mtp_hot_blocks(block_ids: list[int], full_vocab: int):
+    """Validate packed EXL3 output blocks before constructing a reordered draft head."""
+    if not block_ids or block_ids[0] < 0:
+        raise ValueError("MTP hot blocks must be a nonempty list of nonnegative IDs")
+    if block_ids != sorted(set(block_ids)):
+        raise ValueError("MTP hot blocks must be unique and sorted")
+    if block_ids[-1] >= (full_vocab + 15) // 16:
+        raise ValueError("MTP hot block ID exceeds the model vocabulary")
+    # EXL3 applies an independent output Hadamard transform to each 128-token group.
+    # Reordering smaller units produces plausible-shaped but invalid logits.
+    if len(block_ids) % 8:
+        raise ValueError("MTP hot blocks must contain complete 128-token groups")
+    for offset in range(0, len(block_ids), 8):
+        first = block_ids[offset]
+        if first % 8 or block_ids[offset:offset + 8] != list(range(first, first + 8)):
+            raise ValueError("MTP hot blocks must be aligned contiguous groups of 8 packed blocks")
 
 
 class Qwen3_5MTPModel(Model):
@@ -25,10 +45,16 @@ class Qwen3_5MTPModel(Model):
         self,
         config: Qwen3_5Config | Qwen3_5MoeConfig,
         use_moe: bool = False,
+        mtp_hot_vocab_config: MTPHotVocabConfig | None = None,
         **kwargs
     ):
         super().__init__(config, **kwargs)
         self.use_moe = use_moe
+        self.mtp_hot_vocab_config = (
+            mtp_hot_vocab_config
+            if mtp_hot_vocab_config is not None
+            else MTPHotVocabConfig.from_env()
+        )
 
         # Module list: optional embed, then pre_fc norms + fc, then num_mtp_layers * TransformerBlock, then norm
         self.input_layer = Qwen3_5MTPInputLayer(
@@ -177,6 +203,10 @@ class Qwen3_5MTPModel(Model):
         self.target_embed = None
         self.target_lm_head = None
         self.attached_model = None
+        self.mtp_sub_lm_head = None
+        self.mtp_hot_vocab = 0
+        self.mtp_hot_id_map = None
+        self.mtp_subhead_validation = None
 
 
     @override
@@ -214,6 +244,73 @@ class Qwen3_5MTPModel(Model):
         assert isinstance(target.modules[-1], Linear), "Expected Linear lm_head as last target module"
         self.target_lm_head = weakref.ref(target.modules[-1])
 
+        # Experimental single-GPU MTP fast path. Draft against a selected vocabulary subset and
+        # keep its matching input embeddings on GPU. The full target head still verifies every
+        # proposed token, so the subset changes draft cost and acceptance rather than target quality.
+        hot_config = self.mtp_hot_vocab_config
+        hot_blocks_path = hot_config.blocks_path
+        full_head = target.modules[-1].inner
+        if hot_blocks_path:
+            if target.loaded_tp:
+                raise ValueError("MTP hot vocabulary currently supports layer-split inference only")
+            if not isinstance(full_head, LinearEXL3):
+                raise ValueError("MTP hot vocabulary currently requires an EXL3 lm_head")
+            full_vocab = target.modules[-1].out_features_unpadded
+            with open(hot_blocks_path, "r", encoding = "utf-8") as f:
+                block_ids = [int(line) for line in f if line.strip() and not line.lstrip().startswith("#")]
+            validate_mtp_hot_blocks(block_ids, full_vocab)
+            block_idx = torch.tensor(block_ids, device = full_head.trellis.device, dtype = torch.long)
+            token_ids = (
+                block_idx[:, None] * 16 +
+                torch.arange(16, device = block_idx.device)[None, :]
+            ).flatten()
+            token_ids = token_ids[token_ids < full_vocab]
+            # Keep complete packed blocks. The model's vocabulary is block-aligned today;
+            # rejecting a partial final block avoids ambiguous EXL3 output dimensions.
+            if token_ids.numel() != len(block_ids) * 16:
+                raise ValueError("MTP hot blocks may not include a partial final vocabulary block")
+            hot_vocab = token_ids.numel()
+            trellis = full_head.trellis.index_select(1, block_idx).contiguous()
+            svh = full_head.svh.index_select(0, token_ids).contiguous()
+            bias = full_head.bias.index_select(0, token_ids).contiguous() if full_head.bias is not None else None
+            self.mtp_hot_id_map = token_ids
+            self.mtp_sub_lm_head = LinearEXL3(
+                config = target.config,
+                in_features = full_head.in_features,
+                out_features = hot_vocab,
+                suh = full_head.suh,
+                svh = svh,
+                trellis = trellis,
+                mcg = full_head.mcg_tensor,
+                mul1 = full_head.mul1_tensor,
+                bias = bias,
+                out_dtype = full_head.out_dtype,
+                key = "mtp.hot_lm_head",
+            )
+            embed = self.target_embed().embedding.weight.index_select(0, token_ids.cpu())
+            embed_dtype = hot_config.embedding_dtype.lower()
+            if embed_dtype in ("fp8", "float8", "e4m3"):
+                embed_dtype = torch.float8_e4m3fn
+            elif embed_dtype in ("fp16", "float16", "half"):
+                embed_dtype = torch.float16
+            else:
+                raise ValueError(f"Unsupported MTP hot-embedding dtype: {embed_dtype!r}")
+            self.input_layer.hot_embedding = embed.to(
+                device = full_head.trellis.device,
+                dtype = embed_dtype,
+            ).contiguous()
+            inverse = torch.full((full_vocab,), -1, device = token_ids.device, dtype = torch.long)
+            inverse[token_ids] = torch.arange(hot_vocab, device = token_ids.device)
+            self.input_layer.hot_inverse = inverse
+            self.mtp_hot_vocab = hot_vocab
+
+            if hot_config.validate_full_head:
+                self.mtp_subhead_validation = {
+                    "total": 0,
+                    "full_in_hot_vocab": 0,
+                    "matches_when_full_in_hot_vocab": 0,
+                }
+
         target_norm = target.modules[target.logit_layer_idx - 1]
         assert isinstance(target_norm, RMSNorm), "Expected target final RMSNorm immediately before lm_head"
         self.draft_verifier_params.update({
@@ -234,7 +331,27 @@ class Qwen3_5MTPModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        if not self.attached_model().loaded_tp:
+        if self.mtp_sub_lm_head is not None:
+            logits = self.mtp_sub_lm_head.forward(state, params)
+            if params.get("export_draft_conf"):
+                conf, sub_argmax = torch.max(logits, dim = -1)
+                params["draft_conf"] = conf
+            else:
+                sub_argmax = torch.argmax(logits, dim = -1)
+            sub_argmax = self.mtp_hot_id_map[sub_argmax]
+            if self.mtp_subhead_validation is not None:
+                ll = self.attached_model().logit_layer_idx
+                lm = self.attached_model().modules[ll]
+                full_state = lm.prepare_for_device(state, params)
+                full_argmax = torch.argmax(lm.forward(full_state, params), dim = -1)
+                in_hot = self.input_layer.hot_inverse[full_argmax] >= 0
+                matches = sub_argmax == full_argmax
+                stats = self.mtp_subhead_validation
+                stats["total"] += full_argmax.numel()
+                stats["full_in_hot_vocab"] += in_hot.sum().item()
+                stats["matches_when_full_in_hot_vocab"] += (matches & in_hot).sum().item()
+            return sub_argmax
+        elif not self.attached_model().loaded_tp:
             ll = self.attached_model().logit_layer_idx
             lm = self.attached_model().modules[ll]
             logits = lm.prepare_for_device(state, params)

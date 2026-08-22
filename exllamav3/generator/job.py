@@ -272,6 +272,7 @@ class Job:
         self.accepted_draft_tokens = 0
         self.rejected_draft_tokens = 0
         self.draft_stats = []
+        self.draft_token_ids = []
         self.cached_pages = 0
         self.cached_tokens = 0
         self.is_finished = False

@@ -426,3 +426,13 @@ kernel with the kernel name, source line and bad index instead of corrupting mem
 faulting asynchronously downstream. Debug tool for paged-pool issues; significant JIT
 overhead (forces Triton debug mode globally), leave unset in production. AOT/BC graph
 kernels are unaffected (compiled with asserts off).
+
+## MTP hot-vocabulary drafting
+
+See [Qwen MTP hot vocabulary](mtp_hot_vocab.md) for constraints and map generation.
+
+| Variable | Description |
+| --- | --- |
+| `EXL3_MTP_HOT_BLOCKS` | Packed EXL3 block map for a reduced Qwen MTP draft head. |
+| `EXL3_MTP_HOT_EMBED_DTYPE` | Copied draft-embedding dtype: `fp16` (default) or `fp8`. |
+| `EXL3_MTP_VALIDATE_SUBHEAD` | Nonzero compares subset and full draft-head argmax; diagnostics only. |
