@@ -202,7 +202,7 @@ class Generator:
         self.cpu_page_cache = None
         if cpu_cache_size:
             tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
-            self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size, model)
+            self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
             self.cpu_page_cache.attach(self.pagetable)
             self.pagetable.cpu_tier = self.cpu_page_cache
 

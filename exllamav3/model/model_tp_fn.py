@@ -389,21 +389,31 @@ def mp_rotate_cache_pages(
 
 # CPU page cache in TP mode. The main process owns the page table, the slot table and the eviction policy but
 # holds no cache tensors, so it names a slot by index and every rank keeps its own shard of that slot here. A
-# slot is one whole page image of this rank's shard, across every attached cache, in one pinned buffer per
-# cache tensor.
+# slot is one whole page image of this rank's shard, across every attached cache, in ONE pinned slab with a
+# view carved per cache tensor (never one allocation per tensor): a slot touches every layer's K and V, so
+# per-tensor pinning is O(layers) cudaHostAlloc calls per slot, and across a real budget that overruns
+# vm.max_map_count (~65k mappings by default) long before it runs out of memory, silently degrading the whole
+# pool to pageable buffers.
 
 class RankSlotPool:
     """
-    This rank's half (or third, or...) of the CPU page cache: one set of host buffers per slot index.
+    This rank's half (or third, or...) of the CPU page cache: one pinned slab per slot index.
 
-    Pinning host memory manages only ~2.5 GB/s and serializes with copy submission on the driver, so buffers
+    Pinning host memory manages only ~2.5 GB/s and serializes with copy submission on the driver, so slabs
     are pinned ahead of demand by a background thread, mirroring what the single-process cache does. A store
     that outruns the thread pins synchronously and says so, since that stall lands on the generator's own
     dispatch path.
     """
 
     def __init__(self, cache_tensors: list, max_slots: int):
-        self.shapes = [(t.shape[1:], t.dtype) for t in cache_tensors]
+        # Segment layout of one slab, mirroring CPUPageCache._make_slab
+        self.segments = []
+        offset = 0
+        for t in cache_tensors:
+            nbytes = t[0].numel() * t.element_size()
+            self.segments.append((offset, t.shape[1:], t.dtype, nbytes))
+            offset = (offset + nbytes + 255) & ~255
+        self.slab_size = (offset + 4095) & ~4095
         self.max_slots = max_slots
         self.slots = {}
         self.cold_allocs = 0
@@ -417,22 +427,29 @@ class RankSlotPool:
 
     def _make_buffers(self):
         try:
-            return [torch.empty(shape, dtype = dtype, pin_memory = True) for shape, dtype in self.shapes]
+            slab = torch.empty((self.slab_size,), dtype = torch.uint8, pin_memory = True)
         except RuntimeError:
             # Out of lockable memory on this rank. Pageable buffers still work, at roughly half the transfer
-            # bandwidth, which beats failing the store outright
-            self.pageable = True
-            return [torch.empty(shape, dtype = dtype) for shape, dtype in self.shapes]
+            # bandwidth (and stores into them synchronize), which beats failing the store outright (but it
+            # is a real degradation, so warn once)
+            if not self.pageable:
+                self.pageable = True
+                print(" !! CPU page cache: rank out of pinnable memory, falling back to pageable buffers",
+                      flush = True)
+            slab = torch.empty((self.slab_size,), dtype = torch.uint8)
+        return [slab[offset : offset + nbytes].view(dtype).view(shape)
+                for offset, shape, dtype, nbytes in self.segments]
 
 
     def _alloc_worker(self):
-        while True:
-            with self._spare_cond:
-                while len(self.slots) + len(self._spare) >= self.max_slots:
-                    self._spare_cond.wait()
-            buffers = self._make_buffers()  # slow part, outside the lock
-            with self._spare_cond:
-                self._spare.append(buffers)
+        with torch.inference_mode():
+            while True:
+                with self._spare_cond:
+                    while len(self.slots) + len(self._spare) >= self.max_slots:
+                        self._spare_cond.wait()
+                buffers = self._make_buffers()  # slow part, outside the lock
+                with self._spare_cond:
+                    self._spare.append(buffers)
 
 
     def get(self, slot: int):

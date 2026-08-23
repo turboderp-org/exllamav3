@@ -106,6 +106,14 @@ def same(a, b):
     return len(a) == len(b) and all(torch.equal(x, y) for x, y in zip(a, b))
 
 
+@pytest.fixture(autouse = True)
+def inference_mode():
+    # The generator and the TP workers both drive the tier under inference mode, and the pinned slabs the
+    # background threads produce are inference tensors; writing to them outside the mode is a RuntimeError
+    with torch.inference_mode():
+        yield
+
+
 @pytest.fixture
 def tp_cache():
     """One TP model over two ranks with uneven shards, holding two caches, two cache modules each."""
@@ -119,7 +127,7 @@ def tp_cache():
 
 
 def build(model, caches, max_size):
-    return CPUPageCache(caches, max_size, model)
+    return CPUPageCache(caches, max_size)
 
 
 def test_slot_size_is_the_page_summed_over_ranks(tp_cache):
@@ -221,7 +229,7 @@ def test_a_draft_cache_on_its_own_model_is_dispatched_separately():
     main_model.ranks = [make_rank([id(main_cache)], [64, 48]), make_rank([id(main_cache)], [32, 16])]
     draft_model.ranks = [make_rank([id(draft_cache)], [8]), make_rank([id(draft_cache)], [8])]
 
-    cache = CPUPageCache([main_cache, draft_cache], 64 * 4096, main_model)
+    cache = CPUPageCache([main_cache, draft_cache], 64 * 4096)
 
     # One page image spans both models: (64 + 48 + 32 + 16) + (8 + 8) widths, x 2 bytes
     assert cache.slot_size == 4096
@@ -263,7 +271,7 @@ def test_a_local_draft_cache_shares_the_slot_with_a_tp_main_cache():
         layers = {0: FakeCacheLayer([draft_tensor, None])},
     )
 
-    cache = CPUPageCache([main_cache, draft_cache], 64 * 4096, main_model)
+    cache = CPUPageCache([main_cache, draft_cache], 64 * 4096)
     assert len(cache.tp_groups) == 1
     assert cache.segments, "the local draft cache must still be copied here"
     assert cache.slot_size == 4096

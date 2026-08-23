@@ -36,23 +36,20 @@ class CPUPageCache:
         self,
         caches: list,
         max_size: int,
-        model = None,
     ):
         """
         :param caches:
             List of Cache objects whose paged layers make up one page image, i.e. [cache] or
-            [cache, draft_cache]. The model must be loaded (cache tensors allocated)
+            [cache, draft_cache]. The model must be loaded (cache tensors allocated). Each cache names its
+            own model, which is what the dispatch follows: in tensor-parallel mode the cache is sharded
+            across worker processes and the main process holds no tensors to copy from, so this object keeps
+            only the slot table and the eviction policy and every transfer is dispatched per rank. A slot
+            index means the same page image on every rank, and the budget counts whole pages across all of
+            them
 
         :param max_size:
             Capacity in bytes of pinned system memory. Slots are allocated lazily as pages are pushed, so this
             is a ceiling, not an up-front allocation
-
-        :param model:
-            Unused, kept for callers that pass the generator's model. Each cache names its own model, which is
-            what the dispatch has to follow: in tensor-parallel mode the cache is sharded across worker
-            processes and the main process holds no tensors to copy from, so this object keeps only the slot
-            table and the eviction policy and every transfer is dispatched per rank. A slot index means the
-            same page image on every rank, and the budget counts whole pages across all of them
         """
 
         # A draft cache belongs to the draft model, with its own workers and its own view of which cache ids
@@ -214,23 +211,22 @@ class CPUPageCache:
 
     def _evict_one(self, protect: set | None):
         assert self.entries, "CPU page cache has no entries to evict (logic error)"
-        # Counts entries passed over because the allocation in progress claimed them. It deliberately survives
-        # an order rebuild: it is the termination condition, not a property of the current snapshot, and
-        # resetting it there livelocks whenever the protect set outlasts the rebuild interval. A restore
-        # protects every page of the chain it is bringing back, which on a long prompt is hundreds of pages
-        # against a rebuild interval of max_slots/8, so the loop would defer, rebuild, forget it had deferred,
-        # and spin on a full cache forever.
+        # Entries claimed by the allocation in progress (a restore protects every page of the chain it is
+        # bringing back, hundreds of pages on a long prompt) are passed over and requeued; they are only
+        # taken once every entry has been deferred, i.e. everything is protected. A deferral does not count
+        # as an order pop. Pops are consumed entries only, so one call walks past the whole protected run in
+        # a single pass and reaches the first unprotected candidate
         deferred = 0
         while True:
             if not self._order or self._order_pops >= self._order_rebuild:
                 self._build_order()
+                deferred = 0
             h = self._order.popleft()
-            self._order_pops += 1
-            # Entries claimed by the allocation in progress are skipped unless everything is protected
             if protect and h in protect and deferred < len(self.entries):
                 self._order.append(h)
                 deferred += 1
                 continue
+            self._order_pops += 1
             e = self.entries.pop(h, None)
             if e is not None:
                 self.metrics["evictions"] += 1
