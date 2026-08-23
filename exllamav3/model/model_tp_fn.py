@@ -1,6 +1,7 @@
 import torch
 import traceback
 import os
+import signal
 import sys
 import time
 from .model_tp_shared import SMProducer, SMConsumer
@@ -71,6 +72,10 @@ def mp_model_worker(
     producer: dict,
     dbg_t0_: float
 ):
+    # Terminal Ctrl-C is delivered to the whole foreground process group; shutdown is
+    # orchestrated by the parent ("quit" command) or the kernel (PDEATHSIG), never by SIGINT
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     set_t0("TP", dbg_t0_)
     log_tp(device, f"Child process launched")
     if install_parent_death_signal():
