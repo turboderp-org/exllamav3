@@ -83,7 +83,8 @@ class Exl3Backend:
 
                 logits_layer = idx == len(modules) - 1
                 for r in range(len(states)):
-                    params = {}
+                    # Hash-MoE layers (DeepSeek-V4) route by token id; provide the row's ids
+                    params = {"input_ids": ids[r:r + 1]}
                     x = module.prepare_for_device(states[r], params)
                     x = module.forward(x, params)
                     if noise_eps and idx < len(modules) - 2 and x.is_floating_point():
@@ -189,15 +190,28 @@ class TransformersBackend:
             # include_buffers = False keeps non-persistent buffers (rope inv_freq etc., which
             # are not in the shards) materialized with their init values
             with init_empty_weights(include_buffers = False):
-                self.model = AutoModelForCausalLM.from_config(config, dtype = dtype, trust_remote_code = trc)
+                try:
+                    self.model = AutoModelForCausalLM.from_config(config, dtype = dtype, trust_remote_code = trc)
+                except ValueError:
+                    # Multimodal wrappers not registered under CausalLM (Mistral3/Mistral4):
+                    # the ConditionalGeneration class computes text-only logits fine, and the
+                    # never-forwarded vision tower simply stays on meta
+                    from transformers import AutoModelForImageTextToText
+                    self.model = AutoModelForImageTextToText.from_config(config, dtype = dtype, trust_remote_code = trc)
             self.model.eval()
 
             # The streamed head skips the CausalLM wrapper's forward, so post-head transforms
-            # it would apply must be replicated (gemma-style logit softcapping)
+            # it would apply must be replicated (gemma-style logit softcapping, and MuseGlimmer's
+            # output_multiplier pre-scale, applied BEFORE the softcap)
             text_config = getattr(config, "text_config", None) or config
             self.logit_softcap = (
                 getattr(text_config, "final_logit_softcapping", None)
                 or getattr(config, "final_logit_softcapping", None)
+            )
+            self.logit_multiplier = (
+                getattr(text_config, "output_multiplier", None)
+                or getattr(config, "output_multiplier", None)
+                or 1.0
             )
 
             # Shard index: module-side tensor name -> (file, checkpoint tensor name). Checkpoint
@@ -275,6 +289,13 @@ class TransformersBackend:
                         mod_name = mod_name.replace(src, tgt)
                 if mod_name != ck_name:
                     self.tensor_index[mod_name] = (fn, ck_name)
+                # Some conversion mappings (deepseek_v4) declare targets in the bare
+                # base-model namespace and rely on the loader to add base_model_prefix;
+                # alias the prefixed form so module-side lookups resolve. setdefault: real
+                # top-level names (lm_head) must not be shadowed
+                base_prefix = getattr(self.model, "base_model_prefix", "")
+                if base_prefix:
+                    self.tensor_index.setdefault(f"{base_prefix}.{mod_name}", (fn, ck_name))
 
             # Generic fallback for composite checkpoints whose model doesn't declare the
             # container strip in its conversion mapping: alias the text stack into the CausalLM
@@ -283,6 +304,16 @@ class TransformersBackend:
                 if ck_name.startswith("model.language_model."):
                     alias = "model." + ck_name[len("model.language_model."):]
                     self.tensor_index.setdefault(alias, (fn, ck_name))
+
+            # Wrappers nesting a bare text model under language_model keep the text model's own
+            # base prefix in the checkpoint ("language_model.model.*", old-style Mistral3/4);
+            # from_pretrained strips it when nesting, so alias the stripped form of every
+            # resolved name too
+            for mod_name in list(self.tensor_index.keys()):
+                if ".language_model.model." in mod_name:
+                    self.tensor_index.setdefault(
+                        mod_name.replace(".language_model.model.", ".language_model.", 1),
+                        self.tensor_index[mod_name])
 
             # Real (init-valued) buffers up front on the compute device
             for m in self.model.modules():
@@ -296,7 +327,10 @@ class TransformersBackend:
             for bn, _ in self.model.named_buffers():
                 if bn in self.tensor_index:
                     t = self._read_shard(bn)
-                    t = t.to(device, dtype) if t.is_floating_point() else t.to(device)
+                    if t.is_floating_point() and t.dtype != torch.float32:
+                        t = t.to(device, dtype)
+                    else:
+                        t = t.to(device)
                     owner_name, _, leaf = bn.rpartition(".")
                     owner = self.model.get_submodule(owner_name) if owner_name else self.model
                     owner._buffers[leaf] = t
@@ -308,22 +342,66 @@ class TransformersBackend:
             self.head_weight_name = f"{self.prefix[id(head)]}.weight" if head is not None else None
             self.embed_weight_name = f"{self.prefix[id(embed)]}.weight"
         else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                source,
-                dtype = dtype,
-                device_map = options.get("device_map", "auto"),
-                trust_remote_code = options.get("trust_remote_code", True),
-            )
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    source,
+                    dtype = dtype,
+                    device_map = options.get("device_map", "auto"),
+                    trust_remote_code = options.get("trust_remote_code", True),
+                )
+            except ValueError:
+                from transformers import AutoModelForImageTextToText
+                self.model = AutoModelForImageTextToText.from_pretrained(
+                    source,
+                    dtype = dtype,
+                    device_map = options.get("device_map", "auto"),
+                    trust_remote_code = options.get("trust_remote_code", True),
+                )
             self.model.eval()
 
         # Biases and norms are 1D (excluded by the ndim test); router gates excluded by name.
         # In streaming mode, bits come from the checkpoint's actual stored bytes (including
-        # quantization metadata like scales), so quantized formats report their true bitrate
+        # quantization metadata like scales), so quantized formats report their true bitrate.
+        # Packed sub-byte formats (compressed-tensors nvfp4/int-pack, GPTQ/AWQ qweight) store
+        # several weights per element: translate the packed numel to the true weight count, and
+        # count scale/zero-point tensors as bits belonging to the owning weight, not as weights
+        qcfg = getattr(self.model.config, "quantization_config", None)
+        if qcfg is not None and not isinstance(qcfg, dict):
+            qcfg = getattr(qcfg, "to_dict", lambda: {})()
+        qcfg = qcfg or {}
+        pack_num_bits = qcfg.get("bits")
+        for g in (qcfg.get("config_groups") or {}).values():
+            nb = isinstance(g, dict) and (g.get("weights") or {}).get("num_bits")
+            if nb: pack_num_bits = nb
+        qmeta_suffixes = (
+            "_scale", "_scale_2", "_scale_inv", "_global_scale", "_zero_point", "_shape",
+            "_g_idx", ".qzeros", ".scales", ".g_idx",
+        )
+
         sum_bits = sum_numel = head_bits = head_numel = 0
         embed_bits = embed_numel = 0
-        for name, p in self.model.named_parameters():
+        seen = set()
+        named = list(self.model.named_parameters())
+        if qcfg:
+            # Quantized loaders may register packed tensors as buffers
+            named += [nb for nb in self.model.named_buffers() if nb[0] not in {n for n, _ in named}]
+        for name, p in named:
+            if name in seen:
+                continue
+            seen.add(name)
             if name.endswith(".bias") or name.endswith("_bias"):
                 continue
+            # Multimodal encoder stacks don't contribute to text logits; the exllamav3 engine
+            # walks only the text component, so exclude them here for a comparable bpw_layer
+            if any(k in name for k in ("vision", "visual", "mm_projector", "multi_modal", "audio_tower")):
+                continue
+            is_qmeta = any(name.endswith(s) for s in qmeta_suffixes)
+            if (name.endswith("_packed") or name.endswith(".qweight")) and pack_num_bits:
+                numel = p.numel() * (p.element_size() * 8 // pack_num_bits)
+            elif is_qmeta:
+                numel = 0
+            else:
+                numel = p.numel()
             bits = None
             if self.streaming:
                 bits = self._stored_bits(name)
@@ -331,14 +409,14 @@ class TransformersBackend:
                 bits = p.numel() * p.element_size() * 8
             if "embed" in name:
                 embed_bits += bits
-                embed_numel += p.numel()
+                embed_numel += numel
                 continue
             if "lm_head" in name or "output" == name.split(".")[0]:
                 head_bits += bits
-                head_numel += p.numel()
-            elif p.ndim >= 2 and not any(k in name for k in HF_ROUTER_KEYS):
+                head_numel += numel
+            elif (p.ndim >= 2 or is_qmeta) and not any(k in name for k in HF_ROUTER_KEYS):
                 sum_bits += bits
-                sum_numel += p.numel()
+                sum_numel += numel
         if head_numel == 0:
             # Tied embeddings: the head is served by the embedding matrix
             head_bits, head_numel = embed_bits, embed_numel
@@ -421,22 +499,45 @@ class TransformersBackend:
     # fp4 e2m1 magnitudes for codes 0-7; codes 8-15 mirror negative (sign is the msb)
     NVFP4_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 
+    def _scale_float(self, s):
+        """Scale sidecar to fp32. E8M0 exponent bytes (DeepSeek-V4 ue8m0, stored as uint8 or
+        torch.float8_e8m0fnu) decode as 2^(byte - 127); everything else casts directly."""
+        e8m0 = getattr(torch, "float8_e8m0fnu", None)
+        if s.dtype == torch.uint8 or (e8m0 is not None and s.dtype == e8m0):
+            return (s.view(torch.uint8).float() - 127.0).exp2()
+        return s.float()
+
     def _dequant_scaled(self, name):
         """Dequantize a weight stored under its plain name with a weight_scale sidecar:
         ModelOpt NVFP4 (uint8-packed e2m1 nibble pairs low-first, fp8-e4m3 scale per group,
         fp32 global scale) when weight_scale_2 exists, else FP8 (e4m3 values; per-tensor
         scalar for ModelOpt, [out, 1] channel scale for compressed-tensors float-quantized).
         FP8 with blockwise weight_scale_inv (DeepSeek-style 128x128 blocks; despite the name,
-        dequantization MULTIPLIES by it) is handled first. All conventions validated against
-        the bf16 originals."""
+        dequantization MULTIPLIES by it) is handled first, as is the equivalent DeepSeek-V4
+        "<stem>.scale" sidecar convention (fp8 128x128 grid on dense weights, [out, in/32]
+        e8m0 grid on int8-packed fp4 expert weights; block shape derives from the grid).
+        All conventions validated against the bf16 originals."""
         w = self._read_shard(name)
+        if w.dtype == torch.int8:
+            # DeepSeek-V4 fp4 experts: two e2m1 values per byte, low nibble first
+            u8 = w.view(torch.uint8)
+            lut = self.NVFP4_LUT.to(w.device)
+            w = torch.stack([lut[(u8 & 0x0F).long()], lut[(u8 >> 4).long()]], dim = -1).flatten(1)
+        si = None
         if f"{name}_scale_inv" in self.tensor_index:
-            si = self._read_shard(f"{name}_scale_inv").float()
-            bs0 = (w.shape[0] + si.shape[0] - 1) // si.shape[0]
-            bs1 = (w.shape[1] + si.shape[1] - 1) // si.shape[1]
-            ex = si.repeat_interleave(bs0, dim = 0)[:w.shape[0], :] \
-                   .repeat_interleave(bs1, dim = 1)[:, :w.shape[1]]
-            return w.float() * ex
+            si = self._scale_float(self._read_shard(f"{name}_scale_inv"))
+        elif name.endswith(".weight") and f"{name[:-len('.weight')]}.scale" in self.tensor_index:
+            si = self._scale_float(self._read_shard(f"{name[:-len('.weight')]}.scale"))
+        if si is not None:
+            # Block grid of any rank: per-tensor scalar (Mistral-Small-4 dense weights),
+            # per-expert [E, 1, 1] on fused 3D expert stacks, or the 2D 128x128 DeepSeek grid
+            if si.ndim > 0:
+                assert si.ndim == w.ndim, f"{name}: scale rank {si.ndim} vs weight rank {w.ndim}"
+                for d in range(w.ndim):
+                    if si.shape[d] != w.shape[d]:
+                        bs = (w.shape[d] + si.shape[d] - 1) // si.shape[d]
+                        si = si.repeat_interleave(bs, dim = d).narrow(d, 0, w.shape[d])
+            return w.float() * si
         scale = self._read_shard(f"{name}_scale").float()
         if scale.ndim == 1:
             scale = scale.unsqueeze(1)
@@ -467,9 +568,13 @@ class TransformersBackend:
             if name.endswith(".weight"):
                 # ModelOpt-style scale sidecars stored next to the weight itself
                 stem = name[:-len(".weight")]
-                for s in ("weight_scale", "weight_scale_2", "weight_scale_inv", "input_scale", "input_global_scale"):
+                for s in ("weight_scale", "weight_scale_2", "weight_scale_inv", "input_scale", "input_global_scale", "scale"):
                     if f"{stem}.{s}" in self.tensor_index:
                         total += 8 * self._nbytes(f"{stem}.{s}")
+            # Underscore sidecars on suffix-less fused tensors (fp8 expert stacks)
+            for s in ("_scale", "_scale_inv"):
+                if f"{name}{s}" in self.tensor_index:
+                    total += 8 * self._nbytes(f"{name}{s}")
             return total
         if name.endswith(".weight"):
             stem = name[:-len(".weight")]
@@ -492,15 +597,28 @@ class TransformersBackend:
                 total += sum(8 * self._nbytes(k) for k in self.tensor_index if pat.match(k))
             if total:
                 return total
+        fm = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", name)
+        if fm:
+            prefix, kind = fm.group(1), fm.group(2)
+            parts = ("down",) if kind == "down_proj" else ("gate", "up")
+            pat = re.compile(
+                "^" + re.escape(prefix) + r"\.\d+\.(" + "|".join(parts) +
+                r")_proj\.weight(_packed|_scale|_scale_inv|_zero_point|_shape|_g_idx)?$")
+            total = sum(8 * self._nbytes(k) for k in self.tensor_index if pat.match(k))
+            if total:
+                return total
         return None
 
     def _get_tensor(self, name):
         import re
         if name in self.tensor_index:
             # ModelOpt, ct-float-quantized and fp8 keep the quantized tensor under the plain
-            # .weight name; the scale sidecar marks it as needing dequant
-            if self.dequant_scaled and name.endswith(".weight") and (
-                    f"{name}_scale" in self.tensor_index or f"{name}_scale_inv" in self.tensor_index):
+            # .weight name; the scale sidecar marks it as needing dequant. Fused fp8 expert
+            # tensors (Mistral-Small-4 experts.gate_up_proj etc.) carry the same _scale_inv
+            # sidecar without a .weight suffix
+            if self.dequant_scaled and (
+                    f"{name}_scale" in self.tensor_index or f"{name}_scale_inv" in self.tensor_index
+                    or (name.endswith(".weight") and f"{name[:-len('.weight')]}.scale" in self.tensor_index)):
                 return self._dequant_scaled(name)
             return self._read_shard(name)
         if name == self.head_weight_name and self.embed_weight_name in self.tensor_index:
@@ -521,6 +639,26 @@ class TransformersBackend:
                 if f"{stem}.weight_global_scale" in self.tensor_index:
                     return self._dequant_ct_nvfp4(stem)
                 return self._dequant_ct(stem)
+
+        # Per-expert checkpoints vs fused-expert module trees (mistral4 AWQ/compressed-tensors:
+        # experts.{i}.{gate,up,down}_proj vs experts.gate_up_proj) with no declared conversion
+        # mapping: stack the per-expert tensors, resolving each recursively so quantized
+        # formats dequantize on the way in. Module orientation is (E, out, in), gate rows first
+        fm = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", name)
+        if fm:
+            prefix, kind = fm.group(1), fm.group(2)
+            probe = "down" if kind == "down_proj" else "gate"
+            e = 0
+            while (f"{prefix}.{e}.{probe}_proj.weight" in self.tensor_index or
+                   f"{prefix}.{e}.{probe}_proj.weight_packed" in self.tensor_index):
+                e += 1
+            if e:
+                if kind == "down_proj":
+                    return torch.stack([self._get_tensor(f"{prefix}.{i}.down_proj.weight") for i in range(e)])
+                return torch.stack([
+                    torch.cat([self._get_tensor(f"{prefix}.{i}.gate_proj.weight"),
+                               self._get_tensor(f"{prefix}.{i}.up_proj.weight")], dim = 0)
+                    for i in range(e)])
 
         # Merge-type conversion (fused MoE experts): gather the per-expert source tensors for
         # this prefix, stack each source group (MergeModulelist), then concatenate groups
@@ -562,12 +700,30 @@ class TransformersBackend:
 
         raise KeyError(f"{name} not found in checkpoint shards")
 
+    def _plain_fp32(self, name):
+        """True for tensors stored fp32 and read verbatim (no dequant): these are exactly the
+        ones from_pretrained's _keep_in_fp32_modules lists keep in fp32 (hc mixers, sinks,
+        position biases, norms), so the streamed skeleton must too or mHC/routing amplify the
+        bf16 rounding into a visible reference deviation."""
+        if name not in self.tensor_index:
+            return False
+        if f"{name}_scale" in self.tensor_index or f"{name}_scale_inv" in self.tensor_index:
+            return False
+        if name.endswith(".weight") and f"{name[:-len('.weight')]}.scale" in self.tensor_index:
+            return False
+        return True
+
     def _materialize(self, module):
         prefix = self.prefix[id(module)]
         sd = {}
         for pn, _ in module.named_parameters():
             full = f"{prefix}.{pn}" if prefix else pn
-            sd[pn] = self._get_tensor(full).to(self.device, self.dtype)
+            t = self._get_tensor(full)
+            if t.is_floating_point() and not (t.dtype == torch.float32 and self._plain_fp32(full)):
+                t = t.to(self.device, self.dtype)
+            else:
+                t = t.to(self.device)
+            sd[pn] = t
         module.load_state_dict(sd, strict = False, assign = True)
         for pn, p in module.named_parameters():
             if p.is_meta:
@@ -633,6 +789,8 @@ class TransformersBackend:
                 self._materialize(head)
                 for r in range(ids.shape[0]):
                     logits = head(hidden[r:r + 1])
+                    if self.logit_multiplier != 1.0:
+                        logits = logits * self.logit_multiplier
                     if self.logit_softcap:
                         logits = torch.tanh(logits / self.logit_softcap) * self.logit_softcap
                     callback(r, logits)

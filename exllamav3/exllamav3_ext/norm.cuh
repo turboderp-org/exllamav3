@@ -62,3 +62,15 @@ void gated_rms_norm_gr
     int w_groups = 1,
     bool gate_first = false
 );
+
+void rms_norm_gr
+(
+    const at::Tensor& x,
+    const c10::optional<at::Tensor>& w,
+    at::Tensor& y,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    bool span_heads,
+    Graph* graph
+);

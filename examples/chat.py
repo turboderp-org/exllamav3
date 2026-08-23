@@ -1,4 +1,5 @@
 import sys, os
+from functools import partial
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
@@ -46,16 +47,6 @@ def main(args):
     assert not (args.think and args.no_think), "Cannot enable think and no_think modes at the same time"
     save_probs = args.probs
 
-    if args.basic_console:
-        read_input_fn = read_input_ptk
-        streamer_cm = Streamer_basic
-    elif args.mode == "gptoss":
-        read_input_fn = read_input_ptk
-        streamer_cm = Streamer_harmony
-    else:
-        read_input_fn = read_input_ptk
-        streamer_cm = Streamer_rich
-
     # Prompt format
     prompt_format = prompt_formats[args.mode](user_name, bot_name)
     spc = {}
@@ -64,6 +55,17 @@ def main(args):
     prompt_format.set_special(spc)
     system_prompt = prompt_format.default_system_prompt(think) if not args.system_prompt else args.system_prompt
     add_bos = prompt_format.add_bos()
+
+    # Console
+    if args.basic_console:
+        read_input_fn = read_input_ptk
+        streamer_cm = Streamer_basic
+    elif prompt_format.is_harmony_like():
+        read_input_fn = read_input_ptk
+        streamer_cm = partial(Streamer_harmony, tags = prompt_format.harmony_tags())
+    else:
+        read_input_fn = read_input_ptk
+        streamer_cm = Streamer_rich
 
     # Load model
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
@@ -88,9 +90,10 @@ def main(args):
         num_draft_tokens = args.num_draft_tokens,
         ngram_match_min = args.ngram_match_min,
         dynamic_draft_tokens = args.dynamic_draft,
-        dynamic_draft_skip_ema = args.draft_skip_ema,
+        draft_confidence = args.draft_confidence,
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
         recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
+        show_visualizer = args.visualize_cache,
     )
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
     if config.eos_token_id_list and all(config.eos_token_id_list):
@@ -132,6 +135,7 @@ def main(args):
                 user_prompt = "/x"
 
         # Intercept commands
+        num_completions = 1
         en_dis = { True: "Enabled", False: "Disabled" }
         if user_prompt.startswith("/"):
             c = user_prompt.strip().split(" ")
@@ -151,6 +155,8 @@ def main(args):
                         "/load              Load stored session from ~/chat_py_session.json",
                         "/load <filename>   Load stored session from file",
                         "/mli               Toggle multiline input",
+                        "/n <num> <prompt>  Generate <num> completions to <prompt> (streams first completion)",
+                        "/nihs <num>        Insert an approximately <num> token long needle-in-haystack prompt",
                         "/ppt               Print page table",
                         "/probs             Set number of probs recorded (0 to disable), adds overhead",
                         "/python            Extract and run the longest code block in a bwrap sandbox",
@@ -428,6 +434,23 @@ def main(args):
                         print_error("Invalid argument")
                     continue
 
+                # Multiple completions test
+                case "/n":
+                    num_completions = int(c[1]) if len(c) > 1 else "0"
+                    user_prompt = " ".join(c[2:])
+
+                # Needle in haystack prompt
+                case "/nihs":
+                    if len(c) != 2 or not c[1].isnumeric() or int(c[1]) < 1:
+                        print_error("Usage: /nihs <num tokens>")
+                        continue
+                    target_tokens = int(c[1])
+                    if target_tokens > context_length:
+                        print_error(f"Requested length exceeds the {context_length}-token cache size")
+                        continue
+                    user_prompt, ref_value, best_tokens = make_haystack_prompt(target_tokens, tokenizer)
+                    print_info(f"Generated {best_tokens}-token needle-in-haystack prompt, reference answer: {ref_value}")
+
                 case _:
                     print_error(f"Unknown command: {c[0]}")
                     continue
@@ -473,7 +496,7 @@ def main(args):
         last_input_ids = ids.clone()
 
         # Inference
-        job = Job(
+        jobs = [Job(
             input_ids = ids,
             max_new_tokens =  max_response_tokens,
             stop_conditions = stop_conditions,
@@ -482,11 +505,14 @@ def main(args):
             token_healing = enable_healing,
             return_logits = save_probs > 0,
             stop_on_loop = (args.loop_window, args.loop_min_reps),
-        )
-        generator.enqueue(job)
+            identifier = n,
+        ) for n in range(num_completions)]
+        generator.enqueue(jobs)
         saved_topk = []
         saved_probs = []
         saved_samples = []
+
+        completions = ["" for _ in range(num_completions)]
 
         # Stream response
         stop_reason = None
@@ -498,7 +524,11 @@ def main(args):
                 s.stream(prefix)
             while generator.num_remaining_jobs():
                 for r in generator.iterate():
+                    bid = r.get("identifier", None)
+                    if bid is None: continue
                     chunk = r.get("text", "")
+                    completions[bid] += chunk
+                    if bid != 0: continue
                     s.stream(chunk)
                     token_ids = r.get("token_ids")
                     if save_probs and "logits" in r:
@@ -513,13 +543,16 @@ def main(args):
                         ids = torch.cat((ids, token_ids), dim = -1)
                     if r["eos"]:
                         stop_reason = r["eos_reason"]
+                        if generator.num_remaining_jobs():
+                            print_info("Completions pending")
 
                 # Check for keypress while streaming
                 keypress = keyreader.getkey()
                 match keypress:
                     case "\x1b":
                         print(f"\n\n{col_error} !! Aborted.{col_default}")
-                        generator.cancel(job)
+                        for job in jobs:
+                            generator.cancel(job)
                         r = None
                         break
 
@@ -559,6 +592,11 @@ def main(args):
             pprint(r, compact = True, indent = 4)
             print()
 
+        if num_completions > 1:
+            for i in range(num_completions):
+                print_info(f"Completion {i+1} / {num_completions}")
+                print("\n" + completions[i])
+
         # Add response to context
         response = s.all_text.strip()
 
@@ -581,7 +619,14 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
-    model_init.add_args(parser, cache = True, add_sampling_args = True, add_draft_model_args = True, default_cache_size = 32768)
+    model_init.add_args(
+        parser,
+        cache = True,
+        add_sampling_args = True,
+        add_draft_model_args = True,
+        default_cache_size = 32768,
+        default_autosplit_max_batch_size = 1
+    )
     parser.add_argument("-mode", "--mode", type = str, help = "Prompt mode", default = None)
     parser.add_argument("-modes", "--modes", action = "store_true", help = "List available prompt modes and exit")
     parser.add_argument("-un", "--user_name", type = str, default = "User", help = "User name (raw mode only)")
@@ -603,5 +648,6 @@ if __name__ == "__main__":
     parser.add_argument("-ups", "--updates-per-second", type = int, help = "Max number of console updates per second (markdown console), default: 30", default = 30)
     parser.add_argument("-lw", "--loop_window", type = int, help = "Loop detection window in tokens, default = 300", default = 300)
     parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
+    parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     _args = parser.parse_args()
     main(_args)

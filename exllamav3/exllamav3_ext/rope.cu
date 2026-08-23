@@ -7,10 +7,6 @@
 #include "util.cuh"
 #include "reduction.cuh"
 
-#define ROPESTYLE_NONE 0
-#define ROPESTYLE_GPTJ 1
-#define ROPESTYLE_NEOX 2
-#define ROPESTYLE_NANOCHAT 3
 #define MAX_NUM_THREADS 1024
 #define MAX_ROTATE_DIMS 4
 
@@ -31,6 +27,8 @@ void rope_kernel
     const int num_heads_q,
     const int num_heads_k,
     const int head_dim,
+    const int q_head_stride,
+    const int k_head_stride,
     const int partial_head_dim,
     const int position,
     const uint32_t* __restrict__ positions,
@@ -44,9 +42,9 @@ void rope_kernel
     const int inv_freq_stride,
     const float llama_4_scaling_beta,
     const int llama_4_scaling_original,
-    bool post_rope_norm,
     int position_ids_stride,
-    int rotate_dims
+    int rotate_dims,
+    int rotate_offset
 )
 {
     int batch = blockIdx.y;
@@ -71,29 +69,26 @@ void rope_kernel
     auto get_sincos = [&] (int rdim, float &sin, float &cos)
     {
         int pos = get_pos(rdim);
-        float local_attn_factor = attn_factor;
-
-        // Apply Llama 4 scaling
-        if (llama_4_scaling_beta > 0.0f)
-        {
-            float scaling = 1.0f + llama_4_scaling_beta * __logf(1.0f + (float)(pos / llama_4_scaling_original));
-            local_attn_factor *= scaling;
-        }
-
         if (!inv_freq_table)
         {
             float fr = inv_freq[t];
             float pf = __int2float_rn(pos);
-            sin = __sinf(fr * pf) * local_attn_factor;
-            cos = __cosf(fr * pf) * local_attn_factor;
+            sin = __sinf(fr * pf) * attn_factor;
+            cos = __cosf(fr * pf) * attn_factor;
         }
         else
         {
             float fr = inv_freq[batch * inv_freq_stride + pos * partial_head_dim / 2 + t];
-            sin = __sinf(fr) * local_attn_factor;
-            cos = __cosf(fr) * local_attn_factor;
+            sin = __sinf(fr) * attn_factor;
+            cos = __cosf(fr) * attn_factor;
         }
     };
+
+    // Llama 4 scaling: position-dependent scale on the full query head, queries only (the
+    // reference scales query_states after rope; keys enter the cache unscaled)
+    float l4_scaling = 1.0f;
+    if (llama_4_scaling_beta > 0.0f)
+        l4_scaling = 1.0f + llama_4_scaling_beta * __logf(1.0f + (float)(get_pos(0) / llama_4_scaling_original));
 
     float sin_cache[MAX_ROTATE_DIMS];
     float cos_cache[MAX_ROTATE_DIMS];
@@ -113,21 +108,26 @@ void rope_kernel
     int head_dim_pad = (head_dim + 63) / 64 * 64;
 
     // Loop over heads
-    for (int head_idx = threadIdx.y; head_idx < num_heads_q + num_heads_k; head_idx += blockDim.y)
+    // Heads are distributed over gridDim.z as well as blockDim.y: at decode (seq 1, bsz 1)
+    // the per-token grid is otherwise a single block walking every head serially between
+    // block-wide barriers
+    for (int head_idx = blockIdx.z * blockDim.y + threadIdx.y;
+         head_idx < num_heads_q + num_heads_k;
+         head_idx += gridDim.z * blockDim.y)
     {
         const half* g_head_in_ptr;
         half* g_head_out_ptr;
         const void* norm_weight;
         if (head_idx < num_heads_q)
         {
-            g_head_in_ptr = q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * head_dim;
-            g_head_out_ptr = out_q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * head_dim;
+            g_head_in_ptr = q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * q_head_stride;
+            g_head_out_ptr = out_q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * q_head_stride;
             norm_weight = q_norm;
         }
         else if (head_idx < num_heads_q + num_heads_k)
         {
-            g_head_in_ptr = k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * head_dim;
-            g_head_out_ptr = out_k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * head_dim;
+            g_head_in_ptr = k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * k_head_stride;
+            g_head_out_ptr = out_k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * k_head_stride;
             norm_weight = k_norm;
         }
 
@@ -153,7 +153,7 @@ void rope_kernel
         {
             for (int rdim = 0; rdim < rotate_dims; ++rdim)
             {
-                int offset = partial_head_dim * rdim;
+                int offset = rotate_offset + partial_head_dim * rdim;
                 if (t < partial_head_dim / 2)
                 {
                     float sin = sin_cache[rdim];
@@ -165,15 +165,6 @@ void rope_kernel
                         float v2 = __half2float(sh_head[offset + t + partial_head_dim / 2]);
                         float r1 = v1 * cos - v2 * sin;
                         float r2 = v2 * cos + v1 * sin;
-                        sh_head[offset + t] = __float2half_rn(r1);
-                        sh_head[offset + t + partial_head_dim / 2] = __float2half_rn(r2);
-                    }
-                    else if constexpr (rope_mode == ROPESTYLE_NANOCHAT)
-                    {
-                        float v1 = __half2float(sh_head[offset + t]);
-                        float v2 = __half2float(sh_head[offset + t + partial_head_dim / 2]);
-                        float r1 = v1 * cos + v2 * sin;
-                        float r2 = v2 * cos - v1 * sin;
                         sh_head[offset + t] = __float2half_rn(r1);
                         sh_head[offset + t + partial_head_dim / 2] = __float2half_rn(r2);
                     }
@@ -241,33 +232,16 @@ void rope_kernel
             __syncthreads();
         };
 
-        // RMS Norm, unweighted
-        auto apply_norm_uw = [&] ()
+        // Llama 4 scaling. Must be called by the whole block (blockDim.y walks q and k heads
+        // concurrently and the lambda syncs), so k heads scale by 1.0
+        auto apply_l4_scaling = [&] (float scaling)
         {
-            half2 *tptr = (half2*)(sh_head + t * 2);
-            // int lane_id = threadIdx.x % 32;
-            int warp_id = threadIdx.x / 32;
-            int warps = blockDim.x / 32;
-
-            // Sum of squares
-            half2 v = *tptr;
-            float v1 = __low2float(v);
-            float v2 = __high2float(v);
-            float sum = v1 * v1 + v2 * v2;
-            sums[warps * t_head + warp_id] = warp_reduce_sum_f(sum);
-            __syncthreads();
-
-            sum = sums[warps * t_head];
-            for (int i = 1; i < warps; ++i) sum += sums[warps * t_head + i];
-
-            // Normalize and downcast
-            float rmf = rsqrtf(sum / (float) head_dim + norm_eps);
-            v1 *= rmf;
-            v2 *= rmf;
-            v = __floats2half2_rn(v1, v2);
-
-            // Store
-            *tptr = v;
+            if (t < head_dim / 2)
+            {
+                half2* tptr = ((half2*) sh_head) + t;
+                half2 v = *tptr;
+                *tptr = __floats2half2_rn(__low2float(v) * scaling, __high2float(v) * scaling);
+            }
             __syncthreads();
         };
 
@@ -275,7 +249,7 @@ void rope_kernel
         load_head();
         if (q_norm) apply_norm();
         apply_rope();
-        if (post_rope_norm) apply_norm_uw();
+        if (l4_scaling != 1.0f) apply_l4_scaling(head_idx < num_heads_q ? l4_scaling : 1.0f);
         store_head();
     }
 }
@@ -320,8 +294,8 @@ void rope_gr
     float norm_constant_bias,
     float llama_4_scaling_beta,
     int llama_4_scaling_original,
-    bool post_rope_norm,
     int rotate_dims,
+    int rotate_offset,
     Graph* graph
 )
 {
@@ -331,12 +305,18 @@ void rope_gr
     int bsz = q.size(0);
     int seq_len = q.size(1);
     int num_heads_q = q.size(2);
+    int q_head_stride = q.stride(2);
+    int k_head_stride = k.has_value() ? (int) k.value().stride(2) : 0;
+    TORCH_CHECK(q.stride(3) == 1, "rope: q innermost dim must be dense");
+    TORCH_CHECK(out_q.strides() == q.strides(), "rope: out_q must share q's layout");
     int num_heads_k = 0;
     int head_dim = q.size(3);
     int partial_head_dim = inv_freq.size(-1) * 2;
     int inv_freq_stride = 0;
     TORCH_CHECK(rotate_dims > 0 && rotate_dims <= MAX_ROTATE_DIMS, "rotate_dims out of range");
     TORCH_CHECK(rotate_dims == 1 || head_dim == partial_head_dim * rotate_dims, "rotate_dims is inconsistent with inv_freq and head_dim");
+    TORCH_CHECK(rotate_offset >= 0 && rotate_offset + partial_head_dim * rotate_dims <= head_dim,
+                "rotate_offset out of range");
 
     const half* q_ptr = (half*) q.data_ptr();
     half* out_q_ptr = (half*) out_q.data_ptr();
@@ -403,36 +383,38 @@ void rope_gr
             TORCH_CHECK(k_norm.value().dtype() == q_norm.value().dtype(), "q_norm and k_norm must be same dtype");
     }
 
-    dim3 blocks(seq_len, bsz);
     int warps = CEIL_DIVIDE(head_dim / 2, 32);
     int thr = warps * 32;
     int parallel_heads = MIN((MAX_NUM_THREADS / thr), num_heads_q + num_heads_k);
+    // Enough z-blocks that each covers one head-group iteration; scale down when the
+    // token-level grid already fills the device
+    int head_groups = CEIL_DIVIDE(num_heads_q + num_heads_k, parallel_heads);
+    if (seq_len * bsz >= 32) head_groups = 1;
+    dim3 blocks(seq_len, bsz, head_groups);
     dim3 threads(thr, parallel_heads);
 
     #define ARGS q_ptr, out_q_ptr, k_ptr, out_k_ptr, inv_freq_ptr, bsz, \
-                 seq_len, num_heads_q, num_heads_k, head_dim, partial_head_dim, position, positions_ptr, \
+                 seq_len, num_heads_q, num_heads_k, head_dim, q_head_stride, k_head_stride, partial_head_dim, position, positions_ptr, \
                  position_ids_ptr, attn_factor, q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table, \
-                 inv_freq_stride, llama_4_scaling_beta, llama_4_scaling_original, post_rope_norm, position_ids_stride, rotate_dims
+                 inv_freq_stride, llama_4_scaling_beta, llama_4_scaling_original, position_ids_stride, rotate_dims, rotate_offset
 
-    // Pointer form of ARGS for cudaLaunchKernel; positions_ptr sits at index 12 (the
+    // Pointer form of ARGS for cudaLaunchKernel; positions_ptr sits at index 14 (the
     // GP_rope_positions record site)
     #define ARGPTRS &q_ptr, &out_q_ptr, &k_ptr, &out_k_ptr, &inv_freq_ptr, &bsz, \
-                 &seq_len, &num_heads_q, &num_heads_k, &head_dim, &partial_head_dim, &position, &positions_ptr, \
+                 &seq_len, &num_heads_q, &num_heads_k, &head_dim, &q_head_stride, &k_head_stride, &partial_head_dim, &position, &positions_ptr, \
                  &position_ids_ptr, &attn_factor, &q_norm_ptr, &k_norm_ptr, &norm_eps, &norm_constant_bias, &inv_freq_table, \
-                 &inv_freq_stride, &llama_4_scaling_beta, &llama_4_scaling_original, &post_rope_norm, &position_ids_stride, &rotate_dims
+                 &inv_freq_stride, &llama_4_scaling_beta, &llama_4_scaling_original, &position_ids_stride, &rotate_dims, &rotate_offset
 
     void* kernel_ptr = nullptr;
     if (norm_fp16)
     {
         if      (rope_mode == ROPESTYLE_GPTJ)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_GPTJ, false>;
         else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_NEOX, false>;
-        else if (rope_mode == ROPESTYLE_NANOCHAT)   kernel_ptr = (void*) rope_kernel<ROPESTYLE_NANOCHAT, false>;
     }
     else if (norm_bf16)
     {
         if      (rope_mode == ROPESTYLE_GPTJ)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_GPTJ, true>;
         else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_NEOX, true>;
-        else if (rope_mode == ROPESTYLE_NANOCHAT)   kernel_ptr = (void*) rope_kernel<ROPESTYLE_NANOCHAT, true>;
     }
     TORCH_CHECK(kernel_ptr, "rope: incorrect norm dtype");
 
@@ -444,10 +426,10 @@ void rope_gr
         // All position sources are patchable: the kernel branches on the pointers' null-ness at
         // runtime, so one captured graph serves scalar/positions/position_ids modes alike
         graph->record_param(kernel_ptr, GP_rope_inv_freq, 4);
-        graph->record_param(kernel_ptr, GP_rope_position, 11, 4);
-        graph->record_param(kernel_ptr, GP_rope_positions, 12);
-        graph->record_param(kernel_ptr, GP_rope_position_ids, 13);
-        graph->record_param(kernel_ptr, GP_rope_pid_stride, 24, 4);
+        graph->record_param(kernel_ptr, GP_rope_position, 13, 4);
+        graph->record_param(kernel_ptr, GP_rope_positions, 14);
+        graph->record_param(kernel_ptr, GP_rope_position_ids, 15);
+        graph->record_param(kernel_ptr, GP_rope_pid_stride, 26, 4);
         graph->record_param(kernel_ptr, GP_end, 0);
     }
 
@@ -475,13 +457,13 @@ void rope
     float norm_constant_bias,
     float llama_4_scaling_beta,
     int llama_4_scaling_original,
-    bool post_rope_norm,
-    int rotate_dims
+    int rotate_dims,
+    int rotate_offset
 )
 {
     rope_gr(q, out_q, k, out_k, inv_freq, position, positions, position_ids, rope_mode,
             attn_factor, q_norm, k_norm, norm_eps, norm_constant_bias, llama_4_scaling_beta,
-            llama_4_scaling_original, post_rope_norm, rotate_dims, nullptr);
+            llama_4_scaling_original, rotate_dims, rotate_offset, nullptr);
 }
 
 
@@ -553,4 +535,96 @@ int64_t gen_mrope_pos_ids
     }
 
     return next_base_t;
+}
+
+// Llama-4 position-dependent attention scale on full query rows (Ministral/Mistral-4 family:
+// HF multiplies query_states by 1 + beta * ln(1 + pos // original_max) after rope, queries
+// only). The fused rope kernel covers full-rotation attention; MLA rotates only the q_pe
+// slice, so its graph path scales the whole (possibly padded) q row with this kernel instead,
+// before the pe-gather and absorb stages. The scale is rounded to fp16 first so the result
+// matches the module's eager-path (torch) multiply bitwise.
+
+__global__
+void l4_scale_q_kernel
+(
+    half* __restrict__ q,
+    const int seq_len,
+    const int row_width,
+    const int row_stride,
+    const int position,
+    const uint32_t* __restrict__ positions,
+    const uint32_t* __restrict__ position_ids,
+    const float llama_4_scaling_beta,
+    const int llama_4_scaling_original,
+    const int position_ids_stride
+)
+{
+    int row = blockIdx.y;
+    int batch = row / seq_len;
+    int token_pos = row % seq_len;
+    int pos = token_pos + position;
+    if (positions)
+        pos = token_pos + positions[batch];
+    else if (position_ids)
+        pos = position_ids[(batch * seq_len + token_pos) * position_ids_stride];
+
+    float scaling = 1.0f + llama_4_scaling_beta * __logf(1.0f + (float)(pos / llama_4_scaling_original));
+    scaling = __half2float(__float2half_rn(scaling));
+
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= row_width / 2) return;
+    half2* ptr = (half2*) (q + (int64_t) row * row_stride) + t;
+    half2 v = *ptr;
+    *ptr = __floats2half2_rn(__low2float(v) * scaling, __high2float(v) * scaling);
+}
+
+void l4_scale_q_gr
+(
+    at::Tensor& q,
+    int bsz,
+    int seq_len,
+    int row_width,
+    int row_stride,
+    uint32_t position,
+    const c10::optional<at::Tensor>& positions,
+    const c10::optional<at::Tensor>& position_ids,
+    float llama_4_scaling_beta,
+    int llama_4_scaling_original,
+    int position_ids_stride,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(q.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(q, kHalf);
+    TORCH_CHECK(row_width % 2 == 0 && row_stride % 2 == 0, "l4_scale_q: widths must be even");
+    TORCH_CHECK(row_width <= row_stride, "l4_scale_q: row_width exceeds row_stride");
+
+    void* q_ptr = (void*) q.data_ptr();
+    const uint32_t* positions_ptr = (const uint32_t*) OPTPTR(positions);
+    const uint32_t* position_ids_ptr = (const uint32_t*) OPTPTR(position_ids);
+    int ipos = (int) position;
+
+    int threads = 256;
+    dim3 blocks(CEIL_DIVIDE(row_width / 2, threads), bsz * seq_len);
+
+    void* kernel_ptr = (void*) l4_scale_q_kernel;
+    void* kernel_args[] =
+    {
+        &q_ptr, &seq_len, &row_width, &row_stride, &ipos, &positions_ptr, &position_ids_ptr,
+        &llama_4_scaling_beta, &llama_4_scaling_original, &position_ids_stride
+    };
+    cuda_check(cudaLaunchKernel(kernel_ptr, blocks, dim3(threads), kernel_args, 0, stream));
+
+    if (graph)
+    {
+        graph->record_param(kernel_ptr, GP_rope_position, 4, 4);
+        graph->record_param(kernel_ptr, GP_rope_positions, 5);
+        graph->record_param(kernel_ptr, GP_rope_position_ids, 6);
+        graph->record_param(kernel_ptr, GP_rope_pid_stride, 9, 4);
+        graph->record_param(kernel_ptr, GP_end, 0);
+    }
+
+    cuda_check(cudaPeekAtLastError());
 }

@@ -2,16 +2,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
 
-// Shared host buffers (the TP arena, the MoE offload segment) are pinned through cudart so CUDA
-// copies can use them and, where the platform allows it, so kernels can address them directly.
-//
-// These calls previously went through ctypes against a cudart shared library located at runtime
-// by name. That meant guessing DLL/SONAME versions, searching PATH, and potentially binding a
-// second runtime version alongside the one torch had already loaded. Calling from the extension
-// removes the search entirely, and lets the compiler supply the cudaError_t values instead of the
-// hardcoded constants the ctypes version used (which did not match cudaError_t, so the benign
-// cases handled below were raising rather than being tolerated).
-
 void cuda_host_register(uintptr_t ptr, size_t nbytes, unsigned int flags)
 {
     cudaError_t cr = cudaHostRegister(reinterpret_cast<void*>(ptr), nbytes, flags);

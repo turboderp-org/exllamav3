@@ -122,13 +122,14 @@ class CPUPageCache:
 
 
     def _alloc_worker(self):
-        while True:
-            with self._spare_cond:
-                while len(self.slot_slabs) + len(self._spare) >= self.max_slots:
-                    self._spare_cond.wait()
-            sv = self._make_slab()  # slow part, outside the lock
-            with self._spare_cond:
-                self._spare.append(sv)
+        with torch.inference_mode():
+            while True:
+                with self._spare_cond:
+                    while len(self.slot_slabs) + len(self._spare) >= self.max_slots:
+                        self._spare_cond.wait()
+                sv = self._make_slab()  # slow part, outside the lock
+                with self._spare_cond:
+                    self._spare.append(sv)
 
 
     def _new_slot(self, protect: set | None):

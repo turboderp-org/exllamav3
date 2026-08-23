@@ -56,6 +56,11 @@
 #include "libtorch/gated_rmsnorm.h"
 #include "libtorch/mlp.h"
 #include "libtorch/blocksparse_mlp.h"
+#include "libtorch/dsv4_compressor.h"
+#include "libtorch/dsv4_attn.h"
+#include "dsv4_compress.cuh"
+#include "dsa_topk.cuh"
+#include "hc_mix.cuh"
 
 #include "attention.cuh"
 
@@ -83,6 +88,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
+    m.def("routing_sel_norm", &routing_sel_norm, "routing_sel_norm");
+    m.def("moe_split_map", &moe_split_map, "moe_split_map");
+    m.def("moe_split_issue", &moe_split_issue, "moe_split_issue");
+    m.def("moe_split_collect_add", &moe_split_collect_add, "moe_split_collect_add");
+    m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
+    m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
+    m.def("dsa_topk", &dsa_topk, "dsa_topk");
+    m.def("hc_mix", &hc_mix, "hc_mix");
+    m.def("hc_head", &hc_head, "hc_head");
+    m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
+    m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("routing_std", &routing_std, "routing_std");
     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
@@ -107,6 +123,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
     m.def("pack_signs", &pack_signs, "pack_signs");
     m.def("reconstruct", &reconstruct, "reconstruct");
+    m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
@@ -128,6 +145,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_worker_run", &exl3_moe_cpu_worker_run, "exl3_moe_cpu_worker_run",
           py::call_guard<py::gil_scoped_release>());
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
+    m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
     m.def("hgemm", &hgemm, "hgemm");
     m.def("rope", &rope, "rope");
@@ -167,6 +185,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gumbel_noise_f32", &gumbel_noise_f32, "gumbel_noise_f32");
     m.def("gumbel_noise_log", &gumbel_noise_log, "gumbel_noise_log");
     m.def("fused_sampler", &fused_sampler, "fused_sampler");
+    m.def("apply_logit_bitmask", &apply_logit_bitmask, "apply_logit_bitmask");
     m.attr("FUSED_SAMPLER_MAX_BLOCKS") = FUSED_SAMPLER_MAX_BLOCKS;
     m.attr("FUSED_SAMPLER_HIST_STRIDE") = FUSED_SAMPLER_HIST_STRIDE;
     m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
@@ -174,6 +193,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
 
     m.def("cache_rotate", &cache_rotate, "cache_rotate");
+    m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
     m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
 
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
@@ -203,5 +223,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
+    #include "libtorch/dsv4_compressor_bc.h"
+    #include "libtorch/dsv4_attn_bc.h"
     #include "sam_bc.h"
 }

@@ -19,6 +19,13 @@
 //     MoeJob ring       @ 384  MOE_JOB_RING entries
 //     u32 data_ready[]  @ SLOT_FLAGS_OFFSET       per slot, stride 64: GPU publishes job seq
 //     u32 done[]        @ SLOT_FLAGS_OFFSET + 64*MOE_MAX_SLOTS, stride 64: child publishes seq
+//     u32 consumed[]    @ SLOT_FLAGS_OFFSET + 2*64*MOE_MAX_SLOTS, stride 64: the collecting
+//                         device's stream publishes seq after reading the slot output back.
+//                         Slot reuse waits on this, not done: with offloaded layers spread
+//                         over multiple GPUs, the next tenant's issue runs on a different
+//                         stream than the previous tenant's readback, and done (child
+//                         finished writing) alone lets the child overwrite the output while
+//                         the readback is still queued on the other device
 //   [slot data]         @ MOE_CTRL_SIZE, num_slots x slot_size
 //     per slot: [x fp16 cap_rows*Hi][sel i32 cap_rows*topk][w fp16 cap_rows*topk]
 //               [out fp32 cap_rows*Ho], each section 64-byte aligned
@@ -33,6 +40,11 @@
 #define MOE_MAX_WSLOTS 8
 #define MOE_JOB_KIND_COMPUTE 0
 #define MOE_JOB_KIND_STAGE 1
+// GATED: issued by the fused-issue kernel, whose collect side reads the output only when at
+// least one selected expert was CPU-resident. The worker may skip the compute and the
+// output write entirely for an all-inactive job. Plain COMPUTE jobs must keep writing
+// (zeroing) the output, since their collect reads it back unconditionally
+#define MOE_JOB_KIND_COMPUTE_GATED 2
 
 // kind == STAGE: the worker memcpys `rows` experts' packed weights (ids in experts[]) of layer
 // `layer` into weight-staging slot `slot`, after waiting for the parent's pinned_free flag to
@@ -64,7 +76,7 @@ struct MoeJob
 
 // Flag order: data_ready[MAX_SLOTS], done[MAX_SLOTS], stage_done[MAX_WSLOTS],
 // pinned_free[MAX_WSLOTS], each entry 64-byte strided
-#define MOE_FLAGS_SIZE (2 * 64 * MOE_MAX_SLOTS + 2 * 64 * MOE_MAX_WSLOTS)
+#define MOE_FLAGS_SIZE (3 * 64 * MOE_MAX_SLOTS + 2 * 64 * MOE_MAX_WSLOTS)
 
 // Stage jobs travel in their own ring, consumed by a dedicated stager thread in the child, so
 // weight staging (pure memcpy) overlaps the compute pool's work on the token tail instead of

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
+from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
@@ -18,6 +19,21 @@ from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 TEMP_ROWS_FUSED = 128
 TEMP_ROWS_GRAPH = 32
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+
+# Score activations for the nogroup routing kernels (must match routing.cu)
+ROUTING_ACT_SIGMOID = 0
+ROUTING_ACT_SQRTSP = 1
+
+def _esb_h(cfg):
+    """fp16 selection-bias copy for the CUDA top-k kernels, built lazily (load may be
+    deferred when the RoutingCFG is constructed). Mean-centered when the source is wider than
+    fp16: selection is invariant to a constant shift, and centering keeps fp16 rounding well
+    below the inter-expert score gaps even when the bias values are large (GLM-5.2 ~34.0)."""
+    if cfg.e_score_bias_h is None and cfg.e_score_correction_bias is not None:
+        esb = cfg.e_score_correction_bias
+        cfg.e_score_bias_h = esb if esb.dtype == torch.half else (esb - esb.mean()).half()
+    return cfg.e_score_bias_h
+
 
 @dataclass
 class RoutingCFG:
@@ -29,11 +45,13 @@ class RoutingCFG:
     routing_weights_bsz1: torch.Tensor
     selected_experts_bsz1: torch.Tensor
     e_score_correction_bias: torch.Tensor | None
+    e_score_bias_h: torch.Tensor | None   # lazy, see _esb_h
     routed_scaling_factor: float | None
     n_group: int | None
     topk_group: int | None
     per_expert_scale: torch.Tensor | None
     router_bias: torch.Tensor | None = None
+    tid2eid: torch.Tensor | None = None
 
 @dataclass
 class FusedBuffers:
@@ -168,11 +186,12 @@ def routing_dots(bsz, cfg, y, params):
             y,
             cfg.gate_tensor,
             cfg.router_logits_bsz1,
-            cfg.e_score_correction_bias,
+            _esb_h(cfg),
             cfg.selected_experts_bsz1,
             cfg.routing_weights_bsz1,
             cfg.routed_scaling_factor,
             cfg.gate_tensor_t,
+            ROUTING_ACT_SIGMOID,
         )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
 
@@ -180,11 +199,11 @@ def routing_dots(bsz, cfg, y, params):
         activate_all_experts = params.get("activate_all_experts")
         if activate_all_experts:
             router_logits = torch.matmul(y, cfg.gate_tensor)
-            routing_weights = router_logits.sigmoid()
+            routing_weights = router_logits.sigmoid().float()
             if cfg.e_score_correction_bias is not None:
-                routing_weights += cfg.e_score_correction_bias.unsqueeze(0)
+                routing_weights = routing_weights + cfg.e_score_correction_bias.unsqueeze(0).float()
             factor = cfg.routed_scaling_factor / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
-            routing_weights *= factor
+            routing_weights = (routing_weights * factor).half()
             selected_experts = (
                 torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
                 .repeat((bsz, 1))
@@ -197,13 +216,92 @@ def routing_dots(bsz, cfg, y, params):
                 y,
                 cfg.gate_tensor,
                 router_logits,
-                cfg.e_score_correction_bias,
+                _esb_h(cfg),
                 selected_experts,
                 routing_weights,
                 cfg.routed_scaling_factor,
                 None,
+                ROUTING_ACT_SIGMOID,
             )
         return selected_experts, routing_weights
+
+
+def _sqrtsp_scores(cfg, y):
+    logits = torch.matmul(y.float(), cfg.gate_tensor.float())
+    return F.softplus(logits).sqrt()
+
+
+def routing_sqrtsp(bsz, cfg, y, params):
+    """DeepSeek-V4 router: sqrt(softplus(logits)) affinity, noaux_tc bias for selection only,
+    weights normalized over the selected set, times routed_scaling_factor. The nogroup top-k
+    kernel serves every batch size (one block per row); bsz 1 reuses the cached output
+    buffers, larger batches allocate per call. activate_all_experts (conversion) stays
+    torch-composed."""
+    if params.get("activate_all_experts"):
+        scores = _sqrtsp_scores(cfg, y)
+        routing_weights = scores / (scores.sum(dim = -1, keepdim = True) + 1e-20)
+        routing_weights = (routing_weights * cfg.routed_scaling_factor).half()
+        selected_experts = (
+            torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
+            .repeat((bsz, 1))
+        )
+        return selected_experts, routing_weights
+    if cfg.gate_tensor_t is None:
+        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+    if bsz == 1:
+        router_logits = cfg.router_logits_bsz1
+        selected_experts = cfg.selected_experts_bsz1
+        routing_weights = cfg.routing_weights_bsz1
+    else:
+        router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
+        selected_experts = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.long, device = y.device)
+        routing_weights = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device)
+    ext.routing_ds3_nogroup(
+        y,
+        cfg.gate_tensor,
+        router_logits,
+        _esb_h(cfg),
+        selected_experts,
+        routing_weights,
+        cfg.routed_scaling_factor,
+        cfg.gate_tensor_t,
+        ROUTING_ACT_SQRTSP,
+    )
+    return selected_experts, routing_weights
+
+
+def routing_sqrtsp_hash(bsz, cfg, y, params):
+    """DeepSeek-V4 hash-MoE bootstrap: expert indices come from the frozen tid2eid table
+    indexed by the current tokens (params["input_ids"], flattened row-major); the learned
+    gate still weights the selected experts."""
+    if params.get("activate_all_experts"):
+        return routing_sqrtsp(bsz, cfg, y, params)
+    # One device copy of the ids per forward via the params cache, shared by every hash
+    # layer on that device; batch dims flatten row-major, matching the hidden-state rows
+    from .attn import get_for_device
+    input_ids = get_for_device(params, "input_ids", cfg.tid2eid.device).reshape(-1)
+    assert input_ids.shape[0] == bsz, \
+        f"hash routing: {bsz} hidden rows but {input_ids.shape[0]} input ids"
+    selected_experts = cfg.tid2eid[input_ids].to(y.device).long()
+    if cfg.gate_tensor_t is None:
+        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+    if bsz == 1:
+        routing_weights = cfg.routing_weights_bsz1
+        router_logits = cfg.router_logits_bsz1
+    else:
+        router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
+        routing_weights = torch.empty(selected_experts.shape, dtype = torch.half, device = y.device)
+    ext.routing_sel_norm(
+        y,
+        cfg.gate_tensor,
+        router_logits,
+        selected_experts,
+        routing_weights,
+        cfg.routed_scaling_factor,
+        cfg.gate_tensor_t,
+        ROUTING_ACT_SQRTSP,
+    )
+    return selected_experts, routing_weights
 
 
 @dataclass
@@ -219,7 +317,7 @@ class ExpertsCFG:
     out_trim: torch.Tensor | None = None
 
 
-class BlockSparseMLP(Module):
+class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     def __init__(
         self,
@@ -240,6 +338,7 @@ class BlockSparseMLP(Module):
         key_routing_gate: str | None = None,
         key_shared_gate: str | None = None,
         key_e_score_bias: str | None = "gate.e_score_correction_bias",
+        key_tid2eid: str | None = None,
         key_per_expert_scale: str | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
@@ -276,10 +375,12 @@ class BlockSparseMLP(Module):
 
         self.interm_dtype = interm_dtype
         self.interm_div = interm_div
+        self.router_type = router_type
         if interm_div != 1.0:
-            assert router_type in ("dots", "ds3"), \
-                "interm_div requires a router type that folds routed_scaling_factor into the routing weights"
-            routed_scaling_factor = (routed_scaling_factor if routed_scaling_factor is not None else 1.0) * interm_div
+            assert router_type in ("dots", "ds3", "std"), \
+                "interm_div requires a router type that can fold the compensation into the routing weights"
+            if router_type != "std":
+                routed_scaling_factor = (routed_scaling_factor if routed_scaling_factor is not None else 1.0) * interm_div
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
         self.intermediate_size_padded = (intermediate_size + 127) // 128 * 128
@@ -490,6 +591,8 @@ class BlockSparseMLP(Module):
 
         self.e_score_correction_bias = None
         self.e_score_correction_bias_key = key_e_score_bias
+        self.tid2eid = None
+        self.tid2eid_key = key_tid2eid
         self.per_expert_scale = None
         self.per_expert_scale_key = key_per_expert_scale
 
@@ -502,6 +605,8 @@ class BlockSparseMLP(Module):
             case "std_bias": self.routing_fn = routing_std_bias
             case "ds3": self.routing_fn = routing_ds3
             case "dots": self.routing_fn = routing_dots
+            case "sqrtsp": self.routing_fn = routing_sqrtsp
+            case "sqrtsp_hash": self.routing_fn = routing_sqrtsp_hash
             case _: raise ValueError(f"Unknown router type {router_type}")
 
         self.tp_reduce = False
@@ -516,10 +621,9 @@ class BlockSparseMLP(Module):
         self.register_submodule(self.routed_post_norm)
 
         self.bc = None
-        self.cpu_offload = False
         self.bc_sh_exp = False
         self.fused_mode_buffers = None
-
+        self._cpu_init_state()
 
     @override
     def optimizer_targets(self):
@@ -532,114 +636,6 @@ class BlockSparseMLP(Module):
             return [s, [g + u, d]]
         else:
             return [[g + u, d]]
-
-
-    def load_cpu_offload(self, device: torch.Device, **kwargs) -> bool:
-        """
-        Experimental CPU expert offload: register the layer with the persistent CPU MoE worker
-        (which loads the expert weights itself, concurrently with GPU loading) and load
-        everything else (router, norms, shared experts) on the GPU as usual. Eligibility here
-        uses header metadata only; the parent never fetches expert data. Returns False without
-        side effects when the layer is ineligible (non-mul1 codebook, K > 8, or mixed per-expert
-        biases), in which case the caller falls back to the normal path.
-        """
-        stc = self.config.stc
-        cpu = torch.device("cpu")
-        experts = self.gates + self.ups + self.downs
-
-        # Eligibility probe on the first expert of each projection before fetching bulk data
-        probe = ([self.gates[0]] if self.gated else []) + [self.ups[0], self.downs[0]]
-        for l in probe:
-            if stc.get_tensor(l.key + ".mul1", cpu, optional = True) is None:
-                print(f" !! {self.key}: experts are not mul1, CPU offload skipped")
-                return False
-
-        def hdr_shape(l):
-            return stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
-        for l in probe:
-            if hdr_shape(l)[-1] // 16 > 8:
-                print(f" !! {self.key}: K > 8, CPU offload skipped")
-                return False
-        def bias_keys(ls):
-            has = [(l.key + ".bias") in stc.tensor_file_map for l in ls]
-            if any(has) and not all(has):
-                print(f" !! {self.key}: mixed expert biases, CPU offload skipped")
-                return None
-            return all(has)
-        checks = [bias_keys(ls) for ls in ([self.gates] if self.gated else []) + [self.ups, self.downs]]
-        if any(c is None for c in checks):
-            return False
-
-        self.device = torch.device(device)
-        expert_set = set(experts)
-        for module in self.modules:
-            if module not in expert_set:
-                module.load(device, **kwargs)
-        if self.e_score_correction_bias_key:
-            for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
-                self.e_score_correction_bias = self.config.stc.get_tensor(
-                    f"{self.key}.{k}", self.device, optional = True, float2half = True)
-                if self.e_score_correction_bias is not None:
-                    break
-        if self.per_expert_scale_key:
-            self.per_expert_scale = self.config.stc.get_tensor(
-                f"{self.key}.{self.per_expert_scale_key}", self.device, optional = True, allow_bf16 = True)
-        self.load_routing(**kwargs)
-
-        from ..model.moe_cpu_host import MoeCpuHost
-        # One worker per component: an MTP head shares the config but loads after the main
-        # model's worker has started, so it gets its own child (which loads only its own
-        # layers from the same checkpoint)
-        comp = getattr(self.config.infer_params, "moe_cpu_component", "text")
-        hosts = getattr(self.config, "moe_cpu_hosts", None)
-        if hosts is None:
-            hosts = {}
-            self.config.moe_cpu_hosts = hosts
-        host = hosts.get(comp)
-        if host is None:
-            host = MoeCpuHost(self.config)
-            hosts[comp] = host
-        self.cpu_host = host
-        self.cpu_component = comp
-        def dims_of(l):
-            s = stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
-            return (s[0] * 16, s[1] * 16, s[2] // 16)
-        gd = dims_of(self.gates[0]) if self.gated else None
-        ud = dims_of(self.ups[0])
-        dd = dims_of(self.downs[0])
-        hi, ho = ud[0], dd[1]
-
-        # Small per-expert tensors resident on the GPU for the streamed-prefill dequant path
-        # (lists, not stacks: the fetches may be deferred and fill in place)
-        def fetch_aux(ls, suffix, optional = False):
-            out = [stc.get_tensor(l.key + suffix, self.device, optional = optional,
-                                  float2half = True) for l in ls]
-            return out if not optional or out[0] is not None else None
-        aux = dict(
-            suh_u = fetch_aux(self.ups, ".suh"), svh_u = fetch_aux(self.ups, ".svh"),
-            suh_d = fetch_aux(self.downs, ".suh"), svh_d = fetch_aux(self.downs, ".svh"),
-            bias_u = fetch_aux(self.ups, ".bias", True),
-            bias_d = fetch_aux(self.downs, ".bias", True),
-        )
-        if self.gated:
-            aux["suh_g"] = fetch_aux(self.gates, ".suh")
-            aux["svh_g"] = fetch_aux(self.gates, ".svh")
-            aux["bias_g"] = fetch_aux(self.gates, ".bias", True)
-
-        self.cpu_layer_idx = host.register_layer(
-            self.key,
-            [l.key for l in self.gates] if self.gated else [],
-            [l.key for l in self.ups],
-            [l.key for l in self.downs],
-            {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn],
-            float(self.act_limit or 0.0),
-            hi, ho, self.num_experts_per_tok,
-            proj_dims = dict(g = gd, u = ud, d = dd),
-            aux = aux,
-        )
-        self.cpu_offload = True
-        print(f" -- CPU-offloaded experts (worker): {self.key}")
-        return True
 
 
     def load_local(self, **kwargs):
@@ -888,6 +884,16 @@ class BlockSparseMLP(Module):
 
     def load_routing(self, **kwargs):
 
+        if self.interm_div != 1.0 and self.router_type == "std":
+            # std routing has no scaling factor; fold the interm_div compensation into the
+            # per-expert scale, which routing_std applies after top-k normalization. Both the
+            # GPU and CPU-offload load paths come through here, and unload clears the tensor
+            if self.per_expert_scale is None:
+                self.per_expert_scale = torch.full(
+                    (self.num_experts,), self.interm_div, dtype = torch.bfloat16, device = self.device)
+            else:
+                self.per_expert_scale = (self.per_expert_scale.float() * self.interm_div).to(torch.bfloat16)
+
         router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
         routing_weights_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.half, device = self.device)
         selected_experts_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.long, device = self.device)
@@ -902,6 +908,8 @@ class BlockSparseMLP(Module):
             routing_weights_bsz1 = routing_weights_bsz1,
             selected_experts_bsz1 = selected_experts_bsz1,
             e_score_correction_bias = self.e_score_correction_bias,
+            e_score_bias_h = None,
+            tid2eid = self.tid2eid,
             routed_scaling_factor = self.routed_scaling_factor,
             n_group = self.n_group,
             topk_group = self.topk_group,
@@ -911,32 +919,31 @@ class BlockSparseMLP(Module):
 
     @override
     def load(self, device: torch.Device, **kwargs):
-        ip = self.config.infer_params
-        comp = getattr(ip, "moe_cpu_component", "text")
-        budget = getattr(ip, "moe_cpu_offload", 0) if comp == "text" \
-            else getattr(ip, "draft_moe_cpu_offload", 0)
-        if (
-            budget > 0 and
-            ip.moe_cpu_offload_assigned.get(comp, 0) < budget and
-            device is not None and torch.device(device).type == "cuda" and
-            (self.num_local_experts is None or self.num_local_experts == self.num_experts) and
-            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2")
-        ):
-            if self.load_cpu_offload(device, **kwargs):
-                ip.moe_cpu_offload_assigned[comp] = ip.moe_cpu_offload_assigned.get(comp, 0) + 1
-                return
+        # CPU expert offload (see block_sparse_mlp_cpu.py): a whole-layer claim replaces the
+        # GPU load entirely; a split registration shrinks the module to its GPU slice first
+        if self.cpu_maybe_offload_load(device, **kwargs):
+            return
+        self.cpu_maybe_split_load(device, **kwargs)
         super().load(device, **kwargs)
 
         if self.e_score_correction_bias_key:
             for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
-                self.e_score_correction_bias = self.config.stc.get_tensor(
+                esb = self.config.stc.get_tensor(
                     f"{self.key}.{k}",
                     self.device,
                     optional = True,
-                    float2half = True,
+                    allow_bf16 = True,
+                    no_defer = True,
                 )
-                if self.e_score_correction_bias is not None:
+                if esb is not None:
+                    self.e_score_correction_bias = esb if esb.dtype == torch.half else esb.float()
                     break
+        if self.tid2eid_key:
+            self.tid2eid = self.config.stc.get_tensor(
+                f"{self.key}.{self.tid2eid_key}",
+                self.device,
+                no_defer = True,
+            )
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}",
@@ -945,23 +952,14 @@ class BlockSparseMLP(Module):
                 allow_bf16 = True,
             )
         if device is not None and torch.device(device).type == "cuda":
+            self.cpu_post_load()
             self.load_local(**kwargs)
             self.load_routing(**kwargs)
 
 
     @override
     def unload(self):
-        if self.cpu_offload:
-            host = getattr(self, "cpu_host", None)
-            if host is not None:
-                host.unregister()
-            # Release this layer's slot in the component's offload budget so a reload of the
-            # same config can claim it again
-            asn = self.config.infer_params.moe_cpu_offload_assigned
-            comp = getattr(self, "cpu_component", "text")
-            if isinstance(asn, dict) and asn.get(comp, 0) > 0:
-                asn[comp] -= 1
-        self.cpu_offload = False
+        self.cpu_unload()
         self.bc = None
         self.fused_mode_buffers = None
         if self.multi_gate is not None:
@@ -976,6 +974,7 @@ class BlockSparseMLP(Module):
         self.routing_cfg = None
         self.experts_cfg = None
         self.e_score_correction_bias = None
+        self.tid2eid = None
         self.per_expert_scale = None
         self.bcast_sel_bsz1 = None
         self.bcast_weights_bsz1 = None
@@ -1038,16 +1037,16 @@ class BlockSparseMLP(Module):
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
 
-        # Experimental CPU expert offload via the persistent worker. The autosplit measuring
-        # forward only observes VRAM allocation, which the CPU compute cannot affect, so it
-        # skips the (slow, full-chunk) host pass and just allocates the output
+        # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
+        # share to the worker now so it computes concurrently with the GPU expert paths below
+        # (folded back in by cpu_split_combine); whole-layer offload replaces the routed sum
+        cpu_partial = None
+        cpu_pending = None
+        if self.cpu_split_first is not None and not params.get("autosplit_measure"):
+            cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
+
         if self.cpu_offload:
-            if params.get("autosplit_measure"):
-                final_hidden_states = torch.zeros_like(y, dtype = torch.float).reshape(x.shape)
-            else:
-                final_hidden_states = self.cpu_host.submit_prefill(
-                    self.cpu_layer_idx, y, selected_experts, routing_weights
-                ).reshape(x.shape)
+            final_hidden_states = self.cpu_offload_forward(x, y, selected_experts, routing_weights, params)
 
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
@@ -1083,7 +1082,9 @@ class BlockSparseMLP(Module):
                 # Token indices corresponding to each flattened assignment
                 flat_token = buffered_interleaved_arange(num_tokens, top_k, device = y.device)
 
-                if self.routing_device is None or self.num_local_experts == self.num_experts:
+                # Map to local expert ids whenever this module holds a slice (TP shard or
+                # CPU expert split), not only in the multi-device routing case
+                if self.num_local_experts == self.num_experts:
                     flat_expert_local = flat_expert_global
                 else:
                     flat_expert_local = flat_expert_global - self.routing_first
@@ -1262,8 +1263,7 @@ class BlockSparseMLP(Module):
                         mine,
                         maxe,
                         0,
-                        1
-                    )
+                        1, None, None)
 
                 # Up
                 ext.exl3_mgemm(
@@ -1282,8 +1282,7 @@ class BlockSparseMLP(Module):
                     mine,
                     maxe,
                     0,
-                    1
-                )
+                    1, None, None)
 
                 # Activation (gateless: relu_mul(u, u, a) = relu2(u))
                 act_g = cfg.interm_g if self.gated else cfg.interm_u
@@ -1308,8 +1307,7 @@ class BlockSparseMLP(Module):
                     mine,
                     maxe,
                     0,
-                    1
-                )
+                    1, None, None)
 
                 t = cfg.out_d[0]
                 final_hidden_states[i:i+1] = t
@@ -1338,8 +1336,7 @@ class BlockSparseMLP(Module):
                     cfg.min_expert,
                     cfg.max_expert,
                     0,
-                    1
-                )
+                    1, None, None)
 
             # Up
             ext.exl3_mgemm(
@@ -1358,8 +1355,7 @@ class BlockSparseMLP(Module):
                 cfg.min_expert,
                 cfg.max_expert,
                 0,
-                1
-            )
+                1, None, None)
 
             # Activation (gateless: relu_mul(u, u, a) = relu2(u))
             act_g = cfg.interm_g if self.gated else cfg.interm_u
@@ -1383,10 +1379,13 @@ class BlockSparseMLP(Module):
                 cfg.min_expert,
                 cfg.max_expert,
                 0,
-                1
-            )
+                1, None, None)
 
             final_hidden_states = cfg.out_d[:1, ...].view(x.shape)
+
+        # CPU tail partial folds in before the post norms (nonlinear: they must see the
+        # complete routed sum)
+        final_hidden_states = self.cpu_split_combine(final_hidden_states, cpu_partial, cpu_pending, x)
 
         # The post norms are nonlinear, so under TP their inputs must be complete sums, not
         # per-rank partials: reduce the routed and shared contributions separately before the
@@ -1439,6 +1438,8 @@ class BlockSparseMLP(Module):
         t = super().get_tensors()
         if self.e_score_correction_bias is not None:
             t[f"{self.key}.{self.e_score_correction_bias_key}"] = self.e_score_correction_bias.contiguous()
+        if self.tid2eid is not None:
+            t[f"{self.key}.{self.tid2eid_key}"] = self.tid2eid.contiguous()
         if self.per_expert_scale is not None:
             t[f"{self.key}.{self.per_expert_scale_key}"] = self.per_expert_scale.contiguous()
         return t
@@ -1504,7 +1505,11 @@ class BlockSparseMLP(Module):
                 "topk_group": self.topk_group,
                 "act_limit": self.act_limit,
                 "alt_residual_channel": self.alt_residual_channel,
+                "key_tid2eid": self.tid2eid_key,
             },
+            # Hash-MoE bootstrap layers (DeepSeek-V4): frozen token->experts table, needed
+            # wherever routing runs (the output device, like the routing gate)
+            "tid2eid": producer.send(self.tid2eid) if self.tid2eid is not None else None,
             "routing_gate": _export(self.routing_gate),
             "shared_gate": _export(self.shared_gate),
             "e_score_correction_bias": producer.send(self.e_score_correction_bias),
@@ -1600,6 +1605,8 @@ class BlockSparseMLP(Module):
         module.device = device
         module.e_score_correction_bias = consumer.recv(exported["e_score_correction_bias"], cuda = True)
         module.per_expert_scale = consumer.recv(exported["per_expert_scale"], cuda = True)
+        if exported.get("tid2eid") is not None and device == output_device:
+            module.tid2eid = consumer.recv(exported["tid2eid"], cuda = True)
         if unit == "channels" or num_local_experts > 0:
             module.load_local()
         if module.routing_gate is not None:

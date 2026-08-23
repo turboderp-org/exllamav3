@@ -50,7 +50,9 @@ int exl3_mgemm_gr
     int max_index,
     int force_num_sms,
     Graph* graph,
-    int num_tokens = 1
+    int num_tokens = 1,
+    const c10::optional<at::Tensor>& size_n_list = {},
+    const c10::optional<at::Tensor>& c_ptrs = {}
 );
 
 int exl3_mgemm
@@ -70,5 +72,7 @@ int exl3_mgemm
     int min_index,
     int max_index,
     int force_num_sms,
-    int num_tokens = 1
+    int num_tokens = 1,
+    const c10::optional<at::Tensor>& size_n_list = {},
+    const c10::optional<at::Tensor>& c_ptrs = {}
 );

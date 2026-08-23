@@ -409,6 +409,23 @@ void rms_norm_impl
     cuda_check(cudaPeekAtLastError());
 }
 
+void rms_norm_gr
+(
+    const at::Tensor& x,
+    const c10::optional<at::Tensor>& w,
+    at::Tensor& y,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    bool span_heads,
+    Graph* graph
+)
+{
+    c10::optional<at::Tensor> no_r = {};
+    rms_norm_impl(x, w, y, no_r, epsilon, constant_bias, constant_scale, span_heads,
+                  RES_NONE, graph);
+}
+
 void rms_norm
 (
     at::Tensor x,

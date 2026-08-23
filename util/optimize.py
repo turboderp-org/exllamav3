@@ -2,6 +2,10 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.conversion.optimize_model import parser, main, prepare
 
+"""
+Deprecated. See doc/optimize.md
+"""
+
 # Script included in package: ./exllamav3/conversion/optimize_model.py
 
 if __name__ == "__main__":

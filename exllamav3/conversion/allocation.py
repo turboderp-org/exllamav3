@@ -36,6 +36,8 @@ def create_q_strategy(
     head_bpw: int,
     mtp_bpw: int,
     hq: bool,
+    vision_model: Model = None,
+    vision_bpw: int = None,
 ) -> (dict, float):
     """
     Build the per-module quantization bitrate strategy for a converted model.
@@ -58,11 +60,22 @@ def create_q_strategy(
     target_groups = {}
 
     # Collect and initialize targets
-    def _add(module: Module, priority: int):
+    def _add(module: Module, priority: int, fixed_bpw: int = None):
         priority = max(priority, module.q_priority)
         nonlocal sum_numel, sum_bits, targets, aux_targets
         if isinstance(module, Linear) and module.qmap is not None:
-            if module.qbits_key == "bits":
+            if fixed_bpw is not None:
+                # Uncalibrated side model (vision tower): every eligible Linear gets the same
+                # fixed bitrate outside the main budget
+                numel = module.weights_numel()
+                aux_targets[module.key] = QTarget(
+                    numel = numel,
+                    target_bpw = fixed_bpw,
+                    min_bpw = fixed_bpw,
+                    priority = priority
+                )
+
+            elif module.qbits_key == "bits":
                 numel = module.weights_numel()
                 sum_numel += numel
                 sum_bits += numel * base_bpw
@@ -98,13 +111,16 @@ def create_q_strategy(
             else:
                 raise ValueError("Logic error in create_q_strategy")
         for sm in module.modules:
-            _add(sm, priority)
+            _add(sm, priority, fixed_bpw)
 
     modules = model.modules
     if mtp_model:
         modules = modules + mtp_model.modules
     for m in modules:
         _add(m, 0)
+    if vision_model:
+        for m in vision_model.modules:
+            _add(m, 0, fixed_bpw = vision_bpw)
 
     # Target
     max_bits = int(bpw * float(sum_numel))
@@ -154,6 +170,76 @@ def create_q_strategy(
     f_targets = {k: v.target_bpw for k, v in targets.items()}
 
     return f_targets, float(final_bits) / sum_numel if sum_numel else 0
+
+
+def create_q_strategy_from_recipe(
+    model: Model,
+    mtp_model: Model,
+    config: Config,
+    recipe_tensors: dict,
+    head_bpw: int,
+    mtp_bpw: int,
+    vision_model: Model = None,
+    vision_bpw: int = None,
+) -> (dict, float):
+    """
+    Build the per-module quantization strategy from an explicit per-tensor recipe (e.g. produced
+    by util/sc_optimize.py) instead of the budgeted allocation in create_q_strategy. recipe_tensors
+    maps each budgeted ("bits") Linear's key to an integer bitrate (1-8, or 16 to store unquantized).
+    The recipe must cover the budgeted tensors exactly.
+    """
+    from ..modules.linear import Linear
+
+    targets = {}
+    sum_numel = 0
+    sum_bits = 0
+    missing = []
+
+    def _add(module, fixed_bpw = None):
+        nonlocal sum_numel, sum_bits
+        if isinstance(module, Linear) and module.qmap is not None:
+            if fixed_bpw is not None:
+                targets[module.key] = fixed_bpw
+            elif module.qbits_key == "bits":
+                bpw = recipe_tensors.get(module.key)
+                if bpw is None:
+                    missing.append(module.key)
+                else:
+                    targets[module.key] = bpw
+                    if bpw <= 8:
+                        sum_numel += module.weights_numel()
+                        sum_bits += module.weights_numel() * bpw
+            elif module.qbits_key == "head_bits":
+                targets[module.key] = head_bpw
+            elif module.qbits_key == "mtp_bits":
+                targets[module.key] = mtp_bpw
+            else:
+                raise ValueError("Logic error in create_q_strategy_from_recipe")
+        for sm in module.modules:
+            _add(sm, fixed_bpw)
+
+    modules = model.modules
+    if mtp_model:
+        modules = modules + mtp_model.modules
+    for m in modules:
+        _add(m)
+    if vision_model:
+        for m in vision_model.modules:
+            _add(m, fixed_bpw = vision_bpw)
+
+    if missing:
+        raise ValueError(
+            f"Recipe is missing bitrates for {len(missing)} quantizable tensor(s), "
+            f"e.g.: {', '.join(missing[:5])}"
+        )
+    unknown = [k for k in recipe_tensors if k not in targets]
+    if unknown:
+        raise ValueError(
+            f"Recipe contains {len(unknown)} key(s) not matching any budgeted tensor in the "
+            f"model, e.g.: {', '.join(unknown[:5])}"
+        )
+
+    return targets, float(sum_bits) / sum_numel if sum_numel else 0
 
 
 def print_strategy(

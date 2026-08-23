@@ -163,3 +163,9 @@ class Module(ABC):
 
     def get_compile_tensors(self, stc):
         return stc.get_tensors(self.key, allow_bf16 = True)
+
+    def autosplit_extra_measure(self, params):
+        """
+        Extra measuring forwards for the autosplit loader.
+        """
+        pass

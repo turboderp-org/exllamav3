@@ -102,8 +102,8 @@ uint64_t mgemm_autotune_hash
         h ^= v;
         h *= 1099511628211ull;
     };
-    mix((uint64_t) bszm_in);
-    mix((uint64_t) bszm_out);
+    mix((uint64_t) MIN(bszm_in, 24));
+    mix((uint64_t) MIN(bszm_out, 24));
     return h;
 }
 
@@ -398,7 +398,9 @@ int exl3_mgemm_gr
     int max_index,
     int force_num_sms,
     Graph* graph,
-    int num_tokens
+    int num_tokens,
+    const c10::optional<at::Tensor>& size_n_list,
+    const c10::optional<at::Tensor>& c_ptrs
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -427,7 +429,28 @@ int exl3_mgemm_gr
     int bsz = A.size(1);
     int bszm_in = A.size(0);
     int bszm_out = C.size(0);
+
+    // Per-matrix output widths/pointers (uniform-width callers pass neither): C then only
+    // provides the dtype and the max width (locks/shape sizing); outputs go to c_ptrs
+    const int* size_n_list_ptr = nullptr;
+    void** c_list_ptr = nullptr;
+    if (size_n_list)
+    {
+        TORCH_CHECK(c_ptrs, "exl3_mgemm: size_n_list requires c_ptrs");
+        TORCH_CHECK_DTYPE(size_n_list.value(), kInt);
+        TORCH_CHECK_DTYPE(c_ptrs.value(), kLong);
+        TORCH_CHECK(num_tokens == 1 && min_index < 0 && !weights,
+                    "exl3_mgemm: per-matrix widths incompatible with multi-token/filtering/weights");
+        size_n_list_ptr = (const int*) size_n_list.value().data_ptr();
+        c_list_ptr = (void**) c_ptrs.value().data_ptr();
+        bszm_out = (int) c_ptrs.value().size(0);
+    }
     int bszm = MAX(bszm_in, bszm_out);
+
+    // The kernel writes one hadamard-transformed input slab PER MATRIX (A_had + j * m * k);
+    // an undersized scratch is silent OOB corruption (found the hard way)
+    TORCH_CHECK(A_had.numel() >= (int64_t) bszm * A.size(1) * A.size(2),
+                "exl3_mgemm: A_had must hold bszm * m * k elements");
 
     const int64_t* indices_ptr = (const int64_t*) OPTPTR(indices);
     const half* weights_ptr = (const half*) OPTPTR(weights);
@@ -495,7 +518,9 @@ int exl3_mgemm_gr
         (void*)& bszm_out,
         (void*)& min_index,
         (void*)& max_index,
-        (void*)& num_tokens
+        (void*)& num_tokens,
+        (void*)& size_n_list_ptr,
+        (void*)& c_list_ptr
     };
 
     auto add_graph_args = [&](void* kernel_ptr)
@@ -620,7 +645,9 @@ int exl3_mgemm
     int min_index,
     int max_index,
     int force_num_sms,
-    int num_tokens
+    int num_tokens,
+    const c10::optional<at::Tensor>& size_n_list,
+    const c10::optional<at::Tensor>& c_ptrs
 )
 {
     return exl3_mgemm_gr
@@ -641,6 +668,8 @@ int exl3_mgemm
         max_index,
         force_num_sms,
         nullptr,
-        num_tokens
+        num_tokens,
+        size_n_list,
+        c_ptrs
     );
 }

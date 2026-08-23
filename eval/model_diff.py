@@ -36,7 +36,7 @@ def save_tensor(tensor, path: str, tensor_name: str = None):
 def get_dataset_text(spec: dict):
     assert spec["dataset"] == "wiki2", "Only wiki2 implemented atm"
     dataset_text = "\n\n".join(
-        load_dataset("wikitext", "wikitext-2-raw-v1", split = "test")
+        load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split = "test")
         ["text"]
     )
     return dataset_text
@@ -144,6 +144,9 @@ def main(args):
     save_logits_a = []
     save_logits_b = []
 
+    params_a = [{} for _ in range(len(states_a))]
+    params_b = [{} for _ in range(len(states_b))]
+
     # Inference
     for idx, (module_a, module_b) in enumerate(zip(model_a.modules, model_b.modules)):
 
@@ -184,13 +187,15 @@ def main(args):
             state_b = states_b[b]
             eval_ids = all_eval_ids[b]
 
-            params_a = {"sim_kvq": sim_kvq}
-            state_a = module_a.prepare_for_device(state_a, params_a)
-            state_a = module_a.forward(state_a, params_a)
+            params_a[b].update({"sim_kvq": sim_kvq})
+            params_a[b]["dev_cache"] = None
+            state_a = module_a.prepare_for_device(state_a, params_a[b])
+            state_a = module_a.forward(state_a, params_a[b])
 
-            params_b = {}
-            state_b = module_b.prepare_for_device(state_b, params_b)
-            state_b = module_b.forward(state_b, params_b)
+            params_b[b].update({})
+            params_b[b]["dev_cache"] = None
+            state_b = module_b.prepare_for_device(state_b, params_b[b])
+            state_b = module_b.forward(state_b, params_b[b])
 
             # Optionally override model A state for first layers
             if idx < args.keep_b:

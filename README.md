@@ -25,6 +25,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Command-A**, **Command-R7B**, **Command-R+** etc. (Cohere2ForCausalLM)
 - **DeciLM**, **Nemotron** (DeciLMForCausalLM)
 - **Deepseek V3** (DeepseekV3ForCausalLM)
+- **Deepseek V4** (DeepseekV4ForCausalLM)
 - **dots.llm1** (Dots1ForCausalLM) (`n_group>1` currently not supported)
 - **ERNIE 4.5** (Ernie4_5_ForCausalLM, Ernie4_5_MoeForCausalLM)
 - **EXAONE 4.0** (Exaone4ForCausalLM)
@@ -42,9 +43,8 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Llama**, **Llama 2**, **Llama 3**, **Llama 3.1-Nemotron** etc. (LlamaForCausalLM)
 - **MiMo-RL** (MiMoForCausalLM)
 - **MiniMax-M2** (MiniMaxM2ForCausalLM)
-- **Mistral**, **Ministral 3**, **Devstral 2** etc. (MistralForCausalLM, Mistral3ForConditionalGeneration) *- multimodal*
+- **Mistral**, **Ministral 3**, **Devstral 2**, **Mistral-4** etc. (MistralForCausalLM, Mistral3ForConditionalGeneration) *- multimodal*
 - **Mixtral** (MixtralForCausalLM)
-- **NanoChat** (NanoChatForCausalLM)
 - **NemotronH, Nemotron-3** (NemotronHForCausalLM)
 - **Olmo 3.1** (Olmo3ForCausalLM)
 - **Olmo-Hybrid** (OlmoHybridForCausalLM)

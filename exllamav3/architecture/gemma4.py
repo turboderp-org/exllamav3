@@ -80,7 +80,8 @@ class Gemma4Config(Config):
         for layer_type in self.layer_types:
             match layer_type:
                 case "sliding_attention":
-                    self.swa_pattern.append(self.sliding_window)
+                    # HF mask keeps sliding_window including the query
+                    self.swa_pattern.append(self.sliding_window - 1)
                 case "full_attention":
                     self.swa_pattern.append(-1)
                 case _:

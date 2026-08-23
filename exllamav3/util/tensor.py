@@ -227,6 +227,14 @@ class GTensorCache:
         self.cache[key] = (refc + 1, v)
         return v
 
+    def get_bucketed(self, device, numel, dtype, x = ""):
+        """Flat backing rounded up to the next power of two, sliced to numel. For workspaces
+        whose size is parameterized by a runtime shape (batch size, query length, split
+        count): nearby sizes share one kept entry instead of ratcheting a new allocation per
+        distinct size, and the total kept per tag is bounded by 2x the largest use."""
+        nb = 1 << max(numel - 1, 0).bit_length()
+        return self.get(device, (nb,), dtype, x)[:numel]
+
     # def drop(self, device, shape, dtype, x = ""):
     #     key = self.make_key(device, shape, dtype, x)
     #     refc, v = self.cache[key]

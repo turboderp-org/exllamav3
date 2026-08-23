@@ -5,7 +5,7 @@ from ..loader.safetensors import SafetensorsCollection
 from ..version import __version__
 from ..loader.safetensors_alt import save_file
 from ..util.memory import free_mem
-from ..modules import Module
+from ..modules import Module, Linear
 from .quant_config import update_config, create_quantization_config_json
 
 def tsize(t):
@@ -16,7 +16,7 @@ def dsize(d):
     for _, v in d.items(): size += tsize(v)
     return size
 
-def compile_model(args, model, config, tokenizer, mtp_model = None):
+def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model = None):
 
     in_dir = args["in_dir"]
     out_dir = args["out_dir"]
@@ -45,6 +45,9 @@ def compile_model(args, model, config, tokenizer, mtp_model = None):
     modules = model.modules
     if mtp_model:
         modules = modules + mtp_model.modules
+    if vision_model:
+        modules = modules + vision_model.modules
+    walked_modules = modules
     for module in modules:
         sizes = module.get_compile_sizes(qtensors_stc)
         if len(sizes) == 0:
@@ -59,10 +62,39 @@ def compile_model(args, model, config, tokenizer, mtp_model = None):
         total_size += size
         out_map[-1].append(module)
 
-    # Additional tensors
+    # Additional tensors. Skip any that the walked modules already emit: a tensor under a walked
+    # module's key prefix and present in the compiled qtensors is copied through by that module,
+    # and .weight/.bias belonging to a walked Linear are superseded by its EXL3 tensors. Presence
+    # in a qtensors file alone is NOT enough: modules collect output tensors by key prefix, so a
+    # tensor saved outside its module's prefix (e.g. the DFlash fc norm) still relies on the
+    # extras fallback
+    covered_linears = set()
+    module_prefixes = []
+    for module in walked_modules:
+        module_prefixes.append(module.key + ".")
+        for m in module:
+            if isinstance(m, Linear):
+                covered_linears.add(m.key + ".weight")
+                covered_linears.add(m.key + ".bias")
+
+    def under_module_prefix(key):
+        return any(key.startswith(p) for p in module_prefixes)
+
     extra_tensors = {}
     for _, cls in config.model_classes.items():
         extra_tensors.update(cls.get_additional_compiled_tensors(config))
+    skipped = 0
+    for key in list(extra_tensors.keys()):
+        produced = (
+            not args.get("model_stc")
+            and under_module_prefix(key)
+            and qtensors_stc.has_tensor(key)
+        )
+        if produced or key in covered_linears:
+            del extra_tensors[key]
+            skipped += 1
+    if skipped:
+        print(f" -- Skipping {skipped} source tensor(s) already covered by compiled modules")
     for key, data in extra_tensors.items():
         size = data["n_bytes"]
         if size > max_shard_bytes:
@@ -183,6 +215,12 @@ def compile_model(args, model, config, tokenizer, mtp_model = None):
             qcfg.update({
                 "original_quantization_config": orig_qcfg
             })
+
+    if vision_model and args.get("vision_bits", 16) != 16:
+        qcfg["vision_bits"] = args["vision_bits"]
+
+    if mtp_model:
+        qcfg["mtp_bits"] = args["mtp_bits"]
 
     update_config(config_dict)
     config_dict["quantization_config"] = qcfg

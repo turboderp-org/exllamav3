@@ -67,7 +67,8 @@ class Gemma3Config(Config):
             self.swa_pattern = []
             for t in layer_types:
                 if t == "sliding_attention":
-                    self.swa_pattern.append(self.sliding_window)
+                    # HF mask keeps sliding_window including the query
+                    self.swa_pattern.append(self.sliding_window - 1)
                 elif t == "full_attention":
                     self.swa_pattern.append(-1)
                 else:
@@ -75,7 +76,8 @@ class Gemma3Config(Config):
 
         elif sliding_window_pattern:
             self.swa_pattern = [
-                self.sliding_window if (idx + 1) % sliding_window_pattern != 0 else -1
+                # HF mask keeps sliding_window including the query
+                self.sliding_window - 1 if (idx + 1) % sliding_window_pattern != 0 else -1
                 for idx in range(self.num_hidden_layers)
             ]
 
@@ -188,7 +190,8 @@ class Gemma3TextConfig(Config):
             self.swa_pattern = []
             for t in layer_types:
                 if t == "sliding_attention":
-                    self.swa_pattern.append(self.sliding_window)
+                    # HF mask keeps sliding_window including the query
+                    self.swa_pattern.append(self.sliding_window - 1)
                 elif t == "full_attention":
                     self.swa_pattern.append(-1)
                 else:
@@ -196,7 +199,8 @@ class Gemma3TextConfig(Config):
 
         elif sliding_window_pattern:
             self.swa_pattern = [
-                self.sliding_window if (idx + 1) % sliding_window_pattern != 0 else -1
+                # HF mask keeps sliding_window including the query
+                self.sliding_window - 1 if (idx + 1) % sliding_window_pattern != 0 else -1
                 for idx in range(self.num_hidden_layers)
             ]
 

@@ -268,7 +268,6 @@ class SlidingAttention(Module):
         v_proj: Linear | Module | None = None,
         o_proj: Linear | Module | None = None,
         g_proj: Linear | Module | None = None,
-        post_rope_norm: bool = False,
         full_gate: bool = False,
         gate_softplus: bool = False,
         select_hq_bits: int = 0,
@@ -296,7 +295,6 @@ class SlidingAttention(Module):
         # so round UP to whole pages to preserve at least the requested slack after a shift
         self.kv_state_size = -(-(sliding_window + sliding_window_overp) // PAGE_SIZE) * PAGE_SIZE
         self.logit_softcapping = logit_softcapping
-        self.post_rope_norm = post_rope_norm
         self.full_gate = full_gate
         self.gate_softplus = gate_softplus
         self.bt_cache = {}
@@ -321,10 +319,6 @@ class SlidingAttention(Module):
         self.key_sinks = key_sinks
         self.sinks = None
 
-        if post_rope_norm:
-            assert q_norm is None and k_norm is None, \
-                "Post-RoPE norm only supported without weights"
-
         if self.num_kv_heads == 0:
             return
 
@@ -343,6 +337,7 @@ class SlidingAttention(Module):
                 frange = frange_q,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                trim_padded_out = True,
             )
             self.register_submodule(self.q_proj)
         else:
@@ -361,6 +356,7 @@ class SlidingAttention(Module):
                 frange = frange_k,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                trim_padded_out = True,
             )
             self.v_proj = Linear(
                 config,
@@ -372,6 +368,7 @@ class SlidingAttention(Module):
                 frange = frange_v,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                trim_padded_out = True,
             )
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
@@ -532,8 +529,15 @@ class SlidingAttention(Module):
 
         # Head norm
         if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
-            self.q_norm_tensor = self.q_norm.weight.data
-            self.k_norm_tensor = self.k_norm.weight.data
+            if self.q_norm.unweighted:
+                # Unweighted head norm == weighted norm with all-ones scale; synthesize the weight so
+                # the fused rope+norm kernel and the BC graph path still apply
+                ones = torch.ones(self.head_dim, dtype = torch.half, device = device)
+                self.q_norm_tensor = ones
+                self.k_norm_tensor = ones
+            else:
+                self.q_norm_tensor = self.q_norm.weight.data
+                self.k_norm_tensor = self.k_norm.weight.data
 
 
 
@@ -639,8 +643,7 @@ class SlidingAttention(Module):
                 -1,
                 -1,
                 0,
-                1
-            )
+                1, None, None)
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
@@ -672,8 +675,7 @@ class SlidingAttention(Module):
                 -1,
                 -1,
                 0,
-                1
-            )
+                1, None, None)
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
 
@@ -783,7 +785,6 @@ class SlidingAttention(Module):
                 self.norm_eps,
                 self.norm_constant_bias,
                 inv_freq,
-                self.post_rope_norm
             )
 
         o = paged_attn_triton_prefill(
@@ -850,7 +851,6 @@ class SlidingAttention(Module):
                 self.norm_eps,
                 self.norm_constant_bias,
                 inv_freq,
-                self.post_rope_norm
             )
 
         # Recurrent state: a short contiguous fp16 K/V span per sequence, viewed as a paged
@@ -1039,7 +1039,6 @@ class SlidingAttention(Module):
                 "sliding_window": self.sliding_window,
                 "sliding_window_overp": self.sliding_window_overp,
                 "logit_softcapping": self.logit_softcapping,
-                "post_rope_norm": self.post_rope_norm,
                 "full_gate": self.full_gate,
             },
             "num_kv_heads": self.num_kv_heads,

@@ -4,11 +4,14 @@ from ...model.config import Config
 from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
+import os
 from ...util import profile_opt
 
 AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
+
+no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
 
 class LinearEXL3:
 
@@ -73,6 +76,7 @@ class LinearEXL3:
         self.mcg = self.mcg_tensor is not None
         self.mul1 = self.mul1_tensor is not None
 
+        self._fused_reconstruct = None
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
         self.bc = ext.BC_LinearEXL3(
             self.trellis,
@@ -119,6 +123,12 @@ class LinearEXL3:
             if self.key in ovr and ovr[self.key].inner is not self:
                 return ovr[self.key].forward(x, params, out_dtype)
 
+        # The EXL3 kernels read x as contiguous rows; a strided view (e.g. a head-group slice
+        # of a wider tensor) would be silently misread as interleaved garbage. Producers are
+        # responsible for contiguity (a silent copy here would hide a hot-path inefficiency
+        # and break CUDA-graph address stability)
+        assert x.is_contiguous(), f"LinearEXL3 {self.key}: non-contiguous input {tuple(x.shape)}"
+
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
@@ -157,12 +167,34 @@ class LinearEXL3:
         y = torch.empty(out_shape, dtype = out_dtype or self.default_out_dtype, device = x.device)
 
         y_ = y.view(rows, self.out_features)
-        xh = torch.empty_like(x)
-        ext.had_r_128(x, xh, self.suh, None, 1.0)
+
+        # Fused path: reconstruct emits ORIGINAL-basis weights (both Hadamards + sign
+        # vectors folded into the memory-bound reconstruct kernel), so the gemm runs on the
+        # raw input and the standalone input/output had_r_128 launches disappear (~14% of
+        # long-chunk prefill GPU time). Requires 128-divisible dims (always true for EXL3
+        # tensors: both sides are had-transformed at quant time)
+        if self._fused_reconstruct is None:
+            self._fused_reconstruct = (
+                self.in_features % 128 == 0 and self.out_features % 128 == 0
+                and not no_fused_reconstruct
+            )
+
+        # The fused kernel costs ~4x plain reconstruct (k*n-proportional) while the saved
+        # had launches scale with rows*(k+n); breakeven is rows ~400-900 across shapes
+        use_fused = self._fused_reconstruct and rows >= 1024
+
+        if use_fused:
+            xh = x
+        else:
+            xh = torch.empty_like(x)
+            ext.had_r_128(x, xh, self.suh, None, 1.0)
 
         if self.out_features <= MAX_RECONSTRUCT_SLICE_N:
             w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
-            ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
+            if use_fused:
+                ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
+            else:
+                ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
             ext.hgemm(xh, w, y_)
         else:
             numel_ = self.in_features * MAX_RECONSTRUCT_SLICE_N
@@ -171,10 +203,15 @@ class LinearEXL3:
                 n_end = min(n_start + MAX_RECONSTRUCT_SLICE_N, self.out_features)
                 numel = self.in_features * (n_end - n_start)
                 w = w_[:numel].view(self.in_features, n_end - n_start)
-                ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
+                if use_fused:
+                    ext.reconstruct_had_slice(
+                        w, self.trellis, self.suh, self.svh[n_start:], self.K, self.mcg, self.mul1, n_start)
+                else:
+                    ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
                 ext.hgemm(xh, w, y_[:, n_start:n_end])
 
-        ext.had_r_128(y_, y_, None, self.svh, 1.0)
+        if not use_fused:
+            ext.had_r_128(y_, y_, None, self.svh, 1.0)
 
         if self.bias is not None:
             y += self.bias

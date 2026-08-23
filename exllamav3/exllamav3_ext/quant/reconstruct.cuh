@@ -20,3 +20,15 @@ void reconstruct_slice
     bool mul1,
     int64_t n_offset
 );
+
+void reconstruct_had_slice
+(
+    at::Tensor unpacked,
+    at::Tensor packed,
+    at::Tensor suh,
+    at::Tensor svh,
+    int K,
+    bool mcg,
+    bool mul1,
+    int64_t n_offset
+);

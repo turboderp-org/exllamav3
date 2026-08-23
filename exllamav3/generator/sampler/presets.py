@@ -97,9 +97,11 @@ class ComboSampler(CustomSampler):
         temp_last: bool = False,
         adaptive_target: float = 1.0,
         adaptive_decay: float = 0.9,
+        logit_bias: dict[int, float] | None = None,
     ):
         # Steps with default parameters become no-ops
         stack = [
+            SS_LogitBias(logit_bias or {}),
             SS_RepP(rep_p, rep_sustain_range, rep_decay_range),
             SS_PresFreqP(pres_p, freq_p, rep_sustain_range, rep_decay_range),
         ]

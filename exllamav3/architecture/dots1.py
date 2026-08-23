@@ -168,7 +168,6 @@ class Dots1Model(Model):
             for idx in range(config.num_hidden_layers)
         ]
 
-        # TODO: The first attn.o_proj is irregular and breaks quantization. For now, skip quantizing it
         self.modules[self.first_block_idx].attn.o_proj.qmap = None
 
         self.last_kv_module_idx = len(self.modules) - 1

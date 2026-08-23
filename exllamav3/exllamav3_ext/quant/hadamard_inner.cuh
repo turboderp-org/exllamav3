@@ -348,7 +348,7 @@ void had_hf_r_128_guad_inner
     // Hadamard
     vu = had(vu);
 
-    // Post scale  TODO: should maybe do this in float32
+    // Post scale
     int i = blockIdx.y * 32 + t;
     half4 scales_u = ((half4*) post_scale_u)[i];
     vu.x = __hmul2(vu.x, scales_u.x);

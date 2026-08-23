@@ -223,3 +223,67 @@ def test_rope_multidim(rope_style, use_norm, in_place):
     if not in_place:
         torch.testing.assert_close(q, q_pre, rtol = 0, atol = 0)
         torch.testing.assert_close(k, k_pre, rtol = 0, atol = 0)
+
+
+@pytest.mark.parametrize("rope_style", rope_styles)
+@pytest.mark.parametrize("partial", [1.0, 0.5])
+@torch.inference_mode()
+def test_rope_llama4_scaling(rope_style, partial):
+    """The Llama-4 position scale (Ministral-3 family) applies to the full query head only,
+    after rope: 1 + beta * ln(1 + pos // original_max). Keys must enter the cache unscaled,
+    and the non-rotated part of a partial-rotary query must be scaled too."""
+    bsz, seq_len, heads_q, heads_k, head_dim = 2, 16, 8, 2, 128
+    beta, original_max = 0.1, 16384
+
+    def make_rope():
+        return RoPE(
+            device = device,
+            rope_settings = RopeSettings(
+                rope_theta = 1000000.0,
+                head_dim = head_dim,
+                rope_scaling = {
+                    "rope_type": "yarn",
+                    "factor": 16.0,
+                    "original_max_position_embeddings": original_max,
+                    "beta_fast": 32.0,
+                    "beta_slow": 1.0,
+                    "mscale": 1.0,
+                    "mscale_all_dim": 1.0,
+                    "llama_4_scaling_beta": beta,
+                },
+                max_position_embeddings = 16 * original_max,
+                partial_rotary_factor = partial,
+                rope_style = rope_style,
+            )
+        )
+
+    def qk():
+        torch.manual_seed(0)
+        q = torch.randn((bsz, seq_len, heads_q, head_dim), dtype = torch.half, device = device)
+        k = torch.randn((bsz, seq_len, heads_k, head_dim), dtype = torch.half, device = device)
+        return q, k
+
+    # Window straddles the first scale step at original_max
+    position = original_max - seq_len // 2
+
+    rope_l4 = make_rope()
+    assert rope_l4.llama_4_scaling_beta == beta
+    assert rope_l4.attn_factor == 1.0  # beta supersedes the static yarn factor
+    q, k = qk()
+    q1, k1 = rope_l4.apply(q, k, position)
+
+    # Same settings with the scale disabled after construction (attn_factor unaffected)
+    rope_ctrl = make_rope()
+    rope_ctrl.llama_4_scaling_beta = 0.0
+    q, k = qk()
+    q0, k0 = rope_ctrl.apply(q, k, position)
+
+    # Keys: bitwise unscaled
+    torch.testing.assert_close(k1, k0, rtol = 0, atol = 0)
+
+    # Queries: whole head scaled by the per-position factor
+    pos = position + torch.arange(seq_len, device = device)
+    scale = 1.0 + beta * torch.log(1.0 + (pos // original_max).float())
+    assert scale.min() == 1.0 and scale.max() > 1.0
+    q_expect = (q0.float() * scale.view(1, seq_len, 1, 1)).half()
+    torch.testing.assert_close(q1, q_expect, rtol = 3e-3, atol = 3e-3)

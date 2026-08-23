@@ -1,5 +1,22 @@
 from collections import OrderedDict
 from ..constants import PAGE_SIZE
+from ..util.memory import malloc_trim
+
+# Checkpoint stashes are MB-scale host allocations with LRU (i.e. interleaved) lifetimes —
+# exactly the churn glibc retains after free (issue #277). Return memory to the OS once
+# enough has been released; per-event cost at this threshold is a few ms. The accumulator
+# is per-process, which also gives each tensor-parallel rank its own (their stashes live
+# in the child processes)
+_TRIM_THRESHOLD = 256 * 1024**2
+_freed_bytes = 0
+
+def note_freed(nbytes: int):
+    global _freed_bytes
+    _freed_bytes += nbytes
+    if _freed_bytes >= _TRIM_THRESHOLD:
+        _freed_bytes = 0
+        malloc_trim()
+
 
 class RecurrentCache(OrderedDict):
     def __init__(
@@ -66,6 +83,7 @@ class RecurrentCache(OrderedDict):
                             self.metrics["stash_evictions_live_kv"] += 1
 
                 self.metrics["stash_evictions"] += 1
+                note_freed(popped["checkpoint_size"])
                 if self.model.loaded_tp:
                     self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
 
@@ -86,6 +104,7 @@ class RecurrentCache(OrderedDict):
         for k in stranded:
             popped = self.pop(k)
             self.metrics["stash_pruned"] += 1
+            note_freed(popped["checkpoint_size"])
             if self.model.loaded_tp:
                 self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
         if stranded:
@@ -144,6 +163,16 @@ def mp_cache_recurrent_unstash(local_context: dict, cache_id: int, cp_handle: in
         l.unstash(slot, s, position)
 
 
+def _stashed_bytes(obj) -> int:
+    import torch
+    if isinstance(obj, torch.Tensor):
+        return obj.numel() * obj.element_size()
+    if isinstance(obj, (list, tuple)):
+        return sum(_stashed_bytes(o) for o in obj)
+    return 0
+
+
 def mp_cache_recurrent_del(local_context: dict, cache_id: int, cp_handle: int):
     recurrent_cache = local_context["recurrent_cache"]
-    del recurrent_cache[cp_handle]
+    stashed = recurrent_cache.pop(cp_handle)
+    note_freed(_stashed_bytes(stashed))

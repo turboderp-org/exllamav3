@@ -77,6 +77,10 @@ class Embedding(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
+        # Ensure input IDs in params
+        if "input_ids" not in params:
+            params["input_ids"] = x
+
         indexed_emb = params.get("indexed_embeddings")
         input_ids = x
         out_dtype = out_dtype or self.out_dtype or x.dtype

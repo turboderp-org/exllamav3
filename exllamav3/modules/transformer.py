@@ -1,9 +1,10 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from ..util.tensor import to2, get_for_device
+from ..util.tensor import to2
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
+from .hyperconnections import HyperConnection
 from ..util import profile_opt
 
 class TransformerBlock(Module):
@@ -13,17 +14,14 @@ class TransformerBlock(Module):
         config: Config | None,
         key: str,
         layer_idx: int | None = None,
-        ve_gate: Linear | None = None,
-        resid_lambda: float | None = None,
-        x0_lambda: float | None = None,
         attn_norm: RMSNorm | LayerNorm | None = None,
         attn: Attention | GatedDeltaNet | None = None,
         attn_post_norm: RMSNorm | LayerNorm | None = None,
         mlp_norm: RMSNorm | LayerNorm | None = None,
         mlp: MLP | GatedMLP | BlockSparseMLP | None = None,
         mlp_post_norm: RMSNorm | LayerNorm | None = None,
-        backout_extract: bool = False,
-        backout_lambda: float | None = None,
+        attn_hc: HyperConnection | None = None,
+        mlp_hc: HyperConnection | None = None,
         key_layer_scalar: str | None = None,
         key_attn_resid_scalar: str | None = None,
         key_mlp_resid_scalar: str | None = None,
@@ -34,17 +32,14 @@ class TransformerBlock(Module):
         super().__init__(config, key, None)
 
         self.layer_idx = layer_idx
-        self.ve_gate = ve_gate
-        self.resid_lambda = resid_lambda
-        self.x0_lambda = x0_lambda
         self.attn_norm = attn_norm
         self.attn = attn
         self.attn_post_norm = attn_post_norm
         self.mlp_norm = mlp_norm
         self.mlp = mlp
         self.mlp_post_norm = mlp_post_norm
-        self.backout_extract = backout_extract
-        self.backout_lambda = backout_lambda
+        self.attn_hc = attn_hc
+        self.mlp_hc = mlp_hc
         self.qbits_key = qbits_key
         self.out_dtype = out_dtype
 
@@ -56,10 +51,22 @@ class TransformerBlock(Module):
         self.attn_resid_scalar = None
         self.mlp_resid_scalar = None
 
-        self.register_submodule(self.ve_gate)
+        # Hyperconnection sites (mHC): the block's residual is (bsz, seq, hc_mult, hidden)
+        # fp32 streams, mixed at each sublayer site instead of the plain residual add
+        if attn_hc is not None or mlp_hc is not None:
+            assert attn_hc is not None and mlp_hc is not None, \
+                "hyperconnections require both attn_hc and mlp_hc"
+            assert all(v is None for v in (
+                attn_post_norm, mlp_post_norm,
+                key_layer_scalar, key_attn_resid_scalar, key_mlp_resid_scalar,
+            )), \
+                "hyperconnections cannot combine with residual scalars/post-norms"
+
+        self.register_submodule(self.attn_hc)
         self.register_submodule(self.attn_norm)
         self.register_submodule(self.attn)
         self.register_submodule(self.attn_post_norm)
+        self.register_submodule(self.mlp_hc)
         self.register_submodule(self.mlp_norm)
         self.register_submodule(self.mlp)
         self.register_submodule(self.mlp_post_norm)
@@ -126,41 +133,6 @@ class TransformerBlock(Module):
             (self.mlp_resid_scalar.numel() if self.mlp_resid_scalar is not None else 0)
         )
 
-    def _apply_resid_lambda(self, x: torch.Tensor, params: dict):
-        if self.layer_idx == 0:
-            x0 = x.clone()
-            params["_nc_x0"] = x0
-            if "quant_preserve" in params:
-                params["quant_preserve"]["_nc_x0"] = x0
-        else:
-            x0 = get_for_device(params, "_nc_x0", self.device)
-        return self.resid_lambda * x + self.x0_lambda * x0
-
-
-    def _extract_backout(self, x: torch.Tensor, params: dict):
-        params["_nc_x_backout"] = x.clone()
-        if "quant_preserve" in params:
-            params["quant_preserve"]["_nc_x_backout"] = params["_nc_x_backout"]
-        return x
-
-
-    def _apply_backout(self, x: torch.Tensor, params: dict):
-        xmid = get_for_device(params, "_nc_x_backout", self.device)
-        if xmid is None:
-            return x
-        return x - self.backout_lambda * xmid
-
-
-    def _compute_ve_addend(self, x: torch.Tensor, params: dict):
-        ve = params[f"_nc_ve.{self.layer_idx}"].to(self.device)  # already on device, except while loading model
-        y = x[..., :self.ve_gate.in_features].half()
-        g = self.ve_gate.forward(y, params)
-        g.sigmoid_()
-        g *= 3
-        params[f"_nc_ve.{self.layer_idx}"] = g.unsqueeze(-1) * ve
-        return x
-
-
     @override
     def forward(
         self,
@@ -172,19 +144,15 @@ class TransformerBlock(Module):
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
 
-        if self.resid_lambda is not None:
-            x = self._apply_resid_lambda(x, params)
-
-        if self.backout_extract:
-            x = self._extract_backout(x, params)
-
-        if self.ve_gate:
-            x = self._compute_ve_addend(x, params)
-
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
 
         if self.attn:
-            if self.attn_norm:
+            if self.attn_hc:
+                hc_post, hc_comb, y = self.attn_hc.mix(x, params)
+                y = y.half()
+                if self.attn_norm:
+                    y = self.attn_norm.forward(y, params, out_dtype = torch.half)
+            elif self.attn_norm:
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
@@ -193,7 +161,9 @@ class TransformerBlock(Module):
                 return x
             if self.attn_resid_scalar is not None:
                 y *= self.attn_resid_scalar
-            if self.attn_post_norm:
+            if self.attn_hc:
+                x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
+            elif self.attn_post_norm:
                 self.attn_post_norm.forward(y, params, residual = x)
             elif self.mlp is not None and self.mlp_norm is not None and self.mlp_norm.can_fuse_residual(x, y):
                 y_resid = y
@@ -201,17 +171,25 @@ class TransformerBlock(Module):
                 x += y
 
         if self.mlp:
-            params["residual"] = x
-            if y_resid is not None:
-                y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
-            elif self.mlp_norm:
-                y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
+            if self.mlp_hc:
+                hc_post, hc_comb, y = self.mlp_hc.mix(x, params)
+                y = y.half()
+                if self.mlp_norm:
+                    y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
             else:
-                y = x.half()
+                params["residual"] = x
+                if y_resid is not None:
+                    y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
+                elif self.mlp_norm:
+                    y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
+                else:
+                    y = x.half()
             y = self.mlp.forward(y, params)
             if self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
-            if self.mlp_post_norm:
+            if self.mlp_hc:
+                x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
+            elif self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)
             else:
                 x += y
@@ -220,15 +198,15 @@ class TransformerBlock(Module):
             s = params.get("export_states")
             if not s:
                 s = params["export_states"] = []
-            if x.dtype == torch.half:
-                s.append(x.clamp_(-65504.0, 65504.0))
+            # With hyperconnections the residual is a stream stack; export the stream mean as
+            # the collapsed hidden state (streams start as broadcast copies of the embedding)
+            x_ = x.mean(dim = 2) if self.attn_hc else x
+            if x_.dtype == torch.half:
+                s.append(x_.clamp_(-65504.0, 65504.0))
             else:
-                x_ = x.half()
+                x_ = x_.half()
                 x_.clamp_(-65504.0, 65504.0)
                 s.append(x_)
-
-        if self.backout_lambda is not None:
-            x = self._apply_backout(x, params)
 
         if self.layer_scalar_f is not None:
             x *= self.layer_scalar_f
@@ -261,9 +239,11 @@ class TransformerBlock(Module):
                 "key_mlp_resid_scalar": self.key_mlp_resid_scalar,
             },
             **{name: _export(getattr(self, name, None)) for name in (
+                "attn_hc",
                 "attn_norm",
                 "attn",
                 "attn_post_norm",
+                "mlp_hc",
                 "mlp_norm",
                 "mlp",
                 "mlp_post_norm",
@@ -289,9 +269,11 @@ class TransformerBlock(Module):
         module = TransformerBlock(
             config = None,
             **exported["kwargs"],
+            attn_hc = _import("attn_hc"),
             attn_norm = _import("attn_norm"),
             attn = _import("attn"),
             attn_post_norm = _import("attn_post_norm"),
+            mlp_hc = _import("mlp_hc"),
             mlp_norm = _import("mlp_norm"),
             mlp = _import("mlp"),
             mlp_post_norm = _import("mlp_post_norm"),

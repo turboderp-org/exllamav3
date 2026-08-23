@@ -1432,6 +1432,66 @@ def quantize_exl3(
     return weight_q, proxy_err, out_tensors
 
 
+# Pinned staging buffers for _WeightStager, two per target device so an upload can be in
+# flight while the next host-side copy fills the other buffer. Grown to the largest tensor
+# seen; a worker thread owns its device, so per-device keying is contention-free
+_stage_bufs = {}
+_stage_bufs_lock = threading.Lock()
+
+def _get_stage_buf(device_index: int, slot: int, nbytes: int):
+    key = (device_index, slot)
+    with _stage_bufs_lock:
+        buf = _stage_bufs.get(key)
+        if buf is None or buf[0].numel() < nbytes:
+            buf = (torch.empty(nbytes, dtype = torch.uint8, pin_memory = True),
+                   torch.cuda.Event())
+            _stage_bufs[key] = buf
+        return buf
+
+
+class _WeightStager:
+    """
+    Stages CPU-swapped weights to the device through pinned buffers on a side stream, one
+    tensor ahead of consumption, casting to fp32 on the device. Replaces the former CPU-side
+    .float() + pageable synchronous upload: half the PCIe bytes (checkpoints are fp16/bf16),
+    pinned bandwidth, and the copy overlaps the previous tensor's regularization.
+    """
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.copy_stream = torch.cuda.Stream(device = device)
+        self.slot = 0
+        self.pending = {}
+
+    def prefetch(self, t: int, w: torch.Tensor):
+        if t in self.pending:
+            return
+        if w.is_cuda:
+            self.pending[t] = (w if w.device == self.device else w.to(self.device), None)
+            return
+        nbytes = w.numel() * w.element_size()
+        buf, reuse_ev = _get_stage_buf(self.device.index, self.slot, nbytes)
+        self.slot ^= 1
+        # The buffer's previous async upload must have drained before the host memcpy refills it
+        reuse_ev.synchronize()
+        pin = buf[:nbytes].view(w.dtype).view(w.shape)
+        pin.copy_(w)
+        dev_w = torch.empty(w.shape, dtype = w.dtype, device = self.device)
+        with torch.cuda.stream(self.copy_stream):
+            dev_w.copy_(pin, non_blocking = True)
+            reuse_ev.record(self.copy_stream)
+        ev = torch.cuda.Event()
+        ev.record(self.copy_stream)
+        self.pending[t] = (dev_w, ev)
+
+    def get(self, t: int, w: torch.Tensor) -> torch.Tensor:
+        self.prefetch(t, w)
+        dev_w, ev = self.pending.pop(t)
+        if ev is not None:
+            torch.cuda.current_stream(self.device).wait_event(ev)
+        return dev_w.float() if dev_w.dtype != torch.float else dev_w
+
+
 def quantize_exl3_batch(
     weights: list[torch.Tensor],
     H_datas: list[dict],
@@ -1491,21 +1551,25 @@ def quantize_exl3_batch(
 
         for t in range(n_t):
             if finalized[t] is None:
-                results[t] = quantize_exl3(weights[t], H_datas[t], quant_args_list[t], False, None, verbose)[1:]
+                results[t] = quantize_exl3(weights[t].float(), H_datas[t], quant_args_list[t], False, None, verbose)[1:]
 
         if not batch_idx:
             return results
 
-        # Regularize each tensor with the scale search deferred, then search all scales in one batch
+        # Regularize each tensor with the scale search deferred, then search all scales in one
+        # batch. Weights arrive in checkpoint precision on the CPU; the stager uploads tensor
+        # t+1 while tensor t regularizes and casts to fp32 on the device
+        stager = _WeightStager(device)
+        stager.prefetch(batch_idx[0], weights[batch_idx[0]])
         regs = {}
-        for t in batch_idx:
+        for bi, t in enumerate(batch_idx):
             qa = quant_args_list[t]
             if "seed" in qa:
                 torch.manual_seed(qa["seed"])
             H, L, su, H_diag = finalized[t]
-            weight = weights[t]
-            if weight.device != device:
-                weight = weight.to(device)
+            weight = stager.get(t, weights[t])
+            if bi + 1 < len(batch_idx):
+                stager.prefetch(batch_idx[bi + 1], weights[batch_idx[bi + 1]])
             if su.is_cuda:
                 su = su.to(device)
             if H_diag is not None and H_diag.is_cuda:
@@ -1531,13 +1595,21 @@ def quantize_exl3_batch(
 
         # Quantize
         if shared_H:
-            L = finalized[batch_idx[0]][1].to(device)
+            # A shared H_data serves many groups spread over several device threads; cache the
+            # device copies of L (and H, below) in the dict so each device pays the transfer
+            # once per layer instead of once per group. A benign race can duplicate a copy;
+            # the loser's tensor is simply collected
+            dev_cache = H_datas[batch_idx[0]].setdefault("dev_cache", {})
+            L = dev_cache.get(("L", device.index))
+            if L is None:
+                L = finalized[batch_idx[0]][1].to(device)
+                dev_cache[("L", device.index)] = L
             widths = [regs[t][0].shape[1] for t in batch_idx]
             weight_r_cat = torch.cat([regs[t][0] for t in batch_idx], dim = 1)
             for t in batch_idx:
                 regs[t][0] = None
             weight_q_cat, encoded_cat = ldlq(weight_r_cat, L, qa0, pb)
-            del L
+            L = None   # device copy stays cached in H_data for the layer's remaining groups
             weight_rs = list(torch.split(weight_r_cat, widths, dim = 1))
             weight_qs = list(torch.split(weight_q_cat, widths, dim = 1))
             encodeds = list(torch.split(encoded_cat, [w // 16 for w in widths], dim = 1))
@@ -1561,7 +1633,10 @@ def quantize_exl3_batch(
             _, su, sv, apply_out_scales = regs[t]
             if shared_H:
                 if Hd is None:
-                    Hd = finalized[t][0].to(device)
+                    Hd = dev_cache.get(("H", device.index))
+                    if Hd is None:
+                        Hd = finalized[t][0].to(device)
+                        dev_cache[("H", device.index)] = Hd
             else:
                 Hd = finalized[t][0].to(device)
             try:

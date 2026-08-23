@@ -227,6 +227,7 @@ def mp_model_forward(
         "position_ids",
         "recurrent_slots",
         "inv_freq",
+        "input_ids",     # hash-MoE routing (DeepSeek-V4 bootstrap layers)
     ]:
         p = params.get(tensor_param)
         if p is not None:

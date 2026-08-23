@@ -23,6 +23,9 @@ struct MoeCpuMatrix
     int k;
     int n;
     int bits;
+    // Band-contiguous ("swizzled") trellis layout: tile (kt, nt) stored at group nt/8, then
+    // kt, then member nt%8, so each 8-tile output band reads as one sequential k-stream
+    int swz = 0;
 };
 
 struct MoeCpuLayer
@@ -55,7 +58,8 @@ int64_t exl3_moe_cpu_make_layer
     const std::vector<at::Tensor>& up_bias,
     const std::vector<at::Tensor>& down_bias,
     int64_t activation,
-    double act_limit
+    double act_limit,
+    int64_t swizzled        // caller repacked trellis tensors band-contiguous (K8 exempt)
 );
 
 void exl3_moe_cpu_free_layer(int64_t handle);
@@ -109,6 +113,9 @@ void exl3_moe_cpu_stage_experts
 // worker startup from MoeCpuTuning.cpu_prof (EXL3_MOE_CPU_PROF env).
 void exl3_moe_cpu_set_prof(bool enabled);
 
-// Kernel availability (dispatch happens internally; these are informational)
+// Kernel availability (dispatch happens internally; these are informational, post-env-cap).
+// has_avx512_vbmi additionally gates the swizzled weight layout in the child loader: the wide
+// swizzle bands need the byte-gather kernels' low temporary count.
 bool exl3_moe_cpu_has_avx2();
 bool exl3_moe_cpu_has_avx512_vnni();
+bool exl3_moe_cpu_has_avx512_vbmi();

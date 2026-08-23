@@ -37,7 +37,6 @@ class MLP(Module):
         pad_to = 128,
         ups: list[Linear | Module] = None,
         downs: list[Linear | Module] = None,
-        interm_scale: float | None = None,
         select_hq_bits: int = 0,
         qbits_key: str = "bits"
     ):
@@ -52,8 +51,6 @@ class MLP(Module):
         self.intermediate_size = intermediate_size
         self.intermediate_split_size = intermediate_split_size
         self.out_size = out_size or hidden_size
-        self.interm_scale = interm_scale
-        self.interm_rscale = None if interm_scale is None else 1.0 / interm_scale
 
         fkey, frange_up = None, None
 
@@ -148,6 +145,7 @@ class MLP(Module):
         match activation_fn:
             case "silu": self.activation_fn_call = F.silu
             case "gelu": self.activation_fn_call = lambda x: F.gelu(x, approximate = "tanh")
+            case "gelu_exact": self.activation_fn_call = F.gelu
             case "quick_gelu": self.activation_fn_call = lambda x: x * torch.sigmoid(1.702 * x)
             case "relu2": self.activation_fn_call = lambda x: torch.square(F.relu(x))
             case "xielu": self.activation_fn_call = self.act_xielu
@@ -286,14 +284,10 @@ class MLP(Module):
             # TODO: mixed precision activation kernel?
 
             a = self.activation_fn_call(u)
-            if self.interm_rscale is not None:
-                a *= self.interm_rscale
             if self.interm_dtype == torch.float:
                 a = a.half()
 
             d_ = self.downs[s].forward(a, params)
-            if self.interm_scale is not None:
-                d_ *= self.interm_scale
 
             if d is None: d = d_
             else: d += d_
@@ -754,8 +748,7 @@ class GatedMLP(Module):
                         -1,
                         -1,
                         0,
-                        1
-                    )
+                        1, None, None)
                     g = gu[0].view(bsz, q_len, self.multi_gu[s].out_features)
                     u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)
 
