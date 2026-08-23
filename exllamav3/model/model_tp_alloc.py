@@ -80,6 +80,8 @@ class TPAllocator:
     ):
         self.num_devices = len(max_mem)
         active_devices = [i for i in range(self.num_devices) if max_mem[i] > 0]
+        if not active_devices:
+            raise RuntimeError("Insufficient VRAM in split for model and cache")
         storage_sum = [0] * self.num_devices
         overhead_max = [0] * self.num_devices
 
