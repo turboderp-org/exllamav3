@@ -261,7 +261,9 @@ class Model(Model_TPMixin, Model_LSMixin):
         Load model, generator function. For regular function, call load() with the same arguments
 
         :param device:
-            (optional) If specified, load to single device, e.g. "cuda:0"
+            (optional) If specified, load to single device, e.g. "cuda:0". Explicitly loading to
+            "cpu" is supported by CPU-capable components (e.g. the Qwen 3.5 vision encoder);
+            autosplit loading always targets CUDA devices only.
 
         :param tp_output_device:
             (optional) If loading with tensor_p == True, device on which to gather output logits. Must be one of

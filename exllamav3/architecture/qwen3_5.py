@@ -117,6 +117,7 @@ class Qwen3_5VLBaseConfig(Config):
 
             self.vision_start_token_id = self.read_cfg(int, "vision_start_token_id", 151652)
             self.vision_end_token_id = self.read_cfg(int, "vision_end_token_id", 151653)
+            self.image_token_id = self.read_cfg(int, "image_token_id", None)
         else:
             self.vision = None
             self.vision_pp = None
@@ -243,6 +244,7 @@ class Qwen3_5VLMoeBaseConfig(Config):
 
             self.vision_start_token_id = self.read_cfg(int, "vision_start_token_id", 151652)
             self.vision_end_token_id = self.read_cfg(int, "vision_end_token_id", 151653)
+            self.image_token_id = self.read_cfg(int, "image_token_id", None)
         else:
             self.vision = None
             self.vision_pp = None

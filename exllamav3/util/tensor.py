@@ -175,6 +175,52 @@ def buffered_interleaved_arange(r: int, k: int, device: torch.device):
         buffered_aranges[(r, k)] = torch.arange(r).repeat_interleave(k)
     return get_for_device(buffered_aranges, (r, k), device)
 
+cpu_matmul_chunk = 256
+
+
+def cpu_matmul(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | None = None):
+    """
+    CPU projection primitive: x @ weight for 2D weight stored [in_features, out_features]
+    (the repository's linear layout) and x with arbitrary leading dimensions.
+
+    Half/bfloat16 inputs producing float output accumulate in FP32 over fixed-size chunks of
+    the reduction dimension, converting only the current activation slice and matching weight
+    rows, so no full float copy of the weight is ever materialized. Matching dtypes use plain
+    matmul.
+    """
+
+    assert weight.dim() == 2
+    assert x.shape[-1] == weight.shape[0], \
+        f"matmul shape mismatch: input {tuple(x.shape)} vs weight {tuple(weight.shape)}"
+    out_shape = x.shape[:-1] + (weight.shape[1],)
+    x2 = x.reshape(-1, x.shape[-1])
+
+    if out_dtype is None:
+        out_dtype = x.dtype
+    same_dtype = x.dtype == weight.dtype and out_dtype == x.dtype
+
+    if same_dtype:
+        return torch.matmul(x2, weight).reshape(out_shape)
+
+    if not x.is_floating_point() or not weight.is_floating_point():
+        raise TypeError(
+            f"cpu_matmul expects floating-point tensors, got x: {x.dtype}, weight: {weight.dtype}"
+        )
+    if out_dtype not in (torch.float32, torch.float64):
+        raise TypeError(f"Unsupported mixed-dtype cpu_matmul output: {out_dtype}")
+
+    # Mixed input/output dtypes (e.g. half weights, float activations): accumulate in FP32,
+    # chunked over the reduction dimension to bound the float conversion temporaries
+    acc_dtype = torch.float32 if out_dtype == torch.float32 else torch.float64
+    acc = torch.zeros(x2.shape[0], weight.shape[1], dtype = acc_dtype)
+    k_dim = x2.shape[1]
+    for k0 in range(0, k_dim, cpu_matmul_chunk):
+        x_chunk = x2[:, k0:k0 + cpu_matmul_chunk].to(acc_dtype)
+        w_chunk = weight[k0:k0 + cpu_matmul_chunk, :].to(acc_dtype)
+        acc.addmm_(x_chunk, w_chunk)
+    out = acc.to(out_dtype) if acc_dtype != out_dtype else acc
+    return out.reshape(out_shape)
+
 
 def to2(
     x: torch.Tensor,

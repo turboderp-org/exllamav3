@@ -12,6 +12,10 @@ mode = "gemma4"
 cache_size = 8192
 streaming = True
 
+# Optional explicit device for the vision component, e.g. "cpu" to keep the vision encoder in
+# system RAM (Qwen 3.5). None keeps the default behavior of loading onto the CUDA autosplit.
+vision_device = None
+
 match mode:
     case "gemma3":
         prompt_format = "gemma"
@@ -77,7 +81,10 @@ def main():
 
     # Load the image component model (can also be loaded after main model)
     vision_model = Model.from_config(config, component = "vision")
-    vision_model.load(progressbar = True)
+    if vision_device is None:
+        vision_model.load(progressbar = True)
+    else:
+        vision_model.load(device = vision_device, progressbar = True)
 
     # Load the text model
     model = Model.from_config(config)

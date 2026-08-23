@@ -25,6 +25,7 @@
 #include "quant/exl3_gemv.cuh"
 #include "quant/exl3_gemv_int8.cuh"
 #include "cpu/moe_mul1.h"
+#include "cpu/reconstruct.h"
 #include "cpu/moe_handoff.h"
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
@@ -122,6 +123,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
+    m.def("reconstruct_had_slice_cpu", &reconstruct_had_slice_cpu, "reconstruct_had_slice_cpu");
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");

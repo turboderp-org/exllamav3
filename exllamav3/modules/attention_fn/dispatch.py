@@ -148,9 +148,32 @@ def attn_dispatch(
     else:
         k_cache, v_cache = None, None
 
-    # Defaults
     if sm_scale is None:
         sm_scale = dim ** (-0.5)
+
+    # CPU tensors: skip GPU backends entirely; only the cacheless SDPA fallback supports host
+    # attention (the Qwen vision tower's non-causal, cacheless call shape)
+    if q.is_cpu:
+        args = AttnArgs(
+            bsz, q_len, num_q_heads, dim,
+            kv_len, num_kv_heads,
+            q, k, v,
+            None, None,
+            causal,
+            sm_scale,
+            cu_seqlens, max_seqlen,
+            window_size,
+            softcap,
+            block_table, cache_seqlens,
+            non_causal_spans,
+            None,
+            sinks,
+        )
+        o = fn_torch_sdpa_fallback_nocache(args)
+        if o is None:
+            _print_no_attn_match_report(args)
+            raise ValueError("No matching attention function for CPU tensors")
+        return o
 
     # Dispatch
     args = AttnArgs(

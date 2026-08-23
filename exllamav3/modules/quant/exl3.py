@@ -3,7 +3,7 @@ import torch
 from ...model.config import Config
 from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n
 from ...ext import exllamav3_ext as ext
-from ...util.tensor import g_tensor_cache
+from ...util.tensor import g_tensor_cache, cpu_matmul
 import os
 from ...util import profile_opt
 
@@ -78,16 +78,21 @@ class LinearEXL3:
 
         self._fused_reconstruct = None
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
-        self.bc = ext.BC_LinearEXL3(
-            self.trellis,
-            self.suh,
-            self.svh,
-            self.K,
-            self.bias,
-            self.mcg,
-            self.mul1,
-            g_tensor_cache.get(*self.bsz1_xh_args)
-        )
+        if self.trellis.device.type == "cpu":
+            # CPU-loaded linear (e.g. Qwen vision offload): execute via dense reconstruction +
+            # host matmul in forward(); no CUDA block cache or graph capture exists here
+            self.bc = None
+        else:
+            self.bc = ext.BC_LinearEXL3(
+                self.trellis,
+                self.suh,
+                self.svh,
+                self.K,
+                self.bias,
+                self.mcg,
+                self.mul1,
+                g_tensor_cache.get(*self.bsz1_xh_args)
+            )
 
 
     def unload(self):
@@ -129,6 +134,12 @@ class LinearEXL3:
         # and break CUDA-graph address stability)
         assert x.is_contiguous(), f"LinearEXL3 {self.key}: non-contiguous input {tuple(x.shape)}"
 
+        # CPU execution: exact per-call reconstruction into one dense half weight, shared host
+        # matmul primitive (FP32 accumulation for float outputs), then release. Steady-state
+        # storage remains the compressed tensors.
+        if x.is_cpu:
+            return self.reconstruct_cpu_matmul(x, out_dtype)
+
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
@@ -137,6 +148,25 @@ class LinearEXL3:
                 return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
         return self.reconstruct_hgemm(x, out_dtype)
+
+
+    def reconstruct_cpu_matmul(self, x: torch.Tensor, out_dtype: torch.dtype | None):
+        dtype = out_dtype or self.default_out_dtype
+        shape = x.shape
+        rows = x.numel() // shape[-1]
+        out_shape = shape[:-1] + (self.out_features,)
+        w = torch.empty(
+            (self.in_features, self.out_features),
+            dtype = torch.half,
+            device = "cpu"
+        )
+        ext.reconstruct_had_slice_cpu(
+            w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0
+        )
+        y = cpu_matmul(x.view(rows, self.in_features), w, dtype).view(out_shape)
+        if self.bias is not None:
+            y += self.bias
+        return y
 
 
     def unpack_bf(self, bitfield: torch.Tensor):

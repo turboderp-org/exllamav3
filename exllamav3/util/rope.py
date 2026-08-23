@@ -370,8 +370,31 @@ class RoPE:
         positions: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         in_place = False,
+        inv_freq: torch.Tensor | None = None,
     ):
-        # TODO: partial rotary factor
+        # Externally precomputed rotary angles (Qwen vision-style 2D grid): rows are already
+        # expanded angle values of shape [sequence, head_dim // 2], not frequencies
+        if inv_freq is not None:
+            assert inv_freq.shape[0] == q.shape[-3]
+            sin = torch.cat((inv_freq.sin(), inv_freq.sin()), dim = -1)
+            cos = torch.cat((inv_freq.cos(), inv_freq.cos()), dim = -1)
+            if len(q.shape) == 3:
+                q = q.unsqueeze(0)
+                k = k.unsqueeze(0) if k is not None else k
+                squeeze = True
+            else:
+                squeeze = False
+            sin = sin.unsqueeze(0)
+            cos = cos.unsqueeze(0)
+            assert self.rope_settings.rope_style == RopeStyle.NEOX
+            if k is not None:
+                q, k = _apply_rope_embed_qk_neox(q.float(), k.float(), sin, cos)
+            else:
+                q = _apply_rope_embed_q_neox(q.float(), sin, cos)
+            q = q.half()
+            k = k.half() if k is not None else None
+            return (q.squeeze(0), k.squeeze(0)) if squeeze else (q, k)
+
         if in_place:
             q_ = q
             k_ = k
@@ -485,6 +508,16 @@ class RoPE:
         if k is not None: k = k.contiguous()
         if positions is not None: positions = positions.contiguous()
         if position_ids is not None: position_ids = position_ids.contiguous()
+
+        # CPU tensors (Qwen vision tower): the extension kernel is CUDA-only; run the host
+        # implementation instead. Only the externally-supplied-frequency NEOX path is supported
+        # on CPU, which is exactly the vision tower's call shape.
+        if q.is_cpu:
+            if inv_freq is None:
+                raise ValueError("CPU RoPE requires external inv_freq (vision-style rotary)")
+            if self.rope_settings.rope_style != RopeStyle.NEOX:
+                raise ValueError("CPU RoPE supports NEOX style only")
+            return self.apply_torch(q, k, inv_freq = inv_freq)
 
         if len(q.shape) == 3:
             q = q.unsqueeze(0)

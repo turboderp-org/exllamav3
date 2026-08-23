@@ -3,7 +3,7 @@ from typing_extensions import override
 import torch
 import torch.nn.functional as F
 
-from ..util.tensor import to2
+from ..util.tensor import to2, cpu_matmul
 from ..model.config import Config
 from . import Module
 from ..ext import exllamav3_ext as ext
@@ -99,8 +99,17 @@ class Conv(Module):
                 out_dtype = out_dtype or self.out_dtype
                 assert x_flat.dtype == torch.half
                 assert w_flat.dtype == torch.half
-                y = torch.empty((x_flat.shape[0], w_flat.shape[1]), dtype = out_dtype, device = x_flat.device)
-                ext.hgemm(x_flat, w_flat, y)
+                if x_flat.device.type == "cpu":
+                    # CPU: matmul with FP32 accumulation, preserving the CUDA kernel's
+                    # CUBLAS_COMPUTE_32F contract for float patch-embedding output.
+                    y = cpu_matmul(x_flat, w_flat, out_dtype)
+                else:
+                    y = torch.empty(
+                        (x_flat.shape[0], w_flat.shape[1]),
+                        dtype = out_dtype,
+                        device = x_flat.device,
+                    )
+                    ext.hgemm(x_flat, w_flat, y)
                 y = y.view(bsz, seqlen, self.out_channels)
                 if self.bias is not None:
                     y += self.bias

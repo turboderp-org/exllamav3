@@ -2,7 +2,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 from ...ext import exllamav3_ext as ext
-from ...util.tensor import to2
+from ...util.tensor import to2, cpu_matmul
 from ...util import first_not_none
 
 class LinearFP16:
@@ -50,7 +50,9 @@ class LinearFP16:
             w.copy_(self.weight)
             self.weight = w
 
-        self.bc = ext.BC_LinearFP16(
+        # CPU-loaded linear (e.g. Qwen vision offload): no CUDA block cache exists; forward()
+        # runs through cpu_matmul instead of the extension kernels
+        self.bc = None if self.weight.device.type == "cpu" else ext.BC_LinearFP16(
             self.weight,
             self.bias,
         )
@@ -74,6 +76,13 @@ class LinearFP16:
         out_shape = x.shape[:-1] + (self.out_features,)
         x = x.view(-1, x.shape[-1])
         dtype = out_dtype or self.out_dtype or torch.half
+
+        if x.device.type == "cpu":
+            y = cpu_matmul(x, self.weight, dtype).view(out_shape)
+            if self.bias is not None:
+                y += self.bias
+            return y
+
         y = torch.empty(
             (x.shape[0], self.out_features),
             dtype = dtype,

@@ -1,4 +1,5 @@
 #include "moe_mul1.h"
+#include "exl3_common.h"
 #include <c10/util/Half.h>
 #include <torch/extension.h>
 
@@ -57,8 +58,8 @@ void exl3_moe_cpu_set_prof(bool enabled)
 
 namespace {
 
-constexpr uint32_t MUL1_MULT = 0x83DCD12Du;
-constexpr float HAD_SCALE = 0.088388347648f;
+using exl3_common::MUL1_MULT;
+using exl3_common::HAD_SCALE;
 constexpr int MAX_M = 4;
 
 #if defined(__GNUC__) && defined(__linux__)
@@ -90,39 +91,18 @@ inline float mul1_k_inv()
 }
 
 // -------------------------------------------------------------------------------------------
-//   Format tables
+//   Format tables and transforms: shared implementation in cpu/exl3_common.h. The MoE path
+//   keeps only its ISA-tier selection wrapper.
 // -------------------------------------------------------------------------------------------
 
-// Matches tensor-core permutation baked into by EXL3 tile storage format
-constexpr std::array<uint16_t, 256> make_tc_perm()
-{
-    std::array<uint16_t, 256> p{};
-    #pragma unroll
-    for (int t = 0; t < 32; ++t)
-    {
-        const int r0 = (t % 4) * 2, r1 = r0 + 1, r2 = r0 + 8, r3 = r0 + 9;
-        const int c0 = t / 4, c1 = c0 + 8;
-        p[t * 8 + 0] = r0 * 16 + c0; p[t * 8 + 1] = r1 * 16 + c0;
-        p[t * 8 + 2] = r2 * 16 + c0; p[t * 8 + 3] = r3 * 16 + c0;
-        p[t * 8 + 4] = r0 * 16 + c1; p[t * 8 + 5] = r1 * 16 + c1;
-        p[t * 8 + 6] = r2 * 16 + c1; p[t * 8 + 7] = r3 * 16 + c1;
-    }
-    return p;
-}
-
-constexpr std::array<uint16_t, 256> make_tc_perm_inv()
-{
-    std::array<uint16_t, 256> inv{};
-    const auto perm = make_tc_perm();
-    for (int i = 0; i < 256; ++i) inv[perm[i]] = i;
-    return inv;
-}
+constexpr auto make_tc_perm = exl3_common::make_tc_perm;
+constexpr auto make_tc_perm_inv = exl3_common::make_tc_perm_inv;
 
 template <int bits, int row, bool second_word>
 constexpr std::array<int32_t, 16> make_row_indices()
 {
     std::array<int32_t, 16> idx{};
-    const auto inv = make_tc_perm_inv();
+    constexpr auto inv = exl3_common::make_tc_perm_inv();
     constexpr int words32 = bits * 256 / 32;
     for (int col = 0; col < 16; ++col) {
         const int t = inv[row * 16 + col];
@@ -146,7 +126,7 @@ constexpr uint16_t make_row_himask()
 template <int bits, int row>
 constexpr int row_shift(int col)
 {
-    const auto inv = make_tc_perm_inv();
+    constexpr auto inv = exl3_common::make_tc_perm_inv();
     const int t = inv[row * 16 + col];
     const int b1 = t * bits + bits + 256 * bits;
     return ((b1 - 1) / 32 + 1) * 32 - b1;
@@ -154,106 +134,27 @@ constexpr int row_shift(int col)
 
 inline uint32_t load_u32_(const uint16_t* ptr, int index)
 {
-    uint32_t v;
-    std::memcpy(&v, ptr + index * 2, sizeof(v));
-    return v;
+    return exl3_common::load_u32_(ptr, index);
 }
 
 template <int bits>
 inline uint16_t decode_state_scalar(const uint16_t* packed, int t_offset)
 {
-    constexpr int words32 = bits * 256 / 32;
-    const int b0 = t_offset * bits + bits - 16 + 256 * bits;
-    const int b1 = b0 + 16;
-    const int shift = ((b1 - 1) / 32 + 1) * 32 - b1;
-    const uint64_t merged = (static_cast<uint64_t>(load_u32_(packed, (b0 / 32) % words32)) << 32) |
-                            load_u32_(packed, ((b1 - 1) / 32) % words32);
-    return static_cast<uint16_t>(merged >> shift);
+    return exl3_common::decode_state_scalar<bits>(packed, t_offset);
 }
 
 inline float decode_mul1_scalar(uint16_t state)
 {
-    const uint32_t x = static_cast<uint32_t>(state) * MUL1_MULT;
-    const int sum = (x & 0xff) + ((x >> 8) & 0xff) + ((x >> 16) & 0xff) + (x >> 24);
-    return (static_cast<float>(sum) - 510.0f) * mul1_k_inv();
+    return exl3_common::decode_3inst<2>(state);
 }
-
-// -------------------------------------------------------------------------------------------
-//   ISA dispatch
-// -------------------------------------------------------------------------------------------
 
 // Declared early: the transforms below select on it. Vbmi = Vnni + AVX512-VBMI (Zen4+, Ice
 // Lake+); kept as a separate tier because Cascade/Cooper Lake have VNNI without VBMI.
 enum class Isa { Scalar, Avx2, Vnni, Vbmi };
 extern const Isa g_isa;
 
-// -------------------------------------------------------------------------------------------
-//   Transforms
-// -------------------------------------------------------------------------------------------
-
-void hadamard_128_scalar(float* v)
-{
-    #pragma unroll
-    for (int width = 1; width < 128; width *= 2)
-        #pragma unroll
-        for (int base = 0; base < 128; base += 2 * width)
-            #pragma unroll
-            for (int i = 0; i < width; ++i) {
-                const float a = v[base + i];
-                const float b = v[base + width + i];
-                v[base + i] = a + b;
-                v[base + width + i] = a - b;
-            }
-}
-
-M1_TARGET_AVX2
-void hadamard_128_avx2(float* v)
-{
-    __m256 r[16];
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) r[i] = _mm256_loadu_ps(v + i * 8);
-
-    // width 1: butterfly within adjacent pairs
-    #pragma unroll
-    for (int i = 0; i < 16; ++i)
-    {
-        const __m256 t = _mm256_permute_ps(r[i], 0b10110001);
-        r[i] = _mm256_blend_ps(_mm256_add_ps(r[i], t), _mm256_sub_ps(t, r[i]), 0b10101010);
-    }
-
-    // width 2: butterfly between 64-bit pairs
-    #pragma unroll
-    for (int i = 0; i < 16; ++i)
-    {
-        const __m256 t = _mm256_permute_ps(r[i], 0b01001110);
-        r[i] = _mm256_blend_ps(_mm256_add_ps(r[i], t), _mm256_sub_ps(t, r[i]), 0b11001100);
-    }
-
-    // width 4: butterfly between 128-bit halves
-    #pragma unroll
-    for (int i = 0; i < 16; ++i)
-    {
-        const __m256 t = _mm256_permute2f128_ps(r[i], r[i], 0x01);
-        r[i] = _mm256_blend_ps(_mm256_add_ps(r[i], t), _mm256_sub_ps(t, r[i]), 0b11110000);
-    }
-
-    // widths 8..64: whole-register butterflies
-    #pragma unroll
-    for (int width = 1; width < 16; width *= 2)
-        #pragma unroll
-        for (int base = 0; base < 16; base += 2 * width)
-            #pragma unroll
-            for (int i = 0; i < width; ++i)
-            {
-                const __m256 a = r[base + i];
-                const __m256 b = r[base + width + i];
-                r[base + i] = _mm256_add_ps(a, b);
-                r[base + width + i] = _mm256_sub_ps(a, b);
-            }
-
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) _mm256_storeu_ps(v + i * 8, r[i]);
-}
+using exl3_common::hadamard_128_avx2;
+using exl3_common::hadamard_128_scalar;
 
 inline void hadamard_128(float* v)
 {
