@@ -22,7 +22,7 @@ def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
     if (
         args.has_kv_cache() or
         args.is_swa() or
-        args.is_varlen() or
+        args.is_varlen() and args.q.shape[0] != 1 or
         args.softcap != 0.0 or
         args.sinks is not None or
         args.non_causal_spans
@@ -43,6 +43,24 @@ def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
         q_t = q_t.to(torch.float32)
         k_t = k_t.to(torch.float32)
         v_t = v_t.to(torch.float32)
+
+    if args.is_varlen():
+        # Packed variable-length input: one segment per cu_seqlens interval. Each
+        # segment starts at position 0, so is_causal is applied per segment.
+        # max_seqlen is unused here; lengths are derived from the boundaries.
+        bounds = args.cu_seqlens.tolist()
+        o = [
+            F.scaled_dot_product_attention(
+                q_t[:, :, s:e],
+                k_t[:, :, s:e],
+                v_t[:, :, s:e],
+                is_causal = args.causal,
+                enable_gqa = args.is_gqa(),
+                scale = args.sm_scale,
+            )
+            for s, e in zip(bounds[:-1], bounds[1:])
+        ]
+        return torch.cat(o, dim = 2).to(out_dtype).transpose(1, 2)
 
     return F.scaled_dot_product_attention(
         q_t,

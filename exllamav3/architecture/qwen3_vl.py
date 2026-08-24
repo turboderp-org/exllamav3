@@ -217,6 +217,7 @@ class Qwen3VLVisionModel(Model):
                         key_fused_qkv = "qkv",
                         key_o = "proj",
                         qmap = "block.attn",
+                        use_cu_seqlens = True,
                     ),
                     mlp_norm = LayerNorm(
                         config = config,
@@ -369,59 +370,124 @@ class Qwen3VLVisionModel(Model):
         image: Image | list[Image],
         text_alias: str | None = None,
     ):
-        v = self.config.vision
-
         if isinstance(image, list):
-            assert text_alias is None, "Cannot apply single alias to list of images"
-            image_tensor = []
-            for i in image:
-                t, prep_image_size, grid_thw = self.preprocess(i)
-                image_tensor.append(t.unsqueeze(0))
-            image_tensor = torch.cat(image_tensor, dim = 0)
+            images = image
             return_batch = True
         else:
-            image_tensor, prep_image_size, grid_thw = self.preprocess(image)
-            image = [image]
-            image_tensor = image_tensor.unsqueeze(0)
+            images = [image]
             return_batch = False
 
-        inv_freq = qwen2_position_embedding_grid_2d(grid_thw, v.head_dim, v.spatial_merge_size, v.rope_theta)
+        if not images:
+            raise ValueError("No images provided")
+        if return_batch:
+            assert text_alias is None, "Cannot apply single alias to list of images"
+
+        prepped = []
+        seg_lens = []
+        for img in images:
+            tensor, prep_image_size, grid_thw = self.preprocess(img)
+            prepped.append((tensor, prep_image_size, grid_thw))
+            seg_lens.append(grid_thw[0] * grid_thw[1] * grid_thw[2])
+
+        bounds = [0]
+        for length in seg_lens:
+            bounds.append(bounds[-1] + length)
+
+        mmes = self._embed_packed(
+            tokenizer,
+            prepped,
+            text_alias,
+            torch.tensor(bounds, dtype = torch.int32),
+            max(seg_lens),
+            images,
+        )
+        return mmes if return_batch else mmes[0]
+
+
+    def get_video_embeddings(
+        self,
+        tokenizer: Tokenizer,
+        frames: list[Image],
+        text_alias: str | None = None,
+    ) -> MMEmbedding:
+        if not frames:
+            raise ValueError("No frames provided")
+
+        # One attention segment per frame (HF convention: get_vision_cu_seqlens with
+        # merge_temporal=False); vision RoPE is spatial-only over the whole clip.
+        tensor, prep_image_size, grid_thw = self.preprocess(frames)
+        t, h, w = grid_thw
+
+        return self._embed_packed(
+            tokenizer,
+            [(tensor, prep_image_size, grid_thw)],
+            text_alias,
+            torch.tensor([i * h * w for i in range(t)] + [t * h * w], dtype = torch.int32),
+            h * w,
+            [frames[0]],
+        )[0]
+
+
+    def _embed_packed(
+        self,
+        tokenizer: Tokenizer,
+        prepped: list[tuple[torch.Tensor, tuple, tuple]],
+        text_alias: str | None,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        images: list[Image],
+    ) -> list[MMEmbedding]:
+        # Pack all inputs into one varlen sequence: tokens concatenated along the
+        # sequence dim, segmented by cu_seqlens, with per-grid RoPE tables stacked.
+        v = self.config.vision
+        m = v.spatial_merge_size
+
+        packed = torch.cat([t.unsqueeze(0) for t, _, _ in prepped], dim = 1)
+        grids = [g for _, _, g in prepped]
+
+        inv_freq = torch.cat([
+            qwen2_position_embedding_grid_2d(g, v.head_dim, m, v.rope_theta)
+            for g in grids
+        ], dim = 0)
+
         params = {
             "causal": False,
-            "grid_thw": torch.tensor([grid_thw], dtype = torch.int),
-            "inv_freq": inv_freq
+            "grid_thw": torch.tensor(grids, dtype = torch.int),
+            "inv_freq": inv_freq,
+            "cu_seqlens": cu_seqlens,
+            "max_seqlen": max_seqlen,
         }
 
-        embedding_tensor = self.forward(
-            image_tensor,
-            params = params,
-        ).cpu()
+        embedding_tensor = self.forward(packed, params = params).cpu()
+        deepstack = [de.squeeze(0) for de in params["deepstack"]] if "deepstack" in params else None
 
-        num_emb_tokens = embedding_tensor.shape[1]
+        merged_lens = [(g[0] * g[1] * g[2]) // (m * m) for g in grids]
+        id_start = self.config.vision_start_token_id
+        id_end = self.config.vision_end_token_id
+
         mmes = []
-        for i in range(embedding_tensor.shape[0]):
-            id_start = self.config.vision_start_token_id
-            id_end = self.config.vision_end_token_id
+        offset = 0
+        for i, num_emb_tokens in enumerate(merged_lens):
             token_string = torch.tensor([[id_start] + [-1] * num_emb_tokens + [id_end]], dtype = torch.long)
-
             mme = MMEmbedding(
-                embeddings = embedding_tensor[i],
+                embeddings = embedding_tensor[0, offset : offset + num_emb_tokens],
                 text_alias = text_alias,
                 token_string = token_string,
-                deepstack_embeddings = [de.squeeze(0) for de in params["deepstack"]] if "deepstack" in params else None,
-                grid_thw = grid_thw,
-                mrope_merge_size = v.spatial_merge_size
+                deepstack_embeddings = None if deepstack is None else [
+                    de[offset : offset + num_emb_tokens] for de in deepstack
+                ],
+                grid_thw = grids[i],
+                mrope_merge_size = m,
             )
-
             mme.metadata.update({
-                "original_size": image[i].size,
-                "preprocessed_size": prep_image_size,
+                "original_size": images[i].size,
+                "preprocessed_size": prepped[i][1],
                 "model_architecture": self.config.architecture,
             })
-
             mmes.append(mme)
+            offset += num_emb_tokens
 
-        return mmes if return_batch else mmes[0]
+        return mmes
 
 
     @override

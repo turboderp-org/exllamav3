@@ -455,3 +455,140 @@ def test_qwen35_vision_tower_cpu_end_to_end():
     assert mme.deepstack_embeddings[0].shape == (4, 64)
     assert torch.isfinite(mme.embeddings).all()
     vm.unload()
+
+
+# ------------------------------------------------------------------------------------------------
+# fn_torch_sdpa_fallback_nocache with cu_seqlens: segmented execution must match per-segment
+# dense SDPA; the dense (non-varlen) path must be unchanged
+# ------------------------------------------------------------------------------------------------
+
+def _sdpa_args(q, k, v, cu_seqlens = None, max_seqlen = None):
+    from exllamav3.modules.attention_fn.common import AttnArgs
+    bsz, seq, heads, dim = q.shape
+    return AttnArgs(
+        bsz = bsz,
+        q_len = seq,
+        num_q_heads = heads,
+        dim = dim,
+        kv_len = k.shape[1],
+        num_kv_heads = k.shape[2],
+        q = q,
+        k = k,
+        v = v,
+        k_cache = None,
+        v_cache = None,
+        causal = False,
+        sm_scale = dim ** -0.5,
+        cu_seqlens = cu_seqlens,
+        max_seqlen = max_seqlen,
+        window_size = None,
+        softcap = 0.0,
+        block_table = None,
+        cache_seqlens = None,
+    )
+
+
+def test_sdpa_varlen_parity():
+    from exllamav3.modules.attention_fn.torch import fn_torch_sdpa_fallback_nocache
+
+    g = torch.Generator().manual_seed(11)
+    q = torch.randn(1, 37, 4, 64, generator = g).half()
+    k = torch.randn(1, 37, 4, 64, generator = g).half()
+    v = torch.randn(1, 37, 4, 64, generator = g).half()
+    bounds = [0, 5, 6, 20, 37]
+
+    ref = torch.cat([
+        fn_torch_sdpa_fallback_nocache(_sdpa_args(q[:, s:e], k[:, s:e], v[:, s:e]))
+        for s, e in zip(bounds[:-1], bounds[1:])
+    ], dim = 1)
+
+    out = fn_torch_sdpa_fallback_nocache(
+        _sdpa_args(q, k, v, cu_seqlens = torch.tensor(bounds, dtype = torch.int32), max_seqlen = 15)
+    )
+    assert out.shape == ref.shape
+    assert torch.allclose(out.float(), ref.float(), rtol = 0, atol = 1e-3), \
+        f"varlen mismatch, max diff {(out.float() - ref.float()).abs().max().item()}"
+
+
+def test_sdpa_fallback_dense_path_unchanged():
+    import torch.nn.functional as F
+    from exllamav3.modules.attention_fn.torch import fn_torch_sdpa_fallback_nocache
+
+    g = torch.Generator().manual_seed(12)
+    q = torch.randn(2, 64, 8, 64, generator = g).half()
+    k = torch.randn(2, 64, 8, 64, generator = g).half()
+    v = torch.randn(2, 64, 8, 64, generator = g).half()
+
+    out = fn_torch_sdpa_fallback_nocache(_sdpa_args(q, k, v)).float()
+    ref = F.scaled_dot_product_attention(
+        q.transpose(1, 2).float(),
+        k.transpose(1, 2).float(),
+        v.transpose(1, 2).float(),
+        is_causal = False,
+        scale = 64 ** -0.5,
+    ).transpose(1, 2)
+    assert rel_err(out, ref) < 2e-3
+
+
+# ------------------------------------------------------------------------------------------------
+# Qwen3VLVisionModel.get_image_embeddings with multiple different-size images: packed varlen
+# forward must reproduce per-image standalone results exactly enough on CPU
+# ------------------------------------------------------------------------------------------------
+
+def test_qwen35_vision_multi_image_packing():
+    from PIL import Image as PILImage
+
+    vm = _make_qwen35_vision_model()
+    # Allow a second, larger image: min/max pixels bound qwen2_smart_resize
+    vm.config.vision_pp.max_pixels = 200 * 200
+    vm.load("cpu")
+
+    img_a = PILImage.new("RGB", (56, 56), (120, 40, 200))
+    img_b = PILImage.new("RGB", (112, 140), (30, 200, 90))  # -> 8x10 patches
+
+    mmes = vm.get_image_embeddings(None, [img_a, img_b])
+    assert len(mmes) == 2
+
+    solo_a = vm.get_image_embeddings(None, img_a)
+    solo_b = vm.get_image_embeddings(None, img_b)
+
+    assert mmes[0].mm_length == 4 and mmes[1].mm_length == 20
+    assert mmes[0].grid_thw == solo_a.grid_thw and mmes[1].grid_thw == solo_b.grid_thw
+    assert mmes[0].metadata["original_size"] == (56, 56)
+    assert mmes[1].metadata["original_size"] == (112, 140)
+
+    for packed, solo in [(mmes[0], solo_a), (mmes[1], solo_b)]:
+        assert torch.isfinite(packed.embeddings).all()
+        assert torch.allclose(packed.embeddings.float(), solo.embeddings.float(), rtol = 0, atol = 1e-3), \
+            f"packing mismatch, max diff {(packed.embeddings.float() - solo.embeddings.float()).abs().max().item()}"
+        for de_p, de_s in zip(packed.deepstack_embeddings, solo.deepstack_embeddings):
+            assert torch.allclose(de_p.float(), de_s.float(), rtol = 0, atol = 1e-3)
+
+    vm.unload()
+
+
+# ------------------------------------------------------------------------------------------------
+# Qwen3VLVisionModel.get_video_embeddings: frame list packs into one clip with one attention
+# segment per frame (temporal_patch_size truncation applies); single MMEmbedding returned
+# ------------------------------------------------------------------------------------------------
+
+def test_qwen35_vision_video_frames():
+    from PIL import Image as PILImage
+
+    vm = _make_qwen35_vision_model()
+    vm.load("cpu")
+
+    frames = [PILImage.new("RGB", (56, 56), (n * 20, 100, 255 - n * 20)) for n in range(8)]
+    mme = vm.get_video_embeddings(None, frames)
+
+    # 8 frames / temporal_patch_size 2 -> t = 4; 4x4 patches per frame -> grid (4, 4, 4)
+    assert isinstance(mme.mm_length, int)
+    assert mme.grid_thw == (4, 4, 4)
+    assert mme.mm_length == 4 * 4 * 4 // 4
+    assert mme.embeddings.shape == (16, 64)
+    assert len(mme.deepstack_embeddings) == 1
+    assert mme.deepstack_embeddings[0].shape == (16, 64)
+    assert torch.isfinite(mme.embeddings).all()
+    assert mme.metadata["original_size"] == (56, 56)
+
+    vm.unload()
