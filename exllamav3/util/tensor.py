@@ -202,6 +202,16 @@ def cpu_matmul(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | N
     if same_dtype:
         return torch.matmul(x2, weight).reshape(out_shape)
 
+    # Fast compute paths (oneDNN GEMM, fp32 accumulation): fp32 weights reach ~0.9 TFLOP/s
+    # SGEMM and bf16 weights ~3 TFLOP/s (AVX512-BF16 dot) on desktop Zen5, while fp16
+    # matmul has no vectorized CPU kernel at all (~3 GFLOP/s scalar fallback). Weights are
+    # kept resident in fp32 (or bf16 where callers opt into it); activations are cast here.
+    if weight.dtype in (torch.float32, torch.bfloat16):
+        y = torch.matmul(x2.to(weight.dtype), weight)
+        if out_dtype != weight.dtype:
+            y = y.to(out_dtype)
+        return y.reshape(out_shape)
+
     if not x.is_floating_point() or not weight.is_floating_point():
         raise TypeError(
             f"cpu_matmul expects floating-point tensors, got x: {x.dtype}, weight: {weight.dtype}"

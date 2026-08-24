@@ -32,14 +32,26 @@ def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
     if args.dim > 256:
         _warn_sdpa_fallback()
 
+    q_t = args.q.transpose(1, 2)
+    k_t = args.k.transpose(1, 2)
+    v_t = args.v.transpose(1, 2)
+
+    # CPU execution: fp16 has no vectorized flash-attention kernel (~2x slower);
+    # fp32 and bf16 benchmark identically here, so upcast to fp32 and restore dtype
+    out_dtype = q_t.dtype
+    if q_t.device.type == "cpu" and q_t.dtype == torch.float16:
+        q_t = q_t.to(torch.float32)
+        k_t = k_t.to(torch.float32)
+        v_t = v_t.to(torch.float32)
+
     return F.scaled_dot_product_attention(
-        args.q.transpose(1, 2),
-        args.k.transpose(1, 2),
-        args.v.transpose(1, 2),
+        q_t,
+        k_t,
+        v_t,
         is_causal = args.causal,
         enable_gqa = args.is_gqa(),
         scale = args.sm_scale,
-    ).transpose(1, 2)
+    ).to(out_dtype).transpose(1, 2)
 
 
 def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:

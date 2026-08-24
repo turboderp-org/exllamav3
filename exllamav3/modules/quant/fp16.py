@@ -62,7 +62,10 @@ class LinearFP16:
 
     def get_tensors(self, key: str):
         t = {}
-        t[f"{key}.weight"] = self.weight.T.contiguous()
+        # CPU execution keeps resident weights in fp32/bf16 (see forward); export as fp16
+        # so the on-disk format stays unchanged (lossless for fp16-origin values)
+        w = self.weight.to(torch.half) if self.weight.dtype != torch.half else self.weight
+        t[f"{key}.weight"] = w.T.contiguous()
         if self.bias is not None:
             t[f"{key}.bias"] = self.bias
         return t
@@ -76,8 +79,15 @@ class LinearFP16:
         out_shape = x.shape[:-1] + (self.out_features,)
         x = x.view(-1, x.shape[-1])
         dtype = out_dtype or self.out_dtype or torch.half
-
         if x.device.type == "cpu":
+            # One-time conversion of the resident weight to fp32 for the oneDNN SGEMM
+            # path (see cpu_matmul): ~0.9 TFLOP/s at 8 threads vs ~3 GFLOP/s for fp16
+            # matmul, which has no vectorized CPU kernel. fp32 is a superset of fp16 so
+            # results stay within the fp16 rounding envelope of the CUDA kernels.
+            # Deferred/placeholder loads make construction-time device checks unreliable,
+            # so this only triggers on actual CPU execution.
+            if self.weight.dtype == torch.half:
+                self.weight = self.weight.to(torch.float32)
             y = cpu_matmul(x, self.weight, dtype).view(out_shape)
             if self.bias is not None:
                 y += self.bias

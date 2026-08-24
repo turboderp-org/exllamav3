@@ -163,7 +163,9 @@ class LinearEXL3:
         ext.reconstruct_had_slice_cpu(
             w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0
         )
-        y = cpu_matmul(x.view(rows, self.in_features), w, dtype).view(out_shape)
+        # fp32 GEMM fast path (see cpu_matmul); the extra weight-dtype pass is negligible
+        # next to reconstruction + GEMM
+        y = cpu_matmul(x.view(rows, self.in_features), w.to(torch.float32), dtype).view(out_shape)
         if self.bias is not None:
             y += self.bias
         return y

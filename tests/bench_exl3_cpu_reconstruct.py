@@ -6,8 +6,8 @@
 # the scalar reference (EXL3_CPU_RECON_SCALAR=1).
 #
 # Usage:
-#   python tests/bench_exl3_cpu_reconstruct.py --model_dir <exl3 vision checkpoint> \
-#       [--threads N] [--runs R]
+#   python tests/bench_exl3_cpu_reconstruct.py --model_dir <exl3 checkpoint> \
+#       [--component vision|text|...] [--threads N] [--runs R]
 #
 # Not collected by pytest.
 
@@ -36,24 +36,18 @@ def find_exl3_linears(module, prefix = ""):
                     yield from find_exl3_linears(item, f"{prefix}{name}[{i}].")
 
 
-def discover_targets(vision_model):
-    """Pick the first attention-block linear, first MLP linear and the final merger linear."""
-    blocks = [m for m in vision_model.modules if type(m).__name__ == "TransformerBlock"]
-    mergers = [m for m in vision_model.modules if "Merger" in type(m).__name__]
-
+def discover_targets(model, max_targets = 6):
+    """Pick representative EXL3 linears: first of each distinct (in, out, bits) shape."""
+    seen = set()
     targets = []
-
-    def first_linear(container, label):
-        for path, lin in find_exl3_linears(container):
-            targets.append((f"{label}.{path}", lin))
-            return True
-        return False
-
-    if blocks:
-        first_linear(blocks[0].__dict__.get("attn"), "attn_block0")
-        first_linear(blocks[0].__dict__.get("mlp"), "mlp_block0")
-    if mergers:
-        first_linear(mergers[-1], "merger_final")
+    for path, lin in find_exl3_linears(model):
+        sig = (lin.inner.in_features, lin.inner.out_features, lin.inner.K)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        targets.append((path, lin))
+        if len(targets) >= max_targets:
+            break
     return targets
 
 
@@ -89,12 +83,13 @@ def trellis_bytes(inner):
 def main():
     parser = argparse.ArgumentParser(description = __doc__)
     parser.add_argument("--model_dir", type = str, required = True,
-                        help = "EXL3 checkpoint directory with a vision component")
+                        help = "EXL3 checkpoint directory")
+    parser.add_argument("--component", type = str, default = "vision",
+                        help = "which component model to scan (default: vision)")
     parser.add_argument("--threads", type = int, default = None,
                         help = "worker threads (default: current torch setting)")
     parser.add_argument("--runs", type = int, default = 10)
     args = parser.parse_args()
-
     if not os.path.isdir(args.model_dir):
         print(f"[FAIL] model_dir not found: {args.model_dir}", file = sys.stderr)
         return 1
@@ -105,15 +100,16 @@ def main():
     from exllamav3 import Config, Model
 
     config = Config.from_directory(args.model_dir)
-    vision_model = Model.from_config(config, component = "vision")
-    vision_model.load(device = "cpu")
+    assert args.component in config.model_classes, \
+        f"{config.architecture} does not define a '{args.component}' component model"
+    model = Model.from_config(config, component = args.component)
+    model.load(device = "cpu")
 
-    targets = discover_targets(vision_model)
+    targets = discover_targets(model)
     if not targets:
-        print("[FAIL] no EXL3 linears found under the vision component "
-              "(is this a --vision_bits 1..8 conversion?)", file = sys.stderr)
+        print(f"[FAIL] no EXL3 linears found under the '{args.component}' component",
+              file = sys.stderr)
         return 1
-
     print(f"threads: {torch.get_num_threads()}, runs: {args.runs}")
     print(f"{'key':40s} {'shape':>14s} {'K':>2s} {'median':>10s} {'packed GB/s':>12s} {'scratch':>10s}")
     for key, lin in targets:
@@ -121,7 +117,7 @@ def main():
         print(f"{key:40s} {str(r['shape']):>14s} {r['K']:2d} {r['median_s']*1e3:8.2f}ms "
               f"{r['packed_gbps']:12.2f} {r['scratch_bytes']/1024:8.0f}KB")
 
-    vision_model.unload()
+    model.unload()
     return 0
 
 

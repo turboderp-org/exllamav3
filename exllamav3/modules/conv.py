@@ -47,6 +47,7 @@ class Conv(Module):
 
     @override
     def load(self, device: torch.device, **kwargs):
+        device = torch.device(device)
         self.device = device
         weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, float2half = True)
         bias = self.config.stc.get_tensor(f"{self.key}.bias", self.device, optional = True, float2half = True)
@@ -98,10 +99,15 @@ class Conv(Module):
                 w_flat = self.weight.view(self.weight.shape[0], -1).T.contiguous()
                 out_dtype = out_dtype or self.out_dtype
                 assert x_flat.dtype == torch.half
-                assert w_flat.dtype == torch.half
+                assert w_flat.dtype in (torch.half, torch.bfloat16, torch.float32)
                 if x_flat.device.type == "cpu":
-                    # CPU: matmul with FP32 accumulation, preserving the CUDA kernel's
-                    # CUBLAS_COMPUTE_32F contract for float patch-embedding output.
+                    # One-time resident-weight conversion to fp32 for the oneDNN SGEMM
+                    # path (see cpu_matmul / LinearFP16.forward); deferred loads make
+                    # construction-time device checks unreliable, so this only triggers on
+                    # actual CPU execution. FP32 accumulation preserved.
+                    if w_flat.dtype == torch.half:
+                        self.weight = self.weight.to(torch.float32)
+                        w_flat = w_flat.to(torch.float32)
                     y = cpu_matmul(x_flat, w_flat, out_dtype)
                 else:
                     y = torch.empty(
