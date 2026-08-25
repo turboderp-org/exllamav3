@@ -523,13 +523,17 @@ class GatedDeltaNet(Module):
     @override
     def optimizer_targets(self):
         if self.qkvz_proj is not None:
-            return [[self.qkvz_proj.optimizer_targets()]]
+            return [[
+                self.qkvz_proj.optimizer_targets(),
+                self.o_proj.optimizer_targets(),
+            ]]
 
         targets = []
         if self.qkv_proj is not None:
-            targets += self.qkv_proj.optimizer_targets()
+            targets.append(self.qkv_proj.optimizer_targets())
         if self.z_proj is not None:
-            targets += self.z_proj.optimizer_targets()
+            targets.append(self.z_proj.optimizer_targets())
+        targets.append(self.o_proj.optimizer_targets())
         return [targets]
 
 

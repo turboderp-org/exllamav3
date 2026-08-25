@@ -94,6 +94,12 @@ if has_triton:
                                        # [win_floor, q_pos0 + R) (window history ++ whole
                                        # chunk, non-causal); history rows are PAGED, read
                                        # via block_table at absolute-position pages
+        Q_SPLIT: tl.constexpr = 0,     # GLM-5.2 absorbed queries: q is the HEAD-MAJOR latent
+                                       # (H, R, D_c) and the (unused, windowless) ring slot
+                                       # carries the token-major rope queries (R, H, D_r)
+        OUT_LATENT: tl.constexpr = 0,  # store only the latent half, head-major (H, R, D_c),
+                                       # the exact mla_unfold input; the rope half of the
+                                       # weighted sum is never accumulated
     ):
         """One program per (query row, head block); heads are the MMA M dim. Consecutive
         programs cover one query's head blocks so gathers stay L2-resident. Two KV phases:
@@ -111,9 +117,15 @@ if has_triton:
         offs_r = tl.arange(0, D_r)
         D = D_c + D_r
 
-        q_base = q + (row * H + offs_h)[:, None] * D
-        qc = tl.load(q_base + offs_c[None, :], mask = valid_h[:, None] & valid_c[None, :], other = 0.0)
-        qr = tl.load(q_base + D_c + offs_r[None, :], mask = valid_h[:, None], other = 0.0)
+        if Q_SPLIT:
+            qc = tl.load(q + (offs_h * R + row)[:, None] * D_c + offs_c[None, :],
+                         mask = valid_h[:, None] & valid_c[None, :], other = 0.0)
+            qr = tl.load(ring + (row * H + offs_h)[:, None] * D_r + offs_r[None, :],
+                         mask = valid_h[:, None], other = 0.0)
+        else:
+            q_base = q + (row * H + offs_h)[:, None] * D
+            qc = tl.load(q_base + offs_c[None, :], mask = valid_h[:, None] & valid_c[None, :], other = 0.0)
+            qr = tl.load(q_base + D_c + offs_r[None, :], mask = valid_h[:, None], other = 0.0)
 
         if HAS_SINKS:
             sink = tl.load(sinks + offs_h, mask = valid_h, other = -float("inf"))
@@ -167,7 +179,8 @@ if has_triton:
                 l = l * alpha + tl.sum(p, axis = 1)
                 pv = p.to(vc.dtype)
                 acc_c = acc_c * alpha[:, None] + tl.dot(pv, vc)
-                acc_r = acc_r * alpha[:, None] + tl.dot(pv, vr)
+                if not OUT_LATENT:
+                    acc_r = acc_r * alpha[:, None] + tl.dot(pv, vr)
                 m_state = m_new
 
         # Phase 2: pool entries -- gathered by index list, or dense with causal bound
@@ -205,11 +218,19 @@ if has_triton:
             l = l * alpha + tl.sum(p, axis = 1)
             pv = p.to(vc.dtype)
             acc_c = acc_c * alpha[:, None] + tl.dot(pv, vc)
-            acc_r = acc_r * alpha[:, None] + tl.dot(pv, vr)
+            if not OUT_LATENT:
+                acc_r = acc_r * alpha[:, None] + tl.dot(pv, vr)
             m_state = m_new
 
         denom = tl.where(l == 0.0, 1.0, l)
         oc = acc_c / denom[:, None]
+
+        if OUT_LATENT:
+            ob = out + (offs_h * R + row)[:, None] * D_c
+            tl.store(ob + offs_c[None, :], oc.to(tl.float16),
+                     mask = valid_h[:, None] & valid_c[None, :])
+            return
+
         o_r = acc_r / denom[:, None]
 
         if DEROTATE:
@@ -274,6 +295,13 @@ if has_triton:
         MULTIROW: tl.constexpr = 0,
         DEBUG_BOUNDS: tl.constexpr = 0,
         DEBUG_PAGES: tl.constexpr = 0,
+        Q_SPLIT: tl.constexpr = 0,     # GLM-5.2 absorbed queries: q is the HEAD-MAJOR latent
+                                       # (H, R, D_c), ring carries the token-major rope
+                                       # queries (R, H, D_r) and ring_stride carries R (both
+                                       # slots are free: Q_SPLIT excludes windows, and under
+                                       # MULTIROW keeps the per-job state args scalar)
+        OUT_LATENT: tl.constexpr = 0,  # accumulate/store only the latent half; ws_acc rows
+                                       # are D_c wide and the combine emits (H, R, D_c)
     ):
         """Flash-decoding split phase: each program covers one (query row, head block) and a
         contiguous slice of that row's VIRTUAL key sequence [window keys ++ pool entries],
@@ -287,17 +315,21 @@ if has_triton:
 
         # MULTIROW: rows are B jobs x SEQ; the position/window/ring state args are per-job
         # i32 arrays, the ring is the stacked (slots, rows, D) tensor addressed by slot, and
-        # the block table holds one row per JOB (paged pools)
+        # the block table holds one row per JOB (paged pools). Under Q_SPLIT (gathered mode,
+        # no window) the per-job state is dead -- causality lives in the selection and k_len
+        # is the uniform K_pad -- so only the job's block-table row matters and the state
+        # args stay scalars
         if MULTIROW:
             job = row // SEQ
             loc = row % SEQ
-            q_pos0 = tl.load(q_pos0 + job)
-            win_floor = tl.load(win_floor + job)
-            ring_beg = tl.load(ring_beg + job)
-            pool_len = tl.load(pool_len + job)
-            k_len = tl.load(k_len + job)
-            slot = tl.load(slot_ids + job)
-            ring = ring + slot.to(tl.int64) * ring_stride
+            if not Q_SPLIT:
+                q_pos0 = tl.load(q_pos0 + job)
+                win_floor = tl.load(win_floor + job)
+                ring_beg = tl.load(ring_beg + job)
+                pool_len = tl.load(pool_len + job)
+                k_len = tl.load(k_len + job)
+                slot = tl.load(slot_ids + job)
+                ring = ring + slot.to(tl.int64) * ring_stride
             bt_row = job
             cbase = job * SEQ
         else:
@@ -312,9 +344,15 @@ if has_triton:
         offs_r = tl.arange(0, D_r)
         D = D_c + D_r
 
-        q_base = q + (row * H + offs_h)[:, None] * D
-        qc = tl.load(q_base + offs_c[None, :], mask = valid_h[:, None] & valid_c[None, :], other = 0.0)
-        qr = tl.load(q_base + D_c + offs_r[None, :], mask = valid_h[:, None], other = 0.0)
+        if Q_SPLIT:
+            qc = tl.load(q + (offs_h * ring_stride + row)[:, None] * D_c + offs_c[None, :],
+                         mask = valid_h[:, None] & valid_c[None, :], other = 0.0)
+            qr = tl.load(ring + (row * H + offs_h)[:, None] * D_r + offs_r[None, :],
+                         mask = valid_h[:, None], other = 0.0)
+        else:
+            q_base = q + (row * H + offs_h)[:, None] * D
+            qc = tl.load(q_base + offs_c[None, :], mask = valid_h[:, None] & valid_c[None, :], other = 0.0)
+            qr = tl.load(q_base + D_c + offs_r[None, :], mask = valid_h[:, None], other = 0.0)
 
         # This row's virtual key range for this split
         if DENSE_POOL:
@@ -362,7 +400,8 @@ if has_triton:
                 l = l * alpha + tl.sum(p, axis = 1)
                 pv = p.to(vc.dtype)
                 acc_c = acc_c * alpha[:, None] + tl.dot(pv, vc)
-                acc_r = acc_r * alpha[:, None] + tl.dot(pv, vr)
+                if not OUT_LATENT:
+                    acc_r = acc_r * alpha[:, None] + tl.dot(pv, vr)
                 m_state = m_new
 
         p0 = tl.maximum(j0 - n_win, 0)
@@ -396,7 +435,8 @@ if has_triton:
             l = l * alpha + tl.sum(p, axis = 1)
             pv = p.to(vc.dtype)
             acc_c = acc_c * alpha[:, None] + tl.dot(pv, vc)
-            acc_r = acc_r * alpha[:, None] + tl.dot(pv, vr)
+            if not OUT_LATENT:
+                acc_r = acc_r * alpha[:, None] + tl.dot(pv, vr)
             m_state = m_new
 
         # Partials out (fp32)
@@ -404,9 +444,13 @@ if has_triton:
         base = ((pid * n_splits + split) * BLOCK_H + hloc) * 2
         tl.store(ws_ml + base, m_state)
         tl.store(ws_ml + base + 1, l)
-        abase = ((pid * n_splits + split) * BLOCK_H + hloc)[:, None] * D
-        tl.store(ws_acc + abase + offs_c[None, :], acc_c, mask = valid_c[None, :])
-        tl.store(ws_acc + abase + D_c + offs_r[None, :], acc_r)
+        if OUT_LATENT:
+            abase = ((pid * n_splits + split) * BLOCK_H + hloc)[:, None] * D_c
+            tl.store(ws_acc + abase + offs_c[None, :], acc_c, mask = valid_c[None, :])
+        else:
+            abase = ((pid * n_splits + split) * BLOCK_H + hloc)[:, None] * D
+            tl.store(ws_acc + abase + offs_c[None, :], acc_c, mask = valid_c[None, :])
+            tl.store(ws_acc + abase + D_c + offs_r[None, :], acc_r)
 
     @triton.jit(do_not_specialize = ["q_pos0", "R", "n_splits"])
     def _dsa_attn_combine_kernel(
@@ -428,6 +472,7 @@ if has_triton:
         BLOCK_D: tl.constexpr,       # even; D_c is even so rope pairs never straddle tiles
         SEQ: tl.constexpr = 1,
         MULTIROW: tl.constexpr = 0,  # q_pos0 is a per-job i32 array when set
+        OUT_LATENT: tl.constexpr = 0,  # ws rows are D_c wide; emit head-major (H, R, D_c)
     ):
         """Combine phase: merge the split partials (sink folded in as one more partial),
         normalize, de-rotate (identity rotation, theta = 0, below the rope columns) and
@@ -440,7 +485,7 @@ if has_triton:
         offs_h = (pid % h_blocks) * BLOCK_H + tl.arange(0, BLOCK_H)
         valid_h = offs_h < H
         hloc = tl.arange(0, BLOCK_H)
-        D: tl.constexpr = D_c + D_r
+        D: tl.constexpr = D_c if OUT_LATENT else D_c + D_r
         offs_d = dtile * BLOCK_D + tl.arange(0, BLOCK_D)
         valid_d = offs_d < D
 
@@ -485,7 +530,9 @@ if has_triton:
             o_e, o_o = tl.split(tl.reshape(o, (BLOCK_H, BLOCK_D // 2, 2)))
             o = tl.interleave(o_e * cos - o_o * sin, o_o * cos + o_e * sin)
 
-        if HPG > 0:
+        if OUT_LATENT:
+            base_h = (offs_h * R + row) * D_c
+        elif HPG > 0:
             base_h = (offs_h // HPG) * (R * HPG * D) + row * (HPG * D) + (offs_h % HPG) * D
         else:
             base_h = (row * H + offs_h) * D
@@ -660,15 +707,31 @@ def dsa_attn(
                              # -- scalar args of the same names are ignored, ring is the
                              # stacked (slots, rows, D) tensor, block_table holds one row
                              # per JOB, R = B * seq
+    q_pe = None,             # GLM-5.2 absorbed form: q is the HEAD-MAJOR latent (H, R, D_c)
+                             # and q_pe the token-major rope queries (R, H, D_r); the kernel
+                             # reads both directly, no packed copy exists anywhere
+    out_latent = False,      # emit only the latent half, head-major (H, R, D_c): the exact
+                             # mla_unfold input, with the rope half never accumulated
 ):
     """Core DSA attention over [sliding ring ++ pool entries], V IS K. Gathered mode when
     `indices` is given, dense-pool mode otherwise (per-query causal entry bound). With
     derot_inv_freq the eq. 26 output de-rotation is fused into the epilogue (otherwise the
     output's rope slice is still rotated and de-rotation is the caller's epilogue); with
     groups > 1 the output is written group-major for the grouped o_proj."""
-    R, H, D = q.shape
-    D_r = pool_r.shape[-1]
-    D_c = D - D_r
+    q_split = q_pe is not None
+    if q_split:
+        # Split absorbed queries exclude every feature that would touch the packed layout
+        assert not (win_len and kv_chunk is not None) and sinks is None and \
+            derot_inv_freq is None and groups == 1 and not group_major and \
+            multirow is None and not nc_block and out_latent
+        H, R, D_c = q.shape
+        D_r = q_pe.shape[-1]
+        D = D_c + D_r
+        assert q_pe.shape == (R, H, D_r) and q_pe.is_contiguous() and q.is_contiguous()
+    else:
+        R, H, D = q.shape
+        D_r = pool_r.shape[-1]
+        D_c = D - D_r
     if scale is None:
         scale = D ** -0.5
     dense_pool = indices is None
@@ -676,15 +739,26 @@ def dsa_attn(
     if group_major is None:
         group_major = groups > 1
     hpg = H // groups if group_major else 0
-    out_shape = (groups, R, hpg * D) if group_major else (R, H, D)
-    if out is None:
-        out = g_tensor_cache.get(q.device, out_shape, torch.half, "dsa_out")
+    if out_latent:
+        out_shape = (H, R, D_c)
+        if out is None:
+            # Owned by the caller (results may be held across calls); not cached
+            out = torch.empty(out_shape, dtype = torch.half, device = q.device)
+        else:
+            assert out.shape == out_shape
     else:
-        assert out.shape == out_shape
+        out_shape = (groups, R, hpg * D) if group_major else (R, H, D)
+        if out is None:
+            out = g_tensor_cache.get(q.device, out_shape, torch.half, "dsa_out")
+        else:
+            assert out.shape == out_shape
 
     dummy_i = block_table  # any valid int32 pointer for unused int args
     has_window = win_len > 0 and kv_chunk is not None
-    if not has_window:
+    if q_split:
+        # The windowless ring slot carries q_pe; kv_chunk stays a dummy pointer
+        ring, kv_chunk = q_pe, q
+    elif not has_window:
         ring, kv_chunk = q, q
     elif ring is None:
         ring = kv_chunk    # window fully inside the chunk (win_floor >= q_pos0)
@@ -730,7 +804,7 @@ def dsa_attn(
         # tiles serially (pure latency); the split phase spreads the keys over
         # R * h_blocks * n_splits programs and the combine folds sinks/derot/store
         hb = triton.cdiv(H, block_h)
-        D_out = D
+        D_out = D_c if out_latent else D
         ws_ml = g_tensor_cache.get(q.device, (R * hb * n_splits * block_h * 2,),
                                    torch.float, "dsa_ws_ml")
         ws_acc = g_tensor_cache.get(q.device, (R * hb * n_splits * block_h * D_out,),
@@ -743,7 +817,8 @@ def dsa_attn(
             npr = block_table.shape[1]     # one block-table row per job
         else:
             a_klen, a_pool, a_qpos, a_floor, a_beg = k_len, pool_len, q_pos0, win_floor, ring_beg
-            a_slots, a_rstride, a_seq = 0, 0, 1
+            # ring_stride carries R for the head-major q_lat load in split-q mode
+            a_slots, a_rstride, a_seq = 0, (R if q_split else 0), 1
         with torch.cuda.device(q.device):
             _dsa_attn_split_kernel[(R * hb, n_splits)](
                 q, ring, kv_chunk, pool_c.reshape(-1, D_c), pool_r.reshape(-1, D_r),
@@ -756,15 +831,17 @@ def dsa_attn(
                 BLOCK_H = block_h, BLOCK_N = block_n, BLOCK_W = 16,
                 SEQ = a_seq, MULTIROW = multirow is not None,
                 DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
+                Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
                 num_warps = num_warps, num_stages = 2,
             )
-            _dsa_attn_combine_kernel[(R * hb, triton.cdiv(D, 128))](
+            _dsa_attn_combine_kernel[(R * hb, triton.cdiv(D_out, 128))](
                 ws_ml, ws_acc, sinks_t, derot_t, out,
                 a_qpos, R, n_splits,
                 H = H, D_c = D_c, D_r = D_r,
                 HAS_SINKS = has_sinks, DEROTATE = derotate, HPG = hpg,
                 BLOCK_H = block_h, BLOCK_D = 128,
                 SEQ = a_seq, MULTIROW = multirow is not None,
+                OUT_LATENT = 1 if out_latent else 0,
                 num_warps = 4, num_stages = 2,
             )
         return out
@@ -786,6 +863,7 @@ def dsa_attn(
             BLOCK_H = block_h, BLOCK_N = block_n, BLOCK_W = 16,
             DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
             NC_BLOCK = 1 if nc_block else 0,
+            Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
             num_warps = num_warps, num_stages = num_stages,
         )
     return out
@@ -820,6 +898,9 @@ def dsa_indexer_scores(
     dbg_pages = -(-k_idx.shape[0] // epp) if dbg else 0
     S_stride = triton.cdiv(max(T, 1), block_n) * block_n
     if scores is None:
+        # Deliberately a per-call allocation: the shape grows with the visible context, so it
+        # is not tensor-cache material.
+        # TODO: The buffer should disappear entirely once scoring and top-k are fused into a streaming kernel
         scores = torch.empty((R, S_stride), dtype = torch.half, device = q_idx.device)
     with torch.cuda.device(q_idx.device):
         if R <= 4:

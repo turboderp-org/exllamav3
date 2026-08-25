@@ -90,7 +90,7 @@ class DSparkAttention(DSV4Attention):
             q, q, kv, kv,
             self._rope_type(), 0, positions, None,
             int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-            self.rms_norm_eps, 0.0, 0.0, 0, False, 1, D - rd,
+            self.rms_norm_eps, 0.0, 0.0, 0, 1, D - rd,
         )
         kv = kv.view(bsz, s, D)
         if dspark_fp8_kv:
@@ -147,7 +147,7 @@ class DSparkAttention(DSV4Attention):
             kv, kv, None, None,
             self._rope_type(), 0, positions, None,
             int(RopeStyle.GPTJ), 1.0, self.kv_norm_w, None,
-            self.rms_norm_eps, 0.0, 0.0, 0, False, 1, D - rd,
+            self.rms_norm_eps, 0.0, 0.0, 0, 1, D - rd,
         )
         if dspark_fp8_kv:
             fp8_fake_quant_(kv[..., : D - rd])

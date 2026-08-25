@@ -17,9 +17,29 @@
 // AOT-compiled Triton cubins launched through TritonKernel; kv_b exists only as the flat
 // (D_c, H * d) tensors those kernels read per-head column blocks from.
 //
-// One lazily configured slot per (bsz, q_len). The block-table width and split configuration
-// are runtime kernel arguments patched per call, so context growth never recaptures. Instances
-// are built per cache layer, since the cache tensors are baked into the captured graphs.
+// One lazily configured slot per (bsz, q_len, regime). The block-table width and split
+// configuration are runtime kernel arguments patched per call, so context growth never
+// recaptures. Instances are built per cache layer, since the cache tensors are baked into the
+// captured graphs.
+//
+// DSA-on-MLA (GLM-5.2): set_indexer() arms the optional lightning-indexer stages. Full-indexer
+// layers append roped indexer keys to a paged side plane every step; in the sparse regime
+// (context past index_topk) they additionally score the plane, select top-k per query
+// (capture-safe radix top-k) and attend over the gathered latent rows instead of the dense
+// flash-decoding kernels: the gathered kernels read the absorbed q_lat and rope q_pe statics
+// directly (Q_SPLIT) and the combine emits the head-major latent the unfold consumes
+// (OUT_LATENT), so no packed query or output staging exists.
+//
+// Shared-indexer layers skip scoring and gather through an EXTERNAL
+// index list whose pointer is patched per call (GP_dsa_indices), so the selection can come
+// from another layer's graph, the eager path, or across devices. The sparse regime follows
+// the BC_DSV4Attention pattern (dsv4_attn.cpp).
+//
+// Batched sparse slots (bsz > 1) run the scoring / top-k / gather stages in MULTIROW mode:
+// the per-job scan widths and causal clamps live in a small device state array derived from
+// the (already patched) cache_seqlens tensor by a leading kernel (dsa_seq_state_gr), the
+// block table is consumed one row per job, and the top-k takes the per-job bound as a device
+// pointer, so batched sparse replay patches nothing beyond what the dense path patches.
 
 struct BC_MLAttention
 {
@@ -73,6 +93,18 @@ struct BC_MLAttention
     at::Tensor xh;
     at::Tensor h32;
 
+    // DSA lightning indexer (set_indexer): 0 = none, 1 = full, 2 = shared
+    int idx_mode = 0;
+    std::shared_ptr<BC_LinearEXL3> idx_wq_b;   // full only, quantized (q_lora_rank -> H_i * D_i)
+    c10::optional<at::Tensor> idx_wk_w;        // (hidden, D_i) fp16, full only
+    c10::optional<at::Tensor> idx_k_norm_w;    // (D_i,) fp16
+    c10::optional<at::Tensor> idx_k_norm_b;    // (D_i,) fp16
+    c10::optional<at::Tensor> idx_weights_w;   // (hidden, H_i) fp16
+    c10::optional<at::Tensor> cache_kidx;      // flat (pages * page_size, D_i) fp16 plane
+    int index_n_heads = 0;
+    int index_head_dim = 0;
+    int index_topk = 0;
+
     struct Slot
     {
         bool configured = false;
@@ -105,6 +137,26 @@ struct BC_MLAttention
         std::shared_ptr<TritonKernel> k_split;
         std::shared_ptr<TritonKernel> k_combine;
         std::shared_ptr<TritonKernel> k_unfold;
+
+        // DSA statics (idx_mode > 0). Full-indexer slots carry the key stages in both
+        // regimes; sparse slots add scoring/selection (full) and the gathered attention
+        at::Tensor x_st;      // (R_pad, hidden) staged input, zero-padded rows for cuBLASLt
+        at::Tensor kidx;      // (R_pad, D_i) raw wk output
+        at::Tensor kidx_n;    // (R, D_i) normed keys, roped in place on the leading D_r dims
+        at::Tensor kidx4;     // rope view (bsz, q_len, 1, D_r)
+        at::Tensor qidx;      // (R, H_i * D_i), sparse full only
+        at::Tensor qidx4;     // rope view (bsz, q_len, H_i, D_r) of the leading dims
+        at::Tensor wts;       // (R_pad, H_i)
+        at::Tensor scores;    // (R, S_max)
+        at::Tensor indices;   // (R, K_pad): own selection (full) or patch target (shared)
+        at::Tensor dsa_arr;   // (2, MAX_BSZ) i32 per-job [q_pos0; past + q_len], bsz > 1 only:
+                              // filled on device from cache_seqlens each step (dsa_seq_state)
+        at::Tensor dsa_ws_ml, dsa_ws_acc;
+        std::shared_ptr<TritonKernel> k_idx_norm, k_plane_append, k_fewq,
+            k_dsa_split, k_dsa_combine;
+        int dsa_hb = 0;
+        int dsa_splits = 0;
+        int fewq_gy = 0;
 
         std::unique_ptr<Graph> graph;
     };
@@ -143,12 +195,27 @@ struct BC_MLAttention
         at::Tensor h32
     );
 
-    bool needs_configure(int bsz, int q_len);
+    void set_indexer
+    (
+        int mode,
+        std::shared_ptr<BC_LinearEXL3> wq_b,
+        c10::optional<at::Tensor> wk_w,
+        c10::optional<at::Tensor> k_norm_w,
+        c10::optional<at::Tensor> k_norm_b,
+        c10::optional<at::Tensor> weights_w,
+        c10::optional<at::Tensor> kidx,
+        int n_heads,
+        int head_dim,
+        int topk
+    );
+
+    bool needs_configure(int bsz, int q_len, int regime);
 
     void configure_slot
     (
         int bsz,
         int q_len,
+        int regime,
         at::Tensor q_full,
         c10::optional<at::Tensor> q_a,
         at::Tensor ckv_kpe,
@@ -176,6 +243,33 @@ struct BC_MLAttention
         int unfold_gx
     );
 
+    // Attaches the DSA statics/kernels to an already-configured slot. Sparse-only pieces are
+    // nullopt for regime 0; scoring pieces are nullopt for shared-indexer instances
+    void configure_slot_dsa
+    (
+        int bsz,
+        int q_len,
+        int regime,
+        c10::optional<at::Tensor> x_st,
+        c10::optional<at::Tensor> kidx,
+        c10::optional<at::Tensor> kidx_n,
+        c10::optional<at::Tensor> qidx,
+        c10::optional<at::Tensor> wts,
+        c10::optional<at::Tensor> scores,
+        c10::optional<at::Tensor> indices,
+        c10::optional<at::Tensor> dsa_arr,
+        c10::optional<at::Tensor> dsa_ws_ml,
+        c10::optional<at::Tensor> dsa_ws_acc,
+        std::shared_ptr<TritonKernel> k_idx_norm,
+        std::shared_ptr<TritonKernel> k_plane_append,
+        std::shared_ptr<TritonKernel> k_fewq,
+        std::shared_ptr<TritonKernel> k_dsa_split,
+        std::shared_ptr<TritonKernel> k_dsa_combine,
+        int dsa_hb,
+        int dsa_splits,
+        int fewq_gy
+    );
+
     void run
     (
         int bsz,
@@ -186,7 +280,10 @@ struct BC_MLAttention
         const at::Tensor& block_table,
         int64_t position,
         const c10::optional<at::Tensor>& positions,
-        const c10::optional<at::Tensor>& position_ids
+        const c10::optional<at::Tensor>& position_ids,
+        int regime,
+        int64_t t_total,
+        const c10::optional<at::Tensor>& ext_indices
     );
 
     void run_gr
@@ -201,9 +298,13 @@ struct BC_MLAttention
         int64_t position,
         const c10::optional<at::Tensor>& positions,
         const c10::optional<at::Tensor>& position_ids,
+        int regime,
+        int64_t t_total,
+        const c10::optional<at::Tensor>& ext_indices,
         Graph* graph
     );
 
 private:
-    Slot& slot(int bsz, int q_len) { return slots[(bsz - 1) * MAX_QLEN + (q_len - 1)]; }
+    Slot& slot(int bsz, int q_len, int regime)
+        { return slots[(regime * MAX_BSZ + bsz - 1) * MAX_QLEN + (q_len - 1)]; }
 };

@@ -40,18 +40,45 @@ class CPUPageCache:
         """
         :param caches:
             List of Cache objects whose paged layers make up one page image, i.e. [cache] or
-            [cache, draft_cache]. The model must be loaded (cache tensors allocated)
+            [cache, draft_cache]. The model must be loaded (cache tensors allocated). Each cache names its
+            own model, which is what the dispatch follows: in tensor-parallel mode the cache is sharded
+            across worker processes and the main process holds no tensors to copy from, so this object keeps
+            only the slot table and the eviction policy and every transfer is dispatched per rank. A slot
+            index means the same page image on every rank, and the budget counts whole pages across all of
+            them
 
         :param max_size:
             Capacity in bytes of pinned system memory. Slots are allocated lazily as pages are pushed, so this
             is a ceiling, not an up-front allocation
         """
 
-        # Segment table: one entry per paged cache tensor. Every cache tensor is page-major, so one page is the
-        # contiguous slice tensor[page_index]
+        # A draft cache belongs to the draft model, with its own workers and its own view of which cache ids
+        # exist, so caches are grouped by owning model and each group is dispatched separately. Grouping is by
+        # identity rather than by id() so that a model whose object is recreated is never conflated with the
+        # old one.
+        tp_groups = {}
+        local_caches = []
+        for cache in caches:
+            cache_model = getattr(cache, "model", None)
+            if cache_model is not None and cache_model.loaded_tp:
+                group = tp_groups.setdefault(id(cache_model), (cache_model, []))
+                group[1].append(id(cache))
+            else:
+                local_caches.append(cache)
+
+        self.tp_groups = list(tp_groups.values())
+        self.tp = bool(self.tp_groups)
+
+        # The two are not exclusive: a model can be TP while its MTP draft model, being one layer, is not, in
+        # which case a slot has a local slab for the draft cache and per-rank buffers for the main one. Both
+        # halves are keyed by the same slot index, so a page is stored and restored as one image either way.
+        #
+        # Segment table: one entry per paged local cache tensor. Every cache tensor is page-major, so one page
+        # is the contiguous slice tensor[page_index]. TP caches have no entry here, since their tensors live in
+        # the workers and the ranks hold the host buffers themselves.
         self.segments = []
         offset = 0
-        for cache in caches:
+        for cache in local_caches:
             for layer in cache.layers.values():
                 for t in layer.get_tensors():
                     if t is None:
@@ -62,12 +89,23 @@ class CPUPageCache:
                     nbytes = t[0].numel() * t.element_size()
                     self.segments.append((t, offset, page_shape, t.dtype))
                     offset = _align(offset + nbytes, 256)
-        assert self.segments, "No paged cache layers to attach CPU page cache tier to."
 
-        self.slot_size = _align(offset, 4096)
+        # Size of this process's half of a slot, which is what a slab has to hold
+        self.slab_size = _align(offset, 4096) if self.segments else 0
+
+        tp_bytes = 0
+        for cache_model, cache_ids in self.tp_groups:
+            tp_bytes += cache_model.tp_cpu_cache_init(cache_ids)
+        assert offset or tp_bytes, "No paged cache layers to attach CPU page cache tier to."
+
+        # A whole page image, across every rank and this process, which is what the budget is spent in
+        self.slot_size = _align(offset + tp_bytes, 4096)
         self.max_slots = int(max_size) // self.slot_size
         assert self.max_slots >= 2, \
             f"CPU page cache of {max_size} bytes is smaller than two pages ({self.slot_size} bytes per page)."
+
+        for cache_model, cache_ids in self.tp_groups:
+            cache_model.tp_cpu_cache_init(cache_ids, self.max_slots)
 
         self.pagetable = None
 
@@ -76,6 +114,9 @@ class CPUPageCache:
         self.slot_slabs = []
         self.slot_views = []
         self.free_slots = deque()
+        # Slots handed out so far. In TP mode this is the only record the main process keeps of them, since the
+        # buffers themselves belong to the ranks
+        self.num_slots = 0
 
         # Eviction order snapshot
         self._order = deque()
@@ -89,15 +130,20 @@ class CPUPageCache:
             "evictions": 0,     # tier entries dropped to make room
             "cold_allocs": 0,   # pushes that had to pin a slab synchronously (spare pool was empty)
         }
+        # cold_allocs is the sum of the two halves, since a slot can have a local slab and per-rank buffers
+        self._local_cold_allocs = 0
+        self._tp_cold_allocs = 0
 
         # Transfers run at PCIe speed, but pinning host memory only manages ~2.5 GB/s and serializes with copy
         # submission on the driver, so the full configured capacity is pinned up front by a background thread
         # (mirroring the GPU cache, whose full allocation is also committed at load). Pushes that outrun the
-        # pinning thread early in the process fall back to pinning synchronously.
+        # pinning thread early in the process fall back to pinning synchronously. Each rank runs the same for
+        # its own shard, so there is nothing to pin here for a cache that is entirely TP.
         self._spare = deque()
         self._spare_cond = threading.Condition()
-        self._alloc_thread = threading.Thread(target = self._alloc_worker, daemon = True)
-        self._alloc_thread.start()
+        if self.segments:
+            self._alloc_thread = threading.Thread(target = self._alloc_worker, daemon = True)
+            self._alloc_thread.start()
 
 
     def attach(self, pagetable):
@@ -113,7 +159,7 @@ class CPUPageCache:
 
 
     def _make_slab(self):
-        slab = torch.empty((self.slot_size,), dtype = torch.uint8, pin_memory = True)
+        slab = torch.empty((self.slab_size,), dtype = torch.uint8, pin_memory = True)
         views = []
         for t, offset, page_shape, dtype in self.segments:
             nbytes = t[0].numel() * t.element_size()
@@ -133,40 +179,54 @@ class CPUPageCache:
 
 
     def _new_slot(self, protect: set | None):
+        """
+        Index of a slot to write into: a recycled one, a fresh one while the budget allows, or the eviction
+        candidate. The index is the whole identity of a slot, since the ranks key their own buffers by it, so
+        a local slab (when there is one) is appended in lockstep and stays at the matching position.
+        """
+
         if self.free_slots:
             return self.free_slots.popleft()
-        if len(self.slot_slabs) < self.max_slots:
+        if self.num_slots >= self.max_slots:
+            return self._evict_one(protect)
+
+        if self.segments:
+            sv = None
             with self._spare_cond:
                 if self._spare:
                     sv = self._spare.popleft()
-                    self.slot_slabs.append(sv[0])
-                    self.slot_views.append(sv[1])
                     self._spare_cond.notify()
-                    return len(self.slot_slabs) - 1
-            sv = self._make_slab()
-            self.metrics["cold_allocs"] += 1
-            with self._spare_cond:
-                self.slot_slabs.append(sv[0])
-                self.slot_views.append(sv[1])
-                self._spare_cond.notify()
-                return len(self.slot_slabs) - 1
-        return self._evict_one(protect)
+            if sv is None:
+                sv = self._make_slab()  # slow part, outside the lock
+                self._local_cold_allocs += 1
+                self.metrics["cold_allocs"] = self._local_cold_allocs + self._tp_cold_allocs
+                with self._spare_cond:
+                    self._spare_cond.notify()
+            self.slot_slabs.append(sv[0])
+            self.slot_views.append(sv[1])
+
+        self.num_slots += 1
+        return self.num_slots - 1
 
 
     def _evict_one(self, protect: set | None):
         assert self.entries, "CPU page cache has no entries to evict (logic error)"
+        # Entries claimed by the allocation in progress (a restore protects every page of the chain it is
+        # bringing back, hundreds of pages on a long prompt) are passed over and requeued; they are only
+        # taken once every entry has been deferred, i.e. everything is protected. A deferral does not count
+        # as an order pop. Pops are consumed entries only, so one call walks past the whole protected run in
+        # a single pass and reaches the first unprotected candidate
         deferred = 0
         while True:
             if not self._order or self._order_pops >= self._order_rebuild:
                 self._build_order()
                 deferred = 0
             h = self._order.popleft()
-            self._order_pops += 1
-            # Entries claimed by the allocation in progress are skipped unless everything is protected
             if protect and h in protect and deferred < len(self.entries):
                 self._order.append(h)
                 deferred += 1
                 continue
+            self._order_pops += 1
             e = self.entries.pop(h, None)
             if e is not None:
                 self.metrics["evictions"] += 1
@@ -235,8 +295,16 @@ class CPUPageCache:
             self.metrics["dedup_hits"] += 1
             return
         slot = self._new_slot(protect)
-        for v, (t, _, _, _) in zip(self.slot_views[slot], self.segments):
+        for v, (t, _, _, _) in zip(self.slot_views[slot] if self.segments else (), self.segments):
             v.copy_(t[page.page_index], non_blocking = True)
+        if self.tp:
+            # Each rank copies its own shard of the page. The count of synchronous pins comes back from them,
+            # since that stall happens in the workers, and is added to any this process incurred for a local
+            # slab so the metric stays one number
+            self._tp_cold_allocs = sum(
+                m.tp_cpu_cache_store(ids, slot, page.page_index) for m, ids in self.tp_groups
+            )
+            self.metrics["cold_allocs"] = self._local_cold_allocs + self._tp_cold_allocs
         self.entries[page.phash] = {
             "slot": slot,
             "prev_hash": page.prev_hash,
@@ -254,7 +322,9 @@ class CPUPageCache:
         """
         e = self.entries[phash]
         e["access_serial"] = serial
-        for v, (t, _, _, _) in zip(self.slot_views[e["slot"]], self.segments):
+        for v, (t, _, _, _) in zip(self.slot_views[e["slot"]] if self.segments else (), self.segments):
             t[page_index].copy_(v, non_blocking = True)
+        for m, ids in self.tp_groups:
+            m.tp_cpu_cache_fetch(ids, e["slot"], page_index)
         self.metrics["restores"] += 1
         return e

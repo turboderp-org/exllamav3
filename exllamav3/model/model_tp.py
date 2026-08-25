@@ -290,6 +290,40 @@ class Model_TPMixin:
             self.tp_worker_result(device)
 
 
+    def tp_cpu_cache_init(self, cache_ids: list[int], max_slots: int = 0):
+        """
+        Size of one whole cache page across every rank, in bytes, allocating each rank's slot pool if max_slots
+        is given. Called once with max_slots = 0 to size a slot, then again once the budget is divided up.
+        """
+        sizes = self.tp_worker_dispatch_wait_multi(
+            self.active_devices,
+            mp_cpu_cache_init,
+            (cache_ids, max_slots)
+        )
+        return sum(sizes)
+
+
+    def tp_cpu_cache_store(self, cache_ids: list[int], slot: int, page_index: int):
+        """
+        Copy a cache page out to system RAM on every rank, stored under slot. Returns the number of stores that
+        had to pin memory synchronously, summed over ranks, since that stall happens out of sight of the main
+        process.
+        """
+        cold = self.tp_worker_dispatch_wait_multi(
+            self.active_devices,
+            mp_cpu_cache_store,
+            (cache_ids, slot, page_index)
+        )
+        return sum(cold)
+
+
+    def tp_cpu_cache_fetch(self, cache_ids: list[int], slot: int, page_index: int):
+        """
+        Copy a stored cache page back into a page slot on every rank
+        """
+        self.tp_dispatch_all(mp_cpu_cache_fetch, (cache_ids, slot, page_index))
+
+
     def tp_dispatch_all(self, func, args):
         """
         Run the same worker function on every active TP device and require all workers to complete.

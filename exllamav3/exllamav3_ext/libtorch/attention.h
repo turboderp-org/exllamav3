@@ -93,7 +93,6 @@ struct BC_Attention
     float attn_factor;
     float l4_scaling_beta;
     int l4_scaling_original;
-    bool post_rope_norm;
     int rotate_dims;
 
     // Cache tensors: fp16 (pages, page_size, kvh, hd) or packed int32 + scales
@@ -178,7 +177,6 @@ struct BC_Attention
         float attn_factor,
         float l4_scaling_beta,
         int l4_scaling_original,
-        bool post_rope_norm,
         int rotate_dims,
         bool quant_cache,
         at::Tensor cache_k,

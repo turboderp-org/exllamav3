@@ -7,7 +7,6 @@ from ..constants import PAGE_SIZE
 import numpy as np
 from .pagetable import Sequence, tensor_hash_checksum, random_hash
 from .filter import Filter
-import math
 import random
 import time
 from ..ext import exllamav3_ext as ext
@@ -168,6 +167,17 @@ class Job:
         if sampler is None:
             sampler = DefaultSampler()
 
+        # Forced output injection (constrain_output_now). forced_ids holds tokens not yet sampled,
+        # forced_index the queue position, forced_sample marks the token currently in flight between
+        # receive_logits and receive_sample as forced. Suspended filters stay disabled for the
+        # remainder of the job (including requeues) since their state machines cannot track
+        # injected tokens.
+        self.forced_ids = rq_state.get("forced_ids")
+        self.forced_index = 0
+        self.forced_ids_device = None
+        self.forced_sample = False
+        self.filters_suspended = rq_state.get("filters_suspended", False)
+
         # Sampling state
         self.held_text = rq_state.get("held_text", "")
         self.held_tokens = rq_state.get("held_tokens")
@@ -261,8 +271,6 @@ class Job:
         self.time_generate = rq_state.get("time_generate", 0.0)
         self.accepted_draft_tokens = 0
         self.rejected_draft_tokens = 0
-        self.draft_ema = rq_state.get("draft_ema")
-        self.draft_skip_count = 0
         self.draft_stats = []
         self.cached_pages = 0
         self.cached_tokens = 0
@@ -478,6 +486,71 @@ class Job:
             self.device_logit_mask = None
 
 
+    def constrain_output_now(self, output: str | torch.Tensor):
+        """
+        Inject a fixed token string into the job's output stream: the next samples are constrained to
+        the given tokens, one per generation step, after which sampling continues unconstrained. The
+        injected tokens pass through the regular generation pipeline, with these exceptions:
+
+        - All filters on the job are permanently disabled: their state machines cannot accept or track
+          arbitrary injected tokens, so they cannot be meaningfully resumed afterwards.
+        - Any held banned-string checkpoint is released (text held back by a partial match is emitted),
+          and banned-string matching is suspended until the last injected token has been processed.
+
+        Stop conditions, max_new_tokens and the loop detector still apply, so an injected token that is
+        a stop token, or injected text that completes a stop string, ends the job with the remaining
+        injected tokens dropped. It is up to the caller to pick a safe moment for the injection (e.g.
+        not during a tool call). Calling again while a previous injection is still draining appends to
+        the pending queue.
+
+        :param output:
+            Text to inject, tokenized with special tokens enabled, or a (1, S) tensor of token IDs.
+        """
+        assert self.generator is not None, \
+            "Job must be enqueued before constraining output"
+        if isinstance(output, torch.Tensor):
+            assert output.dim() == 2 and output.shape[0] == 1, \
+                "Forced token IDs must be a (1, S) tensor"
+            ids = output.to("cpu", torch.long)
+        else:
+            ids = self.generator.tokenizer.encode(
+                output,
+                encode_special_tokens = True,
+                add_bos = False,
+            )
+        assert ids.shape[-1] > 0, "Cannot constrain output to an empty token sequence"
+
+        self.filters_suspended = True
+        for f in self.filters:
+            f.is_active = False
+
+        # Accept any text held back by a partial banned-string match. Matching is suspended while
+        # forced tokens remain, so the checkpoint could never be rewound to anyway
+        self.checkpoint = None
+
+        if self.forced_ids is not None:
+            ids = torch.cat((self.forced_ids[:, self.forced_index:], ids), dim = -1)
+        self.forced_ids = ids
+        self.forced_index = 0
+        self.forced_ids_device = None
+
+
+    def _pop_forced_token(self, device) -> torch.Tensor:
+        """
+        Next pending forced token as a (1, 1) tensor on the sampling device.
+        """
+        if self.forced_ids_device is None:
+            self.forced_ids_device = self.forced_ids.to(device)
+        next_token = self.forced_ids_device[:, self.forced_index : self.forced_index + 1]
+        self.forced_index += 1
+        self.forced_sample = True
+        if self.forced_index >= self.forced_ids.shape[-1]:
+            self.forced_ids = None
+            self.forced_ids_device = None
+            self.forced_index = 0
+        return next_token
+
+
     def receive_logits(
         self,
         logits: torch.Tensor,
@@ -488,13 +561,18 @@ class Job:
         # assert self.is_prefill_done()
         # assert all(seq.live for seq in self.sequences)
 
-        next_token = self.sampler.forward(
-            logits,
-            self.current_device_ids,
-            self.rng.randint(0, (1<<32)-1),
-            self.generator.tokenizer,
-            logit_mask = self.device_logit_mask
-        )
+        # A pending forced token (constrain_output_now) replaces the sampler's choice; everything
+        # downstream treats it as a regular sample. Token healing (new_tokens == -1) resolves first
+        if self.forced_ids is not None and self.new_tokens >= 0:
+            next_token = self._pop_forced_token(logits.device)
+        else:
+            next_token = self.sampler.forward(
+                logits,
+                self.current_device_ids,
+                self.rng.randint(0, (1<<32)-1),
+                self.generator.tokenizer,
+                logit_mask = self.device_logit_mask
+            )
 
         next_prob, next_k_tokens, next_k_probs = None, None, None
 
@@ -535,10 +613,12 @@ class Job:
         """
         next_token = next_token.cpu()
         next_token_i = next_token.item()
+        forced_sample = self.forced_sample
+        self.forced_sample = False
 
         # Activate/advance filters if not healing
         filter_eos_condition = False
-        if self.new_tokens >= 0:
+        if self.new_tokens >= 0 and not self.filters_suspended:
             for f in self.filters:
                 filter_eos_condition |= f.feed(next_token_i)
 
@@ -863,7 +943,14 @@ class Job:
         if requeue_now:
             unset_checkpoint()
 
-        elif self.banned_strings_utf32_offsets is not None and self.new_tokens > 0:
+        # Banned-string matching is suspended for forced tokens (and while more remain queued), so a
+        # rewind can never truncate an injection
+        elif (
+            self.banned_strings_utf32_offsets is not None
+            and self.new_tokens > 0
+            and not forced_sample
+            and self.forced_ids is None
+        ):
             match = ext.partial_strings_match(
                 np.frombuffer(self.held_text.lower().encode("utf-32-le"), dtype = np.uint8),
                 self.banned_strings_utf32_offsets,
@@ -950,7 +1037,8 @@ class Job:
             "time_generate": self.time_generate,
             "rq_new_tokens": self.new_tokens - 1,
             "sam": self.sam,
-            "draft_ema": self.draft_ema,
+            "forced_ids": None if self.forced_ids is None else self.forced_ids[:, self.forced_index:],
+            "filters_suspended": self.filters_suspended,
         }
 
         serial_number = self.serial_number
@@ -1397,7 +1485,7 @@ class Job:
             for f in self.filters:
                 f.attach(self)
                 f.reset()
-                f.is_active = f.trigger_token is None
+                f.is_active = f.trigger_token is None and not self.filters_suspended
 
 
     def is_checkpoint_boundary(self, override_interval = None):
@@ -1462,40 +1550,6 @@ class Job:
         if self.recurrent_state is not None:
             self.recurrent_state.free()
             self.recurrent_state = None
-
-
-    def draft_target(self, max_tokens: int, skip_ema: float = 0.0, probe_interval: int = 16) -> int:
-        """
-        Number of draft tokens this job wants for the next verification window, based on recent acceptance.
-        Optimistic before any window has been measured. With a skip threshold, an EMA below it requests no
-        drafting at all (0), except for a small probe window every probe_interval rounds — skipped rounds
-        produce no acceptance signal, so the probe is the only way the average can recover.
-        """
-        if self.draft_ema is None:
-            return max_tokens
-        if skip_ema > 0.0 and self.draft_ema < skip_ema:
-            self.draft_skip_count += 1
-            if self.draft_skip_count < probe_interval:
-                return 0
-            self.draft_skip_count = 0
-            return min(2, max_tokens)
-        self.draft_skip_count = 0
-        return max(1, min(max_tokens, math.ceil(self.draft_ema)))
-
-
-    def update_draft_ema(self, accepted: int, window: int, alpha_up: float, alpha_down: float):
-        """
-        Update the moving average of accepted draft tokens. Acceptance is censored by the window size, so a fully
-        accepted window counts as one more than observed, letting the window grow again while the output stays
-        predictable. Asymmetric weights let the window climb into a predictable stretch faster than it decays on
-        isolated rejections.
-        """
-        a = accepted + 1 if accepted >= window else accepted
-        if self.draft_ema is None:
-            self.draft_ema = float(a)
-        else:
-            alpha = alpha_up if a > self.draft_ema else alpha_down
-            self.draft_ema = alpha * a + (1.0 - alpha) * self.draft_ema
 
 
     def get_ngram_draft(self, draft_length: int):

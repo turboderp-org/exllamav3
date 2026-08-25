@@ -192,6 +192,7 @@ def main(args):
         dark = output.get("dark", True)
         kld = False
         plot_file = None
+        y_log = False
 
     def plot_entries(with_kld, include_ref = True):
         entries = []
@@ -223,18 +224,22 @@ def main(args):
     floor_line = {"label": "noise floor, mean", "value": floor_res["kld"]} if floor_res else None
 
     def scatter(key, kld, vram):
-        if not output.get(key):
+        # Spec is either a filename or a dict: {file: ..., y_log: true}
+        spec = output.get(key)
+        plot_file, opts = (spec.get("file"), spec) if isinstance(spec, dict) else (spec, {})
+        if not plot_file:
             return
         pa = PlotArgs()
         pa.kld = kld
         pa.vram = vram
-        pa.plot_file = output[key]
+        pa.plot_file = plot_file
+        pa.y_log = bool(opts.get("y_log", False))
         plot_scatter(
             plot_entries(with_kld = kld, include_ref = kld),
             pa,
             ref_line = floor_line if kld else ref_line,
         )
-        print(f" -- Saved plot: {output[key]}")
+        print(f" -- Saved plot: {plot_file}")
 
     scatter("plot_ppl", kld = False, vram = False)
     scatter("plot_kld", kld = True, vram = False)

@@ -243,7 +243,7 @@ class BCDsa:
             "slot_ids": "i32", "ring_stride": "i32",
         } | {n: "constexpr" for n in (
             "H", "page_size", "D_c", "D_c_pad", "D_r", "K_pad", "compress_rate", "scale",
-            "HAS_WINDOW", "DENSE_POOL", "BLOCK_H", "BLOCK_N", "BLOCK_W", "SEQ", "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES")}
+            "HAS_WINDOW", "DENSE_POOL", "BLOCK_H", "BLOCK_N", "BLOCK_W", "SEQ", "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES", "Q_SPLIT", "OUT_LATENT")}
         consts_s = dict(
             H = H, page_size = self.epp, D_c = D_c,
             D_c_pad = 1 << (D_c - 1).bit_length(), D_r = self.rd, K_pad = kp,
@@ -251,6 +251,7 @@ class BCDsa:
             HAS_WINDOW = True, DENSE_POOL = regime == 0,
             BLOCK_H = BLOCK_H, BLOCK_N = 32, BLOCK_W = 16,
             SEQ = 1, MULTIROW = 0, DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
+            Q_SPLIT = 0, OUT_LATENT = 0,
         )
         k_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
 
@@ -260,11 +261,11 @@ class BCDsa:
             "out": "*fp16:16", "q_pos0": "i32", "R": "i32", "n_splits": "i32",
         } | {n: "constexpr" for n in (
             "H", "D_c", "D_r", "HAS_SINKS", "DEROTATE", "HPG", "BLOCK_H", "BLOCK_D",
-            "SEQ", "MULTIROW")}
+            "SEQ", "MULTIROW", "OUT_LATENT")}
         consts_c = dict(
             H = H, D_c = D_c, D_r = self.rd, HAS_SINKS = True, DEROTATE = True,
             HPG = hpg, BLOCK_H = BLOCK_H, BLOCK_D = 128,
-            SEQ = 1, MULTIROW = 0,
+            SEQ = 1, MULTIROW = 0, OUT_LATENT = 0,
         )
         k_combine = _compile_kernel(dev, _dsa_attn_combine_kernel, sig_c, consts_c, 4, 2)
 
@@ -547,7 +548,7 @@ class BCDsaBatch:
             "ring_beg": "*i32:16", "slot_ids": "*i32:16", "ring_stride": "i32",
         } | {n: "constexpr" for n in (
             "H", "page_size", "D_c", "D_c_pad", "D_r", "K_pad", "compress_rate", "scale",
-            "HAS_WINDOW", "DENSE_POOL", "BLOCK_H", "BLOCK_N", "BLOCK_W", "SEQ", "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES")}
+            "HAS_WINDOW", "DENSE_POOL", "BLOCK_H", "BLOCK_N", "BLOCK_W", "SEQ", "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES", "Q_SPLIT", "OUT_LATENT")}
         consts_s = dict(
             H = H, page_size = self.epp, D_c = D_c,
             D_c_pad = 1 << (D_c - 1).bit_length(), D_r = self.rd, K_pad = self.kp,
@@ -555,6 +556,7 @@ class BCDsaBatch:
             HAS_WINDOW = True, DENSE_POOL = not self.has_idx,
             BLOCK_H = BLOCK_H, BLOCK_N = 32, BLOCK_W = 16,
             SEQ = S, MULTIROW = 1, DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
+            Q_SPLIT = 0, OUT_LATENT = 0,
         )
         k_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
 
@@ -564,11 +566,11 @@ class BCDsaBatch:
             "out": "*fp16:16", "q_pos0": "*i32:16", "R": "i32", "n_splits": "i32",
         } | {n: "constexpr" for n in (
             "H", "D_c", "D_r", "HAS_SINKS", "DEROTATE", "HPG", "BLOCK_H", "BLOCK_D",
-            "SEQ", "MULTIROW")}
+            "SEQ", "MULTIROW", "OUT_LATENT")}
         consts_c = dict(
             H = H, D_c = D_c, D_r = self.rd, HAS_SINKS = True, DEROTATE = True,
             HPG = hpg, BLOCK_H = BLOCK_H, BLOCK_D = 128,
-            SEQ = S, MULTIROW = 1,
+            SEQ = S, MULTIROW = 1, OUT_LATENT = 0,
         )
         k_combine = _compile_kernel(dev, _dsa_attn_combine_kernel, sig_c, consts_c, 4, 2)
 

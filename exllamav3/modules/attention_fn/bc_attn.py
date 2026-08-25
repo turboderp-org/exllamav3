@@ -208,7 +208,6 @@ class BCAttn:
             attn_factor = rope.attn_factor if rope is not None else 1.0,
             l4_scaling_beta = rope.llama_4_scaling_beta if rope is not None else 0.0,
             l4_scaling_original = rope.llama_4_scaling_original if rope is not None else 0,
-            post_rope_norm = module.post_rope_norm,
             rotate_dims = rope.rope_settings.rotate_dims if rope is not None else 0,
             quant_cache = self.quant,
             cache_k = self.cache_k,
@@ -374,7 +373,6 @@ def _module_eligible(m):
         # projection runs as a captured cublas gemm over the statically staged input, so it
         # needs a weight that passes the fp16-gate checks
         (not m.headwise_gate or BCAttn._fp16_gate_weight(m.g_proj) is not None) and
-        not getattr(m, "ve_gate", False) and
         (not getattr(m, "interleaved_gate", False) or m.head_dim % 8 == 0) and
         (not m.full_gate or m.g_proj is None or m.multi_qg is not None or
             (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None) or

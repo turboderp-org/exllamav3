@@ -268,7 +268,6 @@ class SlidingAttention(Module):
         v_proj: Linear | Module | None = None,
         o_proj: Linear | Module | None = None,
         g_proj: Linear | Module | None = None,
-        post_rope_norm: bool = False,
         full_gate: bool = False,
         gate_softplus: bool = False,
         select_hq_bits: int = 0,
@@ -296,7 +295,6 @@ class SlidingAttention(Module):
         # so round UP to whole pages to preserve at least the requested slack after a shift
         self.kv_state_size = -(-(sliding_window + sliding_window_overp) // PAGE_SIZE) * PAGE_SIZE
         self.logit_softcapping = logit_softcapping
-        self.post_rope_norm = post_rope_norm
         self.full_gate = full_gate
         self.gate_softplus = gate_softplus
         self.bt_cache = {}
@@ -320,10 +318,6 @@ class SlidingAttention(Module):
         self.g_proj = None
         self.key_sinks = key_sinks
         self.sinks = None
-
-        if post_rope_norm:
-            assert q_norm is None and k_norm is None, \
-                "Post-RoPE norm only supported without weights"
 
         if self.num_kv_heads == 0:
             return
@@ -791,7 +785,6 @@ class SlidingAttention(Module):
                 self.norm_eps,
                 self.norm_constant_bias,
                 inv_freq,
-                self.post_rope_norm
             )
 
         o = paged_attn_triton_prefill(
@@ -858,7 +851,6 @@ class SlidingAttention(Module):
                 self.norm_eps,
                 self.norm_constant_bias,
                 inv_freq,
-                self.post_rope_norm
             )
 
         # Recurrent state: a short contiguous fp16 K/V span per sequence, viewed as a paged
@@ -1047,7 +1039,6 @@ class SlidingAttention(Module):
                 "sliding_window": self.sliding_window,
                 "sliding_window_overp": self.sliding_window_overp,
                 "logit_softcapping": self.logit_softcapping,
-                "post_rope_norm": self.post_rope_norm,
                 "full_gate": self.full_gate,
             },
             "num_kv_heads": self.num_kv_heads,

@@ -32,7 +32,7 @@ block_chars = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
 def get_dataset_text(spec: dict):
     assert spec["dataset"] == "wiki2", "Only wiki2 implemented atm"
     dataset_text = "\n\n".join(
-        load_dataset("wikitext", "wikitext-2-raw-v1", split = "test")
+        load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split = "test")
         ["text"]
     )
     return dataset_text

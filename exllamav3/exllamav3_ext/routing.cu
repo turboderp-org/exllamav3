@@ -863,6 +863,247 @@ selected: Expert indices, int64, shape (bsz, k)
 weights: Output, float16, shape (bsz, k)
 */
 
+// Dynamic expert placement (CPU expert split): one pass over the selected-expert ids that
+// records hit counts, translates router ids to physical slots inplace (the bsz-1 routing
+// statics are read by captured graphs at baked addresses), and emits the worker-side
+// selection with GPU-resident picks replaced by the -1 sentinel. Replaces a 4-5 launch
+// torch chain per MoE layer per step, which measurably outweighed the placement benefit on
+// 40-layer models
+
+__global__ void moe_split_map_kernel
+(
+    int64_t* __restrict__ sel,           // (n,) router ids in, physical slots out
+    const int64_t* __restrict__ map,     // (E,) router id -> physical slot
+    float* __restrict__ hist,            // (E,) hit counts (router space)
+    int64_t* __restrict__ sel_cpu,       // (n,) out: worker slot if CPU-resident else -1
+    const int n,
+    const int first_cpu_slot
+)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int64_t r = sel[i];
+    atomicAdd(&hist[r], 1.0f);
+    int64_t p = map[r];
+    sel_cpu[i] = p >= first_cpu_slot ? p - first_cpu_slot : -1;
+    sel[i] = p;
+}
+
+void moe_split_map
+(
+    at::Tensor sel,
+    const at::Tensor& map,
+    at::Tensor hist,
+    at::Tensor sel_cpu,
+    const int64_t first_cpu_slot
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(sel.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(sel, kLong);
+    TORCH_CHECK_DTYPE(map, kLong);
+    TORCH_CHECK_DTYPE(hist, kFloat);
+    TORCH_CHECK_DTYPE(sel_cpu, kLong);
+    int n = (int) sel.numel();
+    TORCH_CHECK(sel_cpu.numel() >= n, "moe_split_map: sel_cpu too small");
+    int threads = n < 1024 ? n : 1024;
+    int blocks = (n + threads - 1) / threads;
+    moe_split_map_kernel<<<blocks, threads, 0, stream>>>
+    (
+        (int64_t*) sel.data_ptr(),
+        (const int64_t*) map.data_ptr(),
+        (float*) hist.data_ptr(),
+        (int64_t*) sel_cpu.data_ptr(),
+        n, (int) first_cpu_slot
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+// Fused issue for the CPU expert split (decode-size jobs): one launch replaces the map/
+// translate kernel, the int32 cast, the zero-pad and the three D2H memcpys of the two-phase
+// submit path. The kernel writes the staged inputs straight into the device-mapped pinned
+// slot with zero-copy stores, and skips the activation/weight payload entirely (no PCIe
+// traffic) when no selected expert is CPU-resident (common case with a hot/cold-swapped
+// tail). dev_count[slot] tells the collect kernel whether the worker produced anything. With
+// `map`, also translates sel to physical slots in place and bumps the hit histogram (the
+// dynamic-placement duties of moe_split_map)
+__global__ void moe_split_issue_kernel
+(
+    int64_t* __restrict__ sel,           // (rows * topk,) router ids; physical slots out (map mode)
+    const int64_t* __restrict__ map,     // (E,) or null (static split: ids are physical already)
+    float* __restrict__ hist,            // (E,) or null
+    const half* __restrict__ y,          // (rows, h_) device, contiguous
+    const half* __restrict__ w,          // (rows, topk) device, contiguous
+    int32_t* __restrict__ h_sel,         // slot sel, mapped host (rows, topk)
+    half* __restrict__ h_x,              // slot x, mapped host (rows, hi)
+    half* __restrict__ h_w,              // slot w, mapped host (rows, topk)
+    int32_t* __restrict__ dev_count,     // (num_slots,) device
+    const int n,                         // rows * topk
+    const int rows,
+    const int h_,
+    const int hi,
+    const int first_cpu,
+    const int slot_idx
+)
+{
+    __shared__ int s_any;
+    const int t = threadIdx.x;
+    if (t == 0) s_any = 0;
+    __syncthreads();
+
+    int any = 0;
+    for (int i = t; i < n; i += blockDim.x)
+    {
+        int64_t p = sel[i];
+        if (map)
+        {
+            atomicAdd(&hist[p], 1.0f);
+            p = map[p];
+            sel[i] = p;
+        }
+        int32_t lc = p >= first_cpu ? (int32_t)(p - first_cpu) : -1;
+        h_sel[i] = lc;
+        any |= (lc >= 0);
+    }
+    if (any) atomicOr(&s_any, 1);
+    __syncthreads();
+    if (t == 0) dev_count[slot_idx] = s_any;
+    if (!s_any)
+    {
+        __threadfence_system();
+        return;
+    }
+
+    for (int i = t; i < n; i += blockDim.x)
+        h_w[i] = w[i];
+
+    // Activations, zero-padded to the quantized input width. Vectorized when both widths
+    // are 8-half aligned (they are for every real model dim); PCIe write-combining wants
+    // the widest coalesced stores it can get
+    if ((h_ & 7) == 0 && (hi & 7) == 0)
+    {
+        const int h8 = h_ >> 3, hi8 = hi >> 3;
+        const int4* y4 = reinterpret_cast<const int4*>(y);
+        int4* x4 = reinterpret_cast<int4*>(h_x);
+        const int4 z = {0, 0, 0, 0};
+        const int total = rows * hi8;
+        for (int i = t; i < total; i += blockDim.x)
+        {
+            const int row = i / hi8;
+            const int c = i - row * hi8;
+            x4[i] = c < h8 ? y4[row * h8 + c] : z;
+        }
+    }
+    else
+    {
+        const int total = rows * hi;
+        for (int i = t; i < total; i += blockDim.x)
+        {
+            const int row = i / hi;
+            const int c = i - row * hi;
+            h_x[i] = c < h_ ? y[row * h_ + c] : __float2half_rn(0.0f);
+        }
+    }
+    __threadfence_system();
+}
+
+void moe_split_issue
+(
+    at::Tensor sel,
+    const c10::optional<at::Tensor>& map,
+    const c10::optional<at::Tensor>& hist,
+    const at::Tensor& y,
+    const at::Tensor& w,
+    int64_t h_sel_ptr,
+    int64_t h_x_ptr,
+    int64_t h_w_ptr,
+    at::Tensor dev_count,
+    const int64_t slot_idx,
+    const int64_t hi,
+    const int64_t first_cpu
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(sel.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(sel, kLong);
+    TORCH_CHECK_DTYPE(y, kHalf);
+    TORCH_CHECK_DTYPE(w, kHalf);
+    TORCH_CHECK_DTYPE(dev_count, kInt);
+    TORCH_CHECK(y.is_contiguous() && w.is_contiguous() && sel.is_contiguous(),
+                "moe_split_issue: inputs must be contiguous");
+    TORCH_CHECK(map.has_value() == hist.has_value(), "moe_split_issue: map requires hist");
+    int n = (int) sel.numel();
+    int rows = (int) y.size(0);
+    int h_ = (int) y.size(1);
+    moe_split_issue_kernel<<<1, 1024, 0, stream>>>
+    (
+        (int64_t*) sel.data_ptr(),
+        map ? (const int64_t*) map.value().data_ptr() : nullptr,
+        hist ? (float*) hist.value().data_ptr() : nullptr,
+        (const half*) y.data_ptr(),
+        (const half*) w.data_ptr(),
+        reinterpret_cast<int32_t*>(h_sel_ptr),
+        reinterpret_cast<half*>(h_x_ptr),
+        reinterpret_cast<half*>(h_w_ptr),
+        (int32_t*) dev_count.data_ptr(),
+        n, rows, h_, (int) hi, (int) first_cpu, (int) slot_idx
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+// Fused collect for the split path: fold the worker's partial into the routed sum straight
+// from the pinned slot (replacing the H2D memcpy, the width trim and the separate add), or
+// do nothing at all -- no PCIe reads -- when the issue kernel recorded an empty job. Loads
+// go through volatile so no stale line can be served for a slot's previous tenant
+__global__ void moe_split_collect_add_kernel
+(
+    float* __restrict__ final_out,       // (rows, h_) device, contiguous
+    const float* __restrict__ h_out,     // slot out, mapped host (rows, ho)
+    const int32_t* __restrict__ dev_count,
+    const int total,                     // rows * h_
+    const int h_,
+    const int ho,
+    const int slot_idx
+)
+{
+    if (dev_count[slot_idx] == 0) return;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int row = i / h_;
+    const int c = i - row * h_;
+    const volatile float* vo = h_out;
+    final_out[i] += vo[row * ho + c];
+}
+
+void moe_split_collect_add
+(
+    at::Tensor final_out,
+    int64_t h_out_ptr,
+    const at::Tensor& dev_count,
+    const int64_t slot_idx,
+    const int64_t ho
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(final_out.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(final_out, kFloat);
+    TORCH_CHECK_DTYPE(dev_count, kInt);
+    TORCH_CHECK(final_out.is_contiguous(), "moe_split_collect_add: output must be contiguous");
+    int rows = (int) final_out.size(0);
+    int h_ = (int) final_out.size(1);
+    int total = rows * h_;
+    int threads = total < 1024 ? total : 1024;
+    int blocks = (total + threads - 1) / threads;
+    moe_split_collect_add_kernel<<<blocks, threads, 0, stream>>>
+    (
+        (float*) final_out.data_ptr(),
+        reinterpret_cast<const float*>(h_out_ptr),
+        (const int32_t*) dev_count.data_ptr(),
+        total, h_, (int) ho, (int) slot_idx
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
 __global__ void routing_sel_norm_kernel
 (
     const half* __restrict__ scores,

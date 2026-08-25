@@ -42,7 +42,6 @@ void rope_kernel
     const int inv_freq_stride,
     const float llama_4_scaling_beta,
     const int llama_4_scaling_original,
-    bool post_rope_norm,
     int position_ids_stride,
     int rotate_dims,
     int rotate_offset
@@ -169,15 +168,6 @@ void rope_kernel
                         sh_head[offset + t] = __float2half_rn(r1);
                         sh_head[offset + t + partial_head_dim / 2] = __float2half_rn(r2);
                     }
-                    else if constexpr (rope_mode == ROPESTYLE_NANOCHAT)
-                    {
-                        float v1 = __half2float(sh_head[offset + t]);
-                        float v2 = __half2float(sh_head[offset + t + partial_head_dim / 2]);
-                        float r1 = v1 * cos + v2 * sin;
-                        float r2 = v2 * cos - v1 * sin;
-                        sh_head[offset + t] = __float2half_rn(r1);
-                        sh_head[offset + t + partial_head_dim / 2] = __float2half_rn(r2);
-                    }
                     else if constexpr (rope_mode == ROPESTYLE_GPTJ)
                     {
                         half2 *tptr = (half2*)(sh_head + offset + t * 2);
@@ -242,36 +232,6 @@ void rope_kernel
             __syncthreads();
         };
 
-        // RMS Norm, unweighted
-        auto apply_norm_uw = [&] ()
-        {
-            half2 *tptr = (half2*)(sh_head + t * 2);
-            // int lane_id = threadIdx.x % 32;
-            int warp_id = threadIdx.x / 32;
-            int warps = blockDim.x / 32;
-
-            // Sum of squares
-            half2 v = *tptr;
-            float v1 = __low2float(v);
-            float v2 = __high2float(v);
-            float sum = v1 * v1 + v2 * v2;
-            sums[warps * t_head + warp_id] = warp_reduce_sum_f(sum);
-            __syncthreads();
-
-            sum = sums[warps * t_head];
-            for (int i = 1; i < warps; ++i) sum += sums[warps * t_head + i];
-
-            // Normalize and downcast
-            float rmf = rsqrtf(sum / (float) head_dim + norm_eps);
-            v1 *= rmf;
-            v2 *= rmf;
-            v = __floats2half2_rn(v1, v2);
-
-            // Store
-            *tptr = v;
-            __syncthreads();
-        };
-
         // Llama 4 scaling. Must be called by the whole block (blockDim.y walks q and k heads
         // concurrently and the lambda syncs), so k heads scale by 1.0
         auto apply_l4_scaling = [&] (float scaling)
@@ -289,7 +249,6 @@ void rope_kernel
         load_head();
         if (q_norm) apply_norm();
         apply_rope();
-        if (post_rope_norm) apply_norm_uw();
         if (l4_scaling != 1.0f) apply_l4_scaling(head_idx < num_heads_q ? l4_scaling : 1.0f);
         store_head();
     }
@@ -335,7 +294,6 @@ void rope_gr
     float norm_constant_bias,
     float llama_4_scaling_beta,
     int llama_4_scaling_original,
-    bool post_rope_norm,
     int rotate_dims,
     int rotate_offset,
     Graph* graph
@@ -438,27 +396,25 @@ void rope_gr
     #define ARGS q_ptr, out_q_ptr, k_ptr, out_k_ptr, inv_freq_ptr, bsz, \
                  seq_len, num_heads_q, num_heads_k, head_dim, q_head_stride, k_head_stride, partial_head_dim, position, positions_ptr, \
                  position_ids_ptr, attn_factor, q_norm_ptr, k_norm_ptr, norm_eps, norm_constant_bias, inv_freq_table, \
-                 inv_freq_stride, llama_4_scaling_beta, llama_4_scaling_original, post_rope_norm, position_ids_stride, rotate_dims, rotate_offset
+                 inv_freq_stride, llama_4_scaling_beta, llama_4_scaling_original, position_ids_stride, rotate_dims, rotate_offset
 
     // Pointer form of ARGS for cudaLaunchKernel; positions_ptr sits at index 14 (the
     // GP_rope_positions record site)
     #define ARGPTRS &q_ptr, &out_q_ptr, &k_ptr, &out_k_ptr, &inv_freq_ptr, &bsz, \
                  &seq_len, &num_heads_q, &num_heads_k, &head_dim, &q_head_stride, &k_head_stride, &partial_head_dim, &position, &positions_ptr, \
                  &position_ids_ptr, &attn_factor, &q_norm_ptr, &k_norm_ptr, &norm_eps, &norm_constant_bias, &inv_freq_table, \
-                 &inv_freq_stride, &llama_4_scaling_beta, &llama_4_scaling_original, &post_rope_norm, &position_ids_stride, &rotate_dims, &rotate_offset
+                 &inv_freq_stride, &llama_4_scaling_beta, &llama_4_scaling_original, &position_ids_stride, &rotate_dims, &rotate_offset
 
     void* kernel_ptr = nullptr;
     if (norm_fp16)
     {
         if      (rope_mode == ROPESTYLE_GPTJ)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_GPTJ, false>;
         else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_NEOX, false>;
-        else if (rope_mode == ROPESTYLE_NANOCHAT)   kernel_ptr = (void*) rope_kernel<ROPESTYLE_NANOCHAT, false>;
     }
     else if (norm_bf16)
     {
         if      (rope_mode == ROPESTYLE_GPTJ)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_GPTJ, true>;
         else if (rope_mode == ROPESTYLE_NEOX)       kernel_ptr = (void*) rope_kernel<ROPESTYLE_NEOX, true>;
-        else if (rope_mode == ROPESTYLE_NANOCHAT)   kernel_ptr = (void*) rope_kernel<ROPESTYLE_NANOCHAT, true>;
     }
     TORCH_CHECK(kernel_ptr, "rope: incorrect norm dtype");
 
@@ -501,14 +457,13 @@ void rope
     float norm_constant_bias,
     float llama_4_scaling_beta,
     int llama_4_scaling_original,
-    bool post_rope_norm,
     int rotate_dims,
     int rotate_offset
 )
 {
     rope_gr(q, out_q, k, out_k, inv_freq, position, positions, position_ids, rope_mode,
             attn_factor, q_norm, k_norm, norm_eps, norm_constant_bias, llama_4_scaling_beta,
-            llama_4_scaling_original, post_rope_norm, rotate_dims, rotate_offset, nullptr);
+            llama_4_scaling_original, rotate_dims, rotate_offset, nullptr);
 }
 
 

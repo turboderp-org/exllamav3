@@ -35,7 +35,7 @@ def _ext_rope(x, inv_freq, position = 0, position_ids = None):
     # table. attn_factor is 1.0 by V4 semantics (yarn mscale never applied to cos/sin).
     ext.rope(
         x, x, None, None, inv_freq, position, None, position_ids,
-        int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, False, 1, 0,
+        int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, 1, 0,
     )
 
 
@@ -906,7 +906,7 @@ class DSV4Attention(Module):
             q, q, kv, kv,
             self._rope_type(), position, None, None,
             int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-            self.rms_norm_eps, 0.0, 0.0, 0, False, 1, self.head_dim - rd,
+            self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
         )
         return q_res, q, kv.view(bsz, seq, self.head_dim)
 
@@ -1373,7 +1373,7 @@ class DSV4Attention(Module):
                 ext.rope(
                     qi[..., -self.rope_head_dim:], qi[..., -self.rope_head_dim:],
                     None, None, self.inv_freq_compress, 0, a_pos, None,
-                    int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, False, 1, 0)
+                    int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, 1, 0)
                 wts = g_tensor_cache.get(device, (R, Hi), torch.half, "dsv4_b_wts")
                 self.idx_weights.inner.bc.run(x.view(R, -1), wts)
                 s_max = -(-kl.capacity // 128) * 128
@@ -1510,7 +1510,7 @@ class DSV4Attention(Module):
             q, q, kv, kv,
             self._rope_type(), 0, positions, None,
             int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-            self.rms_norm_eps, 0.0, 0.0, 0, False, 1,
+            self.rms_norm_eps, 0.0, 0.0, 0, 1,
             self.head_dim - self.rope_head_dim,
         )
         return q_res, q, kv, comp_kv, comp_gate, idx_kv, idx_gate, q_idx
@@ -1619,7 +1619,7 @@ class DSV4Attention(Module):
                 q, q, kv, kv,
                 self._rope_type(), pos0, None, None,
                 int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-                self.rms_norm_eps, 0.0, 0.0, 0, False, 1,
+                self.rms_norm_eps, 0.0, 0.0, 0, 1,
                 self.head_dim - self.rope_head_dim,
             )
             kv = kv.view(1, seq, self.head_dim)

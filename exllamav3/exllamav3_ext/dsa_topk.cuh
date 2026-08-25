@@ -22,3 +22,12 @@ void dsa_topk
     const c10::optional<at::Tensor>& t_ptr,
     int64_t t_seq
 );
+
+void dsa_seq_state_gr
+(
+    const at::Tensor& cache_seqlens,
+    at::Tensor& arr,
+    int bsz,
+    int q_len,
+    Graph* graph
+);

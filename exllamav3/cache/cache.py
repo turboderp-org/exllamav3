@@ -131,6 +131,10 @@ class Cache:
             If layer_type == CacheLayer_quant, bits per element of the quantized values tensor
         """
         self.model = model
+        # Set by Model.load() / cleared by Model.unload(): cache tensors are allocated by the
+        # model loader (per layer, on the layer's device), so a cache is only usable after a
+        # load of the model it was attached to at load time.
+        self.initialized = False
         self.config = model.config
         self.max_num_tokens = max_num_tokens
 
