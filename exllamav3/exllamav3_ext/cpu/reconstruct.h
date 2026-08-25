@@ -12,7 +12,7 @@
 
 void reconstruct_had_slice_cpu
 (
-    at::Tensor unpacked,    // [k, requested_n] fp16, CPU, contiguous
+    at::Tensor unpacked,    // [k, requested_n] fp16 or fp32, CPU, contiguous
     at::Tensor packed,      // [k/16, n_blocks, K*16] int16, CPU, contiguous
     at::Tensor suh,         // [k] fp16
     at::Tensor svh,         // [requested_n] fp16, pre-offset by caller for slices

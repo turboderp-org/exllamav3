@@ -2,7 +2,7 @@
 #
 # Discovers representative EXL3 linears (first attention-block projection, first MLP projection,
 # final merger projection) in a vision component, then times ext.reconstruct_had_slice_cpu on
-# each weight. Timings are evidence only -- correctness is owned by tests/test_cpu_vision.py and
+# each weight (fp32 output, as produced for the CPU GEMM path). Timings are evidence only -- correctness is owned by tests/test_cpu_vision.py and
 # the scalar reference (EXL3_CPU_RECON_SCALAR=1).
 #
 # Usage:
@@ -53,7 +53,7 @@ def discover_targets(model, max_targets = 6):
 
 def bench_one(lin, runs):
     k, n = lin.inner.in_features, lin.inner.out_features
-    w = torch.empty((k, n), dtype = torch.half)
+    w = torch.empty((k, n), dtype = torch.float32)
     args = (w, lin.inner.trellis, lin.inner.suh, lin.inner.svh,
             lin.inner.K, lin.inner.mcg, lin.inner.mul1, 0)
 

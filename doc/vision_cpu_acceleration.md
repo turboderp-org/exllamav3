@@ -138,9 +138,9 @@ construction-time properties:
    no ripple into rope/norm logic.
 
 5. **`exllamav3/modules/quant/exl3.py` — `reconstruct_cpu_matmul`.**
-   The per-call reconstructed dense half buffer is cast to fp32 before `cpu_matmul`, routing
-   EXL3-CPU through the same fast path. (The extra weight-sized copy is negligible next to
-   reconstruction + GEMM; a native-fp32 writer in C++ is future work.)
+   The per-call reconstructed dense weight feeds `cpu_matmul`'s fp32 GEMM fast path. Since the
+   native fp32 writer landed in the CPU reconstructor (§7.2), the buffer is produced directly
+   in fp32; the interim per-call full-weight cast pass is gone.
 
 ### Why fp32 residency and not bf16
 
@@ -211,8 +211,12 @@ Profiling helpers: `~/Documents/workspace/ML/stuff/{profile_vision_cpu.py,bench_
    forward* (2000-token activation shapes, full-tower GPU-vs-CPU comparison through
    quantized vision weights) — only relevant if quantized vision towers become something
    we ship.
-2. **Native fp32 (or direct-bf16) writer in `reconstruct_had_slice_cpu`.** Removes the extra
-   full-weight cast pass per linear per call. Small win, trivial surface.
+2. **Native fp32 (or direct-bf16) writer in `reconstruct_had_slice_cpu`:** RESOLVED. The CPU
+   reconstructor accepts fp32 output tensors and stores tiles directly in fp32 (fp16 outputs
+   still supported); `reconstruct_cpu_matmul` allocates the dense weight in fp32 and passes it
+   straight to `cpu_matmul`, removing the extra full-weight cast pass per linear per call.
+   Direct-bf16 output remains unbuilt: bf16 residency failed the §4 fidelity gates, so revisit
+   it under item 7 if ever needed.
 3. **W8A8 int8 GEMM with AVX512-VNNI** (the core of how ggml gets its integer throughput):
    quantize activations once per layer to int8 with per-block scales, reuse across all
    output rows, accumulate i32, rescale in fp32 (`vpdpbusd`). Estimated to land well under

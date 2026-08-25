@@ -215,7 +215,8 @@ RECONSTRUCT_CASES = [
 
 @pytest.mark.skipif(not HAS_CUDA, reason = "requires CUDA")
 @pytest.mark.parametrize("k_dim,n_dim,K,mcg,mul1", RECONSTRUCT_CASES)
-def test_reconstruct_cpu_vs_cuda(k_dim, n_dim, K, mcg, mul1):
+@pytest.mark.parametrize("out_dtype", [torch.half, torch.float32], ids=["half", "float"])
+def test_reconstruct_cpu_vs_cuda(k_dim, n_dim, K, mcg, mul1, out_dtype):
     torch.manual_seed(k_dim * 7 + n_dim + K)
     trellis = torch.randint(
         0, 65536, (k_dim // 16, n_dim // 16, 256 * K // 16),
@@ -227,7 +228,7 @@ def test_reconstruct_cpu_vs_cuda(k_dim, n_dim, K, mcg, mul1):
     w_cuda = torch.empty(k_dim, n_dim, dtype = torch.half, device = DEVICE)
     ext.reconstruct_had_slice(w_cuda, trellis, suh, svh, K, mcg, mul1, 0)
 
-    w_cpu = torch.empty(k_dim, n_dim, dtype = torch.half)
+    w_cpu = torch.empty(k_dim, n_dim, dtype = out_dtype)
     ext.reconstruct_had_slice_cpu(
         w_cpu, trellis.cpu(), suh.cpu(), svh.cpu(), K, mcg, mul1, 0
     )
@@ -235,7 +236,7 @@ def test_reconstruct_cpu_vs_cuda(k_dim, n_dim, K, mcg, mul1):
     assert (w_cpu.float() - w_cuda.float().cpu()).abs().max().item() / scale < 2e-3
 
     if n_dim >= 384:
-        ws_cpu = torch.empty(k_dim, 128, dtype = torch.half)
+        ws_cpu = torch.empty(k_dim, 128, dtype = out_dtype)
         ext.reconstruct_had_slice_cpu(
             ws_cpu, trellis.cpu(), suh.cpu(), svh[128:].cpu(), K, mcg, mul1, 128
         )
