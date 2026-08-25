@@ -14,6 +14,13 @@
 #define MOE_SCHED_OFFSET (MAX_TILES_C + 2 * MAX_BARRIERS)
 #define MOE_SCHED_INTS (2 + MOE_MAX_GROUPS)
 
+// mgemm active-slot list for expert-range filtering, after the scheduler state: [0] total count,
+// [1 + c] count for compaction chunk c, then the slot positions, in order
+#define MGEMM_MAX_SLOTS 16384
+#define MGEMM_CHUNKS 32
+#define MGEMM_SLOTS_OFFSET (MOE_SCHED_OFFSET + MOE_SCHED_INTS)
+#define MGEMM_SLOTS_INTS (1 + MGEMM_CHUNKS + MGEMM_MAX_SLOTS)
+
 // Workspace size
 #define WORKSPACE_SIZE (16*1024*1024)
 

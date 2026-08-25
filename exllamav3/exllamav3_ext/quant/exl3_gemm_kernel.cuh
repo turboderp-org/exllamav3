@@ -79,12 +79,6 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
      */
 }
 
-#define MAX_INDICES 128
-
-__device__ int64_t v_indices[128];
-__device__ half v_weights[128];
-__device__ int bszm_sync;
-
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
 void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
@@ -96,45 +90,79 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
     #endif
 
-    // Pack indices within min_index <= idx < max_index
+    // Local matrix for slot j, or -1 if the slot is inactive. With min_index >= 0 the tables are
+    // local to an expert shard: selections outside [min_index, max_index) are inactive and the
+    // rest are rebased. Slots keep their position either way, so slot j always refers to input
+    // row j, output row j and weight j
+    auto slot_matrix = [&] (int j) -> int
+    {
+        int idx = B_indices ? (int) B_indices[j] : j;
+        if (min_index >= 0 && (idx < min_index || idx >= max_index)) return -1;
+        return min_index >= 0 ? idx - min_index : idx;
+    };
+
+    // List the active slots so the loop below can skip the inactive ones. The list holds slot
+    // POSITIONS rather than renumbered indices, which is what lets a filtered launch keep the
+    // fixed per-token slot groups that the reduction needs. One warp per chunk counts, then
+    // writes at the chunk's prefix, so the grid does not wait on a serial scan
+    int* slot_total = locks + MGEMM_SLOTS_OFFSET;
+    int* chunk_count = slot_total + 1;
+    int* slot_list = chunk_count + MGEMM_CHUNKS;
+    int num_slots = bszm;
 
     if (min_index >= 0)
     {
-        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
+        int chunk = blockIdx.z * gridDim.x + blockIdx.x;
+        int num_chunks = MIN((int) (gridDim.x * gridDim.z), MGEMM_CHUNKS);
+        int chunk_size = CEIL_DIVIDE(bszm, num_chunks);
+        int beg = MIN(chunk * chunk_size, bszm);
+        int end = MIN(beg + chunk_size, bszm);
+        int lane = threadIdx.x % 32;
+
+        if (chunk < num_chunks && threadIdx.x < 32)
         {
-            int j = 0;
-            for (int i = 0; i < bszm; ++i)
-            {
-                int idx = B_indices[i];
-                if (idx >= min_index && idx < max_index)
-                {
-                    v_indices[j] = idx - min_index;
-                    if (B_weights) v_weights[j] = B_weights[i];
-                    j++;
-                }
-            }
-            bszm_sync = j;
-            for (; j < bszm; ++j)
-            {
-                v_indices[j] = -1;
-            }
+            int count = 0;
+            for (int i = beg; i < end; i += 32)
+                count += __popc(__ballot_sync(0xffffffff, i + lane < end && slot_matrix(i + lane) >= 0));
+            if (lane == 0) chunk_count[chunk] = count;
         }
         __threadfence();
         grid.sync();
-        B_indices = v_indices;
-        if (B_weights) B_weights = v_weights;
-        bszm = bszm_sync;
+
+        if (chunk < num_chunks && threadIdx.x < 32)
+        {
+            int c = lane < num_chunks ? chunk_count[lane] : 0;
+            int total = c;
+            int base = lane < chunk ? c : 0;
+            for (int s = 16; s; s >>= 1)
+            {
+                total += __shfl_xor_sync(0xffffffff, total, s);
+                base += __shfl_xor_sync(0xffffffff, base, s);
+            }
+            for (int i = beg; i < end; i += 32)
+            {
+                bool active = i + lane < end && slot_matrix(i + lane) >= 0;
+                uint32_t mask = __ballot_sync(0xffffffff, active);
+                if (active) slot_list[base + __popc(mask & ((1u << lane) - 1))] = i + lane;
+                base += __popc(mask);
+            }
+            if (chunk == 0 && lane == 0) slot_total[0] = total;
+        }
+        __threadfence();
+        grid.sync();
+        num_slots = slot_total[0];
     }
 
-    for (int i = 0; i < bszm; i += gridDim.z)
+    for (int i = 0; i < num_slots; i += gridDim.z)
     {
-        int j = i + blockIdx.z;
+        int p = i + blockIdx.z;
+        int j = -1;
         int mat_index = -1;
         const uint16_t* B = nullptr;
-        if (j >= bszm) j = -1;
-        else
+        if (p < num_slots)
         {
-            mat_index = B_indices ? (int) B_indices[j] : j;
+            j = min_index >= 0 ? slot_list[p] : p;
+            mat_index = slot_matrix(j);
             if (mat_index >= 0)
             {
                 B = B_list[mat_index];
@@ -247,10 +275,10 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     // Final reduction: each of the num_tokens groups of (bszm / num_tokens) contiguous slots is
     // summed into its own output row (row t for group t), instead of always collapsing into row
     // 0. num_tokens == 1 (the legacy single-token case) reduces to exactly the original
-    // single-row behavior. Groups MUST be processed in increasing t order per column: row t is
-    // only ever read by group floor(t / stride), which is <= t, so it has already been fully
-    // read (and, if that group's index equals t, is only then correctly overwritten) by the time
-    // group t's own write happens.
+    // single-row behavior. Inactive slots produced no output and are skipped. Groups MUST be
+    // processed in increasing t order per column: row t is only ever read by group
+    // floor(t / stride), which is <= t, so it has already been fully read (and, if that group's
+    // index equals t, is only then correctly overwritten) by the time group t's own write happens.
     if (B_weights && blockIdx.z == 0)
     {
         int total_warps = size_m * size_n / 32;
@@ -270,7 +298,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                     float sum = 0.0f;
                     for (int j = 0; j < stride; ++j)
                     {
-                        sum += *C___;
+                        if (slot_matrix(t * stride + j) >= 0) sum += *C___;
                         C___ += size_m * size_n;
                     }
                     ((float*) C)[t * size_m * size_n + col] = sum;
@@ -281,7 +309,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                     half sum = {};
                     for (int j = 0; j < stride; ++j)
                     {
-                        sum = __hadd(sum, *C___);
+                        if (slot_matrix(t * stride + j) >= 0) sum = __hadd(sum, *C___);
                         C___ += size_m * size_n;
                     }
                     ((half*) C)[t * size_m * size_n + col] = sum;
