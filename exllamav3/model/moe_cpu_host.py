@@ -928,10 +928,17 @@ class MoeCpuHost:
 
     def _act(self, spec, g, u):
         act = spec["activation"]
-        if act == 0:
-            return (torch.nn.functional.silu(g.float()) * u.float()).half()
-        if act == 1:
-            return (torch.nn.functional.gelu(g.float()) * u.float()).half()
+        if act in (0, 1):
+            # Nonzero act_limit clamps up symmetrically and the activated gate from above,
+            # before the multiply (mirrors the act_mul kernels; DS4 ships swiglu_limit = 10
+            # with plain silu)
+            fn = torch.nn.functional.silu if act == 0 else torch.nn.functional.gelu
+            av, uf = fn(g.float()), u.float()
+            lim = spec["act_limit"]
+            if lim:
+                av = av.clamp(max = lim)
+                uf = uf.clamp(-lim, lim)
+            return (av * uf).half()
         if act == 3:
             lim = spec["act_limit"]
             gf = g.float().clamp(max = lim)

@@ -674,7 +674,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.is_quantized and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
-            self.shared_experts is None
+            self.shared_experts is None and
+            not self.config.infer_params.no_reconstruct
         )
 
         # Make fused modules (only used by the quantized fast paths). Gateless experts have no
@@ -757,7 +758,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         )
         self.experts_cfg = cfg
 
-        if self.support_quant_paths or self.support_bc_bsz1:
+        if (self.support_quant_paths or self.support_bc_bsz1) \
+                and not self.config.infer_params.no_reconstruct:
 
             # Embed bound classes for shared experts and shared gate
             sh_exp_bc = None
