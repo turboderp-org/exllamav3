@@ -439,27 +439,75 @@ class Qwen3VLVisionModel(Model):
     ) -> list[MMEmbedding]:
         # Pack all inputs into one varlen sequence: tokens concatenated along the
         # sequence dim, segmented by cu_seqlens, with per-grid RoPE tables stacked.
+        #
+        # EXL3_VISION_PACK_CHUNK: optional upper bound on tokens fed through the tower in
+        # one forward pass. When set (> 0) and more than one input unit is packed,
+        # consecutive units are grouped so each pass stays within the budget and peak
+        # activation RAM stays O(group) instead of O(total); group outputs are concatenated
+        # afterwards and match the monolithic pass within normal fp tolerance (grouping
+        # changes GEMM M dims, so bit equality is not expected). A single unit is never
+        # split internally: one video clip larger than the budget runs as an oversized
+        # group rather than being cut up (the flat temporal conv couples frames within a
+        # clip). Default 0 keeps the monolithic pass exactly as before.
         v = self.config.vision
         m = v.spatial_merge_size
 
-        packed = torch.cat([t.unsqueeze(0) for t, _, _ in prepped], dim = 1)
+        token_counts = [g[0] * g[1] * g[2] for _, _, g in prepped]
+        chunk_tokens = int(os.environ.get("EXL3_VISION_PACK_CHUNK", "0"))
+        groups = None
+        if chunk_tokens > 0 and len(prepped) > 1 and sum(token_counts) > chunk_tokens:
+            groups = []
+            group, group_tokens = [], 0
+            for item, n in zip(prepped, token_counts):
+                if group and group_tokens + n > chunk_tokens:
+                    groups.append(group)
+                    group, group_tokens = [], 0
+                group.append(item)
+                group_tokens += n
+            if group:
+                groups.append(group)
+
+        def run_group(units, group_cu = None, group_max = None):
+            grids_g = [g for _, _, g in units]
+            packed_g = torch.cat([t.unsqueeze(0) for t, _, _ in units], dim = 1)
+            inv_freq_g = torch.cat([
+                qwen2_position_embedding_grid_2d(g, v.head_dim, m, v.rope_theta)
+                for g in grids_g
+            ], dim = 0)
+            if group_cu is None:
+                lens_g = [g[0] * g[1] * g[2] for g in grids_g]
+                bounds_g = [0]
+                for length in lens_g:
+                    bounds_g.append(bounds_g[-1] + length)
+                group_cu = torch.tensor(bounds_g, dtype = torch.int32)
+                group_max = max(lens_g)
+            params_g = {
+                "causal": False,
+                "grid_thw": torch.tensor(grids_g, dtype = torch.int),
+                "inv_freq": inv_freq_g,
+                "cu_seqlens": group_cu,
+                "max_seqlen": group_max,
+            }
+            embedding_tensor_g = self.forward(packed_g, params = params_g).cpu()
+            deepstack_g = \
+                [de.squeeze(0) for de in params_g["deepstack"]] if "deepstack" in params_g else None
+            return embedding_tensor_g, deepstack_g
+
+        if groups is None:
+            embedding_tensor, deepstack = run_group(prepped, cu_seqlens, max_seqlen)
+        else:
+            embeddings, deepstacks = [], []
+            for grp in groups:
+                emb, ds = run_group(grp)
+                embeddings.append(emb)
+                deepstacks.append(ds)
+            embedding_tensor = torch.cat(embeddings, dim = 1)
+            deepstack = None if deepstacks[0] is None else [
+                torch.cat(parts, dim = 0)
+                for parts in zip(*deepstacks)
+            ]
+
         grids = [g for _, _, g in prepped]
-
-        inv_freq = torch.cat([
-            qwen2_position_embedding_grid_2d(g, v.head_dim, m, v.rope_theta)
-            for g in grids
-        ], dim = 0)
-
-        params = {
-            "causal": False,
-            "grid_thw": torch.tensor(grids, dtype = torch.int),
-            "inv_freq": inv_freq,
-            "cu_seqlens": cu_seqlens,
-            "max_seqlen": max_seqlen,
-        }
-
-        embedding_tensor = self.forward(packed, params = params).cpu()
-        deepstack = [de.squeeze(0) for de in params["deepstack"]] if "deepstack" in params else None
 
         merged_lens = [(g[0] * g[1] * g[2]) // (m * m) for g in grids]
         id_start = self.config.vision_start_token_id

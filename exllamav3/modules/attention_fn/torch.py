@@ -49,6 +49,30 @@ def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
         # segment starts at position 0, so is_causal is applied per segment.
         # max_seqlen is unused here; lengths are derived from the boundaries.
         bounds = args.cu_seqlens.tolist()
+        lens = [e - s for s, e in zip(bounds[:-1], bounds[1:])]
+
+        # Equal-length segments (e.g. one video clip: a frame grid per segment) reshape
+        # into a single dense batched SDPA call instead of a Python loop of narrow calls.
+        # is_causal applies within each L x L block either way; unequal-length packs
+        # (multi-image) keep the loop below.
+        if len(lens) > 1 and sum(lens) == q_t.shape[2] and all(l == lens[0] for l in lens):
+            L = lens[0]
+            H = q_t.shape[1]
+            Hkv = k_t.shape[1]
+            S = len(lens)
+            q_b = q_t.reshape(1, H, S, L, -1).squeeze(0).transpose(0, 1)
+            k_b = k_t.reshape(1, Hkv, S, L, -1).squeeze(0).transpose(0, 1)
+            v_b = v_t.reshape(1, Hkv, S, L, -1).squeeze(0).transpose(0, 1)
+            o_b = F.scaled_dot_product_attention(
+                q_b,
+                k_b,
+                v_b,
+                is_causal = args.causal,
+                enable_gqa = args.is_gqa(),
+                scale = args.sm_scale,
+            )
+            return o_b.transpose(0, 1).reshape(1, H, S * L, -1).to(out_dtype).transpose(1, 2)
+
         o = [
             F.scaled_dot_product_attention(
                 q_t[:, :, s:e],

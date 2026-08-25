@@ -489,25 +489,77 @@ def _sdpa_args(q, k, v, cu_seqlens = None, max_seqlen = None):
 
 
 def test_sdpa_varlen_parity():
+    import torch.nn.functional as F
     from exllamav3.modules.attention_fn.torch import fn_torch_sdpa_fallback_nocache
 
     g = torch.Generator().manual_seed(11)
+
+    def dense_ref(q, k, v, bounds):
+        return torch.cat([
+            fn_torch_sdpa_fallback_nocache(_sdpa_args(q[:, s:e], k[:, s:e], v[:, s:e]))
+            for s, e in zip(bounds[:-1], bounds[1:])
+        ], dim = 1)
+
+    def run_counting(fn):
+        # Returns (result, number of F.scaled_dot_product_attention calls made by fn).
+        orig = F.scaled_dot_product_attention
+        count = [0]
+        def wrapped(*a, **kw):
+            count[0] += 1
+            return orig(*a, **kw)
+        F.scaled_dot_product_attention = wrapped
+        try:
+            result = fn()
+        finally:
+            F.scaled_dot_product_attention = orig
+        return result, count[0]
+
+    # Mixed lengths: per-segment loop fallback must stay pinned (one SDPA call per segment).
     q = torch.randn(1, 37, 4, 64, generator = g).half()
     k = torch.randn(1, 37, 4, 64, generator = g).half()
     v = torch.randn(1, 37, 4, 64, generator = g).half()
-    bounds = [0, 5, 6, 20, 37]
+    bounds_mixed = [0, 5, 6, 20, 37]
 
-    ref = torch.cat([
-        fn_torch_sdpa_fallback_nocache(_sdpa_args(q[:, s:e], k[:, s:e], v[:, s:e]))
-        for s, e in zip(bounds[:-1], bounds[1:])
+    ref_mixed = dense_ref(q, k, v, bounds_mixed)
+    out_mixed, n_calls = run_counting(lambda: fn_torch_sdpa_fallback_nocache(
+        _sdpa_args(q, k, v, cu_seqlens = torch.tensor(bounds_mixed, dtype = torch.int32), max_seqlen = 15)
+    ))
+    assert n_calls == len(bounds_mixed) - 1, \
+        f"expected {len(bounds_mixed) - 1} loop calls for mixed lengths, got {n_calls}"
+    assert out_mixed.shape == ref_mixed.shape
+    assert torch.allclose(out_mixed.float(), ref_mixed.float(), rtol = 0, atol = 1e-3), \
+        f"varlen mismatch, max diff {(out_mixed.float() - ref_mixed.float()).abs().max().item()}"
+
+    # Equal lengths (4 x 16): single batched SDPA call, matching both the loop result and
+    # per-segment dense SDPA within fp16 tolerance.
+    L, nseg, H, D = 16, 4, 4, 64
+    T = L * nseg
+    q = torch.randn(1, T, H, D, generator = g).half()
+    k = torch.randn(1, T, H, D, generator = g).half()
+    v = torch.randn(1, T, H, D, generator = g).half()
+    bounds_eq = [i * L for i in range(nseg + 1)]
+
+    ref_loop = dense_ref(q, k, v, bounds_eq)
+    ref_dense = torch.cat([
+        F.scaled_dot_product_attention(
+            q[:, s:e].float().transpose(1, 2),
+            k[:, s:e].float().transpose(1, 2),
+            v[:, s:e].float().transpose(1, 2),
+            is_causal = False,
+            scale = D ** -0.5,
+        ).transpose(1, 2)
+        for s, e in zip(bounds_eq[:-1], bounds_eq[1:])
     ], dim = 1)
 
-    out = fn_torch_sdpa_fallback_nocache(
-        _sdpa_args(q, k, v, cu_seqlens = torch.tensor(bounds, dtype = torch.int32), max_seqlen = 15)
-    )
-    assert out.shape == ref.shape
-    assert torch.allclose(out.float(), ref.float(), rtol = 0, atol = 1e-3), \
-        f"varlen mismatch, max diff {(out.float() - ref.float()).abs().max().item()}"
+    out_eq, n_calls = run_counting(lambda: fn_torch_sdpa_fallback_nocache(
+        _sdpa_args(q, k, v, cu_seqlens = torch.tensor(bounds_eq, dtype = torch.int32), max_seqlen = L)
+    ))
+    assert n_calls == 1, f"expected 1 batched call for equal lengths, got {n_calls}"
+    assert out_eq.shape == ref_loop.shape == ref_dense.shape
+    assert torch.allclose(out_eq.float(), ref_loop.float(), rtol = 0, atol = 1e-3), \
+        f"batched-vs-loop mismatch, max diff {(out_eq.float() - ref_loop.float()).abs().max().item()}"
+    assert torch.allclose(out_eq.float(), ref_dense.float(), rtol = 0, atol = 1e-3), \
+        f"batched-vs-dense mismatch, max diff {(out_eq.float() - ref_dense.float()).abs().max().item()}"
 
 
 def test_sdpa_fallback_dense_path_unchanged():
@@ -563,6 +615,46 @@ def test_qwen35_vision_multi_image_packing():
             f"packing mismatch, max diff {(packed.embeddings.float() - solo.embeddings.float()).abs().max().item()}"
         for de_p, de_s in zip(packed.deepstack_embeddings, solo.deepstack_embeddings):
             assert torch.allclose(de_p.float(), de_s.float(), rtol = 0, atol = 1e-3)
+
+    vm.unload()
+
+
+# ------------------------------------------------------------------------------------------------
+# Qwen3VLVisionModel._embed_packed with EXL3_VISION_PACK_CHUNK: grouping consecutive units into
+# budget-bounded forward passes must reproduce the monolithic packed result within fp tolerance
+# ------------------------------------------------------------------------------------------------
+
+def test_qwen35_vision_chunked_packing_equal():
+    from PIL import Image as PILImage
+
+    vm = _make_qwen35_vision_model()
+    # Allow a second, larger image: min/max pixels bound qwen2_smart_resize
+    vm.config.vision_pp.max_pixels = 200 * 200
+    vm.load("cpu")
+
+    img_a = PILImage.new("RGB", (56, 56), (120, 40, 200))     # 16 raw tokens
+    img_b = PILImage.new("RGB", (112, 140), (30, 200, 90))    # -> 8x10 patches, 80 raw tokens
+
+    mmes_mono = vm.get_image_embeddings(None, [img_a, img_b])
+
+    # Budget 32 over 16 + 80 total tokens: forces two groups ([a] oversized-safe, [b]).
+    old_chunk = os.environ.get("EXL3_VISION_PACK_CHUNK")
+    os.environ["EXL3_VISION_PACK_CHUNK"] = "32"
+    try:
+        mmes_chunk = vm.get_image_embeddings(None, [img_a, img_b])
+    finally:
+        if old_chunk is None:
+            os.environ.pop("EXL3_VISION_PACK_CHUNK", None)
+        else:
+            os.environ["EXL3_VISION_PACK_CHUNK"] = old_chunk
+
+    assert len(mmes_mono) == len(mmes_chunk) == 2
+    for mono, chunk in zip(mmes_mono, mmes_chunk):
+        assert mono.mm_length == chunk.mm_length
+        assert torch.allclose(mono.embeddings.float(), chunk.embeddings.float(), rtol = 0, atol = 1e-3), \
+            f"chunked packing mismatch, max diff {(mono.embeddings.float() - chunk.embeddings.float()).abs().max().item()}"
+        for de_m, de_c in zip(mono.deepstack_embeddings, chunk.deepstack_embeddings):
+            assert torch.allclose(de_m.float(), de_c.float(), rtol = 0, atol = 1e-3)
 
     vm.unload()
 

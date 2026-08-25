@@ -137,3 +137,70 @@ available. Procedure, ready to execute:
      as the GPU-vs-CPU tool; reuse `tensor_metrics` from `tests/compare_vision_gpu_cpu.py`).
 3. A natural home for the script is `tests/compare_vision_hf.py`, mirroring the existing
    comparison tool's structure (preprocess once, two loads, tap/gate table).
+
+---
+
+## 7. Batching throughput follow-up (item 5 speed half)
+
+Round two on future-work item 5: batching *speed* levers not claimed by other items of
+`vision_cpu_acceleration.md` §7 (int8 W8A8 VNNI, bf16/register-blocked kernels, EXL3 writer,
+vision quant, load hygiene all excluded). New measurement harness:
+`tests/compare_vision_gpu_cpu.py --profile` — op attribution over the same synthetic shapes
+as `--bench` (one warmup pass, then one CPU forward under `torch.profiler`, self time bucketed
+into GEMM / attention / cast / other).
+
+### Attribution (`--profile`, torch 2.10.0, RTX 3090 host)
+
+| mode   | shape            | tokens | gemm ms | attn ms | cast ms | other ms | wall ms |
+|--------|------------------|-------:|--------:|--------:|-------:|-------:|--------:|
+| images | 1 x (1,50,40)    |   2000 |   392.6 |   182.8 |    43.4 |    56.3 |   692.3 |
+| images | 4 x (1,50,40)    |   8000 |  1736.0 |   797.3 |   290.9 |   295.5 |  3197.9 |
+| images | 16 x (1,50,40)   |  32000 |  7021.1 |  3218.5 |  1444.7 |  1496.7 | 14452.8 |
+| video  | t=8 x (1,50,40)  |  16000 |  3363.9 |  1537.9 |   625.1 |   590.9 |  6166.2 |
+| video  | t=32 x (1,50,40) |  64000 | 14428.2 |  6713.2 |  2992.3 |  3108.6 | 30041.2 |
+
+(attention = any `_scaled_dot_product*` kernel; cast = `aten::to`/`_to_copy`/`copy_`;
+profiler overhead inflates wall ~5–7% vs `--bench`.)
+
+### Adopted
+
+- **Equal-length batched varlen SDPA** (`modules/attention_fn/torch.py`): packs whose segments
+  all have equal length (video clips, equal-grid image batches) reshape into ONE dense batched
+  SDPA call instead of a Python loop of narrow calls; unequal-length packs keep the loop.
+  Pinned by the extended `test_sdpa_varlen_parity`: batched == loop == per-segment dense SDPA,
+  with call-count asserts proving both dispatch paths. Keep/drop decision rule was "no t=32
+  regression": baseline 27978 ms → 28655 / 28792 ms after (+2.4 / +2.9%, inside this host's
+  ±3.5% run band) → **kept**. Honest caveat: t=8 gained nothing consistently (~+4–5% wall,
+  6321 → 6617 / 6637). A standalone kernel micro-benchmark attributes it: both forms dispatch
+  the same `_scaled_dot_product_flash_attention_for_cpu` kernel, but the batched shape pays
+  +13–16% attention-kernel time at S=8–16 and is 0.97× at S=32 — i.e. wall-neutral on this
+  host; retained for single-call dispatch and the pinned semantics.
+- **Opt-in bounded-RAM chunked packing** (`EXL3_VISION_PACK_CHUNK=<tokens>`): groups
+  consecutive prepped units so each forward stays within a token budget — peak activation RAM
+  O(group) instead of O(total) (e.g. 100 images ≈ 200k tokens ≈ ~2.5 GB transient fp32 MLP
+  buffer unbounded). Group outputs concatenate to the monolithic result within normal fp
+  tolerance (grouping changes GEMM M dims, so bit equality is not expected); proven by
+  `test_qwen35_vision_chunked_packing_equal` at atol 1e-3 vs the monolithic pass. A single
+  unit is never split internally (one video clip runs oversized rather than being cut up).
+  Default off: zero change to existing numerics or performance.
+
+Full suite now 27 tests, all green; comparison-tool legs (single image, multi-image, video)
+pass with gates unchanged (rel_l2 ≤ 8.7e-3, cosine ≥ 0.99996); smoke regression unchanged.
+
+### Measured and rejected
+
+- **Threaded preprocessing**: serial `preprocess()` for 16 images costs 206.6 ms vs 14452.8 ms
+  tower wall at the same shape = **1.4%**, far under the 10% gate. PIL decode/resize is noise
+  next to the CPU tower; not threaded.
+- **Cast-traffic trim**: casts are **~10%** of CPU wall at every ≥8000-token shape (9.1–10.1%),
+  below the 15% gate. The fp16→fp32 activation upcast through `cpu_matmul` stays; restructuring
+  dataflow for a ≤10%-share category was judged not worth it.
+
+### Bound on further gains
+
+At 32k–64k tokens the CPU budget splits GEMM ~48–54%, attention 22–25%, casts ~10%, other
+~10%. Everything adopted this round addresses only slices of attention and peak-RAM behavior;
+the 2–5× levers remain items 3 and 7 of `vision_cpu_acceleration.md` (W8A8 int8 VNNI;
+fp32/bf16-resident GEMM kernels) — measured GEMM share above is the evidence. Split-KV-style
+parallelism stays moot: per-segment length is bounded (~2000 tokens), so cost scales
+~linearly in total tokens (§5).

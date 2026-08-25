@@ -12,12 +12,14 @@
 #   --video_frames K       : K deterministic pseudo-frames derived from --image, packed as one
 #                            clip with one attention segment per frame
 #   --bench                : timing-only leg over synthetic multi-image/video shapes
+#   --profile              : CPU op-attribution leg over the same synthetic shapes
 #
 # Usage:
 #   python tests/compare_vision_gpu_cpu.py --model_dir <dir> [--image cat.png] [--device cuda:0]
 #   python tests/compare_vision_gpu_cpu.py --model_dir <dir> --images a.png b.png c.png
 #   python tests/compare_vision_gpu_cpu.py --model_dir <dir> --video_frames 8
 #   python tests/compare_vision_gpu_cpu.py --model_dir <dir> --bench
+#   python tests/compare_vision_gpu_cpu.py --model_dir <dir> --profile
 
 import argparse
 import os
@@ -252,6 +254,84 @@ def bench(config, prep_model):
         print(f"{mode:<6} {label:<18} {tokens:>8} {segments:>9} {cpu_ms:>10.1f} {gpu_ms:>10.1f}")
 
 
+
+def profile_leg(config, prep_model):
+    """Op-attribution sweep over the same synthetic packed shapes as --bench: one warmup
+    pass, then a single CPU forward under torch.profiler with self CPU time aggregated into
+    coarse categories (GEMM / attention / cast / other). Also measures serial preprocess
+    cost for a 16-image list, which sizes the threaded-preprocessing lever."""
+    from torch.profiler import ProfilerActivity, profile
+
+    v = config.vision
+    ref_t, _, _ = prep_model.preprocess(Image.open(ARGS.image))
+    d_in = ref_t.shape[1]
+    del ref_t
+
+    gen = torch.Generator().manual_seed(0)
+    shapes = (
+        [("images", f"{n} x (1,50,40)", [(1, 50, 40)] * n) for n in (1, 4, 16)] +
+        [("video", f"t={t_} x (1,50,40)", [(t_, 50, 40)]) for t_ in (8, 32)]
+    )
+
+    def synth(mode, grids):
+        tensors = [torch.randn(g[0] * g[1] * g[2], d_in, generator = gen).half() for g in grids]
+        packed, inv_freq, cu, max_len = pack_inputs(v, tensors, grids)
+        if mode == "video":
+            # One segment per frame inside the single clip grid, matching load_video_inputs.
+            cu = frame_boundaries(grids[0])
+            max_len = grids[0][1] * grids[0][2]
+        return packed, inv_freq, cu, max_len
+
+    def categorize(prof):
+        cats = {"gemm": 0.0, "attn": 0.0, "cast": 0.0, "other": 0.0}
+        for evt in prof.key_averages():
+            us = evt.self_cpu_time_total
+            if evt.key in ("aten::mm", "aten::addmm"):
+                cats["gemm"] += us
+            elif "_scaled_dot_product" in evt.key:
+                cats["attn"] += us
+            elif evt.key in ("aten::to", "aten::_to_copy", "aten::copy_"):
+                cats["cast"] += us
+            else:
+                cats["other"] += us
+        return {k: us / 1000.0 for k, us in cats.items()}
+
+    print(f"\n{'mode':<6} {'shape':<18} {'tokens':>8} {'gemm ms':>9} {'attn ms':>9} "
+          f"{'cast ms':>9} {'other ms':>10} {'wall ms':>9}")
+    walls = {}
+    for mode, label, grids in shapes:
+        packed, inv_freq, cu, max_len = synth(mode, grids)
+        params = build_params(config, grids, inv_freq, cu, max_len)
+        model = Model.from_config(config, component = "vision")
+        model.load("cpu")
+        try:
+            pt = packed.cpu()
+            with torch.no_grad():
+                model.forward(pt, params = params)  # warmup pass, timed_forward convention
+            with profile(activities = [ProfilerActivity.CPU]) as prof:
+                t0 = time.perf_counter()
+                with torch.no_grad():
+                    model.forward(pt, params = params)
+                wall_ms = (time.perf_counter() - t0) * 1000.0
+        finally:
+            model.unload()
+        cats = categorize(prof)
+        walls[label] = wall_ms
+        print(f"{mode:<6} {label:<18} {packed.shape[1]:>8} {cats['gemm']:>9.1f} "
+              f"{cats['attn']:>9.1f} {cats['cast']:>9.1f} {cats['other']:>10.1f} {wall_ms:>9.1f}")
+
+    # Serial preprocess cost for a 16-image list: decides whether threaded preprocessing
+    # is worth its complexity (gate: < 10% of the batch tower wall -> skip).
+    n_prep = 16
+    t0 = time.perf_counter()
+    for _ in range(n_prep):
+        prep_model.preprocess(Image.open(ARGS.image))
+    prep_ms = (time.perf_counter() - t0) * 1000.0
+    tower_ms = walls.get("16 x (1,50,40)", float("nan"))
+    print(f"\npreprocess: {n_prep} images serial wall {prep_ms:.1f} ms "
+          f"(16-image tower wall {tower_ms:.1f} ms)")
+
+
 def main():
     global ARGS
     parser = argparse.ArgumentParser(description = __doc__)
@@ -261,8 +341,11 @@ def main():
                         help = "multi-image mode: pack these images into one varlen batch")
     parser.add_argument("--video_frames", type = int, default = None,
                         help = "video mode: build this many pseudo-frames from --image")
-    parser.add_argument("--bench", action = "store_true",
-                        help = "timing-only sweep over synthetic packed shapes")
+    leg = parser.add_mutually_exclusive_group()
+    leg.add_argument("--bench", action = "store_true",
+                     help = "timing-only sweep over synthetic packed shapes")
+    leg.add_argument("--profile", action = "store_true",
+                     help = "CPU op-attribution sweep over the same synthetic shapes")
     parser.add_argument("--device", type = str, default = "cuda:0")
     ARGS = parser.parse_args()
 
@@ -273,6 +356,11 @@ def main():
     if ARGS.bench:
         prep_model = Model.from_config(config, component = "vision")
         bench(config, prep_model)
+        return
+
+    if ARGS.profile:
+        prep_model = Model.from_config(config, component = "vision")
+        profile_leg(config, prep_model)
         return
 
     # Preprocess exactly once per distinct input; both passes consume identical tensors.

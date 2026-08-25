@@ -221,9 +221,15 @@ Profiling helpers: `~/Documents/workspace/ML/stuff/{profile_vision_cpu.py,bench_
 4. **Register-blocked bf16 tinyBLAS extension** (llamafile `mnpack` style) if bf16-quality
    concerns are ever resolved (e.g. bf16 weights + fp32 activation tiles, or per-layer
    sensitivity selection). ~2× over fp32 SGEMM on paper; only worth it after 3.
-5. **Batched/multi-image and long-video paths:** torch's CPU flash attention is fine at
-   T≈2000 but materialization-free tiling matters more as T grows; revisit split-KV style
-   parallelism for large batches.
+5. **Batched/multi-image and long-video paths:** RESOLVED in two rounds. Correctness/wiring
+   (packed varlen multi-image, `get_video_embeddings`, CPU varlen SDPA backend) is recorded in
+   `doc/vision_known_issues.md`. The throughput round (§7 there) added an op-attribution
+   harness (`compare_vision_gpu_cpu.py --profile`), an equal-length batched varlen SDPA fast
+   path (kept: wall-neutral here, semantics pinned by tests), and opt-in bounded-RAM chunked
+   packing (`EXL3_VISION_PACK_CHUNK`). Measured attribution at 32k–64k tokens: fp32 GEMM
+   ~48–54% of CPU wall, attention 22–25%, casts ~10% — further large gains require revisiting
+   items 3/7 (int8/bf16 weight residency), not attention tiling; split-KV-style parallelism is
+   moot with per-segment length bounded at ~2000.
 6. **Load-time hygiene:** mmap-backed safetensors reads (page cache, MAP_POPULATE-style
    prefetch) to cut cold-start latency; one preallocated workspace across ops is already
    effectively provided by torch's allocator here.

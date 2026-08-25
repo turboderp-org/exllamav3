@@ -15,6 +15,10 @@ results. Note that only Gemma3 currently benefits from batch sizes higher than 1
 token per image and only the relative probabilities of 'Yes' and 'No' are considered. A more advanced pipeline is
 probably required to take full advantage of most models.
 
+When batching many images through a vision tower on CPU, setting EXL3_VISION_PACK_CHUNK
+(tokens per forward pass, e.g. 8192) bounds peak activation memory for the packed multi-image
+vision pass; results are identical within floating-point tolerance.
+
 Example:
 
 python examples/imgsearch.py /path/to/images -m /path/to/vlm -v -p "Are there any cats in this image?" 
