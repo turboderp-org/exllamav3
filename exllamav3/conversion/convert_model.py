@@ -37,7 +37,7 @@ parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
 parser.add_argument("-rcp", "--recipe", type = str, default = None, help = "Per-tensor bitrate recipe (YAML from sc_optimize.py), used in place of the budgeted allocation from --bits / --head_bits.")
 parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bits per weight, output (head) layer, default: 6")
 parser.add_argument("-mb", "--mtp_bits", type = int, default = None, help = "Bits per weight, MTP layers, default: 4")
-parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: 16")
+parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
 parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
 parser.add_argument("-cd", "--cal_data", type = str, default = None, help = "Calibration data file (safetensors with packed token rows, e.g. from sc_trace.py) used instead of the bundled corpus mix")
@@ -209,7 +209,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("recipe", False, ""),
         ("head_bits", False, recipe_head_bits or 6),
         ("mtp_bits", True, 4),
-        ("vision_bits", True, 16),
+        ("vision_bits", True, 0),  # 0 = auto: architecture's default_vision_bits cap, or 16
         ("hq", False, False),
         ("cal_data", False, ""),
         ("cal_rows", False, 250),
@@ -286,13 +286,22 @@ def get_base_model(args):
     if mtp_model:
         print(f" -- Created MTP model instance:")
         print(mtp_model.get_layout_tree(4))
-    vision_bits = args.get("vision_bits", 16)
-    assert vision_bits == 16 or 1 <= vision_bits <= 8, \
+    vision_bits = args.get("vision_bits", 0)
+    assert vision_bits in (0, 16) or 1 <= vision_bits <= 8, \
         f" ## --vision_bits must be 1-8, or 16 to store the vision model unquantized"
-    if vision_bits != 16 and "vision" not in config.model_classes:
+    if vision_bits not in (0, 16) and "vision" not in config.model_classes:
         print(f" !! Warning, --vision_bits given but model has no vision component, ignoring")
         vision_bits = 16
-    vision_model = model.from_config(config, component = "vision") if vision_bits != 16 else None
+    vision_model = model.from_config(config, component = "vision") \
+        if vision_bits != 16 and "vision" in config.model_classes else None
+    if vision_bits == 0:
+        # Auto: architectures whose towers are validated for (effectively lossless) low-bpw
+        # quantization declare a default in the vision model's caps; anything else stays fp16.
+        # --vision_bits 16 remains the explicit override to copy the tower unquantized
+        vision_bits = vision_model.caps.get("default_vision_bits", 16) if vision_model else 16
+        if vision_bits == 16:
+            vision_model = None
+    args["vision_bits"] = vision_bits
     if vision_model:
         print(f" -- Created vision model instance (quantizing to {vision_bits} bpw):")
         print(vision_model.get_layout_tree(4))
