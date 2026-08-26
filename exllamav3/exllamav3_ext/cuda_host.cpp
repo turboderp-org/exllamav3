@@ -1,4 +1,5 @@
 #include "cuda_host.h"
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
 
@@ -69,4 +70,23 @@ int cuda_device_get_attribute(int attr, int device)
     );
 
     return value;
+}
+
+at::Tensor pinned_cuda_view(const at::Tensor& t, int64_t device)
+{
+    // CUDA-device alias of a pinned host tensor: same storage, but with a device dtype/layout
+    // so torch ops (matmul/cuBLAS) and extension kernels accept it directly, reading over PCIe
+    // (zero-copy). The view does NOT own the memory; the caller must keep the pinned source
+    // tensor alive for the alias's lifetime. Uses cudaHostGetDevicePointer rather than assuming
+    // UVA pointer equality so the alias also holds under WDDM
+    TORCH_CHECK(t.device().is_cpu(), "pinned_cuda_view: tensor must be a CPU tensor");
+    TORCH_CHECK(t.is_pinned(), "pinned_cuda_view: tensor must be pinned");
+    void* dev_ptr = nullptr;
+    cudaError_t cr = cudaHostGetDevicePointer(&dev_ptr, t.data_ptr(), 0);
+    TORCH_CHECK(
+        cr == cudaSuccess,
+        "cudaHostGetDevicePointer(", t.data_ptr(), ") failed: ", cudaGetErrorString(cr)
+    );
+    auto options = t.options().device(at::kCUDA, static_cast<c10::DeviceIndex>(device));
+    return at::from_blob(dev_ptr, t.sizes(), t.strides(), [](void*) {}, options);
 }

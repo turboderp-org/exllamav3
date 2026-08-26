@@ -26,6 +26,7 @@ class LinearFP16:
         key: str | None = None
     ):
         self.weight = weight
+        self._pinned_store = None
         if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
         self.in_features = in_features
         self.out_features = out_features
@@ -79,10 +80,20 @@ class LinearFP16:
             dtype = dtype,
             device = x.device
         )
+        weight = self.weight
+        pinned = self._pinned_store
+        if pinned is not None:
+            # Pinned-host storage (vision towers): stage the weight into a shared VRAM scratch
+            # first. cuBLAS re-reads B once per m-tile, so computing straight from the zero-copy
+            # alias multiplies the PCIe traffic by ~m/128 (measured 56x wall time on a large
+            # tower at m ~4k); a single async H2D pass then a normal GEMM costs one transfer
+            from ...util.tensor import g_tensor_cache
+            weight = g_tensor_cache.get_bucketed(x.device, pinned.numel(), pinned.dtype, "fp16_pin_stage").view(pinned.shape)
+            weight.copy_(pinned, non_blocking = True)
         if dtype == x.dtype:
-            torch.matmul(x, self.weight, out = y)
+            torch.matmul(x, weight, out = y)
         else:
-            ext.hgemm(x, self.weight, y)
+            ext.hgemm(x, weight, y)
         if self.bias is not None:
             y += self.bias
         y = y.view(out_shape)

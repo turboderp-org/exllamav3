@@ -49,6 +49,10 @@ class InferParams:
         # (see moe_cpu_host.MoeCpuTuning)
         self.moe_cpu_threads = None
         self.draft_moe_cpu_threads = None
+        # Store the vision component's linear-layer weights (fp16 weight or EXL3 trellis) in
+        # pinned host memory instead of VRAM, computing straight from a zero-copy device alias.
+        # Set before loading the vision component
+        self.vision_pinned = os.environ.get("EXL3_VISION_PINNED", "0") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which

@@ -34,6 +34,7 @@ class Model_LSMixin(ABC):
         modules: list,
         verbose: bool
     ):
+        pin = config.infer_params.vision_pinned and getattr(self, "component", "text") == "vision"
         with ProgressBar(f"Loading" if progressbar else None, len(modules)) as progress:
             for idx, module in enumerate(modules):
                 defer = module.can_defer_load()
@@ -42,6 +43,10 @@ class Model_LSMixin(ABC):
                 module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
                 if defer:
                     config.stc.end_deferred_load()
+                if pin:
+                    # After the deferred fills have landed: linear weights move to pinned host
+                    # memory (zero-copy aliases), everything else stays put
+                    module.pin_linears()
                 for h in getattr(config, "moe_cpu_hosts", {}).values():
                     h.commit_module(module.key)
                 progress.update(idx + 1)
@@ -152,6 +157,11 @@ class Model_LSMixin(ABC):
                         module.load(load_device, max_chunk_size = max_chunk_size)
                         if defer:
                             config.stc.end_deferred_load()
+                        if config.infer_params.vision_pinned and \
+                                getattr(self, "component", "text") == "vision":
+                            # Before the measuring forward, so the VRAM accounting reflects the
+                            # pinned (host-resident) weights
+                            module.pin_linears()
 
                         # Forward dummy state through module. The forward runs the real cached
                         # attention path, so any dequant temporaries a quantized cache layer
