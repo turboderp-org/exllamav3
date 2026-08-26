@@ -63,6 +63,10 @@ void exl3_gemm_kernel_inner
     static_assert(EXL3_GEMM_BASE_THREADS == 256);
     static_assert(TILESIZE_M == 16, "Invalid kernel params");                     // strictly assume size_m <= 16
     static_assert(TILESIZE_K % 16 == 0, "Invalid kernel params");
+    // The A-fragment XOR swizzle indexes row m as m * A_COLS + (k ^ x). It only stays inside
+    // the row when A_COLS is a power of two; otherwise the swizzled column runs past the row
+    // and both the store and the ldsm4 read alias neighbouring rows
+    static_assert((A_COLS & (A_COLS - 1)) == 0, "Invalid kernel params (TILESIZE_K / 8 must be a power of two)");
     static_assert(TILESIZE_N % 128 == 0, "Invalid kernel params");
     static_assert
     (
