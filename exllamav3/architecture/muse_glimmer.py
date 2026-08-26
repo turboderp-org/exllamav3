@@ -369,6 +369,7 @@ class MuseGlimmerVisionModel(Model):
         self.config = config
         self.caps.update({
             "image_input": True,
+            "default_vision_bits": 6,
             "supports_tp": False,
         })
         v = self.config.vision
