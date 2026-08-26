@@ -112,8 +112,15 @@ class Tokenizer:
         self.missing_special_delimiters = None
 
         # Get control token IDs
-        ut = self.tokenizer.model.unk_token
-        self.unk_token_id = None if ut is None else self.tokenizer.token_to_id(ut)
+        if isinstance(m, models.Unigram):
+            # Unigram stores the unknown token as an ID in tokenizer.json
+            model_config = maybe_read_json(self.path_tokenizer_json).get("model", {})
+            unk_id = model_config.get("unk_id")
+            ut = None if unk_id is None else self.tokenizer.id_to_token(unk_id)
+        else:
+            ut = m.unk_token
+            unk_id = None if ut is None else self.tokenizer.token_to_id(ut)
+        self.unk_token_id = unk_id
         self.eos_token_id = self.config.eos_token_id
         self.bos_token_id = self.config.bos_token_id
         self.pad_token_id = self.config.pad_token_id
@@ -158,7 +165,7 @@ class Tokenizer:
                     config.eos_token_id_list.append(e)
 
         # Get control token strings
-        self.unk_token = self.tokenizer.model.unk_token
+        self.unk_token = ut
         self.bos_token = None if self.bos_token_id is None else \
             (self.extended_id_to_piece.get(self.bos_token_id) or self.tokenizer.id_to_token(self.bos_token_id))
         self.eos_token = None if self.eos_token_id is None else \
