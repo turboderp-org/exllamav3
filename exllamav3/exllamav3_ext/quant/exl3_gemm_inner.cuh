@@ -44,13 +44,14 @@ void exl3_gemm_kernel_inner
     // Every store/add pair in the k-reduction gets its own staging region. store() ends with a
     // barrier but add() does not, so a region shared between two pairs would let the later
     // pair's store overwrite slots the earlier pair's add is still reading. The sequences below
-    // run TILEBLOCKS_K - 1 pairs
+    // run TILEBLOCKS_K - 1 pairs per row block. The output-hadamard staging holds one 16-row
+    // block at a time and so does not scale with TILESIZE_M
     const int sh_c_red_stride = 4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP;
     const int sh_c_red_pairs = TILEBLOCKS_K > 1 ? TILEBLOCKS_K - 1 : 0;
     const int sh_c_size = MAX  // in floats
     (
-        sh_c_red_pairs * sh_c_red_stride,
-        shmem_out_had ? TILESIZE_N * TILESIZE_M : 0
+        TILEBLOCKS_M * sh_c_red_pairs * sh_c_red_stride,
+        shmem_out_had ? TILESIZE_N * 16 : 0
     );
 
     // XOR-swizzle constants for bank-conflict-free A fragment loads
@@ -61,7 +62,7 @@ void exl3_gemm_kernel_inner
 
     // Sanity checks
     static_assert(EXL3_GEMM_BASE_THREADS == 256);
-    static_assert(TILESIZE_M == 16, "Invalid kernel params");                     // strictly assume size_m <= 16
+    static_assert(TILESIZE_M % 16 == 0, "Invalid kernel params");                  // size_m <= TILESIZE_M
     static_assert(TILESIZE_K % 16 == 0, "Invalid kernel params");
     // The A-fragment XOR swizzle indexes row m as m * A_COLS + (k ^ x). It only stays inside
     // the row when A_COLS is a power of two; otherwise the swizzled column runs past the row
@@ -210,11 +211,11 @@ void exl3_gemm_kernel_inner
     half* gl_c_ptr_16 = ((half*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
     float* gl_c_ptr_32 = ((float*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
 
-    register FragA frag_a[FRAG_STAGES];
+    register FragA frag_a[FRAG_STAGES][TILEBLOCKS_M];
     register FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
-    register FragC frag_c[FRAGS_N_PER_WARP];
+    register FragC frag_c[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #if EXL3_GEMM_H_ACC
-        register FragC_h frag_c_h[FRAGS_N_PER_WARP];
+        register FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #endif
 
     auto advance2 = [&] ()
@@ -281,7 +282,8 @@ void exl3_gemm_kernel_inner
     {
         if (!slice1_iters) return;
 
-        // A fragments (XOR-swizzled shared memory layout)
+        // A fragments (XOR-swizzled shared memory layout), one per row block. The B fragments
+        // below are decoded once and reused across all of them, which is the point of TILESIZE_M
         {
             int r = (lane_id % 8) + 8 * ((lane_id / 8) % 2);
             int base_c = lane_id / 16 + sub_k * 2;
@@ -290,7 +292,7 @@ void exl3_gemm_kernel_inner
             {
                 int R = r + m * 16;
                 int c_swizzled = base_c ^ ((R >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
-                ldsm4(frag_a[buf], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
+                ldsm4(frag_a[buf][m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
             }
         }
 
@@ -312,19 +314,23 @@ void exl3_gemm_kernel_inner
     auto clear_frag_c = [&] ()
     {
         #pragma unroll
-        for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
-            frag_c[n] = {};
-        #if EXL3_GEMM_H_ACC
+        for (int m = 0; m < TILEBLOCKS_M; ++m)
             #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
-                frag_c_h[n] = {};
+                frag_c[m][n] = {};
+        #if EXL3_GEMM_H_ACC
+            #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                    frag_c_h[m][n] = {};
         #endif
     };
 
     // Threadblock reduction
     auto threadblock_reduce = [&] ()
     {
-        auto store = [&] (int i, int slot)
+        auto store = [&] (int i, int m, int slot)
         {
             if (sub_k == i)
             {
@@ -333,13 +339,13 @@ void exl3_gemm_kernel_inner
                 for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
                     #pragma unroll
-                    for (int j = 0; j < 4; ++j) *sh_red++ = frag_c[n][j];
+                    for (int j = 0; j < 4; ++j) *sh_red++ = frag_c[m][n][j];
                 }
             }
             __syncthreads();
         };
 
-        auto add = [&] (int i, int slot)
+        auto add = [&] (int i, int m, int slot)
         {
             if (sub_k == i)
             {
@@ -348,142 +354,148 @@ void exl3_gemm_kernel_inner
                 for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
                     #pragma unroll
-                    for (int j = 0; j < 4; ++j) frag_c[n][j] += *sh_red++;
+                    for (int j = 0; j < 4; ++j) frag_c[m][n][j] += *sh_red++;
                 }
             }
         };
 
-        auto store_small = [&] (int i, int slot)
+        auto store_small = [&] (int i, int m, int slot)
         {
-            if (sub_k == i && lane_id / 4 < size_m)
+            if (sub_k == i && m * 16 + lane_id / 4 < size_m)
             {
                 float* sh_red = sh_c + slot * sh_c_red_stride + (FRAGS_N_PER_WARP * 4) * t;
                 #pragma unroll
                 for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
-                    *sh_red++ = frag_c[n][0];
-                    *sh_red++ = frag_c[n][1];
+                    *sh_red++ = frag_c[m][n][0];
+                    *sh_red++ = frag_c[m][n][1];
                 }
             }
             __syncthreads();
         };
 
-        auto add_small = [&] (int i, int slot)
+        auto add_small = [&] (int i, int m, int slot)
         {
-            if (sub_k == i && lane_id / 4 < size_m)
+            if (sub_k == i && m * 16 + lane_id / 4 < size_m)
             {
                 float* sh_red = sh_c + slot * sh_c_red_stride + (FRAGS_N_PER_WARP * 4) * t;
                 #pragma unroll
                 for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
-                    frag_c[n][0] += *sh_red++;
-                    frag_c[n][1] += *sh_red++;
+                    frag_c[m][n][0] += *sh_red++;
+                    frag_c[m][n][1] += *sh_red++;
                 }
             }
         };
 
-        if (size_m <= 8)
+        #pragma unroll
+        for (int m = 0; m < TILEBLOCKS_M; ++m)
         {
-            if constexpr (TILEBLOCKS_K == 2)
+            const int s0 = m * sh_c_red_pairs;
+            if (size_m - m * 16 <= 8)
             {
-                store_small(1, 0);
-                add_small(0, 0);
+                if constexpr (TILEBLOCKS_K == 2)
+                {
+                    store_small(1, m, s0);
+                    add_small(0, m, s0);
+                }
+                if constexpr (TILEBLOCKS_K == 3)
+                {
+                    store_small(1, m, s0);
+                    add_small(0, m, s0);
+                    store_small(2, m, s0 + 1);
+                    add_small(0, m, s0 + 1);
+                }
+                if constexpr (TILEBLOCKS_K == 4)
+                {
+                    store_small(3, m, s0);
+                    add_small(2, m, s0);
+                    store_small(1, m, s0 + 1);
+                    add_small(0, m, s0 + 1);
+                    store_small(2, m, s0 + 2);
+                    add_small(0, m, s0 + 2);
+                }
             }
-            if constexpr (TILEBLOCKS_K == 3)
+            else
             {
-                store_small(1, 0);
-                add_small(0, 0);
-                store_small(2, 1);
-                add_small(0, 1);
-            }
-            if constexpr (TILEBLOCKS_K == 4)
-            {
-                store_small(3, 0);
-                add_small(2, 0);
-                store_small(1, 1);
-                add_small(0, 1);
-                store_small(2, 2);
-                add_small(0, 2);
-            }
-        }
-        else
-        {
-            if constexpr (TILEBLOCKS_K == 2)
-            {
-                store(1, 0);
-                add(0, 0);
-            }
-            if constexpr (TILEBLOCKS_K == 3)
-            {
-                store(1, 0);
-                add(0, 0);
-                store(2, 1);
-                add(0, 1);
-            }
-            if constexpr (TILEBLOCKS_K == 4)
-            {
-                store(3, 0);
-                add(2, 0);
-                store(1, 1);
-                add(0, 1);
-                store(2, 2);
-                add(0, 2);
+                if constexpr (TILEBLOCKS_K == 2)
+                {
+                    store(1, m, s0);
+                    add(0, m, s0);
+                }
+                if constexpr (TILEBLOCKS_K == 3)
+                {
+                    store(1, m, s0);
+                    add(0, m, s0);
+                    store(2, m, s0 + 1);
+                    add(0, m, s0 + 1);
+                }
+                if constexpr (TILEBLOCKS_K == 4)
+                {
+                    store(3, m, s0);
+                    add(2, m, s0);
+                    store(1, m, s0 + 1);
+                    add(0, m, s0 + 1);
+                    store(2, m, s0 + 2);
+                    add(0, m, s0 + 2);
+                }
             }
         }
     };
 
     // Pre-hadamard: Write final output tile to shmem
-    auto write_sum_tile_sh = [&]()
+    auto write_sum_tile_sh = [&](int m)
     {
         const int n0 = warp_id * FRAGS_N_PER_WARP;
         const int r0 = lane_id / 4;
         const int r1 = r0 + 8;
-        if (r0 < size_m)
+        if (m * 16 + r0 < size_m)
         {
             const int c = (lane_id % 4) * 2;
             #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             {
                 float* c_ptr = ((float*) sh_c) + r0 * TILESIZE_N + (n0 + n) * 8 + c;
-                *c_ptr++ = frag_c[n][0];
-                *c_ptr++ = frag_c[n][1];
+                *c_ptr++ = frag_c[m][n][0];
+                *c_ptr++ = frag_c[m][n][1];
             }
         }
-        if (r1 < size_m)
+        if (m * 16 + r1 < size_m)
         {
             const int c = (lane_id % 4) * 2;
             #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             {
                 float* c_ptr = ((float*) sh_c) + r1 * TILESIZE_N + (n0 + n) * 8 + c;
-                *c_ptr++ = frag_c[n][2];
-                *c_ptr++ = frag_c[n][3];
+                *c_ptr++ = frag_c[m][n][2];
+                *c_ptr++ = frag_c[m][n][3];
             }
         }
     };
 
     // Copy output tile to global with hadamard transform and out scale
-    auto output_had_sh_gl = [&]()
+    auto output_had_sh_gl = [&](int m)
     {
+        int rows = TILEBLOCKS_M == 1 ? size_m : MIN(size_m - m * 16, 16);
         int sh_warp = warp_id;
         constexpr int active_warps = EXL3_GEMM_BASE_THREADS / 32;
         for (;; sh_warp += active_warps)
         {
             int col = sh_warp % (TILESIZE_N / 128);
             int row = sh_warp / (TILESIZE_N / 128);
-            if (row >= size_m) break;
+            if (row >= rows) break;
 
             const float* had_in = sh_c + row * TILESIZE_N + col * 128;
             const half* post_scale_c = post_scale + slice2_n * gl_c_stride_n + col * 128;
 
             if constexpr (c_fp32)
             {
-                float* had_out = gl_c_ptr_32 + row * size_n + col * 128;
+                float* had_out = gl_c_ptr_32 + (m * 16 + row) * size_n + col * 128;
                 had_ff_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
             }
             else
             {
-                half* had_out = gl_c_ptr_16 + row * size_n + col * 128;
+                half* had_out = gl_c_ptr_16 + (m * 16 + row) * size_n + col * 128;
                 had_fh_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
             }
         }
@@ -493,9 +505,11 @@ void exl3_gemm_kernel_inner
     {
         int n0 = warp_id * FRAGS_N_PER_WARP;
         #pragma unroll
+        for (int m = 0; m < TILEBLOCKS_M; ++m)
+        #pragma unroll
         for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
         {
-            int r0 = lane_id / 4;
+            int r0 = m * 16 + lane_id / 4;
             int r1 = r0 + 8;
             int c = (lane_id % 4) * 2;
             if (r0 < size_m)
@@ -503,15 +517,15 @@ void exl3_gemm_kernel_inner
                 if constexpr (c_fp32)
                 {
                     float* c_ptr = gl_c_ptr_32 + r0 * size_n + (n0 + n) * 8 + c;
-                    frag_c[n][0] += *c_ptr++;
-                    frag_c[n][1] += *c_ptr++;
+                    frag_c[m][n][0] += *c_ptr++;
+                    frag_c[m][n][1] += *c_ptr++;
                 }
                 else
                 {
                     half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n + (n0 + n) * 8 + c);
                     float2 interm = __half22float2(*c_ptr);
-                    frag_c[n][0] += interm.x;
-                    frag_c[n][1] += interm.y;
+                    frag_c[m][n][0] += interm.x;
+                    frag_c[m][n][1] += interm.y;
                 }
             }
             if (r1 < size_m)
@@ -519,15 +533,15 @@ void exl3_gemm_kernel_inner
                 if constexpr (c_fp32)
                 {
                     float* c_ptr = gl_c_ptr_32 + r1 * size_n + (n0 + n) * 8 + c;
-                    frag_c[n][2] += *c_ptr++;
-                    frag_c[n][3] += *c_ptr++;
+                    frag_c[m][n][2] += *c_ptr++;
+                    frag_c[m][n][3] += *c_ptr++;
                 }
                 else
                 {
                     half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n + (n0 + n) * 8 + c);
                     float2 interm = __half22float2(*c_ptr);
-                    frag_c[n][2] += interm.x;
-                    frag_c[n][3] += interm.y;
+                    frag_c[m][n][2] += interm.x;
+                    frag_c[m][n][3] += interm.y;
                 }
             }
         }
@@ -537,9 +551,11 @@ void exl3_gemm_kernel_inner
     {
         int n0 = warp_id * FRAGS_N_PER_WARP;
         #pragma unroll
+        for (int m = 0; m < TILEBLOCKS_M; ++m)
+        #pragma unroll
         for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
         {
-            int r0 = lane_id / 4;
+            int r0 = m * 16 + lane_id / 4;
             int r1 = r0 + 8;
             int c = (lane_id % 4) * 2;
             if (r0 < size_m)
@@ -547,13 +563,13 @@ void exl3_gemm_kernel_inner
                 if constexpr (c_fp32)
                 {
                     float* c_ptr = gl_c_ptr_32 + r0 * size_n + (n0 + n) * 8 + c;
-                    *c_ptr++ = frag_c[n][0];
-                    *c_ptr++ = frag_c[n][1];
+                    *c_ptr++ = frag_c[m][n][0];
+                    *c_ptr++ = frag_c[m][n][1];
                 }
                 else
                 {
                     half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n + (n0 + n) * 8 + c);
-                    half2 sum = __floats2half2_rn(frag_c[n][0], frag_c[n][1]);
+                    half2 sum = __floats2half2_rn(frag_c[m][n][0], frag_c[m][n][1]);
                     *c_ptr = sum;
                 }
             }
@@ -562,13 +578,13 @@ void exl3_gemm_kernel_inner
                 if constexpr (c_fp32)
                 {
                     float* c_ptr = gl_c_ptr_32 + r1 * size_n + (n0 + n) * 8 + c;
-                    *c_ptr++ = frag_c[n][2];
-                    *c_ptr++ = frag_c[n][3];
+                    *c_ptr++ = frag_c[m][n][2];
+                    *c_ptr++ = frag_c[m][n][3];
                 }
                 else
                 {
                     half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n + (n0 + n) * 8 + c);
-                    half2 sum = __floats2half2_rn(frag_c[n][2], frag_c[n][3]);
+                    half2 sum = __floats2half2_rn(frag_c[m][n][2], frag_c[m][n][3]);
                     *c_ptr = sum;
                 }
             }
@@ -581,12 +597,14 @@ void exl3_gemm_kernel_inner
         #if EXL3_GEMM_H_ACC
             // Fold the fp16 MMA accumulators into the fp32 accumulators once per k-slice
             #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
+            #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             {
-                float2 f0 = __half22float2(frag_c_h[n][0]);
-                float2 f1 = __half22float2(frag_c_h[n][1]);
-                frag_c[n][0] += f0.x; frag_c[n][1] += f0.y;
-                frag_c[n][2] += f1.x; frag_c[n][3] += f1.y;
+                float2 f0 = __half22float2(frag_c_h[m][n][0]);
+                float2 f1 = __half22float2(frag_c_h[m][n][1]);
+                frag_c[m][n][0] += f0.x; frag_c[m][n][1] += f0.y;
+                frag_c[m][n][2] += f1.x; frag_c[m][n][3] += f1.y;
             }
         #endif
 
@@ -619,17 +637,22 @@ void exl3_gemm_kernel_inner
         // Last block writes in row-major format
         if (!sub_k && last)
         {
-            if constexpr (shmem_out_had)
-                write_sum_tile_sh();
-            else
+            if constexpr (!shmem_out_had)
                 write_sum_gl();
         }
 
         if constexpr (shmem_out_had)
         {
-            if (last) __syncthreads();
-            if (!sub_k && last)
-                output_had_sh_gl();
+            // sh_c stages one 16-row block at a time and is reused by the next block, so each
+            // block's transform must complete before the next one overwrites the staging area
+            #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
+            {
+                if (m && last) __syncthreads();
+                if (!sub_k && last) write_sum_tile_sh(m);
+                if (last) __syncthreads();
+                if (!sub_k && last) output_had_sh_gl(m);
+            }
         }
 
         barrier_release(lock, lock_d, last);
@@ -650,11 +673,15 @@ void exl3_gemm_kernel_inner
         #pragma unroll
         for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
         {
-            #if EXL3_GEMM_H_ACC
-                ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c_h[n]);
-            #else
-                ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c[n]);
-            #endif
+            #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
+            {
+                #if EXL3_GEMM_H_ACC
+                    ptx_mma_m16n8k16(frag_a[buf][m], frag_b[buf][n], frag_c_h[m][n]);
+                #else
+                    ptx_mma_m16n8k16(frag_a[buf][m], frag_b[buf][n], frag_c[m][n]);
+                #endif
+            }
         }
     };
 
