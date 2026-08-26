@@ -37,19 +37,6 @@ limitations:
 
 std::set<void*> kernel_attr_set[MAX_DEVICES] = {};
 
-uint64_t roundup_pow2(uint64_t x)
-{
-    if (x == 0) return 1;
-    x--;
-    x |= x >> 1;
-	x |= x >> 2;
-	x |= x >> 4;
-	x |= x >> 8;
-	x |= x >> 16;
-	x |= x >> 32;
-    return x + 1;
-}
-
 uint64_t gemm_autotune_hash
 (
     int size_m,
@@ -69,7 +56,11 @@ uint64_t gemm_autotune_hash
         h ^= v;
         h *= 1099511628211ull;
     };
-    mix((uint64_t) MIN(roundup_pow2(size_m), 16));
+    // Bucket by 16-row MMA blocks. Every TILESIZE_M is a multiple of 16, so two batch sizes
+    // with the same block count run the same number of strips in every candidate shape and
+    // rank the same. Rounding to a power of two instead merges batch sizes whose best shape
+    // differs, e.g. 33 and 64 across a shape set holding both TILESIZE_M 48 and 64
+    mix((uint64_t) MIN(CEIL_DIVIDE(size_m, 16), 24));
     mix((uint64_t) size_k);
     mix((uint64_t) size_n);
     mix((uint64_t) K);
