@@ -169,7 +169,7 @@ class Step3_7VisionModel(Model):
     ):
         super().__init__(config, **kwargs)
         self.config = config
-        self.caps.update({"image_input": True})
+        self.caps.update({"image_input": True, "default_vision_bits": 6})
 
         if not config.stc.has_tensor(f"{key_prefix}.conv1.weight"):
             key_prefix = "vision_model"
