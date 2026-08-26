@@ -167,6 +167,7 @@ class Qwen3VLVisionModel(Model):
         self.config = config
         self.caps.update({
             "image_input": True,
+            "default_vision_bits": 6,
         })
         v = self.config.vision
 
@@ -232,7 +233,6 @@ class Qwen3VLVisionModel(Model):
                         key_down = "linear_fc2",
                         activation_fn = "gelu",
                         qmap = "block.mlp",
-                        pad_to = 1,
                     ),
                 )
             ]
