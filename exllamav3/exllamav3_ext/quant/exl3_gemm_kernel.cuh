@@ -102,21 +102,39 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     {
         if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
         {
-            int j = 0;
-            for (int i = 0; i < bszm; ++i)
+            if (num_tokens > 1)
             {
-                int idx = B_indices[i];
-                if (idx >= min_index && idx < max_index)
+                // Position-preserving mask: the grouped reduction below sums each token's
+                // fixed run of (bszm / num_tokens) slots, and with bszm_in > 1 slot j also
+                // addresses input row j, so out-of-range picks are marked inactive in place
+                // (skipped by the compute stages and the reduction) instead of compacted away
+                for (int i = 0; i < bszm; ++i)
                 {
-                    v_indices[j] = idx - min_index;
-                    if (B_weights) v_weights[j] = B_weights[i];
-                    j++;
+                    int idx = B_indices[i];
+                    bool keep = idx >= min_index && idx < max_index;
+                    v_indices[i] = keep ? idx - min_index : -1;
+                    if (B_weights) v_weights[i] = keep ? B_weights[i] : __float2half(0.0f);
                 }
+                bszm_sync = bszm;
             }
-            bszm_sync = j;
-            for (; j < bszm; ++j)
+            else
             {
-                v_indices[j] = -1;
+                int j = 0;
+                for (int i = 0; i < bszm; ++i)
+                {
+                    int idx = B_indices[i];
+                    if (idx >= min_index && idx < max_index)
+                    {
+                        v_indices[j] = idx - min_index;
+                        if (B_weights) v_weights[j] = B_weights[i];
+                        j++;
+                    }
+                }
+                bszm_sync = j;
+                for (; j < bszm; ++j)
+                {
+                    v_indices[j] = -1;
+                }
             }
         }
         __threadfence();
@@ -270,7 +288,10 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                     float sum = 0.0f;
                     for (int j = 0; j < stride; ++j)
                     {
-                        sum += *C___;
+                        // Inactive slots (masked by range filtering, or -1 selections) were
+                        // never written by the compute stages: their scratch is stale
+                        if (!B_indices || B_indices[t * stride + j] >= 0)
+                            sum += *C___;
                         C___ += size_m * size_n;
                     }
                     ((float*) C)[t * size_m * size_n + col] = sum;
@@ -281,7 +302,8 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                     half sum = {};
                     for (int j = 0; j < stride; ++j)
                     {
-                        sum = __hadd(sum, *C___);
+                        if (!B_indices || B_indices[t * stride + j] >= 0)
+                            sum = __hadd(sum, *C___);
                         C___ += size_m * size_n;
                     }
                     ((half*) C)[t * size_m * size_n + col] = sum;

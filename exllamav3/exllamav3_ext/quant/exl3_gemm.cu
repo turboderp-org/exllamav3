@@ -371,7 +371,10 @@ or q = j otherwise. This supports the following modes:
 - Expert-range filtering: with min_index >= 0, selections outside
   [min_index, max_index) are removed and retained indices are rebased by
   min_index. This allows B/suh/svh to be local pointer tables for an expert
-  shard. Weights are compacted in the same order.
+  shard. At num_tokens == 1 the retained indices (and their weights) are
+  compacted; at num_tokens > 1 out-of-range slots are instead masked to -1 in
+  place, preserving the per-token slot groups the final reduction depends on
+  (and, with bszm_in > 1, the slot -> input-row correspondence).
 
 Without weights, every active C[j] is a separate output. The active slot count
 is max(a_batches, c_batches), capped to num_indices when indices is present.
@@ -406,9 +409,9 @@ int exl3_mgemm_gr
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
-    TORCH_CHECK(num_tokens == 1 || min_index < 0,
-        "exl3_mgemm: multi-token reduction (num_tokens > 1) is not compatible with expert-range "
-        "filtering (min_index >= 0); TP-sharded experts must use num_tokens == 1");
+    // num_tokens > 1 with expert-range filtering (min_index >= 0) uses position-preserving
+    // masking in the kernel (out-of-range slots marked -1 in place) instead of index
+    // compaction, so the grouped reduction's fixed per-token slot runs stay intact
 
     TORCH_CHECK_DTYPE(A, kHalf);
     TORCH_CHECK_DTYPE(B, kLong);

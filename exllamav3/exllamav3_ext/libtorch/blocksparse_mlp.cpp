@@ -135,7 +135,7 @@ void BC_BlockSparseMLP::run_bszN_gr
             num_tokens
         );
         if (gate_bias_ptrs)
-            moe_bias_add_gr(interm_g_n, gate_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
+            moe_bias_add_gr(interm_g_n, gate_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph, num_tokens);
     }
 
     exl3_mgemm_gr
@@ -160,7 +160,7 @@ void BC_BlockSparseMLP::run_bszN_gr
     );
 
     if (up_bias_ptrs)
-        moe_bias_add_gr(interm_u_n, up_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
+        moe_bias_add_gr(interm_u_n, up_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph, num_tokens);
 
     if (!gated)
         // relu(u) * u = relu^2(u), the non-gated activation
