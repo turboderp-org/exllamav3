@@ -160,6 +160,7 @@ class Glm4VVisionModel(Model):
         self.config = config
         self.caps.update({
             "image_input": True,
+            "default_vision_bits": 6,
         })
         v = self.config.vision
 
