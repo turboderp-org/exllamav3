@@ -122,11 +122,13 @@ class HyperConnection(Module):
             R = b * s
             st = streams.view(R, H, D)
             chunks = ext.hc_mix_num_chunks(R, H * D)
-            partials = g_tensor_cache.get(streams.device, (R, chunks, 2 * H + H * H + 1),
-                                          torch.float, "hc_mix_partials")
-            post = torch.empty((R, H), dtype = torch.float, device = streams.device)
-            comb = torch.empty((R, H, H), dtype = torch.float, device = streams.device)
-            collapsed = torch.empty((R, D), dtype = torch.half, device = streams.device)
+            M1 = 2 * H + H * H + 1
+            dev = streams.device
+            partials = g_tensor_cache.get_bucketed(
+                dev, R * chunks * M1, torch.float, "hc_mix_partials").view(R, chunks, M1)
+            post = g_tensor_cache.get_bucketed(dev, R * H, torch.float, "hc_post").view(R, H)
+            comb = g_tensor_cache.get_bucketed(dev, R * H * H, torch.float, "hc_comb").view(R, H, H)
+            collapsed = g_tensor_cache.get_bucketed(dev, R * D, torch.half, "hc_coll").view(R, D)
             # Small R (decode): fn in fp16 -- the (M, H * D) matrix is the partials kernel's
             # dominant traffic and the kernel dots it in fp32 either way
             if R <= 32:
@@ -207,13 +209,16 @@ class HyperConnection(Module):
 
 
 class HyperHead(Module):
-    """Final mHC stream collapse before the model norm. Top-level raw tensors {key}_fn etc."""
+    """Final mHC stream collapse before the model norm. Top-level raw tensors {key}_fn etc.
+    mean = True (GLM5.3): parameterless unweighted mean over the streams, no tensors."""
 
-    def __init__(self, config: Config, key: str, hc_mult: int, rms_norm_eps: float, hc_eps: float):
+    def __init__(self, config: Config, key: str, hc_mult: int, rms_norm_eps: float, hc_eps: float,
+                 mean: bool = False):
         super().__init__(config = config, key = key, qmap = None)
         self.hc_mult = hc_mult
         self.rms_eps = rms_norm_eps
         self.hc_eps = hc_eps
+        self.mean = mean
         self.norm = RMSNorm(config, f"{key}.norm", rms_norm_eps, unweighted = True,
                             out_dtype = torch.float)
         self.register_submodule(self.norm)
@@ -228,6 +233,8 @@ class HyperHead(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
+        if self.mean:
+            return
         stc = self.config.stc
         self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True).float().contiguous()
         self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True).float().contiguous()
@@ -240,6 +247,8 @@ class HyperHead(Module):
 
     @override
     def get_tensors(self):
+        if self.mean:
+            return {}
         return {
             f"{self.key}_fn": self.fn,
             f"{self.key}_base": self.base,
@@ -251,10 +260,14 @@ class HyperHead(Module):
     # never matches them and they would be silently dropped from the compiled shards
     @override
     def get_compile_sizes(self, stc):
+        if self.mean:
+            return []
         return [stc.get_tensor_size(k) for k in self._tensor_names()]
 
     @override
     def get_compile_tensors(self, stc):
+        if self.mean:
+            return {}
         return {k: stc.get_tensor(k, allow_bf16 = True) for k in self._tensor_names()}
 
     @override
@@ -289,13 +302,16 @@ class HyperHead(Module):
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
+        if self.mean:
+            return x.mean(dim = 2)
         b, s, H, D = x.shape
         if H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
             R = b * s
             chunks = ext.hc_mix_num_chunks(R, H * D)
-            partials = g_tensor_cache.get(x.device, (R, chunks, H + 1),
-                                          torch.float, "hc_head_partials")
-            collapsed = torch.empty((R, D), dtype = torch.float, device = x.device)
+            partials = g_tensor_cache.get_bucketed(
+                x.device, R * chunks * (H + 1), torch.float, "hc_head_partials").view(R, chunks, H + 1)
+            collapsed = g_tensor_cache.get_bucketed(
+                x.device, R * D, torch.float, "hc_head_coll").view(R, D)
             if R <= 32:
                 if self.fn_h is None:
                     self.fn_h = self.fn.half()
