@@ -240,7 +240,7 @@ class SafetensorsCollection:
                     if key.endswith(k):
                         key = key[:-len(k)] + v
                 if key in self.tensor_file_map and warn_if_override:
-                    # print(f" !! Overriding {key} from {self.tensor_file_map[key]} with f{st_file}")
+                    print(f" !! Overriding {key} from {self.tensor_file_map[key]} with {st_file}")
                     overrides += 1
                 self.tensor_file_map[key] = st_file
         if overrides:
