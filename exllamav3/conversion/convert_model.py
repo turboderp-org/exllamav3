@@ -312,7 +312,10 @@ def get_base_model(args):
     else:
         tokenizer = None
     if hasattr(config, "rope_settings"):
-        config.rope_settings.print()
+        if config.rope_settings:
+            config.rope_settings.print()
+        else:
+            print(f" -- No RoPE settings")
     return config, model, mtp_model, vision_model, tokenizer, use_reference_state
 
 
