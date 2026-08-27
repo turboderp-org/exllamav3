@@ -71,7 +71,12 @@ py::class_<BC_MLAttention, std::shared_ptr<BC_MLAttention>>(m, "BC_MLAttention")
     py::arg("kidx"),
     py::arg("n_heads"),
     py::arg("head_dim"),
-    py::arg("topk")
+    py::arg("topk"),
+    py::arg("kpool") = 0,
+    py::arg("kpool_tail") = true,
+    py::arg("gate_w") = py::none(),
+    py::arg("kpool_ape") = py::none(),
+    py::arg("kpool_plane") = py::none()
 )
 .def("needs_configure", &BC_MLAttention::needs_configure)
 .def("configure_slot", &BC_MLAttention::configure_slot,
@@ -125,6 +130,11 @@ py::class_<BC_MLAttention, std::shared_ptr<BC_MLAttention>>(m, "BC_MLAttention")
     py::arg("k_dsa_combine"),
     py::arg("dsa_hb"),
     py::arg("dsa_splits"),
-    py::arg("fewq_gy")
+    py::arg("fewq_gy"),
+    py::arg("gidx") = py::none(),
+    py::arg("pool_idx") = py::none(),
+    py::arg("k_gate_append") = nullptr,
+    py::arg("k_pool_update") = nullptr,
+    py::arg("k_pool_expand") = nullptr
 )
 .def("run", &BC_MLAttention::run);

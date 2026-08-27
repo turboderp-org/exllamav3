@@ -70,7 +70,18 @@ class BCMLA:
         # (fp16-exact at weight magnitudes). The ext object keeps the converted copy alive
         kv_norm_w = m.kv_a_layernorm.weight.data.half().contiguous()
 
+        # NoPE models (GLM5.3: qk_rope_head_dim 0) have no rope instance; the rope stages are
+        # compiled out of the graph and the ext object gets inert placeholders
         rope = m.rope
+        if rope is None or self.qk_rope_head_dim == 0:
+            rope_inv_freq = torch.zeros((1,), dtype = torch.float, device = self.device)
+            rope_style, attn_factor, rotate_dims = 0, 1.0, 0
+        else:
+            rope_inv_freq = rope.inv_freq
+            rope_style = int(rope.rope_settings.rope_style)
+            attn_factor = rope.attn_factor
+            rotate_dims = rope.rope_settings.rotate_dims
+        self.rope_inv_freq = rope_inv_freq
         self.bc = ext.BC_MLAttention(
             num_q_heads = self.num_q_heads,
             hidden_size = self.hidden_size,
@@ -87,10 +98,10 @@ class BCMLA:
             o_proj = m.o_proj.inner.bc,
             kv_norm_w = kv_norm_w,
             norm_eps = m.norm_eps,
-            inv_freq = rope.inv_freq,
-            rope_style = int(rope.rope_settings.rope_style),
-            attn_factor = rope.attn_factor,
-            rotate_dims = rope.rope_settings.rotate_dims,
+            inv_freq = rope_inv_freq,
+            rope_style = rope_style,
+            attn_factor = attn_factor,
+            rotate_dims = rotate_dims,
             # The module zeroes the beta on its RoPE instance (the rope stage must not scale
             # k_pe, and only sees the q_pe slice anyway); the graph applies the full-query
             # scale as its own stage on q_full
@@ -111,9 +122,18 @@ class BCMLA:
         # externally produced index list (patched pointer). See mla_attention.h
         self.indexer_mode = m.indexer_mode
         self.index_topk = m.index_topk
+        # kpool (GLM5.3): the key plane packs [k || gate_scores] rows and selection runs over
+        # pooled keys in a second plane; only full-indexer layers do kpool work
+        self.index_kpool = m.index_kpool if m.indexer_mode == "full" else 0
         if m.indexer_mode == "full":
             self.cache_kidx = layer.get_idx()
             self.idx_norm_eps = m.idx_k_norm.layernorm_eps
+            if self.index_kpool:
+                self.cache_kpool = layer.get_pool()
+                # the checkpoint gate weight is (D_i, hidden); hgemm consumes (in, out)
+                self.idx_gate_w = m.idx_kpool_gate.data.T.contiguous()
+            else:
+                self.cache_kpool = self.idx_gate_w = None
             self.bc.set_indexer(
                 mode = 1,
                 wq_b = m.idx_wq_b.inner.bc,
@@ -121,10 +141,16 @@ class BCMLA:
                 k_norm_w = m.idx_k_norm.weight.data.half().contiguous(),
                 k_norm_b = m.idx_k_norm.bias.data.half().contiguous(),
                 weights_w = m.idx_weights.inner.weight,
-                kidx = self.cache_kidx.view(-1, m.index_head_dim),
+                kidx = self.cache_kidx.view(-1, m.idx_plane_dim),
                 n_heads = m.index_n_heads,
                 head_dim = m.index_head_dim,
                 topk = m.index_topk,
+                kpool = self.index_kpool,
+                kpool_tail = m.index_kpool_tail,
+                gate_w = self.idx_gate_w,
+                kpool_ape = m.idx_kpool_ape if self.index_kpool else None,
+                kpool_plane = self.cache_kpool.view(-1, m.index_head_dim)
+                    if self.index_kpool else None,
             )
         elif m.indexer_mode == "shared":
             self.cache_kidx = None
@@ -307,7 +333,16 @@ class BCMLA:
         BLOCK_H = 16
         N_SPLITS = 16
         hb = -(-H // BLOCK_H)
-        kp = -(-self.index_topk // 32) * 32
+        # kpool: selection picks topk/P pools, expansion emits raw indices plus up to P-1
+        # tail tokens per query row
+        P = self.index_kpool
+        if P:
+            sel = self.index_topk // P
+            kp = -(-(sel * P + (P - 1 if m.index_kpool_tail else 0)) // 32) * 32
+            kp_pool = -(-sel // 32) * 32
+        else:
+            sel = kp_pool = 0
+            kp = -(-self.index_topk // 32) * 32
 
         def sbuf(tag, *shape, dtype = torch.half):
             n = 1
@@ -327,11 +362,27 @@ class BCMLA:
                 {"k_raw": "*fp16", "w": "*fp16", "b": "*fp16", "k_out": "*fp16", "R": "i32"}
                 | {n: "constexpr" for n in ("eps", "D")},
                 dict(eps = float(self.idx_norm_eps), D = Di), 2, 1)
-            k_plane_append = _compile_kernel(dev, _mla_plane_update_kernel,
-                {"rows_new": "*fp16", "plane_cache": "*fp16", "block_table": "*i32",
-                 "cache_seqlens": "*i32", "num_pages_per_seq": "i32", "append_len": "i32"}
-                | {n: "constexpr" for n in ("page_size", "D")},
-                dict(page_size = PAGE_SIZE, D = Di), 2, 2)
+            plane_sig = {"rows_new": "*fp16", "plane_cache": "*fp16", "block_table": "*i32",
+                 "cache_seqlens": "*i32", "num_pages_per_seq": "i32", "append_len": "i32"} \
+                | {n: "constexpr" for n in ("page_size", "D", "DST_D", "DST_OFF")}
+            k_plane_append = _compile_kernel(dev, _mla_plane_update_kernel, plane_sig,
+                dict(page_size = PAGE_SIZE, D = Di,
+                     DST_D = 2 * Di if P else 0, DST_OFF = 0), 2, 2)
+
+        gidx = pool_idx = None
+        k_gate_append = k_pool_update = k_pool_expand = None
+        if full and P:
+            from .dsa_triton import _dsa_pool_update_kernel
+            gidx = sbuf("bcm_gidx", R_pad, Di)
+            gidx.zero_()
+            k_gate_append = _compile_kernel(dev, _mla_plane_update_kernel, plane_sig,
+                dict(page_size = PAGE_SIZE, D = Di, DST_D = 2 * Di, DST_OFF = Di), 2, 2)
+            k_pool_update = _compile_kernel(dev, _dsa_pool_update_kernel,
+                {"plane": "*fp16", "pool_plane": "*fp16", "ape": "*fp32",
+                 "block_table": "*i32", "cache_seqlens": "*i32",
+                 "num_pages_per_row": "i32", "append_len": "i32"}
+                | {n: "constexpr" for n in ("page_size", "P", "D", "MAXPOOLS")},
+                dict(page_size = PAGE_SIZE, P = P, D = Di, MAXPOOLS = q_len // P + 1), 2, 1)
 
         indices = dsa_arr = ws_ml = ws_acc = None
         k_dsa_split = k_dsa_combine = None
@@ -343,8 +394,14 @@ class BCMLA:
                 wts.zero_()
                 # Scoring covers the full plane capacity every step (bounds written -inf in
                 # kernel), so no stale scores survive from longer contexts
-                s_max = self.cache_kidx.view(-1, Di).shape[0]
-                assert s_max % 128 == 0
+                if P:
+                    # Pool capacity padded up to the tile width: tiles past T retire and the
+                    # store mask covers the pad, so the -inf fill survives in the tail
+                    cap = self.cache_kpool.view(-1, Di).shape[0]
+                    s_max = -(-cap // 128) * 128
+                else:
+                    s_max = self.cache_kidx.view(-1, Di).shape[0]
+                    assert s_max % 128 == 0
                 scores = sbuf("bcm_scores", R, s_max)
                 # The scoring kernel writes only [0, T); the warmup top-k scans the full
                 # static width, so the tail must hold -inf from this one-time fill (the
@@ -363,9 +420,9 @@ class BCMLA:
                     "SEQ", "MULTIROW", "EPP", "DEBUG_BOUNDS", "DEBUG_PAGES")}
                 consts = dict(
                     H_i = Hi, H_pad = max(16, 1 << (Hi - 1).bit_length()), D_i = Di,
-                    S_stride = s_max, compress_rate = 1,
+                    S_stride = s_max, compress_rate = P if P else 1,
                     scale = Di ** -0.5 * Hi ** -0.5, BLOCK_N = 128,
-                    SEQ = q_len, MULTIROW = mr, EPP = PAGE_SIZE,
+                    SEQ = q_len, MULTIROW = mr, EPP = PAGE_SIZE // P if P else PAGE_SIZE,
                     DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
                 )
                 k_fewq = _compile_kernel(dev, _dsa_indexer_fewq_kernel, sig, consts, 8, 2)
@@ -375,6 +432,16 @@ class BCMLA:
             # in order on one stream, so a full layer's selection is in place when its shared
             # consumers gather through it, exactly like the eager params flow
             indices = sbuf("bcm_dsa_idx", R, kp, dtype = torch.int32)
+            if full and P:
+                from .dsa_triton import _dsa_pool_expand_kernel
+                pool_idx = sbuf("bcm_pool_idx", R, kp_pool, dtype = torch.int32)
+                k_pool_expand = _compile_kernel(dev, _dsa_pool_expand_kernel,
+                    {"pool_idx": "*i32", "out": "*i32", "q_pos0": "i32"}
+                    | {n: "constexpr" for n in (
+                        "P", "SEL", "K_pad", "KP_pool", "TAIL", "SEQ", "MULTIROW", "BLOCK")},
+                    dict(P = P, SEL = sel, K_pad = kp, KP_pool = kp_pool,
+                         TAIL = 1 if m.index_kpool_tail else 0, SEQ = q_len,
+                         MULTIROW = 0, BLOCK = 256), 4, 1)
             if bsz > 1:
                 dsa_arr = g_tensor_cache.get(dev, (2, MAX_BSZ), torch.int32, "bcm_dsa_arr")
             # ws_acc rows are D_c wide: OUT_LATENT never accumulates the rope half
@@ -425,6 +492,7 @@ class BCMLA:
             bsz, q_len, regime, x_st, kidx, kidx_n, qidx, wts, scores, indices,
             dsa_arr, ws_ml, ws_acc, k_idx_norm, k_plane_append, k_fewq,
             k_dsa_split, k_dsa_combine, hb, N_SPLITS, fewq_gy,
+            gidx, pool_idx, k_gate_append, k_pool_update, k_pool_expand,
         )
 
     def step(
@@ -438,6 +506,11 @@ class BCMLA:
         position_ids: torch.Tensor | None,
     ) -> torch.Tensor | None:
         bsz, q_len, _ = x.shape
+
+        # kpool slots are single-job only: the batched scoring path derives token-unit
+        # bounds on device, and the pooled scan counts pools
+        if self.index_kpool and bsz > 1:
+            return None
 
         if self.indexer_mode is None:
             regime, t_total, ext_indices = 0, 0, None
@@ -496,9 +569,14 @@ def build_bc_mla(module, layer):
     dev = torch.device(m.device)
     if not (
         bc_attn_enable and
-        m.rope is not None and m.rope.rope_settings.rope_style != RopeStyle.NONE and
+        # NoPE models (D_r 0) compile the rope stages out; otherwise a rope instance with a
+        # supported style is required
+        (D_r == 0 or (
+            m.rope is not None and m.rope.rope_settings.rope_style != RopeStyle.NONE and
+            _is_pow2(D_r)
+        )) and
         # The staging/attention kernels index with tl.arange over these widths
-        _is_pow2(D_c) and _is_pow2(D_r) and _is_pow2(D_v) and D_c % 128 == 0 and
+        _is_pow2(D_c) and _is_pow2(D_v) and D_c % 128 == 0 and
         # Projections read x directly (no padded-input staging) and write the statics; the q and
         # kv widths may pad (the kernels read at true offsets), the rest must be exact
         _proj_ok(m.q_proj, in_features = m.q_lora_rank or m.hidden_size) and
@@ -514,6 +592,16 @@ def build_bc_mla(module, layer):
         # weight heads, the biased key norm and the paged key plane on this cache layer
         (m.indexer_mode is None or (
             _is_pow2(m.index_head_dim) and m.qk_rope_head_dim <= m.index_head_dim and
+            # kpool (GLM5.3): pools never straddle pages, selection counts whole pools, and
+            # full layers need the gate/APE tensors and the pooled plane
+            (not m.index_kpool or (
+                PAGE_SIZE % m.index_kpool == 0 and
+                m.index_topk % m.index_kpool == 0 and
+                (m.indexer_mode == "shared" or (
+                    m.idx_kpool_ape is not None and m.idx_kpool_gate is not None and
+                    layer.get_pool() is not None
+                ))
+            )) and
             (m.indexer_mode == "shared" or (
                 m.q_lora_rank and _proj_ok(m.idx_wq_b, in_features = m.q_lora_rank) and
                 getattr(m.idx_wk.inner, "weight", None) is not None and

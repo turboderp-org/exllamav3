@@ -114,8 +114,9 @@ if has_triton:
         tl.store(qk + tok * W_TOT + w, tl.load(tmp_q + row * W_TOT + w, mask = mask_w), mask = mask_w)
         g = tl.arange(0, N_G)
         tl.store(sk + tok * N_G + g, tl.load(tmp_s + row * N_G + g))
-        r = tl.arange(0, D_r)
-        tl.store(kpe_cache + tok * D_r + r, tl.load(kpe_new + row * D_r + r))
+        if D_r > 0:
+            r = tl.arange(0, D_r)
+            tl.store(kpe_cache + tok * D_r + r, tl.load(kpe_new + row * D_r + r))
 
 
     @triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
@@ -148,24 +149,28 @@ if has_triton:
         offs_c = tl.arange(0, D_c)
         tl.store(ckv_cache + tok * D_c + offs_c,
                  tl.load(ckv_new + row * D_c + offs_c))
-        offs_r = tl.arange(0, D_r)
-        tl.store(kpe_cache + tok * D_r + offs_r,
-                 tl.load(kpe_new + row * D_r + offs_r))
+        if D_r > 0:
+            offs_r = tl.arange(0, D_r)
+            tl.store(kpe_cache + tok * D_r + offs_r,
+                     tl.load(kpe_new + row * D_r + offs_r))
 
 
     @triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
     def _mla_plane_update_kernel(
         rows_new,            # (bsz, len, D)
-        plane_cache,         # (pages, page_size, D)
+        plane_cache,         # (pages, page_size, DST_D)
         block_table,
         cache_seqlens,
         num_pages_per_seq,
         append_len,
         page_size: tl.constexpr,
         D: tl.constexpr,
+        DST_D: tl.constexpr = 0,   # plane row width when packing (0 = D); rows land at DST_OFF
+        DST_OFF: tl.constexpr = 0,
     ):
         """Single-plane variant of _mla_kv_update_kernel, for the per-token indexer-key rows
-        of DSA-on-MLA layers (GLM-5.2)."""
+        of DSA-on-MLA layers (GLM-5.2). The DST_D/DST_OFF variant packs a D-wide source into
+        a slice of a wider plane row (GLM5.3 kpool: [k || gate_scores])."""
         row = tl.program_id(0)
         batch = row // append_len
         pos = row - batch * append_len
@@ -177,7 +182,8 @@ if has_triton:
         tok = phys * page_size + page_off
 
         offs = tl.arange(0, D)
-        tl.store(plane_cache + tok * D + offs, tl.load(rows_new + row * D + offs))
+        dst_d = DST_D if DST_D > 0 else D
+        tl.store(plane_cache + tok * dst_d + DST_OFF + offs, tl.load(rows_new + row * D + offs))
 
 
     @triton.jit(do_not_specialize = ["R"])
@@ -255,7 +261,7 @@ if has_triton:
         valid_row = (row_q < q_len) & (row_h < n_q_heads)
 
         offs_c = tl.arange(0, D_c)
-        offs_r = tl.arange(0, D_r)
+        offs_r = tl.arange(0, D_r if D_r > 0 else 1)
 
         # Head-major: the absorbed queries arrive straight from a batched GEMM over heads, and the
         # latent output feeds the next one, so neither D_c-wide tensor is ever permuted
@@ -266,8 +272,9 @@ if has_triton:
             qpe_row = (batch * q_len + row_q) * n_q_heads + row_h
         else:
             qpe_row = q_row
-        q_r = tl.load(q_pe + qpe_row[:, None] * D_r + offs_r[None, :],
-                      mask = valid_row[:, None], other = 0.0)
+        if D_r > 0:
+            q_r = tl.load(q_pe + qpe_row[:, None] * D_r + offs_r[None, :],
+                          mask = valid_row[:, None], other = 0.0)
         if QC > 0:
             # Packed values live in the rotated domain; rotating q here keeps the score dot exact
             # (H32 is orthogonal and block-diagonal per 32, so dot(Hq, Hk) == dot(q, k))
@@ -307,11 +314,12 @@ if has_triton:
                 v_tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
                                  mask = in_range[:, None], other = 0.0)
                 kt = tl.trans(v_tile)
-            kt_pe = tl.load(kpe_cache + tok[None, :] * D_r + offs_r[:, None],
-                            mask = in_range[None, :], other = 0.0)
-
             scores = tl.dot(q_c, kt)
-            scores = tl.dot(q_r, kt_pe, acc = scores) * scale
+            if D_r > 0:
+                kt_pe = tl.load(kpe_cache + tok[None, :] * D_r + offs_r[:, None],
+                                mask = in_range[None, :], other = 0.0)
+                scores = tl.dot(q_r, kt_pe, acc = scores)
+            scores = scores * scale
 
             valid = valid_row[:, None] & in_range[None, :]
             if CAUSAL:
@@ -434,13 +442,14 @@ if has_triton:
         valid_row = offs_m < q_len
 
         offs_c = tl.arange(0, D_c)
-        offs_r = tl.arange(0, D_r)
+        offs_r = tl.arange(0, D_r if D_r > 0 else 1)
 
         q_row = head * n_rows + batch * q_len + offs_m
         q_c = tl.load(q_lat + q_row[:, None] * D_c + offs_c[None, :],
                       mask = valid_row[:, None], other = 0.0)
-        q_r = tl.load(q_pe + q_row[:, None] * D_r + offs_r[None, :],
-                      mask = valid_row[:, None], other = 0.0)
+        if D_r > 0:
+            q_r = tl.load(q_pe + q_row[:, None] * D_r + offs_r[None, :],
+                          mask = valid_row[:, None], other = 0.0)
         if QC > 0:
             q_c = _rot_h32(q_c, h32, BLOCK_M, D_c)
 
@@ -476,11 +485,12 @@ if has_triton:
                 v_tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
                                  mask = in_range[:, None], other = 0.0)
                 kt = tl.trans(v_tile)
-            kt_pe = tl.load(kpe_cache + tok[None, :] * D_r + offs_r[:, None],
-                            mask = in_range[None, :], other = 0.0)
-
             scores = tl.dot(q_c, kt)
-            scores = tl.dot(q_r, kt_pe, acc = scores) * scale
+            if D_r > 0:
+                kt_pe = tl.load(kpe_cache + tok[None, :] * D_r + offs_r[:, None],
+                                mask = in_range[None, :], other = 0.0)
+                scores = tl.dot(q_r, kt_pe, acc = scores)
+            scores = scores * scale
 
             valid = valid_row[:, None] & in_range[None, :]
             if CAUSAL:
@@ -544,10 +554,11 @@ if has_triton:
                            mask = in_range[:, None], other = 0.0)
         tl.store(out_ckv + r[:, None] * D_c + offs_c[None, :], tile, mask = in_range[:, None])
 
-        offs_r2 = tl.arange(0, D_r)
-        kpe = tl.load(kpe_cache + tok[:, None] * D_r + offs_r2[None, :],
-                      mask = in_range[:, None], other = 0.0)
-        tl.store(out_kpe + r[:, None] * D_r + offs_r2[None, :], kpe, mask = in_range[:, None])
+        if D_r > 0:
+            offs_r2 = tl.arange(0, D_r)
+            kpe = tl.load(kpe_cache + tok[:, None] * D_r + offs_r2[None, :],
+                          mask = in_range[:, None], other = 0.0)
+            tl.store(out_kpe + r[:, None] * D_r + offs_r2[None, :], kpe, mask = in_range[:, None])
 
 
     @triton.jit(do_not_specialize = ["R"])
@@ -650,13 +661,14 @@ if has_triton:
         w = tl.load(kv_norm_w + offs_c).to(tl.float32)
         tl.store(ckv + row * D_c + offs_c, (x * w * rmf).to(tl.float16))
 
-        offs_r = tl.arange(0, D_r)
-        tl.store(kpe + row * D_r + offs_r,
-                 tl.load(ckv_kpe + row * CKV_STRIDE + D_c + offs_r))
+        if D_r > 0:
+            offs_r = tl.arange(0, D_r)
+            tl.store(kpe + row * D_r + offs_r,
+                     tl.load(ckv_kpe + row * CKV_STRIDE + D_c + offs_r))
 
-        for h in range(n_q_heads):
-            v = tl.load(q_full + row * Q_STRIDE + h * QK_DIM + D_nope + offs_r)
-            tl.store(q_pe + (row * n_q_heads + h) * D_r + offs_r, v)
+            for h in range(n_q_heads):
+                v = tl.load(q_full + row * Q_STRIDE + h * QK_DIM + D_nope + offs_r)
+                tl.store(q_pe + (row * n_q_heads + h) * D_r + offs_r, v)
 
 
     @triton.jit(do_not_specialize = [
@@ -710,13 +722,14 @@ if has_triton:
 
         offs_nope = tl.arange(0, D_nope_pad)
         nope_ok = offs_nope < D_nope
-        offs_r = tl.arange(0, D_r)
+        offs_r = tl.arange(0, D_r if D_r > 0 else 1)
         offs_v = tl.arange(0, D_v)
 
         qb = q + ((q_row0 + offs_m[:, None]) * n_q_heads + head) * QK_DIM
         q_n = tl.load(qb + offs_nope[None, :],
                       mask = valid_m[:, None] & nope_ok[None, :], other = 0.0)
-        q_p = tl.load(qb + D_nope + offs_r[None, :], mask = valid_m[:, None], other = 0.0)
+        if D_r > 0:
+            q_p = tl.load(qb + D_nope + offs_r[None, :], mask = valid_m[:, None], other = 0.0)
 
         sb = head * s_len + offs_m
         if tile_init != 0:
@@ -735,11 +748,12 @@ if has_triton:
 
             kt = tl.load(k_nope + offs_n[None, :] * (n_q_heads * D_nope) + head * D_nope + offs_nope[:, None],
                          mask = in_r[None, :] & nope_ok[:, None], other = 0.0)
-            kt_pe = tl.load(k_pe + offs_n[None, :] * D_r + offs_r[:, None],
-                            mask = in_r[None, :], other = 0.0)
-
             scores = tl.dot(q_n, kt)
-            scores = tl.dot(q_p, kt_pe, acc = scores) * scale
+            if D_r > 0:
+                kt_pe = tl.load(k_pe + offs_n[None, :] * D_r + offs_r[:, None],
+                                mask = in_r[None, :], other = 0.0)
+                scores = tl.dot(q_p, kt_pe, acc = scores)
+            scores = scores * scale
 
             valid = valid_m[:, None] & in_r[None, :]
             if tile_masked != 0:

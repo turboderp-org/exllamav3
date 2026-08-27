@@ -114,18 +114,20 @@ if has_triton:
         valid_h = offs_h < H
         offs_c = tl.arange(0, D_c_pad)
         valid_c = offs_c < D_c
-        offs_r = tl.arange(0, D_r)
+        offs_r = tl.arange(0, D_r if D_r > 0 else 1)
         D = D_c + D_r
 
         if Q_SPLIT:
             qc = tl.load(q + (offs_h * R + row)[:, None] * D_c + offs_c[None, :],
                          mask = valid_h[:, None] & valid_c[None, :], other = 0.0)
-            qr = tl.load(ring + (row * H + offs_h)[:, None] * D_r + offs_r[None, :],
-                         mask = valid_h[:, None], other = 0.0)
+            if D_r > 0:
+                qr = tl.load(ring + (row * H + offs_h)[:, None] * D_r + offs_r[None, :],
+                             mask = valid_h[:, None], other = 0.0)
         else:
             q_base = q + (row * H + offs_h)[:, None] * D
             qc = tl.load(q_base + offs_c[None, :], mask = valid_h[:, None] & valid_c[None, :], other = 0.0)
-            qr = tl.load(q_base + D_c + offs_r[None, :], mask = valid_h[:, None], other = 0.0)
+            if D_r > 0:
+                qr = tl.load(q_base + D_c + offs_r[None, :], mask = valid_h[:, None], other = 0.0)
 
         if HAS_SINKS:
             sink = tl.load(sinks + offs_h, mask = valid_h, other = -float("inf"))
@@ -135,7 +137,7 @@ if has_triton:
             m_state = tl.full((BLOCK_H,), -float("inf"), tl.float32)
             l = tl.zeros((BLOCK_H,), tl.float32)
         acc_c = tl.zeros((BLOCK_H, D_c_pad), tl.float32)
-        acc_r = tl.zeros((BLOCK_H, D_r), tl.float32)
+        acc_r = tl.zeros((BLOCK_H, D_r if D_r > 0 else 1), tl.float32)
 
         # Phase 1: sliding-window rows, addressed by absolute position: query row sees
         # positions [q_abs - win_len + 1, q_abs] clipped to win_floor; rows at abs >= q_pos0
@@ -164,12 +166,14 @@ if has_triton:
                              mask = mc[:, None] & valid_c[None, :], other = 0.0) \
                    + tl.load(ring + idx_r[:, None] * D + offs_c[None, :],
                              mask = mr[:, None] & valid_c[None, :], other = 0.0)
-                vr = tl.load(kv_chunk + idx_c[:, None] * D + D_c + offs_r[None, :],
-                             mask = mc[:, None], other = 0.0) \
-                   + tl.load(ring + idx_r[:, None] * D + D_c + offs_r[None, :],
-                             mask = mr[:, None], other = 0.0)
                 scores = tl.dot(qc, tl.trans(vc))
-                scores = tl.dot(qr, tl.trans(vr), acc = scores) * scale
+                if D_r > 0:
+                    vr = tl.load(kv_chunk + idx_c[:, None] * D + D_c + offs_r[None, :],
+                                 mask = mc[:, None], other = 0.0) \
+                       + tl.load(ring + idx_r[:, None] * D + D_c + offs_r[None, :],
+                                 mask = mr[:, None], other = 0.0)
+                    scores = tl.dot(qr, tl.trans(vr), acc = scores)
+                scores = scores * scale
                 scores = tl.where(in_range[None, :], scores, -float("inf"))
                 m_new = tl.maximum(m_state, tl.max(scores, axis = 1))
                 m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
@@ -179,7 +183,7 @@ if has_triton:
                 l = l * alpha + tl.sum(p, axis = 1)
                 pv = p.to(vc.dtype)
                 acc_c = acc_c * alpha[:, None] + tl.dot(pv, vc)
-                if not OUT_LATENT:
+                if (not OUT_LATENT) and D_r > 0:
                     acc_r = acc_r * alpha[:, None] + tl.dot(pv, vr)
                 m_state = m_new
 
@@ -205,10 +209,12 @@ if has_triton:
             tok = phys * page_size + idx_s % page_size
             vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
                          mask = in_range[:, None] & valid_c[None, :], other = 0.0)
-            vr = tl.load(pool_r + tok[:, None] * D_r + offs_r[None, :],
-                         mask = in_range[:, None], other = 0.0)
             scores = tl.dot(qc, tl.trans(vc))
-            scores = tl.dot(qr, tl.trans(vr), acc = scores) * scale
+            if D_r > 0:
+                vr = tl.load(pool_r + tok[:, None] * D_r + offs_r[None, :],
+                             mask = in_range[:, None], other = 0.0)
+                scores = tl.dot(qr, tl.trans(vr), acc = scores)
+            scores = scores * scale
             scores = tl.where(in_range[None, :], scores, -float("inf"))
             m_new = tl.maximum(m_state, tl.max(scores, axis = 1))
             m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
@@ -218,7 +224,7 @@ if has_triton:
             l = l * alpha + tl.sum(p, axis = 1)
             pv = p.to(vc.dtype)
             acc_c = acc_c * alpha[:, None] + tl.dot(pv, vc)
-            if not OUT_LATENT:
+            if (not OUT_LATENT) and D_r > 0:
                 acc_r = acc_r * alpha[:, None] + tl.dot(pv, vr)
             m_state = m_new
 
@@ -341,18 +347,20 @@ if has_triton:
         valid_h = offs_h < H
         offs_c = tl.arange(0, D_c_pad)
         valid_c = offs_c < D_c
-        offs_r = tl.arange(0, D_r)
+        offs_r = tl.arange(0, D_r if D_r > 0 else 1)
         D = D_c + D_r
 
         if Q_SPLIT:
             qc = tl.load(q + (offs_h * ring_stride + row)[:, None] * D_c + offs_c[None, :],
                          mask = valid_h[:, None] & valid_c[None, :], other = 0.0)
-            qr = tl.load(ring + (row * H + offs_h)[:, None] * D_r + offs_r[None, :],
-                         mask = valid_h[:, None], other = 0.0)
+            if D_r > 0:
+                qr = tl.load(ring + (row * H + offs_h)[:, None] * D_r + offs_r[None, :],
+                             mask = valid_h[:, None], other = 0.0)
         else:
             q_base = q + (row * H + offs_h)[:, None] * D
             qc = tl.load(q_base + offs_c[None, :], mask = valid_h[:, None] & valid_c[None, :], other = 0.0)
-            qr = tl.load(q_base + D_c + offs_r[None, :], mask = valid_h[:, None], other = 0.0)
+            if D_r > 0:
+                qr = tl.load(q_base + D_c + offs_r[None, :], mask = valid_h[:, None], other = 0.0)
 
         # This row's virtual key range for this split
         if DENSE_POOL:
@@ -368,7 +376,7 @@ if has_triton:
         m_state = tl.full((BLOCK_H,), -float("inf"), tl.float32)
         l = tl.zeros((BLOCK_H,), tl.float32)
         acc_c = tl.zeros((BLOCK_H, D_c_pad), tl.float32)
-        acc_r = tl.zeros((BLOCK_H, D_r), tl.float32)
+        acc_r = tl.zeros((BLOCK_H, D_r if D_r > 0 else 1), tl.float32)
 
         if HAS_WINDOW:
             q_abs = q_pos0 + loc
@@ -385,12 +393,14 @@ if has_triton:
                              mask = mc[:, None] & valid_c[None, :], other = 0.0) \
                    + tl.load(ring + idx_r[:, None] * D + offs_c[None, :],
                              mask = mr[:, None] & valid_c[None, :], other = 0.0)
-                vr = tl.load(kv_chunk + idx_c[:, None] * D + D_c + offs_r[None, :],
-                             mask = mc[:, None], other = 0.0) \
-                   + tl.load(ring + idx_r[:, None] * D + D_c + offs_r[None, :],
-                             mask = mr[:, None], other = 0.0)
                 scores = tl.dot(qc, tl.trans(vc))
-                scores = tl.dot(qr, tl.trans(vr), acc = scores) * scale
+                if D_r > 0:
+                    vr = tl.load(kv_chunk + idx_c[:, None] * D + D_c + offs_r[None, :],
+                                 mask = mc[:, None], other = 0.0) \
+                       + tl.load(ring + idx_r[:, None] * D + D_c + offs_r[None, :],
+                                 mask = mr[:, None], other = 0.0)
+                    scores = tl.dot(qr, tl.trans(vr), acc = scores)
+                scores = scores * scale
                 scores = tl.where(in_range[None, :], scores, -float("inf"))
                 m_new = tl.maximum(m_state, tl.max(scores, axis = 1))
                 m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
@@ -400,7 +410,7 @@ if has_triton:
                 l = l * alpha + tl.sum(p, axis = 1)
                 pv = p.to(vc.dtype)
                 acc_c = acc_c * alpha[:, None] + tl.dot(pv, vc)
-                if not OUT_LATENT:
+                if (not OUT_LATENT) and D_r > 0:
                     acc_r = acc_r * alpha[:, None] + tl.dot(pv, vr)
                 m_state = m_new
 
@@ -422,10 +432,12 @@ if has_triton:
             tok = phys * page_size + idx_s % page_size
             vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
                          mask = in_range[:, None] & valid_c[None, :], other = 0.0)
-            vr = tl.load(pool_r + tok[:, None] * D_r + offs_r[None, :],
-                         mask = in_range[:, None], other = 0.0)
             scores = tl.dot(qc, tl.trans(vc))
-            scores = tl.dot(qr, tl.trans(vr), acc = scores) * scale
+            if D_r > 0:
+                vr = tl.load(pool_r + tok[:, None] * D_r + offs_r[None, :],
+                             mask = in_range[:, None], other = 0.0)
+                scores = tl.dot(qr, tl.trans(vr), acc = scores)
+            scores = scores * scale
             scores = tl.where(in_range[None, :], scores, -float("inf"))
             m_new = tl.maximum(m_state, tl.max(scores, axis = 1))
             m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
@@ -435,7 +447,7 @@ if has_triton:
             l = l * alpha + tl.sum(p, axis = 1)
             pv = p.to(vc.dtype)
             acc_c = acc_c * alpha[:, None] + tl.dot(pv, vc)
-            if not OUT_LATENT:
+            if (not OUT_LATENT) and D_r > 0:
                 acc_r = acc_r * alpha[:, None] + tl.dot(pv, vr)
             m_state = m_new
 
@@ -670,6 +682,109 @@ if has_triton:
         acc = tl.where(offs_n < bound, acc, -float("inf"))
         tl.store(scores + r * S_stride + offs_n, acc.to(tl.float16), mask = valid_n)
 
+
+    @triton.jit(do_not_specialize = ["num_pages_per_row", "append_len"])
+    def _dsa_pool_update_kernel(
+        plane,               # flat (pages * page_size, 2 * D) packed [k || gate] rows
+        pool_plane,          # flat (pages * EPP_POOL, D) pooled keys
+        ape,                 # (P, D) fp16 learned in-pool position embedding
+        block_table,         # (bsz, num_pages_per_row) i32
+        cache_seqlens,       # (bsz,) i32, pre-append counts
+        num_pages_per_row,
+        append_len,
+        page_size: tl.constexpr,
+        P: tl.constexpr,     # tokens per pool
+        D: tl.constexpr,
+        MAXPOOLS: tl.constexpr,   # grid height: append_len // P + 1
+    ):
+        """(Re)build the pooled keys touched by this append: softmax(gate + ape) over the
+        pool's present members, weighted mean of their keys. Branch-free w.r.t. pool
+        completion: partially filled pools are written too but never selected (the causal
+        bound admits only complete pools), and the write that completes a pool sees all P
+        members. Pools never straddle pages (page_size % P == 0)."""
+        b = tl.program_id(0)
+        pi = tl.program_id(1)
+        pos0 = tl.load(cache_seqlens + b)
+        t_end = pos0 + append_len
+        pool = pos0 // P + pi
+        if pool * P >= t_end:
+            return
+
+        offs_d = tl.arange(0, D)
+        bt = block_table + b * num_pages_per_row
+
+        # Per-dim softmax over the present members (j: token pool*P + j < t_end)
+        m = tl.full((D,), -float("inf"), tl.float32)
+        for j in range(P):
+            tok = pool * P + j
+            if tok < t_end:
+                phys = tl.load(bt + tok // page_size)
+                row = phys * page_size + tok % page_size
+                gv = tl.load(plane + row * (2 * D) + D + offs_d).to(tl.float32) \
+                   + tl.load(ape + j * D + offs_d).to(tl.float32)
+                m = tl.maximum(m, gv)
+        den = tl.zeros((D,), tl.float32)
+        acc = tl.zeros((D,), tl.float32)
+        for j in range(P):
+            tok = pool * P + j
+            if tok < t_end:
+                phys = tl.load(bt + tok // page_size)
+                row = phys * page_size + tok % page_size
+                gv = tl.load(plane + row * (2 * D) + D + offs_d).to(tl.float32) \
+                   + tl.load(ape + j * D + offs_d).to(tl.float32)
+                e = tl.exp(gv - m)
+                den += e
+                acc += e * tl.load(plane + row * (2 * D) + offs_d).to(tl.float32)
+        pk = acc / den
+
+        phys0 = tl.load(bt + (pool * P) // page_size)
+        prow = phys0 * (page_size // P) + pool % (page_size // P)
+        tl.store(pool_plane + prow * D + offs_d, pk.to(tl.float16))
+
+
+    @triton.jit(do_not_specialize = ["q_pos0"])
+    def _dsa_pool_expand_kernel(
+        pool_idx,            # (R, KP_pool) i32 selected pool ids, -1 padded
+        out,                 # (R, K_pad) i32 raw token indices
+        q_pos0,              # scalar (patched) or per-job i32 array (MULTIROW)
+        P: tl.constexpr,
+        SEL: tl.constexpr,   # pools selected per row (topk // P)
+        K_pad: tl.constexpr,
+        KP_pool: tl.constexpr,
+        TAIL: tl.constexpr,
+        SEQ: tl.constexpr = 1,
+        MULTIROW: tl.constexpr = 0,
+        BLOCK: tl.constexpr = 256,
+    ):
+        """Expand selected pools to raw token indices (pool * P + j) and append the query's
+        incomplete tail pool as raw tokens. -1 entries pass through; unwritten columns pad
+        with -1."""
+        r = tl.program_id(0)
+        c0 = tl.program_id(1) * BLOCK
+        offs = c0 + tl.arange(0, BLOCK)
+        if MULTIROW:
+            job = r // SEQ
+            loc = r % SEQ
+            q_pos = tl.load(q_pos0 + job) + loc
+        else:
+            q_pos = q_pos0 + r % SEQ
+        vis = q_pos + 1
+
+        # Expanded region [0, SEL * P)
+        pool = tl.load(pool_idx + r * KP_pool + offs // P, mask = offs < SEL * P, other = -1)
+        v = tl.where(pool >= 0, pool * P + offs % P, -1)
+
+        # Tail region [SEL * P, SEL * P + P - 1)
+        if TAIL:
+            tcount = vis % P
+            tstart = vis - tcount
+            ti = offs - SEL * P
+            tv = tl.where(ti < tcount, tstart + ti, -1)
+            v = tl.where((ti >= 0) & (ti < P - 1), tv, v)
+
+        v = tl.where(offs < SEL * P + (P - 1 if TAIL else 0), v, -1)
+        tl.store(out + r * K_pad + offs, v, mask = offs < K_pad)
+
 def dsa_attn(
     q,                       # (R, H, D_c + D_r) fp16, rope slice pre-rotated
     pool_c,                  # (pages, page_size, D_c) or (rows, D_c) fp16
@@ -739,6 +854,8 @@ def dsa_attn(
     if group_major is None:
         group_major = groups > 1
     hpg = H // groups if group_major else 0
+    assert out_latent or q_pe is None or q_pe.shape[-1] > 0, \
+        "dsa_attn: D_r == 0 requires out_latent"
     if out_latent:
         out_shape = (H, R, D_c)
         if out is None:
@@ -821,7 +938,7 @@ def dsa_attn(
             a_slots, a_rstride, a_seq = 0, (R if q_split else 0), 1
         with torch.cuda.device(q.device):
             _dsa_attn_split_kernel[(R * hb, n_splits)](
-                q, ring, kv_chunk, pool_c.reshape(-1, D_c), pool_r.reshape(-1, D_r),
+                q, ring, kv_chunk, pool_c.reshape(-1, D_c), (pool_r.reshape(-1, D_r) if D_r > 0 else pool_r.reshape(-1)),
                 block_table, indices, ws_ml, ws_acc,
                 a_klen, win_len, a_pool, npr, a_qpos, a_floor, a_beg,
                 a_slots, a_rstride,
@@ -849,7 +966,7 @@ def dsa_attn(
     grid = (R * triton.cdiv(H, block_h),)
     with torch.cuda.device(q.device):   # layer split: launch on the tensor's device
         _dsa_attn_kernel[grid](
-            q, ring, kv_chunk, pool_c.reshape(-1, D_c), pool_r.reshape(-1, D_r),
+            q, ring, kv_chunk, pool_c.reshape(-1, D_c), (pool_r.reshape(-1, D_r) if D_r > 0 else pool_r.reshape(-1)),
             block_table, indices, sinks_t, derot_t, out,
             k_len, win_len, pool_len, npr, q_pos0, R, win_floor, ring_beg,
             H = H, page_size = page_size, D_c = D_c, D_c_pad = triton.next_power_of_2(D_c),
