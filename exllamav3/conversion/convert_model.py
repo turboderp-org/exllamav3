@@ -5,7 +5,7 @@ import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear
 from ..modules.linear import convert_exl3_group
-from ..modules.quant.exl3_lib.quantize import auto_split
+from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem, malloc_trim
@@ -1065,6 +1065,9 @@ def main(args, job_state):
     # Iterate over modules
     for idx, module in enumerate(model.modules):
 
+        get_temp_buffers.cache_clear()
+        free_mem()
+
         start_module_time = time.time()
         if idx == model.first_block_idx:
             timed_blocks = 0
@@ -1360,6 +1363,8 @@ def main(args, job_state):
 
         for idx, module in enumerate(side_model.modules):
             assert module.num_slices <= 1
+            get_temp_buffers.cache_clear()   # see main loop
+            free_mem()
             start_module_time = time.time()
 
             q_tensors = {}
