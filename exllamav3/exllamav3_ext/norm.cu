@@ -130,6 +130,11 @@ __device__ __forceinline__ float _silu(float x)
     return x * recip;
 }
 
+__device__ __forceinline__ float _sigmoid_f(float x)
+{
+    return __fdividef(1.0f, 1.0f + __expf(-x));
+}
+
 
 // Block-size-agnostic reduction (any multiple of 32 threads)
 __device__ inline float reduce_dyn(float sum, int warp_id, int lane_id)
@@ -487,9 +492,11 @@ void gated_rms_norm_kernel
     const int dim,
     float constant_bias,
     const int w_groups,         // weight spans w_groups rows, cycled by row index (Mamba2 group norm)
-    const bool gate_first       // apply silu(g) before the norm instead of after (Mamba2 style)
+    const bool gate_first,      // apply silu(g) before the norm instead of after (Mamba2 style)
+    const int gate_act          // 0 = silu (GDN/Mamba2), 1 = sigmoid (KDA)
 )
 {
+    #define _gate_fn(v) (gate_act == 1 ? _sigmoid_f(v) : _silu(v))
     constexpr bool output_fp32 = std::is_same_v<output_t, float>;
     constexpr bool output_fp16 = std::is_same_v<output_t, half>;
     constexpr bool weight_bf16 = std::is_same_v<weight_t, bfloat16>;
@@ -514,10 +521,10 @@ void gated_rms_norm_kernel
             float4 g4;
             if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row * dim)) + column);
             else                       read_bfloat164(g4, ((const bfloat164*) (g + row * dim)) + column);
-            x4.x *= _silu(g4.x);
-            x4.y *= _silu(g4.y);
-            x4.z *= _silu(g4.z);
-            x4.w *= _silu(g4.w);
+            x4.x *= _gate_fn(g4.x);
+            x4.y *= _gate_fn(g4.y);
+            x4.z *= _gate_fn(g4.z);
+            x4.w *= _gate_fn(g4.w);
         }
         sum = sum_sq4(sum, x4);
     }
@@ -549,10 +556,10 @@ void gated_rms_norm_kernel
 
         if (gate_first)
         {
-            x4.x *= _silu(g4.x);
-            x4.y *= _silu(g4.y);
-            x4.z *= _silu(g4.z);
-            x4.w *= _silu(g4.w);
+            x4.x *= _gate_fn(g4.x);
+            x4.y *= _gate_fn(g4.y);
+            x4.z *= _gate_fn(g4.z);
+            x4.w *= _gate_fn(g4.w);
 
             apply4(x4, w4, rmf);
         }
@@ -560,20 +567,21 @@ void gated_rms_norm_kernel
         {
             apply4(x4, w4, rmf);
 
-            x4.x *= _silu(g4.x);
-            x4.y *= _silu(g4.y);
-            x4.z *= _silu(g4.z);
-            x4.w *= _silu(g4.w);
+            x4.x *= _gate_fn(g4.x);
+            x4.y *= _gate_fn(g4.y);
+            x4.z *= _gate_fn(g4.z);
+            x4.w *= _gate_fn(g4.w);
         }
 
         if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row * dim)) + column);
         if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row * dim)) + column);
     }
+    #undef _gate_fn
 }
 
 
 /*
-Compute RMSNorm: y = x * w / sqrt(row_mean(x * x) + epsilon) * silu(g)
+Compute RMSNorm: y = x * w / sqrt(row_mean(x * x) + epsilon) * act(g), act = silu or sigmoid
 - bfloat16 input only, half/float output
 - w_groups > 1: w holds w_groups weight rows of size dim, selected by (row % w_groups). Used for
   Mamba2 group norm where the norm spans dim channels but the weight covers the full inner dim
@@ -589,7 +597,8 @@ void gated_rms_norm_gr
     float constant_bias,
     Graph* graph,
     int w_groups,
-    bool gate_first
+    bool gate_first,
+    int gate_act
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -635,7 +644,8 @@ void gated_rms_norm_gr
             dim,                                                                                \
             constant_bias,                                                                      \
             w_groups,                                                                           \
-            gate_first                                                                          \
+            gate_first,                                                                         \
+            gate_act                                                                            \
         );
 
     //      x_type_____________  w_type_____________  y_type_______  g_type_____________  small  num_threads
@@ -671,8 +681,9 @@ void gated_rms_norm
     float epsilon,
     float constant_bias,
     int w_groups,
-    bool gate_first
+    bool gate_first,
+    int gate_act
 )
 {
-    gated_rms_norm_gr(x, w, y, g, epsilon, constant_bias, nullptr, w_groups, gate_first);
+    gated_rms_norm_gr(x, w, y, g, epsilon, constant_bias, nullptr, w_groups, gate_first, gate_act);
 }

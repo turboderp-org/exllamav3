@@ -653,13 +653,15 @@ void cuda_recurrent_gated_delta_rule_kernel
     }
 }
 
-template <bool save_history, int V_SPLIT>
+template <bool save_history, int V_SPLIT, bool CHANNELWISE = false>
 __global__ __launch_bounds__(128 * SUBK)
 void cuda_recurrent_gated_delta_rule_kernel_128
 (
                                                 // k_head_dim = v_head_dim = 128
     const bfloat16* __restrict__ mixed_qkv,     // [bsz, seqlen, (k_dim + k_dim + v_dim)]
-    const float* __restrict__ g,                // [bsz, seqlen, (group * num_k_heads)]
+    const float* __restrict__ g,                // [bsz, seqlen, (group * num_k_heads)], or
+                                                // [bsz, seqlen, heads, 128] log-decay per
+                                                // k-channel when CHANNELWISE (KDA)
     const bfloat16* __restrict__ beta,          // [bsz, seqlen, (group * num_k_heads)]
     float* __restrict__ recurrent_state,        // [num_slots, max_history + 1, (group * num_k_heads), 128, 128]
     bfloat16* __restrict__ core_attn_out,       // [bsz, seqlen, num_v_heads, 128]
@@ -686,7 +688,7 @@ void cuda_recurrent_gated_delta_rule_kernel_128
 
     int bi = blockIdx.x;
     mixed_qkv +=        bi * seqlen * (3 * HEAD_DIM * num_k_heads + HEAD_DIM * (num_v_heads - num_k_heads));
-    g +=                bi * seqlen * (group * num_k_heads);
+    g +=                (size_t) bi * seqlen * (group * num_k_heads) * (CHANNELWISE ? HEAD_DIM : 1);
     beta +=             bi * seqlen * (group * num_k_heads);
     int state_slot = slots ? slots[bi] : bi;
     float* slot_state = recurrent_state + (size_t) state_slot * slot_size;
@@ -707,6 +709,7 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     __shared__ float sh_q[HEAD_DIM];
     __shared__ float sh_dot1[HEAD_DIM];
     __shared__ float sh_dot2[HEAD_DIM];
+    __shared__ float sh_g[CHANNELWISE ? HEAD_DIM : 1];
 
     for (int s = 0; s < seqlen; ++s)
     {
@@ -764,6 +767,8 @@ void cuda_recurrent_gated_delta_rule_kernel_128
         k = k * rsqrtf(sumk + 1e-6f);
         sh_k[t] = k;
         sh_q[t] = q;
+        if constexpr (CHANNELWISE)
+            sh_g[t] = __expf(g[head * HEAD_DIM + t]);
 
         if (t < V_CHUNK_DIM && bt == 0)
         {
@@ -776,14 +781,21 @@ void cuda_recurrent_gated_delta_rule_kernel_128
         {
             float sum = 0.0f;
             float* sh_k_rd = sh_k + bt * BTS;
+            float* sh_g_rd = sh_g + bt * BTS;
             float* rs_rd = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
 
             #pragma unroll
             for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
             {
                 #pragma unroll
-                for (int j = 0; j < 8; ++j, rs_rd += HEAD_DIM, sh_k_rd++)
-                    sum = sum + *sh_k_rd * *rs_rd;
+                for (int j = 0; j < 8; ++j, rs_rd += HEAD_DIM, sh_k_rd++, sh_g_rd++)
+                {
+                    if constexpr (CHANNELWISE)
+                        // Decay folded per k-channel: kv_mem reads the decayed state
+                        sum = sum + *sh_k_rd * *sh_g_rd * *rs_rd;
+                    else
+                        sum = sum + *sh_k_rd * *rs_rd;
+                }
             }
             atomicAdd(sh_dot1 + t, sum);
         }
@@ -791,11 +803,13 @@ void cuda_recurrent_gated_delta_rule_kernel_128
 
         if (t < V_CHUNK_DIM)
         {
-            float g_h = __expf(g[head]);
+            float g_h = CHANNELWISE ? 1.0f : __expf(g[head]);
             float beta_h = __bfloat162float(beta[head]);
+            // CHANNELWISE: sh_dot1 already read the decayed state, no head-wide factor
             float v = __bfloat162float(gl_v[t]) - sh_dot1[t] * g_h;
             float v_out = 0.0f;
             float* sh_k_rd = sh_k + bt * BTS;
+            float* sh_g_rd = sh_g + bt * BTS;
             float* sh_q_rd = sh_q + bt * BTS;
             float* rs_r = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
             float* rs_w = gl_rs_w + v_start + t + bt * BTS * HEAD_DIM;
@@ -804,10 +818,10 @@ void cuda_recurrent_gated_delta_rule_kernel_128
             for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
             {
                 #pragma unroll
-                for (int j = 0; j < 8; ++j, rs_r += HEAD_DIM, rs_w += HEAD_DIM, sh_k_rd++, sh_q_rd++)
+                for (int j = 0; j < 8; ++j, rs_r += HEAD_DIM, rs_w += HEAD_DIM, sh_k_rd++, sh_g_rd++, sh_q_rd++)
                 {
                     float state = *rs_r;
-                    state = state * g_h + *sh_k_rd * v * beta_h;
+                    state = state * (CHANNELWISE ? *sh_g_rd : g_h) + *sh_k_rd * v * beta_h;
                     *rs_w = state;
                     v_out = v_out + *sh_q_rd * state;
                 }
@@ -820,7 +834,7 @@ void cuda_recurrent_gated_delta_rule_kernel_128
             out[t] = __float2bfloat16_rz(sh_dot2[t] * scale);
 
         mixed_qkv +=        2 * HEAD_DIM * num_k_heads + HEAD_DIM * num_v_heads;
-        g +=                num_v_heads;
+        g +=                num_v_heads * (CHANNELWISE ? HEAD_DIM : 1);
         beta +=             num_v_heads;
         core_attn_out +=    num_v_heads * HEAD_DIM;
     }
@@ -856,6 +870,18 @@ void cuda_recurrent_gated_delta_rule_gr
 
     TORCH_CHECK(qkv_dim == 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim,
                 "mixed_qkv must be [bsz, seqlen, 2*num_k_heads*k_head_dim + num_v_heads*v_head_dim]");
+    // 4-dim g = per-k-channel log decay (KDA); 3-dim g = per-head log decay (GDN)
+    bool channelwise = g.dim() == 4;
+    if (channelwise)
+    {
+        TORCH_CHECK(g.size(0) == bsz && g.size(1) == seqlen && g.size(2) == num_v_heads &&
+                    g.size(3) == k_head_dim,
+                    "channelwise g must be [bsz, seqlen, num_v_heads, k_head_dim]");
+        TORCH_CHECK(k_head_dim == 128 && v_head_dim == 128,
+                    "channelwise decay (KDA) requires 128x128 head dims");
+        TORCH_CHECK(g.is_contiguous(), "channelwise g must be contiguous");
+    }
+    else
     TORCH_CHECK(g.dim() == 3 && g.size(0) == bsz && g.size(1) == seqlen && g.size(2) == num_v_heads,
                 "g must be [bsz, seqlen, num_v_heads]");
     TORCH_CHECK(beta.dim() == 3 && beta.size(0) == bsz && beta.size(1) == seqlen && beta.size(2) == num_v_heads,
@@ -929,7 +955,20 @@ void cuda_recurrent_gated_delta_rule_gr
         }                                                                                 \
     }
 
-    if (!history)
+    if (channelwise)
+    {
+        if (!history)
+        {
+            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 4, true>)
+            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 1, true>)
+        }
+        else
+        {
+            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 4, true>)
+            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<true, 1, true>)
+        }
+    }
+    else if (!history)
     {
         if (k_head_dim == 128 && v_head_dim == 128)
         {
@@ -1666,6 +1705,187 @@ void gdn_ba_gemv_gr
 
     cuda_check(cudaPeekAtLastError());
 }
+
+#define LR_GEMV_WARPS 8
+
+// Float-input fp16-weight GEMV for the KDA low-rank second stages (f_b/g_b): x is a graph
+// static (a first-stage output), so no parameter recording is needed
+__global__ __launch_bounds__(LR_GEMV_WARPS * 32)
+void gdn_lowrank_gemv_f_kernel
+(
+    const float* __restrict__ x,                // [rows, k]
+    const half* __restrict__ w_t,               // [n, k]
+    float* __restrict__ y,                      // [rows, n]
+    const int k,
+    const int n
+)
+{
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int row = blockIdx.x * LR_GEMV_WARPS + warp;
+    if (row >= n) return;
+    int r = blockIdx.y;
+
+    const float* xr = x + (size_t) r * k;
+    const half* wr = w_t + (size_t) row * k;
+
+    float sum = 0.0f;
+    for (int j = lane; j < k; j += 32)
+        sum = fmaf(xr[j], __half2float(wr[j]), sum);
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    if (lane == 0)
+        y[(size_t) r * n + row] = sum;
+}
+
+void gdn_lowrank_gemv_f_gr
+(
+    const at::Tensor& x,            // [.., k] float
+    const at::Tensor& w_t,          // [n, k] half
+    at::Tensor& y,                  // [.., n] float
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(x, kFloat);
+    TORCH_CHECK_DTYPE(w_t, kHalf);
+    TORCH_CHECK_DTYPE(y, kFloat);
+    int k = x.size(-1);
+    int n = w_t.size(0);
+    int rows = (int) (x.numel() / k);
+    TORCH_CHECK(w_t.dim() == 2 && w_t.size(1) == k, "w_t must be [n, k]");
+    TORCH_CHECK(y.numel() == (int64_t) rows * n, "y must be [rows, n]");
+    TORCH_CHECK(x.is_contiguous() && w_t.is_contiguous() && y.is_contiguous(), "tensors must be contiguous");
+
+    dim3 blocks(CEIL_DIVIDE(n, LR_GEMV_WARPS), rows);
+    gdn_lowrank_gemv_f_kernel<<<blocks, LR_GEMV_WARPS * 32, 0, stream>>>
+    (
+        (const float*) x.data_ptr(),
+        (const half*) w_t.data_ptr(),
+        (float*) y.data_ptr(),
+        k, n
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+
+// KDA gate op: transpose/cast qkv to the conv layout, beta = sigmoid(b), per-channel log
+// decay from the low-rank forget path. All inputs/outputs are graph statics
+template <typename a_log_T>
+__global__ void kda_gate_op_kernel
+(
+    const float* __restrict__ in_qkv,           // [B,S,F]
+    const float* __restrict__ in_b,             // [B,S,H]
+    const float* __restrict__ in_f,             // [B,S,H*Dk]
+    const bfloat16* __restrict__ in_dt_bias,    // [H*Dk]
+    const a_log_T* __restrict__ in_a_log,       // [H]
+    bfloat16* __restrict__ out_mixed_qkv,       // [B,F,S]
+    bfloat16* __restrict__ out_beta,            // [B,S,H]
+    float* __restrict__ out_g,                  // [B,S,H,Dk]
+    const int BS,
+    const int S,
+    const int F,
+    const int H,
+    const int Dk,
+    const float lower_bound,                    // "safe gate" bound; softplus form if 0
+    const float beta_scale
+)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int cast_elems = BS * F;
+
+    if (idx < cast_elems)
+    {
+        int f = idx % F;
+        int row = idx / F;
+        int b = row / S;
+        int s = row % S;
+        out_mixed_qkv[((size_t) b * F + f) * S + s] = trunc_bf16(in_qkv[idx]);
+        return;
+    }
+    idx -= cast_elems;
+
+    if (idx < BS * H)
+    {
+        out_beta[idx] = trunc_bf16(_sigmoid_fast_exp(in_b[idx]) * beta_scale);
+        return;
+    }
+    idx -= BS * H;
+
+    if (idx >= BS * H * Dk) return;
+    int c = idx % (H * Dk);
+    int h = c / Dk;
+    float fv = in_f[idx] + as_float(in_dt_bias[c]);
+    float decay = __expf(as_float(in_a_log[h]));
+    float gv;
+    if (lower_bound != 0.0f)
+        gv = lower_bound * _sigmoid_fast_exp(decay * fv);
+    else
+        gv = -decay * softplus(fv);
+    out_g[idx] = gv;
+}
+
+void kda_gate_op_gr
+(
+    const at::Tensor& qkv,          // [B,S,F] float
+    const at::Tensor& b,            // [B,S,H] float
+    const at::Tensor& f,            // [B,S,H*Dk] float
+    const at::Tensor& dt_bias,      // [H*Dk] bfloat16
+    const at::Tensor& a_log,        // [H] float or bfloat16
+    at::Tensor& mixed_qkv,          // out [B,F,S] bfloat16
+    at::Tensor& beta,               // out [B,S,H] bfloat16
+    at::Tensor& g,                  // out [B,S,H,Dk] float
+    const float lower_bound,
+    const float beta_scale,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(qkv.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(qkv, kFloat);
+    TORCH_CHECK_DTYPE(b, kFloat);
+    TORCH_CHECK_DTYPE(f, kFloat);
+    TORCH_CHECK_DTYPE(dt_bias, kBFloat16);
+    TORCH_CHECK_DTYPE(mixed_qkv, kBFloat16);
+    TORCH_CHECK_DTYPE(beta, kBFloat16);
+    TORCH_CHECK_DTYPE(g, kFloat);
+
+    int B = qkv.size(0);
+    int S = qkv.size(1);
+    int F = qkv.size(2);
+    int H = b.size(-1);
+    int Dk = (int) (f.size(-1) / H);
+    int BS = B * S;
+    TORCH_CHECK(g.numel() == (int64_t) BS * H * Dk, "g must be [B,S,H,Dk]");
+
+    int total = BS * F + BS * H + BS * H * Dk;
+    int threads = 256;
+    int blocks = CEIL_DIVIDE(total, threads);
+
+    #define LAUNCH_KGO(T)                                                       \
+        kda_gate_op_kernel<T><<<blocks, threads, 0, stream>>>                   \
+        (                                                                       \
+            (const float*) qkv.data_ptr(),                                      \
+            (const float*) b.data_ptr(),                                        \
+            (const float*) f.data_ptr(),                                        \
+            (const bfloat16*) dt_bias.data_ptr(),                               \
+            (const T*) a_log.data_ptr(),                                        \
+            (bfloat16*) mixed_qkv.data_ptr(),                                   \
+            (bfloat16*) beta.data_ptr(),                                        \
+            (float*) g.data_ptr(),                                              \
+            BS, S, F, H, Dk, lower_bound, beta_scale                            \
+        );
+    if (a_log.dtype() == at::kFloat) { LAUNCH_KGO(float) }
+    else                             { LAUNCH_KGO(bfloat16) }
+    #undef LAUNCH_KGO
+    cuda_check(cudaPeekAtLastError());
+}
+
 
 void gdn_ba_gemv
 (

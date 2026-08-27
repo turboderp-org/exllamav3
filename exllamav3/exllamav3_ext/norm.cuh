@@ -47,7 +47,8 @@ void gated_rms_norm
     float epsilon,
     float constant_bias,
     int w_groups = 1,
-    bool gate_first = false
+    bool gate_first = false,
+    int gate_act = 0
 );
 
 void gated_rms_norm_gr
@@ -60,7 +61,8 @@ void gated_rms_norm_gr
     float constant_bias,
     Graph* graph,
     int w_groups = 1,
-    bool gate_first = false
+    bool gate_first = false,
+    int gate_act = 0
 );
 
 void rms_norm_gr

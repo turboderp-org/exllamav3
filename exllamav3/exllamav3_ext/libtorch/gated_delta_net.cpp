@@ -114,6 +114,56 @@ void BC_GatedDeltaNetSplit::configure_slot
     s.configured = true;
 }
 
+void BC_GatedDeltaNetSplit::configure_slot_kda
+(
+    int bsz,
+    int seqlen,
+    bool history,
+    at::Tensor qkv,
+    at::Tensor z,
+    at::Tensor b_out,
+    at::Tensor fa_out,
+    at::Tensor fb_out,
+    at::Tensor ga_out,
+    at::Tensor beta,
+    at::Tensor g,
+    at::Tensor mixed_qkv,
+    at::Tensor conv_out,
+    at::Tensor core_attn_out,
+    at::Tensor core_attn_out_f,
+    at::Tensor qkv_xh,
+    at::Tensor o_xh
+)
+{
+    Slot& s = slot(bsz, seqlen, history);
+
+    s.qkv             = std::move(qkv);
+    s.z               = std::move(z);
+    s.b_out           = std::move(b_out);
+    s.fa_out          = std::move(fa_out);
+    s.fb_out          = std::move(fb_out);
+    s.ga_out          = std::move(ga_out);
+    s.beta            = std::move(beta);
+    s.g               = std::move(g);
+    s.mixed_qkv       = std::move(mixed_qkv);
+    s.conv_out        = std::move(conv_out);
+    s.core_attn_out   = std::move(core_attn_out);
+    s.core_attn_out_f = std::move(core_attn_out_f);
+    s.qkv_xh          = std::move(qkv_xh);
+    s.o_xh            = std::move(o_xh);
+    s.z_flat = s.z.view({bsz, seqlen, -1});
+
+    TORCH_CHECK(s.qkv.is_contiguous() && s.z.is_contiguous() && s.b_out.is_contiguous() &&
+                s.fa_out.is_contiguous() && s.fb_out.is_contiguous() && s.ga_out.is_contiguous() &&
+                s.beta.is_contiguous() && s.g.is_contiguous() && s.mixed_qkv.is_contiguous() &&
+                s.conv_out.is_contiguous() && s.core_attn_out.is_contiguous() &&
+                s.core_attn_out_f.is_contiguous(),
+                "BC_GatedDeltaNetSplit (KDA): statics must be contiguous");
+
+    s.graph = std::make_unique<Graph>();
+    s.configured = true;
+}
+
 void BC_GatedDeltaNetSplit::run_bszN_gr
 (
     const at::Tensor& x,
@@ -132,20 +182,42 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     exl3_gemm_gr(x, qkv_proj->trellis, s.qkv, qkv_proj->suh, s.qkv_xh, qkv_proj->svh, -1, qkv_proj->mcg, qkv_proj->mul1, 0, graph);
     if (qkv_proj->bias)
         add_gr(s.qkv, qkv_proj->bias.value(), s.qkv, graph);
-    exl3_gemm_gr(x, z_proj->trellis, s.z_flat, z_proj->suh, s.z_xh, z_proj->svh, -1, z_proj->mcg, z_proj->mul1, 0, graph);
-    if (z_proj->bias)
-        add_gr(s.z_flat, z_proj->bias.value(), s.z_flat, graph);
 
-    gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
+    if (kda)
+    {
+        // KDA: three fp16 GEMVs off x (patched inputs), low-rank second stages and the gate op
+        // run entirely on graph statics. z (the sigmoid norm gate) is the g_b output
+        gdn_ba_gemv_gr(x, b_weight_t, {}, s.b_out, graph);
+        gdn_ba_gemv_gr(x, f_a_weight_t, {}, s.fa_out, graph);
+        gdn_ba_gemv_gr(x, g_a_weight_t, {}, s.ga_out, graph);
+        gdn_lowrank_gemv_f_gr(s.fa_out, f_b_weight_t, s.fb_out, graph);
+        gdn_lowrank_gemv_f_gr(s.ga_out, g_b_weight_t, s.z_flat, graph);
+        kda_gate_op_gr
+        (
+            s.qkv, s.b_out, s.fb_out,
+            dt_bias, a_log,
+            s.mixed_qkv, s.beta, s.g,
+            lower_bound, beta_scale,
+            graph
+        );
+    }
+    else
+    {
+        exl3_gemm_gr(x, z_proj->trellis, s.z_flat, z_proj->suh, s.z_xh, z_proj->svh, -1, z_proj->mcg, z_proj->mul1, 0, graph);
+        if (z_proj->bias)
+            add_gr(s.z_flat, z_proj->bias.value(), s.z_flat, graph);
 
-    gated_delta_net_fused_op_3_gr
-    (
-        s.qkv, s.ba,
-        dt_bias, a_log,
-        s.mixed_qkv, s.beta, s.g,
-        beta_scale,
-        graph
-    );
+        gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
+
+        gated_delta_net_fused_op_3_gr
+        (
+            s.qkv, s.ba,
+            dt_bias, a_log,
+            s.mixed_qkv, s.beta, s.g,
+            beta_scale,
+            graph
+        );
+    }
 
     cuda_causal_conv1d_update_gr
     (
@@ -229,17 +301,32 @@ void BC_GatedDeltaNetSplit::run_bszN
         s.graph->capture_end();
     }
 
-    auto args = std::vector<PPTR>
-    {
-        PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
-        PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // z_proj input
-        PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),
-        PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
-        PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
-        PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-        PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
-        PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
-    };
+    std::vector<PPTR> args;
+    if (kda)
+        args = std::vector<PPTR>
+        {
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // b_proj input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // f_a input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // g_a input
+            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
+            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
+        };
+    else
+        args = std::vector<PPTR>
+        {
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // z_proj input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),
+            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
+            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
+        };
     s.graph->launch(args, stream);
 }
 

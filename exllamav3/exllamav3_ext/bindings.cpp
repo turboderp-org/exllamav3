@@ -172,6 +172,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
     m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
     m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
+    m.def("gdn_lowrank_gemv_f", [](const at::Tensor& x, const at::Tensor& w_t, at::Tensor& y)
+        { gdn_lowrank_gemv_f_gr(x, w_t, y, nullptr); }, "gdn_lowrank_gemv_f");
+    m.def("kda_gate_op", [](const at::Tensor& qkv, const at::Tensor& b, const at::Tensor& f,
+                            const at::Tensor& dt_bias, const at::Tensor& a_log,
+                            at::Tensor& mixed_qkv, at::Tensor& beta, at::Tensor& g,
+                            float lower_bound, float beta_scale)
+        { kda_gate_op_gr(qkv, b, f, dt_bias, a_log, mixed_qkv, beta, g, lower_bound, beta_scale, nullptr); },
+        "kda_gate_op");
 
     py::class_<ConvRewindJob>(m, "ConvRewindJob")
         .def(py::init<uintptr_t, uintptr_t, int, int, int>());

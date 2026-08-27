@@ -20,6 +20,7 @@ class GatedRMSNorm(Module):
         constant_bias: float = 0.0,
         groups: int = 1,
         gate_first: bool = False,
+        gate_activation: str = "silu",
     ):
         super().__init__(config, key, None)
         assert qmap is None, "No quant scheme for RMSNorm"
@@ -34,6 +35,10 @@ class GatedRMSNorm(Module):
         # row selected per group, and the gate applied before the norm: y = norm(x * silu(g)) * w
         self.groups = groups
         self.gate_first = gate_first
+        # "silu" (GDN/Mamba2) or "sigmoid" (KDA); sigmoid takes the fp32 torch path (norm,
+        # weight and gate all fp32, gate applied after the weighted norm, per the KDA reference)
+        self.gate_activation = gate_activation
+        assert gate_activation in ("silu", "sigmoid")
         self.bc = None
 
     @override
@@ -53,6 +58,7 @@ class GatedRMSNorm(Module):
             self.constant_bias,
             self.groups,
             self.gate_first,
+            1 if self.gate_activation == "sigmoid" else 0,
         )
 
     @override
@@ -121,8 +127,16 @@ class GatedRMSNorm(Module):
         out_dtype: torch.dtype | None = None,
         gate: torch.Tensor = None,
     ) -> torch.Tensor:
+        gate_act = 1 if self.gate_activation == "sigmoid" else 0
+        if gate_act and not (x.dtype == torch.bfloat16 and x.is_contiguous() and gate.is_contiguous()):
+            # KDA torch fallback: strict-fp32 norm and weight, sigmoid gate after the norm
+            h = x.to(torch.float32)
+            h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim = True) + self.rms_norm_eps)
+            h = self.weight.to(torch.float32) * h
+            h = h * torch.sigmoid(gate.to(torch.float32))
+            return h.to(out_dtype or self.out_dtype or x.dtype)
         y = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
-        ext.gated_rms_norm(x, self.weight, y, gate, self.rms_norm_eps, self.constant_bias, self.groups, self.gate_first)
+        ext.gated_rms_norm(x, self.weight, y, gate, self.rms_norm_eps, self.constant_bias, self.groups, self.gate_first, gate_act)
         return y
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
