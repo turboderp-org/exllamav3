@@ -20,6 +20,7 @@ from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
 from .glm_moe_dsa import GlmMoeDsaModel
+from .glm5_next import Glm5NextModel
 from .gpt_oss import GptOssModel
 from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
@@ -84,6 +85,7 @@ ARCHITECTURES = {
         Glm4VModel,
         Glm4VMoeModel,
         GlmMoeDsaModel,
+        Glm5NextModel,
         GptOssModel,
         HCXVisionV2Model,
         HyV3Model,

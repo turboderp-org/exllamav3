@@ -120,12 +120,17 @@ class Glm4VVisionPatchMerger(Module):
         use_postshuffle_norm: bool = False,
         out_dtype: torch.dtype | None = None,
         qmap: str | None = None,
+        act_limit: float = 0.0,
+        gelu_approx: str = "tanh",
     ):
         super().__init__(config, key, None)
         self.hidden_size = hidden_size
         self.interm_size = interm_size
         self.out_dtype = out_dtype
         self.use_postshuffle_norm = use_postshuffle_norm
+        # GLM5.3: clamped-silu gate (clamp BEFORE the activation, HF convention) and exact GELU
+        self.act_limit = act_limit
+        self.gelu_approx = gelu_approx
 
         self.proj = Linear(
             config = config,
@@ -204,11 +209,13 @@ class Glm4VVisionPatchMerger(Module):
         x = x.view(-1, self.hidden_size)
         y = self.proj.forward(x.half(), params)
         y = self.norm.forward(y, params).half()
-        y = F.gelu(y, approximate = "tanh")
+        y = F.gelu(y, approximate = self.gelu_approx)
         g = self.gate.forward(y, params)
-        g = F.silu(g)
-        y = self.up.forward(y, params)
-        y *= g
+        u = self.up.forward(y, params)
+        if self.act_limit:
+            g = g.clamp(max = self.act_limit)
+            u = u.clamp(min = -self.act_limit, max = self.act_limit)
+        y = u * F.silu(g)
         y = self.down.forward(y, params)
         y = y.view(1, -1, self.hidden_size)
         return y
