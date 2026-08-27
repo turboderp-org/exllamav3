@@ -18,9 +18,10 @@ file from this script alongside the model's other .safetensors files.
 """
 
 
-def quantize_linears_single(bitrate, device, linears, config):
+def quantize_linears_single(bitrate, hq, device, linears, config):
     for linear in linears:
-        if bitrate == 16:
+        k = bitrate if not hq or bitrate > 8 else min(bitrate + linear.select_hq_bits, 8)
+        if k == 16:
             print(
                 f" -- Unquantized: {linear.key:{config.stc.max_key_len() + 6}}"
                 f"  bpw: {16:5.2f}",
@@ -30,7 +31,7 @@ def quantize_linears_single(bitrate, device, linears, config):
             quant_args = {
                 "seed": 0,
                 "mul1": True,
-                "K": bitrate,
+                "K": k,
                 "devices": [device],
                 "device_ratios": None,
                 "apply_out_scales": "always",
@@ -103,7 +104,7 @@ def main(args):
             linear.inner.swap_cpu()
 
         # Quantize
-        quantize_linears_single(args.mtp_bits, args.device, linears, config)
+        quantize_linears_single(args.mtp_bits, args.hq, args.device, linears, config)
 
         # Collect converted module tensors
         for m in module:
@@ -137,6 +138,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("-m", "--model_dir", type = str, help = "Input model directory", required = True)
     parser.add_argument("-mb", "--mtp_bits", type = int, help = "MTP model bitrate, default: 4", default = 4)
+    parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers (attention, shared experts), matching the integrated conversion's --hq")
     parser.add_argument("-o", "--out_file", type = str, help = "Output .safetensors file to contain quantized MTP tensors")
     parser.add_argument("-d", "--device", type = int, help = "Device index to use for quantization, default: 0", default = 0)
     _args = parser.parse_args()
