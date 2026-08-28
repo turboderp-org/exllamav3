@@ -318,7 +318,12 @@ def main(args):
              "turns": [("user", seed)] + [("user", fu) for fu in fus]}
             for seed, fus in CONVERSATIONS]
     convs = []
-    if args.tool_frac > 0:
+    if args.tool_frac >= 1.0:
+        # Tools only
+        convs = [{"tools": tools, "messages": [],
+                  "turns": [("user", seed)] + list(fus)}
+                 for tools, seed, fus in TOOL_CONVERSATIONS]
+    elif args.tool_frac > 0:
         n_tools = min(len(TOOL_CONVERSATIONS),
                       max(1, round(args.tool_frac / (1 - args.tool_frac) * len(CONVERSATIONS))))
         tool_convs = [{"tools": tools, "messages": [],
@@ -392,6 +397,10 @@ def main(args):
                             print(text_temp, end = "")
                             text_temp = ""
                             pb.update(min(total_temp, args.min_tokens))
+            # Flush the tail after the last newline -- for tool-calling turns this is
+            # exactly where the <tool_call> markup sits
+            if text_temp:
+                print(text_temp, end = "")
             response_ids = torch.cat(chunks, dim = -1)[0] if chunks else torch.empty(0, dtype = torch.long)
             if response_ids.numel() == 0:
                 messages.pop()
