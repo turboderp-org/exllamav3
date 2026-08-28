@@ -28,6 +28,44 @@ col_red = "\u001b[31;1m"
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
+
+def monkeypatch_triton_autotuner_thread_safety():
+    """
+    Triton's Autotuner.run() stores the call's arguments as `self.nargs` on the shared
+    kernel object and nulls the attribute on exit.
+
+    capture_module_parallel / advance_state_parallel run one worker thread per device
+    through the same JIT kernels, so a thread finishing run() while another is still inside
+    the seconds-long benchmark loop poisons {**self.nargs, ...}
+
+    Every use of nargs is confined to the calling thread's run() frame, so rebinding the
+    attribute to thread-local storage removes the race with no behavioral change
+    single-threaded. A data descriptor on the class also overrides pre-existing instance
+    attributes, so the patch is safe to apply at any point.
+    """
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:
+        return
+    if getattr(Autotuner, "_exl3_tls_nargs", False):
+        return
+
+    def _get_nargs(self):
+        tls = self.__dict__.get("_exl3_nargs_tls")
+        return getattr(tls, "value", None) if tls is not None else None
+
+    def _set_nargs(self, value):
+        tls = self.__dict__.get("_exl3_nargs_tls")
+        if tls is None:
+            tls = self.__dict__.setdefault("_exl3_nargs_tls", threading.local())
+        tls.value = value
+
+    Autotuner.nargs = property(_get_nargs, _set_nargs)
+    Autotuner._exl3_tls_nargs = True
+
+monkeypatch_triton_autotuner_thread_safety()
+
+
 parser = argparse.ArgumentParser(allow_abbrev = False)
 parser.add_argument("-i", "--in_dir", type = str, default = None, help = "Input (model) directory")
 parser.add_argument("-w", "--work_dir", type = str, default = None, help = "Working directory")
