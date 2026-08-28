@@ -673,6 +673,12 @@ class TransformersBackend:
             groups = []
             for sp in sources:
                 base = prefix + sp
+                if "*" not in base:
+                    # Literal (non-wildcard) source, e.g. glm5_next's per-head conv weights
+                    # q/k/v_conv1d.weight -> Concatenate into conv1d.weight: resolve the
+                    # single tensor directly (recursively, so quantized formats dequantize)
+                    groups.append(self._get_tensor(base))
+                    continue
                 if base.endswith(".weight"):
                     stem_re = re.compile(
                         "^" + re.escape(base[:-len(".weight")]).replace(r"\*", r"(\d+)") + r"\.weight(_packed)?$"
@@ -763,37 +769,123 @@ class TransformersBackend:
         walk(base)
         hook_modules = [embed] + list(layers) + extra
 
+        # Layer-major streaming: every weight is read exactly ONCE for the whole trace, and
+        # every row runs unpadded at its own length. Each row's forward runs in its own
+        # thread; the module hooks act as a scheduler that inverts the loop order without
+        # knowing any model's dataflow: a hooked module materializes once, the rows pass
+        # through it one at a time (other threads suspend at the pre-hook), then it
+        # dematerializes and the next module (discovered dynamically from whichever module
+        # the lead row requests next) begins. Suspended rows hold only their inter-module
+        # activations on the device. This replaced a chunked row-major scheme that re-read
+        # all weights per chunk and hit two batched-forward failure modes besides (FLA int32
+        # byte-offset overflow past 2^31 bytes of activation, and eager sparse-attention
+        # indexers materializing (rows, len, heads, len) fp32 scores over the padded width)
+        import threading
+
+        nz = ids != 0
+        row_len = (ids.shape[1] - nz.flip(1).int().argmax(dim = 1)) * nz.any(dim = 1).int()
+        row_len = row_len.clamp(min = 1).tolist()
+        num_rows = ids.shape[0]
+
         pb_state = {"n": 0}
         pb = ProgressBar("Streaming", len(hook_modules) + 1)
 
+        cv = threading.Condition()
+        st = {"active": None, "turn": 0, "error": None}
+        tls = threading.local()
+
+        def fail(e):
+            if st["error"] is None:
+                st["error"] = e
+            cv.notify_all()
+
         def pre_hook(module, args):
-            self._materialize(module)
+            me = id(module)
+            load = False
+            with cv:
+                while True:
+                    if st["error"] is not None:
+                        raise RuntimeError("layer-major streaming aborted")
+                    if st["turn"] == tls.row:
+                        if st["active"] == me:
+                            return
+                        if st["active"] is None:
+                            st["active"] = "loading"
+                            load = True
+                            break
+                        if st["active"] != "loading":
+                            fail(RuntimeError(
+                                f"module sequence diverged between rows: row {tls.row} "
+                                f"reached {self.prefix.get(me, '?')} while another module "
+                                f"is active (a hooked module is invoked more than once "
+                                f"per forward, or rows take different paths)"))
+                            raise RuntimeError("layer-major streaming aborted")
+                    cv.wait(1.0)
+            # materialize outside the lock (heavy I/O); other rows keep waiting on "loading"
+            try:
+                self._materialize(module)
+            except Exception as e:
+                with cv:
+                    fail(e)
+                raise
+            with cv:
+                st["active"] = me
+                cv.notify_all()
 
         def post_hook(module, args, output):
-            self._dematerialize(module)
-            pb_state["n"] += 1
-            pb.update(pb_state["n"])
+            with cv:
+                st["turn"] += 1
+                if st["turn"] == num_rows:
+                    self._dematerialize(module)
+                    st["active"] = None
+                    st["turn"] = 0
+                    pb_state["n"] += 1
+                    pb.update(pb_state["n"])
+                cv.notify_all()
 
         hooks = []
+        # Noise hooks first: they must fire inside the serialized window (before post_hook
+        # advances the turn), since their torch.Generator is not thread-safe
+        if noise_eps:
+            hooks += self._noise_hooks(noise_eps)
         for m in hook_modules:
             hooks.append(m.register_forward_pre_hook(pre_hook))
             hooks.append(m.register_forward_hook(post_hook))
-        if noise_eps:
-            hooks += self._noise_hooks(noise_eps)
+
+        hidden_cpu = [None] * num_rows
+
+        def worker(r):
+            try:
+                with torch.inference_mode(), torch.cuda.device(self.device):
+                    tls.row = r
+                    part = ids[r:r + 1, :row_len[r]].to(self.device)
+                    out = base(input_ids = part, use_cache = False).last_hidden_state
+                    hidden_cpu[r] = out.to("cpu")
+                    del out
+            except Exception as e:
+                with cv:
+                    fail(e)
 
         try:
             with pb:
-                # One batched pass: every weight is read exactly once. Activations are
-                # rows x len x hidden, tiny next to the weights being streamed
-                hidden = base(input_ids = ids.to(self.device), use_cache = False).last_hidden_state
+                threads = [threading.Thread(target = worker, args = (r,), daemon = True)
+                           for r in range(num_rows)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                if st["error"] is not None:
+                    raise st["error"]
+
                 self._materialize(head)
-                for r in range(ids.shape[0]):
-                    logits = head(hidden[r:r + 1])
+                for r in range(num_rows):
+                    logits = head(hidden_cpu[r].to(self.device))
                     if self.logit_multiplier != 1.0:
                         logits = logits * self.logit_multiplier
                     if self.logit_softcap:
                         logits = torch.tanh(logits / self.logit_softcap) * self.logit_softcap
                     callback(r, logits)
+                    hidden_cpu[r] = None
                 self._dematerialize(head)
                 pb.update(len(hook_modules) + 1)
         finally:
