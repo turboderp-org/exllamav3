@@ -931,13 +931,34 @@ def gguf_shards(source: str) -> list:
 def gguf_storage_info(source: str) -> dict:
     """bpw/vram accounting over the full tensor table, spanning all shards of a split GGUF.
     Norms/biases are < 2 dims; router gates excluded by name; token_embd serves as the head
-    fallback for tied models, overridden by output.weight when present in any shard"""
+    fallback for tied models, overridden by output.weight when present in any shard.
+    NextN/MTP prediction blocks (packed as the last {arch}.nextn_predict_layers of
+    {arch}.block_count) are excluded: the other engines also count decoder layers + head only"""
     from gguf import GGUFReader
     sum_bits = sum_numel = head_bits = head_numel = 0
     head_is_fallback = True
-    for shard in gguf_shards(source):
+    mtp_prefixes = ()
+    for shard_idx, shard in enumerate(gguf_shards(source)):
         reader = GGUFReader(shard)
+        if shard_idx == 0:
+            def kv(key):
+                f = reader.fields.get(key)
+                if f is None:
+                    return None
+                try:
+                    return f.contents()
+                except Exception:
+                    import numpy as np
+                    return int(np.array(f.parts[f.data[0]]).flatten()[0])
+            arch = kv("general.architecture")
+            if arch:
+                nextn = kv(f"{arch}.nextn_predict_layers") or 0
+                blocks = kv(f"{arch}.block_count")
+                if nextn and blocks:
+                    mtp_prefixes = tuple(f"blk.{i}." for i in range(int(blocks) - int(nextn), int(blocks)))
         for t in reader.tensors:
+            if mtp_prefixes and t.name.startswith(mtp_prefixes):
+                continue
             if t.name == "output.weight" or (t.name == "token_embd.weight" and head_is_fallback):
                 head_bits = t.n_bytes * 8
                 head_numel = t.n_elements
