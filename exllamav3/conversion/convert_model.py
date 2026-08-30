@@ -77,6 +77,8 @@ parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bi
 parser.add_argument("-mb", "--mtp_bits", type = int, default = None, help = "Bits per weight, MTP layers, default: 4")
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
 parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
+parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "Bits per weight for hashed n-gram embedding tables, 1-8, default: --bits rounded")
+parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
 parser.add_argument("-cd", "--cal_data", type = str, default = None, help = "Calibration data file (safetensors with packed token rows, e.g. from sc_trace.py) used instead of the bundled corpus mix")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
@@ -249,6 +251,8 @@ def prepare(args) -> (dict, dict, bool, str):
         ("mtp_bits", True, 4),
         ("vision_bits", True, 0),  # 0 = auto: architecture's default_vision_bits cap, or 16
         ("hq", False, False),
+        ("ngram_bits", False, 0),  # 0 = auto: --bits rounded
+        ("ngram_file", False, ""),
         ("cal_data", False, ""),
         ("cal_rows", False, 250),
         ("cal_cols", False, 2048),
@@ -1035,6 +1039,12 @@ def main(args, job_state):
 
     # Get model
     config, model, mtp_model, vision_model, tokenizer, use_reference_state = get_base_model(args)
+
+    # Models with a hashed n-gram embedding table get it quantized (or copied from --ngram_file)
+    # into the output directory up front, so the calibration forward pass runs on the quantized
+    # table; resumable and skipped when already complete
+    from .ngram import prepare_ngram_table_for_conversion
+    prepare_ngram_table_for_conversion(args, config, model)
 
     # Check caps
     can_resume_quant = model.caps.get("can_resume_quant", use_reference_state)

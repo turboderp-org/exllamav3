@@ -50,7 +50,7 @@ def tensor_core_perm_i(device):
 
 
 @lru_cache
-def get_temp_buffers(device, K: int):
+def get_temp_buffers(device, K: int, tile_len: int = 256):
     # The kernel runs one block per tile and caps each wave at min(temp_costs.size(0), 2 * SMs). At K >= 4 the
     # temp buffers are cheap enough to size for full occupancy on large GPUs (+17% throughput on GB202 at big
     # batches); at lower K, temp_edges is multiple GB already and 256 stays the cap
@@ -59,7 +59,7 @@ def get_temp_buffers(device, K: int):
         mp_count = torch.cuda.get_device_properties(device).multi_processor_count
         max_batch_size = max(256, 2 * mp_count)
     temp_costs = torch.zeros((max_batch_size, 2, 65536 >> K), dtype = torch.half, device = device)
-    temp_edges = torch.zeros((max_batch_size, 256, 65536 >> K), dtype = torch.short, device = device)
+    temp_edges = torch.zeros((max_batch_size, tile_len, 65536 >> K), dtype = torch.short, device = device)
     return temp_costs, temp_edges
 
 
@@ -68,10 +68,11 @@ def quantize_tiles(tiles, quant_args: dict):
     Quantize a batch of 16x16 tiles on the current device.
 
     tiles is shaped (num_tiles, 256) in the kernel's expected element order. The CUDA extension returns both the
-    reconstructed float tile values and the short encoded indices used later for packing.
+    reconstructed float tile values and the short encoded indices used later for packing. Length-160 rows
+    (n-gram embedding vectors, mul1 codebook only) are accepted too and quantized as single tail-biting rings.
     """
     tiles = tiles.contiguous()
-    assert tiles.shape[1] == 256
+    assert tiles.shape[1] in (256, 160)
     assert tiles.dtype == torch.float
 
     K = quant_args["K"]
@@ -79,7 +80,11 @@ def quantize_tiles(tiles, quant_args: dict):
     mul1 = "mul1" in quant_args
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
-    temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
+    # NB: same call signature as other sites for tile_len 256, so the lru_cache key stays shared
+    if tiles.shape[1] == 256:
+        temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
+    else:
+        temp_costs, temp_edges = get_temp_buffers(tiles.device, K, tiles.shape[1])
     ext.quantize_tiles(
         tiles,
         quantized_tiles,
