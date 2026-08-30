@@ -20,7 +20,8 @@ class RMSNorm(Module):
         constant_bias: float = 0.0,
         constant_scale: float = 1.0,
         span_heads: bool = False,
-        unweighted: bool = False
+        unweighted: bool = False,
+        groups: int = 1
     ):
         super().__init__(config, key, None)
         assert qmap is None, "No quant scheme for RMSNorm"
@@ -34,6 +35,11 @@ class RMSNorm(Module):
         self.constant_scale = constant_scale
         self.span_heads = span_heads
         self.unweighted = unweighted
+        # Grouped norm (PLE/hyper-connection stream stacks): the weight holds `groups` rows of
+        # (numel / groups) channels, selected per input row by (row % groups); the rms itself is
+        # per row as always. Input (..., groups, dim) flattens to rows cycling the groups
+        self.groups = groups
+        assert groups == 1 or not span_heads
 
         self.tensor_key = f"{self.key}.weight" if tensor_weight_suffix else f"{self.key}"
 
@@ -74,7 +80,8 @@ class RMSNorm(Module):
         x = x * torch.rsqrt(var) * self.constant_scale
         x = x.to(dtype)
         if not self.unweighted:
-            x = x * self.weight if self.constant_bias == 0.0 else x * (self.weight + self.constant_bias)
+            w = self.weight.view(self.groups, -1) if self.groups > 1 else self.weight
+            x = x * w if self.constant_bias == 0.0 else x * (w + self.constant_bias)
         x = x.to(out_dtype or self.out_dtype)
         return x
 
@@ -88,7 +95,7 @@ class RMSNorm(Module):
         (fused x += y; norm(x))
         """
         return (
-            not self.span_heads and
+            not self.span_heads and self.groups == 1 and
             x.dtype in (torch.half, torch.float) and
             y.dtype in (torch.half, torch.float) and
             x.is_contiguous() and y.is_contiguous() and
@@ -127,7 +134,11 @@ class RMSNorm(Module):
         # chunk/prefill shapes (e.g. [B, T, C] vs [B*T, C]).
         # TODO: Weight tensor is always contiguous, so this could be handled more efficiently in the extension
         elif not self.span_heads and x.dim() > 2:
-            x_2d = x.view(-1, x.shape[-1]).contiguous()
+            # Grouped norm: the flattened rows cycle the groups (input (..., groups, dim)), the
+            # kernel selects the weight row by (row % groups)
+            if self.groups > 1:
+                assert x.shape[-2] == self.groups
+            x_2d = x.reshape(-1, x.shape[-1]).contiguous()
             y_2d = torch.empty_like(x_2d, dtype = dtype) if residual is None else residual.view_as(x_2d)
             ext.rms_norm(
                 x_2d,
@@ -138,9 +149,11 @@ class RMSNorm(Module):
                 self.constant_scale,
                 self.span_heads,
                 residual is not None,
+                self.groups,
             )
             y = y_2d.view_as(x)
         else:
+            assert self.groups == 1
             y = torch.empty_like(x, dtype = dtype) if residual is None else residual.view_as(x)
             ext.rms_norm(
                 x,
@@ -186,6 +199,7 @@ class RMSNorm(Module):
                 "span_heads": self.span_heads,
                 "constant_scale": self.constant_scale,
                 "unweighted": self.unweighted,
+                "groups": self.groups,
             },
             "weight": producer.send(self.weight),
             "device": self.device,

@@ -13,7 +13,8 @@ void rms_norm
     float constant_bias,
     float constant_scale,
     bool span_heads,
-    bool add_residual
+    bool add_residual,
+    int w_groups = 1
 );
 
 void rms_norm_gr
