@@ -218,6 +218,15 @@ class SafetensorsCollection:
         self.deferred_mode = False
         self.deferred_loads = []
 
+        # Load-time slab arena (per CUDA device): weight tensors loaded inside a deferred-load
+        # bracket carve out of large shared blocks instead of one allocation each. MoE models
+        # with many small per-expert tensors otherwise shatter the caching allocator (measured:
+        # 74k ~1MB + 150k tiny allocations -> 37k segments, 15.3 GB reserved-but-unallocated on
+        # a 512-expert model). The boundary block is shared across brackets, so at most one
+        # partially-external block per module stays pinned after an unload
+        self.arena = {}                    # device index -> [block (uint8), fill offset]
+        self.arena_enable = os.environ.get("EXL3_LOAD_ARENA", "1") != "0"
+
 
     def add_tensor_files(
         self,
@@ -387,6 +396,29 @@ class SafetensorsCollection:
         return result
 
 
+    ARENA_BLOCK = 128 << 20        # slab block size
+    ARENA_MAX_TENSOR = 64 << 20    # larger tensors get their own allocation (few, no waste)
+    ARENA_ALIGN = 256
+
+    def _arena_alloc(self, shape, dtype: torch.dtype, device: torch.device, zeros: bool):
+        """Persistent weight-tensor allocation: carve from the device's slab block while a
+        deferred-load bracket is open, falling back to a plain allocation otherwise."""
+        device = torch.device(device)
+        nbytes = math.prod(shape) * dtype.itemsize
+        if not (self.arena_enable and self.deferred_mode and device.type == "cuda"
+                and 0 < nbytes <= self.ARENA_MAX_TENSOR):
+            return (torch.zeros if zeros else torch.empty)(shape, dtype = dtype, device = device)
+        blk, off = self.arena.get(device.index, (None, 0))
+        off = -(-off // self.ARENA_ALIGN) * self.ARENA_ALIGN
+        if blk is None or off + nbytes > blk.numel():
+            blk = torch.empty(self.ARENA_BLOCK, dtype = torch.uint8, device = device)
+            off = 0
+        self.arena[device.index] = (blk, off + nbytes)
+        t = blk[off : off + nbytes].view(dtype).view(shape)
+        if zeros:
+            t.zero_()
+        return t
+
     def get_tensor(
         self,
         key: str,
@@ -481,11 +513,11 @@ class SafetensorsCollection:
                         load_dtype = torch.half
                     final_shape = pad_to if pad_to is not None else load_shape_t
                     final_dtype = dtype if not (bf16_to_fp16 or fp32_to_fp16) else torch.float16
-                    if final_shape == load_shape_t:
-                        tensor = torch.empty(final_shape, dtype = final_dtype, device = device)
-                    else:
-                        tensor = torch.zeros(final_shape, dtype = final_dtype, device = device)
+                    tensor = self._arena_alloc(final_shape, final_dtype, device,
+                                               zeros = final_shape != load_shape_t)
                     if transpose or fp32_to_fp16 or final_shape != load_shape_t:
+                        # transient staging: NOT from the arena (freed after the fill; it would
+                        # pin its block as dead weight)
                         temp_tensor = torch.empty(load_shape, dtype = load_dtype, device = device)
                     else:
                         temp_tensor = None
@@ -512,7 +544,15 @@ class SafetensorsCollection:
                         except RuntimeError as e:
                             print(f" ## Error opening {filename}")
                             raise e
-                    tensor = torch.empty(shape, dtype = dtype, device = device)
+                    # Arena only when the loaded tensor IS the final tensor (a conversion or
+                    # transpose below replaces it, stranding the original in the slab)
+                    final = not (dtype == torch.bfloat16 and not allow_bf16) \
+                        and not (dtype == torch.float and float2half) \
+                        and not transpose and pad_to is None
+                    if final:
+                        tensor = self._arena_alloc(shape, dtype, device, zeros = False)
+                    else:
+                        tensor = torch.empty(shape, dtype = dtype, device = device)
                     assert tensor.is_contiguous()
                     # No sync needed here: the loader engine synchronizes the target device
                     # before writing from its own streams
