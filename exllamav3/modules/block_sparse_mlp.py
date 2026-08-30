@@ -1097,11 +1097,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                 # Count how many assignments per expert
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                expert_count_list = expert_count.tolist()
 
-                # Run fused path if possible, skips experts with more than TEMP_ROWS_FUSED tokens
-                if self.fused_mode_buffers is not None:
-                    num_active = sum(1 for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED)
+                def run_fused(num_active):
                     # Gateless: the up module stands in for the gate pointer tables (the kernel
                     # skips the gate GEMM when activation_fn_idx is MOE_ACT_RELU2_NOGATE)
                     multi_gate = self.multi_gate if self.gated else self.multi_up
@@ -1137,9 +1134,26 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         self.act_limit,
                         num_active
                     )
-                    min_rows = TEMP_ROWS_FUSED
+
+                # With few enough total assignments, no expert can exceed the fused kernel's
+                # row capacity: the fused path handles everything, the per-expert count
+                # readback (a CPU sync per layer, ~33% idle at MTP verify shapes) is
+                # unnecessary, and the overflow fallback loop below cannot have work.
+                # num_active -1 = unknown, kernel launches at max concurrency
+                if self.fused_mode_buffers is not None and num_tokens * top_k <= TEMP_ROWS_FUSED:
+                    run_fused(-1)
+                    expert_count_list = None
                 else:
-                    min_rows = 0
+                    expert_count_list = expert_count.tolist()
+
+                    # Run fused path if possible, skips experts with more than TEMP_ROWS_FUSED
+                    # tokens
+                    if self.fused_mode_buffers is not None:
+                        num_active = sum(1 for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED)
+                        run_fused(num_active)
+                        min_rows = TEMP_ROWS_FUSED
+                    else:
+                        min_rows = 0
 
                 out_state = None
                 interm = None
@@ -1147,7 +1161,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 max_count = 0
                 start = 0
 
-                for expert_idx in range(num_ex):
+                # expert_count_list None: everything already handled by the fused kernel above
+                for expert_idx in range(num_ex if expert_count_list is not None else 0):
                     count = expert_count_list[expert_idx]
                     end = start + count
                     if count <= min_rows:
