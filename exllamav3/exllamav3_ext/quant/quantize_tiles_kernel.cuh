@@ -2,6 +2,10 @@
 
 // Templated trellis-quantization (Viterbi) kernel, instantiated per (K, cb) in
 // comp_units/quantize_tiles_inst_k*.cu
+//
+// L is the tile length (number of weights per tail-biting trellis ring). 256 = the 16x16 EXL3 tile;
+// 160 instances (mul1 only) quantize n-gram embedding rows as single vectors. L must be even and
+// <= QUANTIZE_TILES_NUM_THREADS.
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -16,7 +20,7 @@
 #define H_INF __ushort_as_half(0x7c00)
 #endif
 
-template <int K, int cb>
+template <int K, int cb, int L = 256>
 __global__ __launch_bounds__(QUANTIZE_TILES_NUM_THREADS, 2)
 void quantize_tiles_kernel
 (
@@ -36,12 +40,12 @@ void quantize_tiles_kernel
 
     const int tile_idx = blockIdx.x;
     const int thread = threadIdx.x;
-    const float* input_tile = input_tiles_ptr + 256 * tile_idx;
-    float* output_tile = output_tiles_ptr + 256 * tile_idx;
-    uint16_t* output_indices = output_indices_ptr + 256 * tile_idx;
-    uint16_t* temp_edges = temp_edges_ptr + 256 * edges * tile_idx;
+    const float* input_tile = input_tiles_ptr + L * tile_idx;
+    float* output_tile = output_tiles_ptr + L * tile_idx;
+    uint16_t* output_indices = output_indices_ptr + L * tile_idx;
+    uint16_t* temp_edges = temp_edges_ptr + L * edges * tile_idx;
 
-    half* sh_input_tile = (half*) sh; sh += 256 * sizeof(half);
+    half* sh_input_tile = (half*) sh; sh += L * sizeof(half);
     half* sh_min = (half*) sh; sh += 32 * sizeof(half);
     int* sh_idx = (int*) sh; sh += 32 * sizeof(int);
 
@@ -49,12 +53,20 @@ void quantize_tiles_kernel
     half* temp_costs = K >= 2 ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
     half* temp_costs_inc = temp_costs + edges;
 
-    if (thread < 256) sh_input_tile[thread] = __float2half_rn(input_tile[thread]);
+    if (thread < L) sh_input_tile[thread] = __float2half_rn(input_tile[thread]);
     __syncthreads();
+
+    // ri = (i + roll) mod L, with i < L and roll in {0, L / 2}
+    auto ring = [&](int i, int roll)
+    {
+        int ri = i + roll;
+        if (ri >= L) ri -= L;
+        return ri;
+    };
 
     auto forward = [&](int roll, int pre_state)
     {
-        int ri = roll & 255;
+        int ri = ring(0, roll);
         half* t = temp_costs;
         temp_costs = temp_costs_inc;
         temp_costs_inc = t;
@@ -134,9 +146,9 @@ void quantize_tiles_kernel
         }
         __syncthreads();
 
-        for (int i = 1; i < 256; ++i)
+        for (int i = 1; i < L; ++i)
         {
-            ri = (i + roll) & 255;
+            ri = ring(i, roll);
             t = temp_costs;
             temp_costs = temp_costs_inc;
             temp_costs_inc = t;
@@ -265,16 +277,19 @@ void quantize_tiles_kernel
                 if (__hlt(other_min, local_min)) { local_min = other_min; local_idx = other_idx; }
             }
         }
-        return local_idx;
+        // If every cost is inf/NaN (degenerate input), no comparison fires and the index remains
+        // the initial -1; backward would then read temp_edges out of bounds. Return a valid edge
+        // instead: the output is garbage for garbage input, but stays in bounds.
+        return local_idx < 0 ? 0 : local_idx;
     };
 
     auto backward = [&](int roll, bool write, int edge)
     {
         if (thread == 0)
         {
-            for (int i = 255; i >= 0; --i)
+            for (int i = L - 1; i >= 0; --i)
             {
-                const int ri = (i + roll) & 255;
+                const int ri = ring(i, roll);
                 const int prev_edge = (int) temp_edges[edges * ri + edge];
                 const int encoded = (prev_edge << K) | edge;
                 edge = prev_edge;
@@ -291,8 +306,8 @@ void quantize_tiles_kernel
         return sh_idx[0];
     };
 
-    forward(128, -1);
-    int end_state = backward(128, false, argmin_cost());
+    forward(L / 2, -1);
+    int end_state = backward(L / 2, false, argmin_cost());
     forward(0, end_state);
     backward(0, true, end_state);
 }
