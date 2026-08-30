@@ -114,13 +114,19 @@ class Model_LSMixin(ABC):
                 if callback_sync: callback_sync(idx, len(modules))
                 if generator: yield idx, len(modules)
 
-                # Narrow state to max_output_size for logit output layer
+                # Narrow state to max_output_size for logit output layer. When a live dummy state
+                # exists, refresh the backup from it: backup_shape still holds the state that
+                # ENTERED the previous module, which can have a different rank (e.g. a
+                # hyper-connection stream stack ahead of a final mixer)
                 is_logits_layer = module.caps.get("logits_output")
                 if is_logits_layer and not autosplit_no_forward:
-                    b, c, d = backup_shape
-                    backup_shape = (b, min(max_output_size, c), d)
                     if dummy_state is not None:
-                        dummy_state = dummy_state[:, :max_output_size, :]
+                        dummy_state = dummy_state[:, :max_output_size]
+                        backup_shape = dummy_state.shape
+                        backup_dtype = dummy_state.dtype
+                    else:
+                        b, c, *rest = backup_shape
+                        backup_shape = (b, min(max_output_size, c), *rest)
 
                 while True:
                     try:
