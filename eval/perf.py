@@ -83,6 +83,7 @@ def measure_prefill(args, model, cache, warmup = False):
     if args.short_prefill:
         lengths = list(range(lengths[0])) + lengths
 
+    ids_offset = 0 if warmup else args.max_length
     is_recurrent = model.caps.get("recurrent_states", False)
     progress = 0
     results = {}
@@ -106,7 +107,7 @@ def measure_prefill(args, model, cache, warmup = False):
                         "batch_shape": (1, max(length, 256)),
                         "recurrent_states": recurrent,
                     }
-                    model.prefill(workload_ids(start, end - start), params)
+                    model.prefill(workload_ids(start + ids_offset, end - start), params)
                 cuda_sync_active()
                 if is_recurrent:
                     recurrent[0].free()
@@ -123,6 +124,8 @@ def measure_prefill(args, model, cache, warmup = False):
 def measure_generate(args, model, cache, warmup = False):
     chunk_size = args.chunk_size
     lengths = [0] + get_lengths(chunk_size if warmup else args.max_length - 256)
+
+    ids_offset = args.max_length * 2 if warmup else args.max_length * 3
     is_recurrent = model.caps.get("recurrent_states", False)
     progress = 0
     results = {}
@@ -140,7 +143,7 @@ def measure_generate(args, model, cache, warmup = False):
                         "batch_shape": (1, max(length + 256, 256)),
                         "recurrent_states": recurrent
                     }
-                    logits = model.forward(workload_ids(length + i, 1), params)
+                    logits = model.forward(workload_ids(ids_offset + length + i, 1), params)
                     sample = torch.argmax(logits)
                     sample = sample.cpu()  # force sync
                     del logits
