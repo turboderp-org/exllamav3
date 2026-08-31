@@ -112,13 +112,32 @@ cd exllamav3
 # (Optional) switch to dev branch for latest in-progress features
 git checkout dev
 
-# Install requirements (make sure you install Torch separately)
-pip install -r requirements.txt
+# (Recommended) With uv - installs from pyproject.toml. Make sure you install
+# Torch separately first (see below), then create a venv and sync:
+uv venv
+uv sync --extra examples
+```
+
+With uv this automatically installs all dependencies declared in `pyproject.toml`; add `--extra eval` to also install the eval requirements. The library's C++/CUDA extension is built at install time when a matching Torch is present.
+
+Alternatively, with pip:
+
+```sh
+# Install requirements from pyproject.toml (make sure you install Torch separately)
+pip install .
+```
+
+**Installing Torch first (required in all cases):** the Torch dependency is deliberately not auto-installed because it must match your CUDA setup. Use the [PyTorch install guide](https://pytorch.org/get-started/locally/) to install the CUDA-enabled build into your venv *before* running `uv sync` / `pip install .`, e.g.:
+
+```sh
+uv venv
+uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+uv sync
 ```
 
 At this point you should be able to run the conversion, eval and example scripts from the main repo directory, e.g. `python convert.py -i ...`
 
-To install the library for the active venv, run from the repo directory:
+To install the library for the active venv with pip instead:
 
 ```sh
 pip install .
@@ -127,7 +146,6 @@ pip install .
 Relevant env variables for building:
 - `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for compilation. Set this to a reasonable value like 4 in that case.  
 - `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch will build/load it at runtime instead.
-
 
 ## Conversion
 

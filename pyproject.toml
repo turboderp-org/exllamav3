@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61", "wheel", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exllamav3"
+description = "Inference library for running local LLMs on modern consumer GPUs"
+dynamic = ["version"]
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{ name = "turboderp" }]
+keywords = ["llm", "inference", "gpu", "quantization", "llama"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.6.0",
+    "tokenizers>=0.21.1",
+    "numpy>=2.1.0",
+    "rich",
+    "typing_extensions",
+    "safetensors>=0.3.2",
+    "ninja",
+    "pillow",
+    "pyyaml",
+    "marisa_trie",
+    "pydantic",
+    "llguidance>=1.7.0",
+    "flash-linear-attention>=0.5.0",
+]
+
+[project.optional-dependencies]
+eval = [
+    "transformers>=4.50.0",
+    "datasets",
+    "gguf>=0.14.0",
+    "llama-cpp-python",
+    "human_eval==1.0.3",
+    "matplotlib>=3.10.0",
+    "numpy>=2.0.0",
+    "pandas>=2.2.0",
+    "seaborn>=0.13.2",
+    "tabulate",
+]
+examples = [
+    "blessed",
+    "prompt_toolkit",
+    "pyperclip",
+    "requests",
+    "pydantic",
+]
+
+[tool.setuptools]
+package-dir = { "" = "." }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["exllamav3*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "exllamav3.version.__version__" }
+
+[tool.uv]
+package = true
+python-preference = "only-managed"

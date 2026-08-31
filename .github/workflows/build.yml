@@ -341,7 +341,7 @@ jobs:
           Write-Output "TORCH_SPEC=$torchSpec" >> "$env:GITHUB_OUTPUT"
           Write-Output "TORCH_SPEC=$torchSpec" >> "$env:GITHUB_ENV"
 
-      - name: Patch setup.py dependency metadata for this wheel
+      - name: Patch pyproject.toml dependency metadata for this wheel
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -350,26 +350,26 @@ jobs:
           import os
           import re
 
-          setup_py = Path("setup.py")
-          text = setup_py.read_text(encoding="utf-8")
+          project_toml = Path("pyproject.toml")
+          text = project_toml.read_text(encoding="utf-8")
 
           torch_spec = os.environ["TORCH_SPEC"]
 
           text, torch_count = re.subn(
-              r'(["\'])torch>=2\.6\.0\1',
+              r'"torch>=2\.6\.0"',
               f'"torch{torch_spec}"',
               text,
               count=1,
           )
           if torch_count != 1:
-              raise SystemExit("Expected to replace exactly one torch>=2.6.0 requirement in setup.py")
+              raise SystemExit("Expected to replace exactly one torch>=2.6.0 requirement in pyproject.toml")
 
-          setup_py.write_text(text, encoding="utf-8")
-          print(f"Pinned setup.py requirements: torch{torch_spec}")
+          project_toml.write_text(text, encoding="utf-8")
+          print(f"Pinned pyproject.toml requirements: torch{torch_spec}")
           '@
 
-          Set-Content -Path patch_setup_deps.py -Value $patchScript -Encoding UTF8
-          python patch_setup_deps.py
+          Set-Content -Path patch_pyproject_deps.py -Value $patchScript -Encoding UTF8
+          python patch_pyproject_deps.py
 
       - name: Build for CUDA
         if: matrix.cuda != ''
