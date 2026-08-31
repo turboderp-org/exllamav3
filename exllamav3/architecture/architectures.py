@@ -45,6 +45,7 @@ from .qwen2 import Qwen2Model
 from .qwen2_5_vl import Qwen2_5VLModel
 from .qwen3 import Qwen3Model
 from .qwen3_5 import Qwen3_5Model, Qwen3_5MoeModel, Qwen3_5VLModel, Qwen3_5VLMoeModel
+from .qwen4_exp import Qwen4ExpModel
 from .qwen3_moe import Qwen3MoeModel
 from .qwen3_next import Qwen3NextModel
 from .qwen3_vl import Qwen3VLModel
@@ -117,6 +118,7 @@ ARCHITECTURES = {
         Qwen3NextModel,
         Qwen3VLModel,
         Qwen3VLMoeModel,
+        Qwen4ExpModel,
         SeedOssModel,
         SmolLM3Model,
         SolarOpenMoeModel,
