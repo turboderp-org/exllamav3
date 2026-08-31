@@ -403,6 +403,11 @@ class TransformersBackend:
             # walks only the text component, so exclude them here for a comparable bpw_layer
             if any(k in name for k in ("vision", "visual", "mm_projector", "multi_modal", "audio_tower")):
                 continue
+            # Match the exl3/GGUF conventions (Linear-module weights only): hyper-connection
+            # matrices, short-conv kernels and scalar shared-expert gates are excluded there
+            if "hyper_connection" in name or "shared_expert_gate" in name \
+                    or name.endswith("conv1d.weight"):
+                continue
             is_qmeta = any(name.endswith(s) for s in qmeta_suffixes)
             if (name.endswith("_packed") or name.endswith(".qweight")) and pack_num_bits:
                 numel = p.numel() * (p.element_size() * 8 // pack_num_bits)
