@@ -580,8 +580,18 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
         curr_progress = 0
         max_progress = len(linears)
 
-    # Worker thread
+    # Worker thread. An uncaught exception in a worker must abort the whole job: a thread that
+    # dies mid-module would otherwise leave its linears unquantized while the job carries on,
+    # compiling a broken model at the end with only a warning in the scrollback
+    errors = []
+
     def work_thread(device_idx, dev_groups):
+        try:
+            work_thread_(device_idx, dev_groups)
+        except BaseException as e:
+            errors.append(e)
+
+    def work_thread_(device_idx, dev_groups):
         global curr_progress
 
         with torch.inference_mode():
@@ -638,7 +648,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
 
     try:
         with ProgressBar(" -- Quantizing (parallel)", max_progress, transient = True) as progress:
-            while any(t.is_alive() for t in threads):
+            while any(t.is_alive() for t in threads) and not errors:
                 progress.update(curr_progress)
                 time.sleep(0.1)
     except KeyboardInterrupt as e:
@@ -648,6 +658,12 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
             pthread_kill(t.ident, SIGKILL)
         print("Aborted.")
         sys.exit()
+
+    if errors:
+        # Abort immediately (the other workers' remaining groups are wasted work); the traceback
+        # of the failing worker is what the user needs to see
+        print(f" !! Quantization worker failed, aborting job")
+        raise errors[0]
 
     for t in threads:
         t.join(timeout = 0.1)
