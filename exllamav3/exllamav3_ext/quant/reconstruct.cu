@@ -108,6 +108,11 @@ void reconstruct_slice
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    // The kernel-instance tables hold 24 entries: K in 1..8 x {plain, mcg, mul1}.
+    // K is derived from the checkpoint (trellis.shape[-1] // 16), so an untrusted
+    // model file can drive cbi outside the table and launch whatever pointer lies
+    // there. Bound both the input and the computed index.
+    TORCH_CHECK(K >= 1 && K <= 8, "K must be in 1..8, got ", K);
     TORCH_CHECK_SHAPES(unpacked, 0, packed, 0, 16);
     TORCH_CHECK_SIZE(packed, 2, 256 * K / 16);
     TORCH_CHECK_DTYPE(unpacked, kHalf);
@@ -132,6 +137,8 @@ void reconstruct_slice
     int cbi = K - 1;
     if (mcg) cbi += 8;
     else if (mul1) cbi += 16;
+    TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_kernel_instances.size(),
+                "kernel index out of range: ", cbi);
 
     reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
     (
@@ -336,6 +343,11 @@ void reconstruct_had_slice
     const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
+    // The kernel-instance tables hold 24 entries: K in 1..8 x {plain, mcg, mul1}.
+    // K is derived from the checkpoint (trellis.shape[-1] // 16), so an untrusted
+    // model file can drive cbi outside the table and launch whatever pointer lies
+    // there. Bound both the input and the computed index.
+    TORCH_CHECK(K >= 1 && K <= 8, "K must be in 1..8, got ", K);
     TORCH_CHECK_SHAPES(unpacked, 0, packed, 0, 16);
     TORCH_CHECK_SIZE(packed, 2, 256 * K / 16);
     TORCH_CHECK_DTYPE(unpacked, kHalf);
@@ -359,6 +371,8 @@ void reconstruct_had_slice
     int cbi = K - 1;
     if (mcg) cbi += 8;
     else if (mul1) cbi += 16;
+    TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_kernel_instances.size(),
+                "kernel index out of range: ", cbi);
 
     reconstruct_had_kernel_instances[cbi]<<<gridDim, RH_THREADS, 0, stream>>>
     (
