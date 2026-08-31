@@ -287,10 +287,15 @@ class BlockSparseMLP_CPU:
     def can_defer_load(self):
         # The frequency-permuted expert split reads the router tensors right after load (to
         # permute them); deferred fills would land after that read and be lost
-        if (
-            int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0)) > 0 and
-            os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
-        ):
+        # Any permuted expert split REBINDS the router tensors in cpu_post_load, inside the
+        # loader's deferred-load window; a deferred fill then lands in the pre-permutation
+        # tensor and is lost. The old test read EXL3_MOE_CPU_SPLIT, which -mcs never sets
+        # (it sets infer_params.moe_cpu_split), so it was dead on the CLI path.
+        ip = getattr(self.config, "infer_params", None)
+        split_on = int(getattr(ip, "moe_cpu_split", 0) or 0) > 0 if ip else False
+        split_on = split_on or int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0) or 0) > 0
+        if split_on and (os.environ.get("EXL3_MOE_PROFILE")
+                         or os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")):
             return False
         return super().can_defer_load()
 
@@ -465,6 +470,54 @@ class BlockSparseMLP_CPU:
         # via the install message (the child re-reads it from its own checkpoint handle)
         self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
             and not self.tid2eid_key
+        # EXL3_MOE_PROFILE: precomputed placement from one or more measured profiles.
+        # mode "seed" keeps dynamic swapping enabled (start hot, keep adapting); mode
+        # "static" freezes the profile order. The merged ranking is cached on the config so
+        # the profile files are read once per model, not once per layer.
+        prof_spec = os.environ.get("EXL3_MOE_PROFILE")
+        prof_rank = None
+        if prof_spec and not self.tid2eid_key:
+            mode = os.environ.get("EXL3_MOE_PROFILE_MODE", "seed").lower()
+            cache = getattr(self.config, "_moe_profile_cache", None)
+            if cache is None:
+                from ..model.moe_profile import (build_ranking, ranking_lookup,
+                                                  model_fingerprint)
+                md = getattr(self.config, "model_dir", None) or getattr(self.config, "directory", None)
+                # Policy: a profile is valid for one (model, quantization). Model mismatch is
+                # always fatal; checkpoint/quant mismatch is fatal unless explicitly allowed.
+                allow_q = os.environ.get("EXL3_MOE_PROFILE_ALLOW_QUANT_MISMATCH", "0") != "0"
+                mfp = model_fingerprint(self.config, self.num_experts)
+                ranking, keys, info = build_ranking(prof_spec, md, self.num_experts,
+                                                    model_fp=mfp, allow_quant_mismatch=allow_q)
+                cache = {"ranking": ranking, "by_key": ranking_lookup(ranking, keys),
+                         "info": info, "ordinal": 0, "assigned": {}}
+                self.config._moe_profile_cache = cache
+                print(f" -- MoE profile: {len(info['sources'])} source(s), "
+                      f"{info['layers']} layers x {info['experts']} experts, mode={mode}")
+                for srcinfo in info["sources"]:
+                    print(f"      {srcinfo['name']} (w={srcinfo['weight']}) <- {srcinfo['path']}")
+            row = cache["by_key"].get(self.key)
+            if row is None:
+                # Positional profiles (.npz) carry no layer keys: assign rows to MoE
+                # layers in registration order, which is the order they were captured in.
+                idx = cache["assigned"].get(self.key)
+                if idx is None:
+                    idx = cache["ordinal"]
+                    cache["assigned"][self.key] = idx
+                    cache["ordinal"] += 1
+                if idx < cache["ranking"].shape[0]:
+                    row = cache["ranking"][idx]
+            if row is not None and len(row) != self.num_experts:
+                print(f" !! {self.key}: profile row has {len(row)} experts but this layer has "
+                      f"{self.num_experts}; placement unpermuted for this layer")
+                row = None
+            if row is not None:
+                prof_rank = [int(e) for e in row]
+            else:
+                print(f" !! {self.key}: no profile row for this layer, placement unpermuted")
+            if mode == "static":
+                self._split_dynamic = False
+
         stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
         if stats_path and self._split_dynamic:
             # Static placement from a stats file only applies with dynamic swapping disabled
@@ -472,6 +525,14 @@ class BlockSparseMLP_CPU:
             stats_path = None
         if stats_path and self.tid2eid_key:
             print(f" !! {self.key}: tid2eid remap present, tail placement unpermuted")
+            stats_path = None
+        if prof_rank is not None and len(prof_rank) == self.num_experts:
+            # Precomputed hot->cold order: no counts to sort at load, just apply it.
+            self._split_perm = prof_rank
+            if self.gated:
+                self.gates = [self.gates[e] for e in prof_rank]
+            self.ups = [self.ups[e] for e in prof_rank]
+            self.downs = [self.downs[e] for e in prof_rank]
             stats_path = None
         if stats_path:
             import json
@@ -629,11 +690,14 @@ class BlockSparseMLP_CPU:
         stc = self.config.stc
         slot = int(mp[r_cold])
         full_g, full_u, full_d = self._split_saved_lists_ref()
+        # Saved lists are checkpoint-order; r_hot/r_cold are router (permuted) ids. Without
+        # this translation a seeded split swaps the WRONG experts on every sweep.
+        i_hot, i_cold = self._split_ckpt_idx(r_hot), self._split_ckpt_idx(r_cold)
         proj = ([(full_g, self.gates)] if self.gated else []) \
             + [(full_u, self.ups), (full_d, self.downs)]
         pairs = []
         for full, cur in proj:
-            src_key = full[r_hot].key
+            src_key = full[i_hot].key
             dst = cur[slot].inner
             shp = stc.list_tensors(src_key)[src_key + ".trellis"]["shape"]
             if list(shp) != list(dst.trellis.shape):
@@ -642,8 +706,8 @@ class BlockSparseMLP_CPU:
         # The demoted expert also must match the worker slot's tenant (= the promoted
         # expert's shapes, since they exchange homes) for the in-place arena copy
         for full, _ in proj:
-            k_cold = full[r_cold].key
-            k_hot = full[r_hot].key
+            k_cold = full[i_cold].key
+            k_hot = full[i_hot].key
             sc = stc.list_tensors(k_cold)[k_cold + ".trellis"]["shape"]
             sh = stc.list_tensors(k_hot)[k_hot + ".trellis"]["shape"]
             if list(sc) != list(sh):
@@ -663,8 +727,8 @@ class BlockSparseMLP_CPU:
         # from its own checkpoint handle into the arena in place (we are quiesced), and the
         # streamed-prefill aux copies for that slot update to match
         cpu_local = int(mp[r_hot]) - self.cpu_split_first
-        keys = ([full_g[r_cold].key] if self.gated else []) \
-            + [full_u[r_cold].key, full_d[r_cold].key]
+        keys = ([full_g[i_cold].key] if self.gated else []) \
+            + [full_u[i_cold].key, full_d[i_cold].key]
         self.cpu_host.install_expert(self.cpu_layer_idx, cpu_local, keys)
         aux = self.cpu_host.aux.get(self.cpu_layer_idx)
         if aux:
@@ -676,7 +740,7 @@ class BlockSparseMLP_CPU:
                 if lst is None or lst[cpu_local] is None:
                     continue
                 suffix = "." + name.split("_")[0]
-                t = stc.get_tensor(full[r_cold].key + suffix, lst[cpu_local].device,
+                t = stc.get_tensor(full[i_cold].key + suffix, lst[cpu_local].device,
                                    optional = name.startswith("bias"), float2half = True)
                 if t is not None:
                     lst[cpu_local].copy_(t)
@@ -693,6 +757,17 @@ class BlockSparseMLP_CPU:
                         f"swap verify failed: {src_key}.{tname}"
         mp[r_cold], mp[r_hot] = int(mp[r_hot]), slot
         return True
+
+    def _split_ckpt_idx(self, r):
+        """Router-space expert id -> index into the ORIGINAL (checkpoint-order) expert lists.
+
+        _split_saved_lists is captured BEFORE any placement permutation, so it stays in
+        checkpoint order, while router ids are permuted positions once cpu_post_load has
+        permuted the gate columns. _split_perm[j] is the checkpoint expert now living at
+        permuted position j, which is exactly the translation. Identity when unpermuted.
+        """
+        p = self._split_perm
+        return int(p[int(r)]) if p is not None else int(r)
 
     def _split_saved_lists_ref(self):
         g, u, d = self._split_saved[0], self._split_saved[1], self._split_saved[2]
