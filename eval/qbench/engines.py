@@ -135,6 +135,7 @@ class TransformersBackend:
         self.device = device
         self.dtype = dtype
         self.streaming = options.get("streaming", False)
+        self.shard_shims = []
         self.shard_handles = {}
 
         if self.streaming:
@@ -722,8 +723,15 @@ class TransformersBackend:
     def _materialize(self, module):
         prefix = self.prefix[id(module)]
         sd = {}
+        shims = []
         for pn, _ in module.named_parameters():
             full = f"{prefix}.{pn}" if prefix else pn
+            if full not in self.tensor_index and full.endswith(".weight") \
+                    and f"{full[: -len('.weight')]}.shard_0.weight" in self.tensor_index:
+                # Parameter stored as shard_N pieces too large to concatenate (Qwen4Exp's
+                # ~100 GB n-gram table): serve it from the mmapped shards instead
+                shims.append(pn)
+                continue
             t = self._get_tensor(full)
             if t.is_floating_point() and not (t.dtype == torch.float32 and self._plain_fp32(full)):
                 t = t.to(self.device, self.dtype)
@@ -731,11 +739,28 @@ class TransformersBackend:
                 t = t.to(self.device)
             sd[pn] = t
         module.load_state_dict(sd, strict = False, assign = True)
+        for pn in shims:
+            self._install_shard_shim(module, prefix, pn)
         for pn, p in module.named_parameters():
             if p.is_meta:
                 raise RuntimeError(f"No checkpoint tensor for {self.prefix[id(module)]}.{pn}")
 
+    def _install_shard_shim(self, module, prefix, pn):
+        stem_local = pn[: -len(".weight")]
+        stem_full = f"{prefix}.{stem_local}" if prefix else stem_local
+        shards = []
+        while f"{stem_full}.shard_{len(shards)}.weight" in self.tensor_index:
+            shards.append(self._read_shard(f"{stem_full}.shard_{len(shards)}.weight"))
+        owner = module.get_submodule(stem_local)
+        parent_path, _, owner_name = stem_local.rpartition(".")
+        parent = module.get_submodule(parent_path) if parent_path else module
+        parent._modules[owner_name] = _ShardGatherEmbedding(shards, self.dtype)
+        self.shard_shims.append((parent, owner_name, owner))
+
     def _dematerialize(self, module):
+        while self.shard_shims:
+            parent, name, orig = self.shard_shims.pop()
+            parent._modules[name] = orig            # original keeps its meta weight
         for sub in module.modules():
             for pn, p in list(sub._parameters.items()):
                 if p is not None and not p.is_meta:
@@ -913,6 +938,29 @@ class TransformersBackend:
         del self.model
         self.shard_handles.clear()
         free_mem()
+
+
+class _ShardGatherEmbedding(torch.nn.Module):
+    """CPU replacement for a sharded-checkpoint nn.Embedding too large to materialize
+    (Qwen4Exp's 320M-row n-gram table): rows gather directly from the safetensors mmaps, so
+    only the touched pages are ever read. `weight` is a one-row CPU dummy -- the HF caller
+    routes ids to weight.device before the lookup and moves the rows back itself."""
+
+    def __init__(self, shards, dtype):
+        super().__init__()
+        self.shards = shards                        # plain list: stays mmap-backed, unregistered
+        self.rows_per_shard = shards[0].shape[0]
+        self.out_dtype = dtype
+        self.weight = shards[0][:1].to(dtype)
+
+    def forward(self, ids):
+        flat = ids.reshape(-1)
+        out = torch.empty((flat.numel(), self.shards[0].shape[1]), dtype = self.out_dtype)
+        sh = flat // self.rows_per_shard
+        for s in sh.unique().tolist():
+            m = sh == s
+            out[m] = self.shards[s][flat[m] - s * self.rows_per_shard].to(self.out_dtype)
+        return out.view(*ids.shape, -1)
 
 
 def gguf_shards(source: str) -> list:
