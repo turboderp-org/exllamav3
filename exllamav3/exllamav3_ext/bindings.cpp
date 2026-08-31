@@ -84,7 +84,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
     m.def("pinned_cuda_view", &pinned_cuda_view, py::arg("t"), py::arg("device"));
 
-    m.def("rms_norm", &rms_norm, "rms_norm");
+    m.def("rms_norm", &rms_norm, "rms_norm",
+        py::arg("x"), py::arg("w"), py::arg("y"), py::arg("epsilon"),
+        py::arg("constant_bias"), py::arg("constant_scale"), py::arg("span_heads"),
+        py::arg("add_residual"), py::arg("w_groups") = 1);
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
@@ -107,6 +110,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hc_head", &hc_head, "hc_head");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
+    m.def("gr_mix", &gr_mix, "gr_mix");
     m.def("routing_std", &routing_std, "routing_std");
     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
