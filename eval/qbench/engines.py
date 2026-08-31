@@ -979,7 +979,13 @@ def gguf_shards(source: str) -> list:
 def gguf_storage_info(source: str) -> dict:
     """bpw/vram accounting over the full tensor table, spanning all shards of a split GGUF.
     Norms/biases are < 2 dims; router gates excluded by name; token_embd serves as the head
-    fallback for tied models, overridden by output.weight when present in any shard.
+    fallback for tied models, overridden by output.weight when present in any shard. The PLE
+    n-gram table (per_layer_token_embd, Qwen3.8-Flash-Next) is excluded like the embedding:
+    the exl3 engine keeps its table out of bpw_layer/vram too (out-of-line file). Hyper-
+    connection matrices (hc_*/output_hc_*) and short-conv kernels (*_conv1d) are excluded to
+    match the exl3 walk, which counts Linear modules only. Known residual asymmetry: for archs
+    whose exl3 routing gate IS a Linear (qwen4exp), exl3 counts it (~0.05% of weights) while
+    GGUF_ROUTER_KEYS excludes it here.
     NextN/MTP prediction blocks (packed as the last {arch}.nextn_predict_layers of
     {arch}.block_count) are excluded: the other engines also count decoder layers + head only"""
     from gguf import GGUFReader
@@ -1014,9 +1020,11 @@ def gguf_storage_info(source: str) -> dict:
                     head_is_fallback = False
             elif (
                 t.name.endswith(".weight")
-                and t.name != "token_embd.weight"
+                and t.name not in ("token_embd.weight", "per_layer_token_embd.weight")
                 and len(t.shape) >= 2
                 and not any(k in t.name for k in GGUF_ROUTER_KEYS)
+                and ".hc_" not in t.name and not t.name.startswith("output_hc_")
+                and not t.name.endswith("_conv1d.weight")
             ):
                 sum_bits += t.n_bytes * 8
                 sum_numel += t.n_elements
