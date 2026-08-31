@@ -111,13 +111,17 @@ class StreamingSafetensorsWriter:
     """
     Writes a safetensors file front to back without holding the large tensors in memory. All
     shapes must be known up front. The small tensors are placed FIRST in the file and written at
-    open time, then the large streamed tensor's data is appended in row order — so a partial file
+    open time, then the streamed tensors' data is appended in row order — so a partial file
     from an interrupted run already contains a valid header and the small tensors, and a run with
     resume = True continues from the last complete chunk (the header must match exactly, which
     also guarantees the same bias vectors and quantization parameters).
+
+    stream_tensors is a list of (name, shape) sharing one dtype and row width: they are laid out
+    consecutively, so the byte stream is a single contiguous row array and write_chunk() never
+    needs to know which shard a chunk lands in (a chunk may span a shard boundary).
     """
 
-    def __init__(self, path: str, stream_name: str, stream_shape, stream_dtype_str: str,
+    def __init__(self, path: str, stream_tensors: list, stream_dtype_str: str,
                  small_tensors: dict[str, torch.Tensor], metadata: dict[str, str],
                  resume: bool = False, chunk_rows: int = 1):
         dtype_size = {"I16": 2, "U16": 2, "F16": 2, "BF16": 2, "F32": 4, "I64": 8}
@@ -132,17 +136,22 @@ class StreamingSafetensorsWriter:
             header[name] = {"dtype": dts, "shape": list(t.shape), "data_offsets": [offset, offset + nbytes]}
             offset += nbytes
             self.small_tensors[name] = t
-        stream_bytes = int(torch.tensor(stream_shape).prod().item()) * dtype_size[stream_dtype_str]
-        header[stream_name] = {
-            "dtype": stream_dtype_str,
-            "shape": [int(s) for s in stream_shape],
-            "data_offsets": [offset, offset + stream_bytes],
-        }
+        assert all(s[1] == stream_tensors[0][1][1] for _, s in stream_tensors), \
+            "streamed tensors must share one row width"
+        stream_bytes = 0
+        for name, shape in stream_tensors:
+            nbytes = int(torch.tensor(shape).prod().item()) * dtype_size[stream_dtype_str]
+            header[name] = {
+                "dtype": stream_dtype_str,
+                "shape": [int(s) for s in shape],
+                "data_offsets": [offset + stream_bytes, offset + stream_bytes + nbytes],
+            }
+            stream_bytes += nbytes
         hj = json.dumps(header, separators = (",", ":")).encode("utf-8")
         hj += b" " * (-len(hj) % 8)
         self.stream_bytes = stream_bytes
         stream_abs = 8 + len(hj) + offset
-        row_bytes = int(stream_shape[1]) * dtype_size[stream_dtype_str]
+        row_bytes = int(stream_tensors[0][1][1]) * dtype_size[stream_dtype_str]
         self.resume_rows = 0
 
         if resume and os.path.exists(path) and os.path.getsize(path) > 8:
@@ -324,10 +333,21 @@ def quantize_ngram_table(
             print(f" -- computing per-head bias ({bias_sample_rows} sampled rows/head)")
         bias = compute_head_bias(source, f"cuda:{devices[0]}", bias_sample_rows, verbose = False)
 
+    # The table is written as individual shard tensors (mirroring the source's shard row count)
+    # laid out consecutively, so consumers can keep it as separate tensors in RAM instead of one
+    # concatenated table, while the byte stream remains a single contiguous row array
+    shard_rows = source.rows_per_shard
+    stream_tensors = []
+    r0 = 0
+    while r0 < total_rows:
+        r1 = min(r0 + shard_rows, total_rows)
+        stream_tensors.append(
+            (f"{source.prefix}.shard_{len(stream_tensors)}.trellis", (r1 - r0, words_per_row(K))))
+        r0 = r1
+
     writer = StreamingSafetensorsWriter(
         out_path,
-        stream_name = f"{source.prefix}.trellis",
-        stream_shape = (total_rows, words_per_row(K)),
+        stream_tensors = stream_tensors,
         stream_dtype_str = "I16",
         small_tensors = {
             f"{source.prefix}.head_bias": bias,
@@ -343,6 +363,7 @@ def quantize_ngram_table(
             "codebook_scale": cs_desc,  # informational only; the chosen cs is folded into row scales
             "row_dim": str(ROW_DIM),
             "rows": str(total_rows),
+            "shard_rows": str(shard_rows),
             "source": os.path.abspath(model_dir),
         },
         resume = resume,
@@ -479,11 +500,25 @@ class NgramTableReader:
         self.head_vocab_sizes = load_small("ngram_embedding.head_vocab_sizes", torch.int64)
         self.layer_multipliers = load_small("ngram_embedding.layer_multipliers", torch.int64)
 
-        info = header[resolve("ngram_embedding.trellis")]
-        self.num_rows, self.row_words = info["shape"]
+        # Table data: sharded shard_N.trellis tensors (current converter output) or a single
+        # .trellis tensor (older files). Shards are laid out consecutively, so either way the
+        # data is one contiguous row array
+        shard_keys = [k for k in header if k.endswith(".trellis") and ".shard_" in k]
+        if shard_keys:
+            shard_keys.sort(key = lambda k: int(k.rsplit(".shard_", 1)[1].split(".")[0]))
+            infos = [header[k] for k in shard_keys]
+            self.num_rows = sum(i["shape"][0] for i in infos)
+            assert all(i["shape"][1] == infos[0]["shape"][1] for i in infos)
+            assert all(a["data_offsets"][1] == b["data_offsets"][0]
+                       for a, b in zip(infos, infos[1:])), "table shards are not contiguous"
+            self.row_words = infos[0]["shape"][1]
+            info0 = infos[0]
+        else:
+            info0 = header[resolve("ngram_embedding.trellis")]
+            self.num_rows, self.row_words = info0["shape"]
         assert self.row_words == words_per_row(self.K)
         self.row_bytes = self.row_words * 2
-        self.trellis_offset = self.data_base + info["data_offsets"][0]
+        self.trellis_offset = self.data_base + info0["data_offsets"][0]
         self.fd = os.open(path, os.O_RDONLY)
         self._codebooks = {}
 
@@ -541,8 +576,8 @@ def prepare_ngram_table_for_conversion(args: dict, config, model) -> str | None:
         with open(ngram_file, "rb") as f:
             hlen = struct.unpack("<Q", f.read(8))[0]
             header = json.loads(f.read(hlen))
-        assert f"{prefix}.trellis" in header, \
-            f"--ngram_file does not contain {prefix}.trellis (run util/rekey_ngram.py on older files)"
+        assert f"{prefix}.trellis" in header or f"{prefix}.shard_0.trellis" in header, \
+            f"--ngram_file does not contain {prefix}[.shard_0].trellis (run util/rekey_ngram.py on older files)"
         if os.path.abspath(ngram_file) != os.path.abspath(out_path):
             if not os.path.exists(out_path) or os.path.getsize(out_path) != os.path.getsize(ngram_file):
                 print(f" -- Copying pre-quantized n-gram table: {ngram_file}")

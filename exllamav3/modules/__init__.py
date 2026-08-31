@@ -5,6 +5,8 @@ from .block_sparse_mlp import BlockSparseMLP
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .embedding import Embedding
+from .ngram_embedding import NGramEmbedding
+from .ple import PLELayer
 from .attn import Attention
 from .mla_attn import MLAttention
 from .sliding_attn import SlidingAttention, SWAState, SWALayerState

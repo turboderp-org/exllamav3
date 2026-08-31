@@ -53,6 +53,10 @@ class InferParams:
         # pinned host memory instead of VRAM, computing straight from a zero-copy device alias.
         # Set before loading the vision component
         self.vision_pinned = os.environ.get("EXL3_VISION_PINNED", "0") != "0"
+        # Stream an n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) from disk with
+        # per-forward row gathers instead of loading the whole table into system RAM (tens of
+        # GB). Set before loading the model
+        self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
