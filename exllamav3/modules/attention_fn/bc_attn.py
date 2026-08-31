@@ -23,6 +23,17 @@ Instances are keyed per cache layer, since the cache tensors are baked into the 
 graphs. Static intermediates come from g_tensor_cache and are shared between layers of the same
 shape on the same device.
 
+QSA (Qwen3.8-Flash-Next): modules with a qsa_indexer arm the sparse-selection stages
+(set_qsa), following the DSA-on-MLA pattern in bc_mla.py. Armed instances maintain the
+indexer's raw/pooled key planes in-graph on every step (dense slots included, so the planes
+stay complete below the sparse threshold) and regime-1 slots (single-job, q_len 1..16,
+context past the threshold) run scoring / top-k / expansion / gathered GQA attention instead 
+of the dense flash-decoding kernels. Scoring and expansion reuse the DSA kernels (QSA's 
+uniform-head-weight relu score and forced tail block match them exactly); the stage, pool-update
+and gathered split kernels live in qsa_triton.py. A module with an indexer that cannot be armed
+declines the BC path outright: an unarmed graph would let the planes go stale under dense decode
+and poison later sparse selection.
+
 Enabled by default; EXL3_BC_ATTN=0 disables the path. Unsupported module/cache configurations
 fall back to the dispatch path by design (build_bc_attn returns None); unexpected failures
 while building the path raise.
@@ -107,7 +118,7 @@ class BCAttn:
         return w
 
     def __init__(self, module, cache_k, cache_v, k_scales = None, v_scales = None,
-                 k_bits = 0, v_bits = 0):
+                 k_bits = 0, v_bits = 0, qsa_layer = None):
         self.module = module
         # TP shards store their device as a plain index; normalize for .index consumers
         self.device = torch.device(module.device) if isinstance(module.device, int) else module.device
@@ -218,9 +229,31 @@ class BCAttn:
             h32 = h32,
             sinks = self.sinks,
         )
+
+        # QSA indexer (Qwen3.8-Flash-Next): arm the sparse-selection stages. The armed instance
+        # maintains the raw/pooled key planes in-graph on every step (both regimes), so the
+        # caller must not also run the eager plane upkeep
+        self.qsa = qsa_layer is not None
+        if self.qsa:
+            idx = module.qsa_indexer
+            self.qsa_idx = idx
+            self.qsa_layer = qsa_layer
+            self.qsa_threshold = idx.sparse_threshold()
+            self.bc.set_qsa(
+                qk_proj = idx.index_qk_proj.inner.bc,
+                q_norm_w = idx.q_layernorm.weight.data.half().contiguous(),
+                k_norm_w = idx.k_layernorm.weight.data.half().contiguous(),
+                norm_eps = idx.q_layernorm.rms_norm_eps,
+                n_heads = idx.n_heads,
+                head_dim = idx.head_dim,
+                topk = idx.block_topk,
+                compress_ratio = idx.compress_ratio,
+                raw_plane = qsa_layer.raw_k.view(-1, idx.head_dim),
+                pool_plane = qsa_layer.pooled.view(-1, idx.head_dim),
+            )
         self.slot_widths = {}
 
-    def _configure(self, bsz: int, q_len: int, causal: bool):
+    def _configure(self, bsz: int, q_len: int, causal: bool, regime: int):
         import triton
         from .triton_paged import (
             _paged_attn_decode_split_kernel,
@@ -313,8 +346,14 @@ class BCAttn:
                 gate_b = g_tensor_cache.get(dev, (R, qh * hd), torch.half, "bca_g")
         kv = g_tensor_cache.get(dev, (2, R, kvh * hd), torch.half, "bca_kv")
         o = g_tensor_cache.get(dev, (bsz, q_len, qh, hd), torch.half, "bca_o")
-        partial_o = g_tensor_cache.get(dev, (programs * splits_cap * block_rows * hd,), torch.float, "bca_po")
-        partial_ml = g_tensor_cache.get(dev, (programs * splits_cap * block_rows * 2,), torch.float, "bca_ml")
+        # Regime-1 slots never launch the dense split/combine; their partials are sized by the
+        # sparse kernels in _configure_qsa (same bucketed tags, so the footprint is the max)
+        pn_o = programs * splits_cap * block_rows * hd
+        pn_ml = programs * splits_cap * block_rows * 2
+        if regime == 1:
+            pn_o, pn_ml = self._qsa_partial_sizes(bsz * q_len)
+        partial_o = g_tensor_cache.get_bucketed(dev, pn_o, torch.float, "bca_po")
+        partial_ml = g_tensor_cache.get_bucketed(dev, pn_ml, torch.float, "bca_ml")
 
         # Padded hidden dim: zero-padded input staging and padded o_proj output. The pad columns
         # of xp are zeroed here and never written afterwards (the graph copies only the exact
@@ -328,12 +367,168 @@ class BCAttn:
             yp = g_tensor_cache.get(dev, (R, self.hidden_padded), self.o_dtype or torch.half, "bca_yp")
 
         self.bc.configure_slot(
-            bsz, q_len,
+            bsz, q_len, regime,
             q, kv, o, partial_o, partial_ml,
             gate_a, gate_b,
             k_split, k_combine, k_update,
             block_n, splits_cap,
             xp, yp,
+        )
+
+        if self.qsa:
+            self._configure_qsa(bsz, q_len, regime)
+
+    # ---- QSA -----------------------------------------------------------------------------------
+
+    def _qsa_sparse_geometry(self, rows: int):
+        """Static selection/gather widths and the sparse split configuration; rows = bsz *
+        q_len query rows (the gather kernel's batch axis)."""
+        import triton
+        idx = self.qsa_idx
+        cr = idx.compress_ratio
+        sel = idx.block_topk
+        k_pad = -(-(sel * cr + cr - 1) // 32) * 32
+        kp_pool = -(-sel // 32) * 32
+        group = self.num_q_heads // self.num_kv_heads
+        block_h = 16
+        h_blocks = triton.cdiv(group, block_h)
+        programs = rows * self.num_kv_heads * h_blocks
+        block_n = 32
+        target = 2 * _get_sm_count(self.device)
+        splits = max(1, min(target // programs, -(-k_pad // (4 * block_n)), 128))
+        per_split = -(-k_pad // splits)
+        split_len = -(-per_split // block_n) * block_n
+        return k_pad, kp_pool, block_h, h_blocks, programs, block_n, splits, split_len
+
+    def _qsa_partial_sizes(self, rows: int):
+        k_pad, kp_pool, block_h, h_blocks, programs, block_n, splits, split_len = \
+            self._qsa_sparse_geometry(rows)
+        return programs * splits * block_h * self.head_dim, programs * splits * block_h * 2
+
+    def _configure_qsa(self, bsz: int, q_len: int, regime: int):
+        import triton
+        from .mla_triton import _mla_plane_update_kernel
+        from .dsa_triton import _dsa_indexer_fewq_kernel, _dsa_pool_expand_kernel
+        from .qsa_triton import (
+            _qsa_stage_kernel,
+            _qsa_pool_update_kernel,
+            _qsa_sparse_split_kernel,
+        )
+        from .triton_paged import _paged_attn_decode_combine_kernel
+
+        dev = self.device
+        idx = self.qsa_idx
+        Hi, Di, cr = idx.n_heads, idx.head_dim, idx.compress_ratio
+        R = bsz * q_len
+        rope = self.module.rope
+        # The rotary width (sin/cos table width): the C++ side narrows the query rope view to
+        # it and the pool kernel rotates its leading segment
+        rotate_dims = 2 * rope.inv_freq.numel()
+
+        def sbuf(tag, *shape, dtype = torch.half):
+            n = 1
+            for sh in shape: n *= sh
+            return g_tensor_cache.get_bucketed(dev, n, dtype, tag).view(*shape)
+
+        qk = sbuf("bca_qsa_qk", R, (Hi + 1) * Di)
+        q = sbuf("bca_qsa_q", R, Hi, Di)
+        kraw = sbuf("bca_qsa_kraw", R, Di)
+
+        k_stage = _compile_kernel(dev, _qsa_stage_kernel,
+            {"qk": "*fp16", "q_norm_w": "*fp16", "q_out": "*fp16", "k_out": "*fp16", "R": "i32"}
+            | {n: "constexpr" for n in ("eps", "H_i", "D")},
+            dict(eps = float(idx.q_layernorm.rms_norm_eps), H_i = Hi, D = Di), 2, 1)
+
+        k_raw_append = _compile_kernel(dev, _mla_plane_update_kernel,
+            {"rows_new": "*fp16", "plane_cache": "*fp16", "block_table": "*i32",
+             "cache_seqlens": "*i32", "num_pages_per_seq": "i32", "append_len": "i32"}
+            | {n: "constexpr" for n in ("page_size", "D", "DST_D", "DST_OFF")},
+            dict(page_size = PAGE_SIZE, D = Di, DST_D = 0, DST_OFF = 0), 2, 2)
+
+        k_pool_update = _compile_kernel(dev, _qsa_pool_update_kernel,
+            {"raw_plane": "*fp16", "pool_plane": "*fp16", "k_norm_w": "*fp16",
+             "inv_freq": "*fp32", "block_table": "*i32", "cache_seqlens": "*i32",
+             "num_pages_per_row": "i32", "append_len": "i32"}
+            | {n: "constexpr" for n in (
+                "page_size", "P", "D", "ROPE_R", "attn_factor", "eps", "MAXPOOLS")},
+            dict(page_size = PAGE_SIZE, P = cr, D = Di, ROPE_R = rotate_dims,
+                 attn_factor = float(rope.attn_factor),
+                 eps = float(idx.k_layernorm.rms_norm_eps), MAXPOOLS = q_len // cr + 1), 2, 1)
+
+        wts = scores = pool_idx = indices = None
+        k_fewq = k_expand = k_sp_split = k_sp_combine = None
+        fewq_gy = splits = split_len = programs = 0
+        if regime == 1:
+            k_pad, kp_pool, block_h, h_blocks, programs, block_n, splits, split_len = \
+                self._qsa_sparse_geometry(R)
+            wts = sbuf("bca_qsa_wts", R, Hi)
+            wts.fill_(1.0)
+            cap = self.qsa_layer.pooled.shape[0] * self.qsa_layer.pooled.shape[1]
+            s_max = -(-cap // 128) * 128
+            scores = sbuf("bca_qsa_scores", R, s_max)
+            # The scoring kernel writes only [0, T); the warmup top-k scans the full static
+            # width, so the tail must hold -inf from this one-time fill (the captured graph
+            # patches the top-k scan width to T afterwards)
+            scores.fill_(-float("inf"))
+            pool_idx = sbuf("bca_qsa_pool_idx", R, kp_pool, dtype = torch.int32)
+            indices = sbuf("bca_qsa_indices", R, k_pad, dtype = torch.int32)
+
+            k_fewq = _compile_kernel(dev, _dsa_indexer_fewq_kernel,
+                {"q_idx": "*fp16:16", "w": "*fp16:16", "k_idx": "*fp16:16",
+                 "scores": "*fp16:16", "T": "i32", "R": "i32", "q_pos0": "i32",
+                 "bound_max": "i32", "block_table": "*i32:16", "num_pages_per_row": "i32"}
+                | {n: "constexpr" for n in (
+                    "H_i", "H_pad", "D_i", "S_stride", "compress_rate", "scale", "BLOCK_N",
+                    "SEQ", "MULTIROW", "EPP", "DEBUG_BOUNDS", "DEBUG_PAGES")},
+                dict(H_i = Hi, H_pad = max(16, 1 << (Hi - 1).bit_length()), D_i = Di,
+                     S_stride = s_max, compress_rate = cr, scale = float(idx.scale),
+                     BLOCK_N = 128, SEQ = q_len, MULTIROW = 0, EPP = PAGE_SIZE // cr,
+                     DEBUG_BOUNDS = 0, DEBUG_PAGES = 0), 8, 2)
+            fewq_gy = s_max // 128
+
+            k_expand = _compile_kernel(dev, _dsa_pool_expand_kernel,
+                {"pool_idx": "*i32", "out": "*i32", "q_pos0": "i32"}
+                | {n: "constexpr" for n in (
+                    "P", "SEL", "K_pad", "KP_pool", "TAIL", "SEQ", "MULTIROW", "BLOCK")},
+                dict(P = cr, SEL = idx.block_topk, K_pad = k_pad, KP_pool = kp_pool,
+                     TAIL = 1, SEQ = q_len, MULTIROW = 0, BLOCK = 256), 4, 1)
+
+            k_sp_split = _compile_kernel(dev, _qsa_sparse_split_kernel,
+                {"q": "*fp16", "k_cache": "*fp16", "v_cache": "*fp16", "block_table": "*i32",
+                 "indices": "*i32", "partial_o": "*fp32", "partial_ml": "*fp32",
+                 "k_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
+                 "split_len": "i32"}
+                | {n: "constexpr" for n in (
+                    "n_q_heads", "n_kv_heads", "page_size", "head_dim", "K_pad", "scale",
+                    "BLOCK_H", "BLOCK_N", "PAGED")},
+                dict(n_q_heads = self.num_q_heads, n_kv_heads = self.num_kv_heads,
+                     page_size = PAGE_SIZE, head_dim = self.head_dim, K_pad = k_pad,
+                     scale = float(self.sm_scale), BLOCK_H = block_h, BLOCK_N = block_n,
+                     PAGED = 1),
+                4, 2)
+
+            k_sp_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel,
+                {"partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
+                 "num_splits": "i32", "sinks": "*fp32"}
+                | {n: "constexpr" for n in (
+                    "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim",
+                    "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")},
+                # q_len 1: the sparse gather treats every query row as a batch (programs =
+                # R * kv_heads * h_blocks), so the combine's output row is the batch index
+                # alone -- compiling the true q_len here would scatter row r to row r * q_len
+                dict(QCV = 0, HAS_SINKS = False, q_len = 1,
+                     n_q_heads = self.num_q_heads, n_kv_heads = self.num_kv_heads,
+                     head_dim = self.head_dim, BLOCK_M = 1, BLOCK_H = block_h,
+                     BLOCK_ROWS = block_h), 4, 1)
+
+        self.bc.configure_slot_qsa(
+            bsz, q_len, regime,
+            qk, q, kraw,
+            k_stage, k_raw_append, k_pool_update,
+            rotate_dims,
+            wts, scores, pool_idx, indices,
+            k_fewq, k_expand, k_sp_split, k_sp_combine,
+            fewq_gy, splits, split_len, programs,
         )
 
     def step(
@@ -346,26 +541,79 @@ class BCAttn:
         position_ids: torch.Tensor | None,
         inv_freq: torch.Tensor | None,
         causal: bool = True,
-    ) -> torch.Tensor:
+        host_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         bsz, q_len, _ = x.shape
+
+        # QSA regime: dense below the sparse threshold (top-k cannot exclude anything there, so
+        # dense attention is exact), gathered sparse above it. Sparse slots are decode-only;
+        # other shapes fall back to the eager path, which maintains the planes identically
+        regime, t_total = 0, 0
+        if self.qsa:
+            assert host_seqlens is not None, "BC_Attention: QSA step requires host seqlens"
+            t_total = int(host_seqlens.max().item()) + q_len
+            if t_total > self.qsa_threshold:
+                # sparse slots are single-job; every query row of the chunk gets its own
+                # selection (MTP-verify shapes included)
+                if bsz > 1 or not causal:
+                    return None
+                regime = 1
+                # The generator usually passes positions as a tensor and leaves the scalar at
+                # 0; the scoring/expansion bounds consume the scalar
+                position = int(host_seqlens[0].item())
+
         # The captured graph freezes the inv_freq table geometry (table flag, stride, partial
         # head dim) and the causality of the attention kernels, so either changing means
         # reconfigure (in practice constant per model). Everything else that varies per call --
         # position source, block-table pointer/width, split configuration -- is a runtime
         # argument patched into the graph
         skey = (tuple(inv_freq.shape) if inv_freq is not None else None, causal)
-        if self.slot_widths.get((bsz, q_len), ...) != skey:
-            self._configure(bsz, q_len, causal)
-            self.slot_widths[(bsz, q_len)] = skey
+        if self.slot_widths.get((bsz, q_len, regime), ...) != skey:
+            self._configure(bsz, q_len, causal, regime)
+            self.slot_widths[(bsz, q_len, regime)] = skey
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
-        self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq)
+        self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
+                    position_ids, inv_freq, regime, t_total)
         return y
+
+
+def _qsa_module_eligible(m):
+    """QSA-indexer requirements (Qwen3.8-Flash-Next). A module WITH an indexer must be fully
+    armable or the BC path declines outright: an unarmed graph would let the key planes go
+    stale under dense decode and poison later sparse selection."""
+    idx = m.qsa_indexer
+    if idx is None:
+        return True
+    p = idx.index_qk_proj
+    # The rotary width is the sin/cos table width, 2 * len(inv_freq) (rope_settings.rotate_dims
+    # is the rotation-section count, not a width)
+    rd = 2 * m.rope.inv_freq.numel() if (m.rope is not None and m.rope.inv_freq is not None) else 0
+    return (
+        m.rope is not None and
+        p is not None and p.quant_type == "exl3" and p.inner.bc is not None and
+        p.inner.bias is None and
+        getattr(p, "out_features_unpadded", p.out_features) == p.out_features ==
+            (idx.n_heads + 1) * idx.head_dim and
+        idx.q_layernorm.weight is not None and idx.k_layernorm.weight is not None and
+        idx.q_layernorm.constant_bias == 1.0 and idx.k_layernorm.constant_bias == 1.0 and
+        _is_pow2(idx.head_dim) and
+        # The pool-update kernel splits rows into (rope lo, rope hi, pass) segments, each a
+        # power-of-two tl.arange
+        rd % 2 == 0 and 2 <= rd <= idx.head_dim and _is_pow2(rd // 2) and
+        (idx.head_dim == rd or _is_pow2(idx.head_dim - rd)) and
+        m.rope.rope_settings.rotate_dims == 1 and
+        PAGE_SIZE % idx.compress_ratio == 0 and
+        # The gathered sparse kernels support none of these
+        (m.sliding_window is None or m.sliding_window < 0) and not m.logit_softcapping and
+        getattr(m, "sinks", None) is None
+    )
 
 
 def _module_eligible(m):
     """Module-level requirements shared by the global-attention and SWA builders."""
     return (
         bc_attn_enable and
+        _qsa_module_eligible(m) and
         # NoPE is supported (the rope stage is skipped), but the head norms run inside the rope
         # kernel, so a norm-only module without rope has nowhere to apply them
         (m.rope is not None or m.q_norm is None) and
@@ -412,6 +660,7 @@ def build_bc_swa(module, layer_state):
     k_states, v_states = layer_state.get_state_tensors()
     if not (
         _module_eligible(m) and
+        m.qsa_indexer is None and
         k_states is not None and
         k_states.device == torch.device(m.device) and
         m.kv_state_size % PAGE_SIZE == 0
@@ -429,6 +678,7 @@ def build_bc_attn(module, layer):
     """Build a BCAttn for the module/cache-layer pair, or return None when the configuration
     is not supported (caller falls back to the dispatch path)."""
     from ...cache import CacheLayer_quant, CacheLayer_fp16
+    from ...cache.qsa import CacheLayer_qsa
 
     m = module
     if not (
@@ -440,6 +690,11 @@ def build_bc_attn(module, layer):
         )) and
         (not isinstance(layer, CacheLayer_fp16) or (
             layer.k is not None and layer.k.device == torch.device(m.device)
+        )) and
+        # A QSA module needs the side planes on this layer (and the fp16 cache they imply)
+        (m.qsa_indexer is None or (
+            isinstance(layer, CacheLayer_qsa) and layer.raw_k is not None and
+            layer.raw_k.device == torch.device(m.device)
         ))
     ):
         _trace_build(m, None, "attn")
@@ -447,6 +702,7 @@ def build_bc_attn(module, layer):
     if isinstance(layer, CacheLayer_quant):
         bca = BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits)
     else:
-        bca = BCAttn(m, layer.k, layer.v)
+        bca = BCAttn(m, layer.k, layer.v,
+                     qsa_layer = layer if m.qsa_indexer is not None else None)
     _trace_build(m, bca, "attn")
     return bca

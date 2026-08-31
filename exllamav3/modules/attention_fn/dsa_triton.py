@@ -1001,10 +1001,13 @@ def dsa_indexer_scores(
     num_stages = 2,
     block_table = None,      # (npr,) or (1, npr) i32 page table of the (single) job
     epp = 0,                 # pool entries per page (paged mode)
+    scale = None,            # None: D_i ** -0.5 * H_i ** -0.5 (DSA); QSA passes dk ** -0.5
 ):
     """Indexer scores (R, T) fp16 with -inf past each query's causal entry bound
     min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk."""
     R, H_i, D_i = q_idx.shape
+    if scale is None:
+        scale = D_i ** -0.5 * H_i ** -0.5
     T = bound_max
     if block_table is None:
         T = k_idx.shape[0]
@@ -1028,7 +1031,7 @@ def dsa_indexer_scores(
                 q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt, 0,
                 H_i = H_i, H_pad = max(triton.next_power_of_2(H_i), 16), D_i = D_i,
                 S_stride = S_stride, compress_rate = compress_rate,
-                scale = D_i ** -0.5 * H_i ** -0.5,
+                scale = scale,
                 BLOCK_N = block_n, EPP = epp,
                 DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
                 num_warps = num_warps, num_stages = num_stages,
@@ -1038,7 +1041,7 @@ def dsa_indexer_scores(
             _dsa_indexer_kernel[grid](
                 q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt,
                 H_i = H_i, D_i = D_i, S_stride = S_stride, compress_rate = compress_rate,
-                scale = D_i ** -0.5 * H_i ** -0.5,
+                scale = scale,
                 BLOCK_M = block_m, BLOCK_N = block_n, EPP = epp,
                 DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
                 num_warps = num_warps, num_stages = num_stages,

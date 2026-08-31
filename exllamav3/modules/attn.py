@@ -181,7 +181,8 @@ class Attention(Module):
         gate_softplus: bool = False,
         tp_split_norm: bool = True,
         select_hq_bits: int = 0,
-        qbits_key: str = "bits"
+        qbits_key: str = "bits",
+        qsa_indexer: Module | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -195,6 +196,8 @@ class Attention(Module):
         self.sm_scale = sm_scale or self.head_dim ** (-0.5)
         self.rope_settings = rope_settings
         self.rope = None
+        self.qsa_indexer = qsa_indexer
+        self.register_submodule(qsa_indexer)
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
         self.logit_softcapping = logit_softcapping
@@ -725,6 +728,16 @@ class Attention(Module):
         max_seqlen = params["max_seqlen"] if cu_seqlens is not None else None
         simulate_kv_quant = params.get("sim_kvq", None)
 
+        # QSA: Above sparse threshold, project/pool/select and attend through the gathered-GQA kernel
+        # (flat-K/V variant of the BC sparse kernels)
+        qsa_q_idx = qsa_pooled = None
+        if self.qsa_indexer is not None:
+            assert cu_seqlens is None, "QSA indexer: cu_seqlens batching not supported in nc mode"
+            assert causal and position == 0 and positions is None
+            if seqlen > self.qsa_indexer.sparse_threshold():
+                qsa_q_idx, raw_k = self.qsa_indexer.project(x, self.rope, params)
+                qsa_pooled = self.qsa_indexer.pool_keys(raw_k, self.rope, params)
+
         q, k, v, g = self.project_qkv(x, params)
 
         if self.q_norm:
@@ -755,19 +768,22 @@ class Attention(Module):
             _sim_kvq_inplace(k, simulate_kv_quant[0], sq_ca)
             _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
 
-        o = attn_dispatch(
-            q = q,
-            k = k,
-            v = v,
-            cu_seqlens = cu_seqlens,
-            max_seqlen = max_seqlen,
-            causal = causal,
-            sm_scale = self.sm_scale,
-            window_size = self.sliding_window,
-            softcap = self.logit_softcapping,
-            sinks = self.sinks,
-            dispatch_cache = self.dispatch_cache,
-        )
+        if qsa_q_idx is not None:
+            o = self.qsa_indexer.sparse_attend_nc(self, q, k, v, qsa_q_idx, qsa_pooled)
+        else:
+            o = attn_dispatch(
+                q = q,
+                k = k,
+                v = v,
+                cu_seqlens = cu_seqlens,
+                max_seqlen = max_seqlen,
+                causal = causal,
+                sm_scale = self.sm_scale,
+                window_size = self.sliding_window,
+                softcap = self.logit_softcapping,
+                sinks = self.sinks,
+                dispatch_cache = self.dispatch_cache,
+            )
 
         if self.headwise_gate:
             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
@@ -779,7 +795,7 @@ class Attention(Module):
         return o
 
 
-    def bc_attn_step(self, x, cache, params, block_table, cache_seqlens):
+    def bc_attn_step(self, x, cache, params, block_table, cache_seqlens, host_seqlens = None):
         """
         Graph-captured decode attention block (projections through o_proj as one C++ call,
         replayed as one CUDA graph after warmup). Returns the block output, or None when the
@@ -803,9 +819,20 @@ class Attention(Module):
             bca = self.bc_attn[key] = (build_bc_attn(self, layer) or False)
         if bca is False:
             return None
-        return bca.step(x, cache_seqlens, block_table, position, positions, position_ids, inv_freq,
-                        causal = params.get("causal", True))
+        return bca.step(
+            x, cache_seqlens, block_table, position, positions, position_ids, inv_freq,
+            causal = params.get("causal", True), host_seqlens = host_seqlens
+        )
 
+
+    def cache_layer_type(self, default, kwargs: dict):
+        if self.qsa_indexer is None:
+            return default, kwargs
+        from ..cache.fp16 import CacheLayer_fp16
+        from ..cache.qsa import CacheLayer_qsa
+        assert default is CacheLayer_fp16, \
+            "QSA attention currently supports only the fp16 cache layer"
+        return CacheLayer_qsa, kwargs
 
     def decode_flash_attn(
         self,
@@ -829,15 +856,34 @@ class Attention(Module):
         non_causal_spans = params.get("non_causal_spans")
         simulate_kv_quant = params.get("sim_kvq", None)
 
+        # QSA: the indexer's raw/pooled key planes must be maintained on every cached forward.
+        # The BC graph path below maintains them in-graph (both regimes) and runs the gathered
+        # sparse attention once some query position exceeds the threshold below which dense
+        # attention is exactly equivalent (top-k cannot exclude anything); when BC declines,
+        # the eager fallback does both
+        qsa_sparse = False
+        qsa_q_idx = None
+        qsa_layer = None
+        qsa_seqlens_cpu = None
+        if self.qsa_indexer is not None:
+            from ..cache import CacheLayer as _CL
+            qsa_layer = cache if isinstance(cache, _CL) else cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+            qsa_seqlens_cpu = get_for_device(params, "cache_seqlens", "cpu")
+            qsa_sparse = int(qsa_seqlens_cpu.max().item()) + seqlen > self.qsa_indexer.sparse_threshold()
+
         # Graph-captured C++ path for the whole decode attention block (causality is baked
         # into the slot kernels, so non-causal callers like the DFlash draft graph too)
         if (
             _bc_attn_enable and non_causal_spans is None and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
-            o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens)
+            o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
+                                  host_seqlens = qsa_seqlens_cpu)
             if o is not None:
                 return o
+
+        if self.qsa_indexer is not None:
+            qsa_q_idx = self.qsa_indexer.update_planes(qsa_layer, x, self.rope, block_table, qsa_seqlens_cpu, params)
 
         q, k, v, g = self.project_qkv(x, params)
 
@@ -869,23 +915,27 @@ class Attention(Module):
             _sim_kvq_inplace(k, simulate_kv_quant[0], sq_ca)
             _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
 
-        o = attn_dispatch(
-            q = q,
-            k = k,
-            v = v,
-            cache = cache,
-            cache_idx = self.layer_idx,
-            cache_instance = params.get("layer_instance"),
-            block_table = block_table,
-            cache_seqlens = cache_seqlens,
-            causal = causal,
-            sm_scale = self.sm_scale,
-            window_size = self.sliding_window,
-            softcap = self.logit_softcapping,
-            non_causal_spans = non_causal_spans,
-            sinks = self.sinks,
-            dispatch_cache = self.dispatch_cache,
-        )
+        if qsa_sparse:
+            qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
+            o = self.qsa_indexer.sparse_attend(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu)
+        else:
+            o = attn_dispatch(
+                q = q,
+                k = k,
+                v = v,
+                cache = cache,
+                cache_idx = self.layer_idx,
+                cache_instance = params.get("layer_instance"),
+                block_table = block_table,
+                cache_seqlens = cache_seqlens,
+                causal = causal,
+                sm_scale = self.sm_scale,
+                window_size = self.sliding_window,
+                softcap = self.logit_softcapping,
+                non_causal_spans = non_causal_spans,
+                sinks = self.sinks,
+                dispatch_cache = self.dispatch_cache,
+            )
 
         if self.headwise_gate:
             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)

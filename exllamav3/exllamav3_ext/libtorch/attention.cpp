@@ -12,6 +12,7 @@
 #include "../add.cuh"
 #include "../activation.cuh"
 #include "../norm.cuh"
+#include "../dsa_topk.cuh"
 
 BC_Attention::BC_Attention
 (
@@ -120,19 +121,50 @@ BC_Attention::BC_Attention
     TORCH_CHECK(gate_mode >= 0 && gate_mode <= 3, "BC_Attention: unsupported gate mode");
     TORCH_CHECK(gate_mode != 1 || (g_weight && !qg_ptrs_trellis && !g_proj), "BC_Attention: headwise gate requires an fp16 gate weight");
     TORCH_CHECK(!g_weight || gate_mode == 1 || (gate_mode == 2 && !qg_ptrs_trellis && !g_proj), "BC_Attention: fp16 gate weight requires full gate mode without a quantized g projection");
-    slots.resize(MAX_BSZ * MAX_QLEN);
+    slots.resize(2 * MAX_BSZ * MAX_QLEN);
 }
 
-bool BC_Attention::needs_configure(int bsz, int q_len)
+void BC_Attention::set_qsa
+(
+    std::shared_ptr<BC_LinearEXL3> _qk_proj,
+    at::Tensor _q_norm_w,
+    at::Tensor _k_norm_w,
+    float _norm_eps,
+    int _n_heads,
+    int _head_dim,
+    int _topk,
+    int _compress_ratio,
+    at::Tensor _raw_plane,
+    at::Tensor _pool_plane
+)
+{
+    TORCH_CHECK(_qk_proj, "BC_Attention: QSA requires a quantized index_qk projection");
+    TORCH_CHECK(!quant_cache, "BC_Attention: QSA requires the fp16 cache");
+    qsa = true;
+    qsa_qk_proj = std::move(_qk_proj);
+    qsa_q_norm_w = std::move(_q_norm_w);
+    qsa_k_norm_w = std::move(_k_norm_w);
+    qsa_norm_eps = _norm_eps;
+    qsa_n_heads = _n_heads;
+    qsa_head_dim = _head_dim;
+    qsa_topk = _topk;
+    qsa_cr = _compress_ratio;
+    qsa_raw_plane = std::move(_raw_plane);
+    qsa_pool_plane = std::move(_pool_plane);
+}
+
+bool BC_Attention::needs_configure(int bsz, int q_len, int regime)
 {
     TORCH_CHECK(1 <= bsz && bsz <= MAX_BSZ && 1 <= q_len && q_len <= MAX_QLEN, "BC_Attention: shape out of range");
-    return !slot(bsz, q_len).configured;
+    TORCH_CHECK(regime == 0 || regime == 1, "BC_Attention: bad regime");
+    return !slot(bsz, q_len, regime).configured;
 }
 
 void BC_Attention::configure_slot
 (
     int bsz,
     int q_len,
+    int regime,
     at::Tensor q,
     at::Tensor kv,
     at::Tensor o,
@@ -149,7 +181,8 @@ void BC_Attention::configure_slot
     c10::optional<at::Tensor> yp
 )
 {
-    Slot& s = slot(bsz, q_len);
+    TORCH_CHECK(regime == 0 || qsa, "BC_Attention: sparse regime without QSA indexer");
+    Slot& s = slot(bsz, q_len, regime);
     int R = bsz * q_len;
 
     s.q = std::move(q);
@@ -231,6 +264,69 @@ void BC_Attention::configure_slot
     s.configured = true;
 }
 
+void BC_Attention::configure_slot_qsa
+(
+    int bsz,
+    int q_len,
+    int regime,
+    at::Tensor qk,
+    at::Tensor q,
+    at::Tensor kraw,
+    std::shared_ptr<TritonKernel> k_stage,
+    std::shared_ptr<TritonKernel> k_raw_append,
+    std::shared_ptr<TritonKernel> k_pool_update,
+    int rotate_dims,
+    c10::optional<at::Tensor> wts,
+    c10::optional<at::Tensor> scores,
+    c10::optional<at::Tensor> pool_idx,
+    c10::optional<at::Tensor> indices,
+    std::shared_ptr<TritonKernel> k_fewq,
+    std::shared_ptr<TritonKernel> k_expand,
+    std::shared_ptr<TritonKernel> k_split,
+    std::shared_ptr<TritonKernel> k_combine,
+    int fewq_gy,
+    int qsa_splits,
+    int qsa_split_len,
+    int qsa_programs
+)
+{
+    TORCH_CHECK(qsa, "BC_Attention: configure_slot_qsa without set_qsa");
+    Slot& s = slot(bsz, q_len, regime);
+    TORCH_CHECK(s.configured, "BC_Attention: configure_slot before configure_slot_qsa");
+    TORCH_CHECK(k_stage && k_raw_append && k_pool_update, "BC_Attention: QSA plane kernels missing");
+
+    s.qsa_qk = std::move(qk);
+    s.qsa_q = std::move(q);
+    s.qsa_kraw = std::move(kraw);
+    s.qsa_q4 = s.qsa_q.view({bsz, q_len, qsa_n_heads, qsa_head_dim})
+        .narrow(3, 0, rotate_dims);
+    s.k_qsa_stage = k_stage;
+    s.k_qsa_raw_append = k_raw_append;
+    s.k_qsa_pool_update = k_pool_update;
+
+    if (regime == 1)
+    {
+        // Sparse slots are single-job (bsz 1) but cover q_len 1..MAX_QLEN: every query row has
+        // its own index list, scored/expanded with per-row causal bounds (SEQ constexpr), and
+        // the gather kernel treats rows as its batch axis with a shared block-table row
+        TORCH_CHECK(bsz == 1 && q_len <= MAX_QLEN, "BC_Attention: QSA sparse slots are single-job");
+        TORCH_CHECK(wts && scores && pool_idx && indices && k_fewq && k_expand &&
+                    k_split && k_combine, "BC_Attention: QSA sparse statics/kernels missing");
+        s.qsa_wts = wts.value();
+        s.qsa_scores = scores.value();
+        s.qsa_pool_idx = pool_idx.value();
+        s.qsa_indices = indices.value();
+        s.k_qsa_fewq = k_fewq;
+        s.k_qsa_expand = k_expand;
+        s.k_qsa_split = k_split;
+        s.k_qsa_combine = k_combine;
+        s.qsa_fewq_gy = fewq_gy;
+        s.qsa_splits = qsa_splits;
+        s.qsa_split_len = qsa_split_len;
+        s.qsa_programs = qsa_programs;
+    }
+}
+
 // Live split configuration from the current block-table bound (same formula as the python
 // dispatch path, so the two produce identical numerics)
 static inline void split_config(int bt_width, int page_size, int q_len, int block_n, int splits_cap,
@@ -254,6 +350,8 @@ void BC_Attention::run_gr
     const c10::optional<at::Tensor>& positions,
     const c10::optional<at::Tensor>& position_ids,
     const c10::optional<at::Tensor>& inv_freq_override,
+    int regime,
+    int64_t t_total,
     Graph* graph
 )
 {
@@ -416,6 +514,164 @@ void BC_Attention::run_gr
         }
     }
 
+    // QSA indexer planes (both regimes, so the selection has complete history once it
+    // activates): fused q/raw-key projection, staging split + per-head q norm, raw-key plane
+    // append and the pooled keys touched by this append
+    if (qsa)
+    {
+        exl3_gemm_gr(x2, qsa_qk_proj->trellis, s.qsa_qk, qsa_qk_proj->suh,
+                     xh_flat.narrow(0, 0, (int64_t) R * hs).view({R, hs}),
+                     qsa_qk_proj->svh, -1, qsa_qk_proj->mcg, qsa_qk_proj->mul1, 0, graph);
+        {
+            std::vector<void*> args =
+            {
+                (void*) s.qsa_qk.data_ptr(),
+                (void*) qsa_q_norm_w.data_ptr(),
+                (void*) s.qsa_q.data_ptr(),
+                (void*) s.qsa_kraw.data_ptr(),
+                (void*) (intptr_t) R,
+            };
+            s.k_qsa_stage->launch(R, qsa_n_heads + 1, 1, args, stream);
+        }
+        {
+            std::vector<void*> args =
+            {
+                (void*) s.qsa_kraw.data_ptr(),
+                (void*) qsa_raw_plane.data_ptr(),
+                (void*) block_table.data_ptr(),
+                (void*) cache_seqlens.data_ptr(),
+                (void*) (intptr_t) (int) block_table.size(1),
+                (void*) (intptr_t) q_len,
+            };
+            s.k_qsa_raw_append->launch(R, 1, 1, args, stream);
+            if (graph)
+            {
+                graph->record_param(s.k_qsa_raw_append->handle(), GP_attn_block_table, 2);
+                graph->record_param(s.k_qsa_raw_append->handle(), GP_attn_seqlens, 3);
+                graph->record_param(s.k_qsa_raw_append->handle(), GP_attn_num_pages, 4, 4);
+                graph->record_param(s.k_qsa_raw_append->handle(), GP_end, 0);
+            }
+        }
+        {
+            std::vector<void*> args =
+            {
+                (void*) qsa_raw_plane.data_ptr(),
+                (void*) qsa_pool_plane.data_ptr(),
+                (void*) qsa_k_norm_w.data_ptr(),
+                inv_freq ? (void*) inv_freq.value().data_ptr() : (void*) s.qsa_kraw.data_ptr(),
+                (void*) block_table.data_ptr(),
+                (void*) cache_seqlens.data_ptr(),
+                (void*) (intptr_t) (int) block_table.size(1),
+                (void*) (intptr_t) q_len,
+            };
+            // grid height = compiled MAXPOOLS = q_len / P + 1
+            s.k_qsa_pool_update->launch(bsz, q_len / qsa_cr + 1, 1, args, stream);
+            if (graph)
+            {
+                graph->record_param(s.k_qsa_pool_update->handle(), GP_attn_block_table, 4);
+                graph->record_param(s.k_qsa_pool_update->handle(), GP_attn_seqlens, 5);
+                graph->record_param(s.k_qsa_pool_update->handle(), GP_attn_num_pages, 6, 4);
+                graph->record_param(s.k_qsa_pool_update->handle(), GP_end, 0);
+            }
+        }
+    }
+
+    if (regime == 1)
+    {
+        // Sparse regime (bsz == 1, q_len == 1): rope the indexer queries, score the pooled
+        // plane (uniform head weights), select top-k blocks, expand to token indices plus the
+        // query's tail block, and gather-attend. The index list is a slot static; causality
+        // lives entirely in the selection
+        int64_t t_scan = t_total / qsa_cr;
+        {
+            c10::optional<at::Tensor> no_k = {};
+            c10::optional<at::Tensor> no_ko = {};
+            c10::optional<at::Tensor> no_n = {};
+            const at::Tensor& ivf = inv_freq_override ? inv_freq_override.value() : inv_freq.value();
+            rope_gr(s.qsa_q4, s.qsa_q4, no_k, no_ko, ivf, (uint32_t) position, positions,
+                    position_ids, rope_style, attn_factor, no_n, no_n, norm_eps, 0.0f, 0.0f,
+                    0, rotate_dims, 0, graph);
+        }
+        {
+            std::vector<void*> args =
+            {
+                (void*) s.qsa_q.data_ptr(),
+                (void*) s.qsa_wts.data_ptr(),
+                (void*) qsa_pool_plane.data_ptr(),
+                (void*) s.qsa_scores.data_ptr(),
+                (void*) (uintptr_t) (uint32_t) (int) t_scan,
+                (void*) (uintptr_t) (uint32_t) R,
+                (void*) (uintptr_t) (uint32_t) (int) position,
+                (void*) (uintptr_t) (uint32_t) (int) t_scan,
+                (void*) block_table.data_ptr(),
+                (void*) (uintptr_t) (uint32_t) 0,
+            };
+            s.k_qsa_fewq->launch(R, s.qsa_fewq_gy, 1, args, stream);
+            if (graph)
+            {
+                graph->record_param(s.k_qsa_fewq->handle(), GP_dsa_T, 4, 4);
+                graph->record_param(s.k_qsa_fewq->handle(), GP_dsa_qpos, 6, 4);
+                graph->record_param(s.k_qsa_fewq->handle(), GP_dsa_bound_max, 7, 4);
+                graph->record_param(s.k_qsa_fewq->handle(), GP_attn_block_table, 8);
+                graph->record_param(s.k_qsa_fewq->handle(), GP_end, 0);
+            }
+        }
+        dsa_topk_gr(s.qsa_scores, s.qsa_pool_idx, qsa_topk, graph);
+        {
+            std::vector<void*> args =
+            {
+                (void*) s.qsa_pool_idx.data_ptr(),
+                (void*) s.qsa_indices.data_ptr(),
+                (void*) (uintptr_t) (uint32_t) (int) position,
+            };
+            int k_pad = (int) s.qsa_indices.size(1);
+            s.k_qsa_expand->launch(R, CEIL_DIVIDE(k_pad, 256), 1, args, stream);
+            if (graph)
+            {
+                graph->record_param(s.k_qsa_expand->handle(), GP_dsa_qpos, 2, 4);
+                graph->record_param(s.k_qsa_expand->handle(), GP_end, 0);
+            }
+        }
+        {
+            // num_pages_per_seq 0: the kernel's per-row "batch" index then always selects
+            // block-table row 0, shared by all q_len rows of the single job
+            std::vector<void*> args =
+            {
+                (void*) s.q.data_ptr(),
+                (void*) cache_k.data_ptr(),
+                (void*) cache_v.data_ptr(),
+                (void*) block_table.data_ptr(),
+                (void*) s.qsa_indices.data_ptr(),
+                (void*) s.partial_o.data_ptr(),
+                (void*) s.partial_ml.data_ptr(),
+                (void*) (intptr_t) (int) s.qsa_indices.size(1),
+                (void*) (intptr_t) 0,
+                (void*) (intptr_t) s.qsa_splits,
+                (void*) (intptr_t) s.qsa_split_len,
+            };
+            s.k_qsa_split->launch(s.qsa_programs, s.qsa_splits, 1, args, stream);
+            if (graph)
+            {
+                graph->record_param(s.k_qsa_split->handle(), GP_attn_block_table, 3);
+                graph->record_param(s.k_qsa_split->handle(), GP_end, 0);
+            }
+        }
+        {
+            std::vector<void*> args =
+            {
+                (void*) s.partial_o.data_ptr(),
+                (void*) s.partial_ml.data_ptr(),
+                (void*) s.o.data_ptr(),
+                (void*) h32.data_ptr(),
+                (void*) (intptr_t) s.qsa_splits,
+                (void*) s.q.data_ptr(),  // sinks: dead arg, HAS_SINKS = false
+            };
+            s.k_qsa_combine->launch(s.qsa_programs, 1, 1, args, stream);
+        }
+    }
+    else
+    {
+
     // Flash-decoding split kernel + combine, with the split configuration derived from the
     // current block-table bound per call
     void* scales_k = quant_cache ? cache_k_scales.value().data_ptr() : s.q.data_ptr();
@@ -474,6 +730,8 @@ void BC_Attention::run_gr
         }
     }
 
+    }   // regime == 0
+
     // Output gate
     if (gate_mode == 1)
     {
@@ -512,22 +770,25 @@ void BC_Attention::run
     int64_t position,
     const c10::optional<at::Tensor>& positions,
     const c10::optional<at::Tensor>& position_ids,
-    const c10::optional<at::Tensor>& inv_freq_override
+    const c10::optional<at::Tensor>& inv_freq_override,
+    int regime,
+    int64_t t_total
 )
 {
     py::gil_scoped_release release;
     c10::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    Slot& s = slot(bsz, q_len);
+    Slot& s = slot(bsz, q_len, regime);
     TORCH_CHECK(s.configured, "BC_Attention: slot not configured");
     TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "BC_Attention: x and y must be contiguous");
+    TORCH_CHECK(regime == 0 || qsa, "BC_Attention: sparse regime without QSA indexer");
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
     // captured, then launched below like every later run, with only the I/O pointers patched
     if (s.runs == 0)
     {
-        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, nullptr);
+        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
         s.runs = 1;
         return;
     }
@@ -535,7 +796,7 @@ void BC_Attention::run
     if (!s.graph->ready)
     {
         s.graph->capture_begin();
-        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, s.graph.get());
+        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, s.graph.get());
         s.graph->capture_end();
         s.runs = 2;
     }
@@ -545,7 +806,7 @@ void BC_Attention::run
     bool use_qg_mgemm = gate_mode == 2 && qg_ptrs_trellis.has_value() && R <= 32;
 
     std::vector<PPTR> params;
-    params.reserve(20);
+    params.reserve(40);
 
     // Padded hidden dim or fp16 gate: x feeds the staging copy at the head of the graph and the
     // projections read the (static) buffer; otherwise the projections read x directly
@@ -596,8 +857,6 @@ void BC_Attention::run
     // Cache append and attention: the block-table geometry and split configuration are runtime
     // kernel arguments, patched per call like the pointers, so context growth never recaptures
     int bt_width = (int) block_table.size(1);
-    int num_splits, split_len;
-    split_config(bt_width, page_size, q_len, s.block_n, s.splits_cap, &num_splits, &split_len);
     if (quant_cache)
     {
         params.emplace_back(GP_qcache_seqlens, (void*) cache_seqlens.data_ptr());
@@ -610,12 +869,53 @@ void BC_Attention::run
         params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
         params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
     }
-    params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
-    params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
-    params.emplace_back(GP_attn_split_len, (void*) (uintptr_t) split_len);
-    params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
-    params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);
-    params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);   // combine kernel
+
+    // QSA plane stages: qk projection, raw append, pool update
+    if (qsa)
+    {
+        params.emplace_back(GP_gemm_A, xptr);
+        params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
+        params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
+        params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
+        params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
+        params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
+        params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
+    }
+
+    if (regime == 1)
+    {
+        // Indexer-query rope, scoring/top-k bounds (in block units), tail expansion and the
+        // gathered attention. The index list and split configuration are slot statics
+        int t_scan = (int) (t_total / qsa_cr);
+        if (inv_freq)
+        {
+            const at::Tensor& ivf = inv_freq_override ? inv_freq_override.value() : inv_freq.value();
+            int pid_stride = (position_ids && position_ids.value().dim() == 3) ? rotate_dims : 1;
+            params.emplace_back(GP_rope_inv_freq, (void*) ivf.data_ptr());
+            params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
+            params.emplace_back(GP_rope_positions, positions ? (void*) positions.value().data_ptr() : nullptr);
+            params.emplace_back(GP_rope_position_ids, position_ids ? (void*) position_ids.value().data_ptr() : nullptr);
+            params.emplace_back(GP_rope_pid_stride, (void*) (uintptr_t) pid_stride);
+        }
+        params.emplace_back(GP_dsa_T, (void*) (uintptr_t) (uint32_t) t_scan);
+        params.emplace_back(GP_dsa_qpos, (void*) (uintptr_t) (uint32_t) position);
+        params.emplace_back(GP_dsa_bound_max, (void*) (uintptr_t) (uint32_t) t_scan);
+        params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
+        params.emplace_back(GP_dsa_T, (void*) (uintptr_t) (uint32_t) t_scan);   // top-k
+        params.emplace_back(GP_dsa_qpos, (void*) (uintptr_t) (uint32_t) position);   // expand
+        params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());    // gather
+    }
+    else
+    {
+        int num_splits, split_len;
+        split_config(bt_width, page_size, q_len, s.block_n, s.splits_cap, &num_splits, &split_len);
+        params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
+        params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
+        params.emplace_back(GP_attn_split_len, (void*) (uintptr_t) split_len);
+        params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
+        params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);
+        params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);   // combine kernel
+    }
     void* yptr = padded ? s.yp.data_ptr() : (void*) y.data_ptr();
     params.emplace_back(GP_gemm_C, yptr);
     if (o_proj->bias)
