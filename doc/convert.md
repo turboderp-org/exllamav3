@@ -21,10 +21,14 @@ does.
 
 - **-vb / --vision_bits *int***: Number of bits per weight for the vision component, for models that have one. Must be an integer from 1 to 8, or 16 to copy the vision model unquantized. The default depends on the architecture: vision towers validated for low-bitrate quantization default to 6, everything else to 16. Vision layers are quantized without calibration.
 
+- **-ngb / --ngram_bits *int***: Bits per weight for hashed n-gram embedding tables (PLE models, e.g. Qwen3.8-Flash-Next). Must be an integer from 1 to 8, default is `--bits` rounded to the nearest integer. The table is quantized (without calibration) before the layer-by-layer conversion and written as a standalone `ngram_embedding.safetensors` in the output directory; calibration forwards then run against the quantized table. Table quantization is resumable together with the rest of the job.
+
+- **-ngf / --ngram_file *file***: Pre-quantized n-gram table (from `util/convert_ngram.py`) to copy into the output model instead of quantizing the table as part of the job. Overrides `--ngram_bits`.
+
 - **-hq / --hq**: Increase the bitrate of select layers, such as attention and shared-expert layers. Final model bitrate may be somewhat higher than requested by `--bits`, but for MoE models this is typically a very small increase in size (0.05 - 0.10 bpw) for a disproportionately large increase in model fidelity. 
 
 - **-rcp / --recipe *file***: Per-tensor bitrate recipe (YAML, e.g. from `sc_optimize.py`), used in place of the budgeted allocation from `--bits`/`--head_bits`. More about optimized recipes [here](optimize.md).
-- 
+
 - **-cd / --cal_data *file***: Calibration data file (safetensors with packed token rows, e.g. from `sc_trace.py`) used instead of the bundled corpus mix. 
 
 #### Advanced (generally disregard these options)
