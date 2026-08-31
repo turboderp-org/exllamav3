@@ -343,6 +343,38 @@ read.
 
 Enable GPU/CPU handoff profiling, for debug purposes. 
 
+## Model loading
+
+### `EXL3_LOAD_ARENA` (default: `1`)
+
+Slab allocation for small weight tensors during (deferred) module loads: tensors up to 64 MB
+are carved out of shared 128 MB per-device blocks instead of getting one CUDA caching-allocator
+allocation each. MoE models with many small per-expert tensors otherwise shatter the allocator
+into tens of thousands of segments with large reserved-but-unallocated overhead (measured on a
+512-expert model: 37k segments, 15.3 GB waste, fixed to 611 segments / 0.16 GB). Unloading a
+module frees its blocks; at most one boundary block shared with a neighboring module stays
+pinned. Set to `0` to fall back to per-tensor allocations.
+
+### `EXL3_NGRAM_STREAM` (default: `1`)
+
+Default for `Config.infer_params.ngram_stream_from_disk`: stream an n-gram embedding table
+(PLE models, e.g. Qwen3.8-Flash-Next) from disk with per-forward row gathers (threaded,
+run-coalesced preads into pinned staging) instead of loading the whole table into system RAM.
+The quantized table is tens of GB, and streaming costs little on SSD-class storage (decode is
+latency-tolerant at ~30 rows/token; prefill gathers are batched). Set to `0` to hold the table
+in RAM — worthwhile only when the table lives on high-latency storage (e.g. HDD, where
+per-row seeks make streaming unusable). Also settable per load via
+`config.infer_params.ngram_stream_from_disk` or `--ngram_ram` in `model_init`-based scripts.
+The streamed path is `pread`-based and not implemented on Windows: there the table always
+loads into RAM (with a warning when streaming was requested).
+
+### `EXL3_VISION_PINNED` (default: `0`)
+
+Default for `Config.infer_params.vision_pinned`: store the vision component's linear-layer
+weights (fp16 or EXL3 trellis) in pinned host memory instead of VRAM, computing straight from
+a zero-copy device alias. Trades vision-tower speed for VRAM. Set before loading the vision
+component.
+
 ## Multi-GPU
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)
