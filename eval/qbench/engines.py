@@ -135,7 +135,14 @@ class TransformersBackend:
         self.device = device
         self.dtype = dtype
         self.streaming = options.get("streaming", False)
+        # w4a4_sim: emulate NVFP4 activation quantization (ModelOpt W4A4 recipe) on the
+        # quantized expert GEMMs: static per-expert input_scale (calibrated global) + dynamic
+        # per-16-group e4m3 scales + e2m1 values, computed in fp32 and applied as fake-quant
+        # before the bf16 GEMMs. Weight-side fidelity of the same quantizer: 99.88% of stored
+        # e2m1 codes reproduced bit-exact from the bf16 originals
+        self.w4a4_sim = options.get("w4a4_sim", False)
         self.shard_shims = []
+        self.a4_wraps = []
         self.shard_handles = {}
 
         if self.streaming:
@@ -744,6 +751,64 @@ class TransformersBackend:
         for pn, p in module.named_parameters():
             if p.is_meta:
                 raise RuntimeError(f"No checkpoint tensor for {self.prefix[id(module)]}.{pn}")
+        if self.w4a4_sim:
+            self._install_a4_wraps(module, prefix)
+
+    NVFP4_POS = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+    def _nvfp4_fq(self, x, gs):
+        """NVFP4 fake-quant: per-16-group e4m3 scale = e4m3(amax / 6 / gs), values rounded to
+        the e2m1 grid. Returns x.dtype."""
+        lut = self.NVFP4_POS.to(x.device)
+        mid = (lut[1:] + lut[:-1]) / 2
+        xr = x.float().reshape(-1, 16)
+        amax = xr.abs().amax(dim = 1, keepdim = True)
+        sg = (amax / 6.0 / gs).to(torch.float8_e4m3fn).float() * gs
+        sg = torch.where(sg == 0, torch.ones_like(sg), sg)
+        q = xr / sg
+        v = lut[torch.bucketize(q.abs().clamp(max = 6.0), mid)] * q.sign()
+        return (v * sg).reshape(x.shape).to(x.dtype)
+
+    def _install_a4_wraps(self, module, prefix):
+        """Wrap fused-expert modules (Qwen3Next-style forward(hidden, top_k_index,
+        top_k_weights)) with per-expert activation fake-quant, when the checkpoint carries
+        per-expert input_scale tensors for them."""
+        import torch.nn.functional as F
+        for name, sub in module.named_modules():
+            pset = dict(sub.named_parameters(recurse = False))
+            if "gate_up_proj" not in pset or "down_proj" not in pset:
+                continue
+            stem = f"{prefix}.{name}" if prefix else name
+            E = pset["gate_up_proj"].shape[0]
+            if f"{stem}.0.gate_proj.input_scale" not in self.tensor_index:
+                continue
+            gs = torch.tensor([float(self._read_shard(f"{stem}.{e}.gate_proj.input_scale"))
+                               for e in range(E)])
+            ds = torch.tensor([float(self._read_shard(f"{stem}.{e}.down_proj.input_scale"))
+                               for e in range(E)])
+            orig = sub.forward
+
+            def a4_forward(hidden_states, top_k_index, top_k_weights, _m = sub, _gs = gs, _ds = ds):
+                final = torch.zeros_like(hidden_states)
+                with torch.no_grad():
+                    mask = F.one_hot(top_k_index, num_classes = _m.num_experts).permute(2, 1, 0)
+                    hit = torch.greater(mask.sum(dim = (-1, -2)), 0).nonzero()
+                for e in hit:
+                    e = int(e[0])
+                    if e == _m.num_experts:
+                        continue
+                    pos, tok = torch.where(mask[e])
+                    cs = self._nvfp4_fq(hidden_states[tok], float(_gs[e]))
+                    gate, up = F.linear(cs, _m.gate_up_proj[e]).chunk(2, dim = -1)
+                    h = _m.act_fn(gate) * up
+                    h = self._nvfp4_fq(h, float(_ds[e]))
+                    h = F.linear(h, _m.down_proj[e])
+                    h = h * top_k_weights[tok, pos, None]
+                    final.index_add_(0, tok, h.to(final.dtype))
+                return final
+
+            sub.forward = a4_forward
+            self.a4_wraps.append((sub, orig))
 
     def _install_shard_shim(self, module, prefix, pn):
         stem_local = pn[: -len(".weight")]
@@ -754,10 +819,17 @@ class TransformersBackend:
         owner = module.get_submodule(stem_local)
         parent_path, _, owner_name = stem_local.rpartition(".")
         parent = module.get_submodule(parent_path) if parent_path else module
-        parent._modules[owner_name] = _ShardGatherEmbedding(shards, self.dtype)
+        # fp8-stored tables (Qwen3.8-Flash-Next nvfp4 export) carry one global weight_scale
+        scale = None
+        if f"{stem_full}.weight_scale" in self.tensor_index:
+            scale = self._read_shard(f"{stem_full}.weight_scale").float().flatten()[0].item()
+        parent._modules[owner_name] = _ShardGatherEmbedding(shards, self.dtype, scale)
         self.shard_shims.append((parent, owner_name, owner))
 
     def _dematerialize(self, module):
+        while self.a4_wraps:
+            sub, orig = self.a4_wraps.pop()
+            sub.forward = orig
         while self.shard_shims:
             parent, name, orig = self.shard_shims.pop()
             parent._modules[name] = orig            # original keeps its meta weight
@@ -946,12 +1018,13 @@ class _ShardGatherEmbedding(torch.nn.Module):
     only the touched pages are ever read. `weight` is a one-row CPU dummy -- the HF caller
     routes ids to weight.device before the lookup and moves the rows back itself."""
 
-    def __init__(self, shards, dtype):
+    def __init__(self, shards, dtype, scale = None):
         super().__init__()
         self.shards = shards                        # plain list: stays mmap-backed, unregistered
         self.rows_per_shard = shards[0].shape[0]
         self.out_dtype = dtype
-        self.weight = shards[0][:1].to(dtype)
+        self.scale = scale                          # global dequant scale (fp8-stored tables)
+        self.weight = shards[0][:1].float().mul(scale or 1.0).to(dtype)
 
     def forward(self, ids):
         flat = ids.reshape(-1)
@@ -959,7 +1032,10 @@ class _ShardGatherEmbedding(torch.nn.Module):
         sh = flat // self.rows_per_shard
         for s in sh.unique().tolist():
             m = sh == s
-            out[m] = self.shards[s][flat[m] - s * self.rows_per_shard].to(self.out_dtype)
+            rows = self.shards[s][flat[m] - s * self.rows_per_shard].float()
+            if self.scale is not None:
+                rows = rows * self.scale
+            out[m] = rows.to(self.out_dtype)
         return out.view(*ids.shape, -1)
 
 
