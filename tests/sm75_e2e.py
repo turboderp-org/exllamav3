@@ -66,13 +66,25 @@ def main(model_dir):
     print(out.strip())
     print("-" * 60)
 
-    # A working stack answers this; a broken matmul yields repetition or non-ASCII garbage.
-    lowered = out.lower()
-    hits = sum(c in lowered for c in ("red", "blue", "yellow", "green"))
-    if hits < 2:
-        print(f"FAIL: expected colour names, got {hits} matches")
+    # Judge coherence, not task completion: reasoning models spend the 48-token budget
+    # thinking and never reach the answer, which says nothing about kernel correctness.
+    # A broken matmul produces repetition or non-ASCII garbage, and both are caught here.
+    text = out.strip()
+    if len(text) < 20:
+        print(f"FAIL: output too short ({len(text)} chars)")
         return 1
-    print(f"PASS: {hits} colour names present")
+
+    printable = sum(c.isascii() and (c.isprintable() or c.isspace()) for c in text) / len(text)
+    if printable < 0.95:
+        print(f"FAIL: {(1 - printable) * 100:.0f}% non-ASCII, likely garbage")
+        return 1
+
+    words = text.lower().split()
+    if len(words) >= 12 and len(set(words)) < len(words) * 0.35:
+        print(f"FAIL: degenerate repetition ({len(set(words))}/{len(words)} unique)")
+        return 1
+
+    print(f"PASS: {len(words)} words, {len(set(words))} unique, {printable * 100:.0f}% ASCII")
     return 0
 
 
