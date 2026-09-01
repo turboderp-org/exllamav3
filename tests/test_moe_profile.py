@@ -390,7 +390,8 @@ def test_pack_carries_fingerprint_and_layer_keys(tmp_path):
     _pack_mod().pack(src, dst)
     _, keys, meta = mp.load_counts(dst)
     assert keys == [f"model.layers.{i}.mlp" for i in range(4)]
-    assert json.loads(meta["fingerprint"])["experts"] == 32
+    # decoded on load, not left as the JSON text safetensors metadata stores
+    assert meta["fingerprint"]["experts"] == 32
 
 
 def test_pack_prefers_decode_bank(tmp_path):
@@ -448,3 +449,25 @@ def test_serving_read_skips_the_census(tmp_path):
     t, _ = mp._read_safetensors_pread(dst, names=("ranking", "counts"))
     assert set(t) == {"ranking", "counts"}
     assert "census" not in t
+
+
+def test_packed_fingerprint_is_a_dict_not_json_text(tmp_path):
+    """safetensors metadata is string-valued, so structured fields are stored as JSON text.
+    They must be decoded on load: check_fingerprint() indexes them, and a raw string raises
+    "string indices must be integers" at model load -- silently only for packed profiles."""
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("safetensors")
+    src, _ = _census(tmp_path)
+    fp = {"architecture": "X", "layers": 4, "experts": 32, "checkpoint_sha": "deadbeef"}
+    json.dump({"layer_keys": [f"l{i}" for i in range(4)], "fingerprint": fp},
+              open(str(tmp_path / "c.meta.json"), "w"))
+    dst = str(tmp_path / "c.exl3moe")
+    _pack_mod().pack(src, dst)
+    _, _, meta = mp.load_counts(dst)
+    assert isinstance(meta.get("fingerprint"), dict), "fingerprint must decode to a dict"
+    assert meta["fingerprint"]["checkpoint_sha"] == "deadbeef"
+    # and the identity check must run against it without raising
+    warns = list(mp.check_fingerprint(meta["fingerprint"], fp, dst, False))
+    assert warns == []
+    bad = dict(fp, checkpoint_sha="different")
+    assert list(mp.check_fingerprint(meta["fingerprint"], bad, dst, True)), "should warn"

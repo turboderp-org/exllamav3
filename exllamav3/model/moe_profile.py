@@ -280,6 +280,17 @@ def load_counts(path):
         # Never the census: serving needs the ranking, and counts only to merge.
         t, md = _read_safetensors_pread(path, names = ("ranking", "counts"))
         keys = json.loads(md["layer_keys"]) if "layer_keys" in md else None
+        # safetensors metadata values are strings, so structured fields were stored as JSON
+        # text. Decode them back, or check_fingerprint() indexes a str and raises
+        # "string indices must be integers" at load -- which defeats the identity check the
+        # packed format is supposed to carry.
+        md = dict(md)
+        for _k in ("fingerprint", "capture"):
+            if isinstance(md.get(_k), str):
+                try:
+                    md[_k] = json.loads(md[_k])
+                except (ValueError, TypeError):
+                    md.pop(_k)
 
         # A shipped profile may carry the ranking already computed, in which case loading is
         # a mmap and nothing else -- no decompression, no argsort. Measured on a 42x288
