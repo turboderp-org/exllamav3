@@ -31,13 +31,33 @@
 
 namespace exl3_gemv_ns {
 
-// mma.m16n8k16 with the A operand supplied as two FragB halves, fp16 accumulate
+// mma.m16n8k16 with the A operand supplied as two FragB halves, fp16 accumulate.
+// On Turing this splits into the two k=8 halves it is already expressed as (a01 pairs with
+// b[0], a23 with b[1]), accumulating through the same c - bit-equivalent, see ptx.cuh.
 __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, const FragB& b, FragC_h& c)
 {
     const uint32_t* a0 = reinterpret_cast<const uint32_t*>(&a01);
     const uint32_t* a1 = reinterpret_cast<const uint32_t*>(&a23);
     const uint32_t* bb = reinterpret_cast<const uint32_t*>(&b);
     uint32_t* cc = reinterpret_cast<uint32_t*>(&c);
+#if EXL3_SM75
+    asm
+    (
+        "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3}, {%4}, {%0,%1};\n"
+        : "+r"(cc[0]), "+r"(cc[1])
+        :  "r"(a0[0]), "r"(a0[1]),
+           "r"(bb[0])
+    );
+    asm
+    (
+        "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3}, {%4}, {%0,%1};\n"
+        : "+r"(cc[0]), "+r"(cc[1])
+        :  "r"(a1[0]), "r"(a1[1]),
+           "r"(bb[1])
+    );
+#else
     asm
     (
         "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
@@ -46,6 +66,7 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
         :  "r"(a0[0]), "r"(a0[1]), "r"(a1[0]), "r"(a1[1]),
            "r"(bb[0]), "r"(bb[1])
     );
+#endif
 }
 
 // mul1 codebook pair decode via dp4a byte sum (bit-identical to the vabsdiff4 form)
