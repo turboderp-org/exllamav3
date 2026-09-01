@@ -3,6 +3,8 @@
 int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits, bool multi);
 int exl3_gemm_num_kernel_shapes();
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int bits);
+// Dynamic shared memory (bytes) a (shape, bitrate) instantiation requests at launch
+int exl3_gemm_shape_smem(int shape_idx, int bits);
 
 #define EXL3_GEMM_T_ARGS \
     const int bits, \

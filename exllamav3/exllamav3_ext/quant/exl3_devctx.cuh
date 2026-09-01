@@ -30,6 +30,7 @@ class DevCtx
 private:
     int num_sms[MAX_DEVICES] = {};
     int cc[MAX_DEVICES] = {};
+    int smem_max[MAX_DEVICES] = {};
     void* locks[MAX_DEVICES] = {};
     void* ws[MAX_DEVICES] = {};
     std::mutex mtx;
@@ -38,6 +39,10 @@ public:
     static DevCtx& instance();
     int get_num_sms(int device);
     int get_cc(int device);
+    // Usable dynamic shared memory per block, queried from the driver rather than assumed.
+    // sm_86 reports 99 KB and the kernels ask for SMEM_MAX (90 KB); Turing reports 64 KB, so
+    // requesting SMEM_MAX there fails the launch outright. Callers must clamp to this.
+    int get_smem_max(int device);
     void* get_ws(int device);
     int* get_locks(int device);
 
@@ -49,5 +54,6 @@ private:
 
 int g_get_cc(int device);
 int g_get_num_sms(int device);
+int g_get_smem_max(int device);
 
 void prepare_ctx(int device);

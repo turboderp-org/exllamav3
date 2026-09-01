@@ -45,6 +45,18 @@ int DevCtx::get_cc(int device)
     return cc[device];
 }
 
+int DevCtx::get_smem_max(int device)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!smem_max[device])
+    {
+        int optin = 0;
+        cuda_check(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        smem_max[device] = MIN(optin, SMEM_MAX);
+    }
+    return smem_max[device];
+}
+
 void* DevCtx::get_ws(int device)
 {
     std::lock_guard<std::mutex> lock(mtx);
@@ -79,9 +91,15 @@ int g_get_num_sms(int device)
     return DevCtx::instance().get_num_sms(device);
 }
 
+int g_get_smem_max(int device)
+{
+    return DevCtx::instance().get_smem_max(device);
+}
+
 void prepare_ctx(int device)
 {
     DevCtx::instance().get_num_sms(device);
     DevCtx::instance().get_cc(device);
+    DevCtx::instance().get_smem_max(device);
     DevCtx::instance().get_locks(device);
 }
