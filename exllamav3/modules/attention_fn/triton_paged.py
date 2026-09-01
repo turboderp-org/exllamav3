@@ -24,6 +24,62 @@ except ImportError:
 
 from .common import AttnArgs, get_non_causal_span_arglist
 
+_decode_sm_count = {}
+_smem_limit = {}
+
+
+def _dev_smem_limit(device) -> int:
+    """Usable dynamic shared memory per block, cached per device.
+
+    The Triton tile configs below are sized for the ~100 KB that Ampere and later provide.
+    Turing provides 64 KB, and Triton does not degrade gracefully: exceeding the limit raises
+    OutOfResources at launch rather than recompiling smaller. Configs therefore have to be
+    chosen against the real limit up front.
+    """
+    dev = device.index
+    if dev not in _smem_limit:
+        _smem_limit[dev] = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    return _smem_limit[dev]
+
+
+def _oom_is_smem(e: BaseException) -> bool:
+    """True for Triton's shared-memory OutOfResources, which is recoverable by re-dispatch.
+
+    The tile configs are pre-shrunk for small-smem devices, but that reasoning is per-kernel
+    and cannot cover every geometry a caller might present. Treating this one error as a
+    dispatch miss lets the attention dispatcher fall through to the next backend (SDPA,
+    xformers) instead of aborting the forward pass. Any other error still propagates.
+    """
+    if not has_triton:
+        return False
+    from triton.runtime.errors import OutOfResources
+    return isinstance(e, OutOfResources) and "shared memory" in str(e)
+
+
+def _smem_fallback(fn):
+    """Turn a shared-memory OutOfResources into a dispatch miss (None).
+
+    attn_dispatch treats None as 'this backend does not handle these arguments' and moves on
+    to the next candidate, so a Triton kernel that will not fit degrades to a slower backend
+    instead of killing the forward pass. Applied to the dispatcher entry points only, so
+    direct callers still see the original error.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(args):
+        try:
+            return fn(args)
+        except Exception as e:
+            if _oom_is_smem(e):
+                return None
+            raise
+
+    return wrapper
+
+
+
+
 
 def _is_power_of_2(x: int) -> bool:
     return x > 0 and (x & (x - 1)) == 0
@@ -1054,60 +1110,6 @@ def _paged_attn_decode_combine_kernel(
         out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, head_dim)
     out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
     tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None])
-
-
-_decode_sm_count = {}
-_smem_limit = {}
-
-
-def _dev_smem_limit(device) -> int:
-    """Usable dynamic shared memory per block, cached per device.
-
-    The Triton tile configs below are sized for the ~100 KB that Ampere and later provide.
-    Turing provides 64 KB, and Triton does not degrade gracefully: exceeding the limit raises
-    OutOfResources at launch rather than recompiling smaller. Configs therefore have to be
-    chosen against the real limit up front.
-    """
-    dev = device.index
-    if dev not in _smem_limit:
-        _smem_limit[dev] = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
-    return _smem_limit[dev]
-
-
-def _oom_is_smem(e: BaseException) -> bool:
-    """True for Triton's shared-memory OutOfResources, which is recoverable by re-dispatch.
-
-    The tile configs are pre-shrunk for small-smem devices, but that reasoning is per-kernel
-    and cannot cover every geometry a caller might present. Treating this one error as a
-    dispatch miss lets the attention dispatcher fall through to the next backend (SDPA,
-    xformers) instead of aborting the forward pass. Any other error still propagates.
-    """
-    if not has_triton:
-        return False
-    from triton.runtime.errors import OutOfResources
-    return isinstance(e, OutOfResources) and "shared memory" in str(e)
-
-
-def _smem_fallback(fn):
-    """Turn a shared-memory OutOfResources into a dispatch miss (None).
-
-    attn_dispatch treats None as 'this backend does not handle these arguments' and moves on
-    to the next candidate, so a Triton kernel that will not fit degrades to a slower backend
-    instead of killing the forward pass. Applied to the dispatcher entry points only, so
-    direct callers still see the original error.
-    """
-    import functools
-
-    @functools.wraps(fn)
-    def wrapper(args):
-        try:
-            return fn(args)
-        except Exception as e:
-            if _oom_is_smem(e):
-                return None
-            raise
-
-    return wrapper
 
 
 def paged_attn_triton_decode(
