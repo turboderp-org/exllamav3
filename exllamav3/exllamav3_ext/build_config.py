@@ -12,14 +12,14 @@ ROCM_EXCLUDE_FILES = {
     'softcap.cu', 'histogram.cu', 'sam.cpp',
     'cache/q_cache.cu',
     'quant/exl3_gemm.cu', 'quant/exl3_gemv.cu', 'quant/exl3_gemv_int8.cu',
-    'quant/exl3_moe.cu', 'quant/exl3_kernel_map.cu',
+    'quant/exl3_moe.cu', 'quant/exl3_moe_coop.cu', 'quant/exl3_kernel_map.cu',
     'quant/coop_autotune.cu', 'quant/quantize.cu', 'quant/util.cu',
     'generator/sampling_fused.cu',
     'libtorch/gated_delta_net.cpp', 'libtorch/blocksparse_mlp.cpp',
     'libtorch/mlp.cpp', 'libtorch/attention.cpp', 'libtorch/gated_rmsnorm.cpp',
     'libtorch/linear.cpp', 'libtorch/dsv4_attn.cpp', 'libtorch/dsv4_compressor.cpp',
     'libtorch/mla_attention.cpp',
-    'dsv4_compress.cu', 'dsa_topk.cu', 'hc_mix.cu',
+    'dsv4_compress.cu', 'dsa_topk.cu', 'hc_mix.cu', 'ple.cu',
     'cpu/moe_handoff.cu', 'cpu/moe_mul1.cpp',
 }
 
