@@ -29,7 +29,8 @@ memory-bound GPU kernel after one non-blocking H2D copy.
                     Exact port of the torch reference (NGramEmbedding.compute_ngram_ids +
                     torch.unique), which the HF parity test pins down bitwise.
   ngram_gather_cpu: threaded pread of the unique rows (run-coalesced: unique ids are sorted, so
-                    adjacent rows merge into single reads) into a caller buffer.
+                    adjacent rows merge into single reads) into a caller buffer. This file holds
+                    the Linux version; ngram_gather_win.cpp has the overlapped-ReadFile port.
   ngram_dequant:    one block per row: unpack the tail-biting ring bitstream, decode the mul1
                     codebook value per element, apply the fp16 row scale and the per-head bias.
                     Matches dequant_rows() in ngram_codec.py (fp16 codebook rounding included).
@@ -302,24 +303,7 @@ void ngram_gather_cpu
     TORCH_CHECK(!ctx.failed.load(), "ngram_gather_cpu: short read");
 }
 
-#else
-
-// No pread on Windows; the python side forces the RAM table modes there until a
-// ReadFile/OVERLAPPED implementation exists
-void ngram_gather_cpu
-(
-    int64_t fd,
-    int64_t base_offset,
-    int64_t row_bytes,
-    const at::Tensor& uids,
-    int64_t uid_base,
-    at::Tensor out
-)
-{
-    TORCH_CHECK(false, "ngram_gather_cpu: n-gram table streaming is not implemented on Windows");
-}
-
-#endif
+#endif  // ^ Linux (pread); the Windows version (overlapped ReadFile) is in ngram_gather_win.cpp
 
 __global__ __launch_bounds__(ROW_DIM)
 void ngram_dequant_kernel

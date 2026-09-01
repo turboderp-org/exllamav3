@@ -358,15 +358,14 @@ pinned. Set to `0` to fall back to per-tensor allocations.
 ### `EXL3_NGRAM_STREAM` (default: `1`)
 
 Default for `Config.infer_params.ngram_stream_from_disk`: stream an n-gram embedding table
-(PLE models, e.g. Qwen3.8-Flash-Next) from disk with per-forward row gathers (threaded,
-run-coalesced preads into pinned staging) instead of loading the whole table into system RAM.
-The quantized table is tens of GB, and streaming costs little on SSD-class storage (decode is
-latency-tolerant at ~30 rows/token; prefill gathers are batched). Set to `0` to hold the table
-in RAM — worthwhile only when the table lives on high-latency storage (e.g. HDD, where
-per-row seeks make streaming unusable). Also settable per load via
-`config.infer_params.ngram_stream_from_disk` or `--ngram_ram` in `model_init`-based scripts.
-The streamed path is `pread`-based and not implemented on Windows: there the table always
-loads into RAM (with a warning when streaming was requested).
+(PLE models, e.g. Qwen3.8-Flash-Next) from disk with per-forward row gathers (run-coalesced
+positioned reads into pinned staging — threaded preads on Linux, overlapped `ReadFile` at high
+queue depth on Windows) instead of loading the whole table into system RAM. The quantized table
+is tens of GB, and streaming costs little on SSD-class storage (decode is latency-tolerant at
+~30 rows/token; prefill gathers are batched). Set to `0` to hold the table in RAM — worthwhile
+only when the table lives on high-latency storage (e.g. HDD, where per-row seeks make streaming
+unusable). Also settable per load via `config.infer_params.ngram_stream_from_disk` or
+`--ngram_ram` in `model_init`-based scripts.
 
 ### `EXL3_VISION_PINNED` (default: `0`)
 
@@ -427,6 +426,13 @@ window. `0` disables the spin. Mostly useful on hosts where TP profiling shows a
 between the main process and child workers reaching their first kernel launch.
 
 ## Debug
+
+### `EXL3_NGRAM_GATHER_PROF` (default: unset)
+
+Windows only: print per-gather statistics from the streamed n-gram table path (unique rows,
+coalesced runs, reads completed synchronously vs left pending, span tasks drained by pool
+workers vs the calling thread). Activation check for the overlapped-`ReadFile` gather when
+validating a streamed-table model on Windows.
 
 ### `EXLLAMA_DEBUGLOG_<CATEGORY>` (default: unset)
 

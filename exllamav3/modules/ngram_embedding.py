@@ -3,6 +3,7 @@ from typing_extensions import override
 import os
 import torch
 from ..model.config import Config
+from ..loader.safetensors import DiskTensorHandle
 from ..ext import exllamav3_ext as ext
 from . import Module
 from .quant.exl3_lib.ngram_codec import ROW_DIM, mul1_codebook, dequant_rows, words_per_row
@@ -37,9 +38,6 @@ def _find_nth_prime_after(start: int, count: int) -> int:
         while not is_prime(p):
             p += 1
     return p
-
-
-_warned_windows_stream = False
 
 
 class NGramEmbedding(Module):
@@ -179,14 +177,6 @@ class NGramEmbedding(Module):
         if stream_from_disk is None:
             infer_params = getattr(self.config, "infer_params", None)
             stream_from_disk = infer_params.ngram_stream_from_disk if infer_params is not None else True
-        if stream_from_disk and os.name == "nt":
-            # The streamed gather path is pread-based (ngram_gather_cpu, DiskTensorHandle) with
-            # no Windows implementation yet
-            global _warned_windows_stream
-            if not _warned_windows_stream:
-                _warned_windows_stream = True
-                print(" !! n-gram table streaming is not implemented on Windows, loading table into system RAM")
-            stream_from_disk = False
         if stream_from_disk:
             self.mode = "trellis_disk" if quantized else "fp16_disk"
             self.handles = [stc.get_tensor_handle(k) for k in keys]
