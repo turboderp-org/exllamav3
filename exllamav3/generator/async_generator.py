@@ -39,6 +39,15 @@ class AsyncGenerator:
                     async_job = self.jobs.get(job)
                     if not async_job:
                         continue
+                    if "error" in result:
+                        # Per-job failure contained by Generator.reap_failed_job. The raw
+                        # exception must go into the queue as an exception object, not as a
+                        # result dict: __aiter__ re-raises queued exceptions, which the
+                        # server surfaces as an error for this request. A dict here would
+                        # instead stream as a clean (empty) completion.
+                        async_job.put_result(result["error"])
+                        del self.jobs[job]
+                        continue
                     async_job.put_result(result)
                     if result["eos"]:
                         del self.jobs[job]

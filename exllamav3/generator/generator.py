@@ -405,8 +405,11 @@ class Generator:
         self.iterate_start_jobs(results)
 
         # Perform one round of prefill
-        for job in self.active_jobs:
-            job.prefill(results)
+        for job in list(self.active_jobs):
+            try:
+                job.prefill(results)
+            except Exception as e:
+                self.reap_failed_job(job, e, results)
 
         # Recurrent checkpoints
         if self.recurrent_cache is not None:
@@ -1218,6 +1221,24 @@ class Generator:
             self.on_queue_drained()
 
 
+    def reap_failed_job(self, job, error, results: list):
+        """
+        Contain a per-job failure so the generator stays usable for other jobs: release the
+        failed job's pages and recurrent state, drop it from the active set, and append an
+        error-tagged result. The async wrapper recognizes the tag and delivers the raw
+        exception to that job's consumer only (its __aiter__ re-raises queued exceptions),
+        instead of letting the failure escape to _run_iteration, which latches
+        AsyncGenerator.error permanently and kills the iteration task for every job.
+        """
+        try:
+            job.deallocate_pages()
+        except Exception:
+            pass
+        if job in self.active_jobs:
+            self.active_jobs.remove(job)
+        results.append({"job": job, "error": error})
+
+
     def iterate_start_jobs(self, results: list):
         """
         Move pending jobs into the active set when batch and cache capacity allow.
@@ -1260,7 +1281,11 @@ class Generator:
                 job.activate()
 
                 # Allocate pages for job
-                job.allocate_pages()
+                try:
+                    job.allocate_pages()
+                except Exception as e:
+                    self.reap_failed_job(job, e, results)
+                    continue
                 current_max_batch += len(job.sequences)
 
                 r = {
