@@ -20,7 +20,12 @@ import logging
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import torch
+
+from exllamav3 import ArgmaxSampler
 from exllamav3.generator.generator import Generator
+from exllamav3.generator.async_generator import AsyncGenerator
+from exllamav3.generator.job import Job
 
 
 class StubPagetable:
@@ -126,6 +131,89 @@ class FailureContainmentTest(unittest.TestCase):
             logging.getLogger("exllamav3.generator.generator").removeHandler(capture)
         self.assertNotIn(job, generator.active_jobs)
         self.assertTrue(any("stranded" in r.getMessage() for r in records))
+
+    def test_failing_prefill_is_contained_in_iterate(self):
+        bad = StubJob("bad", fail_in="prefill")
+        good = StubJob("good")
+        for i, job in enumerate((bad, good)):
+            job.serial_number = i
+        generator = make_generator([], active=[bad, good])
+        generator.cache = type("C", (), {"initialized": True})()
+        generator.draft_cache = None
+        generator.recurrent_cache = None
+        generator.draft_model = None
+        generator.ngram_match_min = 0
+        generator.visualizer = None
+        generator.iterate_gen = lambda results: None
+        results = generator.iterate()
+        self.assertNotIn(bad, generator.active_jobs)
+        self.assertIn(good, generator.active_jobs)
+        error_results = [r for r in results if r.get("stage") == "error"]
+        self.assertEqual(len(error_results), 1)
+        self.assertIs(error_results[0]["job"], bad)
+
+    def test_async_deliver_error_as_raw_exception(self):
+        job = object()
+        delivered = []
+
+        class StubAsyncJob:
+            def put_result(self, result):
+                delivered.append(result)
+
+        wrapper = AsyncGenerator.__new__(AsyncGenerator)
+        wrapper.jobs = {job: StubAsyncJob()}
+        error = RuntimeError("boom")
+        wrapper.deliver_results([{"job": job, "serial": 0, "stage": "error", "eos": True, "error": error}])
+        self.assertEqual(len(delivered), 1)
+        self.assertIs(delivered[0], error)
+        self.assertNotIn(job, wrapper.jobs)
+
+        # Normal results still pass through as dicts; eos removes the job
+        job2 = object()
+        wrapper.jobs = {job2: StubAsyncJob()}
+        wrapper.deliver_results([{"job": job2, "serial": 1, "stage": "streaming", "eos": False}])
+        self.assertIsInstance(delivered[1], dict)
+        self.assertIn(job2, wrapper.jobs)
+        wrapper.deliver_results([{"job": job2, "serial": 1, "stage": "eos", "eos": True}])
+        self.assertNotIn(job2, wrapper.jobs)
+
+    def test_sync_generate_raises_on_error_result(self):
+        generator = Generator.__new__(Generator)
+
+        def fake_enqueue(job):
+            job.serial_number = 0
+            return 0
+
+        remaining = iter([True, True, False])
+        error = RuntimeError("sync-raise-probe")
+
+        def fake_iterate():
+            return [{
+                "job": None,
+                "serial": 0,
+                "stage": "error",
+                "eos": True,
+                "error": error,
+            }]
+
+        generator.enqueue = fake_enqueue
+        generator.num_remaining_jobs = lambda: next(remaining)
+        generator.iterate = fake_iterate
+        generator.clear_queue = lambda: None
+
+        class StubTokenizer:
+            def encode(self, p, **kwargs):
+                return torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+        generator.tokenizer = StubTokenizer()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            generator.generate(
+                "hello",
+                max_new_tokens=8,
+                sampler=ArgmaxSampler(),
+            )
+        self.assertIs(ctx.exception, error)
 
 
 if __name__ == "__main__":
