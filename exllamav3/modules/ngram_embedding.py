@@ -182,6 +182,25 @@ class NGramEmbedding(Module):
             self.handles = [stc.get_tensor_handle(k) for k in keys]
             if not quantized:
                 self._row_dtype = self.handles[0].dtype
+            # Shards that sit back-to-back in one file (the layout convert_ngram.py writes)
+            # collapse into a single handle spanning the whole table: _gather_rows issues one
+            # synchronous gather call per handle segment
+            h0 = self.handles[0]
+            if len(self.handles) > 1 and all(
+                h.filename == h0.filename and h.row_bytes == h0.row_bytes and
+                h.abs_offset == h0.abs_offset + s * self.rows_per_shard * h0.row_bytes
+                for s, h in enumerate(self.handles)
+            ):
+                merged = DiskTensorHandle(
+                    key = self.key, filename = h0.filename, abs_offset = h0.abs_offset,
+                    shape = [self.num_rows, *h0.row_shape], dtype = h0.dtype)
+                stc.find_stc(keys[0]).disk_handles.append(merged)   # closed with the collection
+                self.handles = [merged]
+                self.rows_per_shard = self.num_rows
+            if os.name == "nt":
+                # Release the loader's handles to the table files now
+                for h in set(h.filename for h in self.handles):
+                    stc.release_file(h)
         else:
             # loaded shard by shard and KEPT as individual tensors (never concatenated)
             self.mode = "trellis_ram" if quantized else "fp16_ram"
