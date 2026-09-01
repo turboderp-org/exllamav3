@@ -52,7 +52,7 @@ int DevCtx::get_smem_max(int device)
     {
         int optin = 0;
         cuda_check(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-        smem_max[device] = MIN(optin, SMEM_MAX);
+        smem_max[device] = MIN(optin, EXL3_SMEM_MAX_DEFAULT);
     }
     return smem_max[device];
 }

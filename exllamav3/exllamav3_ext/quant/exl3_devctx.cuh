@@ -2,6 +2,7 @@
 
 #include <tuple>
 #include <mutex>
+#include "../arch.cuh"
 
 // Max allowable output size, in tiles. Used to allocate global lock buffer per device for sync across threadblocks
 #define MAX_TILES_C (1024 * 1024)
