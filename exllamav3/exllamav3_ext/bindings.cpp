@@ -115,6 +115,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("constant_bias"), py::arg("constant_scale"), py::arg("span_heads"),
         py::arg("add_residual"), py::arg("w_groups") = 1);
 #endif
+#if !defined(USE_ROCM)
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");

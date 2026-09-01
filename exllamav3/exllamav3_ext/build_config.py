@@ -19,7 +19,7 @@ ROCM_EXCLUDE_FILES = {
     'libtorch/mlp.cpp', 'libtorch/attention.cpp', 'libtorch/gated_rmsnorm.cpp',
     'libtorch/linear.cpp', 'libtorch/dsv4_attn.cpp', 'libtorch/dsv4_compressor.cpp',
     'libtorch/mla_attention.cpp',
-    'dsv4_compress.cu', 'dsa_topk.cu', 'hc_mix.cu',
+    'dsv4_compress.cu', 'dsa_topk.cu', 'hc_mix.cu', 'ple.cu',
     'cpu/moe_handoff.cu', 'cpu/moe_mul1.cpp',
 }
 
