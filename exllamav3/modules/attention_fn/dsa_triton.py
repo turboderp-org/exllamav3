@@ -30,6 +30,7 @@ The lightning-indexer scoring kernel is shared as-is between raw-token (V3.2) an
 import os
 import torch
 from ...util.tensor import g_tensor_cache
+from .triton_paged import _dev_smem_limit
 
 # EXL3_DSA_DEBUG_BOUNDS=1: compile the JIT DSA kernels with device-side bounds asserts on
 # every block-table page read and gathered pool index (names the kernel and traps at the
@@ -902,6 +903,13 @@ def dsa_attn(
         # halve the head tile (perf is irrelevant with asserts on)
         num_stages = min(num_stages, 2)
         block_h = min(block_h, 16)
+    # The defaults (block_h 32, D_c 512, 3 stages) stage ~140 KB, which fits the ~99 KB of an
+    # Ampere-or-later device only because Triton counts the live subset - on a 64 KB device it
+    # does not fit at all, and Triton raises rather than shrinking. Shrink the head tile and
+    # pipeline depth the same way the debug path above already does.
+    if _dev_smem_limit(q.device) < 96 * 1024:
+        num_stages = min(num_stages, 2)
+        block_h = min(block_h, 8)
     dbg_pages = -(-(pool_c.numel() // max(D_c, 1)) // max(page_size, 1)) if dsa_debug_bounds else 0
     if nc_block:
         n_splits = 1
