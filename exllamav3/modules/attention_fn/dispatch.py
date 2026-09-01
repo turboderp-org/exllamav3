@@ -6,6 +6,7 @@ from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
 from .triton_paged import (
+    _dev_smem_limit,
     _qc_staging,
     fn_triton_paged_attn,
     fn_triton_paged_attn_longq,
@@ -132,8 +133,14 @@ def attn_dispatch(
         assert block_table is not None
         assert cache_seqlens is not None
         layer = cache if isinstance(cache, CacheLayer) else cache.layers[cache_idx, cache_instance or 0]
+        # The quant-direct path commits to Triton: it writes K/V into the packed cache before
+        # the attention call and then dispatches over _fns_qc, which has no non-Triton member.
+        # A backend miss there is therefore fatal rather than recoverable, so on devices where
+        # the Triton kernels may not fit in shared memory (Turing, 64 KB) take the
+        # dequantize-then-attend path instead, which can fall through to SDPA/xformers.
+        qc_smem_ok = _dev_smem_limit(q.device) >= 96 * 1024
         if (
-            _qc_attn and has_triton and
+            _qc_attn and has_triton and qc_smem_ok and
             isinstance(layer, CacheLayer_quant) and
             layer.compand_a == 0.0 and
             q.dtype == torch.float16 and

@@ -111,9 +111,25 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
     if (size_k % tilesize_k || size_n % tilesize_n) return false;
 
+    // Device-dependent: callers with tensors on a non-current device must set a device guard
+    // first (every in-tree caller runs under OptionalCUDAGuard). Only matters on a mixed-arch
+    // host, where a 90 KB-capable device would otherwise vouch for a 64 KB one.
     int device;
     cudaGetDevice(&device);
     return exl3_gemm_shape_smem(shape_idx, K) <= DevCtx::instance().get_smem_max(device);
+}
+
+// Hard gate for explicitly forced shapes, which skip the autotuner's shape_compat filter.
+// Launching a shape whose static layout exceeds what the launch can request would read past
+// the end of the extern __shared__ block - silent corruption rather than a failed launch.
+void exl3_gemm_check_smem(int shape_idx, int K, const char* who)
+{
+    int device;
+    cudaGetDevice(&device);
+    int need = exl3_gemm_shape_smem(shape_idx, K);
+    int have = DevCtx::instance().get_smem_max(device);
+    TORCH_CHECK(need <= have, who, ": shape ", shape_idx, " at ", K,
+                " bpw needs ", need, " B of shared memory, device provides ", have);
 }
 
 // Instance tables, [K][cb] -> array indexed by shape_idx. Row 0 unused (no K = 0 instances)
@@ -173,6 +189,7 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, K, false, 1, 1) : force_shape_idx;
 
     TORCH_CHECK(shape_idx > 0, "exl3_gemm: no compatible kernel");
+    exl3_gemm_check_smem(shape_idx, K, "exl3_gemm");
     if (out_shape_idx) *out_shape_idx = shape_idx;
     if (out_block_dim) *out_block_dim = exl3_gemm_blockdim[shape_idx];
 
@@ -208,6 +225,7 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
 {
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, K, true, bszm_in, bszm_out) : force_shape_idx;
     TORCH_CHECK(shape_idx > 0, "exl3_mgemm: no compatible kernel");
+    exl3_gemm_check_smem(shape_idx, K, "exl3_mgemm");
     if (out_shape_idx) *out_shape_idx = shape_idx;
     if (out_block_dim) *out_block_dim = exl3_gemm_blockdim[shape_idx];
 

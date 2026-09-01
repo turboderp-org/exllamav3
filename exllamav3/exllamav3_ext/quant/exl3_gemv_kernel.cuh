@@ -33,7 +33,8 @@ namespace exl3_gemv_ns {
 
 // mma.m16n8k16 with the A operand supplied as two FragB halves, fp16 accumulate.
 // On Turing this splits into the two k=8 halves it is already expressed as (a01 pairs with
-// b[0], a23 with b[1]), accumulating through the same c - bit-equivalent, see ptx.cuh.
+// b[0], a23 with b[1]), accumulating through the same c. Same operands and products; one
+// extra rounding at the k=8 boundary. See the longer note in ptx.cuh.
 __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, const FragB& b, FragC_h& c)
 {
     const uint32_t* a0 = reinterpret_cast<const uint32_t*>(&a01);

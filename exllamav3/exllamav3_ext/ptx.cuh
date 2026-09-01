@@ -54,8 +54,14 @@ __device__ inline void ptx_mma_m8n8k4
 // Turing has no m16n8k16. The k=16 operation is the sum of two k=8 operations over disjoint
 // halves of the k dimension, and the register-to-element mapping of m16n8k8 is exactly the
 // low half of m16n8k16's: A {a0,a1} covers k=0..7 and {a2,a3} covers k=8..15, B b0 then b1,
-// C identical. Chaining two mmas through the same accumulator is therefore bit-equivalent to
-// the single k=16 instruction, not an approximation of it.
+// C identical. Chaining two mmas through the same accumulator computes the same products over
+// the same operands.
+//
+// It is not guaranteed bit-identical: PTX does not specify the internal accumulation order of
+// a k=16 step, and the split forces a rounding of the partial sum at the k=8 boundary that the
+// fused form need not perform. The difference is at most one extra rounding per 16-element dot
+// product, far below the quantization noise EXL3 already carries. tests/test_sm75_gemm.py
+// bounds it against a dequantize-then-matmul reference.
 __device__ inline void ptx_mma_m16n8k16
 (
     const FragA& frag_a,
