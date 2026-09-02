@@ -39,7 +39,9 @@ class Model_LSMixin(ABC):
             for idx, module in enumerate(modules):
                 defer = module.can_defer_load()
                 if defer:
-                    config.stc.begin_deferred_load()
+                    # Pinned modules leave the arena alone: their slab slices would keep whole
+                    # blocks resident after the weights move to host memory
+                    config.stc.begin_deferred_load(arena = not pin)
                 module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
                 if defer:
                     config.stc.end_deferred_load()
@@ -158,13 +160,15 @@ class Model_LSMixin(ABC):
 
                         # Load module
                         defer = module.can_defer_load()
+                        pin = config.infer_params.vision_pinned and \
+                            getattr(self, "component", "text") == "vision"
                         if defer:
-                            config.stc.begin_deferred_load()
+                            # Pinned modules leave the arena alone (see _load_single)
+                            config.stc.begin_deferred_load(arena = not pin)
                         module.load(load_device, max_chunk_size = max_chunk_size)
                         if defer:
                             config.stc.end_deferred_load()
-                        if config.infer_params.vision_pinned and \
-                                getattr(self, "component", "text") == "vision":
+                        if pin:
                             # Before the measuring forward, so the VRAM accounting reflects the
                             # pinned (host-resident) weights
                             module.pin_linears()

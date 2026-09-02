@@ -351,8 +351,7 @@ Slab allocation for small weight tensors during (deferred) module loads: tensors
 are carved out of shared 128 MB per-device blocks (first-fit over the open blocks, so partially
 filled tails are packed by later small tensors) instead of getting one CUDA caching-allocator
 allocation each. MoE models with many small per-expert tensors otherwise shatter the allocator
-into tens of thousands of segments with large reserved-but-unallocated overhead (measured on a
-512-expert model: 37k segments, 15.3 GB waste, fixed to 611 segments / 0.16 GB). Unloading a
+into tens of thousands of segments with large reserved-but-unallocated overhead. Unloading a
 module frees its blocks; at most one boundary block shared with a neighboring module stays
 pinned. Set to `0` to fall back to per-tensor allocations.
 

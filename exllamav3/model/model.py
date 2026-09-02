@@ -228,6 +228,8 @@ class Model(Model_TPMixin, Model_LSMixin):
     def unload(self):
         for module in self.modules:
             module.unload()
+        # The loader's open slab blocks must not outlive the tensors sliced from them
+        self.config.stc.release_arena()
         self.active_devices = []
         self.unload_tp()
         self.output_device = None

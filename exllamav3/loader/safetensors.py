@@ -424,6 +424,7 @@ class SafetensorsCollection:
         # partially-external block per module stays pinned after an unload
         self.arena = {}                    # device index -> [block (uint8), fill offset]
         self.arena_enable = os.environ.get("EXL3_LOAD_ARENA", "1") != "0"
+        self.deferred_arena = True
 
 
     def add_tensor_files(
@@ -636,6 +637,13 @@ class SafetensorsCollection:
     ARENA_MAX_OPEN = 8             # open (partially filled) blocks kept per device
     ARENA_PRUNE = 4096             # remaining bytes below which a block counts as full
 
+    def release_arena(self):
+        """Drop the open-block list. Blocks stay alive exactly as long as tensors sliced from
+        them do; the list itself would otherwise keep partially filled blocks resident after
+        their tensors are gone (model unload)"""
+        self.arena = {}
+
+
     def _arena_alloc(self, shape, dtype: torch.dtype, device: torch.device, zeros: bool):
         """Persistent weight-tensor allocation: carve from the device's slab blocks while a
         deferred-load bracket is open, falling back to a plain allocation otherwise. First-fit
@@ -647,7 +655,7 @@ class SafetensorsCollection:
         weight tensors themselves keep their blocks alive)."""
         device = torch.device(device)
         nbytes = math.prod(shape) * dtype.itemsize
-        if not (self.arena_enable and self.deferred_mode and device.type == "cuda"
+        if not (self.arena_enable and self.deferred_mode and self.deferred_arena and device.type == "cuda"
                 and 0 < nbytes <= self.ARENA_MAX_TENSOR):
             return (torch.zeros if zeros else torch.empty)(shape, dtype = dtype, device = device)
         blocks = self.arena.setdefault(device.index, [])
@@ -895,9 +903,13 @@ class SafetensorsCollection:
         self.new_tensors = new_tensors
 
 
-    def begin_deferred_load(self):
+    def begin_deferred_load(self, arena: bool = True):
+        """arena = False keeps this load's tensors out of the slab arena: for modules whose
+        weights leave the device right after loading (vision_pinned), slab slices would pin
+        their whole 128 MB blocks in VRAM for the lifetime of the neighbouring tensors."""
         assert not self.deferred_mode
         self.deferred_mode = True
+        self.deferred_arena = arena
 
 
     def end_deferred_load(self):
@@ -1188,9 +1200,9 @@ class VariantSafetensorsCollection(SafetensorsCollection):
         raise NotImplementedError()
 
 
-    def begin_deferred_load(self):
+    def begin_deferred_load(self, arena: bool = True):
         for stc in [s for _, _, s in self.stcs] + [self.main]:
-            stc.begin_deferred_load()
+            stc.begin_deferred_load(arena)
 
 
     def end_deferred_load(self):
@@ -1201,3 +1213,8 @@ class VariantSafetensorsCollection(SafetensorsCollection):
     def abort_deferred_load(self):
         for stc in [s for _, _, s in self.stcs] + [self.main]:
             stc.abort_deferred_load()
+
+
+    def release_arena(self):
+        for stc in [s for _, _, s in self.stcs] + [self.main]:
+            stc.release_arena()
