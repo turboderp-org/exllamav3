@@ -581,7 +581,7 @@ def _qsa_module_eligible(m):
     """QSA-indexer requirements (Qwen3.8-Flash-Next). A module WITH an indexer must be fully
     armable or the BC path declines outright: an unarmed graph would let the key planes go
     stale under dense decode and poison later sparse selection."""
-    idx = m.qsa_indexer
+    idx = getattr(m, "qsa_indexer", None)
     if idx is None:
         return True
     p = idx.index_qk_proj
@@ -660,7 +660,7 @@ def build_bc_swa(module, layer_state):
     k_states, v_states = layer_state.get_state_tensors()
     if not (
         _module_eligible(m) and
-        m.qsa_indexer is None and
+        getattr(m, "qsa_indexer", None) is None and
         k_states is not None and
         k_states.device == torch.device(m.device) and
         m.kv_state_size % PAGE_SIZE == 0
@@ -681,6 +681,7 @@ def build_bc_attn(module, layer):
     from ...cache.qsa import CacheLayer_qsa
 
     m = module
+    qsa_idx = getattr(m, "qsa_indexer", None)
     if not (
         _module_eligible(m) and
         isinstance(layer, (CacheLayer_quant, CacheLayer_fp16)) and
@@ -692,7 +693,7 @@ def build_bc_attn(module, layer):
             layer.k is not None and layer.k.device == torch.device(m.device)
         )) and
         # A QSA module needs the side planes on this layer (and the fp16 cache they imply)
-        (m.qsa_indexer is None or (
+        (qsa_idx is None or (
             isinstance(layer, CacheLayer_qsa) and layer.raw_k is not None and
             layer.raw_k.device == torch.device(m.device)
         ))
@@ -703,6 +704,6 @@ def build_bc_attn(module, layer):
         bca = BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits)
     else:
         bca = BCAttn(m, layer.k, layer.v,
-                     qsa_layer = layer if m.qsa_indexer is not None else None)
+                     qsa_layer = layer if qsa_idx is not None else None)
     _trace_build(m, bca, "attn")
     return bca
