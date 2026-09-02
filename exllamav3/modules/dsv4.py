@@ -1306,7 +1306,11 @@ class DSV4Attention(Module):
                 bcd = build_bc_dsa_batch(self, rsl, kl)
                 self._bc_dsa_batch[id(rsl)] = bcd if bcd is not None else False
             if bcd:
-                return bcd.run(x, B, S, pos_l, floor_l, beg_l, ec_l, slot_l, bt)
+                y = bcd.run(x, B, S, pos_l, floor_l, beg_l, ec_l, slot_l, bt)
+                # None means the BC path declined (e.g. its fixed tiles do not fit this
+                # device's shared memory); fall through to the eager batched body below
+                if y is not None:
+                    return y
 
         # Eager batched body (capture reference / fallback): per-job state in a device
         # array, same kernels as the graphs
