@@ -34,14 +34,7 @@ class AsyncGenerator:
                 # consumer (e.g. a disconnected client that stopped draining its queue) would wedge the whole
                 # generator (issue #227).
                 results = self.generator.iterate()
-                for result in results:
-                    job = result["job"]
-                    async_job = self.jobs.get(job)
-                    if not async_job:
-                        continue
-                    async_job.put_result(result)
-                    if result["eos"]:
-                        del self.jobs[job]
+                self.deliver_results(results)
 
                 # Yield back to the event loop so result consumers and cancellation requests can run between
                 # generator iterations, even if the synchronous generator immediately has more work available.
@@ -59,6 +52,30 @@ class AsyncGenerator:
             for async_job in self.jobs.values():
                 async_job.put_result(e)
             self.jobs.clear()
+
+    def deliver_results(self, results):
+        """
+        Fan generator results out to the owning AsyncJob queues. Missing jobs can happen if a job
+        was cancelled after iterate() started. Delivery must never block: this single task serves
+        every job, so waiting on one stalled consumer would wedge the whole generator (issue #227).
+        """
+        for result in results:
+            job = result["job"]
+            async_job = self.jobs.get(job)
+            if not async_job:
+                continue
+            if result.get("stage") == "error":
+                # Per-job failure contained by Generator.reap_failed_job. The raw exception
+                # must go into the queue as an exception object, not as a result dict:
+                # __aiter__ re-raises queued exceptions, which the server surfaces as an
+                # error for this request. A dict here would instead stream as a clean
+                # (empty) completion.
+                async_job.put_result(result["error"])
+                del self.jobs[job]
+                continue
+            async_job.put_result(result)
+            if result["eos"]:
+                del self.jobs[job]
 
     def enqueue(self, job: AsyncJob):
         # The iteration task died on a generator exception; surface it to the new job's consumer immediately
