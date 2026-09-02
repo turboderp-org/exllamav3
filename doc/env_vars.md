@@ -347,8 +347,9 @@ Enable GPU/CPU handoff profiling, for debug purposes.
 
 ### `EXL3_LOAD_ARENA` (default: `1`)
 
-Slab allocation for small weight tensors during (deferred) module loads: tensors up to 64 MB
-are carved out of shared 128 MB per-device blocks instead of getting one CUDA caching-allocator
+Slab allocation for small weight tensors during (deferred) module loads: tensors up to 16 MB
+are carved out of shared 128 MB per-device blocks (first-fit over the open blocks, so partially
+filled tails are packed by later small tensors) instead of getting one CUDA caching-allocator
 allocation each. MoE models with many small per-expert tensors otherwise shatter the allocator
 into tens of thousands of segments with large reserved-but-unallocated overhead (measured on a
 512-expert model: 37k segments, 15.3 GB waste, fixed to 611 segments / 0.16 GB). Unloading a

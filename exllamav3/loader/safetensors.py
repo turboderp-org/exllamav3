@@ -628,23 +628,44 @@ class SafetensorsCollection:
 
 
     ARENA_BLOCK = 128 << 20        # slab block size
-    ARENA_MAX_TENSOR = 64 << 20    # larger tensors get their own allocation (few, no waste)
+    # Larger tensors get their own allocation (few, negligible allocator overhead at this
+    # size). The cap matters even with first-fit backfill: a dense model's 32-64MB projections
+    # shed block tails faster than its scarce small-tensor traffic can pack them (issue #313)
+    ARENA_MAX_TENSOR = 16 << 20
     ARENA_ALIGN = 256
+    ARENA_MAX_OPEN = 8             # open (partially filled) blocks kept per device
+    ARENA_PRUNE = 4096             # remaining bytes below which a block counts as full
 
     def _arena_alloc(self, shape, dtype: torch.dtype, device: torch.device, zeros: bool):
-        """Persistent weight-tensor allocation: carve from the device's slab block while a
-        deferred-load bracket is open, falling back to a plain allocation otherwise."""
+        """Persistent weight-tensor allocation: carve from the device's slab blocks while a
+        deferred-load bracket is open, falling back to a plain allocation otherwise. First-fit
+        over the open blocks, oldest first, so a block tail left by a tensor that did not fit
+        is packed by later small tensors instead of being abandoned (issue #313: with a single
+        bump block, a dense model's 32-64MB projections left GBs of dead tails). The open list
+        is bounded: blocks are dropped once effectively full, and past ARENA_MAX_OPEN the
+        smallest remainder is dropped, so load/unload churn cannot pin unbounded tails (the
+        weight tensors themselves keep their blocks alive)."""
         device = torch.device(device)
         nbytes = math.prod(shape) * dtype.itemsize
         if not (self.arena_enable and self.deferred_mode and device.type == "cuda"
                 and 0 < nbytes <= self.ARENA_MAX_TENSOR):
             return (torch.zeros if zeros else torch.empty)(shape, dtype = dtype, device = device)
-        blk, off = self.arena.get(device.index, (None, 0))
-        off = -(-off // self.ARENA_ALIGN) * self.ARENA_ALIGN
-        if blk is None or off + nbytes > blk.numel():
-            blk = torch.empty(self.ARENA_BLOCK, dtype = torch.uint8, device = device)
-            off = 0
-        self.arena[device.index] = (blk, off + nbytes)
+        blocks = self.arena.setdefault(device.index, [])
+        for entry in blocks:
+            blk = entry[0]
+            off = -(-entry[1] // self.ARENA_ALIGN) * self.ARENA_ALIGN
+            if off + nbytes <= blk.numel():
+                break
+        else:
+            blk, off = torch.empty(self.ARENA_BLOCK, dtype = torch.uint8, device = device), 0
+            entry = [blk, 0]
+            blocks.append(entry)
+            if len(blocks) > self.ARENA_MAX_OPEN:
+                # index-based removal: list.remove would compare entries elementwise (tensors)
+                del blocks[min(range(len(blocks)), key = lambda i: blocks[i][0].numel() - blocks[i][1])]
+        entry[1] = off + nbytes
+        if blk.numel() - entry[1] < self.ARENA_PRUNE:
+            blocks[:] = [e for e in blocks if e is not entry]
         t = blk[off : off + nbytes].view(dtype).view(shape)
         if zeros:
             t.zero_()
