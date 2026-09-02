@@ -89,9 +89,22 @@ def routing_std(bsz, cfg, y, params):
                 routing_weights *= cfg.per_expert_scale.unsqueeze(0)
             return selected_experts, routing_weights
         else:
-            router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
-            routing_weights = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device)
-            selected_experts = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.long, device = y.device)
+            # Hoisted per-(bsz, device) buffers, mirroring the bsz-1 fast path above: the
+            # MTP verify batch hits this branch on every pass, and fresh empties per MoE
+            # layer cost hundreds of allocator round trips per pass. Outputs are consumed
+            # by run_bszN in the same forward step; slot reuse is stream-ordered.
+            bufs = getattr(cfg, "_routing_bufs_n", None)
+            if bufs is None:
+                bufs = cfg._routing_bufs_n = {}
+            key = (bsz, y.device)
+            bufs_ = bufs.get(key)
+            if bufs_ is None:
+                bufs[key] = bufs_ = (
+                    torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device),
+                    torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device),
+                    torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.long, device = y.device),
+                )
+            router_logits, routing_weights, selected_experts = bufs_
             ext.routing_std(
                 y,
                 cfg.gate_tensor,

@@ -260,6 +260,10 @@ class GatedResidual(Module):
         self.proj_h = None          # cat(down, inject) half, unfolded (GEMM path)
         self.fn_h = None            # cat(down, inject) * w half, folded (fused path)
         self.rank = 0
+        # Output/scratch buffers for the fused _mix path, keyed by (rows, fn_h rows).
+        # Allocations are hoisted out of the per-site hot path: every decoder layer calls
+        # _mix twice, so fresh empties cost hundreds of allocator round trips per pass.
+        self._mix_bufs = {}
 
     @override
     def load(self, device: torch.device, **kwargs):
@@ -351,14 +355,28 @@ class GatedResidual(Module):
         if not s3.is_contiguous():
             s3 = s3.contiguous()
         dev = s3.device
-        post = torch.empty((R, H), dtype = torch.float, device = dev) \
-            if self.use_combine else None
 
         if R <= self.FUSED_MAX_R:
-            dots = torch.empty((R, self.fn_h.shape[0] + 1, H), dtype = torch.float, device = dev)
-            mixed = torch.empty((R, Dh), dtype = torch.half, device = dev)
+            # Hoisted buffers, keyed by (rows, fn_h rows) so a rebuilt fn_h with a different
+            # rank can never hit a stale shape. SAFETY INVARIANT: at most one outstanding
+            # _mix result per instance per key — true today because nothing calls _mix on a
+            # site instance between its mix() and its apply_(); a refactor that does breaks
+            # this silently. Consumers (gr_mix write -> apply_/lm_head) are stream-ordered
+            # before the next same-slot write.
+            key = (R, self.fn_h.shape[0])
+            bufs = self._mix_bufs.get(key)
+            if bufs is None:
+                bufs = self._mix_bufs[key] = (
+                    torch.empty((R, self.fn_h.shape[0] + 1, H), dtype = torch.float, device = dev),
+                    torch.empty((R, H), dtype = torch.float, device = dev),
+                    torch.empty((R, Dh), dtype = torch.half, device = dev),
+                )
+            dots, post_b, mixed = bufs
+            post = post_b if self.use_combine else None
             ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
         else:
+            post = torch.empty((R, H), dtype = torch.float, device = dev) \
+                if self.use_combine else None
             normed = torch.empty((R * H, Dh), dtype = torch.half, device = dev)
             ext.rms_norm(s3.view(R * H, Dh), self.w_h, normed,
                          self.rms_eps, 0.0, 1.0, False, False, H)
