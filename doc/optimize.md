@@ -83,6 +83,7 @@ plus per-layer Hessians; a 27B model in bf16 fits comfortably in 96 GB).
 python sd_trace.py \
     -m models/foo/exl3/6.00bpw \
     -o models/foo/exl3/cal_trace.json \
+    -co models/foo/exl3/cal_trace.safetensors \
     -cs 262144 \
     -ambs 32
 ```

@@ -50,16 +50,18 @@ def tensor_core_perm_i(device):
 
 
 @lru_cache
-def get_temp_buffers(device, K: int):
+def get_temp_buffers(device, K: int, tile_len: int = 256):
     # The kernel runs one block per tile and caps each wave at min(temp_costs.size(0), 2 * SMs). At K >= 4 the
     # temp buffers are cheap enough to size for full occupancy on large GPUs (+17% throughput on GB202 at big
     # batches); at lower K, temp_edges is multiple GB already and 256 stays the cap
     max_batch_size = 256
     if K >= 4:
         mp_count = torch.cuda.get_device_properties(device).multi_processor_count
-        max_batch_size = max(256, 2 * mp_count)
+        # The kernel may run up to 1024 / threads blocks per SM (see quantize_tiles_kernel.cuh)
+        blocks_per_sm = {7: 4, 8: 8}.get(K, 2)
+        max_batch_size = max(256, blocks_per_sm * mp_count)
     temp_costs = torch.zeros((max_batch_size, 2, 65536 >> K), dtype = torch.half, device = device)
-    temp_edges = torch.zeros((max_batch_size, 256, 65536 >> K), dtype = torch.short, device = device)
+    temp_edges = torch.zeros((max_batch_size, tile_len, 65536 >> K), dtype = torch.short, device = device)
     return temp_costs, temp_edges
 
 
@@ -68,10 +70,11 @@ def quantize_tiles(tiles, quant_args: dict):
     Quantize a batch of 16x16 tiles on the current device.
 
     tiles is shaped (num_tiles, 256) in the kernel's expected element order. The CUDA extension returns both the
-    reconstructed float tile values and the short encoded indices used later for packing.
+    reconstructed float tile values and the short encoded indices used later for packing. Length-160 rows
+    (n-gram embedding vectors, mul1 codebook only) are accepted too and quantized as single tail-biting rings.
     """
     tiles = tiles.contiguous()
-    assert tiles.shape[1] == 256
+    assert tiles.shape[1] in (256, 160)
     assert tiles.dtype == torch.float
 
     K = quant_args["K"]
@@ -79,7 +82,11 @@ def quantize_tiles(tiles, quant_args: dict):
     mul1 = "mul1" in quant_args
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
-    temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
+    # NB: same call signature as other sites for tile_len 256, so the lru_cache key stays shared
+    if tiles.shape[1] == 256:
+        temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
+    else:
+        temp_costs, temp_edges = get_temp_buffers(tiles.device, K, tiles.shape[1])
     ext.quantize_tiles(
         tiles,
         quantized_tiles,
@@ -1476,8 +1483,9 @@ class _WeightStager:
         reuse_ev.synchronize()
         pin = buf[:nbytes].view(w.dtype).view(w.shape)
         pin.copy_(w)
-        dev_w = torch.empty(w.shape, dtype = w.dtype, device = self.device)
         with torch.cuda.stream(self.copy_stream):
+            # dev_w MUST be allocated on the copy stream.
+            dev_w = torch.empty(w.shape, dtype = w.dtype, device = self.device)
             dev_w.copy_(pin, non_blocking = True)
             reuse_ev.record(self.copy_stream)
         ev = torch.cuda.Event()
@@ -1489,6 +1497,9 @@ class _WeightStager:
         dev_w, ev = self.pending.pop(t)
         if ev is not None:
             torch.cuda.current_stream(self.device).wait_event(ev)
+            # The block belongs to the copy stream's pool; mark its use on the consuming stream
+            # so its eventual free isn't recycled under a later async upload
+            dev_w.record_stream(torch.cuda.current_stream(self.device))
         return dev_w.float() if dev_w.dtype != torch.float else dev_w
 
 

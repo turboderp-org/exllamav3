@@ -113,9 +113,22 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("sinks")
 )
 .def("needs_configure", &BC_Attention::needs_configure)
+.def("set_qsa", &BC_Attention::set_qsa,
+    py::arg("qk_proj"),
+    py::arg("q_norm_w"),
+    py::arg("k_norm_w"),
+    py::arg("norm_eps"),
+    py::arg("n_heads"),
+    py::arg("head_dim"),
+    py::arg("topk"),
+    py::arg("compress_ratio"),
+    py::arg("raw_plane"),
+    py::arg("pool_plane")
+)
 .def("configure_slot", &BC_Attention::configure_slot,
     py::arg("bsz"),
     py::arg("q_len"),
+    py::arg("regime"),
     py::arg("q"),
     py::arg("kv"),
     py::arg("o"),
@@ -130,5 +143,29 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("splits_cap"),
     py::arg("xp"),
     py::arg("yp")
+)
+.def("configure_slot_qsa", &BC_Attention::configure_slot_qsa,
+    py::arg("bsz"),
+    py::arg("q_len"),
+    py::arg("regime"),
+    py::arg("qk"),
+    py::arg("q"),
+    py::arg("kraw"),
+    py::arg("k_stage"),
+    py::arg("k_raw_append"),
+    py::arg("k_pool_update"),
+    py::arg("rotate_dims"),
+    py::arg("wts") = c10::nullopt,
+    py::arg("scores") = c10::nullopt,
+    py::arg("pool_idx") = c10::nullopt,
+    py::arg("indices") = c10::nullopt,
+    py::arg("k_fewq") = nullptr,
+    py::arg("k_expand") = nullptr,
+    py::arg("k_split") = nullptr,
+    py::arg("k_combine") = nullptr,
+    py::arg("fewq_gy") = 0,
+    py::arg("qsa_splits") = 0,
+    py::arg("qsa_split_len") = 0,
+    py::arg("qsa_programs") = 0
 )
 .def("run", &BC_Attention::run);

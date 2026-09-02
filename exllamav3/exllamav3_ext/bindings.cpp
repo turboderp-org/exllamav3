@@ -61,6 +61,8 @@
 #include "dsv4_compress.cuh"
 #include "dsa_topk.cuh"
 #include "hc_mix.cuh"
+#include "ple.cuh"
+#include "ngram.cuh"
 
 #include "attention.cuh"
 
@@ -80,8 +82,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_host_unregister", &cuda_host_unregister, py::arg("ptr"));
     m.def("cuda_host_get_device_pointer", &cuda_host_get_device_pointer, py::arg("ptr"));
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
+    m.def("pinned_cuda_view", &pinned_cuda_view, py::arg("t"), py::arg("device"));
 
-    m.def("rms_norm", &rms_norm, "rms_norm");
+    m.def("rms_norm", &rms_norm, "rms_norm",
+        py::arg("x"), py::arg("w"), py::arg("y"), py::arg("epsilon"),
+        py::arg("constant_bias"), py::arg("constant_scale"), py::arg("span_heads"),
+        py::arg("add_residual"), py::arg("w_groups") = 1);
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
@@ -95,10 +101,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
     m.def("dsa_topk", &dsa_topk, "dsa_topk");
+    m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
+    m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
     m.def("hc_mix", &hc_mix, "hc_mix");
+    m.def("ple_gate", &ple_gate, "ple_gate");
+    m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
+    m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
+    m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
+    m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
     m.def("hc_head", &hc_head, "hc_head");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
+    m.def("gr_mix", &gr_mix, "gr_mix");
     m.def("routing_std", &routing_std, "routing_std");
     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
@@ -171,6 +185,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
     m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
     m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
+    m.def("gdn_lowrank_gemv_f", [](const at::Tensor& x, const at::Tensor& w_t, at::Tensor& y)
+        { gdn_lowrank_gemv_f_gr(x, w_t, y, nullptr); }, "gdn_lowrank_gemv_f");
+    m.def("kda_gate_op", [](const at::Tensor& qkv, const at::Tensor& b, const at::Tensor& f,
+                            const at::Tensor& dt_bias, const at::Tensor& a_log,
+                            at::Tensor& mixed_qkv, at::Tensor& beta, at::Tensor& g,
+                            float lower_bound, float beta_scale)
+        { kda_gate_op_gr(qkv, b, f, dt_bias, a_log, mixed_qkv, beta, g, lower_bound, beta_scale, nullptr); },
+        "kda_gate_op");
 
     py::class_<ConvRewindJob>(m, "ConvRewindJob")
         .def(py::init<uintptr_t, uintptr_t, int, int, int>());

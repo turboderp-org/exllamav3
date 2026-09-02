@@ -324,16 +324,20 @@ void dsa_topk_split_kernel
     const int s_stride,
     const int k,
     const int k_pad,
-    const int* __restrict__ t_ptr        // device T override (graph modes, t_seq == 0 only)
+    const int* __restrict__ t_ptr,       // device T override (graph modes, t_seq == 0 only)
+    const int ws_G,                      // tile mode (ws_slot >= 0): workspace slots per row,
+    const int ws_slot,                   //   the slot this launch fills (grid (R, 1)),
+    const int idx_offset                 //   and the global index of the tile's first entry
 )
 {
     if (t_ptr) T = *t_ptr;
     constexpr uint16_t KEY_NEG_INF = 0x03ff;
 
-    const int g = blockIdx.y;
-    const int G = gridDim.y;
-    const int span = ((T + G - 1) / G + 7) & ~7;                         // 8-aligned spans
-    const int beg = g * span;
+    const bool tile = ws_slot >= 0;
+    const int g = tile ? ws_slot : blockIdx.y;
+    const int G = tile ? ws_G : gridDim.y;
+    const int span = tile ? T : (((T + G - 1) / G + 7) & ~7);           // 8-aligned spans
+    const int beg = tile ? 0 : g * span;
     const int Tl = min(beg + span, T) - beg;                             // local length
     int* row_ws = ws_idx + ((size_t) blockIdx.x * G + g) * k_pad;
     half* row_scr = ws_scr + ((size_t) blockIdx.x * G + g) * k_pad;
@@ -498,7 +502,7 @@ void dsa_topk_split_kernel
                 m &= m - 1;
                 if (obase < cap_end)
                 {
-                    row_ws[obase] = beg + ibase + j;   // global index
+                    row_ws[obase] = idx_offset + beg + ibase + j;   // global index
                     row_scr[obase] = row_s[ibase + j];
                 }
                 ++obase;
@@ -521,13 +525,18 @@ void dsa_topk_merge_kernel
     int* __restrict__ out,               // (R, k_pad), -1 padded
     const int G,
     const int k,
-    const int k_pad
+    const int k_pad,
+    half* __restrict__ out_scr,          // optional (R, k_pad): scores of the emitted indices
+    int* __restrict__ out_cnt,           // optional (R,): number emitted (<= k)
+    const int out_stride,                // row stride of out / out_scr (a workspace slot view)
+    const int out_cnt_stride
 )
 {
     const int* row_ws = ws_idx + (size_t) blockIdx.x * G * k_pad;
     const half* row_scr = ws_scr + (size_t) blockIdx.x * G * k_pad;
     const int* row_cnt = ws_cnt + (size_t) blockIdx.x * G;
-    int* row_o = out + (size_t) blockIdx.x * k_pad;
+    int* row_o = out + (size_t) blockIdx.x * out_stride;
+    half* row_os = out_scr ? out_scr + (size_t) blockIdx.x * out_stride : nullptr;
     int t = threadIdx.x;
     int lane = t % 32;
     int warp = t / 32;
@@ -600,11 +609,13 @@ void dsa_topk_merge_kernel
                 {
                     int i = c0 + t;
                     int gidx = -1;
+                    half gscr = __ushort_as_half(0xfc00);
                     bool sel = false;
                     if (i < cg)
                     {
                         gidx = row_ws[g * k_pad + i];
-                        uint16_t key = topk_key(row_scr[g * k_pad + i]);
+                        gscr = row_scr[g * k_pad + i];
+                        uint16_t key = topk_key(gscr);
                         sel = pass == 0 ? (key > thresh) : (key == thresh);
                     }
                     int c = sel ? 1 : 0;
@@ -635,7 +646,10 @@ void dsa_topk_merge_kernel
                     {
                         int obase = base + warp_off[warp] + (incl - c);
                         if (obase < cap_end)
+                        {
                             row_o[obase] = gidx;
+                            if (row_os) row_os[obase] = gscr;
+                        }
                     }
                     base += sh_tile_total;
                 }
@@ -645,6 +659,7 @@ void dsa_topk_merge_kernel
         }
         for (int j = base + t; j < k_pad; j += TOPK_THREADS)
             row_o[j] = -1;
+        if (out_cnt && t == 0) out_cnt[(size_t) blockIdx.x * out_cnt_stride] = base;
     }
     else
     {
@@ -654,11 +669,15 @@ void dsa_topk_merge_kernel
         {
             int cg = cnt_sh[g];
             for (int i = t; i < cg; i += TOPK_THREADS)
+            {
                 row_o[base + i] = row_ws[g * k_pad + i];
+                if (row_os) row_os[base + i] = row_scr[g * k_pad + i];
+            }
             base += cg;
         }
         for (int j = base + t; j < k_pad; j += TOPK_THREADS)
             row_o[j] = -1;
+        if (out_cnt && t == 0) out_cnt[(size_t) blockIdx.x * out_cnt_stride] = base;
     }
 }
 
@@ -708,13 +727,13 @@ void dsa_topk_gr
         dsa_topk_split_kernel<true><<<grid_s, TOPK_THREADS, 0, stream>>>
         (
             (const half*) scores.data_ptr(), ws_idx, ws_scr, ws_cnt,
-            T, (int) scores.stride(0), k, k_pad, t_ptr_
+            T, (int) scores.stride(0), k, k_pad, t_ptr_, 0, -1, 0
         );
         cuda_check(cudaPeekAtLastError());
         dsa_topk_merge_kernel<<<R, TOPK_THREADS, 0, stream>>>
         (
             ws_idx, ws_scr, ws_cnt,
-            (int*) indices.data_ptr(), G, k, k_pad
+            (int*) indices.data_ptr(), G, k, k_pad, nullptr, nullptr, k_pad, 1
         );
         cuda_check(cudaPeekAtLastError());
         if (graph && !t_ptr_)
@@ -748,6 +767,107 @@ void dsa_topk_gr
         graph->record_param(kfn, GP_dsa_T, 2, 4);
         graph->record_param(kfn, GP_end, 0);
     }
+}
+
+// Tiled selection without a full-width score row: each scored tile contributes its local
+// top-k as a candidate slot (dsa_topk_tile), and dsa_topk_merge_tiles reduces the slots of a
+// row to the exact top-k under the same total order as the single-pass kernel (score
+// descending, index ascending), optionally emitting scores and counts so the result can seed
+// slot 0 of the next merge. Workspaces: ws_idx (R, G, k_pad) i32, ws_scr (R, G, k_pad) half,
+// ws_cnt (R, G) i32
+
+void dsa_topk_tile
+(
+    const at::Tensor& scores,            // (R, T_tile) half, dense rows
+    at::Tensor ws_idx,
+    at::Tensor ws_scr,
+    at::Tensor ws_cnt,
+    int64_t slot,
+    int64_t k,
+    int64_t idx_offset
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(scores.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(scores, kHalf);
+    TORCH_CHECK_DTYPE(ws_idx, kInt);
+    TORCH_CHECK_DTYPE(ws_scr, kHalf);
+    TORCH_CHECK_DTYPE(ws_cnt, kInt);
+    TORCH_CHECK(scores.dim() == 2 && scores.stride(1) == 1, "dsa_topk_tile: scores must be (R, T) with dense rows");
+    TORCH_CHECK(ws_idx.dim() == 3 && ws_idx.is_contiguous() && ws_scr.sizes() == ws_idx.sizes() &&
+                ws_scr.is_contiguous() && ws_cnt.dim() == 2 && ws_cnt.is_contiguous(), "dsa_topk_tile: bad workspace");
+    int R = scores.size(0);
+    int T = scores.size(1);
+    int G = ws_idx.size(1);
+    int k_pad = ws_idx.size(2);
+    TORCH_CHECK(ws_idx.size(0) == R && ws_cnt.size(0) == R && ws_cnt.size(1) == G, "dsa_topk_tile: workspace rows/slots mismatch");
+    TORCH_CHECK(slot >= 0 && slot < G && k <= k_pad && G <= TOPK_SPLIT_G, "dsa_topk_tile: bad slot / k");
+    bool vec = scores.stride(0) % 8 == 0 && ((uintptr_t) scores.data_ptr()) % 16 == 0;
+    dim3 grid(R, 1);
+    if (vec)
+        dsa_topk_split_kernel<true><<<grid, TOPK_THREADS, 0, stream>>>
+        (
+            (const half*) scores.data_ptr(), (int*) ws_idx.data_ptr(), (half*) ws_scr.data_ptr(),
+            (int*) ws_cnt.data_ptr(), T, (int) scores.stride(0), (int) k, k_pad, nullptr,
+            G, (int) slot, (int) idx_offset
+        );
+    else
+        dsa_topk_split_kernel<false><<<grid, TOPK_THREADS, 0, stream>>>
+        (
+            (const half*) scores.data_ptr(), (int*) ws_idx.data_ptr(), (half*) ws_scr.data_ptr(),
+            (int*) ws_cnt.data_ptr(), T, (int) scores.stride(0), (int) k, k_pad, nullptr,
+            G, (int) slot, (int) idx_offset
+        );
+    cuda_check(cudaPeekAtLastError());
+}
+
+void dsa_topk_merge_tiles
+(
+    const at::Tensor& ws_idx,
+    const at::Tensor& ws_scr,
+    const at::Tensor& ws_cnt,
+    at::Tensor out_idx,                  // (R, k_pad) i32, -1 padded
+    const c10::optional<at::Tensor>& out_scr,   // (R, k_pad) half
+    const c10::optional<at::Tensor>& out_cnt,   // (R,) i32
+    int64_t k
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(ws_idx.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(ws_idx, kInt);
+    TORCH_CHECK_DTYPE(ws_scr, kHalf);
+    TORCH_CHECK_DTYPE(ws_cnt, kInt);
+    TORCH_CHECK_DTYPE(out_idx, kInt);
+    TORCH_CHECK(ws_idx.dim() == 3 && ws_idx.is_contiguous() && ws_scr.is_contiguous() && ws_cnt.is_contiguous() &&
+                out_idx.dim() == 2 && out_idx.stride(1) == 1, "dsa_topk_merge_tiles: bad tensors");
+    int R = ws_idx.size(0);
+    int G = ws_idx.size(1);
+    int k_pad = ws_idx.size(2);
+    TORCH_CHECK(out_idx.size(0) == R && out_idx.size(1) == k_pad && k <= k_pad && G <= TOPK_SPLIT_G,
+                "dsa_topk_merge_tiles: shape mismatch");
+    half* os = nullptr;
+    int* oc = nullptr;
+    int oc_stride = 1;
+    if (out_scr)
+    {
+        TORCH_CHECK_DTYPE(out_scr.value(), kHalf);
+        TORCH_CHECK(out_scr.value().sizes() == out_idx.sizes() && out_scr.value().strides() == out_idx.strides(),
+                    "dsa_topk_merge_tiles: out_scr must match out_idx");
+        os = (half*) out_scr.value().data_ptr();
+    }
+    if (out_cnt)
+    {
+        TORCH_CHECK_DTYPE(out_cnt.value(), kInt);
+        TORCH_CHECK(out_cnt.value().dim() == 1 && out_cnt.value().size(0) == R, "dsa_topk_merge_tiles: bad out_cnt");
+        oc = (int*) out_cnt.value().data_ptr();
+        oc_stride = (int) out_cnt.value().stride(0);
+    }
+    dsa_topk_merge_kernel<<<R, TOPK_THREADS, 0, stream>>>
+    (
+        (const int*) ws_idx.data_ptr(), (const half*) ws_scr.data_ptr(), (const int*) ws_cnt.data_ptr(),
+        (int*) out_idx.data_ptr(), G, (int) k, k_pad, os, oc, (int) out_idx.stride(0), oc_stride
+    );
+    cuda_check(cudaPeekAtLastError());
 }
 
 // Per-job sequence state for the batched sparse-DSA graph stages (BC_MLAttention

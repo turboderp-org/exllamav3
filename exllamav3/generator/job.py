@@ -1432,7 +1432,13 @@ class Job:
             allocated_pages, cached_pages, non_sequential_pages, stashed_recurrent_state = \
                 seq.allocate_pages(self.pagetable, self.generator.recurrent_cache, protected_hashes)
 
-            self.recurrent_state = None
+            # Free the previous state before acquiring a new one. A bare assignment drops
+            # the handle without returning the slot index to the cache free list, so every
+            # reallocation (multi-sequence jobs, resumption after eviction) permanently
+            # burns a slot; with num_slots == max_batch_size (default 4 on recurrent
+            # models) a few such jobs exhaust the pool. The rewind path already does this
+            # correctly via free_recurrent_state().
+            self.free_recurrent_state()
             if self.generator.recurrent_cache is not None:
                 if stashed_recurrent_state is None:
                     self.recurrent_state = self.generator.cache.get_new_state()

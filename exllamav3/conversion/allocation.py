@@ -104,7 +104,9 @@ def create_q_strategy(
                 aux_targets[module.key] = QTarget(
                     numel = numel,
                     target_bpw = mtp_bpw,
-                    min_bpw = mtp_bpw,
+                    # --hq promotes the same select layers (attention, shared experts) inside
+                    # the MTP head as in the trunk; 16 = store unquantized, never promoted
+                    min_bpw = min(mtp_bpw + module.select_hq_bits, 8) if mtp_bpw <= 8 else mtp_bpw,
                     priority = priority
                 )
 
@@ -162,6 +164,12 @@ def create_q_strategy(
         if hq:
             t.clamp_min()
         final_bits += t.total_bits()
+
+    # Aux targets sit outside the main budget; the only ones with min_bpw above their target
+    # are MTP-head layers with select_hq_bits (head/vision targets clamp as a no-op)
+    if hq:
+        for t in aux_targets.values():
+            t.clamp_min()
 
     # Combined with head layer
     targets.update(aux_targets)

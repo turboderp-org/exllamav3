@@ -8,6 +8,39 @@ from ..ext import exllamav3_ext as ext
 # cudaMemcpyAsync path for A/B testing)
 _split_fused = os.environ.get("EXL3_MOE_SPLIT_FUSED", "1") != "0"
 
+# EXL3_SPLIT_PROF=1: CUDA-event brackets around the fused issue enqueue and the collect
+# wait+readback, reported as stream-time percentiles every ~2048 brackets. The collect
+# bracket is the true exposed stall: it runs after the GPU's own expert work, so any time
+# there is worker lateness the GPU could not hide.
+_split_prof = bool(os.environ.get("EXL3_SPLIT_PROF"))
+_sprof = {"issue": [], "wait": []}
+
+def _sprof_wrap(kind, layer, fn):
+    ev0 = torch.cuda.Event(enable_timing = True)
+    ev1 = torch.cuda.Event(enable_timing = True)
+    ev0.record()
+    r = fn()
+    ev1.record()
+    recs = _sprof[kind]
+    recs.append((layer, ev0, ev1))
+    if kind == "wait" and len(recs) >= 2048:
+        for k, rs in _sprof.items():
+            ts = [(l, a.elapsed_time(b)) for l, a, b in rs if b.query()]
+            if not ts:
+                continue
+            vals = sorted(t for _, t in ts)
+            per_layer = {}
+            for l, t in ts:
+                s = per_layer.setdefault(l, [0.0, 0])
+                s[0] += t; s[1] += 1
+            worst = sorted(per_layer.items(), key = lambda kv: -kv[1][0] / kv[1][1])[:4]
+            print(f" -- split prof [{k}] ({len(vals)} brackets, stream ms): "
+                  f"med {vals[len(vals) // 2]:.3f} p90 {vals[int(len(vals) * 0.9)]:.3f} "
+                  f"max {vals[-1]:.3f} | worst layers "
+                  + " ".join(f"L{l}:{s / n:.3f}" for l, (s, n) in worst), flush = True)
+            _sprof[k] = []
+    return r
+
 """
 Forward-path hooks are cpu_split_submit / cpu_offload_forward / cpu_split_combine, the
 load-path hooks cpu_maybe_offload_load / cpu_maybe_split_load / cpu_post_load, plus
@@ -186,11 +219,13 @@ class BlockSparseMLP_CPU:
             # the worker compute and the readback) when no CPU expert was selected. Replaces
             # three cudaMemcpyAsync launches, the int32 cast and the pad per layer per step
             if _split_fused:
-                pending = self.cpu_host.submit_issue_fused(
+                call = lambda: self.cpu_host.submit_issue_fused(
                     self.cpu_layer_idx, y, selected_experts, routing_weights,
                     self._split_map,
                     self._split_hist if self._split_map is not None else None,
                     self.cpu_split_first)
+                pending = _sprof_wrap("issue", self.cpu_layer_idx, call) \
+                    if _split_prof else call()
                 if pending is not None:
                     return None, ("fused", pending)
             sel_cpu = self._split_translate(selected_experts)
@@ -237,7 +272,11 @@ class BlockSparseMLP_CPU:
         if cpu_pending is not None:
             if isinstance(cpu_pending, tuple) and cpu_pending[0] == "fused":
                 f2 = final_hidden_states.view(-1, final_hidden_states.shape[-1])
-                self.cpu_host.submit_collect_fused(cpu_pending[1], f2)
+                if _split_prof:
+                    _sprof_wrap("wait", self.cpu_layer_idx,
+                                lambda: self.cpu_host.submit_collect_fused(cpu_pending[1], f2))
+                else:
+                    self.cpu_host.submit_collect_fused(cpu_pending[1], f2)
                 return final_hidden_states
             cpu_partial = self.cpu_host.submit_collect(cpu_pending)
         if cpu_partial is not None:

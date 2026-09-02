@@ -83,6 +83,7 @@ def measure_prefill(args, model, cache, warmup = False):
     if args.short_prefill:
         lengths = list(range(lengths[0])) + lengths
 
+    ids_offset = 0 if warmup else args.max_length
     is_recurrent = model.caps.get("recurrent_states", False)
     progress = 0
     results = {}
@@ -106,7 +107,7 @@ def measure_prefill(args, model, cache, warmup = False):
                         "batch_shape": (1, max(length, 256)),
                         "recurrent_states": recurrent,
                     }
-                    model.prefill(workload_ids(start, end - start), params)
+                    model.prefill(workload_ids(start + ids_offset, end - start), params)
                 cuda_sync_active()
                 if is_recurrent:
                     recurrent[0].free()
@@ -123,32 +124,45 @@ def measure_prefill(args, model, cache, warmup = False):
 def measure_generate(args, model, cache, warmup = False):
     chunk_size = args.chunk_size
     lengths = [0] + get_lengths(chunk_size if warmup else args.max_length - 256)
+
+    ids_offset = args.max_length * 2 if warmup else args.max_length * 3
     is_recurrent = model.caps.get("recurrent_states", False)
     progress = 0
     results = {}
+    seqlens = [1, 2, 3, 4] if args.spec_dec else [1]
+    unit = "it" if args.spec_dec else "tokens"
     max_progress = len(lengths)
     with (ProgressBar("Warmup" if warmup else "Generate", max_progress) as pb):
         for length in lengths:
-            recurrent = [cache.get_test_state(length)] if is_recurrent else None
-            torch.cuda.synchronize()
-            with Timer() as t:
-                for i in range(100):
-                    params = {
-                        "attn_mode": "flash_attn",
-                        "cache": cache,
-                        "past_len": length + i,
-                        "batch_shape": (1, max(length + 256, 256)),
-                        "recurrent_states": recurrent
-                    }
-                    logits = model.forward(workload_ids(length + i, 1), params)
-                    sample = torch.argmax(logits)
-                    sample = sample.cpu()  # force sync
-                    del logits
-            if is_recurrent:
-                recurrent[0].free()
-            results[length] = 100 / t.interval
+            for seqlen in seqlens:
+                recurrent = [cache.get_test_state(length)] if is_recurrent else None
+                torch.cuda.synchronize()
+                with Timer() as t:
+                    for i in range(100 // seqlen):
+                        params = {
+                            "attn_mode": "flash_attn",
+                            "cache": cache,
+                            "past_len": length + i * seqlen,
+                            "batch_shape": (1, max(length + 256, 256)),
+                            "recurrent_states": recurrent
+                        }
+                        logits = model.forward(workload_ids(ids_offset + length + i, seqlen), params)
+                        sample = torch.argmax(logits)
+                        sample = sample.cpu()  # force sync
+                        del logits
+                if is_recurrent:
+                    recurrent[0].free()
+                results[seqlen, length] = (100 // seqlen) / t.interval
+
             if not warmup:
-                print(f"Context {length: 6}: {col_green}{results[length]:10.2f}{col_default} tokens/s")
+                print(
+                    f"Context {length: 6}: " +
+                    ",   ".join([
+                        f"S={col_gray}{seqlen} {col_green}{results[seqlen, length]:10.2f}{col_default} {unit}/s"
+                        for seqlen in seqlens
+                    ])
+                )
+
             progress += 1
             pb.update(progress)
 
@@ -205,5 +219,6 @@ if __name__ == "__main__":
     parser.add_argument("-sg", "--skip_gen", action = "store_true", help = "Skip measuring generaition speed")
     parser.add_argument("-swu", "--skip_warmup", action = "store_true", help = "Skip warmup passes")
     parser.add_argument("-short", "--short_prefill", action = "store_true", help = "Test short-prefill/batch throughput")
+    parser.add_argument("-sd", "--spec_dec", action = "store_true", help = "Test spec-decode seqlens 1..4")
     _args = parser.parse_args()
     main(_args)

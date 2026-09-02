@@ -674,7 +674,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.is_quantized and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
-            self.shared_experts is None
+            self.shared_experts is None and
+            not self.config.infer_params.no_reconstruct
         )
 
         # Make fused modules (only used by the quantized fast paths). Gateless experts have no
@@ -757,7 +758,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         )
         self.experts_cfg = cfg
 
-        if self.support_quant_paths or self.support_bc_bsz1:
+        if (self.support_quant_paths or self.support_bc_bsz1) \
+                and not self.config.infer_params.no_reconstruct:
 
             # Embed bound classes for shared experts and shared gate
             sh_exp_bc = None
@@ -999,14 +1001,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Eligibility for the multi-row CUDA-graph path (bsz 1..MAX_BSZN): computed up front so
         # it can override the f_threshold-based routing below (bsz>=f_threshold would otherwise
         # always fall through to the exl3_moe/dense path first, capping this tier's reach at
-        # f_threshold-1 instead of MAX_BSZN). bsz==1 is unrestricted (original bsz-1 path); bsz>1
-        # additionally requires no TP expert-range sharding (the kernel's compaction path doesn't
-        # preserve fixed per-token slot groups) -- shared experts are supported at any bsz via
-        # BC_GatedMLP's own multi-row graph (see mlp.py)
-        bszn_eligible = (
-            self.bc is not None and bsz <= MAX_BSZN and
-            (bsz == 1 or self.experts_cfg.min_expert == -1)
-        )
+        # f_threshold-1 instead of MAX_BSZN). Expert-range shards (CPU split, TP) are handled
+        # by the mgemm kernel's position-preserving mask at num_tokens > 1 (out-of-range picks
+        # inactive in place, so the grouped reduction's slot runs stay intact). Shared experts
+        # are supported at any bsz via BC_GatedMLP's own multi-row graph (see mlp.py)
+        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
 
         # Routing
         if self.router_pre_norm:
@@ -1098,11 +1097,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                 # Count how many assignments per expert
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                expert_count_list = expert_count.tolist()
 
-                # Run fused path if possible, skips experts with more than TEMP_ROWS_FUSED tokens
-                if self.fused_mode_buffers is not None:
-                    num_active = sum(1 for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED)
+                def run_fused(num_active):
                     # Gateless: the up module stands in for the gate pointer tables (the kernel
                     # skips the gate GEMM when activation_fn_idx is MOE_ACT_RELU2_NOGATE)
                     multi_gate = self.multi_gate if self.gated else self.multi_up
@@ -1138,9 +1134,26 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         self.act_limit,
                         num_active
                     )
-                    min_rows = TEMP_ROWS_FUSED
+
+                # With few enough total assignments, no expert can exceed the fused kernel's
+                # row capacity: the fused path handles everything, the per-expert count
+                # readback (a CPU sync per layer, ~33% idle at MTP verify shapes) is
+                # unnecessary, and the overflow fallback loop below cannot have work.
+                # num_active -1 = unknown, kernel launches at max concurrency
+                if self.fused_mode_buffers is not None and num_tokens * top_k <= TEMP_ROWS_FUSED:
+                    run_fused(-1)
+                    expert_count_list = None
                 else:
-                    min_rows = 0
+                    expert_count_list = expert_count.tolist()
+
+                    # Run fused path if possible, skips experts with more than TEMP_ROWS_FUSED
+                    # tokens
+                    if self.fused_mode_buffers is not None:
+                        num_active = sum(1 for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED)
+                        run_fused(num_active)
+                        min_rows = TEMP_ROWS_FUSED
+                    else:
+                        min_rows = 0
 
                 out_state = None
                 interm = None
@@ -1148,7 +1161,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 max_count = 0
                 start = 0
 
-                for expert_idx in range(num_ex):
+                # expert_count_list None: everything already handled by the fused kernel above
+                for expert_idx in range(num_ex if expert_count_list is not None else 0):
                     count = expert_count_list[expert_idx]
                     end = start + count
                     if count <= min_rows:
@@ -1217,9 +1231,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # tokens this small is rare and not worth the argsort/bincount host-sync cost that the
         # fused/exl3_moe path pays), captured as one CUDA graph per bsz and replayed with only a
         # few tensor pointers patched. Shared experts (if present) run through their own
-        # multi-row BC_GatedMLP graph, fused into the same capture. bsz > 1 additionally requires
-        # no TP expert-range sharding (the kernel's compaction path doesn't preserve fixed
-        # per-token slot groups); bsz == 1 is unrestricted
+        # multi-row BC_GatedMLP graph, fused into the same capture. Expert-range shards (CPU
+        # split, TP) produce a partial sum here: out-of-range picks are masked inactive inside
+        # the mgemm kernel and contribute exact zeros
         elif bszn_eligible:
             self.bc.run_bszN(y, selected_experts, routing_weights)
             if self.experts_cfg.out_trim is not None:

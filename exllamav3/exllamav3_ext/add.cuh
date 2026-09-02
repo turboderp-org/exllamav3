@@ -32,7 +32,8 @@ void moe_bias_add_gr
     const at::Tensor& sel,
     int min_expert,
     int max_expert,
-    Graph* graph
+    Graph* graph,
+    int num_tokens = 1
 );
 
 void moe_bias_add_weighted_gr

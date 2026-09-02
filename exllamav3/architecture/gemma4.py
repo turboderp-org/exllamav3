@@ -497,6 +497,7 @@ class Gemma4VisionModel(Model):
         self.config = config
         self.caps.update({
             "image_input": True,
+            "default_vision_bits": 6,
             "supports_tp": False,
         })
         v = self.config.vision
@@ -535,6 +536,7 @@ class Gemma4VisionModel(Model):
                         key_k = "k_proj.linear",
                         key_v = "v_proj.linear",
                         key_o = "o_proj.linear",
+                        qmap = "block.attn",
                         sm_scale = 1.0,
                         q_norm = RMSNorm(
                             config = config,
@@ -578,6 +580,7 @@ class Gemma4VisionModel(Model):
                         key_gate = "gate_proj.linear",
                         key_down = "down_proj.linear",
                         activation_fn = "gelu",
+                        qmap = "block.mlp",
                     ),
                     mlp_post_norm = RMSNorm(
                         config = config,
@@ -610,6 +613,7 @@ class Gemma4VisionModel(Model):
                 key = "model.embed_vision.embedding_projection",
                 in_features = config.vision.hidden_size,
                 out_features = config.hidden_size,
+                qmap = "block",
             )
         ]
 
@@ -753,6 +757,7 @@ class Gemma4UnifiedVisionModel(Gemma4VisionModel):
         self.config = config
         self.caps.update({
             "image_input": True,
+            "default_vision_bits": 6,
             "supports_tp": False,
         })
         v = self.config.vision
@@ -776,6 +781,7 @@ class Gemma4UnifiedVisionModel(Gemma4VisionModel):
                 key = f"model.embed_vision.embedding_projection",
                 in_features = v.output_proj_dims,
                 out_features = config.hidden_size,
+                qmap = "block",
             )
         ]
 

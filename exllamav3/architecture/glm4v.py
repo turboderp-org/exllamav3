@@ -102,32 +102,67 @@ def read_glm4v_vision_config(config_dict: dict):
     v.num_channels = 3
     v.head_dim = v.hidden_size // v.num_heads
     v.rope_theta = 10000.0
-    assert v.model_type in ["glm4v", "glm4v_moe", "glm4v_moe_vision", "glm4v_vision"], \
-        "Expected vision_config->model_type to be 'glm4v', 'glm4v_moe', 'glm4v_vision'" \
-        "or 'glm4v_moe_vision'"
+
+    if v.model_type == "glm5_next_vision":
+        v.is_glm5next = True
+        v.qk_norm = True
+        v.act_limit = config_dict.get("swiglu_limit", 0.0)
+        v.post_conv_norm = False
+        v.pos_embedding = False
+        v.merger_interm_size = config_dict.get("projection_intermediate_size")
+        v.gelu_approx = "none"
+        v.downsample_out = v.out_hidden_size
+
+    else:
+        v.is_glm5next = False
+        v.qk_norm = False
+        v.act_limit = None
+        v.post_conv_norm = True
+        v.pos_embedding = True
+        v.merger_interm_size = v.intermediate_size
+        v.gelu_approx = "tanh"
+        v.downsample_out = v.hidden_size
+
+    types = ["glm4v", "glm4v_moe", "glm4v_moe_vision", "glm4v_vision", "glm5_next_vision"]
+    assert v.model_type in types, \
+        f"Expected vision_config->model_type to be in {types}, got {v.model_type}"
     return v
 
 
-def read_glm4v_pp_config(config_dict: dict):
+def read_glm4v_pp_config(config_dict: dict, glm5_next: bool = False):
+    keys = [
+        ("patch_size", int),
+        ("temporal_patch_size", int),
+        ("merge_size", int),
+        ("image_mean", list),
+        ("image_std", list),
+        ("image_processor_type", str),
+    ]
+    if not glm5_next:
+        keys += [
+            ("size", dict),
+        ]
+    else:
+        keys += [
+            ("min_image_tokens", int),
+            ("max_image_tokens", int),
+        ]
+
     pp = SimpleNamespace(**{
         k: read_dict(config_dict, t, k, no_default)
-        for k, t in [
-            ("size", dict),
-            ("patch_size", int),
-            ("temporal_patch_size", int),
-            ("merge_size", int),
-            ("image_mean", list),
-            ("image_std", list),
-            ("image_processor_type", str),
-        ]
+        for k, t in keys
     })
+
     pp.resample = 3
     pp.rescale_factor = 1 / 255
-    pp.min_pixels = pp.size["shortest_edge"]  # Mislabeled in preprocessor_config
-    pp.max_pixels = pp.size["longest_edge"]
-    assert pp.image_processor_type in ["Glm4vImageProcessor", "Glm46VImageProcessor"], \
-        f"Expected image_processor_type to be 'Glm4vImageProcessor' or 'Glm46VImageProcessor'," \
-        f"got: {pp.image_processor_type}"
+
+    if not glm5_next:
+        pp.min_pixels = pp.size["shortest_edge"]  # Mislabeled in preprocessor_config
+        pp.max_pixels = pp.size["longest_edge"]
+
+    types = ["Glm5NextImageProcessor", "Glm4vImageProcessor", "Glm46VImageProcessor"]
+    assert pp.image_processor_type in types, \
+        f"Expected image_processor_type to be in {types}, got: {pp.image_processor_type}"
     return pp
 
 
@@ -160,6 +195,7 @@ class Glm4VVisionModel(Model):
         self.config = config
         self.caps.update({
             "image_input": True,
+            "default_vision_bits": 6,
         })
         v = self.config.vision
 
@@ -173,20 +209,26 @@ class Glm4VVisionModel(Model):
                 flat = True,
                 out_dtype = torch.float,
             ),
-            RMSNorm(
-                config = config,
-                key = f"{key_prefix}.post_conv_layernorm",
-                rms_norm_eps = v.rms_norm_eps
-            ),
-            Glm4VPosEmbedding(
-                config = config,
-                key = f"{key_prefix}.embeddings.position_embedding",
-                num_position_embeddings = (v.image_size // v.patch_size) ** 2,
-                spatial_merge_size = v.spatial_merge_size,
-                hidden_size = v.hidden_size,
-                out_dtype = torch.float,
-            ),
         ]
+        if v.post_conv_norm:
+            self.modules += [
+                RMSNorm(
+                    config = config,
+                    key = f"{key_prefix}.post_conv_layernorm",
+                    rms_norm_eps = v.rms_norm_eps
+                ),
+            ]
+        if v.pos_embedding:
+            self.modules += [
+                Glm4VPosEmbedding(
+                    config = config,
+                    key = f"{key_prefix}.embeddings.position_embedding",
+                    num_position_embeddings = (v.image_size // v.patch_size) ** 2,
+                    spatial_merge_size = v.spatial_merge_size,
+                    hidden_size = v.hidden_size,
+                    out_dtype = torch.float,
+                ),
+            ]
 
         for idx in range(v.depth):
 
@@ -215,6 +257,16 @@ class Glm4VVisionModel(Model):
                         key_fused_qkv = "qkv",
                         key_o = "proj",
                         qmap = "block.attn",
+                        q_norm = RMSNorm(
+                            config = config,
+                            key = f"{key_prefix}.blocks.{idx}.attn.q_norm",
+                            rms_norm_eps = v.rms_norm_eps,
+                        ) if v.qk_norm else None,
+                        k_norm = RMSNorm(
+                            config = config,
+                            key = f"{key_prefix}.blocks.{idx}.attn.k_norm",
+                            rms_norm_eps = v.rms_norm_eps,
+                        ) if v.qk_norm else None,
                     ),
                     mlp_norm = RMSNorm(
                         config = config,
@@ -230,6 +282,7 @@ class Glm4VVisionModel(Model):
                         key_up = "up_proj",
                         key_down = "down_proj",
                         activation_fn = "silu",
+                        act_limit = v.act_limit or 0.0,
                         qmap = "block.mlp",
                         pad_to = 1,
                     ),
@@ -246,7 +299,7 @@ class Glm4VVisionModel(Model):
                 config = config,
                 key = f"{key_prefix}.downsample",
                 in_channels = v.hidden_size,
-                out_channels = v.hidden_size,
+                out_channels = v.downsample_out,
                 kernel_size = (v.spatial_merge_size, v.spatial_merge_size),
                 out_dtype = torch.float,
                 reshape2d = True,
@@ -260,9 +313,11 @@ class Glm4VVisionModel(Model):
                 key_proj = "proj",
                 key_norm = "post_projection_norm",
                 hidden_size = v.out_hidden_size,
-                interm_size = v.intermediate_size,
+                interm_size = v.merger_interm_size,
                 out_dtype = torch.float,
                 qmap = "block",
+                act_limit = v.act_limit or 0.0,
+                gelu_approx = v.gelu_approx,
             )
         ]
 

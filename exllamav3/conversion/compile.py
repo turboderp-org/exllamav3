@@ -131,6 +131,20 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
         del file_dict
         free_mem()
 
+    # Every tensor the quantizer produced must have reached the shards: a module whose compile
+    # collection misses its own outputs (e.g. a submodule-owned tensor outside the parent's key
+    # prefix) would otherwise ship a silently incomplete model
+    if not args.get("model_stc"):
+        dropped = sorted(k for k in qtensors_stc.tensor_file_map
+                         if k != "__metadata__" and k not in map_dict)
+        if dropped:
+            print(f" !! {len(dropped)} quantized tensor(s) were not collected by any module:")
+            for k in dropped[:10]:
+                print(f"     - {k}")
+            if len(dropped) > 10:
+                print(f"     - (+ {len(dropped) - 10} more)")
+            raise RuntimeError("Compile dropped quantized tensors, output model is incomplete (see above)")
+
     # Copy non-tensor files
     print(f" -- Copying non-tensor files from {in_dir}")
     filtered_files = []

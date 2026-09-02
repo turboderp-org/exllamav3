@@ -7,7 +7,7 @@ from rich.console import Console
 from prompt_toolkit import prompt as ptk_prompt
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import FileHistory
-import time, os
+import time, os, re
 import unicodedata
 
 # ANSI codes
@@ -91,6 +91,18 @@ class Streamer_basic:
         print(print_text, end = "", flush = True)
 
 class MarkdownConsoleStream:
+    """
+    Incrementally rendered Markdown stream.
+
+    Only the uncommitted tail is re-rendered per update, so the cost is bounded by one block or
+    one code chunk regardless of response length. Output is line-diffed against the previous
+    update and only the changed suffix is reprinted, as before.
+    """
+
+    CODE_CHUNK = 16
+
+    _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+    _LIST_RE = re.compile(r"^ {0,3}([-*+]|\d{1,9}[.)])(\s|$)")
 
     def __init__(self, console: Console = None):
         # Make the Rich console a little narrower to prevent overflows from extra-wide emojis
@@ -99,6 +111,12 @@ class MarkdownConsoleStream:
         self.console = console or Console(emoji_variant = "text", width = c)
         self.height = r - 2
         self._last_lines = []
+        self._reset()
+
+    def _reset(self):
+        self.src = ""                 # committed source (a prefix of the streamed text)
+        self.lines = []               # rendered lines of self.src, no leading/trailing blanks
+        self.fence = None             # open fence state when self.src ends inside one
 
     def __enter__(self):
         return self
@@ -106,8 +124,206 @@ class MarkdownConsoleStream:
     def __exit__(self, exc_type, exc_value, traceback):
         return False
 
+    def _render_to_lines(self, markdown_text: str):
+        # Capture Rich's output to a string, then split by lines (consecutive blanks collapsed)
+        with self.console.capture() as cap:
+            self.console.print(Markdown(markdown_text))
+        rendered = cap.get()
+        split = []
+        for s in [r.rstrip() for r in rendered.rstrip("\n").split("\n")]:
+            if s or len(split) == 0 or split[-1]:
+                split.append(s)
+        return split
+
+    @staticmethod
+    def _strip_blank(lines):
+        a, b = 0, len(lines)
+        while a < b and not lines[a]: a += 1
+        while b > a and not lines[b - 1]: b -= 1
+        return lines[a:b]
+
+    def _render_block(self, text):
+        return self._strip_blank(self._render_to_lines(text)) if text.strip() else []
+
+    @staticmethod
+    def _join(a, b, seam):
+        if not a: return list(b)
+        if not b: return list(a)
+        return a + ([""] if seam else []) + b
+
+    # ---- fence handling
+
+    def _fence_open(self, line):
+        m = self._FENCE_RE.match(line)
+        if not m:
+            return None
+        return {"char": m.group(1)[0], "len": len(m.group(1)), "opener": line,
+                "lang": m.group(2).strip().split(" ")[0] if m.group(2).strip() else ""}
+
+    @staticmethod
+    def _fence_lexer(fence):
+        if "lexer" not in fence:
+            from rich.syntax import Syntax
+            try:
+                fence["lexer"] = Syntax("", fence["lang"] or "text").lexer
+            except Exception:
+                fence["lexer"] = None
+        return fence["lexer"]
+
+    def _safe_lookback(self, fence, window, boundary):
+        from pygments.token import String, Comment
+        lexer = self._fence_lexer(fence)
+        if lexer is None or boundary <= 0:
+            return []
+        text = "\n".join(window)
+        off = len("\n".join(window[:boundary])) + 1
+        toks = []
+        for index, ttype, value in lexer.get_tokens_unprocessed(text):
+            toks.append((index, ttype, value))
+            if index >= off:
+                break
+        if not toks:
+            return []
+        def cat(t):
+            return "s" if t in String else "c" if t in Comment else None
+        start = None
+        # A single token spanning the boundary (docstrings, block comments)
+        for i, (index, ttype, value) in enumerate(toks):
+            if index < off < index + len(value):
+                start = i
+                break
+        if start is None:
+            # Multi-line strings/comments some lexers emit as a run of same-category tokens
+            # split at newlines: both sides of the boundary in the run -> start of the run
+            before = next((i for i in range(len(toks) - 1, -1, -1) if toks[i][0] < off), None)
+            after = next((i for i in range(len(toks)) if toks[i][0] >= off), None)
+            if before is not None and after is not None and cat(toks[before][1]) is not None \
+                    and cat(toks[before][1]) == cat(toks[after][1]):
+                start = before
+                while start > 0 and cat(toks[start - 1][1]) == cat(toks[before][1]):
+                    start -= 1
+        if start is None:
+            return []
+        start_line = text.count("\n", 0, toks[start][0])
+        return window[start_line : boundary]
+
+    def _fence_closes(self, fence, line):
+        m = self._FENCE_RE.match(line)
+        return bool(m) and m.group(1)[0] == fence["char"] and len(m.group(1)) >= fence["len"] \
+            and not m.group(2).strip()
+
+    def _code_render(self, fence, code_lines, closed):
+        lb = fence["lookback"]
+        closer = fence["char"] * fence["len"]
+        body = "\n".join(lb + code_lines)
+        text = fence["opener"] + "\n" + body + ("\n" + closer + "\n" if closed else "\n")
+        out = self._render_block(text)
+        if lb:
+            # cached: the lookback rendered alone, minus its bottom padding line
+            key = tuple(lb)
+            if fence.get("lb_key") != key:
+                fence["lb_key"] = key
+                fence["lb_skip"] = len(self._render_block(fence["opener"] + "\n" + "\n".join(lb) + "\n")) - 1
+            out = out[fence["lb_skip"]:]
+        elif fence["committed"]:
+            out = out[1:]                          # top padding belongs to the first chunk
+        return out
+
+    def _commit(self, tail):
+        # Move as much of `tail` as possible into the committed state; return the remainder
+        while True:
+            lines = tail.split("\n")
+            if self.fence is None:
+                # Scan for the last safe blank-line split and for an open fence
+                in_fence = None
+                split_at = None
+                fence_at = None
+                for i, ln in enumerate(lines[:-1]):
+                    f = self._fence_open(ln)
+                    if in_fence is None and f:
+                        in_fence, fence_at = f, i
+                        continue
+                    if in_fence is not None and self._fence_closes(in_fence, ln):
+                        in_fence, fence_at = None, None
+                        continue
+                    if in_fence is None and ln.strip() == "":
+                        nxt = lines[i + 1]
+                        if nxt.startswith(("    ", "\t")) or self._LIST_RE.match(nxt):
+                            continue
+                        split_at = i
+                if split_at is not None and (fence_at is None or split_at < fence_at):
+                    head = "\n".join(lines[: split_at + 1]) + "\n"
+                    self.lines = self._join(self.lines, self._render_block(head), True)
+                    self.src += head
+                    tail = tail[len(head):]
+                    continue
+                if fence_at is not None and len(lines) - 1 - (fence_at + 1) >= self.CODE_CHUNK:
+                    # Open fence with a full chunk of completed lines: commit what precedes the
+                    # opener as prose (a fence ends any paragraph), then open fence state
+                    pre = "\n".join(lines[:fence_at]) + ("\n" if fence_at else "")
+                    if pre:
+                        self.lines = self._join(self.lines, self._render_block(pre), True)
+                    f = self._fence_open(lines[fence_at])
+                    f.update(lookback = [], committed = 0)
+                    self.fence = f
+                    self.src += pre + lines[fence_at] + "\n"
+                    tail = tail[len(pre) + len(lines[fence_at]) + 1:]
+                    continue
+                return tail
+            else:
+                # Inside open fence: commit through a closer, else full chunks of lines
+                fence = self.fence
+                close_at = None
+                for i, ln in enumerate(lines[:-1]):
+                    if self._fence_closes(fence, ln):
+                        close_at = i
+                        break
+                if close_at is not None:
+                    code = lines[:close_at]
+                    out = self._code_render(fence, code, True)
+                    self.lines = self._join(self.lines, out, fence["committed"] == 0)
+                    consumed = "\n".join(lines[: close_at + 1]) + "\n"
+                    self.src += consumed
+                    tail = tail[len(consumed):]
+                    self.fence = None
+                    continue
+                done = len(lines) - 1
+                if done >= self.CODE_CHUNK:
+                    code = lines[: self.CODE_CHUNK]
+                    out = self._code_render(fence, code, False)[:-1]      # drop bottom padding
+                    # the block seam (blank line) belongs to the first chunk
+                    self.lines = self._join(self.lines, out, fence["committed"] == 0)
+                    consumed = "\n".join(code) + "\n"
+                    self.src += consumed
+                    tail = tail[len(consumed):]
+                    fence["committed"] += len(code)
+                    # Highlighter state for the next chunk: the window starts at a token
+                    # boundary (the previous lookback start) and includes the unconsumed tail
+                    # so a token continuing past the new boundary is visible
+                    window = fence["lookback"] + code + lines[self.CODE_CHUNK:]
+                    fence["lookback"] = self._safe_lookback(fence, window, len(fence["lookback"]) + len(code))
+                    continue
+                return tail
+
+    @staticmethod
+    def _common_prefix_length(a, b):
+        n = min(len(a), len(b))
+        i = 0
+        while i < n and a[i] == b[i]:
+            i += 1
+        return i
+
     def update(self, markdown_text) -> None:
-        new_lines = self._render_to_lines(markdown_text)
+        if not markdown_text.startswith(self.src):
+            self._reset()
+        tail = self._commit(markdown_text[len(self.src):])
+        if self.fence is None:
+            new_lines = self._join(self.lines, self._render_block(tail), True)
+        else:
+            code = tail.split("\n")
+            new_lines = self._join(self.lines, self._code_render(self.fence, code, False),
+                                   self.fence["committed"] == 0)
+
         old_lines = self._last_lines
         prefix_length = self._common_prefix_length(old_lines, new_lines)
         prefix_length = max(prefix_length, len(old_lines) - self.height, len(new_lines) - self.height)
@@ -122,28 +338,7 @@ class MarkdownConsoleStream:
                 print(new_lines[prefix_length + i].rstrip())
             else:
                 print(f"{ESC}[2K", end = "")
-                # print()
         self._last_lines = new_lines
-
-    def _render_to_lines(self, markdown_text: str):
-        # Capture Rich’s output to a string, then split by lines.
-        with self.console.capture() as cap:
-            self.console.print(Markdown(markdown_text))
-        rendered = cap.get()
-        split = []
-        for s in [r.rstrip() for r in rendered.rstrip("\n").split("\n")]:
-            if s or len(split) == 0 or split[-1]:
-                split.append(s)
-        return split
-
-    @staticmethod
-    def _common_prefix_length(a, b) -> int:
-        i = 0
-        for x, y in zip(a, b):
-            if x != y:
-                break
-            i += 1
-        return i
 
 class Streamer_rich:
     def __init__(self, args, bot_name, think_tag, end_think_tag, updates_per_second, think):
