@@ -1243,7 +1243,9 @@ class Generator:
             for job in self.pending_jobs.copy():
 
                 if (len(job.sequences) + current_max_batch > self.max_batch_size or
-                        job.current_new_pages_required() > self.pagetable.num_unreferenced_pages()):
+                        job.current_new_pages_required() > self.pagetable.num_unreferenced_pages() or
+                        (self.recurrent_cache is not None and
+                         len(job.sequences) > len(self.cache.free_list))):
                     skipped_jobs.append(job)
                     continue
 
