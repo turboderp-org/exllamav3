@@ -21,8 +21,9 @@ from exllamav3.generator.sampler import GreedySampler
 
 def main(model_dir):
     props = torch.cuda.get_device_properties(0)
+    from exllamav3.ext import exllamav3_ext as ext
     print(f"device: {props.name}  sm_{props.major}{props.minor}  "
-          f"smem_optin={props.shared_memory_per_block_optin}")
+          f"smem_optin={ext.g_get_smem_max(0)}")
 
     config = Config.from_directory(model_dir)
     model = Model.from_config(config)

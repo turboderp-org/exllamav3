@@ -35,10 +35,21 @@ def _dev_smem_limit(device) -> int:
     Turing provides 64 KB, and Triton does not degrade gracefully: exceeding the limit raises
     OutOfResources at launch rather than recompiling smaller. Configs therefore have to be
     chosen against the real limit up front.
+
+    Queried through the extension rather than torch: get_device_properties() only grew a
+    shared-memory attribute in recent versions (absent in 2.6), and the extension already
+    asks the driver for cudaDevAttrMaxSharedMemoryPerBlockOptin. Falls back to the compute
+    capability, which fixes the limit for every architecture the library supports.
     """
     dev = device.index
     if dev not in _smem_limit:
-        _smem_limit[dev] = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+        try:
+            from ...ext import exllamav3_ext as ext
+            limit = ext.g_get_smem_max(dev)
+        except (ImportError, AttributeError):
+            major = torch.cuda.get_device_capability(device)[0]
+            limit = 64 * 1024 if major < 8 else 96 * 1024
+        _smem_limit[dev] = limit
     return _smem_limit[dev]
 
 

@@ -99,7 +99,8 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
             # CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES would fail with an opaque
             # "CUDA driver error". Raise something the BC builders can recognize instead, so
             # they decline and the eager path (which does size its tiles per device) runs.
-            smem_limit = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+            from .triton_paged import _dev_smem_limit
+            smem_limit = _dev_smem_limit(device)
             if ck.metadata.shared > smem_limit:
                 raise BCKernelTooLarge(
                     f"{fn.__name__}: {ck.metadata.shared} B of shared memory exceeds the "

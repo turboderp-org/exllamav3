@@ -106,8 +106,7 @@ def test_smem_budget_respected():
     at 8 bpw (66 KB) has to be filtered out rather than attempted. This asserts the filter is
     actually consulted: every shape the kernel selector accepts must be launchable.
     """
-    props = torch.cuda.get_device_properties(0)
-    limit = props.shared_memory_per_block_optin
+    limit = ext.g_get_smem_max(0)
 
     k, n = 2048, 2048
     for K in range(1, 9):
