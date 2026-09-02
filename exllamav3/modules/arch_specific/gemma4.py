@@ -31,7 +31,7 @@ class Gemma4VisionPatchEmbedder(Module):
             key = f"{key}.input_proj",
             in_features = patch_dim,
             out_features = hidden_size,
-            qmap = None,
+            qmap = "block",
             out_dtype = torch.half,
             pad_to = 1,
         )
@@ -207,7 +207,7 @@ class Gemma4UnifiedVisionEmbedder(Module):
             key = f"{key}.patch_dense",
             in_features = patch_dim,
             out_features = mm_embed_dim,
-            qmap = None,
+            qmap = "block",
             out_dtype = torch.float,
             pad_to = 1,
         )
@@ -263,7 +263,8 @@ class Gemma4UnifiedVisionEmbedder(Module):
         params: dict,
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-        x = self.patch_ln1.forward(x.to(self.patch_dense.inner.weight.dtype), params)
+        # patch_dense may be fp16 or EXL3-quantized; either takes half input
+        x = self.patch_ln1.forward(x.to(torch.half), params)
         x = self.patch_dense.forward(x, params)
         x = self.patch_ln2.forward(x, params)
 

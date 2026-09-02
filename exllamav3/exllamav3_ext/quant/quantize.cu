@@ -23,6 +23,14 @@ static const std::array<fp_quantize_tiles_kernel, 24> quantize_tiles_kernel_inst
 };
 #undef __
 
+// 160-length rows (n-gram embedding vectors), mul1 codebook only
+#define __(i) quantize_tiles_kernel_k##i##_cb2_l160()
+static const std::array<fp_quantize_tiles_kernel, 8> quantize_tiles_kernel_instances_l160
+{
+    __(1), __(2), __(3), __(4), __(5), __(6), __(7), __(8)
+};
+#undef __
+
 
 void quantize_tiles
 (
@@ -40,7 +48,8 @@ void quantize_tiles
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DIM(input_tiles, 2);
-    TORCH_CHECK_SIZE(input_tiles, 1, 256);
+    const int L = input_tiles.size(1);
+    TORCH_CHECK(L == 256 || L == 160, "quantize_tiles tile length must be 256 or 160");
     TORCH_CHECK_SHAPES_FULL(input_tiles, output_indices);
     TORCH_CHECK_DTYPE(input_tiles, kFloat);
     TORCH_CHECK_DTYPE(output_tiles, kFloat);
@@ -57,17 +66,20 @@ void quantize_tiles
     TORCH_CHECK_SIZE(temp_costs, 2, edges);
     TORCH_CHECK_DTYPE(temp_edges, kShort);
     TORCH_CHECK_DIM(temp_edges, 3);
-    TORCH_CHECK_SIZE(temp_edges, 1, 256);
+    TORCH_CHECK_SIZE(temp_edges, 1, L);
     TORCH_CHECK_SIZE(temp_edges, 2, edges);
 
     int device;
     cudaGetDevice(&device);
     const int max_batch_size = MIN((int) temp_costs.size(0), 2 * DevCtx::instance().get_num_sms(device));
-    const int shmem = (K >= 2 ? 2 * edges * sizeof(half) : 0) + 512 + 64 + 128;
+    const int shmem = (K >= 2 ? 2 * edges * sizeof(half) : 0) + L * sizeof(half) + 64 + 128;
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
-    auto kernel = quantize_tiles_kernel_instances[K - 1 + 8 * cb];
+    TORCH_CHECK(L == 256 || cb == 2, "quantize_tiles length 160 requires the mul1 codebook");
+    auto kernel = L == 256 ?
+        quantize_tiles_kernel_instances[K - 1 + 8 * cb] :
+        quantize_tiles_kernel_instances_l160[K - 1];
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
     cuda_check(cudaPeekAtLastError());
 
@@ -76,9 +88,9 @@ void quantize_tiles
         const int bsz = MIN(max_batch_size, num_tiles - batch_i);
         kernel<<<bsz, NUM_THREADS, shmem, stream>>>
         (
-            ((const float*) input_tiles.data_ptr()) + 256 * batch_i,
-            ((float*) output_tiles.data_ptr()) + 256 * batch_i,
-            ((uint16_t*) output_indices.data_ptr()) + 256 * batch_i,
+            ((const float*) input_tiles.data_ptr()) + (int64_t) L * batch_i,
+            ((float*) output_tiles.data_ptr()) + (int64_t) L * batch_i,
+            ((uint16_t*) output_indices.data_ptr()) + (int64_t) L * batch_i,
             (half*) temp_costs.data_ptr(),
             (uint16_t*) temp_edges.data_ptr()
         );

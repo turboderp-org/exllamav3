@@ -64,6 +64,7 @@ class Qwen3_5MTPInputLayer(Module):
             out_dtype = out_dtype,
             pad_to = 1,
             qbits_key = qbits_key,
+            select_hq_bits = 1,
         )
 
         self.register_submodule(self.pre_fc_norm_hidden)

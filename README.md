@@ -34,6 +34,8 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Gemma 4** (Gemma4ForConditionalGeneration, Gemma4UnifiedForConditionalGeneration) *- multimodal* (E2B/E4B currently not supported)
 - **GLM 4**, **GLM 4.5**, **GLM 4.5-Air**, **GLM 4.6** (Glm4ForCausalLM, Glm4MoeForCausalLM)
 - **GLM 4.1V**, **GLM 4.5V** (Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration) *- multimodal*
+- **GLM 5.2** (GlmMoeDsaForCausalLM)
+- **GLM 5.3-Flash** (Glm5NextForConditionalGeneration) *- multimodal*
 - **GPT-OSS** (GptOssForCausalLM)
 - **HyperCLOVAX** (HyperCLOVAXForCausalLM, HCXVisionV2ForCausalLM) *- multimodal*
 - **Hy3** (HYV3ForCausalLM)
@@ -56,6 +58,7 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **Qwen 3-VL MoE** (Qwen3VLMoeForConditionalGeneration) *- multimodal*
 - **Qwen 3.5** (Qwen3_5ForConditionalGeneration) *- multimodal*
 - **Qwen 3.5 MoE** (Qwen3_5MoeForConditionalGeneration) *- multimodal*
+- **Qwen 3.8-Flash-Next** (Qwen4ExpForConditionalGeneration) *- multimodal*
 - **Seed-OSS** (SeedOssForCausalLM)
 - **SmolLM** (SmolLM3ForCausalLM)
 - **SolarOpen** (SolarOpenForCausalLM)

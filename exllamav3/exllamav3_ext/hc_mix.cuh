@@ -40,5 +40,17 @@ void hc_apply
     at::Tensor x,
     const at::Tensor& y,
     const at::Tensor& post,
-    const at::Tensor& comb
+    const c10::optional<at::Tensor>& comb
+);
+
+void gr_mix
+(
+    const at::Tensor& streams,
+    const at::Tensor& fn,
+    const at::Tensor& upt,
+    const at::Tensor& w,
+    double rms_eps,
+    at::Tensor dots,
+    c10::optional<at::Tensor> post,
+    at::Tensor mixed
 );

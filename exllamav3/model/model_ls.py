@@ -34,6 +34,7 @@ class Model_LSMixin(ABC):
         modules: list,
         verbose: bool
     ):
+        pin = config.infer_params.vision_pinned and getattr(self, "component", "text") == "vision"
         with ProgressBar(f"Loading" if progressbar else None, len(modules)) as progress:
             for idx, module in enumerate(modules):
                 defer = module.can_defer_load()
@@ -42,6 +43,10 @@ class Model_LSMixin(ABC):
                 module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
                 if defer:
                     config.stc.end_deferred_load()
+                if pin:
+                    # After the deferred fills have landed: linear weights move to pinned host
+                    # memory (zero-copy aliases), everything else stays put
+                    module.pin_linears()
                 for h in getattr(config, "moe_cpu_hosts", {}).values():
                     h.commit_module(module.key)
                 progress.update(idx + 1)
@@ -109,13 +114,19 @@ class Model_LSMixin(ABC):
                 if callback_sync: callback_sync(idx, len(modules))
                 if generator: yield idx, len(modules)
 
-                # Narrow state to max_output_size for logit output layer
+                # Narrow state to max_output_size for logit output layer. When a live dummy state
+                # exists, refresh the backup from it: backup_shape still holds the state that
+                # ENTERED the previous module, which can have a different rank (e.g. a
+                # hyper-connection stream stack ahead of a final mixer)
                 is_logits_layer = module.caps.get("logits_output")
                 if is_logits_layer and not autosplit_no_forward:
-                    b, c, d = backup_shape
-                    backup_shape = (b, min(max_output_size, c), d)
                     if dummy_state is not None:
-                        dummy_state = dummy_state[:, :max_output_size, :]
+                        dummy_state = dummy_state[:, :max_output_size]
+                        backup_shape = dummy_state.shape
+                        backup_dtype = dummy_state.dtype
+                    else:
+                        b, c, *rest = backup_shape
+                        backup_shape = (b, min(max_output_size, c), *rest)
 
                 while True:
                     try:
@@ -152,6 +163,11 @@ class Model_LSMixin(ABC):
                         module.load(load_device, max_chunk_size = max_chunk_size)
                         if defer:
                             config.stc.end_deferred_load()
+                        if config.infer_params.vision_pinned and \
+                                getattr(self, "component", "text") == "vision":
+                            # Before the measuring forward, so the VRAM accounting reflects the
+                            # pinned (host-resident) weights
+                            module.pin_linears()
 
                         # Forward dummy state through module. The forward runs the real cached
                         # attention path, so any dequant temporaries a quantized cache layer
@@ -160,7 +176,7 @@ class Model_LSMixin(ABC):
                             dummy_state = module.prepare_for_device(dummy_state, params)
                             dummy_state = module.forward(dummy_state, params)
                             for sm in module:
-                                module.autosplit_extra_measure(params)
+                                sm.autosplit_extra_measure(params)
 
                         # Account for max_output_factor after last layer
                         extra_dummy_out_states = None

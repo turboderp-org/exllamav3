@@ -269,7 +269,7 @@ void exl3_moe_cpu_worker_run
     const bool hprof = getenv("EXL3_MOE_HANDOFF_PROF") != nullptr;
     double hp_gap = 0.0, hp_spin = 0.0, hp_comp = 0.0;
     double hp_gap_mx = 0.0, hp_spin_mx = 0.0, hp_comp_mx = 0.0;
-    long hp_jobs = 0;
+    long hp_jobs = 0, hp_empty = 0, hp_assign = 0, hp_rows = 0;
     auto hp_prev_end = std::chrono::steady_clock::now();
 
     store_release_u32(ready, 1);
@@ -319,9 +319,23 @@ void exl3_moe_cpu_worker_run
                 // selected expert is CPU-resident, so an all-inactive job is a pure no-op
                 const int32_t* selp = reinterpret_cast<const int32_t*>(slot + off_sel);
                 const int total = (int) job.rows * (int) job.topk;
-                run = false;
-                for (int i = 0; i < total; ++i)
-                    if (selp[i] >= 0) { run = true; break; }
+                if (hprof)
+                {
+                    // Full-count variant: CPU-assignment stats for the profiler report
+                    int n = 0;
+                    for (int i = 0; i < total; ++i)
+                        if (selp[i] >= 0) n++;
+                    run = n > 0;
+                    hp_assign += n;
+                    hp_rows += (int) job.rows;
+                    if (!run) hp_empty++;
+                }
+                else
+                {
+                    run = false;
+                    for (int i = 0; i < total; ++i)
+                        if (selp[i] >= 0) { run = true; break; }
+                }
             }
             if (run)
                 exl3_moe_cpu_forward_raw(
@@ -352,12 +366,15 @@ void exl3_moe_cpu_worker_run
             if (++hp_jobs % 64 == 0)
             {
                 printf(" -- handoff prof (%ld jobs, ms/job avg|max): gap %.3f|%.3f "
-                       "spin %.3f|%.3f compute %.3f|%.3f\n",
+                       "spin %.3f|%.3f compute %.3f|%.3f | empty %ld/64, "
+                       "cpu-assign/row %.2f\n",
                        hp_jobs, hp_gap / 64, hp_gap_mx, hp_spin / 64, hp_spin_mx,
-                       hp_comp / 64, hp_comp_mx);
+                       hp_comp / 64, hp_comp_mx, hp_empty,
+                       hp_rows ? (double) hp_assign / (double) hp_rows : 0.0);
                 fflush(stdout);
                 hp_gap = hp_spin = hp_comp = 0.0;
                 hp_gap_mx = hp_spin_mx = hp_comp_mx = 0.0;
+                hp_empty = 0; hp_assign = 0; hp_rows = 0;
             }
         }
     }

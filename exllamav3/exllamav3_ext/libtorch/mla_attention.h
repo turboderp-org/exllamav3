@@ -104,6 +104,13 @@ struct BC_MLAttention
     int index_n_heads = 0;
     int index_head_dim = 0;
     int index_topk = 0;
+    // K-pool compression (GLM5.3): plane rows are packed [k || gate_scores] (2 * D_i wide),
+    // pooled keys live in a second plane and scoring/top-k run over pools
+    int index_kpool = 0;
+    bool index_kpool_tail = true;
+    c10::optional<at::Tensor> idx_gate_w;      // (hidden, D_i) fp16
+    c10::optional<at::Tensor> idx_kpool_ape;   // (P, D_i) fp16
+    c10::optional<at::Tensor> cache_kpool;     // flat (pages * page_size / P, D_i) fp16
 
     struct Slot
     {
@@ -152,8 +159,11 @@ struct BC_MLAttention
         at::Tensor dsa_arr;   // (2, MAX_BSZ) i32 per-job [q_pos0; past + q_len], bsz > 1 only:
                               // filled on device from cache_seqlens each step (dsa_seq_state)
         at::Tensor dsa_ws_ml, dsa_ws_acc;
+        at::Tensor gidx;      // (R, D_i) gate-score rows (kpool)
+        at::Tensor pool_idx;  // (R, KP_pool) selected pool ids (kpool sparse)
         std::shared_ptr<TritonKernel> k_idx_norm, k_plane_append, k_fewq,
             k_dsa_split, k_dsa_combine;
+        std::shared_ptr<TritonKernel> k_gate_append, k_pool_update, k_pool_expand;
         int dsa_hb = 0;
         int dsa_splits = 0;
         int fewq_gy = 0;
@@ -206,7 +216,12 @@ struct BC_MLAttention
         c10::optional<at::Tensor> kidx,
         int n_heads,
         int head_dim,
-        int topk
+        int topk,
+        int kpool = 0,
+        bool kpool_tail = true,
+        c10::optional<at::Tensor> gate_w = {},
+        c10::optional<at::Tensor> kpool_ape = {},
+        c10::optional<at::Tensor> kpool_plane = {}
     );
 
     bool needs_configure(int bsz, int q_len, int regime);
@@ -267,7 +282,12 @@ struct BC_MLAttention
         std::shared_ptr<TritonKernel> k_dsa_combine,
         int dsa_hb,
         int dsa_splits,
-        int fewq_gy
+        int fewq_gy,
+        c10::optional<at::Tensor> gidx = {},
+        c10::optional<at::Tensor> pool_idx = {},
+        std::shared_ptr<TritonKernel> k_gate_append = nullptr,
+        std::shared_ptr<TritonKernel> k_pool_update = nullptr,
+        std::shared_ptr<TritonKernel> k_pool_expand = nullptr
     );
 
     void run

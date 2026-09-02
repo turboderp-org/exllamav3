@@ -135,6 +135,14 @@ class TransformersBackend:
         self.device = device
         self.dtype = dtype
         self.streaming = options.get("streaming", False)
+        # w4a4_sim: emulate NVFP4 activation quantization (ModelOpt W4A4 recipe) on the
+        # quantized expert GEMMs: static per-expert input_scale (calibrated global) + dynamic
+        # per-16-group e4m3 scales + e2m1 values, computed in fp32 and applied as fake-quant
+        # before the bf16 GEMMs. Weight-side fidelity of the same quantizer: 99.88% of stored
+        # e2m1 codes reproduced bit-exact from the bf16 originals
+        self.w4a4_sim = options.get("w4a4_sim", False)
+        self.shard_shims = []
+        self.a4_wraps = []
         self.shard_handles = {}
 
         if self.streaming:
@@ -394,6 +402,11 @@ class TransformersBackend:
             # Multimodal encoder stacks don't contribute to text logits; the exllamav3 engine
             # walks only the text component, so exclude them here for a comparable bpw_layer
             if any(k in name for k in ("vision", "visual", "mm_projector", "multi_modal", "audio_tower")):
+                continue
+            # Match the exl3/GGUF conventions (Linear-module weights only): hyper-connection
+            # matrices, short-conv kernels and scalar shared-expert gates are excluded there
+            if "hyper_connection" in name or "shared_expert_gate" in name \
+                    or name.endswith("conv1d.weight"):
                 continue
             is_qmeta = any(name.endswith(s) for s in qmeta_suffixes)
             if (name.endswith("_packed") or name.endswith(".qweight")) and pack_num_bits:
@@ -673,6 +686,12 @@ class TransformersBackend:
             groups = []
             for sp in sources:
                 base = prefix + sp
+                if "*" not in base:
+                    # Literal (non-wildcard) source, e.g. glm5_next's per-head conv weights
+                    # q/k/v_conv1d.weight -> Concatenate into conv1d.weight: resolve the
+                    # single tensor directly (recursively, so quantized formats dequantize)
+                    groups.append(self._get_tensor(base))
+                    continue
                 if base.endswith(".weight"):
                     stem_re = re.compile(
                         "^" + re.escape(base[:-len(".weight")]).replace(r"\*", r"(\d+)") + r"\.weight(_packed)?$"
@@ -716,8 +735,15 @@ class TransformersBackend:
     def _materialize(self, module):
         prefix = self.prefix[id(module)]
         sd = {}
+        shims = []
         for pn, _ in module.named_parameters():
             full = f"{prefix}.{pn}" if prefix else pn
+            if full not in self.tensor_index and full.endswith(".weight") \
+                    and f"{full[: -len('.weight')]}.shard_0.weight" in self.tensor_index:
+                # Parameter stored as shard_N pieces too large to concatenate (Qwen4Exp's
+                # ~100 GB n-gram table): serve it from the mmapped shards instead
+                shims.append(pn)
+                continue
             t = self._get_tensor(full)
             if t.is_floating_point() and not (t.dtype == torch.float32 and self._plain_fp32(full)):
                 t = t.to(self.device, self.dtype)
@@ -725,11 +751,93 @@ class TransformersBackend:
                 t = t.to(self.device)
             sd[pn] = t
         module.load_state_dict(sd, strict = False, assign = True)
+        for pn in shims:
+            self._install_shard_shim(module, prefix, pn)
         for pn, p in module.named_parameters():
             if p.is_meta:
                 raise RuntimeError(f"No checkpoint tensor for {self.prefix[id(module)]}.{pn}")
+        if self.w4a4_sim:
+            self._install_a4_wraps(module, prefix)
+
+    NVFP4_POS = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+    def _nvfp4_fq(self, x, gs):
+        """NVFP4 fake-quant: per-16-group e4m3 scale = e4m3(amax / 6 / gs), values rounded to
+        the e2m1 grid. Returns x.dtype."""
+        lut = self.NVFP4_POS.to(x.device)
+        mid = (lut[1:] + lut[:-1]) / 2
+        xr = x.float().reshape(-1, 16)
+        amax = xr.abs().amax(dim = 1, keepdim = True)
+        sg = (amax / 6.0 / gs).to(torch.float8_e4m3fn).float() * gs
+        sg = torch.where(sg == 0, torch.ones_like(sg), sg)
+        q = xr / sg
+        v = lut[torch.bucketize(q.abs().clamp(max = 6.0), mid)] * q.sign()
+        return (v * sg).reshape(x.shape).to(x.dtype)
+
+    def _install_a4_wraps(self, module, prefix):
+        """Wrap fused-expert modules (Qwen3Next-style forward(hidden, top_k_index,
+        top_k_weights)) with per-expert activation fake-quant, when the checkpoint carries
+        per-expert input_scale tensors for them."""
+        import torch.nn.functional as F
+        for name, sub in module.named_modules():
+            pset = dict(sub.named_parameters(recurse = False))
+            if "gate_up_proj" not in pset or "down_proj" not in pset:
+                continue
+            stem = f"{prefix}.{name}" if prefix else name
+            E = pset["gate_up_proj"].shape[0]
+            if f"{stem}.0.gate_proj.input_scale" not in self.tensor_index:
+                continue
+            gs = torch.tensor([float(self._read_shard(f"{stem}.{e}.gate_proj.input_scale"))
+                               for e in range(E)])
+            ds = torch.tensor([float(self._read_shard(f"{stem}.{e}.down_proj.input_scale"))
+                               for e in range(E)])
+            orig = sub.forward
+
+            def a4_forward(hidden_states, top_k_index, top_k_weights, _m = sub, _gs = gs, _ds = ds):
+                final = torch.zeros_like(hidden_states)
+                with torch.no_grad():
+                    mask = F.one_hot(top_k_index, num_classes = _m.num_experts).permute(2, 1, 0)
+                    hit = torch.greater(mask.sum(dim = (-1, -2)), 0).nonzero()
+                for e in hit:
+                    e = int(e[0])
+                    if e == _m.num_experts:
+                        continue
+                    pos, tok = torch.where(mask[e])
+                    cs = self._nvfp4_fq(hidden_states[tok], float(_gs[e]))
+                    gate, up = F.linear(cs, _m.gate_up_proj[e]).chunk(2, dim = -1)
+                    h = _m.act_fn(gate) * up
+                    h = self._nvfp4_fq(h, float(_ds[e]))
+                    h = F.linear(h, _m.down_proj[e])
+                    h = h * top_k_weights[tok, pos, None]
+                    final.index_add_(0, tok, h.to(final.dtype))
+                return final
+
+            sub.forward = a4_forward
+            self.a4_wraps.append((sub, orig))
+
+    def _install_shard_shim(self, module, prefix, pn):
+        stem_local = pn[: -len(".weight")]
+        stem_full = f"{prefix}.{stem_local}" if prefix else stem_local
+        shards = []
+        while f"{stem_full}.shard_{len(shards)}.weight" in self.tensor_index:
+            shards.append(self._read_shard(f"{stem_full}.shard_{len(shards)}.weight"))
+        owner = module.get_submodule(stem_local)
+        parent_path, _, owner_name = stem_local.rpartition(".")
+        parent = module.get_submodule(parent_path) if parent_path else module
+        # fp8-stored tables (Qwen3.8-Flash-Next nvfp4 export) carry one global weight_scale
+        scale = None
+        if f"{stem_full}.weight_scale" in self.tensor_index:
+            scale = self._read_shard(f"{stem_full}.weight_scale").float().flatten()[0].item()
+        parent._modules[owner_name] = _ShardGatherEmbedding(shards, self.dtype, scale)
+        self.shard_shims.append((parent, owner_name, owner))
 
     def _dematerialize(self, module):
+        while self.a4_wraps:
+            sub, orig = self.a4_wraps.pop()
+            sub.forward = orig
+        while self.shard_shims:
+            parent, name, orig = self.shard_shims.pop()
+            parent._modules[name] = orig            # original keeps its meta weight
         for sub in module.modules():
             for pn, p in list(sub._parameters.items()):
                 if p is not None and not p.is_meta:
@@ -763,37 +871,123 @@ class TransformersBackend:
         walk(base)
         hook_modules = [embed] + list(layers) + extra
 
+        # Layer-major streaming: every weight is read exactly ONCE for the whole trace, and
+        # every row runs unpadded at its own length. Each row's forward runs in its own
+        # thread; the module hooks act as a scheduler that inverts the loop order without
+        # knowing any model's dataflow: a hooked module materializes once, the rows pass
+        # through it one at a time (other threads suspend at the pre-hook), then it
+        # dematerializes and the next module (discovered dynamically from whichever module
+        # the lead row requests next) begins. Suspended rows hold only their inter-module
+        # activations on the device. This replaced a chunked row-major scheme that re-read
+        # all weights per chunk and hit two batched-forward failure modes besides (FLA int32
+        # byte-offset overflow past 2^31 bytes of activation, and eager sparse-attention
+        # indexers materializing (rows, len, heads, len) fp32 scores over the padded width)
+        import threading
+
+        nz = ids != 0
+        row_len = (ids.shape[1] - nz.flip(1).int().argmax(dim = 1)) * nz.any(dim = 1).int()
+        row_len = row_len.clamp(min = 1).tolist()
+        num_rows = ids.shape[0]
+
         pb_state = {"n": 0}
         pb = ProgressBar("Streaming", len(hook_modules) + 1)
 
+        cv = threading.Condition()
+        st = {"active": None, "turn": 0, "error": None}
+        tls = threading.local()
+
+        def fail(e):
+            if st["error"] is None:
+                st["error"] = e
+            cv.notify_all()
+
         def pre_hook(module, args):
-            self._materialize(module)
+            me = id(module)
+            load = False
+            with cv:
+                while True:
+                    if st["error"] is not None:
+                        raise RuntimeError("layer-major streaming aborted")
+                    if st["turn"] == tls.row:
+                        if st["active"] == me:
+                            return
+                        if st["active"] is None:
+                            st["active"] = "loading"
+                            load = True
+                            break
+                        if st["active"] != "loading":
+                            fail(RuntimeError(
+                                f"module sequence diverged between rows: row {tls.row} "
+                                f"reached {self.prefix.get(me, '?')} while another module "
+                                f"is active (a hooked module is invoked more than once "
+                                f"per forward, or rows take different paths)"))
+                            raise RuntimeError("layer-major streaming aborted")
+                    cv.wait(1.0)
+            # materialize outside the lock (heavy I/O); other rows keep waiting on "loading"
+            try:
+                self._materialize(module)
+            except Exception as e:
+                with cv:
+                    fail(e)
+                raise
+            with cv:
+                st["active"] = me
+                cv.notify_all()
 
         def post_hook(module, args, output):
-            self._dematerialize(module)
-            pb_state["n"] += 1
-            pb.update(pb_state["n"])
+            with cv:
+                st["turn"] += 1
+                if st["turn"] == num_rows:
+                    self._dematerialize(module)
+                    st["active"] = None
+                    st["turn"] = 0
+                    pb_state["n"] += 1
+                    pb.update(pb_state["n"])
+                cv.notify_all()
 
         hooks = []
+        # Noise hooks first: they must fire inside the serialized window (before post_hook
+        # advances the turn), since their torch.Generator is not thread-safe
+        if noise_eps:
+            hooks += self._noise_hooks(noise_eps)
         for m in hook_modules:
             hooks.append(m.register_forward_pre_hook(pre_hook))
             hooks.append(m.register_forward_hook(post_hook))
-        if noise_eps:
-            hooks += self._noise_hooks(noise_eps)
+
+        hidden_cpu = [None] * num_rows
+
+        def worker(r):
+            try:
+                with torch.inference_mode(), torch.cuda.device(self.device):
+                    tls.row = r
+                    part = ids[r:r + 1, :row_len[r]].to(self.device)
+                    out = base(input_ids = part, use_cache = False).last_hidden_state
+                    hidden_cpu[r] = out.to("cpu")
+                    del out
+            except Exception as e:
+                with cv:
+                    fail(e)
 
         try:
             with pb:
-                # One batched pass: every weight is read exactly once. Activations are
-                # rows x len x hidden, tiny next to the weights being streamed
-                hidden = base(input_ids = ids.to(self.device), use_cache = False).last_hidden_state
+                threads = [threading.Thread(target = worker, args = (r,), daemon = True)
+                           for r in range(num_rows)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                if st["error"] is not None:
+                    raise st["error"]
+
                 self._materialize(head)
-                for r in range(ids.shape[0]):
-                    logits = head(hidden[r:r + 1])
+                for r in range(num_rows):
+                    logits = head(hidden_cpu[r].to(self.device))
                     if self.logit_multiplier != 1.0:
                         logits = logits * self.logit_multiplier
                     if self.logit_softcap:
                         logits = torch.tanh(logits / self.logit_softcap) * self.logit_softcap
                     callback(r, logits)
+                    hidden_cpu[r] = None
                 self._dematerialize(head)
                 pb.update(len(hook_modules) + 1)
         finally:
@@ -823,6 +1017,33 @@ class TransformersBackend:
         free_mem()
 
 
+class _ShardGatherEmbedding(torch.nn.Module):
+    """CPU replacement for a sharded-checkpoint nn.Embedding too large to materialize
+    (Qwen4Exp's 320M-row n-gram table): rows gather directly from the safetensors mmaps, so
+    only the touched pages are ever read. `weight` is a one-row CPU dummy -- the HF caller
+    routes ids to weight.device before the lookup and moves the rows back itself."""
+
+    def __init__(self, shards, dtype, scale = None):
+        super().__init__()
+        self.shards = shards                        # plain list: stays mmap-backed, unregistered
+        self.rows_per_shard = shards[0].shape[0]
+        self.out_dtype = dtype
+        self.scale = scale                          # global dequant scale (fp8-stored tables)
+        self.weight = shards[0][:1].float().mul(scale or 1.0).to(dtype)
+
+    def forward(self, ids):
+        flat = ids.reshape(-1)
+        out = torch.empty((flat.numel(), self.shards[0].shape[1]), dtype = self.out_dtype)
+        sh = flat // self.rows_per_shard
+        for s in sh.unique().tolist():
+            m = sh == s
+            rows = self.shards[s][flat[m] - s * self.rows_per_shard].float()
+            if self.scale is not None:
+                rows = rows * self.scale
+            out[m] = rows.to(self.out_dtype)
+        return out.view(*ids.shape, -1)
+
+
 def gguf_shards(source: str) -> list:
     """All files of a split GGUF ("...-00001-of-00003.gguf" naming); [source] when unsplit"""
     import re
@@ -839,13 +1060,40 @@ def gguf_shards(source: str) -> list:
 def gguf_storage_info(source: str) -> dict:
     """bpw/vram accounting over the full tensor table, spanning all shards of a split GGUF.
     Norms/biases are < 2 dims; router gates excluded by name; token_embd serves as the head
-    fallback for tied models, overridden by output.weight when present in any shard"""
+    fallback for tied models, overridden by output.weight when present in any shard. The PLE
+    n-gram table (per_layer_token_embd, Qwen3.8-Flash-Next) is excluded like the embedding:
+    the exl3 engine keeps its table out of bpw_layer/vram too (out-of-line file). Hyper-
+    connection matrices (hc_*/output_hc_*) and short-conv kernels (*_conv1d) are excluded to
+    match the exl3 walk, which counts Linear modules only. Known residual asymmetry: for archs
+    whose exl3 routing gate IS a Linear (qwen4exp), exl3 counts it (~0.05% of weights) while
+    GGUF_ROUTER_KEYS excludes it here.
+    NextN/MTP prediction blocks (packed as the last {arch}.nextn_predict_layers of
+    {arch}.block_count) are excluded: the other engines also count decoder layers + head only"""
     from gguf import GGUFReader
     sum_bits = sum_numel = head_bits = head_numel = 0
     head_is_fallback = True
-    for shard in gguf_shards(source):
+    mtp_prefixes = ()
+    for shard_idx, shard in enumerate(gguf_shards(source)):
         reader = GGUFReader(shard)
+        if shard_idx == 0:
+            def kv(key):
+                f = reader.fields.get(key)
+                if f is None:
+                    return None
+                try:
+                    return f.contents()
+                except Exception:
+                    import numpy as np
+                    return int(np.array(f.parts[f.data[0]]).flatten()[0])
+            arch = kv("general.architecture")
+            if arch:
+                nextn = kv(f"{arch}.nextn_predict_layers") or 0
+                blocks = kv(f"{arch}.block_count")
+                if nextn and blocks:
+                    mtp_prefixes = tuple(f"blk.{i}." for i in range(int(blocks) - int(nextn), int(blocks)))
         for t in reader.tensors:
+            if mtp_prefixes and t.name.startswith(mtp_prefixes):
+                continue
             if t.name == "output.weight" or (t.name == "token_embd.weight" and head_is_fallback):
                 head_bits = t.n_bytes * 8
                 head_numel = t.n_elements
@@ -853,9 +1101,11 @@ def gguf_storage_info(source: str) -> dict:
                     head_is_fallback = False
             elif (
                 t.name.endswith(".weight")
-                and t.name != "token_embd.weight"
+                and t.name not in ("token_embd.weight", "per_layer_token_embd.weight")
                 and len(t.shape) >= 2
                 and not any(k in t.name for k in GGUF_ROUTER_KEYS)
+                and ".hc_" not in t.name and not t.name.startswith("output_hc_")
+                and not t.name.endswith("_conv1d.weight")
             ):
                 sum_bits += t.n_bytes * 8
                 sum_numel += t.n_elements

@@ -50,16 +50,26 @@ class CacheLayer_MLA_fp16(CacheLayer):
             # per-token indexer-key plane alongside the latent
             idx_dim = getattr(attention, "idx_plane_dim", None)
             self.shape_i = (pages, PAGE_SIZE, idx_dim) if idx_dim else None
+            # K-pool indexer compression (GLM5.3): a pooled-key plane maintained
+            # incrementally, one entry per kpool consecutive tokens (pools never straddle
+            # pages since PAGE_SIZE % kpool == 0)
+            kpool = getattr(attention, "index_kpool", 0)
+            self.kpool = kpool if (idx_dim and kpool) else 0
+            self.shape_p = (pages, PAGE_SIZE // kpool, attention.index_head_dim) \
+                if self.kpool else None
         else:
             self.kv_lora_rank = None
             self.qk_rope_head_dim = None
             self.shape_c = None
             self.shape_r = None
             self.shape_i = None
+            self.kpool = 0
+            self.shape_p = None
 
         self.k = None      # latent, (pages, PAGE_SIZE, 1, kv_lora_rank)
         self.v = None      # rope key, (pages, PAGE_SIZE, 1, qk_rope_head_dim)
         self.k_idx = None  # indexer keys, (pages, PAGE_SIZE, index_head_dim), roped
+        self.k_pool = None # pooled indexer keys, (pages, PAGE_SIZE // kpool, index_head_dim)
         self.device = None
 
 
@@ -69,6 +79,7 @@ class CacheLayer_MLA_fp16(CacheLayer):
         self.k = torch.zeros(self.shape_c, dtype = torch.half, device = device) if self.shape_c else None
         self.v = torch.zeros(self.shape_r, dtype = torch.half, device = device) if self.shape_r else None
         self.k_idx = torch.zeros(self.shape_i, dtype = torch.half, device = device) if self.shape_i else None
+        self.k_pool = torch.zeros(self.shape_p, dtype = torch.half, device = device) if self.shape_p else None
 
 
     @override
@@ -77,6 +88,7 @@ class CacheLayer_MLA_fp16(CacheLayer):
         self.k = None
         self.v = None
         self.k_idx = None
+        self.k_pool = None
 
 
     @override
@@ -130,6 +142,18 @@ class CacheLayer_MLA_fp16(CacheLayer):
         return self.k_idx
 
 
+    def get_pool(self) -> torch.Tensor:
+        return self.k_pool
+
+
+    def update_pool_direct(self, pool_seqlens: torch.Tensor, block_table: torch.Tensor,
+                           pool_keys: torch.Tensor):
+        """Append newly completed pooled keys, shaped (bsz, n_new, index_head_dim);
+        pool_seqlens counts existing complete pools per row (cache_seqlens // kpool)."""
+        from ..modules.attention_fn.mla_triton import mla_plane_append
+        mla_plane_append(pool_keys, self.k_pool, block_table, pool_seqlens)
+
+
     @override
     def copy_page(self, source: CacheLayer_MLA_fp16, from_page: int, to_page: int, num_tokens: int):
         assert self.shape_c == source.shape_c and self.shape_r == source.shape_r
@@ -137,11 +161,15 @@ class CacheLayer_MLA_fp16(CacheLayer):
         self.v[to_page, :num_tokens, :, :].copy_(source.v[from_page, :num_tokens, :, :], non_blocking = True)
         if self.k_idx is not None:
             self.k_idx[to_page, :num_tokens, :].copy_(source.k_idx[from_page, :num_tokens, :], non_blocking = True)
+        if self.k_pool is not None:
+            # Pool entries covering the copied tokens (partial-pool entries are never read)
+            n_pool = -(-num_tokens // self.kpool)
+            self.k_pool[to_page, :n_pool, :].copy_(source.k_pool[from_page, :n_pool, :], non_blocking = True)
 
 
     @override
     def get_tensors(self):
-        return [t for t in [self.k, self.v, self.k_idx] if t is not None]
+        return [t for t in [self.k, self.v, self.k_idx, self.k_pool] if t is not None]
 
 
     @override
@@ -217,16 +245,23 @@ class CacheLayer_MLA_quant(CacheLayer):
             self.shape_r = (pages, PAGE_SIZE, 1, self.qk_rope_head_dim)
             idx_dim = getattr(attention, "idx_plane_dim", None)
             self.shape_i = (pages, PAGE_SIZE, idx_dim) if idx_dim else None
+            kpool = getattr(attention, "index_kpool", 0)
+            self.kpool = kpool if (idx_dim and kpool) else 0
+            self.shape_p = (pages, PAGE_SIZE // kpool, attention.index_head_dim) \
+                if self.kpool else None
         else:
             self.qshape = None
             self.sshape = None
             self.shape_r = None
             self.shape_i = None
+            self.kpool = 0
+            self.shape_p = None
 
         self.qk = None     # packed latent, int32
         self.sk = None     # fp16 group scales
         self.v = None      # rope key, fp16
         self.k_idx = None  # indexer keys, fp16, roped
+        self.k_pool = None # pooled indexer keys, fp16
         self.device = None
         self._scratch = {}
 
@@ -238,6 +273,7 @@ class CacheLayer_MLA_quant(CacheLayer):
         self.sk = torch.zeros(self.sshape, dtype = torch.half, device = device) if self.sshape else None
         self.v = torch.zeros(self.shape_r, dtype = torch.half, device = device) if self.shape_r else None
         self.k_idx = torch.zeros(self.shape_i, dtype = torch.half, device = device) if self.shape_i else None
+        self.k_pool = torch.zeros(self.shape_p, dtype = torch.half, device = device) if self.shape_p else None
 
 
     @override
@@ -247,6 +283,7 @@ class CacheLayer_MLA_quant(CacheLayer):
         self.sk = None
         self.v = None
         self.k_idx = None
+        self.k_pool = None
         self._scratch = {}
 
 
@@ -312,6 +349,16 @@ class CacheLayer_MLA_quant(CacheLayer):
         return self.k_idx
 
 
+    def get_pool(self) -> torch.Tensor:
+        return self.k_pool
+
+
+    def update_pool_direct(self, pool_seqlens: torch.Tensor, block_table: torch.Tensor,
+                           pool_keys: torch.Tensor):
+        from ..modules.attention_fn.mla_triton import mla_plane_append
+        mla_plane_append(pool_keys, self.k_pool, block_table, pool_seqlens)
+
+
     @override
     def copy_page(self, source: CacheLayer_MLA_quant, from_page: int, to_page: int, num_tokens: int):
         assert self.qshape == source.qshape and self.shape_r == source.shape_r
@@ -320,11 +367,14 @@ class CacheLayer_MLA_quant(CacheLayer):
         self.v[to_page, :num_tokens, :, :].copy_(source.v[from_page, :num_tokens, :, :], non_blocking = True)
         if self.k_idx is not None:
             self.k_idx[to_page, :num_tokens, :].copy_(source.k_idx[from_page, :num_tokens, :], non_blocking = True)
+        if self.k_pool is not None:
+            n_pool = -(-num_tokens // self.kpool)
+            self.k_pool[to_page, :n_pool, :].copy_(source.k_pool[from_page, :n_pool, :], non_blocking = True)
 
 
     @override
     def get_tensors(self):
-        return [t for t in [self.qk, self.sk, self.v, self.k_idx] if t is not None]
+        return [t for t in [self.qk, self.sk, self.v, self.k_idx, self.k_pool] if t is not None]
 
 
     @override

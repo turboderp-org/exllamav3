@@ -20,6 +20,7 @@ from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
 from .glm_moe_dsa import GlmMoeDsaModel
+from .glm5_next import Glm5NextModel
 from .gpt_oss import GptOssModel
 from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
@@ -44,6 +45,7 @@ from .qwen2 import Qwen2Model
 from .qwen2_5_vl import Qwen2_5VLModel
 from .qwen3 import Qwen3Model
 from .qwen3_5 import Qwen3_5Model, Qwen3_5MoeModel, Qwen3_5VLModel, Qwen3_5VLMoeModel
+from .qwen4_exp import Qwen4ExpModel
 from .qwen3_moe import Qwen3MoeModel
 from .qwen3_next import Qwen3NextModel
 from .qwen3_vl import Qwen3VLModel
@@ -84,6 +86,7 @@ ARCHITECTURES = {
         Glm4VModel,
         Glm4VMoeModel,
         GlmMoeDsaModel,
+        Glm5NextModel,
         GptOssModel,
         HCXVisionV2Model,
         HyV3Model,
@@ -115,6 +118,7 @@ ARCHITECTURES = {
         Qwen3NextModel,
         Qwen3VLModel,
         Qwen3VLMoeModel,
+        Qwen4ExpModel,
         SeedOssModel,
         SmolLM3Model,
         SolarOpenMoeModel,

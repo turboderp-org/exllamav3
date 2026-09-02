@@ -183,26 +183,31 @@ __global__ void moe_bias_add_kernel
     const int stride,
     const int width,
     const int min_expert,
-    const int max_expert
+    const int max_expert,
+    const int packed
 )
 {
     int col = blockIdx.x * C2D_THREADS + threadIdx.x;
     int k = blockIdx.y;
     if (col >= width) return;
     // Expert-parallel split: sel holds global expert indices but the pointer table only covers the
-    // local range, and the mgemm PACKS its output rows to the local entries of sel (in order). Skip
-    // foreign experts and add each local expert's bias at its packed row, not its position in sel
+    // local range. Skip foreign experts. At num_tokens == 1 the mgemm PACKS its output rows to the
+    // local entries of sel (in order), so the bias lands at the packed row; at num_tokens > 1 the
+    // mgemm masks in place (position-preserving), so the bias lands at the slot's own row
     int64_t e = sel[k];
     int row = k;
     if (min_expert >= 0)
     {
         if (e < min_expert || e >= max_expert) return;
         e -= min_expert;
-        row = 0;
-        for (int i = 0; i < k; ++i)
+        if (packed)
         {
-            int64_t ei = sel[i];
-            if (ei >= min_expert && ei < max_expert) row++;
+            row = 0;
+            for (int i = 0; i < k; ++i)
+            {
+                int64_t ei = sel[i];
+                if (ei >= min_expert && ei < max_expert) row++;
+            }
         }
     }
     const half* b = (const half*) bias_ptrs[e];
@@ -252,7 +257,8 @@ void moe_bias_add_gr
     const at::Tensor& sel,
     int min_expert,
     int max_expert,
-    Graph* graph
+    Graph* graph,
+    int num_tokens
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(interm.device());
@@ -273,7 +279,8 @@ void moe_bias_add_gr
         stride,
         width,
         min_expert,
-        max_expert
+        max_expert,
+        num_tokens == 1 ? 1 : 0
     );
     if (graph)
     {

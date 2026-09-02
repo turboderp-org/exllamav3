@@ -107,6 +107,7 @@ def main(args):
     )
 
     # Load the image component model
+    config.infer_params.vision_pinned = config.infer_params.vision_pinned or args.vision_offload
     vision_model = Model.from_config(config, component = "vision")
     vision_model.load(progressbar = True)
 
@@ -157,6 +158,7 @@ if __name__ == "__main__":
     model_init.add_args(parser, cache = True, default_cache_size = 16384, add_draft_model_args = True)
     parser.add_argument("-p", "--prompt", type = str, help = "Text prompt (default: Describe this image.)", default = "Describe this image.")
     parser.add_argument("-nr", "--no_render", action = "store_true", help = "Don't render images in the terminal")
+    parser.add_argument("-vo", "--vision_offload", action = "store_true", help = "Offload vision tower to system memory")
     parser.add_argument("input", nargs = "+", type = str, help = "Input files")
     _args = parser.parse_args()
     main(_args)

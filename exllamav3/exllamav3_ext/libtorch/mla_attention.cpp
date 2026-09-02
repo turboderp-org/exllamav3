@@ -92,12 +92,19 @@ void BC_MLAttention::set_indexer
     c10::optional<at::Tensor> kidx,
     int n_heads,
     int head_dim,
-    int topk
+    int topk,
+    int kpool,
+    bool kpool_tail,
+    c10::optional<at::Tensor> gate_w,
+    c10::optional<at::Tensor> kpool_ape,
+    c10::optional<at::Tensor> kpool_plane
 )
 {
     TORCH_CHECK(mode == 1 || mode == 2, "BC_MLAttention: indexer mode must be 1 (full) or 2 (shared)");
     TORCH_CHECK(mode != 1 || (wq_b && wk_w && k_norm_w && k_norm_b && weights_w && kidx),
                 "BC_MLAttention: full indexer requires all indexer tensors");
+    TORCH_CHECK(!kpool || mode != 1 || (gate_w && kpool_ape && kpool_plane),
+                "BC_MLAttention: kpool full indexer requires gate weight, APE and pooled plane");
     idx_mode = mode;
     idx_wq_b = std::move(wq_b);
     idx_wk_w = std::move(wk_w);
@@ -108,6 +115,11 @@ void BC_MLAttention::set_indexer
     index_n_heads = n_heads;
     index_head_dim = head_dim;
     index_topk = topk;
+    index_kpool = kpool;
+    index_kpool_tail = kpool_tail;
+    idx_gate_w = std::move(gate_w);
+    idx_kpool_ape = std::move(kpool_ape);
+    cache_kpool = std::move(kpool_plane);
 }
 
 bool BC_MLAttention::needs_configure(int bsz, int q_len, int regime)
@@ -215,7 +227,12 @@ void BC_MLAttention::configure_slot_dsa
     std::shared_ptr<TritonKernel> k_dsa_combine,
     int dsa_hb,
     int dsa_splits,
-    int fewq_gy
+    int fewq_gy,
+    c10::optional<at::Tensor> gidx,
+    c10::optional<at::Tensor> pool_idx,
+    std::shared_ptr<TritonKernel> k_gate_append,
+    std::shared_ptr<TritonKernel> k_pool_update,
+    std::shared_ptr<TritonKernel> k_pool_expand
 )
 {
     TORCH_CHECK(idx_mode != 0, "BC_MLAttention: configure_slot_dsa without set_indexer");
@@ -232,6 +249,14 @@ void BC_MLAttention::configure_slot_dsa
             .narrow(3, 0, qk_rope_head_dim);
         s.k_idx_norm = k_idx_norm;
         s.k_plane_append = k_plane_append;
+        if (index_kpool)
+        {
+            TORCH_CHECK(gidx && k_gate_append && k_pool_update,
+                        "BC_MLAttention: kpool statics/kernels missing");
+            s.gidx = gidx.value();
+            s.k_gate_append = k_gate_append;
+            s.k_pool_update = k_pool_update;
+        }
     }
     if (regime == 1)
     {
@@ -254,6 +279,13 @@ void BC_MLAttention::configure_slot_dsa
                 .narrow(3, 0, qk_rope_head_dim);
             s.wts = wts.value();
             s.scores = scores.value();
+            if (index_kpool)
+            {
+                TORCH_CHECK(pool_idx && k_pool_expand,
+                            "BC_MLAttention: kpool sparse statics/kernels missing");
+                s.pool_idx = pool_idx.value();
+                s.k_pool_expand = k_pool_expand;
+            }
             s.k_fewq = k_fewq;
             s.fewq_gy = fewq_gy;
         }
@@ -362,7 +394,9 @@ void BC_MLAttention::run_gr
     }
 
     // Partial RoPE on the rope halves, in place on the statics; the position sources are patched
-    // per call and the kernel branches on the pointers at runtime
+    // per call and the kernel branches on the pointers at runtime. NoPE models (GLM5.3,
+    // qk_rope_head_dim 0) skip the stage entirely
+    if (qk_rope_head_dim > 0)
     {
         c10::optional<at::Tensor> out_k = s.kpe4;
         rope_gr(s.q_pe4, s.q_pe4, s.kpe4, out_k, inv_freq, (uint32_t) position, positions, position_ids,
@@ -453,6 +487,7 @@ void BC_MLAttention::run_gr
             s.k_idx_norm->launch(R, 1, 1, args, stream);
         }
         dbg("idx_norm");
+        if (qk_rope_head_dim > 0)
         {
             c10::optional<at::Tensor> no_k = {};
             c10::optional<at::Tensor> no_ko = {};
@@ -479,6 +514,57 @@ void BC_MLAttention::run_gr
                 graph->record_param(s.k_plane_append->handle(), GP_attn_seqlens, 3);
                 graph->record_param(s.k_plane_append->handle(), GP_attn_num_pages, 4, 4);
                 graph->record_param(s.k_plane_append->handle(), GP_end, 0);
+            }
+        }
+        if (index_kpool)
+        {
+            // Gate scores land in the packed plane next to the keys, then the pools touched by
+            // this append are (re)built in the pooled plane (softmax(gate + ape)-weighted key
+            // means; partial pools are written but never selected)
+            at::Tensor gidx_rows = s.gidx.narrow(0, 0, R);
+            hgemm_gr(x_rows, idx_gate_w.value(), gidx_rows, graph);
+            dbg("gate_hgemm");
+            {
+                std::vector<void*> args =
+                {
+                    (void*) s.gidx.data_ptr(),
+                    (void*) cache_kidx.value().data_ptr(),
+                    (void*) block_table.data_ptr(),
+                    (void*) cache_seqlens.data_ptr(),
+                    (void*) (intptr_t) (int) block_table.size(1),
+                    (void*) (intptr_t) q_len,
+                };
+                s.k_gate_append->launch(R, 1, 1, args, stream);
+                dbg("gate_append");
+                if (graph)
+                {
+                    graph->record_param(s.k_gate_append->handle(), GP_attn_block_table, 2);
+                    graph->record_param(s.k_gate_append->handle(), GP_attn_seqlens, 3);
+                    graph->record_param(s.k_gate_append->handle(), GP_attn_num_pages, 4, 4);
+                    graph->record_param(s.k_gate_append->handle(), GP_end, 0);
+                }
+            }
+            {
+                std::vector<void*> args =
+                {
+                    (void*) cache_kidx.value().data_ptr(),
+                    (void*) cache_kpool.value().data_ptr(),
+                    (void*) idx_kpool_ape.value().data_ptr(),
+                    (void*) block_table.data_ptr(),
+                    (void*) cache_seqlens.data_ptr(),
+                    (void*) (intptr_t) (int) block_table.size(1),
+                    (void*) (intptr_t) q_len,
+                };
+                // grid height = compiled MAXPOOLS = q_len / P + 1
+                s.k_pool_update->launch(bsz, q_len / index_kpool + 1, 1, args, stream);
+                dbg("pool_update");
+                if (graph)
+                {
+                    graph->record_param(s.k_pool_update->handle(), GP_attn_block_table, 3);
+                    graph->record_param(s.k_pool_update->handle(), GP_attn_seqlens, 4);
+                    graph->record_param(s.k_pool_update->handle(), GP_attn_num_pages, 5, 4);
+                    graph->record_param(s.k_pool_update->handle(), GP_end, 0);
+                }
             }
         }
     }
@@ -509,6 +595,7 @@ void BC_MLAttention::run_gr
             exl3_gemm_gr(s.q_a, idx_wq_b->trellis, s.qidx, idx_wq_b->suh,
                          xh.view({-1}).narrow(0, 0, (int64_t) R * q_lora_rank).view({R, q_lora_rank}),
                          idx_wq_b->svh, -1, idx_wq_b->mcg, idx_wq_b->mul1, 0, graph);
+            if (qk_rope_head_dim > 0)
             {
                 c10::optional<at::Tensor> no_k = {};
                 c10::optional<at::Tensor> no_ko = {};
@@ -523,16 +610,20 @@ void BC_MLAttention::run_gr
             {
                 // Scoring covers the full static width every step (bounds written as -inf), so
                 // no stale region survives shorter contexts. T / q_pos0 / bound_max patch
+                // kpool: score over the pooled plane; scan width and causal bound count in
+                // POOL units (the kernel's compress_rate handles the per-row token bound)
+                int64_t t_scan = index_kpool ? t_total / index_kpool : t_total;
                 std::vector<void*> args =
                 {
                     (void*) s.qidx.data_ptr(),
                     (void*) s.wts.data_ptr(),
-                    (void*) cache_kidx.value().data_ptr(),
+                    index_kpool ? (void*) cache_kpool.value().data_ptr()
+                                : (void*) cache_kidx.value().data_ptr(),
                     (void*) s.scores.data_ptr(),
-                    multirow ? (void*) arr_bound : (void*) (uintptr_t) (uint32_t) (int) t_total,
+                    multirow ? (void*) arr_bound : (void*) (uintptr_t) (uint32_t) (int) t_scan,
                     (void*) (uintptr_t) (uint32_t) R,
                     multirow ? (void*) arr_pos : (void*) (uintptr_t) (uint32_t) (int) position,
-                    multirow ? (void*) arr_bound : (void*) (uintptr_t) (uint32_t) (int) t_total,
+                    multirow ? (void*) arr_bound : (void*) (uintptr_t) (uint32_t) (int) t_scan,
                     (void*) block_table.data_ptr(),
                     (void*) (uintptr_t) (uint32_t) (multirow ? (int) block_table.size(1) : 0),
                 };
@@ -556,6 +647,26 @@ void BC_MLAttention::run_gr
             // top-k needs no scan-width patch and only reads freshly written score rows
             if (multirow)
                 dsa_topk_gr(s.scores, s.indices, index_topk, graph, arr_bound_t, q_len);
+            else if (index_kpool)
+            {
+                // Select pools, then expand to raw token indices (x P) and append the query's
+                // incomplete tail pool per row
+                dsa_topk_gr(s.scores, s.pool_idx, index_topk / index_kpool, graph);
+                dbg("pool_topk");
+                std::vector<void*> args =
+                {
+                    (void*) s.pool_idx.data_ptr(),
+                    (void*) s.indices.data_ptr(),
+                    (void*) (uintptr_t) (uint32_t) (int) position,
+                };
+                int k_pad = (int) s.indices.size(1);
+                s.k_pool_expand->launch(R, CEIL_DIVIDE(k_pad, 256), 1, args, stream);
+                if (graph)
+                {
+                    graph->record_param(s.k_pool_expand->handle(), GP_dsa_qpos, 2, 4);
+                    graph->record_param(s.k_pool_expand->handle(), GP_end, 0);
+                }
+            }
             else
                 dsa_topk_gr(s.scores, s.indices, index_topk, graph);
         dbg("topk");
@@ -726,6 +837,7 @@ void BC_MLAttention::run
     TORCH_CHECK(regime == 0 || idx_mode != 0, "BC_MLAttention: sparse regime without indexer");
     TORCH_CHECK(idx_mode != 2 || regime == 0 || ext_indices,
                 "BC_MLAttention: shared-indexer sparse step requires external indices");
+    TORCH_CHECK(!index_kpool || bsz == 1, "BC_MLAttention: kpool indexer requires bsz 1");
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
     // captured, then launched below like every later run, with only the I/O pointers patched
@@ -765,7 +877,8 @@ void BC_MLAttention::run
     // Latent projection
     params.emplace_back(GP_gemm_A, (void*) x.data_ptr());
 
-    // RoPE position sources
+    // RoPE position sources (NoPE models never captured the stage)
+    if (qk_rope_head_dim > 0)
     {
         params.emplace_back(GP_rope_inv_freq, (void*) inv_freq.data_ptr());
         params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
@@ -785,14 +898,27 @@ void BC_MLAttention::run
     if (idx_mode == 1)
     {
         params.emplace_back(GP_copy2d_src, (void*) x.data_ptr());
-        params.emplace_back(GP_rope_inv_freq, (void*) inv_freq.data_ptr());
-        params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
-        params.emplace_back(GP_rope_positions, positions ? (void*) positions.value().data_ptr() : nullptr);
-        params.emplace_back(GP_rope_position_ids, position_ids ? (void*) position_ids.value().data_ptr() : nullptr);
-        params.emplace_back(GP_rope_pid_stride, (void*) (uintptr_t) pid_stride);
+        if (qk_rope_head_dim > 0)
+        {
+            params.emplace_back(GP_rope_inv_freq, (void*) inv_freq.data_ptr());
+            params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
+            params.emplace_back(GP_rope_positions, positions ? (void*) positions.value().data_ptr() : nullptr);
+            params.emplace_back(GP_rope_position_ids, position_ids ? (void*) position_ids.value().data_ptr() : nullptr);
+            params.emplace_back(GP_rope_pid_stride, (void*) (uintptr_t) pid_stride);
+        }
         params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
         params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
         params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
+        if (index_kpool)
+        {
+            // gate plane append, then pool update
+            params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
+            params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
+            params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
+            params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
+            params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
+            params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
+        }
     }
 
     if (regime == 1)
@@ -806,11 +932,14 @@ void BC_MLAttention::run
             // the scalar scan width and clamps
             if (multirow)   // seq-state derive precedes the qidx stages in the graph
                 params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
-            params.emplace_back(GP_rope_inv_freq, (void*) inv_freq.data_ptr());
-            params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
-            params.emplace_back(GP_rope_positions, positions ? (void*) positions.value().data_ptr() : nullptr);
-            params.emplace_back(GP_rope_position_ids, position_ids ? (void*) position_ids.value().data_ptr() : nullptr);
-            params.emplace_back(GP_rope_pid_stride, (void*) (uintptr_t) pid_stride);
+            if (qk_rope_head_dim > 0)
+            {
+                params.emplace_back(GP_rope_inv_freq, (void*) inv_freq.data_ptr());
+                params.emplace_back(GP_rope_position, (void*) (uintptr_t) (uint32_t) position);
+                params.emplace_back(GP_rope_positions, positions ? (void*) positions.value().data_ptr() : nullptr);
+                params.emplace_back(GP_rope_position_ids, position_ids ? (void*) position_ids.value().data_ptr() : nullptr);
+                params.emplace_back(GP_rope_pid_stride, (void*) (uintptr_t) pid_stride);
+            }
             if (multirow)
             {
                 params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr()); // fewq
@@ -818,11 +947,16 @@ void BC_MLAttention::run
             }
             else
             {
-                params.emplace_back(GP_dsa_T, (void*) (uintptr_t) (uint32_t) (int) t_total);
+                // kpool: fewq/topk scan widths in POOL units; the expand kernel's row-0
+                // position pairs as the second GP_dsa_qpos
+                int t_scan = index_kpool ? (int) (t_total / index_kpool) : (int) t_total;
+                params.emplace_back(GP_dsa_T, (void*) (uintptr_t) (uint32_t) t_scan);
                 params.emplace_back(GP_dsa_qpos, (void*) (uintptr_t) (uint32_t) (int) position);
-                params.emplace_back(GP_dsa_bound_max, (void*) (uintptr_t) (uint32_t) (int) t_total);
+                params.emplace_back(GP_dsa_bound_max, (void*) (uintptr_t) (uint32_t) t_scan);
                 params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
-                params.emplace_back(GP_dsa_T, (void*) (uintptr_t) (uint32_t) (int) t_total);   // topk
+                params.emplace_back(GP_dsa_T, (void*) (uintptr_t) (uint32_t) t_scan);   // topk
+                if (index_kpool)
+                    params.emplace_back(GP_dsa_qpos, (void*) (uintptr_t) (uint32_t) (int) position);
             }
         }
         at::Tensor idx_t = ext_indices ? ext_indices.value() : s.indices;

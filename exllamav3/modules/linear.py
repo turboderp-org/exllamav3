@@ -445,6 +445,37 @@ class Linear(Module):
 
 
     @override
+    def pin_linears(self):
+        """Move this layer's bulk weight storage (fp16 weight or EXL3 trellis) to pinned host
+        memory and swap in a zero-copy CUDA alias, freeing the VRAM. Compute paths read the
+        weights over PCIe: fine for occasional, compute-bound vision-tower batches. Small
+        tensors (bias, suh/svh) stay in VRAM. Runs post-load, so it covers every load flavor
+        (fused/sliced/fp8-dequant) and deferred fills have already landed."""
+        inner = self.inner
+        if inner is None or self.device is None:
+            return
+        device = torch.device(self.device)
+        if device.type != "cuda":
+            return
+
+        def pin_alias(t):
+            if not t.is_contiguous():
+                t = t.contiguous()
+            p = torch.empty(t.shape, dtype = t.dtype, device = "cpu", pin_memory = True)
+            p.copy_(t)
+            return p, ext.pinned_cuda_view(p, device.index if device.index is not None else 0)
+
+        if isinstance(inner, LinearFP16) and inner.swap_device is None:
+            inner._pinned_store, inner.weight = pin_alias(inner.weight)
+            inner.bc = ext.BC_LinearFP16(inner.weight, inner.bias)
+        elif isinstance(inner, LinearEXL3):
+            from ..util.tensor import g_tensor_cache
+            inner._pinned_store, inner.trellis = pin_alias(inner.trellis)
+            inner.bc = ext.BC_LinearEXL3(
+                inner.trellis, inner.suh, inner.svh, inner.K, inner.bias,
+                inner.mcg, inner.mul1, g_tensor_cache.get(*inner.bsz1_xh_args))
+
+    @override
     def unload(self):
         if self.inner is not None:
             self.inner.unload()

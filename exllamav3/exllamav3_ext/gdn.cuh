@@ -188,6 +188,32 @@ void gdn_ba_gemv_gr
     Graph* graph
 );
 
+// Float-input fp16-weight GEMV for the KDA low-rank second stages (graph statics, no patching)
+void gdn_lowrank_gemv_f_gr
+(
+    const at::Tensor& x,            // [.., k] float
+    const at::Tensor& w_t,          // [n, k] half
+    at::Tensor& y,                  // [.., n] float
+    Graph* graph
+);
+
+// KDA (GLM5.3) helper: cast/transpose qkv to bf16 mixed_qkv, beta = sigmoid(b), per-k-channel
+// log decay from the low-rank forget path (safe-gate when lower_bound != 0, else softplus)
+void kda_gate_op_gr
+(
+    const at::Tensor& qkv,          // [B,S,F] float
+    const at::Tensor& b,            // [B,S,H] float
+    const at::Tensor& f,            // [B,S,H*Dk] float
+    const at::Tensor& dt_bias,      // [H*Dk] bfloat16
+    const at::Tensor& a_log,        // [H] float or bfloat16
+    at::Tensor& mixed_qkv,          // out [B,F,S] bfloat16
+    at::Tensor& beta,               // out [B,S,H] bfloat16
+    at::Tensor& g,                  // out [B,S,H,Dk] float
+    const float lower_bound,
+    const float beta_scale,
+    Graph* graph
+);
+
 // Batched recurrent-state rewind (speculative decoding draft rejection/commit)
 
 // conv_state shift: conv_state[slot, :, :cdim] <- conv_state[slot, :, p-cdim:p]. `dim` independent
