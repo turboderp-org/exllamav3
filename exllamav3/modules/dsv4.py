@@ -1345,6 +1345,7 @@ class DSV4Attention(Module):
         is device-driven (per-job state from `arr`, slot/block-table indirection
         in-kernel)."""
         from .attention_fn.dsa_triton import dsa_attn, _dsa_indexer_fewq_kernel
+        from .attention_fn.triton_paged import _dev_small_smem
         import triton
         device = x.device
         a_pos, a_floor, a_beg, a_ec, a_slots, a_klen = arr.unbind(0)
@@ -1380,16 +1381,21 @@ class DSV4Attention(Module):
                     int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, 1, 0)
                 wts = g_tensor_cache.get(device, (R, Hi), torch.half, "dsv4_b_wts")
                 self.idx_weights.inner.bc.run(x.view(R, -1), wts)
-                s_max = -(-kl.capacity // 128) * 128
+                # BLOCK_N 128 stages ~96 KB, which a 64 KB device (Turing) cannot hold;
+                # Triton raises OutOfResources at launch rather than recompiling smaller.
+                # s_max is both the score-buffer stride and the tile alignment, so it has to
+                # track BLOCK_N - hence one variable for both rather than a literal 128.
+                idx_bn = 64 if _dev_small_smem(device) else 128
+                s_max = -(-kl.capacity // idx_bn) * idx_bn
                 scores = g_tensor_cache.get(device, (R, s_max), torch.half, "dsv4_b_scores")
                 with torch.cuda.device(device):
-                    _dsa_indexer_fewq_kernel[(R, triton.cdiv(s_max, 128))](
+                    _dsa_indexer_fewq_kernel[(R, triton.cdiv(s_max, idx_bn))](
                         qi.view(R, Hi, Di), wts.view(R, Hi), kl.pool_idx.view(-1, Di),
                         scores, a_ec, R, a_pos, a_ec, bt_st,
                         bt_st.stride(0),
                         H_i = Hi, H_pad = max(triton.next_power_of_2(Hi), 16), D_i = Di,
                         S_stride = s_max, compress_rate = m,
-                        scale = Di ** -0.5 * Hi ** -0.5, BLOCK_N = 128,
+                        scale = Di ** -0.5 * Hi ** -0.5, BLOCK_N = idx_bn,
                         SEQ = S, MULTIROW = 1, EPP = kl.epp,
                         DEBUG_BOUNDS = 1 if dsa_debug_bounds else 0,
                         DEBUG_PAGES = kl.num_pages if dsa_debug_bounds else 0,
