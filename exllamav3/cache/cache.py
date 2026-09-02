@@ -373,6 +373,13 @@ class Cache:
         self.free_list.appendleft(state.slot)
 
 
+    def reset_states(self):
+        """
+        Return every state slot to the pool. A Generator calls this when it takes ownership of the cache.
+        """
+        self.free_list = deque(range(self.num_slots))
+
+
     def get_recurrent_layer(
         self,
         layer_instance: tuple,

@@ -223,6 +223,8 @@ class Generator:
         if self.model.caps.get("recurrent_states"):
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
             self.recurrent_cache.pagetable = self.pagetable
+            # The new page table owns every page, so every state slot is ours too
+            cache.reset_states()
             # Limit batch size if cache has recurrent states
             self.max_batch_size = min(self.max_batch_size, cache.num_slots)
         else:
