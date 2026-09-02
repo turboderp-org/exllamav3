@@ -101,6 +101,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
     m.def("dsa_topk", &dsa_topk, "dsa_topk");
+    m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
+    m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
     m.def("hc_mix", &hc_mix, "hc_mix");
     m.def("ple_gate", &ple_gate, "ple_gate");
     m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");

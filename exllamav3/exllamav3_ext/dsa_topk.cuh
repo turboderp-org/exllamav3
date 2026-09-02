@@ -23,6 +23,26 @@ void dsa_topk
     int64_t t_seq
 );
 
+void dsa_topk_tile
+(
+    const at::Tensor& scores,
+    at::Tensor ws_idx,
+    at::Tensor ws_scr,
+    at::Tensor ws_cnt,
+    int64_t slot,
+    int64_t k,
+    int64_t idx_offset
+);
+void dsa_topk_merge_tiles
+(
+    const at::Tensor& ws_idx,
+    const at::Tensor& ws_scr,
+    const at::Tensor& ws_cnt,
+    at::Tensor out_idx,
+    const c10::optional<at::Tensor>& out_scr,
+    const c10::optional<at::Tensor>& out_cnt,
+    int64_t k
+);
 void dsa_seq_state_gr
 (
     const at::Tensor& cache_seqlens,
