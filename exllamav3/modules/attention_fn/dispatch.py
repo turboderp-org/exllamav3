@@ -6,7 +6,7 @@ from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
 from .triton_paged import (
-    _dev_smem_limit,
+    _dev_small_smem,
     _qc_staging,
     fn_triton_paged_attn,
     fn_triton_paged_attn_longq,
@@ -138,7 +138,7 @@ def attn_dispatch(
         # A backend miss there is therefore fatal rather than recoverable, so on devices where
         # the Triton kernels may not fit in shared memory (Turing, 64 KB) take the
         # dequantize-then-attend path instead, which can fall through to SDPA/xformers.
-        qc_smem_ok = _dev_smem_limit(q.device) >= 96 * 1024
+        qc_smem_ok = not _dev_small_smem(q.device)
         if (
             _qc_attn and has_triton and qc_smem_ok and
             isinstance(layer, CacheLayer_quant) and

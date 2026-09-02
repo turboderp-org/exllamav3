@@ -40,10 +40,12 @@ public:
     static DevCtx& instance();
     int get_num_sms(int device);
     int get_cc(int device);
-    // Usable dynamic shared memory per block, queried from the driver rather than assumed.
-    // sm_86 reports 99 KB and the kernels ask for SMEM_MAX (90 KB); Turing reports 64 KB, so
-    // requesting SMEM_MAX there fails the launch outright. Callers must clamp to this.
+    // Device capability: dynamic shared memory per block the driver will grant, unclamped
+    // (sm_86 reports 99 KB, Turing 64 KB). Use this to decide what a device can do.
     int get_smem_max(int device);
+    // What an EXL3 kernel may actually request: the above, capped at the SMEM_MAX the kernels
+    // are written against. Use this for cudaFuncSetAttribute and launch parameters.
+    int get_smem_request(int device);
     void* get_ws(int device);
     int* get_locks(int device);
 

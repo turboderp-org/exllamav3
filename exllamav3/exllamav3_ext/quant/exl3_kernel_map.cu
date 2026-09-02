@@ -116,7 +116,7 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     // host, where a 90 KB-capable device would otherwise vouch for a 64 KB one.
     int device;
     cudaGetDevice(&device);
-    return exl3_gemm_shape_smem(shape_idx, K) <= DevCtx::instance().get_smem_max(device);
+    return exl3_gemm_shape_smem(shape_idx, K) <= DevCtx::instance().get_smem_request(device);
 }
 
 // Hard gate for explicitly forced shapes, which skip the autotuner's shape_compat filter.
@@ -127,7 +127,7 @@ void exl3_gemm_check_smem(int shape_idx, int K, const char* who)
     int device;
     cudaGetDevice(&device);
     int need = exl3_gemm_shape_smem(shape_idx, K);
-    int have = DevCtx::instance().get_smem_max(device);
+    int have = DevCtx::instance().get_smem_request(device);
     TORCH_CHECK(need <= have, who, ": shape ", shape_idx, " at ", K,
                 " bpw needs ", need, " B of shared memory, device provides ", have);
 }

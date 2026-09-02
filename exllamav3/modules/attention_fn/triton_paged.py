@@ -26,6 +26,22 @@ from .common import AttnArgs, get_non_causal_span_arglist
 
 _decode_sm_count = {}
 _smem_limit = {}
+_small_smem = {}
+
+
+def _dev_small_smem(device) -> bool:
+    """True on devices whose shared memory is too small for the stock Triton tile configs.
+
+    Gated on compute capability rather than a byte threshold: the configs are sized for the
+    ~99 KB that sm_80 and later report, and every pre-Ampere part is materially below that
+    (Turing 64 KB, Volta 96 KB). A byte comparison would have to sit within a few KB of the
+    real Ampere value to separate them, which makes it fragile against exactly the parts it
+    is meant to classify.
+    """
+    dev = device.index if hasattr(device, "index") else device
+    if dev not in _small_smem:
+        _small_smem[dev] = torch.cuda.get_device_capability(dev)[0] < 8
+    return _small_smem[dev]
 
 
 def _dev_smem_limit(device) -> int:
@@ -1855,7 +1871,7 @@ def paged_attn_triton_prefill(
     # halves the staged bytes and keeps the kv tile (and thus the inner-loop shape) intact,
     # which costs occupancy but not correctness. Triton raises rather than shrinking on its
     # own, so this has to be decided before the launch.
-    if _dev_smem_limit(q.device) < 96 * 1024:
+    if _dev_small_smem(q.device):
         cfg = (max(16, cfg[0] // 2), cfg[1], cfg[2], cfg[3])
     num_stages_forced = num_stages is not None
     block_m = block_m or cfg[0]

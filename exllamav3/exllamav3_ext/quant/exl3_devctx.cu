@@ -50,11 +50,20 @@ int DevCtx::get_smem_max(int device)
     std::lock_guard<std::mutex> lock(mtx);
     if (!smem_max[device])
     {
+        // The driver value, unclamped: this is a device capability, and callers that only need
+        // "what may I request for an EXL3 kernel" clamp to SMEM_MAX themselves (see
+        // get_smem_request). Clamping here would have made an sm_86 device indistinguishable
+        // from a 90 KB one and dragged it onto the Turing code paths.
         int optin = 0;
         cuda_check(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-        smem_max[device] = MIN(optin, EXL3_SMEM_MAX_DEFAULT);
+        smem_max[device] = optin;
     }
     return smem_max[device];
+}
+
+int DevCtx::get_smem_request(int device)
+{
+    return MIN(get_smem_max(device), EXL3_SMEM_MAX_DEFAULT);
 }
 
 void* DevCtx::get_ws(int device)

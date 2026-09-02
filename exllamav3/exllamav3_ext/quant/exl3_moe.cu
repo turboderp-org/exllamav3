@@ -209,7 +209,7 @@ void exl3_moe
     // Every MoE instantiation fits in 44 KB (TILESIZE_N caps at 256, unlike the GEMM's 512),
     // so clamping the request to the device limit never excludes a shape here; it only stops
     // Turing's 64 KB cap from rejecting the fixed 90 KB ask.
-    int smem_max = DevCtx::instance().get_smem_max(device);
+    int smem_max = DevCtx::instance().get_smem_request(device);
 
     // Launch. All blocks of the grid must be co-resident for the group barriers, so groups * width <= num_sms.
     // With a known number of active experts, launch only as many groups as there are experts and widen them to

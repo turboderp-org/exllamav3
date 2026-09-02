@@ -158,7 +158,7 @@ int exl3_gemm_gr
     int* locks = DevCtx::instance().get_locks(device);
     // Turing allows only 64 KB of dynamic shared memory per block, so the fixed SMEM_MAX
     // request would fail the launch there. Ask for what this device actually permits.
-    int smem_max = DevCtx::instance().get_smem_max(device);
+    int smem_max = DevCtx::instance().get_smem_request(device);
 
     // Dispatch
     int K = B.size(2) / 16;
@@ -483,7 +483,7 @@ int exl3_mgemm_gr
     int device;
     cudaGetDevice(&device);
     int total_sms = DevCtx::instance().get_num_sms(device);
-    int smem_max = DevCtx::instance().get_smem_max(device);
+    int smem_max = DevCtx::instance().get_smem_request(device);
     int num_sms = force_num_sms ? force_num_sms : total_sms;
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);
