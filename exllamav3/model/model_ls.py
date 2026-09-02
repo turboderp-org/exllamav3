@@ -176,7 +176,7 @@ class Model_LSMixin(ABC):
                             dummy_state = module.prepare_for_device(dummy_state, params)
                             dummy_state = module.forward(dummy_state, params)
                             for sm in module:
-                                module.autosplit_extra_measure(params)
+                                sm.autosplit_extra_measure(params)
 
                         # Account for max_output_factor after last layer
                         extra_dummy_out_states = None
