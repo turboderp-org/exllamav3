@@ -903,13 +903,15 @@ def dsa_attn(
         # halve the head tile (perf is irrelevant with asserts on)
         num_stages = min(num_stages, 2)
         block_h = min(block_h, 16)
-    # The defaults (block_h 32, D_c 512, 3 stages) stage ~140 KB, which fits the ~99 KB of an
-    # Ampere-or-later device only because Triton counts the live subset - on a 64 KB device it
-    # does not fit at all, and Triton raises rather than shrinking. Shrink the head tile and
-    # pipeline depth the same way the debug path above already does.
+    # The defaults (block_h 32, block_n 32, 3 stages) stage ~140 KB against the ~99 KB an
+    # Ampere-or-later device provides; a 64 KB device cannot hold them at all, and Triton
+    # raises rather than shrinking. The KV tiles dominate at DeepSeek's D_c = 512
+    # (block_n x 512 x 2 B per stage), so the kv tile has to come down along with the head
+    # tile and the pipeline depth - the debug path above already does the latter two.
     if _dev_smem_limit(q.device) < 96 * 1024:
         num_stages = min(num_stages, 2)
         block_h = min(block_h, 8)
+        block_n = min(block_n, 16)
     dbg_pages = -(-(pool_c.numel() // max(D_c, 1)) // max(page_size, 1)) if dsa_debug_bounds else 0
     if nc_block:
         n_splits = 1
