@@ -7,7 +7,7 @@ name = "exllamav3"
 description = "Inference library for running local LLMs on modern consumer GPUs"
 dynamic = ["version"]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10.11"
 license = {text = "MIT"}
 authors = [{ name = "turboderp" }]
 keywords = ["llm", "inference", "gpu", "quantization", "llama"]
@@ -29,6 +29,7 @@ dependencies = [
     "pydantic",
     "llguidance>=1.7.0",
     "flash-linear-attention>=0.5.0",
+    "triton-windows; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]
@@ -51,6 +52,24 @@ examples = [
     "requests",
     "pydantic",
 ]
+cu124 = [
+    "torch>=2.6.0",
+]
+cu126 = [
+    "torch>=2.6.0",
+]
+cu128 = [
+    "torch>=2.6.0",
+]
+cu129 = [
+    "torch>=2.6.0",
+]
+cu130 = [
+    "torch>=2.6.0",
+]
+cu132 = [
+    "torch>=2.6.0",
+]
 
 [tool.setuptools]
 package-dir = { "" = "." }
@@ -65,3 +84,61 @@ version = { attr = "exllamav3.version.__version__" }
 [tool.uv]
 package = true
 python-preference = "only-managed"
+
+# Optionally pin a specific PyTorch version. The flavor extras above select the CUDA
+# index (cu124/cu126/cu128/cu129/cu130/cu132); by default torch resolves to the
+# latest on that index satisfying >=2.6.0. Add a constraint to fix a version for
+# both `uv sync --extra <flavor>` and `uv add 'exllamav3[<flavor>]'`.
+# Uncomment and adjust as needed:
+# constraint-dependencies = ["torch==2.11.0"]
+
+conflicts = [
+    [
+        { extra = "cu124" },
+        { extra = "cu126" },
+        { extra = "cu128" },
+        { extra = "cu129" },
+        { extra = "cu130" },
+        { extra = "cu132" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124", extra = "cu124" },
+    { index = "pytorch-cu126", extra = "cu126" },
+    { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu129", extra = "cu129" },
+    { index = "pytorch-cu130", extra = "cu130" },
+    { index = "pytorch-cu132", extra = "cu132" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true

@@ -104,44 +104,64 @@ Before building, make sure you have an appropriate version of Torch installed. I
 
 On Windows, you should also make sure you have the `triton-windows` package installed. ExLlamaV3 may work without it, but many things will work suboptimally.   
 
+Torch is deliberately **not** auto-installed with a pinned version because the build must match your CUDA setup and your preferred PyTorch release. exllamav3 declares a minimum (`torch>=2.6.0`); with `uv`, the CUDA flavor extras below also select *which* PyTorch index torch comes from. Install a torch that matches your GPU, then install exllamav3 using whichever workflow fits:
+
+**Pinning a specific PyTorch version (optional):** the flavor extra picks the *index*, but by default torch resolves to the latest version on that index that satisfies `>=2.6.0`. If you need a specific torch version, add a constraint in your project's `[tool.uv]` table — this works for both `uv sync` and `uv add`:
+
+```toml
+[tool.uv]
+constraint-dependencies = ["torch==2.11.0"]
+```
+
+Then e.g. `uv sync --extra cu130` or `uv add 'exllamav3[cu130]'` installs `torch==2.11.0` from the cu130 index.
+
+**Option 1 — Working in the cloned repo directly (`uv sync`):**
+
 ```sh
-# Clone the repo
 git clone https://github.com/turboderp-org/exllamav3
 cd exllamav3
-
 # (Optional) switch to dev branch for latest in-progress features
 git checkout dev
 
-# (Recommended) With uv - installs from pyproject.toml. Make sure you install
-# Torch separately first (see below), then create a venv and sync:
 uv venv
-uv sync --extra examples
+uv sync --extra cu130
+# add --extra examples and/or --extra eval for those extra dependencies
 ```
 
-With uv this automatically installs all dependencies declared in `pyproject.toml`; add `--extra eval` to also install the eval requirements. The library's C++/CUDA extension is built at install time when a matching Torch is present.
+The flavor extras are `cu124`, `cu126`, `cu128`, `cu129`, `cu130`, and `cu132` — pick the one matching your PyTorch CUDA build. The library's C++/CUDA extension is built at install time when a matching Torch is present.
 
-Alternatively, with pip:
+**Option 2 — Using exllamav3 as a dependency from another project (`uv add`):**
 
 ```sh
-# Install requirements from pyproject.toml (make sure you install Torch separately)
+# local checkout
+uv add 'path/to/exllamav3[cu130]'                                  # non-editable
+uv add 'path/to/exllamav3[cu130]' --editable                      # editable
+
+# straight from GitHub
+uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]'            # default branch
+uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]' --branch dev  # specific branch
+```
+
+**Option 3 — Bring your own torch and let `uv` pick the backend automatically:**
+
+```sh
+uv venv            # or: uv venv --python-preference only-managed
+source .venv/bin/activate
+uv pip install torch --torch-backend=auto
+uv pip install .
+```
+
+`--torch-backend=auto` inspects your system and installs the matching PyTorch CUDA build; see [Automatic backend selection](https://docs.astral.sh/uv/guides/integration/pytorch/#automatic-backend-selection).
+
+**Option 4 — With pip:**
+
+```sh
+# install a CUDA-enabled torch first so it matches your setup, e.g.:
+pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install .
-```
-
-**Installing Torch first (required in all cases):** the Torch dependency is deliberately not auto-installed because it must match your CUDA setup. Use the [PyTorch install guide](https://pytorch.org/get-started/locally/) to install the CUDA-enabled build into your venv *before* running `uv sync` / `pip install .`, e.g.:
-
-```sh
-uv venv
-uv pip install torch --index-url https://download.pytorch.org/whl/cu128
-uv sync
 ```
 
 At this point you should be able to run the conversion, eval and example scripts from the main repo directory, e.g. `python convert.py -i ...`
-
-To install the library for the active venv with pip instead:
-
-```sh
-pip install .
-```
 
 Relevant env variables for building:
 - `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for compilation. Set this to a reasonable value like 4 in that case.  
