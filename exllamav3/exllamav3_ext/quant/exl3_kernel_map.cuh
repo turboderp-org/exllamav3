@@ -82,6 +82,53 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 
 #define EXL3_GEMM_BASE_THREADS 256
 
+// Dynamic shared memory a (shape, bitrate) instantiation stages, as laid out by
+// exl3_gemm_kernel_inner: SH_STAGES deep double-buffered A and B tiles, then the fp32 sh_c
+// region. Single definition, used both by that kernel's static_assert and by the host-side
+// shape filter, so the two cannot disagree about what a shape costs.
+//
+// shmem_out_had is the GEMM's sh_c variant (it stages a full output tile for the fused output
+// Hadamard); the MoE kernel passes false and only needs the reduction scratch.
+// Parameters are ordered to match the EXL3_GEMM_SHAPE_n expansion (TILESIZE_M, TILESIZE_K,
+// TILESIZE_N, SH_STAGES, FRAG_STAGES) so the macro can be splatted in directly; frag_stages
+// is a register-pipelining depth and does not affect shared memory.
+__host__ __device__ constexpr int exl3_gemm_smem_bytes(
+    int tilesize_m, int tilesize_k, int tilesize_n, int sh_stages, int frag_stages,
+    int bits, bool shmem_out_had)
+{
+    (void) frag_stages;
+    int tileblocks_k = tilesize_k / 16;
+    int tileblocks_n = tilesize_n / 16;
+    int frags_n_per_warp = 2 * tileblocks_n / (EXL3_GEMM_BASE_THREADS / 32);
+
+    int sh_a_stage_size = tilesize_m * tilesize_k;                             // halfs
+    int sh_b_stage_size = tileblocks_k * tileblocks_n * 256 / 16 * bits;       // uint16s
+    int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp;             // floats
+    int sh_c_had = shmem_out_had ? tilesize_n * tilesize_m : 0;
+    if (sh_c_had > sh_c_size) sh_c_size = sh_c_had;
+
+    return sh_stages * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size;
+}
+
+// Same, addressed by shape index: expands the EXL3_GEMM_SHAPE_n macro so the tile dims and
+// stage count come from the one place they are declared, rather than a parallel table that
+// has to be updated by hand whenever a shape changes.
+#define EXL3_GEMM_SMEM_FOR_SHAPE(_shape, _bits, _had) \
+    exl3_gemm_smem_bytes(_shape, _bits, _had)
+
+__host__ __device__ constexpr int exl3_gemm_smem_bytes_for_shape(
+    int shape_idx, int bits, bool shmem_out_had)
+{
+    switch (shape_idx)
+    {
+        case 1: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_1, bits, shmem_out_had);
+        case 2: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_2, bits, shmem_out_had);
+        case 3: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_3, bits, shmem_out_had);
+        case 4: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_4, bits, shmem_out_had);
+        default: return 0;
+    }
+}
+
 // Instance arrays are indexed by shape and defined per (K, cb) so each codebook compiles as a separate
 // translation unit (see comp_units/exl3_comp_unit_K_cbX.cu)
 

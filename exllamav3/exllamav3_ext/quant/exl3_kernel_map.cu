@@ -83,26 +83,17 @@ int exl3_gemm_tilesize_k[] = {EXL3_GEMM_TILESIZE_K};
 int exl3_gemm_tilesize_n[] = {EXL3_GEMM_TILESIZE_N};
 int exl3_gemm_blockdim[] = {EXL3_GEMM_BLOCKDIM};
 
-// Shared memory a shape/bitrate instantiation needs, mirroring the layout computed in
-// exl3_gemm_kernel_inner (sh_a and sh_b staged SH_STAGES deep, then the fp32 sh_c region).
-// Kept in sync with the static_assert there; used to reject shapes that exceed what a
-// device can actually give a block, which on Turing is 64 KB rather than 90.
-static const int exl3_gemm_sh_stages[] = {0, 6, 4, 4, 4};
-
+// Shared memory a shape/bitrate instantiation needs. Derived from the EXL3_GEMM_SHAPE_n
+// macros via exl3_gemm_smem_bytes(), which the kernel itself static_asserts against, so this
+// cannot drift from the actual layout. Used to reject shapes exceeding what a device will
+// give a block - 64 KB on Turing rather than 90.
+//
+// shmem_out_had = true: the GEMM path stages a full output tile for the fused output Hadamard,
+// which is the larger of the two sh_c variants, so this is the conservative bound for both it
+// and the MoE kernel (which passes false).
 int exl3_gemm_shape_smem(int shape_idx, int K)
 {
-    const int TILESIZE_M = 16;
-    int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
-    int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
-    int sh_stages = exl3_gemm_sh_stages[shape_idx];
-
-    int sh_a_stage_size = TILESIZE_M * tilesize_k;                              // halfs
-    int sh_b_stage_size = (tilesize_k / 16) * (tilesize_n / 16) * 256 / 16 * K; // uint16s
-    int frags_n_per_warp = 2 * (tilesize_n / 16) / (EXL3_GEMM_BASE_THREADS / 32);
-    int sh_c_size = MAX(4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp,          // floats
-                        tilesize_n * TILESIZE_M);
-
-    return sh_stages * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size;
+    return exl3_gemm_smem_bytes_for_shape(shape_idx, K, true);
 }
 
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int K)
