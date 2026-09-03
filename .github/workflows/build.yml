@@ -420,7 +420,11 @@ jobs:
               print(line)
               req_text = line.removeprefix("Requires-Dist:").strip()
               req = Requirement(req_text)
-              actual[canonicalize_name(req.name)] = req
+              # Only unconditional requirements (no marker) belong to the package's base
+              # dependency set. Optional-dependency markers (extra == "cuXXX") are handled
+              # elsewhere and would otherwise overwrite the base requirement below.
+              if req.marker is None:
+                  actual[canonicalize_name(req.name)] = req
 
           for name, expected_req in expected.items():
               key = canonicalize_name(name)
