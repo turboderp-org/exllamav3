@@ -143,6 +143,9 @@ class Generator:
 
         # Paging
         self.pagetable = PageTable(self, cache)
+        # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
+        cache.owner_serial = getattr(cache, "owner_serial", 0) + 1
+        self.cache_owner_serial = cache.owner_serial
         self.max_total_tokens = PAGE_SIZE * self.pagetable.max_pages
 
         # Draft model
@@ -403,6 +406,16 @@ class Generator:
 
         assert self.cache.initialized, \
             "Cache tensors were never allocated. Construct the Cache BEFORE calling model.load()"
+        owner_serial = getattr(self.cache, "owner_serial", None)
+        if owner_serial is not None and owner_serial != getattr(self, "cache_owner_serial", owner_serial):
+            # Superseded: drop every job without touching the cache (the new owner may already have
+            # reused these pages and state slots) and refuse to run
+            self.pending_jobs.clear()
+            self.active_jobs.clear()
+            raise RuntimeError(
+                "This Generator no longer owns its Cache: a newer Generator was created over the same "
+                "Cache. Close or discard the old Generator before creating a new one."
+            )
         assert self.draft_cache is None or self.draft_cache.initialized, \
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
