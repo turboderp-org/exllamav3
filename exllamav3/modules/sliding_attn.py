@@ -503,7 +503,8 @@ class SlidingAttention(Module):
             )
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
-            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "kvh_1")
+            # Staging buffers span the padded K, not hidden_size (see attn.py)
+            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.k_proj.in_features), torch.half, "kvh_1")
             self.prealloc_kv_1 = g_tensor_cache.get(device, (2, 1, self.num_kv_heads * self.head_dim), torch.half, "kv_1")
 
         # Test if Q and G proj can be fused
@@ -524,7 +525,7 @@ class SlidingAttention(Module):
             )
         ):
             self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
-            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "qgh_1")
+            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.q_proj.in_features), torch.half, "qgh_1")
             self.prealloc_qg_1 = g_tensor_cache.get(device, (2, 1, self.num_q_heads * self.head_dim), torch.half, "qg_1")
 
         # Head norm
@@ -620,12 +621,16 @@ class SlidingAttention(Module):
             else:
                 g = None
         else:
-            x = x.view(1, bsz * q_len, dim)
+            # The fused path doesn't zero-extend the input for padded in_features: do it here (K is the
+            # padded width the mgemm kernel reads)
+            if x.shape[-1] < self.q_proj.in_features:
+                x = torch.nn.functional.pad(x, (0, self.q_proj.in_features - x.shape[-1]))
+            x = x.view(1, bsz * q_len, self.q_proj.in_features)
             if bsz * q_len == 1:
                 qgh = self.prealloc_qgh_1
                 qg = self.prealloc_qg_1
             else:
-                qgh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                qgh = torch.empty((2, bsz * q_len, self.q_proj.in_features), dtype = torch.half, device = x.device)
                 qg = torch.empty((2, bsz * q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
@@ -652,12 +657,14 @@ class SlidingAttention(Module):
             v = self.v_proj.forward(x, params)
 
         else:
-            x = x.view(1, bsz * q_len, dim)
+            if x.shape[-1] < self.k_proj.in_features:
+                x = torch.nn.functional.pad(x, (0, self.k_proj.in_features - x.shape[-1]))
+            x = x.view(1, bsz * q_len, self.k_proj.in_features)
             if bsz * q_len == 1:
                 kvh = self.prealloc_kvh_1
                 kv = self.prealloc_kv_1
             else:
-                kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                kvh = torch.empty((2, bsz * q_len, self.k_proj.in_features), dtype = torch.half, device = x.device)
                 kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
