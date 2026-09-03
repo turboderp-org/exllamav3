@@ -181,7 +181,7 @@ class LinearFP16:
     def tp_import_split_n(local_context, exported, plan, splits, dbg = False):
         consumer = local_context["consumer"]
         device = local_context["device"]
-        id_w = exported["suh"]
+        id_w = exported["weight"]
         id_b = exported["bias"]
 
         w_ = []
