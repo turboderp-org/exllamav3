@@ -1,6 +1,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cooperative_groups.h>
+#include <climits>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 
@@ -9,6 +10,7 @@ namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
 #include "exl3_gemm_bf16_io.cuh"
+#include "exl3_bf16_io_common.cuh"
 #include "exl3_gemm_kernel.cuh"
 #include "exl3_devctx.cuh"
 
@@ -82,13 +84,13 @@ int launch_bf16_io
         ? reinterpret_cast<void*>(exl3_gemm_bf16_io_kernel<bits, cb, true>)
         : reinterpret_cast<void*>(exl3_gemm_bf16_io_kernel<bits, cb, false>);
     int device = A.get_device();
-    int num_sms = force_num_sms > 0
-        ? force_num_sms
-        : DevCtx::instance().get_num_sms(device);
+    int total_sms = DevCtx::instance().get_num_sms(device);
+    int cooperative_capacity = exl3_bf16_cooperative_capacity(
+        kernel, device, block_dim, smem_bytes);
+    int num_sms = exl3_bf16_select_sms(
+        force_num_sms, total_sms, cooperative_capacity, 1);
     int* locks_ptr = DevCtx::instance().get_locks(device);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    cuda_check(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
     const __nv_bfloat16* A_ptr = reinterpret_cast<const __nv_bfloat16*>(A.data_ptr());
     const uint16_t* B_ptr = reinterpret_cast<const uint16_t*>(B.data_ptr());
@@ -139,20 +141,39 @@ int exl3_gemm_bf16_io
     TORCH_CHECK_DTYPE(suh, kHalf);
     TORCH_CHECK_DTYPE(A_had, kHalf);
     TORCH_CHECK_DTYPE(svh, kHalf);
-    TORCH_CHECK(A.dim() == 2 && B.dim() == 3);
-    TORCH_CHECK(C_scratch.dim() == 2 && C_bf16.dim() == 2 && A_had.dim() == 2);
-    TORCH_CHECK(suh.dim() == 1 && svh.dim() == 1);
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 3,
+                "BF16 I/O requires 2D A and 3D encoded B");
+    TORCH_CHECK(C_scratch.dim() == 2 && C_bf16.dim() == 2 && A_had.dim() == 2,
+                "BF16 I/O scratch, output and Hadamard workspace must be 2D");
+    TORCH_CHECK(suh.dim() == 1 && svh.dim() == 1,
+                "BF16 I/O SUH and SVH must be one-dimensional");
     TORCH_CHECK(force_shape_idx == 2, "BF16 I/O supports shape 2 only");
     TORCH_CHECK(mcg, "BF16 I/O supports MCG only");
-    TORCH_CHECK(A.numel() / A.size(-1) <= 16, "BF16 I/O supports m <= 16");
-    TORCH_CHECK(A.size(-1) == B.size(0) * 16);
+    TORCH_CHECK(A.size(0) > 0 && A.size(0) <= 16, "BF16 I/O supports 1 <= m <= 16");
+    TORCH_CHECK(A.size(1) > 0 && A.size(1) % 128 == 0,
+                "BF16 I/O requires positive, 128-aligned k");
+    TORCH_CHECK(B.size(0) > 0 && B.size(1) > 0,
+                "BF16 I/O requires positive encoded k and n dimensions");
+    TORCH_CHECK(B.size(2) == 5 * 16 || B.size(2) == 6 * 16,
+                "BF16 I/O requires an exact K5 or K6 encoded B width");
+    TORCH_CHECK(A.size(1) <= INT_MAX && B.size(1) <= INT_MAX / 16,
+                "BF16 I/O dimensions exceed the kernel integer range");
+    TORCH_CHECK(A.size(-1) == B.size(0) * 16,
+                "BF16 I/O A and encoded B have incompatible k dimensions");
     int size_m = A.size(0);
     int size_k = A.size(1);
     int size_n = B.size(1) * 16;
-    TORCH_CHECK(A_had.sizes() == A.sizes());
-    TORCH_CHECK(C_scratch.sizes() == at::IntArrayRef({size_m, size_n}));
-    TORCH_CHECK(C_bf16.sizes() == C_scratch.sizes());
-    TORCH_CHECK(suh.numel() == size_k && svh.numel() == size_n);
+    TORCH_CHECK(size_n % 128 == 0, "BF16 I/O requires 128-aligned n");
+    TORCH_CHECK(size_n / 128 <= MAX_TILES_C,
+                "BF16 I/O output exceeds the device lock workspace");
+    TORCH_CHECK(A_had.sizes() == A.sizes(),
+                "BF16 I/O Hadamard workspace must match A");
+    TORCH_CHECK(C_scratch.sizes() == at::IntArrayRef({size_m, size_n}),
+                "BF16 I/O FP16 scratch has an incompatible shape");
+    TORCH_CHECK(C_bf16.sizes() == C_scratch.sizes(),
+                "BF16 I/O output must match the FP16 scratch shape");
+    TORCH_CHECK(suh.numel() == size_k && svh.numel() == size_n,
+                "BF16 I/O SUH or SVH has an incompatible length");
     int bits = B.size(2) / 16;
     if (bits == 5) return launch_bf16_io<5, 1>(A, B, C_scratch, C_bf16, suh, A_had, svh, force_num_sms, final_grid_sync);
     if (bits == 6) return launch_bf16_io<6, 1>(A, B, C_scratch, C_bf16, suh, A_had, svh, force_num_sms, final_grid_sync);
