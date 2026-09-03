@@ -112,6 +112,7 @@ void exl3_moe_cpu_stage_experts
 // Per-phase profiling of the compute pool, reported to stdout every 512 jobs. Set once at
 // worker startup from MoeCpuTuning.cpu_prof (EXL3_MOE_CPU_PROF env).
 void exl3_moe_cpu_set_prof(bool enabled);
+int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);   // test hook
 
 // Kernel availability (dispatch happens internally; these are informational, post-env-cap).
 // has_avx512_vbmi additionally gates the swizzled weight layout in the child loader: the wide

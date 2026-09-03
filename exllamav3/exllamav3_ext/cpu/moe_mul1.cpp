@@ -1392,12 +1392,18 @@ inline bool pin_threads_enabled()
 struct Pool
 {
     int spawned = 0;
-    std::atomic<uint64_t> gen{0};
+    // One word per dispatch: generation in the high bits, participant count in the low 16. A
+    // worker reads both in a single load, so a worker that was preempted between observing a
+    // new generation and reading its participant count can never pair a stale generation with
+    // the next dispatch's count
+    std::atomic<uint64_t> dispatch{0};
+    uint64_t generation = 0;
     std::atomic<uint64_t> done{0};
     std::atomic<PoolFn> fn{nullptr};
     void* ctx = nullptr;
     int num_workers = 1;
-    std::atomic<int> run_nw{1};   // participant count for the CURRENT dispatch (see run)
+    static constexpr int DISPATCH_NW_BITS = 16;
+    static int dispatch_nw(uint64_t d) { return (int) (d & ((1ull << DISPATCH_NW_BITS) - 1)); }
     std::vector<int> core_order;
 
     void pin_self(int idx)
@@ -1423,7 +1429,7 @@ struct Pool
         uint64_t seen = 0;
         int idle = 0;
         while (true) {
-            const uint64_t g = gen.load(std::memory_order_acquire);
+            const uint64_t g = dispatch.load(std::memory_order_acquire);
             if (g == seen)
             {
                 // Matches the outer job-ring poll's threshold (moe_handoff.cu)
@@ -1435,7 +1441,7 @@ struct Pool
                 // (default 15.6 ms), and the run() barrier turns one late waker into everyone
                 // oversleeping the next phase dispatc
                 uint64_t cmp = seen;
-                WaitOnAddress(&gen, &cmp, sizeof(uint64_t), INFINITE);
+                WaitOnAddress(&dispatch, &cmp, sizeof(uint64_t), INFINITE);
 #endif
                 continue;
             }
@@ -1445,10 +1451,9 @@ struct Pool
             // The participant count may sit below this worker's index (pool shrink, or a
             // small-job dispatch cap): surplus workers must not run the function (their
             // (idx, nw) pair indexes out of range) and must not ack, or run() returns before
-            // the participating workers have finished. run_nw is published with release
-            // ordering before the gen bump, so a worker that observes the new gen also
-            // observes its participant count
-            const int nw = run_nw.load(std::memory_order_acquire);
+            // the participating workers have finished. The count travels in the dispatch word
+            // itself, so it always belongs to the generation just observed
+            const int nw = dispatch_nw(g);
             if (idx < nw)
             {
                 fn.load(std::memory_order_relaxed)(ctx, idx, nw);
@@ -1480,11 +1485,11 @@ struct Pool
         if (n <= 1) { f(c, 0, 1); return; }
         ctx = c;
         fn.store(f, std::memory_order_relaxed);
-        run_nw.store(n, std::memory_order_release);
         const uint64_t d0 = done.load(std::memory_order_acquire);
-        gen.fetch_add(1, std::memory_order_release);
+        ++generation;
+        dispatch.store((generation << DISPATCH_NW_BITS) | (uint64_t) n, std::memory_order_release);
 #ifndef __linux__
-        WakeByAddressAll(&gen);
+        WakeByAddressAll(&dispatch);
 #endif
         f(c, 0, n);
         while (static_cast<int64_t>(done.load(std::memory_order_acquire) - d0) < n - 1)
@@ -1494,6 +1499,33 @@ struct Pool
 
 Pool g_pool;
 std::mutex g_pool_mutex;
+
+// -------------------------------------------------------------------------------------------
+//   Pool self-test hook (tests/test_moe_cpu_pool_.py)
+// -------------------------------------------------------------------------------------------
+
+// Drives the pool with a participant count alternating between `small` and the full pool, with
+// `threads` workers (oversubscribe to force preemption inside the dispatch handshake). Every
+// dispatch must run each participant exactly once, no non-participant at all, and run() must not
+// return while a participant is still inside the function. Returns the number of anomalies.
+struct PoolStressCtx
+{
+    std::atomic<int>* runs;
+    std::atomic<int>* active;
+    int spin;
+};
+
+static void pool_stress_fn(void* c, int idx, int nw)
+{
+    auto* s = (PoolStressCtx*) c;
+    s->active->fetch_add(1, std::memory_order_acq_rel);
+    s->runs[idx].fetch_add(1, std::memory_order_acq_rel);
+    volatile uint64_t x = (uint64_t) idx;
+    for (int i = 0; i < s->spin * (1 + (idx % 7)); ++i)
+        x = x * 6364136223846793005ull + 1442695040888963407ull;
+    s->active->fetch_sub(1, std::memory_order_acq_rel);
+}
+
 
 // -------------------------------------------------------------------------------------------
 //   MoE Layer registry
@@ -1988,6 +2020,31 @@ static const MoeCpuLayer* get_layer(int64_t handle)
     std::lock_guard<std::mutex> lock(g_layers_mutex);
     TORCH_CHECK(handle >= 0 && handle < static_cast<int64_t>(g_layers.size()) && g_layers[handle], "invalid CPU MoE layer handle");
     return g_layers[handle];
+}
+
+// Exported pool self-test (helpers above live in the anonymous namespace of this TU)
+int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin)
+{
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    g_pool.ensure(threads);
+    std::vector<std::atomic<int>> runs(threads);
+    std::atomic<int> active{0};
+    int64_t anomalies = 0;
+    for (int it = 0; it < iters; ++it)
+    {
+        const int n_req = (it & 1) ? small : 0;
+        const int n = (n_req > 0 && n_req < threads) ? n_req : threads;
+        for (auto& r : runs) r.store(0, std::memory_order_relaxed);
+        PoolStressCtx c{runs.data(), &active, spin};
+        g_pool.run(&pool_stress_fn, &c, n_req);
+        if (active.load(std::memory_order_acquire) != 0) ++anomalies;          // returned early
+        for (int i = 0; i < threads; ++i)
+        {
+            const int r = runs[i].load(std::memory_order_acquire);
+            if (i < n ? r != 1 : r != 0) ++anomalies;                           // double / missing / surplus run
+        }
+    }
+    return anomalies;
 }
 
 void exl3_moe_cpu_forward_raw(
