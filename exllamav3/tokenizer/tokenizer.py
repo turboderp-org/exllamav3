@@ -147,8 +147,9 @@ class Tokenizer:
         self.bos_token_id = get_default_token_id("bos_token", self.bos_token_id, 1)
         self.eos_token_id = get_default_token_id("eos_token", self.eos_token_id, 2)
 
-        # Update EOS token ID in config if tokenizer_config.json disagrees with config.json
-        e = get_default_token_id("eos_token", None, 2)
+        # Update EOS token ID in config if tokenizer_config.json disagrees with config.json (no eos_token there:
+        # leave config.json alone rather than forcing the id-2 fallback onto it)
+        e = get_default_token_id("eos_token", None, None)
         if e:
             if config.eos_token_id != e:
                 config.eos_token_id = e
