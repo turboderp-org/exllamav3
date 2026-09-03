@@ -1040,6 +1040,7 @@ class SlidingAttention(Module):
                 "sliding_window_overp": self.sliding_window_overp,
                 "logit_softcapping": self.logit_softcapping,
                 "full_gate": self.full_gate,
+                "gate_softplus": self.gate_softplus,
             },
             "num_kv_heads": self.num_kv_heads,
             "n_gqa": self.num_q_heads // self.num_kv_heads,

@@ -1047,6 +1047,8 @@ class Attention(Module):
 
     def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
+        assert getattr(self, "qsa_indexer", None) is None, \
+            "TP export of Attention with a QSA indexer is not implemented"
 
         def _export(child):
             nonlocal producer
@@ -1074,6 +1076,9 @@ class Attention(Module):
                 "tp_split_norm": self.tp_split_norm,
                 "use_k_as_v": self.use_k_as_v,
                 "interleaved_gate": self.interleaved_gate,
+                "full_gate": self.full_gate,
+                "gate_softplus": self.gate_softplus,
+                "use_cu_seqlens": self.use_cu_seqlens,
             },
             "num_kv_heads": self.num_kv_heads,
             **{name: _export(getattr(self, name, None)) for name in (
@@ -1118,8 +1123,13 @@ class Attention(Module):
             if num_kv_heads else None
         if interleaved_gate and num_kv_heads:
             q_split = q_split[0], q_split[1] * 2, q_split[2] * 2
-        qh_split = (True, first * n_gqa, last * n_gqa) \
-            if num_kv_heads else None
+        # Full gate spans head_dim channels per q head, headwise gate is one channel per q head
+        if exported["kwargs"].get("full_gate", False):
+            qh_split = (True, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+                if num_kv_heads else None
+        else:
+            qh_split = (True, first * n_gqa, last * n_gqa) \
+                if num_kv_heads else None
         kv_split = (True, first * head_dim, last * head_dim) \
             if num_kv_heads else None
         o_split = (False, first * head_dim * n_gqa, last * head_dim * n_gqa) \
