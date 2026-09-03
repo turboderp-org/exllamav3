@@ -552,6 +552,8 @@ class SlidingAttention(Module):
     def unload(self):
         super().unload()
 
+        for rl in self.recurrent_layers:
+            rl.free()
         self.bc_attn = {}
         self.rope = None
         self.sinks = None
