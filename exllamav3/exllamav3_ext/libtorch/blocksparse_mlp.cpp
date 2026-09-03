@@ -336,13 +336,24 @@ void BC_BlockSparseMLP::run_bszN
             args.push_back(PPTR(GP_end,                             nullptr));
         };
 
+        auto patch_shared_input = [&]()
+        {
+            if (shared_experts->gu_ptrs_trellis)
+                args.push_back(PPTR(GP_mgemm_A,                 x_dense_ptr));
+            else
+            {
+                args.push_back(PPTR(GP_gemm_A,                  x_dense_ptr));
+                args.push_back(PPTR(GP_gemm_A,                  x_dense_ptr));
+            }
+        };
+
         if (shared_experts && shared_gate)
         {
             args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
             args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
             args.push_back(PPTR(GP_end,                         nullptr));
             if (down_bias_ptrs) patch_bias();
-            args.push_back(PPTR(GP_mgemm_A,                     x_dense_ptr));
+            patch_shared_input();
             args.push_back(PPTR(GP_add_sigmoid_gate_proj_y,     x_dense_ptr));
             args.push_back(PPTR(GP_add_sigmoid_gate_proj_z,     (void*) out_d.data_ptr()));
         }
@@ -352,7 +363,7 @@ void BC_BlockSparseMLP::run_bszN
             args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
             args.push_back(PPTR(GP_end,                         nullptr));
             if (down_bias_ptrs) patch_bias();
-            args.push_back(PPTR(GP_mgemm_A,                     x_dense_ptr));
+            patch_shared_input();
             args.push_back(PPTR(GP_add_x,                       (void*) out_d.data_ptr()));
             args.push_back(PPTR(GP_add_z,                       (void*) out_d.data_ptr()));
         }
@@ -482,6 +493,11 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     // tables are unused placeholders) and act_relu2; the gate GEMMs are skipped throughout
     gated = !gates.empty();
     TORCH_CHECK(gated || act_relu2, "BC_BlockSparseMLP: gateless experts require act_relu2");
+    // Separate gate/up GEMVs with biases would record add nodes ahead of the residual add that the
+    // launcher patches by type; not supported (fused gate+up tables never carry biases)
+    TORCH_CHECK(!(shared_experts && !shared_experts->gu_ptrs_trellis &&
+                  ((shared_experts->gate && shared_experts->gate->bias) || (shared_experts->up && shared_experts->up->bias))),
+                "BC_BlockSparseMLP: shared expert with separate gate/up GEMVs must not have gate/up biases");
     TORCH_CHECK(!(shared_experts && (down_bias_ptrs || y_pad)),
         "BC_BlockSparseMLP: shared experts not supported with expert biases or padded dims");
     gate_ptrs_trellis_cpu   = gate_ptrs_trellis.cpu();
