@@ -148,6 +148,14 @@ void load_disk_cache_locked()
     std::vector<char> record_bytes(header.record_size);
     while (in.read(record_bytes.data(), header.record_size))
     {
+        // An embedded header (two processes appended their first record concurrently): rewind to
+        // just after it and keep reading records from there
+        if (header.record_size >= sizeof(DiskCacheHeader) &&
+            std::memcmp(record_bytes.data(), DISK_CACHE_MAGIC, sizeof(DISK_CACHE_MAGIC)) == 0)
+        {
+            in.seekg(-(std::streamoff)(header.record_size - sizeof(DiskCacheHeader)), std::ios::cur);
+            continue;
+        }
         DiskCacheRecordV1 record;
         std::memcpy(&record, record_bytes.data(), sizeof(record));
         disk_cache[record.hash] = record;
@@ -176,16 +184,22 @@ void append_disk_cache_locked(const DiskCacheRecordV1& record)
     std::ofstream out(path, std::ios::binary | std::ios::app);
     if (!out) return;
 
+    // Header and first record go out in one write so a concurrent first writer can never split them;
+    // if two processes both see an empty file, the second header lands between records and the
+    // reader skips it (load_disk_cache_locked)
     if (write_header)
     {
         DiskCacheHeader header;
         std::memcpy(header.magic, DISK_CACHE_MAGIC, sizeof(header.magic));
         header.format = DISK_CACHE_FORMAT;
         header.record_size = sizeof(DiskCacheRecordV1);
-        out.write((const char*) &header, sizeof(header));
+        char buf[sizeof(header) + sizeof(record)];
+        std::memcpy(buf, &header, sizeof(header));
+        std::memcpy(buf + sizeof(header), &record, sizeof(record));
+        out.write(buf, sizeof(buf));
     }
-
-    out.write((const char*) &record, sizeof(record));
+    else
+        out.write((const char*) &record, sizeof(record));
 }
 
 bool launch_from_disk_cache
