@@ -381,7 +381,7 @@ class Mistral3VisionModel(Model):
                 key_up = "linear_1",
                 key_down = "linear_2",
                 hidden_size = config.vision.hidden_size,
-                intermediate_size = 5120,  # This seems to be hard coded?
+                intermediate_size = config.hidden_size,
                 out_size = config.hidden_size,
                 activation_fn = "gelu",
                 qmap = "block",
