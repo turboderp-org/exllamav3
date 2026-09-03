@@ -392,6 +392,12 @@ class NGramEmbedding(Module):
         row_dtype = torch.int16 if trellis else self._row_dtype
         p = self._grow_pin(n, row_words, row_dtype)
 
+        # The previous call's non_blocking uploads read these pinned buffers; the generator issues chunk
+        # forwards back to back with no host sync, so wait for them before rewriting the staging area
+        ev = p.get("event")
+        if ev is not None:
+            ev.synchronize()
+
         U = ext.ngram_hash_cpu(
             ids, out_len, self.layer_multipliers, self.head_offsets, self.head_vocab_sizes,
             self.heads_per_ngram, self.eos_token_id,
@@ -408,6 +414,9 @@ class NGramEmbedding(Module):
             ext.ngram_dequant(packed_d, self.K, heads_d, self.head_bias, rows)
         else:
             rows = packed_d.float()
+        if rows.is_cuda:
+            p["event"] = torch.cuda.Event()
+            p["event"].record(torch.cuda.current_stream(rows.device))
         out = rows.index_select(0, inv_d).view(bsz, out_len, H * ROW_DIM)
         dt = out_dtype or self.out_dtype or torch.half
         return out.to(dt)
