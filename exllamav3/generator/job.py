@@ -806,6 +806,7 @@ class Job:
             unhealed = id_to_piece[self.prefix_token[0].item()]
             new_text = new_text[len(unhealed):]
 
+        held_text_before = self.held_text
         self.held_text += new_text
         self.held_tokens.append(next_token)
         if self.return_probs:
@@ -822,8 +823,9 @@ class Job:
         if token in self.stop_tokens:
             return emit(results, emit_eos = True, eos_reason = "stop_token", stop_token = token)
 
-        # Stop if we reach max_new_tokens
-        if self.new_tokens >= self.max_new_tokens - self.generator.num_draft_tokens:
+        # Stop if we reach max_new_tokens. Exact: a limit reached inside a speculative window is fine, the
+        # generator rejects the window's remaining draft positions when a job ends mid-window (eos path)
+        if self.new_tokens >= self.max_new_tokens:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "max_new_tokens")
 
         # End on filter completed
@@ -852,7 +854,7 @@ class Job:
             if self.checkpoint is None:
                 self.checkpoint = {
                     "offset": 1,
-                    "held_text": self.held_text[:-len(new_text)],
+                    "held_text": held_text_before,   # not held_text[:-len(new_text)]: new_text may be empty
                     "held_tokens": self.held_tokens.clone(1),
                     "held_probs": self.held_probs.clone(1),
                     "held_k_tokens": self.held_k_tokens.clone(1),
@@ -1087,6 +1089,10 @@ class Job:
         self.generator = generator
         self.pagetable = generator.pagetable
         self.skips = 0
+
+        # No explicit limit: whatever the cache can still hold beyond the prompt
+        if self.max_new_tokens is None:
+            self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids))
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
