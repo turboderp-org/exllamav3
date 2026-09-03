@@ -271,13 +271,17 @@ __global__ void routing_ds3_nogroup_topk_kernel
     {
         int stage_warps = CEIL_DIVIDE(num_candidates, 32);
 
+        // Every thread loads its candidate before any warp writes: the K-wide write slices below
+        // overlap other warps' 32-wide read windows, so a fast warp must not write until all
+        // reads of this stage are done
+        int pos = t;
+        key = pos < num_candidates ? sh_key[pos] : -1.0e30f;
+        payload = pos < num_candidates ? sh_payload[pos] : 0.0f;
+        idx = pos < num_candidates ? sh_idx[pos] : -1;
+        __syncthreads();
+
         if (warp_id < stage_warps)
         {
-            int pos = t;
-            key = pos < num_candidates ? sh_key[pos] : -1.0e30f;
-            payload = pos < num_candidates ? sh_payload[pos] : 0.0f;
-            idx = pos < num_candidates ? sh_idx[pos] : -1;
-
             for (int k = 0; k < K; ++k)
             {
                 float best_key = key;
@@ -525,13 +529,15 @@ __global__ void routing_std_topk_kernel
     {
         int stage_warps = CEIL_DIVIDE(num_candidates, 32);
 
+        // Load before any warp writes (see routing_ds3_nogroup_topk_kernel)
+        int pos = t;
+        key = pos < num_candidates ? sh_key[pos] : -1.0e30f;
+        payload = key;
+        idx = pos < num_candidates ? sh_idx[pos] : -1;
+        __syncthreads();
+
         if (warp_id < stage_warps)
         {
-            int pos = t;
-            key = pos < num_candidates ? sh_key[pos] : -1.0e30f;
-            payload = key;
-            idx = pos < num_candidates ? sh_idx[pos] : -1;
-
             for (int k = 0; k < K; ++k)
             {
                 float best_key = key;
@@ -636,6 +642,9 @@ __global__ void routing_std_kernel
         max_logit = lane_id < num_warps ? max_red[lane_id] : __ushort_as_half(0xfbff);
         max_logit = warp_reduce_max_h(max_logit);
         max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
+        // max_red aliases sh_v: no warp may start writing its top-K into sh_v below until every
+        // warp has finished reading the reduction slots
+        __syncthreads();
     }
 
     // Input logit, shifted
