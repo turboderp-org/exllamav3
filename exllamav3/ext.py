@@ -38,8 +38,8 @@ else:
 
             # Possible locations for MSVC, in order of preference
 
-            program_files_x64 = os.environ["ProgramW6432"]
-            program_files_x86 = os.environ["ProgramFiles(x86)"]
+            program_files_x64 = os.environ.get("ProgramW6432", os.environ.get("ProgramFiles", r"C:\Program Files"))
+            program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
 
             msvc_dirs = \
             [
