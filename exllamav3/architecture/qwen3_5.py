@@ -125,7 +125,7 @@ class Qwen3_5VLBaseConfig(Config):
         self.mtp_num_hidden_layers = self.read_cfg(int, pfx("mtp_num_hidden_layers"), 0)
         self.mtp_use_dedicated_embeddings = self.read_cfg(bool, pfx("mtp_use_dedicated_embeddings"), False)
         if self.mtp_num_hidden_layers == 0:
-            del self.model_classes["mtp"]
+            self.model_classes.pop("mtp", None)   # only registered by the configs that pass an mtp_model
 
 
 class Qwen3_5VLConfig(Qwen3_5VLBaseConfig):
@@ -251,7 +251,7 @@ class Qwen3_5VLMoeBaseConfig(Config):
         self.mtp_num_hidden_layers = self.read_cfg(int, pfx("mtp_num_hidden_layers"), 0)
         self.mtp_use_dedicated_embeddings = self.read_cfg(bool, pfx("mtp_use_dedicated_embeddings"), False)
         if self.mtp_num_hidden_layers == 0:
-            del self.model_classes["mtp"]
+            self.model_classes.pop("mtp", None)   # only registered by the configs that pass an mtp_model
 
         assert not self.mtp_use_dedicated_embeddings, "MTP dedicated embeddings not currently supported"
 
