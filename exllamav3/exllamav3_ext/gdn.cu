@@ -307,6 +307,7 @@ void gated_delta_net_fused_op_2
     size_t S = b.size(1);
     size_t H = b.size(2);
 
+    TORCH_CHECK(H <= FUSED_OP_2_THREADS, "gated_delta_net_fused_op_2: too many heads");
     int rows_per_block = FUSED_OP_2_THREADS / H;
     int threads = rows_per_block * H;
     int blocks = CEIL_DIVIDE(B * S, rows_per_block);
