@@ -208,27 +208,31 @@ void rope_kernel
             v1 *= rmf;
             v2 *= rmf;
 
-            // Downcast, apply weight and store
-            if constexpr (norm_bf16)
+            // Downcast, apply weight and store. Lanes past head_dim / 2 (block rounded up to whole warps)
+            // hold padding and must not read the weight
+            if (t * 2 < head_dim)
             {
-                bfloat162 *wptr = (bfloat162*)(((bfloat16*)norm_weight) + t * 2);
-                float2 w = __bfloat1622float2(*wptr);
-                w.x += norm_constant_bias;
-                w.y += norm_constant_bias;
-                v1 *= w.x;
-                v2 *= w.y;
-                v = __floats2half2_rn(v1, v2);
-            }
-            else
-            {
-                half2 norm_constant_bias_h2 = __float2half2_rn(norm_constant_bias);
-                half2 *wptr = (half2*)(((half*)norm_weight) + t * 2);
-                half2 w = __hadd2(*wptr, norm_constant_bias_h2);
-                v = __floats2half2_rn(v1, v2);
-                v = __hmul2(w, v);
-            }
+                if constexpr (norm_bf16)
+                {
+                    bfloat162 *wptr = (bfloat162*)(((bfloat16*)norm_weight) + t * 2);
+                    float2 w = __bfloat1622float2(*wptr);
+                    w.x += norm_constant_bias;
+                    w.y += norm_constant_bias;
+                    v1 *= w.x;
+                    v2 *= w.y;
+                    v = __floats2half2_rn(v1, v2);
+                }
+                else
+                {
+                    half2 norm_constant_bias_h2 = __float2half2_rn(norm_constant_bias);
+                    half2 *wptr = (half2*)(((half*)norm_weight) + t * 2);
+                    half2 w = __hadd2(*wptr, norm_constant_bias_h2);
+                    v = __floats2half2_rn(v1, v2);
+                    v = __hmul2(w, v);
+                }
 
-            *tptr = v;
+                *tptr = v;
+            }
             __syncthreads();
         };
 
@@ -340,7 +344,7 @@ void rope_gr
     bool inv_freq_table = false;
     if (inv_freq.dim() > 1)
     {
-        TORCH_CHECK(inv_freq.dim() >= 2 || inv_freq.dim() <= 3);
+        TORCH_CHECK(inv_freq.dim() >= 2 && inv_freq.dim() <= 3, "inv_freq table must be 2-D or 3-D");
         // TORCH_CHECK_SHAPES(q, 3, inv_freq, -1, 2);
         inv_freq_table = true;
         inv_freq_stride = inv_freq.size(-1) * inv_freq.size(-2);
@@ -429,7 +433,7 @@ void rope_gr
         graph->record_param(kernel_ptr, GP_rope_position, 13, 4);
         graph->record_param(kernel_ptr, GP_rope_positions, 14);
         graph->record_param(kernel_ptr, GP_rope_position_ids, 15);
-        graph->record_param(kernel_ptr, GP_rope_pid_stride, 26, 4);
+        graph->record_param(kernel_ptr, GP_rope_pid_stride, 25, 4);   // ARGPTRS index of position_ids_stride
         graph->record_param(kernel_ptr, GP_end, 0);
     }
 
