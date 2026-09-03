@@ -162,13 +162,16 @@ struct BC_GatedDeltaNetSplit
         // like each projection's own input
         at::Tensor qkv_xh, z_xh, o_xh;
 
+        // State-buffer geometry baked into this slot's captured graph (scalar kernel args can't
+        // be patched): set on the slot's first eager run, checked before every replay
+        int graph_state_size = -1;
+        int graph_hist_stride = -1;
+
         std::unique_ptr<Graph> graph;
     };
     std::vector<Slot> slots;        // history == false (only seqlen == 1 ever populated)
     std::vector<Slot> slots_hist;   // history == true
 
-    int graph_state_size;
-    int graph_hist_stride;
 
     BC_GatedDeltaNetSplit
     (
@@ -202,9 +205,7 @@ struct BC_GatedDeltaNetSplit
         conv1d_weight   (std::move(_conv1d_weight)),
         conv1d_bias     (std::move(_conv1d_bias)),
         norm            (_norm),
-        beta_scale      (_beta_scale),
-        graph_state_size(-1),
-        graph_hist_stride(-1)
+        beta_scale      (_beta_scale)
     {
         slots.resize(MAX_BSZ * MAX_QLEN);
         slots_hist.resize(MAX_BSZ * MAX_QLEN);
@@ -257,9 +258,7 @@ struct BC_GatedDeltaNetSplit
         f_a_weight_t    (std::move(_f_a_weight_t)),
         f_b_weight_t    (std::move(_f_b_weight_t)),
         g_a_weight_t    (std::move(_g_a_weight_t)),
-        g_b_weight_t    (std::move(_g_b_weight_t)),
-        graph_state_size(-1),
-        graph_hist_stride(-1)
+        g_b_weight_t    (std::move(_g_b_weight_t))
     {
         slots.resize(MAX_BSZ * MAX_QLEN);
         slots_hist.resize(MAX_BSZ * MAX_QLEN);
@@ -387,13 +386,15 @@ struct BC_Mamba2
         // Hadamard scratch for the bypassed exl3_gemm_gr calls (in_proj/o_proj)
         at::Tensor in_xh, o_xh;
 
+        // Per-slot state geometry snapshot (see BC_GatedDeltaNetSplit::Slot)
+        int graph_state_size = -1;
+        int graph_hist_stride = -1;
+
         std::unique_ptr<Graph> graph;
     };
     std::vector<Slot> slots;        // history == false (only seqlen == 1 ever populated)
     std::vector<Slot> slots_hist;   // history == true
 
-    int graph_state_size;
-    int graph_hist_stride;
 
     BC_Mamba2
     (
@@ -433,9 +434,7 @@ struct BC_Mamba2
         norm            (_norm),
         padded_in       (_padded_in),
         padded_out      (_padded_out),
-        dt_first        (_dt_first),
-        graph_state_size(-1),
-        graph_hist_stride(-1)
+        dt_first        (_dt_first)
     {
         v_dim = num_v_heads * v_head_dim;
         slots.resize(MAX_BSZ * MAX_QLEN);
