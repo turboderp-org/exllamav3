@@ -908,7 +908,7 @@ class SS_AdaptiveP(SS_Base):
 
                 temp = torch.argmax(state.logits, dim = -1)
                 state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
-                sampled_prob = state.probs[0, temp].item()
+                sampled_prob = state.probs[buffered_arange(state.bsz, state.in_logits.device), temp]   # per row; see log below
 
                 # self.log.append((adapted_target, sampled_prob))
                 # if len(self.log) == 300:
