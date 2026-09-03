@@ -1292,7 +1292,7 @@ def main(args, job_state):
             # (single large tensors, e.g. lm_head)
             if (
                 len(linears) >= len(devices) and
-                all(b <= 8 for _, b in strategy.items())
+                all(strategy[l.key] <= 8 for l in linears)
             ):
                 quantize_linears_parallel(args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), capture_H, state)
             else:
@@ -1467,7 +1467,7 @@ def main(args, job_state):
             # Quantize (same dispatch as the main loop)
             if (
                 len(linears) >= len(devices) and
-                all(b <= 8 for _, b in strategy.items())
+                all(strategy[l.key] <= 8 for l in linears)
             ):
                 quantize_linears_parallel(args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), None, None)
             else:
