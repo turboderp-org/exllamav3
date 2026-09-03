@@ -78,6 +78,14 @@ include-package-data = true
 [tool.setuptools.packages.find]
 include = ["exllamav3*"]
 
+[tool.setuptools.package-data]
+exllamav3 = [
+    "py.typed",
+    "util/hadamard_data/*",
+    "conversion/standard_cal_data/*.utf8",
+    "exllamav3_ext/**/*",
+]
+
 [tool.setuptools.dynamic]
 version = { attr = "exllamav3.version.__version__" }
 
