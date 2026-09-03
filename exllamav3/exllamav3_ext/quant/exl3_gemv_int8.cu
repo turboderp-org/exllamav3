@@ -200,6 +200,12 @@ static bool exl3_gemv_int8_sq
     };
 
     cudaError_t err = cudaLaunchKernel(fn, dim3(grid), dim3(NUM_THREADS), kernelArgs, smem, stream);
+    if (err != cudaSuccess)
+    {
+        // Nothing was captured: the caller's fallback kernel records its own parameter sites
+        cudaGetLastError();
+        return false;
+    }
     if (graph)
     {
         graph->record_param(fn, GP_gemm_A, 0);
@@ -209,11 +215,6 @@ static bool exl3_gemv_int8_sq
         graph->record_param(fn, GP_gemm_A_had, 8);
         graph->record_param(fn, GP_gemm_B_svh, 9);
         graph->record_param(fn, GP_end, 0);
-    }
-    if (err != cudaSuccess)
-    {
-        cudaGetLastError();
-        return false;
     }
     return true;
 }
@@ -345,13 +346,13 @@ bool exl3_gemv_int8
     };
 
     cudaError_t err = cudaLaunchCooperativeKernel(fn, grid, NUM_THREADS, kernelArgs, smem, stream);
-    add_graph_args((void*) fn);
-
     if (err != cudaSuccess)
     {
         // e.g. cooperative launch unsupported or co-residency violated: fall back to the regular kernel
+        // (which records its own graph parameter sites)
         cudaGetLastError();
         return false;
     }
+    add_graph_args((void*) fn);
     return true;
 }

@@ -239,7 +239,8 @@ static void pool_worker_main(int thread_idx)
 
             if (job0.device_id != cur_device)
             {
-                cudaSetDevice(job0.device_id);
+                cr = cudaSetDevice(job0.device_id);
+                if (cr != cudaSuccess) { batch_fail(std::string("stloader: cudaSetDevice failed: ") + cudaGetErrorString(cr)); break; }
                 cur_device = job0.device_id;
             }
 
@@ -307,7 +308,8 @@ static void pool_worker_main(int thread_idx)
         // Drain this worker's outstanding copies and conversions before reporting done
         for (auto& p : streams)
         {
-            cudaSetDevice(p.first);
+            cr = cudaSetDevice(p.first);
+            if (cr != cudaSuccess) { batch_fail(std::string("stloader: cudaSetDevice failed: ") + cudaGetErrorString(cr)); continue; }
             cr = cudaStreamSynchronize(p.second);
             if (cr != cudaSuccess)
                 batch_fail(std::string("stloader: stream sync failed: ") + cudaGetErrorString(cr));
