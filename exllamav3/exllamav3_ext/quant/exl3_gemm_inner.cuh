@@ -19,7 +19,7 @@
     #define EXL3_GEMM_H_ACC 0
 #endif
 
-template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
+template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool preserve_half_output = false>
 inline __device__
 void exl3_gemm_kernel_inner
 (
@@ -30,7 +30,9 @@ void exl3_gemm_kernel_inner
     const int size_k,
     const int size_n,
     int* __restrict__ locks,
-    const half* post_scale
+    const half* post_scale,
+    __nv_bfloat16* final_bf16 = nullptr,
+    int final_bf16_stride = 0
 )
 {
     const int TILEBLOCKS_M = TILESIZE_M / 16;
@@ -199,6 +201,10 @@ void exl3_gemm_kernel_inner
 
     half* gl_c_ptr_16 = ((half*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
     float* gl_c_ptr_32 = ((float*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
+    int gl_c_stride_bf16 = final_bf16_stride ? final_bf16_stride : size_n;
+    __nv_bfloat16* gl_c_ptr_bf16 = final_bf16
+        ? final_bf16 + slice_m * TILESIZE_M * gl_c_stride_bf16 + slice2_n * gl_c_stride_n
+        : nullptr;
 
     register FragA frag_a[FRAG_STAGES];
     register FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
@@ -221,6 +227,7 @@ void exl3_gemm_kernel_inner
                 gl_c_ptr_32 += gl_c_stride_n;
             else
                 gl_c_ptr_16 += gl_c_stride_n;
+            if (gl_c_ptr_bf16) gl_c_ptr_bf16 += gl_c_stride_n;
         }
     };
 
@@ -466,7 +473,15 @@ void exl3_gemm_kernel_inner
             const float* had_in = sh_c + row * TILESIZE_N + col * 128;
             const half* post_scale_c = post_scale + slice2_n * gl_c_stride_n + col * 128;
 
-            if constexpr (c_fp32)
+            if (gl_c_ptr_bf16)
+            {
+                __nv_bfloat16* had_out = gl_c_ptr_bf16 + row * gl_c_stride_bf16 + col * 128;
+                if constexpr (preserve_half_output)
+                    had_fhb_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
+                else
+                    had_fb_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
+            }
+            else if constexpr (c_fp32)
             {
                 float* had_out = gl_c_ptr_32 + row * size_n + col * 128;
                 had_ff_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
