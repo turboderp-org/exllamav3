@@ -1,2 +1,4 @@
 include exllamav3/util/hadamard_data/*
+include exllamav3/py.typed
+include exllamav3/conversion/standard_cal_data/*.utf8
 recursive-include exllamav3/exllamav3_ext *
