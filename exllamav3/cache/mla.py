@@ -175,7 +175,8 @@ class CacheLayer_MLA_fp16(CacheLayer):
     @override
     def storage_size(self):
         return (np.prod(self.shape_c) + np.prod(self.shape_r) +
-                (np.prod(self.shape_i) if self.shape_i else 0)) * torch.half.itemsize
+                (np.prod(self.shape_i) if self.shape_i else 0) +
+                (np.prod(self.shape_p) if self.shape_p else 0)) * torch.half.itemsize
 
 
     @override
@@ -382,7 +383,8 @@ class CacheLayer_MLA_quant(CacheLayer):
         return (
             np.prod(self.qshape) * torch.int.itemsize +
             np.prod(self.sshape) * torch.half.itemsize +
-            (np.prod(self.shape_r) + (np.prod(self.shape_i) if self.shape_i else 0)) * torch.half.itemsize
+            (np.prod(self.shape_r) + (np.prod(self.shape_i) if self.shape_i else 0) +
+             (np.prod(self.shape_p) if self.shape_p else 0)) * torch.half.itemsize
         )
 
 
