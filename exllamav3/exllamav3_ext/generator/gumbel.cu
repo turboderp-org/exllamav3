@@ -30,6 +30,13 @@ void gumbel_noise_kernel_f16
     curandStatePhilox4_32_10_t state;
     curand_init(random, idx, 0, &state);
 
+    if (idx + 1 >= size)
+    {
+        // Odd size: the last element has no pair partner
+        float x = __half2float(in_logits[idx]) + gumbel(curand_uniform(&state));
+        logits[idx] = __float2half_rn(x);
+        return;
+    }
     half2 x01 = *((half2*) (in_logits + idx));
     float x0 = __half2float(__low2half(x01));
     float x1 = __half2float(__high2half(x01));
@@ -100,7 +107,7 @@ void gumbel_noise_f16
     TORCH_CHECK_DTYPE(logits, kHalf);
 
     int size = logits.numel();
-    int blocks = CEIL_DIVIDE(size / 2, NUM_THREADS);
+    int blocks = CEIL_DIVIDE(CEIL_DIVIDE(size, 2), NUM_THREADS);
 
     gumbel_noise_kernel_f16<<<blocks, NUM_THREADS, 0, stream>>>
     (

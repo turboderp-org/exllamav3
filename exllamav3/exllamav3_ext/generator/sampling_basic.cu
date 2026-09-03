@@ -15,6 +15,7 @@ constexpr float NEG_INF_F32 = -std::numeric_limits<float>::infinity();
 
 inline __device__ float gumbel(float x)
 {
+    x = fminf(x, 0.99999994f);  // curand_uniform is (0, 1]: x == 1.0 would produce a huge spike
     return -__logf(fmaxf(-__logf(fmaxf(x, 1e-20)), 1e-20));
 }
 
@@ -54,9 +55,9 @@ inline __device__ bool read2f
     else
     {
         half2 x0x1 = *((half2*) (logits_ptr + idx));
-        if (idx < max_logit - 1) x0 = __half2float(__low2half(x0x1));
+        if (idx < max_logit) x0 = __half2float(__low2half(x0x1));          // element idx
         else x0 = NEG_INF_F32;
-        if (idx < max_logit) x1 = __half2float(__high2half(x0x1));
+        if (idx + 1 < max_logit) x1 = __half2float(__high2half(x0x1));     // element idx + 1
         else x1 = NEG_INF_F32;
         return true;
     }
