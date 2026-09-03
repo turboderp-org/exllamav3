@@ -397,7 +397,7 @@ class Attention(Module):
     def optimizer_targets(self):
         q = self.q_proj.optimizer_targets()
         k = self.k_proj.optimizer_targets()
-        v = self.v_proj.optimizer_targets()
+        v = self.v_proj.optimizer_targets() if self.v_proj is not None else []   # use_k_as_v: no V projection
         o = self.o_proj.optimizer_targets()
         return [[q, k + v, o]]
 
