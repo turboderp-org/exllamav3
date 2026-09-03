@@ -71,8 +71,8 @@ class Job:
         Create new job.
 
         :param input_ids:
-            Tokenized IDs of the input prompt, shape (1, n). Alternatively, list of tokenized IDs to inference on
-            seperately but sample collectively (e.g. CFG prompt pair)
+            Tokenized IDs of the input prompt, shape (1, n) (a single-element list is also accepted). A job holds
+            exactly one sequence
 
         :param max_new_tokens:
             Max no. output tokens to allow. None (default): no limit other than the cache capacity
