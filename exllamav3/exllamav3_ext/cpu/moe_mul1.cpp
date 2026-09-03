@@ -41,6 +41,12 @@
 // below 2^15, which makes the operand order load-bearing). Accuracy matches the GPU int8-GEMV
 // mode-2 class (~0.9% per-call output RMS). i32 accumulators are safe for k up to ~8192.
 //
+// On the AVX2 tier (no VNNI) the byte-sum must be emulated with vpmaddubsw, whose i16 pair sums
+// saturate once an activation is inside the pair. The accumulate therefore keeps the pair x-free:
+// sum the product bytes once per k-row into i16 pair-sums <= 510, then multiply by x with one
+// vpmaddwd per token row. +-127 activations, bit-exact vs the masked accumulate it replaces,
+// ~2x its throughput (measured on Zen 3 + Zen 5).
+//
 // State extraction uses compile-time (bits, row) index tables for vpermt2var plus immediate
 // funnel shifts, following benchmarks/exl3_cpu_gemm. The GEMV streams k-major with a contiguous
 // band of output tiles held in register accumulators per worker, so cold expert weights are read
@@ -270,12 +276,20 @@ struct PreparedIn
 {
     float* tin;         // m x k, transformed fp32 (scalar kernel)
     int32_t* splat32;   // m x k, int8 activation replicated x4
+    // m x k, x8 (two's-complement, read as i16) in BOTH 16-bit slots of the dword. AVX2
+    // bytesum-first accumulate: the product-byte pair sums (b0+b1, b2+b3, each <= 510) are
+    // formed once per k-row with x OUTSIDE the pair (so no saturation at full +-127), then a
+    // single vpmaddwd per token row against this pattern returns bytesum*x as one i32.
+    // Bit-exact reassociation of the same integer sum: 4 ops/row + 4 shared, vs 16 (masked)
+    // or 12 (activation-split). VNNI/VBMI ignore.
+    int32_t* splat_dup;
     float q[MAX_M];
     int32_t sum_x8[MAX_M];
 };
 
 M1_TARGET_AVX2
-void quantize_row_avx2(const float* dst, int32_t* splat, int k, float& q_out, int32_t& s_out)
+void quantize_row_avx2(const float* dst, int32_t* splat, int32_t* splat_dup,
+    int k, float& q_out, int32_t& s_out)
 {
     __m256 vmax = _mm256_setzero_ps();
     const __m256 sign = _mm256_set1_ps(-0.0f);
@@ -299,6 +313,14 @@ void quantize_row_avx2(const float* dst, int32_t* splat, int k, float& q_out, in
         vsum = _mm256_add_epi32(vsum, v);
         const __m256i b = _mm256_and_si256(v, mask8);
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(splat + i), _mm256_mullo_epi32(b, rep));
+        // x in both 16-bit slots (see PreparedIn::splat_dup): the low 16 bits of v are already
+        // the two's-complement i16 activation; replicate into the high slot
+        if (splat_dup)
+        {
+            const __m256i low16 = _mm256_and_si256(v, _mm256_set1_epi32(0xffff));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(splat_dup + i),
+                _mm256_or_si256(low16, _mm256_slli_epi32(low16, 16)));
+        }
     }
     alignas(32) int32_t sm[8];
     _mm256_store_si256(reinterpret_cast<__m256i*>(sm), vsum);
@@ -373,11 +395,14 @@ void prepare_rows
 
         // int8 quantization, one scale per row
         int32_t* splat = p.splat32 + static_cast<size_t>(r) * k;
+        // dup is only read by the AVX2 maddubs kernels; skip the stores on the VNNI/VBMI tiers
+        int32_t* splat_dup = (p.splat_dup && g_isa == Isa::Avx2)
+            ? p.splat_dup + static_cast<size_t>(r) * k : nullptr;
         float q;
         int32_t s;
         if (g_isa != Isa::Scalar)
         {
-            quantize_row_avx2(dst, splat, k, q, s);
+            quantize_row_avx2(dst, splat, splat_dup, k, q, s);
         }
         else
         {
@@ -966,27 +991,26 @@ inline void avx2_row_codes(const __m256i (&preg)[bits], __m256i& codes_lo, __m25
 }
 
 M1_TARGET_AVX2
-inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat, int k,
-    int m, __m256i (&acc)[MAX_M][2], const __m256i& mult, const __m256i& ones16,
-    const __m256i& even_mask, int row)
+inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat_dup, int k,
+    int m, __m256i (&acc)[MAX_M][2], const __m256i& mult, const __m256i& ones32, int row)
 {
-    const __m256i prod0 = _mm256_mullo_epi32(codes_lo, mult);
-    const __m256i prod1 = _mm256_mullo_epi32(codes_hi, mult);
-    const __m256i p0e = _mm256_and_si256(prod0, even_mask);
-    const __m256i p0o = _mm256_andnot_si256(even_mask, prod0);
-    const __m256i p1e = _mm256_and_si256(prod1, even_mask);
-    const __m256i p1o = _mm256_andnot_si256(even_mask, prod1);
-
-    for (int i = 0; i < m; ++i)
-    {
-        const __m256i xs = _mm256_set1_epi32(splat[static_cast<size_t>(i) * k + row]);
-        acc[i][0] = _mm256_add_epi32(acc[i][0], _mm256_add_epi32(
-            _mm256_madd_epi16(_mm256_maddubs_epi16(p0e, xs), ones16),
-            _mm256_madd_epi16(_mm256_maddubs_epi16(p0o, xs), ones16)));
-        acc[i][1] = _mm256_add_epi32(acc[i][1], _mm256_add_epi32(
-            _mm256_madd_epi16(_mm256_maddubs_epi16(p1e, xs), ones16),
-            _mm256_madd_epi16(_mm256_maddubs_epi16(p1o, xs), ones16)));
-    }
+    // Bytesum-first accumulate: maddubs(prod, 0x01010101) sums each product-byte pair into an
+    // i16 lane ((b0+b1), (b2+b3), <= 510). x is OUTSIDE the pair so vpmaddubsw cannot saturate
+    // at full +-127 activations; one vpmaddwd per token row against splat_dup (x8 in both 16-bit
+    // slots) then folds (b0+b1)*x+(b2+b3)*x into a single i32. 4 shared + 4 per-row ops,
+    // bit-exact vs the 16-op masked accumulate it replaces (verified K1-K8 x m1-4 against an
+    // exact scalar reference). The token loop is unrolled by hand: with a runtime-bounded loop
+    // GCC spills the pair sums and pays per-iteration overhead (~1.4x on Zen 3).
+    const __m256i p_lo = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_lo, mult), ones32);
+    const __m256i p_hi = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_hi, mult), ones32);
+    #define ACC_ROW(i) \
+        if ((i) < m) { \
+            const __m256i xs = _mm256_set1_epi32(splat_dup[static_cast<size_t>(i) * k + row]); \
+            acc[i][0] = _mm256_add_epi32(acc[i][0], _mm256_madd_epi16(p_lo, xs)); \
+            acc[i][1] = _mm256_add_epi32(acc[i][1], _mm256_madd_epi16(p_hi, xs)); \
+        }
+    ACC_ROW(0) ACC_ROW(1) ACC_ROW(2) ACC_ROW(3)
+    #undef ACC_ROW
 }
 
 // Word-level row pairing on AVX2 is gated to bits == 8 ONLY: measured +11% there (each gather
@@ -997,8 +1021,8 @@ inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* sp
 template <int bits, int row = 0>
 M1_TARGET_AVX2
 inline void avx2_rows_accum(
-    const __m256i (&preg)[bits], const int32_t* splat, int k, int m, __m256i (&acc)[MAX_M][2],
-    const __m256i& mult, const __m256i& ones16, const __m256i& even_mask)
+    const __m256i (&preg)[bits], const int32_t* splat_dup, int k, int m, __m256i (&acc)[MAX_M][2],
+    const __m256i& mult, const __m256i& ones32)
 {
     if constexpr (bits == 8)
     {
@@ -1016,23 +1040,23 @@ inline void avx2_rows_accum(
                 _mm256_srli_epi32(b_lo, s0), _mm256_slli_epi32(a_lo, 32 - s0)), mask16);
             __m256i codes_hi = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
-            avx2_accum_row(codes_lo, codes_hi, splat, k, m, acc, mult, ones16, even_mask, row);
+            avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
             // Odd row: same gathered words, shifted by an extra `bits` (>= 32 shifts are
             // well-defined zero, so the slli term drops out cleanly when s - bits == 0)
             codes_lo = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_lo, s0 - bits), _mm256_slli_epi32(a_lo, 32 - (s0 - bits))), mask16);
             codes_hi = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_hi, s1 - bits), _mm256_slli_epi32(a_hi, 32 - (s1 - bits))), mask16);
-            avx2_accum_row(codes_lo, codes_hi, splat, k, m, acc, mult, ones16, even_mask, row + 1);
-            avx2_rows_accum<bits, row + 2>(preg, splat, k, m, acc, mult, ones16, even_mask);
+            avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row + 1);
+            avx2_rows_accum<bits, row + 2>(preg, splat_dup, k, m, acc, mult, ones32);
         }
     }
     else if constexpr (row < 16)
     {
         __m256i codes_lo, codes_hi;
         avx2_row_codes<bits, row>(preg, codes_lo, codes_hi);
-        avx2_accum_row(codes_lo, codes_hi, splat, k, m, acc, mult, ones16, even_mask, row);
-        avx2_rows_accum<bits, row + 1>(preg, splat, k, m, acc, mult, ones16, even_mask);
+        avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
+        avx2_rows_accum<bits, row + 1>(preg, splat_dup, k, m, acc, mult, ones32);
     }
 }
 
@@ -1044,8 +1068,19 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
     const int tiles_n = mat.n / 16;
     constexpr int packed_size = 16 * bits;
     const __m256i mult = _mm256_set1_epi32(static_cast<int32_t>(MUL1_MULT));
-    const __m256i ones16 = _mm256_set1_epi16(1);
-    const __m256i even_mask = _mm256_set1_epi16(0x00ff);
+    const __m256i ones32 = _mm256_set1_epi32(0x01010101);
+    const int32_t* splat_dup = in.splat_dup;
+
+    // The k-major stream strides row_stride (>= 8 KB) per step, beyond what the HW prefetcher
+    // tracks (and the swizzled layout the VNNI path uses is not applied for AVX2). Cold-stack
+    // (offloaded expert) microbench: +20..70% at K>=4, largest at K8, warm-neutral, so always
+    // on. Distance 4 measured best cold (>= 2 everywhere within noise, 4 adds another +10..35%
+    // at K5-K8 cold); prefetching past the allocation end is architecturally safe.
+    constexpr int pf_lines = (32 * bits + 63) / 64;   // cache lines per tile row
+    // bits==6 (96B rows) collapses at distance 4 when cold (reproducibly ~2x slower on both
+    // the 7960X and this Zen5 box; the 3-line window from 4 rows out interacts badly with the
+    // 96B stride). Distance 2 measures >= everywhere else for K6 while costing <2% warm.
+    constexpr int pf_dist = (bits == 6) ? 2 : 4;
 
     for (int tile_n = tn0; tile_n < tn1; ++tile_n)
     {
@@ -1060,13 +1095,18 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
         const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
         for (int tile_k = 0; tile_k < tiles_k; ++tile_k, packed += row_stride)
         {
-            const int32_t* splat = in.splat32 + tile_k * 16;
+            const uint16_t* pf = packed + row_stride * pf_dist;
+            #pragma unroll
+            for (int l = 0; l < pf_lines; ++l)
+                _mm_prefetch(reinterpret_cast<const char*>(pf) + l * 64, _MM_HINT_T0);
+
+            const int32_t* splat_k = splat_dup + tile_k * 16;
             // One 256-bit (8xu32) register per bits: covers packed_size = 16*bits u16 = bits*8
             // u32 words exactly, the whole k-tile's row of packed states
             __m256i preg[bits];
             for (int i = 0; i < bits; ++i)
                 preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + i * 16));
-            avx2_rows_accum<bits>(preg, splat, mat.k, m, acc, mult, ones16, even_mask);
+            avx2_rows_accum<bits>(preg, splat_k, mat.k, m, acc, mult, ones32);
         }
 
         for (int i = 0; i < m; ++i)
@@ -1536,6 +1576,7 @@ struct ForwardArena
 {
     std::vector<float> tin_g, tin_u, tin_d;
     std::vector<int32_t> splat_g, splat_u, splat_d;
+    std::vector<int32_t> splat_dup_g, splat_dup_u, splat_dup_d;
     std::vector<float> tout_g, tout_u, tout_d;
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
 
@@ -2051,6 +2092,9 @@ void exl3_moe_cpu_forward_raw(
     grow(ar.splat_g, static_cast<size_t>(nc) * MAX_M * H);
     grow(ar.splat_u, static_cast<size_t>(nc) * MAX_M * H);
     grow(ar.splat_d, static_cast<size_t>(nc) * MAX_M * I);
+    grow(ar.splat_dup_g, static_cast<size_t>(nc) * MAX_M * H);
+    grow(ar.splat_dup_u, static_cast<size_t>(nc) * MAX_M * H);
+    grow(ar.splat_dup_d, static_cast<size_t>(nc) * MAX_M * I);
     grow(ar.tout_g, static_cast<size_t>(nc) * MAX_M * I);
     grow(ar.tout_u, static_cast<size_t>(nc) * MAX_M * I);
     grow(ar.tout_d, static_cast<size_t>(nc) * MAX_M * H);
@@ -2062,11 +2106,14 @@ void exl3_moe_cpu_forward_raw(
     for (int j = 0; j < nc; ++j)
     {
         ctx.prep_g[j] = { ar.tin_g.data() + static_cast<size_t>(j) * MAX_M * H,
-                          ar.splat_g.data() + static_cast<size_t>(j) * MAX_M * H, {}, {} };
+                          ar.splat_g.data() + static_cast<size_t>(j) * MAX_M * H,
+                          ar.splat_dup_g.data() + static_cast<size_t>(j) * MAX_M * H, {}, {} };
         ctx.prep_u[j] = { ar.tin_u.data() + static_cast<size_t>(j) * MAX_M * H,
-                          ar.splat_u.data() + static_cast<size_t>(j) * MAX_M * H, {}, {} };
+                          ar.splat_u.data() + static_cast<size_t>(j) * MAX_M * H,
+                          ar.splat_dup_u.data() + static_cast<size_t>(j) * MAX_M * H, {}, {} };
         ctx.prep_d[j] = { ar.tin_d.data() + static_cast<size_t>(j) * MAX_M * I,
-                          ar.splat_d.data() + static_cast<size_t>(j) * MAX_M * I, {}, {} };
+                          ar.splat_d.data() + static_cast<size_t>(j) * MAX_M * I,
+                          ar.splat_dup_d.data() + static_cast<size_t>(j) * MAX_M * I, {}, {} };
     }
 
     std::lock_guard<std::mutex> lock(g_pool_mutex);
