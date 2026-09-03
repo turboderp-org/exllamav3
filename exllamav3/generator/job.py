@@ -75,7 +75,7 @@ class Job:
             seperately but sample collectively (e.g. CFG prompt pair)
 
         :param max_new_tokens:
-            Max no. output tokens to allow
+            Max no. output tokens to allow. None (default): no limit other than the cache capacity
 
         :param min_new_tokens:
             Minimum number of tokens to generate before stop tokens become active. Until this number have been
@@ -207,9 +207,13 @@ class Job:
                 "input_ids must be [1, seq_len] tensor or list of [1, seq_len] tensors"
             seq = Sequence(ids, seq_ids)
             self.sequences.append(seq)
+        assert len(self.sequences) == 1, \
+            "A job holds exactly one sequence (multi-sequence jobs are not supported)"
 
         # Generation parameters
-        self.max_new_tokens = max_new_tokens - 1 or 1
+        assert max_new_tokens is None or max_new_tokens >= 1, "max_new_tokens must be >= 1, or None for no limit"
+        # None: no limit beyond what the cache can hold; resolved against the generator in prepare_for_queue
+        self.max_new_tokens = max_new_tokens
         self.min_new_tokens = min_new_tokens
         self.new_tokens = 0 if self.prefix_token is None else -1
         self.sampler = sampler
