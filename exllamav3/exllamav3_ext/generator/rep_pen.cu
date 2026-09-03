@@ -178,7 +178,7 @@ void apply_pres_freq_pens_kernel
         float factor = decay_range > 0 ? 1.0f - (distf - sustain_rangef) / decay_rangef : 1.0f;
         factor = CLAMP(factor, 0.0f, 1.0f);
         atomicAdd(frequency + tid - range_min, factor * freq_p);
-        shmemAtomicMaxF(presence + tid - range_min, factor * pres_p);
+        shmemAtomicMaxF(presence + tid - range_min, factor);
     }
     __syncthreads();
 
@@ -195,7 +195,7 @@ void apply_pres_freq_pens_kernel
             v = ((float*) in_logits)[i + range_min];
 
         v -= frequency[i];
-        v -= presence[i];
+        v -= presence[i] * pres_p;
         out_logits[i + range_min] = v;
     }
 }

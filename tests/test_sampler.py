@@ -58,6 +58,37 @@ custom_test_cases = [
         "expect_logits": [[2, 2, 2, 1.75, 1.5, 1.25, 1, 1, 1, 1]],
     },
     {
+        # OAI/vLLM semantics: negative penalties reward reuse (presence used to be silently dropped)
+        "name": "presfreq_p negative presence",
+        "sampler": CustomSampler([
+            SS_PresFreqP(-1, 0),
+            SS_Sample_mn()
+        ]),
+        "input": [[10, 10, 10, 10, 10, 10, 10, 10, 10, 10]],
+        "input_seq": [[0, 0, 0, 1, 1, 1, 1, 1, 1, 9]],
+        "expect_logits": [[11, 11, 10, 10, 10, 10, 10, 10, 10, 11]],
+    },
+    {
+        "name": "presfreq_p negative frequency",
+        "sampler": CustomSampler([
+            SS_PresFreqP(0, -1),
+            SS_Sample_mn()
+        ]),
+        "input": [[10, 10, 10, 10, 10, 10, 10, 10, 10, 10]],
+        "input_seq": [[0, 0, 0, 1, 1, 1, 1, 1, 1, 9]],
+        "expect_logits": [[13, 16, 10, 10, 10, 10, 10, 10, 10, 11]],
+    },
+    {
+        "name": "presfreq_p negative presence with decay",
+        "sampler": CustomSampler([
+            SS_PresFreqP(-1, 0, 4, 4),
+            SS_Sample_mn()
+        ]),
+        "input": [[2, 2, 2, 2, 2, 2, 2, 2, 2, 2]],
+        "input_seq": [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]],
+        "expect_logits": [[2, 2, 2, 2.25, 2.5, 2.75, 3, 3, 3, 3]],
+    },
+    {
         "name": "rep_p 1",
         "sampler": CustomSampler([
             SS_RepP(2),
