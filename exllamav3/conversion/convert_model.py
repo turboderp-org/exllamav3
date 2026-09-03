@@ -227,19 +227,24 @@ def prepare(args) -> (dict, dict, bool, str):
             else:
                 raise ValueError(f" ## Missing required argument: {arg}")
         if arg in args and vars(args)[arg] is not None:
-            if arg in in_args and vars(args)[arg] and in_args[arg] != vars(args)[arg]:
+            new = vars(args)[arg]
+            if arg in in_args and in_args[arg] != new:
+                if not new:
+                    # An unset store_true flag (or a zero default) can't be told from "unspecified":
+                    # the resumed job's saved value stands (e.g. --hq stays on when resuming without it)
+                    return
                 if can_override:
                     print(
                         f" !! Warning: Overriding {arg} from existing job, was: {in_args[arg]}, "
-                        f"new value: {vars(args)[arg]}"
+                        f"new value: {new}"
                     )
                 else:
                     raise ValueError(
                         f" ## Error: Resuming job with {arg} = {in_args[arg]}, "
-                        f"cannot override with new value of {vars(args)[arg]}. "
+                        f"cannot override with new value of {new}. "
                         f"Please start a new job to change this value."
                     )
-            in_args[arg] = vars(args)[arg]
+            in_args[arg] = new
 
     for arg_, can_override, default in [
         ("in_dir", True, None),
