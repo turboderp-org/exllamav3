@@ -34,7 +34,7 @@ class Glm4VPosEmbedding(Module):
 
     @override
     def weights_numel(self):
-        return self.num_position_embeddings + self.hidden_size
+        return self.num_position_embeddings * self.hidden_size
 
 
     def optimizer_targets(self):

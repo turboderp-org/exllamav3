@@ -104,7 +104,7 @@ class Qwen4ExpMTPInputLayer(Module):
 
     @override
     def weights_numel(self):
-        return self.hc_mult * self.hidden_size
+        return super().weights_numel() + self.hc_mult * self.hidden_size
 
     # The module key is the bare "mtp" prefix, which would swallow every mtp.* tensor in the
     # default prefix-based compile collection (duplicating the decoder block's and mixer's
