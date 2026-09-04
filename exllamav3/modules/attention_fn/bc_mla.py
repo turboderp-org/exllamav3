@@ -1,4 +1,5 @@
 import torch
+from ...util.device_copy import to_device
 
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
@@ -533,8 +534,7 @@ class BCMLA:
                     ext_indices = params.get("dsa_topk_indices")
                     if ext_indices is None:
                         return None
-                    if ext_indices.device != x.device:
-                        ext_indices = ext_indices.to(x.device)
+                    ext_indices = to_device(ext_indices, x.device)
 
         if (bsz, q_len, regime) not in self.configured:
             self._configure(bsz, q_len, regime)

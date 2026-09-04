@@ -4,7 +4,7 @@ import torch
 
 from ...ext import exllamav3_ext as ext
 from ...modules import Module, RMSNorm
-from ...modules.module import no_p2p_copy
+from ...util.device_copy import to_device
 from ...modules.dsv4 import DSV4Attention
 from ...modules.attention_fn.dsa_triton import dsa_attn
 from ...util.rope import RopeStyle
@@ -44,7 +44,7 @@ def to_dev(t: torch.Tensor, device) -> torch.Tensor:
     .to() silently yields an empty tensor; route through system memory when flagged."""
     if t.device == device:
         return t
-    return t.cpu().to(device) if no_p2p_copy else t.to(device)
+    return to_device(t, device)
 
 
 class DSparkAttention(DSV4Attention):

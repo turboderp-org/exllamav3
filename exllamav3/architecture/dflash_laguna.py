@@ -9,7 +9,7 @@ from ..util.rope import RopeStyle
 from ..modules import RMSNorm, TransformerBlock, Attention, GatedMLP
 from ..modules.arch_specific.dflash import DFlashInputLayer
 from ..modules.attn import prepare_for_attn
-from ..modules.module import no_p2p_copy
+from ..util.device_copy import to_device
 import weakref
 
 from ..util.tensor import get_for_device
@@ -239,11 +239,7 @@ class DFlashLagunaModel(Model):
         # Ensure all state snapshots are on the same device
         device = self.input_layer.device
         for i in range(len(target_hidden)):
-            if target_hidden[i].device != device:
-                if no_p2p_copy:
-                    target_hidden[i] = target_hidden[i].cpu().to(device)
-                else:
-                    target_hidden[i] = target_hidden[i].to(device)
+            target_hidden[i] = to_device(target_hidden[i], device)
 
         # Per-tap norm, concatenate, project to hidden size, norm -- once
         target_hidden = [

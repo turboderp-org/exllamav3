@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+from ..util.device_copy import to_device
 import weakref
 
 from ..model.config import Config
@@ -170,7 +171,7 @@ class Qwen4ExpMTPModel(Model):
         # state is the flattened pre-mixer stream stack; collapse it before the shared head
         mixer = self.stack_out.mixer
         bsz, seq, _ = state.shape
-        stack = state.to(mixer.device).view(bsz, seq, mixer.hc_mult, mixer.hidden_size)
+        stack = to_device(state, mixer.device).view(bsz, seq, mixer.hc_mult, mixer.hidden_size)
         state = mixer.forward(stack, params)
         ll = self.attached_model().logit_layer_idx
         lm = self.attached_model().modules[ll]

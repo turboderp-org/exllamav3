@@ -11,7 +11,6 @@ from ..util.rope import RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear, BlockSparseMLP
 from ..modules.arch_specific.qwen3_5_mtp import Qwen3_5MTPInputLayer
 from ..modules.attn import prepare_for_attn
-from ..modules.module import no_p2p_copy
 from ..util.tensor import get_for_device
 
 from typing import TYPE_CHECKING
