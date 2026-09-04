@@ -88,8 +88,8 @@ class Generator:
             Minimum number of tokens to match for n-gram draft (0 = disabled).
 
         :param dynamic_draft_tokens:
-            Adapt the per-round draft length to the workload. The draft is cut using drafter confidence
-            (argmax logit), calibrated online against observed acceptance rates (see draft_confidence). A
+            Adapt the per-round draft length to the workload. The draft is cut using a drafter-provided
+            confidence score, calibrated online against observed acceptance rates (see draft_confidence). A
             DFlash drafter still runs at its fixed diffusion block size and only the verified window shrinks;
             AR and MTP drafters stop the drafting loop itself early, saving one drafter forward per pruned
             position. The acceptance behavior of the surviving positions is unchanged. Has no effect on n-gram
@@ -97,7 +97,7 @@ class Generator:
 
         :param draft_confidence:
             Used with dynamic_draft_tokens and a draft model: target acceptance probability for drafted
-            positions, evaluated against an online mapping from drafter confidence (argmax logit) to observed
+            positions, evaluated against an online mapping from drafter confidence scores to observed
             acceptance rates. Scale-free and portable across model pairs. For DFlash (block produced at fixed
             cost) the block is cut at the first position whose estimated conditional acceptance drops below
             the target. For AR and MTP drafters (one forward per position, and a position only pays off if
