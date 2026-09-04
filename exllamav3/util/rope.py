@@ -165,6 +165,12 @@ class RoPE:
         if not t:
             if rs.rope_scaling is not None:
                 t = rs.rope_scaling.get("rope_type", rs.rope_scaling.get("type"))
+        # MRoPE sectioning is orthogonal to the scaling type: a multimodal model keeps its
+        # mrope_section next to whatever rope_type it uses (Qwen3.5 with YaRN context extension
+        # as recommended by its model card, for one), so read it before dispatching on the type
+        if rs.rope_scaling:
+            self.mrope_interleaved = rs.rope_scaling.get("mrope_interleaved")  # Ignored in HF impl., always True
+            self.mrope_section = rs.rope_scaling.get("mrope_section")
         match t:
             case None:
                 self._rope_params_default()
@@ -189,9 +195,6 @@ class RoPE:
         base = rs.rope_theta
         dim = rs.rotary_dim or int(rs.head_dim * rs.partial_rotary_factor)
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype = torch.int64, device = self.device).float() / dim))
-        if rs.rope_scaling:
-            self.mrope_interleaved = rs.rope_scaling.get("mrope_interleaved")  # Ignored in HF impl., always True
-            self.mrope_section = rs.rope_scaling.get("mrope_section")
         self.inv_freq, self.attn_factor = inv_freq, 1.0
 
 
@@ -249,13 +252,6 @@ class RoPE:
 
     def _rope_params_yarn(self):
         rs = self.rope_settings
-        # PATCH: also pick up mrope_section / mrope_interleaved for multimodal
-        # models (Qwen3.5/3.8 VL). Without this, vision rendering crashes in
-        # get_mrope_freqs() with "TypeError: 'NoneType' object is not subscriptable".
-        if rs.rope_scaling:
-            if rs.rope_scaling.get("mrope_section") is not None:
-                self.mrope_section = rs.rope_scaling.get("mrope_section")
-                self.mrope_interleaved = rs.rope_scaling.get("mrope_interleaved")
         max_position_embeddings = rs.override_max_position_embeddings or rs.max_position_embeddings
         assert max_position_embeddings is not None, \
             "YaRN scaling requires explicit max_position_embeddings"
