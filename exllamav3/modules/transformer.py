@@ -195,17 +195,27 @@ class TransformerBlock(Module):
                 x += y
 
         if export_state:
-            s = params.get("export_states")
-            if not s:
-                s = params["export_states"] = []
             # With hyperconnections the residual is a stream stack; export the stream mean as
             # the collapsed hidden state (streams start as broadcast copies of the embedding)
             x_ = x.mean(dim = 2) if self.attn_hc else x
             if x_.dtype == torch.half:
-                s.append(x_.clamp_(-65504.0, 65504.0))
+                x_ = x_.clamp_(-65504.0, 65504.0)
             else:
                 x_ = x_.half()
                 x_.clamp_(-65504.0, 65504.0)
+
+            # DFlash projections concatenate taps in checkpoint order, which is not necessarily
+            # layer order. Other state consumers retain the existing append-in-execution-order path.
+            state_order = params.get("export_state_order")
+            if state_order is not None:
+                s = params.get("export_states")
+                if s is None:
+                    s = params["export_states"] = [None] * len(state_order)
+                s[state_order[self.layer_idx]] = x_
+            else:
+                s = params.get("export_states")
+                if s is None:
+                    s = params["export_states"] = []
                 s.append(x_)
 
         if self.layer_scalar_f is not None:

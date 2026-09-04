@@ -18,28 +18,60 @@ def _warn_sdpa_fallback():
     has_warned_sdpa_fallback = True
 
 
+def _torch_sdpa_nocache(q, k, v, causal, scale, window_size):
+    q_len = q.shape[1]
+    kv_len = k.shape[1]
+    left, right = window_size
+    attn_mask = None
+    # Preserve PyTorch's optimized causal path for ordinary self-attention. A dense mask is
+    # only needed for sliding windows or prefix-aligned span queries (q_len != kv_len).
+    use_is_causal = causal and q_len == kv_len and left < 0 and right < 0
+    if not use_is_causal and (causal or left >= 0 or right >= 0):
+        q_pos = torch.arange(q_len, device = q.device) + kv_len - q_len
+        k_pos = torch.arange(kv_len, device = q.device)
+        attn_mask = torch.ones((q_len, kv_len), dtype = torch.bool, device = q.device)
+        if causal:
+            attn_mask &= k_pos[None, :] <= q_pos[:, None]
+        if left >= 0:
+            attn_mask &= k_pos[None, :] >= q_pos[:, None] - left
+        if right >= 0:
+            attn_mask &= k_pos[None, :] <= q_pos[:, None] + right
+
+    return F.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        attn_mask = attn_mask,
+        is_causal = use_is_causal,
+        enable_gqa = q.shape[2] != k.shape[2],
+        scale = scale,
+    ).transpose(1, 2)
+
+
 def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
     if (
         args.has_kv_cache() or
-        args.is_swa() or
         args.is_varlen() or
         args.softcap != 0.0 or
-        args.sinks is not None or
-        args.non_causal_spans
+        args.sinks is not None
     ):
         return None
 
     if args.dim > 256:
         _warn_sdpa_fallback()
 
-    return F.scaled_dot_product_attention(
-        args.q.transpose(1, 2),
-        args.k.transpose(1, 2),
-        args.v.transpose(1, 2),
-        is_causal = args.causal,
-        enable_gqa = args.is_gqa(),
-        scale = args.sm_scale,
-    ).transpose(1, 2)
+    if not args.non_causal_spans:
+        return _torch_sdpa_nocache(
+            args.q, args.k, args.v, args.causal, args.sm_scale, args.get_window_size()
+        )
+
+    outputs = []
+    for span in get_non_causal_span_arglist(args):
+        outputs.append(_torch_sdpa_nocache(
+            span["q"], span["k"], span["v"], span["causal"], args.sm_scale,
+            span["window_size"],
+        ))
+    return torch.cat(outputs, dim = 1)
 
 
 def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:

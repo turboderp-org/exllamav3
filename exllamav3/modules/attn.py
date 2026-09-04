@@ -720,6 +720,7 @@ class Attention(Module):
         params: dict,
     ):
         causal = params.get("causal", True)
+        non_causal_spans = params.get("non_causal_spans")
         position = params.get("position", 0)
         positions = get_for_device(params, "positions", self.device, None)
         position_ids = get_for_device(params, "position_ids", self.device, None)
@@ -781,6 +782,7 @@ class Attention(Module):
                 sm_scale = self.sm_scale,
                 window_size = self.sliding_window,
                 softcap = self.logit_softcapping,
+                non_causal_spans = non_causal_spans,
                 sinks = self.sinks,
                 dispatch_cache = self.dispatch_cache,
             )

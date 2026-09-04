@@ -107,17 +107,24 @@ def get_non_causal_span_arglist(args: AttnArgs):
                 n_kv_heads_override = args.num_kv_heads,
             ))
             continue
+        # With no cache, retain the chunk prefix before this span as ordinary K/V. Cached
+        # calls already have that prefix in the page table and append only this span's rows.
+        cacheless = args.cache_seqlens is None
+        k = args.k[:, : b] if cacheless else args.k[:, a : b]
+        v = args.v[:, : b] if cacheless else args.v[:, a : b]
+        cache_seqlens = None if cacheless else args.cache_seqlens + a
+
         # Only the Triton wrappers take a sinks argument; backends without support decline
         # sinked calls before expanding the spans, so the key is omitted when unused
         extra = dict(sinks = args.sinks) if args.sinks is not None else {}
         arglist.append(dict(
-            q = args.q[:, a: b],
-            k = args.k[:, a: b],
-            v = args.v[:, a: b],
+            q = args.q[:, a : b],
+            k = k,
+            v = v,
             k_cache = args.k_cache,
             v_cache = args.v_cache,
             block_table = args.block_table,
-            cache_seqlens = args.cache_seqlens + a,
+            cache_seqlens = cache_seqlens,
             causal = not nc,
             softmax_scale = args.sm_scale,
             window_size = window_size,

@@ -63,6 +63,8 @@ class DFlashConfig(Config):
         self.mask_token_id = self.read_cfg(int, ["dflash_config->mask_token_id", "mask_token_id"], no_default)
         self.target_layer_ids = self.read_cfg(list, ["dflash_config->target_layer_ids", "target_layer_ids"], no_default)
         self.target_layer_ids = [i + self.tap_shift for i in self.target_layer_ids]
+        assert len(set(self.target_layer_ids)) == len(self.target_layer_ids), \
+            "DFlash target_layer_ids must be unique"
         self.block_size = self.read_cfg(int, ["block_size", "dflash_config->block_size"], no_default)
 
         # RoPE
@@ -190,6 +192,9 @@ class DFlashModel(Model):
 
         self.draft_verifier_params.update({
             "export_state_layers": set(config.target_layer_ids),
+            "export_state_order": {
+                layer_id: idx for idx, layer_id in enumerate(config.target_layer_ids)
+            },
         })
 
 
