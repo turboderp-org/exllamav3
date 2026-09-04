@@ -102,18 +102,9 @@ Note that the PyPi package does not contain a prebuilt extension and requires th
 
 Before building, make sure you have an appropriate version of Torch installed. Install a `flash-attn-2` wheel, e.g. from [here](https://mjunya.com/flash-attention-prebuild-wheels/). 
 
-On Windows, you should also make sure you have the `triton-windows` package installed. ExLlamaV3 may work without it, but many things will work suboptimally.   
+On Windows, you should also make sure you have the `triton-windows` package installed (with `uv` this is handled for you automatically). ExLlamaV3 may work without it, but many things will work suboptimally.   
 
 Torch is deliberately **not** auto-installed with a pinned version because the build must match your CUDA setup and your preferred PyTorch release. exllamav3 declares a minimum (`torch>=2.6.0`); with `uv`, the CUDA flavor extras below also select *which* PyTorch index torch comes from. Install a torch that matches your GPU, then install exllamav3 using whichever workflow fits:
-
-**Pinning a specific PyTorch version (optional):** the flavor extra picks the *index*, but by default torch resolves to the latest version on that index that satisfies `>=2.6.0`. If you need a specific torch version, add a constraint in your project's `[tool.uv]` table — this works for both `uv sync` and `uv add`:
-
-```toml
-[tool.uv]
-constraint-dependencies = ["torch==2.11.0"]
-```
-
-Then e.g. `uv sync --extra cu130` or `uv add 'exllamav3[cu130]'` installs `torch==2.11.0` from the cu130 index.
 
 **Option 1 — Working in the cloned repo directly (`uv sync`):**
 
@@ -133,13 +124,19 @@ The flavor extras are `cu124`, `cu126`, `cu128`, `cu129`, `cu130`, and `cu132` �
 **Option 2 — Using exllamav3 as a dependency from another project (`uv add`):**
 
 ```sh
+# `uv add` works inside an existing project (a directory with a pyproject.toml).
+# `uv init` creates one if you're starting a new project, if integrating into
+# an existing project skip `uv init`.
+uv init my-project
+cd my-project
+
 # local checkout
-uv add 'path/to/exllamav3[cu130]'                                  # non-editable
-uv add 'path/to/exllamav3[cu130]' --editable                      # editable
+uv add 'path/to/exllamav3[cu130]'               # non-editable
+uv add 'path/to/exllamav3[cu130]' --editable    # editable
 
 # straight from GitHub
-uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]'            # default branch
-uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]' --branch dev  # specific branch
+uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]'                 # default branch
+uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]' --branch dev    # specific branch
 ```
 
 **Option 3 — Bring your own torch and let `uv` pick the backend automatically:**
@@ -160,6 +157,17 @@ uv pip install .
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install .
 ```
+
+**Pinning a specific PyTorch version (optional):** the flavor extra picks the *index*, but by default torch resolves to the latest version on that index that satisfies `>=2.6.0`. If you need a specific torch version, add a constraint in your project's `[tool.uv]` table — this works for both `uv sync` and `uv add`:
+
+```toml
+[tool.uv]
+constraint-dependencies = ["torch==2.11.0"]
+```
+
+Then e.g. `uv sync --extra cu130` or `uv add 'exllamav3[cu130]'` installs `torch==2.11.0` from the cu130 index.
+
+Or, if you're installing torch manually with `uv pip install torch` (e.g. as in Option 3 above), specify the version directly, e.g. `uv pip install "torch==2.11.0" --torch-backend=auto`.
 
 At this point you should be able to run the conversion, eval and example scripts from the main repo directory, e.g. `python convert.py -i ...`
 
