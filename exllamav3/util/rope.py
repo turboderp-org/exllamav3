@@ -249,6 +249,13 @@ class RoPE:
 
     def _rope_params_yarn(self):
         rs = self.rope_settings
+        # PATCH: also pick up mrope_section / mrope_interleaved for multimodal
+        # models (Qwen3.5/3.8 VL). Without this, vision rendering crashes in
+        # get_mrope_freqs() with "TypeError: 'NoneType' object is not subscriptable".
+        if rs.rope_scaling:
+            if rs.rope_scaling.get("mrope_section") is not None:
+                self.mrope_section = rs.rope_scaling.get("mrope_section")
+                self.mrope_interleaved = rs.rope_scaling.get("mrope_interleaved")
         max_position_embeddings = rs.override_max_position_embeddings or rs.max_position_embeddings
         assert max_position_embeddings is not None, \
             "YaRN scaling requires explicit max_position_embeddings"
