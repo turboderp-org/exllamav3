@@ -154,7 +154,14 @@ class Config(ABC):
         self.num_q_heads = -1
         self.num_kv_heads = -1
         self.pos_encoding_mode = "NONE"
-        self.max_position_embeddings = self.read_cfg(int, "max_position_embeddings", self.default_max_position_embeddings())
+        # Multimodal configs keep the text model's limit under text_config (Qwen3.5/3.8, Gemma4,
+        # Mistral3, GLM-4v/5, Muse, Step3.7 ...); the RoPE settings already read the nested dict,
+        # this keeps the public value in step with them
+        self.max_position_embeddings = self.read_cfg(
+            int,
+            ["max_position_embeddings", "text_config->max_position_embeddings"],
+            self.default_max_position_embeddings()
+        )
 
         # Main RoPE module (for MRoPE, individual attn layers have their own modules)
         self.g_rope = None

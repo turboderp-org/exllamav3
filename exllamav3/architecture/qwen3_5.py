@@ -104,10 +104,6 @@ class Qwen3_5VLBaseConfig(Config):
             default_rope_theta = 10000000,
             config_dict = self.read_cfg(dict, text_cfg, no_default) if text_cfg else None
         )
-        # VL configs keep the text limit under text_config, while Config reads only the
-        # top-level key and otherwise falls back to 8192. Keep public metadata aligned with
-        # the RoPE settings actually used by attention.
-        self.max_position_embeddings = self.rope_settings.max_position_embeddings
 
         # Vision model settings
         if vision_model:
@@ -234,7 +230,6 @@ class Qwen3_5VLMoeBaseConfig(Config):
             default_rope_theta = 10000000,
             config_dict = self.read_cfg(dict, text_cfg, no_default) if text_cfg else None
         )
-        self.max_position_embeddings = self.rope_settings.max_position_embeddings
 
         # Vision model settings
         if vision_model:
