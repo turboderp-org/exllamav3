@@ -100,7 +100,9 @@ Note that the PyPi package does not contain a prebuilt extension and requires th
 
 ### Method 3: Building from source
 
-`exllamav3` declares a minimum `torch` version (>= 2.6.0) and CUDA version (>= 12.4), but beyond that the user is free to select a version of `torch` that is compatible with their environment. `torch` can be installed in three ways (from least to most effort):
+`exllamav3` declares a minimum `torch` version (>= 2.6.0) and CUDA version (>= 12.4), but beyond that the user is free to select a version of `torch` that is compatible with their environment.
+
+`torch` can be installed in three ways (from least to most effort):
 1. **with `uv`, setting only `--extra cuXXX`** installs `torch` automatically with the specified CUDA version, `torch` version is selected by `uv` from compatible versions in the specific index associated with the chosed CUDA version (options 1 and 2)
 2. **with `uv`, setting `--extra cuXXX` and specifying `[tool.uv].constraint-dependencies`** same as (1) but `torch` version is manually overridden using a constraint in `pyproject.toml` (applicable to non-Github `uv` install paths in options 1 and 2), see the [pinning a specific PyTorch version (optional)](#pinning-a-specific-pytorch-version-optional) section for additional details
 3. Manually with `uv pip` or `pip` (options 3 and 4)
