@@ -561,6 +561,7 @@ class Generator:
         return results
 
 
+    @torch.inference_mode()
     def on_queue_drained(self):
         """
         Idle-transition housekeeping: drop recurrent checkpoints stranded by KV eviction, then defragment the

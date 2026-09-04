@@ -48,10 +48,14 @@ cpu_unload. The worker process itself lives in model/moe_cpu_host.py.
 """
 
 
+@torch.inference_mode()
 def run_pending_swap_sweeps(infer_params):
     """Run any pending dynamic-placement sweep (see BlockSparseMLP._split_swap_tick). Called
     by the generator when its job queue drains, so placement only ever changes between
-    generations; safe no-op otherwise."""
+    generations; safe no-op otherwise. The sweep updates the placement map, the hit
+    histogram and the arena slots in place, and those are inference tensors (allocated under
+    inference mode at load), so it must itself run under inference mode: the generator's
+    cancel() and clear_queue() paths reach here outside any forward (issue #329)."""
     if not getattr(infer_params, "moe_cpu_swap_pending", False):
         return
     infer_params.moe_cpu_swap_pending = False
