@@ -100,11 +100,12 @@ Note that the PyPi package does not contain a prebuilt extension and requires th
 
 ### Method 3: Building from source
 
-Before building, make sure you have an appropriate version of Torch installed. Install a `flash-attn-2` wheel, e.g. from [here](https://mjunya.com/flash-attention-prebuild-wheels/). 
+`exllamav3` declares a minimum `torch` version (>= 2.6.0) and CUDA version (>= 12.4), but beyond that the user is free to select a version of `torch` that is compatible with their environment. `torch` can be installed in three ways (from least to most effort):
+1. **with `uv`, setting only `--extra cuXXX`** installs `torch` automatically with the specified CUDA version, `torch` version is selected by `uv` from compatible versions in the specific index associated with the chosed CUDA version (options 1 and 2)
+2. **with `uv`, setting `--extra cuXXX` and specifying `[tool.uv].constraint-dependencies`** same as (1) but `torch` version is manually overridden using a constraint in `pyproject.toml` (applicable to non-Github `uv` install paths in options 1 and 2)
+3. Manually with `uv pip` or `pip` (options 3 and 4)
 
-On Windows, you should also make sure you have the `triton-windows` package installed (with `uv` this is handled for you automatically). ExLlamaV3 may work without it, but many things will work suboptimally.   
-
-Torch is deliberately **not** auto-installed with a pinned version because the build must match your CUDA setup and your preferred PyTorch release. exllamav3 declares a minimum (`torch>=2.6.0`); with `uv`, the CUDA flavor extras below also select *which* PyTorch index torch comes from. Install a torch that matches your GPU, then install exllamav3 using whichever workflow fits:
+The flavor extras (`--extra`) are `cu124`, `cu126`, `cu128`, `cu129`, `cu130`, and `cu132` — pick the one matching your installed CUDA build. The library's C++/CUDA extension is built at install time.
 
 **Option 1 — Working in the cloned repo directly (`uv sync`):**
 
@@ -119,9 +120,7 @@ uv sync --extra cu130
 # add --extra examples and/or --extra eval for those extra dependencies
 ```
 
-The flavor extras are `cu124`, `cu126`, `cu128`, `cu129`, `cu130`, and `cu132` — pick the one matching your PyTorch CUDA build. The library's C++/CUDA extension is built at install time when a matching Torch is present.
-
-**Option 2 — Using exllamav3 as a dependency from another project (`uv add`):**
+**Option 2 — Using `exllamav3` as a dependency from another project (`uv add`):**
 
 ```sh
 # `uv add` works inside an existing project (a directory with a pyproject.toml).
@@ -139,7 +138,7 @@ uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]'              
 uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]' --branch dev    # specific branch
 ```
 
-**Option 3 — Bring your own torch and let `uv` pick the backend automatically:**
+**Option 3 — Bring your own `torch` and let `uv` pick the backend automatically:**
 
 ```sh
 uv venv            # or: uv venv --python-preference only-managed
@@ -150,7 +149,11 @@ uv pip install .
 
 `--torch-backend=auto` inspects your system and installs the matching PyTorch CUDA build; see [Automatic backend selection](https://docs.astral.sh/uv/guides/integration/pytorch/#automatic-backend-selection).
 
-**Option 4 — With pip:**
+**Option 4 — With `pip`:**
+
+Install a `flash-attn-2` wheel, e.g. from [here](https://mjunya.com/flash-attention-prebuild-wheels/).
+
+On Windows, you should also make sure you have the `triton-windows` package installed. ExLlamaV3 may work without it, but many things will work suboptimally.   
 
 ```sh
 # install a CUDA-enabled torch first so it matches your setup, e.g.:
@@ -158,7 +161,8 @@ pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install .
 ```
 
-**Pinning a specific PyTorch version (optional):** the flavor extra picks the *index*, but by default torch resolves to the latest version on that index that satisfies `>=2.6.0`. If you need a specific torch version, add a constraint in your project's `[tool.uv]` table — this works for both `uv sync` and `uv add`:
+#### Pinning a specific PyTorch version (optional)
+The flavor extra picks the *index*, but by default torch resolves to the latest version on that index that satisfies `>=2.6.0`. If you need a specific torch version, add a constraint in your project's `[tool.uv]` table — this works for both `uv sync` and `uv add`:
 
 ```toml
 [tool.uv]
@@ -169,7 +173,9 @@ Then e.g. `uv sync --extra cu130` or `uv add 'exllamav3[cu130]'` installs `torch
 
 Or, if you're installing torch manually with `uv pip install torch` (e.g. as in Option 3 above), specify the version directly, e.g. `uv pip install "torch==2.11.0" --torch-backend=auto`.
 
-At this point you should be able to run the conversion, eval and example scripts from the main repo directory, e.g. `python convert.py -i ...`
+---
+
+After installing with one of the options above, you should be able to run the conversion, eval and example scripts from the main repo directory, e.g., `uv run python convert.pt -i ...` or, for manual installations once the venv is active, `python convert.py -i ...`
 
 Relevant env variables for building:
 - `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for compilation. Set this to a reasonable value like 4 in that case.  
