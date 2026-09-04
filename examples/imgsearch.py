@@ -32,7 +32,7 @@ def resolve_files(input_path):
 def get_token_mask(tokenizer, substr):
     vocab = tokenizer.get_id_to_piece_list()
     substr1 = substr.upper()
-    substr2 = substr.upper()
+    substr2 = " " + substr1     # word-initial variant (space-prefixed piece)
     mask = torch.tensor([(token.upper().startswith(substr1) or token.upper().startswith(substr2)) for token in vocab])
     return mask
 
