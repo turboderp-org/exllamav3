@@ -10,7 +10,7 @@ from ..util import cuda_sync_active
 
 logger = logging.getLogger(__name__)
 from ..util.memory import malloc_trim
-from .pagetable import PageTable
+from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
@@ -147,6 +147,7 @@ class Generator:
         cache.owner_serial = getattr(cache, "owner_serial", 0) + 1
         self.cache_owner_serial = cache.owner_serial
         self.max_total_tokens = PAGE_SIZE * self.pagetable.max_pages
+        self._cache_stats_memo = (None, None)
 
         # Draft model
         self.draft_model = draft_model
@@ -268,6 +269,104 @@ class Generator:
 
     def num_pending_jobs(self):
         return len(self.pending_jobs)
+
+    def get_cache_stats(self) -> dict:
+        """
+        Snapshot of cache occupancy and prompt-cache efficiency, intended for status displays.
+
+        Returns a dict with:
+            page_size: tokens per page
+            max_tokens: total cache capacity, in tokens
+            used_tokens: tokens in pages referenced by active jobs
+            cached_tokens: tokens in complete pages that a later or concurrent job could actually reuse: every
+                page on an unbroken chain down to a root, whether or not an active job currently references it.
+                Complete pages whose ancestors were evicted (orphans) don't count, since a prefix match walks
+                the chain from the root
+            free_tokens: tokens in unreferenced pages holding no reusable content
+            tier_cached_tokens: reusable tokens held only in the system-memory tier (sysmem K/V cache), by the
+                same chain rule; 0 without a tier
+            tier_max_tokens: capacity of the system-memory tier, 0 without one
+            alloc_pages: cumulative pages claimed by started jobs
+            alloc_cached_pages: cumulative pages of those that were reused from the prompt cache
+            alloc_tier_pages: of those, pages restored from the system-memory tier
+            hit_rate: alloc_cached_pages / alloc_pages, or None before any job has started
+            tier_hit_rate: alloc_tier_pages / alloc_pages, the part of hit_rate served from the system-memory
+                tier, or None before any job has started
+            active_jobs, pending_jobs: current job counts
+
+        The chain walk is memoized on a signature of the page tables, so repeated calls between changes are
+        cheap.
+        """
+        pt = self.pagetable
+        tier = pt.cpu_tier
+
+        # The chain walk is linear in the number of pages, which can be large with a big system-memory
+        # tier, so it only reruns when something that can change the outcome has moved
+        signature = (
+            len(pt.referenced_pages),
+            len(pt.unreferenced_pages),
+            sum(1 for h in pt.referenced_pages if is_content_hash(h)),
+            pt.metrics["alloc_pages"],
+            pt.metrics["evictions"],
+            pt.last_defrag_serial,
+            len(tier) if tier is not None else 0,
+            (tier.metrics["pushes"], tier.metrics["evictions"]) if tier is not None else None,
+        )
+        memo_signature, memo = self._cache_stats_memo
+        if signature == memo_signature:
+            return {**memo, "active_jobs": len(self.active_jobs), "pending_jobs": len(self.pending_jobs)}
+
+        # prev-hash links of every complete page, per tier
+        gpu_links = {}
+        for pages in (pt.referenced_pages, pt.unreferenced_pages):
+            for h, page in pages.items():
+                if is_content_hash(h):
+                    gpu_links[h] = page.prev_hash
+        tier_links = {h: e["prev_hash"] for h, e in tier.entries.items()} if tier is not None else {}
+
+        # A page is reusable when its whole chain is present in either tier
+        resumable = {}
+        def is_resumable(h):
+            chain = []
+            while h is not None and h not in resumable:
+                chain.append(h)
+                if h in gpu_links:
+                    h = gpu_links[h]
+                elif h in tier_links:
+                    h = tier_links[h]
+                else:
+                    resumable[h] = False
+                    break
+            result = True if h is None else resumable[h]
+            for c in chain:
+                resumable[c] = result
+            return result
+
+        cached = sum(1 for h in gpu_links if is_resumable(h))
+        tier_cached = sum(1 for h in tier_links if h not in gpu_links and is_resumable(h))
+        used = len(pt.referenced_pages)
+        free = sum(1 for h in pt.unreferenced_pages if not is_content_hash(h))
+        alloc = pt.metrics["alloc_pages"]
+        alloc_cached = pt.metrics["alloc_cached_pages"]
+        alloc_tier = pt.metrics["alloc_tier_pages"]
+        stats = {
+            "page_size": PAGE_SIZE,
+            "max_tokens": pt.max_pages * PAGE_SIZE,
+            "used_tokens": used * PAGE_SIZE,
+            "cached_tokens": cached * PAGE_SIZE,
+            "free_tokens": free * PAGE_SIZE,
+            "tier_cached_tokens": tier_cached * PAGE_SIZE,
+            "tier_max_tokens": tier.max_slots * PAGE_SIZE if tier is not None else 0,
+            "alloc_pages": alloc,
+            "alloc_cached_pages": alloc_cached,
+            "alloc_tier_pages": alloc_tier,
+            "hit_rate": alloc_cached / alloc if alloc else None,
+            "tier_hit_rate": alloc_tier / alloc if alloc else None,
+            "active_jobs": len(self.active_jobs),
+            "pending_jobs": len(self.pending_jobs),
+        }
+        self._cache_stats_memo = (signature, stats)
+        return stats
 
 
     def clear_queue(self):
