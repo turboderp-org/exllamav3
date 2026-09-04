@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import os
+from concurrent.futures import ThreadPoolExecutor
 import torch
 from ..model.config import Config
 from ..loader.safetensors import DiskTensorHandle
@@ -38,6 +39,33 @@ def _find_nth_prime_after(start: int, count: int) -> int:
         while not is_prime(p):
             p += 1
     return p
+
+
+PREFETCH_ENABLED = os.environ.get("EXL3_NGRAM_PREFETCH", "1") != "0"   # debug/A-B switch
+PREFETCH_MIN_TOKENS = 256   # positions (bsz * seq) below which prefetch() declines (decode-sized)
+MAX_PIN_SETS = 2            # staging sets: one with the last forward's uploads in flight, one being staged
+
+
+class _PinSet:
+    """Pinned staging buffers for one hash + gather: unique row ids, the inverse map, the per-row
+    head index and the packed rows. `held` while a queued prefetch or a running forward owns it;
+    `event` marks the last forward's uploads from it."""
+
+    def __init__(self):
+        self.uids = None
+        self.inverse = None
+        self.heads = None
+        self.packed = None
+        self.event = None
+        self.held = False
+
+    def grow(self, n: int, row_words: int, row_dtype: torch.dtype):
+        if self.uids is None or self.uids.numel() < n or self.packed.shape[1] != row_words \
+                or self.packed.dtype != row_dtype:
+            self.uids = torch.empty(n, dtype = torch.int64, pin_memory = True)
+            self.inverse = torch.empty(n, dtype = torch.int64, pin_memory = True)
+            self.heads = torch.empty(n, dtype = torch.int32, pin_memory = True)
+            self.packed = torch.empty((n, row_words), dtype = row_dtype, pin_memory = True)
 
 
 class NGramEmbedding(Module):
@@ -86,7 +114,10 @@ class NGramEmbedding(Module):
         self.head_vocab_sizes = None
         self.layer_multipliers = None
         self.codebook = None
-        self._pin = None            # reusable pinned staging buffers for the fast path
+        self._pins = []             # pinned staging sets for the fast path (see _PinSet)
+        self._pending = []          # queued prefetches, oldest first: {"history", "pin", "future"}
+        self._executor = None
+        self.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
         self._row_dtype = None      # stored row dtype of the unquantized table
 
         self.caps.update({"prefer_cpu": True})
@@ -112,6 +143,11 @@ class NGramEmbedding(Module):
         bias = get(names["bias"], optional = True) if "bias" in names else None
         self.head_bias = bias.half().contiguous().to(self.device) if bias is not None else None
         assert self.head_offsets.shape[0] == self.num_heads
+        # These were buffered reads of the table file. On Windows a buffered file object (even a
+        # closed one, for a few seconds) throttles the unbuffered row gathers on the same file, so
+        # release the loader's handle now rather than at the end of the load
+        for f in {stc.tensor_file_map[n] for n in names.values() if n in stc.tensor_file_map}:
+            stc.release_file(f)
 
     @override
     def load(self, device: torch.device, **kwargs):
@@ -213,11 +249,12 @@ class NGramEmbedding(Module):
 
     @override
     def unload(self):
+        self._drain_prefetch()      # queued workers still read the table; first
         self.device = None
         self.mode = None
         self.tables = None
         self.handles = None
-        self._pin = None
+        self._pins = []
         self._row_dtype = None
         self.head_bias = None
         self.head_offsets = None
@@ -331,22 +368,79 @@ class NGramEmbedding(Module):
     # Hashing, eos segmentation and dedup run in one C++ call on the CPU, where the token ids
     # already live (pinned in the generator, so nothing round-trips through the device); the
     # unique rows are gathered with threaded preads (disk modes) or index_select (RAM modes)
-    # into a reusable pinned staging buffer; one non-blocking H2D then feeds the GPU trellis
-    # dequant kernel (or a plain upcast for unquantized tables) and the inverse gather.
+    # into a pinned staging set; one non-blocking H2D then feeds the GPU trellis dequant kernel
+    # (or a plain upcast for unquantized tables) and the inverse gather.
+    #
+    # The staging step depends only on the token ids, so it can run ahead of the forward on a
+    # worker thread (prefetch()): the model stages the chunk before its first layers are issued,
+    # and the cold gather (~90 ms per 4096-token chunk, vs ~5 ms page-cache-warm) overlaps block
+    # 0 instead of stalling at this layer. Each queued prefetch owns one staging set; forward()
+    # takes the set whose staged history equals the one it was given and stages inline
+    # otherwise, so a prefetch for the wrong ids can only cost time. A set's CUDA event marks
+    # the last forward's uploads from it; the next writer waits on it before reusing the buffers.
+    # Decode-sized inputs stay inline: their 16-row gathers are already parallel preads, and the
+    # thread hop per token measured as a net loss.
 
-    def _grow_pin(self, n: int, row_words: int, row_dtype: torch.dtype):
-        need_ids = n
-        p = self._pin
-        if p is None or p["uids"].numel() < need_ids or p["packed"].shape[1] != row_words \
-                or p["packed"].dtype != row_dtype:
-            self._pin = p = {
-                "uids": torch.empty(need_ids, dtype = torch.int64, pin_memory = True),
-                "inverse": torch.empty(need_ids, dtype = torch.int64, pin_memory = True),
-                "heads": torch.empty(need_ids, dtype = torch.int32, pin_memory = True),
-                "packed": torch.empty((need_ids, row_words), dtype = row_dtype,
-                                      pin_memory = True),
-            }
-        return p
+    def _drain_prefetch(self):
+        for e in list(self._pending):
+            self._retire(e)
+        if self._executor is not None:
+            self._executor.shutdown(wait = True)
+            self._executor = None
+
+    def _forget(self, entry: dict):
+        # by identity: list.remove would compare the entries' history tensors
+        self._pending = [e for e in self._pending if e is not entry]
+
+    def _retire(self, entry: dict):
+        # Drop a queued prefetch that no forward will take. Its worker may still be writing the
+        # staging set, so wait it out (a cold gather, at most) unless it hasn't started
+        self._forget(entry)
+        self.prefetch_stats["retired"] += 1
+        f = entry["future"]
+        if not f.cancel():
+            f.result()
+        entry["pin"].held = False
+
+    def _acquire_pin(self, n: int, row_words: int, row_dtype: torch.dtype) -> _PinSet:
+        """A staging set not held by a queued prefetch, grown to n ids."""
+        free = [p for p in self._pins if not p.held]
+        if not free and len(self._pins) < MAX_PIN_SETS:
+            free = [_PinSet()]
+            self._pins += free
+        if not free:
+            # every set is held by a queued prefetch: retire one, preferably one whose staging
+            # already finished (a stale guess), else the oldest
+            done = [e for e in self._pending if e["future"].done()]
+            self._retire(done[0] if done else self._pending[0])
+            free = [p for p in self._pins if not p.held]
+        pin = free[0]
+        pin.grow(n, row_words, row_dtype)
+        pin.held = True
+        return pin
+
+    @torch.inference_mode()
+    def _stage(self, history: torch.Tensor, pin: _PinSet) -> int:
+        """Hash + gather for a (bsz, context + seq) id history into pin; returns the unique row
+        count. Runs on the prefetch worker or inline (inference mode is thread-local, and the
+        staging buffers are inference tensors)."""
+        out_len = history.shape[1] - self.context_len
+        if pin.event is not None:
+            # the previous forward's non_blocking uploads read this set; the generator issues
+            # chunk forwards back to back with no host sync, so wait before rewriting it
+            pin.event.synchronize()
+        U = ext.ngram_hash_cpu(
+            history, out_len, self.layer_multipliers, self.head_offsets, self.head_vocab_sizes,
+            self.heads_per_ngram, self.eos_token_id,
+            pin.uids, pin.inverse, pin.heads)
+        self._gather_rows(pin.uids[:U], pin.packed[:U])
+        return U
+
+    def _match(self, history: torch.Tensor) -> dict | None:
+        for e in self._pending:
+            if e["history"].shape == history.shape and torch.equal(e["history"], history):
+                return e
+        return None
 
     def _gather_rows(self, uids: torch.Tensor, out: torch.Tensor):
         """Gather the (sorted) unique rows into the pinned staging buffer, routing shard
@@ -370,6 +464,35 @@ class NGramEmbedding(Module):
                                          store.row_bytes, seg.contiguous(), base, out[i0 : i1])
             i0 = i1
 
+    def prefetch(self, history: torch.Tensor):
+        """
+        Stage the rows for a coming forward over `history`, the exact (bsz, context + seq) id
+        history that forward() will receive, on a worker thread. Decode-sized inputs stage inline
+        faster than the thread hop, so those are ignored; a history already queued is ignored too.
+        """
+        if not PREFETCH_ENABLED or self.mode is None or history.dim() != 2:
+            return
+        bsz, out_len = history.shape[0], history.shape[1] - self.context_len
+        if out_len <= 0 or bsz * out_len < PREFETCH_MIN_TOKENS:
+            return
+        history = history.to("cpu", torch.int64).contiguous().clone()
+        if self._match(history) is not None:
+            return
+        trellis = self.mode.startswith("trellis")
+        pin = self._acquire_pin(
+            bsz * out_len * self.num_heads,
+            words_per_row(self.K) if trellis else ROW_DIM,
+            torch.int16 if trellis else self._row_dtype)
+        for h in self.handles or []:
+            h._ensure_open()        # lazy open isn't thread-safe; do it here, not on the worker
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "ngram_prefetch")
+        self._pending.append({
+            "history": history,
+            "pin": pin,
+            "future": self._executor.submit(self._stage, history, pin),
+        })
+
     @override
     def forward(
         self,
@@ -390,33 +513,30 @@ class NGramEmbedding(Module):
         trellis = self.mode.startswith("trellis")
         row_words = words_per_row(self.K) if trellis else ROW_DIM
         row_dtype = torch.int16 if trellis else self._row_dtype
-        p = self._grow_pin(n, row_words, row_dtype)
 
-        # The previous call's non_blocking uploads read these pinned buffers; the generator issues chunk
-        # forwards back to back with no host sync, so wait for them before rewriting the staging area
-        ev = p.get("event")
-        if ev is not None:
-            ev.synchronize()
+        entry = self._match(ids)
+        if entry is not None:
+            self._forget(entry)
+            self.prefetch_stats["hit"] += 1
+            pin = entry["pin"]
+            U = entry["future"].result()
+        else:
+            self.prefetch_stats["miss"] += 1
+            pin = self._acquire_pin(n, row_words, row_dtype)
+            U = self._stage(ids, pin)
 
-        U = ext.ngram_hash_cpu(
-            ids, out_len, self.layer_multipliers, self.head_offsets, self.head_vocab_sizes,
-            self.heads_per_ngram, self.eos_token_id,
-            p["uids"], p["inverse"], p["heads"])
-        uids = p["uids"][:U]
-        packed = p["packed"][:U]
-        self._gather_rows(uids, packed)
-
-        packed_d = packed.to(dev, non_blocking = True)
-        inv_d = p["inverse"][:n].to(dev, non_blocking = True)
+        packed_d = pin.packed[:U].to(dev, non_blocking = True)
+        inv_d = pin.inverse[:n].to(dev, non_blocking = True)
         if trellis:
-            heads_d = p["heads"][:U].to(dev, non_blocking = True)
+            heads_d = pin.heads[:U].to(dev, non_blocking = True)
             rows = torch.empty((U, ROW_DIM), dtype = torch.half, device = dev)
             ext.ngram_dequant(packed_d, self.K, heads_d, self.head_bias, rows)
         else:
             rows = packed_d.float()
         if rows.is_cuda:
-            p["event"] = torch.cuda.Event()
-            p["event"].record(torch.cuda.current_stream(rows.device))
+            pin.event = torch.cuda.Event()
+            pin.event.record(torch.cuda.current_stream(rows.device))
+        pin.held = False
         out = rows.index_select(0, inv_d).view(bsz, out_len, H * ROW_DIM)
         dt = out_dtype or self.out_dtype or torch.half
         return out.to(dt)
