@@ -74,6 +74,7 @@ class MoeCpuTuning:
     def __init__(self):
         # --- CPU worker / staging ---
         self.num_slots = int(os.environ.get("EXL3_MOE_CPU_SLOTS", 4))
+        assert 1 <= self.num_slots <= 8, "EXL3_MOE_CPU_SLOTS must be 1..8 (MOE_MAX_SLOTS in moe_handoff.h)"
         self.cap_rows = int(os.environ.get("EXL3_MOE_CPU_SLOT_ROWS", 64))
         # Thread count fallback chain ends here; config.infer_params.moe_cpu_threads (or the
         # draft/MTP equivalent) takes precedence per host when set (MoeCpuHost.__init__)
@@ -92,7 +93,7 @@ class MoeCpuTuning:
 
         # --- GPU-streaming prefill ---
         self.stream_t_explicit = "EXL3_MOE_STREAM_T" in os.environ
-        self.stream_t = int(os.environ.get("EXL3_MOE_STREAM_T", 16))
+        self.stream_t = int(os.environ.get("EXL3_MOE_STREAM_T", 8))
         self.stream_fused_t = int(os.environ.get("EXL3_MOE_STREAM_FUSED_T", 512))
         self.stream_min_rows = int(os.environ.get("EXL3_MOE_STREAM_MIN_ROWS", 32))
         self.batch_experts = max(1, min(
@@ -891,21 +892,38 @@ class MoeCpuHost:
         # EXL3_MOE_STREAM_T overrides the scaling.
         probe = min(self.wslot_size, 16 << 20)
         ev0, ev1 = torch.cuda.Event(enable_timing = True), torch.cuda.Event(enable_timing = True)
+        bw = 0.0
         with torch.cuda.stream(st["copy_stream"]):
-            for _ in range(2):   # warm-up: first transfer pays wakeup/pagetable costs
+            # An idle PCIe link sits in a low power state (the Windows driver drops it to Gen1
+            # after a few idle seconds) and only retrains under sustained traffic, over a few
+            # hundred ms. Two warm-up copies would measure the sleeping link; warm it for a
+            # wall-clock budget, then take the best of several timed copies: streaming keeps
+            # the link awake, so the peak is the rate the break-even estimate should use
+            import time
+            t0 = time.perf_counter()
+            for _ in range(256):
                 st["vram_slots"][0][:probe // 2].copy_(self.wviews[0][:probe // 2],
                                                        non_blocking = True)
-            ev0.record(st["copy_stream"])
-            st["vram_slots"][0][:probe // 2].copy_(self.wviews[0][:probe // 2],
-                                                   non_blocking = True)
-            ev1.record(st["copy_stream"])
-        ev1.synchronize()
-        bw = probe / (ev0.elapsed_time(ev1) * 1e-3) / 1e9   # GB/s
+                st["copy_stream"].synchronize()
+                if time.perf_counter() - t0 > 0.25:
+                    break
+            for _ in range(8):
+                ev0.record(st["copy_stream"])
+                st["vram_slots"][0][:probe // 2].copy_(self.wviews[0][:probe // 2],
+                                                       non_blocking = True)
+                ev1.record(st["copy_stream"])
+                ev1.synchronize()
+                bw = max(bw, probe / (ev0.elapsed_time(ev1) * 1e-3) / 1e9)   # GB/s
         st["bw"] = bw
         if TUNING.stream_t_explicit:
             st["stream_t"] = self.stream_t
         else:
-            st["stream_t"] = max(self.stream_t, int(self.stream_t * 25.0 / max(bw, 0.5)))
+            # Calibrated on Qwen3.8-Flash-Next (512 experts, 410 on the CPU, 12 threads) over
+            # gen5 x16 (57 GB/s), gen5 x8 (29 GB/s) and gen4 x4 (6.7 GB/s) links: 8 was best
+            # on both gen5 links (4 and 16 both slower), 16 on gen4 x4 (32 no better). The
+            # break-even count grows with the square root of the bandwidth deficit, not
+            # linearly: the tail's CPU cost falls with the same rows the streaming gains
+            st["stream_t"] = max(self.stream_t, int(round(self.stream_t * (25.0 / max(bw, 0.5)) ** 0.5)))
         if TUNING.stream_debug:
             print(f" -- stream state cuda:{key}: pinned->device {bw:.1f} GB/s, "
                   f"stream_t {st['stream_t']}")
