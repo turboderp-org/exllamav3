@@ -72,6 +72,9 @@ def to_device(t: torch.Tensor, device: torch.device | str | int, non_blocking: b
     t.to(device), with CUDA-to-CUDA moves bounced through host memory when the pair needs it.
     Host-to-device and device-to-host moves pass straight through (non_blocking honoured).
     """
+    if device is None:
+        # Emulate tensor.to(None): no-op
+        return t
     device = torch.device(device)
     if t.device == device:
         return t

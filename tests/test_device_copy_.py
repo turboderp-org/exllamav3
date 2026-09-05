@@ -32,8 +32,10 @@ real_verdict = dict(dc._verdicts)
 h = to_device(a, "cpu"); assert h.device.type == "cpu"
 p = torch.empty(16, pin_memory = True); g = to_device(p, d1, non_blocking = True); assert g.device == d1
 assert dc.stats["probes"] == 1
-# same-device is a no-op returning the same object
+# same-device is a no-op returning the same object, and so is a None destination (TP-side
+# modules have no local device; issue seen with MTP + TP)
 assert to_device(a, d0) is a
+assert to_device(a, None) is a and dc.stats["probes"] == 1
 
 # 2. simulated broken fabric one way: only that direction bounces, the other stays direct
 reset()
