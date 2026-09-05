@@ -30,7 +30,9 @@ void exl3_gemm_kernel_inner
     const int size_k,
     const int size_n,
     int* __restrict__ locks,
-    const half* post_scale
+    const half* post_scale,
+    const float output_scale = 1.0f,
+    const bool accumulate = false
 )
 {
     const int TILEBLOCKS_M = TILESIZE_M / 16;
@@ -580,6 +582,17 @@ void exl3_gemm_kernel_inner
             }
         #endif
 
+        if (output_scale != 1.0f)
+        {
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+            {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    frag_c[n][j] *= output_scale;
+            }
+        }
+
         // First reduce all partial sums along k for the current slice
         threadblock_reduce();
 
@@ -593,6 +606,14 @@ void exl3_gemm_kernel_inner
 
         bool first = lock_i == 0;
         bool last = lock_i + lock_d == tiles_k;
+
+        // An additive pass starts from the preceding packed stage's result.
+        // Only the first k-slice reads it; later slices consume this pass's
+        // partial sum through the existing global reduction protocol.
+        if (!sub_k && first && accumulate)
+        {
+            read_sum_gl();
+        }
 
         // Second and subsequent threadblocks in column read back the intermediate sum from global memory
         if (!sub_k && !first)

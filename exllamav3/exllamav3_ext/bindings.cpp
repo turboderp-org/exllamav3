@@ -236,6 +236,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
+    m.attr("EXL3_MOE_ADDITIVE_ABI_VERSION") = EXL3_MOE_ADDITIVE_ABI_VERSION;
+    m.def("exl3_moe_additive", &exl3_moe_additive, "exl3_moe_additive");
+    m.def(
+        "exl3_moe_additive_fused",
+        &exl3_moe_additive_fused,
+        "exl3_moe_additive_fused"
+    );
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");
     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");
