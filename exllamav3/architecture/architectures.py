@@ -7,6 +7,7 @@ from .decilm import DeciLMModel
 from .deepseek_v3 import DeepseekV3Model
 from .deepseek_v4 import DeepseekV4Model
 from .dflash import DFlashModel
+from .dflash2 import DFlash2Model
 from .dflash_laguna import DFlashLagunaModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
@@ -71,6 +72,7 @@ ARCHITECTURES = {
         DeepseekV3Model,
         DeepseekV4Model,
         DFlashModel,
+        DFlash2Model,
         DFlashLagunaModel,
         Dots1Model,
         Ernie4_5Model,

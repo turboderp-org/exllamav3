@@ -170,8 +170,24 @@ class Generator:
         else:
             self.num_draft_tokens = 0
 
+        if draft_model and (required_draft_size := draft_model.caps.get("required_draft_size")) is not None:
+            if self.num_draft_tokens != required_draft_size:
+                raise ValueError(
+                    f"Draft model requires exactly {required_draft_size} draft tokens, "
+                    f"got {self.num_draft_tokens}."
+                )
+        elif draft_model and (max_draft_size := draft_model.caps.get("max_draft_size")) is not None:
+            if self.num_draft_tokens > max_draft_size:
+                raise ValueError(
+                    f"Draft model supports at most {max_draft_size} draft tokens, "
+                    f"got {self.num_draft_tokens}."
+                )
+
         self.ngram_match_min = ngram_match_min
-        self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
+        self.dynamic_draft = (
+            dynamic_draft_tokens and self.num_draft_tokens > 0 and
+            (draft_model is None or draft_model.caps.get("supports_dynamic_draft", True))
+        )
         self.record_draft_stats = record_draft_stats
         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
 
@@ -796,6 +812,8 @@ class Generator:
         max_seq_len = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
+            assert len(job.sequences) == 1, \
+                "DFlash drafting does not currently support CFG/multi-sequence jobs"
             max_seq_len = max(
                 max_seq_len,
                 job.get_max_seq_len() + self.num_draft_tokens + 1,
