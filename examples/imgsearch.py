@@ -42,7 +42,13 @@ def main(args):
     # Resolve filenames
     input_files = []
     for arg in args.input:
-        input_files += resolve_files(arg)
+        files = resolve_files(arg)
+        if not files:
+            print(f"No such file: {arg}")
+        input_files += files
+    if not input_files:
+        print("No input images")
+        sys.exit(1)
 
     # Prepare model etc.
     model, config, _, tokenizer = model_init.init(args)

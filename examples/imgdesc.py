@@ -10,6 +10,7 @@ from pathlib import (Path)
 # ANSI codes
 col_default = "\u001b[0m"
 col_yellow = "\u001b[33;1m"
+col_red = "\u001b[31;1m"
 col_green = "\u001b[32;1m"
 
 MAX_DIM = 64  # maximum image dimension, in half-block pixels
@@ -93,7 +94,13 @@ def main(args):
     # Resolve filenames
     input_files = []
     for arg in args.input:
-        input_files += resolve_files(arg)
+        files = resolve_files(arg)
+        if not files:
+            print(f"{col_yellow}No such file: {arg}{col_default}")
+        input_files += files
+    if not input_files:
+        print(f"{col_red}No input images{col_default}")
+        sys.exit(1)
 
     # Prepare model etc.
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
