@@ -22,6 +22,8 @@
 #include "quant/reconstruct.cuh"
 #include "quant/hadamard.cuh"
 #include "quant/exl3_gemm.cuh"
+#include "quant/exl3_gemm_bf16_io.cuh"
+#include "quant/exl3_mgemm_bf16_io.cuh"
 #include "quant/exl3_gemv.cuh"
 #include "quant/exl3_gemv_int8.cuh"
 #include "cpu/moe_mul1.h"
@@ -142,6 +144,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
+    m.def("exl3_gemm_bf16_io", &exl3_gemm_bf16_io, "exl3_gemm_bf16_io");
+    m.def("exl3_mgemm_bf16_io", &exl3_mgemm_bf16_io, "exl3_mgemm_bf16_io");
+    m.def("exl3_mgemm_bf16_io_grouped_had", &exl3_mgemm_bf16_io_grouped_had, "exl3_mgemm_bf16_io_grouped_had");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
