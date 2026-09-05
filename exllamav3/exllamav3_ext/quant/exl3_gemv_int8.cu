@@ -242,6 +242,16 @@ bool exl3_gemv_int8
     int device;
     cudaGetDevice(&device);
     if (K < 1 || K > exl3_gemv_int8_max_k(device)) return false;
+
+    // Both int8 kernels below size their shared memory against a fixed ~80 KB budget baked into
+    // gemv_int8_sq_rows_max() and the coop path's 768-row bound, and - critically - the kernels
+    // recompute rows_per from those same constants on the device, so the host cannot simply ask
+    // for less without desyncing the two. On Turing (64 KB) the cudaFuncSetAttribute would fail
+    // and the following cuda_check would abort the process. This path is a decode-time
+    // optimization over the regular fp16 tensor-core kernel, which handles the same work, so
+    // declining is a performance loss and nothing more.
+    if (DevCtx::instance().get_smem_max(device) < 80 * 1024) return false;
+
     int num_sms = DevCtx::instance().get_num_sms(device);
     bool c_fp32 = C.dtype() == at::kFloat;
     bool residual = exl3_gemv_int8_mode() == 1;

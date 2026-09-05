@@ -4,7 +4,7 @@ from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
 from .bc_attn import bc_attn_enable, _trace_build, _compile_kernel, _get_sm_count, _is_pow2, \
-    MAX_BSZ, MAX_QLEN
+    BCKernelTooLarge, MAX_BSZ, MAX_QLEN
 
 """
 Graph-captured decode attention for MLA (BC_MLAttention): the whole decode block -- q
@@ -537,7 +537,10 @@ class BCMLA:
                         ext_indices = ext_indices.to(x.device)
 
         if (bsz, q_len, regime) not in self.configured:
-            self._configure(bsz, q_len, regime)
+            try:
+                self._configure(bsz, q_len, regime)
+            except BCKernelTooLarge:
+                return None
             self.configured.add((bsz, q_len, regime))
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,

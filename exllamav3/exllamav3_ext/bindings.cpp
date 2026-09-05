@@ -146,6 +146,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
+    m.def("g_get_smem_max", &g_get_smem_max, "g_get_smem_max");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
     m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
     m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");

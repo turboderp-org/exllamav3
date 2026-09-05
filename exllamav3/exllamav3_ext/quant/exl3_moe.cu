@@ -206,6 +206,10 @@ void exl3_moe
     int num_sms = DevCtx::instance().get_num_sms(device);
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);
+    // Every MoE instantiation fits in 44 KB (TILESIZE_N caps at 256, unlike the GEMM's 512),
+    // so clamping the request to the device limit never excludes a shape here; it only stops
+    // Turing's 64 KB cap from rejecting the fixed 90 KB ask.
+    int smem_max = DevCtx::instance().get_smem_request(device);
 
     // Launch. All blocks of the grid must be co-resident for the group barriers, so groups * width <= num_sms.
     // With a known number of active experts, launch only as many groups as there are experts and widen them to
@@ -227,7 +231,7 @@ void exl3_moe
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
         moe_kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }
@@ -293,7 +297,7 @@ void exl3_moe
         grid_dim,
         block_dim,
         kernelArgs,
-        SMEM_MAX,
+        smem_max,
         stream
     );
 

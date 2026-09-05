@@ -61,6 +61,16 @@ def _is_pow2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 
+class BCKernelTooLarge(RuntimeError):
+    """An AOT-compiled BC kernel needs more shared memory than the device provides.
+
+    Signals 'decline to the eager path', not a bug: the BC kernels bake their tile shapes in
+    as constexprs sized for Ampere-and-later shared memory, while the eager Triton path picks
+    tiles per device. Raised at compile time so the BC builders can catch it during setup
+    rather than surfacing an opaque driver error at launch.
+    """
+
+
 def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                     num_warps: int, num_stages: int):
     key = (device.index, fn.__name__, tuple(sorted(constexprs.items())), num_warps, num_stages,
@@ -84,6 +94,18 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
         with torch.cuda.device(device):
             src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
             ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
+            # The tile shapes here are fixed constexprs chosen for a ~100 KB smem device. On a
+            # 64 KB device (Turing) the cubin still compiles, but TritonKernel's
+            # CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES would fail with an opaque
+            # "CUDA driver error". Raise something the BC builders can recognize instead, so
+            # they decline and the eager path (which does size its tiles per device) runs.
+            from .triton_paged import _dev_smem_limit
+            smem_limit = _dev_smem_limit(device)
+            if ck.metadata.shared > smem_limit:
+                raise BCKernelTooLarge(
+                    f"{fn.__name__}: {ck.metadata.shared} B of shared memory exceeds the "
+                    f"device limit of {smem_limit} B"
+                )
             k = ext.TritonKernel(ck.asm["cubin"], ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
@@ -569,7 +591,10 @@ class BCAttn:
         # argument patched into the graph
         skey = (tuple(inv_freq.shape) if inv_freq is not None else None, causal)
         if self.slot_widths.get((bsz, q_len, regime), ...) != skey:
-            self._configure(bsz, q_len, causal, regime)
+            try:
+                self._configure(bsz, q_len, causal, regime)
+            except BCKernelTooLarge:
+                return None
             self.slot_widths[(bsz, q_len, regime)] = skey
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,

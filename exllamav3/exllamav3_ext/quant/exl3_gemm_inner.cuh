@@ -7,6 +7,8 @@
 #define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
 
 #include "exl3_dq.cuh"
+// For exl3_gemm_smem_bytes(), the shared definition of this kernel's shared memory footprint
+#include "exl3_kernel_map.cuh"
 
 // On GA10x, HMMA with fp32 accumulation runs at half rate and dominates the m=1 (decode-bound) case.
 // Accumulate MMA results in fp16 instead and fold into the fp32 accumulators once per k-slice: ~14%
@@ -62,6 +64,16 @@ void exl3_gemm_kernel_inner
     (
         SMEM_MAX >= SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
         "Invalid kernel params (insufficient shared memory for shape)"
+    );
+    // The host filters shapes by asking exl3_gemm_smem_bytes() what this layout costs; if that
+    // function and the layout above ever diverge, the filter would vet a footprint the kernel
+    // does not actually have. Assert they agree, per instantiation, at compile time.
+    static_assert
+    (
+        exl3_gemm_smem_bytes(TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES,
+                             bits, shmem_out_had)
+            == SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
+        "exl3_gemm_smem_bytes() disagrees with the kernel's shared memory layout"
     );
 
     // Shared memory

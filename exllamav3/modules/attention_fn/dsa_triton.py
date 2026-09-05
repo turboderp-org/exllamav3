@@ -30,6 +30,7 @@ The lightning-indexer scoring kernel is shared as-is between raw-token (V3.2) an
 import os
 import torch
 from ...util.tensor import g_tensor_cache
+from .triton_paged import _dev_small_smem
 
 # EXL3_DSA_DEBUG_BOUNDS=1: compile the JIT DSA kernels with device-side bounds asserts on
 # every block-table page read and gathered pool index (names the kernel and traps at the
@@ -902,6 +903,15 @@ def dsa_attn(
         # halve the head tile (perf is irrelevant with asserts on)
         num_stages = min(num_stages, 2)
         block_h = min(block_h, 16)
+    # The defaults (block_h 32, block_n 32, 3 stages) stage ~140 KB against the ~99 KB an
+    # Ampere-or-later device provides; a 64 KB device cannot hold them at all, and Triton
+    # raises rather than shrinking. The KV tiles dominate at DeepSeek's D_c = 512
+    # (block_n x 512 x 2 B per stage), so the kv tile has to come down along with the head
+    # tile and the pipeline depth - the debug path above already does the latter two.
+    if _dev_small_smem(q.device):
+        num_stages = min(num_stages, 2)
+        block_h = min(block_h, 8)
+        block_n = min(block_n, 16)
     dbg_pages = -(-(pool_c.numel() // max(D_c, 1)) // max(page_size, 1)) if dsa_debug_bounds else 0
     if nc_block:
         n_splits = 1
@@ -1016,6 +1026,15 @@ def dsa_indexer_scores(
         bt = block_table.reshape(-1)
     dbg = 1 if (dsa_debug_bounds and epp) else 0
     dbg_pages = -(-k_idx.shape[0] // epp) if dbg else 0
+    # The default tiles (block_m 64, block_n 128) stage ~96 KB, which a 64 KB device cannot
+    # hold at all; Triton raises OutOfResources at launch rather than recompiling smaller.
+    # Halving both keeps the kernel shape intact at a quarter of the staged bytes. Note this
+    # must happen before S_stride is computed, since that is a function of block_n and the
+    # scores buffer it sizes is what the kernel indexes.
+    if _dev_small_smem(q_idx.device):
+        block_m = min(block_m, 32)
+        block_n = min(block_n, 64)
+        num_stages = min(num_stages, 2)
     S_stride = triton.cdiv(max(T, 1), block_n) * block_n
     if scores is None:
         # Deliberately a per-call allocation: the shape grows with the visible context, so it

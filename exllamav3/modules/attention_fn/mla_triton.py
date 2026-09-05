@@ -45,6 +45,7 @@ import os
 import torch
 
 from ...util.tensor import g_tensor_cache
+from .triton_paged import _dev_small_smem
 
 # Debug aid: synchronize and error-check after every MLA kernel launch, so an async illegal
 # memory access is attributed to the kernel that caused it instead of a later sync point
@@ -937,6 +938,12 @@ def mla_attn_triton_decode(
         # scheduler overlaps anyway); swept best on Ampere/Ada/Blackwell at 512-wide latents.
         # fp16: smaller tiles, deeper pipeline
         block_n = (32 if D_c <= 512 else 16) if qc is None else (_qc_bn_override or 64)
+        # A 64 KB device cannot hold the wide tile: at DeepSeek-V4's D_c=512/D_r=64 the fp16
+        # path stages block_n * 576 * 2 B per stage, i.e. 108 KB at (32, 3 stages) and still
+        # 72 KB at 2 stages. Dropping to the narrow tile the D_c > 512 case already uses puts
+        # it at 54 KB. Triton raises OutOfResources rather than shrinking on its own.
+        if _dev_small_smem(q_lat.device):
+            block_n = min(block_n, 16)
     if num_stages is None:
         num_stages = 3 if qc is None else 1
     if num_warps is None:
@@ -1208,6 +1215,10 @@ def mla_attn_triton_prefill(
         block_m = 32 if qc is None else 16
     if block_n is None:
         block_n = 32 if qc is None else 64
+    # Same 64 KB ceiling as the paged kernel above; see the note there.
+    if _dev_small_smem(q_lat.device):
+        block_m = min(block_m, 16)
+        block_n = min(block_n, 16)
     if num_stages is None:
         num_stages = 2 if qc is None else 1
 

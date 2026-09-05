@@ -1,5 +1,11 @@
 
-# <img src="doc/cat.png" width="40"> ExLlamaV3
+# <img src="doc/cat.png" width="40"> ExLlamaV3 (Turing / sm_75 fork)
+
+> **This fork adds Turing (sm_75) support.** Upstream EXL3 requires Ampere or newer; see
+> [upstream #162](https://github.com/turboderp-org/exllamav3/issues/162) and
+> [#81](https://github.com/turboderp-org/exllamav3/issues/81). Tesla T4, RTX 20-series and
+> Quadro RTX now run EXL3. See [doc/sm75.md](doc/sm75.md) for what was changed and what it
+> costs. Everything below is upstream documentation.
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs. Headline features:
 
