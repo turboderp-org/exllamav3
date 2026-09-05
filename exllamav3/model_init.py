@@ -7,6 +7,7 @@ from .generator.sampler import ComboSampler
 from argparse import ArgumentParser
 import yaml
 from pathlib import Path
+from .architecture.mtp_hot_vocab import MTPHotVocabConfig
 
 def add_args(
     parser: ArgumentParser,
@@ -115,6 +116,9 @@ def add_args(
         parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
         parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
         parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = int, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head)", default = 0)
+        parser.add_argument("--mtp_hot_blocks", type = str, default = None, help = "Experimental: packed EXL3 block map for the Qwen MTP draft head")
+        parser.add_argument("--mtp_hot_embedding_dtype", choices = ("fp16", "fp8"), default = "fp16", help = "Embedding-copy dtype for --mtp_hot_blocks (default: fp16)")
+        parser.add_argument("--mtp_hot_validate", action = "store_true", help = "Validate subset-head argmax against the full draft head (slow; diagnostics only)")
 
 
 def get_arg_sampler(args):
@@ -253,10 +257,20 @@ def init(
 
     # Model instance
     model = Model.from_config(config, swa_full = args.swa_full)
+    hot_config = MTPHotVocabConfig(
+        blocks_path = getattr(args, "mtp_hot_blocks", None),
+        embedding_dtype = getattr(args, "mtp_hot_embedding_dtype", "fp16"),
+        validate_full_head = getattr(args, "mtp_hot_validate", False),
+    )
+    if hot_config.enabled and not use_mtp:
+        raise ValueError("MTP hot-vocabulary options require --mtp")
+
+    draft_kwargs = {"mtp_hot_vocab_config": hot_config} if use_mtp and hot_config.enabled else {}
     draft_model = Model.from_config(
         draft_config,
         swa_full = args.swa_full,
         component = "mtp" if use_mtp else "text",
+        **draft_kwargs,
     ) if draft_model_dir else None
 
     # Cache
