@@ -90,7 +90,7 @@ def main(args):
                     model.default_chat_prompt(f"{be.text_alias}\n{args.prompt.strip()}")
                     for be in batch_embed
                 ]
-                input_ids = tokenizer.encode(batch_prompt, embeddings = batch_embed)
+                input_ids = tokenizer.encode(batch_prompt, embeddings = batch_embed, encode_special_tokens = True)
                 params = {
                     "last_tokens_only": 1,
                     "indexed_embeddings": batch_embed

@@ -125,7 +125,7 @@ def main(args):
 
         embed = vision_model.get_image_embeddings(tokenizer, img)
         prompt = model.default_chat_prompt(f"{embed.text_alias}\n{args.prompt.strip()}")
-        input_ids = tokenizer.encode(prompt, embeddings = [embed])
+        input_ids = tokenizer.encode(prompt, embeddings = [embed], encode_special_tokens = True)
 
         job = Job(
             input_ids = input_ids,
