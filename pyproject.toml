@@ -1,0 +1,138 @@
+[build-system]
+requires = ["setuptools>=61", "wheel", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exllamav3"
+description = "Inference library for running local LLMs on modern consumer GPUs"
+dynamic = ["version"]
+readme = "README.md"
+requires-python = ">=3.10.11"
+license = {text = "MIT"}
+authors = [{ name = "turboderp" }]
+keywords = ["llm", "inference", "gpu", "quantization", "llama"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.6.0",
+    "tokenizers>=0.21.1",
+    "numpy>=2.1.0",
+    "rich",
+    "typing_extensions",
+    "safetensors>=0.3.2",
+    "ninja",
+    "pillow",
+    "pyyaml",
+    "marisa_trie",
+    "pydantic",
+    "llguidance>=1.7.0",
+    "flash-linear-attention>=0.5.0",
+    "triton-windows; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+eval = [
+    "transformers>=4.50.0",
+    "datasets",
+    "gguf>=0.14.0",
+    "llama-cpp-python",
+    "human_eval==1.0.3",
+    "matplotlib>=3.10.0",
+    "numpy>=2.0.0",
+    "pandas>=2.2.0",
+    "seaborn>=0.13.2",
+    "tabulate",
+]
+examples = [
+    "blessed",
+    "prompt_toolkit",
+    "pyperclip",
+    "requests",
+    "pydantic",
+]
+
+[dependency-groups]
+cu124 = ["torch>=2.6.0"]
+cu126 = ["torch>=2.6.0"]
+cu128 = ["torch>=2.6.0"]
+cu129 = ["torch>=2.6.0"]
+cu130 = ["torch>=2.6.0"]
+cu132 = ["torch==2.13.0"]
+
+[tool.setuptools]
+package-dir = { "" = "." }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["exllamav3*"]
+
+[tool.setuptools.package-data]
+exllamav3 = [
+    "py.typed",
+    "util/hadamard_data/*",
+    "conversion/standard_cal_data/*.utf8",
+    "exllamav3_ext/**/*",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "exllamav3.version.__version__" }
+
+[tool.uv]
+package = true
+python-preference = "only-managed"
+exclude-dependencies = ["flash-attn"]
+conflicts = [
+    [
+        { group = "cu124" },
+        { group = "cu126" },
+        { group = "cu128" },
+        { group = "cu129" },
+        { group = "cu130" },
+        { group = "cu132" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124", group = "cu124" },
+    { index = "pytorch-cu126", group = "cu126" },
+    { index = "pytorch-cu128", group = "cu128" },
+    { index = "pytorch-cu129", group = "cu129" },
+    { index = "pytorch-cu130", group = "cu130" },
+    { index = "pytorch-cu132", group = "cu132" },
+]
+
+# [tool.uv.extra-build-dependencies]
+# flash-attn = [{ requirement = "torch", match-runtime = true }]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
