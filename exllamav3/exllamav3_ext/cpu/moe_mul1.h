@@ -96,19 +96,6 @@ void exl3_moe_cpu_forward_raw
     int threads
 );
 
-// Copy `count` experts' packed trellis tensors (gate, up, down order; gate absent when
-// gateless) of a registered layer into a staging buffer, expert-major, parallelized over the
-// worker pool. Offsets are deterministic from the layer's matrix dims so the parent can compute
-// the same layout for the VRAM-side views.
-void exl3_moe_cpu_stage_experts
-(
-    int64_t handle,
-    const uint32_t* expert_ids,
-    int count,
-    uint8_t* dst,
-    int threads
-);
-
 // Per-phase profiling of the compute pool, reported to stdout every 512 jobs. Set once at
 // worker startup from MoeCpuTuning.cpu_prof (EXL3_MOE_CPU_PROF env).
 void exl3_moe_cpu_set_prof(bool enabled);

@@ -1707,45 +1707,18 @@ void transform_out(const MoeCpuMatrix& mat, float* tout, int m)
 // Assign workers to GEMVs: with more GEMVs than workers, each worker strides over whole GEMVs;
 // otherwise GEMV j gets the contiguous worker group [j*nw/total, (j+1)*nw/total). Returns false
 // when this worker has no assignment. Missing either regime silently drops GEMVs.
-inline bool gemv_assignment(int worker, int num_workers, int total, int& j0, int& j_step, int& sub, int& per)
-{
-    if (total <= 0) return false;
-    if (total >= num_workers)
-    {
-        j0 = worker; j_step = num_workers; sub = 0; per = 1;
-        return j0 < total;
-    }
+// GEMV phases are partitioned in units of one UNIT_TILES-wide output band of one GEMV (a
+// whole swizzle group, so the swizzled band kernels never straddle a group boundary), and each
+// worker takes a contiguous block of units. Load stays within one band of even regardless of
+// how the GEMV count divides the worker count: whole-GEMV assignment ran 15 gate/up GEMVs on
+// 12 workers as two rounds with 9 workers idle in the second (decode top-10 with ~8 CPU
+// experts), and split single GEMVs unevenly in the down phase.
+constexpr int UNIT_TILES = 8;
 
-    for (int j = 0; j < total; ++j)
-    {
-        const int w0 = j * num_workers / total;
-        const int w1 = (j + 1) * num_workers / total;
-        if (worker >= w0 && worker < w1) {
-            j0 = j; j_step = total; sub = worker - w0; per = w1 - w0;
-            return true;
-        }
-    }
-    return false;
-}
-
-// Contiguous tile range for split sub/per of one GEMV. Swizzled matrices hand out whole
-// 8-tile groups per worker: the band kernels' swizzled addressing assumes n0's group is not
-// split mid-band (band tables only produce divisors of 8, which stay inside a group only
-// when the range starts group-aligned).
-inline void tile_split(const MoeCpuMatrix& mat, int sub, int per, int& t0, int& t1)
+inline void unit_range(int worker, int num_workers, int total, int& u0, int& u1)
 {
-    const int tiles_n = mat.n / 16;
-    if (mat.swz)
-    {
-        const int groups = tiles_n / 8;
-        t0 = groups * sub / per * 8;
-        t1 = groups * (sub + 1) / per * 8;
-    }
-    else
-    {
-        t0 = tiles_n * sub / per;
-        t1 = tiles_n * (sub + 1) / per;
-    }
+    u0 = static_cast<int>(static_cast<int64_t>(total) * worker / num_workers);
+    u1 = static_cast<int>(static_cast<int64_t>(total) * (worker + 1) / num_workers);
 }
 
 void forward_phase(void* vctx, int worker, int num_workers)
@@ -1775,22 +1748,21 @@ void forward_phase(void* vctx, int worker, int num_workers)
 
         case 1:
         {
-            // Gate + up GEMVs: workers spread over the GEMVs, contiguous tile ranges within each
+            // Gate + up GEMVs: contiguous block of band units per worker
             const int gu = L.gates.empty() ? 1 : 2;
-            const int total = nc * gu;
-            int j0, j_step, sub, per;
-            if (gemv_assignment(worker, num_workers, total, j0, j_step, sub, per))
-                for (int j = j0; j < total; j += j_step)
-                {
-                    const Chunk& ch = c.chunks[j / gu];
-                    const bool up = gu == 1 || (j % gu);
-                    const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
-                    const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                    float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I;
-                    int t0, t1;
-                    tile_split(mat, sub, per, t0, t1);
-                    run_tiles(mat, p, tout, ch.m, t0, t1);
-                }
+            const int upg = (I / 16) / UNIT_TILES;
+            int u0, u1;
+            unit_range(worker, num_workers, nc * gu * upg, u0, u1);
+            for (int u = u0; u < u1; ++u)
+            {
+                const int j = u / upg, b = u % upg;
+                const Chunk& ch = c.chunks[j / gu];
+                const bool up = gu == 1 || (j % gu);
+                const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
+                const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
+                float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I;
+                run_tiles(mat, p, tout, ch.m, b * UNIT_TILES, (b + 1) * UNIT_TILES);
+            }
             break;
         }
 
@@ -1856,17 +1828,18 @@ void forward_phase(void* vctx, int worker, int num_workers)
 
         case 3:
         {
-            // Down GEMVs
-            int j0, j_step, sub, per;
-            if (gemv_assignment(worker, num_workers, nc, j0, j_step, sub, per))
-                for (int j = j0; j < nc; j += j_step) {
-                    const Chunk& ch = c.chunks[j];
-                    const MoeCpuMatrix& mat = L.downs[ch.expert];
-                    float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
-                    int t0, t1;
-                    tile_split(mat, sub, per, t0, t1);
-                    run_tiles(mat, c.prep_d[j], tout, ch.m, t0, t1);
-                }
+            // Down GEMVs: contiguous block of band units per worker
+            const int dpg = (H / 16) / UNIT_TILES;
+            int u0, u1;
+            unit_range(worker, num_workers, nc * dpg, u0, u1);
+            for (int u = u0; u < u1; ++u)
+            {
+                const int j = u / dpg, b = u % dpg;
+                const Chunk& ch = c.chunks[j];
+                const MoeCpuMatrix& mat = L.downs[ch.expert];
+                float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
+                run_tiles(mat, c.prep_d[j], tout, ch.m, b * UNIT_TILES, (b + 1) * UNIT_TILES);
+            }
             break;
         }
 
@@ -1904,83 +1877,6 @@ void forward_phase(void* vctx, int worker, int num_workers)
 } // namespace
 
 static const MoeCpuLayer* get_layer(int64_t handle);
-
-namespace {
-
-struct StageCtx
-{
-    const MoeCpuLayer* layer;
-    const uint32_t* ids;
-    int count;
-    uint8_t* dst;
-};
-
-inline size_t trellis_bytes(const MoeCpuMatrix& m)
-{
-    return static_cast<size_t>(m.k / 16) * (m.n / 16) * 16 * m.bits * 2;
-}
-
-// Staged bytes are copied verbatim, swizzled or not: the GPU restores the native tile order
-// after the DMA (moe_unswizzle_trellis), which is one read + one write at VRAM bandwidth instead
-// of tiles_k * groups scattered memcpys here. Un-swizzling on the stager thread measured as the
-// whole VBMI-vs-VNNI prefill gap on a fully streamed 119B model (~17% at 32K).
-inline void stage_copy_trellis(uint8_t* dst, const MoeCpuMatrix& m)
-{
-    std::memcpy(dst, m.trellis, trellis_bytes(m));
-}
-
-void stage_phase(void* vctx, int worker, int num_workers)
-{
-    StageCtx& c = *static_cast<StageCtx*>(vctx);
-    const bool gated = !c.layer->gates.empty();
-    const int nmat = gated ? 3 : 2;
-    // Each (expert, matrix) is one unit; offsets accumulate expert-major in g, u, d order
-    const size_t gb = gated ? trellis_bytes(c.layer->gates[0]) : 0;
-    const size_t ub = trellis_bytes(c.layer->ups[0]);
-    const size_t db = trellis_bytes(c.layer->downs[0]);
-    const size_t per_expert = gb + ub + db;
-    for (int u = worker; u < c.count * nmat; u += num_workers)
-    {
-        const int e = c.ids[u / nmat];
-        const int mi = u % nmat;
-        size_t off = static_cast<size_t>(u / nmat) * per_expert;
-        const MoeCpuMatrix* m;
-        if (gated && mi == 0)      { m = &c.layer->gates[e]; }
-        else if (mi == (gated ? 1 : 0)) { m = &c.layer->ups[e]; off += gb; }
-        else                       { m = &c.layer->downs[e]; off += gb + ub; }
-        stage_copy_trellis(c.dst + off, *m);
-    }
-}
-
-} // namespace
-
-void exl3_moe_cpu_stage_experts
-(
-    int64_t handle,
-    const uint32_t* expert_ids,
-    int count,
-    uint8_t* dst,
-    int threads
-)
-{
-    // Runs on the worker's stager thread, concurrently with compute jobs on the pool: use
-    // scratch threads, never the shared pool. A few threads saturate memcpy DRAM bandwidth.
-    StageCtx ctx { get_layer(handle), expert_ids, count, dst };
-    const bool gated = !ctx.layer->gates.empty();
-    int units = count * (gated ? 3 : 2);
-    int nt = std::min(threads > 0 ? threads : 1, units);
-    if (nt <= 1)
-    {
-        stage_phase(&ctx, 0, 1);
-        return;
-    }
-    std::vector<std::thread> ts;
-    ts.reserve(nt);
-    for (int i = 0; i < nt; ++i)
-        ts.emplace_back(stage_phase, &ctx, i, nt);
-    for (auto& t : ts)
-        t.join();
-}
 
 bool exl3_moe_cpu_has_avx2() { return g_isa != Isa::Scalar; }
 bool exl3_moe_cpu_has_avx512_vnni() { return g_isa >= Isa::Vnni; }

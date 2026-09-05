@@ -30,6 +30,9 @@
 //     per slot: [x fp16 cap_rows*Hi][sel i32 cap_rows*topk][w fp16 cap_rows*topk]
 //               [out fp32 cap_rows*Ho], each section 64-byte aligned
 //
+// Streamed prefill DMAs expert weights straight out of the child's arena chunks (shared
+// sections the parent maps and page-locks, see moe_cpu_host.py); there is no staging ring.
+//
 // Ordering: the parent writes a job descriptor and bumps jobs_tail before enqueueing the GPU
 // memcpys and the data_ready publish for that seq, so the child always sees the descriptor
 // before it can see the data flag. Sequence numbers increase monotonically from 1; slot reuse is
@@ -37,55 +40,31 @@
 
 #define MOE_JOB_RING 256
 #define MOE_MAX_SLOTS 8
-#define MOE_MAX_WSLOTS 8
 #define MOE_JOB_KIND_COMPUTE 0
-#define MOE_JOB_KIND_STAGE 1
 // GATED: issued by the fused-issue kernel, whose collect side reads the output only when at
 // least one selected expert was CPU-resident. The worker may skip the compute and the
 // output write entirely for an all-inactive job. Plain COMPUTE jobs must keep writing
 // (zeroing) the output, since their collect reads it back unconditionally
 #define MOE_JOB_KIND_COMPUTE_GATED 2
 
-// kind == STAGE: the worker memcpys `rows` experts' packed weights (ids in experts[]) of layer
-// `layer` into weight-staging slot `slot`, after waiting for the parent's pinned_free flag to
-// reach prev_seq (the slot's previous tenant has been DMA'd to VRAM). Weight-staging slots
-// follow the compute slots in the shared region; their geometry travels in the layout dict.
-//
-// MOE_JOB_MAX_EXPERTS is the structural capacity of the experts[] array (just sizes a uint32_t
-// array in shared memory; overprovisioning has no runtime cost since only the first `rows`
-// entries are ever read). The runtime batch size actually used per stage job is a separate,
-// Python-side tunable (MoeCpuTuning.batch_experts in moe_cpu_host.py, default 24) clamped to
-// this capacity.
-#define MOE_JOB_MAX_EXPERTS 256
-
 struct MoeJob
 {
     uint32_t seq;
     uint32_t layer;
-    uint32_t rows;       // compute: token rows; stage: expert count
+    uint32_t rows;
     uint32_t topk;
     uint32_t slot;
     uint32_t kind;
-    uint32_t prev_seq;   // stage: pinned_free value to wait for before overwriting the slot
-    uint32_t experts[MOE_JOB_MAX_EXPERTS];
-    uint32_t _pad;
+    uint32_t _pad[2];
 };
 
 #define MOE_CTRL_JOBS_OFFSET 384
 #define MOE_SLOT_FLAGS_OFFSET (MOE_CTRL_JOBS_OFFSET + MOE_JOB_RING * sizeof(MoeJob))
 
-// Flag order: data_ready[MAX_SLOTS], done[MAX_SLOTS], stage_done[MAX_WSLOTS],
-// pinned_free[MAX_WSLOTS], each entry 64-byte strided
-#define MOE_FLAGS_SIZE (3 * 64 * MOE_MAX_SLOTS + 2 * 64 * MOE_MAX_WSLOTS)
-
-// Stage jobs travel in their own ring, consumed by a dedicated stager thread in the child, so
-// weight staging (pure memcpy) overlaps the compute pool's work on the token tail instead of
-// queuing behind it
-#define MOE_STAGE_RING 64
-#define MOE_STAGE_TAIL_OFFSET (MOE_SLOT_FLAGS_OFFSET + MOE_FLAGS_SIZE)
-#define MOE_STAGE_HEAD_OFFSET (MOE_STAGE_TAIL_OFFSET + 64)
-#define MOE_STAGE_JOBS_OFFSET (MOE_STAGE_TAIL_OFFSET + 128)
-#define MOE_CTRL_SIZE (MOE_STAGE_JOBS_OFFSET + MOE_STAGE_RING * sizeof(MoeJob))
+// Flag order: data_ready[MAX_SLOTS], done[MAX_SLOTS], consumed[MAX_SLOTS], each entry 64-byte
+// strided
+#define MOE_FLAGS_SIZE (3 * 64 * MOE_MAX_SLOTS)
+#define MOE_CTRL_SIZE (MOE_SLOT_FLAGS_OFFSET + MOE_FLAGS_SIZE)
 
 // GPU-side flag ops on the current torch CUDA stream (addresses inside the registered region).
 // Prefer stream memory operations (front-end executed, no SM occupancy, no launch cost) over the
@@ -106,9 +85,5 @@ void exl3_moe_cpu_worker_run
     int64_t max_hi,
     int64_t max_ho,
     int64_t max_topk,
-    int64_t wstage_offset,
-    int64_t num_wslots,
-    int64_t wslot_size,
-    int64_t threads,
-    int64_t stage_threads
+    int64_t threads
 );
