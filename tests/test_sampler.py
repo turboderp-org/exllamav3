@@ -779,18 +779,18 @@ def dry_reference_penalties(window, breakers, multiplier, base, allowed_length):
 def test_dry_oracle(past_device):
     """
     Randomized differential test of SS_DRY against the brute-force oracle, exact to the bit
-    since both sides compute the penalty in float64 and round once to float32. The scan runs on
-    the device holding past_ids, so both placements are covered; a slice of the cases shrinks
-    the chunk budget to force the offset loop across chunk boundaries, and another injects
-    out-of-vocabulary and negative past IDs, which match as ordinary tokens but are never
-    penalized or treated as breakers.
+    since both sides compute the penalty in float64 and round once to float32. past_ids are
+    given on the host and on the device (the kernel uploads host ids); a slice of the cases
+    injects out-of-vocabulary and negative past IDs, which match as ordinary tokens but are
+    never penalized or treated as breakers, and the last cases use windows long enough to
+    spread the offset scan over several kernel blocks.
     """
     rng = random.Random(11)
-    chunk_numel = sampler_custom._DRY_CHUNK_NUMEL
     try:
-        for case in range(200):
+        for case in range(220):
             dim = rng.choice([16, 33, 64])
-            n = rng.randint(3, 60)
+            # the last cases span several scan blocks of the kernel (1024 offsets each)
+            n = rng.randint(3, 60) if case < 200 else rng.randint(1500, 3000)
             alphabet = rng.randint(2, 8)
             seq = [rng.randrange(alphabet) for _ in range(n)]
             if case % 5 == 0:
@@ -800,7 +800,6 @@ def test_dry_oracle(past_device):
             allowed = rng.choice([0, 1, 2, 5])
             dry_range = rng.choice([0, 3, 7, 100])
             breakers = frozenset(rng.sample(range(alphabet + 2), rng.randint(0, 3)))
-            sampler_custom._DRY_CHUNK_NUMEL = 64 if case % 4 == 0 else chunk_numel
 
             sampler = CustomSampler([SS_DRY(multiplier, base, allowed, dry_range, breakers or None)])
             logits = torch.zeros((1, dim), dtype = torch.float, device = device)
@@ -822,7 +821,7 @@ def test_dry_oracle(past_device):
             assert torch.equal(state.logits[0].cpu(), -expect), \
                 (seq, multiplier, base, allowed, dry_range, sorted(breakers))
     finally:
-        sampler_custom._DRY_CHUNK_NUMEL = chunk_numel
+        pass
 
 
 def test_dry_validation():

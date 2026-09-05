@@ -890,14 +890,12 @@ def dry_default_sequence_breaker_tokens(tokenizer: Tokenizer) -> frozenset[int]:
     return frozenset(breakers | set(tokenizer.extended_id_to_piece.keys()))
 
 
-# llama.cpp's FLOAT_MAX_LOG: ln of the largest float32
+# llama.cpp equivalent FLOAT_MAX_LOG: ln of the largest float32
 _DRY_FLOAT_MAX_LOG = 88.7228391
 
 # Matches at or beyond the exponent clamp all produce the same penalty, so the match scan stops
-# there. _DRY_MATCH_CAP bounds the scan where the clamp cannot (dry_base near 1), and
-# _DRY_CHUNK_NUMEL bounds the [offsets, match cap] comparison transients
+# there. _DRY_MATCH_CAP bounds the scan where the clamp cannot (dry_base near 1)
 _DRY_MATCH_CAP = 2048
-_DRY_CHUNK_NUMEL = 8 * 1024 * 1024
 
 
 @lru_cache(10)
@@ -941,9 +939,10 @@ class SS_DRY(SS_Base):
     follows exllamav2, including dry_range = 0 meaning the whole context. exllamav2's own DRY is
     a different algorithm (an occurrence-counting trie), so outputs are not expected to match it.
 
-    The scan runs on the device holding past_ids and costs
-    O(window * min(allowed_length + clamp, 2048)) comparisons per sampled token (160 per window
-    token at the default base), which is why dry_range should be capped for very long contexts.
+    One kernel launch per sampled token (ext.dry_penalty) on the logits device; past_ids are
+    uploaded first if they live on the host. The scan is O(window) comparisons per token for
+    ordinary text and at most O(window * min(allowed_length + clamp, 2048)) for a context that
+    is one long verbatim repeat.
     """
     def __init__(
         self,
@@ -996,79 +995,14 @@ class SS_DRY(SS_Base):
         self.dry_range = int(dry_range)
         self.max_exponent = _dry_max_exponent(self.dry_base)
         self.breakers = TokenMask(dry_sequence_breakers) if dry_sequence_breakers else None
-        self.base_t = {}
-
-    def _apply_row(self, logits: torch.Tensor, past: torch.Tensor, dim: int, breakers: TokenMask | None):
-        n = past.shape[-1]
-        m = n if self.dry_range <= 0 else min(n, self.dry_range)
-        if m <= self.dry_allowed_length:
-            return
-        # Reversed window, r[0] being the most recent token
-        r = past[n - m:].flip(0)
-        device = r.device
-
-        # The nearest breaker caps a match at its distance from the end of the context. Matches
-        # without breakers are bounded by the window itself, so no cap is needed then
-        if breakers is not None:
-            mask = breakers.get(dim, device)
-            rb = mask[r.clamp(min = 0, max = dim - 1)] & (r >= 0) & (r < dim)
-            rep_limit = torch.where(rb, torch.arange(m, device = device), m).min()
-        else:
-            mask = None
-            rep_limit = None
-
-        # For each offset k into the past, the length of the match between the window suffix
-        # and the sequence ending k tokens earlier is the run of leading True in
-        # r[j] == r[j + k]. The token that followed the earlier sequence is charged with the
-        # longest match it would extend. Offsets are chunked to bound the [C, J] transients.
-        # Uncharged offsets scatter into an extra slot at dim so the loop stays free of
-        # host-device syncs
-        j_cap = min(self.dry_allowed_length + self.max_exponent, _DRY_MATCH_CAP) \
-            if self.max_exponent > 0 else _DRY_MATCH_CAP
-        J = max(1, min(m - 1, j_cap))
-        suffix = r[:J]
-        jj = torch.arange(J, device = device)
-        l_max = torch.full((dim + 1,), -1, dtype = torch.long, device = device)
-        chunk = max(1, _DRY_CHUNK_NUMEL // J)
-        for k0 in range(1, m, chunk):
-            ks = torch.arange(k0, min(k0 + chunk, m), device = device)
-            idx = ks[:, None] + jj[None, :]
-            eq = (r[idx.clamp(max = m - 1)] == suffix[None, :]) & (idx < m)
-            length = eq.cumprod(dim = 1, dtype = torch.int8).sum(dim = 1, dtype = torch.long)
-            if rep_limit is not None:
-                length = torch.minimum(length, rep_limit)
-            followers = r[ks - 1]
-            charge = (length >= self.dry_allowed_length) & (followers >= 0) & (followers < dim)
-            l_max.scatter_reduce_(
-                0,
-                torch.where(charge, followers, dim),
-                torch.where(charge, length, -1),
-                reduce = "amax"
-            )
-
-        l_max = l_max[:dim]
-        charged = l_max >= 0
-        if mask is not None:
-            charged &= ~mask
-        exponent = l_max - self.dry_allowed_length
-        if self.max_exponent > 0:
-            exponent = exponent.clamp(max = self.max_exponent)
-        base_t = self.base_t.get(device)
-        if base_t is None:
-            base_t = torch.tensor(self.dry_base, dtype = torch.double, device = device)
-            self.base_t[device] = base_t
-        # llama.cpp's std::pow promotes to double and the result saturates when converted to
-        # float32, so an oversized penalty lands the logit at -inf rather than overflowing early
-        penalty = self.dry_multiplier * torch.pow(base_t, exponent.to(torch.double))
-        penalty = torch.where(charged, penalty, torch.zeros_like(penalty))
-        logits -= penalty.to(device = logits.device, dtype = torch.float)
 
     def run(self, state: SamplingState):
         match state.state:
             case SS.INIT:
-                state.logits = state.in_logits.to(torch.float, copy = True)
+                in_logits = state.in_logits
+                state.logits = torch.empty_like(in_logits, dtype = torch.float)
             case SS.LOGITS:
-                pass
+                in_logits = state.logits
             case _:
                 raise ValueError("Sampling logic error")
         breakers = self.breakers
@@ -1076,8 +1010,26 @@ class SS_DRY(SS_Base):
             breakers = _dry_default_breaker_mask(state.tokenizer)
         assert state.past_ids is not None, "SS_DRY requires past token IDs"
         assert state.past_ids.shape[0] == state.bsz
-        for i in range(state.bsz):
-            self._apply_row(state.logits[i], state.past_ids[i], state.dim, breakers)
+        device = in_logits.device
+        past_ids = state.past_ids
+        if past_ids.device != device:
+            past_ids = past_ids.to(device, non_blocking = past_ids.is_pinned())
+        n_ws = state.bsz * state.dim
+        scratch = torch.full((n_ws + state.bsz,), -1, dtype = torch.int32, device = device)
+        ext.dry_penalty(
+            in_logits,
+            state.logits,
+            past_ids.contiguous(),
+            breakers.get(state.dim, device) if breakers is not None else None,
+            scratch[:n_ws],
+            scratch[n_ws:],
+            self.dry_multiplier,
+            self.dry_base,
+            self.dry_allowed_length,
+            self.dry_range,
+            self.max_exponent,
+            _DRY_MATCH_CAP,
+        )
         state.state = SS.LOGITS
 
     def alt(self):
