@@ -269,11 +269,29 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
-        for module, instance, idx in self.fwd_modules:
-            params["layer_instance"] = instance
-            if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
-                x = x[..., -num:, :].contiguous()
-            x = module.prepare_for_device(x, params)
-            x = module.forward(x, params)
+        # Keep the process-wide CUDA context on the module's device. Stock ext host wrappers
+        # self-guard (CUDAGuard on the tensor's device), but nothing sets the current device
+        # for the forward itself, so an unguarded eager launch -- extension code, a capture
+        # helper, a new kernel -- runs on cuda:0 with foreign tensors: silently over P2P on
+        # peer pairs (paying the latency), faulting with an illegal access on non-peer pairs
+        # (surfacing asynchronously, misattributed to whatever kernel checks next). Modules
+        # are device-contiguous, so this costs at most one set_device per device transition
+        # plus one restore.
+        prev_device = torch.cuda.current_device()
+        cur = None
+        try:
+            for module, instance, idx in self.fwd_modules:
+                params["layer_instance"] = instance
+                if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
+                    x = x[..., -num:, :].contiguous()
+                dev = module.device
+                if dev is not None and getattr(dev, "type", None) == "cuda" and dev != cur:
+                    torch.cuda.set_device(dev)
+                    cur = dev
+                x = module.prepare_for_device(x, params)
+                x = module.forward(x, params)
+        finally:
+            if cur is not None and cur != prev_device:
+                torch.cuda.set_device(prev_device)
         return x
 
