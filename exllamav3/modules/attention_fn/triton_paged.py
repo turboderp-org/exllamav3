@@ -1222,6 +1222,16 @@ def paged_attn_triton_decode(
 
     if block_n is None:
         block_n = max(16, 8192 // head_dim)   # K + V tiles in smem across num_stages
+        # That default fixes block_n * head_dim at 8192, i.e. 32 KB of K + V per stage, so at
+        # the default depth of 2 the kv tiles alone are 64 KB and a Turing device cannot hold
+        # them at all. Unlike the other kernels here this one does not merely lose occupancy:
+        # _smem_fallback would turn the OutOfResources into a dispatch miss and every decode
+        # step would run on SDPA, when a narrower kv tile keeps it on Triton. Halve until it
+        # fits - the k loop runs more iterations, the kernel shape is unchanged.
+        if _dev_small_smem(q.device):
+            budget = int(_dev_smem_limit(q.device) * 0.9)
+            while block_n > 16 and block_n * head_dim * 4 * num_stages > budget:
+                block_n //= 2
 
     group_size = n_q_heads // n_kv_heads
     block_m = triton.next_power_of_2(q_len)
