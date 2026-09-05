@@ -107,7 +107,7 @@ Note that the PyPi package does not contain a prebuilt extension and requires th
 2. **with `uv`, setting `--group cuXXX` and pinning a torch version inside that group** (applicable to non-Github `uv` install paths in options 1 and 2) — see the [pinning a specific PyTorch version (optional)](#pinning-a-specific-pytorch-version-optional) section for details (note a global `[tool.uv] constraint-dependencies` does not work for this)
 3. Manually with `uv pip` or `pip` (options 3 and 4)
 
-The CUDA flavors are declared as uv **dependency groups** (`cu124`, `cu126`, `cu128`, `cu129`, `cu130`, `cu132`) — pick the one matching your installed CUDA build by passing `--group <flavor>` to `uv sync` / `uv run`. While developing you can also set `[tool.uv] default-groups = ["cuXXX"]` to make a flavor the default for the project (see [Pinning the CUDA flavor for local development](#pinning-the-cuda-flavor-for-local-development)). The library's C++/CUDA extension is built at install time. Selecting a flavor installs the matching CUDA build of `torch`; `flash-attn` is installed separately (see [Prebuilt flash-attn](#prebuilt-flash-attn)).
+The CUDA flavors are declared as uv **dependency groups** (`cu124`, `cu126`, `cu128`, `cu129`, `cu130`, `cu132`) — pick the one matching your installed CUDA build by passing `--group <flavor>` to `uv sync` / `uv run`. While developing you can also set `[tool.uv] default-groups = ["cuXXX"]` to make a flavor the default for the project (see [Pinning the CUDA flavor for local development](#pinning-the-cuda-flavor-for-local-development)). Both `uv sync` and `pip install .` build the package in an isolated environment where your `torch` is not visible, so they install the extension sources and compile them at first import (JIT, a few minutes once per torch version). For a precompiled install run `pip install --no-build-isolation .` in an environment that already has `torch`, or use the release wheels. Selecting a flavor installs the matching CUDA build of `torch`; `flash-attn` is optional and installed separately (see [Prebuilt flash-attn](#prebuilt-flash-attn)).
 
 ##### Pinning the CUDA flavor for local development
 
@@ -139,20 +139,25 @@ uv sync --group examples --group eval
 
 **Option 2 — Using `exllamav3` as a dependency from another project (`uv add`):**
 
+The CUDA flavor groups belong to this repo's own `pyproject.toml`; a dependent project cannot
+select them (`exllamav3[cu130]` is not an extra and uv will warn that it doesn't exist). Add the
+package plainly and choose `torch` in your own project, either by installing it first
+(`uv pip install torch --torch-backend=auto`) or by declaring a `[tool.uv.sources]` entry for
+`torch` pointing at the PyTorch index for your CUDA version, as this repo does.
+
 ```sh
 # `uv add` works inside an existing project (a directory with a pyproject.toml).
-# `uv init` creates one if you're starting a new project, if integrating into
-# an existing project skip `uv init`.
+# `uv init` creates one if you're starting a new project.
 uv init my-project
 cd my-project
 
 # local checkout
-uv add 'path/to/exllamav3[cu130]'               # non-editable
-uv add 'path/to/exllamav3[cu130]' --editable    # editable
+uv add path/to/exllamav3               # non-editable
+uv add path/to/exllamav3 --editable    # editable
 
 # straight from GitHub
-uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]'                 # default branch
-uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]' --branch dev    # specific branch
+uv add 'git+https://github.com/turboderp-org/exllamav3.git'                 # default branch
+uv add 'git+https://github.com/turboderp-org/exllamav3.git' --branch dev    # specific branch
 ```
 
 **Option 3 — Bring your own `torch` and let `uv` pick the backend automatically:**

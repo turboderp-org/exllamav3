@@ -63,8 +63,6 @@ sources = [
     if file.endswith(('.c', '.cpp', '.cu'))
 ]
 
-print(sources)
-
 setup_kwargs = (
     {
         "ext_modules": [

@@ -4,8 +4,8 @@ except ImportError as e:
     raise RuntimeError(
         "PyTorch is required but not installed. exllamav3 deliberately does not install "
         "a default torch because it must match your CUDA setup; install a matching build "
-        "first (for example `uv pip install torch --torch-backend=auto`, or select a CUDA "
-        "flavor extra such as `uv sync --extra cu130`). "
+        "first (for example `uv pip install torch --torch-backend=auto`, or in this repo select a "
+        "CUDA flavor group such as `uv sync --group cu130`). "
         "See the README (\"Building from source\") for all install variants. "
         "https://github.com/turboderp-org/exllamav3"
     ) from e
