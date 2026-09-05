@@ -586,7 +586,28 @@ void vnni_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
                 ? mat.trellis + (static_cast<size_t>(n0 / 8) * tiles_k * 8
                                  + static_cast<size_t>(tile_k) * 8 + (n0 % 8) + b) * packed_size
                 : packed_row + b * packed_size;
-            _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+            if (mat.swz && band == 8)
+            {
+                // Whole-group band on the swizzled layout: the k-stream is sequential, one line
+                // one step ahead is enough and the HW prefetcher follows the run (wider/farther
+                // measured neutral on K4, 7960X)
+                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+            }
+            else
+            {
+                // Strided stream: the native layout (K8, or VNNI-only CPUs where nothing is
+                // swizzled) strides row_stride per step, and a partial-group band on the
+                // swizzled layout (rows 3-4 at band 4) reads half a group then skips half; both
+                // outrun the HW prefetcher, so touch every line of the tile row a few steps
+                // ahead, as the AVX2 tier does (PR #331). +11% decode on K8 (7960X, four
+                // order-alternated pairs, 60.9 -> 67.9 tok/s), prefill unchanged; bits == 6 keeps
+                // the shorter distance that tier found necessary for its 96-byte rows
+                constexpr int pf_lines = (packed_size * 2 + 63) / 64;
+                constexpr int pf_dist = (bits == 6) ? 2 : 4;
+                const char* pf = reinterpret_cast<const char*>(packed + pf_step * pf_dist);
+                for (int l = 0; l < pf_lines; ++l)
+                    _mm_prefetch(pf + l * 64, _MM_HINT_T0);
+            }
             const uint32_t* pw = reinterpret_cast<const uint32_t*>(packed);
             const __m512i p0 = _mm512_maskz_loadu_epi32(mask0, pw);
             const __m512i p1 = _mm512_maskz_loadu_epi32(mask1, pw + 16);
@@ -844,7 +865,28 @@ void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
                 ? mat.trellis + (static_cast<size_t>(n0 / 8) * tiles_k * 8
                                  + static_cast<size_t>(tile_k) * 8 + (n0 % 8) + b) * packed_size
                 : packed_row + b * packed_size;
-            _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+            if (mat.swz && band == 8)
+            {
+                // Whole-group band on the swizzled layout: the k-stream is sequential, one line
+                // one step ahead is enough and the HW prefetcher follows the run (wider/farther
+                // measured neutral on K4, 7960X)
+                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+            }
+            else
+            {
+                // Strided stream: the native layout (K8, or VNNI-only CPUs where nothing is
+                // swizzled) strides row_stride per step, and a partial-group band on the
+                // swizzled layout (rows 3-4 at band 4) reads half a group then skips half; both
+                // outrun the HW prefetcher, so touch every line of the tile row a few steps
+                // ahead, as the AVX2 tier does (PR #331). +11% decode on K8 (7960X, four
+                // order-alternated pairs, 60.9 -> 67.9 tok/s), prefill unchanged; bits == 6 keeps
+                // the shorter distance that tier found necessary for its 96-byte rows
+                constexpr int pf_lines = (packed_size * 2 + 63) / 64;
+                constexpr int pf_dist = (bits == 6) ? 2 : 4;
+                const char* pf = reinterpret_cast<const char*>(packed + pf_step * pf_dist);
+                for (int l = 0; l < pf_lines; ++l)
+                    _mm_prefetch(pf + l * 64, _MM_HINT_T0);
+            }
             const uint32_t* pw = reinterpret_cast<const uint32_t*>(packed);
             const __m512i p0 = _mm512_maskz_loadu_epi32(mask0, pw);
             const __m512i p1 = _mm512_maskz_loadu_epi32(mask1, pw + 16);
@@ -1878,28 +1920,13 @@ inline size_t trellis_bytes(const MoeCpuMatrix& m)
     return static_cast<size_t>(m.k / 16) * (m.n / 16) * 16 * m.bits * 2;
 }
 
-// Staged bytes feed the GPU dequant path, which expects the NATIVE (k/16, n/16, 16K) tile
-// order. Swizzled matrices are un-swizzled here. Per (group, kt) the swizzled source holds
-// 8 tiles contiguously that are also contiguous in the native destination, so this is
-// tiles_k * groups medium-sized memcpys (e.g. 184 x 23 x 768B at K3 2944^2) instead of one
-// big one; the stager threads absorb the difference and the PCIe leg downstream dominates.
+// Staged bytes are copied verbatim, swizzled or not: the GPU restores the native tile order
+// after the DMA (moe_unswizzle_trellis), which is one read + one write at VRAM bandwidth instead
+// of tiles_k * groups scattered memcpys here. Un-swizzling on the stager thread measured as the
+// whole VBMI-vs-VNNI prefill gap on a fully streamed 119B model (~17% at 32K).
 inline void stage_copy_trellis(uint8_t* dst, const MoeCpuMatrix& m)
 {
-    if (!m.swz)
-    {
-        std::memcpy(dst, m.trellis, trellis_bytes(m));
-        return;
-    }
-    const int tiles_k = m.k / 16;
-    const int tiles_n = m.n / 16;
-    const int groups = tiles_n / 8;
-    const size_t tile_b = static_cast<size_t>(m.bits) * 32;
-    const uint8_t* src = reinterpret_cast<const uint8_t*>(m.trellis);
-    for (int g = 0; g < groups; ++g)
-        for (int kt = 0; kt < tiles_k; ++kt)
-            std::memcpy(dst + (static_cast<size_t>(kt) * tiles_n + g * 8) * tile_b,
-                        src + (static_cast<size_t>(g) * tiles_k + kt) * 8 * tile_b,
-                        8 * tile_b);
+    std::memcpy(dst, m.trellis, trellis_bytes(m));
 }
 
 void stage_phase(void* vctx, int worker, int num_workers)

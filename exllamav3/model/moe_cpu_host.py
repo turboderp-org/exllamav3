@@ -872,10 +872,17 @@ class MoeCpuHost:
                 for k in ("g", "u", "d"):
                     if pd.get(k):
                         mx = max(mx, pd[k][0] * pd[k][1])
+        # Experts arrive band-swizzled when the VBMI CPU tier owns them (same rule as the child's
+        # arena rehome, K8 excepted per matrix); the GPU restores the native tile order into a
+        # parallel ring after each DMA
+        swz = TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_vbmi()
         st = dict(
             copy_stream = torch.cuda.Stream(device = device),
             vram_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
                           for _ in range(self.num_wslots)],
+            native_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
+                            for _ in range(self.num_wslots)] if swz else None,
+            swz = swz,
             wready_ev = [torch.cuda.Event() for _ in range(self.num_wslots)],
             wconsumed_ev = [torch.cuda.Event() for _ in range(self.num_wslots)],
             wslot_used = [False] * self.num_wslots,
@@ -1117,12 +1124,22 @@ class MoeCpuHost:
                 ext.exl3_moe_flag_wait(self.stage_done_addr[ws], seq, abort)
                 st["vram_slots"][ws][:used].copy_(self.wviews[ws][:used], non_blocking = True)
                 ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
+                if st["swz"]:
+                    # Restore the native tile order on the copy stream, one launch per projection
+                    # over the whole batch (K8 matrices were never swizzled: plain copy)
+                    for name, off in (("g", 0), ("u", gb), ("d", gb + ub)):
+                        if not pd.get(name):
+                            continue
+                        k, n, K = pd[name]
+                        ext.moe_unswizzle_trellis(
+                            st["vram_slots"][ws], st["native_slots"][ws], len(batch), exp_b, off,
+                            k // 16, n // 16, K, K != 8)
                 st["wready_ev"][ws].record(copy_stream)
             st["wslot_used"][ws] = True
 
             # Compute the batch on the current stream once the DMA lands
             torch.cuda.current_stream().wait_event(st["wready_ev"][ws])
-            vslot = st["vram_slots"][ws]
+            vslot = st["native_slots"][ws] if st["swz"] else st["vram_slots"][ws]
             per_e = [(bi, e, token_sorted[offs[e] : offs[e] + counts_h[e]],
                       weight_sorted[offs[e] : offs[e] + counts_h[e]])
                      for bi, e in enumerate(batch)]

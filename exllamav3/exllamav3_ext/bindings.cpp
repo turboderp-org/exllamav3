@@ -38,6 +38,7 @@
 #include "generator/sampling_fused.cuh"
 #include "generator/rep_pen.cuh"
 #include "generator/dry.cuh"
+#include "moe_unswizzle.cuh"
 #include "generator/cache.cuh"
 
 #include "cache/q_cache.cuh"
@@ -155,6 +156,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx2", &exl3_moe_cpu_has_avx2, "exl3_moe_cpu_has_avx2");
     m.def("exl3_moe_flag_write", &exl3_moe_flag_write, "exl3_moe_flag_write");
     m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
+    m.def("moe_unswizzle_trellis", &moe_unswizzle_trellis, "moe_unswizzle_trellis");
     m.def("exl3_moe_cpu_set_memops", &exl3_moe_cpu_set_memops, "exl3_moe_cpu_set_memops");
     m.def("exl3_moe_cpu_set_prof", &exl3_moe_cpu_set_prof, "exl3_moe_cpu_set_prof");
     m.def("exl3_moe_cpu_pool_stress", &exl3_moe_cpu_pool_stress, "exl3_moe_cpu_pool_stress");
