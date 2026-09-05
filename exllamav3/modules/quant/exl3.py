@@ -6,12 +6,20 @@ from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
 import os
 from ...util import profile_opt
+from .exl3_triton import has_triton, linear_exl3_triton
 
 AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
+
+# Opt-in Triton implementation of the EXL3 linear (fused dequant + GEMM in
+# exl3_triton.py), used for every row count instead of the BC/reconstruct
+# paths. Falls back with a clear error if Triton is unavailable.
+use_triton = os.environ.get("EXL3_PREFER_TRITON_LINEAR", "0") != "0"
+if use_triton and not has_triton:
+    raise ImportError("EXL3_PREFER_TRITON_LINEAR=1 requires Triton, but Triton is not available")
 
 class LinearEXL3:
 
@@ -131,6 +139,13 @@ class LinearEXL3:
 
         reconstruct = params.get("reconstruct")
         if not reconstruct:
+            if use_triton:
+                dtype = out_dtype or self.default_out_dtype
+                return linear_exl3_triton(
+                    x, self.trellis, self.suh, self.svh, self.K,
+                    self.mcg, self.mul1, self.in_features, self.out_features,
+                    self.trellis.device, dtype, self.bias,
+                )
             rows = x.numel() // x.shape[-1]
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
                 dtype = out_dtype or self.default_out_dtype
