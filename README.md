@@ -103,11 +103,24 @@ Note that the PyPi package does not contain a prebuilt extension and requires th
 `exllamav3` declares a minimum `torch` version (>= 2.6.0) and CUDA version (>= 12.4), but beyond that the user is free to select a version of `torch` that is compatible with their environment.
 
 `torch` can be installed in three ways (from least to most effort):
-1. **with `uv`, setting only `--extra cuXXX`** installs `torch` automatically with the specified CUDA version, `torch` version is selected by `uv` from compatible versions in the specific index associated with the chosed CUDA version (options 1 and 2)
-2. **with `uv`, setting `--extra cuXXX` and specifying `[tool.uv].constraint-dependencies`** same as (1) but `torch` version is manually overridden using a constraint in `pyproject.toml` (applicable to non-Github `uv` install paths in options 1 and 2), see the [pinning a specific PyTorch version (optional)](#pinning-a-specific-pytorch-version-optional) section for additional details
+1. **with `uv`, setting only `--group cuXXX`** installs `torch` automatically with the specified CUDA version, `torch` version is selected by `uv` from compatible versions in the specific index associated with the chosen CUDA version (options 1 and 2)
+2. **with `uv`, setting `--group cuXXX` and pinning a torch version inside that group** (applicable to non-Github `uv` install paths in options 1 and 2) — see the [pinning a specific PyTorch version (optional)](#pinning-a-specific-pytorch-version-optional) section for details (note a global `[tool.uv] constraint-dependencies` does not work for this)
 3. Manually with `uv pip` or `pip` (options 3 and 4)
 
-The flavor extras (`--extra`) are `cu124`, `cu126`, `cu128`, `cu129`, `cu130`, and `cu132` — pick the one matching your installed CUDA build. The library's C++/CUDA extension is built at install time.
+The CUDA flavors are declared as uv **dependency groups** (`cu124`, `cu126`, `cu128`, `cu129`, `cu130`, `cu132`) — pick the one matching your installed CUDA build by passing `--group <flavor>` to `uv sync` / `uv run`. While developing you can also set `[tool.uv] default-groups = ["cuXXX"]` to make a flavor the default for the project (see [Pinning the CUDA flavor for local development](#pinning-the-cuda-flavor-for-local-development)). The library's C++/CUDA extension is built at install time. Selecting a flavor installs the matching CUDA build of `torch`; `flash-attn` is installed separately (see [Prebuilt flash-attn](#prebuilt-flash-attn)).
+
+##### Pinning the CUDA flavor for local development
+
+If you're developing on the repo and always want a particular CUDA flavor without passing
+`--group` every time, set it as the project default under `[tool.uv]`:
+
+```toml
+[tool.uv]
+default-groups = ["cu132"]
+```
+
+With that in place, plain `uv sync` / `uv run` enable the `cu132` group (and its
+pinned `torch`).
 
 **Option 1 — Working in the cloned repo directly (`uv sync`):**
 
@@ -118,8 +131,10 @@ cd exllamav3
 git checkout dev
 
 uv venv
-uv sync --extra cu130
-# add --extra examples and/or --extra eval for those extra dependencies
+uv sync --group cu130          # pick the CUDA flavor matching your build
+# while developing, default a flavor for the repo via [tool.uv] default-groups
+# non-CUDA optional dependencies are installed as before:
+uv sync --group examples --group eval
 ```
 
 **Option 2 — Using `exllamav3` as a dependency from another project (`uv add`):**
@@ -163,15 +178,43 @@ pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install .
 ```
 
-#### Pinning a specific PyTorch version (optional)
-The flavor extra picks the *index*, but by default torch resolves to the latest version on that index that satisfies `>=2.6.0`. If you need a specific torch version, add a constraint in your project's `[tool.uv]` table — this works for both `uv sync` and `uv add`:
+#### Prebuilt flash-attn
 
-```toml
-[tool.uv]
-constraint-dependencies = ["torch==2.11.0"]
+Compiling `flash-attn` from source is extremely slow, so it is strongly recommended to install a **prebuilt wheel**. The CUDA flavor groups do **not** pull in `flash-attn` automatically; install it yourself, matching the `torch` build, CUDA flavor, Python version, and platform you're running. Two options:
+
+1. **Manually** — pick a `flash-attn-2` wheel for your setup, e.g. from [here](https://mjunya.com/flash-attention-prebuild-wheels/), and install it (e.g. `uv pip install <wheel-url>`).
+2. **With the helper** — `scripts/flash_attn_install.py` detects your environment (torch build, CUDA flavor, Python, platform), finds the exact matching wheel from [`mjun0812/flash-attention-prebuild-wheels`](https://github.com/mjun0812/flash-attention-prebuild-wheels), and — after a `[Yn]` confirmation — runs the corresponding `uv pip install <release-url>`.
+
+##### Installing flash-attn into an existing environment directly
+
+If you already have a CUDA `torch` installed in an environment and just want to add a
+matching prebuilt `flash-attn` wheel, `scripts/flash_attn_install.py` detects that
+environment (torch build, CUDA flavor, Python, platform), finds the exact matching wheel
+from `mjun0812/flash-attention-prebuild-wheels`, and — after a `[Yn]` confirmation —
+runs the corresponding `uv pip install <release-url>`. Run it with an active torch
+environment, or pass its python explicitly:
+
+The install target is resolved in this order: (1) the active `VIRTUAL_ENV`, (2) the
+python uv would use for the project (`pyproject.toml` in the current dir or parents, via
+`uv run python`), (3) an explicit `--python-bin`, (4) an error otherwise.
+
+```sh
+uv run scripts/flash_attn_install.py                    # active VIRTUAL_ENV, else project
+uv run scripts/flash_attn_install.py --python-bin /path/to/python
 ```
 
-Then e.g. `uv sync --extra cu130` or `uv add 'exllamav3[cu130]'` installs `torch==2.11.0` from the cu130 index.
+Only stdlib plus `rich` (declared as a PEP 723 inline dependency) are used. It prints a
+summary of what it detected and the exact install command before asking for confirmation.
+
+#### Pinning a specific PyTorch version (optional)
+The CUDA flavor group picks the *index*, but by default torch resolves to the latest version on that index that satisfies `>=2.6.0`. To pin a specific torch version, set it **inside the flavor's dependency group** — you can use the plain version without a `+cuXXX` suffix, and uv resolves it against that flavor's index. A global `[tool.uv] constraint-dependencies` does *not* work for this, because it would have to hold for every group at once (each CUDA index uses a different `+cuXXX` local version) and locking fails.
+
+```toml
+[dependency-groups]
+cu130 = ["torch==2.11.0"]
+```
+
+Then `uv sync --group cu130` installs `torch==2.11.0+cu130` from the cu130 index. (You do not need to write the `+cuXXX` suffix yourself — uv matches `torch==2.11.0` to that flavor's local build.)
 
 Or, if you're installing torch manually with `uv pip install torch` (e.g. as in Option 3 above), specify the version directly, e.g. `uv pip install "torch==2.11.0" --torch-backend=auto`.
 

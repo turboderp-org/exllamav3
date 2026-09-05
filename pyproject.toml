@@ -52,24 +52,14 @@ examples = [
     "requests",
     "pydantic",
 ]
-cu124 = [
-    "torch>=2.6.0",
-]
-cu126 = [
-    "torch>=2.6.0",
-]
-cu128 = [
-    "torch>=2.6.0",
-]
-cu129 = [
-    "torch>=2.6.0",
-]
-cu130 = [
-    "torch>=2.6.0",
-]
-cu132 = [
-    "torch>=2.6.0",
-]
+
+[dependency-groups]
+cu124 = ["torch>=2.6.0"]
+cu126 = ["torch>=2.6.0"]
+cu128 = ["torch>=2.6.0"]
+cu129 = ["torch>=2.6.0"]
+cu130 = ["torch>=2.6.0"]
+cu132 = ["torch==2.13.0"]
 
 [tool.setuptools]
 package-dir = { "" = "." }
@@ -92,34 +82,30 @@ version = { attr = "exllamav3.version.__version__" }
 [tool.uv]
 package = true
 python-preference = "only-managed"
-
-# Optionally pin a specific PyTorch version. The flavor extras above select the CUDA
-# index (cu124/cu126/cu128/cu129/cu130/cu132); by default torch resolves to the
-# latest on that index satisfying >=2.6.0. Add a constraint to fix a version for
-# both `uv sync --extra <flavor>` and `uv add 'exllamav3[<flavor>]'`.
-# Uncomment and adjust as needed:
-# constraint-dependencies = ["torch==2.11.0"]
-
+exclude-dependencies = ["flash-attn"]
 conflicts = [
     [
-        { extra = "cu124" },
-        { extra = "cu126" },
-        { extra = "cu128" },
-        { extra = "cu129" },
-        { extra = "cu130" },
-        { extra = "cu132" },
+        { group = "cu124" },
+        { group = "cu126" },
+        { group = "cu128" },
+        { group = "cu129" },
+        { group = "cu130" },
+        { group = "cu132" },
     ],
 ]
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu124", extra = "cu124" },
-    { index = "pytorch-cu126", extra = "cu126" },
-    { index = "pytorch-cu128", extra = "cu128" },
-    { index = "pytorch-cu129", extra = "cu129" },
-    { index = "pytorch-cu130", extra = "cu130" },
-    { index = "pytorch-cu132", extra = "cu132" },
+    { index = "pytorch-cu124", group = "cu124" },
+    { index = "pytorch-cu126", group = "cu126" },
+    { index = "pytorch-cu128", group = "cu128" },
+    { index = "pytorch-cu129", group = "cu129" },
+    { index = "pytorch-cu130", group = "cu130" },
+    { index = "pytorch-cu132", group = "cu132" },
 ]
+
+# [tool.uv.extra-build-dependencies]
+# flash-attn = [{ requirement = "torch", match-runtime = true }]
 
 [[tool.uv.index]]
 name = "pytorch-cu124"
