@@ -193,7 +193,7 @@ class PLELayer(Module):
         # decoder block that shares this layer index in the cache's recurrent-layer map
         assert layer_idx < 0
         self.layer_idx = layer_idx
-        self.caps.update({"recurrent_cache": True})
+        self.caps.update({"recurrent_cache": True, "prefetch_ids": True})
         self.layer_state_cls = PLELayerState
         self.recurrent_layers = []
         self.tp_recurrent_lookup = {}
@@ -305,6 +305,51 @@ class PLELayer(Module):
         delta = gated + conv_out.view(bsz, seq, H, D)
         return delta, conv_stream
 
+    def _prepare_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        # the hashing runs host-side; in the hot path the generator's ids are already CPU
+        ids = ids.to("cpu", torch.int64)
+        if self.mm_token_id is not None and int(ids.max()) >= FIRST_MM_EMBEDDING_INDEX:
+            # multimodal spans carry embedding alias ids; the reference hashes the literal
+            # placeholder token there, so substitute it (the carried id context then matches
+            # what HF's would hold as well)
+            ids = ids.clone()
+            ids[ids >= FIRST_MM_EMBEDDING_INDEX] = self.mm_token_id
+        return ids
+
+    def _history(self, ids: torch.Tensor) -> torch.Tensor:
+        """(bsz, ctx + seq) hashing history at the start of a sequence: eos-padded context."""
+        pad = ids.new_full((ids.shape[0], self.ple_embedding.context_len), self.ple_embedding.eos_token_id)
+        return torch.cat((pad, ids), dim = 1)
+
+    def _state_history(self, ids: torch.Tensor, params: dict):
+        """History for a forward with recurrent states in params: the carried context comes from
+        the state slots. Returns (history, layer state, slots), or (history, None, None) for a
+        stateless forward at position 0."""
+        rsg = params.get("recurrent_states")
+        if rsg:
+            layer_instance = (self.layer_idx, params.get("layer_instance", 0))
+            rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+            _, id_state = rsl.get_state_tensors()
+            slots = get_for_device(params, "recurrent_slots", "cpu").tolist()
+            assert len(slots) == ids.shape[0]
+            ctx = self.ple_embedding.context_len
+            prev_ids = torch.stack([id_state[s, :ctx] for s in slots])
+            return torch.cat((prev_ids, ids), dim = 1), rsl, slots
+        assert params.get("position", 0) == 0, \
+            "PLELayer requires recurrent states for forwards past position 0"
+        return self._history(ids), None, None
+
+    def prefetch(self, input_ids: torch.Tensor, params: dict):
+        """
+        Called by the model before its first layers are issued: stage the n-gram rows for the
+        coming forward over input_ids on a worker thread (NGramEmbedding.prefetch), with the
+        carried id context read from the recurrent state slots the forward will use. The gather
+        then overlaps block 0. A history that doesn't match what forward() then builds is simply
+        not used, so this can only affect timing, never results.
+        """
+        history, _, _ = self._state_history(self._prepare_ids(input_ids), params)
+        self.ple_embedding.prefetch(history)
+
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         """
@@ -320,27 +365,14 @@ class PLELayer(Module):
             # autosplit measuring forward: no token ids in params; a dummy history gives the
             # same memory profile (the real n-gram gather is a few hundred rows at most)
             ids = torch.zeros((bsz, seq), dtype = torch.long)
-        # the hashing runs host-side; in the hot path the generator's ids are already CPU
-        ids = ids.to("cpu", torch.int64)
-        if self.mm_token_id is not None and int(ids.max()) >= FIRST_MM_EMBEDDING_INDEX:
-            # multimodal spans carry embedding alias ids; the reference hashes the literal
-            # placeholder token there, so substitute it (the carried id context then matches
-            # what HF's would hold as well)
-            ids = ids.clone()
-            ids[ids >= FIRST_MM_EMBEDDING_INDEX] = self.mm_token_id
+        ids = self._prepare_ids(ids)
         ctx = self.ple_embedding.context_len
         win = self.conv_state_len
         save_history = params.get("recurrent_history", False)
 
-        rsg = params.get("recurrent_states")
-        if rsg:
-            layer_instance = (self.layer_idx, params.get("layer_instance", 0))
-            rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+        history, rsl, slots = self._state_history(ids, params)
+        if rsl is not None:
             conv_state, id_state = rsl.get_state_tensors()
-            slots = get_for_device(params, "recurrent_slots", "cpu").tolist()
-            assert len(slots) == bsz
-            prev_ids = torch.stack([id_state[s, :ctx] for s in slots])
-            history = torch.cat((prev_ids, ids), dim = 1)
             cs = torch.stack([conv_state[s, :, :win] for s in slots]).to(x.device)
             delta, conv_stream = self.forward_streams(x, history, params, conv_state = cs)
             for i, s in enumerate(slots):
@@ -353,8 +385,5 @@ class PLELayer(Module):
                     conv_state[s, :, :win].copy_(conv_stream[i, :, -win:])
                     id_state[s, :ctx].copy_(history[i, -ctx:])
         else:
-            assert params.get("position", 0) == 0, \
-                "PLELayer requires recurrent states for forwards past position 0"
-            pad = ids.new_full((bsz, ctx), self.ple_embedding.eos_token_id)
-            delta, _ = self.forward_streams(x, torch.cat((pad, ids), dim = 1), params)
+            delta, _ = self.forward_streams(x, history, params)
         return x + delta

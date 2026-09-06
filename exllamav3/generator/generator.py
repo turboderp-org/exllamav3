@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -6,8 +7,10 @@ from ..cache.recurrent import RecurrentCache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
+
+logger = logging.getLogger(__name__)
 from ..util.memory import malloc_trim
-from .pagetable import PageTable
+from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
@@ -140,7 +143,11 @@ class Generator:
 
         # Paging
         self.pagetable = PageTable(self, cache)
+        # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
+        cache.owner_serial = getattr(cache, "owner_serial", 0) + 1
+        self.cache_owner_serial = cache.owner_serial
         self.max_total_tokens = PAGE_SIZE * self.pagetable.max_pages
+        self._cache_stats_memo = (None, None)
 
         # Draft model
         self.draft_model = draft_model
@@ -220,6 +227,8 @@ class Generator:
         if self.model.caps.get("recurrent_states"):
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
             self.recurrent_cache.pagetable = self.pagetable
+            # The new page table owns every page, so every state slot is ours too
+            cache.reset_states()
             # Limit batch size if cache has recurrent states
             self.max_batch_size = min(self.max_batch_size, cache.num_slots)
         else:
@@ -260,6 +269,104 @@ class Generator:
 
     def num_pending_jobs(self):
         return len(self.pending_jobs)
+
+    def get_cache_stats(self) -> dict:
+        """
+        Snapshot of cache occupancy and prompt-cache efficiency, intended for status displays.
+
+        Returns a dict with:
+            page_size: tokens per page
+            max_tokens: total cache capacity, in tokens
+            used_tokens: tokens in pages referenced by active jobs
+            cached_tokens: tokens in complete pages that a later or concurrent job could actually reuse: every
+                page on an unbroken chain down to a root, whether or not an active job currently references it.
+                Complete pages whose ancestors were evicted (orphans) don't count, since a prefix match walks
+                the chain from the root
+            free_tokens: tokens in unreferenced pages holding no reusable content
+            tier_cached_tokens: reusable tokens held only in the system-memory tier (sysmem K/V cache), by the
+                same chain rule; 0 without a tier
+            tier_max_tokens: capacity of the system-memory tier, 0 without one
+            alloc_pages: cumulative pages claimed by started jobs
+            alloc_cached_pages: cumulative pages of those that were reused from the prompt cache
+            alloc_tier_pages: of those, pages restored from the system-memory tier
+            hit_rate: alloc_cached_pages / alloc_pages, or None before any job has started
+            tier_hit_rate: alloc_tier_pages / alloc_pages, the part of hit_rate served from the system-memory
+                tier, or None before any job has started
+            active_jobs, pending_jobs: current job counts
+
+        The chain walk is memoized on a signature of the page tables, so repeated calls between changes are
+        cheap.
+        """
+        pt = self.pagetable
+        tier = pt.cpu_tier
+
+        # The chain walk is linear in the number of pages, which can be large with a big system-memory
+        # tier, so it only reruns when something that can change the outcome has moved
+        signature = (
+            len(pt.referenced_pages),
+            len(pt.unreferenced_pages),
+            sum(1 for h in pt.referenced_pages if is_content_hash(h)),
+            pt.metrics["alloc_pages"],
+            pt.metrics["evictions"],
+            pt.last_defrag_serial,
+            len(tier) if tier is not None else 0,
+            (tier.metrics["pushes"], tier.metrics["evictions"]) if tier is not None else None,
+        )
+        memo_signature, memo = self._cache_stats_memo
+        if signature == memo_signature:
+            return {**memo, "active_jobs": len(self.active_jobs), "pending_jobs": len(self.pending_jobs)}
+
+        # prev-hash links of every complete page, per tier
+        gpu_links = {}
+        for pages in (pt.referenced_pages, pt.unreferenced_pages):
+            for h, page in pages.items():
+                if is_content_hash(h):
+                    gpu_links[h] = page.prev_hash
+        tier_links = {h: e["prev_hash"] for h, e in tier.entries.items()} if tier is not None else {}
+
+        # A page is reusable when its whole chain is present in either tier
+        resumable = {}
+        def is_resumable(h):
+            chain = []
+            while h is not None and h not in resumable:
+                chain.append(h)
+                if h in gpu_links:
+                    h = gpu_links[h]
+                elif h in tier_links:
+                    h = tier_links[h]
+                else:
+                    resumable[h] = False
+                    break
+            result = True if h is None else resumable[h]
+            for c in chain:
+                resumable[c] = result
+            return result
+
+        cached = sum(1 for h in gpu_links if is_resumable(h))
+        tier_cached = sum(1 for h in tier_links if h not in gpu_links and is_resumable(h))
+        used = len(pt.referenced_pages)
+        free = sum(1 for h in pt.unreferenced_pages if not is_content_hash(h))
+        alloc = pt.metrics["alloc_pages"]
+        alloc_cached = pt.metrics["alloc_cached_pages"]
+        alloc_tier = pt.metrics["alloc_tier_pages"]
+        stats = {
+            "page_size": PAGE_SIZE,
+            "max_tokens": pt.max_pages * PAGE_SIZE,
+            "used_tokens": used * PAGE_SIZE,
+            "cached_tokens": cached * PAGE_SIZE,
+            "free_tokens": free * PAGE_SIZE,
+            "tier_cached_tokens": tier_cached * PAGE_SIZE,
+            "tier_max_tokens": tier.max_slots * PAGE_SIZE if tier is not None else 0,
+            "alloc_pages": alloc,
+            "alloc_cached_pages": alloc_cached,
+            "alloc_tier_pages": alloc_tier,
+            "hit_rate": alloc_cached / alloc if alloc else None,
+            "tier_hit_rate": alloc_tier / alloc if alloc else None,
+            "active_jobs": len(self.active_jobs),
+            "pending_jobs": len(self.pending_jobs),
+        }
+        self._cache_stats_memo = (signature, stats)
+        return stats
 
 
     def clear_queue(self):
@@ -398,6 +505,16 @@ class Generator:
 
         assert self.cache.initialized, \
             "Cache tensors were never allocated. Construct the Cache BEFORE calling model.load()"
+        owner_serial = getattr(self.cache, "owner_serial", None)
+        if owner_serial is not None and owner_serial != getattr(self, "cache_owner_serial", owner_serial):
+            # Superseded: drop every job without touching the cache (the new owner may already have
+            # reused these pages and state slots) and refuse to run
+            self.pending_jobs.clear()
+            self.active_jobs.clear()
+            raise RuntimeError(
+                "This Generator no longer owns its Cache: a newer Generator was created over the same "
+                "Cache. Close or discard the old Generator before creating a new one."
+            )
         assert self.draft_cache is None or self.draft_cache.initialized, \
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
@@ -405,8 +522,11 @@ class Generator:
         self.iterate_start_jobs(results)
 
         # Perform one round of prefill
-        for job in self.active_jobs:
-            job.prefill(results)
+        for job in list(self.active_jobs):
+            try:
+                job.prefill(results)
+            except Exception as e:
+                self.reap_failed_job(job, e, results)
 
         # Recurrent checkpoints
         if self.recurrent_cache is not None:
@@ -441,6 +561,7 @@ class Generator:
         return results
 
 
+    @torch.inference_mode()
     def on_queue_drained(self):
         """
         Idle-transition housekeeping: drop recurrent checkpoints stranded by KV eviction, then defragment the
@@ -1218,6 +1339,36 @@ class Generator:
             self.on_queue_drained()
 
 
+    def reap_failed_job(self, job, error, results: list):
+        """
+        Contain a per-job failure so the generator stays usable for other jobs: release the
+        failed job's pages and recurrent state, drop it from the active set, and append an
+        error result carrying the standard serial/stage/eos fields. The async wrapper
+        delivers the raw exception to that job's consumer only (AsyncJob.__aiter__ re-raises
+        queued exceptions) and the sync generate() API raises it, instead of the failure
+        escaping to _run_iteration, which latches AsyncGenerator.error permanently and kills
+        the iteration task for every job.
+        """
+        try:
+            job.deallocate_pages()
+        except Exception:
+            logger.error(
+                "reap_failed_job: deallocate_pages() raised while cleaning up failed "
+                "job %s; pages or recurrent state may be stranded",
+                job,
+                exc_info = True,
+            )
+        if job in self.active_jobs:
+            self.active_jobs.remove(job)
+        results.append({
+            "job": job,
+            "serial": job.serial_number,
+            "stage": "error",
+            "eos": True,
+            "error": error,
+        })
+
+
     def iterate_start_jobs(self, results: list):
         """
         Move pending jobs into the active set when batch and cache capacity allow.
@@ -1260,7 +1411,11 @@ class Generator:
                 job.activate()
 
                 # Allocate pages for job
-                job.allocate_pages()
+                try:
+                    job.allocate_pages()
+                except Exception as e:
+                    self.reap_failed_job(job, e, results)
+                    continue
                 current_max_batch += len(job.sequences)
 
                 r = {
@@ -1445,6 +1600,12 @@ class Generator:
 
             for r in results:
                 idx = order[r["serial"]]
+                if r["stage"] == "error":
+                    # A per-job failure was contained by reap_failed_job; surface the
+                    # original exception to this caller rather than returning a silently
+                    # truncated completion. Jobs from the same batch that are still in
+                    # flight are left to the generator's normal queue handling.
+                    raise r["error"]
                 if r["stage"] == "streaming":
                     text = r.get("text", "")
                     completions[idx] += text

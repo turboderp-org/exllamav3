@@ -216,8 +216,12 @@ void pg_all_reduce_kernel
             wait_min_stage(ctx->reduce_stage_consumed + dst_rank, stage_end, deadline);
         }
 
-        if (*abort_flag) break;
+        // Every block must arrive at the barrier in every round: a block that breaks out on its own
+        // timeout while the other block is already parked in grid.sync() would leave that block
+        // waiting forever. Sync first, then read the (possibly other block's) abort flag through a
+        // volatile load so a cached copy can't hide it
         grid.sync();
+        if (*((volatile uint32_t*) abort_flag)) break;
     }
 
     // Finished. Reset counters for next kernel

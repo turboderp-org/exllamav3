@@ -37,9 +37,11 @@ class ProgressBar:
             sys.stdout.flush()
 
     def new_task(self, text: str, count: int):
+        if not getattr(self, "progress", None):
+            return   # created without text: no task to retarget
         self.text = text
         self.count = count
         if self.text:
-            self.progress.update(self.task_id, description = self.text, total = count, progress = 0)
+            self.progress.update(self.task_id, description = self.text, total = count, completed = 0)
 
 

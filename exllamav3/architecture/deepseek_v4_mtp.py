@@ -10,7 +10,7 @@ from ..modules import RMSNorm, Linear, Embedding, GatedMLP, BlockSparseMLP, Tran
     HyperConnection, HyperHead
 from ..modules.arch_specific.dspark import DSparkAttention, DSparkInputLayer, to_dev
 from ..modules.attn import prepare_for_attn
-from ..modules.module import no_p2p_copy
+from ..util.device_copy import to_device
 from ..util.tensor import get_for_device
 
 from typing import TYPE_CHECKING
@@ -294,11 +294,7 @@ class DeepseekV4MTPModel(Model):
             target_hidden = [t[:, :max_length] for t in target_hidden]
         device = self.input_layer.main_proj.device
         for i in range(len(target_hidden)):
-            if target_hidden[i].device != device:
-                if no_p2p_copy:
-                    target_hidden[i] = target_hidden[i].cpu().to(device)
-                else:
-                    target_hidden[i] = target_hidden[i].to(device)
+            target_hidden[i] = to_device(target_hidden[i], device)
         th = torch.cat(target_hidden, dim = -1)
         params = dict(params)
         params["cache"] = cache

@@ -9,10 +9,10 @@
 #include "exl3_devctx.cuh"
 #include <cmath>
 
-#define NUM_THREADS 512
 #define H_INF __ushort_as_half(0x7c00)
 
 #include "comp_units/quantize_tiles_instances.cuh"
+#include "quantize_tiles_kernel.cuh"
 
 #define __(i, cb) quantize_tiles_kernel_k##i##_cb##cb()
 static const std::array<fp_quantize_tiles_kernel, 24> quantize_tiles_kernel_instances
@@ -71,7 +71,9 @@ void quantize_tiles
 
     int device;
     cudaGetDevice(&device);
-    const int max_batch_size = MIN((int) temp_costs.size(0), 2 * DevCtx::instance().get_num_sms(device));
+    // Block geometry follows K and the architecture the loaded code was compiled for (see
+    // quantize_tiles_kernel.cuh): read it back from the kernel's launch bound rather than recomputing it
+    // from the device, so a PTX-JIT'd instance still launches with the block size it was built for
     const int shmem = (K >= 2 ? 2 * edges * sizeof(half) : 0) + L * sizeof(half) + 64 + 128;
     int cb = 0;
     if (mcg) cb = 1;
@@ -82,11 +84,16 @@ void quantize_tiles
         quantize_tiles_kernel_instances_l160[K - 1];
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
     cuda_check(cudaPeekAtLastError());
+    cudaFuncAttributes attr;
+    cuda_check(cudaFuncGetAttributes(&attr, kernel));
+    const int num_threads = attr.maxThreadsPerBlock;
+    const int blocks_per_sm = 1024 / num_threads;
+    const int max_batch_size = MIN((int) temp_costs.size(0), blocks_per_sm * DevCtx::instance().get_num_sms(device));
 
     for (int batch_i = 0; batch_i < num_tiles; batch_i += max_batch_size)
     {
         const int bsz = MIN(max_batch_size, num_tiles - batch_i);
-        kernel<<<bsz, NUM_THREADS, shmem, stream>>>
+        kernel<<<bsz, num_threads, shmem, stream>>>
         (
             ((const float*) input_tiles.data_ptr()) + (int64_t) L * batch_i,
             ((float*) output_tiles.data_ptr()) + (int64_t) L * batch_i,
@@ -157,7 +164,7 @@ void decode
     int cols = input_indices.size(1);
 
     dim3 blockDim(64);
-    dim3 gridDim(cols / 64, rows);
+    dim3 gridDim(CEIL_DIVIDE(cols, 64), rows);
 
     if (output_tiles.dtype() == at::kFloat)
         decode_kernel<<<gridDim, blockDim, 0, stream>>>

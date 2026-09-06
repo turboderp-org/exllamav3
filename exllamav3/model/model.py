@@ -68,8 +68,15 @@ class Model(Model_TPMixin, Model_LSMixin):
     @cached_property
     def _get_recurrent_layers(self):
         return [m for m in self if m.caps.get("recurrent_cache")]
+
     def get_recurrent_layers(self):
         return self._get_recurrent_layers
+
+    @cached_property
+    def _get_prefetch_layers(self):
+        # modules that stage input-dependent data (PLE n-gram rows) on a worker thread before the
+        # first layers are issued, so the gather overlaps block 0 instead of stalling at its layer
+        return [m for m in self if m.caps.get("prefetch_ids")]
 
 
     def get_layer_instances(self, layer_idx):
@@ -197,6 +204,8 @@ class Model(Model_TPMixin, Model_LSMixin):
             advance_recurrent_states(input_ids, params, self)
             return y
         else:
+            for m in self._get_prefetch_layers:
+                m.prefetch(x, params)
             y = self.prefill_ls(x, params)
             advance_recurrent_states(input_ids, params, self)
             return y
@@ -220,6 +229,8 @@ class Model(Model_TPMixin, Model_LSMixin):
             advance_recurrent_states(input_ids, params, self)
             return y
         else:
+            for m in self._get_prefetch_layers:
+                m.prefetch(x, params)
             y = self.forward_ls(x, params)
             advance_recurrent_states(input_ids, params, self)
             return y
@@ -228,6 +239,8 @@ class Model(Model_TPMixin, Model_LSMixin):
     def unload(self):
         for module in self.modules:
             module.unload()
+        # The loader's open slab blocks must not outlive the tensors sliced from them
+        self.config.stc.release_arena()
         self.active_devices = []
         self.unload_tp()
         self.output_device = None

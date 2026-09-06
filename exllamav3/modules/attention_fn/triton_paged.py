@@ -644,7 +644,9 @@ def fn_triton_paged_attn(args: AttnArgs) -> torch.Tensor | None:
         not has_triton or
         args.is_varlen() or
         not args.has_kv_cache() or
-        args.q_len > 256
+        args.q_len > 256 or
+        args.dim > 512 or
+        not _is_power_of_2(args.dim)
     ):
         return None
 

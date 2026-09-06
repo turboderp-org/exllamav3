@@ -120,8 +120,7 @@ class BCAttn:
     def __init__(self, module, cache_k, cache_v, k_scales = None, v_scales = None,
                  k_bits = 0, v_bits = 0, qsa_layer = None):
         self.module = module
-        # TP shards store their device as a plain index; normalize for .index consumers
-        self.device = torch.device(module.device) if isinstance(module.device, int) else module.device
+        self.device = torch.device(module.device)
         self.head_dim = module.head_dim
         self.num_q_heads = module.num_q_heads
         self.num_kv_heads = module.num_kv_heads

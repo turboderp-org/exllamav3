@@ -194,8 +194,10 @@ def main(args, job_state):
     print(f" -- Total optimized params: {total_targets}")
     state_size = config_ref.hidden_size * init_states_ref.numel() * 4
     r_sys = int(args["max_sys"] * 1024**3) - state_size * 2
+    if r_sys <= 0:
+        raise ValueError(f" ## --max_sys too small: need more than {2 * state_size / 1024**3:.2f} GB for the reference states alone")
     t_sys_cand = total_targets * state_size
-    num_chunks = int(math.ceil(t_sys_cand / r_sys))
+    num_chunks = max(1, int(math.ceil(t_sys_cand / r_sys)))
     tpl = targets_per_layer
     lpc = int(math.ceil(len(tpl) / num_chunks))
     tpl_chunks = []

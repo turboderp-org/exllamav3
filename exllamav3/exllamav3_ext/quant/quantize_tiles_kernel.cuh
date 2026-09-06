@@ -4,8 +4,7 @@
 // comp_units/quantize_tiles_inst_k*.cu
 //
 // L is the tile length (number of weights per tail-biting trellis ring). 256 = the 16x16 EXL3 tile;
-// 160 instances (mul1 only) quantize n-gram embedding rows as single vectors. L must be even and
-// <= QUANTIZE_TILES_NUM_THREADS.
+// 160 instances (mul1 only) quantize n-gram embedding rows as single vectors. L must be even.
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -15,13 +14,34 @@
 #include "../util.cuh"
 #include "codebook.cuh"
 
-#define QUANTIZE_TILES_NUM_THREADS 512
 #ifndef H_INF
 #define H_INF __ushort_as_half(0x7c00)
 #endif
 
+// Block geometry per K and architecture. Each step of the trellis has edges / 2 = 32768 >> K units of
+// work, so beyond K = 6 a 512-thread block leaves most of its threads idle; below Blackwell the block
+// shrinks to that width and the launcher runs correspondingly more blocks per SM (+12-19% at K = 8 on
+// sm_86/sm_89). sm_120's ptxas unrolls the 2^K-candidate loop far more aggressively: it needs ~128
+// registers at K = 6 (2-5x slower when capped at 64) and spills badly whenever a smaller block raises
+// the per-thread budget at K = 7/8, so there the geometry stays at 512 threads. The tile length L only
+// changes the step count and buffer sizes, never the per-step parallelism. The launcher reads the block
+// size back from the compiled kernel's attributes, so it always matches the code that actually loaded.
+#if defined(__CUDA_ARCH__)
+#define QT_ARCH __CUDA_ARCH__
+#else
+#define QT_ARCH 0
+#endif
+__host__ __device__ constexpr int qt_num_threads(int K, int arch)
+{
+    return (arch < 1000 && K >= 7) ? (32768 >> K) : 512;
+}
+__host__ __device__ constexpr int qt_min_blocks(int K, int arch)
+{
+    return K == 6 ? 1 : 1024 / qt_num_threads(K, arch);
+}
+
 template <int K, int cb, int L = 256>
-__global__ __launch_bounds__(QUANTIZE_TILES_NUM_THREADS, 2)
+__global__ __launch_bounds__(qt_num_threads(K, QT_ARCH), qt_min_blocks(K, QT_ARCH))
 void quantize_tiles_kernel
 (
     const float* __restrict__ input_tiles_ptr,
@@ -34,6 +54,8 @@ void quantize_tiles_kernel
     extern __shared__ uint8_t shbuf[];
     uint8_t* sh = shbuf;
 
+    constexpr int NT = qt_num_threads(K, QT_ARCH);
+    constexpr int NW = NT / 32;
     constexpr int Kr = 16 - K;
     constexpr int max_q = 1 << K;
     constexpr int edges = 65536 >> K;
@@ -53,7 +75,7 @@ void quantize_tiles_kernel
     half* temp_costs = K >= 2 ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
     half* temp_costs_inc = temp_costs + edges;
 
-    if (thread < L) sh_input_tile[thread] = __float2half_rn(input_tile[thread]);
+    for (int i = thread; i < L; i += NT) sh_input_tile[i] = __float2half_rn(input_tile[i]);
     __syncthreads();
 
     // ri = (i + roll) mod L, with i < L and roll in {0, L / 2}
@@ -71,7 +93,7 @@ void quantize_tiles_kernel
         temp_costs = temp_costs_inc;
         temp_costs_inc = t;
 
-        for (int out_edge_idx = 2 * thread; out_edge_idx < edges; out_edge_idx += 2 * QUANTIZE_TILES_NUM_THREADS)
+        for (int out_edge_idx = 2 * thread; out_edge_idx < edges; out_edge_idx += 2 * NT)
         {
             const half2 w2 = __half2half2(sh_input_tile[ri]);
             int in_edge_idx = out_edge_idx >> K;
@@ -153,7 +175,7 @@ void quantize_tiles_kernel
             temp_costs = temp_costs_inc;
             temp_costs_inc = t;
 
-            for (int out_edge_idx = 2 * thread; out_edge_idx < edges; out_edge_idx += 2 * QUANTIZE_TILES_NUM_THREADS)
+            for (int out_edge_idx = 2 * thread; out_edge_idx < edges; out_edge_idx += 2 * NT)
             {
                 const half2 w2 = __half2half2(sh_input_tile[ri]);
                 int in_edge_idx = out_edge_idx >> K;
@@ -235,12 +257,12 @@ void quantize_tiles_kernel
         half local_min1 = H_INF;
         int local_idx0 = -1;
         int local_idx1 = -1;
-        for (int e = thread; e < edges; e += 2 * QUANTIZE_TILES_NUM_THREADS)
+        for (int e = thread; e < edges; e += 2 * NT)
         {
             half v = temp_costs_inc[e];
             if (__hlt(v, local_min0)) { local_min0 = v; local_idx0 = e; }
         }
-        for (int e = thread + QUANTIZE_TILES_NUM_THREADS; e < edges; e += 2 * QUANTIZE_TILES_NUM_THREADS)
+        for (int e = thread + NT; e < edges; e += 2 * NT)
         {
             half v = temp_costs_inc[e];
             if (__hlt(v, local_min1)) { local_min1 = v; local_idx1 = e; }
@@ -260,15 +282,15 @@ void quantize_tiles_kernel
         }
         sh_min[warp_id] = local_min0;
         sh_idx[warp_id] = local_idx0;
-        sh_min[16 + warp_id] = local_min1;
-        sh_idx[16 + warp_id] = local_idx1;
+        sh_min[NW + warp_id] = local_min1;
+        sh_idx[NW + warp_id] = local_idx1;
         __syncthreads();
 
         int local_idx = 0;
         if (warp_id == 0)
         {
-            half local_min = sh_min[lane_id];
-            local_idx = sh_idx[lane_id];
+            half local_min = lane_id < 2 * NW ? sh_min[lane_id] : H_INF;
+            local_idx = lane_id < 2 * NW ? sh_idx[lane_id] : -1;
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1)
             {

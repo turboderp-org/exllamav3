@@ -147,8 +147,9 @@ class Tokenizer:
         self.bos_token_id = get_default_token_id("bos_token", self.bos_token_id, 1)
         self.eos_token_id = get_default_token_id("eos_token", self.eos_token_id, 2)
 
-        # Update EOS token ID in config if tokenizer_config.json disagrees with config.json
-        e = get_default_token_id("eos_token", None, 2)
+        # Update EOS token ID in config if tokenizer_config.json disagrees with config.json (no eos_token there:
+        # leave config.json alone rather than forcing the id-2 fallback onto it)
+        e = get_default_token_id("eos_token", None, None)
         if e:
             if config.eos_token_id != e:
                 config.eos_token_id = e
@@ -174,7 +175,7 @@ class Tokenizer:
         # Use "<pad>" or BOS token as fallback for padding token
         if self.pad_token_id is None:
             pad_test = self.tokenizer.token_to_id("<pad>")
-            if pad_test:
+            if pad_test is not None:   # id 0 is a valid <pad>
                 self.pad_token_id = pad_test
             elif self.eos_token_id != self.bos_token_id:
                 self.pad_token_id = self.eos_token_id
@@ -458,7 +459,7 @@ class Tokenizer:
             end = 0
             while end < len(seq):
                 if seq[end] in self.extended_id_to_piece:
-                    if end > start: text += self.tokenizer.decode(seq[start: end], decode_special_tokens)
+                    if end > start: text += self.tokenizer.decode(seq[start: end], skip_special_tokens = not decode_special_tokens)
                     text += self.extended_id_to_piece[seq[end]]
                     end += 1
                     start = end

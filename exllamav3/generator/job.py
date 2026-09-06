@@ -71,11 +71,11 @@ class Job:
         Create new job.
 
         :param input_ids:
-            Tokenized IDs of the input prompt, shape (1, n). Alternatively, list of tokenized IDs to inference on
-            seperately but sample collectively (e.g. CFG prompt pair)
+            Tokenized IDs of the input prompt, shape (1, n) (a single-element list is also accepted). A job holds
+            exactly one sequence
 
         :param max_new_tokens:
-            Max no. output tokens to allow
+            Max no. output tokens to allow. None (default): no limit other than the cache capacity
 
         :param min_new_tokens:
             Minimum number of tokens to generate before stop tokens become active. Until this number have been
@@ -207,9 +207,13 @@ class Job:
                 "input_ids must be [1, seq_len] tensor or list of [1, seq_len] tensors"
             seq = Sequence(ids, seq_ids)
             self.sequences.append(seq)
+        assert len(self.sequences) == 1, \
+            "A job holds exactly one sequence (multi-sequence jobs are not supported)"
 
         # Generation parameters
-        self.max_new_tokens = max_new_tokens - 1 or 1
+        assert max_new_tokens is None or max_new_tokens >= 1, "max_new_tokens must be >= 1, or None for no limit"
+        # None: no limit beyond what the cache can hold; resolved against the generator in prepare_for_queue
+        self.max_new_tokens = max_new_tokens
         self.min_new_tokens = min_new_tokens
         self.new_tokens = 0 if self.prefix_token is None else -1
         self.sampler = sampler
@@ -802,6 +806,7 @@ class Job:
             unhealed = id_to_piece[self.prefix_token[0].item()]
             new_text = new_text[len(unhealed):]
 
+        held_text_before = self.held_text
         self.held_text += new_text
         self.held_tokens.append(next_token)
         if self.return_probs:
@@ -818,8 +823,9 @@ class Job:
         if token in self.stop_tokens:
             return emit(results, emit_eos = True, eos_reason = "stop_token", stop_token = token)
 
-        # Stop if we reach max_new_tokens
-        if self.new_tokens >= self.max_new_tokens - self.generator.num_draft_tokens:
+        # Stop if we reach max_new_tokens. Exact: a limit reached inside a speculative window is fine, the
+        # generator rejects the window's remaining draft positions when a job ends mid-window (eos path)
+        if self.new_tokens >= self.max_new_tokens:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "max_new_tokens")
 
         # End on filter completed
@@ -848,7 +854,7 @@ class Job:
             if self.checkpoint is None:
                 self.checkpoint = {
                     "offset": 1,
-                    "held_text": self.held_text[:-len(new_text)],
+                    "held_text": held_text_before,   # not held_text[:-len(new_text)]: new_text may be empty
                     "held_tokens": self.held_tokens.clone(1),
                     "held_probs": self.held_probs.clone(1),
                     "held_k_tokens": self.held_k_tokens.clone(1),
@@ -1083,6 +1089,10 @@ class Job:
         self.generator = generator
         self.pagetable = generator.pagetable
         self.skips = 0
+
+        # No explicit limit: whatever the cache can still hold beyond the prompt
+        if self.max_new_tokens is None:
+            self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids))
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
@@ -1432,7 +1442,13 @@ class Job:
             allocated_pages, cached_pages, non_sequential_pages, stashed_recurrent_state = \
                 seq.allocate_pages(self.pagetable, self.generator.recurrent_cache, protected_hashes)
 
-            self.recurrent_state = None
+            # Free the previous state before acquiring a new one. A bare assignment drops
+            # the handle without returning the slot index to the cache free list, so every
+            # reallocation (multi-sequence jobs, resumption after eviction) permanently
+            # burns a slot; with num_slots == max_batch_size (default 4 on recurrent
+            # models) a few such jobs exhaust the pool. The rewind path already does this
+            # correctly via free_recurrent_state().
+            self.free_recurrent_state()
             if self.generator.recurrent_cache is not None:
                 if stashed_recurrent_state is None:
                     self.recurrent_state = self.generator.cache.get_new_state()

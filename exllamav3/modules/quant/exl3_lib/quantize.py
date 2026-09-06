@@ -57,7 +57,9 @@ def get_temp_buffers(device, K: int, tile_len: int = 256):
     max_batch_size = 256
     if K >= 4:
         mp_count = torch.cuda.get_device_properties(device).multi_processor_count
-        max_batch_size = max(256, 2 * mp_count)
+        # The kernel may run up to 1024 / threads blocks per SM (see quantize_tiles_kernel.cuh)
+        blocks_per_sm = {7: 4, 8: 8}.get(K, 2)
+        max_batch_size = max(256, blocks_per_sm * mp_count)
     temp_costs = torch.zeros((max_batch_size, 2, 65536 >> K), dtype = torch.half, device = device)
     temp_edges = torch.zeros((max_batch_size, tile_len, 65536 >> K), dtype = torch.short, device = device)
     return temp_costs, temp_edges
@@ -1221,6 +1223,7 @@ def regularize(
         g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
     else:
         g_scale = 1.0
+        mse_scale = None
     weight *= g_scale
     su /= g_scale
 
@@ -1230,7 +1233,7 @@ def regularize(
     if verbose:
         print(f"     - su/sv std: {su.std().item():.6f}   {sv.std().item():.6f}")
         print(f"     - global scale: {g_scale:.6f}")
-        print(f"     - sample mse: {mse_scale.item():.6f}")
+        if mse_scale is not None: print(f"     - sample mse: {mse_scale.item():.6f}")
         print(f"     - apply_out_scales: {str(apply_out_scales)}")
 
     return apply_out_scales, weight, g_scale, su, sv

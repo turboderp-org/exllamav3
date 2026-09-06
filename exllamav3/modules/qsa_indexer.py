@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from typing_extensions import override
 import math
 import torch
@@ -201,7 +202,28 @@ class QSAIndexer(Module):
     # comes from the host-side cache lengths: no per-layer H2D copy, no sync, and none of the
     # arange/where/cat elementwise chains of the torch references kept below for the tests
 
-    SEL_SLAB = 1024          # rows per launch; also the expand kernel's fixed SEQ constexpr
+    # Rows per launch (also the expand kernel's fixed SEQ constexpr) and pools per score tile.
+    # Selection scores are computed tile by tile into a fixed SEL_SLAB x SEL_TILE fp16 slab
+    # (16 MiB, sharing the DSA indexer's backing) with a running top-k candidate set, so the
+    # workspace never scales with the context (a single rows x T buffer would be 128 MiB per
+    # slab at 256K). The slab stays wide: the scorer's pooled-key reuse is per row slab, so
+    # narrower slabs cost more than the extra top-k passes save
+    SEL_SLAB = 1024
+    SEL_TILE = int(os.environ.get("EXL3_QSA_SCORE_TILE", 8192))
+    # Row count up to which the plane-update workspaces come from g_tensor_cache (decode-class
+    # calls: MTP verify, bsz > 1 fallbacks, where allocation latency matters); prefill chunks
+    # allocate per call, the static cache being meant for small buffers only
+    STATIC_ROWS = 32
+
+    @staticmethod
+    def _workspace(rows: int, numel: int, dtype, tag: str, device):
+        from ..util.tensor import g_tensor_cache
+        if rows <= QSAIndexer.STATIC_ROWS:
+            return g_tensor_cache.get_bucketed(device, numel, dtype, tag)
+        # Power-of-two size so the caching allocator reuses the freed block across chunks: the
+        # score width grows with the context, and exact sizes would cache one segment per chunk
+        nb = 1 << max(numel - 1, 0).bit_length()
+        return torch.empty((nb,), dtype = dtype, device = device)[:numel]
 
     def k_pad(self):
         cr = self.compress_ratio
@@ -219,6 +241,10 @@ class QSAIndexer(Module):
         q_rows (R, H, dk) roped, pool_flat (rows, dk) pooled keys (contiguous, or the paged plane
         with block_table/epp), T visible complete pools for the last row. Writes out_rows
         (R, K_pad) int32: selected pools expanded to tokens plus each row's tail, -1 padded.
+
+        Scores are computed per SEL_TILE pools into a fixed slab. Beyond one tile the per-tile
+        top-k candidates are merged under dsa_topk's own total order (score desc, index asc), so
+        the result is identical to a single pass over the whole row.
         """
         import triton
         from .attention_fn.dsa_triton import dsa_indexer_scores, _dsa_pool_expand_kernel
@@ -228,28 +254,65 @@ class QSAIndexer(Module):
         cr = self.compress_ratio
         dev = q_rows.device
         k_pad = out_rows.shape[1]
-        kp = -(-self.block_topk // 32) * 32
+        k_sel = self.block_topk
+        kp = -(-k_sel // 32) * 32
+        t_tile = self.SEL_TILE
+        if block_table is not None:
+            t_tile = max(epp, t_tile // epp * epp)   # tiles must start on a pool page
+        s_backing = g_tensor_cache.get(dev, (self.SEL_SLAB * self.SEL_TILE,), torch.half, "dsa_stile")
+
+        def tile_scores(q_slab, rows, t0, t1):
+            # Tile [t0, t1) of the pooled plane scored as if it started at pool 0: the row-0
+            # position shifts by t0 * cr so the causal bounds shift by t0. Contiguous pools:
+            # the launcher scans k_idx.shape[0] rows, so hand it exactly the visible ones
+            s_stride = triton.cdiv(t1 - t0, 128) * 128
+            sc = s_backing[: rows * s_stride].view(rows, s_stride)
+            if block_table is None:
+                return dsa_indexer_scores(
+                    q_slab, self._sel_weights(rows, dev), pool_flat[t0 : t1], pos0 + r0 - t0 * cr,
+                    cr, t1 - t0, scores = sc, scale = self.scale,
+                )
+            bt = block_table[t0 // epp : -(-t1 // epp)] if t0 else block_table
+            return dsa_indexer_scores(
+                q_slab, self._sel_weights(rows, dev), pool_flat, pos0 + r0 - t0 * cr, cr, t1 - t0,
+                scores = sc, block_table = bt, epp = epp, scale = self.scale,
+            )
+
         for r0 in range(0, R, self.SEL_SLAB):
             r1 = min(r0 + self.SEL_SLAB, R)
             rows = r1 - r0
             T_slab = min(T, (pos0 + r1) // cr)
-            s_stride = triton.cdiv(max(T_slab, 1), 128) * 128
-            scores = g_tensor_cache.get_bucketed(dev, rows * s_stride, torch.half, "qsa_sel_scores") \
-                .view(rows, s_stride)
             pool_idx = g_tensor_cache.get_bucketed(dev, rows * kp, torch.int32, "qsa_sel_pool") \
                 .view(rows, kp)
-            if T_slab > 0:
-                # contiguous pools: the launcher scans k_idx.shape[0] rows, so hand it exactly
-                # the visible ones (the paged form takes the bound explicitly)
-                pools = pool_flat if block_table is not None else pool_flat[: T_slab]
-                sc = dsa_indexer_scores(
-                    q_rows[r0 : r1], self._sel_weights(rows, dev), pools, pos0 + r0, cr,
-                    T_slab, scores = scores, block_table = block_table, epp = epp,
-                    scale = self.scale,
-                )
-                ext.dsa_topk(sc, pool_idx, min(self.block_topk, T_slab), None, 0)
-            else:
+            q_slab = q_rows[r0 : r1]
+            if T_slab <= 0:
                 pool_idx.fill_(-1)
+            elif T_slab <= t_tile:
+                sc = tile_scores(q_slab, rows, 0, T_slab)
+                ext.dsa_topk(sc, pool_idx, min(k_sel, T_slab), None, 0)
+            else:
+                # Tiled: each tile's local top-k becomes candidate slot 1 next to the running set
+                # in slot 0, and the native merge reduces the pair under the single-pass kernel's
+                # own total order (score descending, index ascending), emitting the merged set --
+                # with scores -- into slot 0 of the other workspace for the next tile. Workspaces
+                # are fixed-size per call, so the allocator reuses them across chunks
+                ws = [(torch.empty((rows, 2, kp), dtype = torch.int32, device = dev),
+                       torch.empty((rows, 2, kp), dtype = torch.half, device = dev),
+                       torch.zeros((rows, 2), dtype = torch.int32, device = dev)) for _ in range(2)]
+                cur = 0
+                tiles = list(range(0, T_slab, t_tile))
+                for n, t0 in enumerate(tiles):
+                    t1 = min(t0 + t_tile, T_slab)
+                    sc = tile_scores(q_slab, rows, t0, t1)
+                    w_idx, w_scr, w_cnt = ws[cur]
+                    ext.dsa_topk_tile(sc, w_idx, w_scr, w_cnt, 1, min(k_sel, t1 - t0), t0)
+                    if n == len(tiles) - 1:
+                        ext.dsa_topk_merge_tiles(w_idx, w_scr, w_cnt, pool_idx, None, None, k_sel)
+                    else:
+                        n_idx, n_scr, n_cnt = ws[cur ^ 1]
+                        ext.dsa_topk_merge_tiles(
+                            w_idx, w_scr, w_cnt, n_idx[:, 0], n_scr[:, 0], n_cnt[:, 0], k_sel)
+                        cur ^= 1
             with torch.cuda.device(dev):
                 _dsa_pool_expand_kernel[(rows, triton.cdiv(k_pad, 256))](
                     pool_idx, out_rows[r0 : r1], pos0 + r0,
@@ -412,9 +475,9 @@ class QSAIndexer(Module):
         page_size = layer.raw_k.shape[1]
 
         qk = self.index_qk_proj.forward(x.contiguous(), params).view(R, (H + 1) * dk)
-        q = g_tensor_cache.get_bucketed(dev, R * H * dk, torch.half, "qsa_up_q") \
+        q = self._workspace(R, R * H * dk, torch.half, "qsa_up_q", dev) \
             .view(bsz, seqlen, H, dk)
-        kraw = g_tensor_cache.get_bucketed(dev, R * dk, torch.half, "qsa_up_k") \
+        kraw = self._workspace(R, R * dk, torch.half, "qsa_up_k", dev) \
             .view(bsz, seqlen, dk)
         with torch.cuda.device(dev):
             _qsa_stage_kernel[(R, H + 1)](

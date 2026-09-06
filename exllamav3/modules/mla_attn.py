@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+from ..util.device_copy import to_device
 from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
@@ -840,8 +841,7 @@ class MLAttention(Module):
                 indices = params.get("dsa_topk_indices")
                 assert indices is not None, \
                     "shared-indexer DSA layer found no top-k selection in params"
-                if indices.device != x.device:
-                    indices = indices.to(x.device)
+                indices = to_device(indices, x.device)
             return self._attend_sparse(
                 q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, indices, qc,
             )

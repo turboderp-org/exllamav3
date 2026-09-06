@@ -635,6 +635,8 @@ class DSV4Attention(Module):
         super().unload()
         for cl in self.cache_layers:
             cl.free()
+        for rl in self.recurrent_layers:
+            rl.free()
         self.sinks = None
         if self.compressor is not None:
             self.compressor.ape = None

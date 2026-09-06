@@ -124,11 +124,17 @@ class HyperConnection(Module):
             chunks = ext.hc_mix_num_chunks(R, H * D)
             M1 = 2 * H + H * H + 1
             dev = streams.device
-            partials = g_tensor_cache.get_bucketed(
-                dev, R * chunks * M1, torch.float, "hc_mix_partials").view(R, chunks, M1)
-            post = g_tensor_cache.get_bucketed(dev, R * H, torch.float, "hc_post").view(R, H)
-            comb = g_tensor_cache.get_bucketed(dev, R * H * H, torch.float, "hc_comb").view(R, H, H)
-            collapsed = g_tensor_cache.get_bucketed(dev, R * D, torch.half, "hc_coll").view(R, D)
+            # Decode-class row counts take the static workspaces (allocation latency matters and
+            # the graphed callers rely on them); prefill chunks allocate per call so the static
+            # cache holds only small buffers
+            def ws(numel, dtype, tag):
+                if R <= 32:
+                    return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
+                return torch.empty((numel,), dtype = dtype, device = dev)
+            partials = ws(R * chunks * M1, torch.float, "hc_mix_partials").view(R, chunks, M1)
+            post = ws(R * H, torch.float, "hc_post").view(R, H)
+            comb = ws(R * H * H, torch.float, "hc_comb").view(R, H, H)
+            collapsed = ws(R * D, torch.half, "hc_coll").view(R, D)
             # Small R (decode): fn in fp16 -- the (M, H * D) matrix is the partials kernel's
             # dominant traffic and the kernel dots it in fp32 either way
             if R <= 32:

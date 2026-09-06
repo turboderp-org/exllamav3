@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+from ..util.device_copy import to_device
 import torch.nn.functional as F
 from ..model.config import Config
 from ..util.tensor import to2
@@ -282,7 +283,7 @@ def routing_sqrtsp_hash(bsz, cfg, y, params):
     input_ids = get_for_device(params, "input_ids", cfg.tid2eid.device).reshape(-1)
     assert input_ids.shape[0] == bsz, \
         f"hash routing: {bsz} hidden rows but {input_ids.shape[0]} input ids"
-    selected_experts = cfg.tid2eid[input_ids].to(y.device).long()
+    selected_experts = to_device(cfg.tid2eid[input_ids], y.device).long()
     if cfg.gate_tensor_t is None:
         cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
     if bsz == 1:
