@@ -258,13 +258,11 @@ layers use the reconstruct path for every streamed expert regardless of count.
 Prefill chunk size floor below which GPU streaming never engages and every expert runs on the
 CPU tail as usual (decode, at 1 row per pass, always stays under this).
 
-### `EXL3_MOE_STREAM_BATCH_EXPERTS` (default: `24`, max `256`)
+### `EXL3_MOE_STREAM_BATCH_EXPERTS` (default: `24`)
 
 Experts packed per streamed batch (one DMA sequence, one un-swizzle launch and, below
-`EXL3_MOE_STREAM_FUSED_T, one fused-kernel launch). Further capped by slot capacity
-(`EXL3_MOE_CPU_WSLOT_MB` divided by one expert's packed byte size). The hard ceiling of 256 is
-the structural size of the job descriptor's expert-id array; raising the ceiling itself costs
-only a small amount of shared-memory overprovisioning, not runtime.
+`EXL3_MOE_STREAM_FUSED_T`, one fused-kernel launch). The effective batch is capped by slot
+capacity (`EXL3_MOE_CPU_WSLOT_MB` divided by one expert's packed byte size).
 
 ### `EXL3_MOE_CPU_MAX_ISA` (default: unset, auto-detect)
 

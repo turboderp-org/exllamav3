@@ -109,6 +109,19 @@ TUNING = MoeCpuTuning()
 ext.exl3_moe_cpu_set_memops(TUNING.memops)
 
 
+def _stream_prof_line(pr, L, rows):
+    """One EXL3_MOE_STREAM_PROF report. Host-side figures cover the L layers of the pass; the
+    GPU-side figures are harvested one layer late (at the next router sync), so they are
+    normalized by the number of layers actually harvested this period (gpu_n), which lags the
+    pass by one and would otherwise divide by zero at L == 1."""
+    g = max(pr["gpu_n"], 1)
+    return (f" -- stream prof ({pr['n']} layers, rows {rows}, ms/layer): router-sync "
+            f"{pr['sync'] / L * 1e3:.2f} host-enqueue {pr['host'] / L * 1e3:.2f} "
+            f"gpu-span {pr['gpu'] / g:.2f} | batches/layer {pr['batches'] / L:.1f} | "
+            f"per layer: stage-wait {pr['stagewait'] / g:.2f} "
+            f"dma {pr['dma'] / g:.2f} compute {pr['compute'] / g:.2f}")
+
+
 class _SharedArena:
     """
     Growable pool of 1 GiB shared-memory chunks that expert weights are copied into. The
@@ -124,6 +137,7 @@ class _SharedArena:
 
     def _new_chunk(self, min_bytes):
         size = max(MOE_ARENA_CHUNK, (min_bytes + (2 << 20) - 1) & ~((2 << 20) - 1))
+        self._check_shm_capacity(size)
         shm = shared_memory.SharedMemory(create = True, size = size)
         self.chunks.append(shm)
         self.cur = shm
@@ -133,8 +147,34 @@ class _SharedArena:
             print(f" -- arena: new chunk {size/1e6:.1f} MB, {len(self.chunks)} chunks, "
                   f"{total/1e9:.3f} GB total", flush = True)
 
+    def _check_shm_capacity(self, size):
+        """POSIX shared memory is a tmpfs (/dev/shm) and ftruncate succeeds lazily, so an
+        undersized mount (Docker's default is 64 MiB) would only surface as SIGBUS when the
+        pages are first written. Fail here instead, with the sizing the deployment needs."""
+        if not hasattr(os, "statvfs"):
+            return
+        try:
+            st = os.statvfs("/dev/shm")
+        except OSError:
+            return
+        avail = st.f_bavail * st.f_frsize
+        if size <= avail:
+            return
+        have = sum(c.size for c in self.chunks)
+        raise RuntimeError(
+            f"CPU MoE shared arena: /dev/shm has {avail / 2**30:.2f} GiB available, the next "
+            f"{size / 2**30:.2f} GiB chunk does not fit ({have / 2**30:.2f} GiB allocated so "
+            f"far). Every CPU-offloaded expert lives in /dev/shm, which must hold the whole "
+            f"offloaded set; enlarge it (Docker: --shm-size, Compose: shm_size)")
+
     def names(self):
         return [c.name for c in self.chunks]
+
+    def unlink(self):
+        """Release the chunk names. Only the name goes; live mappings (the extension's layer
+        tensors) stay valid until process exit, so no close() is needed or possible here."""
+        for c in self.chunks:
+            c.unlink()
 
     def reserve(self, nbytes):
         """Make sure the next `nbytes` of rehomes land contiguously in one chunk; returns the
@@ -198,6 +238,10 @@ def _moe_cpu_child_main(conn, model_dir, threads):
             pass
 
     shm = None
+    arena = None
+    # The parent unlinks the arena chunks at shutdown once it has their names; until that
+    # handoff the child owns them and must release them if it fails
+    handed_off = False
 
     def leave():
         """Clean exit without interpreter teardown: the arena chunks stay exported to the
@@ -300,6 +344,7 @@ def _moe_cpu_child_main(conn, model_dir, threads):
                 leave()
 
         conn.send(("arena", arena.names(), layer_blocks))
+        handed_off = True
 
         stc.close()
         shm = shared_memory.SharedMemory(name = shm_name)
@@ -361,6 +406,8 @@ def _moe_cpu_child_main(conn, model_dir, threads):
             conn.send(("err", traceback.format_exc()))
         except Exception:
             pass
+        if arena is not None and not handed_off:
+            arena.unlink()
         raise
     finally:
         if shm is not None:
@@ -590,11 +637,10 @@ class MoeCpuHost:
             raise RuntimeError(f"CPU MoE worker failed:\n{msg[1]}")
         assert msg[0] == "arena", f"unexpected worker message {msg[0]!r}"
         _, names, self.blocks = msg
-        for name in names:
-            chunk = shared_memory.SharedMemory(name = name)
+        self.arena_shm = [shared_memory.SharedMemory(name = name) for name in names]
+        for chunk in self.arena_shm:
             view = torch.frombuffer(chunk.buf, dtype = torch.uint8)
             cuda_host_register(view.data_ptr(), chunk.size)
-            self.arena_shm.append(chunk)
             self.arena.append(view)
 
         import time
@@ -1039,14 +1085,15 @@ class MoeCpuHost:
                     counts_h, flat, shifted, neg)
             import time
             if self._sprof is None:
-                self._sprof = dict(n = 0, sync = 0.0, host = 0.0, gpu = 0.0, batches = 0,
-                                   stagewait = 0.0, dma = 0.0, compute = 0.0, ev = None,
-                                   pending = [])
+                self._sprof = dict(n = 0, sync = 0.0, host = 0.0, gpu = 0.0, gpu_n = 0,
+                                   batches = 0, stagewait = 0.0, dma = 0.0, compute = 0.0,
+                                   ev = None, pending = [])
             pr = self._sprof
             if pr["ev"] is not None:
                 # Previous layer's events completed at the router sync above
                 e0, e1 = pr["ev"]
                 pr["gpu"] += e0.elapsed_time(e1)
+                pr["gpu_n"] += 1
                 for pe in pr["pending"]:
                     pr["stagewait"] += pe[0].elapsed_time(pe[1])
                     pr["dma"] += pe[1].elapsed_time(pe[2])
@@ -1065,18 +1112,11 @@ class MoeCpuHost:
             pr["sync"] += self._sprof_sync
             pr["n"] += 1
             pr["batches"] += (len(streamed) + self.batch_experts - 1) // self.batch_experts
-            # Report once per full pass over the registered layers; the GPU-side figures lag
-            # one layer (collected at the next router sync), hence L - 1
+            # Report once per full pass over the registered layers
             L = len(self.specs)
             if pr["n"] % L == 0:
-                n = pr["n"]
-                print(f" -- stream prof ({n} layers, rows {rows}, ms/layer): router-sync "
-                      f"{pr['sync'] / L * 1e3:.2f} host-enqueue {pr['host'] / L * 1e3:.2f} "
-                      f"gpu-span {pr['gpu'] / (L - 1):.2f} | batches/layer {pr['batches'] / L:.1f} | "
-                      f"per layer: stage-wait {pr['stagewait'] / (L - 1):.2f} "
-                      f"dma {pr['dma'] / (L - 1):.2f} compute {pr['compute'] / (L - 1):.2f}",
-                      flush = True)
-                pr.update(sync = 0.0, host = 0.0, gpu = 0.0, batches = 0,
+                print(_stream_prof_line(pr, L, rows), flush = True)
+                pr.update(sync = 0.0, host = 0.0, gpu = 0.0, gpu_n = 0, batches = 0,
                           stagewait = 0.0, dma = 0.0, compute = 0.0)
             return out
 
@@ -1347,9 +1387,15 @@ class MoeCpuHost:
             self._flags_u32 = None
             import gc
             gc.collect()
+            # The child created the chunks (and registered them with the shared resource
+            # tracker); with the child gone, this is the single unlink that releases them
             for chunk in self.arena_shm:
                 try:
                     chunk.close()
+                except Exception:
+                    pass
+                try:
+                    chunk.unlink()
                 except Exception:
                     pass
             self.arena_shm = []
