@@ -20,6 +20,28 @@ from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 TEMP_ROWS_FUSED = 128
 TEMP_ROWS_GRAPH = 32
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+ROUTING_CACHE_ROWS = 128
+
+
+def _routing_buffers(cfg, bsz, device):
+    """Router outputs for a multi-row call: (router_logits (bsz, E) half, selected_experts
+    (bsz, K) long, routing_weights (bsz, K) half). Decode/MTP-class row counts (verify windows,
+    small batches: up to ROUTING_CACHE_ROWS) take bucketed workspaces from the per-device static
+    cache, shared by every MoE layer on the device: a layer's routing outputs are consumed by
+    its own expert compute (and offload/broadcast hand-offs) before the next layer routes on the
+    same stream, so one set per device suffices and nearby row counts share a backing instead
+    of one static per shape. Prefill-sized calls allocate per call (not CPU-bound, and the
+    static cache is meant to hold only small buffers)."""
+    E, K = cfg.num_experts, cfg.num_experts_per_tok
+    if bsz <= ROUTING_CACHE_ROWS:
+        ws = lambda numel, dtype, tag: g_tensor_cache.get_bucketed(device, numel, dtype, tag)
+    else:
+        ws = lambda numel, dtype, tag: torch.empty((numel,), dtype = dtype, device = device)
+    return (
+        ws(bsz * E, torch.half, "moe_route_logits").view(bsz, E),
+        ws(bsz * K, torch.long, "moe_route_sel").view(bsz, K),
+        ws(bsz * K, torch.half, "moe_route_w").view(bsz, K),
+    )
 
 # Score activations for the nogroup routing kernels (must match routing.cu)
 ROUTING_ACT_SIGMOID = 0
@@ -90,22 +112,7 @@ def routing_std(bsz, cfg, y, params):
                 routing_weights *= cfg.per_expert_scale.unsqueeze(0)
             return selected_experts, routing_weights
         else:
-            # Hoisted per-(bsz, device) buffers, mirroring the bsz-1 fast path above: the
-            # MTP verify batch hits this branch on every pass, and fresh empties per MoE
-            # layer cost hundreds of allocator round trips per pass. Outputs are consumed
-            # by run_bszN in the same forward step; slot reuse is stream-ordered.
-            bufs = getattr(cfg, "_routing_bufs_n", None)
-            if bufs is None:
-                bufs = cfg._routing_bufs_n = {}
-            key = (bsz, y.device)
-            bufs_ = bufs.get(key)
-            if bufs_ is None:
-                bufs[key] = bufs_ = (
-                    torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device),
-                    torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device),
-                    torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.long, device = y.device),
-                )
-            router_logits, routing_weights, selected_experts = bufs_
+            router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
             ext.routing_std(
                 y,
                 cfg.gate_tensor,
@@ -223,9 +230,7 @@ def routing_dots(bsz, cfg, y, params):
                 .repeat((bsz, 1))
             )
         else:
-            router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
-            routing_weights = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device)
-            selected_experts = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.long, device = y.device)
+            router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
             ext.routing_ds3_nogroup(
                 y,
                 cfg.gate_tensor,
@@ -267,9 +272,7 @@ def routing_sqrtsp(bsz, cfg, y, params):
         selected_experts = cfg.selected_experts_bsz1
         routing_weights = cfg.routing_weights_bsz1
     else:
-        router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
-        selected_experts = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.long, device = y.device)
-        routing_weights = torch.empty((bsz, cfg.num_experts_per_tok), dtype = torch.half, device = y.device)
+        router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
     ext.routing_ds3_nogroup(
         y,
         cfg.gate_tensor,
@@ -303,8 +306,7 @@ def routing_sqrtsp_hash(bsz, cfg, y, params):
         routing_weights = cfg.routing_weights_bsz1
         router_logits = cfg.router_logits_bsz1
     else:
-        router_logits = torch.empty((bsz, cfg.num_experts), dtype = torch.half, device = y.device)
-        routing_weights = torch.empty(selected_experts.shape, dtype = torch.half, device = y.device)
+        router_logits, _, routing_weights = _routing_buffers(cfg, bsz, y.device)
     ext.routing_sel_norm(
         y,
         cfg.gate_tensor,
