@@ -492,18 +492,21 @@ class BCAttn:
                 dict(P = cr, SEL = idx.block_topk, K_pad = k_pad, KP_pool = kp_pool,
                      TAIL = 1, SEQ = q_len, MULTIROW = 0, BLOCK = 256), 4, 1)
 
+            # Quantized K/V: the gather reads the packed pages through the shared QC
+            # loaders (scales + H32 appended to the runtime args, same as the dense slots)
+            ct = "*i32" if self.quant else "*fp16"
             k_sp_split = _compile_kernel(dev, _qsa_sparse_split_kernel,
-                {"q": "*fp16", "k_cache": "*fp16", "v_cache": "*fp16", "block_table": "*i32",
+                {"q": "*fp16", "k_cache": ct, "v_cache": ct, "block_table": "*i32",
                  "indices": "*i32", "partial_o": "*fp32", "partial_ml": "*fp32",
                  "k_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
-                 "split_len": "i32"}
+                 "split_len": "i32", "k_scales": "*fp16", "v_scales": "*fp16", "h32": "*fp16"}
                 | {n: "constexpr" for n in (
                     "n_q_heads", "n_kv_heads", "page_size", "head_dim", "K_pad", "scale",
-                    "BLOCK_H", "BLOCK_N", "PAGED")},
+                    "BLOCK_H", "BLOCK_N", "PAGED", "QCK", "QCV")},
                 dict(n_q_heads = self.num_q_heads, n_kv_heads = self.num_kv_heads,
                      page_size = PAGE_SIZE, head_dim = self.head_dim, K_pad = k_pad,
                      scale = float(self.sm_scale), BLOCK_H = block_h, BLOCK_N = block_n,
-                     PAGED = 1),
+                     PAGED = 1, QCK = self.k_bits, QCV = self.v_bits),
                 4, 2)
 
             k_sp_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel,
@@ -515,7 +518,7 @@ class BCAttn:
                 # q_len 1: the sparse gather treats every query row as a batch (programs =
                 # R * kv_heads * h_blocks), so the combine's output row is the batch index
                 # alone -- compiling the true q_len here would scatter row r to row r * q_len
-                dict(QCV = 0, HAS_SINKS = False, q_len = 1,
+                dict(QCV = self.v_bits, HAS_SINKS = False, q_len = 1,
                      n_q_heads = self.num_q_heads, n_kv_heads = self.num_kv_heads,
                      head_dim = self.head_dim, BLOCK_M = 1, BLOCK_H = block_h,
                      BLOCK_ROWS = block_h), 4, 1)
@@ -677,7 +680,7 @@ def build_bc_attn(module, layer):
     """Build a BCAttn for the module/cache-layer pair, or return None when the configuration
     is not supported (caller falls back to the dispatch path)."""
     from ...cache import CacheLayer_quant, CacheLayer_fp16
-    from ...cache.qsa import CacheLayer_qsa
+    from ...cache.qsa import QSAPlanes
 
     m = module
     qsa_idx = getattr(m, "qsa_indexer", None)
@@ -691,16 +694,17 @@ def build_bc_attn(module, layer):
         (not isinstance(layer, CacheLayer_fp16) or (
             layer.k is not None and layer.k.device == torch.device(m.device)
         )) and
-        # A QSA module needs the side planes on this layer (and the fp16 cache they imply)
+        # A QSA module needs the side planes on this layer (fp16 or quantized K/V)
         (qsa_idx is None or (
-            isinstance(layer, CacheLayer_qsa) and layer.raw_k is not None and
+            isinstance(layer, QSAPlanes) and layer.raw_k is not None and
             layer.raw_k.device == torch.device(m.device)
         ))
     ):
         _trace_build(m, None, "attn")
         return None
     if isinstance(layer, CacheLayer_quant):
-        bca = BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits)
+        bca = BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits,
+                     qsa_layer = layer if qsa_idx is not None else None)
     else:
         bca = BCAttn(m, layer.k, layer.v,
                      qsa_layer = layer if qsa_idx is not None else None)

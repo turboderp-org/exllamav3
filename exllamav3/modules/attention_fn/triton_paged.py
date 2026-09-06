@@ -848,6 +848,65 @@ def _qc_load_v(qwords, scales, tok_rows, kv_head, offs_d, mask_n,
     inv_m = 1.0 / (1 << (BITS - 1))
     return ((raw.to(tl.float32) - mh) * (scx.to(tl.float32) * inv_m)).to(tl.float16)
 
+
+# Padded-width variants for row widths that are a multiple of 32 but not a power of two (the
+# DSA latent pools: DeepSeek-V4 stores head_dim - rope_dim = 448). Words and scale groups past
+# the real width are masked to zero, so the returned tile is (BLOCK_N, HD_PAD) / (HD_PAD, BLOCK_N)
+# with zero columns beyond head_dim, matching a zero-padded fp16 tile. Single-kv-head layout
+# (one packed row per token, GPT = head_dim // 32 words per plane bit)
+
+@triton.jit
+def _qc_plane_v_p(qwords_row, row_words, mask_n, pbase,
+                  W: tl.constexpr, BITS: tl.constexpr, head_dim: tl.constexpr, HD_PAD: tl.constexpr):
+    WPH: tl.constexpr = head_dim * W // 32
+    WPH_PAD: tl.constexpr = HD_PAD * W // 32
+    VPW: tl.constexpr = 32 // W
+    garr = tl.arange(0, WPH_PAD)
+    cols = (garr // W) * BITS + pbase + (garr % W)
+    w = tl.load(qwords_row + row_words[:, None] + cols[None, :],
+                mask = mask_n[:, None] & (garr < WPH)[None, :], other = 0)
+    nib = (w[:, :, None] >> (tl.arange(0, VPW) * W)[None, None, :]) & ((1 << W) - 1)
+    return tl.reshape(nib, (w.shape[0], HD_PAD))
+
+
+@triton.jit
+def _qc_load_v_p(qwords, scales, tok_rows, mask_n,
+                 BITS: tl.constexpr, head_dim: tl.constexpr, HD_PAD: tl.constexpr):
+    """(BLOCK_N, HD_PAD) fp16 tile from a single-head packed cache whose row width head_dim
+    need not be a power of two; columns >= head_dim are zero."""
+    GPT: tl.constexpr = head_dim // 32
+    G_PAD: tl.constexpr = HD_PAD // 32
+    row_words = tok_rows * (GPT * BITS)
+    raw = tl.zeros((1, 1), tl.int32)
+    pbase = 0
+    first = True
+    if BITS & 8:
+        raw = _qc_plane_v_p(qwords, row_words, mask_n, pbase, 8, BITS, head_dim, HD_PAD)
+        pbase += 8
+        first = False
+    if BITS & 4:
+        p = _qc_plane_v_p(qwords, row_words, mask_n, pbase, 4, BITS, head_dim, HD_PAD)
+        raw = p if first else (raw << 4) | p
+        pbase += 4
+        first = False
+    if BITS & 2:
+        p = _qc_plane_v_p(qwords, row_words, mask_n, pbase, 2, BITS, head_dim, HD_PAD)
+        raw = p if first else (raw << 2) | p
+        pbase += 2
+        first = False
+    if BITS & 1:
+        p = _qc_plane_v_p(qwords, row_words, mask_n, pbase, 1, BITS, head_dim, HD_PAD)
+        raw = p if first else (raw << 1) | p
+    garr = tl.arange(0, G_PAD)
+    sc = tl.load(scales + tok_rows[:, None] * GPT + garr[None, :],
+                 mask = mask_n[:, None] & (garr < GPT)[None, :], other = 0.0)
+    scx = tl.reshape(tl.broadcast_to(sc[:, :, None], (sc.shape[0], G_PAD, 32)),
+                     (sc.shape[0], HD_PAD))
+    mh = (1 << (BITS - 1)) - 0.5
+    inv_m = 1.0 / (1 << (BITS - 1))
+    return ((raw.to(tl.float32) - mh) * (scx.to(tl.float32) * inv_m)).to(tl.float16)
+
+
 @triton.jit
 def _paged_attn_decode_split_kernel(
     q,
@@ -1749,20 +1808,25 @@ def paged_attn_triton_prefill(
         # ~2% of the kernel and the fp16 kernel runs at full speed. Compute-bound chunks only;
         # short query batches stay on the direct path, which reads less gmem
         # (causal only: VLM span chunks fan out into several wrapper calls over the same window,
-        # which would repeat the dequant pass per span -- those keep the direct path. The scratch
-        # is sized for the whole cache pool, not the current block-table span: one stable
-        # allocation that the autosplit measuring pass reserves at load time, valid for any
-        # bsz-1 window; batched windows that pad beyond the pool fall back to the direct path)
-        pool_pages = k_cache.shape[0]
+        # which would repeat the dequant pass per span -- those keep the direct path.) The
+        # scratch is a per-call transient sized to the referenced window: the block-table span
+        # (a job's pages, not the cache pool), narrowed further when the caller bounds the past
+        # length (QSA's dense regime never sees more than its sparse threshold, so a 512k-token
+        # pool needs a 2k-token scratch there), and rounded up to a power of two in pages so
+        # the allocator sees a handful of distinct sizes. Context-shaped workspaces are not
+        # kept as statics: the old pool-sized static held a full fp16 copy of the cache
+        # (1 GiB per 512k tokens on Qwen3.8) for the life of the process
         if (_qc_staging == 1 and q_len >= _qc_prefill_two_pass_min_q
-                and new_kv_mode == 0 and k is None and causal
-                and bsz * block_table.shape[1] <= pool_pages):
+                and new_kv_mode == 0 and k is None and causal):
             from ...ext import exllamav3_ext as ext
-            from ...util.tensor import g_tensor_cache
             npps_w = block_table.shape[1]
+            if max_kv_len is not None:
+                npps_w = min(npps_w, -(-(max_kv_len + kv_append_len) // page_size))
+                block_table = block_table[:, :npps_w].contiguous()
             n_kvh = n_kv_heads_override
-            kd = g_tensor_cache.get(q.device, (pool_pages, page_size, n_kvh, head_dim), torch.half, "qc_pf_k")
-            vd = g_tensor_cache.get(q.device, (pool_pages, page_size, n_kvh, head_dim), torch.half, "qc_pf_v")
+            pages_alloc = max(1, 1 << (bsz * npps_w - 1).bit_length())
+            kd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
+            vd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
             ext.dequant_cache_paged_window(
                 k_cache, k_scales, kd, v_cache, v_scales, vd,
                 cache_seqlens, block_table, page_size, kv_append_len, 0.0,
@@ -2194,6 +2258,7 @@ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
         qc=(sk, sv, k_bits, v_bits),
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,
+        max_kv_len=args.max_kv_len,
     )
 
 
@@ -2228,4 +2293,5 @@ def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
         qc=(sk, sv, k_bits, v_bits),
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,
+        max_kv_len=args.max_kv_len,
     )

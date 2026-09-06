@@ -510,10 +510,13 @@ class MLAttention(Module):
                     )
 
                 dev = x.device
-                s_backing = g_tensor_cache.get(dev, (slab * t_tile,), torch.half, "dsa_stile")
+                # One fixed score-row stride (the tile width) for every slab and tile: the
+                # stride is a kernel constexpr, so letting it follow the visible length
+                # recompiled the scoring kernel on every new 128-key boundary
+                s_stride = -(-t_tile // 128) * 128
+                s_backing = g_tensor_cache.get(dev, (slab * s_stride,), torch.half, "dsa_stile")
 
                 if t_slab <= t_tile:
-                    s_stride = -(-t_slab // 128) * 128
                     sc = tile_scores(0, t_slab, s_backing[: rows * s_stride].view(rows, s_stride))
                     ext.dsa_topk(sc, out_slab, k_sel, None, 0)
                     continue
@@ -525,7 +528,6 @@ class MLAttention(Module):
                 run_idx = torch.full((rows, k_sel), -1, dtype = torch.int32, device = dev)
                 for t0 in range(0, t_slab, t_tile):
                     t1 = min(t0 + t_tile, t_slab)
-                    s_stride = -(-(t1 - t0) // 128) * 128
                     sc = tile_scores(t0, t1, s_backing[: rows * s_stride].view(rows, s_stride))
                     k_t = min(k_sel, t1 - t0)
                     kp_t = -(-k_t // 32) * 32
@@ -650,11 +652,12 @@ class MLAttention(Module):
                         )
 
                     dev = x.device
-                    s_backing = g_tensor_cache.get(dev, (slab * t_tile,), torch.half, "dsa_stile")
+                    # Fixed score-row stride (see _indexer_topk): a constexpr in the kernel
+                    s_stride = -(-t_tile // 128) * 128
+                    s_backing = g_tensor_cache.get(dev, (slab * s_stride,), torch.half, "dsa_stile")
                     kp_sel = -(-k_sel // 32) * 32
 
                     if pools_slab <= t_tile:
-                        s_stride = -(-pools_slab // 128) * 128
                         sc = tile_scores(0, pools_slab,
                                          s_backing[: rows * s_stride].view(rows, s_stride))
                         pool_idx = torch.empty((rows, kp_sel), dtype = torch.int32, device = dev)
@@ -666,7 +669,6 @@ class MLAttention(Module):
                         run_idx = torch.full((rows, k_sel), -1, dtype = torch.int32, device = dev)
                         for t0 in range(0, pools_slab, t_tile):
                             t1 = min(t0 + t_tile, pools_slab)
-                            s_stride = -(-(t1 - t0) // 128) * 128
                             sc = tile_scores(t0, t1, s_backing[: rows * s_stride].view(rows, s_stride))
                             k_t = min(k_sel, t1 - t0)
                             kp_t = -(-k_t // 32) * 32
@@ -896,15 +898,13 @@ class MLAttention(Module):
                        block_table, indices, qc):
         """Gathered attention over the top-k selected latent rows (V3.2-on-MLA form of
         dsa_attn: no window, no sinks, V is the latent). The chunk's own rows are already in
-        the paged pool and the indexer's causal bound keeps the selection causal, so the
+        the paged pool (fp16 or packed-quantized; the packed form is dequantized online by the
+        gather kernel) and the indexer's causal bound keeps the selection causal, so the
         kernel needs no mask of its own. The kernel reads the head-major absorbed queries and
         the token-major rope queries directly and emits the head-major latent output the
         unfold consumes: no packed query copy, no output slice/transpose, and the rope half
         of the weighted sum is never accumulated."""
         from .attention_fn.dsa_triton import dsa_attn
-
-        assert qc is None, \
-            "sparse DSA over a quantized MLA cache is not supported yet; use an fp16 cache"
 
         H = self.num_q_heads
         R = bsz * seqlen
@@ -920,6 +920,7 @@ class MLAttention(Module):
             indices = indices, k_len = indices.shape[1],
             scale = self.sm_scale, page_size = ckv_cache.shape[1],
             q_pe = q_pe.reshape(R, H, D_r), out_latent = True,
+            qc = qc,   # packed latent pages read online (scales, bits)
         )
         o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
         o = o.reshape(bsz, seqlen, H * self.v_head_dim)
@@ -946,8 +947,7 @@ class MLAttention(Module):
 
         # Graph-captured C++ path for the whole decode block (projections through o_proj as one
         # replayed CUDA graph). Falls back to the dispatch path for unsupported configurations,
-        # including per-step declines (sparse DSA over a quantized cache, missing shared
-        # selection)
+        # including per-step declines (missing shared selection)
         if (
             seqlen <= MAX_DECODE_QLEN and bsz <= _bc_max_bsz and
             params.get("causal", True) and params.get("inv_freq") is None
@@ -1079,22 +1079,25 @@ class MLAttention(Module):
             bcm = build_bc_mla(self, layer)
         if bcm:
             from .attention_fn.bc_attn import MAX_BSZ
-            regimes = (0, 1) if self.indexer_mode is not None and not quant else (0,)
+            regimes = (0, 1) if self.indexer_mode is not None else (0,)
             for b, q in ((1, 1), (MAX_BSZ, MAX_DECODE_QLEN)):
                 for rg in regimes:
                     bcm._configure(b, q, rg)
 
-        # Sparse prefill at maximum context (the sparse path only serves fp16-cache indexer
-        # layers). Synthetic state: every block-table entry aliases page 0, zeroed so the
-        # math stays finite
-        if self.indexer_mode is None or quant:
+        # Sparse prefill at maximum context. Synthetic state: every block-table entry aliases
+        # page 0, zeroed so the math stays finite
+        if self.indexer_mode is None:
             return
         from ..constants import PAGE_SIZE
-        num_pages = layer.k.shape[0]
+        num_pages = (layer.qk if quant else layer.k).shape[0]
         t_syn = num_pages * PAGE_SIZE - chunk
         if t_syn + chunk <= self.index_topk:
             return   # cache too small to ever reach the sparse regime
-        layer.k[0].zero_()
+        if quant:
+            layer.qk[0].zero_()
+            layer.sk[0].zero_()
+        else:
+            layer.k[0].zero_()
         layer.v[0].zero_()
         if self.idx_plane_dim:
             layer.get_idx()[0].zero_()

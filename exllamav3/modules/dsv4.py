@@ -220,7 +220,7 @@ class DSV4Compressor:
 
 
     def forward_fused(self, x, params, buf_kv, buf_gate, ovl, dest_a, dest_b, position,
-                      pool_bt = None, pool_epp = 0):
+                      pool_bt = None, pool_epp = 0, stage_rel = False):
         """Cached-path forward (bsz 1): project + window-pool + norm + rope, writing emitted
         entries straight into the per-slot pools and updating the ring/snapshot state. One
         C++ transition via the BC companion when the chunk fits its scratch, else the two
@@ -234,14 +234,14 @@ class DSV4Compressor:
             not any(k in params for k in ("capture", "quant_preserve", "ovr", "reconstruct"))
         if use_bc:
             self.bc.run(x[0], buf_kv, buf_gate, ovl, dest_a, dest_b, position, None, None,
-                        pool_bt, pool_epp)
+                        pool_bt, pool_epp, stage_rel)
         else:
             kv = self.wkv.forward(x, params)[0]
             gate = self.wgate.forward(x, params)[0]
             ext.dsv4_compress(
                 kv, gate, buf_kv, buf_gate, ovl, self.ape, self.fused_norm_w,
                 self.norm.rms_norm_eps, self.fused_inv_freq, dest_a, dest_b, position,
-                None, self.compress_rate, None, pool_bt, pool_epp,
+                None, self.compress_rate, None, pool_bt, pool_epp, stage_rel,
             )
 
 
@@ -595,9 +595,12 @@ class DSV4Attention(Module):
 
 
     def cache_layer_type(self, default, kwargs: dict):
-        """DSA pools are always CacheLayer_dsa regardless of the requested transformer cache
-        layer type; a quantized Cache quantizes only its transformer/MLA layers (pools stay
-        fp16 in v1, like recurrent state)."""
+        """DSA pools are always CacheLayer_dsa; a quantized Cache request packs the pool's
+        nope part at k_bits (the rope part and indexer keys stay fp16). Falls back to fp16
+        pools when the nope width is not a multiple of 32."""
+        from ..cache import CacheLayer_quant
+        if issubclass(default, CacheLayer_quant) and (self.head_dim - self.rope_head_dim) % 32 == 0:
+            return CacheLayer_dsa, {"k_bits": kwargs["k_bits"], "v_bits": kwargs.get("v_bits")}
         return CacheLayer_dsa, {}
 
 
@@ -1353,17 +1356,30 @@ class DSV4Attention(Module):
         indices = None
         if self.compressor is not None:
             comp, idx = self.compressor, self.indexer
-            ext.dsv4_compress(
-                comp_kv, comp_gate, rsl.comp_buf_kv, rsl.comp_buf_gate,
-                rsl.comp_ovl, comp.ape, comp.fused_norm_w, comp.norm.rms_norm_eps,
-                comp.fused_inv_freq, kl.pool_c.view(-1, kl.D_c), kl.pool_r.view(-1, kl.D_r),
-                0, a_pos, m, a_slots, bt_st, kl.epp)
+            if kl.quant:
+                # Packed pool: per-job staging rows, then quantize + scatter through each
+                # job's block-table row
+                stage = g_tensor_cache.get(device, (B, S // m + 1, self.head_dim), torch.half, "dsv4_b_stage")
+                ext.dsv4_compress(
+                    comp_kv, comp_gate, rsl.comp_buf_kv, rsl.comp_buf_gate,
+                    rsl.comp_ovl, comp.ape, comp.fused_norm_w, comp.norm.rms_norm_eps,
+                    comp.fused_inv_freq, stage, None,
+                    0, a_pos, m, a_slots, None, 0, True)
+                ext.dsv4_pool_quant_scatter(
+                    stage, kl.pool_c_view(), kl.pool_s.view(-1, kl.G), kl.pool_r.view(-1, kl.D_r),
+                    bt_st, 0, a_pos, m, S, kl.epp)
+            else:
+                ext.dsv4_compress(
+                    comp_kv, comp_gate, rsl.comp_buf_kv, rsl.comp_buf_gate,
+                    rsl.comp_ovl, comp.ape, comp.fused_norm_w, comp.norm.rms_norm_eps,
+                    comp.fused_inv_freq, kl.pool_c.view(-1, kl.D_c), kl.pool_r.view(-1, kl.D_r),
+                    0, a_pos, m, a_slots, bt_st, kl.epp, False)
             if self.layer_type == "csa":
                 ext.dsv4_compress(
                     idx_kv, idx_gate, rsl.idx_buf_kv, rsl.idx_buf_gate,
                     rsl.idx_ovl, idx.ape, idx.fused_norm_w, idx.norm.rms_norm_eps,
                     idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None,
-                    0, a_pos, m, a_slots, bt_st, kl.epp)
+                    0, a_pos, m, a_slots, bt_st, kl.epp, False)
 
         if self.compressor is not None and self.layer_type == "csa":
             if True:
@@ -1399,11 +1415,13 @@ class DSV4Attention(Module):
 
         # Paged pools: the split kernel reads one block-table row per job from the fixed
         # (B, num_pages) static
+        qc = None
         if self.compressor is not None:
             bt = bt_st
             epp = kl.epp
-            pool_c = kl.pool_c.view(-1, self.head_dim - self.rope_head_dim)
+            pool_c = kl.pool_c_view()
             pool_r = kl.pool_r.view(-1, self.rope_head_dim)
+            qc = kl.qc()
         else:
             epp = 256
             pool_c = g_tensor_cache.get(device, (1, self.head_dim - self.rope_head_dim),
@@ -1419,7 +1437,7 @@ class DSV4Attention(Module):
             win_len = w, indices = indices,
             compress_rate = m, scale = self.sm_scale,
             derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
-            page_size = epp,
+            page_size = epp, qc = qc,
             out = g_tensor_cache.get(device, (self.o_groups, R, hpg * self.head_dim),
                                      torch.half, "dsv4_b_out"),
             multirow = dict(
@@ -1654,32 +1672,42 @@ class DSV4Attention(Module):
             # written into the paged pools through the job's block table, ring/snapshot
             # state updated. With the fan the projections are already done: feed the
             # compress kernels directly
-            pool_c_flat = kl.pool_c.view(-1, kl.D_c)
             pool_r_flat = kl.pool_r.view(-1, kl.D_r)
+            if kl.quant:
+                # Packed pool: compress into transient staging rows (this step's entries),
+                # then quantize + scatter through the block table
+                stage = g_tensor_cache.get(device, (seq // m + 1, self.head_dim), torch.half, "dsv4_stage")
+                dest_a, dest_b, dbt, depp, rel = stage, None, None, 0, True
+            else:
+                dest_a, dest_b, dbt, depp, rel = kl.pool_c.view(-1, kl.D_c), pool_r_flat, bt_row, epp, False
             if use_fan:
                 comp = self.compressor
                 ext.dsv4_compress(
                     fouts[2], fouts[3], rsl.comp_buf_kv[slot], rsl.comp_buf_gate[slot],
                     rsl.comp_ovl[slot] if rsl.comp_ovl is not None else None,
                     comp.ape, comp.fused_norm_w, comp.norm.rms_norm_eps, comp.fused_inv_freq,
-                    pool_c_flat, pool_r_flat, pos0, None, m, None, bt_row, epp)
+                    dest_a, dest_b, pos0, None, m, None, dbt, depp, rel)
                 if self.layer_type == "csa":
                     idx = self.indexer
                     ext.dsv4_compress(
                         fouts[4], fouts[5], rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
                         rsl.idx_ovl[slot], idx.ape, idx.fused_norm_w, idx.norm.rms_norm_eps,
                         idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None, pos0,
-                        None, m, None, bt_row, epp)
+                        None, m, None, bt_row, epp, False)
             else:
                 self.compressor.forward_fused(
                     x, params, rsl.comp_buf_kv[slot], rsl.comp_buf_gate[slot],
                     rsl.comp_ovl[slot] if rsl.comp_ovl is not None else None,
-                    pool_c_flat, pool_r_flat, pos0, bt_row, epp)
+                    dest_a, dest_b, pos0, dbt, depp, stage_rel = rel)
                 if self.layer_type == "csa":
                     self.indexer.forward_fused(
                         x, params, rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
                         rsl.idx_ovl[slot], kl.pool_idx.view(-1, kl.D_i), None, pos0,
                         bt_row, epp)
+            if kl.quant:
+                ext.dsv4_pool_quant_scatter(
+                    stage, kl.pool_c_view(), kl.pool_s.view(-1, kl.G), pool_r_flat,
+                    bt_row, pos0, None, m, seq, epp)
             pool_len = ec
 
             # Selection is only non-trivial once the pool exceeds index_topk: below that,
@@ -1690,8 +1718,10 @@ class DSV4Attention(Module):
                     x, params, q_res, kl.pool_idx.view(-1, kl.D_i), ec, pos0, q_idx_pre,
                     block_table = bt_row, epp = epp)
 
+        qc = None
         if self.compressor is not None:
-            pool_c, pool_r = kl.pool_c, kl.pool_r
+            pool_c, pool_r = kl.pool_c_view(), kl.pool_r
+            qc = kl.qc()
             bt = bt_row
         else:
             pool_c = x.new_empty((1, self.head_dim - self.rope_head_dim), dtype = torch.half)
@@ -1708,7 +1738,7 @@ class DSV4Attention(Module):
             indices = indices, k_len = k_len, pool_len = pool_len, q_pos0 = pos0,
             compress_rate = dense_m, scale = self.sm_scale,
             derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
-            page_size = epp,
+            page_size = epp, qc = qc,
             out = torch.empty((self.o_groups, seq, hpg * self.head_dim), dtype = torch.half, device = device),
         )
 

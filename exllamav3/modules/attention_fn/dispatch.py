@@ -113,6 +113,7 @@ def attn_dispatch(
     non_causal_spans: list | None = None,
     sinks: torch.Tensor | None = None,
     dispatch_cache: dict | None = None,
+    max_kv_len: int | None = None,
 ):
     """
     Select and run the first compatible attention implementation for the supplied tensors.
@@ -167,6 +168,7 @@ def attn_dispatch(
         non_causal_spans,
         q_cache,
         sinks,
+        max_kv_len = max_kv_len,
     )
     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache
