@@ -285,6 +285,10 @@ extraction leaves the register headroom for the wide bands the swizzled layout w
 m > 1; K8 tensors always stay in the native layout (they route to the dword kernel). The
 GPU-streaming prefill path DMAs the swizzled bytes as-is and repacks them on the GPU
 (`moe_unswizzle_trellis`), so the bytes reaching the GPU dequant are unaffected. Set to `0` to keep the native layout.
+The parent reads the setting when it constructs a worker host and passes it to the worker
+explicitly; the worker reports the layout it actually used (native when the CPU lacks VBMI)
+back to the parent at startup. A same-process change to the tuning after a host exists
+therefore affects only hosts constructed afterwards and never reinterprets packed bytes.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`; `0` on Windows)
 
@@ -307,9 +311,12 @@ streamed batch.
 
 Print, once per pass over the CPU-offloaded layers, the streamed-prefill timing per layer:
 router sync (host wait for the expert counts), host enqueue time, GPU span of the layer's
-streamed work, batches per layer, and within the GPU span the copy-stream wait for a free raw
-slot, the arena-to-VRAM DMA and the un-swizzle plus expert compute. Uses timing events, so it
-perturbs throughput slightly; diagnostic only.
+streamed work, batches per layer (as actually staged: bounded by the compute slot's capacity
+as well as `EXL3_MOE_STREAM_BATCH_EXPERTS`), and within the GPU span the copy-stream wait for
+a free raw slot (`raw-slot-wait`, bracketed around the reuse wait itself), the arena-to-VRAM
+DMA and the un-swizzle plus expert compute. The GPU-side figures are harvested one layer late
+and normalized by the layers harvested in the period. Uses timing events, so it perturbs
+throughput slightly; diagnostic only.
 
 ### `EXL3_MOE_CPU_PROF` (default: `0`)
 

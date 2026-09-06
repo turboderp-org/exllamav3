@@ -118,8 +118,20 @@ def _stream_prof_line(pr, L, rows):
     return (f" -- stream prof ({pr['n']} layers, rows {rows}, ms/layer): router-sync "
             f"{pr['sync'] / L * 1e3:.2f} host-enqueue {pr['host'] / L * 1e3:.2f} "
             f"gpu-span {pr['gpu'] / g:.2f} | batches/layer {pr['batches'] / L:.1f} | "
-            f"per layer: stage-wait {pr['stagewait'] / g:.2f} "
+            f"per layer: raw-slot-wait {pr['rawwait'] / g:.2f} "
             f"dma {pr['dma'] / g:.2f} compute {pr['compute'] / g:.2f}")
+
+
+def _proj_swizzled(arena_swz, K):
+    """Physical order of one trellis projection in the arena: band-swizzled when the worker
+    swizzles at all, except K8 matrices, which always stay in native tile order. The worker
+    reports arena_swz once at startup; both sides derive every projection's layout from it"""
+    return bool(arena_swz) and K != 8
+
+
+def _stream_per_slot(wslot_size, exp_b, batch_experts):
+    """Experts per streamed batch: bounded by the compute slot's capacity and the batch cap"""
+    return min(wslot_size // exp_b, batch_experts)
 
 
 class _SharedArena:
@@ -130,16 +142,21 @@ class _SharedArena:
     double as DMA sources for streamed prefill.
     """
 
-    def __init__(self):
+    def __init__(self, conn = None):
         self.chunks = []
         self.cur = None
         self.cur_off = 0
+        # Parent-side pipe: every chunk's name is published the moment it exists, so the
+        # parent can release it however the worker ends
+        self.conn = conn
 
     def _new_chunk(self, min_bytes):
         size = max(MOE_ARENA_CHUNK, (min_bytes + (2 << 20) - 1) & ~((2 << 20) - 1))
         self._check_shm_capacity(size)
         shm = shared_memory.SharedMemory(create = True, size = size)
         self.chunks.append(shm)
+        if self.conn is not None:
+            self.conn.send(("chunk", shm.name, shm.size))
         self.cur = shm
         self.cur_off = 0
         if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
@@ -166,15 +183,6 @@ class _SharedArena:
             f"{size / 2**30:.2f} GiB chunk does not fit ({have / 2**30:.2f} GiB allocated so "
             f"far). Every CPU-offloaded expert lives in /dev/shm, which must hold the whole "
             f"offloaded set; enlarge it (Docker: --shm-size, Compose: shm_size)")
-
-    def names(self):
-        return [c.name for c in self.chunks]
-
-    def unlink(self):
-        """Release the chunk names. Only the name goes; live mappings (the extension's layer
-        tensors) stay valid until process exit, so no close() is needed or possible here."""
-        for c in self.chunks:
-            c.unlink()
 
     def reserve(self, nbytes):
         """Make sure the next `nbytes` of rehomes land contiguously in one chunk; returns the
@@ -208,12 +216,15 @@ class _SharedArena:
         return dst.view(tensor.dtype).view(tensor.shape)
 
 
-def _moe_cpu_child_main(conn, model_dir, threads):
+def _moe_cpu_child_main(conn, model_dir, threads, swizzle):
     """
     Child entry point: receives ("layer", spec) messages, loading each layer's expert tensors
-    (deferred, multithreaded) and acking, until ("start", shm_name, layout) switches it into the
-    worker loop, after replying ("arena", chunk names, per-layer expert block locations) so the
-    parent can map the arena. Errors are reported over the pipe before exiting.
+    (deferred, multithreaded) into the shared arena (publishing each chunk's name as ("chunk",
+    name, size) on creation) and acking, until ("start", shm_name, layout) switches it into the
+    worker loop, after replying ("arena", per-layer expert block locations, swizzled) so the
+    parent can map the arena and knows the physical trellis order. `swizzle` is the parent's
+    snapshot of the tuning request; the actual order also depends on this CPU's VBMI support,
+    which is why the child reports it back. Errors are reported over the pipe before exiting.
     """
     import ctypes
     import signal
@@ -238,10 +249,6 @@ def _moe_cpu_child_main(conn, model_dir, threads):
             pass
 
     shm = None
-    arena = None
-    # The parent unlinks the arena chunks at shutdown once it has their names; until that
-    # handoff the child owns them and must release them if it fails
-    handed_off = False
 
     def leave():
         """Clean exit without interpreter teardown: the arena chunks stay exported to the
@@ -258,7 +265,8 @@ def _moe_cpu_child_main(conn, model_dir, threads):
     try:
         stc = SafetensorsCollection(model_dir)
         cpu = torch.device("cpu")
-        arena = _SharedArena()
+        # The parent releases the chunks at shutdown: it learns each name on creation
+        arena = _SharedArena(conn)
 
         def fetch(keys):
             out = []
@@ -271,10 +279,10 @@ def _moe_cpu_child_main(conn, model_dir, threads):
             return out
 
         # Swizzle the trellis copies band-contiguous when the VBMI kernel tier will consume them
-        swz = TUNING.swizzle and cext.exl3_moe_cpu_has_avx512_vbmi()
+        swz = bool(swizzle and cext.exl3_moe_cpu_has_avx512_vbmi())
 
         def rehome_trellis(t):
-            return arena.rehome(t, band_swizzle = swz and t.shape[2] // 16 != 8)
+            return arena.rehome(t, band_swizzle = _proj_swizzled(swz, t.shape[2] // 16))
 
         def nbytes(t):
             return t.numel() * t.element_size()
@@ -343,8 +351,7 @@ def _moe_cpu_child_main(conn, model_dir, threads):
             elif msg[0] == "quit":
                 leave()
 
-        conn.send(("arena", arena.names(), layer_blocks))
-        handed_off = True
+        conn.send(("arena", layer_blocks, swz))
 
         stc.close()
         shm = shared_memory.SharedMemory(name = shm_name)
@@ -360,7 +367,7 @@ def _moe_cpu_child_main(conn, model_dir, threads):
                 v_tr, v_suh, v_svh, v_bias = plist[ei]
                 new = stc.get_tensor(key + ".trellis", cpu)
                 assert new.shape == v_tr.shape, f"install shape mismatch: {key}"
-                if swz and v_tr.shape[2] // 16 != 8:
+                if _proj_swizzled(swz, v_tr.shape[2] // 16):
                     tk, tn, ps = new.shape
                     v_tr.view(tn // 8, tk, 8, ps) \
                         .copy_(new.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3))
@@ -406,8 +413,6 @@ def _moe_cpu_child_main(conn, model_dir, threads):
             conn.send(("err", traceback.format_exc()))
         except Exception:
             pass
-        if arena is not None and not handed_off:
-            arena.unlink()
         raise
     finally:
         if shm is not None:
@@ -425,6 +430,7 @@ class MoeCpuHost:
         self.acked = 0
         self.started = False
         self.shm = None
+        self.v_quit = None
         self.proc = None
         self.conn = None
         self.seq = 0
@@ -447,6 +453,11 @@ class MoeCpuHost:
         self.stream_t = TUNING.stream_t
         self.stream_min_rows = TUNING.stream_min_rows
         self.batch_experts = TUNING.batch_experts
+        # Requested trellis order, frozen here: a same-process tuning change after this host
+        # exists must not reinterpret bytes the worker already packed. The worker reports the
+        # actual order (arena_swz) at startup
+        self.swizzle = TUNING.swizzle
+        self.arena_swz = False
         self.next_wslot = 0
         self.next_rslot = 0
         self.aux = {}
@@ -454,6 +465,9 @@ class MoeCpuHost:
         # per-expert (chunk, offset) of the contiguous [gate | up | down] trellis block
         self.arena = []
         self.arena_shm = []
+        # Names of every arena chunk the worker has created, published on creation: the parent
+        # owns their release regardless of how the worker ends
+        self.arena_names = []
         self.blocks = []
         # EXL3_MOE_STREAM_PROF accumulators (per-layer timings of the streamed prefill path)
         self._sprof = None
@@ -465,7 +479,7 @@ class MoeCpuHost:
         self.conn, child_conn = ctx.Pipe(duplex = True)
         self.proc = ctx.Process(
             target = _moe_cpu_child_main,
-            args = (child_conn, self.model_dir, self.threads),
+            args = (child_conn, self.model_dir, self.threads, self.swizzle),
             daemon = True,
         )
         self.proc.start()
@@ -476,15 +490,23 @@ class MoeCpuHost:
         cleanupper.register_atexit(self.shutdown)
 
     def _pump(self, timeout):
-        """Receive one message from the child, surfacing errors and death"""
+        """Receive one message from the child. A worker error or death releases everything
+        this host owns before raising, so a failed load leaves nothing behind"""
         if self.conn.poll(timeout):
             msg = self.conn.recv()
-            if msg[0] == "err":
-                raise RuntimeError(f"CPU MoE worker failed:\n{msg[1]}")
             if msg[0] == "ok":
                 self.acked += 1
+            elif msg[0] == "chunk":
+                self.arena_names.append(msg[1])
+            elif msg[0] == "err":
+                self.shutdown()
+                raise RuntimeError(f"CPU MoE worker failed:\n{msg[1]}")
+            else:
+                self.shutdown()
+                raise RuntimeError(f"unexpected CPU MoE worker message {msg[0]!r}")
             return True
         if not self.proc.is_alive():
+            self.shutdown()
             raise RuntimeError("CPU MoE worker process died")
         return False
 
@@ -551,7 +573,15 @@ class MoeCpuHost:
             return
         while self.acked < len(self.specs):
             self._pump(1.0)
+        try:
+            self._start()
+        except BaseException:
+            # Whatever failed (control block, a registration, the worker, the layout report):
+            # release every registration, mapping and chunk name before surfacing it
+            self.shutdown()
+            raise
 
+    def _start(self):
         max_hi = max(s["hi"] for s in self.specs)
         max_ho = max(s["ho"] for s in self.specs)
         max_topk = max(s["topk"] for s in self.specs)
@@ -635,20 +665,23 @@ class MoeCpuHost:
         msg = self.conn.recv()
         if msg[0] == "err":
             raise RuntimeError(f"CPU MoE worker failed:\n{msg[1]}")
-        assert msg[0] == "arena", f"unexpected worker message {msg[0]!r}"
-        _, names, self.blocks = msg
-        self.arena_shm = [shared_memory.SharedMemory(name = name) for name in names]
-        for chunk in self.arena_shm:
+        if msg[0] != "arena":
+            raise RuntimeError(f"unexpected CPU MoE worker message {msg[0]!r}")
+        _, self.blocks, self.arena_swz = msg
+        for name in self.arena_names:
+            chunk = shared_memory.SharedMemory(name = name)
+            self.arena_shm.append(chunk)
             view = torch.frombuffer(chunk.buf, dtype = torch.uint8)
+            # Appended only once pinned: shutdown unregisters exactly what registered
             cuda_host_register(view.data_ptr(), chunk.size)
             self.arena.append(view)
 
         import time
-        t0 = time.time()
+        t0 = time.monotonic()
         while not self.v_ready[0]:
             if not self.proc.is_alive():
                 raise RuntimeError("CPU MoE worker process died during startup")
-            if time.time() - t0 > 60:
+            if time.monotonic() - t0 > 60:
                 raise RuntimeError("CPU MoE worker startup timeout")
             time.sleep(0.005)
         self.started = True
@@ -929,10 +962,10 @@ class MoeCpuHost:
                 for k in ("g", "u", "d"):
                     if pd.get(k):
                         mx = max(mx, pd[k][0] * pd[k][1])
-        # Experts arrive band-swizzled when the VBMI CPU tier owns them (same rule as the child's
-        # arena rehome, K8 excepted per matrix); the GPU restores the native tile order into the
-        # compute ring after each DMA
-        swz = TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_vbmi()
+        # Experts arrive in the order the worker reported at startup (band-swizzled when the
+        # VBMI tier owns them, K8 excepted per matrix); the GPU restores the native tile order
+        # into the compute ring after each DMA
+        swz = self.arena_swz
         st = dict(
             copy_stream = torch.cuda.Stream(device = device),
             # Compute slots hold native-order expert blocks; raw slots are the DMA landing
@@ -1086,7 +1119,7 @@ class MoeCpuHost:
             import time
             if self._sprof is None:
                 self._sprof = dict(n = 0, sync = 0.0, host = 0.0, gpu = 0.0, gpu_n = 0,
-                                   batches = 0, stagewait = 0.0, dma = 0.0, compute = 0.0,
+                                   batches = 0, rawwait = 0.0, dma = 0.0, compute = 0.0,
                                    ev = None, pending = [])
             pr = self._sprof
             if pr["ev"] is not None:
@@ -1095,7 +1128,7 @@ class MoeCpuHost:
                 pr["gpu"] += e0.elapsed_time(e1)
                 pr["gpu_n"] += 1
                 for pe in pr["pending"]:
-                    pr["stagewait"] += pe[0].elapsed_time(pe[1])
+                    pr["rawwait"] += pe[0].elapsed_time(pe[1])
                     pr["dma"] += pe[1].elapsed_time(pe[2])
                     pr["compute"] += pe[3].elapsed_time(pe[4])
                 pr["pending"] = []
@@ -1111,13 +1144,14 @@ class MoeCpuHost:
             pr["ev"] = (ev0, ev1)
             pr["sync"] += self._sprof_sync
             pr["n"] += 1
-            pr["batches"] += (len(streamed) + self.batch_experts - 1) // self.batch_experts
+            per_slot = _stream_per_slot(self.wslot_size, spec["expert_bytes"], self.batch_experts)
+            pr["batches"] += -(-len(streamed) // per_slot)
             # Report once per full pass over the registered layers
             L = len(self.specs)
             if pr["n"] % L == 0:
                 print(_stream_prof_line(pr, L, rows), flush = True)
                 pr.update(sync = 0.0, host = 0.0, gpu = 0.0, gpu_n = 0, batches = 0,
-                          stagewait = 0.0, dma = 0.0, compute = 0.0)
+                          rawwait = 0.0, dma = 0.0, compute = 0.0)
             return out
 
     def _submit_prefill_streamed(self, layer_idx, y, selected_experts, routing_weights, spec,
@@ -1163,7 +1197,7 @@ class MoeCpuHost:
         pd = spec["proj_dims"]
         gb, ub, db = spec["proj_bytes"]
         exp_b = spec["expert_bytes"]
-        per_slot = min(self.wslot_size // exp_b, self.batch_experts)
+        per_slot = _stream_per_slot(self.wslot_size, exp_b, self.batch_experts)
         gated = pd.get("g") is not None
         copy_stream = st["copy_stream"]
 
@@ -1199,11 +1233,14 @@ class MoeCpuHost:
             raw = st["raw_slots"][rs]
             prof = self._sprof if TUNING.stream_prof else None
             with torch.cuda.stream(copy_stream):
-                if st["rslot_used"][rs]:
-                    copy_stream.wait_event(st["rfree_ev"][rs])
+                # Timing bracket around the raw-slot reuse wait: pe[0] before, pe[1] after,
+                # so the interval is the exposed copy-stream stall (zero when the slot is free)
                 if prof is not None:
                     pe = [torch.cuda.Event(enable_timing = True) for _ in range(4)]
                     pe[0].record(copy_stream)
+                if st["rslot_used"][rs]:
+                    copy_stream.wait_event(st["rfree_ev"][rs])
+                if prof is not None:
                     pe[1].record(copy_stream)
                 for bi, e in enumerate(batch):
                     ci, off = blocks[e]
@@ -1230,7 +1267,7 @@ class MoeCpuHost:
                 if pd.get(name):
                     k, n, K = pd[name]
                     ext.moe_unswizzle_trellis(raw, vslot, len(batch), exp_b, off,
-                                              k // 16, n // 16, K, st["swz"] and K != 8)
+                                              k // 16, n // 16, K, _proj_swizzled(st["swz"], K))
             st["rfree_ev"][rs].record(cur)
             st["wslot_used"][ws] = True
             per_e = [(bi, e, token_sorted[offs[e] : offs[e] + counts_h[e]],
@@ -1335,21 +1372,24 @@ class MoeCpuHost:
 
     def shutdown(self):
         if self.proc is not None:
+            # The child's main thread serves the pipe at runtime (expert installs); the flag
+            # stops its compute thread, the message unblocks the recv loop. A broken pipe
+            # (worker already gone) must not skip reaping it
             try:
-                if self.started and self.shm is not None:
+                if self.v_quit is not None:
                     self.v_quit[0] = 1
-                    # The child's main thread serves the pipe at runtime (expert installs);
-                    # the flag stops its compute thread, the message unblocks the recv loop
-                    if self.conn is not None:
-                        self.conn.send(("quit",))
-                elif self.conn is not None:
+                if self.conn is not None:
                     self.conn.send(("quit",))
+            except Exception:
+                pass
+            try:
                 self.proc.join(timeout = 5)
                 if self.proc.is_alive():
                     self.proc.terminate()
                     self.proc.join(timeout = 2)
                 if self.proc.is_alive():
                     self.proc.kill()
+                    self.proc.join(timeout = 2)
             except Exception:
                 pass
             self.proc = None
@@ -1367,43 +1407,46 @@ class MoeCpuHost:
             except Exception:
                 pass
             self.conn = None
+        # Unpin exactly what was pinned: the control block, and each arena chunk whose view
+        # was appended after its registration succeeded
         if self.shm is not None:
             try:
                 cuda_host_unregister(self.base_ptr)
             except Exception:
                 pass
-            for view in self.arena:
-                try:
-                    cuda_host_unregister(view.data_ptr())
-                except Exception:
-                    pass
-            # Drop every view over the buffers before closing, or mmap refuses to unmap
-            self.slots = None
-            self.sstate = None
-            self.arena = []
-            self.blocks = []
-            self.v_quit = self.v_pass_wake = self.v_abort = self.v_ready = None
-            self.v_jobs_tail = self.v_jobs_head = self.v_jobs = None
-            self._flags_u32 = None
-            import gc
-            gc.collect()
-            # The child created the chunks (and registered them with the shared resource
-            # tracker); with the child gone, this is the single unlink that releases them
-            for chunk in self.arena_shm:
-                try:
-                    chunk.close()
-                except Exception:
-                    pass
-                try:
-                    chunk.unlink()
-                except Exception:
-                    pass
-            self.arena_shm = []
+        for view in self.arena:
+            try:
+                cuda_host_unregister(view.data_ptr())
+            except Exception:
+                pass
+        # Drop every view over the buffers before closing, or mmap refuses to unmap
+        self.slots = None
+        self.sstate = None
+        self.arena = []
+        self.blocks = []
+        self.v_quit = self.v_pass_wake = self.v_abort = self.v_ready = None
+        self.v_jobs_tail = self.v_jobs_head = self.v_jobs = None
+        self._flags_u32 = None
+        import gc
+        gc.collect()
+        if self.shm is not None:
             try:
                 self.shm.close()
                 self.shm.unlink()
             except Exception:
                 pass
             self.shm = None
+        # Release every chunk the worker published, mapped here or not: with the child gone
+        # this is the single unlink
+        mapped = {chunk.name: chunk for chunk in self.arena_shm}
+        for name in self.arena_names:
+            try:
+                chunk = mapped.get(name) or shared_memory.SharedMemory(name = name)
+                chunk.close()
+                chunk.unlink()
+            except Exception:
+                pass
+        self.arena_shm = []
+        self.arena_names = []
         self.started = False
         self.by_key = {}
