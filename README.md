@@ -103,24 +103,11 @@ Note that the PyPi package does not contain a prebuilt extension and requires th
 `exllamav3` declares a minimum `torch` version (>= 2.6.0) and CUDA version (>= 12.4), but beyond that the user is free to select a version of `torch` that is compatible with their environment.
 
 `torch` can be installed in three ways (from least to most effort):
-1. **with `uv`, setting only `--group cuXXX`** installs `torch` automatically with the specified CUDA version, `torch` version is selected by `uv` from compatible versions in the specific index associated with the chosen CUDA version (options 1 and 2)
-2. **with `uv`, setting `--group cuXXX` and pinning a torch version inside that group** (applicable to non-Github `uv` install paths in options 1 and 2) — see the [pinning a specific PyTorch version (optional)](#pinning-a-specific-pytorch-version-optional) section for details (note a global `[tool.uv] constraint-dependencies` does not work for this)
+1. **with `uv`, setting only `--extra cuXXX`** installs `torch` automatically with the specified CUDA version, `torch` version is selected by `uv` from compatible versions in the specific index associated with the chosen CUDA version (options 1 and 2)
+2. **with `uv`, creating a thin project that depends on `exllamav3[cuXXX]` and pins a specific `torch` version** — like (1) but `torch` is pinned in the thin project's `pyproject.toml`, see [pinning a specific PyTorch version (optional)](#pinning-a-specific-pytorch-version-optional) for details
 3. Manually with `uv pip` or `pip` (options 3 and 4)
 
-The CUDA flavors are declared as uv **dependency groups** (`cu124`, `cu126`, `cu128`, `cu129`, `cu130`, `cu132`) — pick the one matching your installed CUDA build by passing `--group <flavor>` to `uv sync` / `uv run`. While developing you can also set `[tool.uv] default-groups = ["cuXXX"]` to make a flavor the default for the project (see [Pinning the CUDA flavor for local development](#pinning-the-cuda-flavor-for-local-development)). Both `uv sync` and `pip install .` build the package in an isolated environment where your `torch` is not visible, so they install the extension sources and compile them at first import (JIT, a few minutes once per torch version). For a precompiled install run `pip install --no-build-isolation .` in an environment that already has `torch`, or use the release wheels. Selecting a flavor installs the matching CUDA build of `torch`.
-
-##### Pinning the CUDA flavor for local development
-
-If you're developing on the repo and always want a particular CUDA flavor without passing
-`--group` every time, set it as the project default under `[tool.uv]`:
-
-```toml
-[tool.uv]
-default-groups = ["cu132"]
-```
-
-With that in place, plain `uv sync` / `uv run` enable the `cu132` group (and its
-pinned `torch`).
+The flavor extras (`--extra`) are `cu124`, `cu126`, `cu128`, `cu129`, `cu130`, and `cu132` — pick the one matching your installed CUDA build. Both `uv sync` and `pip install .` build the package in an isolated environment where your `torch` is not visible, so they install the extension sources and compile them at first import (JIT, a few minutes once per torch version). For a precompiled install run `pip install --no-build-isolation .` in an environment that already has `torch`, or use the release wheels. Selecting a flavor installs the matching CUDA build of `torch`.
 
 **Option 1 — Working in the cloned repo directly (`uv sync`):**
 
@@ -131,33 +118,26 @@ cd exllamav3
 git checkout dev
 
 uv venv
-uv sync --group cu130          # pick the CUDA flavor matching your build
-# while developing, default a flavor for the repo via [tool.uv] default-groups
-# non-CUDA optional dependencies are installed as before:
-uv sync --group examples --group eval
+uv sync --extra cu130
+# add --extra examples and/or --extra eval for those extra dependencies
 ```
 
 **Option 2 — Using `exllamav3` as a dependency from another project (`uv add`):**
 
-The CUDA flavor groups belong to this repo's own `pyproject.toml`; a dependent project cannot
-select them (`exllamav3[cu130]` is not an extra and uv will warn that it doesn't exist). Add the
-package plainly and choose `torch` in your own project, either by installing it first
-(`uv pip install torch --torch-backend=auto`) or by declaring a `[tool.uv.sources]` entry for
-`torch` pointing at the PyTorch index for your CUDA version, as this repo does.
-
 ```sh
 # `uv add` works inside an existing project (a directory with a pyproject.toml).
-# `uv init` creates one if you're starting a new project.
+# `uv init` creates one if you're starting a new project, if integrating into
+# an existing project skip `uv init`.
 uv init my-project
 cd my-project
 
 # local checkout
-uv add path/to/exllamav3               # non-editable
-uv add path/to/exllamav3 --editable    # editable
+uv add 'path/to/exllamav3[cu130]'               # non-editable
+uv add 'path/to/exllamav3[cu130]' --editable    # editable
 
 # straight from GitHub
-uv add 'git+https://github.com/turboderp-org/exllamav3.git'                 # default branch
-uv add 'git+https://github.com/turboderp-org/exllamav3.git' --branch dev    # specific branch
+uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]'                 # default branch
+uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]' --branch dev    # specific branch
 ```
 
 **Option 3 — Bring your own `torch` and let `uv` pick the backend automatically:**
@@ -182,16 +162,43 @@ pip install .
 ```
 
 #### Pinning a specific PyTorch version (optional)
-The CUDA flavor group picks the *index*, but by default torch resolves to the latest version on that index that satisfies `>=2.6.0`. To pin a specific torch version, set it **inside the flavor's dependency group** — you can use the plain version without a `+cuXXX` suffix, and uv resolves it against that flavor's index. A global `[tool.uv] constraint-dependencies` does *not* work for this, because it would have to hold for every group at once (each CUDA index uses a different `+cuXXX` local version) and locking fails.
+The flavor extra picks the *index*, but by default torch resolves to the latest version on that
+index that satisfies `>=2.6.0`. To pin a specific torch version while developing on `exllamav3`,
+create a **"thin" project** that consumes your local checkout as an editable install and declares
+the exact `torch` version itself. This keeps the pin out of the `exllamav3` pyproject, so
+you can change the torch version freely without touching the repo.
 
-```toml
-[dependency-groups]
-cu130 = ["torch==2.11.0"]
+```
+my-exllamav3-dev/          # thin project (uv init)
+├── pyproject.toml
+└── src/                  # package sources (auto-generated)
 ```
 
-Then `uv sync --group cu130` installs `torch==2.11.0+cu130` from the cu130 index. (You do not need to write the `+cuXXX` suffix yourself — uv matches `torch==2.11.0` to that flavor's local build.)
+In `pyproject.toml`:
 
-Or, if you're installing torch manually with `uv pip install torch` (e.g. as in Option 3 above), specify the version directly, e.g. `uv pip install "torch==2.11.0" --torch-backend=auto`.
+```toml
+[project]
+name = "my-exllamav3-dev"
+version = "0.1.0"
+description = "Dev environment for exllamav3"
+requires-python = ">=3.10.11"
+dependencies = [
+    "exllamav3[cu130]",   # select correct CUDA version
+    "torch==2.13.0",      # pin the exact torch version you need
+]
+
+[tool.uv.sources]
+exllamav3 = { path = "../exllamav3", editable = true }
+```
+
+Adjust `../exllamav3` to point at your local checkout, then a plain `uv sync` sets up an
+environment with the correct PyTorch index (routed via the `cuXXX` extra),
+the pinned version of `torch` from that index (as long as it exists), and an editable install of `exllamav3` so code
+changes apply immediately. Switch CUDA flavors by changing the extra (`exllamav3[cu124]`,
+`exllamav3[cu128]`, …) and/or the torch pin in the thin project.
+
+Or, if you're installing torch manually with `uv pip install torch` (e.g. as in Option 3 above),
+specify the version directly, e.g. `uv pip install "torch==2.11.0" --torch-backend=auto`.
 
 ---
 
