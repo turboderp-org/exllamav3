@@ -68,7 +68,7 @@ cu130 = [
     "torch>=2.6.0",
 ]
 cu132 = [
-    "torch==2.13.0",
+    "torch>=2.6.0",
 ]
 
 [tool.setuptools]
