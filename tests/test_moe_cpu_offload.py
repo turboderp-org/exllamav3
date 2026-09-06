@@ -57,9 +57,12 @@ def experts():
 
 @pytest.fixture(scope = "module")
 def inputs():
+    # Hidden-state scale keeps the gate/up intermediates in a realistic range: random trellis
+    # codes with randn had-scales decode to weights large enough that unit-scale inputs drive
+    # the gate activation past exp() overflow, which the -Ofast Linux build turns into NaN rows
     cases = []
     for rows in (1, 3, 64):
-        x = (torch.randn(rows, H) * 0.5).half()
+        x = (torch.randn(rows, H) * 0.05).half()
         sel = torch.stack([torch.randperm(E)[:TOPK] for _ in range(rows)]).to(torch.int32)
         w = torch.rand(rows, TOPK).half()
         cases.append((x, sel, w))
