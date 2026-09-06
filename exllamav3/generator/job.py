@@ -1320,11 +1320,21 @@ class Job:
                 # span extends before the chunk, so non-causal attention windows cover the whole
                 # span rather than just the in-chunk suffix
                 mm_span_prefix = 0
-                if self.embeddings:
+                # The mask covers only the prompt; generated tokens are never multimodal
+                if self.embeddings and prefill_start <= len(seq.multimodal_mask):
                     pp = prefill_start
                     while pp > 0 and seq.multimodal_mask[pp - 1]:
                         mm_span_prefix += 1
                         pp -= 1
+
+                # Rewind prefill can exceed the prompt-length table, which the RoPE kernel reads unchecked
+                if self.alt_rope_freqs is not None and prefill_end > self.alt_rope_freqs.shape[-2]:
+                    ids = seq.sequence_ids.torch()
+                    # Appending text advances the next position and sequence length equally,
+                    # leaving alt_rope_offset unchanged for decode
+                    self.alt_rope_freqs, _ = self.generator.model.g_rope.get_mrope_freqs(
+                        ids, self.embeddings, ids.shape[-1]
+                    )
 
                 params = {
                     "attn_mode": "flash_attn",
