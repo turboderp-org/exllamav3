@@ -1305,10 +1305,13 @@ class Job:
                 # chunk redundantly but won't write out-of-bounds since cache pages are already allocated for the
                 # whole input sequence including MM tokens. (This is for Gemma4 specifically, which has image token
                 # spans of at most 280 tokens.)
+                # The mask covers only the prompt: a rewind replay chunk past it (generated tokens
+                # are never multimodal) must not index beyond the mask
                 if atomic_mm_prefill:
                     ext_prefill_end = prefill_end
                     while (
                         ext_prefill_end < len(seq.sequence_ids) - 1 and
+                        ext_prefill_end < len(seq.multimodal_mask) and
                         seq.multimodal_mask[ext_prefill_end - 1] and
                         seq.multimodal_mask[ext_prefill_end]
                     ):

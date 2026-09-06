@@ -37,7 +37,7 @@ class ModelProbe:
     forward = prefill
 
 
-def make_job(prompt_length, sequence_length, replay_start, *, image=True, image_at_end=False, mtp=False):
+def make_job(prompt_length, sequence_length, replay_start, *, image=True, image_at_end=False, mtp=False, atomic=False):
     rope = RoPE("cpu", RopeSettings(
         head_dim=24,
         partial_rotary_factor=0.5,
@@ -74,6 +74,9 @@ def make_job(prompt_length, sequence_length, replay_start, *, image=True, image_
         draft_model=None,
         mtp_draft=mtp,
     )
+    if atomic:
+        # Gemma 4: chunks ending inside an image span are extended to cover the whole span
+        job.generator.model.caps = {"atomic_mm_prefill": True}
     if image:
         job.alt_rope_freqs, next_position = rope.get_mrope_freqs(prompt, embeddings, prompt_length)
         job.alt_rope_offset = next_position - prompt_length
@@ -165,6 +168,24 @@ class MultimodalRewindPrefillTest(unittest.TestCase):
                 positions = torch.arange(1125, length) + job.alt_rope_offset
                 expected = positions.float()[None, :, None] * rope.inv_freq[None, None, :]
                 torch.testing.assert_close(table[:, 1125:], expected, rtol=0, atol=0)
+
+    def test_atomic_replay_beyond_prompt_does_not_index_mask(self):
+        # Gemma-style atomic MM prefill walks the mask forward from the chunk end; a rewind
+        # replay chunk past the prompt must not index beyond the prompt-length mask
+        for length in (1401, 1665):
+            with self.subTest(sequence_length=length):
+                _, params = self.check_chunk(1125, length, 1280, min(length - 1, 1536), atomic=True)
+                self.assertEqual(params["mm_span_prefix"], 0)
+
+    def test_atomic_chunk_inside_prompt_still_extends_over_image_span(self):
+        # The image span [248, 320) straddles the first chunk's end at 256: the atomic path
+        # must still extend the chunk to the end of the span
+        job = make_job(1125, 1175, 0, atomic=True)
+        with self.assertRaises(ModelBoundaryReached):
+            job.prefill([])
+        ids, params = job.generator.model.calls[0]
+        self.assertEqual(ids.shape[-1], 320)
+        self.assertEqual(params["cache_seqlens"].item(), 0)
 
 
 if __name__ == "__main__":
