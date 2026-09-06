@@ -52,14 +52,24 @@ examples = [
     "requests",
     "pydantic",
 ]
-
-[dependency-groups]
-cu124 = ["torch>=2.6.0"]
-cu126 = ["torch>=2.6.0"]
-cu128 = ["torch>=2.6.0"]
-cu129 = ["torch>=2.6.0"]
-cu130 = ["torch>=2.6.0"]
-cu132 = ["torch==2.13.0"]
+cu124 = [
+    "torch>=2.6.0",
+]
+cu126 = [
+    "torch>=2.6.0",
+]
+cu128 = [
+    "torch>=2.6.0",
+]
+cu129 = [
+    "torch>=2.6.0",
+]
+cu130 = [
+    "torch>=2.6.0",
+]
+cu132 = [
+    "torch>=2.6.0",
+]
 
 [tool.setuptools]
 package-dir = { "" = "." }
@@ -83,23 +93,23 @@ version = { attr = "exllamav3.version.__version__" }
 package = true
 conflicts = [
     [
-        { group = "cu124" },
-        { group = "cu126" },
-        { group = "cu128" },
-        { group = "cu129" },
-        { group = "cu130" },
-        { group = "cu132" },
+        { extra = "cu124" },
+        { extra = "cu126" },
+        { extra = "cu128" },
+        { extra = "cu129" },
+        { extra = "cu130" },
+        { extra = "cu132" },
     ],
 ]
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu124", group = "cu124" },
-    { index = "pytorch-cu126", group = "cu126" },
-    { index = "pytorch-cu128", group = "cu128" },
-    { index = "pytorch-cu129", group = "cu129" },
-    { index = "pytorch-cu130", group = "cu130" },
-    { index = "pytorch-cu132", group = "cu132" },
+    { index = "pytorch-cu124", extra = "cu124" },
+    { index = "pytorch-cu126", extra = "cu126" },
+    { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu129", extra = "cu129" },
+    { index = "pytorch-cu130", extra = "cu130" },
+    { index = "pytorch-cu132", extra = "cu132" },
 ]
 
 
