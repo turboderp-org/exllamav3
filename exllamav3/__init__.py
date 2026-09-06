@@ -10,6 +10,34 @@ except ImportError as e:
         "https://github.com/turboderp-org/exllamav3"
     ) from e
 
+
+def _default_allocator_settings():
+    """
+    Expandable segments for the CUDA caching allocator, unless the user configured the
+    allocator themselves.
+
+    The runtime setter works before CUDA is initialized and also applies to every segment
+    created after it, so hosts that already touched CUDA before importing the library still
+    get it for the model.
+
+    Skipped on Windows (virtual-memory API support is uneven there) and on torch builds that
+    reject the option.
+    """
+    import os, sys
+    if "PYTORCH_CUDA_ALLOC_CONF" in os.environ or sys.platform == "win32":
+        return
+    if os.environ.get("EXL3_EXPANDABLE_SEGMENTS", "1") == "0":
+        return
+    try:
+        # torch >= 2.13 exposes the setter on the accelerator API and deprecates the cuda one
+        setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None) \
+            or torch.cuda.memory._set_allocator_settings
+        setter("expandable_segments:True")
+    except Exception:
+        pass
+
+_default_allocator_settings()
+
 from .model.config import Config
 from .model.model import Model
 from .tokenizer import Tokenizer, MMEmbedding
