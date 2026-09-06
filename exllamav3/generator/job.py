@@ -273,8 +273,10 @@ class Job:
         self.time_enqueued = rq_state.get("time_enqueued", 0.0)
         self.time_prefill = rq_state.get("time_prefill", 0.0)
         self.time_generate = rq_state.get("time_generate", 0.0)
-        self.accepted_draft_tokens = 0
-        self.rejected_draft_tokens = 0
+        self.accepted_draft_tokens = rq_state.get("accepted_draft_tokens", 0)
+        self.rejected_draft_tokens = rq_state.get("rejected_draft_tokens", 0)
+        self.rq_prompt_tokens = rq_state.get("prompt_tokens")
+        self.rq_cached = rq_state.get("cached")
         self.draft_stats = []
         self.cached_pages = 0
         self.cached_tokens = 0
@@ -760,15 +762,19 @@ class Job:
 
             if emit_eos:
                 self.is_finished = True
+                cached = self.rq_cached if self.rq_cached is not None else (
+                    self.cached_pages // len(self.sequences),
+                    (self.cached_pages * PAGE_SIZE + self.cached_tokens) // len(self.sequences),
+                )
                 r.update({
                     "full_completion": self.full_completion,
                     "new_tokens": self.rq_new_tokens + self.new_tokens,
-                    "prompt_tokens": len(self.sequences[0].input_ids),
+                    "prompt_tokens": self.rq_prompt_tokens or len(self.sequences[0].input_ids),
                     "time_enqueued": self.time_enqueued,
                     "time_prefill": self.time_prefill,
                     "time_generate": self.time_generate,
-                    "cached_pages": self.cached_pages // len(self.sequences),
-                    "cached_tokens": (self.cached_pages * PAGE_SIZE + self.cached_tokens) // len(self.sequences),
+                    "cached_pages": cached[0],
+                    "cached_tokens": cached[1],
                 })
                 if self.generator.draft_model or self.generator.ngram_match_min:
                     r.update({
@@ -1041,7 +1047,12 @@ class Job:
             "time_enqueued": self.time_enqueued,
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
-            "rq_new_tokens": self.new_tokens - 1,
+            "rq_new_tokens": self.new_tokens,   # every token accepted so far counts; the requeued segment starts after them
+            "accepted_draft_tokens": self.accepted_draft_tokens,
+            "rejected_draft_tokens": self.rejected_draft_tokens,
+            "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),
+            "cached": self.rq_cached if self.rq_cached is not None else (
+                self.cached_pages, self.cached_pages * PAGE_SIZE + self.cached_tokens),
             "sam": self.sam,
             "forced_ids": None if self.forced_ids is None else self.forced_ids[:, self.forced_index:],
             "filters_suspended": self.filters_suspended,
@@ -1090,9 +1101,11 @@ class Job:
         self.pagetable = generator.pagetable
         self.skips = 0
 
-        # No explicit limit: whatever the cache can still hold beyond the prompt
+        # No explicit limit: whatever the cache can still hold beyond the prompt, less the default
+        # requeue budget's headroom below so that budget still fits the cache exactly
         if self.max_new_tokens is None:
-            self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids))
+            self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids)
+                                      - 1 - self.generator.num_draft_tokens)
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
@@ -1103,7 +1116,8 @@ class Job:
                 y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
                 self.max_rq_tokens = y - x
         else:
-            self.max_rq_tokens = self.max_new_tokens + 1
+            # Default budget: the whole response plus one speculative window past the limit
+            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.num_draft_tokens
 
         # Compatibility checks
         if self.banned_strings and self.generator.recurrent_cache is not None:
