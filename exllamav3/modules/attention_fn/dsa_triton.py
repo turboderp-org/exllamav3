@@ -47,7 +47,7 @@ except ImportError:
 
 if has_triton:
 
-    from .triton_paged import _rot_h32, _qc_load_v_p, _get_h32
+    from .triton_paged import _rot_h32, _qc_load_v, _get_h32
 
     @triton.jit(do_not_specialize = [
         "k_len", "win_len", "pool_len", "num_pages_per_row", "q_pos0", "R",
@@ -223,7 +223,7 @@ if has_triton:
                 tl.device_assert(tl.where(in_range, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_attn: pool page OOB")
             tok = phys * page_size + idx_s % page_size
             if QC > 0:
-                vc = _qc_load_v_p(pool_c, pool_s, tok, in_range, QC, D_c, D_c_pad)
+                vc = _qc_load_v(pool_c, pool_s, tok, 0, offs_c, in_range, QC, 1, D_c, D_c_pad)
             else:
                 vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
                              mask = in_range[:, None] & valid_c[None, :], other = 0.0)
@@ -465,7 +465,7 @@ if has_triton:
                 tl.device_assert(tl.where(in_range, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_split: pool page OOB")
             tok = phys * page_size + idx_s % page_size
             if QC > 0:
-                vc = _qc_load_v_p(pool_c, pool_s, tok, in_range, QC, D_c, D_c_pad)
+                vc = _qc_load_v(pool_c, pool_s, tok, 0, offs_c, in_range, QC, 1, D_c, D_c_pad)
             else:
                 vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
                              mask = in_range[:, None] & valid_c[None, :], other = 0.0)

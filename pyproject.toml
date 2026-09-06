@@ -81,7 +81,6 @@ version = { attr = "exllamav3.version.__version__" }
 
 [tool.uv]
 package = true
-exclude-dependencies = ["flash-attn"]
 conflicts = [
     [
         { group = "cu124" },
@@ -103,8 +102,6 @@ torch = [
     { index = "pytorch-cu132", group = "cu132" },
 ]
 
-# [tool.uv.extra-build-dependencies]
-# flash-attn = [{ requirement = "torch", match-runtime = true }]
 
 [[tool.uv.index]]
 name = "pytorch-cu124"

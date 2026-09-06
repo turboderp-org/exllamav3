@@ -223,7 +223,7 @@ if has_triton:
                 tok = idx_c
 
             if QCK > 0:
-                k_tile = _qc_load_kt(k_cache, k_scales, tok, kv_head, offs_d, valid_n, QCK, n_kv_heads, head_dim)
+                k_tile = _qc_load_kt(k_cache, k_scales, tok, kv_head, offs_d, valid_n, QCK, n_kv_heads, head_dim, head_dim)
             else:
                 k_ptrs = k_cache + ((tok[None, :] * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
                 k_tile = tl.load(k_ptrs, mask = valid_n[None, :], other = 0.0)
@@ -241,7 +241,7 @@ if has_triton:
 
             if QCV > 0:
                 # Rotated-domain values: the partials stay rotated, the combine rotates back
-                v_tile = _qc_load_v(v_cache, v_scales, tok, kv_head, offs_d, valid_n, QCV, n_kv_heads, head_dim)
+                v_tile = _qc_load_v(v_cache, v_scales, tok, kv_head, offs_d, valid_n, QCV, n_kv_heads, head_dim, head_dim)
             else:
                 v_ptrs = v_cache + ((tok[:, None] * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
                 v_tile = tl.load(v_ptrs, mask = valid_n[:, None], other = 0.0)
@@ -329,7 +329,7 @@ if has_triton:
             _paged_attn_decode_combine_kernel[(programs,)](
                 partial_o, partial_ml, o, h32, splits, partial_ml,
                 QCV = v_bits, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
-                head_dim = hd, BLOCK_M = 1, BLOCK_H = BLOCK_H, BLOCK_ROWS = BLOCK_H,
+                head_dim = hd, HD_PAD = hd, BLOCK_M = 1, BLOCK_H = BLOCK_H, BLOCK_ROWS = BLOCK_H,
                 num_warps = 4, num_stages = 1,
             )
         return o

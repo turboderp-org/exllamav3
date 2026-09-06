@@ -107,7 +107,7 @@ Note that the PyPi package does not contain a prebuilt extension and requires th
 2. **with `uv`, setting `--group cuXXX` and pinning a torch version inside that group** (applicable to non-Github `uv` install paths in options 1 and 2) — see the [pinning a specific PyTorch version (optional)](#pinning-a-specific-pytorch-version-optional) section for details (note a global `[tool.uv] constraint-dependencies` does not work for this)
 3. Manually with `uv pip` or `pip` (options 3 and 4)
 
-The CUDA flavors are declared as uv **dependency groups** (`cu124`, `cu126`, `cu128`, `cu129`, `cu130`, `cu132`) — pick the one matching your installed CUDA build by passing `--group <flavor>` to `uv sync` / `uv run`. While developing you can also set `[tool.uv] default-groups = ["cuXXX"]` to make a flavor the default for the project (see [Pinning the CUDA flavor for local development](#pinning-the-cuda-flavor-for-local-development)). Both `uv sync` and `pip install .` build the package in an isolated environment where your `torch` is not visible, so they install the extension sources and compile them at first import (JIT, a few minutes once per torch version). For a precompiled install run `pip install --no-build-isolation .` in an environment that already has `torch`, or use the release wheels. Selecting a flavor installs the matching CUDA build of `torch`; `flash-attn` is optional and installed separately (see [Prebuilt flash-attn](#prebuilt-flash-attn)).
+The CUDA flavors are declared as uv **dependency groups** (`cu124`, `cu126`, `cu128`, `cu129`, `cu130`, `cu132`) — pick the one matching your installed CUDA build by passing `--group <flavor>` to `uv sync` / `uv run`. While developing you can also set `[tool.uv] default-groups = ["cuXXX"]` to make a flavor the default for the project (see [Pinning the CUDA flavor for local development](#pinning-the-cuda-flavor-for-local-development)). Both `uv sync` and `pip install .` build the package in an isolated environment where your `torch` is not visible, so they install the extension sources and compile them at first import (JIT, a few minutes once per torch version). For a precompiled install run `pip install --no-build-isolation .` in an environment that already has `torch`, or use the release wheels. Selecting a flavor installs the matching CUDA build of `torch`.
 
 ##### Pinning the CUDA flavor for local development
 
@@ -173,8 +173,6 @@ uv pip install .
 
 **Option 4 — With `pip`:**
 
-Install a `flash-attn-2` wheel, e.g. from [here](https://mjunya.com/flash-attention-prebuild-wheels/).
-
 On Windows, you should also make sure you have the `triton-windows` package installed. ExLlamaV3 may work without it, but many things will work suboptimally.   
 
 ```sh
@@ -182,34 +180,6 @@ On Windows, you should also make sure you have the `triton-windows` package inst
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install .
 ```
-
-#### Prebuilt flash-attn
-
-Compiling `flash-attn` from source is extremely slow, so it is strongly recommended to install a **prebuilt wheel**. The CUDA flavor groups do **not** pull in `flash-attn` automatically; install it yourself, matching the `torch` build, CUDA flavor, Python version, and platform you're running. Two options:
-
-1. **Manually** — pick a `flash-attn-2` wheel for your setup, e.g. from [here](https://mjunya.com/flash-attention-prebuild-wheels/), and install it (e.g. `uv pip install <wheel-url>`).
-2. **With the helper** — `scripts/flash_attn_install.py` detects your environment (torch build, CUDA flavor, Python, platform), finds the exact matching wheel from [`mjun0812/flash-attention-prebuild-wheels`](https://github.com/mjun0812/flash-attention-prebuild-wheels), and — after a `[Yn]` confirmation — runs the corresponding `uv pip install <release-url>`.
-
-##### Installing flash-attn into an existing environment directly
-
-If you already have a CUDA `torch` installed in an environment and just want to add a
-matching prebuilt `flash-attn` wheel, `scripts/flash_attn_install.py` detects that
-environment (torch build, CUDA flavor, Python, platform), finds the exact matching wheel
-from `mjun0812/flash-attention-prebuild-wheels`, and — after a `[Yn]` confirmation —
-runs the corresponding `uv pip install <release-url>`. Run it with an active torch
-environment, or pass its python explicitly:
-
-The install target is resolved in this order: (1) the active `VIRTUAL_ENV`, (2) the
-python uv would use for the project (`pyproject.toml` in the current dir or parents, via
-`uv run python`), (3) an explicit `--python-bin`, (4) an error otherwise.
-
-```sh
-uv run scripts/flash_attn_install.py                    # active VIRTUAL_ENV, else project
-uv run scripts/flash_attn_install.py --python-bin /path/to/python
-```
-
-Only stdlib plus `rich` (declared as a PEP 723 inline dependency) are used. It prints a
-summary of what it detected and the exact install command before asking for confirmation.
 
 #### Pinning a specific PyTorch version (optional)
 The CUDA flavor group picks the *index*, but by default torch resolves to the latest version on that index that satisfies `>=2.6.0`. To pin a specific torch version, set it **inside the flavor's dependency group** — you can use the plain version without a `+cuXXX` suffix, and uv resolves it against that flavor's index. A global `[tool.uv] constraint-dependencies` does *not* work for this, because it would have to hold for every group at once (each CUDA index uses a different `+cuXXX` local version) and locking fails.

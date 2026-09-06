@@ -263,10 +263,11 @@ class BCAttn:
 
         dev = self.device
         hd = self.head_dim
+        hd_pad = triton.next_power_of_2(hd)   # kernel tile width (zero-padded past hd)
         qh, kvh = self.num_q_heads, self.num_kv_heads
         group_size = qh // kvh
 
-        block_n = max(16, 8192 // hd)
+        block_n = max(16, 8192 // hd_pad)
         block_m = triton.next_power_of_2(q_len)
         block_h = max(16 // block_m, 1)
         block_rows = block_m * block_h
@@ -289,12 +290,12 @@ class BCAttn:
             "sinks": "*fp32",
         } | {n: "constexpr" for n in (
             "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
-            "page_size", "head_dim", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
+            "page_size", "head_dim", "HD_PAD", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
             "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N")}
         consts = dict(
             QCK = self.k_bits, QCV = self.v_bits,
             q_len = q_len, kv_append_len = q_len, n_q_heads = qh, n_kv_heads = kvh,
-            page_size = PAGE_SIZE, head_dim = hd, scale = float(self.sm_scale),
+            page_size = PAGE_SIZE, head_dim = hd, HD_PAD = hd_pad, scale = float(self.sm_scale),
             CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
@@ -305,11 +306,11 @@ class BCAttn:
             "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
             "num_splits": "i32", "sinks": "*fp32",
         } | {n: "constexpr" for n in (
-            "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim",
+            "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD",
             "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")}
         consts_c = dict(
             QCV = self.v_bits, HAS_SINKS = self.sinks is not None, q_len = q_len,
-            n_q_heads = qh, n_kv_heads = kvh, head_dim = hd,
+            n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
         )
         k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
@@ -347,7 +348,7 @@ class BCAttn:
         o = g_tensor_cache.get(dev, (bsz, q_len, qh, hd), torch.half, "bca_o")
         # Regime-1 slots never launch the dense split/combine; their partials are sized by the
         # sparse kernels in _configure_qsa (same bucketed tags, so the footprint is the max)
-        pn_o = programs * splits_cap * block_rows * hd
+        pn_o = programs * splits_cap * block_rows * hd_pad
         pn_ml = programs * splits_cap * block_rows * 2
         if regime == 1:
             pn_o, pn_ml = self._qsa_partial_sizes(bsz * q_len)
@@ -513,14 +514,14 @@ class BCAttn:
                 {"partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
                  "num_splits": "i32", "sinks": "*fp32"}
                 | {n: "constexpr" for n in (
-                    "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim",
+                    "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD",
                     "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")},
                 # q_len 1: the sparse gather treats every query row as a batch (programs =
                 # R * kv_heads * h_blocks), so the combine's output row is the batch index
                 # alone -- compiling the true q_len here would scatter row r to row r * q_len
                 dict(QCV = self.v_bits, HAS_SINKS = False, q_len = 1,
                      n_q_heads = self.num_q_heads, n_kv_heads = self.num_kv_heads,
-                     head_dim = self.head_dim, BLOCK_M = 1, BLOCK_H = block_h,
+                     head_dim = self.head_dim, HD_PAD = self.head_dim, BLOCK_M = 1, BLOCK_H = block_h,
                      BLOCK_ROWS = block_h), 4, 1)
 
         self.bc.configure_slot_qsa(
@@ -633,7 +634,9 @@ def _module_eligible(m):
         # block returns. Span-heads norms stay declined (cross-rank norm inside the block)
         not getattr(m, "tp_span_heads_norm", False) and
         (m.q_norm is None or m.q_norm_tensor is not None) and
-        _is_pow2(m.head_dim) and m.head_dim <= 512 and
+        # Non-power-of-two head dims run zero-padded to the next power of two in the graph
+        # kernels; quantized caches need 32-value groups
+        m.head_dim <= 512 and m.head_dim % 8 == 0 and
         m.num_q_heads % m.num_kv_heads == 0 and
         # Padded dims: the projection inputs stage through a zero-padded static and the o_proj
         # output is trimmed, but the q/k/v/gate outputs and the o_proj input must be the exact
