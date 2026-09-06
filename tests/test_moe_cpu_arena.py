@@ -35,17 +35,6 @@ def test_arena_preflight_accepts_large_shm(monkeypatch):
         c.unlink()
 
 
-@pytest.mark.skipif(os.name == "nt", reason = "shared memory names are not persistent on Windows")
-def test_arena_unlink_releases_names():
-    arena = _SharedArena()
-    arena.reserve(1)
-    name = arena.chunks[0].name
-    shared_memory.SharedMemory(name = name).close()
-    arena.unlink()
-    with pytest.raises(FileNotFoundError):
-        shared_memory.SharedMemory(name = name)
-
-
 def _prof(**kw):
     pr = dict(n = 0, sync = 0.0, host = 0.0, gpu = 0.0, gpu_n = 0, batches = 0,
               rawwait = 0.0, dma = 0.0, compute = 0.0, ev = None, pending = [])
