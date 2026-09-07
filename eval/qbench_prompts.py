@@ -305,7 +305,7 @@ def main(args):
         ngram_match_min = args.ngram_match_min,
         dynamic_draft_tokens = args.dynamic_draft,
         draft_confidence = args.draft_confidence,
-        max_chunk_size = 2048
+        max_chunk_size = args.max_chunk_size,
     )
 
     TEMPLATE_VARS = DEFAULT_TEMPLATE_VARS.copy()
