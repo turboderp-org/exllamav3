@@ -129,7 +129,6 @@ class Lfm2Model(Model):
                             key_out = "out_proj",
                             qmap = "block.attn",
                             out_dtype = torch.float,
-                            select_hq_bits = 2,
                         )
                         if config.layer_types[idx] == "conv" else
                         Attention(
@@ -158,7 +157,6 @@ class Lfm2Model(Model):
                                 rms_norm_eps = config.rms_norm_eps,
                             ),
                             out_dtype = torch.float,
-                            select_hq_bits = 2,
                         )
                     ),
                     mlp_norm = RMSNorm(
@@ -177,7 +175,6 @@ class Lfm2Model(Model):
                         qmap = "block.mlp",
                         interm_dtype = torch.half,
                         out_dtype = torch.float,
-                        select_hq_bits = 1,
                     ),
                 )
             ]
