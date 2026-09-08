@@ -2,6 +2,16 @@
 
 // Approximate tanh
 
+// ROCm: hide the device helpers from host parses (the JIT loader builds .cpp files
+// with the host compiler, where HIP's headers lack the intrinsics they use); the
+// polyfills and host-parse shims live in compat_rocm.cuh
+
+#if defined(USE_ROCM) && !defined(__HIPCC__)
+
+#include "compat_rocm.cuh"
+
+#else
+
 __forceinline__ __device__ float copysignf_pos(float a, float b)
 {
     float r;
@@ -26,4 +36,10 @@ __inline__ __device__ float tanh_opt(float x)
     return r;
 }
 
+#endif
+
+#endif  // defined(USE_ROCM) && !defined(__HIPCC__)
+
+#if defined(USE_ROCM) && defined(__HIPCC__)
+#include "compat_rocm.cuh"
 #endif

@@ -140,7 +140,8 @@ void reconstruct_slice
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+    auto reconstruct_kernel = reconstruct_kernel_instances[cbi];
+    reconstruct_kernel<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),
@@ -374,7 +375,8 @@ void reconstruct_had_slice
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_had_kernel_instances[cbi]<<<gridDim, RH_THREADS, 0, stream>>>
+    auto reconstruct_had_kernel = reconstruct_had_kernel_instances[cbi];
+    reconstruct_had_kernel<<<gridDim, RH_THREADS, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),

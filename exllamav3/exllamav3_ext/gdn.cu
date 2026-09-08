@@ -1,5 +1,7 @@
 #include <cuda_fp16.h>
+#if __has_include(<cuda_fp16.hpp>)
 #include <cuda_fp16.hpp>
+#endif
 #include "activation.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
