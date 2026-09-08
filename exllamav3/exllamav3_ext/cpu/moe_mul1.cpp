@@ -73,11 +73,13 @@ constexpr int MAX_M = 4;
 #define M1_TARGET_BW __attribute__((target("avx512f,avx512bw,avx512vl,fma,f16c")))
 #define M1_TARGET_VNNI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,fma,f16c")))
 #define M1_TARGET_VBMI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,fma,f16c")))
+#define M1_ALWAYS_INLINE __attribute__((always_inline)) inline
 #else
 #define M1_TARGET_AVX2
 #define M1_TARGET_BW
 #define M1_TARGET_VNNI
 #define M1_TARGET_VBMI
+#define M1_ALWAYS_INLINE __forceinline
 #endif
 
 inline void cpu_pause()
@@ -716,9 +718,12 @@ void vnni_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
 //   contracting vpmaddwd+vpaddd into vpdpwssd.
 // -------------------------------------------------------------------------------------------
 
+// Force-inlined: GCC otherwise outlines the 16-row chain behind a call on every tile step, and
+// with every zmm register caller-saved the band loop then reloads all of its live constants
+// (index tables, multiplier, shift vectors) after each call (+8-9% inlined, Skylake-SP)
 template <int bits, int rows, int band, int R>
 M1_TARGET_BW
-inline void bw_band_rows
+M1_ALWAYS_INLINE void bw_band_rows
 (
     __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat_dup, int k,
     __m512i (&acc)[band][MAX_M]
