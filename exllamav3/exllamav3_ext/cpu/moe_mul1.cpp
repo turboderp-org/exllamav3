@@ -1911,48 +1911,30 @@ void transform_out(const MoeCpuMatrix& mat, float* tout, int m)
 }
 
 
-// Assign workers to GEMVs: with more GEMVs than workers, each worker strides over whole GEMVs;
-// otherwise GEMV j gets the contiguous worker group [j*nw/total, (j+1)*nw/total). Returns false
-// when this worker has no assignment. Missing either regime silently drops GEMVs.
-inline bool gemv_assignment(int worker, int num_workers, int total, int& j0, int& j_step, int& sub, int& per)
-{
-    if (total <= 0) return false;
-    if (total >= num_workers)
-    {
-        j0 = worker; j_step = num_workers; sub = 0; per = 1;
-        return j0 < total;
-    }
+// Assign this worker its share of a phase's `total` GEMVs (all of one width, tiles_n tiles),
+// calling gemv(j, t0, t1) per tile range. Few GEMVs (decode, small batches; each expert read
+// once): the GEMVs' tiles form one flat range, split evenly across workers in 8-tile groups so
+// no piece crosses a group of its GEMV (the swizzled band kernels' invariant; n % 128 == 0
+// makes every tiles_n a multiple of 8). Whole-GEMV assignment left a 2:1 imbalance whenever
+// 2 * cold experts fell between multiples of the worker count (16 gate/up GEMVs on 20 workers:
+// twelve single-worker GEMVs set the phase time while eight workers idled half of it). Many
+// GEMVs (prefill): whole GEMVs strided across workers, so all workers stream the same expert's
+// chunks together and L3 serves the repeats; the imbalance there is at most one GEMV in four.
+constexpr int FLAT_MAX_GEMVS_PER_WORKER = 4;
 
-    for (int j = 0; j < total; ++j)
-    {
-        const int w0 = j * num_workers / total;
-        const int w1 = (j + 1) * num_workers / total;
-        if (worker >= w0 && worker < w1) {
-            j0 = j; j_step = total; sub = worker - w0; per = w1 - w0;
-            return true;
-        }
-    }
-    return false;
-}
-
-// Contiguous tile range for split sub/per of one GEMV. Swizzled matrices hand out whole
-// 8-tile groups per worker: the band kernels' swizzled addressing assumes n0's group is not
-// split mid-band (band tables only produce divisors of 8, which stay inside a group only
-// when the range starts group-aligned).
-inline void tile_split(const MoeCpuMatrix& mat, int sub, int per, int& t0, int& t1)
+template <typename Gemv>
+inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Gemv gemv)
 {
-    const int tiles_n = mat.n / 16;
-    if (mat.swz)
+    if (total > FLAT_MAX_GEMVS_PER_WORKER * num_workers)
     {
-        const int groups = tiles_n / 8;
-        t0 = groups * sub / per * 8;
-        t1 = groups * (sub + 1) / per * 8;
+        for (int j = worker; j < total; j += num_workers) gemv(j, 0, tiles_n);
+        return;
     }
-    else
-    {
-        t0 = tiles_n * sub / per;
-        t1 = tiles_n * (sub + 1) / per;
-    }
+    const int64_t groups = static_cast<int64_t>(total) * (tiles_n / 8);
+    const int f0 = static_cast<int>(groups * worker / num_workers) * 8;
+    const int f1 = static_cast<int>(groups * (worker + 1) / num_workers) * 8;
+    for (int j = f0 / tiles_n; j * tiles_n < f1; ++j)
+        gemv(j, std::max(f0 - j * tiles_n, 0), std::min(f1 - j * tiles_n, tiles_n));
 }
 
 void forward_phase(void* vctx, int worker, int num_workers)
@@ -1982,22 +1964,17 @@ void forward_phase(void* vctx, int worker, int num_workers)
 
         case 1:
         {
-            // Gate + up GEMVs: workers spread over the GEMVs, contiguous tile ranges within each
+            // Gate + up GEMVs (see assign_gemvs)
             const int gu = L.gates.empty() ? 1 : 2;
-            const int total = nc * gu;
-            int j0, j_step, sub, per;
-            if (gemv_assignment(worker, num_workers, total, j0, j_step, sub, per))
-                for (int j = j0; j < total; j += j_step)
-                {
-                    const Chunk& ch = c.chunks[j / gu];
-                    const bool up = gu == 1 || (j % gu);
-                    const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
-                    const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                    float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I;
-                    int t0, t1;
-                    tile_split(mat, sub, per, t0, t1);
-                    run_tiles(mat, p, tout, ch.m, t0, t1);
-                }
+            assign_gemvs(worker, num_workers, nc * gu, I / 16, [&](int j, int t0, int t1)
+            {
+                const Chunk& ch = c.chunks[j / gu];
+                const bool up = gu == 1 || (j % gu);
+                const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
+                const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
+                float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I;
+                run_tiles(mat, p, tout, ch.m, t0, t1);
+            });
             break;
         }
 
@@ -2064,16 +2041,12 @@ void forward_phase(void* vctx, int worker, int num_workers)
         case 3:
         {
             // Down GEMVs
-            int j0, j_step, sub, per;
-            if (gemv_assignment(worker, num_workers, nc, j0, j_step, sub, per))
-                for (int j = j0; j < nc; j += j_step) {
-                    const Chunk& ch = c.chunks[j];
-                    const MoeCpuMatrix& mat = L.downs[ch.expert];
-                    float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
-                    int t0, t1;
-                    tile_split(mat, sub, per, t0, t1);
-                    run_tiles(mat, c.prep_d[j], tout, ch.m, t0, t1);
-                }
+            assign_gemvs(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
+            {
+                const Chunk& ch = c.chunks[j];
+                float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
+                run_tiles(L.downs[ch.expert], c.prep_d[j], tout, ch.m, t0, t1);
+            });
             break;
         }
 
