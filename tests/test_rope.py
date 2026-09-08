@@ -8,7 +8,7 @@ import torch.testing
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
-device = "cuda:2"
+device = os.environ.get("EXL_TEST_DEVICE", "cuda:2")
 
 # ((bsz, seq_len, num_heads_q, head_dim), (bsz, seq_len, num_heads_k, head_dim))
 qk_dims = [

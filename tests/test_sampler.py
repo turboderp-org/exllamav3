@@ -16,7 +16,7 @@ from exllamav3.generator.sampler.presets import DefaultSampler, CategoricalSampl
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 150)
 
-device = "cuda:2"
+device = os.environ.get("EXL_TEST_DEVICE", "cuda:2")
 dims = [
     (1, 16),
     (9, 16),
