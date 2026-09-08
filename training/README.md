@@ -138,9 +138,10 @@ python training/qlora_infer_native.py --model /path/to/exl3-model --adapter out/
   fails — before serving resumes (`offload_aux_when_training`, on by default;
   `exllamav3.training.ModelParker` is the reusable mechanism). The demo's
   `--mtp` flag loads the model's MTP head for speculative decoding and wires
-  exactly this. Note the offline trainers never load vision/MTP components at
-  all — only `Model.from_config(config)`'s text trunk — so this applies to
-  the serve-and-train path only. The script doubles as the reference wiring
+  exactly this. The offline trainer loads a component only when asked to
+  (`--vision` for the tower, `--mtp-targets` to *train* the head — see the
+  MTP section below); otherwise only `Model.from_config(config)`'s text trunk
+  — so this applies to the serve-and-train path only. The script doubles as the reference wiring
   for server backends (e.g. tabbyAPI's `backends/exllamav3/model.py`); the
   `[integration]`-marked lines are the complete glue. CPU-tested in
   `tests/test_realtime.py`.
@@ -181,6 +182,68 @@ style at runtime on both Qwen3.5-MoE-family and Gemma4-MoE), but MoE decode is
 significantly slower while such an adapter is loaded — for serving speed,
 deploy by merge-and-requantize. See the Session 20/21/26/28 notes in
 `doc/qlora_handoff.md`.
+
+## MTP (multi-token prediction) head training
+
+Qwen3.5/3.6 checkpoints ship a one-block MTP head -- the self-speculative
+draft the generator runs with `draft_model = Model.from_config(config,
+component="mtp")`. It is a separate component model that `qlora_train_native.py`
+otherwise never loads, and its linears sit outside the trunk's `--targets`
+matching entirely, so by default an adapter never touches it. Fine-tuning the
+trunk shifts the hidden states the head reads, so a stale head's draft
+acceptance rate drifts down; `--mtp-targets` retrains it.
+
+- **What trains.** `--mtp-targets [LEAF ...]` loads the head (on the trunk's
+  output device; `--mtp-device` to override) and adapts the named leaves
+  INSIDE it: the same vocabulary as `--targets` (`q_proj` ... `down_proj`,
+  `expert_*` on the MoE head) plus `fc`, the head's `[2d -> d]` input
+  projection. A bare `--mtp-targets` = the default attn+mlp list + `fc`.
+  `--targets` and `--mtp-targets` are disjoint: neither reaches into the
+  other's model, so `--targets --mtp-targets` (an empty trunk list) trains
+  **only the MTP tensors**.
+- **The loss.** The head's own next-token CE through the shared LM head: at
+  position `i` it sees the trunk's final-norm state from `i-1` plus token
+  `i`'s embedding and predicts token `i+1` -- exactly the generator's draft
+  wiring (`cat(zero_carry, target_hidden[:, :-1])`; a zero carry at position
+  0 and at every packed document start). Trunk training jointly: `loss =
+  trunk + --mtp-loss-weight * mtp` (the log line shows both). Head only: the
+  head's loss *is* the loss, and the trunk runs under `no_grad` (no
+  checkpointing, no saved activations -- a cheap run). The eval / best-val
+  loss follows the same composition.
+- **Two-stage recipe (recommended).** Train the trunk as usual, then fit the
+  head to the tuned trunk it will draft for:
+  ```
+  # stage 1: trunk
+  python training/qlora_train_native.py --model M --targets q_proj k_proj v_proj o_proj \
+      gate_proj up_proj down_proj ... --out out/trunk
+  # stage 2: head, trunk adapter loaded and frozen (same --r/--targets as stage 1)
+  python training/qlora_train_native.py --model M --resume out/trunk --freeze-trunk \
+      --targets q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
+      --mtp-targets ... --out out/trunk_mtp
+  ```
+  `--freeze-trunk` keeps the resumed trunk adapters applied (and re-exported)
+  but out of the optimizer; the optimizer starts cold. Or train both at once
+  in one run (`--targets ... --mtp-targets`), which costs a second head pass
+  per step.
+- **The adapter.** One dir: the head's tensors sit in the same
+  `adapter_model.safetensors` under their own `mtp.layers.N...` / `mtp.fc`
+  keys (`adapter_config.json` records `mtp_target_modules`). The runtime
+  loader matches keys by module suffix, so `LoRA.from_directory(model, dir)`
+  applies the trunk's and skips the head's, and `LoRA.from_directory(
+  draft_model, dir)` the reverse -- `qlora_infer_native.py --mtp` does both
+  per arm and prints the arm's draft acceptance rate, the number a retrained
+  head is meant to move. Resuming a trunk-only checkpoint into an MTP run
+  starts the head's adapters fresh (a note is printed).
+- **Gate first.** `qlora_validate_native.py --check-mtp` compares the native
+  head forward against the inference draft path on the real quant; run it
+  before the first `--mtp-targets` run on a new model. Layout supported: the
+  Qwen3.5/3.6 head (two pre-fc norms + `fc` over `[embedding | trunk state]`,
+  N TransformerBlocks, final norm); the DeepSeek/GLM pre-norm-residual heads
+  and the Qwen3.8 hyper-connection head are rejected loudly. Not wired into
+  the DDP / preference / EBFT trainers or the realtime coordinator; not
+  combinable with `--vision` image batches. **Not yet box-validated** -- the
+  CPU test (`tests/test_native_llama.py`) checks the forward against an
+  independent reference, the `--check-mtp` gate is the on-box proof.
 
 ## MuseGlimmer
 

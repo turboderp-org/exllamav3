@@ -554,6 +554,121 @@ def test_modules_to_save_param_groups():
     print("[modules_to_save] param-group split (embed/head = no weight decay) PASSED")
 
 
+def test_mtp_head_matches_reference_and_trains_head_only():
+    # The MTP (multi-token prediction) head forward, Qwen3.5 layout: position i
+    # pairs token i's embedding with the trunk's final-norm state at i-1 (zero
+    # carry at 0 and at every packed document start), each half RMS-normed by
+    # its own pre-fc norm, concatenated [embedding | state], projected by fc
+    # (2d -> d), through the head's block and final norm -- vs an independent
+    # plain-torch reference. Then: gradients reach every head adapter (fc +
+    # the block's projections) while the detached trunk state and the frozen
+    # base weights get none, and the trunk/head trainable bookkeeping.
+    torch.manual_seed(7)
+    d, nq, nkv, hd, inter, V, r = 16, 4, 2, 8, 32, 40, 3
+    entry, meta, refw, lins = _build_block(d, nq, nkv, hd, inter,
+                                           dtype=torch.float32, r=r)
+    fc_lin = MockLinear(2 * d, d, "mtp.fc", dtype=torch.float32)
+    fc = DiffLinear(fc_lin, r=r, compute_dtype=torch.float32)
+    # Non-zero B so the adapters actually contribute (and are visible in the
+    # reference, which reads the effective weights through the wrappers).
+    with torch.no_grad():
+        for w in [fc, entry.q_proj, entry.k_proj, entry.v_proj, entry.o_proj,
+                  entry.gates[0], entry.ups[0], entry.downs[0]]:
+            w.lora_b.normal_(std=0.05)
+
+    net = _headless_net()
+    nn.Module.__init__(net)          # _parameters/_modules/training for the attrs below
+    net.compute_dtype = torch.float32
+    net.gradient_checkpointing = False
+    net.use_liger = False
+    net.head_pre_scale = 1.0
+    net._adapters_off = False
+    net.embed_weight = None
+    net.embed_lora_a = net.embed_lora_b = None
+    table = nn.Embedding(V, d)
+    table.weight.requires_grad_(False)
+    net.embed = types.SimpleNamespace(embedding=table)
+    norm_h, norm_e, norm_f = _ns_norm(d, torch.float32), _ns_norm(d, torch.float32), \
+        _ns_norm(d, torch.float32)
+    net.mtp = types.SimpleNamespace(
+        fc=fc, blocks=[entry],
+        norm_hidden_spec=_spec(norm_h.weight), norm_embed_spec=_spec(norm_e.weight),
+        final_norm_spec=_spec(norm_f.weight))
+    net._mtp_block_meta = [meta]
+    net._mtp_device = torch.device("cpu")
+
+    b, t = 2, 6
+    ids = torch.randint(0, V, (b, t))
+    state = torch.randn(b, t, d)                       # the trunk's final-norm output
+    positions = torch.arange(t).unsqueeze(0).expand(b, t)
+    seg = torch.tensor([[0, 0, 0, 0, 0, 0], [0, 0, 1, 1, 1, 2]])   # row 1: packed docs
+
+    def eff(w):    # effective weight of a wrapper: frozen + scale * A @ B
+        return w.linear.frozen_weight + w.scale * (w.lora_a.detach() @ w.lora_b.detach())
+
+    def ref(seg_ids):
+        prev = torch.cat([torch.zeros(b, 1, d), state[:, :-1]], dim=1)
+        if seg_ids is not None:
+            start = torch.ones(b, t, dtype=torch.bool)
+            start[:, 1:] = seg_ids[:, 1:] != seg_ids[:, :-1]
+            prev = prev.masked_fill(start.unsqueeze(-1), 0.0)
+        y = _ref_rmsnorm(prev, norm_h.weight, 1e-5)
+        e = _ref_rmsnorm(table.weight[ids], norm_e.weight, 1e-5)
+        x = torch.cat([e, y], dim=-1) @ eff(fc)
+        rw = dict(refw, q=eff(entry.q_proj), k=eff(entry.k_proj), v=eff(entry.v_proj),
+                  o=eff(entry.o_proj), gate=eff(entry.gates[0]),
+                  up=eff(entry.ups[0]), down=eff(entry.downs[0]))
+        x = _ref_block(meta, rw, x, positions)
+        return _ref_rmsnorm(x, norm_f.weight, 1e-5)
+
+    def ctx(seg_ids):
+        return {"mem_eff": False, "pack_ctx": None, "attention_mask": None,
+                "get_bias": lambda w, dev: net._attn_bias(None, t, dev, torch.float32, w),
+                "seg_ids": seg_ids, "trunk_state": state, "position_ids": positions}
+
+    for seg_ids, label in ((None, "unpacked"), (seg, "packed doc starts zero the carry")):
+        with torch.no_grad():
+            out = net._forward_mtp(ids, ctx(seg_ids))
+        err = (out - ref(seg_ids)).abs().max().item()
+        assert err < 1e-4, f"MTP forward mismatch vs reference ({label}): max|d|={err}"
+        print(f"[mtp] {label}: matches plain-torch reference (max|d|={err:.2e})")
+    # The zeroed carry must actually matter (else the packed case tests nothing).
+    with torch.no_grad():
+        assert not torch.allclose(net._forward_mtp(ids, ctx(None)),
+                                  net._forward_mtp(ids, ctx(seg)))
+
+    # Backward: every head adapter gets a gradient; the frozen bases and the
+    # (detached) trunk state get none -- the frozen-trunk stage-2 contract.
+    net.train()
+    out = net._forward_mtp(ids, ctx(None))
+    out.float().pow(2).mean().backward()
+    wrappers = [fc, entry.q_proj, entry.k_proj, entry.v_proj, entry.o_proj,
+                entry.gates[0], entry.ups[0], entry.downs[0]]
+    for w in wrappers:
+        assert w.lora_a.grad is not None and w.lora_b.grad is not None, w.linear.key
+        assert w.lora_b.grad.abs().sum() > 0, f"zero grad on {w.linear.key}"
+        assert w.linear.frozen_weight.grad is None
+    assert state.grad is None and table.weight.grad is None
+    print("[mtp] backward reaches fc + every block adapter; trunk state / base frozen")
+
+    # trunk_trainable / parameter accessors under freeze_trunk semantics.
+    trunk_w = DiffLinear(MockLinear(d, d, "model.layers.0.self_attn.q_proj",
+                                    dtype=torch.float32), r=r, compute_dtype=torch.float32)
+    net._wrappers = [trunk_w] + wrappers
+    net._mtp_wrappers = wrappers
+    net.head_weight = None
+    net.head_lora_a = net.head_lora_b = None
+    assert net.trunk_trainable()
+    assert len(net.lora_parameters()) == 2 * (1 + len(wrappers))
+    trunk_w.lora_a.requires_grad_(False)
+    trunk_w.lora_b.requires_grad_(False)
+    assert not net.trunk_trainable()
+    assert len(net.lora_parameters()) == 2 * len(wrappers)
+    assert net.lora_param_groups(0.0)[0]["params"] == net.lora_parameters()
+    assert net.mtp_parameters() == net.lora_parameters()
+    print("[mtp] freeze_trunk: trunk adapters drop out of the trainable set, head stays")
+
+
 def main():
     from util import run_timed
     run_timed([
@@ -565,6 +680,7 @@ def main():
         test_packing_block_isolation,
         test_packing_pad_no_nan,
         test_modules_to_save_param_groups,
+        test_mtp_head_matches_reference_and_trains_head_only,
     ], label="native-llama")
     print("\nAll native-Llama differentiable-forward checks passed.")
 

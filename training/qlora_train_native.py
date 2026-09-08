@@ -177,7 +177,8 @@ RUN_LOG_FIELDS = [
     "lr", "scheduler", "warmup_steps", "weight_decay",
     "batch", "grad_accum", "world_size", "eff_batch",
     "epochs", "steps_planned", "steps_done", "seq_len",
-    "targets", "compute_dtype", "attn_impl", "parallel", "shuffle", "pack", "pack_algo", "ga_loss",
+    "targets", "mtp_targets", "freeze_trunk",
+    "compute_dtype", "attn_impl", "parallel", "shuffle", "pack", "pack_algo", "ga_loss",
     "max_samples", "train_embeddings", "train_head",
     "lora_embed", "lora_head", "module_lora_lr_mul",
     "prompt_format",
@@ -1827,6 +1828,36 @@ def _run_main():
                          "expert_up_proj/expert_down_proj to also adapt the routed "
                          "experts (one adapter pair per expert per layer -- see "
                          "--expert-r). The router is always frozen.")
+    ap.add_argument("--mtp-targets", nargs="*", default=None, metavar="LEAF",
+                    help="ALSO load and train the model's MTP (multi-token "
+                         "prediction / self-speculative draft) head -- Qwen3.5/"
+                         "3.6 family -- adapting these leaf names INSIDE it "
+                         "(same vocabulary as --targets, plus 'fc', the head's "
+                         "[2d->d] input projection; bare flag = the default "
+                         "attn+mlp list + fc). --targets never reaches into the "
+                         "head and --mtp-targets never reaches into the trunk, "
+                         "so '--targets --mtp-targets' (empty trunk list) trains "
+                         "the MTP tensors ALONE on the frozen trunk. The head "
+                         "learns the trunk's next-token task one step ahead "
+                         "(state i-1 + token i -> token i+1, exactly the "
+                         "generator's draft wiring); its adapters save into the "
+                         "same adapter dir under mtp.* keys.")
+    ap.add_argument("--mtp-loss-weight", type=float, default=1.0,
+                    help="With --mtp-targets AND a training trunk: weight of the "
+                         "head's loss in 'trunk + w * mtp'. Ignored when only the "
+                         "head trains (its loss is then THE loss).")
+    ap.add_argument("--freeze-trunk", action="store_true",
+                    help="Stage 2 of the two-stage MTP recipe: --resume a "
+                         "finished trunk adapter with the SAME --r/--targets, "
+                         "freeze it (it still applies in the forward and is "
+                         "re-exported), and train only --mtp-targets so the "
+                         "head is fitted to the tuned trunk it will draft for. "
+                         "The trunk then runs under no_grad (no checkpointing / "
+                         "saved activations). Implies --reset-optimizer.")
+    ap.add_argument("--mtp-device", default=None,
+                    help="(--mtp-targets) device for the MTP head (default: the "
+                         "trunk's output device -- --device, or the last split "
+                         "device under --parallel split).")
     ap.add_argument("--expert-r", type=int, default=None,
                     help="LoRA rank for ROUTED-expert adapters (expert_* targets) "
                          "when it should differ from --r. On a many-expert model "
@@ -2216,6 +2247,34 @@ def _run_main():
     if pad_id is None or pad_id < 0:
         pad_id = tokenizer.eos_token_id or 0
 
+    # 1b. MTP head (--mtp-targets): the model's own draft head, a separate
+    #     component model (like the vision tower) that the offline trainers
+    #     otherwise never load. Loaded WHOLE on the trunk's output device, where
+    #     the final-norm state it consumes is produced; it borrows the trunk's
+    #     embedding + LM head (attach_to at inference; the native forward reads
+    #     them from the trunk directly).
+    mtp_model = None
+    if args.mtp_targets is not None:
+        if "mtp" not in config.model_classes:
+            raise SystemExit(f"--mtp-targets: {config.architecture} defines no MTP "
+                             f"head (or this checkpoint has mtp_num_hidden_layers "
+                             f"= 0 / no mtp.* tensors).")
+        mtp_device = args.mtp_device or (str(model.output_device)
+                                         if args.parallel == "split" else args.device)
+        _FAIL_CTX["phase"] = "load_mtp"
+        mtp_model = Model.from_config(config, component="mtp")
+        mtp_model.load(device=mtp_device, progressbar=True)
+        print(f" -- MTP head loaded on {mtp_device} "
+              f"({len(mtp_model.modules)} modules)")
+    elif args.freeze_trunk:
+        raise SystemExit("--freeze-trunk leaves nothing to train without --mtp-targets.")
+    elif args.mtp_device:
+        raise SystemExit("--mtp-device needs --mtp-targets.")
+    if args.freeze_trunk and not args.resume:
+        print(" -- note: --freeze-trunk without --resume: the trunk is the plain "
+              "base model (no adapter), so this is MTP-only training on the "
+              "base trunk -- same as '--targets --mtp-targets ...'.")
+
     # 2. Build the differentiable QLoRA model (frozen base + trainable adapters).
     if args.offload_embed_head_optim and not (args.train_embeddings or args.train_head):
         raise SystemExit("--offload-embed-head-optim has nothing to offload without "
@@ -2236,8 +2295,22 @@ def _run_main():
         offload_activations=args.offload_activations,
         offload_mode=args.offload_mode, use_liger=args.use_liger,
         expert_r=args.expert_r, lora_dropout=args.lora_dropout,
+        # A bare --mtp-targets (empty list) means the default head target list;
+        # the net reads None as that default ([] = load the head, adapt nothing
+        # -- what the validate gate builds).
+        mtp_model=mtp_model, mtp_targets=(args.mtp_targets or None),
+        mtp_loss_weight=args.mtp_loss_weight, freeze_trunk=args.freeze_trunk,
     )
     net.train()
+    if net.mtp is not None:
+        if not net.mtp_parameters():
+            raise SystemExit("--mtp-targets matched no linear in the MTP head; "
+                             f"available: {sorted({w.key.split('.')[-1] for w in net._mtp_wrappers})}")
+        print(f" -- MTP head: {len(net.mtp.blocks)} block(s) on {net._mtp_device}, "
+              f"targets={net.mtp_target_modules}; "
+              + ("trunk FROZEN -- the head's loss is the loss, trunk under no_grad"
+                 if not net.trunk_trainable() else
+                 f"trained jointly (loss = trunk + {args.mtp_loss_weight:g} * mtp)"))
     if args.pack and (getattr(net, "has_gdn", False)
                       or getattr(net, "has_shortconv", False)):
         raise SystemExit(
@@ -2576,10 +2649,32 @@ def _run_main():
     #     seeds best_val/ema below; resume_step shifts the loop's start.
     resume_step, resume_state = 0, None
     yaml_base_lrs = list(sched.base_lrs)  # per-group base LRs from the CONFIG
-    if args.resume and not args.reset_optimizer:
+    # --freeze-trunk changes the trainable set (head only), so the resumed
+    # optimizer state (trunk adapters) can't apply: always a cold start there.
+    if args.resume and not args.reset_optimizer and not args.freeze_trunk:
         resume_state = load_trainer_state(args.resume)
         if resume_state is not None:
-            restore_optimizer_state(opt, resume_state["optimizer"])
+            try:
+                restore_optimizer_state(opt, resume_state["optimizer"])
+            except ValueError as e:
+                if net.mtp is None:
+                    raise
+                # A trunk checkpoint resumed into a joint trunk+MTP run: the
+                # param groups grew by the head's adapters, so the saved moments
+                # don't line up. Continue cold (weights restored, schedule from
+                # step 0) rather than die -- the same as --reset-optimizer.
+                print(f" -- note: optimizer state in {args.resume} does not match "
+                      f"the trunk+MTP parameter set ({e}); starting the optimizer "
+                      f"and schedule cold (as --reset-optimizer).")
+                groups = (net.lora_param_groups(args.weight_decay, args.lr,
+                                                args.module_lora_lr_mul)
+                          if args.offload_embed_head_optim else
+                          net.param_groups(args.weight_decay, args.lr,
+                                           args.module_lora_lr_mul))
+                opt = build_optimizer(groups, args.lr, args.optim)
+                sched = make_lr_scheduler(opt, args.scheduler, args.steps, warmup_steps)
+                resume_state = None
+        if resume_state is not None:
             # The CPU-offload optimizer manages its own (CPU) state placement, so
             # load it directly rather than through restore_optimizer_state (which would
             # move state onto the params' GPU devices). Absent in pre-offload runs.
@@ -2733,6 +2828,8 @@ def _run_main():
     run_config.update(
         steps_planned=args.steps, steps_per_epoch=args.steps_per_epoch,
         warmup_steps=warmup_steps, targets=" ".join(net.target_modules),
+        mtp_targets=" ".join(net.mtp_target_modules),
+        freeze_trunk=int(bool(args.freeze_trunk)),
         trainable_params=net.num_trainable(), n_train=len(examples),
         n_val=len(val_examples), n_eval2=len(val2_examples))
     run_name = (args.run_name or args.wandb_run_name
@@ -2859,7 +2956,10 @@ def _run_main():
             "grad_accum": args.grad_accum, "world_size": 1,
             "eff_batch": args.batch * args.grad_accum, "epochs": args.epochs,
             "steps_planned": args.steps, "steps_done": step, "seq_len": args.seq_len,
-            "targets": " ".join(net.target_modules), "compute_dtype": args.compute_dtype,
+            "targets": " ".join(net.target_modules),
+            "mtp_targets": " ".join(net.mtp_target_modules),
+            "freeze_trunk": int(bool(args.freeze_trunk)),
+            "compute_dtype": args.compute_dtype,
             "attn_impl": args.attn_impl, "parallel": args.parallel,
             "shuffle": int(bool(args.shuffle)), "pack": int(bool(args.pack)),
             "pack_algo": args.pack_algo if args.pack else "",
@@ -2955,6 +3055,7 @@ def _run_main():
             _FAIL_CTX["phase"] = f"train step {step}"
             step_t0 = time.time()
             accum_loss = 0.0
+            accum_parts: dict = {}
             step_sup = step_tot = 0
             timer.begin_step()
             # Draw the WHOLE accumulation window first so each micro-batch can be
@@ -2991,6 +3092,9 @@ def _run_main():
                 # accum_loss uses the same weights, so under "token" it is the
                 # true per-token mean over the whole accumulation window.
                 accum_loss += loss_val * w_i
+                # Joint trunk+MTP runs: the components behind the summed loss.
+                for k, v in getattr(net, "last_losses", {}).items():
+                    accum_parts[k] = accum_parts.get(k, 0.0) + v * w_i
                 step_sup += int((labels != -100).sum())   # supervised tokens
                 step_tot += int(attn.sum())                # total (non-pad) tokens
 
@@ -3032,9 +3136,13 @@ def _run_main():
             epoch_now = step / args.steps_per_epoch
             cur_lr = sched.get_last_lr()[0]
             b_dist = adapter_b_norm()
+            # Joint trunk+MTP: show the two components next to their sum. In
+            # MTP-only runs the loss IS the head's loss, so nothing extra.
+            parts = (f"(trunk {accum_parts['trunk']:6.4f} mtp {accum_parts['mtp']:6.4f}) "
+                     if "trunk" in accum_parts else "")
             print(f"  step {step:>5}/{args.steps} | "
                   f"ep {epoch_now:.2f}/{epochs_total:.4g} | "
-                  f"loss {accum_loss:6.4f} | "
+                  f"loss {accum_loss:6.4f} {parts}| "
                   f"ema {ema:6.4f} | grad {gnorm:7.4f} | lr {cur_lr:.2e} | "
                   f"|dB| {b_dist:7.3f} | {tot_tps:,.0f} tok/s | {timer.step_line()}")
             train_metrics = {
@@ -3042,6 +3150,7 @@ def _run_main():
                 "train/grad_norm": gnorm, "train/lr": cur_lr,
                 "train/adapter_b_dist": b_dist, "train/epoch": epoch_now,
                 "perf/sup_tok_s": sup_tps, "perf/tot_tok_s": tot_tps,
+                **{f"train/loss_{k}": v for k, v in accum_parts.items()},
             }
             if report is not None:
                 report.log(train_metrics, step=step)
@@ -3224,7 +3333,9 @@ def _run_main():
         wandb_run.summary.update(final_summary)
         _finish_wandb()
     print("Verify with: python training/qlora_infer_native.py "
-          f"--model {args.model} --adapter {args.out}")
+          f"--model {args.model} --adapter {args.out}"
+          + (" --mtp   (loads the head + its adapters and drafts with it)"
+             if net.mtp is not None else ""))
 
 
 if __name__ == "__main__":
