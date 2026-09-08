@@ -54,6 +54,7 @@ from .qwen3_vl_moe import Qwen3VLMoeModel
 from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
 from .solar_open_moe import SolarOpenMoeModel
+from .spark2_5 import Spark2_5Model
 from .step3_5 import Step3_5Model
 from .step3_7 import Step3_7Model
 
@@ -124,6 +125,7 @@ ARCHITECTURES = {
         SeedOssModel,
         SmolLM3Model,
         SolarOpenMoeModel,
+        Spark2_5Model,
         Step3_5Model,
         Step3_7Model,
     ]
