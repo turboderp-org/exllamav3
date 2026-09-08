@@ -82,7 +82,7 @@ void quantize_tiles
     auto kernel = L == 256 ?
         quantize_tiles_kernel_instances[K - 1 + 8 * cb] :
         quantize_tiles_kernel_instances_l160[K - 1];
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+    cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
     cuda_check(cudaPeekAtLastError());
     cudaFuncAttributes attr;
     cuda_check(cudaFuncGetAttributes(&attr, kernel));
