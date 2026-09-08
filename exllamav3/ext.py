@@ -94,6 +94,12 @@ else:
         "-Xcudafe", "--diag_suppress=20012",
     ]
 
+    if torch.version.hip:
+        # no --use_fast_math (reassociates FP reductions); -Wno-register for
+        # ROCm 7.14's clang
+        extra_cuda_cflags = ["-O3", "-Wno-register"]
+        extra_cflags += ["-Wno-register"]
+
     if windows:
         # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break
         #       older cu128 builds
@@ -106,7 +112,7 @@ else:
             extra_cflags += ["/Zi"]
             extra_cuda_cflags += []
     else:
-        extra_cflags += ["-Ofast"]
+        extra_cflags += ["-O3" if torch.version.hip else "-Ofast"]
         extra_cuda_cflags += []
         if ext_debug:
             extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
@@ -118,7 +124,7 @@ else:
     if torch.version.hip:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
 
-    if verbose:
+    if verbose and not torch.version.hip:
         extra_cuda_cflags += ["--ptxas-options=-v"]
 
     # linker flags
@@ -134,12 +140,8 @@ else:
 
     library_dir = os.path.dirname(os.path.abspath(__file__))
     sources_dir = os.path.join(library_dir, extension_name)
-    sources = [
-        os.path.abspath(os.path.join(root, file))
-        for root, _, files in os.walk(sources_dir)
-        for file in files
-        if file.endswith(('.c', '.cpp', '.cu'))
-    ]
+    from .exllamav3_ext.build_config import get_sources
+    sources = get_sources(sources_dir, bool(torch.version.hip))
 
     # Load extension
 
