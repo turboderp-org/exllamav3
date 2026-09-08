@@ -1,27 +1,19 @@
 #pragma once
 
-// AMDGCN equivalents of the portable inline-PTX primitives ptx.cuh defines on CUDA.
-// ptx.cuh includes this file in its USE_ROCM branch; consumers keep including ptx.cuh
-// on both platforms and see the same symbols.
-//
-// The CUDA originals are .sys-scope (cross-GPU) acquire/release ops used by the
-// TP collectives to poll flags in host-pinned memory; the mappings below use
-// __hip_atomic_* with an explicit system scope rather than plain __atomic builtins,
-// whose default scope on AMDGCN is agent (single-GPU).
+// AMDGCN equivalents of ptx.cuh's inline-PTX primitives. The originals the TP
+// collectives use are system-scope (cross-GPU) acquire/release ops, hence the
+// explicit __hip_atomic_* scopes (plain __atomic defaults to agent scope).
 
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
-// HIP headers do not define __grid_constant__ (CUDA 12 kernel-parameter qualifier);
 // by-value struct parameters work on AMDGCN without it
 #ifndef __grid_constant__
 #define __grid_constant__
 #endif
 
-// HIP provides no __nanosleep; s_sleep takes a constant immediate (~1 us granularity),
-// so the 64..1024 ns backoff ladder becomes a fixed ~1 us sleep. The spin loops only
-// need some yield between polls. Reserved-namespace names (__*) may not be defined
-// here, so the shim installs as a macro instead of a function.
+// no __nanosleep on HIP; s_sleep takes a constant immediate, so the backoff ladder
+// becomes a fixed ~1 us yield between polls
 #if !defined(__nanosleep)
 #define __nanosleep(ns) ((void) (ns), __builtin_amdgcn_s_sleep(1))
 #endif
@@ -46,8 +38,8 @@ __device__ __forceinline__ void stg_release_sys_u64(uint64_t* p, uint64_t v)
     __hip_atomic_store((unsigned long long*) p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// No write-through store on AMDGCN; a system-scope release store to host-pinned memory
-// is the closest equivalent (the flag is coherent over PCIe/NPL)
+// no write-through store on AMDGCN; a system-scope release store is the closest
+// equivalent for host-pinned flags
 __device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
 {
     __hip_atomic_store((unsigned int*) p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -60,8 +52,7 @@ __device__ __forceinline__ uint32_t ldg_cv_u32(const uint32_t* p)
 
 __device__ __forceinline__ uint4 ldg_cv_u128(const uint4* p)
 {
-    // HIP's uint4 wrapper has no volatile-qualified copy constructor; load the four
-    // words through a volatile pointer so each still lowers to a glc load
+    // volatile word loads (HIP's uint4 has no volatile copy constructor)
     const volatile unsigned int* q = reinterpret_cast<const volatile unsigned int*>(p);
     uint4 v;
     v.x = q[0];
@@ -71,10 +62,8 @@ __device__ __forceinline__ uint4 ldg_cv_u128(const uint4* p)
     return v;
 }
 
-// gfx1100 has no wall-clock counter (the s-memrealtime target feature is absent), so
-// the sync deadline is budgeted in clock64() ticks; see parallel/timeout.cuh.
-// High-side 5 GHz: clock64() never exceeds the boost clock, so a deadline computed
-// with this rate can only fire late, never early.
+// no wall-clock counter on gfx1100; clock64() budgeted at a high-side 5 GHz so
+// deadlines can only fire late (see parallel/timeout.cuh)
 __device__ __forceinline__ uint64_t globaltimer_ns()
 {
     return (uint64_t) clock64();
@@ -82,8 +71,7 @@ __device__ __forceinline__ uint64_t globaltimer_ns()
 
 #define GLOBALTIMER_HZ 5000000000ull
 
-// Bitfield primitives (ptx.cuh's API, AMDGCN equivalents): the shift-and-mask
-// forms compile to the same S_BFE/V_ALIGNBIT patterns the PTX asm lowers to
+// bitfield primitives with ptx.cuh's API
 struct FragB { half2 elems[2]; __device__ half2& operator[](int i) { return elems[i]; } };
 
 #define FSHF_IMM(dst, lo, hi, imm) \
@@ -96,14 +84,9 @@ static __forceinline__ __device__ uint32_t bfe64(uint32_t lo, uint32_t hi, int o
     return static_cast<uint32_t>((value >> offset) & ((1ULL << length) - 1));
 }
 
-// libcu++ cuda::atomic_ref shim over the clang __hip_atomic builtins, so the
-// shared kernel sources (exl3_moe_kernel.cuh) compile unmodified. Only the
-// pieces the tree uses are provided; if a ROCm SDK ever ships libcu++
-// (<cuda/atomic>), the real one wins via __has_include.
-//
-// NB: the Scope parameter is accepted but not differentiated - every use in this
-// tree (MoE scheduler and group barriers) is agent-scope, so all scopes map to
-// __HIP_MEMORY_SCOPE_AGENT. A system-scope user would need a real mapping.
+// cuda::atomic_ref shim so shared kernel sources compile unmodified; the real
+// libcu++ wins via __has_include. Scope is not differentiated: every use here is
+// agent-scope.
 #if !__has_include(<cuda/atomic>)
 namespace cuda
 {
@@ -141,9 +124,7 @@ namespace cuda
 }
 #endif
 
-// Inter-block barrier for the grouped MoE launch (ptx.cuh's cuda::atomic_ref form).
-// Sense-reversing arrive-and-wait over the same counter
-// layout: [2*group_id] = arrival count, [2*group_id + 1] = sense.
+// sense-reversing inter-block barrier; counter layout [2*group_id] = count, [+1] = sense
 __device__ inline void group_barrier
 (
     int group_id,

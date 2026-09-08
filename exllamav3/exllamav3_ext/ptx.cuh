@@ -1,6 +1,5 @@
 #pragma once
-// ROCm: the AMDGCN equivalents of the portable primitives below come from
-// ptx_rocm_compat.cuh; the CUDA-only contents of this header do not parse on HIP
+// AMDGCN equivalents come from ptx_rocm_compat.cuh
 #if defined(USE_ROCM)
 #include "ptx_rocm_compat.cuh"
 #else
@@ -304,7 +303,7 @@ __device__ __forceinline__ uint64_t globaltimer_ns()
     return t;
 }
 
-// %globaltimer ticks nanoseconds (used by parallel/timeout.cuh)
+// ticks nanoseconds (timeout.cuh)
 #define GLOBALTIMER_HZ 1000000000ull
 
 // Bitfield stuff
