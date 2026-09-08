@@ -12,6 +12,29 @@ CUDA_EXCLUDE_FILES = {
 }
 
 
+def maybe_set_rocm_home():
+    """Set ROCM_HOME for torch's cpp_extension when the ROCm SDK is installed as
+    Python wheels (AMD's TheRock index) and no other ROCm is discoverable.
+
+    cpp_extension resolves the SDK location once at import time (env var, then
+    hipcc on PATH, then /opt/rocm), and a wheel-provided SDK is in neither
+    place, so this must run before cpp_extension is imported. The wheel-provided
+    root also needs its first-use expansion, which get_devel_root() performs.
+    Any failure leaves the environment untouched and defers to torch's own
+    discovery chain."""
+
+    if os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH"):
+        return
+    try:
+        from rocm_sdk._devel import get_devel_root
+        root = get_devel_root()
+        if not (root / "bin" / "hipcc").exists():
+            return
+    except Exception:
+        return
+    os.environ["ROCM_HOME"] = str(root)
+
+
 def get_sources(sources_dir, is_rocm, base_dir = None):
     """Walk the extension source directory and return the source file list. Stale
     hipify intermediates (*.hip, *_hip.*) are skipped. With base_dir the paths are

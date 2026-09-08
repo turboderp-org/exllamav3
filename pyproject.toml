@@ -33,6 +33,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+rocm = [
+    # Full ROCm/HIP stack from AMD's TheRock multi-arch wheel index. No system
+    # ROCm install is required: runtime, libraries, compiler and device kernels
+    # all live in the venv. The explicit index only applies to direct
+    # dependencies, so every package that exists solely on the AMD index must
+    # be listed here and mapped in [tool.uv.sources] below.
+    "torch[device-gfx1100]>=2.6.0",
+    "triton",
+    "rocm[libraries,devel,device-gfx1100]>=7.14",
+    "rocm-bootstrap",
+    "rocm-sdk-core>=7.14",
+    "rocm-sdk-libraries>=7.14",
+    "rocm-sdk-devel>=7.14",
+    "rocm-sdk-device-gfx1100>=7.14",
+    "amd-torch-device-gfx1100",
+    "amd-torch-device-gfx11",
+]
 eval = [
     "transformers>=4.50.0",
     "datasets",
@@ -99,6 +116,7 @@ conflicts = [
         { extra = "cu129" },
         { extra = "cu130" },
         { extra = "cu132" },
+        { extra = "rocm" },
     ],
 ]
 
@@ -110,8 +128,40 @@ torch = [
     { index = "pytorch-cu129", extra = "cu129" },
     { index = "pytorch-cu130", extra = "cu130" },
     { index = "pytorch-cu132", extra = "cu132" },
+    { index = "amd-rocm", extra = "rocm" },
+]
+triton = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-bootstrap = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-core = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-libraries = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-devel = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+rocm-sdk-device-gfx1100 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+amd-torch-device-gfx1100 = [
+    { index = "amd-rocm", extra = "rocm" },
+]
+amd-torch-device-gfx11 = [
+    { index = "amd-rocm", extra = "rocm" },
 ]
 
+[[tool.uv.index]]
+name = "amd-rocm"
+url = "https://repo.amd.com/rocm/whl-multi-arch/"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu124"

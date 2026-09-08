@@ -2,10 +2,17 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import torch
-from torch.utils.cpp_extension import load
 import os
 import sys
 from .util.arch_list import maybe_set_arch_list_env
+from .exllamav3_ext.build_config import maybe_set_rocm_home
+
+if torch.version.hip:
+    # Must run before cpp_extension is imported: it resolves the SDK location
+    # (ROCM_HOME) at import time, and a wheel-provided SDK needs this lookup
+    maybe_set_rocm_home()
+
+from torch.utils.cpp_extension import load
 
 extension_name = "exllamav3_ext"
 verbose = False  # Print wall of text when compiling

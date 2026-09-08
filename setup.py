@@ -3,11 +3,25 @@ import os
 
 from setuptools import setup
 
-if torch := importlib.util.find_spec("torch") is not None:
-    from torch.utils import cpp_extension
-    from torch import version as torch_version
-
+library_dir = "exllamav3"
 extension_name = "exllamav3_ext"
+sources_dir = os.path.join(library_dir, extension_name)
+
+# Load build_config by file path: importing the exllamav3 package here would trigger
+# its __init__ and JIT-compile the extension in the middle of pip install
+_spec = importlib.util.spec_from_file_location(
+    "exllamav3_build_config", os.path.join(sources_dir, "build_config.py"))
+_build_config = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_build_config)
+
+if torch := importlib.util.find_spec("torch") is not None:
+    from torch import version as torch_version
+    if torch_version.hip:
+        # Must run before cpp_extension is imported: it resolves the SDK location
+        # (ROCM_HOME) at import time, and a wheel-provided SDK needs this lookup
+        _build_config.maybe_set_rocm_home()
+    from torch.utils import cpp_extension
+
 precompile = "EXLLAMA_NOCOMPILE" not in os.environ
 verbose = "EXLLAMA_VERBOSE" in os.environ
 ext_debug = "EXLLAMA_EXT_DEBUG" in os.environ
@@ -61,14 +75,6 @@ extra_compile_args = {
     "nvcc": extra_cuda_cflags,
 }
 
-library_dir = "exllamav3"
-sources_dir = os.path.join(library_dir, extension_name)
-
-# load build_config by path: importing the package would JIT the extension
-_spec = importlib.util.spec_from_file_location(
-    "exllamav3_build_config", os.path.join(sources_dir, "build_config.py"))
-_build_config = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_build_config)
 is_rocm = bool(torch and torch_version.hip)
 if is_rocm and not os.environ.get("PYTORCH_ROCM_ARCH"):
     # arch_list.py can't be imported here (it would JIT the extension)
