@@ -65,6 +65,17 @@ experts are opt-in via the explicit ``expert_gate_proj``/``expert_up_proj``/
 on a many-expert model that is a large trainable surface with sparse
 per-expert gradients; see ``_MOE_EXPERT_TARGET_ALIASES``). The router gate
 and the shared-expert gate stay frozen always.
+
+MTP head (``mtp_model`` / ``mtp_targets``): the Qwen3.5/3.6 multi-token
+prediction head -- the generator's self-speculative draft, a separate
+component model the trunk's targets never reach -- can be trained next to the
+trunk or ALONE on a frozen trunk. Its block(s) get the same differentiable
+block forward; its input layer (two pre-fc norms + ``fc`` over
+``[embedding | trunk final-norm state]``) and the generator's one-position
+shift are reproduced in ``_forward_mtp``; its loss is the same shifted CE
+through the shared LM head. ``freeze_trunk`` is the two-stage recipe (fit the
+head to a finished trunk adapter). See ``backbone.mtp_layout`` for the
+accepted layout.
 """
 
 from __future__ import annotations
@@ -552,7 +563,26 @@ class NativeLlamaQLoRA(nn.Module):
         use_liger: bool = False,
         expert_r: Optional[int] = None,
         lora_dropout: float = 0.0,
+        mtp_model: Optional[nn.Module] = None,
+        mtp_targets: Optional[Iterable[str]] = None,
+        mtp_loss_weight: float = 1.0,
+        freeze_trunk: bool = False,
     ):
+        """
+        ``mtp_model`` (optional): the model's loaded MTP (multi-token
+        prediction) head, ``Model.from_config(config, component="mtp")``, to
+        train NEXT TO the trunk -- see :meth:`_forward_mtp`. ``mtp_targets``
+        are the leaf names adapted inside the head (same vocabulary as
+        ``target_modules`` plus ``fc``, the head's input projection; None =
+        the default list + ``fc``); the trunk's ``target_modules`` never reach
+        into the head and vice versa, so ``target_modules=[]`` with
+        ``mtp_targets`` set trains the MTP tensors ALONE. ``mtp_loss_weight``
+        scales the head's next-token loss when it is summed with the trunk's.
+        ``freeze_trunk`` freezes every trunk-side trainable (per-linear LoRA,
+        embed/head adapters) after construction -- the two-stage recipe: load
+        a finished trunk adapter with ``load_adapter`` and fit the head to the
+        tuned trunk it will draft for, exporting both in one adapter dir.
+        """
         super().__init__()
         # Offload the (grad-checkpointed) saved activations to CPU, and/or route
         # RMSNorm + SwiGLU through Liger Triton kernels. Both are CUDA + fp16/bf16
@@ -625,30 +655,59 @@ class NativeLlamaQLoRA(nn.Module):
         self.has_shortconv = False
         self.has_moe = False
 
-        def wrap(linear, leaf, aliases=None, r_override=None):
-            # `aliases` (GDN / MoE-expert layers) lets several requested target
-            # names select one physical linear (see _GDN_TARGET_ALIASES /
-            # _MOE_EXPERT_TARGET_ALIASES; an empty tuple = never targetable);
-            # plain layers match on their own leaf name only. `r_override`
-            # (MoE routed experts) trains the hit at a different rank than the
-            # net-wide r -- PEFT's rank_pattern recipe for many-expert models.
-            names = aliases if aliases is not None else (leaf,)
-            hit = targets.intersection(names)
-            satisfied_targets.update(hit)
-            r_eff = (r_override if r_override is not None else r) if hit else 0
-            w = DiffLinear(
-                linear,
-                r=r_eff,
-                alpha=alpha,
-                use_rslora=use_rslora,
-                compute_dtype=compute_dtype,
-                dropout=lora_dropout,
-            )
-            wrappers.append(w)
-            return w
+        def make_wrap(targets, satisfied_targets):
+            def wrap(linear, leaf, aliases=None, r_override=None):
+                # `aliases` (GDN / MoE-expert layers) lets several requested
+                # target names select one physical linear (see
+                # _GDN_TARGET_ALIASES / _MOE_EXPERT_TARGET_ALIASES; an empty
+                # tuple = never targetable); plain layers match on their own
+                # leaf name only. `r_override` (MoE routed experts) trains the
+                # hit at a different rank than the net-wide r -- PEFT's
+                # rank_pattern recipe for many-expert models.
+                names = aliases if aliases is not None else (leaf,)
+                hit = targets.intersection(names)
+                satisfied_targets.update(hit)
+                r_eff = (r_override if r_override is not None else r) if hit else 0
+                w = DiffLinear(
+                    linear,
+                    r=r_eff,
+                    alpha=alpha,
+                    use_rslora=use_rslora,
+                    compute_dtype=compute_dtype,
+                    dropout=lora_dropout,
+                )
+                wrappers.append(w)
+                return w
+            return wrap
+
+        # The decoder blocks to build entries for: the trunk's, then (when an
+        # MTP head is attached) the head's own block(s), which are ordinary
+        # TransformerBlocks and get the SAME entry/forward as a trunk block --
+        # only their target set and destination lists differ.
+        wrap = make_wrap(targets, satisfied_targets)
+        plan = [(blk, wrap, self.blocks, self._block_meta, self._block_devices)
+                for blk in blocks]
+        self.mtp = None
+        self.mtp_target_modules: list[str] = []
+        self.mtp_loss_weight = float(mtp_loss_weight)
+        self._mtp_wrappers: list[DiffLinear] = []
+        mtp_targets_defaulted = mtp_targets is None
+        if mtp_model is not None:
+            mtp_in, mtp_blocks, mtp_final_norm = backbone.mtp_layout(mtp_model)
+            mtargets = (set(mtp_targets) if mtp_targets is not None
+                        else set(DEFAULT_TARGET_MODULES) | {"fc"})
+            mtp_satisfied: set[str] = set()
+            mwrap = make_wrap(mtargets, mtp_satisfied)
+            self.mtp = nn.Module()
+            self.mtp.blocks = nn.ModuleList()
+            self._mtp_block_meta: list[dict] = []
+            self._mtp_block_devices: list = []
+            plan += [(blk, mwrap, self.mtp.blocks, self._mtp_block_meta,
+                      self._mtp_block_devices) for blk in mtp_blocks]
 
         has_mrope = False
-        for blk in blocks:
+        n_trunk_wrappers = 0
+        for blk, wrap, out_blocks, out_meta, out_devs in plan:
             backbone.assert_block_supported(blk)
             has_mrope = has_mrope or backbone.attn_has_mrope(blk)
             meta = backbone.block_metadata(blk)
@@ -766,10 +825,42 @@ class NativeLlamaQLoRA(nn.Module):
             entry.gates = nn.ModuleList(gates)
             entry.ups = nn.ModuleList(ups)
             entry.downs = nn.ModuleList(downs)
-            self.blocks.append(entry)
+            out_blocks.append(entry)
+            out_meta.append(meta)
+            out_devs.append(backbone.block_device(blk))
+            if out_blocks is self.blocks:
+                n_trunk_wrappers = len(wrappers)   # plan is trunk-then-MTP
 
-            self._block_meta.append(meta)
-            self._block_devices.append(backbone.block_device(blk))
+        if self.mtp is not None:
+            # The head's input layer: two pre-fc norms + the [2d -> d] fc over
+            # [embedding | trunk state] (backbone.mtp_layout), then its final
+            # norm. The block(s) were built by the loop above. Everything
+            # lives on one device: the head is loaded whole, next to the
+            # trunk's output device where the final-norm state it consumes
+            # is produced.
+            nh, ne, fc = backbone.mtp_input_parts(mtp_in)
+            self.mtp.fc = mwrap(fc, "fc")
+            self.mtp.norm_hidden_spec = backbone.norm_spec(nh)
+            self.mtp.norm_embed_spec = backbone.norm_spec(ne)
+            self.mtp.final_norm_spec = backbone.norm_spec(mtp_final_norm)
+            devs = set(map(str, self._mtp_block_devices))
+            devs.add(str(backbone.linear_device(fc)))
+            assert len(devs) == 1, \
+                f"MTP head modules span devices {sorted(devs)}; load it on one device"
+            self._mtp_device = self._mtp_block_devices[0]
+            self._mtp_wrappers = wrappers[n_trunk_wrappers:]
+            missing = mtargets - mtp_satisfied
+            if missing and mtp_targets_defaulted:
+                print(f" -- note: default MTP target(s) {sorted(missing)} matched "
+                      f"no linear in the MTP head; training the rest.")
+                mtargets -= missing
+                missing = set()
+            if missing:
+                raise ValueError(
+                    f"mtp_targets {sorted(missing)} matched no linear in the MTP "
+                    f"head (available leaves: "
+                    f"{sorted({w.key.split('.')[-1] for w in self._mtp_wrappers})})")
+            self.mtp_target_modules = sorted(mtargets)
 
         self._wrappers = wrappers
         if self.has_moe:
@@ -935,6 +1026,44 @@ class NativeLlamaQLoRA(nn.Module):
             self.head_lora_a = nn.Parameter(torch.empty(hid, r, dtype=torch.float32, device=dev))
             self.head_lora_b = nn.Parameter(torch.zeros(r, vocab, dtype=torch.float32, device=dev))
             nn.init.kaiming_uniform_(self.head_lora_a, a=5 ** 0.5)
+
+        # --- freeze the trunk (MTP-only stage 2) ------------------------------
+        # Every trunk-side trainable keeps its VALUE (a resumed trunk adapter
+        # still applies in the forward, and save_adapter still exports it) but
+        # stops training: requires_grad off, and the parameter accessors below
+        # (lora_parameters / param_groups / num_trainable) skip it, so the
+        # optimizer, grad clip and the trainable count see only the head.
+        # With nothing trainable upstream the trunk forward then runs under
+        # no_grad (see forward), which is the whole point: a frozen trunk
+        # stores no activations and re-runs no blocks in backward.
+        self.freeze_trunk = bool(freeze_trunk)
+        if self.freeze_trunk:
+            if self.mtp is None:
+                raise ValueError("freeze_trunk without an MTP head leaves nothing to train")
+            mtp_ids = {id(w) for w in self._mtp_wrappers}
+            for w in self._wrappers:
+                if w.r > 0 and id(w) not in mtp_ids:
+                    w.lora_a.requires_grad_(False)
+                    w.lora_b.requires_grad_(False)
+            for p in (self.embed_weight, self.head_weight, self.embed_lora_a,
+                      self.embed_lora_b, self.head_lora_a, self.head_lora_b):
+                if p is not None:
+                    p.requires_grad_(False)
+
+    def trunk_trainable(self) -> bool:
+        """True when anything OUTSIDE the MTP head can receive a gradient: a
+        trunk per-linear adapter, or an embed/head trainable. False = the trunk
+        is a pure frozen feature extractor for the head (freeze_trunk, or
+        target_modules=[] with mtp_targets set), and forward() runs it under
+        no_grad."""
+        mtp_ids = {id(w) for w in getattr(self, "_mtp_wrappers", [])}
+        for w in self._wrappers:
+            if w.r > 0 and id(w) not in mtp_ids and w.lora_a.requires_grad:
+                return True
+        for p in self.module_lora_parameters() + self.modules_to_save_parameters():
+            if p.requires_grad:
+                return True
+        return False
 
     # --- forward -----------------------------------------------------------
 
@@ -1697,7 +1826,8 @@ class NativeLlamaQLoRA(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         seg_ids: Optional[torch.Tensor] = None,
         mm: Optional[dict] = None,
-    ) -> torch.Tensor:
+        mtp: bool = False,
+    ):
         """Return final-norm hidden states ``[b, t, d]`` in fp32 -- the LM head's
         INPUT: on an arch with a head logit pre-scale (MuseGlimmer's
         ``output_multiplier``) that scalar is already folded in, so every head
@@ -1717,7 +1847,107 @@ class NativeLlamaQLoRA(nn.Module):
         (``deepstack``), and on a bidirectional-image arch the ``spans`` lift
         the causal mask inside each image. On an mRoPE tower ``position_ids``
         is then the 3-D ``[3, b, t]`` tensor (``vision.mrope_position_ids``).
-        Not combinable with sample packing."""
+        Not combinable with sample packing.
+
+        ``mtp=True`` (an MTP head must be attached) ALSO runs the head on the
+        trunk's output and returns ``(hidden, mtp_hidden)`` -- the head's own
+        final-norm state, same shape/dtype contract, whose position ``i`` is the
+        head's prediction of token ``i+1`` (see :meth:`_forward_mtp`). When
+        nothing outside the head trains (``trunk_trainable()`` False) the trunk
+        runs under ``no_grad``: no checkpointing, no saved activations -- it is
+        a frozen feature extractor for the head."""
+        if mtp and self.mtp is None:
+            raise ValueError("forward(mtp=True) but no MTP head is attached")
+        if mtp and mm is not None:
+            raise ValueError("MTP head training is not supported on image batches (mm)")
+        trunk_grad = torch.is_grad_enabled() and not (mtp and not self.trunk_trainable())
+        with torch.set_grad_enabled(trunk_grad):
+            hidden, ctx = self._forward_trunk(input_ids, attention_mask, position_ids,
+                                              seg_ids, mm)
+        if not mtp:
+            return hidden
+        return hidden, self._forward_mtp(input_ids, ctx)
+
+    def _embed(self, input_ids: torch.Tensor, device) -> torch.Tensor:
+        """The token embedding as the trunk's first block sees it -- the frozen
+        table (or the trainable ``embed_weight``) with the module's multiplier /
+        normalize applied, plus the embedding LoRA shift -- on ``device`` in the
+        compute dtype. NOT including the image splice or the MuseGlimmer
+        embed_norm (those follow in ``_forward_trunk``). Shared by the trunk and
+        the MTP head, which borrows the trunk's embedding at inference."""
+        if self.embed_weight is not None and not self._adapters_off:
+            # Trainable input embedding: lookup against the fp32 master weight,
+            # then the same multiplier/normalize the frozen path applies.
+            ew = self.embed_weight
+            looked_up = F.embedding(input_ids.to(ew.device), ew)
+            hidden = backbone.embed_apply(self.embed, looked_up).to(device).to(self.compute_dtype)
+        else:
+            hidden = backbone.embed_tokens(self.embed, input_ids).to(device).to(self.compute_dtype)
+
+        # Embedding LoRA: add a rank-r, token-indexed shift to the (frozen) embedding
+        # output. Only the rows for tokens present in the batch get a gradient (the
+        # F.embedding lookup is sparse over a), so this is cheap. Added after the
+        # base embed scaling; the from-zero B absorbs any constant factor, so this is
+        # as expressive as adding before the scale. requires_grad carries back to a/b
+        # (so the grad-checkpoint detach below leaves the path intact).
+        if self.embed_lora_a is not None and not self._adapters_off:
+            ea = self.embed_lora_a.to(self.compute_dtype)
+            eb = self.embed_lora_b.to(self.compute_dtype)
+            delta = F.embedding(input_ids.to(ea.device), ea) @ eb       # [b, t, hid]
+            hidden = hidden + self._module_lora_scale * delta.to(hidden.device).to(hidden.dtype)
+        return hidden
+
+    def _run_block(self, meta, entry, hidden, position_ids, dev, ctx, ckpt):
+        """One decoder block (trunk or MTP head) on ``hidden``, dispatching on
+        the block kind, with the attention backend / bias / packing descriptor
+        drawn from the per-forward ``ctx`` (built by ``_forward_trunk``)."""
+        if meta.get("kind", "attn") == "gdn":
+            # GatedDeltaNet block: no RoPE, no attention bias, no packing
+            # (packing is rejected up front -- the recurrence would carry
+            # state across packed document boundaries).
+            if ckpt:
+                return torch.utils.checkpoint.checkpoint(
+                    self._gdn_forward, meta, entry, hidden,
+                    use_reentrant=False,
+                )
+            return self._gdn_forward(meta, entry, hidden)
+        if meta.get("kind", "attn") == "shortconv":
+            # ShortConv block (LFM2): causal conv, no RoPE, no
+            # attention bias, no packing (rejected up front).
+            if ckpt:
+                return torch.utils.checkpoint.checkpoint(
+                    self._shortconv_forward, meta, entry, hidden,
+                    use_reentrant=False,
+                )
+            return self._shortconv_forward(meta, entry, hidden)
+        mode = self._attn_mode_for(meta, ctx["mem_eff"])
+        # eager: seg-aware additive bias. flash + sdpa both isolate
+        # documents via pack_ctx (cu_seqlens for flash-varlen; per-
+        # document SDPA loop for big-head), so neither builds the
+        # [t, t] bias.
+        attn_bias = ctx["get_bias"](meta["sliding_window"], dev) if mode == "eager" else None
+        pack_ctx = ctx["pack_ctx"]
+        pack = pack_ctx if (mode in ("flash", "sdpa") and pack_ctx is not None) else None
+        if ckpt:
+            return torch.utils.checkpoint.checkpoint(
+                self._block_forward, meta, entry, hidden, position_ids, attn_bias,
+                mode, pack, use_reentrant=False,
+            )
+        return self._block_forward(meta, entry, hidden, position_ids, attn_bias, mode, pack)
+
+    def _forward_trunk(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
+        mm: Optional[dict] = None,
+    ):
+        """The trunk half of :meth:`forward`: returns ``(hidden, ctx)`` where
+        ``hidden`` is the (head-pre-scaled) final-norm state and ``ctx`` the
+        per-forward attention context (positions, mask, packing descriptor,
+        bias builder, the UNSCALED final-norm state) that the MTP head's
+        forward consumes."""
         # Quant-aware noise tick: advance once per grad-enabled training
         # forward so each micro-batch draws fresh noise while the (up to 3)
         # weight reconstructions within its forward + backward all see the
@@ -1748,26 +1978,7 @@ class NativeLlamaQLoRA(nn.Module):
         # forward_ls). Start on the first block's device. The embedding is loaded
         # on CPU (prefer_cpu); backbone.embed_tokens runs the lookup there.
         first_device = self._block_devices[0]
-        if self.embed_weight is not None and not self._adapters_off:
-            # Trainable input embedding: lookup against the fp32 master weight,
-            # then the same multiplier/normalize the frozen path applies.
-            ew = self.embed_weight
-            looked_up = F.embedding(input_ids.to(ew.device), ew)
-            hidden = backbone.embed_apply(self.embed, looked_up).to(first_device).to(self.compute_dtype)
-        else:
-            hidden = backbone.embed_tokens(self.embed, input_ids).to(first_device).to(self.compute_dtype)
-
-        # Embedding LoRA: add a rank-r, token-indexed shift to the (frozen) embedding
-        # output. Only the rows for tokens present in the batch get a gradient (the
-        # F.embedding lookup is sparse over a), so this is cheap. Added after the
-        # base embed scaling; the from-zero B absorbs any constant factor, so this is
-        # as expressive as adding before the scale. requires_grad carries back to a/b
-        # (so the grad-checkpoint detach below leaves the path intact).
-        if self.embed_lora_a is not None and not self._adapters_off:
-            ea = self.embed_lora_a.to(self.compute_dtype)
-            eb = self.embed_lora_b.to(self.compute_dtype)
-            delta = F.embedding(input_ids.to(ea.device), ea) @ eb       # [b, t, hid]
-            hidden = hidden + self._module_lora_scale * delta.to(hidden.device).to(hidden.dtype)
+        hidden = self._embed(input_ids, first_device)
 
         # Image splice: the frozen vision features take the image positions,
         # AFTER the text embedding scaling and adapters (they are never scaled
@@ -1804,7 +2015,9 @@ class NativeLlamaQLoRA(nn.Module):
         # it (no gradient is lost: the embedding is frozen). But when the embedding
         # is TRAINABLE, hidden already requires grad and carries the path back to
         # embed_weight -- detaching would sever it, so only detach when needed.
-        ckpt = self.gradient_checkpointing and self.training
+        # (Under no_grad -- eval, or a frozen trunk feeding the MTP head --
+        # there is nothing to checkpoint: skip the recompute machinery.)
+        ckpt = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         if ckpt and not hidden.requires_grad:
             hidden = hidden.detach().requires_grad_(True)
 
@@ -1846,6 +2059,10 @@ class NativeLlamaQLoRA(nn.Module):
         pack_ctx = self._build_pack_context(seg_ids, attention_mask, bsz, t,
                                             first_device) if (seg_ids is not None
                                                               and mem_eff) else None
+        # The per-forward attention context, shared with the MTP head's blocks
+        # (same mask, positions, packing and backend selection as the trunk's).
+        ctx = {"mem_eff": mem_eff, "get_bias": get_bias, "pack_ctx": pack_ctx,
+               "attention_mask": attention_mask, "seg_ids": seg_ids}
 
         # Activation offload: park the (grad-checkpointed) block-boundary activations
         # saved for backward in CPU RAM, trading CPU<->GPU copies for GPU memory.
@@ -1873,43 +2090,7 @@ class NativeLlamaQLoRA(nn.Module):
                     hidden = backbone.to_device(hidden, dev)
                     position_ids = backbone.to_device(position_ids, dev)
                     cur_device = dev
-                if meta.get("kind", "attn") == "gdn":
-                    # GatedDeltaNet block: no RoPE, no attention bias, no packing
-                    # (packing is rejected above -- the recurrence would carry
-                    # state across packed document boundaries).
-                    if ckpt:
-                        hidden = torch.utils.checkpoint.checkpoint(
-                            self._gdn_forward, meta, entry, hidden,
-                            use_reentrant=False,
-                        )
-                    else:
-                        hidden = self._gdn_forward(meta, entry, hidden)
-                elif meta.get("kind", "attn") == "shortconv":
-                    # ShortConv block (LFM2): causal conv, no RoPE, no
-                    # attention bias, no packing (rejected above).
-                    if ckpt:
-                        hidden = torch.utils.checkpoint.checkpoint(
-                            self._shortconv_forward, meta, entry, hidden,
-                            use_reentrant=False,
-                        )
-                    else:
-                        hidden = self._shortconv_forward(meta, entry, hidden)
-                else:
-                    mode = self._attn_mode_for(meta, mem_eff)
-                    # eager: seg-aware additive bias. flash + sdpa both isolate
-                    # documents via pack_ctx (cu_seqlens for flash-varlen; per-
-                    # document SDPA loop for big-head), so neither builds the
-                    # [t, t] bias.
-                    attn_bias = get_bias(meta["sliding_window"], dev) if mode == "eager" else None
-                    pack = pack_ctx if (mode in ("flash", "sdpa") and pack_ctx is not None) else None
-                    if ckpt:
-                        hidden = torch.utils.checkpoint.checkpoint(
-                            self._block_forward, meta, entry, hidden, position_ids, attn_bias,
-                            mode, pack, use_reentrant=False,
-                        )
-                    else:
-                        hidden = self._block_forward(meta, entry, hidden, position_ids,
-                                                     attn_bias, mode, pack)
+                hidden = self._run_block(meta, entry, hidden, position_ids, dev, ctx, ckpt)
                 # Deepstack (Qwen3-VL / Qwen3.5-VL): the vision tower's
                 # intermediate feature map for this depth is added onto the
                 # image positions after the block -- the DeepstackEmbed module
@@ -1936,6 +2117,11 @@ class NativeLlamaQLoRA(nn.Module):
         # single [b, t, d] tensor, so the fp32 cast here is negligible).
         hidden = backbone.to_device(hidden, self.device)
         hidden = self._norm(hidden, self.final_norm_spec).float()
+        # The raw final-norm state is what the MTP head consumes (inference
+        # exports exactly this module's output as target_hidden), BEFORE the
+        # head pre-scale below.
+        ctx["trunk_state"] = hidden
+        ctx["position_ids"] = position_ids
         # Head logit pre-scale (MuseGlimmer output_multiplier), folded into the
         # head INPUT: inference computes `logits = (head(x) [+ lora]) * pre_scale`
         # before the softcap, and the native head is a bias-free `x @ W` (+ a
@@ -1945,7 +2131,59 @@ class NativeLlamaQLoRA(nn.Module):
         # sampler all take their hidden state from this return. 1.0 -> no-op.
         if self.head_pre_scale != 1.0:
             hidden = hidden * self.head_pre_scale
-        return hidden
+        return hidden, ctx
+
+    def _forward_mtp(self, input_ids: torch.Tensor, ctx: dict) -> torch.Tensor:
+        """The MTP head's differentiable forward, reproducing the inference
+        draft path (``Qwen3_5MTPInputLayer.forward`` + the generator's
+        prefill wiring in ``job.py``) over a whole sequence at once:
+
+        * position ``i`` pairs token ``i``'s embedding with the trunk's
+          final-norm state at ``i-1`` -- the state that PRODUCED token ``i`` --
+          and predicts token ``i+1``; the generator feeds exactly this
+          ``cat(carry, target_hidden[:, :-1])`` shift, with a zero carry at the
+          very first position (and here at every packed document start);
+        * each half is RMS-normed by its own pre-fc norm, the two are
+          concatenated ``[embedding | state]`` and projected by ``fc``
+          (``2d -> d``), which is the head's residual-stream input;
+        * the head's block(s) run at the trunk's position ids (the draft cache
+          continues the trunk's positions) with the same mask / packing, then
+          its own final norm. The trunk's LM head (borrowed at inference via
+          ``attach_to``) turns the result into logits, so the returned state
+          follows :meth:`forward`'s contract (fp32, head pre-scale folded in)
+          and every head-loss path applies unchanged with ``shift=True``.
+
+        The embedding is the trunk's, adapters included (``_embed``): at
+        inference the head reads the attached model's embedding module."""
+        dev = self._mtp_device
+        state = ctx["trunk_state"]                                  # [b, t, d] fp32
+        b, t, d = state.shape
+        h = backbone.to_device(state, dev).to(self.compute_dtype)
+        prev = torch.cat([h.new_zeros(b, 1, d), h[:, :-1]], dim=1)  # state i-1 at i
+        seg_ids = ctx["seg_ids"]
+        if seg_ids is not None:
+            # Packed documents: each starts from a zero carry like a fresh
+            # sequence, never from the previous document's last state.
+            seg = seg_ids.to(dev)
+            start = torch.ones(b, t, dtype=torch.bool, device=dev)
+            start[:, 1:] = seg[:, 1:] != seg[:, :-1]
+            prev = prev.masked_fill(start.unsqueeze(-1), 0)
+        y = self._norm(prev, self.mtp.norm_hidden_spec)
+        e = self._norm(self._embed(input_ids, dev), self.mtp.norm_embed_spec)
+        x = self.mtp.fc(torch.cat([e, y], dim=-1))
+        # Same checkpointing contract as the trunk: the checkpointed block
+        # needs an input that requires grad; with a frozen trunk + frozen fc
+        # nothing upstream does, so detach to a leaf (no gradient is lost).
+        ckpt = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+        if ckpt and not x.requires_grad:
+            x = x.detach().requires_grad_(True)
+        position_ids = backbone.to_device(ctx["position_ids"], dev)
+        for meta, entry in zip(self._mtp_block_meta, self.mtp.blocks):
+            x = self._run_block(meta, entry, x, position_ids, dev, ctx, ckpt)
+        x = self._norm(x, self.mtp.final_norm_spec).float()
+        if self.head_pre_scale != 1.0:
+            x = x * self.head_pre_scale
+        return x
 
     # --- heads -------------------------------------------------------------
 
@@ -1960,6 +2198,22 @@ class NativeLlamaQLoRA(nn.Module):
                mm: Optional[dict] = None) -> torch.Tensor:
         """Materialize full logits ``[b, t, vocab]`` (validation / small batches)."""
         hidden = self.forward(input_ids, attention_mask, position_ids, seg_ids, mm=mm)
+        return self._head_logits(hidden)
+
+    def mtp_logits(self, input_ids: torch.Tensor,
+                   attention_mask: Optional[torch.Tensor] = None,
+                   position_ids: Optional[torch.Tensor] = None,
+                   seg_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Materialize the MTP head's logits ``[b, t, vocab]`` through the
+        (borrowed) LM head: position ``i`` is the head's draft for token
+        ``i+1`` -- the validate gate compares this against the inference draft
+        forward. Frozen head only (the LoRA/trainable-head deltas are a
+        training-loss concern; see ``_head_loss``)."""
+        _, mtp_hidden = self.forward(input_ids, attention_mask, position_ids, seg_ids,
+                                     mtp=True)
+        return self._head_logits(mtp_hidden)
+
+    def _head_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         w = self.lm_head_weight_fn()()
         logits = backbone.to_device(hidden, w.device).to(w.dtype) @ w
         if self.final_softcap:
@@ -1990,8 +2244,34 @@ class NativeLlamaQLoRA(nn.Module):
         resets + block-diagonal attention). The shifted CE needs no packing special
         case: at a document boundary the shift predicts the next document's first
         token, which is always a masked (-100) prompt token, so it contributes no
-        loss. ``mm`` is the image splice (see :meth:`forward`)."""
-        hidden = self.forward(input_ids, attention_mask, position_ids, seg_ids, mm=mm)
+        loss. ``mm`` is the image splice (see :meth:`forward`).
+
+        With an MTP head attached the head's next-token loss (its state at
+        ``i`` vs label ``i+1`` -- the same shifted CE through the same LM head)
+        is added: ``trunk + mtp_loss_weight * mtp`` while the trunk trains,
+        the head's loss ALONE when it doesn't (``trunk_trainable()`` False --
+        the trunk's loss is then a constant, and skipping it saves a head
+        pass). The components land in ``last_losses`` for logging."""
+        if self.mtp is None:
+            hidden = self.forward(input_ids, attention_mask, position_ids, seg_ids, mm=mm)
+            return self._head_loss(hidden, labels, chunk, ignore_index)
+        hidden, mtp_hidden = self.forward(input_ids, attention_mask, position_ids,
+                                          seg_ids, mm=mm, mtp=True)
+        mtp_loss = self._head_loss(mtp_hidden, labels, chunk, ignore_index)
+        if not self.trunk_trainable():
+            self.last_losses = {"mtp": float(mtp_loss.detach())}
+            return mtp_loss
+        trunk_loss = self._head_loss(hidden, labels, chunk, ignore_index)
+        self.last_losses = {"trunk": float(trunk_loss.detach()),
+                            "mtp": float(mtp_loss.detach())}
+        return trunk_loss + self.mtp_loss_weight * mtp_loss.to(trunk_loss.device)
+
+    def _head_loss(self, hidden: torch.Tensor, labels: torch.Tensor,
+                   chunk: int = DEFAULT_CHUNK,
+                   ignore_index: int = IGNORE_INDEX) -> torch.Tensor:
+        """Shifted CE of a final-norm state ``[b, t, d]`` through the LM head
+        (frozen fused / chunked heads, or the trainable/LoRA head) -- the
+        trunk's state or the MTP head's, which share the head."""
         # Materialize logits only at supervised positions when the head trains
         # (train_head OR lora_head) -- the fused heads are frozen-head only (no
         # weight/LoRA gradient). Memory scales with the supervised token count.
@@ -2230,6 +2510,11 @@ class NativeLlamaQLoRA(nn.Module):
         self.quant_aware = mode if mode not in (None, "") else "none"
         self.quant_aware_scale = float(scale)
 
+    # Every accessor below returns only params that still TRAIN: freeze_trunk
+    # (MTP stage 2) turns requires_grad off on the trunk side while the
+    # wrappers keep their (resumed) values, and the optimizer / grad clip /
+    # trainable count must not see those. Without freeze_trunk nothing is
+    # filtered (every adapter param is created with requires_grad=True).
     def lora_parameters(self) -> list[nn.Parameter]:
         ps: list[nn.Parameter] = []
         for w in self._wrappers:
@@ -2239,7 +2524,7 @@ class NativeLlamaQLoRA(nn.Module):
         # they ride with the per-linear LoRA: optimized by the main optimizer and
         # included in the grad clip.
         ps += self.module_lora_parameters()
-        return ps
+        return [p for p in ps if p.requires_grad]
 
     def module_lora_parameters(self) -> list[nn.Parameter]:
         """LoRA adapters on the embedding / LM head (lora_embed / lora_head), if any.
@@ -2249,7 +2534,7 @@ class NativeLlamaQLoRA(nn.Module):
             ps += [self.embed_lora_a, self.embed_lora_b]
         if getattr(self, "head_lora_a", None) is not None:
             ps += [self.head_lora_a, self.head_lora_b]
-        return ps
+        return [p for p in ps if p.requires_grad]
 
     def modules_to_save_parameters(self) -> list[nn.Parameter]:
         """Trainable full embed/head params (PEFT ``modules_to_save``), if any.
@@ -2259,6 +2544,14 @@ class NativeLlamaQLoRA(nn.Module):
             ps.append(self.embed_weight)
         if self.head_weight is not None:
             ps.append(self.head_weight)
+        return [p for p in ps if p.requires_grad]
+
+    def mtp_parameters(self) -> list[nn.Parameter]:
+        """The MTP head's adapter params (empty without a head)."""
+        ps: list[nn.Parameter] = []
+        for w in getattr(self, "_mtp_wrappers", []):
+            if w.r > 0:
+                ps += [w.lora_a, w.lora_b]
         return ps
 
     def trainable_parameters(self) -> list[nn.Parameter]:
@@ -2274,7 +2567,7 @@ class NativeLlamaQLoRA(nn.Module):
         the log line and the offload-optimizer mirror read."""
         per_linear: list[nn.Parameter] = []
         for w in self._wrappers:
-            if w.r > 0:
+            if w.r > 0 and w.lora_a.requires_grad:
                 per_linear += [w.lora_a, w.lora_b]
         mod = self.module_lora_parameters()
         if not mod or module_lora_lr_mul == 1.0:
@@ -2582,6 +2875,12 @@ class NativeLlamaQLoRA(nn.Module):
             # mode the adapter was trained under (training.quant_aware).
             "quant_aware": getattr(self, "quant_aware", "none"),
             "quant_aware_scale": getattr(self, "quant_aware_scale", 1.0),
+            # MTP head adapters ride in the same adapter_model.safetensors under
+            # the head's own module keys (mtp.layers.N..., mtp.fc); a loader
+            # given the trunk skips them and one given the head skips the
+            # trunk's, so ONE dir serves both models. Provenance only.
+            **({"mtp_target_modules": list(self.mtp_target_modules)}
+               if getattr(self, "mtp", None) is not None else {}),
         }
         with open(os.path.join(directory, "adapter_config.json"), "w", encoding="utf8") as f:
             json.dump(config, f, indent=2)
@@ -2611,11 +2910,20 @@ class NativeLlamaQLoRA(nn.Module):
         # recomputed (randomized SVD is not deterministic across runs).
         sidecar_path = os.path.join(directory, "pissa_init.safetensors")
         loaded = 0
+        # MTP head wrappers may legitimately be absent from the checkpoint:
+        # the two-stage recipe resumes a finished TRUNK adapter (freeze_trunk)
+        # and fits a fresh head to it. Those start from init (B = 0) with a
+        # note; a missing TRUNK tensor is still an error.
+        mtp_ids = {id(w) for w in getattr(self, "_mtp_wrappers", [])}
+        fresh_mtp = 0
         if os.path.exists(sidecar_path):
             sc = load_file(sidecar_path)
             with torch.no_grad():
                 for w in self._wrappers:
                     if w.r <= 0:
+                        continue
+                    if id(w) in mtp_ids and f"{w.key}.lora_a" not in sc:
+                        fresh_mtp += 1
                         continue
                     try:
                         a = sc[f"{w.key}.lora_a"]
@@ -2660,6 +2968,9 @@ class NativeLlamaQLoRA(nn.Module):
                 key = f"base_model.model.{w.key}"
                 ak, bk = f"{key}.lora_A.weight", f"{key}.lora_B.weight"
                 if ak not in state or bk not in state:
+                    if id(w) in mtp_ids:
+                        fresh_mtp += 1
+                        continue
                     raise KeyError(f"checkpoint missing tensors for {w.key} ({ak})")
                 a = state[ak].t()  # [r, in] -> [in, r]
                 b = state[bk].t()  # [out, r] -> [r, out]
@@ -2715,5 +3026,9 @@ class NativeLlamaQLoRA(nn.Module):
         if loaded == 0 and restored_extra == 0:
             raise ValueError("No trainable adapters matched the checkpoint.")
 
+        if fresh_mtp:
+            print(f" -- note: {directory} carries no MTP head adapters; {fresh_mtp} "
+                  f"MTP wrappers start from init (the head is fitted fresh to "
+                  f"the resumed trunk).")
         print(f" -- resumed {loaded} adapters from {directory} (optimizer state not restored)")
         return loaded

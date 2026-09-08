@@ -48,6 +48,18 @@ PROMPTS = [
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
+    ap.add_argument("--mtp", action="store_true",
+                    help="Also load the model's MTP (multi-token prediction) head "
+                         "and generate WITH it as the self-speculative draft. Each "
+                         "--adapter is loaded onto the head too (its mtp.* tensors, "
+                         "if the adapter trained the head via --mtp-targets), so "
+                         "the arms show the drafted output and the per-arm "
+                         "acceptance rate -- the number a retrained head is meant "
+                         "to move. Outputs are identical with or without a draft; "
+                         "only speed / acceptance differ.")
+    ap.add_argument("--num-draft-tokens", type=int, default=None,
+                    help="(--mtp) draft window per verify step (default: the head's "
+                         "own default, 4 for Qwen3.5).")
     ap.add_argument("--adapter", nargs="*", default=None,
                     help="Adapter directories, each generated as a separate arm off "
                          "ONE model load (unloaded between arms). Omit entirely for a "
@@ -119,7 +131,21 @@ def main():
     else:
         model.load(device="cuda:0", progressbar=True)
     tokenizer = Tokenizer.from_config(config)
-    generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
+    # --mtp: the model's own draft head as a second component model on the
+    # trunk's output device (it borrows the trunk's embedding + LM head via
+    # attach_to, which the Generator performs). Same wiring as the realtime
+    # demo's --mtp and eval/spec_decode.py.
+    draft_model, draft_cache = None, None
+    if args.mtp:
+        if "mtp" not in config.model_classes:
+            raise SystemExit(f"--mtp: {config.architecture} defines no MTP head")
+        draft_model = Model.from_config(config, component="mtp")
+        draft_cache = Cache(draft_model, max_num_tokens=4096)
+        draft_model.load(device=str(model.output_device) if args.use_per_device
+                         else "cuda:0", progressbar=True)
+    generator = Generator(model=model, cache=cache, tokenizer=tokenizer,
+                          draft_model=draft_model, draft_cache=draft_cache,
+                          num_draft_tokens=args.num_draft_tokens)
     ctf = args.chat_template_file
     if args.prompt_format == "jinja" and ctf is None:
         cand = os.path.join(args.model, "chat_template.jinja")
@@ -153,8 +179,9 @@ def main():
         print("=" * 70)
         print(label)
         print("=" * 70)
+        dacc = drej = 0
         for p in prompts:
-            resp = generator.generate(
+            resp, last = generator.generate(
                 prompt=build_prompt(p),
                 max_new_tokens=args.max_new_tokens,
                 sampler=sampler,
@@ -162,10 +189,20 @@ def main():
                 add_bos=False,
                 completion_only=True,
                 stop_conditions=stop,
+                return_last_results=True,
             )
             print(f"\n> {p}\n{resp}")
             if dump is not None:
                 dump.append({"instruction": p, "input": "", "output": resp})
+            # Draft bookkeeping from the job's final result (the same fields
+            # eval/spec_decode.py aggregates): every drafted position is
+            # counted as accepted or rejected.
+            dacc += int(last.get("accepted_draft_tokens", 0) or 0)
+            drej += int(last.get("rejected_draft_tokens", 0) or 0)
+        if draft_model is not None:
+            fed = dacc + drej
+            print(f"[mtp] draft acceptance over this arm: {dacc}/{fed} = "
+                  f"{(dacc / fed if fed else 0.0):.1%}")
         print()
 
     # Arm 1 is always the untouched base: no adapter is ever loaded before this
@@ -182,11 +219,19 @@ def main():
         lora = LoRA.from_directory(model, adapter_dir,
                                    lora_scaling=args.lora_scaling,
                                    module_lora_scale=args.module_lora_scale)
+        # The head's adapters (mtp.* keys) live in the same dir; the loader
+        # matches keys by module suffix, so given the draft model it applies
+        # exactly those and skips the trunk's (and vice versa above).
+        lora_mtp = (LoRA.from_directory(draft_model, adapter_dir,
+                                        lora_scaling=args.lora_scaling)
+                    if draft_model is not None else None)
         dump = [] if args.gen_out else None
         run(f"ARM: {adapter_dir}", dump=dump)
         if dump is not None:
             dumps[adapter_dir] = dump
         lora.unload()
+        if lora_mtp is not None:
+            lora_mtp.unload()
 
     if args.gen_out:
         import json

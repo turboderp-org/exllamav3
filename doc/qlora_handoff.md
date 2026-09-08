@@ -1180,7 +1180,8 @@ hidden states, so a *frozen* MTP draft head's speculative-acceptance rate would
 drift — retraining MTP alongside would need (a) a Gemma4 `"mtp"` component in
 exllamav3 and (b) a differentiable MTP forward + multi-token loss in our path
 (neither exists). MTP speeds up *inference* (self-speculative decoding), not
-training.
+training. (Session 53: (b) now exists for the Qwen3.5/3.6 head --
+`--mtp-targets`; Gemma4 still lacks (a).)
 
 ---
 
@@ -4920,6 +4921,107 @@ encode masks / finalize / too_long / collate_mm, content-part resolution.
 packing of image rows, DDP (`vision` keys are single/split only in the
 launcher), training the vision tower / projector (frozen by design, as in
 Axolotl's default), `qlora_infer_native.py --image`.
+
+---
+
+### Session 53 — MTP (multi-token prediction) head training: `--mtp-targets` / `--freeze-trunk`
+
+> Asked: can an adapter target *just* the MTP tensors? Before this session:
+> no. The offline trainer loads only `Model.from_config(config)` (the text
+> trunk); `--targets` matches leaf names against the trunk's blocks; the
+> `mtp.*` tensors live in a separate component model
+> (`component="mtp"`, `Qwen3_5MTPModel`) that was never built, so no target
+> name could reach them. Now: yes, on the Qwen3.5/3.6 layout.
+
+**What the head is (Qwen3.5/3.6, `architecture/qwen3_5_mtp.py`).** One
+component model: `Qwen3_5MTPInputLayer` (two RMSNorms `pre_fc_norm_hidden` /
+`pre_fc_norm_embedding` + `fc: [2d -> d]` over `cat([embedding | trunk
+state])`), `mtp_num_hidden_layers` ordinary `TransformerBlock`s (gated
+full attention + dense or MoE MLP, `mtp_bits` quant), `mtp.norm`. No
+embedding / head of its own: `attach_to(trunk)` borrows the trunk's, and
+sets `export_state_norm_keys = {trunk final norm}` so the trunk forward
+exports its post-final-norm state as `target_hidden`. The generator's
+prefill wiring (`job.py`) is the ground truth for the shift: `shifted_hidden
+= cat(carry, target_hidden[:, :-1])`, carry = zeros at the start of a
+sequence -- position `i` of the head sees token `i`'s embedding + the state
+that PRODUCED token `i` (`i-1`) and drafts token `i+1`, at the trunk's own
+position ids (the draft cache continues the trunk's positions).
+
+**What was built.**
+- `backbone.mtp_layout(mtp_model)` / `mtp_input_parts`: index + validate the
+  head (rejects anything but the Qwen3.5 input layer -- the DeepSeek/GLM
+  pre-norm-residual heads and Qwen3.8's hyper-connection head are different
+  computations).
+- `NativeLlamaQLoRA(..., mtp_model=, mtp_targets=, mtp_loss_weight=,
+  freeze_trunk=)`. The head's blocks are built by the SAME entry loop as the
+  trunk's (the loop now iterates a trunk-then-MTP plan with a per-model
+  `wrap`), so every block feature (interleaved gate, q/k-norm, MoE + shared
+  expert, expert_* targets, `--expert-r`) applies to the head unchanged.
+  `mtp.fc` wraps as a DiffLinear under the leaf name `fc`. Targets are
+  disjoint: `--targets` never reaches the head, `--mtp-targets` never the
+  trunk; `mtp_targets=None` = default list + `fc`; `[]` = load the head,
+  adapt nothing (the validate gate).
+- `forward(..., mtp=True)` -> `(hidden, mtp_hidden)`. The trunk body moved
+  into `_forward_trunk`, which also returns a per-forward `ctx` (positions,
+  mask, packing descriptor, bias builder, the UNSCALED final-norm state).
+  `_forward_mtp` does the shift (zero carry at 0 and at packed document
+  starts via `seg_ids`), the two pre-fc norms, `fc`, the block(s) through the
+  shared `_run_block` dispatch (gdn / shortconv / attn -- also factored out
+  of the trunk loop), the final norm, head pre-scale. `_embed` is factored
+  out too: the head reads the trunk's embedding INCLUDING its adapters, as
+  inference does. **When nothing outside the head trains
+  (`trunk_trainable()` False) the trunk runs under `no_grad`** -- no
+  checkpointing, no saved activations; `ckpt` now also requires
+  `is_grad_enabled()` (a no-op change for eval).
+- `compute_loss` = `_head_loss(trunk) + mtp_loss_weight * _head_loss(mtp)`
+  when the trunk trains, else the head's loss alone (the trunk's is a
+  constant; the head pass is skipped). Components in `net.last_losses`; the
+  trainer prints `loss X (trunk a mtp b)` and logs `train/loss_trunk|mtp`.
+  `_head_loss` is the old compute_loss body (fused / chunked / trainable
+  head), so the head's loss also sees a `--lora-head` delta exactly as
+  inference would (the head borrows the LM head).
+- `freeze_trunk`: requires_grad off on every trunk-side trainable; the
+  accessors (`lora_parameters` / `param_groups` / `num_trainable`) filter on
+  `requires_grad`, so optimizer + grad clip + count see only the head. Values
+  are kept: a `--resume`d trunk adapter still applies and `save_adapter`
+  re-exports it -- ONE adapter dir carries trunk + head. `load_adapter`
+  tolerates a checkpoint without `mtp.*` tensors (head starts fresh, note
+  printed); the trainer falls back to a cold optimizer when the resumed
+  optimizer state doesn't match the grown param set, and `--freeze-trunk`
+  always starts cold.
+- Trainer flags: `--mtp-targets [LEAF ...]`, `--mtp-loss-weight`,
+  `--freeze-trunk`, `--mtp-device`; CSV columns `mtp_targets`,
+  `freeze_trunk`. `qlora_infer_native.py --mtp [--num-draft-tokens N]`:
+  loads the head as the draft, applies each `--adapter` to BOTH models
+  (`LoRA.from_directory` matches by module-key suffix and skips the rest),
+  prints per-arm draft acceptance from the job result's
+  `accepted/rejected_draft_tokens`. `qlora_validate_native.py --check-mtp`:
+  native `net.mtp_logits(ids)` vs the inference path (trunk forward with
+  `draft.draft_verifier_params` -> `export_states[-1]`, the generator's
+  shift, `draft.forward(ids, {"target_hidden": shifted})`, the trunk's
+  `lm_head` Linear), same top-1 / agreement / cosine gate as the trunk.
+- `tests/test_native_llama.py::test_mtp_head_matches_reference_and_trains_head_only`:
+  the head forward vs an independent plain-torch reference (unpacked, and
+  packed-doc-start zeroing), gradients reach fc + every block adapter while
+  the trunk state / base weights get none, and the freeze_trunk accessor
+  semantics. CPU, passes (max|d| 9e-7).
+
+**Not box-validated** (no GPU / model in the session). First things to run on
+the box, in order: `qlora_validate_native.py --model <qwen3.5 quant>
+--check-mtp` (the head forward is the only new piece the trunk gate doesn't
+cover; if `draft.forward` without a cache trips on the flash_attn_nc path,
+that is a validate-script problem, not a trainer one -- the trainer never
+runs the inference head), then a short `--targets --mtp-targets` run
+watching `loss` fall, then `qlora_infer_native.py --mtp --adapter out/...`
+and compare the base arm's acceptance rate against the adapter arm's.
+**Scope not done:** DDP / preference / EBFT trainers and the realtime
+coordinator don't take an MTP head; no image batches with MTP; Gemma4 still
+has no `mtp` component in exllamav3 (Session 7 note stands); a
+`load_adapter` of a joint checkpoint into a trunk-only run silently ignores
+the `mtp.*` tensors (by design). Pre-existing and unrelated:
+`tests/test_realtime.py` crashes on master since the v1.4.7 sync
+(`aux_offload.unpark` reads `config.infer_params` that the test's mock
+config lacks).
 
 ---
 

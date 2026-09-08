@@ -689,6 +689,67 @@ def check_head_slice(net):
     return ok
 
 
+def check_mtp(model, tokenizer, config, prompts, device, cdt, attn_impl="auto"):
+    """MTP head parity: the native head forward (``NativeLlamaQLoRA._forward_mtp``
+    -- the shifted trunk state + token embedding through the pre-fc norms, fc,
+    the head's block(s) and final norm, then the borrowed LM head) against the
+    inference draft path (the trunk's exported post-final-norm state, shifted
+    exactly as the generator's prefill wiring does, through the MTP component
+    model's own forward). Position ``i`` of both is the head's draft for token
+    ``i+1``; the same top-1 / argmax-agreement / cosine gate as the trunk check.
+
+    Run this before spending a run on --mtp-targets: the head's forward is the
+    one piece of the MTP path the trunk gate does not cover."""
+    from exllamav3.model.model import Model as _Model
+    print("\n" + "=" * 78)
+    print("MTP head parity (native draft forward vs inference draft path)")
+    print("=" * 78)
+    draft = _Model.from_config(config, component="mtp")
+    draft.load(device=str(model.output_device) if getattr(model, "output_device", None)
+               is not None else device, progressbar=True)
+    draft.attach_to(model)      # borrows embed / lm_head, sets the export key
+    # Adapter-free head: pure frozen forward for parity (mtp_targets=[] wraps
+    # every head linear at r=0, like target_modules=[] for the trunk).
+    net = NativeLlamaQLoRA(model, target_modules=[], compute_dtype=cdt,
+                           gradient_checkpointing=False, attn_impl=attn_impl,
+                           mtp_model=draft, mtp_targets=[])
+    net.eval()
+    lm = model.modules[-1]
+    ok_all = True
+    for prompt in prompts:
+        ids = tokenizer.encode(prompt, add_bos=True).to(device)
+        with torch.inference_mode():
+            # Trunk forward with the final norm's output exported -- the very
+            # tensor the generator hands the head as target_hidden.
+            params = dict(draft.draft_verifier_params)
+            model.forward(ids, params)
+            state = params["export_states"][-1]                    # [1, t, d] half
+            # The generator's prefill shift: position i sees the state that
+            # produced token i (i-1), zero carry at the first position.
+            shifted = torch.cat((torch.zeros_like(state[:, :1, :]), state[:, :-1, :]), dim=1)
+            mtp_state = draft.forward(ids, {"target_hidden": shifted})   # [1, t, d]
+            logits_native = lm.forward(lm.prepare_for_device(mtp_state, {}), {}).float()
+        with torch.no_grad():
+            logits_diff = net.mtp_logits(ids).float()
+        logits_diff = logits_diff.to(logits_native.device)
+        V = min(logits_native.shape[-1], logits_diff.shape[-1])    # padded vocab
+        ln, ld = logits_native[0, :, :V], logits_diff[0, :, :V]
+        top1_native, top1_diff = int(ln[-1].argmax()), int(ld[-1].argmax())
+        match = top1_native == top1_diff
+        max_abs = (ln[-1] - ld[-1]).abs().max().item()
+        cos = torch.cosine_similarity(ln[-1], ld[-1], dim=0).item()
+        agree = (ln.argmax(-1) == ld.argmax(-1)).float().mean().item()
+        is_lowp = cdt in (torch.float16, torch.bfloat16)
+        ok = match or (is_lowp and agree >= 0.8 and cos >= 0.999)
+        ok_all &= ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {prompt!r}: draft top-1 native="
+              f"{tokenizer.decode(torch.tensor([top1_native]))!r} diff="
+              f"{tokenizer.decode(torch.tensor([top1_diff]))!r} | argmax agree "
+              f"{agree:.3f} | cos {cos:.5f} | max|dlogit| {max_abs:.3f}")
+    print(f"[mtp] head parity {'PASSED' if ok_all else 'FAILED'}")
+    return ok_all
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -737,6 +798,10 @@ def main():
                     help="text that follows the image in the --image gate prompt")
     ap.add_argument("--check-backward", action="store_true",
                     help="also smoke-test cross-device gradient flow (tiny adapter + backward)")
+    ap.add_argument("--check-mtp", action="store_true",
+                    help="Also load the model's MTP head (Qwen3.5/3.6) and gate "
+                         "the native draft forward against the inference draft "
+                         "path. Run before any --mtp-targets training run.")
     ap.add_argument("--check-packing", action="store_true",
                     help="also verify sample packing: a packed block's per-document "
                          "logits must match running each document alone (block-"
@@ -871,6 +936,15 @@ def main():
                                   ref_model_dir=args.init_ref_model,
                                   svd_niter=args.init_svd_niter,
                                   attn_impl=args.attn_impl)
+
+    if args.check_mtp:
+        if "mtp" not in config.model_classes:
+            print(f"\n -- --check-mtp: {config.architecture} defines no MTP head "
+                  f"(or the checkpoint carries none); FAIL")
+            all_ok = False
+        else:
+            all_ok &= check_mtp(model, tokenizer, config, prompts, args.device, cdt,
+                                attn_impl=args.attn_impl)
 
     if args.check_packing:
         if getattr(net, "has_gdn", False) or getattr(net, "has_shortconv", False):

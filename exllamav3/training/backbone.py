@@ -166,6 +166,56 @@ def embed_norm(model):
     return pre[0] if pre else None
 
 
+# --- MTP (multi-token prediction) head ---------------------------------------
+
+def mtp_layout(mtp_model):
+    """
+    Index a loaded MTP component model (``Model.from_config(config,
+    component="mtp")``) and validate its layout, returning
+    ``(input_layer, blocks, final_norm)``. The layout the native MTP forward
+    reproduces is the Qwen3.5/3.6 one::
+
+        MTPInputLayer  TransformerBlock ... TransformerBlock  RMSNorm
+
+    where the input layer holds two pre-fc RMSNorms (one on the trunk's
+    post-final-norm hidden state, one on the token embedding) and a
+    ``[2*hidden -> hidden]`` fc projection over their concatenation
+    ``[embedding | hidden]``; the embedding and LM head are BORROWED from the
+    trunk at inference (``attach_to``), so the MTP model carries neither.
+
+    Everything else is rejected here rather than silently dropped -- the
+    DeepSeek/GLM-style heads consume a pre-norm residual, and the Qwen3.8
+    (``Qwen4ExpMTPInputLayer``) head splits the projection and runs hyper
+    connections; neither is what this forward computes.
+    """
+    from ..modules import TransformerBlock, RMSNorm
+    mods = list(mtp_model.modules)
+    assert len(mods) >= 3, \
+        f"MTP model has {len(mods)} modules; expected input layer + block(s) + final norm"
+    inp = mods[0]
+    name = getattr(inp, "module_name", type(inp).__name__)
+    assert name == "Qwen3_5MTPInputLayer" and all(
+        hasattr(inp, a) for a in ("pre_fc_norm_hidden", "pre_fc_norm_embedding", "fc")), \
+        f"unsupported MTP input layer {name}: only the Qwen3.5/3.6 layout " \
+        f"(pre_fc_norm_hidden + pre_fc_norm_embedding + fc over [embedding | " \
+        f"trunk final-norm state]) is reproduced by the native MTP forward"
+    assert isinstance(mods[-1], RMSNorm), \
+        f"expected final RMSNorm as last MTP module, got {type(mods[-1]).__name__}"
+    blocks = mods[1:-1]
+    bad = [type(m).__name__ for m in blocks if not isinstance(m, TransformerBlock)]
+    assert not bad, \
+        f"non-TransformerBlock module(s) inside the MTP head: {bad}; unsupported layout"
+    return inp, blocks, mods[-1]
+
+
+def mtp_input_parts(input_layer):
+    """``(pre_fc_norm_hidden, pre_fc_norm_embedding, fc)`` of a Qwen3.5-style
+    MTP input layer (see ``mtp_layout``). ``fc`` is a native ``Linear``
+    (``[2*hidden, hidden]``), so it takes a LoRA like any block projection."""
+    return (input_layer.pre_fc_norm_hidden, input_layer.pre_fc_norm_embedding,
+            input_layer.fc)
+
+
 # --- per-block structure ---------------------------------------------------
 
 def is_gated_delta_net(attn) -> bool:
