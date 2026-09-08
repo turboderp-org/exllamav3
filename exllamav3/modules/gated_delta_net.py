@@ -683,7 +683,7 @@ class GatedDeltaNet(Module):
                 self.norm.bc,
                 self.beta_scale
             )
-            self.bc_split = True
+            self.bc_split = self.bc is not None
 
         is_quantized_kda = (
             device != torch.device("cpu") and self.kda and
