@@ -78,8 +78,9 @@ def quantize_tiles(tiles, quant_args: dict):
     assert tiles.dtype == torch.float
 
     K = quant_args["K"]
-    mcg = "mcg" in quant_args
-    mul1 = "mul1" in quant_args
+    # Read as booleans, not key presence (an explicit False must not select the codebook)
+    mcg = bool(quant_args.get("mcg", False))
+    mul1 = bool(quant_args.get("mul1", False))
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
     # NB: same call signature as other sites for tile_len 256, so the lru_cache key stays shared
@@ -268,8 +269,8 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
 
                 # Work buffers
                 K = quant_args["K"]
-                mcg = "mcg" in quant_args
-                mul1 = "mul1" in quant_args
+                mcg = bool(quant_args.get("mcg", False))
+                mul1 = bool(quant_args.get("mul1", False))
                 temp_costs, temp_edges = get_temp_buffers(device, K)
 
                 ext.quantize_tiles(

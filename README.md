@@ -208,6 +208,28 @@ Relevant env variables for building:
 - `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for compilation. Set this to a reasonable value like 4 in that case.  
 - `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch will build/load it at runtime instead.
 
+For the test suite, `EXL_TEST_DEVICE` overrides the test device (e.g. `cuda:1`).
+
+
+### Experimental ROCm (AMD GPUs) support
+
+ROCm support is experimental and performance is significantly reduced compared to CUDA. The `rocm` extra installs the full stack — PyTorch, the ROCm SDK and the device kernels — as wheels from AMD's TheRock index into the venv; no system ROCm install is required, and the build discovers the SDK automatically (no environment variables). Like the CUDA flavors, `uv sync` builds in an isolated environment without visibility of `torch`, so the extension compiles at first import:
+
+```sh
+uv venv
+uv sync --extra rocm
+```
+
+For a precompiled extension, install the dependencies first and then build against them:
+
+```sh
+uv sync --extra rocm --no-install-project
+uv sync --extra rocm --no-build-isolation
+```
+
+The default device target is gfx1100 (RX 7900 XTX); for another GPU, replace `gfx1100` with your architecture (e.g. `gfx950`, `gfx1200`) in the packages that carry a device suffix in the `rocm` extra and the matching `[tool.uv.sources]` entries.
+
+All kernels except the warp-matrix EXL3 GEMV engines build natively and inference runs through them; the EXL3 conversion flow is untested. Tested on gfx1100 (RX 7900 XTX).
 ## Conversion
 
 To convert a model to EXL3 format, use:

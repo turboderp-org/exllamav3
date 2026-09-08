@@ -138,7 +138,7 @@ void rope_kernel
             if (t < head_dim / 2)
                 ((half2*) sh_head)[t] = ((half2*)g_head_in_ptr)[t];
             else
-                ((half2*) sh_head)[t] = {};
+                ((half2*) sh_head)[t] = half2{};
             __syncthreads();
         };
         auto store_head = [&] ()
@@ -188,7 +188,7 @@ void rope_kernel
         auto apply_norm = [&] ()
         {
             half2 *tptr = (half2*)(sh_head + t * 2);
-            // int lane_id = threadIdx.x % 32;
+            int lane_id = threadIdx.x % 32;
             int warp_id = threadIdx.x / 32;
             int warps = blockDim.x / 32;
 
@@ -197,7 +197,8 @@ void rope_kernel
             float v1 = __low2float(v);
             float v2 = __high2float(v);
             float sum = v1 * v1 + v2 * v2;
-            sums[warps * t_head + warp_id] = warp_reduce_sum_f(sum);
+            sum = warp_reduce_sum_f(sum);
+            if (lane_id == 0) sums[warps * t_head + warp_id] = sum;
             __syncthreads();
 
             sum = sums[warps * t_head];

@@ -7,6 +7,10 @@ namespace py = pybind11;
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda.h>
+#if defined(USE_ROCM)
+// driver-type aliases hipify doesn't map (cuda_drv_compat.cuh)
+#include "cuda_drv_compat.cuh"
+#endif
 
 using PPTR = std::tuple<int, void*>;
 

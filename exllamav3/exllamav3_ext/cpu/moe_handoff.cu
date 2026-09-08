@@ -53,22 +53,37 @@ __global__ void moe_flag_wait_kernel(uint32_t* flag, uint32_t value, uint32_t* a
     }
 }
 
-// Stream memory operations: same semantics as the flag kernels (CU_STREAM_WAIT_VALUE_GEQ is
-// documented as the cyclic comparison (int32_t)(*addr - value) >= 0, identical to the kernel's
-// predicate), but executed by the GPU front-end: no SM occupancy (nothing to co-schedule against
-// exl3_moe's all-blocks-resident launch) and no kernel-launch cost per wait. The kernel path
-// remains as a fallback (EXL3_MOE_MEMOPS=0 forces it); note the memop wait has no timeout, so
-// dead-worker detection moves to the host-side watchdog, which unblocks pending waits by
-// writing satisfying values into the flags.
 namespace {
 
-typedef CUresult (CUDAAPI* fn_stream_wait32)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
-typedef CUresult (CUDAAPI* fn_stream_write32)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
-
+// Stream memory operations: same semantics as the flag kernels (wait >= is the cyclic
+// comparison (int32_t)(*addr - value) >= 0), but executed by the GPU front-end: no SM
+// occupancy and no kernel-launch cost per wait. The kernel path remains as a fallback
+// (EXL3_MOE_MEMOPS=0); the memop wait has no timeout, so dead-worker detection moves to
+// the host-side watchdog. On HIP the runtime API links directly; CUDA resolves the
+// driver entry points with dlsym.
 struct MemOps
 {
-    fn_stream_wait32 wait = nullptr;
-    fn_stream_write32 write = nullptr;
+#if defined(USE_ROCM)
+    static constexpr unsigned WAIT_GEQ = hipStreamWaitValueGte;
+    static constexpr int OK = hipSuccess;
+    bool resolved = true;
+    int write(cudaStream_t stream, uintptr_t addr, uint32_t value, unsigned)
+    {
+        return (int) hipStreamWriteValue32((hipStream_t) stream, (void*) addr, value, hipStreamWriteValueDefault);
+    }
+    int wait(cudaStream_t stream, uintptr_t addr, uint32_t value, unsigned flags)
+    {
+        return (int) hipStreamWaitValue32((hipStream_t) stream, (int*) addr, value, flags);
+    }
+#else
+    typedef CUresult (CUDAAPI* fn_stream_wait32)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
+    typedef CUresult (CUDAAPI* fn_stream_write32)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
+
+    static constexpr unsigned WAIT_GEQ = CU_STREAM_WAIT_VALUE_GEQ;
+    static constexpr int OK = CUDA_SUCCESS;
+
+    fn_stream_wait32 wait_fn = nullptr;
+    fn_stream_write32 write_fn = nullptr;
     bool resolved = false;
     MemOps()
     {
@@ -78,20 +93,29 @@ struct MemOps
         void* h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
         if (!h) h = dlopen("libcuda.so", RTLD_LAZY | RTLD_NOLOAD);
         if (!h) return;
-        wait = (fn_stream_wait32) dlsym(h, "cuStreamWaitValue32_v2");
-        if (!wait) wait = (fn_stream_wait32) dlsym(h, "cuStreamWaitValue32");
-        write = (fn_stream_write32) dlsym(h, "cuStreamWriteValue32_v2");
-        if (!write) write = (fn_stream_write32) dlsym(h, "cuStreamWriteValue32");
+        wait_fn = (fn_stream_wait32) dlsym(h, "cuStreamWaitValue32_v2");
+        if (!wait_fn) wait_fn = (fn_stream_wait32) dlsym(h, "cuStreamWaitValue32");
+        write_fn = (fn_stream_write32) dlsym(h, "cuStreamWriteValue32_v2");
+        if (!write_fn) write_fn = (fn_stream_write32) dlsym(h, "cuStreamWriteValue32");
 #else
         HMODULE h = GetModuleHandleA("nvcuda.dll");
         if (!h) return;
-        wait = (fn_stream_wait32) GetProcAddress(h, "cuStreamWaitValue32_v2");
-        if (!wait) wait = (fn_stream_wait32) GetProcAddress(h, "cuStreamWaitValue32");
-        write = (fn_stream_write32) GetProcAddress(h, "cuStreamWriteValue32_v2");
-        if (!write) write = (fn_stream_write32) GetProcAddress(h, "cuStreamWriteValue32");
+        wait_fn = (fn_stream_wait32) GetProcAddress(h, "cuStreamWaitValue32_v2");
+        if (!wait_fn) wait_fn = (fn_stream_wait32) GetProcAddress(h, "cuStreamWaitValue32");
+        write_fn = (fn_stream_write32) GetProcAddress(h, "cuStreamWriteValue32_v2");
+        if (!write_fn) write_fn = (fn_stream_write32) GetProcAddress(h, "cuStreamWriteValue32");
 #endif
-        resolved = wait && write;
+        resolved = wait_fn && write_fn;
     }
+    CUresult write(cudaStream_t stream, uintptr_t addr, uint32_t value, unsigned flags)
+    {
+        return write_fn((CUstream) stream, (CUdeviceptr) addr, (cuuint32_t) value, flags);
+    }
+    CUresult wait(cudaStream_t stream, uintptr_t addr, uint32_t value, unsigned flags)
+    {
+        return wait_fn((CUstream) stream, (CUdeviceptr) addr, (cuuint32_t) value, flags);
+    }
+#endif
 };
 
 MemOps& memops() { static MemOps m; return m; }
@@ -112,8 +136,8 @@ void exl3_moe_flag_write(uintptr_t flag, int64_t value)
     if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
         && g_memops_ok.load(std::memory_order_relaxed))
     {
-        CUresult r = m.write((CUstream) stream, (CUdeviceptr) flag, (cuuint32_t) value, 0);
-        if (r == CUDA_SUCCESS) return;
+        auto r = m.write(stream, flag, (uint32_t) value, 0);
+        if (r == MemOps::OK) return;
         g_memops_ok.store(false, std::memory_order_relaxed);
     }
     moe_flag_write_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<uint32_t*>(flag), static_cast<uint32_t>(value));
@@ -126,13 +150,8 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
     if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
         && g_memops_ok.load(std::memory_order_relaxed))
     {
-        CUresult r = m.wait(
-            (CUstream) stream,
-            (CUdeviceptr) flag,
-            (cuuint32_t) value,
-            CU_STREAM_WAIT_VALUE_GEQ
-        );
-        if (r == CUDA_SUCCESS) return;
+        auto r = m.wait(stream, flag, (uint32_t) value, MemOps::WAIT_GEQ);
+        if (r == MemOps::OK) return;
         g_memops_ok.store(false, std::memory_order_relaxed);
     }
     moe_flag_wait_kernel<<<1, 1, 0, stream>>>

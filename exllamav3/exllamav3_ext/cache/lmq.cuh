@@ -6,7 +6,7 @@
 #ifdef __CUDA_ARCH__
 #define LM_CLAMP_IDX(idx, lo, hi) max((lo), min((hi), (idx)))
 #else
-static inline int lm_clamp_(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); }
+static __host__ __device__ inline int lm_clamp_(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); }
 #define LM_CLAMP_IDX(idx, lo, hi) lm_clamp_((idx), (lo), (hi))
 #endif
 #endif

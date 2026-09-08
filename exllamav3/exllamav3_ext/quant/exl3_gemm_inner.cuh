@@ -30,7 +30,8 @@ void exl3_gemm_kernel_inner
     const int size_k,
     const int size_n,
     int* __restrict__ locks,
-    const half* post_scale
+    const half* post_scale,
+    float* __restrict__ sh   // column-tile staging, unused on CUDA (signature parity)
 )
 {
     const int TILEBLOCKS_M = TILESIZE_M / 16;

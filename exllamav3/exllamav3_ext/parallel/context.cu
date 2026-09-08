@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <cstdio>
 #include "context.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -34,6 +35,7 @@ void pg_init_context(uintptr_t ctx)
     ctx_ptr->reduce_jobs_head = 0;
     ctx_ptr->reduce_jobs_tail = 0;
     ctx_ptr->cpusum_stage_cpu = 0;
+    ctx_ptr->sync_timeout_name[0] = 0;
 }
 
 void pg_check_timeout(uintptr_t ctx)
@@ -41,6 +43,9 @@ void pg_check_timeout(uintptr_t ctx)
     PGContext* ctx_ptr = (PGContext*) ctx;
     if (ctx_ptr->sync_timeout)
     {
+        // name stashed by the device (see timeout.cuh)
+        fprintf(stderr, " ## Synchronization timeout in kernel: %s\n\n",
+                ctx_ptr->sync_timeout_name);
         TORCH_CHECK(false, "Synchronization timeout");
     }
 }

@@ -223,7 +223,7 @@ def check_topk(device, R, T, k, mode, seed):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--device", default = "cuda:0")
+    p.add_argument("--device", default = os.environ.get("EXL_TEST_DEVICE", "cuda:0"))
     args = p.parse_args()
     device = torch.device(args.device)
     torch.cuda.set_device(device)

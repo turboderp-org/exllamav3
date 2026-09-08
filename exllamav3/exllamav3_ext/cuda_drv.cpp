@@ -11,6 +11,31 @@
 #define DRV_STR2(x) #x
 #define DRV_STR(x) DRV_STR2(x)
 
+#if defined(USE_ROCM)
+
+// HIP has no separate driver library: the module/graph entry points are exported by
+// the HIP runtime the extension already links against.
+
+const CudaDrv& CudaDrv::instance()
+{
+    static CudaDrv d = []
+    {
+        CudaDrv d{};
+        d.module_load_data                  = cuModuleLoadData;
+        d.module_unload                     = cuModuleUnload;
+        d.module_get_function               = cuModuleGetFunction;
+        d.func_set_attribute                = cuFuncSetAttribute;
+        d.launch_kernel                     = cuLaunchKernel;
+        d.graph_kernel_node_get_params      = cuGraphKernelNodeGetParams;
+        d.graph_exec_kernel_node_set_params = cuGraphExecKernelNodeSetParams;
+        return d;
+    }
+    ();
+    return d;
+}
+
+#else
+
 static void* drv_sym(void* lib, const char* name)
 {
     #ifdef _WIN32
@@ -47,3 +72,5 @@ const CudaDrv& CudaDrv::instance()
     ();
     return d;
 }
+
+#endif

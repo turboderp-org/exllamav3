@@ -788,6 +788,24 @@ _sm_count = {}
 # mla_attn_triton_prefill_mha
 _mha_block_m = {}
 
+# launch configs resolved once per (device, kernel, tile), adapting the pipeline depth
+# (and at the floor the tile width) to parts with less shared memory than the defaults
+# assume; OutOfResources is raised before anything is enqueued
+_gemm_cfg = {}
+
+
+def _launch_adaptive(attempts, launch):
+    """launch(block_m, width, num_stages) is tried for each config until one fits in shared
+    memory. Returns the config that ran, for caching by the caller."""
+    for cfg in attempts:
+        try:
+            launch(*cfg)
+            return cfg
+        except triton.runtime.errors.OutOfResources:
+            pass
+    raise triton.runtime.errors.OutOfResources(
+        "no launch config fits in shared memory", None, "smem")
+
 
 def _get_sm_count(device: torch.device) -> int:
     idx = device.index if hasattr(device, "index") else device
@@ -1035,13 +1053,22 @@ def mla_absorb(q: torch.Tensor, w_uk_flat: torch.Tensor, n_q_heads: int, qk_nope
     D_c = w_uk_flat.shape[0]
     out = torch.empty((H, R, D_c), dtype = torch.half, device = q.device)
     block_m = min(64, triton.next_power_of_2(max(R, 16)))
+    cfg_key = ("absorb", q.device.index, block_m, H, qk_dim, D_c)
+    attempts = _gemm_cfg.get(cfg_key)
+    if attempts is None:
+        attempts = [(block_m, 128, 2), (block_m, 128, 1)]
+        if D_c % 64 == 0:
+            attempts.append((block_m, 64, 1))
     with torch.cuda.device(q.device):
-        _mla_absorb_kernel[(triton.cdiv(R, block_m), D_c // 128, H)](
-            q, w_uk_flat, out, R,
-            H, qk_dim, H * qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim), D_c,
-            block_m, 128,
-            num_warps = 4, num_stages = 2,
-        )
+        cfg = _launch_adaptive(
+            attempts,
+            lambda bm, bn, ns: _mla_absorb_kernel[(triton.cdiv(R, bm), D_c // bn, H)](
+                q, w_uk_flat, out, R,
+                H, qk_dim, H * qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim), D_c,
+                bm, bn,
+                num_warps = 4, num_stages = ns,
+            ))
+    _gemm_cfg[cfg_key] = [cfg]
     _dbg_sync("mla_absorb", q.device)
     return out
 
@@ -1051,13 +1078,22 @@ def mla_unfold(o_lat: torch.Tensor, w_uv_flat: torch.Tensor, v_head_dim: int):
     H, R, D_c = o_lat.shape
     out = torch.empty((R, H, v_head_dim), dtype = torch.half, device = o_lat.device)
     block_m = min(64, triton.next_power_of_2(max(R, 16)))
+    cfg_key = ("unfold", o_lat.device.index, block_m, H, D_c, v_head_dim)
+    attempts = _gemm_cfg.get(cfg_key)
+    if attempts is None:
+        attempts = [(block_m, 128, 2), (block_m, 128, 1)]
+        if D_c % 64 == 0:
+            attempts.append((block_m, 64, 1))
     with torch.cuda.device(o_lat.device):
-        _mla_unfold_kernel[(triton.cdiv(R, block_m), H)](
-            o_lat, w_uv_flat, out, R,
-            H, D_c, v_head_dim,
-            block_m, 128,
-            num_warps = 4, num_stages = 2,
-        )
+        cfg = _launch_adaptive(
+            attempts,
+            lambda bm, bk, ns: _mla_unfold_kernel[(triton.cdiv(R, bm), H)](
+                o_lat, w_uv_flat, out, R,
+                H, D_c, v_head_dim,
+                bm, bk,
+                num_warps = 4, num_stages = ns,
+            ))
+    _gemm_cfg[cfg_key] = [cfg]
     _dbg_sync("mla_unfold", o_lat.device)
     return out
 
@@ -1095,10 +1131,13 @@ def mla_attn_triton_prefill_mha(
     page_size = kpe_cache.shape[1]
     dev = q.device
 
-    # 99KB-smem devices (SM120 / consumer Ampere+) cannot hold the default 128-row q tile at
-    # these head dims; probe once per (device, dims) and remember the largest tile that fits
-    fb_key = (dev.index, qk_dim, v_head_dim, block_m)
-    block_m = _mha_block_m.get(fb_key, block_m)
+    # devices with less shared memory than the default tile needs probe once per
+    # (device, dims); the ladder halves the q tile, then the kv tile, then the
+    # pipeline depth
+    fb_key = (dev.index, qk_dim, v_head_dim)
+    cached_cfg = _mha_block_m.get(fb_key)
+    if cached_cfg is not None:
+        block_m, block_n, num_stages = cached_cfg
 
     if qc is not None:
         from .triton_paged import _get_h32
@@ -1149,24 +1188,31 @@ def mla_attn_triton_prefill_mha(
                 # Up-projection as two plain contiguous GEMMs (never the strided-batched form)
                 torch.mm(ckv_t[:tl_len], w_uk_flat, out = k_nope_t[:tl_len])
                 torch.mm(ckv_t[:tl_len], w_uv_flat, out = v_t[:tl_len])
-                while True:
-                    try:
-                        _mla_prefill_mha_kernel[(triton.cdiv(q_len, block_m), H)](
-                            q, k_nope_t, v_t, kpe_t,
-                            state_m, state_l, state_acc, out,
-                            b * q_len, q_len, a, tl_len, past0,
-                            int(ti == 0), int(ti == len(tiles) - 1), int(e - 1 > past0),
-                            H, qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim),
-                            D_r, v_head_dim, float(softmax_scale),
-                            block_m, block_n,
-                            num_warps = num_warps, num_stages = num_stages,
-                        )
-                        _mha_block_m[fb_key] = block_m
-                        break
-                    except triton.runtime.errors.OutOfResources:
-                        # Launch failed before running anything; a smaller q tile is safe
-                        assert block_m > 32, "MHA prefill kernel does not fit in shared memory"
-                        block_m //= 2
+                attempts = [(block_m, block_n, num_stages)]
+                if cached_cfg is None:
+                    m = block_m
+                    while m > 16:
+                        m //= 2
+                        attempts.append((m, block_n, num_stages))
+                    if block_n > 32:
+                        attempts += [(16, block_n // 2, num_stages), (16, block_n // 2, 1)]
+                    else:
+                        attempts.append((16, block_n, 1))
+                block_m, block_n, num_stages = _launch_adaptive(
+                    attempts,
+                    lambda bm, bn, ns: _mla_prefill_mha_kernel[(triton.cdiv(q_len, bm), H)](
+                        q, k_nope_t, v_t, kpe_t,
+                        state_m, state_l, state_acc, out,
+                        b * q_len, q_len, a, tl_len, past0,
+                        int(ti == 0), int(ti == len(tiles) - 1), int(e - 1 > past0),
+                        H, qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim),
+                        D_r, v_head_dim, float(softmax_scale),
+                        bm, bn,
+                        num_warps = num_warps, num_stages = ns,
+                    ))
+                if cached_cfg is None:
+                    _mha_block_m[fb_key] = (block_m, block_n, num_stages)
+                    cached_cfg = True
     _dbg_sync("mla_prefill_mha", dev)
     return out
 
@@ -1216,13 +1262,25 @@ def mla_attn_triton_prefill(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(D_c + D_r)
 
+    cfg_key = ("absorbed", q_lat.device.index, D_c, D_r, n_q_heads, block_m, block_n, num_stages)
+    attempts = _gemm_cfg.get(cfg_key)
+    if attempts is None:
+        attempts = [(block_m, block_n, num_stages)]
+        m = max(block_m, 16)
+        while m > 16:
+            m //= 2
+            attempts.append((m, block_n, num_stages))
+        attempts.append((16, block_n, 1))
     with torch.cuda.device(q_lat.device):
-        _mla_prefill_kernel[(triton.cdiv(q_len, block_m), bsz * n_q_heads)](
-            q_lat, q_pe, ckv_cache, kpe_cache, ckv_scales, h32, block_table, cache_seqlens, out,
-            block_table.shape[1], q_len, n_rows,
-            qc_bits, bool(qc_trans), pre_appended_len, n_q_heads, page_size, D_c, D_r, float(softmax_scale),
-            bool(causal), block_m, block_n,
-            num_warps = num_warps, num_stages = num_stages,
-        )
+        cfg = _launch_adaptive(
+            attempts,
+            lambda bm, bn, ns: _mla_prefill_kernel[(triton.cdiv(q_len, bm), bsz * n_q_heads)](
+                q_lat, q_pe, ckv_cache, kpe_cache, ckv_scales, h32, block_table, cache_seqlens, out,
+                block_table.shape[1], q_len, n_rows,
+                qc_bits, bool(qc_trans), pre_appended_len, n_q_heads, page_size, D_c, D_r, float(softmax_scale),
+                bool(causal), bm, bn,
+                num_warps = num_warps, num_stages = ns,
+            ))
+    _gemm_cfg[cfg_key] = [cfg]
     _dbg_sync("mla_prefill", q_lat.device)
     return out

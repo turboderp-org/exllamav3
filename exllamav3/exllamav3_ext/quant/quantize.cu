@@ -71,10 +71,15 @@ void quantize_tiles
 
     int device;
     cudaGetDevice(&device);
-    // Block geometry follows K and the architecture the loaded code was compiled for (see
-    // quantize_tiles_kernel.cuh): read it back from the kernel's launch bound rather than recomputing it
-    // from the device, so a PTX-JIT'd instance still launches with the block size it was built for
-    const int shmem = (K >= 2 ? 2 * edges * sizeof(half) : 0) + L * sizeof(half) + 64 + 128;
+    // mirror the kernel's costs_in_shared gate: no dynamic smem for the cost tables
+    // when they do not fit
+#if defined(USE_ROCM)
+    const size_t cost_tables = (K >= 2 && (size_t) 2 * edges * sizeof(half) + L * sizeof(half) + 64 + 128 <= QUANTIZE_TILES_SMEM_LIMIT)
+        ? 2 * edges * sizeof(half) : 0;
+#else
+    const size_t cost_tables = (K >= 2) ? 2 * edges * sizeof(half) : 0;
+#endif
+    const int shmem = cost_tables + L * sizeof(half) + 64 + 128;
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
@@ -82,10 +87,10 @@ void quantize_tiles
     auto kernel = L == 256 ?
         quantize_tiles_kernel_instances[K - 1 + 8 * cb] :
         quantize_tiles_kernel_instances_l160[K - 1];
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+    cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
     cuda_check(cudaPeekAtLastError());
     cudaFuncAttributes attr;
-    cuda_check(cudaFuncGetAttributes(&attr, kernel));
+    cuda_check(cudaFuncGetAttributes(&attr, (const void*) kernel));
     const int num_threads = attr.maxThreadsPerBlock;
     const int blocks_per_sm = 1024 / num_threads;
     const int max_batch_size = MIN((int) temp_costs.size(0), blocks_per_sm * DevCtx::instance().get_num_sms(device));

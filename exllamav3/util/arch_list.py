@@ -10,6 +10,21 @@ def maybe_set_arch_list_env():
     if os.environ.get('TORCH_CUDA_ARCH_LIST', None):
         return
 
+    if torch.version.hip:
+        if not os.environ.get('PYTORCH_ROCM_ARCH'):
+            arch_list = []
+            for i in range(torch.cuda.device_count()):
+                # gcnArchName is the canonical gfx target
+                props = torch.cuda.get_device_properties(i)
+                name = getattr(props, 'gcnArchName', None)
+                if name:
+                    name = name.split(':', 1)[0]
+                    if name.startswith('gfx') and name not in arch_list:
+                        arch_list.append(name)
+            if arch_list:
+                os.environ["PYTORCH_ROCM_ARCH"] = ";".join(arch_list)
+        return
+
     if not torch.version.cuda:
         return
 

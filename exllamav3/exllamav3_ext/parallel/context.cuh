@@ -61,6 +61,8 @@ struct alignas(64) PGContext
     alignas(64) uint32_t cpusum_stage_recv[MAX_DEVICES * REDUCE_STAGE_STRIDE];
     alignas(64) uint32_t cpusum_stage_recv_mb[MAX_DEVICES * CPUREDUCE_MB_BLOCKS * REDUCE_STAGE_STRIDE];
     alignas(64) uint32_t cpusum_stage_cpu; char _pad4[64 - sizeof(uint32_t)];
+    // timeout kernel name, printed host-side (device printf is unreliable)
+    alignas(64) char sync_timeout_name[64];
     ReduceJob reduce_jobs[MAX_REDUCE_JOBS];
 };
 

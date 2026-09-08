@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda.h>
+#include "cuda_drv_compat.cuh"
 
 // CUDA driver API entry points, resolved at runtime from the driver library so the extension
 // never links against libcuda (only the runtime is needed at build time). Symbol names are

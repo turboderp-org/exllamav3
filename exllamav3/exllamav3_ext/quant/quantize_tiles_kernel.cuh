@@ -72,7 +72,15 @@ void quantize_tiles_kernel
     int* sh_idx = (int*) sh; sh += 32 * sizeof(int);
 
     half* sh_temp_costs = (half*) sh;
+#if defined(USE_ROCM)
+    // fall back to the global tables when the cost tables exceed the device's
+    // dynamic-smem ceiling (QUANTIZE_TILES_SMEM_LIMIT)
+    half* temp_costs =
+        (K >= 2 && (size_t) 2 * edges * sizeof(half) + L * sizeof(half) + 64 + 128 <= QUANTIZE_TILES_SMEM_LIMIT)
+        ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
+#else
     half* temp_costs = K >= 2 ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
+#endif
     half* temp_costs_inc = temp_costs + edges;
 
     for (int i = thread; i < L; i += NT) sh_input_tile[i] = __float2half_rn(input_tile[i]);
