@@ -839,6 +839,38 @@ if has_triton:
         v = tl.where(offs < SEL * P + (P - 1 if TAIL else 0), v, -1)
         tl.store(out + r * K_pad + offs, v, mask = offs < K_pad)
 
+# Packed-pool prefill staging: the gathered kernel dequantizes every selected entry per query
+# row, so a prefill chunk of R rows re-expands R * k entries per layer (R = 4096, k = 2048:
+# 8.4M expansions), several times the whole context. From EXL3_DSA_QC_STAGE_MIN_R rows on, the
+# referenced pool window (pool_len entries, i.e. the actual context, never the cache pool) is
+# gathered and dequantized once into a per-call fp16 transient and the fp16 kernel runs over
+# it: measured 3.9x faster attention at 16k context (GLM-5.3, q6). EXL3_DSA_QC_STAGE=0 keeps
+# the online path; _MAX_ENTRIES bounds the transient (1M entries * 576 dims ~ 1.2 GB)
+_dsa_qc_stage = os.environ.get("EXL3_DSA_QC_STAGE", "1") != "0"
+_dsa_qc_stage_min_r = int(os.environ.get("EXL3_DSA_QC_STAGE_MIN_R", "64"))
+_dsa_qc_stage_max_entries = int(os.environ.get("EXL3_DSA_QC_STAGE_MAX_ENTRIES", str(1 << 20)))
+
+
+def _stage_packed_pool(pool_c, qc, pool_r, block_table, page_size, pool_len, D_c, D_r):
+    """Gather the pages holding entries [0, pool_len) of a packed pool and dequantize them into
+    a contiguous fp16 pool with an identity block table. Returns (pool_c, pool_r, block_table)
+    for the fp16 kernel path."""
+    from ...ext import exllamav3_ext as ext
+    pool_s, bits = qc
+    G = D_c // 32
+    npw = -(-pool_len // page_size)
+    pages = block_table[0, :npw].long()
+    pc = pool_c.reshape(-1, page_size, G * bits)[pages]
+    ps = pool_s.reshape(-1, page_size, G)[pages]
+    n_rows = npw * page_size
+    rows_alloc = max(page_size, 1 << (n_rows - 1).bit_length())      # pow2: few distinct sizes
+    out = torch.empty((rows_alloc, D_c), dtype = torch.half, device = pool_c.device)
+    ext.dequant_cache_cont(pc.view(-1, G * bits), ps.view(-1, G), out[:n_rows], 0.0)
+    pr = pool_r.reshape(-1, page_size, D_r)[pages].contiguous() if D_r > 0 else pool_r
+    bt = torch.arange(npw, dtype = torch.int32, device = pool_c.device).unsqueeze(0)
+    return out[:n_rows].view(npw, page_size, D_c), pr, bt
+
+
 def dsa_attn(
     q,                       # (R, H, D_c + D_r) fp16, rope slice pre-rotated
     pool_c,                  # (pages, page_size, D_c) or (rows, D_c) fp16
@@ -932,6 +964,13 @@ def dsa_attn(
             assert out.shape == out_shape
 
     dummy_i = block_table  # any valid int32 pointer for unused int args
+    if (qc is not None and _dsa_qc_stage and multirow is None and not nc_block
+            and R >= _dsa_qc_stage_min_r and block_table.shape[0] == 1
+            and 0 < pool_len <= _dsa_qc_stage_max_entries):
+        pool_c, pool_r, block_table = _stage_packed_pool(
+            pool_c, qc, pool_r, block_table, page_size, pool_len, D_c, D_r)
+        qc = None
+        dummy_i = block_table
     if qc is not None:
         pool_s, qc_bits = qc
         assert D_c % 32 == 0 and pool_c.dtype == torch.int32 and pool_s.dtype == torch.half

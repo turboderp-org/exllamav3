@@ -78,7 +78,7 @@ def _derotate_ref(o_r, inv_freq, pos):
 
 
 def check_attn(device, R, H, D_c, D_r, n_keys, topk, window, sinks_on, dense, m, seed, tol = 6e-3,
-               derot = False, groups = 1, qc_bits = 0, nc_chunk = False):
+               derot = False, groups = 1, qc_bits = 0, nc_chunk = False, single_bt = False):
     torch.manual_seed(seed)
     D = D_c + D_r
     pages = (n_keys + PAGE_SIZE - 1) // PAGE_SIZE
@@ -126,9 +126,12 @@ def check_attn(device, R, H, D_c, D_r, n_keys, topk, window, sinks_on, dense, m,
         derot_inv_freq = -1.0 / (10000.0 ** (torch.arange(0, D_r, 2, dtype = torch.float,
                                                           device = device) / D_r))
 
+    # Single-row (stride-0) block table, as the bsz-1 sparse prefill passes it: the packed-pool
+    # staging path keys on it (and on pool_len = the referenced context)
+    bt_k = bt[:1].contiguous() if single_bt else bt
     def run(ns):
         return dsa_attn(
-            q, pc_arg, pool_r, bt, sinks = sinks,
+            q, pc_arg, pool_r, bt_k, sinks = sinks,
             ring = ring if window > 0 else None, kv_chunk = kv_chunk if window > 0 else None,
             win_len = window, win_floor = win_floor, ring_beg = ring_beg,
             indices = indices, k_len = k_len,
@@ -138,6 +141,14 @@ def check_attn(device, R, H, D_c, D_r, n_keys, topk, window, sinks_on, dense, m,
         )
     got = run(1).clone()   # out comes from the tensor cache: un-alias the two runs
     got_split = run(8).clone()
+    if single_bt and qc_bits:
+        # Also the online-dequant path over the same inputs (staging forced off)
+        import exllamav3.modules.attention_fn.dsa_triton as dt
+        dt._dsa_qc_stage = False
+        try:
+            got_split = run(1).clone()
+        finally:
+            dt._dsa_qc_stage = True
     ref = ref_attn(q, pool_c, pool_r, bt, sinks, ring, kv_chunk, window, win_floor, ring_beg,
                    indices, dense, n_keys, q_pos0, m, nc_chunk = nc_chunk)
     if derot:
@@ -150,7 +161,8 @@ def check_attn(device, R, H, D_c, D_r, n_keys, topk, window, sinks_on, dense, m,
     rel = err / max(ref.abs().max().item(), 1e-6)
     rel_s = (got_split.float() - ref).abs().max().item() / max(ref.abs().max().item(), 1e-6)
     tag = (f"R{R} H{H} Dc{D_c} keys{n_keys} k{topk} win{window} sinks{int(sinks_on)} "
-           f"dense{int(dense)} derot{int(derot)} g{groups} qc{qc_bits} nc{int(nc_chunk)}")
+           f"dense{int(dense)} derot{int(derot)} g{groups} qc{qc_bits} nc{int(nc_chunk)}"
+           f"{' staged(+online as split)' if single_bt and qc_bits else ''}")
     ok = rel < tol and rel_s < tol
     print(f"  {'PASS' if ok else 'FAIL'} attn {tag}: rel {rel:.2e} split {rel_s:.2e}")
     return ok
@@ -296,6 +308,19 @@ def main():
     for i, (c, dr, g, b) in enumerate(nc_cases):
         ok &= check_attn(device, *c, seed = 600 + i, derot = dr, groups = g, qc_bits = b,
                          tol = 1.2e-2 if b else 6e-3, nc_chunk = True)
+
+    # Packed-pool prefill staging (single-row block table, R >= 64, pool_len = context): the
+    # staged fp16 path and the online path must both match the reference
+    stage_cases = [
+        ((200, 64, 448, 64, 2048, 512, 0, False, False, 1), False, 1, 4),    # V3.2/GLM gathered
+        ((200, 64, 448, 64, 2048, 512, 0, False, False, 1), True, 8, 6),
+        ((130, 64, 448, 64, 40, 0, 128, True, True, 128), True, 8, 6),      # V4 HCA dense + window
+        ((64, 16, 256, 32, 700, 96, 8, False, False, 1), True, 4, 3),       # odd dims, min R
+        ((4096, 64, 448, 64, 8192, 2048, 0, False, False, 1), True, 8, 6),  # full-size chunk
+    ]
+    for i, (c, dr, g, b) in enumerate(stage_cases):
+        ok &= check_attn(device, *c, seed = 700 + i, derot = dr, groups = g, qc_bits = b,
+                         tol = 1.2e-2, single_bt = True)
 
     for i, (R, T, H_i, D_i) in enumerate([
         (64, 512, 64, 128), (2048, 512, 64, 128), (7, 33, 4, 16), (128, 4096, 64, 128),
