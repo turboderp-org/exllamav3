@@ -17,6 +17,10 @@ GiB = 1024**3
 def _require_cuda_memory(min_free_bytes: int):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
+    # the caching allocator can reuse cached blocks; release them first or the
+    # measurement counts them as used
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
     free_bytes, _ = torch.cuda.mem_get_info(device)
     if free_bytes < min_free_bytes:
         pytest.skip(f"test requires at least {min_free_bytes / GiB:.1f} GiB free CUDA memory")
