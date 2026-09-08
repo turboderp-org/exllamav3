@@ -1147,6 +1147,7 @@ class DSV4Attention(Module):
                 compress_rate = m, scale = self.sm_scale,
                 derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
                 out = torch.empty((self.o_groups, seq, hpg * hd), dtype = torch.half, device = device),
+                nc_chunk = bool(params.get("nc_chunk", False)),
             )
             outs.append(self._project_o_grouped(out.unsqueeze(1), params, out_dtype))
         return torch.cat(outs, dim = 0) if bsz > 1 else outs[0]
@@ -1740,6 +1741,8 @@ class DSV4Attention(Module):
             derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
             page_size = epp, qc = qc,
             out = torch.empty((self.o_groups, seq, hpg * self.head_dim), dtype = torch.half, device = device),
+            # Image chunk (vision): bidirectional over the chunk, own window into history
+            nc_chunk = bool(params.get("nc_chunk", False)),
         )
 
         # Ring update after attention: the shift/rebase branches move rows the kernel

@@ -20,7 +20,7 @@ PAGE_SIZE = 256
 
 
 def ref_attn(q, pool_c, pool_r, bt, sinks, ring, kv_chunk, window, win_floor, ring_beg,
-             indices, dense, pool_len, q_pos0, m):
+             indices, dense, pool_len, q_pos0, m, nc_chunk = False):
     R, H, D = q.shape
     D_r = pool_r.shape[-1]
     D_c = D - D_r
@@ -32,8 +32,12 @@ def ref_attn(q, pool_c, pool_r, bt, sinks, ring, kv_chunk, window, win_floor, ri
         rows = []
         if window > 0:
             q_abs = q_pos0 + r
-            for j in range(window):
-                a = q_abs - j
+            if nc_chunk:
+                # image chunk: every chunk row (bidirectional) + this row's own history window
+                cand = list(range(q_pos0, q_pos0 + R)) + list(range(q_abs - window + 1, q_pos0))
+            else:
+                cand = [q_abs - j for j in range(window)]
+            for a in cand:
                 if a < win_floor:
                     continue
                 src = kv_chunk[a - q_pos0] if a >= q_pos0 else ring[a - ring_beg]
@@ -74,7 +78,7 @@ def _derotate_ref(o_r, inv_freq, pos):
 
 
 def check_attn(device, R, H, D_c, D_r, n_keys, topk, window, sinks_on, dense, m, seed, tol = 6e-3,
-               derot = False, groups = 1, qc_bits = 0):
+               derot = False, groups = 1, qc_bits = 0, nc_chunk = False):
     torch.manual_seed(seed)
     D = D_c + D_r
     pages = (n_keys + PAGE_SIZE - 1) // PAGE_SIZE
@@ -130,11 +134,12 @@ def check_attn(device, R, H, D_c, D_r, n_keys, topk, window, sinks_on, dense, m,
             indices = indices, k_len = k_len,
             pool_len = n_keys, q_pos0 = q_pos0, compress_rate = m,
             derot_inv_freq = derot_inv_freq, groups = groups, n_splits = ns, qc = qc,
+            nc_chunk = nc_chunk,
         )
     got = run(1).clone()   # out comes from the tensor cache: un-alias the two runs
     got_split = run(8).clone()
     ref = ref_attn(q, pool_c, pool_r, bt, sinks, ring, kv_chunk, window, win_floor, ring_beg,
-                   indices, dense, n_keys, q_pos0, m)
+                   indices, dense, n_keys, q_pos0, m, nc_chunk = nc_chunk)
     if derot:
         for r in range(R):
             ref[r, :, D_c:] = _derotate_ref(ref[r, :, D_c:].double(), derot_inv_freq,
@@ -145,7 +150,7 @@ def check_attn(device, R, H, D_c, D_r, n_keys, topk, window, sinks_on, dense, m,
     rel = err / max(ref.abs().max().item(), 1e-6)
     rel_s = (got_split.float() - ref).abs().max().item() / max(ref.abs().max().item(), 1e-6)
     tag = (f"R{R} H{H} Dc{D_c} keys{n_keys} k{topk} win{window} sinks{int(sinks_on)} "
-           f"dense{int(dense)} derot{int(derot)} g{groups} qc{qc_bits}")
+           f"dense{int(dense)} derot{int(derot)} g{groups} qc{qc_bits} nc{int(nc_chunk)}")
     ok = rel < tol and rel_s < tol
     print(f"  {'PASS' if ok else 'FAIL'} attn {tag}: rel {rel:.2e} split {rel_s:.2e}")
     return ok
@@ -277,6 +282,20 @@ def main():
     for i, (c, dr, g, b) in enumerate(qc_cases):
         ok &= check_attn(device, *c, seed = 400 + i, derot = dr, groups = g, qc_bits = b,
                          tol = 1.2e-2)
+
+    # Non-causal image chunk (V4 vision): every row sees the whole chunk plus its own window
+    # into the ring; chunks longer than the window, floor clipping, dense HCA pools, QC
+    nc_cases = [
+        ((200, 64, 448, 64, 2048, 512, 128, True, False, 4), True, 8, 0),    # CSA, chunk > window
+        ((390, 64, 448, 64, 40, 0, 128, True, True, 128), True, 8, 0),       # HCA dense, long chunk
+        ((64, 8, 448, 64, 24, 4, 128, True, False, 1), False, 1, 0),         # window floor at 0
+        ((16, 16, 256, 32, 700, 96, 8, False, False, 1), True, 4, 0),        # odd dims, small window
+        ((200, 64, 448, 64, 2048, 512, 128, True, False, 4), True, 8, 4),    # QC pools
+        ((130, 64, 448, 64, 40, 0, 128, True, True, 128), False, 8, 6),
+    ]
+    for i, (c, dr, g, b) in enumerate(nc_cases):
+        ok &= check_attn(device, *c, seed = 600 + i, derot = dr, groups = g, qc_bits = b,
+                         tol = 1.2e-2 if b else 6e-3, nc_chunk = True)
 
     for i, (R, T, H_i, D_i) in enumerate([
         (64, 512, 64, 128), (2048, 512, 64, 128), (7, 33, 4, 16), (128, 4096, 64, 128),

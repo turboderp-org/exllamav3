@@ -98,6 +98,11 @@ if has_triton:
                                        # [win_floor, q_pos0 + R) (window history ++ whole
                                        # chunk, non-causal); history rows are PAGED, read
                                        # via block_table at absolute-position pages
+        NC_CHUNK: tl.constexpr = 0,    # non-causal image chunk (DeepSeek-V4 vision): every
+                                       # row sees the WHOLE chunk plus its own causal window
+                                       # of NC_HIST history rows from the ring; win_len is
+                                       # the scan length (NC_HIST - 1 + R), top = chunk end
+        NC_HIST: tl.constexpr = 0,
         Q_SPLIT: tl.constexpr = 0,     # GLM-5.2 absorbed queries: q is the HEAD-MAJOR latent
                                        # (H, R, D_c) and the (unused, windowless) ring slot
                                        # carries the token-major rope queries (R, H, D_r)
@@ -157,7 +162,7 @@ if has_triton:
         # come from this chunk's kv rows, older rows from the ring at abs - ring_beg
         if HAS_WINDOW:
             q_abs = q_pos0 + row
-            if NC_BLOCK:
+            if NC_BLOCK or NC_CHUNK:
                 top = q_pos0 + R - 1
             else:
                 top = q_abs
@@ -165,6 +170,9 @@ if has_triton:
                 offs_j = n0 + tl.arange(0, BLOCK_W)
                 abs_pos = top - offs_j
                 in_range = (offs_j < win_len) & (abs_pos >= win_floor)
+                if NC_CHUNK:
+                    # chunk rows: all visible; history rows: this row's own window
+                    in_range = in_range & ((abs_pos >= q_pos0) | (abs_pos > q_abs - NC_HIST))
                 mc = in_range & (abs_pos >= q_pos0)
                 mr = in_range & (abs_pos < q_pos0)
                 idx_c = tl.where(mc, abs_pos - q_pos0, 0)
@@ -863,6 +871,10 @@ def dsa_attn(
                              # paged pools; 256 with an identity table for contiguous pools)
     nc_block = False,        # DSpark draft mode: non-causal chunk + paged window history
                              # (single job per call; forces the one-shot kernel)
+    nc_chunk = False,        # non-causal image chunk (DeepSeek-V4 vision): every query sees
+                             # the whole chunk (bidirectional) plus its own win_len-wide
+                             # causal window into the ring history; pool phases unchanged
+                             # (single job, one-shot kernel)
     multirow = None,         # batched jobs: dict(q_pos, win_floor, ring_beg, pool_len,
                              # k_len (B,) i32; slot_ids (B,) i32; ring_stride int; seq int)
                              # -- scalar args of the same names are ignored, ring is the
@@ -966,6 +978,14 @@ def dsa_attn(
         dbg_pages = 0
     if nc_block:
         n_splits = 1
+    nc_hist = 0
+    if nc_chunk:
+        assert has_window and not nc_block and multirow is None, "nc_chunk: single windowed job only"
+        n_splits = 1
+        # Scan the whole chunk plus (win_len - 1) history rows below it; the kernel keeps
+        # only each row's own history window
+        nc_hist = win_len
+        win_len = win_len + R - 1
     if multirow is not None:
         n_splits = n_splits or 8
     if n_splits == 0:
@@ -1043,6 +1063,7 @@ def dsa_attn(
             BLOCK_H = block_h, BLOCK_N = block_n, BLOCK_W = 16,
             DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
             NC_BLOCK = 1 if nc_block else 0,
+            NC_CHUNK = 1 if nc_chunk else 0, NC_HIST = nc_hist,
             Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
             QC = qc_bits,
             num_warps = num_warps, num_stages = num_stages,
