@@ -219,7 +219,7 @@ ROCm support is experimental and performance is significantly reduced compared t
 pip install rocm[libraries,devel] "torch[device-gfx1100]" --index-url https://repo.amd.com/rocm/whl-multi-arch/
 pip install -r requirements.txt
 python -m rocm_sdk init
-pip install . --no-build-isolation
+ROCM_HOME="$(python -m rocm_sdk path --root)" pip install . --no-build-isolation
 ```
 
 All kernels except the warp-matrix EXL3 GEMV engines build natively and inference runs through them; the EXL3 conversion flow is untested. Tested on gfx1100 (RX 7900 XTX).
