@@ -457,9 +457,21 @@ inline void dword_gather(__m512i p0, __m512i p1, __m512i p2, __m512i p3, __m512i
     }
 }
 
+// Per-lane shift counts for the funnel merge: cols 0-7 use s0, cols 8-15 use s1
+template <int s0, int s1>
+constexpr std::array<int32_t, 16> make_lane_shifts()
+{
+    std::array<int32_t, 16> v{};
+    for (int i = 0; i < 16; ++i) v[i] = i < 8 ? s0 : s1;
+    return v;
+}
+
 // Shift-merge codes for `row` out of its gathered word vectors; delta = bits extracts row+1
 // from row's own gather (valid when word_pair_ok). Vector shifts by >= 32 are well-defined
-// zero, so the s' == 0 case needs no special path.
+// zero, so the s' == 0 case needs no special path. The two half-rows generally need different
+// shifts: one per-lane variable funnel shift (vpsrlvd/vpsllvd against compile-time count
+// vectors) merges both in 4 uops (GCC fuses the or+and into vpternlogd), where two immediate
+// funnel shifts plus a lane blend took 8.
 template <int bits, int row, int delta>
 M1_TARGET_BW
 inline __m512i dword_codes(__m512i a, __m512i b)
@@ -467,9 +479,19 @@ inline __m512i dword_codes(__m512i a, __m512i b)
     constexpr int s0 = row_shift<bits, row>(0) - delta;
     constexpr int s1 = row_shift<bits, row>(8) - delta;
     static_assert(s0 >= 0 && s1 >= 0, "pairing delta exceeds shift headroom");
-    const __m512i c0 = _mm512_or_si512(_mm512_srli_epi32(b, s0), _mm512_slli_epi32(a, 32 - s0));
-    const __m512i c1 = _mm512_or_si512(_mm512_srli_epi32(b, s1), _mm512_slli_epi32(a, 32 - s1));
-    return _mm512_and_si512(_mm512_mask_blend_epi32(0xff00, c0, c1), _mm512_set1_epi32(0xffff));
+    if constexpr (s0 == s1)
+    {
+        const __m512i c = _mm512_or_si512(_mm512_srli_epi32(b, s0), _mm512_slli_epi32(a, 32 - s0));
+        return _mm512_and_si512(c, _mm512_set1_epi32(0xffff));
+    }
+    else
+    {
+        alignas(64) static constexpr auto sh = make_lane_shifts<s0, s1>();
+        alignas(64) static constexpr auto shc = make_lane_shifts<32 - s0, 32 - s1>();
+        const __m512i c = _mm512_or_si512(_mm512_srlv_epi32(b, _mm512_load_si512(sh.data())),
+                                          _mm512_sllv_epi32(a, _mm512_load_si512(shc.data())));
+        return _mm512_and_si512(c, _mm512_set1_epi32(0xffff));
+    }
 }
 
 template <int bits, int row>
