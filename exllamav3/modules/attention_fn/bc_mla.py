@@ -194,8 +194,13 @@ class BCMLA:
             4, 2)
 
         absorb_bm = min(64, triton.next_power_of_2(max(R, 16)))
+        # 16-byte aligned pointers; the AMD backend miscompiles the unaligned
+        # specialization at wide NoPE tiles
+        _mla_absorb_sig = {"q": "*fp16", "w_uk_flat": "*fp16", "out": "*fp16", "R": "i32"}
+        if torch.version.hip:
+            _mla_absorb_sig = {k: (v + ":16" if v.startswith("*") else v) for k, v in _mla_absorb_sig.items()}
         k_absorb = _compile_kernel(dev, _mla_absorb_kernel,
-            {"q": "*fp16", "w_uk_flat": "*fp16", "out": "*fp16", "R": "i32"}
+            _mla_absorb_sig
             | {n: "constexpr" for n in (
                 "n_q_heads", "QK_DIM", "Q_STRIDE", "D_nope", "NOPE_PAD", "D_c", "BLOCK_M", "BLOCK_N")},
             dict(n_q_heads = H, QK_DIM = QK, Q_STRIDE = self.w_q, D_nope = D_nope,

@@ -44,8 +44,7 @@ bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "1") != "0"
 # EXL3_BC_ATTN_TRACE=1: print build/decline per module/layer (activation check for A/B tests)
 _bc_trace = os.environ.get("EXL3_BC_ATTN_TRACE", "0") != "0"
 
-# Row budget of the graphed attention path: ROCm's captured GEMMs are M == 1 only, so
-# multi-row slots decline to the dispatch path; CUDA keeps the upstream unbounded budget
+# captured GEMMs are M == 1 only on HIP; multi-row slots decline to the dispatch path
 _GRAPHED_EXL3_ROWS_MAX = 1 if torch.version.hip else None
 
 def _trace_build(m, result, kind):
@@ -65,6 +64,25 @@ def _is_pow2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 
+def _get_sm_count(device: torch.device | int) -> int:
+    idx = device.index if hasattr(device, "index") else device
+    if idx not in _sm_count:
+        _sm_count[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return _sm_count[idx]
+
+
+_shared_mem = {}
+
+
+def _get_shared_mem(device: torch.device | int) -> int:
+    idx = device.index if hasattr(device, "index") else device
+    if idx not in _shared_mem:
+        import triton
+        _shared_mem[idx] = triton.runtime.driver.active.utils.get_device_properties(
+            idx)["max_shared_mem"]
+    return _shared_mem[idx]
+
+
 def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                     num_warps: int, num_stages: int):
     key = (device.index, fn.__name__, tuple(sorted(constexprs.items())), num_warps, num_stages,
@@ -82,25 +100,26 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
         for name, ty in signature.items():
             if isinstance(ty, str) and ty.endswith(":16"):
                 sig[name] = ty[:-3]
-                attrs[(fn.arg_names.index(name),)] = [["tt.divisibility", 16]]
+                # without the pointer_range tag the AMD backend miscompiles wide-K tiles
+                spec = [["tt.divisibility", 16]]
+                if torch.version.hip:
+                    spec.append(["tt.pointer_range", 32])
+                attrs[(fn.arg_names.index(name),)] = spec
             else:
                 sig[name] = ty
         with torch.cuda.device(device):
             src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
             ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
-            # Triton emits the same kernel as hsaco on ROCm (the loader accepts either)
+            # a module over the device's shared memory fails only at load time; drop
+            # the pipeline depth until it fits
+            limit = _get_shared_mem(device)
+            while ck.metadata.shared > limit and num_stages > 1:
+                num_stages -= 1
+                ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
             cubin = ck.asm["hsaco"] if torch.version.hip else ck.asm["cubin"]
             k = ext.TritonKernel(cubin, ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
-
-
-def _get_sm_count(device: torch.device | int) -> int:
-    # TP shards store their device as a plain index
-    idx = device.index if hasattr(device, "index") else device
-    if idx not in _sm_count:
-        _sm_count[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
-    return _sm_count[idx]
 
 
 class BCAttn:
