@@ -339,7 +339,7 @@ madvise` hosts, plus any compaction the kernel needs first), so it must not sit 
 startup path; the worker reads 4K pages until each chunk lands. `EXL3_MOE_ARENA_DEBUG=1`
 prints how long it took. Set to `0` to skip hugepage promotion entirely.
 
-### `EXL3_MOE_CPU_START_TIMEOUT` (default: `600`)
+### `EXL3_MOE_CPU_START_TIMEOUT` (default: `60`)
 
 Seconds the parent waits for the CPU worker to signal ready after every offloaded layer has
 been handed over. Startup is the shared-memory attach, layer registration and thread spawn,
