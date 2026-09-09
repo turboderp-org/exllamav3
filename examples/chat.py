@@ -96,6 +96,7 @@ def main(args):
         show_visualizer = args.visualize_cache,
         max_chunk_size = args.generator_chunk_size,
     )
+    vra_last = None   # previous /vra report, for the delta column
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
     if config.eos_token_id_list and all(config.eos_token_id_list):
         stop_conditions += config.eos_token_id_list
@@ -170,6 +171,7 @@ def main(args):
                         "/t                 Tokenize context",
                         "/think             Toggle reasoning mode",
                         "/tps               Toggle tokens/second output",
+                        "/vra               VRAM accounting per device, with deltas since the previous /vra",
                         "/x                 Exit",
                     ]))
                     continue
@@ -273,6 +275,15 @@ def main(args):
                 # Page table/cache
                 case "/ppt":
                     print_info(generator.pagetable.dump_page_list())
+                    continue
+
+                # VRAM accounting (with deltas against the previous /vra)
+                case "/vra":
+                    from exllamav3.util.memory import vram_accounting, format_vram_report
+                    vra_now = vram_accounting(model, cache, generator)
+                    print()
+                    print(format_vram_report(vra_now, previous = vra_last))
+                    vra_last = vra_now
                     continue
 
                 # Edit system prompt

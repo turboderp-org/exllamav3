@@ -47,6 +47,8 @@ except ImportError:
 
 if has_triton:
 
+    from .triton_paged import _rot_h32, _qc_load_v, _get_h32
+
     @triton.jit(do_not_specialize = [
         "k_len", "win_len", "pool_len", "num_pages_per_row", "q_pos0", "R",
         "win_floor", "ring_beg",
@@ -72,6 +74,8 @@ if has_triton:
         R,                   # runtime: query row count (HPG group stride)
         win_floor,           # runtime: lowest absolute position visible to the window
         ring_beg,            # runtime: absolute position of ring row 0
+        pool_s,              # (pages * page_size, D_c // 32) fp16 group scales (QC > 0)
+        h32,                 # (32, 32) fp16 H32 / sqrt(32) (QC > 0)
         H: tl.constexpr,
         page_size: tl.constexpr,
         D_c: tl.constexpr,
@@ -100,6 +104,8 @@ if has_triton:
         OUT_LATENT: tl.constexpr = 0,  # store only the latent half, head-major (H, R, D_c),
                                        # the exact mla_unfold input; the rope half of the
                                        # weighted sum is never accumulated
+        QC: tl.constexpr = 0,          # pool_c is the packed quantized pool (QC bits per
+                                       # value, 32-value groups, H32-rotated domain)
     ):
         """One program per (query row, head block); heads are the MMA M dim. Consecutive
         programs cover one query's head blocks so gathers stay L2-resident. Two KV phases:
@@ -128,6 +134,13 @@ if has_triton:
             qc = tl.load(q_base + offs_c[None, :], mask = valid_h[:, None] & valid_c[None, :], other = 0.0)
             if D_r > 0:
                 qr = tl.load(q_base + D_c + offs_r[None, :], mask = valid_h[:, None], other = 0.0)
+
+        if QC > 0:
+            # Packed pool values live in the H32-rotated domain (orthonormal, block-diagonal
+            # per 32 values): rotate q once so every score dot is exact, rotate the fp16
+            # window tiles into the same domain, and rotate the accumulated output back in
+            # the epilogue (one-shot kernel) or the combine (split kernels)
+            qc = _rot_h32(qc, h32, BLOCK_H, D_c_pad)
 
         if HAS_SINKS:
             sink = tl.load(sinks + offs_h, mask = valid_h, other = -float("inf"))
@@ -166,6 +179,8 @@ if has_triton:
                              mask = mc[:, None] & valid_c[None, :], other = 0.0) \
                    + tl.load(ring + idx_r[:, None] * D + offs_c[None, :],
                              mask = mr[:, None] & valid_c[None, :], other = 0.0)
+                if QC > 0:
+                    vc = _rot_h32(vc, h32, BLOCK_W, D_c_pad)
                 scores = tl.dot(qc, tl.trans(vc))
                 if D_r > 0:
                     vr = tl.load(kv_chunk + idx_c[:, None] * D + D_c + offs_r[None, :],
@@ -207,8 +222,11 @@ if has_triton:
                 tl.device_assert(tl.where(in_range, idx_s < pool_len, True), "dsa_attn: entry idx >= pool_len")
                 tl.device_assert(tl.where(in_range, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_attn: pool page OOB")
             tok = phys * page_size + idx_s % page_size
-            vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
-                         mask = in_range[:, None] & valid_c[None, :], other = 0.0)
+            if QC > 0:
+                vc = _qc_load_v(pool_c, pool_s, tok, 0, offs_c, in_range, QC, 1, D_c, D_c_pad)
+            else:
+                vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
+                             mask = in_range[:, None] & valid_c[None, :], other = 0.0)
             scores = tl.dot(qc, tl.trans(vc))
             if D_r > 0:
                 vr = tl.load(pool_r + tok[:, None] * D_r + offs_r[None, :],
@@ -230,6 +248,9 @@ if has_triton:
 
         denom = tl.where(l == 0.0, 1.0, l)
         oc = acc_c / denom[:, None]
+        if QC > 0:
+            # Accumulated in the rotated domain: one inverse rotation (H32 is involutory)
+            oc = _rot_h32(oc, h32, BLOCK_H, D_c_pad).to(tl.float32)
 
         if OUT_LATENT:
             ob = out + (offs_h * R + row)[:, None] * D_c
@@ -284,6 +305,8 @@ if has_triton:
         ring_beg,
         slot_ids,            # MULTIROW: (B,) i32 ring slot per job (else ignored, pass 0)
         ring_stride,         # MULTIROW: ring slot stride in elements
+        pool_s,              # (pages * page_size, D_c // 32) fp16 group scales (QC > 0)
+        h32,                 # (32, 32) fp16 H32 / sqrt(32) (QC > 0)
         H: tl.constexpr,
         page_size: tl.constexpr,
         D_c: tl.constexpr,
@@ -308,6 +331,8 @@ if has_triton:
                                        # MULTIROW keeps the per-job state args scalar)
         OUT_LATENT: tl.constexpr = 0,  # accumulate/store only the latent half; ws_acc rows
                                        # are D_c wide and the combine emits (H, R, D_c)
+        QC: tl.constexpr = 0,          # packed quantized pool (see _dsa_attn_kernel); the
+                                       # partials stay in the rotated domain
     ):
         """Flash-decoding split phase: each program covers one (query row, head block) and a
         contiguous slice of that row's VIRTUAL key sequence [window keys ++ pool entries],
@@ -362,6 +387,13 @@ if has_triton:
             if D_r > 0:
                 qr = tl.load(q_base + D_c + offs_r[None, :], mask = valid_h[:, None], other = 0.0)
 
+        if QC > 0:
+            # Packed pool values live in the H32-rotated domain (orthonormal, block-diagonal
+            # per 32 values): rotate q once so every score dot is exact, rotate the fp16
+            # window tiles into the same domain, and rotate the accumulated output back in
+            # the epilogue (one-shot kernel) or the combine (split kernels)
+            qc = _rot_h32(qc, h32, BLOCK_H, D_c_pad)
+
         # This row's virtual key range for this split
         if DENSE_POOL:
             n_pool = tl.minimum((q_pos0 + loc + 1) // compress_rate, pool_len)
@@ -393,6 +425,8 @@ if has_triton:
                              mask = mc[:, None] & valid_c[None, :], other = 0.0) \
                    + tl.load(ring + idx_r[:, None] * D + offs_c[None, :],
                              mask = mr[:, None] & valid_c[None, :], other = 0.0)
+                if QC > 0:
+                    vc = _rot_h32(vc, h32, BLOCK_W, D_c_pad)
                 scores = tl.dot(qc, tl.trans(vc))
                 if D_r > 0:
                     vr = tl.load(kv_chunk + idx_c[:, None] * D + D_c + offs_r[None, :],
@@ -430,8 +464,11 @@ if has_triton:
                 tl.device_assert(tl.where(in_range, idx_s < pool_len, True), "dsa_split: entry idx >= pool_len")
                 tl.device_assert(tl.where(in_range, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_split: pool page OOB")
             tok = phys * page_size + idx_s % page_size
-            vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
-                         mask = in_range[:, None] & valid_c[None, :], other = 0.0)
+            if QC > 0:
+                vc = _qc_load_v(pool_c, pool_s, tok, 0, offs_c, in_range, QC, 1, D_c, D_c_pad)
+            else:
+                vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
+                             mask = in_range[:, None] & valid_c[None, :], other = 0.0)
             scores = tl.dot(qc, tl.trans(vc))
             if D_r > 0:
                 vr = tl.load(pool_r + tok[:, None] * D_r + offs_r[None, :],
@@ -474,6 +511,7 @@ if has_triton:
         q_pos0,
         R,
         n_splits,
+        h32,                 # (32, 32) fp16 H32 / sqrt(32) (QC > 0)
         H: tl.constexpr,
         D_c: tl.constexpr,
         D_r: tl.constexpr,
@@ -485,6 +523,7 @@ if has_triton:
         SEQ: tl.constexpr = 1,
         MULTIROW: tl.constexpr = 0,  # q_pos0 is a per-job i32 array when set
         OUT_LATENT: tl.constexpr = 0,  # ws rows are D_c wide; emit head-major (H, R, D_c)
+        QC: tl.constexpr = 0,          # split partials came from a packed pool (rotated)
     ):
         """Combine phase: merge the split partials (sink folded in as one more partial),
         normalize, de-rotate (identity rotation, theta = 0, below the rope columns) and
@@ -524,6 +563,13 @@ if has_triton:
 
         denom = tl.where(l_run == 0.0, 1.0, l_run)
         o = acc / denom[:, None]
+
+        if QC > 0:
+            # Partials from a packed pool are in the rotated domain: one inverse rotation per
+            # 32-group of the latent columns (the rope columns are fp16 pages, never rotated;
+            # D_c is a multiple of 32, so no group straddles the boundary)
+            o_rot = _rot_h32(o, h32, BLOCK_H, BLOCK_D).to(tl.float32)
+            o = tl.where(offs_d[None, :] < D_c, o_rot, o)
 
         if DEROTATE:
             # Uniform pair rotation: theta = 0 (identity) below the rope columns
@@ -827,6 +873,9 @@ def dsa_attn(
                              # reads both directly, no packed copy exists anywhere
     out_latent = False,      # emit only the latent half, head-major (H, R, D_c): the exact
                              # mla_unfold input, with the rope half never accumulated
+    qc = None,               # (scales, bits): pool_c is the packed quantized pool (pages,
+                             # page_size, D_c // 32 * bits) int32 with fp16 group scales
+                             # (pages, page_size, D_c // 32); read online in the kernels
 ):
     """Core DSA attention over [sliding ring ++ pool entries], V IS K. Gathered mode when
     `indices` is given, dense-pool mode otherwise (per-query causal entry bound). With
@@ -871,6 +920,14 @@ def dsa_attn(
             assert out.shape == out_shape
 
     dummy_i = block_table  # any valid int32 pointer for unused int args
+    if qc is not None:
+        pool_s, qc_bits = qc
+        assert D_c % 32 == 0 and pool_c.dtype == torch.int32 and pool_s.dtype == torch.half
+        h32_t = _get_h32(q.device)
+        pc_arg = pool_c
+    else:
+        pool_s, qc_bits, h32_t = q, 0, q   # any valid fp16 pointers for the unused args
+        pc_arg = pool_c.reshape(-1, D_c)
     has_window = win_len > 0 and kv_chunk is not None
     if q_split:
         # The windowless ring slot carries q_pe; kv_chunk stays a dummy pointer
@@ -902,7 +959,11 @@ def dsa_attn(
         # halve the head tile (perf is irrelevant with asserts on)
         num_stages = min(num_stages, 2)
         block_h = min(block_h, 16)
-    dbg_pages = -(-(pool_c.numel() // max(D_c, 1)) // max(page_size, 1)) if dsa_debug_bounds else 0
+    if dsa_debug_bounds:
+        pool_rows = pool_s.numel() // (D_c // 32) if qc is not None else pool_c.numel() // max(D_c, 1)
+        dbg_pages = -(-pool_rows // max(page_size, 1))
+    else:
+        dbg_pages = 0
     if nc_block:
         n_splits = 1
     if multirow is not None:
@@ -938,10 +999,10 @@ def dsa_attn(
             a_slots, a_rstride, a_seq = 0, (R if q_split else 0), 1
         with torch.cuda.device(q.device):
             _dsa_attn_split_kernel[(R * hb, n_splits)](
-                q, ring, kv_chunk, pool_c.reshape(-1, D_c), (pool_r.reshape(-1, D_r) if D_r > 0 else pool_r.reshape(-1)),
+                q, ring, kv_chunk, pc_arg, (pool_r.reshape(-1, D_r) if D_r > 0 else pool_r.reshape(-1)),
                 block_table, indices, ws_ml, ws_acc,
                 a_klen, win_len, a_pool, npr, a_qpos, a_floor, a_beg,
-                a_slots, a_rstride,
+                a_slots, a_rstride, pool_s, h32_t,
                 H = H, page_size = page_size, D_c = D_c, D_c_pad = triton.next_power_of_2(D_c),
                 D_r = D_r, K_pad = K_pad, compress_rate = compress_rate, scale = scale,
                 HAS_WINDOW = has_window, DENSE_POOL = dense_pool,
@@ -949,16 +1010,18 @@ def dsa_attn(
                 SEQ = a_seq, MULTIROW = multirow is not None,
                 DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
                 Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
+                QC = qc_bits,
                 num_warps = num_warps, num_stages = 2,
             )
             _dsa_attn_combine_kernel[(R * hb, triton.cdiv(D_out, 128))](
                 ws_ml, ws_acc, sinks_t, derot_t, out,
-                a_qpos, R, n_splits,
+                a_qpos, R, n_splits, h32_t,
                 H = H, D_c = D_c, D_r = D_r,
                 HAS_SINKS = has_sinks, DEROTATE = derotate, HPG = hpg,
                 BLOCK_H = block_h, BLOCK_D = 128,
                 SEQ = a_seq, MULTIROW = multirow is not None,
                 OUT_LATENT = 1 if out_latent else 0,
+                QC = qc_bits,
                 num_warps = 4, num_stages = 2,
             )
         return out
@@ -966,9 +1029,9 @@ def dsa_attn(
     grid = (R * triton.cdiv(H, block_h),)
     with torch.cuda.device(q.device):   # layer split: launch on the tensor's device
         _dsa_attn_kernel[grid](
-            q, ring, kv_chunk, pool_c.reshape(-1, D_c), (pool_r.reshape(-1, D_r) if D_r > 0 else pool_r.reshape(-1)),
+            q, ring, kv_chunk, pc_arg, (pool_r.reshape(-1, D_r) if D_r > 0 else pool_r.reshape(-1)),
             block_table, indices, sinks_t, derot_t, out,
-            k_len, win_len, pool_len, npr, q_pos0, R, win_floor, ring_beg,
+            k_len, win_len, pool_len, npr, q_pos0, R, win_floor, ring_beg, pool_s, h32_t,
             H = H, page_size = page_size, D_c = D_c, D_c_pad = triton.next_power_of_2(D_c),
             D_r = D_r, K_pad = K_pad, compress_rate = compress_rate,
             scale = scale,
@@ -981,6 +1044,7 @@ def dsa_attn(
             DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
             NC_BLOCK = 1 if nc_block else 0,
             Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
+            QC = qc_bits,
             num_warps = num_warps, num_stages = num_stages,
         )
     return out
@@ -1016,12 +1080,23 @@ def dsa_indexer_scores(
         bt = block_table.reshape(-1)
     dbg = 1 if (dsa_debug_bounds and epp) else 0
     dbg_pages = -(-k_idx.shape[0] // epp) if dbg else 0
-    S_stride = triton.cdiv(max(T, 1), block_n) * block_n
+    # S_stride is a kernel constexpr (row stride of the score matrix), so every distinct value
+    # is a separate Triton compile. It must therefore NOT track the visible context: a caller
+    # that hands in a backing sets it (a fixed tile width, one compile per model); without a
+    # backing the per-call allocation is rounded to a power of two, bounding the compile count
+    # by log2 of the context. The kernels only write columns < T either way
+    T_pad = triton.cdiv(max(T, 1), block_n) * block_n
     if scores is None:
         # Deliberately a per-call allocation: the shape grows with the visible context, so it
         # is not tensor-cache material.
         # TODO: The buffer should disappear entirely once scoring and top-k are fused into a streaming kernel
+        S_stride = max(block_n, triton.next_power_of_2(T_pad))
         scores = torch.empty((R, S_stride), dtype = torch.half, device = q_idx.device)
+    else:
+        S_stride = scores.shape[1]
+        assert scores.shape[0] >= R and S_stride >= T_pad and S_stride % 8 == 0 \
+            and scores.stride(1) == 1 and scores.stride(0) == S_stride, \
+            "dsa_indexer_scores: score backing must be a row-contiguous (>= R, >= T rounded to the tile) view"
     with torch.cuda.device(q_idx.device):
         if R <= 4:
             # Few-query (decode) shape: heads as the MMA M dim, one dot per key tile --

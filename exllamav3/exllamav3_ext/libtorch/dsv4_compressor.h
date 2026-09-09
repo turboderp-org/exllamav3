@@ -93,7 +93,8 @@ struct BC_DSV4Compressor
         class Graph* graph,
         bool proj_precomputed = false,                  // kv/gate already in mg_c (fan mgemm)
         const c10::optional<at::Tensor>& pool_bt = {},  // paged pools: job's block table row
-        int pool_epp = 0
+        int pool_epp = 0,
+        bool stage_rel = false                          // dest_a = staging rows [0, nw)
     );
 
     void run
@@ -108,6 +109,7 @@ struct BC_DSV4Compressor
         const c10::optional<at::Tensor>& position_tensor,
         const c10::optional<at::Tensor>& mg_c,
         const c10::optional<at::Tensor>& pool_bt,
-        int pool_epp
+        int pool_epp,
+        bool stage_rel
     );
 };

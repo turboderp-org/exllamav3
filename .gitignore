@@ -1,6 +1,8 @@
 *.egg-info/
 build/
 malamus/
+uv.lock
+
 *.pyc
 __pycache__/
 .idea
