@@ -304,11 +304,11 @@ if has_triton:
                 # the dequantized fp16 tile for the score dot (QC_TRANS 1) -- the transpose is of
                 # a plain fp16 value, not of loader interleave output (the miscompiling shape)
                 if QC_TRANS:
-                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
+                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
                     kt = tl.trans(v_tile)
                 else:
-                    kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
-                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
+                    kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
+                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
             else:
                 # V is K: load the latent tile once, transpose it for the score dot
                 v_tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
@@ -476,11 +476,11 @@ if has_triton:
 
             if QC > 0:
                 if QC_TRANS:
-                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
+                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
                     kt = tl.trans(v_tile)
                 else:
-                    kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
-                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
+                    kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
+                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
             else:
                 v_tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
                                  mask = in_range[:, None], other = 0.0)
@@ -546,7 +546,7 @@ if has_triton:
 
         offs_c = tl.arange(0, D_c)
         if QC > 0:
-            tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c)
+            tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
             # h32 is symmetric orthonormal, so the same multiply that rotates also unrotates
             tile = _rot_h32(tile, h32, BLOCK_R, D_c)
         else:

@@ -139,7 +139,6 @@ void BC_Attention::set_qsa
 )
 {
     TORCH_CHECK(_qk_proj, "BC_Attention: QSA requires a quantized index_qk projection");
-    TORCH_CHECK(!quant_cache, "BC_Attention: QSA requires the fp16 cache");
     qsa = true;
     qsa_qk_proj = std::move(_qk_proj);
     qsa_q_norm_w = std::move(_q_norm_w);
@@ -648,6 +647,10 @@ void BC_Attention::run_gr
                 (void*) (intptr_t) 0,
                 (void*) (intptr_t) s.qsa_splits,
                 (void*) (intptr_t) s.qsa_split_len,
+                // Packed K/V pages: group scales + H32 (dead args for fp16 caches)
+                (void*) (quant_cache ? cache_k_scales.value().data_ptr() : s.q.data_ptr()),
+                (void*) (quant_cache ? cache_v_scales.value().data_ptr() : s.q.data_ptr()),
+                (void*) h32.data_ptr(),
             };
             s.k_qsa_split->launch(s.qsa_programs, s.qsa_splits, 1, args, stream);
             if (graph)

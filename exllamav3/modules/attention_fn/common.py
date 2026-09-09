@@ -24,6 +24,9 @@ class AttnArgs(NamedTuple):
     non_causal_spans: list | None = None
     q_cache: tuple | None = None    # (qk, sk, qv, sv, k_bits, v_bits): packed quantized cache
     sinks: torch.Tensor | None = None    # learned per-q-head sink logits (gpt-oss style)
+    max_kv_len: int | None = None   # host-known bound on the past length any row attends to
+                                    # (lets cached kernels size windows / staging below the
+                                    # block-table span; e.g. QSA's dense regime)
 
     def sanity_check(self):
         # Cache must be paged

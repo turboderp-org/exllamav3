@@ -263,10 +263,11 @@ class BCAttn:
 
         dev = self.device
         hd = self.head_dim
+        hd_pad = triton.next_power_of_2(hd)   # kernel tile width (zero-padded past hd)
         qh, kvh = self.num_q_heads, self.num_kv_heads
         group_size = qh // kvh
 
-        block_n = max(16, 8192 // hd)
+        block_n = max(16, 8192 // hd_pad)
         block_m = triton.next_power_of_2(q_len)
         block_h = max(16 // block_m, 1)
         block_rows = block_m * block_h
@@ -289,12 +290,12 @@ class BCAttn:
             "sinks": "*fp32",
         } | {n: "constexpr" for n in (
             "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
-            "page_size", "head_dim", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
+            "page_size", "head_dim", "HD_PAD", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
             "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N")}
         consts = dict(
             QCK = self.k_bits, QCV = self.v_bits,
             q_len = q_len, kv_append_len = q_len, n_q_heads = qh, n_kv_heads = kvh,
-            page_size = PAGE_SIZE, head_dim = hd, scale = float(self.sm_scale),
+            page_size = PAGE_SIZE, head_dim = hd, HD_PAD = hd_pad, scale = float(self.sm_scale),
             CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
@@ -305,11 +306,11 @@ class BCAttn:
             "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
             "num_splits": "i32", "sinks": "*fp32",
         } | {n: "constexpr" for n in (
-            "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim",
+            "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD",
             "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")}
         consts_c = dict(
             QCV = self.v_bits, HAS_SINKS = self.sinks is not None, q_len = q_len,
-            n_q_heads = qh, n_kv_heads = kvh, head_dim = hd,
+            n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
         )
         k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
@@ -347,7 +348,7 @@ class BCAttn:
         o = g_tensor_cache.get(dev, (bsz, q_len, qh, hd), torch.half, "bca_o")
         # Regime-1 slots never launch the dense split/combine; their partials are sized by the
         # sparse kernels in _configure_qsa (same bucketed tags, so the footprint is the max)
-        pn_o = programs * splits_cap * block_rows * hd
+        pn_o = programs * splits_cap * block_rows * hd_pad
         pn_ml = programs * splits_cap * block_rows * 2
         if regime == 1:
             pn_o, pn_ml = self._qsa_partial_sizes(bsz * q_len)
@@ -492,32 +493,35 @@ class BCAttn:
                 dict(P = cr, SEL = idx.block_topk, K_pad = k_pad, KP_pool = kp_pool,
                      TAIL = 1, SEQ = q_len, MULTIROW = 0, BLOCK = 256), 4, 1)
 
+            # Quantized K/V: the gather reads the packed pages through the shared QC
+            # loaders (scales + H32 appended to the runtime args, same as the dense slots)
+            ct = "*i32" if self.quant else "*fp16"
             k_sp_split = _compile_kernel(dev, _qsa_sparse_split_kernel,
-                {"q": "*fp16", "k_cache": "*fp16", "v_cache": "*fp16", "block_table": "*i32",
+                {"q": "*fp16", "k_cache": ct, "v_cache": ct, "block_table": "*i32",
                  "indices": "*i32", "partial_o": "*fp32", "partial_ml": "*fp32",
                  "k_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
-                 "split_len": "i32"}
+                 "split_len": "i32", "k_scales": "*fp16", "v_scales": "*fp16", "h32": "*fp16"}
                 | {n: "constexpr" for n in (
                     "n_q_heads", "n_kv_heads", "page_size", "head_dim", "K_pad", "scale",
-                    "BLOCK_H", "BLOCK_N", "PAGED")},
+                    "BLOCK_H", "BLOCK_N", "PAGED", "QCK", "QCV")},
                 dict(n_q_heads = self.num_q_heads, n_kv_heads = self.num_kv_heads,
                      page_size = PAGE_SIZE, head_dim = self.head_dim, K_pad = k_pad,
                      scale = float(self.sm_scale), BLOCK_H = block_h, BLOCK_N = block_n,
-                     PAGED = 1),
+                     PAGED = 1, QCK = self.k_bits, QCV = self.v_bits),
                 4, 2)
 
             k_sp_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel,
                 {"partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
                  "num_splits": "i32", "sinks": "*fp32"}
                 | {n: "constexpr" for n in (
-                    "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim",
+                    "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD",
                     "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")},
                 # q_len 1: the sparse gather treats every query row as a batch (programs =
                 # R * kv_heads * h_blocks), so the combine's output row is the batch index
                 # alone -- compiling the true q_len here would scatter row r to row r * q_len
-                dict(QCV = 0, HAS_SINKS = False, q_len = 1,
+                dict(QCV = self.v_bits, HAS_SINKS = False, q_len = 1,
                      n_q_heads = self.num_q_heads, n_kv_heads = self.num_kv_heads,
-                     head_dim = self.head_dim, BLOCK_M = 1, BLOCK_H = block_h,
+                     head_dim = self.head_dim, HD_PAD = self.head_dim, BLOCK_M = 1, BLOCK_H = block_h,
                      BLOCK_ROWS = block_h), 4, 1)
 
         self.bc.configure_slot_qsa(
@@ -630,7 +634,9 @@ def _module_eligible(m):
         # block returns. Span-heads norms stay declined (cross-rank norm inside the block)
         not getattr(m, "tp_span_heads_norm", False) and
         (m.q_norm is None or m.q_norm_tensor is not None) and
-        _is_pow2(m.head_dim) and m.head_dim <= 512 and
+        # Non-power-of-two head dims run zero-padded to the next power of two in the graph
+        # kernels; quantized caches need 32-value groups
+        m.head_dim <= 512 and m.head_dim % 8 == 0 and
         m.num_q_heads % m.num_kv_heads == 0 and
         # Padded dims: the projection inputs stage through a zero-padded static and the o_proj
         # output is trimmed, but the q/k/v/gate outputs and the o_proj input must be the exact
@@ -677,7 +683,7 @@ def build_bc_attn(module, layer):
     """Build a BCAttn for the module/cache-layer pair, or return None when the configuration
     is not supported (caller falls back to the dispatch path)."""
     from ...cache import CacheLayer_quant, CacheLayer_fp16
-    from ...cache.qsa import CacheLayer_qsa
+    from ...cache.qsa import QSAPlanes
 
     m = module
     qsa_idx = getattr(m, "qsa_indexer", None)
@@ -691,16 +697,17 @@ def build_bc_attn(module, layer):
         (not isinstance(layer, CacheLayer_fp16) or (
             layer.k is not None and layer.k.device == torch.device(m.device)
         )) and
-        # A QSA module needs the side planes on this layer (and the fp16 cache they imply)
+        # A QSA module needs the side planes on this layer (fp16 or quantized K/V)
         (qsa_idx is None or (
-            isinstance(layer, CacheLayer_qsa) and layer.raw_k is not None and
+            isinstance(layer, QSAPlanes) and layer.raw_k is not None and
             layer.raw_k.device == torch.device(m.device)
         ))
     ):
         _trace_build(m, None, "attn")
         return None
     if isinstance(layer, CacheLayer_quant):
-        bca = BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits)
+        bca = BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits,
+                     qsa_layer = layer if qsa_idx is not None else None)
     else:
         bca = BCAttn(m, layer.k, layer.v,
                      qsa_layer = layer if qsa_idx is not None else None)
