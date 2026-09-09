@@ -259,13 +259,3 @@ class Qwen3NextModel(Model):
         p += f"{prompt}<|im_end|>\n"
         p += f"<|im_start|>assistant\n"
         return p
-
-
-    @override
-    def check_compat(self):
-        try:
-            from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-            from fla.modules.fused_norm_gate import rms_norm_gated
-        except ModuleNotFoundError as e:
-            print(" ## Qwen3-Next requires flash-linear-attention (https://github.com/fla-org/flash-linear-attention)")
-            raise e

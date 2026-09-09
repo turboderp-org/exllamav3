@@ -302,7 +302,7 @@ supporters (🐈❤️!) The following projects in particular deserve a special 
 - [QTIP](https://github.com/Cornell-RelaxML/qtip)
 - [Transformers](https://github.com/huggingface/transformers)
 - [Marlin](https://github.com/IST-DASLab/marlin)
-- [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention)
+- [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) (chunked linear-attention prefill kernels, vendored under `exllamav3/vendor/fla`)
 
 <p align="center">
   <img src="doc/cat.png" width="40" alt="">
