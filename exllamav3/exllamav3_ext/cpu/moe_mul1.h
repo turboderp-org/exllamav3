@@ -7,9 +7,9 @@
 // CPU-side MoE expert GEMM for mul1 (cb2) EXL3 tensors, standalone from the module code so it
 // can be benchmarked and driven directly. A layer is registered once (raw pointers into CPU
 // trellis/suh/svh tensors, which the caller must keep alive) and then invoked per forward with
-// the routing results. Kernels dispatch at runtime on scalar / AVX2 / AVX-512+VNNI; the mul1
-// codebook is affine in a byte-sum, so dequantization and the activation product fuse into
-// integer dot products (see exl3_moe_cpu_forward for the math).
+// the routing results. Kernels dispatch at runtime on scalar / AVX2 / AVX-512BW / AVX-512+VNNI;
+// the mul1 codebook is affine in a byte-sum, so dequantization and the activation product
+// fuse into integer dot products (see exl3_moe_cpu_forward for the math).
 //
 // Current limits: mul1 codebook only, K in [1, 8]. Gated experts with silu/gelu/swiglu_oai
 // (act_limit) or gateless with relu2; optional per-expert biases (uniform per projection).
@@ -115,8 +115,9 @@ void exl3_moe_cpu_set_prof(bool enabled);
 int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);   // test hook
 
 // Kernel availability (dispatch happens internally; these are informational, post-env-cap).
-// has_avx512_vbmi additionally gates the swizzled weight layout in the child loader: the wide
-// swizzle bands need the byte-gather kernels' low temporary count.
+// has_avx512_vbmi and has_avx512_bw additionally gate the swizzled weight layout in the child
+// loader (the VBMI tier's wide swizzle bands need the byte-gather kernels' low temporary count).
 bool exl3_moe_cpu_has_avx2();
+bool exl3_moe_cpu_has_avx512_bw();
 bool exl3_moe_cpu_has_avx512_vnni();
 bool exl3_moe_cpu_has_avx512_vbmi();
