@@ -118,6 +118,7 @@ class MgemmCase:
             for index in range(count)
         ]
         self.shared_suh = make_signs(k, device, 5000 + bits)
+        self.suhs = [self.shared_suh] * count
         self.svhs = [make_signs(n, device, 6000 + index) for index in range(count)]
         self.b_ptrs = self.pointer_tensor(self.bs, device)
         self.suh_ptrs = self.pointer_tensor([self.shared_suh] * count, device)
@@ -193,7 +194,7 @@ class MgemmCase:
     def reference(self):
         a_fp16 = self.a_bf16.to(torch.float16)
         outputs = []
-        for b, svh in zip(self.bs, self.svhs):
+        for b, suh, svh in zip(self.bs, self.suhs, self.svhs):
             a_had = torch.empty_like(a_fp16)
             output = torch.empty(
                 (self.m, self.n), dtype = torch.float16, device = a_fp16.device
@@ -202,7 +203,7 @@ class MgemmCase:
                 a_fp16,
                 b,
                 output,
-                self.shared_suh,
+                suh,
                 a_had,
                 svh,
                 2,
@@ -232,6 +233,18 @@ def test_exl3_gemm_bf16_io_matches_fp16_boundary(bits, m):
     assert float(torch.nn.functional.cosine_similarity(
         without_final_sync.float().flatten(), reference.float().flatten(), dim = 0
     )) > 0.99999
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.run(final_grid_sync = False)
+    for _ in range(3):
+        case.a_bf16.copy_(torch.randn_like(case.a_bf16))
+        graph.replay()
+        torch.cuda.synchronize()
+        replay = case.output.clone()
+        case.run(final_grid_sync = False)
+        torch.testing.assert_close(case.output, replay, rtol = 0, atol = 0)
+        assert relative_rms(replay, case.reference()) < 0.003
 
 
 @pytest.mark.parametrize("bits", (5, 6))
@@ -283,11 +296,58 @@ def test_exl3_mgemm_bf16_io_modes_and_graph(bits, m):
         case.run_grouped(direct_output = True, final_group_barrier = False)
     graph.replay()
     torch.cuda.synchronize()
-    before = case.output.clone()
-    case.a_bf16.copy_(torch.randn_like(case.a_bf16))
-    graph.replay()
+    for _ in range(3):
+        case.a_bf16.copy_(torch.randn_like(case.a_bf16))
+        graph.replay()
+        torch.cuda.synchronize()
+        replay = case.output.clone()
+        case.run_grouped(direct_output = True, final_group_barrier = False)
+        torch.testing.assert_close(case.output, replay, rtol = 0, atol = 0)
+        assert relative_rms(replay, case.reference()) < 0.003
+
+
+@pytest.mark.parametrize("bits", (5, 6))
+@pytest.mark.parametrize("m", (1, 16))
+@torch.inference_mode()
+def test_exl3_grouped_had_multiple_groups_and_output_padding(bits, m):
+    device = require_supported_device()
+    case = MgemmCase(m, 5120, 512, bits, 4, device)
+    unique_suh = [make_signs(case.k, device, 8000 + i) for i in range(3)]
+    group_ids = (1, 0, 1, 2)
+    case.suhs = [unique_suh[i] for i in group_ids]
+    case.suh_ptrs = case.pointer_tensor(case.suhs, device)
+    case.unique_suh_ptrs = case.pointer_tensor(unique_suh, device)
+    case.had_group_ids = torch.tensor(group_ids, dtype = torch.int32)
+    case.a_had_grouped = torch.empty(
+        (len(unique_suh), m, case.k), dtype = torch.float16, device = device
+    )
+    width = case.count * case.n
+    case.output = torch.full(
+        (m, width + 128), 42, dtype = torch.bfloat16, device = device
+    )
+
+    case.run(direct_output = False, final_group_barrier = True)
     torch.cuda.synchronize()
-    assert not torch.equal(case.output, before)
+    ordinary = case.output.clone()
+    for direct in (False, True):
+        case.output.fill_(42)
+        case.run_grouped(direct_output = direct, final_group_barrier = False)
+        torch.testing.assert_close(case.output, ordinary, rtol = 0, atol = 0)
+        assert torch.all(case.output[:, width:] == 42)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.run_grouped(direct_output = True, final_group_barrier = False)
+    for _ in range(3):
+        case.a_bf16.copy_(torch.randn_like(case.a_bf16))
+        case.output.fill_(42)
+        graph.replay()
+        torch.cuda.synchronize()
+        replay = case.output.clone()
+        case.run(direct_output = False, final_group_barrier = True)
+        torch.testing.assert_close(case.output, replay, rtol = 0, atol = 0)
+        assert torch.all(replay[:, width:] == 42)
+        assert relative_rms(replay[:, :width], case.reference()) < 0.003
 
 
 @torch.inference_mode()
