@@ -27,7 +27,7 @@ def main(args):
         draft_model = draft_model,
         draft_cache = draft_cache,
         show_visualizer = args.visualize_cache,
-        max_chunk_size = args.max_chunk_size,
+        max_chunk_size = args.chunk_size,
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
         recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
     )
