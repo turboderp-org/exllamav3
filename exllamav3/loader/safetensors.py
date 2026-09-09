@@ -782,6 +782,7 @@ class SafetensorsCollection:
                     else:
                         temp_tensor = None
                     self.deferred_loads.append({
+                        "key": key,
                         "filename": filename,
                         "file_offset": offset + beg,
                         "bytesize": bytesize,
@@ -984,7 +985,14 @@ class SafetensorsCollection:
                         if w["transpose"]:
                             src = src.T
                         unpadded_idx = tuple(slice(0, s) for s in src.shape)
-                        w["dest_tensor"][unpadded_idx].copy_(src)
+                        try:
+                            w["dest_tensor"][unpadded_idx].copy_(src)
+                        except RuntimeError as e:
+                            raise ValueError(
+                                f"Deferred load of {w['key']}: source shape {tuple(src.shape)} "
+                                f"(transpose = {w['transpose']}) does not fit destination "
+                                f"{tuple(w['dest_tensor'].shape)}"
+                            ) from e
 
             if cpu_loads:
                 loads = flatten(cpu_loads)

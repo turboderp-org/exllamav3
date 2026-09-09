@@ -72,7 +72,7 @@ def run_fused(kv_rows, gate_rows, ape, norm_w, eps, inv_freq, m, overlapping, hd
     for c in chunks:
         ext.dsv4_compress(
             kv_rows[pos:pos + c], gate_rows[pos:pos + c], ring_kv, ring_gate, ovl,
-            ape, norm_w, eps, inv_freq, dest_a, dest_b, pos, None, m)
+            ape, norm_w, eps, inv_freq, dest_a, dest_b, pos, None, m, None, None, 0)
         pos += c
     nw = total // m
     out = torch.cat([dest_a[:nw], dest_b[:nw]], dim = -1) if split else dest_a[:nw].clone()

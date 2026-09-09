@@ -44,8 +44,14 @@ class CacheLayer_dsa(CacheLayer):
     pool_r (rope part) and, for CSA, pool_idx (indexer keys), each shaped
     (num_pages, PAGE_SIZE // m, D) so that one token page holds the pool entries produced by
     exactly that page's tokens. Tensors are page-major, so the defragmenter's rotation and
-    the CPU tier's per-page slabs apply unchanged. Pools are always fp16 in v1; a quantized
-    Cache quantizes only its transformer/MLA layers, like recurrent state.
+    the CPU tier's per-page slabs apply unchanged.
+
+    With k_bits > 0 the nope part is stored packed in the cache-quant format (32-value
+    groups, H32-rotated domain, group scales; the layout CacheLayer_quant / _MLA_quant use,
+    read online by the shared Triton loaders inside the DSA attention kernels): pool_q holds
+    the int32 words and pool_s the fp16 group scales. The rope part (pool_r) and the indexer
+    keys (pool_idx) stay fp16: they are small and feed every positional score / selection.
+    Requires D_c to be a multiple of 32 (448 on DeepSeek-V4).
     """
 
     def __init__(
@@ -54,9 +60,15 @@ class CacheLayer_dsa(CacheLayer):
         attention,
         cache_id: int,
         max_num_tokens: int,
+        k_bits: int = 0,
+        v_bits: int | None = None,
+        compand_a: float = 0.0,
         **kwargs
     ):
         super().__init__(config, attention, cache_id, max_num_tokens)
+        assert compand_a == 0.0, "compander is not supported by the online-dequant loaders"
+        self.k_bits = k_bits
+        self.v_bits = v_bits
         assert max_num_tokens % PAGE_SIZE == 0, \
             f"max_num_tokens must be a multiple of {PAGE_SIZE}."
         m = attention.compress_rate
@@ -70,23 +82,50 @@ class CacheLayer_dsa(CacheLayer):
         self.D_c = D - D_r
         self.D_r = D_r
         self.D_i = attention.index_head_dim if attention.layer_type == "csa" else 0
+        if k_bits:
+            assert 2 <= k_bits <= 8, "quantized DSA pool must be from 2 to 8 bits"
+            assert self.D_c % 32 == 0, "quantized DSA pool requires head_dim - rope_dim to be a multiple of 32"
+        self.G = self.D_c // 32
         self.pool_c = None
+        self.pool_q = None
+        self.pool_s = None
         self.pool_r = None
         self.pool_idx = None
         self.device = None
         self._slot_bt = None
 
+    @property
+    def quant(self) -> bool:
+        return self.k_bits > 0
+
     def alloc(self, device: torch.device):
         self.device = device
-        self.pool_c = torch.zeros((self.num_pages, self.epp, self.D_c), dtype = torch.half, device = device)
+        if self.k_bits:
+            self.pool_q = torch.zeros((self.num_pages, self.epp, self.G * self.k_bits), dtype = torch.int32, device = device)
+            self.pool_s = torch.zeros((self.num_pages, self.epp, self.G), dtype = torch.half, device = device)
+        else:
+            self.pool_c = torch.zeros((self.num_pages, self.epp, self.D_c), dtype = torch.half, device = device)
         self.pool_r = torch.zeros((self.num_pages, self.epp, self.D_r), dtype = torch.half, device = device)
         if self.D_i:
             self.pool_idx = torch.zeros((self.num_pages, self.epp, self.D_i), dtype = torch.half, device = device)
 
     def free(self):
         self.device = None
-        self.pool_c = self.pool_r = self.pool_idx = None
+        self.pool_c = self.pool_q = self.pool_s = self.pool_r = self.pool_idx = None
         self._slot_bt = None
+
+    def pool_c_view(self) -> torch.Tensor:
+        """Flat nope pool for the attention kernels: (rows, D_c) fp16, or the packed
+        (rows, G * bits) int32 words with qc() giving the scales."""
+        if self.k_bits:
+            return self.pool_q.view(-1, self.G * self.k_bits)
+        return self.pool_c.view(-1, self.D_c)
+
+    def qc(self):
+        """(scales (rows, G) fp16, bits) for dsa_attn's packed-pool mode, or None."""
+        if self.k_bits:
+            return self.pool_s.view(-1, self.G), self.k_bits
+        return None
 
     def get_kv(self, cache_seqlens, block_table, sliding_window = -1):
         return None, None
@@ -101,17 +140,24 @@ class CacheLayer_dsa(CacheLayer):
         ne = min(num_tokens // self.compress_rate, self.epp)
         if ne <= 0:
             return
-        self.pool_c[to_page, :ne].copy_(source.pool_c[from_page, :ne], non_blocking = True)
+        if self.k_bits:
+            self.pool_q[to_page, :ne].copy_(source.pool_q[from_page, :ne], non_blocking = True)
+            self.pool_s[to_page, :ne].copy_(source.pool_s[from_page, :ne], non_blocking = True)
+        else:
+            self.pool_c[to_page, :ne].copy_(source.pool_c[from_page, :ne], non_blocking = True)
         self.pool_r[to_page, :ne].copy_(source.pool_r[from_page, :ne], non_blocking = True)
         if self.pool_idx is not None:
             self.pool_idx[to_page, :ne].copy_(source.pool_idx[from_page, :ne], non_blocking = True)
 
     def get_tensors(self):
-        return [t for t in [self.pool_c, self.pool_r, self.pool_idx] if t is not None]
+        return [t for t in [self.pool_c, self.pool_q, self.pool_s, self.pool_r, self.pool_idx] if t is not None]
 
     def storage_size(self):
-        n = self.num_pages * self.epp * (self.D_c + self.D_r + self.D_i)
-        return n * torch.half.itemsize
+        rows = self.num_pages * self.epp
+        if self.k_bits:
+            return rows * (self.G * self.k_bits * torch.int32.itemsize +
+                           (self.G + self.D_r + self.D_i) * torch.half.itemsize)
+        return rows * (self.D_c + self.D_r + self.D_i) * torch.half.itemsize
 
     def overhead_size(self):
         return 0
@@ -137,6 +183,8 @@ class CacheLayer_dsa(CacheLayer):
             "args": {
                 "cache_id": self.cache_id,
                 "max_num_tokens": self.max_num_tokens,
+                "k_bits": self.k_bits,
+                "v_bits": self.v_bits,
             }
         }
 

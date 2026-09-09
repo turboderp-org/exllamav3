@@ -6,7 +6,8 @@ import torch
 import torch.nn.functional as F
 
 from exllamav3.modules import MLAttention
-from exllamav3.cache import CacheLayer_MLA_fp16
+from exllamav3.cache import CacheLayer_MLA_fp16, CacheLayer_MLA_quant
+from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.constants import PAGE_SIZE
 from exllamav3.util.rope import RopeSettings, RopeStyle
 from exllamav3.modules.attention_fn.mla_triton import has_triton
@@ -106,9 +107,25 @@ def ref_index_scores(module, t, key, x, positions):
     return scores.masked_fill(causal, -float("inf"))
 
 
-def ref_forward_indices(module, t, key, x, positions, indices):
+def _sim_cache_quant(v, bits):
+    """Round-trip a (..., D) fp16 tensor through the cache quantizer at `bits` (same CUDA
+    kernels that fill CacheLayer_MLA_quant), so a reference can carry the cache's exact
+    latent values."""
+    D = v.shape[-1]
+    rows = v.numel() // D
+    pq = torch.empty((rows, D // 32 * bits), dtype = torch.int32, device = v.device)
+    ps = torch.empty((rows, D // 32), dtype = torch.half, device = v.device)
+    ext.quant_cache_cont(v.reshape(rows, D).half().contiguous(), pq, ps, 0.0)
+    out = torch.empty((rows, D), dtype = torch.half, device = v.device)
+    ext.dequant_cache_cont(pq, ps, out, 0.0)
+    return out.view(v.shape)
+
+
+def ref_forward_indices(module, t, key, x, positions, indices, ckv_quant_bits = 0):
     """Dense reference MLA restricted to a given per-query selection: the module's gathered
-    output must match this regardless of how the selection was made."""
+    output must match this regardless of how the selection was made. With ckv_quant_bits the
+    latent is round-tripped through the cache quantizer (the values a CacheLayer_MLA_quant
+    at that width holds; the fp16 rope key is exact in both)."""
     m = module
     bsz, S, _ = x.shape
 
@@ -124,6 +141,8 @@ def ref_forward_indices(module, t, key, x, positions, indices):
 
     ckv_kpe = xf @ t[f"{key}.kv_a_proj_with_mqa.weight"].float().T
     ckv = rms_norm(ckv_kpe[..., :m.kv_lora_rank], t[f"{key}.kv_a_layernorm.weight"], m.norm_eps)
+    if ckv_quant_bits:
+        ckv = _sim_cache_quant(ckv.half(), ckv_quant_bits).float()
     k_pe = ckv_kpe[..., m.kv_lora_rank:].view(bsz, S, 1, rope_dim)
 
     q_pe, k_pe = m.rope.apply(
@@ -337,3 +356,82 @@ def test_dsa_cached_decode():
     ref = ref_forward_indices(module, t, key, x, positions, indices)
     assert rel_err(out, ref[:, prefill:]) < 5e-3, \
         f"rel err {rel_err(out, ref[:, prefill:]):.3e}"
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+def test_dsa_cached_quant_prefill(bits):
+    """Sparse cached prefill over the packed-quantized latent (CacheLayer_MLA_quant): the
+    gather kernel dequantizes online in the H32-rotated domain. Reference: the masked dense
+    attention driven by the module's own selection, with the latent round-tripped through the
+    same quantizer (the selection is identical to the fp16-cache case: indexer planes stay
+    fp16). Residual error is the reference's fp16 ckv rounding flipping a few quantization
+    levels, hence the width-dependent tolerance."""
+    S, chunk = 384, 128
+    topk = 64
+    module, t, key = build_dsa(topk = topk, seed = 41)
+    bsz = 2
+    x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.5).half()
+    positions = torch.zeros((bsz,), dtype = torch.int32, device = device)
+
+    layer = CacheLayer_MLA_quant(None, module, 0, 4 * PAGE_SIZE * bsz, k_bits = bits)
+    layer.alloc(torch.device(device))
+    bt = torch.arange(4 * bsz, dtype = torch.int32, device = device).view(bsz, 4)
+    seqlens = torch.zeros((bsz,), dtype = torch.int32, device = device)
+    outs, chunk_indices = [], []
+    for a in range(0, S, chunk):
+        b = min(a + chunk, S)
+        params = {
+            "attn_mode": "flash_attn", "cache": layer, "block_table": bt,
+            "cache_seqlens": seqlens, "positions": seqlens.clone(),
+        }
+        outs.append(module.forward(x[:, a:b].contiguous(), params))
+        chunk_indices.append(params["dsa_topk_indices"].view(bsz, b - a, -1))
+        seqlens = seqlens + (b - a)
+    out = torch.cat(outs, dim = 1)
+    k_pad = max(ci.shape[-1] for ci in chunk_indices)
+    indices = torch.cat(
+        [F.pad(ci, (0, k_pad - ci.shape[-1]), value = -1) for ci in chunk_indices], dim = 1)
+    ref = ref_forward_indices(module, t, key, x, positions, indices, ckv_quant_bits = bits)
+    tol = {8: 6e-3, 4: 2.5e-2}[bits]
+    assert rel_err(out, ref) < tol, f"rel err {rel_err(out, ref):.3e} (tol {tol})"
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+def test_dsa_cached_quant_decode(bits):
+    """Single-token decode steps over a sparse context held in the packed-quantized cache."""
+    S = 200
+    module, t, key = build_dsa(topk = 64, seed = 43)
+    bsz = 1
+    x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.5).half()
+    positions = torch.zeros((bsz,), dtype = torch.int32, device = device)
+
+    layer = CacheLayer_MLA_quant(None, module, 0, 4 * PAGE_SIZE, k_bits = bits)
+    layer.alloc(torch.device(device))
+    bt = torch.arange(4, dtype = torch.int32, device = device).view(1, 4)
+    seqlens = torch.zeros((bsz,), dtype = torch.int32, device = device)
+    prefill = S - 8
+    params = {
+        "attn_mode": "flash_attn", "cache": layer, "block_table": bt,
+        "cache_seqlens": seqlens, "positions": seqlens.clone(),
+    }
+    module.forward(x[:, :prefill].contiguous(), params)
+    seqlens += prefill
+    outs, step_indices = [], []
+    for i in range(prefill, S):
+        params = {
+            "attn_mode": "flash_attn", "cache": layer, "block_table": bt,
+            "cache_seqlens": seqlens, "positions": seqlens.clone(),
+        }
+        outs.append(module.forward(x[:, i:i + 1].contiguous(), params))
+        step_indices.append(params["dsa_topk_indices"].view(bsz, 1, -1))
+        seqlens += 1
+    out = torch.cat(outs, dim = 1)
+    k_pad = step_indices[0].shape[-1]
+    indices = torch.arange(S, dtype = torch.int32, device = device) \
+        .view(1, 1, S).expand(bsz, S, S).contiguous()
+    indices[:, prefill:, :] = F.pad(
+        torch.cat(step_indices, dim = 1), (0, S - k_pad), value = -1)
+    ref = ref_forward_indices(module, t, key, x, positions, indices, ckv_quant_bits = bits)
+    tol = {8: 6e-3, 4: 2.5e-2}[bits]
+    e = rel_err(out, ref[:, prefill:])
+    assert e < tol, f"rel err {e:.3e} (tol {tol})"

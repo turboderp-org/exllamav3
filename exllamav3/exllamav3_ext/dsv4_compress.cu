@@ -74,7 +74,10 @@ void dsv4_compress_windows_kernel
     const int db_stride,
     const int* __restrict__ pool_bt,     // paged pools: block table (one row per job), else nullptr
     const int bt_stride,                 // paged pools, batched: block table row stride
-    const int epp                        // paged pools: entries per page
+    const int epp,                       // paged pools: entries per page
+    const bool stage_rel                 // dest_a is a per-JOB staging buffer of this step's
+                                         // entries at rows [0, nw) (packed-pool quantization
+                                         // follows); dest_b / pool_bt unused
 )
 {
     extern __shared__ float sh[];        // comp[hd] + reduce[hd / 32]
@@ -96,7 +99,7 @@ void dsv4_compress_windows_kernel
         if (ovl) ovl += (size_t) slot * ovl_stride;
         if (!pool_bt)
         {
-            dest_a += (size_t) slot * da_stride;
+            dest_a += (size_t) (stage_rel ? job : slot) * da_stride;
             if (dest_b) dest_b += (size_t) slot * db_stride;
         }
     }
@@ -198,8 +201,8 @@ void dsv4_compress_windows_kernel
         out = ((c - c0) & 1) ? (v_o * cs + v_e * sn) : (v_e * cs - v_o * sn);
     }
 
-    size_t drow = (size_t) (ec0 + w);
-    if (pool_bt)
+    size_t drow = stage_rel ? (size_t) w : (size_t) (ec0 + w);
+    if (pool_bt && !stage_rel)
         drow = (size_t) pool_bt[drow / epp] * epp + drow % epp;
     if (!dest_b || c < Wa)
         dest_a[drow * Wa + c] = __float2half_rn(out);
@@ -381,7 +384,8 @@ void dsv4_compress_gr
     Graph* graph,
     const c10::optional<at::Tensor>& slot_ids,
     const c10::optional<at::Tensor>& pool_bt,
-    int pool_epp
+    int pool_epp,
+    bool stage_rel
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(kv_new.device());
@@ -486,7 +490,7 @@ void dsv4_compress_gr
             seq, m, buf_rows, ovl_depth, W, hd, rd, Wa,
             overlap,
             slot_ids_ptr, ring_stride, ovl_stride, da_stride, db_stride,
-            pool_bt_ptr, bt_stride, pool_epp
+            pool_bt_ptr, bt_stride, pool_epp, stage_rel
         );
         cuda_check(cudaPeekAtLastError());
     }
@@ -526,7 +530,8 @@ void dsv4_compress
     int m,
     const c10::optional<at::Tensor>& slot_ids,
     const c10::optional<at::Tensor>& pool_bt,
-    int pool_epp
+    int pool_epp,
+    bool stage_rel
 )
 {
     dsv4_compress_gr
@@ -548,6 +553,7 @@ void dsv4_compress
         nullptr,
         slot_ids,
         pool_bt,
-        pool_epp
+        pool_epp,
+        stage_rel
     );
 }

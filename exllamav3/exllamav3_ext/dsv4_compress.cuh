@@ -26,7 +26,8 @@ void dsv4_compress_gr
     Graph* graph,
     const c10::optional<at::Tensor>& slot_ids = {},
     const c10::optional<at::Tensor>& pool_bt = {},
-    int pool_epp = 0
+    int pool_epp = 0,
+    bool stage_rel = false          // dest_a = per-job staging rows [0, nw) (see kernel)
 );
 
 void dsv4_compress
@@ -47,7 +48,8 @@ void dsv4_compress
     int m,
     const c10::optional<at::Tensor>& slot_ids,
     const c10::optional<at::Tensor>& pool_bt,
-    int pool_epp
+    int pool_epp,
+    bool stage_rel
 );
 
 void dsv4_ring_append_gr

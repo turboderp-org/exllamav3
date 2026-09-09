@@ -129,7 +129,7 @@ class Glm5NextConfig(Config):
         ip = prep["image_processor"]
         vp = prep.get("video_processor", ip)
         self.vision_pp = read_glm4v_pp_config(ip, glm5_next = True)
-        self.vision_pp.max_video_tokens = vp.get("max_image_tokens", ip.get("max_image_tokens")),
+        self.vision_pp.max_video_tokens = vp.get("max_image_tokens", ip.get("max_image_tokens"))
 
         self.vision_start_token_id = self.read_cfg(int, "image_start_token_id", no_default)
         self.vision_end_token_id = self.read_cfg(int, "image_end_token_id", no_default)

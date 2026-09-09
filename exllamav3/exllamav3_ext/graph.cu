@@ -174,13 +174,16 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
     {
         if (!node_needs_update[n]) continue;
         if (node_is_driver[n])
-            CudaDrv::instance().graph_exec_kernel_node_set_params((CUgraphExec) graph_exec, (CUgraphNode) nodes[n], &node_params_drv[n]);
+        {
+            CUresult r = CudaDrv::instance().graph_exec_kernel_node_set_params((CUgraphExec) graph_exec, (CUgraphNode) nodes[n], &node_params_drv[n]);
+            TORCH_CHECK(r == CUDA_SUCCESS, "Graph node parameter update failed (driver), CUresult ", (int) r);
+        }
         else
-            cudaGraphExecKernelNodeSetParams(graph_exec, nodes[n], &node_params[n]);
+            cuda_check(cudaGraphExecKernelNodeSetParams(graph_exec, nodes[n], &node_params[n]));
         node_needs_update[n] = false;
     }
 
-    cudaGraphLaunch(graph_exec, stream);
+    cuda_check(cudaGraphLaunch(graph_exec, stream));
 }
 
 void Graph::inspect_graph()

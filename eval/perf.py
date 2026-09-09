@@ -179,7 +179,7 @@ def main(args):
         args.max_length = args.cache_size
         print(f" !! max_length cannot exceed cache size, limiting to {args.max_length}")
 
-    model, config, cache, tokenizer = model_init.init(args, max_chunk_size = args.chunk_size)
+    model, config, cache, tokenizer = model_init.init(args)
     load_workload_ids(tokenizer, args.max_length + 512)
     bpw_layer, bpw_head, vram_bits = model.get_storage_info()
 
@@ -212,9 +212,9 @@ if __name__ == "__main__":
         parser,
         default_cache_size = 32768,
         default_autosplit_max_batch_size = 1,
+        default_chunk_size = 4096,
     )
     parser.add_argument("-max_length", "--max_length", type = int, help = "Max context length to measure (default: 32768)", default = 32768)
-    parser.add_argument("-chunk_size", "--chunk_size", type = int, help = "Max chunk size (default: 4096)", default = 4096)
     parser.add_argument("-spf", "--skip_prefill", action = "store_true", help = "Skip measuring prefill speed")
     parser.add_argument("-sg", "--skip_gen", action = "store_true", help = "Skip measuring generaition speed")
     parser.add_argument("-swu", "--skip_warmup", action = "store_true", help = "Skip warmup passes")

@@ -259,13 +259,15 @@ class QSAIndexer(Module):
         t_tile = self.SEL_TILE
         if block_table is not None:
             t_tile = max(epp, t_tile // epp * epp)   # tiles must start on a pool page
-        s_backing = g_tensor_cache.get(dev, (self.SEL_SLAB * self.SEL_TILE,), torch.half, "dsa_stile")
+        # Fixed score-row stride for every tile: it is a constexpr of the scoring kernel, so a
+        # stride that followed the visible length recompiled it at every new 128-pool boundary
+        s_stride = -(-t_tile // 128) * 128
+        s_backing = g_tensor_cache.get(dev, (self.SEL_SLAB * s_stride,), torch.half, "dsa_stile")
 
         def tile_scores(q_slab, rows, t0, t1):
             # Tile [t0, t1) of the pooled plane scored as if it started at pool 0: the row-0
             # position shifts by t0 * cr so the causal bounds shift by t0. Contiguous pools:
             # the launcher scans k_idx.shape[0] rows, so hand it exactly the visible ones
-            s_stride = triton.cdiv(t1 - t0, 128) * 128
             sc = s_backing[: rows * s_stride].view(rows, s_stride)
             if block_table is None:
                 return dsa_indexer_scores(
@@ -647,15 +649,23 @@ class QSAIndexer(Module):
         update_planes. Returns (bsz, seq, num_q_heads, head_dim) fp16.
         """
         from .attention_fn.qsa_triton import qsa_sparse_attend_rows
+        from ..cache.quant import CacheLayer_quant
         bsz, seq = q.shape[:2]
         indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
         bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
             .reshape(bsz * seq, -1).contiguous()
+        if isinstance(layer, CacheLayer_quant):
+            # Packed pages, dequantized online by the gather kernel
+            qk, sk, qv, sv, kb, vb = layer.get_qkv()
+            k_arg, v_arg, qc, page_size = qk, qv, (sk, sv, kb, vb), qk.shape[1]
+        else:
+            k_arg = layer.k.view(-1, attn.num_kv_heads, attn.head_dim)
+            v_arg = layer.v.view(-1, attn.num_kv_heads, attn.head_dim)
+            qc, page_size = None, layer.k.shape[1]
         o = qsa_sparse_attend_rows(
             q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous(),
-            layer.k.view(-1, attn.num_kv_heads, attn.head_dim),
-            layer.v.view(-1, attn.num_kv_heads, attn.head_dim),
-            indices, attn.sm_scale,
-            block_table = bt_rows, page_size = layer.k.shape[1],
+            k_arg, v_arg, indices, attn.sm_scale,
+            block_table = bt_rows, page_size = page_size,
+            qc = qc, n_kv_heads = attn.num_kv_heads,
         )
         return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)

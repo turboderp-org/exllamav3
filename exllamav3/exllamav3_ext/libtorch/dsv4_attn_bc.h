@@ -15,7 +15,8 @@ py::class_<BC_DSV4Attention, std::shared_ptr<BC_DSV4Attention>>(m, "BC_DSV4Atten
         at::Tensor, at::Tensor, at::Tensor,
         int, int, int, int, int, int, int, int, int, int, int, int, int, float, float, int, int,
         c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>,
-        c10::optional<at::Tensor>, c10::optional<at::Tensor>
+        c10::optional<at::Tensor>, c10::optional<at::Tensor>,
+        c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>, int
     >()
 )
 .def("needs_configure", &BC_DSV4Attention::needs_configure)
@@ -40,7 +41,8 @@ py::class_<BC_DSV4BatchAttention, std::shared_ptr<BC_DSV4BatchAttention>>(m, "BC
         at::Tensor, at::Tensor,
         int, int, int, int, int, int, int, int, int, int, int, int, int, float, float, int, int,
         c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>,
-        c10::optional<at::Tensor>, c10::optional<at::Tensor>, int, bool, bool
+        c10::optional<at::Tensor>, c10::optional<at::Tensor>, int, bool, bool,
+        c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>, int
     >()
 )
 .def("needs_configure", &BC_DSV4BatchAttention::needs_configure)

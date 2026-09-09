@@ -345,6 +345,11 @@ Enable GPU/CPU handoff profiling, for debug purposes.
 
 ## Model loading
 
+### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
+
+Use expandable segments for all Torch allocations. Opt out with a value of 1 or by explicitly
+setting `PYTORCH_CUDA_ALLOC_CONF`.
+
 ### `EXL3_LOAD_ARENA` (default: `1`)
 
 Slab allocation for small weight tensors during (deferred) module loads: tensors up to 16 MB
@@ -378,8 +383,13 @@ component.
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)
 
-When set, device-to-device tensor moves in the layer split bounce through host memory instead
-of using peer-to-peer copies. Workaround for platforms with broken or misreported P2P support.
+Controls device-to-device tensor moves (the layer split boundary, draft/MTP heads reading the
+target model's states, sparse-attention selections shared between layers). On some platforms
+the driver reports peer-to-peer access that the PCIe fabric does not deliver, and a direct copy
+silently yields garbage. Unset: the first move between each pair of GPUs probes it (a few
+random floats there and back, checked on the host) and, if the probe fails, every later move
+between that pair bounces through system memory, with a warning printed once. Set to `1`: always
+bounce, no probing. Set to `0`: always copy directly, no probing.
 
 ### `EXLLAMA_MASTER_ADDR` (default: `127.0.0.1`), `EXLLAMA_MASTER_PORT` (default: auto)
 

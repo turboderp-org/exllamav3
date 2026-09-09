@@ -175,7 +175,7 @@ class Gemma2Model(Model):
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
         p = "<bos><start_of_turn>user\n"
         if system_prompt:
-            p += "{system_prompt}\n\n"
+            p += f"{system_prompt}\n\n"
         p += f"{prompt}\n"
         p += f"<start_of_turn>model\n"
         return p

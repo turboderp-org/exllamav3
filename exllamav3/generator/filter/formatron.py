@@ -49,10 +49,18 @@ def _load_formatron() -> bool:
     return formatron_available
 
 
-@lru_cache(10)
 def create_engine_vocabulary(
     tokenizer: Tokenizer,
     vocab_processors: list[callable] | None = None
+) -> kbnf.Vocabulary:
+    # lru_cache needs hashable arguments; the documented list form is converted here
+    return _create_engine_vocabulary(tokenizer, tuple(vocab_processors) if vocab_processors else None)
+
+
+@lru_cache(10)
+def _create_engine_vocabulary(
+    tokenizer: Tokenizer,
+    vocab_processors: tuple | None = None
 ) -> kbnf.Vocabulary:
     vocab = tokenizer.get_vocab_dict()
     new_vocab = get_original_characters(vocab, vocab_processors)

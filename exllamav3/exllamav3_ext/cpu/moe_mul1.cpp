@@ -41,6 +41,12 @@
 // below 2^15, which makes the operand order load-bearing). Accuracy matches the GPU int8-GEMV
 // mode-2 class (~0.9% per-call output RMS). i32 accumulators are safe for k up to ~8192.
 //
+// On the AVX2 tier (no VNNI) the byte-sum must be emulated with vpmaddubsw, whose i16 pair sums
+// saturate once an activation is inside the pair. The accumulate therefore keeps the pair x-free:
+// sum the product bytes once per k-row into i16 pair-sums <= 510, then multiply by x with one
+// vpmaddwd per token row. +-127 activations, bit-exact vs the masked accumulate it replaces,
+// ~2x its throughput (measured on Zen 3 + Zen 5).
+//
 // State extraction uses compile-time (bits, row) index tables for vpermt2var plus immediate
 // funnel shifts, following benchmarks/exl3_cpu_gemm. The GEMV streams k-major with a contiguous
 // band of output tiles held in register accumulators per worker, so cold expert weights are read
@@ -270,12 +276,20 @@ struct PreparedIn
 {
     float* tin;         // m x k, transformed fp32 (scalar kernel)
     int32_t* splat32;   // m x k, int8 activation replicated x4
+    // m x k, x8 (two's-complement, read as i16) in BOTH 16-bit slots of the dword. AVX2
+    // bytesum-first accumulate: the product-byte pair sums (b0+b1, b2+b3, each <= 510) are
+    // formed once per k-row with x OUTSIDE the pair (so no saturation at full +-127), then a
+    // single vpmaddwd per token row against this pattern returns bytesum*x as one i32.
+    // Bit-exact reassociation of the same integer sum: 4 ops/row + 4 shared, vs 16 (masked)
+    // or 12 (activation-split). VNNI/VBMI ignore.
+    int32_t* splat_dup;
     float q[MAX_M];
     int32_t sum_x8[MAX_M];
 };
 
 M1_TARGET_AVX2
-void quantize_row_avx2(const float* dst, int32_t* splat, int k, float& q_out, int32_t& s_out)
+void quantize_row_avx2(const float* dst, int32_t* splat, int32_t* splat_dup,
+    int k, float& q_out, int32_t& s_out)
 {
     __m256 vmax = _mm256_setzero_ps();
     const __m256 sign = _mm256_set1_ps(-0.0f);
@@ -299,6 +313,14 @@ void quantize_row_avx2(const float* dst, int32_t* splat, int k, float& q_out, in
         vsum = _mm256_add_epi32(vsum, v);
         const __m256i b = _mm256_and_si256(v, mask8);
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(splat + i), _mm256_mullo_epi32(b, rep));
+        // x in both 16-bit slots (see PreparedIn::splat_dup): the low 16 bits of v are already
+        // the two's-complement i16 activation; replicate into the high slot
+        if (splat_dup)
+        {
+            const __m256i low16 = _mm256_and_si256(v, _mm256_set1_epi32(0xffff));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(splat_dup + i),
+                _mm256_or_si256(low16, _mm256_slli_epi32(low16, 16)));
+        }
     }
     alignas(32) int32_t sm[8];
     _mm256_store_si256(reinterpret_cast<__m256i*>(sm), vsum);
@@ -373,11 +395,14 @@ void prepare_rows
 
         // int8 quantization, one scale per row
         int32_t* splat = p.splat32 + static_cast<size_t>(r) * k;
+        // dup is only read by the AVX2 maddubs kernels; skip the stores on the VNNI/VBMI tiers
+        int32_t* splat_dup = (p.splat_dup && g_isa == Isa::Avx2)
+            ? p.splat_dup + static_cast<size_t>(r) * k : nullptr;
         float q;
         int32_t s;
         if (g_isa != Isa::Scalar)
         {
-            quantize_row_avx2(dst, splat, k, q, s);
+            quantize_row_avx2(dst, splat, splat_dup, k, q, s);
         }
         else
         {
@@ -561,7 +586,28 @@ void vnni_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
                 ? mat.trellis + (static_cast<size_t>(n0 / 8) * tiles_k * 8
                                  + static_cast<size_t>(tile_k) * 8 + (n0 % 8) + b) * packed_size
                 : packed_row + b * packed_size;
-            _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+            if (mat.swz && band == 8)
+            {
+                // Whole-group band on the swizzled layout: the k-stream is sequential, one line
+                // one step ahead is enough and the HW prefetcher follows the run (wider/farther
+                // measured neutral on K4, 7960X)
+                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+            }
+            else
+            {
+                // Strided stream: the native layout (K8, or VNNI-only CPUs where nothing is
+                // swizzled) strides row_stride per step, and a partial-group band on the
+                // swizzled layout (rows 3-4 at band 4) reads half a group then skips half; both
+                // outrun the HW prefetcher, so touch every line of the tile row a few steps
+                // ahead, as the AVX2 tier does (PR #331). +11% decode on K8 (7960X, four
+                // order-alternated pairs, 60.9 -> 67.9 tok/s), prefill unchanged; bits == 6 keeps
+                // the shorter distance that tier found necessary for its 96-byte rows
+                constexpr int pf_lines = (packed_size * 2 + 63) / 64;
+                constexpr int pf_dist = (bits == 6) ? 2 : 4;
+                const char* pf = reinterpret_cast<const char*>(packed + pf_step * pf_dist);
+                for (int l = 0; l < pf_lines; ++l)
+                    _mm_prefetch(pf + l * 64, _MM_HINT_T0);
+            }
             const uint32_t* pw = reinterpret_cast<const uint32_t*>(packed);
             const __m512i p0 = _mm512_maskz_loadu_epi32(mask0, pw);
             const __m512i p1 = _mm512_maskz_loadu_epi32(mask1, pw + 16);
@@ -819,7 +865,28 @@ void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
                 ? mat.trellis + (static_cast<size_t>(n0 / 8) * tiles_k * 8
                                  + static_cast<size_t>(tile_k) * 8 + (n0 % 8) + b) * packed_size
                 : packed_row + b * packed_size;
-            _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+            if (mat.swz && band == 8)
+            {
+                // Whole-group band on the swizzled layout: the k-stream is sequential, one line
+                // one step ahead is enough and the HW prefetcher follows the run (wider/farther
+                // measured neutral on K4, 7960X)
+                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+            }
+            else
+            {
+                // Strided stream: the native layout (K8, or VNNI-only CPUs where nothing is
+                // swizzled) strides row_stride per step, and a partial-group band on the
+                // swizzled layout (rows 3-4 at band 4) reads half a group then skips half; both
+                // outrun the HW prefetcher, so touch every line of the tile row a few steps
+                // ahead, as the AVX2 tier does (PR #331). +11% decode on K8 (7960X, four
+                // order-alternated pairs, 60.9 -> 67.9 tok/s), prefill unchanged; bits == 6 keeps
+                // the shorter distance that tier found necessary for its 96-byte rows
+                constexpr int pf_lines = (packed_size * 2 + 63) / 64;
+                constexpr int pf_dist = (bits == 6) ? 2 : 4;
+                const char* pf = reinterpret_cast<const char*>(packed + pf_step * pf_dist);
+                for (int l = 0; l < pf_lines; ++l)
+                    _mm_prefetch(pf + l * 64, _MM_HINT_T0);
+            }
             const uint32_t* pw = reinterpret_cast<const uint32_t*>(packed);
             const __m512i p0 = _mm512_maskz_loadu_epi32(mask0, pw);
             const __m512i p1 = _mm512_maskz_loadu_epi32(mask1, pw + 16);
@@ -966,27 +1033,26 @@ inline void avx2_row_codes(const __m256i (&preg)[bits], __m256i& codes_lo, __m25
 }
 
 M1_TARGET_AVX2
-inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat, int k,
-    int m, __m256i (&acc)[MAX_M][2], const __m256i& mult, const __m256i& ones16,
-    const __m256i& even_mask, int row)
+inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat_dup, int k,
+    int m, __m256i (&acc)[MAX_M][2], const __m256i& mult, const __m256i& ones32, int row)
 {
-    const __m256i prod0 = _mm256_mullo_epi32(codes_lo, mult);
-    const __m256i prod1 = _mm256_mullo_epi32(codes_hi, mult);
-    const __m256i p0e = _mm256_and_si256(prod0, even_mask);
-    const __m256i p0o = _mm256_andnot_si256(even_mask, prod0);
-    const __m256i p1e = _mm256_and_si256(prod1, even_mask);
-    const __m256i p1o = _mm256_andnot_si256(even_mask, prod1);
-
-    for (int i = 0; i < m; ++i)
-    {
-        const __m256i xs = _mm256_set1_epi32(splat[static_cast<size_t>(i) * k + row]);
-        acc[i][0] = _mm256_add_epi32(acc[i][0], _mm256_add_epi32(
-            _mm256_madd_epi16(_mm256_maddubs_epi16(p0e, xs), ones16),
-            _mm256_madd_epi16(_mm256_maddubs_epi16(p0o, xs), ones16)));
-        acc[i][1] = _mm256_add_epi32(acc[i][1], _mm256_add_epi32(
-            _mm256_madd_epi16(_mm256_maddubs_epi16(p1e, xs), ones16),
-            _mm256_madd_epi16(_mm256_maddubs_epi16(p1o, xs), ones16)));
-    }
+    // Bytesum-first accumulate: maddubs(prod, 0x01010101) sums each product-byte pair into an
+    // i16 lane ((b0+b1), (b2+b3), <= 510). x is OUTSIDE the pair so vpmaddubsw cannot saturate
+    // at full +-127 activations; one vpmaddwd per token row against splat_dup (x8 in both 16-bit
+    // slots) then folds (b0+b1)*x+(b2+b3)*x into a single i32. 4 shared + 4 per-row ops,
+    // bit-exact vs the 16-op masked accumulate it replaces (verified K1-K8 x m1-4 against an
+    // exact scalar reference). The token loop is unrolled by hand: with a runtime-bounded loop
+    // GCC spills the pair sums and pays per-iteration overhead (~1.4x on Zen 3).
+    const __m256i p_lo = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_lo, mult), ones32);
+    const __m256i p_hi = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_hi, mult), ones32);
+    #define ACC_ROW(i) \
+        if ((i) < m) { \
+            const __m256i xs = _mm256_set1_epi32(splat_dup[static_cast<size_t>(i) * k + row]); \
+            acc[i][0] = _mm256_add_epi32(acc[i][0], _mm256_madd_epi16(p_lo, xs)); \
+            acc[i][1] = _mm256_add_epi32(acc[i][1], _mm256_madd_epi16(p_hi, xs)); \
+        }
+    ACC_ROW(0) ACC_ROW(1) ACC_ROW(2) ACC_ROW(3)
+    #undef ACC_ROW
 }
 
 // Word-level row pairing on AVX2 is gated to bits == 8 ONLY: measured +11% there (each gather
@@ -997,8 +1063,8 @@ inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* sp
 template <int bits, int row = 0>
 M1_TARGET_AVX2
 inline void avx2_rows_accum(
-    const __m256i (&preg)[bits], const int32_t* splat, int k, int m, __m256i (&acc)[MAX_M][2],
-    const __m256i& mult, const __m256i& ones16, const __m256i& even_mask)
+    const __m256i (&preg)[bits], const int32_t* splat_dup, int k, int m, __m256i (&acc)[MAX_M][2],
+    const __m256i& mult, const __m256i& ones32)
 {
     if constexpr (bits == 8)
     {
@@ -1016,23 +1082,23 @@ inline void avx2_rows_accum(
                 _mm256_srli_epi32(b_lo, s0), _mm256_slli_epi32(a_lo, 32 - s0)), mask16);
             __m256i codes_hi = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
-            avx2_accum_row(codes_lo, codes_hi, splat, k, m, acc, mult, ones16, even_mask, row);
+            avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
             // Odd row: same gathered words, shifted by an extra `bits` (>= 32 shifts are
             // well-defined zero, so the slli term drops out cleanly when s - bits == 0)
             codes_lo = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_lo, s0 - bits), _mm256_slli_epi32(a_lo, 32 - (s0 - bits))), mask16);
             codes_hi = _mm256_and_si256(_mm256_or_si256(
                 _mm256_srli_epi32(b_hi, s1 - bits), _mm256_slli_epi32(a_hi, 32 - (s1 - bits))), mask16);
-            avx2_accum_row(codes_lo, codes_hi, splat, k, m, acc, mult, ones16, even_mask, row + 1);
-            avx2_rows_accum<bits, row + 2>(preg, splat, k, m, acc, mult, ones16, even_mask);
+            avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row + 1);
+            avx2_rows_accum<bits, row + 2>(preg, splat_dup, k, m, acc, mult, ones32);
         }
     }
     else if constexpr (row < 16)
     {
         __m256i codes_lo, codes_hi;
         avx2_row_codes<bits, row>(preg, codes_lo, codes_hi);
-        avx2_accum_row(codes_lo, codes_hi, splat, k, m, acc, mult, ones16, even_mask, row);
-        avx2_rows_accum<bits, row + 1>(preg, splat, k, m, acc, mult, ones16, even_mask);
+        avx2_accum_row(codes_lo, codes_hi, splat_dup, k, m, acc, mult, ones32, row);
+        avx2_rows_accum<bits, row + 1>(preg, splat_dup, k, m, acc, mult, ones32);
     }
 }
 
@@ -1044,8 +1110,19 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
     const int tiles_n = mat.n / 16;
     constexpr int packed_size = 16 * bits;
     const __m256i mult = _mm256_set1_epi32(static_cast<int32_t>(MUL1_MULT));
-    const __m256i ones16 = _mm256_set1_epi16(1);
-    const __m256i even_mask = _mm256_set1_epi16(0x00ff);
+    const __m256i ones32 = _mm256_set1_epi32(0x01010101);
+    const int32_t* splat_dup = in.splat_dup;
+
+    // The k-major stream strides row_stride (>= 8 KB) per step, beyond what the HW prefetcher
+    // tracks (and the swizzled layout the VNNI path uses is not applied for AVX2). Cold-stack
+    // (offloaded expert) microbench: +20..70% at K>=4, largest at K8, warm-neutral, so always
+    // on. Distance 4 measured best cold (>= 2 everywhere within noise, 4 adds another +10..35%
+    // at K5-K8 cold); prefetching past the allocation end is architecturally safe.
+    constexpr int pf_lines = (32 * bits + 63) / 64;   // cache lines per tile row
+    // bits==6 (96B rows) collapses at distance 4 when cold (reproducibly ~2x slower on both
+    // the 7960X and this Zen5 box; the 3-line window from 4 rows out interacts badly with the
+    // 96B stride). Distance 2 measures >= everywhere else for K6 while costing <2% warm.
+    constexpr int pf_dist = (bits == 6) ? 2 : 4;
 
     for (int tile_n = tn0; tile_n < tn1; ++tile_n)
     {
@@ -1060,13 +1137,18 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
         const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
         for (int tile_k = 0; tile_k < tiles_k; ++tile_k, packed += row_stride)
         {
-            const int32_t* splat = in.splat32 + tile_k * 16;
+            const uint16_t* pf = packed + row_stride * pf_dist;
+            #pragma unroll
+            for (int l = 0; l < pf_lines; ++l)
+                _mm_prefetch(reinterpret_cast<const char*>(pf) + l * 64, _MM_HINT_T0);
+
+            const int32_t* splat_k = splat_dup + tile_k * 16;
             // One 256-bit (8xu32) register per bits: covers packed_size = 16*bits u16 = bits*8
             // u32 words exactly, the whole k-tile's row of packed states
             __m256i preg[bits];
             for (int i = 0; i < bits; ++i)
                 preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + i * 16));
-            avx2_rows_accum<bits>(preg, splat, mat.k, m, acc, mult, ones16, even_mask);
+            avx2_rows_accum<bits>(preg, splat_k, mat.k, m, acc, mult, ones32);
         }
 
         for (int i = 0; i < m; ++i)
@@ -1392,12 +1474,18 @@ inline bool pin_threads_enabled()
 struct Pool
 {
     int spawned = 0;
-    std::atomic<uint64_t> gen{0};
+    // One word per dispatch: generation in the high bits, participant count in the low 16. A
+    // worker reads both in a single load, so a worker that was preempted between observing a
+    // new generation and reading its participant count can never pair a stale generation with
+    // the next dispatch's count
+    std::atomic<uint64_t> dispatch{0};
+    uint64_t generation = 0;
     std::atomic<uint64_t> done{0};
     std::atomic<PoolFn> fn{nullptr};
     void* ctx = nullptr;
     int num_workers = 1;
-    std::atomic<int> run_nw{1};   // participant count for the CURRENT dispatch (see run)
+    static constexpr int DISPATCH_NW_BITS = 16;
+    static int dispatch_nw(uint64_t d) { return (int) (d & ((1ull << DISPATCH_NW_BITS) - 1)); }
     std::vector<int> core_order;
 
     void pin_self(int idx)
@@ -1423,7 +1511,7 @@ struct Pool
         uint64_t seen = 0;
         int idle = 0;
         while (true) {
-            const uint64_t g = gen.load(std::memory_order_acquire);
+            const uint64_t g = dispatch.load(std::memory_order_acquire);
             if (g == seen)
             {
                 // Matches the outer job-ring poll's threshold (moe_handoff.cu)
@@ -1435,7 +1523,7 @@ struct Pool
                 // (default 15.6 ms), and the run() barrier turns one late waker into everyone
                 // oversleeping the next phase dispatc
                 uint64_t cmp = seen;
-                WaitOnAddress(&gen, &cmp, sizeof(uint64_t), INFINITE);
+                WaitOnAddress(&dispatch, &cmp, sizeof(uint64_t), INFINITE);
 #endif
                 continue;
             }
@@ -1445,10 +1533,9 @@ struct Pool
             // The participant count may sit below this worker's index (pool shrink, or a
             // small-job dispatch cap): surplus workers must not run the function (their
             // (idx, nw) pair indexes out of range) and must not ack, or run() returns before
-            // the participating workers have finished. run_nw is published with release
-            // ordering before the gen bump, so a worker that observes the new gen also
-            // observes its participant count
-            const int nw = run_nw.load(std::memory_order_acquire);
+            // the participating workers have finished. The count travels in the dispatch word
+            // itself, so it always belongs to the generation just observed
+            const int nw = dispatch_nw(g);
             if (idx < nw)
             {
                 fn.load(std::memory_order_relaxed)(ctx, idx, nw);
@@ -1480,11 +1567,11 @@ struct Pool
         if (n <= 1) { f(c, 0, 1); return; }
         ctx = c;
         fn.store(f, std::memory_order_relaxed);
-        run_nw.store(n, std::memory_order_release);
         const uint64_t d0 = done.load(std::memory_order_acquire);
-        gen.fetch_add(1, std::memory_order_release);
+        ++generation;
+        dispatch.store((generation << DISPATCH_NW_BITS) | (uint64_t) n, std::memory_order_release);
 #ifndef __linux__
-        WakeByAddressAll(&gen);
+        WakeByAddressAll(&dispatch);
 #endif
         f(c, 0, n);
         while (static_cast<int64_t>(done.load(std::memory_order_acquire) - d0) < n - 1)
@@ -1494,6 +1581,33 @@ struct Pool
 
 Pool g_pool;
 std::mutex g_pool_mutex;
+
+// -------------------------------------------------------------------------------------------
+//   Pool self-test hook (tests/test_moe_cpu_pool_.py)
+// -------------------------------------------------------------------------------------------
+
+// Drives the pool with a participant count alternating between `small` and the full pool, with
+// `threads` workers (oversubscribe to force preemption inside the dispatch handshake). Every
+// dispatch must run each participant exactly once, no non-participant at all, and run() must not
+// return while a participant is still inside the function. Returns the number of anomalies.
+struct PoolStressCtx
+{
+    std::atomic<int>* runs;
+    std::atomic<int>* active;
+    int spin;
+};
+
+static void pool_stress_fn(void* c, int idx, int nw)
+{
+    auto* s = (PoolStressCtx*) c;
+    s->active->fetch_add(1, std::memory_order_acq_rel);
+    s->runs[idx].fetch_add(1, std::memory_order_acq_rel);
+    volatile uint64_t x = (uint64_t) idx;
+    for (int i = 0; i < s->spin * (1 + (idx % 7)); ++i)
+        x = x * 6364136223846793005ull + 1442695040888963407ull;
+    s->active->fetch_sub(1, std::memory_order_acq_rel);
+}
+
 
 // -------------------------------------------------------------------------------------------
 //   MoE Layer registry
@@ -1536,6 +1650,7 @@ struct ForwardArena
 {
     std::vector<float> tin_g, tin_u, tin_d;
     std::vector<int32_t> splat_g, splat_u, splat_d;
+    std::vector<int32_t> splat_dup_g, splat_dup_u, splat_dup_d;
     std::vector<float> tout_g, tout_u, tout_d;
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
 
@@ -1805,28 +1920,13 @@ inline size_t trellis_bytes(const MoeCpuMatrix& m)
     return static_cast<size_t>(m.k / 16) * (m.n / 16) * 16 * m.bits * 2;
 }
 
-// Staged bytes feed the GPU dequant path, which expects the NATIVE (k/16, n/16, 16K) tile
-// order. Swizzled matrices are un-swizzled here. Per (group, kt) the swizzled source holds
-// 8 tiles contiguously that are also contiguous in the native destination, so this is
-// tiles_k * groups medium-sized memcpys (e.g. 184 x 23 x 768B at K3 2944^2) instead of one
-// big one; the stager threads absorb the difference and the PCIe leg downstream dominates.
+// Staged bytes are copied verbatim, swizzled or not: the GPU restores the native tile order
+// after the DMA (moe_unswizzle_trellis), which is one read + one write at VRAM bandwidth instead
+// of tiles_k * groups scattered memcpys here. Un-swizzling on the stager thread measured as the
+// whole VBMI-vs-VNNI prefill gap on a fully streamed 119B model (~17% at 32K).
 inline void stage_copy_trellis(uint8_t* dst, const MoeCpuMatrix& m)
 {
-    if (!m.swz)
-    {
-        std::memcpy(dst, m.trellis, trellis_bytes(m));
-        return;
-    }
-    const int tiles_k = m.k / 16;
-    const int tiles_n = m.n / 16;
-    const int groups = tiles_n / 8;
-    const size_t tile_b = static_cast<size_t>(m.bits) * 32;
-    const uint8_t* src = reinterpret_cast<const uint8_t*>(m.trellis);
-    for (int g = 0; g < groups; ++g)
-        for (int kt = 0; kt < tiles_k; ++kt)
-            std::memcpy(dst + (static_cast<size_t>(kt) * tiles_n + g * 8) * tile_b,
-                        src + (static_cast<size_t>(g) * tiles_k + kt) * 8 * tile_b,
-                        8 * tile_b);
+    std::memcpy(dst, m.trellis, trellis_bytes(m));
 }
 
 void stage_phase(void* vctx, int worker, int num_workers)
@@ -1990,6 +2090,31 @@ static const MoeCpuLayer* get_layer(int64_t handle)
     return g_layers[handle];
 }
 
+// Exported pool self-test (helpers above live in the anonymous namespace of this TU)
+int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin)
+{
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    g_pool.ensure(threads);
+    std::vector<std::atomic<int>> runs(threads);
+    std::atomic<int> active{0};
+    int64_t anomalies = 0;
+    for (int it = 0; it < iters; ++it)
+    {
+        const int n_req = (it & 1) ? small : 0;
+        const int n = (n_req > 0 && n_req < threads) ? n_req : threads;
+        for (auto& r : runs) r.store(0, std::memory_order_relaxed);
+        PoolStressCtx c{runs.data(), &active, spin};
+        g_pool.run(&pool_stress_fn, &c, n_req);
+        if (active.load(std::memory_order_acquire) != 0) ++anomalies;          // returned early
+        for (int i = 0; i < threads; ++i)
+        {
+            const int r = runs[i].load(std::memory_order_acquire);
+            if (i < n ? r != 1 : r != 0) ++anomalies;                           // double / missing / surplus run
+        }
+    }
+    return anomalies;
+}
+
 void exl3_moe_cpu_forward_raw(
     int64_t handle,
     const at::Half* x,
@@ -2051,6 +2176,9 @@ void exl3_moe_cpu_forward_raw(
     grow(ar.splat_g, static_cast<size_t>(nc) * MAX_M * H);
     grow(ar.splat_u, static_cast<size_t>(nc) * MAX_M * H);
     grow(ar.splat_d, static_cast<size_t>(nc) * MAX_M * I);
+    grow(ar.splat_dup_g, static_cast<size_t>(nc) * MAX_M * H);
+    grow(ar.splat_dup_u, static_cast<size_t>(nc) * MAX_M * H);
+    grow(ar.splat_dup_d, static_cast<size_t>(nc) * MAX_M * I);
     grow(ar.tout_g, static_cast<size_t>(nc) * MAX_M * I);
     grow(ar.tout_u, static_cast<size_t>(nc) * MAX_M * I);
     grow(ar.tout_d, static_cast<size_t>(nc) * MAX_M * H);
@@ -2062,11 +2190,14 @@ void exl3_moe_cpu_forward_raw(
     for (int j = 0; j < nc; ++j)
     {
         ctx.prep_g[j] = { ar.tin_g.data() + static_cast<size_t>(j) * MAX_M * H,
-                          ar.splat_g.data() + static_cast<size_t>(j) * MAX_M * H, {}, {} };
+                          ar.splat_g.data() + static_cast<size_t>(j) * MAX_M * H,
+                          ar.splat_dup_g.data() + static_cast<size_t>(j) * MAX_M * H, {}, {} };
         ctx.prep_u[j] = { ar.tin_u.data() + static_cast<size_t>(j) * MAX_M * H,
-                          ar.splat_u.data() + static_cast<size_t>(j) * MAX_M * H, {}, {} };
+                          ar.splat_u.data() + static_cast<size_t>(j) * MAX_M * H,
+                          ar.splat_dup_u.data() + static_cast<size_t>(j) * MAX_M * H, {}, {} };
         ctx.prep_d[j] = { ar.tin_d.data() + static_cast<size_t>(j) * MAX_M * I,
-                          ar.splat_d.data() + static_cast<size_t>(j) * MAX_M * I, {}, {} };
+                          ar.splat_d.data() + static_cast<size_t>(j) * MAX_M * I,
+                          ar.splat_dup_d.data() + static_cast<size_t>(j) * MAX_M * I, {}, {} };
     }
 
     std::lock_guard<std::mutex> lock(g_pool_mutex);

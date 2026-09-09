@@ -237,6 +237,16 @@ class MLP(Module):
         self.bsz1_pa_args = []
 
 
+    @override
+    def pin_linears(self):
+        # Pinning swaps the children's native linear handles; the graphed bsz-1 path built by
+        # load_local captured the old ones and, through them, the original VRAM trellis. Rebuild
+        # it against the pinned linears so the moved weights are actually released
+        super().pin_linears()
+        if self.device is not None:
+            self.load_local(self.device)
+
+
     def act_xielu_torch(self, x):
         alpha_p = nn.functional.softplus(self.alpha_p.float()).item()
         alpha_n = nn.functional.softplus(self.alpha_n.float()).item() + 0.5
@@ -693,6 +703,21 @@ class GatedMLP(Module):
 
 
     @override
+    def pin_linears(self):
+        # As MLP.pin_linears, plus the fused gate/up MultiLinear: its pointer table holds raw
+        # device addresses of the pre-pin trellis tensors, which the prefill path would otherwise
+        # keep reading after those tensors are freed
+        super().pin_linears()
+        if self.device is None:
+            return
+        for i in range(self.num_slices):
+            if self.multi_gu[i] is not None:
+                self.multi_gu[i].unload()
+                self.multi_gu[i] = None
+        self.load_local(self.device, 0)
+
+
+    @override
     def forward(
         self,
         x: torch.Tensor,
@@ -714,8 +739,8 @@ class GatedMLP(Module):
 
                 if self.bc is not None and bsz * q_len <= MAX_BSZN:
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
-                    x = x.view(1, bsz * q_len, dim)
-                    self.bc.run_bszN(x, d.view(x.shape))
+                    xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
+                    self.bc.run_bszN(xv, d.view(xv.shape))
 
                 elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
@@ -729,11 +754,11 @@ class GatedMLP(Module):
                     del d_
 
                 else:
-                    x = x.view(1, bsz * q_len, dim)
+                    xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     guh = torch.empty((2, bsz * q_len, dim), dtype = self.interm_dtype, device = x.device)
                     gu = torch.empty((2, bsz * q_len, self.multi_gu[s].out_features), dtype = self.interm_dtype, device = x.device)
                     ext.exl3_mgemm(
-                        x,
+                        xv,
                         self.multi_gu[s].ptrs_trellis,
                         gu,
                         self.multi_gu[s].ptrs_suh,

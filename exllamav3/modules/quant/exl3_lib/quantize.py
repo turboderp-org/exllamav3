@@ -1223,6 +1223,7 @@ def regularize(
         g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
     else:
         g_scale = 1.0
+        mse_scale = None
     weight *= g_scale
     su /= g_scale
 
@@ -1232,7 +1233,7 @@ def regularize(
     if verbose:
         print(f"     - su/sv std: {su.std().item():.6f}   {sv.std().item():.6f}")
         print(f"     - global scale: {g_scale:.6f}")
-        print(f"     - sample mse: {mse_scale.item():.6f}")
+        if mse_scale is not None: print(f"     - sample mse: {mse_scale.item():.6f}")
         print(f"     - apply_out_scales: {str(apply_out_scales)}")
 
     return apply_out_scales, weight, g_scale, su, sv

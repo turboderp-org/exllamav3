@@ -1,6 +1,7 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 import torch
+from ..util.device_copy import to_device
 import os
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -9,7 +10,6 @@ from ..model.model_tp_alloc import TPAllocation
 from functools import cached_property
 
 # Use host bounce when moving state from device to device in layer split
-no_p2p_copy = os.environ.get('EXLLAMA_NO_P2P_COPY', None)
 
 class Module(ABC):
 
@@ -82,15 +82,13 @@ class Module(ABC):
             module.unload()
 
     def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
-        global no_p2p_copy
         if x.device != self.device:
-            if no_p2p_copy:
-                x = x.cpu().to(self.device)
-            else:
-                # Pinned CPU sources (e.g. the generator's staged input IDs) upload without
-                # blocking the host; the copy is stream-ordered ahead of the consuming kernels
-                nb = x.device.type == "cpu" and x.is_pinned()
-                x = x.to(self.device, non_blocking = nb)
+            # Pinned CPU sources (e.g. the generator's staged input IDs) upload without
+            # blocking the host; the copy is stream-ordered ahead of the consuming kernels.
+            # Device-to-device moves go through to_device, which bounces them via host memory
+            # on platforms where peer copies corrupt data (probed, or EXLLAMA_NO_P2P_COPY)
+            nb = x.device.type == "cpu" and x.is_pinned()
+            x = to_device(x, self.device, non_blocking = nb)
         return x
 
     def get_qmaps(self):

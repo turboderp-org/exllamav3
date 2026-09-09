@@ -1043,10 +1043,13 @@ class PromptFormat_ds4(PromptFormat):
         for (u, a) in messages:
             context += f"<｜User｜>{u}"
             context += f"<｜Assistant｜>"
-            context += f"<think>" if think else f"</think>"
             if a is not None:
-                context += f"{a}"
+                if "</think>" in a:
+                    a = a.split("</think>", 1)[1].lstrip("\n")
+                context += f"</think>{a}"
                 context += f"<｜end▁of▁sentence｜>"
+            else:
+                context += f"<think>" if think else f"</think>"
         return context
 
     def add_bos(self):

@@ -32,7 +32,7 @@ def resolve_files(input_path):
 def get_token_mask(tokenizer, substr):
     vocab = tokenizer.get_id_to_piece_list()
     substr1 = substr.upper()
-    substr2 = substr.upper()
+    substr2 = " " + substr1     # word-initial variant (space-prefixed piece)
     mask = torch.tensor([(token.upper().startswith(substr1) or token.upper().startswith(substr2)) for token in vocab])
     return mask
 
@@ -42,7 +42,13 @@ def main(args):
     # Resolve filenames
     input_files = []
     for arg in args.input:
-        input_files += resolve_files(arg)
+        files = resolve_files(arg)
+        if not files:
+            print(f"No such file: {arg}")
+        input_files += files
+    if not input_files:
+        print("No input images")
+        sys.exit(1)
 
     # Prepare model etc.
     model, config, _, tokenizer = model_init.init(args)
@@ -90,7 +96,7 @@ def main(args):
                     model.default_chat_prompt(f"{be.text_alias}\n{args.prompt.strip()}")
                     for be in batch_embed
                 ]
-                input_ids = tokenizer.encode(batch_prompt, embeddings = batch_embed)
+                input_ids = tokenizer.encode(batch_prompt, embeddings = batch_embed, encode_special_tokens = True)
                 params = {
                     "last_tokens_only": 1,
                     "indexed_embeddings": batch_embed

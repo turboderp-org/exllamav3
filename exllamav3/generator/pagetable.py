@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from functools import lru_cache
 import heapq
 import torch
@@ -1007,14 +1008,21 @@ class PageTable:
         def get_buffer(shape, device, dtype):
             return torch.empty(shape, device = device, dtype = dtype)
 
-        if self.generator.model.loaded_tp:
-            self.generator.model.tp_rotate_cache_pages(id(self.cache), all_rotations_cpu)
-        else:
-            cache_tensors = self.cache.get_all_tensors()
-            for cache in cache_tensors:
-                buffer = get_buffer(cache[0].shape, cache.device, cache.dtype)
-                all_rotations = get_all_rotations(cache.device)
-                ext.cache_rotate(cache, all_rotations, buffer)
+        # Every cache that shares this page table's block tables must move in lockstep
+        caches = [self.cache]
+        draft_cache = getattr(self.generator, "draft_cache", None)
+        if draft_cache is not None and not os.environ.get("EXL3_DEBUG_NO_DRAFT_DEFRAG"):
+            caches.append(draft_cache)
+        # Dispatch per cache, not per main model: an MTP/DFlash draft model never loads TP, so its
+        # cache is not registered with the TP workers even when the main model is TP-loaded
+        for c in caches:
+            if c.model.loaded_tp:
+                c.model.tp_rotate_cache_pages(id(c), all_rotations_cpu)
+            else:
+                for cache in c.get_all_tensors():
+                    buffer = get_buffer(cache[0].shape, cache.device, cache.dtype)
+                    all_rotations = get_all_rotations(cache.device)
+                    ext.cache_rotate(cache, all_rotations, buffer)
 
         # Write new page indices
         for page in self.all_pages:

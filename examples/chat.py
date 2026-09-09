@@ -94,7 +94,9 @@ def main(args):
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
         recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
         show_visualizer = args.visualize_cache,
+        max_chunk_size = args.generator_chunk_size,
     )
+    vra_last = None   # previous /vra report, for the delta column
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
     if config.eos_token_id_list and all(config.eos_token_id_list):
         stop_conditions += config.eos_token_id_list
@@ -169,6 +171,7 @@ def main(args):
                         "/t                 Tokenize context",
                         "/think             Toggle reasoning mode",
                         "/tps               Toggle tokens/second output",
+                        "/vra               VRAM accounting per device, with deltas since the previous /vra",
                         "/x                 Exit",
                     ]))
                     continue
@@ -274,6 +277,15 @@ def main(args):
                     print_info(generator.pagetable.dump_page_list())
                     continue
 
+                # VRAM accounting (with deltas against the previous /vra)
+                case "/vra":
+                    from exllamav3.util.memory import vram_accounting, format_vram_report
+                    vra_now = vram_accounting(model, cache, generator)
+                    print()
+                    print(format_vram_report(vra_now, previous = vra_last))
+                    vra_last = vra_now
+                    continue
+
                 # Edit system prompt
                 case "/sp":
                     print_info("Press Alt-Enter to submit")
@@ -317,8 +329,8 @@ def main(args):
                 case "/save_ids":
                     if last_input_ids is None:
                         print_error(f"No IDs to save")
-                    else:
-                        d = {"ids": last_input_ids}
+                        continue
+                    d = {"ids": last_input_ids}
                     save_file(d, "last_ids.safetensors")
                     print_info(f"Saved IDs to last_ids.safetensors")
                     continue
@@ -398,16 +410,16 @@ def main(args):
                 case "/load":
                     if len(c) == 1:
                         c.append("~/chat_py_session.json")
-                        try:
-                            (
-                                system_prompt,
-                                banned_strings,
-                                context
-                            ) = load_session(c[1])
-                            print_info(f"Loaded session from: {c[1]}")
-                        except:
-                            print_error(f"Error loading {c[1]}")
-                        continue
+                    try:
+                        (
+                            system_prompt,
+                            banned_strings,
+                            context
+                        ) = load_session(c[1])
+                        print_info(f"Loaded session from: {c[1]}")
+                    except:
+                        print_error(f"Error loading {c[1]}")
+                    continue
 
                 # Print token IDs for last response
                 case "/t":
@@ -436,7 +448,7 @@ def main(args):
 
                 # Multiple completions test
                 case "/n":
-                    num_completions = int(c[1]) if len(c) > 1 else "0"
+                    num_completions = int(c[1]) if len(c) > 1 else 1
                     user_prompt = " ".join(c[2:])
 
                 # Needle in haystack prompt
@@ -649,5 +661,6 @@ if __name__ == "__main__":
     parser.add_argument("-lw", "--loop_window", type = int, help = "Loop detection window in tokens, default = 300", default = 300)
     parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
+    parser.add_argument("-gcs", "--generator_chunk_size", type = int, default = 2048, help = "Maximum prompt-prefill chunk size, default = 2048")
     _args = parser.parse_args()
     main(_args)

@@ -98,7 +98,7 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
     for key, data in extra_tensors.items():
         size = data["n_bytes"]
         if size > max_shard_bytes:
-            print(f" !! Warning, unable to fit module {module.key} in single shard of {args['shard_size']} MB")
+            print(f" !! Warning, unable to fit tensor {key} in single shard of {args['shard_size']} MB")
         if current_shard_size + size > max_shard_bytes and current_shard_size > 0:
             current_shard_size = 0
             out_map.append([])

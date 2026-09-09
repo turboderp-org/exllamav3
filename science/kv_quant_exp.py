@@ -295,12 +295,12 @@ with torch.inference_mode():
             k_scale = torch.zeros(scale_shape, dtype = torch.half, device = k.device)
             v_quant = torch.zeros(quant_shape, dtype = torch.int, device = k.device)
             v_scale = torch.zeros(scale_shape, dtype = torch.half, device = k.device)
-            ext.quant_cache_cont(k, k_quant, k_scale)
-            ext.quant_cache_cont(v, v_quant, v_scale)
+            ext.quant_cache_cont(k, k_quant, k_scale, 0.0)
+            ext.quant_cache_cont(v, v_quant, v_scale, 0.0)
             k_kern = torch.empty_like(k)
             v_kern = torch.empty_like(v)
-            ext.dequant_cache_cont(k_quant, k_scale, k_kern)
-            ext.dequant_cache_cont(v_quant, v_scale, v_kern)
+            ext.dequant_cache_cont(k_quant, k_scale, k_kern, 0.0)
+            ext.dequant_cache_cont(v_quant, v_scale, v_kern, 0.0)
             test_qkv(f"Kernel {bits} bits", q, k_kern, v_kern, ref_o, ref_scores, False, False, False)
 
         # Reference
