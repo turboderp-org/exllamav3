@@ -990,25 +990,56 @@ class MoeCpuHost:
         # Probe pinned->device bandwidth once: the break-even assignment count for streaming an
         # expert scales inversely with the link's bandwidth, so a chipset-attached x4 card needs
         # a much hotter expert to justify the weight DMA than a CPU-direct x16 one. An explicit
-        # EXL3_MOE_STREAM_T overrides the scaling. An idle PCIe link sits in a low power state
-        # and only retrains to full width/speed under sustained traffic (hundreds of ms on
-        # Windows), so warm it for a wall-clock budget and take the best of several samples
+        # EXL3_MOE_STREAM_T overrides the scaling.
         import time
         probe = min(self.wslot_size, 16 << 20)
         src = self.arena[0][:probe]
         ev0, ev1 = torch.cuda.Event(enable_timing = True), torch.cuda.Event(enable_timing = True)
         bw = 0.0
         with torch.cuda.stream(st["copy_stream"]):
+            # An idle PCIe link sits in a low power state (the Windows driver drops it to Gen1
+            # after a few idle seconds) and only retrains under sustained traffic. The retrain
+            # arrives as a single step rather than a ramp, and its latency is not bounded by
+            # anything we control: measured ~160 ms on an RTX 4090 under WDDM, on a link that
+            # then holds 26.5 GB/s. A fixed warm-up budget is therefore a coin flip whenever the
+            # step lands near it, and losing that flip is expensive -- the probe reads a Gen1/
+            # Gen2 link, stream_t is scaled far too high, and the result is cached for the life
+            # of the loaded model (measured: 6.8 GB/s read, stream_t 15 instead of 8, -18.1%
+            # prefill, no recovery short of a reload).
+            #
+            # So time every copy and keep the best over a window long enough to contain the
+            # retrain. A plateau alone cannot be trusted to mean "this link is slow": the
+            # retrain passes through intermediate generations, and an intermediate plateau is
+            # indistinguishable from a genuinely slow link by bandwidth alone (the failure
+            # above read 6.8 GB/s, a Gen2 plateau, not the Gen1 floor). Hence a floor on total
+            # observation time, with the settle window only allowed to end the probe after it.
+            # A genuinely slow link pays the floor once per loaded model and keeps its low
+            # reading and its high stream_t, which is what the calibration wants.
+            floor = 2.0         # observe at least this long: ~12x the observed retrain latency
+            settle = 0.5        # after the floor, best unimproved this long -> at the ceiling
+            cap = 5.0           # bound for a link that never settles
             t0 = time.perf_counter()
-            while time.perf_counter() - t0 < 0.25:
-                st["raw_slots"][0][:probe].copy_(src, non_blocking = True)
-                st["copy_stream"].synchronize()
-            for _ in range(8):
+            t_improved = t0
+            while True:
                 ev0.record(st["copy_stream"])
                 st["raw_slots"][0][:probe].copy_(src, non_blocking = True)
                 ev1.record(st["copy_stream"])
                 ev1.synchronize()
-                bw = max(bw, probe / (ev0.elapsed_time(ev1) * 1e-3) / 1e9)   # GB/s
+                sample = probe / (ev0.elapsed_time(ev1) * 1e-3) / 1e9   # GB/s
+                now = time.perf_counter()
+                if sample > bw * 1.02:      # 2%: ignore sample noise, catch a link generation
+                    t_improved = now
+                bw = max(bw, sample)
+                if now - t0 >= floor and now - t_improved >= settle:
+                    break
+                if now - t0 >= cap:
+                    # Still climbing at the cap: the reading is known-bad rather than merely
+                    # low, and stream_t derived from it will be too high. Say so -- silently
+                    # caching it is what makes this failure invisible.
+                    print(f" !! CPU MoE: pinned->device probe on cuda:{key} did not settle "
+                          f"({bw:.1f} GB/s and still rising after {cap:.1f} s). stream_t may be "
+                          f"too high; pin EXL3_MOE_STREAM_T to override.")
+                    break
         st["bw"] = bw
         if TUNING.stream_t_explicit:
             st["stream_t"] = self.stream_t
