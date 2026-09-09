@@ -218,8 +218,9 @@ class Spark2_5Model(Model):
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
         # HF chat_template.jinja wraps turns in <|System|>/<|User|>/<|Assistant|> blocks separated
         # by <|end▁of▁sentence|>. The default raw-text path uses a single round, no tools.
-        p = "<｜start▁of▁sentence｜>"
+        bos, eos = "<｜start▁of▁sentence｜>", "<｜end▁of▁sentence｜>"
+        p = f"{bos}<|System|>\nyou are a helpful assistant."
         if system_prompt:
-            p += f"<|System|>\n{system_prompt}<｜end▁of▁sentence｜>"
-        p += f"<|User|>\n{prompt}<｜end▁of▁sentence｜><|Assistant|>\n"
+            p += f"\n\n{system_prompt}"
+        p += f"{eos}{bos}<|User|>{prompt}{eos}{bos}<|Bot|></think>"
         return p
