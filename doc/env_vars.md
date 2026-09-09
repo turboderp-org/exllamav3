@@ -286,12 +286,14 @@ started. Note that capping below `bw` also disables the swizzled weight layout (
 Repack the CPU worker's expert trellis copies into a band-contiguous ("swizzled") layout at
 load, so each GEMV band streams sequentially from DRAM instead of in short strided runs
 (+45-75% cold decode GEMV throughput measured on a 7960X, reaching the sequential-read
-roofline). Takes effect on the `vbmi` kernel tier, whose byte-gather extraction leaves the
-register headroom for the wide bands the swizzled layout wants at m > 1, and on the `bw` tier
-(+2-29% on Skylake-SP, where the sequential per-band k-stream beats 96-128 B strided reads);
-the `vnni` tier keeps the native layout. K8 tensors always stay in the native layout (they
-route to the dword kernel). The GPU-streaming prefill path un-swizzles during staging, so
-staged bytes reaching the GPU dequant are unaffected. Set to `0` to keep the native layout.
+roofline). Takes effect on every AVX-512 kernel tier: `vbmi`, whose byte-gather extraction
+leaves the register headroom for the wide bands the swizzled layout wants at m > 1, `bw`
+(+2-29% on Skylake-SP, where the sequential per-band k-stream beats 96-128 B strided reads)
+and `vnni` (the dword kernel with the same band structure; +40% cold-expert decode measured
+with the tier forced on a 7960X). The `avx2` and `scalar` tiers read the native layout. K8
+tensors always stay in the native layout (they route to the dword kernel). The GPU-streaming
+prefill path un-swizzles during staging, so staged bytes reaching the GPU dequant are
+unaffected. Set to `0` to keep the native layout.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 

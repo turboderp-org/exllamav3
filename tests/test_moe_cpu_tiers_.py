@@ -9,6 +9,11 @@ The tier is fixed per process by EXL3_MOE_CPU_MAX_ISA (read once at static init)
 runs in a subprocess; on a VBMI machine that exercises vbmi, vnni, bw, avx2 and scalar in one run.
 Covers K1-8, gated and gateless experts, 1..5 tokens (m = 1..4 rows per expert chunk), the
 swizzled layout, and a 256-token case that takes the GEMV phases' many-GEMV (strided) regime.
+
+A second test repeats the comparison on real expert weights from the lfm2.5-8b-a1b mul1 ladder
+(one K per model, layer 2, single-threaded so the accumulation order is fixed): there the int8
+tiers must be bit-identical, since real trellis statistics can expose extraction bugs that
+random states miss. Skipped when the ladder is not present.
 """
 import os, sys, subprocess, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -83,6 +88,60 @@ def _worker(tier, out_path):
     torch.save(results, out_path)
 
 
+LADDER_ROOT = os.environ.get("EXL3_MOE_TIER_LADDER", "/mnt/str/models/lfm2.5-8b-a1b/exl3")
+LADDER = {1: "1.10bpw_mul1", 2: "2.10bpw_mul1", 3: "3.10bpw_mul1", 4: "4.10bpw_mul1",
+          5: "5.10bpw_mul1", 6: "6.10bpw_mul1", 7: "7.06bpw_mul1", 8: "8.00bpw_mul1"}
+LADDER_LAYER, LADDER_E, LADDER_TOPK = 2, 4, 2
+
+
+def _ladder_present():
+    return all(os.path.isdir(os.path.join(LADDER_ROOT, sub)) for sub in LADDER.values())
+
+
+def _worker_real(tier, out_path):
+    """Real-weight cases: K1-8 from the ladder, m = 1..4 rows, single thread, native layout."""
+    os.environ["EXL3_MOE_CPU_MAX_ISA"] = tier
+    import json, torch
+    from safetensors import safe_open
+    from exllamav3.ext import exllamav3_ext as ext
+    torch.manual_seed(0)
+    results = {}
+    for bits, sub in LADDER.items():
+        d = os.path.join(LADDER_ROOT, sub)
+        idx = os.path.join(d, "model.safetensors.index.json")
+        wm = json.load(open(idx))["weight_map"] if os.path.exists(idx) else None
+        handles = {}
+        def get(k):
+            fn = wm[k] if wm else "model.safetensors"
+            if fn not in handles: handles[fn] = safe_open(os.path.join(d, fn), "pt")
+            return handles[fn].get_tensor(k)
+        def mats(name):
+            out = []
+            for e in range(LADDER_E):
+                k = f"model.layers.{LADDER_LAYER}.feed_forward.experts.{e}.{name}"
+                out.append((get(k + ".trellis").contiguous(), get(k + ".suh").half().contiguous(),
+                            get(k + ".svh").half().contiguous()))
+            return out
+        g, u, dn = mats("w1"), mats("w3"), mats("w2")
+        handles.clear()
+        assert g[0][0].shape[2] // 16 == bits, (sub, g[0][0].shape)
+        H = g[0][1].numel()
+        h = ext.exl3_moe_cpu_make_layer(
+            [t[0] for t in g], [t[1] for t in g], [t[2] for t in g],
+            [t[0] for t in u], [t[1] for t in u], [t[2] for t in u],
+            [t[0] for t in dn], [t[1] for t in dn], [t[2] for t in dn],
+            [], [], [], 0, 0.0, 0)
+        for m in range(1, 5):
+            x = torch.randn(m, H).half()
+            sel = torch.stack([torch.randperm(LADDER_E)[:LADDER_TOPK] for _ in range(m)]).int()
+            w = torch.rand(m, LADDER_TOPK).float()
+            out = torch.zeros(m, H, dtype = torch.float)
+            ext.exl3_moe_cpu_forward(h, x, sel, w, out, 1)
+            results[(bits, m)] = out.clone()
+        ext.exl3_moe_cpu_free_layer(h)
+    torch.save(results, out_path)
+
+
 def _supported_tiers():
     from exllamav3.ext import exllamav3_ext as ext
     tiers = ["scalar"]
@@ -122,8 +181,45 @@ def test_cpu_moe_tiers_agree():
             print(f" -- {tier:6}: {len(res)} cases ({nswz} swizzled), worst rel {worst:.2e} vs avx2, {exact} bit-exact")
 
 
+def test_cpu_moe_tiers_real_weights():
+    import pytest, torch
+    if not _ladder_present():
+        pytest.skip(f"lfm2.5 mul1 ladder not found under {LADDER_ROOT}")
+    tiers = _supported_tiers()
+    assert "avx2" in tiers, "no vector tier available; nothing to compare"
+    with tempfile.TemporaryDirectory() as td:
+        outs = {}
+        for tier in tiers:
+            path = os.path.join(td, f"{tier}.pt")
+            env = dict(os.environ, EXL3_MOE_CPU_MAX_ISA = tier)
+            subprocess.run([sys.executable, os.path.abspath(__file__), "--worker-real", tier, path],
+                           env = env, check = True)
+            outs[tier] = torch.load(path)
+        ref = outs["avx2"]
+        worst_scalar = 0.0
+        for tier, res in outs.items():
+            assert res.keys() == ref.keys(), f"{tier}: case set differs from avx2"
+            for key, out in res.items():
+                r = ref[key]
+                assert torch.isfinite(out).all() and r.abs().max() > 0, (tier, key)
+                if tier == "scalar":
+                    rel = ((out - r).abs().max() / r.abs().max()).item()
+                    worst_scalar = max(worst_scalar, rel)
+                    assert rel <= SCALAR_TOL, f"scalar vs avx2 at (K, m) = {key}: rel {rel:.3e}"
+                else:
+                    assert torch.equal(out, r), \
+                        f"{tier} differs from avx2 at (K, m) = {key}: max abs diff {(out - r).abs().max().item():.3e}"
+        print(f" -- real weights: {[t for t in tiers if t != 'scalar']} bit-identical over K1-8 x m1-4; "
+              f"scalar worst rel {worst_scalar:.2e}")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--worker":
         _worker(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--worker-real":
+        _worker_real(sys.argv[2], sys.argv[3])
     else:
-        test_cpu_moe_tiers_agree(); print("PASS")
+        test_cpu_moe_tiers_agree()
+        if _ladder_present():
+            test_cpu_moe_tiers_real_weights()
+        print("PASS")

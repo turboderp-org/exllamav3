@@ -87,8 +87,9 @@ class MoeCpuTuning:
         # region once easily-compactable free memory runs low, which can stall loading badly
         self.arena_hugepage = os.environ.get("EXL3_MOE_ARENA_HUGEPAGE", "1") != "0"
         # Band-contiguous ("swizzled") expert trellis layout: repacked at arena rehome so each
-        # 8-tile output band streams sequentially from DRAM. Applied when the VBMI or the
-        # AVX-512BW kernel tier is active. EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
+        # 8-tile output band streams sequentially from DRAM. Applied on every AVX-512 kernel
+        # tier (bw, vnni, vbmi); the AVX2 and scalar tiers read the native layout.
+        # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
         self.swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
 
         # --- GPU-streaming prefill ---
@@ -235,8 +236,9 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
                 out.append((trellis, suh, svh, bias))
             return out
 
-        # Swizzle the trellis copies band-contiguous when the VBMI/BW kernel tiers will consume them
-        swz = TUNING.swizzle and (cext.exl3_moe_cpu_has_avx512_vbmi() or cext.exl3_moe_cpu_has_avx512_bw())
+        # Swizzle the trellis copies band-contiguous when an AVX-512 kernel tier will consume
+        # them (has_avx512_bw is true for the bw, vnni and vbmi tiers alike)
+        swz = TUNING.swizzle and cext.exl3_moe_cpu_has_avx512_bw()
 
         def rehome_trellis(t):
             return arena.rehome(t, band_swizzle = swz and t.shape[2] // 16 != 8)
@@ -873,10 +875,10 @@ class MoeCpuHost:
                 for k in ("g", "u", "d"):
                     if pd.get(k):
                         mx = max(mx, pd[k][0] * pd[k][1])
-        # Experts arrive band-swizzled when the VBMI CPU tier owns them (same rule as the child's
+        # Experts arrive band-swizzled when an AVX-512 CPU tier owns them (same rule as the child's
         # arena rehome, K8 excepted per matrix); the GPU restores the native tile order into a
         # parallel ring after each DMA
-        swz = TUNING.swizzle and (ext.exl3_moe_cpu_has_avx512_vbmi() or ext.exl3_moe_cpu_has_avx512_bw())
+        swz = TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_bw()
         st = dict(
             copy_stream = torch.cuda.Stream(device = device),
             vram_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
