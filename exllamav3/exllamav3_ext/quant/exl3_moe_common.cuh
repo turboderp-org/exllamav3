@@ -40,6 +40,17 @@
     const half** __restrict__ down_suh,         \
     const half** __restrict__ down_svh,         \
                                                 \
+    const uint16_t** __restrict__ residual_gate_trellis, \
+    const uint16_t** __restrict__ residual_up_trellis,   \
+    const uint16_t** __restrict__ residual_down_trellis, \
+    const float* __restrict__ residual_gate_scales,      \
+    const float* __restrict__ residual_up_scales,        \
+    const float* __restrict__ residual_down_scales,      \
+    const int* __restrict__ residual_gate_k,             \
+    const int* __restrict__ residual_up_k,               \
+    const int* __restrict__ residual_down_k,             \
+    const int num_residual_stages,                       \
+                                                \
     const int64_t* __restrict__ expert_count,   \
     const int64_t* __restrict__ token_sorted,   \
     const half* __restrict__ weight_sorted,     \
@@ -55,5 +66,6 @@
     const int K_gate,                           \
     const int K_up,                             \
     const int K_down,                           \
+    const bool tile_overflow,                   \
                                                 \
     int* __restrict__ locks

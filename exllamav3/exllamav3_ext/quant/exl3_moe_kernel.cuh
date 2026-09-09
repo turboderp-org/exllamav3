@@ -61,9 +61,11 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         end += expert_count[expert_idx];
         int token_count = end - start;
 
-        // Skip if no tokens or too many tokens for fused kernel (batch is handled by reconstruct path outside kernel)
+        // The legacy entry point leaves oversized experts to its reconstruct
+        // fallback. Additive callers have no such fallback, so they process an
+        // expert's route span in bounded workspace-sized tiles below.
         if (token_count == 0) continue;
-        if (token_count > max_tokens_per_expert) continue;
+        if (!tile_overflow && token_count > max_tokens_per_expert) continue;
 
         // Skip if expert is claimed by a different group
         if (expert_idx_assign++ != ticket) continue;
@@ -79,190 +81,299 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         const half* exp_down_suh = down_suh[expert_idx];
         const half* exp_down_svh = down_svh[expert_idx];
 
-        // Gather + input hadamard for g, u. Non-gated mode skips the g staging (and the g GEMM
-        // below); the activation synthesizes the gate lane from u
-        const bool gated = act_function != MOE_ACT_RELU2_NOGATE;
-        auto had_gather_gu_in = [&]()
+        const int expert_end = end;
+        for (int chunk_start = start; chunk_start < expert_end;
+             chunk_start += max_tokens_per_expert)
         {
-            const int warps_per_token = hidden_dim / 128;
-            const int total_warps = token_count * warps_per_token;
-            const int64_t* top_x = token_sorted + start;
-            for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
+            start = chunk_start;
+            token_count = MIN(expert_end - chunk_start, max_tokens_per_expert);
+
+            // Gather + input hadamard for g, u. Non-gated mode skips the g staging (and the g GEMM
+            // below); the activation synthesizes the gate lane from u
+            const bool gated = act_function != MOE_ACT_RELU2_NOGATE;
+            auto had_gather_gu_in = [&]()
             {
-                int token_idx = top_x[warp_idx / warps_per_token];
-                int token_off = warp_idx % warps_per_token;
-                const half* in_ptr = hidden_state + token_idx * hidden_dim + token_off * 128;
-                if (gated)
+                const int warps_per_token = hidden_dim / 128;
+                const int total_warps = token_count * warps_per_token;
+                const int64_t* top_x = token_sorted + start;
+                for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
+                {
+                    int token_idx = top_x[warp_idx / warps_per_token];
+                    int token_off = warp_idx % warps_per_token;
+                    const half* in_ptr = hidden_state + token_idx * hidden_dim + token_off * 128;
+                    if (gated)
+                        had_hf_r_128_inner<true, false>
+                        (
+                            in_ptr,
+                            temp_state_g + 128 * warp_idx,
+                            exp_gate_suh + 128 * token_off,
+                            0.088388347648f
+                        );
                     had_hf_r_128_inner<true, false>
                     (
                         in_ptr,
-                        temp_state_g + 128 * warp_idx,
-                        exp_gate_suh + 128 * token_off,
+                        temp_state_u + 128 * warp_idx,
+                        exp_up_suh + 128 * token_off,
                         0.088388347648f
                     );
-                had_hf_r_128_inner<true, false>
-                (
-                    in_ptr,
-                    temp_state_u + 128 * warp_idx,
-                    exp_up_suh + 128 * token_off,
-                    0.088388347648f
-                );
-            }
-            group_barrier(group_idx, group_size, barrier_counters_sense);
-        };
+                }
+                group_barrier(group_idx, group_size, barrier_counters_sense);
+            };
 
-        had_gather_gu_in();
+            had_gather_gu_in();
 
-        // g, u GEMM
-        auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
-        {
-            int size_m = token_count;
-            while (size_m > 0)
+            // g, u GEMM
+            auto gemm_up = [&](
+                const half* in_addr,
+                half* out_addr,
+                const uint16_t* trellis,
+                const int K,
+                const float output_scale,
+                const bool accumulate
+            )
             {
-                #define ARGS            \
-                    in_addr,            \
-                    trellis,            \
-                    out_addr,           \
-                    MIN(size_m, 16),    \
-                    hidden_dim,         \
-                    intermediate_dim,   \
-                    locks,              \
-                    nullptr
-                #define SHAPE_ARGS      \
-                    MOE_TILESIZE_M,     \
-                    MOE_TILESIZE_K,     \
-                    MOE_TILESIZE_N,     \
-                    MOE_SH_STAGES,      \
-                    MOE_FRAG_STAGES
-                if constexpr (t_bits)
-                    exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
-                else switch(K)
+                int size_m = token_count;
+                while (size_m > 0)
                 {
-                    case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                };
-                #undef ARGS
-                #undef SHAPE_ARGS
+                    #define ARGS            \
+                        in_addr,            \
+                        trellis,            \
+                        out_addr,           \
+                        MIN(size_m, 16),    \
+                        hidden_dim,         \
+                        intermediate_dim,   \
+                        locks,              \
+                        nullptr,            \
+                        output_scale,       \
+                        accumulate
+                    #define SHAPE_ARGS      \
+                        MOE_TILESIZE_M,     \
+                        MOE_TILESIZE_K,     \
+                        MOE_TILESIZE_N,     \
+                        MOE_SH_STAGES,      \
+                        MOE_FRAG_STAGES
+                    if constexpr (t_bits == 0)
+                    {
+                        if (accumulate) switch(K)
+                        {
+                            case 1: exl3_gemm_kernel_inner<1, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 2: exl3_gemm_kernel_inner<2, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 3: exl3_gemm_kernel_inner<3, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 4: exl3_gemm_kernel_inner<4, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 5: exl3_gemm_kernel_inner<5, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 6: exl3_gemm_kernel_inner<6, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 7: exl3_gemm_kernel_inner<7, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 8: exl3_gemm_kernel_inner<8, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            default: __trap();
+                        }
+                        else switch(K)
+                        {
+                            case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            default: __trap();
+                        }
+                    }
+                    else
+                        exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
+                    #undef ARGS
+                    #undef SHAPE_ARGS
 
-                in_addr += 16 * hidden_dim;
-                out_addr += 16 * intermediate_dim;
-                size_m -= 16;
-            }
-        };
+                    in_addr += 16 * hidden_dim;
+                    out_addr += 16 * intermediate_dim;
+                    size_m -= 16;
+                }
+            };
 
-        if (gated)
-            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
-        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
-        group_barrier(group_idx, group_size, barrier_counters_sense);
-
-        // Output hadamard for g, u + activation+gate + input hadamard for d
-        auto had_guad = [&]()
-        {
-            const int warps_per_token = intermediate_dim / 128;
-            const int total_warps = token_count * warps_per_token;
-            for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
-            {
-                int token_off = warp_idx % warps_per_token;
-                had_hf_r_128_guad_inner
-                (
-                    temp_intermediate_g + 128 * warp_idx,
-                    temp_intermediate_u + 128 * warp_idx,
-                    temp_intermediate_g + 128 * warp_idx,
-                    exp_gate_svh + 128 * token_off,
-                    exp_up_svh + 128 * token_off,
-                    exp_down_suh + 128 * token_off,
-                    0.088388347648f,
-                    act_limit,
-                    act_function
+            if (gated)
+                gemm_up(
+                    temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate,
+                    1.0f, false
                 );
-            }
+            gemm_up(
+                temp_state_u, temp_intermediate_u, exp_up_trellis, K_up, 1.0f, false
+            );
             group_barrier(group_idx, group_size, barrier_counters_sense);
-        };
-
-        had_guad();
-
-        // d GEMM
-        auto gemm_down = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
-        {
-            int size_m = token_count;
-            while (size_m > 0)
-            {
-                #define ARGS            \
-                    in_addr,            \
-                    trellis,            \
-                    out_addr,           \
-                    MIN(size_m, 16),    \
-                    intermediate_dim,   \
-                    hidden_dim,         \
-                    locks,              \
-                    nullptr
-                #define SHAPE_ARGS      \
-                    MOE_TILESIZE_M,     \
-                    MOE_TILESIZE_K,     \
-                    MOE_TILESIZE_N,     \
-                    MOE_SH_STAGES,      \
-                    MOE_FRAG_STAGES
-                if constexpr (t_bits)
-                    exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
-                else switch(K)
+            if constexpr (t_bits == 0)
+                for (int stage = 0; stage < num_residual_stages; ++stage)
                 {
-                    case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                };
-                #undef ARGS
-                #undef SHAPE_ARGS
+                    const int residual_idx = stage * num_experts + expert_idx;
+                    const float gate_scale = residual_gate_scales[residual_idx];
+                    const float up_scale = residual_up_scales[residual_idx];
+                    if (gated && gate_scale != 0.0f)
+                        gemm_up(
+                            temp_state_g,
+                            temp_intermediate_g,
+                            residual_gate_trellis[residual_idx],
+                            residual_gate_k[stage],
+                            gate_scale,
+                            true
+                        );
+                    if (up_scale != 0.0f)
+                        gemm_up(
+                            temp_state_u,
+                            temp_intermediate_u,
+                            residual_up_trellis[residual_idx],
+                            residual_up_k[stage],
+                            up_scale,
+                            true
+                        );
+                    group_barrier(group_idx, group_size, barrier_counters_sense);
+                }
 
-                in_addr += 16 * intermediate_dim;
-                out_addr += 16 * hidden_dim;
-                size_m -= 16;
-            }
-        };
-
-        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
-        group_barrier(group_idx, group_size, barrier_counters_sense);
-
-        // Output hadamard for d + scatter add
-        auto had_d_out = [&]()
-        {
-            const int warps_per_token = hidden_dim / 128;
-            const int total_warps = token_count * warps_per_token;
-            const int64_t* top_x = token_sorted + start;
-            const half* weights = weight_sorted + start;
-            for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
+            // Output hadamard for g, u + activation+gate + input hadamard for d
+            auto had_guad = [&]()
             {
-                int token_idx = top_x[warp_idx / warps_per_token];
-                half weight = weights[warp_idx / warps_per_token];
-                int token_off = warp_idx % warps_per_token;
-                float* out_ptr = output_state + token_idx * hidden_dim + token_off * 128;
-                had_hf_r_128_d_inner
-                (
-                    temp_state_g + 128 * warp_idx,
-                    out_ptr,
-                    exp_down_svh + 128 * token_off,
-                    0.088388347648f * __half2float(weight)
-                );
-            }
-        };
+                const int warps_per_token = intermediate_dim / 128;
+                const int total_warps = token_count * warps_per_token;
+                for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
+                {
+                    int token_off = warp_idx % warps_per_token;
+                    had_hf_r_128_guad_inner
+                    (
+                        temp_intermediate_g + 128 * warp_idx,
+                        temp_intermediate_u + 128 * warp_idx,
+                        temp_intermediate_g + 128 * warp_idx,
+                        exp_gate_svh + 128 * token_off,
+                        exp_up_svh + 128 * token_off,
+                        exp_down_suh + 128 * token_off,
+                        0.088388347648f,
+                        act_limit,
+                        act_function
+                    );
+                }
+                group_barrier(group_idx, group_size, barrier_counters_sense);
+            };
 
-        had_d_out();
+            had_guad();
 
-        // Draw the next ticket and publish it to the group through the end-of-expert barrier, which also protects
-        // the temp buffers for reuse. Grabbed tickets continue from num_groups since 0..num_groups-1 are implicit
-        if (block_idx == 0 && threadIdx.x == 0)
-            sched[2 + group_idx] = num_groups + atomicAdd(&sched[0], 1);
-        group_barrier(group_idx, group_size, barrier_counters_sense);
+            // d GEMM
+            auto gemm_down = [&](
+                const half* in_addr,
+                half* out_addr,
+                const uint16_t* trellis,
+                const int K,
+                const float output_scale,
+                const bool accumulate
+            )
+            {
+                int size_m = token_count;
+                while (size_m > 0)
+                {
+                    #define ARGS            \
+                        in_addr,            \
+                        trellis,            \
+                        out_addr,           \
+                        MIN(size_m, 16),    \
+                        intermediate_dim,   \
+                        hidden_dim,         \
+                        locks,              \
+                        nullptr,            \
+                        output_scale,       \
+                        accumulate
+                    #define SHAPE_ARGS      \
+                        MOE_TILESIZE_M,     \
+                        MOE_TILESIZE_K,     \
+                        MOE_TILESIZE_N,     \
+                        MOE_SH_STAGES,      \
+                        MOE_FRAG_STAGES
+                    if constexpr (t_bits == 0)
+                    {
+                        if (accumulate) switch(K)
+                        {
+                            case 1: exl3_gemm_kernel_inner<1, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 2: exl3_gemm_kernel_inner<2, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 3: exl3_gemm_kernel_inner<3, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 4: exl3_gemm_kernel_inner<4, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 5: exl3_gemm_kernel_inner<5, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 6: exl3_gemm_kernel_inner<6, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 7: exl3_gemm_kernel_inner<7, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            case 8: exl3_gemm_kernel_inner<8, false, 1, SHAPE_ARGS, false>(ARGS); break;
+                            default: __trap();
+                        }
+                        else switch(K)
+                        {
+                            case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                            default: __trap();
+                        }
+                    }
+                    else
+                        exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
+                    #undef ARGS
+                    #undef SHAPE_ARGS
+
+                    in_addr += 16 * intermediate_dim;
+                    out_addr += 16 * hidden_dim;
+                    size_m -= 16;
+                }
+            };
+
+            gemm_down(
+                temp_intermediate_g, temp_state_g, exp_down_trellis, K_down,
+                1.0f, false
+            );
+            group_barrier(group_idx, group_size, barrier_counters_sense);
+            if constexpr (t_bits == 0)
+                for (int stage = 0; stage < num_residual_stages; ++stage)
+                {
+                    const int residual_idx = stage * num_experts + expert_idx;
+                    const float down_scale = residual_down_scales[residual_idx];
+                    if (down_scale != 0.0f)
+                        gemm_down(
+                            temp_intermediate_g,
+                            temp_state_g,
+                            residual_down_trellis[residual_idx],
+                            residual_down_k[stage],
+                            down_scale,
+                            true
+                        );
+                    group_barrier(group_idx, group_size, barrier_counters_sense);
+                }
+
+            // Output hadamard for d + scatter add
+            auto had_d_out = [&]()
+            {
+                const int warps_per_token = hidden_dim / 128;
+                const int total_warps = token_count * warps_per_token;
+                const int64_t* top_x = token_sorted + start;
+                const half* weights = weight_sorted + start;
+                for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
+                {
+                    int token_idx = top_x[warp_idx / warps_per_token];
+                    half weight = weights[warp_idx / warps_per_token];
+                    int token_off = warp_idx % warps_per_token;
+                    float* out_ptr = output_state + token_idx * hidden_dim + token_off * 128;
+                    had_hf_r_128_d_inner
+                    (
+                        temp_state_g + 128 * warp_idx,
+                        out_ptr,
+                        exp_down_svh + 128 * token_off,
+                        0.088388347648f * __half2float(weight)
+                    );
+                }
+            };
+
+            had_d_out();
+
+            // Every tile ends with a barrier that protects the temp buffers. The
+            // last tile also draws and publishes the group's next expert ticket.
+            if (chunk_start + token_count == expert_end &&
+                block_idx == 0 && threadIdx.x == 0)
+                sched[2 + group_idx] = num_groups + atomicAdd(&sched[0], 1);
+            group_barrier(group_idx, group_size, barrier_counters_sense);
+        }
         ticket = sched[2 + group_idx];
     }
 
