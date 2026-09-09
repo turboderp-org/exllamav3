@@ -189,11 +189,7 @@ void exl3_moe_cpu_worker_run
     int64_t max_hi,
     int64_t max_ho,
     int64_t max_topk,
-    int64_t wstage_offset,
-    int64_t num_wslots,
-    int64_t wslot_size,
-    int64_t threads,
-    int64_t stage_threads
+    int64_t threads
 )
 {
     // GIL is released by the binding's call_guard; do not release it again here
@@ -206,57 +202,7 @@ void exl3_moe_cpu_worker_run
     MoeJob* jobs = reinterpret_cast<MoeJob*>(base + MOE_CTRL_JOBS_OFFSET);
     uint32_t* data_ready = reinterpret_cast<uint32_t*>(base + MOE_SLOT_FLAGS_OFFSET);
     uint32_t* done = reinterpret_cast<uint32_t*>(base + MOE_SLOT_FLAGS_OFFSET + 64 * MOE_MAX_SLOTS);
-    uint32_t* stage_done = reinterpret_cast<uint32_t*>(base + MOE_SLOT_FLAGS_OFFSET + 3 * 64 * MOE_MAX_SLOTS);
-    uint32_t* pinned_free = reinterpret_cast<uint32_t*>(base + MOE_SLOT_FLAGS_OFFSET + 3 * 64 * MOE_MAX_SLOTS + 64 * MOE_MAX_WSLOTS);
-    uint32_t* stage_tail = reinterpret_cast<uint32_t*>(base + MOE_STAGE_TAIL_OFFSET);
-    uint32_t* stage_head = reinterpret_cast<uint32_t*>(base + MOE_STAGE_HEAD_OFFSET);
-    MoeJob* stage_jobs = reinterpret_cast<MoeJob*>(base + MOE_STAGE_JOBS_OFFSET);
     uint8_t* data = base + MOE_CTRL_SIZE;
-    uint8_t* wstage = base + wstage_offset;
-
-    // Dedicated stager: consumes the stage ring so weight memcpys run concurrently with the
-    // compute pool's work on the token tail. Uses its own scratch threads, never the pool.
-    // stage_threads comes from the parent (MoeCpuTuning), passed through the "start" layout.
-    int stage_threads_ = stage_threads > 0 ? (int) stage_threads : 1;
-    std::thread stager([&]()
-    {
-        uint32_t shead = load_acquire_u32(stage_head);
-        uint32_t s_last_wake = 0;
-        int s_idle = 0;
-        while (true)
-        {
-            if (load_acquire_u32(quit)) return;
-            const uint32_t wake = load_acquire_u32(pass_wake);
-            if (wake != s_last_wake) { s_last_wake = wake; s_idle = 0; }
-            if (load_acquire_u32(stage_tail) == shead)
-            {
-                if (++s_idle < 65536) { cpu_pause_(); continue; }
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
-                continue;
-            }
-            s_idle = 0;
-
-            const MoeJob job = stage_jobs[shead % MOE_STAGE_RING];
-            shead++;
-            store_release_u32(stage_head, shead);
-
-            // Wait until the slot's previous tenant has been DMA'd out
-            uint32_t* pf = pinned_free + size_t(job.slot) * 16;
-            while ((int32_t)(load_acquire_u32(pf) - job.prev_seq) < 0)
-            {
-                if (load_acquire_u32(quit)) return;
-                cpu_pause_();
-            }
-            exl3_moe_cpu_stage_experts(
-                static_cast<int64_t>(job.layer),
-                job.experts,
-                static_cast<int>(job.rows),
-                wstage + size_t(job.slot) * wslot_size,
-                stage_threads_
-            );
-            store_release_u32(stage_done + size_t(job.slot) * 16, job.seq);
-        }
-    });
 
     // Fixed slot section offsets from the registered maxima
     const size_t off_x = 0;
@@ -379,5 +325,4 @@ void exl3_moe_cpu_worker_run
         }
     }
     out:;
-    stager.join();
 }

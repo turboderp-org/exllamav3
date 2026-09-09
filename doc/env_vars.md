@@ -226,18 +226,18 @@ H2D-staged fp32 output.
 
 ### `EXL3_MOE_CPU_WSLOTS` (default: `2`), `EXL3_MOE_CPU_WSLOT_MB` (default: `32`)
 
-Depth and per-slot size of the pinned/VRAM weight-staging ring used by GPU-streamed prefill.
-Each slot must be large enough to hold a batch of streamed experts' packed weights (see
-`EXL3_MOE_STREAM_BATCH_EXPERTS`); if not, the batch is capped by capacity instead.
+Depth and per-slot size of the VRAM ring that GPU-streamed prefill computes from, plus two raw
+DMA landing slots of the same size. Each slot must be large enough to hold a batch of streamed
+experts' packed weights (see `EXL3_MOE_STREAM_BATCH_EXPERTS`); if not, the batch is capped by
+capacity instead. VRAM cost is `(WSLOTS + 2) * WSLOT_MB`.
 
-### `EXL3_MOE_CPU_STAGE_THREADS` (default: `4`)
+Streamed experts are DMA'd straight out of the CPU worker's expert arena: the arena is a set of
+1 GiB shared-memory chunks that the parent maps and page-locks (`cudaHostRegister`) at worker
+start, so every streamed byte costs one DRAM read (the DMA) instead of a host memcpy into a
+pinned staging buffer plus the DMA. The parent's register call must succeed for the whole arena;
+on Linux the chunks live in `/dev/shm`, which must be sized for the offloaded experts.
 
-Memcpy threads used by the worker's dedicated stager (which packs streamed experts' weights
-into the pinned staging ring, concurrently with the compute pool working the CPU tail). A few
-threads saturate host memcpy bandwidth; raising this mainly helps wide streamed batches on
-models with many small experts (see issue trace on Qwen3.6-35B-A3B).
-
-### `EXL3_MOE_STREAM_T` (default: per-device, bandwidth-scaled from `16`)
+### `EXL3_MOE_STREAM_T` (default: per-device, bandwidth-scaled from `8`)
 
 Minimum per-expert token-assignment count (in a prefill chunk) for an expert's weights to be
 streamed to the GPU instead of computed on the CPU tail. Unset, the effective threshold scales
@@ -258,13 +258,11 @@ layers use the reconstruct path for every streamed expert regardless of count.
 Prefill chunk size floor below which GPU streaming never engages and every expert runs on the
 CPU tail as usual (decode, at 1 row per pass, always stays under this).
 
-### `EXL3_MOE_STREAM_BATCH_EXPERTS` (default: `24`, max `256`)
+### `EXL3_MOE_STREAM_BATCH_EXPERTS` (default: `24`)
 
-Experts packed per weight-staging batch (one stage job, one DMA, and, below
-`EXL3_MOE_STREAM_FUSED_T, one fused-kernel launch). Further capped by staging-slot capacity
-(`EXL3_MOE_CPU_WSLOT_MB` divided by one expert's packed byte size). The hard ceiling of 256 is
-the structural size of the job descriptor's expert-id array; raising the ceiling itself costs
-only a small amount of shared-memory overprovisioning, not runtime.
+Experts packed per streamed batch (one DMA sequence, one un-swizzle launch and, below
+`EXL3_MOE_STREAM_FUSED_T`, one fused-kernel launch). The effective batch is capped by slot
+capacity (`EXL3_MOE_CPU_WSLOT_MB` divided by one expert's packed byte size).
 
 ### `EXL3_MOE_CPU_MAX_ISA` (default: unset, auto-detect)
 
@@ -292,23 +290,42 @@ leaves the register headroom for the wide bands the swizzled layout wants at m >
 and `vnni` (the dword kernel with the same band structure; +40% cold-expert decode measured
 with the tier forced on a 7960X). The `avx2` and `scalar` tiers read the native layout. K8
 tensors always stay in the native layout (they route to the dword kernel). The GPU-streaming
-prefill path un-swizzles during staging, so staged bytes reaching the GPU dequant are
-unaffected. Set to `0` to keep the native layout.
+prefill path DMAs the swizzled bytes as-is and repacks them on the GPU
+(`moe_unswizzle_trellis`), so the bytes reaching the GPU dequant are unaffected. Set to `0` to
+keep the native layout.
 
-### `EXL3_MOE_MEMOPS` (default: `1`)
+The parent reads the setting when it constructs a worker host and passes it to the worker
+explicitly; the worker reports the layout it actually used (native when the CPU lacks AVX-512)
+back to the parent at startup. A same-process change to the tuning after a host exists
+therefore affects only hosts constructed afterwards and never reinterprets packed bytes.
+
+### `EXL3_MOE_MEMOPS` (default: `1`; `0` on Windows)
 
 The parent enqueues its wait/publish handshake with the worker as CUDA stream memory operations
 (`cuStreamWaitValue32`/`WriteValue32`, front-end executed: no SM occupancy, no per-op launch
-cost) rather than the older spin-wait kernels. Set to `0` to force the kernel fallback, kept
-around specifically because the memop path is not yet exercised on Windows. The kernel path's
-30-second stall timeout does not apply to the memop path; a dead worker there is instead detected
-by a host-side watchdog that unblocks any pending wait.
+cost) rather than the older spin-wait kernels. Set to `0` to force the kernel fallback. Under
+WDDM the memop path measured slower than the kernel waits (23-26 vs 28-30 tok/s single-token
+decode on an RTX 4090 with 410 CPU experts per layer), so Windows defaults to `0`; set `1` to
+try the memop path there. The kernel path's 30-second stall timeout does not apply to the memop
+path; a dead worker there is instead detected by a host-side watchdog that unblocks any pending
+wait.
 
 ### `EXL3_MOE_STREAM_DEBUG` (default: `0`)
 
 Print per-layer and per-batch engagement: streamed bandwidth probe result and threshold, expert
 counts, streamed-vs-tail assignment split, and fused-vs-reconstruct tier split within each
 streamed batch.
+
+### `EXL3_MOE_STREAM_PROF` (default: `0`)
+
+Print, once per pass over the CPU-offloaded layers, the streamed-prefill timing per layer:
+router sync (host wait for the expert counts), host enqueue time, GPU span of the layer's
+streamed work, batches per layer (as actually staged: bounded by the compute slot's capacity
+as well as `EXL3_MOE_STREAM_BATCH_EXPERTS`), and within the GPU span the copy-stream wait for
+a free raw slot (`raw-slot-wait`, bracketed around the reuse wait itself), the arena-to-VRAM
+DMA and the un-swizzle plus expert compute. The GPU-side figures are harvested one layer late
+and normalized by the layers harvested in the period. Uses timing events, so it perturbs
+throughput slightly; diagnostic only.
 
 ### `EXL3_MOE_CPU_PROF` (default: `0`)
 
@@ -317,27 +334,15 @@ per worker at startup.
 
 ### `EXL3_MOE_ARENA_DEBUG` (default: `0`)
 
-Print each hugepage-arena chunk allocation (size, running total) as the CPU worker loads expert
-weights, and confirmation when the end-of-load `MADV_COLLAPSE` pass (see
-`EXL3_MOE_ARENA_HUGEPAGE`) is issued. The worker copies loaded expert tensors into a small
-number of large (1 GiB) anonymous mappings instead of leaving them as many separate small
-(sub-2MB) allocations, confirmed via `/proc/<pid>/smaps` that the latter cannot be backed by
-transparent huge pages even under system-wide THP=always, since each is its own VMA.
+Print each arena chunk allocation (size, running total) as the CPU worker loads expert weights.
+The worker copies loaded expert tensors into a small number of large (1 GiB) shared-memory
+chunks instead of leaving them as many separate small allocations; the parent maps and
+page-locks the same chunks for streamed prefill.
 
-### `EXL3_MOE_ARENA_HUGEPAGE` (default: `1`)
-
-Whether to attempt hugepage promotion for the arena chunks described above. This is done as a
-single `MADV_COLLAPSE` (Linux 6.1+) pass over each chunk *after* all expert weights for every
-offloaded layer have been loaded, deliberately not via a live `MADV_HUGEPAGE` hint during the
-per-layer writes: on hosts where `/sys/kernel/mm/transparent_hugepage/defrag` is `madvise`, that
-hint makes the kernel do *synchronous* compaction on first touch of a hinted region once
-easily-compactable free memory runs low, which turns into multi-second stalls per offloaded
-layer partway through a large model's load. The collapse pass runs on a background thread in
-the worker after it has started serving: it copies the whole arena (about 4 GiB/s on a
-7960X when the chunks were faulted as 4K pages, i.e. on `transparent_hugepage/enabled =
-madvise` hosts, plus any compaction the kernel needs first), so it must not sit on the
-startup path; the worker reads 4K pages until each chunk lands. `EXL3_MOE_ARENA_DEBUG=1`
-prints how long it took. Set to `0` to skip hugepage promotion entirely.
+Hugepage promotion (`EXL3_MOE_ARENA_HUGEPAGE`, a post-load `MADV_COLLAPSE` pass) applied to the
+earlier anonymous-mapping arena and does not carry over to the shared-memory one: the chunks
+are page-locked by the parent for DMA, and collapsing them measured as no change to either
+prefill or decode.
 
 ### `EXL3_MOE_CPU_START_TIMEOUT` (default: `60`)
 
