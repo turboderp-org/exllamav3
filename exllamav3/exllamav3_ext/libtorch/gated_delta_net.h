@@ -126,6 +126,26 @@ struct BC_GatedDeltaNetSplit
     std::shared_ptr<BC_GatedRMSNorm> norm;
     const float beta_scale;
 
+    // Sliced qkv+z bundle (exl3_mgemm sliced mode, see attention.h): both projections read x,
+    // cut into equal-width column slices and run as ONE launch when R <= 32. Meta (CPU int32,
+    // 5 x slices): target (0 qkv, 1 z), column offset, width, row stride, source. Outputs are
+    // fp32 (the projections' out dtype), so the carrier is fp32
+    c10::optional<at::Tensor> qkvz_ptrs_trellis, qkvz_ptrs_suh, qkvz_ptrs_svh, qkvz_meta;
+    int qkvz_K = 0;
+    bool qkvz_mcg = false;
+    bool qkvz_mul1 = false;
+    at::Tensor qkvz_size_n, qkvz_n_stride, qkvz_had_src, qkvz_carrier;
+    void set_qkvz_bundle
+    (
+        at::Tensor ptrs_trellis,
+        at::Tensor ptrs_suh,
+        at::Tensor ptrs_svh,
+        at::Tensor meta,
+        int K,
+        bool mcg,
+        bool mul1
+    );
+
     // KDA mode (GLM5.3): b/f_a/g_a fp16 GEMVs off x, low-rank f_b/g_b second stages, per-
     // k-channel decay ("safe gate" when lower_bound != 0), sigmoid-gated norm (z = g_b out)
     bool kda = false;
@@ -161,6 +181,7 @@ struct BC_GatedDeltaNetSplit
         // Hadamard scratch for the bypassed exl3_gemm_gr calls (qkv_proj/z_proj/o_proj), shaped
         // like each projection's own input
         at::Tensor qkv_xh, z_xh, o_xh;
+        at::Tensor qkvz_c_ptrs, qkvz_xh;   // sliced qkv+z bundle: per-slice output pointers, (2, R, hidden) scratch
 
         // State-buffer geometry baked into this slot's captured graph (scalar kernel args can't
         // be patched): set on the slot's first eager run, checked before every replay

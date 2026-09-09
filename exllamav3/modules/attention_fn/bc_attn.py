@@ -148,6 +148,7 @@ class BCAttn:
         rope = module.rope
         mkv = module.multi_kv
         mqg = module.multi_qg
+        mqkv = getattr(module, "multi_qkv", None)
         w = max(self.hidden_padded, self.num_q_heads * self.head_dim)
         xh = g_tensor_cache.get(self.device, (2 * MAX_R * w,), torch.half, "bca_xh")
 
@@ -203,6 +204,13 @@ class BCAttn:
             qg_K = mqg.K if mqg is not None else 0,
             qg_mcg = bool(mqg.mcg) if mqg is not None else False,
             qg_mul1 = bool(mqg.mul1) if mqg is not None else False,
+            qkv_ptrs_trellis = mqkv.ptrs_trellis if mqkv is not None else None,
+            qkv_ptrs_suh = mqkv.ptrs_suh if mqkv is not None else None,
+            qkv_ptrs_svh = mqkv.ptrs_svh if mqkv is not None else None,
+            qkv_meta = mqkv.meta if mqkv is not None else None,
+            qkv_K = mqkv.K if mqkv is not None else 0,
+            qkv_mcg = bool(mqkv.mcg) if mqkv is not None else False,
+            qkv_mul1 = bool(mqkv.mul1) if mqkv is not None else False,
             q_norm = module.q_norm_tensor,
             k_norm = module.k_norm_tensor,
             norm_eps = module.norm_eps,
