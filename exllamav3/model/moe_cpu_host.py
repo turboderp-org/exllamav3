@@ -151,17 +151,19 @@ class _HugeArena:
         loading gets the same steady-state throughput benefit without blocking incremental
         per-layer progress. Best-effort: silently leaves chunks at 4K pages if collapse fails or
         the kernel doesn't support it."""
-        import mmap, os
+        import mmap, os, time
         if not TUNING.arena_hugepage:
             return
         collapse = getattr(mmap, "MADV_COLLAPSE", 25)
+        t0 = time.perf_counter()
         for c in self.chunks:
             try:
                 c.madvise(collapse)
             except Exception:
                 pass
         if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
-            print(f" -- arena: MADV_COLLAPSE issued on {len(self.chunks)} chunks", flush = True)
+            print(f" -- arena: MADV_COLLAPSE issued on {len(self.chunks)} chunks "
+                  f"in {time.perf_counter() - t0:.1f} s", flush = True)
 
     def rehome(self, tensor, band_swizzle = False):
         """Copy `tensor` into the arena and return a same-dtype/shape view over the copy. The
@@ -291,8 +293,6 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
             elif msg[0] == "quit":
                 return
 
-        arena.promote_hugepages()
-
         stc.close()
         shm = shared_memory.SharedMemory(name = shm_name)
         base = np.frombuffer(shm.buf, dtype = np.uint8).ctypes.data
@@ -333,6 +333,13 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
             daemon = True,
         )
         worker.start()
+
+        # Hugepage promotion runs off the startup path: MADV_COLLAPSE is synchronous and copies
+        # the whole arena into 2 MiB pages (tens of seconds for a 50+ GiB arena, minutes when
+        # free memory is fragmented and the kernel has to compact first), and the parent's
+        # startup wait must not depend on it. Page migration is transparent to the compute
+        # threads, so the worker serves requests on 4K pages until each chunk lands
+        threading.Thread(target = arena.promote_hugepages, daemon = True).start()
 
         while True:
             try:
@@ -586,11 +593,16 @@ class MoeCpuHost:
 
         import time
         t0 = time.time()
+        # Startup is now just the shared-memory attach, layer registration and thread spawn
+        # (hugepage promotion runs in the worker's background); the limit stays generous for
+        # slow hosts and is overridable
+        timeout = float(os.environ.get("EXL3_MOE_CPU_START_TIMEOUT", "60"))
         while not self.v_ready[0]:
             if not self.proc.is_alive():
                 raise RuntimeError("CPU MoE worker process died during startup")
-            if time.time() - t0 > 60:
-                raise RuntimeError("CPU MoE worker startup timeout")
+            if time.time() - t0 > timeout:
+                raise RuntimeError(
+                    f"CPU MoE worker startup timeout ({timeout:.0f} s; EXL3_MOE_CPU_START_TIMEOUT overrides)")
             time.sleep(0.005)
         self.started = True
         self._flags_u32 = u32

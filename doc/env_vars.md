@@ -332,7 +332,18 @@ offloaded layer have been loaded, deliberately not via a live `MADV_HUGEPAGE` hi
 per-layer writes: on hosts where `/sys/kernel/mm/transparent_hugepage/defrag` is `madvise`, that
 hint makes the kernel do *synchronous* compaction on first touch of a hinted region once
 easily-compactable free memory runs low, which turns into multi-second stalls per offloaded
-layer partway through a large model's load. Set to `0` to skip hugepage promotion entirely.
+layer partway through a large model's load. The collapse pass runs on a background thread in
+the worker after it has started serving: it copies the whole arena (about 4 GiB/s on a
+7960X when the chunks were faulted as 4K pages, i.e. on `transparent_hugepage/enabled =
+madvise` hosts, plus any compaction the kernel needs first), so it must not sit on the
+startup path; the worker reads 4K pages until each chunk lands. `EXL3_MOE_ARENA_DEBUG=1`
+prints how long it took. Set to `0` to skip hugepage promotion entirely.
+
+### `EXL3_MOE_CPU_START_TIMEOUT` (default: `600`)
+
+Seconds the parent waits for the CPU worker to signal ready after every offloaded layer has
+been handed over. Startup is the shared-memory attach, layer registration and thread spawn,
+so the default is only a safety net against a wedged worker; raise it on very slow hosts.
 
 ### `EXL3_MOE_CPU_PIN` (default: `1`)
 
