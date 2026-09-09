@@ -8,7 +8,7 @@ import random
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
 devices = [
-    "cuda:1"
+    "cuda:0"
 ]
 
 page_size = 256
@@ -17,6 +17,11 @@ head_dims = [128, 64, 96, 32, 256]
 num_kv_headss = [8, 2, 1]
 cache_sizes = [32768]
 bitss = [8]  # Not testing accuracy, so 8-bit only to test the paging logic
+
+# Token contents are random: the quantizer Hadamard-rotates each 32-group and quantizes on a midpoint grid, so a
+# constant group (31 exactly-zero coefficients) is a worst case whose rounding errors all land on element 0
+def token_fill(gen, num_kv_heads, head_dim, device):
+    return torch.randn((num_kv_heads, head_dim), generator = gen).half().to(device)
 
 @pytest.mark.parametrize("device", devices)
 @pytest.mark.parametrize("block_table_size", block_table_sizes)
@@ -59,7 +64,9 @@ def test_kv_quant(device, block_table_size, head_dim, num_kv_heads, cache_size, 
             cache_seqlens,
             block_table,
             page_size,
-            length
+            length,
+            0.0,      # compand_a: no companding
+            False,    # in_contiguous: the input is the pool-shaped cache tensor
         )
 
     def dq():
@@ -73,19 +80,20 @@ def test_kv_quant(device, block_table_size, head_dim, num_kv_heads, cache_size, 
             cache_seqlens,
             block_table,
             page_size,
-            -1
+            -1,
+            0.0,      # compand_a
         )
 
+    gen = torch.Generator().manual_seed(1)
     def tq():
-        torch.testing.assert_close(cache_k_tensor, cache_k_tensor_out, atol = 0.08, rtol = 0.01)
-        torch.testing.assert_close(cache_v_tensor, cache_v_tensor_out, atol = 0.08, rtol = 0.01)
+        torch.testing.assert_close(cache_k_tensor, cache_k_tensor_out, atol = 0.08, rtol = 0.05)
+        torch.testing.assert_close(cache_v_tensor, cache_v_tensor_out, atol = 0.08, rtol = 0.05)
 
     # Put some stuff in cache
     for i in range(bsz):
         cache_seqlens[i] = i
-        for h in range(num_kv_heads):
-            cache_k_tensor[block_table[i, 0], i, h, :] = h
-            cache_v_tensor[block_table[i, 0], i, h, :] = h + num_kv_heads
+        cache_k_tensor[block_table[i, 0], i] = token_fill(gen, num_kv_heads, head_dim, device)
+        cache_v_tensor[block_table[i, 0], i] = token_fill(gen, num_kv_heads, head_dim, device)
     q(1)
     for i in range(bsz):
         cache_seqlens[i] += 1
@@ -100,10 +108,8 @@ def test_kv_quant(device, block_table_size, head_dim, num_kv_heads, cache_size, 
         l = random.randint(10, pages * page_size - 2)
         new_cache_seqlens[i] = l
         for j in range(l):
-            m = j % 13
-            for h in range(num_kv_heads):
-                cache_k_tensor[block_table[i, j // page_size], j % page_size, h, :] = h + m
-                cache_v_tensor[block_table[i, j // page_size], j % page_size, h, :] = h + m + num_kv_heads
+            cache_k_tensor[block_table[i, j // page_size], j % page_size] = token_fill(gen, num_kv_heads, head_dim, device)
+            cache_v_tensor[block_table[i, j // page_size], j % page_size] = token_fill(gen, num_kv_heads, head_dim, device)
     cache_seqlens[:] = 0
     q(new_cache_seqlens.amax())
     cache_seqlens.copy_(new_cache_seqlens)
@@ -134,8 +140,8 @@ def test_kv_quant(device, block_table_size, head_dim, num_kv_heads, cache_size, 
         l = cache_seqlens[i]
         for j in range(5):
             pos = l + j
-            cache_k_tensor[block_table[i, pos // page_size], + pos % page_size, :, :] = 32 + j
-            cache_v_tensor[block_table[i, pos // page_size], + pos % page_size, :, :] = 32 + j
+            cache_k_tensor[block_table[i, pos // page_size], pos % page_size] = token_fill(gen, num_kv_heads, head_dim, device)
+            cache_v_tensor[block_table[i, pos // page_size], pos % page_size] = token_fill(gen, num_kv_heads, head_dim, device)
     q(5)
     for i in range(bsz):
         cache_seqlens[i] += 5

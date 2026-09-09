@@ -39,6 +39,8 @@
 #include "generator/gumbel.cuh"
 #include "generator/sampling_fused.cuh"
 #include "generator/rep_pen.cuh"
+#include "generator/dry.cuh"
+#include "moe_unswizzle.cuh"
 #include "generator/cache.cuh"
 
 #include "cache/q_cache.cuh"
@@ -61,6 +63,7 @@
 #include "libtorch/dsv4_compressor.h"
 #include "libtorch/dsv4_attn.h"
 #include "dsv4_compress.cuh"
+#include "dsv4_pool_quant.cuh"
 #include "dsa_topk.cuh"
 #include "hc_mix.cuh"
 #include "ple.cuh"
@@ -101,6 +104,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("moe_split_issue", &moe_split_issue, "moe_split_issue");
     m.def("moe_split_collect_add", &moe_split_collect_add, "moe_split_collect_add");
     m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
+    m.def("dsv4_pool_quant_scatter", &dsv4_pool_quant_scatter, "dsv4_pool_quant_scatter");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
     m.def("dsa_topk", &dsa_topk, "dsa_topk");
     m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
@@ -159,8 +163,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx2", &exl3_moe_cpu_has_avx2, "exl3_moe_cpu_has_avx2");
     m.def("exl3_moe_flag_write", &exl3_moe_flag_write, "exl3_moe_flag_write");
     m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
+    m.def("moe_unswizzle_trellis", &moe_unswizzle_trellis, "moe_unswizzle_trellis");
     m.def("exl3_moe_cpu_set_memops", &exl3_moe_cpu_set_memops, "exl3_moe_cpu_set_memops");
     m.def("exl3_moe_cpu_set_prof", &exl3_moe_cpu_set_prof, "exl3_moe_cpu_set_prof");
+    m.def("exl3_moe_cpu_pool_stress", &exl3_moe_cpu_pool_stress, "exl3_moe_cpu_pool_stress");
     m.def("exl3_moe_cpu_worker_run", &exl3_moe_cpu_worker_run, "exl3_moe_cpu_worker_run",
           py::call_guard<py::gil_scoped_release>());
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
@@ -216,6 +222,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.attr("FUSED_SAMPLER_MAX_BLOCKS") = FUSED_SAMPLER_MAX_BLOCKS;
     m.attr("FUSED_SAMPLER_HIST_STRIDE") = FUSED_SAMPLER_HIST_STRIDE;
     m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
+    m.def("dry_penalty", &dry_penalty, "dry_penalty");
     m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
     m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
 

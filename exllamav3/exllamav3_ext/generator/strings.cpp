@@ -5,8 +5,13 @@
 //
 // Returns:
 // -1: No matches
-// -2: Partial match; at least one string in S partially overlaps Q on the right-hand side
-// >= 0: Index into Q of full match with at least one string in S
+// -2: Partial match; some string in S overlaps the right-hand end of Q, starting before any full
+//     match, so a later completion could produce an earlier stop than any full match found so far
+// >= 0: Index into Q of the EARLIEST full match with any string in S
+//
+// All strings are scanned before deciding: an earlier-listed string's trailing partial match must
+// not hide a later-listed string's full match at a smaller index (the caller truncates at the
+// returned index, so a hidden full match would be overrun)
 
 int partial_strings_match
 (
@@ -29,6 +34,10 @@ int partial_strings_match
     uint32_t* strings_utf32 = static_cast<uint32_t*>(info.ptr);
     int s_total = info.size / 4;
 
+    const int none = q_len + 1;
+    int best_full = none;       // earliest full match over all strings
+    int best_partial = none;    // earliest start of a match that runs off the end of Q
+
     for (int i = 0; i < num_strings; ++i)
     {
         int beg = offsets_int[i] / 4;
@@ -37,21 +46,19 @@ int partial_strings_match
 
         if (s_len <= 0 || beg + s_len > s_total) continue;
 
-        int a = 0;
-        int b = 0;
-        while (a < q_len)
+        // Only starts before the best candidates so far can change the outcome
+        int limit = best_full < best_partial ? best_full : best_partial;
+        for (int a0 = 0; a0 < q_len && a0 < limit; ++a0)
         {
-            int a0 = a;
-            while (q[a++] == s[b++])
-            {
-                if (b == s_len) return a0;
-                if (a == q_len) return -2;
-            }
-            a = a0 + 1;
-            b = 0;
-       }
+            int k = 0;
+            while (a0 + k < q_len && k < s_len && q[a0 + k] == s[k]) ++k;
+            if (k == s_len) { best_full = a0; break; }               // earliest full match of this string
+            if (a0 + k == q_len) { best_partial = a0; break; }       // ran off the end of Q while matching
+        }
     }
 
+    if (best_partial < best_full) return -2;
+    if (best_full < none) return best_full;
     return -1;
 }
 

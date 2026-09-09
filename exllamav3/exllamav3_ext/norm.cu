@@ -186,6 +186,7 @@ void rms_norm_kernel
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
     int row = blockIdx.x;
+    const size_t row_off = (size_t) row * dim;   // 64-bit: rows * dim can exceed 2^31 elements
 
     if (w && w_groups > 1)
         w += (size_t) (row % w_groups) * dim;
@@ -203,8 +204,8 @@ void rms_norm_kernel
     {
         // r += x, rounded to the residual dtype so the result matches an unfused add
         float4 r4;
-        if constexpr (residual_fp16) read_half4<false>(r4, ((const half4*) (r + row * dim)) + column);
-        else                         read_float4(r4, ((const float4*) (r + row * dim)) + column);
+        if constexpr (residual_fp16) read_half4<false>(r4, ((const half4*) (r + row_off)) + column);
+        else                         read_float4(r4, ((const float4*) (r + row_off)) + column);
         x4.x += r4.x;
         x4.y += r4.y;
         x4.z += r4.z;
@@ -216,14 +217,14 @@ void rms_norm_kernel
                 __halves2half2(__float2half_rn(x4.x), __float2half_rn(x4.y)),
                 __halves2half2(__float2half_rn(x4.z), __float2half_rn(x4.w))
             );
-            WRITE64(((half4*) (r + row * dim)) + column, h4);
+            WRITE64(((half4*) (r + row_off)) + column, h4);
             x4.x = LOW_TO_FLOAT(h4.x);
             x4.y = HIGH_TO_FLOAT(h4.x);
             x4.z = LOW_TO_FLOAT(h4.y);
             x4.w = HIGH_TO_FLOAT(h4.y);
         }
         else
-            write_float4(x4, ((float4*) (r + row * dim)) + column);
+            write_float4(x4, ((float4*) (r + row_off)) + column);
     };
 
     auto apply_out = [&] (float4& x4, int column, float rmf)
@@ -250,16 +251,16 @@ void rms_norm_kernel
         if constexpr (res_mode == RES_POST)
         {
             float4 r4;
-            if constexpr (output_fp16) read_half4<false>(r4, ((half4*) (y + row * dim)) + column);
-            if constexpr (output_fp32) read_float4(r4, ((float4*) (y + row * dim)) + column);
+            if constexpr (output_fp16) read_half4<false>(r4, ((half4*) (y + row_off)) + column);
+            if constexpr (output_fp32) read_float4(r4, ((float4*) (y + row_off)) + column);
             x4.x += r4.x;
             x4.y += r4.y;
             x4.z += r4.z;
             x4.w += r4.w;
         }
 
-        if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row * dim)) + column);
-        if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row * dim)) + column);
+        if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row_off)) + column);
+        if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row_off)) + column);
     };
 
     if (single)
@@ -269,7 +270,7 @@ void rms_norm_kernel
         float sum = 0.0f;
         if (t < columns)
         {
-            read_in(x4, x + row * dim + 4 * t);
+            read_in(x4, x + row_off + 4 * t);
             if constexpr (res_mode == RES_IN) add_resid_in(x4, t);
             sum = sum_sq4(sum, x4);
         }
@@ -284,7 +285,7 @@ void rms_norm_kernel
         for (int column = t; column < columns; column += blockDim.x)
         {
             float4 x4;
-            read_in(x4, x + row * dim + 4 * column);
+            read_in(x4, x + row_off + 4 * column);
             if constexpr (res_mode == RES_IN) add_resid_in(x4, column);
             sum = sum_sq4(sum, x4);
         }
@@ -297,11 +298,11 @@ void rms_norm_kernel
             // For RES_IN the summed values were written back to r in the first pass
             if constexpr (res_mode == RES_IN)
             {
-                if constexpr (residual_fp16) read_half4<false>(x4, ((const half4*) (r + row * dim)) + column);
-                else                         read_float4(x4, ((const float4*) (r + row * dim)) + column);
+                if constexpr (residual_fp16) read_half4<false>(x4, ((const half4*) (r + row_off)) + column);
+                else                         read_float4(x4, ((const float4*) (r + row_off)) + column);
             }
             else
-                read_in(x4, x + row * dim + 4 * column);
+                read_in(x4, x + row_off + 4 * column);
             apply_out(x4, column, rmf);
         }
     }
@@ -522,6 +523,7 @@ void gated_rms_norm_kernel
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
     int row = blockIdx.x;
+    const size_t row_off = (size_t) row * dim;   // 64-bit: rows * dim can exceed 2^31 elements
 
     int columns = dim / 4;
     const weight_t* w_row = w + (size_t) (row % w_groups) * dim;
@@ -531,12 +533,12 @@ void gated_rms_norm_kernel
     for (int column = t; column < columns; column += num_threads)
     {
         float4 x4;
-        read_bfloat164(x4, ((const bfloat164*) (x + row * dim)) + column);
+        read_bfloat164(x4, ((const bfloat164*) (x + row_off)) + column);
         if (gate_first)
         {
             float4 g4;
-            if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row * dim)) + column);
-            else                       read_bfloat164(g4, ((const bfloat164*) (g + row * dim)) + column);
+            if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row_off)) + column);
+            else                       read_bfloat164(g4, ((const bfloat164*) (g + row_off)) + column);
             x4.x *= _gate_fn(g4.x);
             x4.y *= _gate_fn(g4.y);
             x4.z *= _gate_fn(g4.z);
@@ -556,11 +558,11 @@ void gated_rms_norm_kernel
         float4 w4;
         float4 g4;
 
-        read_bfloat164(x4, ((const bfloat164*) (x + row * dim)) + column);
+        read_bfloat164(x4, ((const bfloat164*) (x + row_off)) + column);
         if constexpr (weight_bf16) read_bfloat164(w4, ((const bfloat164*) w_row) + column);
         else                       read_float4   (w4, ((const float4*)    w_row) + column);
-        if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row * dim)) + column);
-        else                       read_bfloat164(g4, ((const bfloat164*) (g + row * dim)) + column);
+        if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row_off)) + column);
+        else                       read_bfloat164(g4, ((const bfloat164*) (g + row_off)) + column);
 
         if (constant_bias != 0.0f)
         {
@@ -589,8 +591,8 @@ void gated_rms_norm_kernel
             x4.w *= _gate_fn(g4.w);
         }
 
-        if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row * dim)) + column);
-        if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row * dim)) + column);
+        if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row_off)) + column);
+        if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row_off)) + column);
     }
     #undef _gate_fn
 }

@@ -380,9 +380,14 @@ class Qwen2_5VLVisionModel(Model):
         if isinstance(image, list):
             assert text_alias is None, "Cannot apply single alias to list of images"
             image_tensor = []
+            grids = []
             for i in image:
                 t, prep_image_size, grid_thw = self.preprocess(i)
                 image_tensor.append(t.unsqueeze(0))
+                grids.append(grid_thw)
+            # The window index and RoPE tables below are built from one grid, so a batch must be uniform
+            assert all(g == grids[0] for g in grids), \
+                "Batched images must have the same size; embed differently sized images separately"
             image_tensor = torch.cat(image_tensor, dim = 0)
             return_batch = True
         else:
@@ -419,9 +424,9 @@ class Qwen2_5VLVisionModel(Model):
             params = params,
         ).cpu()
 
-        # Qwen2.5 wants this, idk
+        # Undo the window permutation applied to the token order inside the tower, per image
         reverse_indices = torch.argsort(window_index)
-        embedding_tensor = embedding_tensor[0][reverse_indices, :].unsqueeze(0)
+        embedding_tensor = embedding_tensor[:, reverse_indices, :]
 
         num_emb_tokens = embedding_tensor.shape[1]
         mmes = []

@@ -61,8 +61,8 @@ void count_inf_nan_kernel
     uint64_cu numel
 )
 {
-    uint64_cu idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    uint64_cu max_idx = MIN(blockIdx.x * BLOCK_SIZE + BLOCK_SIZE, numel);
+    uint64_cu idx = (uint64_cu) blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    uint64_cu max_idx = MIN((uint64_cu) blockIdx.x * BLOCK_SIZE + BLOCK_SIZE, numel);
     uint64_cu thread_inf = 0;
     uint64_cu thread_nan = 0;
     for (; idx < max_idx; idx += NUM_THREADS)

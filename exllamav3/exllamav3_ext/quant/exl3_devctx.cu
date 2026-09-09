@@ -50,8 +50,9 @@ void* DevCtx::get_ws(int device)
     std::lock_guard<std::mutex> lock(mtx);
     if (!ws[device])
     {
-        cudaSetDevice(device);
-        cudaMalloc(&ws[device], WORKSPACE_SIZE);
+        c10::cuda::CUDAGuard guard(device);
+        cudaError_t e = cudaMalloc(&ws[device], WORKSPACE_SIZE);
+        TORCH_CHECK(e == cudaSuccess, "exl3 workspace allocation failed on device ", device, ": ", cudaGetErrorString(e));
     }
     return ws[device];
 }
@@ -61,10 +62,12 @@ int* DevCtx::get_locks(int device)
     std::lock_guard<std::mutex> lock(mtx);
     if (!locks[device])
     {
-        cudaSetDevice(device);
+        c10::cuda::CUDAGuard guard(device);
         size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS) * sizeof(int);
-        cudaMalloc(&locks[device], size);
-        cudaMemset(locks[device], 0, size);
+        cudaError_t e = cudaMalloc(&locks[device], size);
+        TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer allocation failed on device ", device, ": ", cudaGetErrorString(e));
+        e = cudaMemset(locks[device], 0, size);
+        TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer memset failed: ", cudaGetErrorString(e));
     }
     return (int*) locks[device];
 }

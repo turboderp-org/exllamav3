@@ -701,6 +701,9 @@ void BC_MLAttention::run_gr
                 (void*) (uintptr_t) (uint32_t) 0,   // ring_beg
                 (void*) (uintptr_t) (uint32_t) 0,   // slot_ids
                 (void*) (uintptr_t) (uint32_t) R,   // ring_stride slot: q_lat row stride
+                // Packed latent cache: group scales + H32 (dead args for fp16 pages)
+                (void*) (quant_cache ? cache_scales.value().data_ptr() : cache_kpe.data_ptr()),
+                (void*) h32.data_ptr(),
             };
             s.k_dsa_split->launch(R * s.dsa_hb, s.dsa_splits, 1, args, stream);
             dbg("dsa_split");
@@ -726,6 +729,7 @@ void BC_MLAttention::run_gr
                 (void*) (uintptr_t) (uint32_t) (int) position,
                 (void*) (uintptr_t) (uint32_t) R,
                 (void*) (uintptr_t) (uint32_t) s.dsa_splits,
+                (void*) h32.data_ptr(),
             };
             int gy = CEIL_DIVIDE(kv_lora_rank, 128);
             s.k_dsa_combine->launch(R * s.dsa_hb, gy, 1, args, stream);

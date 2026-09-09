@@ -1,5 +1,6 @@
 from __future__ import annotations
 import torch
+from .device_copy import to_device
 
 class SeqTensor:
 
@@ -151,7 +152,7 @@ def get_for_device(
             v._static_dev_copies = scache
         dv = scache.get(device)
         if dv is None:
-            dv = v.to(device)
+            dv = to_device(v, device)
             scache[device] = dv
     else:
         # Pinned sources upload asynchronously: the copy is stream-ordered ahead of the kernels
@@ -159,7 +160,7 @@ def get_for_device(
         # must not refill them until a sync point (the generator syncs every iteration when
         # collecting sampled tokens)
         nb = v.device.type == "cpu" and v.is_pinned()
-        dv = v.to(device, non_blocking = nb)
+        dv = to_device(v, device, non_blocking = nb)
     cache[cache_key] = (v, dv)
     return dv
 

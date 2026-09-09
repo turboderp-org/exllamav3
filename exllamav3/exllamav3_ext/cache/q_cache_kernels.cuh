@@ -321,9 +321,9 @@ void quant_cache_paged_kernel
     int base = token_pos * groups_per_token + g0;
     int in_base = in_pos * groups_per_token + g0;
 
-    quant_block_x4<k_bits>(k_in + in_base * 32, k_out + base * k_bits, k_out_scales + base, sh_pack[warp], active, compand_a);
+    quant_block_x4<k_bits>(k_in + (size_t) in_base * 32, k_out + (size_t) base * k_bits, k_out_scales + base, sh_pack[warp], active, compand_a);
     __syncwarp();
-    quant_block_x4<v_bits>(v_in + in_base * 32, v_out + base * v_bits, v_out_scales + base, sh_pack[warp], active, compand_a);
+    quant_block_x4<v_bits>(v_in + (size_t) in_base * 32, v_out + (size_t) base * v_bits, v_out_scales + base, sh_pack[warp], active, compand_a);
 }
 
 #define __(i, j) quant_cache_paged_kernel<i, j>
@@ -392,8 +392,8 @@ void dequant_cache_paged_kernel
             + (token_idx % CQ_PAGE_SIZE) : token_pos;
         int base_out = out_pos * groups_per_token + g0;
 
-        dequant_block_x4<k_bits>(k_in + base * k_bits, k_in_scales + base, k_out + base_out * 32, active, compand_a);
-        dequant_block_x4<v_bits>(v_in + base * v_bits, v_in_scales + base, v_out + base_out * 32, active, compand_a);
+        dequant_block_x4<k_bits>(k_in + (size_t) base * k_bits, k_in_scales + base, k_out + (size_t) base_out * 32, active, compand_a);
+        dequant_block_x4<v_bits>(v_in + (size_t) base * v_bits, v_in_scales + base, v_out + (size_t) base_out * 32, active, compand_a);
 
         chunk_id += d_chunks;
     }

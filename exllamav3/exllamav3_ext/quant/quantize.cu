@@ -164,7 +164,7 @@ void decode
     int cols = input_indices.size(1);
 
     dim3 blockDim(64);
-    dim3 gridDim(cols / 64, rows);
+    dim3 gridDim(CEIL_DIVIDE(cols, 64), rows);
 
     if (output_tiles.dtype() == at::kFloat)
         decode_kernel<<<gridDim, blockDim, 0, stream>>>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+from ...util.device_copy import to_device
 import torch.nn.functional as F
 from .. import Module, Linear
 from ...model import Config
@@ -101,7 +102,7 @@ class MuseGlimmerVisionPatchEmbedder(Module):
             y = y[:, window_index]
             inv_freq = params.get("inv_freq")
             if inv_freq is not None:
-                params["inv_freq"] = inv_freq[window_index.to(inv_freq.device)]
+                params["inv_freq"] = inv_freq[to_device(window_index, inv_freq.device)]
 
         return to2(y, out_dtype, self.out_dtype)
 

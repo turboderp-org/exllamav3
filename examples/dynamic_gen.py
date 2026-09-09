@@ -214,7 +214,7 @@ def main():
                             f"{r['cached_tokens']:7} t / {r['prompt_tokens']:7} t"))
                         print(term.darkgray("Enqueued:          ") + term.blue(f"{r['time_enqueued']:9.2f} s"))
                         print(term.darkgray("Prefill:           ") + term.blue(f"{r['time_prefill']:9.2f} s"))
-                        print(term.darkgray("Generation:        ") + term.blue(f"{r['new_tokens']:9.2f} s"))
+                        print(term.darkgray("Generation:        ") + term.blue(f"{r['time_generate']:9.2f} s"))
                         speed_input = r['prompt_tokens'] / (r['time_prefill'] + 1e-10)
                         speed_output = r['new_tokens'] / (r['time_generate'] + 1e-10)
                         speed_total = total_tokens / total_time

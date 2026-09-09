@@ -100,34 +100,113 @@ Note that the PyPi package does not contain a prebuilt extension and requires th
 
 ### Method 3: Building from source
 
-Before building, make sure you have an appropriate version of Torch installed. Install a `flash-attn-2` wheel, e.g. from [here](https://mjunya.com/flash-attention-prebuild-wheels/). 
+`exllamav3` declares a minimum `torch` version (>= 2.6.0) and CUDA version (>= 12.4), but beyond that the user is free to select a version of `torch` that is compatible with their environment.
+
+`torch` can be installed in three ways (from least to most effort):
+1. **with `uv`, setting only `--extra cuXXX`** installs `torch` automatically with the specified CUDA version, `torch` version is selected by `uv` from compatible versions in the specific index associated with the chosen CUDA version (options 1 and 2)
+2. **with `uv`, creating a thin project that depends on `exllamav3[cuXXX]` and pins a specific `torch` version** — like (1) but `torch` is pinned in the thin project's `pyproject.toml`, see [pinning a specific PyTorch version (optional)](#pinning-a-specific-pytorch-version-optional) for details
+3. Manually with `uv pip` or `pip` (options 3 and 4)
+
+The flavor extras (`--extra`) are `cu124`, `cu126`, `cu128`, `cu129`, `cu130`, and `cu132` — pick the one matching your installed CUDA build. Both `uv sync` and `pip install .` build the package in an isolated environment where your `torch` is not visible, so they install the extension sources and compile them at first import (JIT, a few minutes once per torch version). For a precompiled install run `pip install --no-build-isolation .` in an environment that already has `torch`, or use the release wheels. Selecting a flavor installs the matching CUDA build of `torch`.
+
+**Option 1 — Working in the cloned repo directly (`uv sync`):**
+
+```sh
+git clone https://github.com/turboderp-org/exllamav3
+cd exllamav3
+# (Optional) switch to dev branch for latest in-progress features
+git checkout dev
+
+uv venv
+uv sync --extra cu130
+# add --extra examples and/or --extra eval for those extra dependencies
+```
+
+**Option 2 — Using `exllamav3` as a dependency from another project (`uv add`):**
+
+```sh
+# `uv add` works inside an existing project (a directory with a pyproject.toml).
+# `uv init` creates one if you're starting a new project, if integrating into
+# an existing project skip `uv init`.
+uv init my-project
+cd my-project
+
+# local checkout
+uv add 'path/to/exllamav3[cu130]'               # non-editable
+uv add 'path/to/exllamav3[cu130]' --editable    # editable
+
+# straight from GitHub
+uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]'                 # default branch
+uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]' --branch dev    # specific branch
+```
+
+**Option 3 — Bring your own `torch` and let `uv` pick the backend automatically:**
+
+```sh
+uv venv            # or: uv venv --python-preference only-managed
+source .venv/bin/activate
+uv pip install torch --torch-backend=auto
+uv pip install .
+```
+
+`--torch-backend=auto` inspects your system and installs the matching PyTorch CUDA build; see [Automatic backend selection](https://docs.astral.sh/uv/guides/integration/pytorch/#automatic-backend-selection).
+
+**Option 4 — With `pip`:**
 
 On Windows, you should also make sure you have the `triton-windows` package installed. ExLlamaV3 may work without it, but many things will work suboptimally.   
 
 ```sh
-# Clone the repo
-git clone https://github.com/turboderp-org/exllamav3
-cd exllamav3
-
-# (Optional) switch to dev branch for latest in-progress features
-git checkout dev
-
-# Install requirements (make sure you install Torch separately)
-pip install -r requirements.txt
-```
-
-At this point you should be able to run the conversion, eval and example scripts from the main repo directory, e.g. `python convert.py -i ...`
-
-To install the library for the active venv, run from the repo directory:
-
-```sh
+# install a CUDA-enabled torch first so it matches your setup, e.g.:
+pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install .
 ```
+
+#### Pinning a specific PyTorch version (optional)
+The flavor extra picks the *index*, but by default torch resolves to the latest version on that
+index that satisfies `>=2.6.0`. To pin a specific torch version while developing on `exllamav3`,
+create a **"thin" project** that consumes your local checkout as an editable install and declares
+the exact `torch` version itself. This keeps the pin out of the `exllamav3` pyproject, so
+you can change the torch version freely without touching the repo.
+
+```
+my-exllamav3-dev/          # thin project (uv init)
+├── pyproject.toml
+└── src/                  # package sources (auto-generated)
+```
+
+In `pyproject.toml`:
+
+```toml
+[project]
+name = "my-exllamav3-dev"
+version = "0.1.0"
+description = "Dev environment for exllamav3"
+requires-python = ">=3.10.11"
+dependencies = [
+    "exllamav3[cu130]",   # select correct CUDA version
+    "torch==2.13.0",      # pin the exact torch version you need
+]
+
+[tool.uv.sources]
+exllamav3 = { path = "../exllamav3", editable = true }
+```
+
+Adjust `../exllamav3` to point at your local checkout, then a plain `uv sync` sets up an
+environment with the correct PyTorch index (routed via the `cuXXX` extra),
+the pinned version of `torch` from that index (as long as it exists), and an editable install of `exllamav3` so code
+changes apply immediately. Switch CUDA flavors by changing the extra (`exllamav3[cu124]`,
+`exllamav3[cu128]`, …) and/or the torch pin in the thin project.
+
+Or, if you're installing torch manually with `uv pip install torch` (e.g. as in Option 3 above),
+specify the version directly, e.g. `uv pip install "torch==2.11.0" --torch-backend=auto`.
+
+---
+
+After installing with one of the options above, you should be able to run the conversion, eval and example scripts from the main repo directory, e.g., `uv run python convert.pt -i ...` or, for manual installations once the venv is active, `python convert.py -i ...`
 
 Relevant env variables for building:
 - `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for compilation. Set this to a reasonable value like 4 in that case.  
 - `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch will build/load it at runtime instead.
-
 
 ## Conversion
 

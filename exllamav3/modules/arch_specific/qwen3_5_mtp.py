@@ -3,7 +3,7 @@ from typing_extensions import override
 import torch
 import torch.nn.functional as F
 from .. import LayerNorm
-from ..module import no_p2p_copy
+from ...util.device_copy import to_device
 from ...model.config import Config
 from ...model.model_tp_fn import mp_model_forward_embedding
 from ...modules import Module, Linear, RMSNorm
@@ -106,10 +106,10 @@ class Qwen3_5MTPInputLayer(Module):
             x = self.attached_model().tp_producer.send(x)
             x = self.attached_model().tp_dispatch_master(mp_model_forward_embedding, (x, params))
             x = x.half()
-        x = self.pre_fc_norm_embedding.forward(x.to(self.device), params)
+        x = self.pre_fc_norm_embedding.forward(to_device(x, self.device), params)
 
         # Project
-        x = torch.cat((x.to(y.device), y), dim = -1)
+        x = torch.cat((to_device(x, y.device), y), dim = -1)
         x = self.fc.forward(x, params)
         return to2(x, out_dtype, self.out_dtype)
 

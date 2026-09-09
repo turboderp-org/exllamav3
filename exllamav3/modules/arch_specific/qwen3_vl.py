@@ -1,5 +1,6 @@
 from __future__ import annotations
 import torch
+from ...util.device_copy import to_device
 from torch import nn
 from ...model.config import Config
 from ...modules import Module, Linear, LayerNorm
@@ -97,7 +98,7 @@ class Qwen3VLPosEmbedding(Module):
 
     @override
     def weights_numel(self):
-        return self.num_position_embeddings + self.hidden_size
+        return self.num_position_embeddings * self.hidden_size
 
 
     def optimizer_targets(self):
@@ -129,7 +130,7 @@ class Qwen3VLPosEmbedding(Module):
         out_dtype: torch.dtype | None = None
     ):
         pos_emb = self.fast_pos_embed_interpolate(params["grid_thw"])
-        x += pos_emb.to(x.device)
+        x += to_device(pos_emb, x.device)
         return to2(x, out_dtype, self.out_dtype)
 
 
@@ -164,7 +165,7 @@ class DeepstackEmbed(Module):
         if emb is None:
             return x
 
-        t = emb[self.deepstack_index].to(x.device)
+        t = to_device(emb[self.deepstack_index], x.device)
         x += t
 
         return x

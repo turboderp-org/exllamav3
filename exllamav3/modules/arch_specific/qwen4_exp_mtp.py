@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+from ...util.device_copy import to_device
 from ...model.config import Config
 from ...modules import Module, Linear, RMSNorm
 from ...util.tensor import get_for_device, to2
@@ -104,7 +105,7 @@ class Qwen4ExpMTPInputLayer(Module):
 
     @override
     def weights_numel(self):
-        return self.hc_mult * self.hidden_size
+        return super().weights_numel() + self.hc_mult * self.hidden_size
 
     # The module key is the bare "mtp" prefix, which would swallow every mtp.* tensor in the
     # default prefix-based compile collection (duplicating the decoder block's and mixer's
@@ -151,7 +152,7 @@ class Qwen4ExpMTPInputLayer(Module):
 
         # Token embedding via the attached model
         emb = self.attached_model().modules[0].forward(x, params, out_dtype = torch.half)
-        emb = self.pre_fc_norm_embedding.forward(emb.to(self.device), params)
+        emb = self.pre_fc_norm_embedding.forward(to_device(emb, self.device), params)
         emb = self.fc_embedding.forward(emb, params)                           # (b, s, D)
 
         if self.stream_tap:

@@ -1,6 +1,7 @@
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
+import numpy as np
 import torch
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3 import (
@@ -56,6 +57,37 @@ custom_test_cases = [
         "input": [[2, 2, 2, 2, 2, 2, 2, 2, 2, 2]],
         "input_seq": [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]],
         "expect_logits": [[2, 2, 2, 1.75, 1.5, 1.25, 1, 1, 1, 1]],
+    },
+    {
+        # OAI/vLLM semantics: negative penalties reward reuse (presence used to be silently dropped)
+        "name": "presfreq_p negative presence",
+        "sampler": CustomSampler([
+            SS_PresFreqP(-1, 0),
+            SS_Sample_mn()
+        ]),
+        "input": [[10, 10, 10, 10, 10, 10, 10, 10, 10, 10]],
+        "input_seq": [[0, 0, 0, 1, 1, 1, 1, 1, 1, 9]],
+        "expect_logits": [[11, 11, 10, 10, 10, 10, 10, 10, 10, 11]],
+    },
+    {
+        "name": "presfreq_p negative frequency",
+        "sampler": CustomSampler([
+            SS_PresFreqP(0, -1),
+            SS_Sample_mn()
+        ]),
+        "input": [[10, 10, 10, 10, 10, 10, 10, 10, 10, 10]],
+        "input_seq": [[0, 0, 0, 1, 1, 1, 1, 1, 1, 9]],
+        "expect_logits": [[13, 16, 10, 10, 10, 10, 10, 10, 10, 11]],
+    },
+    {
+        "name": "presfreq_p negative presence with decay",
+        "sampler": CustomSampler([
+            SS_PresFreqP(-1, 0, 4, 4),
+            SS_Sample_mn()
+        ]),
+        "input": [[2, 2, 2, 2, 2, 2, 2, 2, 2, 2]],
+        "input_seq": [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]],
+        "expect_logits": [[2, 2, 2, 2.25, 2.5, 2.75, 3, 3, 3, 3]],
     },
     {
         "name": "rep_p 1",
@@ -253,6 +285,125 @@ custom_test_cases = [
         # nan and +inf biases are dropped (tokens 0 and 3 unchanged); 4.0 adds to token 1
         "expect_logits": [[1.0, 5.0, ni, 1.0]],
     },
+    {
+        # DRY: the context suffix [1, 2, 3] repeats earlier, so token 1, which would extend that
+        # repeat to length 4, is penalized by multiplier * base ** (3 - allowed_length) = 1.75
+        "name": "dry",
+        "sampler": CustomSampler([
+            SS_DRY(1.0, 1.75, 2, 0, []),
+            SS_Sample_mn()
+        ]),
+        "input": [[2] * 8],
+        "input_seq": [[0, 1, 2, 3, 1, 2, 3]],
+        "expect_logits": [[2, 0.25, 2, 2, 2, 2, 2, 2]],
+    },
+    {
+        # A repeat no longer than allowed_length is not penalized
+        "name": "dry, allowed length",
+        "sampler": CustomSampler([
+            SS_DRY(1.0, 1.75, 4, 0, []),
+            SS_Sample_mn()
+        ]),
+        "input": [[2] * 8],
+        "input_seq": [[0, 1, 2, 3, 1, 2, 3]],
+        "expect_logits": [[2] * 8],
+    },
+    {
+        # dry_range bounds the window: the earlier occurrence of [1, 2, 3] falls outside the
+        # last 4 tokens
+        "name": "dry, range",
+        "sampler": CustomSampler([
+            SS_DRY(1.0, 1.75, 2, 4, []),
+            SS_Sample_mn()
+        ]),
+        "input": [[2] * 8],
+        "input_seq": [[1, 2, 3, 1, 2, 3]],
+        "expect_logits": [[2] * 8],
+    },
+    {
+        # Same context without the range cap
+        "name": "dry, full range",
+        "sampler": CustomSampler([
+            SS_DRY(1.0, 1.75, 2, 0, []),
+            SS_Sample_mn()
+        ]),
+        "input": [[2] * 8],
+        "input_seq": [[1, 2, 3, 1, 2, 3]],
+        "expect_logits": [[2, 0.25, 2, 2, 2, 2, 2, 2]],
+    },
+    {
+        # A sequence breaker (9) caps the match at its distance from the end of the context:
+        # the full repeat of [1, 2, 9, 3] has length 4, but rep_limit is 1, so the exponent is
+        # 1 - allowed_length = 0 and token 1 is penalized by the bare multiplier, not by
+        # multiplier * base ** 3
+        "name": "dry, breaker caps match",
+        "sampler": CustomSampler([
+            SS_DRY(0.5, 2.0, 1, 0, [9]),
+            SS_Sample_mn()
+        ]),
+        "input": [[2] * 10],
+        "input_seq": [[1, 2, 9, 3, 1, 2, 9, 3]],
+        "expect_logits": [[2, 1.5, 2, 2, 2, 2, 2, 2, 2, 2]],
+    },
+    {
+        # A breaker token (9) is never penalized, even where it would extend a repeat
+        "name": "dry, breaker not penalized",
+        "sampler": CustomSampler([
+            SS_DRY(1.0, 1.75, 2, 0, [9]),
+            SS_Sample_mn()
+        ]),
+        "input": [[2] * 10],
+        "input_seq": [[1, 2, 9, 1, 2]],
+        "expect_logits": [[2] * 10],
+    },
+    {
+        # Control for the case above: without breakers the same context penalizes token 9
+        "name": "dry, no breakers control",
+        "sampler": CustomSampler([
+            SS_DRY(1.0, 1.75, 2, 0, []),
+            SS_Sample_mn()
+        ]),
+        "input": [[2] * 10],
+        "input_seq": [[1, 2, 9, 1, 2]],
+        "expect_logits": [[2, 2, 2, 2, 2, 2, 2, 2, 2, 1]],
+    },
+    {
+        # Two rows with independent histories; the second row's run of token 4 gives the
+        # longest match 6 and penalty base ** (6 - 2)
+        "name": "dry, batch",
+        "sampler": CustomSampler([
+            SS_DRY(1.0, 1.75, 2, 0, []),
+            SS_Sample_mn()
+        ]),
+        "input": [[2] * 8] * 2,
+        "input_seq": [[0, 1, 2, 3, 1, 2, 3], [4, 4, 4, 4, 4, 4, 4]],
+        "expect_logits": [[2, 0.25, 2, 2, 2, 2, 2, 2], [2, 2, 2, 2, -7.37890625, 2, 2, 2]],
+    },
+    {
+        # The exponent clamp: llama.cpp computes FLOAT_MAX_LOG / log(base) in float32, which
+        # for base = 2.0 is exactly 128, so the penalty is 2 ** 128 and saturates the float32
+        # logit to -inf. A float64 clamp would land on 127 and a finite logit
+        "name": "dry, exponent clamp",
+        "sampler": CustomSampler([
+            SS_DRY(1.0, 2.0, 2, 0, []),
+            SS_Sample_mn()
+        ]),
+        "input": [[2] * 8],
+        "input_seq": [[3] * 200],
+        "expect_logits": [[2, 2, 2, ni, 2, 2, 2, 2]],
+    },
+    {
+        # DRY after another logits step exercises the SS.LOGITS branch
+        "name": "dry, after ban_tokens",
+        "sampler": CustomSampler([
+            SS_BanTokens([0]),
+            SS_DRY(1.0, 1.75, 2, 0, []),
+            SS_Sample_mn()
+        ]),
+        "input": [[2] * 8],
+        "input_seq": [[1, 2, 3, 1, 2, 3]],
+        "expect_logits": [[ni, 0.25, 2, 2, 2, 2, 2, 2]],
+    },
 ]
 
 
@@ -410,17 +561,26 @@ def test_fused_collapse():
     assert fused_mode(ComboSampler(
         temperature = 0.8, min_p = 0.05, logit_bias = {1: 5.0}
     )) == SS_Fused.MODE_SAMPLE_MINP
+    # As does a leading DRY step, standalone or through ComboSampler
+    assert fused_mode(CustomSampler([
+        SS_DRY(0.8, 1.75, 2, 0, [1]), SS_Temperature(0.8), SS_MinP(0.05), SS_Sample()
+    ])) == SS_Fused.MODE_SAMPLE_MINP
+    assert fused_mode(ComboSampler(dry_multiplier = 0.8, temperature = 0.8, min_p = 0.05)) \
+        == SS_Fused.MODE_SAMPLE_MINP
     # Reference/multinomial nodes and non-canonical filter orders stay on the eager path
     assert fused_mode(CustomSampler([SS_MinP(0.1), SS_Sample_mn()])) is None
     assert fused_mode(CustomSampler([SS_TopP(0.9), SS_MinP(0.1), SS_Temperature(0.8), SS_Sample()])) is None
     # XTC needs the sorted distribution, so it has no fused form
     assert fused_mode(CustomSampler([SS_Temperature(0.8), SS_XTC(0.5, 0.1), SS_Sample()])) is None
-    # An empty ban list, a zero XTC probability and an XTC threshold above half are no-ops, and a
-    # no-op does not keep the tail off the fused path
+    # An empty ban list, a zero XTC probability, an XTC threshold above half, a zero DRY
+    # multiplier and a DRY base below 1 are no-ops, and a no-op does not keep the tail off the
+    # fused path
     for neutral in [
         SS_BanTokens([]),
         SS_XTC(0.0, 0.1),
         SS_XTC(0.5, 0.6),
+        SS_DRY(0.0),
+        SS_DRY(0.5, 0.5),
     ]:
         assert fused_mode(CustomSampler([
             neutral, SS_Temperature(0.8), SS_MinP(0.05), SS_Sample()
@@ -573,6 +733,150 @@ def test_argmax_sorted():
             assert sample.tolist() == expected, (steps, sample.tolist(), expected)
     finally:
         sampler_custom.fused_sampler_enable = enabled
+
+
+def dry_reference_penalties(window, breakers, multiplier, base, allowed_length):
+    """
+    Brute-force DRY oracle: computes each match length by direct comparison of the window with
+    the sequence ending at every earlier position, rather than SS_DRY's chunked run-length scan,
+    so the two cannot share an indexing bug. The penalty arithmetic follows
+    llama_sampler_dry_apply, with the exponent clamp computed in float32 via numpy.
+    """
+    m = len(window)
+    mult = float(np.float32(multiplier))
+    b = float(np.float32(base))
+    if np.float32(b) > np.float32(1.000001):
+        max_exp = int(np.float32(88.7228391) / np.log(np.float32(b)))
+    else:
+        max_exp = 0
+    rep_limit = m
+    for i in range(m):
+        if window[m - 1 - i] in breakers:
+            rep_limit = i
+            break
+    if rep_limit < allowed_length:
+        return {}
+    best = {}
+    for i in range(m - 1):
+        length = 0
+        while length <= i and window[i - length] == window[m - 1 - length]:
+            length += 1
+        length = min(length, rep_limit)
+        tok = window[i + 1]
+        if length >= allowed_length and tok not in breakers:
+            best[tok] = max(best.get(tok, 0), length)
+    penalties = {}
+    for tok, length in best.items():
+        exponent = length - allowed_length
+        if max_exp and exponent > max_exp:
+            exponent = max_exp
+        penalties[tok] = mult * float(np.float64(b) ** exponent)
+    return penalties
+
+
+@pytest.mark.parametrize("past_device", ["cpu", device])
+@torch.inference_mode()
+def test_dry_oracle(past_device):
+    """
+    Randomized differential test of SS_DRY against the brute-force oracle, exact to the bit
+    since both sides compute the penalty in float64 and round once to float32. past_ids are
+    given on the host and on the device (the kernel uploads host ids); a slice of the cases
+    injects out-of-vocabulary and negative past IDs, which match as ordinary tokens but are
+    never penalized or treated as breakers, and the last cases use windows long enough to
+    spread the offset scan over several kernel blocks.
+    """
+    rng = random.Random(11)
+    try:
+        for case in range(220):
+            dim = rng.choice([16, 33, 64])
+            # the last cases span several scan blocks of the kernel (1024 offsets each)
+            n = rng.randint(3, 60) if case < 200 else rng.randint(1500, 3000)
+            alphabet = rng.randint(2, 8)
+            seq = [rng.randrange(alphabet) for _ in range(n)]
+            if case % 5 == 0:
+                seq[rng.randrange(n)] = rng.choice([-1, dim, dim + 7])
+            multiplier = rng.choice([0.5, 1.0, 2.7])
+            base = rng.choice([1.0, 1.05, 1.75, 2.0, 3.0])
+            allowed = rng.choice([0, 1, 2, 5])
+            dry_range = rng.choice([0, 3, 7, 100])
+            breakers = frozenset(rng.sample(range(alphabet + 2), rng.randint(0, 3)))
+
+            sampler = CustomSampler([SS_DRY(multiplier, base, allowed, dry_range, breakers or None)])
+            logits = torch.zeros((1, dim), dtype = torch.float, device = device)
+            seq_t = torch.tensor([seq], dtype = torch.long, device = past_device)
+            if past_device == "cpu":
+                seq_t = seq_t.pin_memory()
+            state = sampler.forward(logits, sequence_ids = seq_t, rand_u32 = 0, return_state = True)
+
+            m = n if dry_range <= 0 else min(n, dry_range)
+            window = seq[-m:]
+            if m <= allowed:
+                penalties = {}
+            else:
+                penalties = dry_reference_penalties(window, breakers, multiplier, base, allowed)
+            expect = torch.zeros(dim)
+            for tok, val in penalties.items():
+                if 0 <= tok < dim:
+                    expect[tok] = torch.tensor(val, dtype = torch.float64).to(torch.float32)
+            assert torch.equal(state.logits[0].cpu(), -expect), \
+                (seq, multiplier, base, allowed, dry_range, sorted(breakers))
+    finally:
+        pass
+
+
+def test_dry_validation():
+    with pytest.raises(AssertionError):
+        SS_DRY(-0.5)
+    with pytest.raises(AssertionError):
+        SS_DRY(1.0, 1.75, 2.5)
+    with pytest.raises(AssertionError):
+        SS_DRY(1.0, 1.75, 2, 0.5)
+
+
+class _DryStubTokenizer:
+    """
+    Minimal stand-in for the breaker-derivation interface of Tokenizer, matching what
+    dry_default_sequence_breaker_tokens reads.
+    """
+    def __init__(self, breaker_pieces = True):
+        self.extended_id_to_piece = {7: "<x>"} if breaker_pieces else {}
+        self.actual_vocab_size = 12
+        self.breaker_pieces = breaker_pieces
+
+    def get_id_to_piece_list(self, include_special_tokens = False):
+        # IDs 1 and 3 contain default breaker characters
+        if self.breaker_pieces:
+            return ["a", "b.", "c", "d\n", "e", "f", "g"]
+        return ["a", "b", "c", "d", "e", "f", "g"]
+
+
+@torch.inference_mode()
+def test_dry_default_breakers():
+    """
+    With dry_sequence_breakers = None the default set derives per tokenizer from the one passed
+    to forward(), as the generator does: token 3 is a breaker for the stub, so it caps the match
+    at rep_limit 2 and is itself not penalized, while the tokenizer-less call penalizes it, and
+    a later tokenizer without breaker pieces penalizes it again through the same sampler
+    """
+    logits = torch.zeros((1, 12), dtype = torch.float, device = device)
+    seq_t = torch.tensor([[0, 5, 2, 3, 5, 2]], dtype = torch.long, device = "cpu", pin_memory = True)
+    sampler = CustomSampler([SS_DRY(1.0, 1.75, 2, 0)])
+
+    state = sampler.forward(logits.clone(), sequence_ids = seq_t, rand_u32 = 0, return_state = True)
+    assert state.logits[0, 3].item() == -1.0, state.logits
+
+    state = sampler.forward(
+        logits.clone(), sequence_ids = seq_t, rand_u32 = 0, return_state = True,
+        tokenizer = _DryStubTokenizer(),
+    )
+    assert torch.equal(state.logits[0], logits[0]), state.logits
+
+    # Not latched to the first tokenizer seen: a vocabulary without breaker pieces penalizes
+    state = sampler.forward(
+        logits.clone(), sequence_ids = seq_t, rand_u32 = 0, return_state = True,
+        tokenizer = _DryStubTokenizer(breaker_pieces = False),
+    )
+    assert state.logits[0, 3].item() == -1.0, state.logits
 
 
 @pytest.mark.parametrize("dim", dims)
