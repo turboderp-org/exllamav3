@@ -98,6 +98,7 @@ def main(args):
     # -vb 16: raw copy of the source tower (no module round-trip: padded architectures
     # would otherwise re-emit padded fp16 weights)
     modules = vmodel.modules if args.vision_bits != 16 else []
+    fused_sources = set()
 
     for idx, module in enumerate(modules):
         assert module.num_slices <= 1
@@ -119,6 +120,9 @@ def main(args):
         module.config.stc.close()
 
         linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]
+        # Fused source weights (qkv / gate_up) are replaced by their split quantized
+        # projections: remember the fused keys so the raw fused .weight is not copied along
+        fused_sources.update(m.fkey for m in linears if getattr(m, "fkey", None))
         assert all(isinstance(linear.inner, LinearFP16) for linear in linears), \
             f"Vision component of {args.model_dir} is already quantized; " \
             f"quantize from a checkpoint with an fp16 tower"
@@ -157,6 +161,8 @@ def main(args):
         if name in q_tensors:
             continue
         if name.rsplit(".", 1)[0] in quantized_parents:
+            continue
+        if name.endswith(".weight") and name.rsplit(".", 1)[0] in fused_sources:
             continue
         q_tensors[name] = config.stc.get_tensor(name, "cpu")
         n_aux += 1

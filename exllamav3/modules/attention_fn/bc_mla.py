@@ -450,17 +450,21 @@ class BCMLA:
             ws_acc = sbuf("bcm_dsa_wsacc", R * hb * N_SPLITS * BLOCK_H * D_c, dtype = torch.float)
             self.slot_indices[(bsz, q_len)] = indices
 
+            # Packed latent cache: the gather kernel reads the int32 pages through the
+            # shared QC loaders (scales + H32 appended to the runtime args)
             sig_s = {
                 "q": "*fp16:16", "ring": "*fp16:16", "kv_chunk": "*fp16:16",
-                "pool_c": "*fp16:16", "pool_r": "*fp16:16", "block_table": "*i32:16",
+                "pool_c": "*i32:16" if self.quant else "*fp16:16", "pool_r": "*fp16:16",
+                "block_table": "*i32:16",
                 "indices": "*i32:16", "ws_ml": "*fp32:16", "ws_acc": "*fp32:16",
                 "k_len": "i32", "win_len": "i32", "pool_len": "i32",
                 "num_pages_per_row": "i32", "q_pos0": "i32", "win_floor": "i32",
                 "ring_beg": "i32", "slot_ids": "i32", "ring_stride": "i32",
+                "pool_s": "*fp16:16", "h32": "*fp16:16",
             } | {n: "constexpr" for n in (
                 "H", "page_size", "D_c", "D_c_pad", "D_r", "K_pad", "compress_rate", "scale",
                 "HAS_WINDOW", "DENSE_POOL", "BLOCK_H", "BLOCK_N", "BLOCK_W", "SEQ",
-                "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES", "Q_SPLIT", "OUT_LATENT")}
+                "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES", "Q_SPLIT", "OUT_LATENT", "QC")}
             consts_s = dict(
                 H = H, page_size = PAGE_SIZE, D_c = D_c,
                 D_c_pad = 1 << (D_c - 1).bit_length(), D_r = D_r, K_pad = kp,
@@ -472,6 +476,7 @@ class BCMLA:
                 SEQ = q_len, MULTIROW = 1 if bsz > 1 else 0,
                 DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
                 Q_SPLIT = 1, OUT_LATENT = 1,
+                QC = self.k_bits if self.quant else 0,
             )
             k_dsa_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
 
@@ -479,13 +484,15 @@ class BCMLA:
                 "ws_ml": "*fp32:16", "ws_acc": "*fp32:16", "sinks": "*fp32:16",
                 "derot_inv_freq": "*fp32:16",
                 "out": "*fp16:16", "q_pos0": "i32", "R": "i32", "n_splits": "i32",
+                "h32": "*fp16:16",
             } | {n: "constexpr" for n in (
                 "H", "D_c", "D_r", "HAS_SINKS", "DEROTATE", "HPG", "BLOCK_H", "BLOCK_D",
-                "SEQ", "MULTIROW", "OUT_LATENT")}
+                "SEQ", "MULTIROW", "OUT_LATENT", "QC")}
             consts_c = dict(
                 H = H, D_c = D_c, D_r = D_r, HAS_SINKS = False, DEROTATE = False,
                 HPG = 0, BLOCK_H = BLOCK_H, BLOCK_D = 128,
                 SEQ = 1, MULTIROW = 0, OUT_LATENT = 1,
+                QC = self.k_bits if self.quant else 0,
             )
             k_dsa_combine = _compile_kernel(dev, _dsa_attn_combine_kernel, sig_c, consts_c, 4, 2)
 
@@ -522,9 +529,6 @@ class BCMLA:
             regime = 1 if t_total > self.index_topk else 0
             ext_indices = None
             if regime:
-                # Sparse restriction: fp16 latent cache (the gather kernels read fp16 rows)
-                if self.quant:
-                    return None
                 # Single job: the scalar position drives the scoring bounds (the generator
                 # usually passes positions as a tensor and leaves the scalar at 0). Batched
                 # slots derive their per-job bounds on device from cache_seqlens instead

@@ -347,8 +347,10 @@ class GatedResidual(Module):
             if self.use_combine else None
         return post, mixed
 
-    def _mix(self, streams: torch.Tensor):
-        """streams (b, s, H, D) fp32 -> (post (R, H) fp32 or None, mixed (R, D) half)."""
+    def _mix(self, streams: torch.Tensor, cached: bool = True):
+        """streams (b, s, H, D) fp32 -> (post (R, H) fp32 or None, mixed (R, D) half).
+        cached: small-R outputs may come from the per-device static workspaces (see below);
+        callers that hold the result across another mix on the device pass False."""
         H, Dh = self.hc_mult, self.hidden_size
         R = streams.shape[0] * streams.shape[1]
         s3 = streams.reshape(R, H, Dh)
@@ -357,14 +359,26 @@ class GatedResidual(Module):
         if not s3.is_contiguous():
             s3 = s3.contiguous()
         dev = s3.device
-        post = torch.empty((R, H), dtype = torch.float, device = dev) \
-            if self.use_combine else None
 
         if R <= self.FUSED_MAX_R:
-            dots = torch.empty((R, self.fn_h.shape[0] + 1, H), dtype = torch.float, device = dev)
-            mixed = torch.empty((R, Dh), dtype = torch.half, device = dev)
+            # Decode/MTP-class row counts (the fused path's whole domain) take bucketed
+            # workspaces from the per-device static cache, shared by every GatedResidual site
+            # on the device: a site's outputs are consumed (block input, apply_) before the
+            # next site mixes on the same stream, so one set per device suffices and no
+            # per-site statics are needed. Sized by numel, so a rebuilt fn_h with another rank
+            # simply lands in a different bucket; nearby R share a backing via slices.
+            def ws(numel, dtype, tag):
+                if cached:
+                    return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
+                return torch.empty((numel,), dtype = dtype, device = dev)
+            M = self.fn_h.shape[0] + 1
+            dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
+            post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
+            mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
             ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
         else:
+            post = torch.empty((R, H), dtype = torch.float, device = dev) \
+                if self.use_combine else None
             normed = torch.empty((R * H, Dh), dtype = torch.half, device = dev)
             ext.rms_norm(s3.view(R * H, Dh), self.w_h, normed,
                          self.rms_eps, 0.0, 1.0, False, False, H)
@@ -420,7 +434,8 @@ class GatedResidual(Module):
                 states = params["export_states"] = []
             states.append(x.flatten(-2).half())
         b, s = x.shape[:2]
-        _, mixed = self._mix(x)
+        # Conversion passes hold this output while other modules run; give them fresh tensors
+        _, mixed = self._mix(x, cached = "capture" not in params and "quant_preserve" not in params)
         mixed = mixed.view(b, s, self.hidden_size)
         dt = out_dtype or self.out_dtype
         return mixed if dt is None else mixed.to(dt)

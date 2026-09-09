@@ -7,7 +7,9 @@ from ..modules import Embedding, RMSNorm, Linear, GatedMLP, BlockSparseMLP, Tran
     HyperConnection, ExpandStreams, HyperHead
 from ..modules.dsv4 import DSV4Attention
 from ..modules.attn import prepare_for_attn
+from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from .deepseek_v4_mtp import DeepseekV4MTPModel
+from .deepseek_v4_vision import DeepseekV4VisionModel, read_deepseek_v4_vision_config
 
 # DeepSeek-V4: hybrid sparse attention (sliding / CSA / HCA per compress_ratios), mHC
 # hyper-connection residual streams, hash-MoE bootstrap layers, sqrt-softplus routing.
@@ -102,6 +104,14 @@ class DeepseekV4Config(Config):
             self.stc.has_tensor(f"mtp.0.attn.wkv.{t}") for t in ("weight", "trellis")):
             del self.model_classes["mtp"]
 
+        # Vision tower (V4-Flash-Vision-Exp): plain ViT + aligner at the checkpoint root
+        self.vision = read_deepseek_v4_vision_config(self)
+        if self.vision is not None and any(
+            self.stc.has_tensor(f"vision.patch_embed.proj.{t}") for t in ("weight", "trellis")):
+            self.model_classes["vision"] = DeepseekV4VisionModel
+        else:
+            self.vision = None
+
 
 class DeepseekV4Model(Model):
     config_class = DeepseekV4Config
@@ -174,6 +184,7 @@ class DeepseekV4Model(Model):
                 key_down = "experts.{expert_idx}.w2",
                 key_routing_gate = "gate",
                 key_e_score_bias = "gate.bias",
+                key_e_score_bias_vl = "gate.bias_vl",       # vision variant only (optional)
                 key_tid2eid = "gate.tid2eid" if is_hash else None,
                 qmap = "block.mlp",
                 interm_dtype = torch.half,
@@ -261,6 +272,9 @@ class DeepseekV4Model(Model):
             "recurrent_states": True,
             "default_recurrent_checkpoint_interval": 2048,
         })
+        if config.vision is not None:
+            # Image spans are prefilled as exactly one chunk each (see _prepare_image_chunk)
+            self.caps.update({"mm_exact_chunks": True})
         from ..cache.dsa import DSV4State
         self.recurrent_state_cls = DSV4State
 
@@ -268,6 +282,7 @@ class DeepseekV4Model(Model):
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         # Hash-MoE layers route by token id (get_for_device copies once per device)
         params["input_ids"] = input_ids
+        _prepare_image_chunk(input_ids, params)
         return prepare_for_attn(input_ids, params)
 
     @override
@@ -277,3 +292,31 @@ class DeepseekV4Model(Model):
             p += f"{system_prompt}\n\n"
         p += f"<|User|>{prompt}<|Assistant|>"
         return p
+
+
+def _prepare_image_chunk(input_ids: torch.Tensor, params: dict):
+    """
+    Vision (V4-Flash-Vision-Exp): an image span [IMAGE_START .. IMAGE_END] must be prefilled
+    as exactly one chunk, which then attends bidirectionally within itself (plus each row's
+    ordinary window into the history) -- the reference's per-row "visible" bounds. The
+    generator cuts chunks that way (caps mm_exact_chunks); this checks it and sets
+    params["nc_chunk"]. The embedding's leading pad rows (before align_lead) are text-like.
+    """
+    embs = params.get("indexed_embeddings")
+    if not embs or input_ids.shape[1] == 1:
+        return
+    ids = input_ids[0]
+    if not bool((ids >= FIRST_MM_EMBEDDING_INDEX).any()):
+        return
+    for e in embs:
+        lo, hi = e.first_index + getattr(e, "align_lead", 0), e.last_index
+        n_span = int(((ids >= lo) & (ids < hi)).sum())
+        if n_span == 0:
+            continue
+        span_len = hi - lo
+        if input_ids.shape[0] == 1 and n_span == ids.shape[0] == span_len:
+            params["nc_chunk"] = True
+            return
+        raise RuntimeError(
+            "DeepSeek-V4 vision: an image span must be prefilled as exactly one chunk "
+            f"(chunk of {ids.shape[0]} rows holds {n_span} of a {span_len}-row span)")

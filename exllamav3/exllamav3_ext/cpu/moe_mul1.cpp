@@ -41,7 +41,7 @@
 // below 2^15, which makes the operand order load-bearing). Accuracy matches the GPU int8-GEMV
 // mode-2 class (~0.9% per-call output RMS). i32 accumulators are safe for k up to ~8192.
 //
-// On the AVX2 tier (no VNNI) the byte-sum must be emulated with vpmaddubsw, whose i16 pair sums
+// On the AVX2 and AVX-512BW tiers (no VNNI) the byte-sum is emulated with vpmaddubsw, whose i16 pair sums
 // saturate once an activation is inside the pair. The accumulate therefore keeps the pair x-free:
 // sum the product bytes once per k-row into i16 pair-sums <= 510, then multiply by x with one
 // vpmaddwd per token row. +-127 activations, bit-exact vs the masked accumulate it replaces,
@@ -70,12 +70,16 @@ constexpr int MAX_M = 4;
 
 #if defined(__GNUC__) && defined(__linux__)
 #define M1_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
+#define M1_TARGET_BW __attribute__((target("avx512f,avx512bw,avx512vl,fma,f16c")))
 #define M1_TARGET_VNNI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,fma,f16c")))
 #define M1_TARGET_VBMI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,fma,f16c")))
+#define M1_ALWAYS_INLINE __attribute__((always_inline)) inline
 #else
 #define M1_TARGET_AVX2
+#define M1_TARGET_BW
 #define M1_TARGET_VNNI
 #define M1_TARGET_VBMI
+#define M1_ALWAYS_INLINE __forceinline
 #endif
 
 inline void cpu_pause()
@@ -190,8 +194,9 @@ inline float decode_mul1_scalar(uint16_t state)
 // -------------------------------------------------------------------------------------------
 
 // Declared early: the transforms below select on it. Vbmi = Vnni + AVX512-VBMI (Zen4+, Ice
-// Lake+); kept as a separate tier because Cascade/Cooper Lake have VNNI without VBMI.
-enum class Isa { Scalar, Avx2, Vnni, Vbmi };
+// Lake+); kept as a separate tier because Cascade/Cooper Lake have VNNI without VBMI. Bw =
+// AVX-512F/BW/VL without VNNI (Skylake-SP/X): the dword kernel with the AVX2-style accumulate.
+enum class Isa { Scalar, Avx2, Bw, Vnni, Vbmi };
 extern const Isa g_isa;
 
 // -------------------------------------------------------------------------------------------
@@ -395,8 +400,8 @@ void prepare_rows
 
         // int8 quantization, one scale per row
         int32_t* splat = p.splat32 + static_cast<size_t>(r) * k;
-        // dup is only read by the AVX2 maddubs kernels; skip the stores on the VNNI/VBMI tiers
-        int32_t* splat_dup = (p.splat_dup && g_isa == Isa::Avx2)
+        // dup is only read by the AVX2/BW maddubs kernels; skip the stores on the VNNI/VBMI tiers
+        int32_t* splat_dup = (p.splat_dup && (g_isa == Isa::Avx2 || g_isa == Isa::Bw))
             ? p.splat_dup + static_cast<size_t>(r) * k : nullptr;
         float q;
         int32_t s;
@@ -431,7 +436,7 @@ void prepare_rows
 // Gather the two 32-bit word vectors covering row `row`'s 16-bit states (the permute stage of
 // the extraction, split out so a row pair can share it -- see vnni_band_rows)
 template <int bits, int row>
-M1_TARGET_VNNI
+M1_TARGET_BW
 inline void dword_gather(__m512i p0, __m512i p1, __m512i p2, __m512i p3, __m512i& a, __m512i& b)
 {
     alignas(64) static constexpr auto i0d = make_row_indices<bits, row, false>();
@@ -454,23 +459,45 @@ inline void dword_gather(__m512i p0, __m512i p1, __m512i p2, __m512i p3, __m512i
     }
 }
 
+// Per-lane shift counts for the funnel merge: cols 0-7 use s0, cols 8-15 use s1
+template <int s0, int s1>
+constexpr std::array<int32_t, 16> make_lane_shifts()
+{
+    std::array<int32_t, 16> v{};
+    for (int i = 0; i < 16; ++i) v[i] = i < 8 ? s0 : s1;
+    return v;
+}
+
 // Shift-merge codes for `row` out of its gathered word vectors; delta = bits extracts row+1
 // from row's own gather (valid when word_pair_ok). Vector shifts by >= 32 are well-defined
-// zero, so the s' == 0 case needs no special path.
+// zero, so the s' == 0 case needs no special path. The two half-rows generally need different
+// shifts: one per-lane variable funnel shift (vpsrlvd/vpsllvd against compile-time count
+// vectors) merges both in 4 uops (GCC fuses the or+and into vpternlogd), where two immediate
+// funnel shifts plus a lane blend took 8.
 template <int bits, int row, int delta>
-M1_TARGET_VNNI
+M1_TARGET_BW
 inline __m512i dword_codes(__m512i a, __m512i b)
 {
     constexpr int s0 = row_shift<bits, row>(0) - delta;
     constexpr int s1 = row_shift<bits, row>(8) - delta;
     static_assert(s0 >= 0 && s1 >= 0, "pairing delta exceeds shift headroom");
-    const __m512i c0 = _mm512_or_si512(_mm512_srli_epi32(b, s0), _mm512_slli_epi32(a, 32 - s0));
-    const __m512i c1 = _mm512_or_si512(_mm512_srli_epi32(b, s1), _mm512_slli_epi32(a, 32 - s1));
-    return _mm512_and_si512(_mm512_mask_blend_epi32(0xff00, c0, c1), _mm512_set1_epi32(0xffff));
+    if constexpr (s0 == s1)
+    {
+        const __m512i c = _mm512_or_si512(_mm512_srli_epi32(b, s0), _mm512_slli_epi32(a, 32 - s0));
+        return _mm512_and_si512(c, _mm512_set1_epi32(0xffff));
+    }
+    else
+    {
+        alignas(64) static constexpr auto sh = make_lane_shifts<s0, s1>();
+        alignas(64) static constexpr auto shc = make_lane_shifts<32 - s0, 32 - s1>();
+        const __m512i c = _mm512_or_si512(_mm512_srlv_epi32(b, _mm512_load_si512(sh.data())),
+                                          _mm512_sllv_epi32(a, _mm512_load_si512(shc.data())));
+        return _mm512_and_si512(c, _mm512_set1_epi32(0xffff));
+    }
 }
 
 template <int bits, int row>
-M1_TARGET_VNNI
+M1_TARGET_BW
 inline __m512i extract_row(__m512i p0, __m512i p1, __m512i p2, __m512i p3)
 {
     __m512i a, b;
@@ -673,6 +700,168 @@ void vnni_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
                     }
                 }
                 break;
+        }
+        n0 += band;
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+//   AVX-512 BW banded kernel
+//
+//   AVX-512F/BW/VL without VNNI (Skylake-SP/X), which otherwise fell through to the AVX2 tier.
+//   The VNNI kernel's dword extraction and k-major band structure (pure AVX-512F) with the AVX2
+//   tier's accumulate in place of vpdpbusd: vpmaddubsw of the product bytes against 0x01 pairs
+//   gives (b0+b1), (b2+b3) as i16 lanes (<= 510, cannot saturate), then one vpmaddwd per token
+//   row against splat_dup (x8 in both 16-bit slots). Bit-exact with the AVX2 and VNNI tiers.
+//   Separate functions rather than a template flag on the VNNI kernel: a function carries one
+//   target attribute, and compiling this accumulate under the VNNI target would permit
+//   contracting vpmaddwd+vpaddd into vpdpwssd.
+// -------------------------------------------------------------------------------------------
+
+// Force-inlined: GCC otherwise outlines the 16-row chain behind a call on every tile step, and
+// with every zmm register caller-saved the band loop then reloads all of its live constants
+// (index tables, multiplier, shift vectors) after each call (+8-9% inlined, Skylake-SP)
+template <int bits, int rows, int band, int R>
+M1_TARGET_BW
+M1_ALWAYS_INLINE void bw_band_rows
+(
+    __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat_dup, int k,
+    __m512i (&acc)[band][MAX_M]
+)
+{
+    if constexpr (dword_pair_wins<bits>())
+    {
+        if constexpr (R < 16) {
+            const __m512i mult = _mm512_set1_epi32(static_cast<int32_t>(MUL1_MULT));
+            const __m512i ones = _mm512_set1_epi32(0x01010101);
+            __m512i a, wb;
+            dword_gather<bits, R>(p0, p1, p2, p3, a, wb);
+            const __m512i code0 = dword_codes<bits, R, 0>(a, wb);
+            __m512i code1;
+            if constexpr (word_pair_ok<bits, R>())
+            {
+                code1 = dword_codes<bits, R, bits>(a, wb);
+            }
+            else
+            {
+                dword_gather<bits, R + 1>(p0, p1, p2, p3, a, wb);
+                code1 = dword_codes<bits, R + 1, 0>(a, wb);
+            }
+            const __m512i ps0 = _mm512_maddubs_epi16(_mm512_mullo_epi32(code0, mult), ones);
+            const __m512i ps1 = _mm512_maddubs_epi16(_mm512_mullo_epi32(code1, mult), ones);
+            for (int i = 0; i < rows; ++i)
+            {
+                const __m512i x0 = _mm512_set1_epi32(splat_dup[static_cast<size_t>(i) * k + R]);
+                const __m512i x1 = _mm512_set1_epi32(splat_dup[static_cast<size_t>(i) * k + R + 1]);
+                acc[b][i] = _mm512_add_epi32(acc[b][i], _mm512_madd_epi16(ps0, x0));
+                acc[b][i] = _mm512_add_epi32(acc[b][i], _mm512_madd_epi16(ps1, x1));
+            }
+            bw_band_rows<bits, rows, band, R + 2>(p0, p1, p2, p3, b, splat_dup, k, acc);
+        }
+    }
+    else
+    {
+        if constexpr (R < 16) {
+            const __m512i mult = _mm512_set1_epi32(static_cast<int32_t>(MUL1_MULT));
+            const __m512i ones = _mm512_set1_epi32(0x01010101);
+            const __m512i code = extract_row<bits, R>(p0, p1, p2, p3);
+            const __m512i ps = _mm512_maddubs_epi16(_mm512_mullo_epi32(code, mult), ones);
+            for (int i = 0; i < rows; ++i)
+                acc[b][i] = _mm512_add_epi32(acc[b][i], _mm512_madd_epi16(ps,
+                    _mm512_set1_epi32(splat_dup[static_cast<size_t>(i) * k + R])));
+            bw_band_rows<bits, rows, band, R + 1>(p0, p1, p2, p3, b, splat_dup, k, acc);
+        }
+    }
+}
+
+template <int bits, int rows, int band>
+M1_TARGET_BW
+void bw_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
+{
+    const int tiles_k = mat.k / 16;
+    const int tiles_n = mat.n / 16;
+    constexpr int packed_size = 16 * bits;
+    constexpr int words32 = bits * 256 / 32;
+    constexpr auto ld_mask = [](int n) -> __mmask16
+    {
+        return n >= 16 ? 0xffffu : (n <= 0 ? 0x0000u : static_cast<__mmask16>((1u << n) - 1u));
+    };
+    constexpr __mmask16 mask0 = ld_mask(words32 - 0);
+    constexpr __mmask16 mask1 = ld_mask(words32 - 16);
+    constexpr __mmask16 mask2 = ld_mask(words32 - 32);
+    constexpr __mmask16 mask3 = ld_mask(words32 - 48);
+
+    __m512i acc[band][MAX_M];
+    for (int b = 0; b < band; ++b)
+        for (int i = 0; i < rows; ++i)
+            acc[b][i] = _mm512_setzero_si512();
+
+    // Layout and prefetch handling as in vnni_band (see the comments there); the host hands
+    // this tier the swizzled layout too (moe_cpu_host gates it on has_avx512_bw)
+    const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
+    const size_t pf_step = mat.swz ? static_cast<size_t>(8) * packed_size : row_stride;
+    const uint16_t* packed_row = mat.trellis + static_cast<size_t>(n0) * packed_size;
+    for (int tile_k = 0; tile_k < tiles_k; ++tile_k, packed_row += row_stride)
+    {
+        const int32_t* splat_dup = in.splat_dup + tile_k * 16;
+        for (int b = 0; b < band; ++b)
+        {
+            const uint16_t* packed = mat.swz
+                ? mat.trellis + (static_cast<size_t>(n0 / 8) * tiles_k * 8
+                                 + static_cast<size_t>(tile_k) * 8 + (n0 % 8) + b) * packed_size
+                : packed_row + b * packed_size;
+            if (mat.swz && band == 8)
+            {
+                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+            }
+            else
+            {
+                constexpr int pf_lines = (packed_size * 2 + 63) / 64;
+                constexpr int pf_dist = (bits == 6) ? 2 : 4;
+                const char* pf = reinterpret_cast<const char*>(packed + pf_step * pf_dist);
+                for (int l = 0; l < pf_lines; ++l)
+                    _mm_prefetch(pf + l * 64, _MM_HINT_T0);
+            }
+            const uint32_t* pw = reinterpret_cast<const uint32_t*>(packed);
+            const __m512i p0 = _mm512_maskz_loadu_epi32(mask0, pw);
+            const __m512i p1 = _mm512_maskz_loadu_epi32(mask1, pw + 16);
+            const __m512i p2 = mask2 ? _mm512_maskz_loadu_epi32(mask2, pw + 32) : _mm512_setzero_si512();
+            const __m512i p3 = mask3 ? _mm512_maskz_loadu_epi32(mask3, pw + 48) : _mm512_setzero_si512();
+            bw_band_rows<bits, rows, band, 0>(p0, p1, p2, p3, b, splat_dup, mat.k, acc);
+        }
+    }
+    for (int b = 0; b < band; ++b)
+        for (int i = 0; i < rows; ++i)
+        {
+            const float scale = mul1_k_inv() * in.q[i];
+            const __m512 corr = _mm512_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
+            const __m512 out = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[b][i]), _mm512_set1_ps(scale), corr);
+            _mm512_storeu_ps(tout + static_cast<size_t>(i) * mat.n + (n0 + b) * 16, out);
+        }
+}
+
+template <int bits, int rows>
+M1_TARGET_BW
+void bw_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
+{
+    // Same band widths as vnni_tiles (one more live temporary per band step, same budget)
+    constexpr int band_cap = 8;
+    const int max_band = mat.swz ? (rows == 1 ? 8 : rows <= 3 ? 4 : 2)
+                                 : (rows == 1 ? band_cap : (12 / rows < 8 ? 12 / rows : 8));
+    int n0 = tn0;
+    while (n0 < tn1)
+    {
+        const int band = std::min(tn1 - n0, max_band);
+        switch (band)
+        {
+            case 1: bw_band<bits, rows, 1>(mat, in, tout, n0); break;
+            case 2: bw_band<bits, rows, 2>(mat, in, tout, n0); break;
+            case 3: bw_band<bits, rows, 3>(mat, in, tout, n0); break;
+            case 4: bw_band<bits, rows, 4>(mat, in, tout, n0); break;
+            case 5: bw_band<bits, rows, 5>(mat, in, tout, n0); break;
+            case 6: bw_band<bits, rows, 6>(mat, in, tout, n0); break;
+            case 7: bw_band<bits, rows, 7>(mat, in, tout, n0); break;
+            default: bw_band<bits, rows, 8>(mat, in, tout, n0); break;
         }
         n0 += band;
     }
@@ -1207,8 +1396,13 @@ Isa detect_isa()
     Isa hw;
 #if defined(__GNUC__) && defined(__linux__)
     if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
-        __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512vnni"))
-        hw = __builtin_cpu_supports("avx512vbmi") ? Isa::Vbmi : Isa::Vnni;
+        __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("fma"))
+    {
+        if (__builtin_cpu_supports("avx512vnni"))
+            hw = __builtin_cpu_supports("avx512vbmi") ? Isa::Vbmi : Isa::Vnni;
+        else
+            hw = Isa::Bw;
+    }
     else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
         hw = Isa::Avx2;
     else
@@ -1239,13 +1433,13 @@ Isa detect_isa()
         const bool vnni = (info[2] & (1u << 11)) != 0;
         const bool vbmi = (info[2] & (1u << 1)) != 0;
         const bool avx2 = (info[1] & (1u << 5)) != 0;
-        hw = (avx512 && vnni && zmm_os) ? (vbmi ? Isa::Vbmi : Isa::Vnni)
+        hw = (avx512 && fma && zmm_os) ? (vnni ? (vbmi ? Isa::Vbmi : Isa::Vnni) : Isa::Bw)
            : (avx2 && fma && ymm_os)    ? Isa::Avx2
            :                              Isa::Scalar;
     }
 #endif
 
-    // EXL3_MOE_CPU_MAX_ISA=scalar|avx2|vnni|vbmi: cap detection at a lower tier for testing
+    // EXL3_MOE_CPU_MAX_ISA=scalar|avx2|bw|vnni|vbmi: cap detection at a lower tier for testing
     // (e.g. exercising the AVX2 path on AVX512-VNNI hardware, or the dword scheme on VBMI
     // hardware). Never upgrades past what the CPU actually supports; an unrecognized value is
     // ignored.
@@ -1256,6 +1450,7 @@ Isa detect_isa()
         Isa cap;
         if (s == "scalar") cap = Isa::Scalar;
         else if (s == "avx2") cap = Isa::Avx2;
+        else if (s == "bw" || s == "avx512bw") cap = Isa::Bw;
         else if (s == "vnni" || s == "avx512") cap = Isa::Vnni;
         else if (s == "vbmi") cap = Isa::Vbmi;
         else return hw;
@@ -1347,6 +1542,45 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                 case 8 * 4 + 1: vnni_tiles<8, 2>(mat, in, tout, tn0, tn1); return;
                 case 8 * 4 + 2: vnni_tiles<8, 3>(mat, in, tout, tn0, tn1); return;
                 case 8 * 4 + 3: vnni_tiles<8, 4>(mat, in, tout, tn0, tn1); return;
+            }
+            return;
+        }
+        case Isa::Bw:
+        {
+            switch (mat.bits * 4 + m - 1)
+            {
+                case 1 * 4 + 0: bw_tiles<1, 1>(mat, in, tout, tn0, tn1); return;
+                case 1 * 4 + 1: bw_tiles<1, 2>(mat, in, tout, tn0, tn1); return;
+                case 1 * 4 + 2: bw_tiles<1, 3>(mat, in, tout, tn0, tn1); return;
+                case 1 * 4 + 3: bw_tiles<1, 4>(mat, in, tout, tn0, tn1); return;
+                case 2 * 4 + 0: bw_tiles<2, 1>(mat, in, tout, tn0, tn1); return;
+                case 2 * 4 + 1: bw_tiles<2, 2>(mat, in, tout, tn0, tn1); return;
+                case 2 * 4 + 2: bw_tiles<2, 3>(mat, in, tout, tn0, tn1); return;
+                case 2 * 4 + 3: bw_tiles<2, 4>(mat, in, tout, tn0, tn1); return;
+                case 3 * 4 + 0: bw_tiles<3, 1>(mat, in, tout, tn0, tn1); return;
+                case 3 * 4 + 1: bw_tiles<3, 2>(mat, in, tout, tn0, tn1); return;
+                case 3 * 4 + 2: bw_tiles<3, 3>(mat, in, tout, tn0, tn1); return;
+                case 3 * 4 + 3: bw_tiles<3, 4>(mat, in, tout, tn0, tn1); return;
+                case 4 * 4 + 0: bw_tiles<4, 1>(mat, in, tout, tn0, tn1); return;
+                case 4 * 4 + 1: bw_tiles<4, 2>(mat, in, tout, tn0, tn1); return;
+                case 4 * 4 + 2: bw_tiles<4, 3>(mat, in, tout, tn0, tn1); return;
+                case 4 * 4 + 3: bw_tiles<4, 4>(mat, in, tout, tn0, tn1); return;
+                case 5 * 4 + 0: bw_tiles<5, 1>(mat, in, tout, tn0, tn1); return;
+                case 5 * 4 + 1: bw_tiles<5, 2>(mat, in, tout, tn0, tn1); return;
+                case 5 * 4 + 2: bw_tiles<5, 3>(mat, in, tout, tn0, tn1); return;
+                case 5 * 4 + 3: bw_tiles<5, 4>(mat, in, tout, tn0, tn1); return;
+                case 6 * 4 + 0: bw_tiles<6, 1>(mat, in, tout, tn0, tn1); return;
+                case 6 * 4 + 1: bw_tiles<6, 2>(mat, in, tout, tn0, tn1); return;
+                case 6 * 4 + 2: bw_tiles<6, 3>(mat, in, tout, tn0, tn1); return;
+                case 6 * 4 + 3: bw_tiles<6, 4>(mat, in, tout, tn0, tn1); return;
+                case 7 * 4 + 0: bw_tiles<7, 1>(mat, in, tout, tn0, tn1); return;
+                case 7 * 4 + 1: bw_tiles<7, 2>(mat, in, tout, tn0, tn1); return;
+                case 7 * 4 + 2: bw_tiles<7, 3>(mat, in, tout, tn0, tn1); return;
+                case 7 * 4 + 3: bw_tiles<7, 4>(mat, in, tout, tn0, tn1); return;
+                case 8 * 4 + 0: bw_tiles<8, 1>(mat, in, tout, tn0, tn1); return;
+                case 8 * 4 + 1: bw_tiles<8, 2>(mat, in, tout, tn0, tn1); return;
+                case 8 * 4 + 2: bw_tiles<8, 3>(mat, in, tout, tn0, tn1); return;
+                case 8 * 4 + 3: bw_tiles<8, 4>(mat, in, tout, tn0, tn1); return;
             }
             return;
         }
@@ -1704,21 +1938,30 @@ void transform_out(const MoeCpuMatrix& mat, float* tout, int m)
 }
 
 
-// Assign workers to GEMVs: with more GEMVs than workers, each worker strides over whole GEMVs;
-// otherwise GEMV j gets the contiguous worker group [j*nw/total, (j+1)*nw/total). Returns false
-// when this worker has no assignment. Missing either regime silently drops GEMVs.
-// GEMV phases are partitioned in units of one UNIT_TILES-wide output band of one GEMV (a
-// whole swizzle group, so the swizzled band kernels never straddle a group boundary), and each
-// worker takes a contiguous block of units. Load stays within one band of even regardless of
-// how the GEMV count divides the worker count: whole-GEMV assignment ran 15 gate/up GEMVs on
-// 12 workers as two rounds with 9 workers idle in the second (decode top-10 with ~8 CPU
-// experts), and split single GEMVs unevenly in the down phase.
-constexpr int UNIT_TILES = 8;
+// Assign this worker its share of a phase's `total` GEMVs (all of one width, tiles_n tiles),
+// calling gemv(j, t0, t1) per tile range. Few GEMVs (decode, small batches; each expert read
+// once): the GEMVs' tiles form one flat range, split evenly across workers in 8-tile groups so
+// no piece crosses a group of its GEMV (the swizzled band kernels' invariant; n % 128 == 0
+// makes every tiles_n a multiple of 8). Whole-GEMV assignment left a 2:1 imbalance whenever
+// 2 * cold experts fell between multiples of the worker count (16 gate/up GEMVs on 20 workers:
+// twelve single-worker GEMVs set the phase time while eight workers idled half of it). Many
+// GEMVs (prefill): whole GEMVs strided across workers, so all workers stream the same expert's
+// chunks together and L3 serves the repeats; the imbalance there is at most one GEMV in four.
+constexpr int FLAT_MAX_GEMVS_PER_WORKER = 4;
 
-inline void unit_range(int worker, int num_workers, int total, int& u0, int& u1)
+template <typename Gemv>
+inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Gemv gemv)
 {
-    u0 = static_cast<int>(static_cast<int64_t>(total) * worker / num_workers);
-    u1 = static_cast<int>(static_cast<int64_t>(total) * (worker + 1) / num_workers);
+    if (total > FLAT_MAX_GEMVS_PER_WORKER * num_workers)
+    {
+        for (int j = worker; j < total; j += num_workers) gemv(j, 0, tiles_n);
+        return;
+    }
+    const int64_t groups = static_cast<int64_t>(total) * (tiles_n / 8);
+    const int f0 = static_cast<int>(groups * worker / num_workers) * 8;
+    const int f1 = static_cast<int>(groups * (worker + 1) / num_workers) * 8;
+    for (int j = f0 / tiles_n; j * tiles_n < f1; ++j)
+        gemv(j, std::max(f0 - j * tiles_n, 0), std::min(f1 - j * tiles_n, tiles_n));
 }
 
 void forward_phase(void* vctx, int worker, int num_workers)
@@ -1748,21 +1991,17 @@ void forward_phase(void* vctx, int worker, int num_workers)
 
         case 1:
         {
-            // Gate + up GEMVs: contiguous block of band units per worker
+            // Gate + up GEMVs (see assign_gemvs)
             const int gu = L.gates.empty() ? 1 : 2;
-            const int upg = (I / 16) / UNIT_TILES;
-            int u0, u1;
-            unit_range(worker, num_workers, nc * gu * upg, u0, u1);
-            for (int u = u0; u < u1; ++u)
+            assign_gemvs(worker, num_workers, nc * gu, I / 16, [&](int j, int t0, int t1)
             {
-                const int j = u / upg, b = u % upg;
                 const Chunk& ch = c.chunks[j / gu];
                 const bool up = gu == 1 || (j % gu);
                 const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
                 const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
                 float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I;
-                run_tiles(mat, p, tout, ch.m, b * UNIT_TILES, (b + 1) * UNIT_TILES);
-            }
+                run_tiles(mat, p, tout, ch.m, t0, t1);
+            });
             break;
         }
 
@@ -1828,18 +2067,13 @@ void forward_phase(void* vctx, int worker, int num_workers)
 
         case 3:
         {
-            // Down GEMVs: contiguous block of band units per worker
-            const int dpg = (H / 16) / UNIT_TILES;
-            int u0, u1;
-            unit_range(worker, num_workers, nc * dpg, u0, u1);
-            for (int u = u0; u < u1; ++u)
+            // Down GEMVs
+            assign_gemvs(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
             {
-                const int j = u / dpg, b = u % dpg;
                 const Chunk& ch = c.chunks[j];
-                const MoeCpuMatrix& mat = L.downs[ch.expert];
                 float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
-                run_tiles(mat, c.prep_d[j], tout, ch.m, b * UNIT_TILES, (b + 1) * UNIT_TILES);
-            }
+                run_tiles(L.downs[ch.expert], c.prep_d[j], tout, ch.m, t0, t1);
+            });
             break;
         }
 
@@ -1879,6 +2113,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
 static const MoeCpuLayer* get_layer(int64_t handle);
 
 bool exl3_moe_cpu_has_avx2() { return g_isa != Isa::Scalar; }
+bool exl3_moe_cpu_has_avx512_bw() { return g_isa >= Isa::Bw; }
 bool exl3_moe_cpu_has_avx512_vnni() { return g_isa >= Isa::Vnni; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }
 

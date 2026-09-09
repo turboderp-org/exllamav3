@@ -826,12 +826,17 @@ class Attention(Module):
 
 
     def cache_layer_type(self, default, kwargs: dict):
+        """QSA modules need the indexer side planes on their cache layer: map the requested
+        K/V layer type to its planes-carrying variant (fp16 or quantized)."""
         if self.qsa_indexer is None:
             return default, kwargs
         from ..cache.fp16 import CacheLayer_fp16
-        from ..cache.qsa import CacheLayer_qsa
-        assert default is CacheLayer_fp16, \
-            "QSA attention currently supports only the fp16 cache layer"
+        from ..cache.quant import CacheLayer_quant
+        from ..cache.qsa import CacheLayer_qsa, CacheLayer_qsa_quant
+        if issubclass(default, CacheLayer_quant):
+            return CacheLayer_qsa_quant, kwargs
+        assert issubclass(default, CacheLayer_fp16), \
+            f"{default.__name__} is not supported for QSA layers; use CacheLayer_fp16 or CacheLayer_quant"
         return CacheLayer_qsa, kwargs
 
 
@@ -843,12 +848,13 @@ class Attention(Module):
         cache = params.get("cache")
         if cache is None:
             return
-        from ..cache import CacheLayer
-        from ..cache.qsa import CacheLayer_qsa
+        from ..cache import CacheLayer, CacheLayer_quant
+        from ..cache.qsa import QSAPlanes
         layer = cache if isinstance(cache, CacheLayer) else \
             cache.layers[self.layer_idx, params.get("layer_instance") or 0]
-        if not isinstance(layer, CacheLayer_qsa):
+        if not isinstance(layer, QSAPlanes):
             return
+        quant = isinstance(layer, CacheLayer_quant)
         chunk = params["batch_shape"][1]
 
         # Decode statics: every buffer the (bsz <= MAX_BSZ, q_len <= MAX_QLEN) slot family
@@ -869,12 +875,12 @@ class Attention(Module):
 
         # Sparse prefill at maximum context. Synthetic state: every block-table entry aliases
         # page 0, zeroed so the math stays finite
-        num_pages = layer.k.shape[0]
+        num_pages = (layer.qk if quant else layer.k).shape[0]
         t_syn = num_pages * PAGE_SIZE - chunk
         if t_syn + chunk <= self.qsa_indexer.sparse_threshold():
             return   # cache too small to ever reach the sparse regime
-        layer.k[0].zero_()
-        layer.v[0].zero_()
+        for t in ((layer.qk, layer.qv, layer.sk, layer.sv) if quant else (layer.k, layer.v)):
+            t[0].zero_()
         layer.raw_k[0].zero_()
         layer.pooled[0].zero_()
         p2 = {k2: v2 for k2, v2 in params.items() if k2 not in
@@ -971,6 +977,9 @@ class Attention(Module):
             qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
             o = self.qsa_indexer.sparse_attend(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu)
         else:
+            # QSA dense regime: the past is bounded by the sparse threshold, which lets the
+            # quantized-cache prefill size its staging to the window instead of the job's pages
+            max_kv_len = int(qsa_seqlens_cpu.max().item()) if qsa_seqlens_cpu is not None else None
             o = attn_dispatch(
                 q = q,
                 k = k,
@@ -987,6 +996,7 @@ class Attention(Module):
                 non_causal_spans = non_causal_spans,
                 sinks = self.sinks,
                 dispatch_cache = self.dispatch_cache,
+                max_kv_len = max_kv_len,
             )
 
         if self.headwise_gate:

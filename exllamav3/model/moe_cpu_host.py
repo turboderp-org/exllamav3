@@ -83,8 +83,9 @@ class MoeCpuTuning:
         self.num_wslots = int(os.environ.get("EXL3_MOE_CPU_WSLOTS", 2))
         self.wslot_size = int(os.environ.get("EXL3_MOE_CPU_WSLOT_MB", 32)) * 1024 * 1024
         # Band-contiguous ("swizzled") expert trellis layout: repacked at arena rehome so each
-        # 8-tile output band streams sequentially from DRAM. Only applied when the VBMI kernel
-        # tier is active. EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
+        # 8-tile output band streams sequentially from DRAM. Applied on every AVX-512 kernel
+        # tier (bw, vnni, vbmi); the AVX2 and scalar tiers read the native layout.
+        # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
         self.swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
 
         # --- GPU-streaming prefill ---
@@ -223,8 +224,8 @@ def _moe_cpu_child_main(conn, model_dir, threads, swizzle):
     name, size) on creation) and acking, until ("start", shm_name, layout) switches it into the
     worker loop, after replying ("arena", per-layer expert block locations, swizzled) so the
     parent can map the arena and knows the physical trellis order. `swizzle` is the parent's
-    snapshot of the tuning request; the actual order also depends on this CPU's VBMI support,
-    which is why the child reports it back. Errors are reported over the pipe before exiting.
+    snapshot of the tuning request; the actual order also depends on this CPU's AVX-512
+    support, which is why the child reports it back. Errors are reported over the pipe before exiting.
     """
     import ctypes
     import signal
@@ -278,8 +279,9 @@ def _moe_cpu_child_main(conn, model_dir, threads, swizzle):
                 out.append((trellis, suh, svh, bias))
             return out
 
-        # Swizzle the trellis copies band-contiguous when the VBMI kernel tier will consume them
-        swz = bool(swizzle and cext.exl3_moe_cpu_has_avx512_vbmi())
+        # Swizzle the trellis copies band-contiguous when an AVX-512 kernel tier will consume
+        # them (has_avx512_bw is true for the bw, vnni and vbmi tiers alike)
+        swz = bool(swizzle and cext.exl3_moe_cpu_has_avx512_bw())
 
         def rehome_trellis(t):
             return arena.rehome(t, band_swizzle = _proj_swizzled(swz, t.shape[2] // 16))
@@ -678,18 +680,24 @@ class MoeCpuHost:
 
         import time
         t0 = time.monotonic()
+        # Startup is the shared-memory attach, the arena mapping and page-lock, layer
+        # registration and the thread spawn; the limit stays generous for slow hosts and is
+        # overridable
+        timeout = float(os.environ.get("EXL3_MOE_CPU_START_TIMEOUT", "60"))
         while not self.v_ready[0]:
             if not self.proc.is_alive():
                 raise RuntimeError("CPU MoE worker process died during startup")
-            if time.monotonic() - t0 > 60:
-                raise RuntimeError("CPU MoE worker startup timeout")
+            if time.monotonic() - t0 > timeout:
+                raise RuntimeError(
+                    f"CPU MoE worker startup timeout ({timeout:.0f} s; EXL3_MOE_CPU_START_TIMEOUT overrides)")
             time.sleep(0.005)
         self.started = True
         self._flags_u32 = u32
         self._start_watchdog()
         kern = "avx512-vbmi" if ext.exl3_moe_cpu_has_avx512_vbmi() else \
                ("avx512-vnni" if ext.exl3_moe_cpu_has_avx512_vnni() else \
-               ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar"))
+               ("avx512-bw" if ext.exl3_moe_cpu_has_avx512_bw() else \
+               ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar")))
         print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
 
     def _start_watchdog(self):
@@ -962,9 +970,9 @@ class MoeCpuHost:
                 for k in ("g", "u", "d"):
                     if pd.get(k):
                         mx = max(mx, pd[k][0] * pd[k][1])
-        # Experts arrive in the order the worker reported at startup (band-swizzled when the
-        # VBMI tier owns them, K8 excepted per matrix); the GPU restores the native tile order
-        # into the compute ring after each DMA
+        # Experts arrive in the order the worker reported at startup (band-swizzled when an
+        # AVX-512 tier owns them, K8 excepted per matrix); the GPU restores the native tile
+        # order into the compute ring after each DMA
         swz = self.arena_swz
         st = dict(
             copy_stream = torch.cuda.Stream(device = device),

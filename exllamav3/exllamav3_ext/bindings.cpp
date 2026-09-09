@@ -61,6 +61,7 @@
 #include "libtorch/dsv4_compressor.h"
 #include "libtorch/dsv4_attn.h"
 #include "dsv4_compress.cuh"
+#include "dsv4_pool_quant.cuh"
 #include "dsa_topk.cuh"
 #include "hc_mix.cuh"
 #include "ple.cuh"
@@ -101,6 +102,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("moe_split_issue", &moe_split_issue, "moe_split_issue");
     m.def("moe_split_collect_add", &moe_split_collect_add, "moe_split_collect_add");
     m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
+    m.def("dsv4_pool_quant_scatter", &dsv4_pool_quant_scatter, "dsv4_pool_quant_scatter");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
     m.def("dsa_topk", &dsa_topk, "dsa_topk");
     m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
@@ -162,6 +164,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_pool_stress", &exl3_moe_cpu_pool_stress, "exl3_moe_cpu_pool_stress");
     m.def("exl3_moe_cpu_worker_run", &exl3_moe_cpu_worker_run, "exl3_moe_cpu_worker_run",
           py::call_guard<py::gil_scoped_release>());
+    m.def("exl3_moe_cpu_has_avx512_bw", &exl3_moe_cpu_has_avx512_bw, "exl3_moe_cpu_has_avx512_bw");
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");

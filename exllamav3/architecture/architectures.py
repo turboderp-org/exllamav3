@@ -19,6 +19,7 @@ from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
+from .glm4_moe_lite import Glm4MoeLiteModel
 from .glm_moe_dsa import GlmMoeDsaModel
 from .glm5_next import Glm5NextModel
 from .gpt_oss import GptOssModel
@@ -27,6 +28,7 @@ from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
 from .laguna import LagunaModel
+from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
@@ -85,6 +87,7 @@ ARCHITECTURES = {
         Glm4MoeModel,
         Glm4VModel,
         Glm4VMoeModel,
+        Glm4MoeLiteModel,
         GlmMoeDsaModel,
         Glm5NextModel,
         GptOssModel,
@@ -93,6 +96,7 @@ ARCHITECTURES = {
         HyperClovaxModel,
         IQuestCoderModel,
         LagunaModel,
+        Lfm2Model,
         Lfm2MoeModel,
         LlamaModel,
         MiMoModel,

@@ -329,7 +329,7 @@ jobs:
           $pytorchIndexUrl = "https://download.pytorch.org/whl/cu$cudaVersionPytorch"
 
           uv pip install torch==${{ matrix.torch }} --index-url $pytorchIndexUrl
-          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+          uv pip install --upgrade build "setuptools==84.0.0" wheel packaging ninja safetensors tokenizers numpy
 
       - name: Compute Torch requirement pin
         id: dep_pins
@@ -494,7 +494,7 @@ jobs:
       - name: Build sdist and py3-none-any JIT wheel
         run: |
           uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
-          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+          uv pip install --upgrade build "setuptools==84.0.0" wheel packaging ninja safetensors tokenizers numpy
 
           # Build both:
           #   - exllamav3-<version>.tar.gz

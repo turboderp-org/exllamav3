@@ -266,13 +266,17 @@ capacity (`EXL3_MOE_CPU_WSLOT_MB` divided by one expert's packed byte size).
 
 ### `EXL3_MOE_CPU_MAX_ISA` (default: unset, auto-detect)
 
-Caps the CPU kernel's runtime ISA detection at `scalar`, `avx2`, `vnni`/`avx512`, or `vbmi`,
-for testing a lower-tier kernel path on hardware that supports better. The `vbmi` tier
+Caps the CPU kernel's runtime ISA detection at `scalar`, `avx2`, `bw`/`avx512bw`,
+`vnni`/`avx512`, or `vbmi`, for testing a lower-tier kernel path on hardware that supports
+better. The `bw` tier covers AVX-512F/BW/VL hardware without VNNI (Skylake-SP/X: 1st-gen Xeon
+Scalable, Core-X), which previously fell through to `avx2`: the `vnni` dword kernel with the
+AVX2 tier's vpmaddubsw/vpmaddwd accumulate, ~1.5x the `avx2` tier's cold-expert decode
+throughput on a Xeon Gold 6148. The `vbmi` tier
 (AVX512-VBMI byte-gather state extraction, Zen 4+ / Ice Lake+; Cascade/Cooper Lake have VNNI
 without VBMI and stay on the `vnni` tier) is 15-70% faster than the dword scheme depending on
 bitrate. Never upgrades past what the CPU actually supports; unrecognized values are ignored.
 Read once per process (parent and worker independently), so it must be set before either is
-started. Note that capping below `vbmi` also disables the swizzled weight layout (see
+started. Note that capping below `bw` also disables the swizzled weight layout (see
 `EXL3_MOE_CPU_SWIZZLE`).
 
 ### `EXL3_MOE_CPU_SWIZZLE` (default: `1`)
@@ -280,13 +284,18 @@ started. Note that capping below `vbmi` also disables the swizzled weight layout
 Repack the CPU worker's expert trellis copies into a band-contiguous ("swizzled") layout at
 load, so each GEMV band streams sequentially from DRAM instead of in short strided runs
 (+45-75% cold decode GEMV throughput measured on a 7960X, reaching the sequential-read
-roofline). Only takes effect when the `vbmi` kernel tier is active, whose byte-gather
-extraction leaves the register headroom for the wide bands the swizzled layout wants at
-m > 1; K8 tensors always stay in the native layout (they route to the dword kernel). The
-GPU-streaming prefill path DMAs the swizzled bytes as-is and repacks them on the GPU
-(`moe_unswizzle_trellis`), so the bytes reaching the GPU dequant are unaffected. Set to `0` to keep the native layout.
+roofline). Takes effect on every AVX-512 kernel tier: `vbmi`, whose byte-gather extraction
+leaves the register headroom for the wide bands the swizzled layout wants at m > 1, `bw`
+(+2-29% on Skylake-SP, where the sequential per-band k-stream beats 96-128 B strided reads)
+and `vnni` (the dword kernel with the same band structure; +40% cold-expert decode measured
+with the tier forced on a 7960X). The `avx2` and `scalar` tiers read the native layout. K8
+tensors always stay in the native layout (they route to the dword kernel). The GPU-streaming
+prefill path DMAs the swizzled bytes as-is and repacks them on the GPU
+(`moe_unswizzle_trellis`), so the bytes reaching the GPU dequant are unaffected. Set to `0` to
+keep the native layout.
+
 The parent reads the setting when it constructs a worker host and passes it to the worker
-explicitly; the worker reports the layout it actually used (native when the CPU lacks VBMI)
+explicitly; the worker reports the layout it actually used (native when the CPU lacks AVX-512)
 back to the parent at startup. A same-process change to the tuning after a host exists
 therefore affects only hosts constructed afterwards and never reinterprets packed bytes.
 
@@ -330,6 +339,17 @@ The worker copies loaded expert tensors into a small number of large (1 GiB) sha
 chunks instead of leaving them as many separate small allocations; the parent maps and
 page-locks the same chunks for streamed prefill.
 
+Hugepage promotion (`EXL3_MOE_ARENA_HUGEPAGE`, a post-load `MADV_COLLAPSE` pass) applied to the
+earlier anonymous-mapping arena and does not carry over to the shared-memory one: the chunks
+are page-locked by the parent for DMA, and collapsing them measured as no change to either
+prefill or decode.
+
+### `EXL3_MOE_CPU_START_TIMEOUT` (default: `60`)
+
+Seconds the parent waits for the CPU worker to signal ready after every offloaded layer has
+been handed over. Startup is the shared-memory attach, layer registration and thread spawn,
+so the default is only a safety net against a wedged worker; raise it on very slow hosts.
+
 ### `EXL3_MOE_CPU_PIN` (default: `1`)
 
 Pin each worker thread (and the worker's own main thread) to a distinct physical CPU core,
@@ -347,6 +367,11 @@ read.
 Enable GPU/CPU handoff profiling, for debug purposes. 
 
 ## Model loading
+
+### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
+
+Use expandable segments for all Torch allocations. Opt out with a value of 1 or by explicitly
+setting `PYTORCH_CUDA_ALLOC_CONF`.
 
 ### `EXL3_LOAD_ARENA` (default: `1`)
 

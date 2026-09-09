@@ -57,6 +57,11 @@ struct BC_DSV4Attention
     // refreshes each step (fixed pointer, so the graphs never patch it)
     at::Tensor ring;             // (ring_rows, D)
     c10::optional<at::Tensor> comp_buf_kv, comp_buf_gate, comp_ovl, pool_c, pool_r;
+    // Packed-quantized pool (pool_bits > 0): pool_c holds the int32 words, pool_s the
+    // group scales, h32 the rotation table for the Triton loaders, and pool_stage the
+    // per-step fp16 staging rows the compressor emits before quantize + scatter
+    c10::optional<at::Tensor> pool_s, pool_stage, h32;
+    int pool_bits;
     c10::optional<at::Tensor> idx_buf_kv, idx_buf_gate, idx_ovl, pool_idx;
     at::Tensor pool_bt;          // (1, num_pages) int32 per-job static
     at::Tensor pos_dev;          // (1,) int32 -- shared per (device, job slot)
@@ -126,7 +131,9 @@ struct BC_DSV4Attention
         int _n_splits, int _block_h,
         c10::optional<at::Tensor> _fan_trellis = {}, c10::optional<at::Tensor> _fan_suh = {},
         c10::optional<at::Tensor> _fan_svh = {}, c10::optional<at::Tensor> _fan_n = {},
-        c10::optional<at::Tensor> _fan_indices = {}
+        c10::optional<at::Tensor> _fan_indices = {},
+        c10::optional<at::Tensor> _pool_s = {}, c10::optional<at::Tensor> _pool_stage = {},
+        c10::optional<at::Tensor> _h32 = {}, int _pool_bits = 0
     ) :
         q_a(_q_a), q_b(_q_b), wkv(_wkv), wo_b(_wo_b), idx_wq_b(_idx_wq_b),
         idx_weights_w(std::move(_idx_weights_w)),
@@ -142,6 +149,8 @@ struct BC_DSV4Attention
         comp_buf_kv(std::move(_comp_buf_kv)), comp_buf_gate(std::move(_comp_buf_gate)),
         comp_ovl(std::move(_comp_ovl)),
         pool_c(std::move(_pool_c)), pool_r(std::move(_pool_r)),
+        pool_s(std::move(_pool_s)), pool_stage(std::move(_pool_stage)), h32(std::move(_h32)),
+        pool_bits(_pool_bits),
         idx_buf_kv(std::move(_idx_buf_kv)), idx_buf_gate(std::move(_idx_buf_gate)),
         idx_ovl(std::move(_idx_ovl)), pool_idx(std::move(_pool_idx)),
         pool_bt(std::move(_pool_bt)), pos_dev(std::move(_pos_dev)),
@@ -233,6 +242,11 @@ struct BC_DSV4BatchAttention
     // per-step device state (arr, bt_st) whose POINTERS the graphs bake
     at::Tensor ring;                                // (n_slots, ring_rows, D)
     c10::optional<at::Tensor> comp_buf_kv, comp_buf_gate, comp_ovl, pool_c, pool_r;
+    // Packed-quantized pool (pool_bits > 0): pool_c holds the int32 words, pool_s the
+    // group scales, h32 the rotation table for the Triton loaders, and pool_stage the
+    // per-step fp16 staging rows the compressor emits before quantize + scatter
+    c10::optional<at::Tensor> pool_s, pool_stage, h32;
+    int pool_bits;
     c10::optional<at::Tensor> idx_buf_kv, idx_buf_gate, idx_ovl, pool_idx;
     at::Tensor arr;                                 // (6, MAX_B) int32: pos/floor/beg/ec/slot/klen
     at::Tensor bt_st;                               // (MAX_B, num_pages) int32
@@ -295,7 +309,9 @@ struct BC_DSV4BatchAttention
         c10::optional<at::Tensor> _fan2_trellis = {}, c10::optional<at::Tensor> _fan2_suh = {},
         c10::optional<at::Tensor> _fan2_svh = {}, c10::optional<at::Tensor> _fan2_n = {},
         c10::optional<at::Tensor> _fan2_indices = {},
-        int _fan2_k = 0, bool _fan2_mcg = false, bool _fan2_mul1 = false
+        int _fan2_k = 0, bool _fan2_mcg = false, bool _fan2_mul1 = false,
+        c10::optional<at::Tensor> _pool_s = {}, c10::optional<at::Tensor> _pool_stage = {},
+        c10::optional<at::Tensor> _h32 = {}, int _pool_bits = 0
     ) :
         q_b(_q_b), wo_b(_wo_b), idx_wq_b(_idx_wq_b),
         idx_weights_w(std::move(_idx_weights_w)),
@@ -319,6 +335,8 @@ struct BC_DSV4BatchAttention
         comp_buf_kv(std::move(_comp_buf_kv)), comp_buf_gate(std::move(_comp_buf_gate)),
         comp_ovl(std::move(_comp_ovl)),
         pool_c(std::move(_pool_c)), pool_r(std::move(_pool_r)),
+        pool_s(std::move(_pool_s)), pool_stage(std::move(_pool_stage)), h32(std::move(_h32)),
+        pool_bits(_pool_bits),
         idx_buf_kv(std::move(_idx_buf_kv)), idx_buf_gate(std::move(_idx_buf_gate)),
         idx_ovl(std::move(_idx_ovl)), pool_idx(std::move(_pool_idx)),
         arr(std::move(_arr)), bt_st(std::move(_bt_st)),
