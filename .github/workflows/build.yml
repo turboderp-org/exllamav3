@@ -19,6 +19,7 @@ on:
           - windows
           - windows_smoke
           - cu132
+          - torch_212_213
           - sdist
 
 permissions:
@@ -47,7 +48,10 @@ jobs:
 
           oses = ["ubuntu-22.04", "windows-2022"]
           pyvers = ["3.10", "3.11", "3.12", "3.13.3", "3.14"]
-          torches = ["2.7.0", "2.8.0", "2.9.0", "2.10.0", "2.11.0"]
+          # Torch 2.12+ ships no cu128 wheels (only cu126/cu130/cu132), so those versions are
+          # built against CUDA 13.2 below
+          torches = ["2.8.0", "2.9.0", "2.10.0", "2.11.0"]
+          torches_cu13 = ["2.12.0", "2.13.0"]
           cudaarch = "8.0 8.6 8.9 9.0 10.0 12.0+PTX"
 
           combos = []
@@ -58,13 +62,16 @@ jobs:
               if torch == "2.11.0" and pyver in ("3.10", "3.11"):
                   continue
               # Python 3.14 only builds Torch 2.9+
-              if pyver == "3.14" and torch in ("2.7.0", "2.8.0"):
+              if pyver == "3.14" and torch == "2.8.0":
                   continue
               combos.append(dict(os = os_, pyver = pyver, cuda = "12.8.1", rocm = "", torch = torch, cudaarch = cudaarch))
 
-          # CUDA 13.2 wheels are only built for Python 3.12+ with Torch 2.11
+          # CUDA 13.2 wheels: Torch 2.11 for Python 3.12+ (cu130 index), Torch 2.12/2.13 for every
+          # Python version (cu132 index, see the dependency step)
           for os_, pyver in itertools.product(oses, ["3.12", "3.13.3", "3.14"]):
               combos.append(dict(os = os_, pyver = pyver, cuda = "13.2.0", rocm = "", torch = "2.11.0", cudaarch = cudaarch))
+          for os_, pyver, torch in itertools.product(oses, pyvers, torches_cu13):
+              combos.append(dict(os = os_, pyver = pyver, cuda = "13.2.0", rocm = "", torch = torch, cudaarch = cudaarch))
 
           if target == "windows":
               combos = [c for c in combos if c["os"] == "windows-2022"]
@@ -77,6 +84,9 @@ jobs:
                              torch = "2.11.0", cudaarch = "8.6")]
           elif target == "cu132":
               combos = [c for c in combos if c["cuda"] == "13.2.0"]
+          elif target == "torch_212_213":
+              # Temporary: just the new Torch 2.12 / 2.13 wheels
+              combos = [c for c in combos if c["torch"] in torches_cu13]
 
           print(f"{len(combos)} jobs:")
           for c in combos:
@@ -321,7 +331,8 @@ jobs:
           $cudaVersionPytorch = '${{ matrix.cuda }}'.Remove('${{ matrix.cuda }}'.LastIndexOf('.')).Replace('.','')
           $cudaVersionBuild = $cudaVersionPytorch
           if ($cudaVersion.StartsWith('13.')) {
-            $cudaVersionPytorch = '130'
+            # Torch 2.11 only has cu130 wheels; 2.12+ publishes cu132 wheels matching the toolkit
+            $cudaVersionPytorch = if ([version]'${{ matrix.torch }}' -ge [version]'2.12.0') { '132' } else { '130' }
             $cudaVersionBuild = $cudaVersion.Remove($cudaVersion.LastIndexOf('.')).Replace('.','')
           }
           Write-Output "CUDA_VERSION_PYTORCH=$cudaVersionPytorch" >> "$env:GITHUB_OUTPUT"
@@ -493,7 +504,7 @@ jobs:
 
       - name: Build sdist and py3-none-any JIT wheel
         run: |
-          uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
           uv pip install --upgrade build "setuptools==84.0.0" wheel packaging ninja safetensors tokenizers numpy
 
           # Build both:
