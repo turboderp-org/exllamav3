@@ -22,6 +22,15 @@
 // rope_style is ROPESTYLE_GPTJ (adjacent-pair rotation, Step3.7) or ROPESTYLE_NEOX
 // (split-half rotation); other values throw. attn_factor scales sin/cos.
 //
+// Fused RMS norm (G4, like rope.cu apply_norm): q_norm/k_norm are optional 1-D [hd]
+// f32/f16/bf16 weight tables with norm_eps/norm_constant_bias. Each present table
+// norms its tensor over the full head_dim (variance over hd, scale x (w + bias))
+// before rotation; tails (rotate_dims == 1, P < hd) are normalized but not rotated.
+// q/k gate independently, so the dflash k-only call (weight on the q arg, k absent)
+// just works. Weights fold once to float32 per call; the hot loop stays pure float32
+// vector math (FMA accumulation, one streaming variance pass + one streaming
+// scale+rotate pass, no temp buffer).
+//
 // Layouts: q/out_q [bsz, seq, nheads_q, hd] with stride(3) == 1 and identical
 // strides; k/out_k optional with the same bsz/seq/hd. q/k/out in
 // {float32, half, bfloat16} in any combination; inv_freq float32 CPU;
@@ -46,4 +55,8 @@ void rope_cpu(
     const c10::optional<at::Tensor>& position_ids,
     int rope_style,
     float attn_factor,
-    int rotate_dims);
+    int rotate_dims,
+    const c10::optional<at::Tensor>& q_norm,
+    const c10::optional<at::Tensor>& k_norm,
+    float norm_eps,
+    float norm_constant_bias);

@@ -373,6 +373,10 @@ class RoPE:
         position_ids: torch.Tensor | None = None,
         in_place = False,
         inv_freq: torch.Tensor | None = None,
+        q_norm: torch.Tensor | None = None,
+        k_norm: torch.Tensor | None = None,
+        norm_eps: float = 1e-6,
+        norm_constant_bias: float = 0.0,
     ):
         # Host reference for every CPU vision-tower call shape (the native rope_cpu
         # kernel's oracle): float32 math, single round to the caller's dtype.
@@ -381,6 +385,10 @@ class RoPE:
         # override or self.inv_freq, angles are pos * freq). Position resolution
         # mirrors rope.cu get_pos: position_ids (2-D shared, or 3-D per-rdim for
         # rotate_dims == 2) > positions[batch] + token > pos + token.
+        # Fused RMS norm (G4): each present weight table norms its tensor over the
+        # full head_dim before rotation, like rope.cu apply_norm (variance over hd,
+        # scale x (w + bias)); q/k gate independently so the dflash k-only call
+        # (weight on the q arg, k absent) just works.
         in_dtype = q.dtype
         style = self.rope_settings.rope_style
         rotate_dims = self.rope_settings.rotate_dims
@@ -395,6 +403,13 @@ class RoPE:
 
         qf = q.float()
         kf = k.float() if k is not None else None
+
+        if q_norm is not None:
+            wq = q_norm.to(qf.device, dtype = torch.float32).reshape(-1) + norm_constant_bias
+            qf = qf * torch.rsqrt(qf.pow(2).mean(dim = -1, keepdim = True) + norm_eps) * wq
+        if k_norm is not None and kf is not None:
+            wk = k_norm.to(kf.device, dtype = torch.float32).reshape(-1) + norm_constant_bias
+            kf = kf * torch.rsqrt(kf.pow(2).mean(dim = -1, keepdim = True) + norm_eps) * wk
 
         if len(qf.shape) == 3:
             qf = qf.unsqueeze(0)
@@ -501,15 +516,14 @@ class RoPE:
         inv_freq: torch.Tensor | None = None,
         q_norm: torch.Tensor | None = None,
         k_norm: torch.Tensor | None = None,
+        norm_eps: float = 1e-6,
+        norm_constant_bias: float = 0.0,
     ):
         # CPU mirror of apply's CUDA path: normalize to 4-D, try the fused native
         # kernel, fall back to apply_torch. Never raises for shape reasons; the
         # reference raises on truly inconsistent geometry, like rope_gr's checks.
-        # G4 scope, kept loud: fused q/k norms and Llama-4 query scaling have no
-        # CPU path yet. Silently dropping them would corrupt Gemma4/Ministral
-        # towers (attn.py fuses norms into rope when q_norm_tensor exists).
-        if q_norm is not None or k_norm is not None:
-            raise ValueError("CPU RoPE with fused q/k norms is not supported yet (G4)")
+        # Llama-4 query scaling still has no CPU path: kept loud, since silently
+        # dropping it would corrupt Ministral towers.
         if self.llama_4_scaling_beta != 0.0:
             raise ValueError("CPU RoPE with Llama-4 scaling is not supported")
         q_orig, k_orig = q, k
@@ -526,6 +540,10 @@ class RoPE:
             # inv_freq override). Both native and torch paths need it on q's device.
             ivf = ivf.to(q.device)
         ivf = ivf.contiguous()
+        # Norm weights are tiny 1-D tables; same device dance so both the native
+        # kernel (CPU contiguous) and the torch fallback see q's device.
+        qn4 = q_norm.to(q.device).contiguous() if q_norm is not None else None
+        kn4 = k_norm.to(q.device).contiguous() if k_norm is not None else None
 
         if len(q4.shape) == 3:
             q4 = q4.unsqueeze(0)
@@ -541,7 +559,8 @@ class RoPE:
             out_q = q4
             out_k = k4
 
-        if self._rope_cpu_ext(q4, out_q, k4, out_k, ivf, position, pos4, pid4):
+        if self._rope_cpu_ext(q4, out_q, k4, out_k, ivf, position, pos4, pid4,
+                              qn4, kn4, norm_eps, norm_constant_bias):
             if squeeze:
                 out_q = out_q.squeeze(0)
                 out_k = out_k.squeeze(0) if out_k is not None else None
@@ -554,6 +573,10 @@ class RoPE:
             position_ids = position_ids,
             in_place = in_place,
             inv_freq = ivf,
+            q_norm = qn4,
+            k_norm = kn4,
+            norm_eps = norm_eps,
+            norm_constant_bias = norm_constant_bias,
         )
 
 
@@ -567,6 +590,10 @@ class RoPE:
         position,
         positions: torch.Tensor | None,
         position_ids: torch.Tensor | None,
+        q_norm: torch.Tensor | None = None,
+        k_norm: torch.Tensor | None = None,
+        norm_eps: float = 1e-6,
+        norm_constant_bias: float = 0.0,
     ) -> bool:
         """Native fused rope_cpu; False when unsupported (caller falls back to torch)."""
         fn = getattr(ext, "rope_cpu", None)
@@ -615,6 +642,18 @@ class RoPE:
                 return False
         elif hd != P * rotate_dims:
             return False
+        # Fused norms: 1-D [hd] CPU float tables like rope_gr's q_norm/k_norm args.
+        # Anything else (wrong device/dtype/geometry) falls back to apply_torch
+        # rather than throwing out of the forward.
+        for w in (q_norm, k_norm):
+            if w is None:
+                continue
+            if not (w.is_cpu and w.is_contiguous() and w.is_floating_point()):
+                return False
+            if w.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                return False
+            if w.dim() != 1 or w.size(0) != hd:
+                return False
         if position_ids is not None:
             rd = position_ids.dim()
             if rd not in (2, 3):
@@ -628,7 +667,8 @@ class RoPE:
                 return False
         try:
             fn(q, out_q, k, out_k, inv_freq, position, positions, position_ids,
-               int(style), float(self.attn_factor), int(rotate_dims))
+               int(style), float(self.attn_factor), int(rotate_dims),
+               q_norm, k_norm, float(norm_eps), float(norm_constant_bias))
         except Exception:
             return False
         return True
@@ -702,6 +742,8 @@ class RoPE:
                 inv_freq = inv_freq,
                 q_norm = q_norm,
                 k_norm = k_norm,
+                norm_eps = norm_eps,
+                norm_constant_bias = norm_constant_bias,
             )
         if len(q.shape) == 3:
             q = q.unsqueeze(0)

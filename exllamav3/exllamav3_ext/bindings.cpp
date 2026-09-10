@@ -193,7 +193,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("q"), py::arg("out_q"), py::arg("k"), py::arg("out_k"),
         py::arg("inv_freq"), py::arg("position"), py::arg("positions"),
         py::arg("position_ids"), py::arg("rope_style"), py::arg("attn_factor"),
-        py::arg("rotate_dims"), py::call_guard<py::gil_scoped_release>());
+        py::arg("rotate_dims"), py::arg("q_norm"), py::arg("k_norm"),
+        py::arg("norm_eps"), py::arg("norm_constant_bias"), py::call_guard<py::gil_scoped_release>());
     m.def("xielu", &xielu, "xielu");
     m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
     m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");

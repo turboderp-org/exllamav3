@@ -184,6 +184,13 @@ struct RpCtx
     int pidz = 0;
     int pid_rank = 0;
     RpIsa isa = RP_SCALAR;
+    // Fused RMS norm (G4): folded (w + bias) tables, full-head_dim like rope.cu
+    // apply_norm (variance over hd, then scale x weight before rotation).
+    // Null per tensor disables its norm; q/k gate independently so the dflash
+    // k-only call (norm on the q arg, k absent) just works.
+    const float* q_w = nullptr;
+    const float* k_w = nullptr;
+    float norm_eps = 1e-6f;
 };
 
 inline int64_t rp_pos(const RpCtx& c, int64_t b, int64_t s, int rdim)
@@ -434,6 +441,412 @@ void rp_row_gptj_256(
     }
 }
 
+// -------------------------------------------------------------------------------------------
+// Fused RMS-norm rows (G4): variance over the full head_dim like rope.cu apply_norm,
+// then scale x folded weight fused into the rotate, single round to the output dtype.
+// Weights arrive folded ((float)w + bias) so the hot loop is pure float32 vector math:
+// one streaming variance pass (ggml-style sum of squares, FMA-accumulated) plus one
+// streaming scale+rotate pass. No temp buffer: the second pass re-reads the input row
+// (hd <= 512, L1-resident) and the per-row branch in rp_token is perfectly predicted.
+// Scale-before-swap matters for GPT-J: weights are per-lane, so normalize first, then
+// the adjacent-swap trick runs on normalized values. Every row is fully read before it
+// is written, so in_place aliasing stays exact. Tails (R == 1, P < hd) are normalized
+// but not rotated, matching CUDA (norm covers hd, rope covers the P prefix).
+// -------------------------------------------------------------------------------------------
+
+EXL3_CPU_TARGET_AVX2
+inline float rp_hsum8(__m256 v)
+{
+    const __m128 lo = _mm256_castps256_ps128(v);
+    const __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+inline void rp_row_scalar_norm(
+    const char* in, char* out, int hd, int P, int R, int style,
+    const float* sin, const float* cos, const float* w, float eps,
+    RpDt idt, RpDt odt, int iesz, int oesz)
+{
+    float acc = 0.0f;
+    for (int j = 0; j < hd; ++j)
+    {
+        const float f = rp_load_s(in + (size_t)j * iesz, idt);
+        acc += f * f;
+    }
+    const float rmf = 1.0f / std::sqrt(acc / (float)hd + eps);
+    const int H = P / 2;
+    for (int r = 0; r < R; ++r)
+    {
+        const float* sn = sin + (size_t)r * H;
+        const float* cs = cos + (size_t)r * H;
+        const char* si = in + (size_t)r * P * iesz;
+        char* so = out + (size_t)r * P * oesz;
+        const float* ws = w + (size_t)r * P;
+        if (style == ROPESTYLE_NEOX)
+        {
+            for (int j = 0; j < H; ++j)
+            {
+                const float v1 = rp_load_s(si + (size_t)j * iesz, idt) * rmf * ws[j];
+                const float v2 = rp_load_s(si + (size_t)(j + H) * iesz, idt) * rmf * ws[j + H];
+                rp_store_s(so + (size_t)j * oesz, odt, v1 * cs[j] - v2 * sn[j]);
+                rp_store_s(so + (size_t)(j + H) * oesz, odt, v2 * cs[j] + v1 * sn[j]);
+            }
+        }
+        else
+        {
+            for (int j = 0; j < H; ++j)
+            {
+                const float v1 = rp_load_s(si + (size_t)(2 * j) * iesz, idt) * rmf * ws[2 * j];
+                const float v2 = rp_load_s(si + (size_t)(2 * j + 1) * iesz, idt) * rmf * ws[2 * j + 1];
+                rp_store_s(so + (size_t)(2 * j) * oesz, odt, v1 * cs[j] - v2 * sn[j]);
+                rp_store_s(so + (size_t)(2 * j + 1) * oesz, odt, v2 * cs[j] + v1 * sn[j]);
+            }
+        }
+    }
+    if (R == 1 && P < hd)
+    {
+        for (int j = P; j < hd; ++j)
+            rp_store_s(out + (size_t)j * oesz, odt, rp_load_s(in + (size_t)j * iesz, idt) * rmf * w[j]);
+    }
+}
+
+template <RpDt ID, RpDt OD>
+EXL3_CPU_TARGET_AVX512
+void rp_row_neox_512_norm(
+    const char* in, char* out, int hd, int P, int R,
+    const float* sin, const float* cos, const float* w, float eps,
+    int iesz, int oesz)
+{
+    constexpr int V = 16;
+    __m512 acc = _mm512_setzero_ps();
+    const int vend_hd = hd / V * V;
+    for (int j = 0; j < vend_hd; j += V)
+    {
+        const __m512 v = rp_ld16<ID>(in + (size_t)j * iesz);
+        acc = _mm512_fmadd_ps(v, v, acc);
+    }
+    float tail = 0.0f;
+    for (int j = vend_hd; j < hd; ++j)
+    {
+        const float f = rp_load_s(in + (size_t)j * iesz, ID);
+        tail += f * f;
+    }
+    const float rmf = 1.0f / std::sqrt((_mm512_reduce_add_ps(acc) + tail) / (float)hd + eps);
+    const __m512 vrmf = _mm512_set1_ps(rmf);
+    const int H = P / 2;
+    for (int r = 0; r < R; ++r)
+    {
+        const float* sn = sin + (size_t)r * H;
+        const float* cs = cos + (size_t)r * H;
+        const char* si = in + (size_t)r * P * iesz;
+        char* so = out + (size_t)r * P * oesz;
+        const float* ws = w + (size_t)r * P;
+        int j = 0;
+        const int vend = H / V * V;
+        for (; j < vend; j += V)
+        {
+            const __m512 v1 = rp_ld16<ID>(si + (size_t)j * iesz);
+            const __m512 v2 = rp_ld16<ID>(si + (size_t)(j + H) * iesz);
+            const __m512 n1 = _mm512_mul_ps(_mm512_mul_ps(v1, vrmf), _mm512_loadu_ps(ws + j));
+            const __m512 n2 = _mm512_mul_ps(_mm512_mul_ps(v2, vrmf), _mm512_loadu_ps(ws + j + H));
+            const __m512 c = _mm512_loadu_ps(cs + j);
+            const __m512 s = _mm512_loadu_ps(sn + j);
+            rp_st16(so + (size_t)j * oesz,
+                    _mm512_fmsub_ps(n1, c, _mm512_mul_ps(n2, s)), OD);
+            rp_st16(so + (size_t)(j + H) * oesz,
+                    _mm512_fmadd_ps(n2, c, _mm512_mul_ps(n1, s)), OD);
+        }
+        for (; j < H; ++j)
+        {
+            const float v1 = rp_load_s(si + (size_t)j * iesz, ID) * rmf * ws[j];
+            const float v2 = rp_load_s(si + (size_t)(j + H) * iesz, ID) * rmf * ws[j + H];
+            rp_store_s(so + (size_t)j * oesz, OD, v1 * cs[j] - v2 * sn[j]);
+            rp_store_s(so + (size_t)(j + H) * oesz, OD, v2 * cs[j] + v1 * sn[j]);
+        }
+    }
+    if (R == 1 && P < hd)
+    {
+        int j = P;
+        for (; j + V <= hd; j += V)
+        {
+            const __m512 v = rp_ld16<ID>(in + (size_t)j * iesz);
+            rp_st16(out + (size_t)j * oesz,
+                    _mm512_mul_ps(_mm512_mul_ps(v, vrmf), _mm512_loadu_ps(w + j)), OD);
+        }
+        for (; j < hd; ++j)
+            rp_store_s(out + (size_t)j * oesz, OD, rp_load_s(in + (size_t)j * iesz, ID) * rmf * w[j]);
+    }
+}
+
+template <RpDt ID, RpDt OD>
+EXL3_CPU_TARGET_AVX2
+void rp_row_neox_256_norm(
+    const char* in, char* out, int hd, int P, int R,
+    const float* sin, const float* cos, const float* w, float eps,
+    int iesz, int oesz)
+{
+    constexpr int V = 8;
+    __m256 acc = _mm256_setzero_ps();
+    const int vend_hd = hd / V * V;
+    for (int j = 0; j < vend_hd; j += V)
+    {
+        const __m256 v = rp_ld8<ID>(in + (size_t)j * iesz);
+        acc = _mm256_fmadd_ps(v, v, acc);
+    }
+    float tail = 0.0f;
+    for (int j = vend_hd; j < hd; ++j)
+    {
+        const float f = rp_load_s(in + (size_t)j * iesz, ID);
+        tail += f * f;
+    }
+    const float rmf = 1.0f / std::sqrt((rp_hsum8(acc) + tail) / (float)hd + eps);
+    const __m256 vrmf = _mm256_set1_ps(rmf);
+    const int H = P / 2;
+    for (int r = 0; r < R; ++r)
+    {
+        const float* sn = sin + (size_t)r * H;
+        const float* cs = cos + (size_t)r * H;
+        const char* si = in + (size_t)r * P * iesz;
+        char* so = out + (size_t)r * P * oesz;
+        const float* ws = w + (size_t)r * P;
+        int j = 0;
+        const int vend = H / V * V;
+        for (; j < vend; j += V)
+        {
+            const __m256 v1 = rp_ld8<ID>(si + (size_t)j * iesz);
+            const __m256 v2 = rp_ld8<ID>(si + (size_t)(j + H) * iesz);
+            const __m256 n1 = _mm256_mul_ps(_mm256_mul_ps(v1, vrmf), _mm256_loadu_ps(ws + j));
+            const __m256 n2 = _mm256_mul_ps(_mm256_mul_ps(v2, vrmf), _mm256_loadu_ps(ws + j + H));
+            const __m256 c = _mm256_loadu_ps(cs + j);
+            const __m256 s = _mm256_loadu_ps(sn + j);
+            rp_st8(so + (size_t)j * oesz,
+                   _mm256_fmsub_ps(n1, c, _mm256_mul_ps(n2, s)), OD);
+            rp_st8(so + (size_t)(j + H) * oesz,
+                   _mm256_fmadd_ps(n2, c, _mm256_mul_ps(n1, s)), OD);
+        }
+        for (; j < H; ++j)
+        {
+            const float v1 = rp_load_s(si + (size_t)j * iesz, ID) * rmf * ws[j];
+            const float v2 = rp_load_s(si + (size_t)(j + H) * iesz, ID) * rmf * ws[j + H];
+            rp_store_s(so + (size_t)j * oesz, OD, v1 * cs[j] - v2 * sn[j]);
+            rp_store_s(so + (size_t)(j + H) * oesz, OD, v2 * cs[j] + v1 * sn[j]);
+        }
+    }
+    if (R == 1 && P < hd)
+    {
+        int j = P;
+        for (; j + V <= hd; j += V)
+        {
+            const __m256 v = rp_ld8<ID>(in + (size_t)j * iesz);
+            rp_st8(out + (size_t)j * oesz,
+                   _mm256_mul_ps(_mm256_mul_ps(v, vrmf), _mm256_loadu_ps(w + j)), OD);
+        }
+        for (; j < hd; ++j)
+            rp_store_s(out + (size_t)j * oesz, OD, rp_load_s(in + (size_t)j * iesz, ID) * rmf * w[j]);
+    }
+}
+
+template <RpDt ID, RpDt OD>
+EXL3_CPU_TARGET_AVX512
+void rp_row_gptj_512_norm(
+    const char* in, char* out, int hd, int P, int R,
+    const float* sin, const float* cos, const float* w, float eps,
+    int iesz, int oesz)
+{
+    constexpr int V = 16;
+    __m512 acc = _mm512_setzero_ps();
+    const int vend_hd = hd / V * V;
+    for (int j = 0; j < vend_hd; j += V)
+    {
+        const __m512 v = rp_ld16<ID>(in + (size_t)j * iesz);
+        acc = _mm512_fmadd_ps(v, v, acc);
+    }
+    float tail = 0.0f;
+    for (int j = vend_hd; j < hd; ++j)
+    {
+        const float f = rp_load_s(in + (size_t)j * iesz, ID);
+        tail += f * f;
+    }
+    const float rmf = 1.0f / std::sqrt((_mm512_reduce_add_ps(acc) + tail) / (float)hd + eps);
+    const __m512 vrmf = _mm512_set1_ps(rmf);
+    const __m512i dup_idx = _mm512_setr_epi32(
+        0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7);
+    const __m512 sign = _mm512_castsi512_ps(_mm512_setr_epi32(
+        (int)0x80000000, 0, (int)0x80000000, 0,
+        (int)0x80000000, 0, (int)0x80000000, 0,
+        (int)0x80000000, 0, (int)0x80000000, 0,
+        (int)0x80000000, 0, (int)0x80000000, 0));
+    for (int r = 0; r < R; ++r)
+    {
+        const float* sn = sin + (size_t)r * (P / 2);
+        const float* cs = cos + (size_t)r * (P / 2);
+        const char* si = in + (size_t)r * P * iesz;
+        char* so = out + (size_t)r * P * oesz;
+        const float* ws = w + (size_t)r * P;
+        int j = 0;
+        const int vend = P / V * V;
+        for (; j < vend; j += V)
+        {
+            const __m512 v = rp_ld16<ID>(si + (size_t)j * iesz);
+            const __m512 vn = _mm512_mul_ps(_mm512_mul_ps(v, vrmf), _mm512_loadu_ps(ws + j));
+            const __m512 cd = _mm512_permutexvar_ps(
+                dup_idx, _mm512_castps256_ps512(_mm256_loadu_ps(cs + j / 2)));
+            const __m512 sd = _mm512_permutexvar_ps(
+                dup_idx, _mm512_castps256_ps512(_mm256_loadu_ps(sn + j / 2)));
+            const __m512 sw = _mm512_shuffle_ps(vn, vn, 0xB1);
+            rp_st16(so + (size_t)j * oesz,
+                    _mm512_fmadd_ps(sw, _mm512_xor_ps(sd, sign),
+                                    _mm512_mul_ps(vn, cd)), OD);
+        }
+        for (; j < P; j += 2)
+        {
+            const float v1 = rp_load_s(si + (size_t)j * iesz, ID) * rmf * ws[j];
+            const float v2 = rp_load_s(si + (size_t)(j + 1) * iesz, ID) * rmf * ws[j + 1];
+            const float c = cs[j / 2], s = sn[j / 2];
+            rp_store_s(so + (size_t)j * oesz, OD, v1 * c - v2 * s);
+            rp_store_s(so + (size_t)(j + 1) * oesz, OD, v2 * c + v1 * s);
+        }
+    }
+    if (R == 1 && P < hd)
+    {
+        int j = P;
+        for (; j + V <= hd; j += V)
+        {
+            const __m512 v = rp_ld16<ID>(in + (size_t)j * iesz);
+            rp_st16(out + (size_t)j * oesz,
+                    _mm512_mul_ps(_mm512_mul_ps(v, vrmf), _mm512_loadu_ps(w + j)), OD);
+        }
+        for (; j < hd; ++j)
+            rp_store_s(out + (size_t)j * oesz, OD, rp_load_s(in + (size_t)j * iesz, ID) * rmf * w[j]);
+    }
+}
+
+template <RpDt ID, RpDt OD>
+EXL3_CPU_TARGET_AVX2
+void rp_row_gptj_256_norm(
+    const char* in, char* out, int hd, int P, int R,
+    const float* sin, const float* cos, const float* w, float eps,
+    int iesz, int oesz)
+{
+    constexpr int V = 8;
+    __m256 acc = _mm256_setzero_ps();
+    const int vend_hd = hd / V * V;
+    for (int j = 0; j < vend_hd; j += V)
+    {
+        const __m256 v = rp_ld8<ID>(in + (size_t)j * iesz);
+        acc = _mm256_fmadd_ps(v, v, acc);
+    }
+    float tail = 0.0f;
+    for (int j = vend_hd; j < hd; ++j)
+    {
+        const float f = rp_load_s(in + (size_t)j * iesz, ID);
+        tail += f * f;
+    }
+    const float rmf = 1.0f / std::sqrt((rp_hsum8(acc) + tail) / (float)hd + eps);
+    const __m256 vrmf = _mm256_set1_ps(rmf);
+    const __m256 sign = _mm256_setr_ps(
+        -0.0f, +0.0f, -0.0f, +0.0f, -0.0f, +0.0f, -0.0f, +0.0f);
+    for (int r = 0; r < R; ++r)
+    {
+        const float* sn = sin + (size_t)r * (P / 2);
+        const float* cs = cos + (size_t)r * (P / 2);
+        const char* si = in + (size_t)r * P * iesz;
+        char* so = out + (size_t)r * P * oesz;
+        const float* ws = w + (size_t)r * P;
+        int j = 0;
+        const int vend = P / V * V;
+        for (; j < vend; j += V)
+        {
+            const __m256 v = rp_ld8<ID>(si + (size_t)j * iesz);
+            const __m256 vn = _mm256_mul_ps(_mm256_mul_ps(v, vrmf), _mm256_loadu_ps(ws + j));
+            const __m128 c4 = _mm_loadu_ps(cs + j / 2);
+            const __m128 s4 = _mm_loadu_ps(sn + j / 2);
+            const __m256 cd = _mm256_insertf128_ps(
+                _mm256_castps128_ps256(_mm_unpacklo_ps(c4, c4)),
+                _mm_unpackhi_ps(c4, c4), 1);
+            const __m256 sd = _mm256_insertf128_ps(
+                _mm256_castps128_ps256(_mm_unpacklo_ps(s4, s4)),
+                _mm_unpackhi_ps(s4, s4), 1);
+            const __m256 sw = _mm256_shuffle_ps(vn, vn, 0xB1);
+            rp_st8(so + (size_t)j * oesz,
+                   _mm256_fmadd_ps(sw, _mm256_xor_ps(sd, sign),
+                                   _mm256_mul_ps(vn, cd)), OD);
+        }
+        for (; j < P; j += 2)
+        {
+            const float v1 = rp_load_s(si + (size_t)j * iesz, ID) * rmf * ws[j];
+            const float v2 = rp_load_s(si + (size_t)(j + 1) * iesz, ID) * rmf * ws[j + 1];
+            const float c = cs[j / 2], s = sn[j / 2];
+            rp_store_s(so + (size_t)j * oesz, OD, v1 * c - v2 * s);
+            rp_store_s(so + (size_t)(j + 1) * oesz, OD, v2 * c + v1 * s);
+        }
+    }
+    if (R == 1 && P < hd)
+    {
+        int j = P;
+        for (; j + V <= hd; j += V)
+        {
+            const __m256 v = rp_ld8<ID>(in + (size_t)j * iesz);
+            rp_st8(out + (size_t)j * oesz,
+                   _mm256_mul_ps(_mm256_mul_ps(v, vrmf), _mm256_loadu_ps(w + j)), OD);
+        }
+        for (; j < hd; ++j)
+            rp_store_s(out + (size_t)j * oesz, OD, rp_load_s(in + (size_t)j * iesz, ID) * rmf * w[j]);
+    }
+}
+
+template <RpDt ID, RpDt OD>
+inline void rp_row_any_norm(
+    const RpCtx& c, const char* in, char* out,
+    const float* sin, const float* cos, const float* w, int iesz, int oesz)
+{
+    if (c.isa == RP_AVX512)
+    {
+        if (c.style == ROPESTYLE_NEOX)
+            rp_row_neox_512_norm<ID, OD>(in, out, c.hd, c.P, c.R, sin, cos, w, c.norm_eps, iesz, oesz);
+        else
+            rp_row_gptj_512_norm<ID, OD>(in, out, c.hd, c.P, c.R, sin, cos, w, c.norm_eps, iesz, oesz);
+    }
+    else
+    {
+        if (c.style == ROPESTYLE_NEOX)
+            rp_row_neox_256_norm<ID, OD>(in, out, c.hd, c.P, c.R, sin, cos, w, c.norm_eps, iesz, oesz);
+        else
+            rp_row_gptj_256_norm<ID, OD>(in, out, c.hd, c.P, c.R, sin, cos, w, c.norm_eps, iesz, oesz);
+    }
+}
+
+inline void rp_apply_row_norm(
+    const RpCtx& c, const char* in, char* out,
+    const float* sin, const float* cos, const float* w,
+    RpDt idt, RpDt odt, int iesz, int oesz)
+{
+    if (c.isa == RP_SCALAR || odt == RP_BF16)
+    {
+        rp_row_scalar_norm(in, out, c.hd, c.P, c.R, c.style, sin, cos, w, c.norm_eps,
+                           idt, odt, iesz, oesz);
+        return;
+    }
+#define RP_CALL_CN(ID, OD) rp_row_any_norm<ID, OD>(c, in, out, sin, cos, w, iesz, oesz)
+#define RP_SWITCH_ODN(ID) \
+    switch (odt) \
+    { \
+        case RP_F32: RP_CALL_CN(ID, RP_F32); break; \
+        default: RP_CALL_CN(ID, RP_F16); break; \
+    }
+    switch (idt)
+    {
+        case RP_F32: RP_SWITCH_ODN(RP_F32); break;
+        case RP_F16: RP_SWITCH_ODN(RP_F16); break;
+        default: RP_SWITCH_ODN(RP_BF16); break;
+    }
+#undef RP_CALL_CN
+#undef RP_SWITCH_ODN
+}
+
 // One tensor's rows: vector widths only narrow to f32/f16 (bf16 outputs take the
 // threaded scalar kernel, same rule as act_mul/rms_norm).
 template <RpDt ID, RpDt OD>
@@ -523,8 +936,12 @@ inline void rp_token(const RpCtx& c, int64_t b, int64_t s, float* buf)
     for (int h = 0; h < c.Hq; ++h)
     {
         const size_t row = ((size_t)b * c.seq + s) * c.Hq + h;
-        rp_apply_row(c, c.q + row * q_row_in, c.oq + row * q_row_out,
-                     sin, cos, c.q_idt, c.q_odt, c.q_iesz, c.q_oesz);
+        if (c.q_w)
+            rp_apply_row_norm(c, c.q + row * q_row_in, c.oq + row * q_row_out,
+                              sin, cos, c.q_w, c.q_idt, c.q_odt, c.q_iesz, c.q_oesz);
+        else
+            rp_apply_row(c, c.q + row * q_row_in, c.oq + row * q_row_out,
+                         sin, cos, c.q_idt, c.q_odt, c.q_iesz, c.q_oesz);
     }
     if (c.k)
     {
@@ -533,8 +950,12 @@ inline void rp_token(const RpCtx& c, int64_t b, int64_t s, float* buf)
         for (int h = 0; h < c.Hk; ++h)
         {
             const size_t row = ((size_t)b * c.seq + s) * c.Hk + h;
-            rp_apply_row(c, c.k + row * k_row_in, c.ok + row * k_row_out,
-                         sin, cos, c.k_idt, c.k_odt, c.k_iesz, c.k_oesz);
+            if (c.k_w)
+                rp_apply_row_norm(c, c.k + row * k_row_in, c.ok + row * k_row_out,
+                                  sin, cos, c.k_w, c.k_idt, c.k_odt, c.k_iesz, c.k_oesz);
+            else
+                rp_apply_row(c, c.k + row * k_row_in, c.ok + row * k_row_out,
+                             sin, cos, c.k_idt, c.k_odt, c.k_iesz, c.k_oesz);
         }
     }
 }
@@ -586,7 +1007,11 @@ void rope_cpu(
     const c10::optional<at::Tensor>& position_ids,
     int rope_style,
     float attn_factor,
-    int rotate_dims)
+    int rotate_dims,
+    const c10::optional<at::Tensor>& q_norm,
+    const c10::optional<at::Tensor>& k_norm,
+    float norm_eps,
+    float norm_constant_bias)
 {
     TORCH_CHECK(q.device().is_cpu() && out_q.device().is_cpu() &&
                 inv_freq.device().is_cpu(), "rope_cpu: CPU tensors only");
@@ -638,6 +1063,29 @@ void rope_cpu(
         TORCH_CHECK(hd == P * rotate_dims,
                     "rope_cpu: rotate_dims is inconsistent with inv_freq and head_dim");
     }
+    // Fused RMS-norm weights (G4): 1-D [hd] half/bf16/float32, folded once to float32
+    // with the constant bias (matches rms_norm_cpu's bias-on-weights folding and the
+    // CUDA rope apply_norm weight+bias path; bias 1.0 is half-exact so no precision
+    // concern). Null per tensor disables its norm.
+    std::vector<float> q_wfold, k_wfold;
+    auto fold_norm = [&](const at::Tensor& w, const char* name, std::vector<float>& fold)
+    {
+        TORCH_CHECK(w.device().is_cpu() && w.is_contiguous(), name, ": CPU contiguous only");
+        TORCH_CHECK(w.dim() == 1 && w.size(0) == hd, name, ": q/k norm is incorrect size");
+        TORCH_CHECK(w.is_floating_point() && (w.scalar_type() == at::kFloat ||
+                    w.scalar_type() == at::kHalf || w.scalar_type() == at::kBFloat16),
+                    name, ": q/k norm dtype must be f32/f16/bf16");
+        const RpDt dt = rp_dtype(w.scalar_type());
+        const char* base = static_cast<const char*>(w.const_data_ptr());
+        const int esz = (int)w.element_size();
+        fold.resize(hd);
+        for (int j = 0; j < hd; ++j)
+            fold[j] = rp_load_s(base + (size_t)j * esz, dt) + norm_constant_bias;
+    };
+    if (q_norm.has_value())
+        fold_norm(q_norm.value(), "rope_cpu: q_norm", q_wfold);
+    if (k_norm.has_value())
+        fold_norm(k_norm.value(), "rope_cpu: k_norm", k_wfold);
 
     const bool table = inv_freq.dim() > 1;
     int64_t table_seq = 0;
@@ -710,6 +1158,9 @@ void rope_cpu(
         c.pid_rank = rd;
     }
     c.isa = rp_pick_isa();
+    if (!q_wfold.empty()) c.q_w = q_wfold.data();
+    if (!k_wfold.empty()) c.k_w = k_wfold.data();
+    c.norm_eps = norm_eps;
 
     rp_run(c);
 }
