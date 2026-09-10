@@ -374,86 +374,264 @@ class RoPE:
         in_place = False,
         inv_freq: torch.Tensor | None = None,
     ):
-        # Externally precomputed rotary angles (Qwen vision-style 2D grid): rows are already
-        # expanded angle values of shape [sequence, head_dim // 2], not frequencies
-        if inv_freq is not None:
-            assert inv_freq.shape[0] == q.shape[-3]
-            sin = torch.cat((inv_freq.sin(), inv_freq.sin()), dim = -1)
-            cos = torch.cat((inv_freq.cos(), inv_freq.cos()), dim = -1)
-            if len(q.shape) == 3:
-                q = q.unsqueeze(0)
-                k = k.unsqueeze(0) if k is not None else k
-                squeeze = True
-            else:
-                squeeze = False
-            sin = sin.unsqueeze(0)
-            cos = cos.unsqueeze(0)
-            assert self.rope_settings.rope_style == RopeStyle.NEOX
-            if k is not None:
-                q, k = _apply_rope_embed_qk_neox(q.float(), k.float(), sin, cos)
-            else:
-                q = _apply_rope_embed_q_neox(q.float(), sin, cos)
-            q = q.half()
-            k = k.half() if k is not None else None
-            return (q.squeeze(0), k.squeeze(0)) if squeeze else (q, k)
+        # Host reference for every CPU vision-tower call shape (the native rope_cpu
+        # kernel's oracle): float32 math, single round to the caller's dtype.
+        # Frequency sources: a table (inv_freq.dim() > 1, rows are precomputed
+        # angles: Step3.7 GPT-J grid, Mistral/Qwen NEOX tables) or a vector (1-D
+        # override or self.inv_freq, angles are pos * freq). Position resolution
+        # mirrors rope.cu get_pos: position_ids (2-D shared, or 3-D per-rdim for
+        # rotate_dims == 2) > positions[batch] + token > pos + token.
+        in_dtype = q.dtype
+        style = self.rope_settings.rope_style
+        rotate_dims = self.rope_settings.rotate_dims
+        attn_factor = self.attn_factor
+
+        if positions is not None and position_ids is not None:
+            raise ValueError("RoPE: positions and position_ids are mutually exclusive")
 
         if in_place:
             q_ = q
             k_ = k
 
-        q = q.float()
-        k = k.float()
+        qf = q.float()
+        kf = k.float() if k is not None else None
 
-        if len(q.shape) == 3:
-            q = q.unsqueeze(0)
-            k = k.unsqueeze(0) if k is not None else k
+        if len(qf.shape) == 3:
+            qf = qf.unsqueeze(0)
+            kf = kf.unsqueeze(0) if kf is not None else kf
             squeeze = True
         else:
             squeeze = False
-        bsz, qlen, numheads_q, dim = q.shape
+        bsz, qlen, _, dim = qf.shape
 
-        if positions is not None:
-            position_ids = torch.arange(qlen, device = self.device).unsqueeze(0).repeat(bsz, 1)
-            position_ids += positions.unsqueeze(1)
-
-        if position_ids is not None:
-            if len(position_ids.shape) == 1:
-                position_ids = position_ids.unsqueeze(0)
-            else:
-                assert position_ids.shape[0] == bsz
-            self.expand_cache(position_ids.max().item())
-            sin = self.cached_sin[position_ids]
-            cos = self.cached_cos[position_ids]
-
+        if position_ids is not None and position_ids.dim() == 3:
+            # Gemma4 partial rotary: per-section positions [bsz, qlen, rotate_dims]
+            assert position_ids.size(0) == bsz and position_ids.size(1) == qlen and \
+                position_ids.size(2) == rotate_dims, \
+                f"RoPE: 3-D position_ids must be [bsz, qlen, rotate_dims], got {tuple(position_ids.shape)}"
+            pos_idx = position_ids.long()
+        elif position_ids is not None:
+            pid = position_ids.long()
+            if pid.dim() == 1:
+                pid = pid.unsqueeze(0)
+            assert pid.dim() == 2 and pid.size(0) == bsz and pid.size(1) == qlen, \
+                f"RoPE: 2-D position_ids must be [bsz, qlen], got {tuple(position_ids.shape)}"
+            pos_idx = pid.unsqueeze(-1).expand(bsz, qlen, rotate_dims)
+        elif positions is not None:
+            base = positions.long().view(bsz, 1, 1) + \
+                torch.arange(qlen, dtype = torch.long, device = q.device).view(1, qlen, 1)
+            pos_idx = base.expand(bsz, qlen, rotate_dims)
         else:
-            self.expand_cache(pos + qlen)
-            sin = self.cached_sin[pos : pos + qlen].unsqueeze(0)
-            cos = self.cached_cos[pos : pos + qlen].unsqueeze(0)
+            base = int(pos) + torch.arange(qlen, dtype = torch.long, device = q.device).view(1, qlen, 1)
+            pos_idx = base.expand(bsz, qlen, rotate_dims)
 
-        if k is not None:
-            if self.rope_settings.rope_style == RopeStyle.NEOX:
-                q, k = _apply_rope_embed_qk_neox(q, k, sin, cos)
+        ivf = self.inv_freq if inv_freq is None else inv_freq
+        ivf_f = ivf.float()
+        if ivf_f.dim() > 1:
+            # Table of precomputed angles, row [.., P/2]. 3-D tables carry the batch
+            # dim first (Step3.7 patches: [batch, seq, P/2]); 2-D tables are indexed
+            # by position only (Mistral gathered table).
+            if ivf_f.dim() == 3:
+                b_idx = torch.arange(bsz, device = ivf_f.device).view(bsz, 1, 1) \
+                    .expand(bsz, qlen, rotate_dims)
+                rows = ivf_f[b_idx, pos_idx.to(ivf_f.device)]
             else:
-                q, k = _apply_rope_embed_qk_gptj(q, k, sin, cos)
+                rows = ivf_f[pos_idx.to(ivf_f.device)]
+            P = ivf_f.size(-1) * 2
+            sin_t = rows.sin() * attn_factor  # [bsz, qlen, R, P/2]
+            cos_t = rows.cos() * attn_factor
         else:
-            if self.rope_settings.rope_style == RopeStyle.NEOX:
-                q = _apply_rope_embed_q_neox(q, sin, cos)
-            else:
-                q = _apply_rope_embed_q_gptj(q, sin, cos)
+            P = ivf_f.numel() * 2
+            ang = pos_idx.float().unsqueeze(-1) * ivf_f.view(1, 1, 1, -1)
+            sin_t = ang.sin() * attn_factor  # [bsz, qlen, R, P/2]
+            cos_t = ang.cos() * attn_factor
+
+        if rotate_dims == 1:
+            assert P <= dim, f"RoPE: rotary width {P} exceeds head_dim {dim}"
+        else:
+            assert dim == P * rotate_dims, \
+                f"RoPE: head_dim {dim} != partial {P} * rotate_dims {rotate_dims}"
+
+        def _rot_sections(x):
+            parts = []
+            for rdim in range(rotate_dims):
+                s = sin_t[:, :, rdim, :].unsqueeze(2)
+                c = cos_t[:, :, rdim, :].unsqueeze(2)
+                sec = x[..., rdim * P:(rdim + 1) * P]
+                if style == RopeStyle.NEOX:
+                    x1, x2 = sec.split(P // 2, dim = -1)
+                    parts.append(torch.cat((x1 * c - x2 * s, x2 * c + x1 * s), dim = -1))
+                else:
+                    xe = sec[..., 0::2]
+                    xo = sec[..., 1::2]
+                    parts.append(torch.stack((xe * c - xo * s, xo * c + xe * s), dim = -1).flatten(-2))
+            out = parts[0] if rotate_dims == 1 else torch.cat(parts, dim = -1)
+            if out.shape[-1] < dim:
+                out = torch.cat((out, x[..., out.shape[-1]:]), dim = -1)
+            return out
+
+        qf = _rot_sections(qf)
+        if kf is not None:
+            kf = _rot_sections(kf)
+
+        q_out = qf.to(in_dtype)
+        k_out = kf.to(in_dtype) if kf is not None else None
 
         if squeeze:
-            q = q.squeeze(0)
-            k = k.squeeze(0) if k is not None else k
-
-        q = q.half()
-        k = k.half()
+            q_out = q_out.squeeze(0)
+            k_out = k_out.squeeze(0) if k_out is not None else None
 
         if in_place:
-            q_.copy_(q)
-            k_.copy_(k)
+            q_.copy_(q_out)
+            if k_ is not None:
+                k_.copy_(k_out)
             return q_, k_
         else:
-            return q, k
+            return q_out, k_out
+
+
+    def apply_cpu(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None = None,
+        position: int = 0,
+        positions: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        in_place = False,
+        inv_freq: torch.Tensor | None = None,
+        q_norm: torch.Tensor | None = None,
+        k_norm: torch.Tensor | None = None,
+    ):
+        # CPU mirror of apply's CUDA path: normalize to 4-D, try the fused native
+        # kernel, fall back to apply_torch. Never raises for shape reasons; the
+        # reference raises on truly inconsistent geometry, like rope_gr's checks.
+        # G4 scope, kept loud: fused q/k norms and Llama-4 query scaling have no
+        # CPU path yet. Silently dropping them would corrupt Gemma4/Ministral
+        # towers (attn.py fuses norms into rope when q_norm_tensor exists).
+        if q_norm is not None or k_norm is not None:
+            raise ValueError("CPU RoPE with fused q/k norms is not supported yet (G4)")
+        if self.llama_4_scaling_beta != 0.0:
+            raise ValueError("CPU RoPE with Llama-4 scaling is not supported")
+        q_orig, k_orig = q, k
+        q4 = q.contiguous()
+        k4 = k.contiguous() if k is not None else None
+        pos4 = positions.contiguous() if positions is not None else None
+        pid4 = position_ids.contiguous() if position_ids is not None else None
+        ivf = self.inv_freq if inv_freq is None else inv_freq
+        if ivf.dim() == 0:
+            raise ValueError("RoPE: inv_freq must be a vector or angle table")
+        if ivf.device != q.device:
+            # Tiny table/vector (at most thousands of floats); a tower running on
+            # CPU may still hold it on CUDA (Gemma4 partial rotary passes no
+            # inv_freq override). Both native and torch paths need it on q's device.
+            ivf = ivf.to(q.device)
+        ivf = ivf.contiguous()
+
+        if len(q4.shape) == 3:
+            q4 = q4.unsqueeze(0)
+            k4 = k4.unsqueeze(0) if k4 is not None else k4
+            squeeze = True
+        else:
+            squeeze = False
+
+        if not in_place:
+            out_q = torch.empty_like(q4)
+            out_k = torch.empty_like(k4) if k4 is not None else None
+        else:
+            out_q = q4
+            out_k = k4
+
+        if self._rope_cpu_ext(q4, out_q, k4, out_k, ivf, position, pos4, pid4):
+            if squeeze:
+                out_q = out_q.squeeze(0)
+                out_k = out_k.squeeze(0) if out_k is not None else None
+            return out_q, out_k
+
+        return self.apply_torch(
+            q_orig, k_orig,
+            pos = position,
+            positions = positions,
+            position_ids = position_ids,
+            in_place = in_place,
+            inv_freq = ivf,
+        )
+
+
+    def _rope_cpu_ext(
+        self,
+        q: torch.Tensor,
+        out_q: torch.Tensor,
+        k: torch.Tensor | None,
+        out_k: torch.Tensor | None,
+        inv_freq: torch.Tensor,
+        position,
+        positions: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+    ) -> bool:
+        """Native fused rope_cpu; False when unsupported (caller falls back to torch)."""
+        fn = getattr(ext, "rope_cpu", None)
+        if fn is None:
+            return False
+        try:
+            position = int(position)
+        except (TypeError, ValueError):
+            return False
+        style = self.rope_settings.rope_style
+        if style not in (RopeStyle.GPTJ, RopeStyle.NEOX):
+            return False
+        for t in (q, out_q):
+            if not (t.is_cpu and t.is_contiguous() and t.is_floating_point()):
+                return False
+            if t.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                return False
+        if q.dim() != 4 or q.stride(3) != 1 or out_q.stride() != q.stride():
+            return False
+        if k is not None:
+            for t in (k, out_k):
+                if not (t.is_cpu and t.is_contiguous() and t.is_floating_point()):
+                    return False
+                if t.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                    return False
+            if k.dim() != 4 or k.stride(3) != 1 or out_k.stride() != k.stride():
+                return False
+            if k.size(0) != q.size(0) or k.size(1) != q.size(1) or k.size(3) != q.size(3):
+                return False
+        if not (inv_freq.is_cpu and inv_freq.is_contiguous() and
+                inv_freq.dtype == torch.float32):
+            return False
+        if (positions is not None) and (position_ids is not None):
+            return False
+        for p in (positions, position_ids):
+            if p is not None and (not p.is_cpu or not p.is_contiguous() or
+                    p.dtype not in (torch.int32, torch.int64)):
+                return False
+        rotate_dims = self.rope_settings.rotate_dims
+        if not (1 <= rotate_dims <= 4):
+            return False
+        P = inv_freq.size(-1) * 2 if inv_freq.dim() > 1 else inv_freq.numel() * 2
+        hd = q.size(3)
+        if rotate_dims == 1:
+            if P > hd:
+                return False
+        elif hd != P * rotate_dims:
+            return False
+        if position_ids is not None:
+            rd = position_ids.dim()
+            if rd not in (2, 3):
+                return False
+            if position_ids.size(0) != q.size(0) or position_ids.size(1) != q.size(1):
+                return False
+            if rd == 3 and position_ids.size(2) != rotate_dims:
+                return False
+        if positions is not None:
+            if positions.dim() != 1 or positions.size(0) != q.size(0):
+                return False
+        try:
+            fn(q, out_q, k, out_k, inv_freq, position, positions, position_ids,
+               int(style), float(self.attn_factor), int(rotate_dims))
+        except Exception:
+            return False
+        return True
 
 
     def get_mrope_freqs(
@@ -510,16 +688,21 @@ class RoPE:
         if positions is not None: positions = positions.contiguous()
         if position_ids is not None: position_ids = position_ids.contiguous()
 
-        # CPU tensors (Qwen vision tower): the extension kernel is CUDA-only; run the host
-        # implementation instead. Only the externally-supplied-frequency NEOX path is supported
-        # on CPU, which is exactly the vision tower's call shape.
+        # CPU tensors (vision towers): the extension kernel is CUDA-only, so run the
+        # fused host kernel when available, else the torch reference above. All three
+        # vision call shapes are supported: external-angle tables (Step3.7 GPT-J,
+        # Mistral/Qwen NEOX gathers) and partial rotary (Gemma4 rotate_dims=2).
         if q.is_cpu:
-            if inv_freq is None:
-                raise ValueError("CPU RoPE requires external inv_freq (vision-style rotary)")
-            if self.rope_settings.rope_style != RopeStyle.NEOX:
-                raise ValueError("CPU RoPE supports NEOX style only")
-            return self.apply_torch(q, k, inv_freq = inv_freq)
-
+            return self.apply_cpu(
+                q, k,
+                position = position,
+                positions = positions,
+                position_ids = position_ids,
+                in_place = in_place,
+                inv_freq = inv_freq,
+                q_norm = q_norm,
+                k_norm = k_norm,
+            )
         if len(q.shape) == 3:
             q = q.unsqueeze(0)
             k = k.unsqueeze(0)

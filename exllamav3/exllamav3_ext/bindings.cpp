@@ -30,6 +30,7 @@
 #include "cpu/vision_gemm.h"
 #include "cpu/act_mul_cpu.h"
 #include "cpu/rms_norm_cpu.h"
+#include "cpu/rope_cpu.h"
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -188,6 +189,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("silu_mul_cpu", &silu_mul_cpu, "silu_mul_cpu", py::call_guard<py::gil_scoped_release>());
     m.def("gelu_mul_cpu", &gelu_mul_cpu, "gelu_mul_cpu", py::call_guard<py::gil_scoped_release>());
     m.def("relu2_mul_cpu", &relu2_mul_cpu, "relu2_mul_cpu", py::call_guard<py::gil_scoped_release>());
+    m.def("rope_cpu", &rope_cpu, "rope_cpu",
+        py::arg("q"), py::arg("out_q"), py::arg("k"), py::arg("out_k"),
+        py::arg("inv_freq"), py::arg("position"), py::arg("positions"),
+        py::arg("position_ids"), py::arg("rope_style"), py::arg("attn_factor"),
+        py::arg("rotate_dims"), py::call_guard<py::gil_scoped_release>());
     m.def("xielu", &xielu, "xielu");
     m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
     m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
