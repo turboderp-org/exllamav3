@@ -7,6 +7,7 @@ import torch
 
 from ..ext import exllamav3_ext as ext
 from ..util.misc import Cleanupper, install_parent_death_signal
+from ..util.shm import check_shm_capacity
 from .model_tp_cuda import (
     cuda_host_register,
     cuda_host_unregister,
@@ -523,6 +524,7 @@ class MoeCpuHost:
         self.layout["wslot_size"] = self.wslot_size
         self.layout["cpu_prof"] = TUNING.cpu_prof
         size = MOE_CTRL_SIZE + self.num_slots * slot_size + self.num_wslots * self.wslot_size
+        check_shm_capacity(size, "The CPU MoE offload handoff segment")
         self.shm = shared_memory.SharedMemory(create = True, size = size)
         buf = np.frombuffer(self.shm.buf, dtype = np.uint8)
         buf[:MOE_CTRL_SIZE] = 0

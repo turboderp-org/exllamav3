@@ -4,6 +4,7 @@ import numpy as np
 from multiprocessing import shared_memory
 import uuid
 from .model_tp_cuda import cuda_host_register, cuda_host_unregister, CUDA_HOST_REGISTER_PORTABLE
+from ..util.shm import check_shm_capacity
 
 DEFAULT_BUFFER_SIZE = 2 * 1024 ** 3
 MAX_CACHE_PER_PROCESS = 4 * 1024**3
@@ -37,6 +38,7 @@ class SMProducer:
         self.buffer_size = buffer_size
 
         # Create SHM handle and numpy buffer
+        check_shm_capacity(self.buffer_size, "The tensor-parallel shared arena")
         self.shm = shared_memory.SharedMemory(create = True, size = self.buffer_size, name = self.shm_name)
         self.buf = np.ndarray((self.buffer_size,), dtype = np.uint8, buffer = self.shm.buf)
         self.buf_is_pinned = False
