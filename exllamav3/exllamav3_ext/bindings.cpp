@@ -31,6 +31,8 @@
 #include "quant/exl3_devctx.cuh"
 #include "quant/exl3_moe.cuh"
 
+#include "quant/p2b_moe.cuh"
+
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
 #include "generator/sampling_extra.cuh"
@@ -144,6 +146,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("had_r_128", &had_r_128, "had_r_128");
+    m.def("p2b_fused_moe", &p2b_fused_moe_cuda, "p2b_fused_moe",
+          py::call_guard<py::gil_scoped_release>());
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
