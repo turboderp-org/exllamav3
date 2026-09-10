@@ -14,6 +14,71 @@
 #include "exl3_devctx.cuh"
 #include "../ptx.cuh"
 
+// Prefill tile dispatch for one expert's rows. Small experts pay M=16's low fixed cost; large
+// ones amortise B decode over M=64. All tiers use the MoE-only _mt inner; the shared dense inner
+// is untouched. FS is the fragment pipeline depth per tier.
+template<int t_bits, int M_TILE, int N_TILE, int cb, int FS>
+__device__ __forceinline__
+void moe_gemm_tile
+(
+    const half* __restrict__ in_addr,
+    const uint16_t* __restrict__ trellis,
+    half* __restrict__ out_addr,
+    const int size_m,
+    const int size_k,
+    const int size_n,
+    int* __restrict__ locks,
+    const int K
+)
+{
+    #define MOE_TILE_ARGS \
+        in_addr, trellis, out_addr, MIN(size_m, M_TILE), size_k, size_n, locks, nullptr
+    #define MOE_TILE_SHAPE \
+        M_TILE, MOE_TILESIZE_K, N_TILE, MOE_SH_STAGES, FS
+    if constexpr (t_bits)
+        exl3_gemm_kernel_inner_mt<t_bits, false, cb, MOE_TILE_SHAPE, false>(MOE_TILE_ARGS);
+    else switch (K)
+    {
+        case 1: exl3_gemm_kernel_inner_mt<1, false, cb, MOE_TILE_SHAPE, false>(MOE_TILE_ARGS); break;
+        case 2: exl3_gemm_kernel_inner_mt<2, false, cb, MOE_TILE_SHAPE, false>(MOE_TILE_ARGS); break;
+        case 3: exl3_gemm_kernel_inner_mt<3, false, cb, MOE_TILE_SHAPE, false>(MOE_TILE_ARGS); break;
+        case 4: exl3_gemm_kernel_inner_mt<4, false, cb, MOE_TILE_SHAPE, false>(MOE_TILE_ARGS); break;
+        case 5: exl3_gemm_kernel_inner_mt<5, false, cb, MOE_TILE_SHAPE, false>(MOE_TILE_ARGS); break;
+        case 6: exl3_gemm_kernel_inner_mt<6, false, cb, MOE_TILE_SHAPE, false>(MOE_TILE_ARGS); break;
+        case 7: exl3_gemm_kernel_inner_mt<7, false, cb, MOE_TILE_SHAPE, false>(MOE_TILE_ARGS); break;
+        case 8: exl3_gemm_kernel_inner_mt<8, false, cb, MOE_TILE_SHAPE, false>(MOE_TILE_ARGS); break;
+    }
+    #undef MOE_TILE_ARGS
+    #undef MOE_TILE_SHAPE
+}
+
+// Whole-expert loop for the M=32/64 tiers, outlined so their (larger) register frames do not
+// inflate the kernel's live set. The M=16 tier is left inline at the call site: it is small and
+// every small expert pays a call otherwise.
+template<int t_bits, int M_TILE, int N_TILE, int cb, int FS>
+__device__ __noinline__
+void moe_gemm_rows
+(
+    const half* __restrict__ in_addr,
+    const uint16_t* __restrict__ trellis,
+    half* __restrict__ out_addr,
+    int size_m,
+    const int size_k,
+    const int size_n,
+    int* __restrict__ locks,
+    const int K
+)
+{
+    while (size_m > 0)
+    {
+        moe_gemm_tile<t_bits, M_TILE, N_TILE, cb, FS>
+        (in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K);
+        in_addr += M_TILE * size_k;
+        out_addr += M_TILE * size_n;
+        size_m -= M_TILE;
+    }
+}
+
 template<int t_bits, int MOE_TILESIZE_N, int cb>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
@@ -29,12 +94,11 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     const int warps_per_block = block_threads / 32;
     const int warp_idx0 = block_idx * warps_per_block + warp_id;
 
-    // Prefill row tile for this N shape. M=64 (4 m16 fragments) was measured slower: the extra
-    // fragment registers spill and small experts waste whole fragments. M=32 is the measured
-    // sweet spot (2 fragments per dequantized B tile) and fits the smem budget at every N/K.
-    // N=128 fits an M=64 tile (4 m16 fragments sharing each dequantized B tile) with
-    // single-buffered A; N=256's reduction scratch does not, so it keeps M=32.
-    constexpr int MOE_M_TILE = (MOE_TILESIZE_N == 128) ? 64 : MOE_TILESIZE_M;
+    // Per-expert tile dispatch thresholds and the large tile for this N shape. N=128 fits M=64
+    // with single-buffered A (FS=2 to chase STACK 0); N=256's reduction scratch does not, so its
+    // large tier stays M=32.
+    constexpr int MOE_BIG_M = (MOE_TILESIZE_N == 128) ? 64 : MOE_TILESIZE_M;
+    constexpr int MOE_BIG_FS = (MOE_TILESIZE_N == 128) ? 2 : MOE_FRAG_STAGES;
 
     // Buffers for group
     temp_state_g += group_idx * max_tokens_per_expert * hidden_dim;
@@ -123,44 +187,15 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         // g, u GEMM
         auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
         {
-            int size_m = token_count;
-            while (size_m > 0)
-            {
-                #define ARGS            \
-                    in_addr,            \
-                    trellis,            \
-                    out_addr,           \
-                    MIN(size_m, MOE_M_TILE), \
-                    hidden_dim,         \
-                    intermediate_dim,   \
-                    locks,              \
-                    nullptr
-                #define SHAPE_ARGS      \
-                    MOE_M_TILE,         \
-                    MOE_TILESIZE_K,     \
-                    MOE_TILESIZE_N,     \
-                    MOE_SH_STAGES,      \
-                    MOE_FRAG_STAGES
-                if constexpr (t_bits)
-                    exl3_gemm_kernel_inner_mt<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
-                else switch(K)
-                {
-                    case 1: exl3_gemm_kernel_inner_mt<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner_mt<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner_mt<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner_mt<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner_mt<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner_mt<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner_mt<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner_mt<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                };
-                #undef ARGS
-                #undef SHAPE_ARGS
-
-                in_addr += MOE_M_TILE * hidden_dim;
-                out_addr += MOE_M_TILE * intermediate_dim;
-                size_m -= MOE_M_TILE;
-            }
+            if (token_count <= 16)
+                moe_gemm_tile<t_bits, 16, MOE_TILESIZE_N, cb, MOE_FRAG_STAGES>
+                (in_addr, trellis, out_addr, token_count, hidden_dim, intermediate_dim, locks, K);
+            else if (token_count <= 48)
+                moe_gemm_rows<t_bits, 32, MOE_TILESIZE_N, cb, MOE_FRAG_STAGES>
+                (in_addr, trellis, out_addr, token_count, hidden_dim, intermediate_dim, locks, K);
+            else
+                moe_gemm_rows<t_bits, MOE_BIG_M, MOE_TILESIZE_N, cb, MOE_BIG_FS>
+                (in_addr, trellis, out_addr, token_count, hidden_dim, intermediate_dim, locks, K);
         };
 
         if (gated)
@@ -197,44 +232,15 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         // d GEMM
         auto gemm_down = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
         {
-            int size_m = token_count;
-            while (size_m > 0)
-            {
-                #define ARGS            \
-                    in_addr,            \
-                    trellis,            \
-                    out_addr,           \
-                    MIN(size_m, MOE_M_TILE), \
-                    intermediate_dim,   \
-                    hidden_dim,         \
-                    locks,              \
-                    nullptr
-                #define SHAPE_ARGS      \
-                    MOE_M_TILE,         \
-                    MOE_TILESIZE_K,     \
-                    MOE_TILESIZE_N,     \
-                    MOE_SH_STAGES,      \
-                    MOE_FRAG_STAGES
-                if constexpr (t_bits)
-                    exl3_gemm_kernel_inner_mt<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
-                else switch(K)
-                {
-                    case 1: exl3_gemm_kernel_inner_mt<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner_mt<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner_mt<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner_mt<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner_mt<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner_mt<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner_mt<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner_mt<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                };
-                #undef ARGS
-                #undef SHAPE_ARGS
-
-                in_addr += MOE_M_TILE * intermediate_dim;
-                out_addr += MOE_M_TILE * hidden_dim;
-                size_m -= MOE_M_TILE;
-            }
+            if (token_count <= 16)
+                moe_gemm_tile<t_bits, 16, MOE_TILESIZE_N, cb, MOE_FRAG_STAGES>
+                (in_addr, trellis, out_addr, token_count, intermediate_dim, hidden_dim, locks, K);
+            else if (token_count <= 48)
+                moe_gemm_rows<t_bits, 32, MOE_TILESIZE_N, cb, MOE_FRAG_STAGES>
+                (in_addr, trellis, out_addr, token_count, intermediate_dim, hidden_dim, locks, K);
+            else
+                moe_gemm_rows<t_bits, MOE_BIG_M, MOE_TILESIZE_N, cb, MOE_BIG_FS>
+                (in_addr, trellis, out_addr, token_count, intermediate_dim, hidden_dim, locks, K);
         };
 
         gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
