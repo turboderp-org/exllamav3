@@ -191,7 +191,7 @@ python examples/chat.py -h
 | **Command-A**, **Command-R+** etc.               | `Cohere2ForCausalLM` |  |  |
 | **DeciLM**, **Nemotron**                         | `DeciLMForCausalLM` |  |  |
 | **Deepseek V3**                                  | `DeepseekV3ForCausalLM` |  |  |
-| **Deepseek V4**                                  | `DeepseekV4ForCausalLM` |  |  |
+| **Deepseek V4**                                  | `DeepseekV4ForCausalLM` | ✓ |  |
 | **dots.llm1**                                    | `Dots1ForCausalLM` |  | |
 | **ERNIE 4.5**                                    | `Ernie4_5_ForCausalLM`<br>`Ernie4_5_MoeForCausalLM` |  |  |
 | **EXAONE 4.0**                                   | `Exaone4ForCausalLM` |  |  |
