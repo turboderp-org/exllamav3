@@ -62,6 +62,11 @@ class DFlashConfig(Config):
         # level in later ones (MuseGlimmerAssistant)
         self.mask_token_id = self.read_cfg(int, ["dflash_config->mask_token_id", "mask_token_id"], no_default)
         self.target_layer_ids = self.read_cfg(list, ["dflash_config->target_layer_ids", "target_layer_ids"], no_default)
+        # The offset is per checkpoint and not derivable from the config: gemma4-31b-it-dflash
+        # wants +1 (2.4-2.9 vs 0.3 accepted/round), gemma4-26b-a4b-it-dflash wants 0 (3.2 vs
+        # 0.8), same trainer version. A checkpoint (or its quantized config.json) can pin it with
+        # "tap_shift" under dflash_config or at the top level
+        self.tap_shift = self.read_cfg(int, ["dflash_config->tap_shift", "tap_shift"], self.tap_shift)
         self.target_layer_ids = [i + self.tap_shift for i in self.target_layer_ids]
         self.block_size = self.read_cfg(int, ["block_size", "dflash_config->block_size"], no_default)
 
