@@ -27,6 +27,8 @@
 #include "cpu/moe_mul1.h"
 #include "cpu/reconstruct.h"
 #include "cpu/moe_handoff.h"
+#include "cpu/vision_gemm.h"
+#include "cpu/rms_norm_cpu.h"
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -92,6 +94,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("constant_bias"), py::arg("constant_scale"), py::arg("span_heads"),
         py::arg("add_residual"), py::arg("w_groups") = 1);
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
+    m.def("rms_norm_cpu", &rms_norm_cpu, "rms_norm_cpu",
+        py::arg("x"), py::arg("w"), py::arg("y"), py::arg("epsilon"),
+        py::arg("constant_bias"), py::arg("constant_scale"),
+        py::arg("add_residual"), py::arg("w_groups") = 1);
+    m.def("rms_norm_res_in_cpu", &rms_norm_res_in_cpu, "rms_norm_res_in_cpu");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
 
@@ -143,6 +150,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("reconstruct_had_slice_cpu", &reconstruct_had_slice_cpu, "reconstruct_had_slice_cpu");
+    m.def("vision_gemm_blocked_cpu", &vision_gemm_blocked_cpu, "vision_gemm_blocked_cpu");
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
@@ -166,6 +174,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::call_guard<py::gil_scoped_release>());
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
+    m.def("exl3_moe_cpu_has_avx512", &exl3_moe_cpu_has_avx512, "exl3_moe_cpu_has_avx512");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
     m.def("hgemm", &hgemm, "hgemm");
     m.def("rope", &rope, "rope");

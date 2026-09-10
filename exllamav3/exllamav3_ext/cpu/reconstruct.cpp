@@ -1,5 +1,6 @@
 #include "reconstruct.h"
 #include "exl3_common.h"
+#include "moe_mul1.h"
 #include <torch/extension.h>
 #include <ATen/Parallel.h>
 
@@ -7,17 +8,18 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
-#include <vector>
+#include <type_traits>
 
 // Dense EXL3 CPU reconstruction, fused with both-side Hadamard transforms: emits
 // W = diag(suh) . H128 . W_hat . H128 . diag(svh) (per 128x128 tile, 1/sqrt(128) per side),
 // i.e. the ORIGINAL-basis weights, matching quant/reconstruct.cu's reconstruct_had_slice.
 //
 // Tiles are independent, so workers parallelize over 128x128 output tiles with one reusable
-// stack scratch each; no per-tile heap allocation and no cross-tile state. The FWHT and the
-// scale/store stages use AVX2+F16C when the host supports it; set EXL3_CPU_RECON_SCALAR=1 to
-// force the scalar reference path (the numerical contract is unchanged either way).
+// stack scratch each; no per-tile heap allocation and no cross-tile state. Work runs on the
+// persistent process-wide pool shared with the MoE CPU path (moe_mul1.cpp) instead of a
+// per-call thread fan-out. The FWHT and the scale/store stages use AVX-512 where the host
+// supports it (moe ISA detection), else AVX2+F16C; set EXL3_CPU_RECON_SCALAR=1 to force the
+// scalar reference path (the numerical contract is unchanged either way).
 //
 // The reference test bounds deviation from the CUDA kernel at relative max error < 2e-3.
 
@@ -28,6 +30,7 @@ constexpr int TILE = 128;
 using exl3_common::decode_3inst;
 using exl3_common::decode_state_scalar;
 using exl3_common::hadamard_128_avx2;
+using exl3_common::hadamard_128_avx512;
 using exl3_common::hadamard_128_scalar;
 using exl3_common::HAD_SCALE;
 
@@ -38,9 +41,10 @@ bool force_scalar()
     return v;
 }
 
-inline void hadamard_128(float* v, bool avx2)
+inline void hadamard_128(float* v, bool avx512, bool avx2)
 {
-    if (avx2) hadamard_128_avx2(v);
+    if (avx512) hadamard_128_avx512(v);
+    else if (avx2) hadamard_128_avx2(v);
     else      hadamard_128_scalar(v);
 }
 
@@ -90,6 +94,24 @@ inline void scale_store_row_avx2(float* out, const float* row, float su, const a
     }
 }
 
+// 512-bit float-output store: same math as the AVX2 version, 16 lanes per iteration.
+// Half output keeps the AVX2 `_mm256_cvtps_ph` path (no AVX512-FP16 assumption).
+EXL3_CPU_TARGET_AVX512
+inline void scale_store_row_avx512(float* out, const float* row, float su, const at::Half* svh)
+{
+    const __m512 rs = _mm512_set1_ps(HAD_SCALE);
+    const __m512 vsu = _mm512_set1_ps(su);
+    for (int c = 0; c < TILE; c += 16)
+    {
+        __m512 v = _mm512_loadu_ps(row + c);
+        const __m512 sv = _mm512_cvtph_ps(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(svh + c)));
+        v = _mm512_mul_ps(_mm512_mul_ps(v, rs), vsu);
+        v = _mm512_mul_ps(v, sv);
+        _mm512_storeu_ps(out + c, v);
+    }
+}
+
 template <int bits, int cb>
 inline void decode_tile(const uint16_t* packed_tile, float* sub, const std::array<uint16_t, 256>& perm)
 {
@@ -124,6 +146,7 @@ struct ReconParams
     int K;
     int cb_index;
     bool avx2;
+    bool avx512;
     size_t tile_words;
 };
 
@@ -184,7 +207,7 @@ void reconstruct_run(const ReconParams& rp, OutT* p_out)
             {
                 alignas(64) float v[TILE];
                 for (int r = 0; r < TILE; ++r) v[r] = tile[r * TILE + c];
-                hadamard_128(v, rp.avx2);
+                hadamard_128(v, rp.avx512, rp.avx2);
                 for (int r = 0; r < TILE; ++r) tile[r * TILE + c] = v[r] * HAD_SCALE;
             }
 
@@ -193,36 +216,37 @@ void reconstruct_run(const ReconParams& rp, OutT* p_out)
             for (int r = 0; r < TILE; ++r)
             {
                 float* row = tile + r * TILE;
-                hadamard_128(row, rp.avx2);
+                hadamard_128(row, rp.avx512, rp.avx2);
                 const float su = static_cast<float>(rp.p_suh[kt * TILE + r]);
                 const at::Half* svh_row = rp.p_svh + nt * TILE;
                 OutT* out_row = out_tile + static_cast<size_t>(r) * rp.n_dim;
-                if (rp.avx2) scale_store_row_avx2(out_row, row, su, svh_row);
-                else         scale_store_row_scalar(out_row, row, su, svh_row);
+                if constexpr (std::is_same_v<OutT, float>)
+                {
+                    if (rp.avx512) scale_store_row_avx512(out_row, row, su, svh_row);
+                    else if (rp.avx2) scale_store_row_avx2(out_row, row, su, svh_row);
+                    else scale_store_row_scalar(out_row, row, su, svh_row);
+                }
+                else
+                {
+                    if (rp.avx2) scale_store_row_avx2(out_row, row, su, svh_row);
+                    else scale_store_row_scalar(out_row, row, su, svh_row);
+                }
             }
         }
     };
 
-    // Explicit fan-out: at::parallel_for runs serially in some torch builds, so split the
-    // tile range across a short-lived std::thread pool sized by the intra-op thread count
-    int n_workers = (int) std::min<int64_t>(std::max(at::get_num_threads(), 1), total_tiles);
-    if (n_workers <= 1)
+    // Run on the persistent process-wide pool shared with the MoE CPU path (moe_mul1.cpp):
+    // at::parallel_for runs serially in some torch builds, and a per-call thread fan-out
+    // re-pays spawn/join (~192 spawns/forward across the vision tower) every forward.
+    struct RangeRun
     {
-        process_range(0, total_tiles);
-    }
-    else
-    {
-        const int64_t chunk = (total_tiles + n_workers - 1) / n_workers;
-        std::vector<std::thread> workers;
-        for (int w = 0; w < n_workers; ++w)
+        static void tile(void* c, int64_t b, int64_t e)
         {
-            const int64_t b = (int64_t) w * chunk;
-            const int64_t e = std::min(total_tiles, b + chunk);
-            if (b >= e) break;
-            workers.emplace_back(process_range, b, e);
+            const auto* f = static_cast<const decltype(process_range)*>(c);
+            (*f)(b, e);
         }
-        for (auto& th : workers) th.join();
-    }
+    };
+    cpu_pool_run_tiles(total_tiles, &RangeRun::tile, (void*) &process_range);
 }
 
 } // namespace
@@ -273,6 +297,7 @@ void reconstruct_had_slice_cpu
     rp.K = static_cast<int>(K);
     rp.cb_index = mul1 ? 2 : (mcg ? 1 : 0);
     rp.avx2 = !force_scalar();
+    rp.avx512 = rp.avx2 && exl3_moe_cpu_has_avx512();
     rp.tile_words = static_cast<size_t>(K) * 16;
 
     if (unpacked.scalar_type() == at::kFloat)

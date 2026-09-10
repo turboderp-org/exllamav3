@@ -3,7 +3,7 @@ from typing_extensions import override
 import torch
 import torch.nn.functional as F
 
-from ..util.tensor import to2, cpu_matmul
+from ..util.tensor import to2, cpu_matmul, repack_64
 from ..model.config import Config
 from . import Module
 from ..ext import exllamav3_ext as ext
@@ -43,7 +43,12 @@ class Conv(Module):
         self.flat = flat
         self.dim = in_channels
         for d in self.kernel_size: self.dim *= d
-
+        # CPU flat-branch cache: transposed fp32 weight, rebuilt only when the resident
+        # weight object or shape changes (deferred loads swap self.weight under us)
+        self._cpu_w_flat = None
+        self._cpu_w_flat_src = None
+        # Panel-major repack of _cpu_w_flat for the native GEMM (same lifetime)
+        self._cpu_w64 = None
 
     @override
     def load(self, device: torch.device, **kwargs):
@@ -61,6 +66,9 @@ class Conv(Module):
         self.device = None
         self.weight = None
         self.bias = None
+        self._cpu_w_flat = None
+        self._cpu_w_flat_src = None
+        self._cpu_w64 = None
 
 
     @override
@@ -96,29 +104,51 @@ class Conv(Module):
 
             if self.flat:
                 x_flat = x.view(-1, self.dim)
-                w_flat = self.weight.view(self.weight.shape[0], -1).T.contiguous()
                 out_dtype = out_dtype or self.out_dtype
-                assert x_flat.dtype == torch.half
-                assert w_flat.dtype in (torch.half, torch.bfloat16, torch.float32)
+                if x_flat.shape[0] == 0:
+                    y = torch.empty(
+                        (bsz, seqlen, self.out_channels),
+                        dtype = out_dtype or x.dtype,
+                        device = x.device,
+                    )
+                    return to2(y, out_dtype, self.out_dtype)
                 if x_flat.device.type == "cpu":
                     # One-time resident-weight conversion to fp32 for the oneDNN SGEMM
                     # path (see cpu_matmul / LinearFP16.forward); deferred loads make
                     # construction-time device checks unreliable, so this only triggers on
                     # actual CPU execution. FP32 accumulation preserved.
-                    if w_flat.dtype == torch.half:
+                    if self.weight.dtype == torch.half:
                         self.weight = self.weight.to(torch.float32)
-                        w_flat = w_flat.to(torch.float32)
-                    y = cpu_matmul(x_flat, w_flat, out_dtype)
+                    # Cache the transposed weight across forwards; the resident weight
+                    # object is stable after the conversion above, so identity + shape
+                    # is a sufficient invalidation key (grouped packing only changes M)
+                    w_flat = self._cpu_w_flat
+                    if (
+                        w_flat is None
+                        or self._cpu_w_flat_src is not self.weight
+                        or w_flat.shape != (self.dim, self.out_channels)
+                    ):
+                        w_flat = self.weight.view(self.weight.shape[0], -1).T.contiguous()
+                        self._cpu_w_flat = w_flat
+                        self._cpu_w_flat_src = self.weight
+                        self._cpu_w64 = None
+                    assert x_flat.dtype == torch.half
+                    assert w_flat.dtype in (torch.half, torch.bfloat16, torch.float32)
+                    if self._cpu_w64 is None:
+                        self._cpu_w64 = repack_64(w_flat)
+                    y = cpu_matmul(x_flat, w_flat, out_dtype, self.bias, self._cpu_w64)
+                    y = y.view(bsz, seqlen, self.out_channels)
                 else:
+                    w_flat = self.weight.view(self.weight.shape[0], -1).T.contiguous()
                     y = torch.empty(
                         (x_flat.shape[0], w_flat.shape[1]),
                         dtype = out_dtype,
                         device = x_flat.device,
                     )
                     ext.hgemm(x_flat, w_flat, y)
-                y = y.view(bsz, seqlen, self.out_channels)
-                if self.bias is not None:
-                    y += self.bias
+                    y = y.view(bsz, seqlen, self.out_channels)
+                    if self.bias is not None:
+                        y += self.bias
             else:
                 # Extremely inefficient for Qwen3
                 x = x.view(-1, self.in_channels, self.kernel_size[0], self.kernel_size[1], self.kernel_size[2])

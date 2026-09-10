@@ -77,6 +77,9 @@ class LinearEXL3:
         self.mul1 = self.mul1_tensor is not None
 
         self._fused_reconstruct = None
+        # CPU path: persistent dense fp32 buffer reused across forwards (reconstruct writes
+        # every tile each call, so reuse is safe; forward() is single-threaded in Python)
+        self._cpu_w_buf = None
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
         if self.trellis.device.type == "cpu":
             # CPU-loaded linear (e.g. Qwen vision offload): execute via dense reconstruction +
@@ -155,19 +158,31 @@ class LinearEXL3:
         shape = x.shape
         rows = x.numel() // shape[-1]
         out_shape = shape[:-1] + (self.out_features,)
-        w = torch.empty(
-            (self.in_features, self.out_features),
-            dtype = torch.float32,
-            device = "cpu"
-        )
+        w = self._cpu_w_buf
+        if w is None or w.shape != (self.in_features, self.out_features) or w.dtype != torch.float32:
+            try:
+                w = torch.empty(
+                    (self.in_features, self.out_features),
+                    dtype = torch.float32,
+                    device = "cpu"
+                )
+            except RuntimeError:
+                # OOM with a stale cached buffer: drop it and retry once uncached
+                self._cpu_w_buf = None
+                w = torch.empty(
+                    (self.in_features, self.out_features),
+                    dtype = torch.float32,
+                    device = "cpu"
+                )
+            self._cpu_w_buf = w
         ext.reconstruct_had_slice_cpu(
             w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0
         )
         # Native fp32 reconstruction writer: the dense buffer comes out directly in the GEMM's
-        # resident dtype (fp32 fast path in cpu_matmul), no post-reconstruction cast pass
-        y = cpu_matmul(x.view(rows, self.in_features), w, dtype).view(out_shape)
-        if self.bias is not None:
-            y += self.bias
+        # resident dtype (native path in cpu_matmul), no post-reconstruction cast pass.
+        # Bias fuses into the GEMM epilogue (native path) or the trailing add inside
+        # cpu_matmul (fallback paths); same result either way.
+        y = cpu_matmul(x.view(rows, self.in_features), w, dtype, self.bias).view(out_shape)
         return y
 
 

@@ -1,0 +1,7 @@
+# Vision CPU port — G1..G5 (no weights needed, synthetic CPU-vs-CUDA verification)
+
+- [x] G1 — `RMSNorm` CPU fallback (`exllamav3/modules/rmsnorm.py:106-167` → `forward_torch:71`): add `if x.is_cpu` dispatch incl. residual/`groups`/`unweighted`/`constant_bias` paths. Verify: random weight + `x`, CPU vs `ext.rms_norm` on CUDA, `rel_err < 3e-3`.
+- [ ] G2 — `GatedMLP` torch fallback (`exllamav3/modules/mlp.py:583-585,724,756`): `down(act(gate)*up)` over existing `Linear` CPU path, all 3 acts + `act_limit` + `interm_dtype`. Verify: random gate/up/down, CPU vs CUDA `ext.*_mul` + `hgemm` path.
+- [ ] G3 — `RoPE` CPU variants (`exllamav3/util/rope.py:516-521`): GPTJ external-angle arm (Step3.7), `inv_freq[position_ids]` gather (Mistral table), Gemma4-base partial-rotary (`head_dim//2`, `rotate_dims=2`) grid helper from `transformers==5.15.1` source. Verify: random `q/k` + synthetic angle rows, CPU vs `ext.rope` on CUDA vs direct rotate reference.
+- [ ] G4 — fused q/k-norm on CPU (`rope.py:521` drops norms): apply torch norm before rotation when `q_norm`/`k_norm` passed. Verify: random norm weights + `q/k` + angles, CPU vs CUDA fused path.
+- [ ] G5 — attention fallback ceiling (`exllamav3/modules/attention_fn/torch.py:22-30`): extend/confirm SWA/`bsz>1`-varlen/softcap/sinks/spans handling; none hit by vision towers (all cacheless bsz1, `window=-1`). Verify: random `q/k/v` + `cu_seqlens`, segmented vs dense `F.scaled_dot_product_attention` parity.

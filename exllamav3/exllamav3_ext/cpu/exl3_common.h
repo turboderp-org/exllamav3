@@ -17,8 +17,12 @@
 
 #if defined(__GNUC__) && defined(__linux__)
 #define EXL3_CPU_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
+#define EXL3_CPU_TARGET_AVX512 __attribute__((target("avx512f,avx512vl,avx512bw,avx512dq,f16c")))
+#define EXL3_CPU_TARGET_BF16 __attribute__((target("avx512f,avx512vl,avx512bw,avx512dq,avx512bf16,f16c")))
 #else
 #define EXL3_CPU_TARGET_AVX2
+#define EXL3_CPU_TARGET_AVX512
+#define EXL3_CPU_TARGET_BF16
 #endif
 
 namespace exl3_common {
@@ -185,6 +189,58 @@ inline void hadamard_128_avx2(float* v)
             }
 
     for (int i = 0; i < 16; ++i) _mm256_storeu_ps(v + i * 8, r[i]);
+}
+
+// 512-bit version of the same 7-stage Sylvester transform: 8x16 lanes, so the four
+// within-register stages cover widths 1/2/4/8 and the whole-register loop widths 16/32/64.
+// Stage order matches the scalar reference (ascending width), so results are bit-comparable
+// up to ordinary floating-point reassociation across the wider lanes.
+EXL3_CPU_TARGET_AVX512
+inline void hadamard_128_avx512(float* v)
+{
+    __m512 r[8];
+    for (int i = 0; i < 8; ++i) r[i] = _mm512_loadu_ps(v + i * 16);
+
+    // width 1: butterfly within adjacent pairs
+    for (int i = 0; i < 8; ++i)
+    {
+        const __m512 t = _mm512_permute_ps(r[i], 0b10110001);
+        r[i] = _mm512_mask_blend_ps(0xAAAA, _mm512_add_ps(r[i], t), _mm512_sub_ps(t, r[i]));
+    }
+
+    // width 2: butterfly between 32-bit pairs
+    for (int i = 0; i < 8; ++i)
+    {
+        const __m512 t = _mm512_permute_ps(r[i], 0b01001110);
+        r[i] = _mm512_mask_blend_ps(0xCCCC, _mm512_add_ps(r[i], t), _mm512_sub_ps(t, r[i]));
+    }
+
+    // width 4: swap 64-bit halves (128-bit lanes [L1,L0,L3,L2])
+    for (int i = 0; i < 8; ++i)
+    {
+        const __m512 t = _mm512_shuffle_f32x4(r[i], r[i], 0xB1);
+        r[i] = _mm512_mask_blend_ps(0xF0F0, _mm512_add_ps(r[i], t), _mm512_sub_ps(t, r[i]));
+    }
+
+    // width 8: swap 256-bit halves (128-bit lanes [L2,L3,L0,L1])
+    for (int i = 0; i < 8; ++i)
+    {
+        const __m512 t = _mm512_shuffle_f32x4(r[i], r[i], 0x4E);
+        r[i] = _mm512_mask_blend_ps(0xFF00, _mm512_add_ps(r[i], t), _mm512_sub_ps(t, r[i]));
+    }
+
+    // widths 16..64: whole-register butterflies
+    for (int width = 1; width < 8; width *= 2)
+        for (int base = 0; base < 8; base += 2 * width)
+            for (int i = 0; i < width; ++i)
+            {
+                const __m512 a = r[base + i];
+                const __m512 b = r[base + width + i];
+                r[base + i] = _mm512_add_ps(a, b);
+                r[base + width + i] = _mm512_sub_ps(a, b);
+            }
+
+    for (int i = 0; i < 8; ++i) _mm512_storeu_ps(v + i * 16, r[i]);
 }
 
 } // namespace exl3_common

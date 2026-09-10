@@ -2,7 +2,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 from ...ext import exllamav3_ext as ext
-from ...util.tensor import to2, cpu_matmul
+from ...util.tensor import to2, cpu_matmul, repack_64
 from ...util import first_not_none
 
 class LinearFP16:
@@ -27,6 +27,10 @@ class LinearFP16:
     ):
         self.weight = weight
         self._pinned_store = None
+        # CPU native-GEMM cache: panel-major repack of the resident weight, rebuilt when
+        # the resident object or shape changes (same lazy rule as the fp32 conversion)
+        self._cpu_w64 = None
+        self._cpu_w64_src = None
         if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
         self.in_features = in_features
         self.out_features = out_features
@@ -89,9 +93,20 @@ class LinearFP16:
             # so this only triggers on actual CPU execution.
             if self.weight.dtype == torch.half:
                 self.weight = self.weight.to(torch.float32)
-            y = cpu_matmul(x, self.weight, dtype).view(out_shape)
-            if self.bias is not None:
-                y += self.bias
+            # Panel-major repack for the native GEMM, cached across forwards (grouped
+            # packing only changes M, never the resident weight)
+            w64 = self._cpu_w64
+            if (
+                w64 is None
+                or self._cpu_w64_src is not self.weight
+                or w64.shape != ((self.out_features + 63) // 64, self.in_features, 64)
+            ):
+                w64 = repack_64(self.weight)
+                self._cpu_w64 = w64
+                self._cpu_w64_src = self.weight
+            # bias fuses into the GEMM epilogue (native path) or the trailing add
+            # inside cpu_matmul (fallback paths); same result either way
+            y = cpu_matmul(x, self.weight, dtype, self.bias, w64).view(out_shape)
             return y
 
         y = torch.empty(

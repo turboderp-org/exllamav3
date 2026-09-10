@@ -359,10 +359,13 @@ class StubSTC:
             t = t.t()
         return t.to(device)
 
-    def begin_deferred_load(self):
+    def begin_deferred_load(self, arena = True):
         pass
 
     def end_deferred_load(self):
+        pass
+
+    def release_arena(self):
         pass
 
 

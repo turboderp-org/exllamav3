@@ -179,7 +179,26 @@ def buffered_interleaved_arange(r: int, k: int, device: torch.device):
 cpu_matmul_chunk = 256
 
 
-def cpu_matmul(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | None = None):
+def repack_64(weight: torch.Tensor) -> torch.Tensor:
+    """
+    Repack a [K, N] CPU weight into panel-major [NB, K, 64] (NB = ceil(N / 64)) for the
+    native vision GEMM: each k-step then walks B sequentially. A strided walk over plain
+    [K, N] stalls ~5x on L3 latency with this kernel's reuse pattern (measured), so the
+    one-time repack (same dtype, same values, last panel zero-padded) pays for itself on
+    the first forward. Callers cache the result keyed on the resident weight's identity.
+    """
+    assert weight.dim() == 2 and weight.device.type == "cpu"
+    K, N = weight.shape
+    NB = (N + 63) // 64
+    out = torch.zeros((NB, K, 64), dtype = weight.dtype, device = weight.device)
+    for g in range(NB):
+        m = min(64, N - g * 64)
+        if m:
+            out[g, :, :m].copy_(weight[:, g * 64 : g * 64 + m])
+    return out
+
+
+def cpu_matmul(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | None = None, bias: torch.Tensor | None = None, weight_blocked: torch.Tensor | None = None):
     """
     CPU projection primitive: x @ weight for 2D weight stored [in_features, out_features]
     (the repository's linear layout) and x with arbitrary leading dimensions.
@@ -188,20 +207,59 @@ def cpu_matmul(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | N
     the reduction dimension, converting only the current activation slice and matching weight
     rows, so no full float copy of the weight is ever materialized. Matching dtypes use plain
     matmul.
+
+    The `x2.to(weight.dtype)` activation cast below allocates one M x K temporary per call
+    (~10% of vision wall); the native vision GEMM fast path ahead avoids it by streaming A
+    with on-the-fly conversion instead. `bias`, when given, is added to the 2D product
+    before the output reshape (same result as the callers' trailing `y += bias`).
+    `weight_blocked` is the repack_64() panel-major form of `weight`, cached by the caller
+    keyed on the resident weight; when present and usable the native kernel consumes it,
+    else the plain-`weight` oneDNN/chunked paths below run.
     """
 
     assert weight.dim() == 2
     assert x.shape[-1] == weight.shape[0], \
         f"matmul shape mismatch: input {tuple(x.shape)} vs weight {tuple(weight.shape)}"
     out_shape = x.shape[:-1] + (weight.shape[1],)
+    # Non-contiguous views (callers pass contiguous; be tolerant, never misread)
     x2 = x.reshape(-1, x.shape[-1])
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
 
     if out_dtype is None:
         out_dtype = x.dtype
+
+    # Native vision GEMM: register-blocked fp32 accumulation over panel-major B with
+    # on-the-fly activation conversion and a fused bias+cast epilogue (no temporaries).
+    # Any kernel gap falls through to the oneDNN/chunked paths below; a forward never
+    # fails here.
+    if (
+        weight_blocked is not None
+        and x.is_cpu
+        and (bias is None or bias.is_cpu)
+        and x.dtype in (torch.float32, torch.float16, torch.bfloat16)
+        and weight_blocked.dtype in (torch.float32, torch.bfloat16)
+        and weight_blocked.dim() == 3 and weight_blocked.size(2) == 64
+        and weight_blocked.size(1) == weight.shape[0]
+        and weight_blocked.size(0) * 64 >= weight.shape[1]
+        and out_dtype in (torch.float32, torch.float16, torch.bfloat16)
+    ):
+        try:
+            from ..ext import exllamav3_ext as ext
+            y = torch.empty((x2.shape[0], weight.shape[1]), dtype = out_dtype, device = "cpu")
+            ext.vision_gemm_blocked_cpu(x2, weight_blocked, bias, y)
+            return y.reshape(out_shape)
+        except Exception:
+            pass
     same_dtype = x.dtype == weight.dtype and out_dtype == x.dtype
 
     if same_dtype:
-        return torch.matmul(x2, weight).reshape(out_shape)
+        y = torch.matmul(x2, weight)
+        if bias is not None:
+            y = y + bias
+        return y.reshape(out_shape)
 
     # Fast compute paths (oneDNN GEMM, fp32 accumulation): fp32 weights reach ~0.9 TFLOP/s
     # SGEMM and bf16 weights ~3 TFLOP/s (AVX512-BF16 dot) on desktop Zen5, while fp16
@@ -211,6 +269,8 @@ def cpu_matmul(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | N
         y = torch.matmul(x2.to(weight.dtype), weight)
         if out_dtype != weight.dtype:
             y = y.to(out_dtype)
+        if bias is not None:
+            y = y + bias
         return y.reshape(out_shape)
 
     if not x.is_floating_point() or not weight.is_floating_point():
@@ -230,6 +290,8 @@ def cpu_matmul(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | N
         w_chunk = weight[k0:k0 + cpu_matmul_chunk, :].to(acc_dtype)
         acc.addmm_(x_chunk, w_chunk)
     out = acc.to(out_dtype) if acc_dtype != out_dtype else acc
+    if bias is not None:
+        out = out + bias
     return out.reshape(out_shape)
 
 

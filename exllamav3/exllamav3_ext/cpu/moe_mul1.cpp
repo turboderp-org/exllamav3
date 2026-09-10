@@ -1,6 +1,7 @@
 #include "moe_mul1.h"
 #include "exl3_common.h"
 #include <c10/util/Half.h>
+#include <ATen/Parallel.h>
 #include <torch/extension.h>
 
 #include <algorithm>
@@ -79,14 +80,6 @@ constexpr int MAX_M = 4;
 #define M1_TARGET_VBMI
 #endif
 
-inline void cpu_pause()
-{
-#ifdef __linux__
-    __builtin_ia32_pause();
-#else
-    _mm_pause();
-#endif
-}
 
 inline float half_to_float(at::Half h) { return static_cast<float>(h); }
 
@@ -1282,6 +1275,17 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
     }
 }
 
+} // end anonymous namespace: the pool below needs external linkage (moe_mul1.h)
+
+inline void cpu_pause()
+{
+#ifdef __linux__
+    __builtin_ia32_pause();
+#else
+    _mm_pause();
+#endif
+}
+
 // -------------------------------------------------------------------------------------------
 //   Thread pool (persistent, spin-parked; master participates as worker 0)
 // -------------------------------------------------------------------------------------------
@@ -1482,6 +1486,60 @@ struct Pool
 
 Pool g_pool;
 std::mutex g_pool_mutex;
+
+struct CpuPoolTilesCtx
+{
+    int64_t total;
+    CpuPoolTileFn fn;
+    void* ctx;
+    std::atomic<int64_t> next{0};
+};
+
+static void cpu_pool_tiles_fn(void* c, int worker, int nw)
+{
+    (void) worker; (void) nw;
+    auto* t = static_cast<CpuPoolTilesCtx*>(c);
+    while (true)
+    {
+        const int64_t i = t->next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= t->total) break;
+        t->fn(t->ctx, i, i + 1);
+    }
+}
+
+void cpu_pool_run_tiles(int64_t total, CpuPoolTileFn fn, void* ctx)
+{
+    if (total <= 0 || fn == nullptr) return;
+    int n = at::get_num_threads();
+    if (n < 1) n = 1;
+#ifdef __linux__
+    // Pool::ensure pins the calling thread (worker 0) to core 0. A pinned Python/main
+    // thread then contends with pool worker 0 on that core during every torch op
+    // (attention included) for the rest of the process, so restore the entry affinity
+    // before returning; the pool re-pins on the next ensure either way.
+    cpu_set_t saved_set;
+    const bool have_aff =
+        pthread_getaffinity_np(pthread_self(), sizeof(saved_set), &saved_set) == 0;
+#endif
+    try
+    {
+        // Held across run(): the pool is not reentrant, same discipline as the MoE forward
+        std::lock_guard<std::mutex> lock(g_pool_mutex);
+        g_pool.ensure(n);
+        CpuPoolTilesCtx t{total, fn, ctx};
+        g_pool.run(&cpu_pool_tiles_fn, &t);
+    }
+    catch (...)
+    {
+        for (int64_t i = 0; i < total; ++i) fn(ctx, i, i + 1);
+    }
+#ifdef __linux__
+    if (have_aff)
+        pthread_setaffinity_np(pthread_self(), sizeof(saved_set), &saved_set);
+#endif
+}
+
+namespace {
 
 // -------------------------------------------------------------------------------------------
 //   Pool self-test hook (tests/test_moe_cpu_pool_.py)
@@ -1886,6 +1944,7 @@ void exl3_moe_cpu_stage_experts
 bool exl3_moe_cpu_has_avx2() { return g_isa != Isa::Scalar; }
 bool exl3_moe_cpu_has_avx512_vnni() { return g_isa >= Isa::Vnni; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }
+bool exl3_moe_cpu_has_avx512() { return g_isa >= Isa::Vnni; }
 
 static MoeCpuMatrix make_matrix
 (

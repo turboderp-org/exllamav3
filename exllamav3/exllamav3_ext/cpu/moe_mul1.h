@@ -120,3 +120,13 @@ int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);  
 bool exl3_moe_cpu_has_avx2();
 bool exl3_moe_cpu_has_avx512_vnni();
 bool exl3_moe_cpu_has_avx512_vbmi();
+// AVX512F+BW+VL (true for the Vnni/Vbmi tiers above): gates 512-bit kernels that need no
+// VNNI/VBMI integer instructions (reconstruct Hadamard/scale-store, vision GEMM fp32 path)
+bool exl3_moe_cpu_has_avx512();
+
+// Tile driver over the same persistent pool the MoE forward uses: exactly one process-wide
+// pool exists (defined in moe_mul1.cpp). Runs fn(ctx, begin, end) over [0, total) in 1-tile
+// chunks stolen via atomic fetch-add; returns when all tiles are done. Never throws: falls
+// back to an inline serial loop if the pool cannot run.
+typedef void (*CpuPoolTileFn)(void* ctx, int64_t begin, int64_t end);
+void cpu_pool_run_tiles(int64_t total, CpuPoolTileFn fn, void* ctx);

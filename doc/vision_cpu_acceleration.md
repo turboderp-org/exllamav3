@@ -239,7 +239,20 @@ Profiling helpers: `~/Documents/workspace/ML/stuff/{profile_vision_cpu.py,bench_
    effectively provided by torch's allocator here.
 7. **Optional knob:** expose weight residency dtype (fp32 default / bf16 fast) per component,
    with the §5 envelope documented, for RAM-constrained machines.
-
+8. **Native blocked fp32 GEMM (register-tiled, AVX-512 FMA):** RESOLVED 2026-09-10.
+   `exllamav3_ext/cpu/vision_gemm.cpp` owns the vision CPU path end to end: B stays in the
+   load-time panel-major repack (`repack_64`, 64-wide), the kernel runs 8x32 FMA blocks
+   (halves panel re-reads vs 4x64, which mattered once panels spill out of L3 between the
+   tower's back-to-back GEMMs), and half/bf16 A is widened to fp32 once per 256-row tile
+   by a vector pack (bit-exact; the pre-pack loop lost ~65% to scalar `half_to_float`,
+   520 vs 1515 GFLOP/s on M2000-K768-N768). Fused fp32 bias epilogue, fp32/half/bf16
+   outputs, AVX2 (4x16) + scalar fallbacks via `EXL3_VISION_GEMM_ISA`, torch/chunked
+   fallback inline on any dispatch failure. Two measured lessons: (a) pool dispatch must
+   not leak the worker-0 core pin onto the calling thread (`cpu_pool_run_tiles`
+   saves/restores affinity — the leak cost attention ~90 ms/pass); (b) micro-benchmarks
+   flatter L3-hot numbers, in-situ runs L3-cold — size the kernel for the cold case.
+   Single image: CPU wall 601 ms (profile leg 627 ms; GEMM 245 ms vs oneDNN 408 ms),
+   down from 692–774 ms; tower envelope intact (final rel_l2 6.3e-3, cosine 0.99998).
 ## 8. References (what we took from llama.cpp)
 
 Repo clone surveyed: `~/Documents/workspace/ML/exllama/llama.cpp`. We copied no code; the
