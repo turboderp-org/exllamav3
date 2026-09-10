@@ -701,6 +701,10 @@ class GatedMLP(Module):
     ) -> torch.Tensor:
         bsz, q_len, dim = x.shape
 
+        # CPU tensors (vision towers): native fused act*mul kernel, torch fallback off-path
+        if x.is_cpu:
+            return self.forward_cpu(x, params, out_dtype)
+
         if self.num_slices == 0:
             d = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
@@ -764,6 +768,84 @@ class GatedMLP(Module):
                 params["backend"].all_reduce(d)
 
         return to2(d, out_dtype, self.out_dtype)
+
+
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        # CPU mirror of the generic (unfused) forward branch: bc/multi_gu are always None on
+        # CPU (load_local guards device != cpu), so gate/up/down run through the Linear CPU
+        # path and only the activation needs a CPU entry point.
+        bsz, q_len, dim = x.shape
+
+        if self.num_slices == 0:
+            d = torch.zeros_like(x, dtype = self.out_dtype)
+            if self.tp_reduce:
+                params["backend"].all_reduce(d, False)
+        else:
+            qs = params.get("q_mlp_slice")
+            r = [qs] if qs is not None else range(0, self.num_slices)
+            d = None
+
+            for s in r:
+                g = self.gates[s].forward(x, params)
+                u = self.ups[s].forward(x, params)
+                a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                if not self._act_mul_cpu(g, u, a):
+                    self._act_torch(g, u, a)
+                d_ = self.downs[s].forward(a, params)
+
+                if d is None: d = d_
+                else: d += d_
+                del d_
+
+            if self.tp_reduce:
+                params["backend"].all_reduce(d)
+
+        return to2(d, out_dtype, self.out_dtype)
+
+
+    def _act_mul_cpu(self, g: torch.Tensor, u: torch.Tensor, a: torch.Tensor) -> bool:
+        """Native fused act*mul; False when unsupported (caller falls back to torch)."""
+        if self.activation_fn == "silu": fn = ext.silu_mul_cpu
+        elif self.activation_fn == "gelu": fn = ext.gelu_mul_cpu
+        elif self.activation_fn == "relu2": fn = ext.relu2_mul_cpu
+        else:
+            raise ValueError(f"GatedMLP: unsupported activation_fn on CPU: {self.activation_fn}")
+        if not (g.is_cpu and u.is_cpu and a.is_cpu):
+            return False
+        if not (g.is_contiguous() and u.is_contiguous() and a.is_contiguous()):
+            return False
+        if not (g.is_floating_point() and u.is_floating_point() and a.is_floating_point()):
+            return False
+        try:
+            fn(g, u, a, self.act_limit)
+        except Exception:
+            return False
+        return True
+
+
+    def _act_torch(self, g: torch.Tensor, u: torch.Tensor, a: torch.Tensor):
+        # Reference under the native kernel: fp32, CUDA clamp order (u symmetric, activated
+        # gate from above only), single round into a. Writes via a fresh tensor + copy_: a
+        # may alias g or u (interm_dtype == half passes a is u).
+        gf, uf = g.float(), u.float()
+        if self.activation_fn == "silu":
+            s = gf * torch.sigmoid(gf)
+        elif self.activation_fn == "gelu":
+            s = F.gelu(gf, approximate = "tanh")
+        elif self.activation_fn == "relu2":
+            s = torch.square(F.relu(gf))
+        else:
+            raise ValueError(f"GatedMLP: unsupported activation_fn on CPU: {self.activation_fn}")
+        L = self.act_limit
+        if L:
+            uf = uf.clamp(-L, L)
+            s = torch.minimum(s, torch.full_like(s, L))
+        a.copy_((s * uf).to(a.dtype))
 
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:

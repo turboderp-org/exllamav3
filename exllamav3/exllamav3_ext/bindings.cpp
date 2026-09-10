@@ -28,6 +28,7 @@
 #include "cpu/reconstruct.h"
 #include "cpu/moe_handoff.h"
 #include "cpu/vision_gemm.h"
+#include "cpu/act_mul_cpu.h"
 #include "cpu/rms_norm_cpu.h"
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
@@ -184,6 +185,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gelu_mul", &gelu_mul, "gelu_mul");
     m.def("relu2_mul", &relu2_mul, "relu2_mul");
     m.def("relu_mul", &relu_mul, "relu_mul");
+    m.def("silu_mul_cpu", &silu_mul_cpu, "silu_mul_cpu", py::call_guard<py::gil_scoped_release>());
+    m.def("gelu_mul_cpu", &gelu_mul_cpu, "gelu_mul_cpu", py::call_guard<py::gil_scoped_release>());
+    m.def("relu2_mul_cpu", &relu2_mul_cpu, "relu2_mul_cpu", py::call_guard<py::gil_scoped_release>());
     m.def("xielu", &xielu, "xielu");
     m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
     m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
