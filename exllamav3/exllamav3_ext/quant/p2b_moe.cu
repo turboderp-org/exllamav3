@@ -15,6 +15,7 @@
 #include <cuda_fp16.h>
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cooperative_groups.h>
 
 #include "../util.h"
@@ -213,6 +214,10 @@ void p2b_moe_batched_kernel(
     int m,
     int hidden,
     int inter,
+    // Diagnostic: run only the first N of the four grid-synchronised phases and return the
+    // intermediates, so a parity failure can be bisected to a phase instead of a tile. 4 (the
+    // default at every production call site) runs the whole kernel; reachable from Python only
+    // through p2b_stage_debug. Finding the codebook dispatch fault took this.
     int stop_after)
 {
     auto grid = cg::this_grid();
@@ -245,6 +250,7 @@ void p2b_moe_batched_kernel(
         for (; this_warp < total_warps; this_warp += grid_warps) {
             int s = this_warp / warps_per_exp;
             int w = this_warp % warps_per_exp;
+            if (__half2float(rw[s]) == 0.0f) continue;
             int src = ids[s];
             int row = rows[s];
             const half* gu_e = reinterpret_cast<const half*>(gu_ptrs[src]);
@@ -267,6 +273,7 @@ void p2b_moe_batched_kernel(
             int rem = item >> 1;
             int s = rem / num_groups_gate;
             int group = rem % num_groups_gate;
+            if (__half2float(rw[s]) == 0.0f) continue;
             int src = ids[s];
 
             const uint32_t* B32 = reinterpret_cast<const uint32_t*>(is_up ? ut_ptrs[src] : gt_ptrs[src]);
@@ -289,6 +296,7 @@ void p2b_moe_batched_kernel(
         for (; this_warp < total_warps; this_warp += grid_warps) {
             int s = this_warp / warps_per_exp;
             int w = this_warp % warps_per_exp;
+            if (__half2float(rw[s]) == 0.0f) continue;
             int src = ids[s];
             const half* gv_e = reinterpret_cast<const half*>(gv_ptrs[src]);
             const half* uv_e = reinterpret_cast<const half*>(uv_ptrs[src]);
@@ -305,6 +313,7 @@ void p2b_moe_batched_kernel(
     {
         int total_elements = slots * inter;
         for (int j = tid; j < total_elements; j += total_threads) {
+            if (__half2float(rw[j / inter]) == 0.0f) continue;
             float g = __half2float(gate[j]);
             float u = __half2float(up[j]);
             float s = g / (1.0f + expf(-g));
@@ -320,6 +329,7 @@ void p2b_moe_batched_kernel(
         for (; this_warp < total_warps; this_warp += grid_warps) {
             int s = this_warp / warps_per_exp;
             int w = this_warp % warps_per_exp;
+            if (__half2float(rw[s]) == 0.0f) continue;
             int src = ids[s];
             const half* du_e = reinterpret_cast<const half*>(du_ptrs[src]);
             half* hd_e = had_down + (size_t) s * inter;
@@ -336,6 +346,7 @@ void p2b_moe_batched_kernel(
         for (int item = blockIdx.x; item < total_work; item += gridDim.x) {
             int s = item / num_groups_down;
             int group = item % num_groups_down;
+            if (__half2float(rw[s]) == 0.0f) continue;
             int src = ids[s];
 
             const uint32_t* B32 = reinterpret_cast<const uint32_t*>(dt_ptrs[src]);
@@ -358,6 +369,7 @@ void p2b_moe_batched_kernel(
         for (; this_warp < total_warps; this_warp += grid_warps) {
             int s = this_warp / warps_per_exp;
             int w = this_warp % warps_per_exp;
+            if (__half2float(rw[s]) == 0.0f) continue;
             int src = ids[s];
             const half* dv_e = reinterpret_cast<const half*>(dv_ptrs[src]);
             half* dp_e = down + (size_t) s * hidden;
@@ -372,15 +384,16 @@ void p2b_moe_batched_kernel(
             int s = j / hidden;
             int col = j % hidden;
             float w = __half2float(rw[s]);
-            atomicAdd(accum + (size_t) rows[s] * hidden + col, w * __half2float(down[j]));
+            if (w != 0.0f)
+                atomicAdd(accum + (size_t) rows[s] * hidden + col, w * __half2float(down[j]));
         }
         grid.sync();
     }
 
-    // Write back to out
+    // Write back to out (fp32; the accumulator is returned directly)
     if (stop_after >= 4)
     for (int j = tid; j < m * hidden; j += total_threads) {
-        out[j] = __float2half(accum[j]);
+        ((float* __restrict__) out)[j] = accum[j];
     }
 }
 
@@ -420,7 +433,7 @@ static void launch_moe_batched(
     half* gp = reinterpret_cast<half*>(gate.data_ptr<c10::Half>());
     half* up_p = reinterpret_cast<half*>(up.data_ptr<c10::Half>());
     half* dp = reinterpret_cast<half*>(down.data_ptr<c10::Half>());
-    half* op = reinterpret_cast<half*>(out.data_ptr<c10::Half>());
+    float* op = out.data_ptr<float>();  // fp32 accumulator returned directly
     half* hg_p = reinterpret_cast<half*>(had_gate.data_ptr<c10::Half>());
     half* hu_p = reinterpret_cast<half*>(had_up.data_ptr<c10::Half>());
     half* hd_p = reinterpret_cast<half*>(had_down.data_ptr<c10::Half>());
@@ -447,10 +460,13 @@ at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
     const at::Tensor& dt, const at::Tensor& du, const at::Tensor& dv,
     const at::Tensor& ids, const at::Tensor& rows, const at::Tensor& rw,
     int64_t kg, int64_t ku, int64_t kd, bool mcg, bool mul1,
-    int64_t hidden, int64_t inter)
+    int64_t hidden, int64_t inter,
+    at::Tensor& gate, at::Tensor& up, at::Tensor& down,
+    at::Tensor& had_gate, at::Tensor& had_up, at::Tensor& had_down,
+    at::Tensor& accum)
 {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf, "p2b fused MoE requires CUDA fp16 input");
-    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kHalf, "p2b fused MoE output must be CUDA fp16");
+    TORCH_CHECK(out.is_cuda(), "p2b fused MoE output must be CUDA");  // dtype checked fp32 below
     TORCH_CHECK(kg == ku && ku == kd && (kg == 2 || kg == 3 || kg == 4), "unsupported fused MoE K");
     TORCH_CHECK(!(mcg && mul1), "specified both mcg and mul1");
     // Codebook select, mirroring exl3_gemv.cu: 0 = default (neither flag), 1 = MCG, 2 = mul1
@@ -459,13 +475,11 @@ at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
     const int slots = static_cast<int>(ids.numel());
     const int m = static_cast<int>(x.numel() / x.size(-1));
 
-    auto gate = at::empty({slots, inter}, x.options());
-    auto up = at::empty({slots, inter}, x.options());
-    auto down = at::empty({slots, hidden}, x.options());
-    auto had_gate = at::empty({slots, hidden}, x.options());
-    auto had_up = at::empty({slots, hidden}, x.options());
-    auto had_down = at::empty({slots, inter}, x.options());
-    auto accum = at::zeros({m, hidden}, x.options().dtype(at::kFloat));
+    TORCH_CHECK(out.scalar_type() == at::kFloat, "p2b out must be fp32");
+    TORCH_CHECK(gate.size(0) >= slots && up.size(0) >= slots && down.size(0) >= slots &&
+                had_gate.size(0) >= slots && had_up.size(0) >= slots && had_down.size(0) >= slots,
+                "p2b scratch too small for slot count");
+    TORCH_CHECK(accum.size(0) >= m && accum.size(1) >= hidden, "p2b accum too small");
 
     #define P2B_DISPATCH(BITS, CB) launch_moe_batched<BITS, CB>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rows, rw, out, gate, up, down, had_gate, had_up, had_down, accum, slots, m, hidden, inter)
     #define P2B_SWITCH_CB(BITS) \
@@ -517,4 +531,46 @@ std::vector<at::Tensor> p2b_stage_debug_cuda(const at::Tensor& x,
     #undef P2B_DBG_CB
     #undef P2B_DBG
     return {had_gate, had_up, gate, up, had_down, down, out};
+}
+
+
+// Map global expert picks to local ids in one launch: out-of-range slots clamp to expert 0
+// with zero weight, in-range slots keep their weight. Replaces ~9 elementwise launches + 2
+// copies per layer in the Python caller.
+__global__ void p2b_map_slots_kernel(
+    const int64_t* __restrict__ sel,
+    const __half* __restrict__ rw,
+    int32_t* __restrict__ ids_out,
+    __half* __restrict__ rw_out,
+    int n,
+    int64_t first,
+    int64_t E)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int64_t l = sel[i] - first;
+    bool ok = (l >= 0) && (l < E);
+    ids_out[i] = ok ? (int32_t) l : 0;
+    rw_out[i] = ok ? rw[i] : __float2half(0.0f);
+}
+
+void p2b_map_slots(
+    const at::Tensor& sel,
+    const at::Tensor& rw,
+    at::Tensor& ids_out,
+    at::Tensor& rw_out,
+    int64_t first,
+    int64_t E)
+{
+    const int n = (int) sel.numel();
+    const at::cuda::OptionalCUDAGuard device_guard(sel.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(sel.scalar_type() == at::kLong && rw.scalar_type() == at::kHalf, "p2b_map_slots dtype");
+    p2b_map_slots_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+        sel.data_ptr<int64_t>(),
+        (const __half*) rw.data_ptr<c10::Half>(),
+        ids_out.data_ptr<int32_t>(),
+        (__half*) rw_out.data_ptr<c10::Half>(),
+        n, first, E);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

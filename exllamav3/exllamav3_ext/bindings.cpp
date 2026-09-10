@@ -148,6 +148,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("p2b_fused_moe", &p2b_fused_moe_cuda, "p2b_fused_moe",
           py::call_guard<py::gil_scoped_release>());
+    m.def("p2b_map_slots", &p2b_map_slots, "p2b_map_slots",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("p2b_stage_debug", &p2b_stage_debug_cuda,
+          "p2b_stage_debug: run the p2b MoE kernel to phase N and return the staged "
+          "intermediates (diagnostic; not used at inference)",
+          py::call_guard<py::gil_scoped_release>());
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
