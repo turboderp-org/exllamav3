@@ -19,6 +19,7 @@ from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
+from .glm4_moe_lite import Glm4MoeLiteModel
 from .glm_moe_dsa import GlmMoeDsaModel
 from .glm5_next import Glm5NextModel
 from .gpt_oss import GptOssModel
@@ -86,6 +87,7 @@ ARCHITECTURES = {
         Glm4MoeModel,
         Glm4VModel,
         Glm4VMoeModel,
+        Glm4MoeLiteModel,
         GlmMoeDsaModel,
         Glm5NextModel,
         GptOssModel,
