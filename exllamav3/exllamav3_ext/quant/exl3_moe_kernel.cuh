@@ -32,7 +32,9 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     // Prefill row tile for this N shape. M=64 (4 m16 fragments) was measured slower: the extra
     // fragment registers spill and small experts waste whole fragments. M=32 is the measured
     // sweet spot (2 fragments per dequantized B tile) and fits the smem budget at every N/K.
-    constexpr int MOE_M_TILE = MOE_TILESIZE_M;
+    // N=128 fits an M=64 tile (4 m16 fragments sharing each dequantized B tile) with
+    // single-buffered A; N=256's reduction scratch does not, so it keeps M=32.
+    constexpr int MOE_M_TILE = (MOE_TILESIZE_N == 128) ? 64 : MOE_TILESIZE_M;
 
     // Buffers for group
     temp_state_g += group_idx * max_tokens_per_expert * hidden_dim;

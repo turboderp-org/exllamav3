@@ -10,7 +10,7 @@
 #define MOE_SMS_PER_EXPERT 8       // default/minimum group width, also sets max concurrency (buffer count)
 #define MOE_MAX_SMS_PER_EXPERT 32  // widest expert group when few experts are active
 #define MOE_TILESIZE_K 32
-#define MOE_TILESIZE_M 32          // prefill row tile: 2 m16 fragments share each dequantized B tile
+#define MOE_TILESIZE_M 32          // N=256 row tile; N=128 uses 64 (see MOE_M_TILE)
 #define MOE_SH_STAGES 3
 #define MOE_FRAG_STAGES 3
 

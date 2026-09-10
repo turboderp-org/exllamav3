@@ -930,7 +930,7 @@ void exl3_gemm_kernel_inner_mt
     half* gl_c_ptr_16 = ((half*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
     float* gl_c_ptr_32 = ((float*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
 
-    register FragA frag_a[FRAG_STAGES][TILEBLOCKS_M];
+    register FragA frag_a[TILEBLOCKS_M];   // single-buffered: A is cheap from shared, B is prefetched
     register FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
     register FragC frag_c[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #if EXL3_GEMM_H_ACC
@@ -1010,7 +1010,7 @@ void exl3_gemm_kernel_inner_mt
             {
                 int R = r + m * 16;
                 int c_swizzled = base_c ^ ((R >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
-                ldsm4(frag_a[buf][m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
+                ldsm4(frag_a[m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
             }
         }
 
@@ -1606,9 +1606,9 @@ void exl3_gemm_kernel_inner_mt
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             {
                 #if EXL3_GEMM_H_ACC
-                    ptx_mma_m16n8k16(frag_a[buf][0], frag_b[buf][n], frag_c_h[0][n]);
+                    ptx_mma_m16n8k16(frag_a[0], frag_b[buf][n], frag_c_h[0][n]);
                 #else
-                    ptx_mma_m16n8k16(frag_a[buf][0], frag_b[buf][n], frag_c[0][n]);
+                    ptx_mma_m16n8k16(frag_a[0], frag_b[buf][n], frag_c[0][n]);
                 #endif
             }
         }
@@ -1620,9 +1620,9 @@ void exl3_gemm_kernel_inner_mt
                 for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
                     #if EXL3_GEMM_H_ACC
-                        ptx_mma_m16n8k16(frag_a[buf][m], frag_b[buf][n], frag_c_h[m][n]);
+                        ptx_mma_m16n8k16(frag_a[m], frag_b[buf][n], frag_c_h[m][n]);
                     #else
-                        ptx_mma_m16n8k16(frag_a[buf][m], frag_b[buf][n], frag_c[m][n]);
+                        ptx_mma_m16n8k16(frag_a[m], frag_b[buf][n], frag_c[m][n]);
                     #endif
                 }
         }
