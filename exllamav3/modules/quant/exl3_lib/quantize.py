@@ -424,7 +424,7 @@ def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool, debug_in
     # Cholesky factorization: H = L @ L.T
     # Try on GPU first
     num_cholesky_retries = 0
-    retry_cpu = False
+    cpu_fallback = None
     while True:
         try:
             L = torch.linalg.cholesky(H)
@@ -449,16 +449,21 @@ def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool, debug_in
             H.diagonal().add_(2.0 * quant_args.get("sigma_reg", 0.025) * H.diagonal().mean())
             continue
 
-        # Fall back on CPU factorization
+        # Fall back on CPU factorization if the GPU is out of memory, or if the CUDA solver rejects the call
+        # outright: cuSOLVER returns "Invalid argument" for every Cholesky on some torch/CUDA builds (seen with
+        # torch 2.10+cu128), including well-conditioned SPD matrices
         except Exception as e:
             if e.__class__.__name__ == "OutOfMemoryError" or "CUDA out of memory" in str(e) or "HIP out of memory" in str(e):
-                retry_cpu = True
+                cpu_fallback = "out of memory"
+                break
+            elif "Invalid argument" in str(e):
+                cpu_fallback = "invalid argument"
                 break
             else:
                 raise e
 
-    if retry_cpu:
-        print(f" !! Out of memory on {str(H.device)}, trying CPU fallback")
+    if cpu_fallback:
+        print(f" !! Cholesky decomp. failed on {str(H.device)} ({cpu_fallback}), trying CPU fallback")
         free_mem()
         H_cpu = H.cpu()
         L_cpu = torch.linalg.cholesky(H_cpu)
@@ -474,8 +479,14 @@ def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool, debug_in
     # Compute D as D[i] = DL[i] @ DL[i].T for each diagonal block i (don't actually end up needing this)
     # D = DL @ DL.transpose(1, 2)
 
-    # Invert each diagonal block
-    DL = torch.linalg.inv(DL)
+    # Invert each diagonal block, with the same CPU fallback if the CUDA solver rejects the call
+    try:
+        DL = torch.linalg.inv(DL)
+    except RuntimeError as e:
+        if "Invalid argument" not in str(e):
+            raise e
+        print(f" !! Block inverse failed on {str(DL.device)} (invalid argument), trying CPU fallback")
+        DL = torch.linalg.inv(DL.cpu()).to(DL.device)
 
     # Multiply each block's column with its inverse
     L = L.view(n, m, b)
