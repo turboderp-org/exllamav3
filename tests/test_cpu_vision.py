@@ -187,13 +187,33 @@ def test_attn_dispatch_cpu_nocache():
     assert rel_err(o, ref) < 2e-3
 
 
-def test_attn_dispatch_cpu_unsupported_raises():
+def test_attn_dispatch_cpu_swa_supported():
+    # G5 ceiling: SWA now runs the fused native kernel (restricted KV range, no N^2
+    # temp) and must match a windowed SDPA reference.
     bsz, heads, seq, dim = 1, 4, 32, 32
     q = torch.randn(bsz, seq, heads, dim).half()
     k = torch.randn_like(q)
     v = torch.randn_like(q)
+    o = attn_dispatch(q = q, k = k, v = v, causal = True, window_size = 8)
+    qt, kt, vt = q.transpose(1, 2).float(), k.transpose(1, 2).float(), v.transpose(1, 2).float()
+    idx = torch.arange(seq)
+    m = (idx[None, :] <= idx[:, None]) & (idx[None, :] >= idx[:, None] - 8)
+    add = torch.zeros(seq, seq).masked_fill(~m, float("-inf"))
+    ref = torch.nn.functional.scaled_dot_product_attention(qt, kt, vt, attn_mask = add, is_causal = False).transpose(1, 2).half()
+    assert o.shape == ref.shape
+    assert rel_err(o, ref) < 3e-3
+
+
+def test_attn_dispatch_cpu_unsupported_raises():
+    # varlen + spans never co-occur (vision vs text paths); still declined.
+    bsz, heads, seq, dim = 1, 4, 32, 32
+    q = torch.randn(bsz, seq, heads, dim).half()
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    cu = torch.tensor([0, 16, 32], dtype = torch.int32)
     with pytest.raises(ValueError):
-        attn_dispatch(q = q, k = k, v = v, causal = False, window_size = 8)
+        attn_dispatch(q = q, k = k, v = v, causal = False, cu_seqlens = cu, max_seqlen = 16,
+                      non_causal_spans = [(0, 16, True, 0), (16, 32, False, 0)])
 
 
 # ------------------------------------------------------------------------------------------------

@@ -3,6 +3,82 @@ from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
 from torch.nn.attention.bias import causal_lower_right
 import torch.nn.functional as F
 
+
+def _attn_cpu_native_single(
+    q, k, v,
+    sm_scale, causal, window_left, window_right, softcap, sinks, cu_seqlens, q_start,
+):
+    from ...ext import exllamav3_ext as ext
+    fn = getattr(ext, "attn_cpu", None)
+    if fn is None:
+        raise RuntimeError("attn_cpu native kernel unavailable")
+    # Speed: fp16/bf16 QK dots would pay per-dot cvtph/shift conversion (K rows are
+    # reloaded L times). One upfront upcast to fp32 makes the hot loops pure f32
+    # (like the torch fallback's fp16->fp32 path); cost is O(N*D) vs O(N^2*D).
+    if q.dtype != torch.float32:
+        qc = q.to(torch.float32, copy = True)
+        kc = k.to(torch.float32, copy = True)
+        vc = v.to(torch.float32, copy = True)
+        qc = qc.contiguous() if not qc.is_contiguous() else qc
+        kc = kc.contiguous() if not kc.is_contiguous() else kc
+        vc = vc.contiguous() if not vc.is_contiguous() else vc
+    else:
+        qc = q.contiguous() if q.is_contiguous() else q.contiguous()
+        kc = k.contiguous() if k.is_contiguous() else k.contiguous()
+        vc = v.contiguous() if v.is_contiguous() else v.contiguous()
+    o = torch.empty(q.shape, dtype = q.dtype, device = q.device)
+    sinks_c = None
+    if sinks is not None:
+        sinks_c = sinks.float().contiguous() if sinks.dtype != torch.float32 or not sinks.is_contiguous() else sinks
+    cu_c = None
+    if cu_seqlens is not None:
+        cu_c = cu_seqlens.contiguous() if cu_seqlens.is_contiguous() else cu_seqlens.contiguous()
+        if cu_c.device.type != "cpu":
+            cu_c = cu_c.cpu()
+    fn(qc, kc, vc, o, float(sm_scale), bool(causal),
+       int(window_left), int(window_right), float(softcap or 0.0),
+       sinks_c, cu_c, int(q_start))
+    return o
+
+
+def _attn_cpu_nocache(args: AttnArgs) -> torch.Tensor | None:
+    # Full CPU ceiling: dense + varlen (bsz1 or shared bsz>1) + SWA + softcap + sinks +
+    # non-causal spans (prefix attention per span). Returns None only when the call is
+    # cached (CPU never takes the paged path) or varlen+spans co-occur (never hit).
+    if args.has_kv_cache():
+        return None
+    if args.is_varlen() and args.non_causal_spans:
+        return None
+    try:
+        if args.non_causal_spans:
+            outs = []
+            for span in args.non_causal_spans:
+                a, b, nc = span[:3]
+                pre = span[3] if len(span) > 3 else 0
+                l = b - a
+                if args.window_size is not None and args.window_size > 0 and nc:
+                    wl_span = max(args.window_size, l + pre)
+                    wr_span = l - 1
+                else:
+                    wl_span, wr_span = args.get_window_size()
+                q_span = args.q[:, a:b]
+                k_pre = args.k[:, :b]
+                v_pre = args.v[:, :b]
+                outs.append(_attn_cpu_native_single(
+                    q_span, k_pre, v_pre,
+                    args.sm_scale, not nc, wl_span, wr_span,
+                    args.softcap, args.sinks, None, a,
+                ))
+            return torch.cat(outs, dim = 1)
+        wl, wr = args.get_window_size()
+        return _attn_cpu_native_single(
+            args.q, args.k, args.v,
+            args.sm_scale, args.causal, wl, wr,
+            args.softcap, args.sinks, args.cu_seqlens, 0,
+        )
+    except Exception:
+        return None
+
 has_warned_sdpa_fallback = False
 def _warn_sdpa_fallback():
     global has_warned_sdpa_fallback
@@ -19,8 +95,33 @@ def _warn_sdpa_fallback():
 
 
 def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
-    if (
-        args.has_kv_cache() or
+    if args.has_kv_cache():
+        return None
+
+    # CPU routing for speed. NOTE: the fused native kernel (attn_cpu) is SLOWER
+    # than torch CPU SDPA on simple shapes, so simple stays on torch:
+    # Ryzen 9700X / 8 threads, fp16, median ms —
+    #   dense-1k: torch 6.37 vs AVX 19.79 vs scalar 53.59;
+    #   dense-4k: torch 93.64 vs AVX 680.22 vs scalar 1393.09;
+    #   varlen 32x64: torch-batched 0.78 vs AVX 1.98 vs scalar 5.28.
+    # Torch lowers to oneDNN/MKL blocked GEMM (~500-700 GFLOPS); per-dot streaming
+    # in attn_cpu reaches only ~100-160 GFLOPS (AVX still 2-3x scalar).
+    # Ceiling shapes (SWA/windowed, bsz>1-varlen, softcap, sinks, spans) have no
+    # torch fast path (manual masks materialize N^2 or OOM); native is primary
+    # there (restricted KV ranges, no N^2 temp). Example: SWA L=4096,w=128 native
+    # 8.7ms vs dense-full torch 25.2ms. CUDA for reference (RTX 3090, torch SDPA
+    # fp16): 1k 0.10ms / 4k 1.28ms, ~150-500x the AVX times.
+    if args.q.is_cpu:
+        needs_native = (
+            args.is_swa() or
+            args.is_varlen() and args.q.shape[0] != 1 or
+            args.softcap != 0.0 or
+            args.sinks is not None or
+            args.non_causal_spans
+        )
+        if needs_native:
+            return _attn_cpu_nocache(args)
+    elif (
         args.is_swa() or
         args.is_varlen() and args.q.shape[0] != 1 or
         args.softcap != 0.0 or

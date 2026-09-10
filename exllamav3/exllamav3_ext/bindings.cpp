@@ -31,6 +31,7 @@
 #include "cpu/act_mul_cpu.h"
 #include "cpu/rms_norm_cpu.h"
 #include "cpu/rope_cpu.h"
+#include "cpu/attn_cpu.h"
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -195,6 +196,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("position_ids"), py::arg("rope_style"), py::arg("attn_factor"),
         py::arg("rotate_dims"), py::arg("q_norm"), py::arg("k_norm"),
         py::arg("norm_eps"), py::arg("norm_constant_bias"), py::call_guard<py::gil_scoped_release>());
+    m.def("attn_cpu", &attn_cpu, "attn_cpu",
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("o"),
+        py::arg("sm_scale"), py::arg("causal"),
+        py::arg("window_left"), py::arg("window_right"), py::arg("softcap"),
+        py::arg("sinks"), py::arg("cu_seqlens"), py::arg("q_start"),
+        py::call_guard<py::gil_scoped_release>());
     m.def("xielu", &xielu, "xielu");
     m.def("add_sigmoid_gate", &add_sigmoid_gate, "add_sigmoid_gate");
     m.def("mul_sigmoid_", &mul_sigmoid_, "mul_sigmoid_");
