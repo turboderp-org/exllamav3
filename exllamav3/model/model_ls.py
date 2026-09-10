@@ -15,6 +15,44 @@ from .config import Config
 from abc import ABC, abstractmethod
 
 
+
+class _LSDeviceContext:
+    """
+    Keeps the process-wide CUDA current device on the module's device across a layer-split module
+    loop. Nothing else sets it: prepare_for_device moves the tensor, and stock ext host wrappers
+    self-guard on the tensor's device, so stock code is correct only because every entry point
+    remembers to. An unguarded eager launch (extension code, a capture helper, a new kernel) then
+    runs on cuda:0 against foreign tensors -- silently over P2P on peer pairs, an illegal access
+    on non-peer pairs that surfaces at whatever kernel checks errors next.
+
+    Modules are device-contiguous, so this costs one exchange per device transition plus one
+    restore. It uses the _exchange_device / _maybe_exchange_device pair that torch.cuda.device
+    itself uses: the restore never creates a context on a device that had none, so a process whose
+    model skips cuda:0 (e.g. -gs 0,24,24) does not gain a ~500 MB context there on the way out,
+    which torch.cuda.set_device(0) would.
+    """
+    __slots__ = ("prev", "cur")
+
+    def __init__(self):
+        self.prev = -1
+        self.cur = -1
+
+    def enter(self, device):
+        if device is None or getattr(device, "type", None) != "cuda":
+            return
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        if idx == self.cur:
+            return
+        prev = torch.cuda._exchange_device(idx)
+        if self.cur == -1:
+            self.prev = prev
+        self.cur = idx
+
+    def restore(self):
+        if self.cur != -1:
+            torch.cuda._maybe_exchange_device(self.prev)
+            self.cur = -1
+
 class Model_LSMixin(ABC):
 
     def __init__(self):
@@ -279,14 +317,19 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
-        for module, instance, idx in self.fwd_modules:
-            params["layer_instance"] = instance
-            pf = (idx, instance) == self.last_kv_module_idx_instance
-            params["prefill"] = pf
-            x = module.prepare_for_device(x, params)
-            x = module.forward(x, params)
-            if pf:
-                break
+        ctx = _LSDeviceContext()
+        try:
+            for module, instance, idx in self.fwd_modules:
+                params["layer_instance"] = instance
+                pf = (idx, instance) == self.last_kv_module_idx_instance
+                params["prefill"] = pf
+                ctx.enter(module.device)
+                x = module.prepare_for_device(x, params)
+                x = module.forward(x, params)
+                if pf:
+                    break
+        finally:
+            ctx.restore()
         del params["prefill"]
         return None
 
@@ -298,11 +341,16 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
-        for module, instance, idx in self.fwd_modules:
-            params["layer_instance"] = instance
-            if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
-                x = x[..., -num:, :].contiguous()
-            x = module.prepare_for_device(x, params)
-            x = module.forward(x, params)
+        ctx = _LSDeviceContext()
+        try:
+            for module, instance, idx in self.fwd_modules:
+                params["layer_instance"] = instance
+                if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
+                    x = x[..., -num:, :].contiguous()
+                ctx.enter(module.device)
+                x = module.prepare_for_device(x, params)
+                x = module.forward(x, params)
+        finally:
+            ctx.restore()
         return x
 
