@@ -29,6 +29,11 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     const int warps_per_block = block_threads / 32;
     const int warp_idx0 = block_idx * warps_per_block + warp_id;
 
+    // Prefill row tile for this N shape. M=64 (4 m16 fragments) was measured slower: the extra
+    // fragment registers spill and small experts waste whole fragments. M=32 is the measured
+    // sweet spot (2 fragments per dequantized B tile) and fits the smem budget at every N/K.
+    constexpr int MOE_M_TILE = MOE_TILESIZE_M;
+
     // Buffers for group
     temp_state_g += group_idx * max_tokens_per_expert * hidden_dim;
     temp_state_u += group_idx * max_tokens_per_expert * hidden_dim;
@@ -123,36 +128,36 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     in_addr,            \
                     trellis,            \
                     out_addr,           \
-                    MIN(size_m, 16),    \
+                    MIN(size_m, MOE_M_TILE), \
                     hidden_dim,         \
                     intermediate_dim,   \
                     locks,              \
                     nullptr
                 #define SHAPE_ARGS      \
-                    MOE_TILESIZE_M,     \
+                    MOE_M_TILE,         \
                     MOE_TILESIZE_K,     \
                     MOE_TILESIZE_N,     \
                     MOE_SH_STAGES,      \
                     MOE_FRAG_STAGES
                 if constexpr (t_bits)
-                    exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
+                    exl3_gemm_kernel_inner_mt<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
                 else switch(K)
                 {
-                    case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 1: exl3_gemm_kernel_inner_mt<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 2: exl3_gemm_kernel_inner_mt<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 3: exl3_gemm_kernel_inner_mt<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 4: exl3_gemm_kernel_inner_mt<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 5: exl3_gemm_kernel_inner_mt<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 6: exl3_gemm_kernel_inner_mt<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 7: exl3_gemm_kernel_inner_mt<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 8: exl3_gemm_kernel_inner_mt<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
                 };
                 #undef ARGS
                 #undef SHAPE_ARGS
 
-                in_addr += 16 * hidden_dim;
-                out_addr += 16 * intermediate_dim;
-                size_m -= 16;
+                in_addr += MOE_M_TILE * hidden_dim;
+                out_addr += MOE_M_TILE * intermediate_dim;
+                size_m -= MOE_M_TILE;
             }
         };
 
@@ -197,36 +202,36 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     in_addr,            \
                     trellis,            \
                     out_addr,           \
-                    MIN(size_m, 16),    \
+                    MIN(size_m, MOE_M_TILE), \
                     intermediate_dim,   \
                     hidden_dim,         \
                     locks,              \
                     nullptr
                 #define SHAPE_ARGS      \
-                    MOE_TILESIZE_M,     \
+                    MOE_M_TILE,         \
                     MOE_TILESIZE_K,     \
                     MOE_TILESIZE_N,     \
                     MOE_SH_STAGES,      \
                     MOE_FRAG_STAGES
                 if constexpr (t_bits)
-                    exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
+                    exl3_gemm_kernel_inner_mt<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
                 else switch(K)
                 {
-                    case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 1: exl3_gemm_kernel_inner_mt<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 2: exl3_gemm_kernel_inner_mt<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 3: exl3_gemm_kernel_inner_mt<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 4: exl3_gemm_kernel_inner_mt<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 5: exl3_gemm_kernel_inner_mt<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 6: exl3_gemm_kernel_inner_mt<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 7: exl3_gemm_kernel_inner_mt<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 8: exl3_gemm_kernel_inner_mt<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
                 };
                 #undef ARGS
                 #undef SHAPE_ARGS
 
-                in_addr += 16 * intermediate_dim;
-                out_addr += 16 * hidden_dim;
-                size_m -= 16;
+                in_addr += MOE_M_TILE * intermediate_dim;
+                out_addr += MOE_M_TILE * hidden_dim;
+                size_m -= MOE_M_TILE;
             }
         };
 
