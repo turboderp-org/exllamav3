@@ -52,7 +52,12 @@ int exl3_mgemm_gr
     Graph* graph,
     int num_tokens = 1,
     const c10::optional<at::Tensor>& size_n_list = {},
-    const c10::optional<at::Tensor>& c_ptrs = {}
+    const c10::optional<at::Tensor>& c_ptrs = {},
+    // Sliced mode (see exl3_mgemm_gr): per-entry full row width of the slice's matrix, per-entry
+    // source matrix index (suh and A_had are then per source), and the number of sources
+    const c10::optional<at::Tensor>& n_stride_list = {},
+    const c10::optional<at::Tensor>& had_src_list = {},
+    int num_had_src = 0
 );
 
 int exl3_mgemm
@@ -74,5 +79,8 @@ int exl3_mgemm
     int force_num_sms,
     int num_tokens = 1,
     const c10::optional<at::Tensor>& size_n_list = {},
-    const c10::optional<at::Tensor>& c_ptrs = {}
+    const c10::optional<at::Tensor>& c_ptrs = {},
+    const c10::optional<at::Tensor>& n_stride_list = {},
+    const c10::optional<at::Tensor>& had_src_list = {},
+    int num_had_src = 0
 );

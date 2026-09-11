@@ -19,6 +19,7 @@ on:
           - windows
           - windows_smoke
           - cu132
+          - torch_212_213
           - sdist
 
 permissions:
@@ -47,7 +48,10 @@ jobs:
 
           oses = ["ubuntu-22.04", "windows-2022"]
           pyvers = ["3.10", "3.11", "3.12", "3.13.3", "3.14"]
-          torches = ["2.7.0", "2.8.0", "2.9.0", "2.10.0", "2.11.0"]
+          # Torch 2.12+ ships no cu128 wheels (only cu126/cu130/cu132), so those versions are
+          # built against CUDA 13.2 below
+          torches = ["2.8.0", "2.9.0", "2.10.0", "2.11.0"]
+          torches_cu13 = ["2.12.0", "2.13.0"]
           cudaarch = "8.0 8.6 8.9 9.0 10.0 12.0+PTX"
 
           combos = []
@@ -58,13 +62,16 @@ jobs:
               if torch == "2.11.0" and pyver in ("3.10", "3.11"):
                   continue
               # Python 3.14 only builds Torch 2.9+
-              if pyver == "3.14" and torch in ("2.7.0", "2.8.0"):
+              if pyver == "3.14" and torch == "2.8.0":
                   continue
               combos.append(dict(os = os_, pyver = pyver, cuda = "12.8.1", rocm = "", torch = torch, cudaarch = cudaarch))
 
-          # CUDA 13.2 wheels are only built for Python 3.12+ with Torch 2.11
+          # CUDA 13.2 wheels: Torch 2.11 for Python 3.12+ (cu130 index), Torch 2.12/2.13 for every
+          # Python version (cu132 index, see the dependency step)
           for os_, pyver in itertools.product(oses, ["3.12", "3.13.3", "3.14"]):
               combos.append(dict(os = os_, pyver = pyver, cuda = "13.2.0", rocm = "", torch = "2.11.0", cudaarch = cudaarch))
+          for os_, pyver, torch in itertools.product(oses, pyvers, torches_cu13):
+              combos.append(dict(os = os_, pyver = pyver, cuda = "13.2.0", rocm = "", torch = torch, cudaarch = cudaarch))
 
           if target == "windows":
               combos = [c for c in combos if c["os"] == "windows-2022"]
@@ -77,6 +84,9 @@ jobs:
                              torch = "2.11.0", cudaarch = "8.6")]
           elif target == "cu132":
               combos = [c for c in combos if c["cuda"] == "13.2.0"]
+          elif target == "torch_212_213":
+              # Temporary: just the new Torch 2.12 / 2.13 wheels
+              combos = [c for c in combos if c["torch"] in torches_cu13]
 
           print(f"{len(combos)} jobs:")
           for c in combos:
@@ -321,7 +331,8 @@ jobs:
           $cudaVersionPytorch = '${{ matrix.cuda }}'.Remove('${{ matrix.cuda }}'.LastIndexOf('.')).Replace('.','')
           $cudaVersionBuild = $cudaVersionPytorch
           if ($cudaVersion.StartsWith('13.')) {
-            $cudaVersionPytorch = '130'
+            # Torch 2.11 only has cu130 wheels; 2.12+ publishes cu132 wheels matching the toolkit
+            $cudaVersionPytorch = if ([version]'${{ matrix.torch }}' -ge [version]'2.12.0') { '132' } else { '130' }
             $cudaVersionBuild = $cudaVersion.Remove($cudaVersion.LastIndexOf('.')).Replace('.','')
           }
           Write-Output "CUDA_VERSION_PYTORCH=$cudaVersionPytorch" >> "$env:GITHUB_OUTPUT"
@@ -329,7 +340,7 @@ jobs:
           $pytorchIndexUrl = "https://download.pytorch.org/whl/cu$cudaVersionPytorch"
 
           uv pip install torch==${{ matrix.torch }} --index-url $pytorchIndexUrl
-          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+          uv pip install --upgrade build "setuptools==84.0.0" wheel packaging ninja safetensors tokenizers numpy
 
       - name: Compute Torch requirement pin
         id: dep_pins
@@ -341,7 +352,7 @@ jobs:
           Write-Output "TORCH_SPEC=$torchSpec" >> "$env:GITHUB_OUTPUT"
           Write-Output "TORCH_SPEC=$torchSpec" >> "$env:GITHUB_ENV"
 
-      - name: Patch setup.py dependency metadata for this wheel
+      - name: Patch pyproject.toml dependency metadata for this wheel
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -350,26 +361,26 @@ jobs:
           import os
           import re
 
-          setup_py = Path("setup.py")
-          text = setup_py.read_text(encoding="utf-8")
+          project_toml = Path("pyproject.toml")
+          text = project_toml.read_text(encoding="utf-8")
 
           torch_spec = os.environ["TORCH_SPEC"]
 
           text, torch_count = re.subn(
-              r'(["\'])torch>=2\.6\.0\1',
+              r'"torch>=2\.6\.0"',
               f'"torch{torch_spec}"',
               text,
               count=1,
           )
           if torch_count != 1:
-              raise SystemExit("Expected to replace exactly one torch>=2.6.0 requirement in setup.py")
+              raise SystemExit("Expected to replace exactly one torch>=2.6.0 requirement in pyproject.toml")
 
-          setup_py.write_text(text, encoding="utf-8")
-          print(f"Pinned setup.py requirements: torch{torch_spec}")
+          project_toml.write_text(text, encoding="utf-8")
+          print(f"Pinned pyproject.toml requirements: torch{torch_spec}")
           '@
 
-          Set-Content -Path patch_setup_deps.py -Value $patchScript -Encoding UTF8
-          python patch_setup_deps.py
+          Set-Content -Path patch_pyproject_deps.py -Value $patchScript -Encoding UTF8
+          python patch_pyproject_deps.py
 
       - name: Build for CUDA
         if: matrix.cuda != ''
@@ -420,7 +431,11 @@ jobs:
               print(line)
               req_text = line.removeprefix("Requires-Dist:").strip()
               req = Requirement(req_text)
-              actual[canonicalize_name(req.name)] = req
+              # Only unconditional requirements (no marker) belong to the package's base
+              # dependency set. Optional-dependency markers (extra == "cuXXX") are handled
+              # elsewhere and would otherwise overwrite the base requirement below.
+              if req.marker is None:
+                  actual[canonicalize_name(req.name)] = req
 
           for name, expected_req in expected.items():
               key = canonicalize_name(name)
@@ -489,8 +504,8 @@ jobs:
 
       - name: Build sdist and py3-none-any JIT wheel
         run: |
-          uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
-          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+          uv pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --upgrade build "setuptools==84.0.0" wheel packaging ninja safetensors tokenizers numpy
 
           # Build both:
           #   - exllamav3-<version>.tar.gz

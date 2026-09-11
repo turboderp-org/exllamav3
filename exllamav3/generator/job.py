@@ -273,8 +273,10 @@ class Job:
         self.time_enqueued = rq_state.get("time_enqueued", 0.0)
         self.time_prefill = rq_state.get("time_prefill", 0.0)
         self.time_generate = rq_state.get("time_generate", 0.0)
-        self.accepted_draft_tokens = 0
-        self.rejected_draft_tokens = 0
+        self.accepted_draft_tokens = rq_state.get("accepted_draft_tokens", 0)
+        self.rejected_draft_tokens = rq_state.get("rejected_draft_tokens", 0)
+        self.rq_prompt_tokens = rq_state.get("prompt_tokens")
+        self.rq_cached = rq_state.get("cached")
         self.draft_stats = []
         self.cached_pages = 0
         self.cached_tokens = 0
@@ -760,15 +762,19 @@ class Job:
 
             if emit_eos:
                 self.is_finished = True
+                cached = self.rq_cached if self.rq_cached is not None else (
+                    self.cached_pages // len(self.sequences),
+                    (self.cached_pages * PAGE_SIZE + self.cached_tokens) // len(self.sequences),
+                )
                 r.update({
                     "full_completion": self.full_completion,
                     "new_tokens": self.rq_new_tokens + self.new_tokens,
-                    "prompt_tokens": len(self.sequences[0].input_ids),
+                    "prompt_tokens": self.rq_prompt_tokens or len(self.sequences[0].input_ids),
                     "time_enqueued": self.time_enqueued,
                     "time_prefill": self.time_prefill,
                     "time_generate": self.time_generate,
-                    "cached_pages": self.cached_pages // len(self.sequences),
-                    "cached_tokens": (self.cached_pages * PAGE_SIZE + self.cached_tokens) // len(self.sequences),
+                    "cached_pages": cached[0],
+                    "cached_tokens": cached[1],
                 })
                 if self.generator.draft_model or self.generator.ngram_match_min:
                     r.update({
@@ -1041,7 +1047,12 @@ class Job:
             "time_enqueued": self.time_enqueued,
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
-            "rq_new_tokens": self.new_tokens - 1,
+            "rq_new_tokens": self.new_tokens,   # every token accepted so far counts; the requeued segment starts after them
+            "accepted_draft_tokens": self.accepted_draft_tokens,
+            "rejected_draft_tokens": self.rejected_draft_tokens,
+            "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),
+            "cached": self.rq_cached if self.rq_cached is not None else (
+                self.cached_pages, self.cached_pages * PAGE_SIZE + self.cached_tokens),
             "sam": self.sam,
             "forced_ids": None if self.forced_ids is None else self.forced_ids[:, self.forced_index:],
             "filters_suspended": self.filters_suspended,
@@ -1090,9 +1101,11 @@ class Job:
         self.pagetable = generator.pagetable
         self.skips = 0
 
-        # No explicit limit: whatever the cache can still hold beyond the prompt
+        # No explicit limit: whatever the cache can still hold beyond the prompt, less the default
+        # requeue budget's headroom below so that budget still fits the cache exactly
         if self.max_new_tokens is None:
-            self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids))
+            self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids)
+                                      - 1 - self.generator.num_draft_tokens)
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
@@ -1103,7 +1116,8 @@ class Job:
                 y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
                 self.max_rq_tokens = y - x
         else:
-            self.max_rq_tokens = self.max_new_tokens + 1
+            # Default budget: the whole response plus one speculative window past the limit
+            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.num_draft_tokens
 
         # Compatibility checks
         if self.banned_strings and self.generator.recurrent_cache is not None:
@@ -1213,6 +1227,7 @@ class Job:
             prefill_end = min(prefill_end, len(seq.sequence_ids) - 1)
 
             atomic_mm_prefill = bool(self.embeddings) and self.generator.model.caps.get("atomic_mm_prefill")
+            mm_exact_chunks = bool(self.embeddings) and self.generator.model.caps.get("mm_exact_chunks")
             # assert not atomic_mm_prefill or not self.recurrent_state, \
             #     "Atomic prefill is not supported for recurrent models"
 
@@ -1242,7 +1257,7 @@ class Job:
             if prefill_end <= prefill_start:
                 continue
 
-            assert prefill_start % PAGE_SIZE == 0
+            assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
@@ -1297,6 +1312,30 @@ class Job:
                     recurrent_last_page = True
                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
+            # Exact multimodal chunking (DeepSeek-V4 vision): an image span is prefilled as
+            # exactly one chunk (non-causal within itself) and never re-fed, since the
+            # ring / compressor / pool states are streams. Text chunks end at a span start and
+            # a span chunk ends at the span end, page boundaries notwithstanding (pages are
+            # allocated for the whole prompt)
+            if mm_exact_chunks and prefill_end > prefill_start:
+                for s_beg, s_end in self.mm_exact_spans(seq):
+                    if s_beg < prefill_start < s_end:
+                        raise RuntimeError(
+                            "DeepSeek-V4 vision: prefill would start inside an image span "
+                            "(the image is only partially cached); clear the cache or resend the prompt")
+                    if prefill_start == s_beg:
+                        cut = s_end
+                    elif prefill_start < s_beg < prefill_end:
+                        cut = s_beg
+                    else:
+                        continue
+                    if cut != prefill_end:
+                        prefill_end = cut
+                        p1 = (prefill_end + PAGE_SIZE - 1) // PAGE_SIZE
+                        recurrent_last_page = False
+                        prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
+                    break
+
             # Inference
             if prefill_end > prefill_start:
 
@@ -1305,10 +1344,13 @@ class Job:
                 # chunk redundantly but won't write out-of-bounds since cache pages are already allocated for the
                 # whole input sequence including MM tokens. (This is for Gemma4 specifically, which has image token
                 # spans of at most 280 tokens.)
+                # The mask covers only the prompt: a rewind replay chunk past it (generated tokens
+                # are never multimodal) must not index beyond the mask
                 if atomic_mm_prefill:
                     ext_prefill_end = prefill_end
                     while (
                         ext_prefill_end < len(seq.sequence_ids) - 1 and
+                        ext_prefill_end < len(seq.multimodal_mask) and
                         seq.multimodal_mask[ext_prefill_end - 1] and
                         seq.multimodal_mask[ext_prefill_end]
                     ):
@@ -1320,11 +1362,21 @@ class Job:
                 # span extends before the chunk, so non-causal attention windows cover the whole
                 # span rather than just the in-chunk suffix
                 mm_span_prefix = 0
-                if self.embeddings:
+                # The mask covers only the prompt; generated tokens are never multimodal
+                if self.embeddings and prefill_start <= len(seq.multimodal_mask):
                     pp = prefill_start
                     while pp > 0 and seq.multimodal_mask[pp - 1]:
                         mm_span_prefix += 1
                         pp -= 1
+
+                # Rewind prefill can exceed the prompt-length table, which the RoPE kernel reads unchecked
+                if self.alt_rope_freqs is not None and prefill_end > self.alt_rope_freqs.shape[-2]:
+                    ids = seq.sequence_ids.torch()
+                    # Appending text advances the next position and sequence length equally,
+                    # leaving alt_rope_offset unchanged for decode
+                    self.alt_rope_freqs, _ = self.generator.model.g_rope.get_mrope_freqs(
+                        ids, self.embeddings, ids.shape[-1]
+                    )
 
                 params = {
                     "attn_mode": "flash_attn",
@@ -1399,7 +1451,10 @@ class Job:
                     pf_b = min(local_idx * PAGE_SIZE + PAGE_SIZE, prefill_end)
                     pfp_a = pf_a - local_idx * PAGE_SIZE
                     pfp_b = pf_b - local_idx * PAGE_SIZE
-                    page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
+                    # The loop runs one page past the chunk; with a chunk ending mid-page
+                    # (exact multimodal chunking) that page starts after prefill_end
+                    if pfp_b > pfp_a:
+                        page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
                     page.can_revert = False
 
                 progress += prefill_end - prefill_start
@@ -1523,6 +1578,23 @@ class Job:
         else:
             return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval_pp == 0
 
+
+    def mm_exact_spans(self, seq):
+        """Prompt positions [start, end) of each embedding's non-causal span (its rows from
+        align_lead on, i.e. IMAGE_START .. IMAGE_END for DeepSeek-V4), ascending. Computed once:
+        the prompt never moves."""
+        spans = getattr(self, "_mm_exact_spans", None)
+        if spans is None:
+            ids = seq.sequence_ids.torch()[0]
+            spans = []
+            for e in self.embeddings:
+                lo, hi = e.first_index + getattr(e, "align_lead", 0), e.last_index
+                pos = torch.nonzero((ids >= lo) & (ids < hi)).flatten()
+                if pos.numel():
+                    spans.append((int(pos[0]), int(pos[-1]) + 1))
+            spans.sort()
+            self._mm_exact_spans = spans
+        return spans
 
     def maybe_stash_recurrent(self, cache, interval = None):
         """

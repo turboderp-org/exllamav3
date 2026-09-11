@@ -20,7 +20,7 @@ PAGE_SIZE = 256
 
 
 def ref_attn(q, pool_c, pool_r, bt, sinks, ring, kv_chunk, window, win_floor, ring_beg,
-             indices, dense, pool_len, q_pos0, m):
+             indices, dense, pool_len, q_pos0, m, nc_chunk = False):
     R, H, D = q.shape
     D_r = pool_r.shape[-1]
     D_c = D - D_r
@@ -32,8 +32,12 @@ def ref_attn(q, pool_c, pool_r, bt, sinks, ring, kv_chunk, window, win_floor, ri
         rows = []
         if window > 0:
             q_abs = q_pos0 + r
-            for j in range(window):
-                a = q_abs - j
+            if nc_chunk:
+                # image chunk: every chunk row (bidirectional) + this row's own history window
+                cand = list(range(q_pos0, q_pos0 + R)) + list(range(q_abs - window + 1, q_pos0))
+            else:
+                cand = [q_abs - j for j in range(window)]
+            for a in cand:
                 if a < win_floor:
                     continue
                 src = kv_chunk[a - q_pos0] if a >= q_pos0 else ring[a - ring_beg]
@@ -74,12 +78,27 @@ def _derotate_ref(o_r, inv_freq, pos):
 
 
 def check_attn(device, R, H, D_c, D_r, n_keys, topk, window, sinks_on, dense, m, seed, tol = 6e-3,
-               derot = False, groups = 1):
+               derot = False, groups = 1, qc_bits = 0, nc_chunk = False, single_bt = False):
     torch.manual_seed(seed)
     D = D_c + D_r
     pages = (n_keys + PAGE_SIZE - 1) // PAGE_SIZE
     pool_c = torch.randn((pages, PAGE_SIZE, D_c), dtype = torch.half, device = device)
     pool_r = torch.randn((pages, PAGE_SIZE, D_r), dtype = torch.half, device = device)
+    # Packed-quantized latent pool: the kernel dequantizes online; the reference reads the
+    # SAME values dequantized by the CUDA kernel, so the tolerance tests the loader/rotation
+    # path, not the quantizer
+    qc = None
+    pc_arg = pool_c
+    if qc_bits:
+        rows, groups_c = pages * PAGE_SIZE, D_c // 32
+        pq = torch.empty((rows, groups_c * qc_bits), dtype = torch.int32, device = device)
+        ps = torch.empty((rows, groups_c), dtype = torch.half, device = device)
+        ext.quant_cache_cont(pool_c.reshape(rows, D_c).contiguous(), pq, ps, 0.0)
+        deq = torch.empty((rows, D_c), dtype = torch.half, device = device)
+        ext.dequant_cache_cont(pq, ps, deq, 0.0)
+        pool_c = deq.view(pages, PAGE_SIZE, D_c)
+        pc_arg = pq.view(pages, PAGE_SIZE, groups_c * qc_bits)
+        qc = (ps, qc_bits)
     perm = torch.randperm(pages, device = device, dtype = torch.int32)
     bt = perm.unsqueeze(0).expand(R, pages).contiguous()
     q = torch.randn((R, H, D), dtype = torch.half, device = device)
@@ -107,19 +126,31 @@ def check_attn(device, R, H, D_c, D_r, n_keys, topk, window, sinks_on, dense, m,
         derot_inv_freq = -1.0 / (10000.0 ** (torch.arange(0, D_r, 2, dtype = torch.float,
                                                           device = device) / D_r))
 
+    # Single-row (stride-0) block table, as the bsz-1 sparse prefill passes it: the packed-pool
+    # staging path keys on it (and on pool_len = the referenced context)
+    bt_k = bt[:1].contiguous() if single_bt else bt
     def run(ns):
         return dsa_attn(
-            q, pool_c, pool_r, bt, sinks = sinks,
+            q, pc_arg, pool_r, bt_k, sinks = sinks,
             ring = ring if window > 0 else None, kv_chunk = kv_chunk if window > 0 else None,
             win_len = window, win_floor = win_floor, ring_beg = ring_beg,
             indices = indices, k_len = k_len,
             pool_len = n_keys, q_pos0 = q_pos0, compress_rate = m,
-            derot_inv_freq = derot_inv_freq, groups = groups, n_splits = ns,
+            derot_inv_freq = derot_inv_freq, groups = groups, n_splits = ns, qc = qc,
+            nc_chunk = nc_chunk,
         )
     got = run(1).clone()   # out comes from the tensor cache: un-alias the two runs
     got_split = run(8).clone()
+    if single_bt and qc_bits:
+        # Also the online-dequant path over the same inputs (staging forced off)
+        import exllamav3.modules.attention_fn.dsa_triton as dt
+        dt._dsa_qc_stage = False
+        try:
+            got_split = run(1).clone()
+        finally:
+            dt._dsa_qc_stage = True
     ref = ref_attn(q, pool_c, pool_r, bt, sinks, ring, kv_chunk, window, win_floor, ring_beg,
-                   indices, dense, n_keys, q_pos0, m)
+                   indices, dense, n_keys, q_pos0, m, nc_chunk = nc_chunk)
     if derot:
         for r in range(R):
             ref[r, :, D_c:] = _derotate_ref(ref[r, :, D_c:].double(), derot_inv_freq,
@@ -130,7 +161,8 @@ def check_attn(device, R, H, D_c, D_r, n_keys, topk, window, sinks_on, dense, m,
     rel = err / max(ref.abs().max().item(), 1e-6)
     rel_s = (got_split.float() - ref).abs().max().item() / max(ref.abs().max().item(), 1e-6)
     tag = (f"R{R} H{H} Dc{D_c} keys{n_keys} k{topk} win{window} sinks{int(sinks_on)} "
-           f"dense{int(dense)} derot{int(derot)} g{groups}")
+           f"dense{int(dense)} derot{int(derot)} g{groups} qc{qc_bits} nc{int(nc_chunk)}"
+           f"{' staged(+online as split)' if single_bt and qc_bits else ''}")
     ok = rel < tol and rel_s < tol
     print(f"  {'PASS' if ok else 'FAIL'} attn {tag}: rel {rel:.2e} split {rel_s:.2e}")
     return ok
@@ -241,6 +273,54 @@ def main():
     ]
     for i, (c, dr, g) in enumerate(epi_cases):
         ok &= check_attn(device, *c, seed = 300 + i, derot = dr, groups = g)
+
+    # Packed-quantized pools (QC): online dequant in the pool phase, q / window tiles rotated
+    # into the H32 domain, output rotated back in the epilogue or the combine. Covers the
+    # padded loader (D_c 448), the pow2 widths (512 / 256), window + sinks + derot/groups
+    # (V4), and the windowless gathered form (V3.2 / GLM)
+    qc_cases = [
+        ((7, 64, 448, 64, 2048, 512, 128, True, False, 4), False, 1, 8),
+        ((7, 64, 448, 64, 2048, 512, 128, True, False, 4), True, 8, 4),
+        ((5, 64, 448, 64, 300, 512, 128, True, False, 4), True, 1, 3),
+        ((9, 64, 448, 64, 40, 0, 0, True, True, 128), True, 8, 8),
+        ((6, 64, 448, 64, 64, 0, 128, True, True, 128), False, 8, 6),
+        ((3, 128, 512, 64, 4096, 2048, 0, False, False, 1), False, 1, 8),
+        ((3, 128, 512, 64, 4096, 2048, 0, False, False, 1), False, 1, 4),
+        ((3, 128, 512, 64, 4096, 2048, 0, False, False, 1), False, 1, 2),
+        ((2, 16, 256, 32, 700, 96, 8, False, False, 1), True, 4, 5),
+        ((1, 64, 448, 64, 1024, 512, 128, True, False, 4), True, 8, 7),
+        ((24, 8, 448, 64, 24, 4, 128, True, False, 1), False, 1, 8),
+    ]
+    for i, (c, dr, g, b) in enumerate(qc_cases):
+        ok &= check_attn(device, *c, seed = 400 + i, derot = dr, groups = g, qc_bits = b,
+                         tol = 1.2e-2)
+
+    # Non-causal image chunk (V4 vision): every row sees the whole chunk plus its own window
+    # into the ring; chunks longer than the window, floor clipping, dense HCA pools, QC
+    nc_cases = [
+        ((200, 64, 448, 64, 2048, 512, 128, True, False, 4), True, 8, 0),    # CSA, chunk > window
+        ((390, 64, 448, 64, 40, 0, 128, True, True, 128), True, 8, 0),       # HCA dense, long chunk
+        ((64, 8, 448, 64, 24, 4, 128, True, False, 1), False, 1, 0),         # window floor at 0
+        ((16, 16, 256, 32, 700, 96, 8, False, False, 1), True, 4, 0),        # odd dims, small window
+        ((200, 64, 448, 64, 2048, 512, 128, True, False, 4), True, 8, 4),    # QC pools
+        ((130, 64, 448, 64, 40, 0, 128, True, True, 128), False, 8, 6),
+    ]
+    for i, (c, dr, g, b) in enumerate(nc_cases):
+        ok &= check_attn(device, *c, seed = 600 + i, derot = dr, groups = g, qc_bits = b,
+                         tol = 1.2e-2 if b else 6e-3, nc_chunk = True)
+
+    # Packed-pool prefill staging (single-row block table, R >= 64, pool_len = context): the
+    # staged fp16 path and the online path must both match the reference
+    stage_cases = [
+        ((200, 64, 448, 64, 2048, 512, 0, False, False, 1), False, 1, 4),    # V3.2/GLM gathered
+        ((200, 64, 448, 64, 2048, 512, 0, False, False, 1), True, 8, 6),
+        ((130, 64, 448, 64, 40, 0, 128, True, True, 128), True, 8, 6),      # V4 HCA dense + window
+        ((64, 16, 256, 32, 700, 96, 8, False, False, 1), True, 4, 3),       # odd dims, min R
+        ((4096, 64, 448, 64, 8192, 2048, 0, False, False, 1), True, 8, 6),  # full-size chunk
+    ]
+    for i, (c, dr, g, b) in enumerate(stage_cases):
+        ok &= check_attn(device, *c, seed = 700 + i, derot = dr, groups = g, qc_bits = b,
+                         tol = 1.2e-2, single_bt = True)
 
     for i, (R, T, H_i, D_i) in enumerate([
         (64, 512, 64, 128), (2048, 512, 64, 128), (7, 33, 4, 16), (128, 4096, 64, 128),

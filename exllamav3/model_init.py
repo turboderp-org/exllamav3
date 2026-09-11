@@ -18,6 +18,7 @@ def add_args(
     default_sampling_args: dict = None,
     default_autosplit_max_batch_size: int = 1,
     add_draft_model_args: bool = False,
+    default_chunk_size: int = 4096,
 ):
     """
     Add standard model loading arguments to command line parser
@@ -48,6 +49,9 @@ def add_args(
 
     :param add_draft_model_args:
         bool, add draft model args. If True, init() will return draft_model and draft_config as well
+
+    :param default_chunk_size:
+        int, value for -chunk_size / --chunk_size
     """
     parser.add_argument("-m", "--model_dir", type = str, help = "Path to model directory", required = True)
     parser.add_argument("-gs", "--gpu_split", type = str, help = "Maximum amount of VRAM to use per device, in GB.")
@@ -69,11 +73,13 @@ def add_args(
 
     parser.add_argument("-swa_full", "--swa_full", action = "store_true", help = f"Use full cache for SWA layers. Default is recurrent mode with snapshots")
     parser.add_argument("-ambs", "--autosplit_max_batch_size", type = int, help = f"Max batch size to account for when loading in autosplit mode (default: {default_autosplit_max_batch_size})", default = default_autosplit_max_batch_size)
+    parser.add_argument("-chunk_size", "--chunk_size", type = int, help = f"Max chunk size (default: {default_chunk_size})", default = default_chunk_size)
 
     parser.add_argument("-lv", "--load_verbose", action = "store_true", help = "Verbose output while loading")
     parser.add_argument("-asnf", "--autosplit_no_forward", action = "store_true", help = "Skip forward pass in autosplit, for debug purposes.")
 
     parser.add_argument("-layer_map", "--layer_map", type = str, help = "RYS layer map as a list of ints or (inclusive) ranges, example: 0..15,11..31 (repeats layers 11 through 15 once)", default = None)
+
 
     if add_sampling_args:
         defs = default_sampling_args if default_sampling_args is not None else {}
@@ -344,6 +350,7 @@ def init(
             verbose = args.load_verbose,
             max_batch_size = args.autosplit_max_batch_size,
             autosplit_no_forward = args.autosplit_no_forward,
+            max_chunk_size = args.chunk_size,
             **kwargs
         )
 
@@ -359,6 +366,7 @@ def init(
         tp_options = tp_options,
         max_batch_size = args.autosplit_max_batch_size,
         autosplit_no_forward = args.autosplit_no_forward,
+        max_chunk_size = args.chunk_size,
         **kwargs
     )
 

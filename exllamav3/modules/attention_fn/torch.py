@@ -1,6 +1,5 @@
 import torch
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
-from torch.nn.attention.bias import causal_lower_right
 import torch.nn.functional as F
 
 
@@ -78,6 +77,13 @@ def _attn_cpu_nocache(args: AttnArgs) -> torch.Tensor | None:
         )
     except Exception:
         return None
+
+
+def _causal_lower_right(*args):
+    # torch.nn.attention.bias pulls in torch._dynamo (~0.5 s at import) and is only needed on this
+    # fallback path, so import on first use
+    from torch.nn.attention.bias import causal_lower_right
+    return causal_lower_right(*args)
 
 has_warned_sdpa_fallback = False
 def _warn_sdpa_fallback():
@@ -278,7 +284,7 @@ def _torch_bighead_fallback(
                 kv_end = total_len - seqlen_q + chunk_end
                 k_sdpa = k_sdpa_full[:, :, :kv_end]
                 v_sdpa = v_sdpa_full[:, :, :kv_end]
-                attn_mask = causal_lower_right(chunk_len, kv_end)
+                attn_mask = _causal_lower_right(chunk_len, kv_end)
             else:
                 k_sdpa = k_sdpa_full[:, :, :total_len]
                 v_sdpa = v_sdpa_full[:, :, :total_len]

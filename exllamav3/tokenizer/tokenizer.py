@@ -312,8 +312,11 @@ class Tokenizer:
         self,
         text: str,
         special: bool,
-        embeddings: list[MMEmbedding]
+        embeddings: list[MMEmbedding],
+        position_offset: int = 0,
     ):
+        """position_offset: prompt position of the first id produced here (1 when a BOS token
+        will be prepended), so position-aligned embeddings land on the right phase."""
         out_parts = []
 
         if embeddings:
@@ -326,7 +329,7 @@ class Tokenizer:
 
         for text in in_parts:
             if text in aliases:
-                out_parts += aliases[text].token_list
+                out_parts += aliases[text].token_list_at(position_offset + len(out_parts))
             else:
                 out_parts += self.encode_part(text, special)
 
@@ -377,7 +380,8 @@ class Tokenizer:
 
             # text is a list of strings
 
-            list_ids = [self.encode_special_or_unspecial(t, encode_special_tokens, embeddings) for t in text]
+            pos0 = 1 if add_bos and self.bos_token_id is not None else 0
+            list_ids = [self.encode_special_or_unspecial(t, encode_special_tokens, embeddings, pos0) for t in text]
 
             if add_bos and self.bos_token_id is not None:
                 for ids in list_ids: ids.insert(0, self.bos_token_id)
@@ -406,7 +410,8 @@ class Tokenizer:
             # text is a single string
 
             # ids = self.encode_special(text) if encode_special_tokens else self.encode_unspecial(text)
-            ids = self.encode_special_or_unspecial(text, encode_special_tokens, embeddings)
+            pos0 = 1 if add_bos and self.bos_token_id is not None else 0
+            ids = self.encode_special_or_unspecial(text, encode_special_tokens, embeddings, pos0)
             if add_bos and self.bos_token_id is not None:
                 ids.insert(0, self.bos_token_id)
             if add_eos and self.eos_token_id is not None:

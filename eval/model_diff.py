@@ -147,6 +147,12 @@ def main(args):
     params_a = [{} for _ in range(len(states_a))]
     params_b = [{} for _ in range(len(states_b))]
 
+    # Architecture-specific input preparation, as Model.forward does before the module chain:
+    # positions for attention, and e.g. the token ids DeepSeek-V4's hash-routed MoE layers need
+    for b in range(len(states_a)):
+        states_a[b] = model_a.prepare_inputs(states_a[b], params_a[b])
+        states_b[b] = model_b.prepare_inputs(states_b[b], params_b[b])
+
     # Inference
     for idx, (module_a, module_b) in enumerate(zip(model_a.modules, model_b.modules)):
 
@@ -189,13 +195,16 @@ def main(args):
 
             params_a[b].update({"sim_kvq": sim_kvq})
             params_a[b]["dev_cache"] = None
+            # Modules may hand back a view of a shared g_tensor_cache workspace (e.g. the
+            # hyperconnection head's collapsed state): both models on one device would alias the
+            # same buffer and later transients would overwrite it, so the harness keeps its own copy
             state_a = module_a.prepare_for_device(state_a, params_a[b])
-            state_a = module_a.forward(state_a, params_a[b])
+            state_a = module_a.forward(state_a, params_a[b]).clone()
 
             params_b[b].update({})
             params_b[b]["dev_cache"] = None
             state_b = module_b.prepare_for_device(state_b, params_b[b])
-            state_b = module_b.forward(state_b, params_b[b])
+            state_b = module_b.forward(state_b, params_b[b]).clone()
 
             # Optionally override model A state for first layers
             if idx < args.keep_b:
@@ -217,8 +226,10 @@ def main(args):
             if not logits_layer:
                 rows = state_a.shape[0]
                 for j in range(rows):
-                    sa = state_a[j].to(float)
-                    sb = state_b[j].to(float)
+                    # Hyperconnection models carry the residual as (seq, streams, hidden): compare
+                    # the streams flattened to rows, the Frobenius norm needs 2D
+                    sa = state_a[j].reshape(-1, state_a.shape[-1]).to(float)
+                    sb = state_b[j].reshape(-1, state_b.shape[-1]).to(float)
                     cos_error_sum += cosine_error(sa, sb)
                     sqnr_sum += sqnr(sa, sb)
                     sa -= sb

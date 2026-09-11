@@ -1,5 +1,6 @@
 *.egg-info/
 build/
+uv.lock
 
 *.pyc
 __pycache__/

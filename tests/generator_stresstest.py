@@ -220,7 +220,7 @@ def main(args):
         cache = cache,
         tokenizer = tokenizer,
         max_batch_size = args.autosplit_max_batch_size,
-        max_chunk_size = args.max_chunk_size,
+        max_chunk_size = args.chunk_size,
         draft_model = draft_model,
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
