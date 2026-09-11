@@ -497,6 +497,7 @@ class MoeCpuHost:
         self.next_wslot = 0
         self.wslot_prev_seq = [0] * MOE_MAX_WSLOTS
         self.aux = {}
+        self._dev_bufs = {}      # per device: persistent streamed-prefill buffers (see _device_buffers)
         # Pinned arena (EXL3_MOE_PINNED_ARENA): parent-side mappings of the worker's memfd
         # chunks (mmap, int16 view) indexed like the worker's chunk list, and per layer the
         # per-expert (chunk, byte offset) of its contiguous [gate | up | down] trellis block
@@ -1011,12 +1012,7 @@ class MoeCpuHost:
         for job in jobs:
             self._collect_one(job, out, rtmp, h)
 
-    def _ensure_stream_state(self, device):
-        key = torch.device(device).index or 0
-        st = self.sstate.get(key)
-        if st is not None:
-            return st
-        # Reconstruct scratch sized for the largest projection
+    def _max_proj_numel(self):
         mx = 0
         for s in self.specs:
             pd = s.get("proj_dims")
@@ -1024,27 +1020,61 @@ class MoeCpuHost:
                 for k in ("g", "u", "d"):
                     if pd.get(k):
                         mx = max(mx, pd[k][0] * pd[k][1])
-        # Experts arrive band-swizzled when an AVX-512 CPU tier owns them (same rule as the child's
-        # arena rehome, K8 excepted per matrix); the GPU restores the native tile order into a
-        # parallel ring after each DMA
-        swz = TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_bw()
+        return mx
+
+    def _device_buffers(self, device):
+        """The persistent device-side buffers of the streamed-prefill path (VRAM weight ring,
+        native-order ring for swizzled experts, reconstruct scratch, fused-tier buffers, batched
+        tier statics), created on first request per device. The autosplit loader requests them
+        during a layer's measured load (prefill_worst_case_parts), before the worker starts, so
+        they count as allocated when the split is planned instead of appearing on the first real
+        prefill; _ensure_stream_state adopts them"""
+        key = torch.device(device).index or 0
+        d = self._dev_bufs.get(key)
+        mx = self._max_proj_numel()
+        if d is None:
+            # Experts arrive band-swizzled when an AVX-512 CPU tier owns them (same rule as the
+            # child's arena rehome, K8 excepted per matrix); the GPU restores the native tile
+            # order into a parallel ring after each DMA
+            swz = TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_bw()
+            d = dict(
+                vram_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
+                              for _ in range(self.num_wslots)],
+                native_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
+                                for _ in range(self.num_wslots)] if swz else None,
+                swz = swz,
+                w_scratch = None,
+                fused_bufs = {},
+                recon = {},
+            )
+            self._dev_bufs[key] = d
+        # Reconstruct scratch sized for the largest projection registered so far; grows if a
+        # later layer is larger
+        if mx and (d["w_scratch"] is None or d["w_scratch"].numel() < mx):
+            d["w_scratch"] = torch.empty(mx, dtype = torch.half, device = device)
+        return d
+
+    def _ensure_stream_state(self, device):
+        key = torch.device(device).index or 0
+        st = self.sstate.get(key)
+        if st is not None:
+            return st
+        bufs = self._device_buffers(device)
         st = dict(
             copy_stream = torch.cuda.Stream(device = device),
-            vram_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
-                          for _ in range(self.num_wslots)],
-            native_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
-                            for _ in range(self.num_wslots)] if swz else None,
-            swz = swz,
+            vram_slots = bufs["vram_slots"],
+            native_slots = bufs["native_slots"],
+            swz = bufs["swz"],
             wready_ev = [torch.cuda.Event() for _ in range(self.num_wslots)],
             wconsumed_ev = [torch.cuda.Event() for _ in range(self.num_wslots)],
             wslot_used = [False] * self.num_wslots,
-            w_scratch = torch.empty(mx, dtype = torch.half, device = device) if mx else None,
-            # Fused-tier (exl3_moe) temp buffers, allocated lazily per (hidden, intermediate)
-            # shape: the kernel reads both dims from the buffers, so they must match the layer
+            w_scratch = bufs["w_scratch"],
+            # Fused-tier (exl3_moe) temp buffers per (hidden, intermediate) shape and the
+            # batched reconstruct tier state per layer, shared with the preallocated buffers
             fused_t = TUNING.stream_fused_t,
-            fused_bufs = {},
+            fused_bufs = bufs["fused_bufs"],
             # Batched reconstruct tier state per layer (moe_batch_recon.BatchReconLayer)
-            recon = {},
+            recon = bufs["recon"],
         )
 
         # Probe pinned->device bandwidth once: the break-even assignment count for streaming an
@@ -1176,9 +1206,81 @@ class MoeCpuHost:
                 layer_idx, y, selected_experts, routing_weights, spec, streamed, st,
                 counts_h, flat, shifted, neg)
 
+    def _stream_fused_t(self, spec, aux, h):
+        """Fused-kernel row capacity for a streamed layer, 0 when the layer isn't eligible
+        (same rule as support_fused on the GPU side: silu/gelu gated or relu2 gateless, no
+        per-expert biases, no padded dims)"""
+        return TUNING.stream_fused_t if (
+            spec["activation"] in (0, 1, 2) and spec["hi"] == h and spec["ho"] == h
+            and not any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d"))
+        ) else 0
+
+    def _stream_recon_layer(self, st, layer_idx, spec, aux, device):
+        """Batched reconstruct tier state for a streamed layer, built once per (device,
+        layer); None when disabled or the experts carry biases (a batched add would be needed)"""
+        if not self.batch_recon or any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d")):
+            return None
+        recon = st["recon"].get(layer_idx)
+        if recon is None:
+            from ..modules.moe_batch_recon import BatchReconLayer
+            pd = spec["proj_dims"]
+            gated = pd.get("g") is not None
+            scales = {p: (aux["suh_" + p], aux["svh_" + p])
+                      for p in (("g", "u", "d") if gated else ("u", "d"))}
+            recon = BatchReconLayer(
+                pd.get("g"), pd["u"], pd["d"], (False, True), (False, True), (False, True),
+                spec["activation"], spec["act_limit"], device, scales)
+            st["recon"][layer_idx] = recon
+        return recon
+
+    def _stream_fused_bufs(self, st, spec, device):
+        """Fused-tier temp buffers for a streamed layer's (hidden, intermediate) shape, kept
+        per device (the kernel reads both dims from the buffers, so they must match the layer)"""
+        key = (spec["hi"], spec["proj_dims"]["u"][1])
+        fbufs = st["fused_bufs"].get(key)
+        if fbufs is None:
+            conc = ext.exl3_moe_max_concurrency(torch.device(device).index or 0)
+            fbufs = tuple(
+                torch.empty((conc, TUNING.stream_fused_t, dim), dtype = torch.half, device = device)
+                for dim in (key[0], key[0], key[1], key[1]))
+            st["fused_bufs"][key] = fbufs
+        return fbufs
+
+    def prefill_worst_case_parts(self, layer_idx, rows, device, assignments):
+        """Autosplit worst case for one layer's prefill on `device` with `assignments` routed
+        rows on CPU-resident experts, as (fixed, variable) bytes: the outputs and lists that
+        live for the whole call, and the larger of one batched-reconstruct group and the
+        per-expert path (freed before the GPU-side tiers allocate theirs). The persistent
+        device buffers are allocated for real here (_device_buffers) so the load accounts for
+        them"""
+        spec = self.specs[layer_idx]
+        h, hi = spec["ho"], spec["hi"]
+        A = assignments
+        # Plain CPU path: the fp32 output and the readback staging
+        fixed = rows * h * 4 + min(self.cap_rows, rows) * h * 4
+        if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
+                or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux):
+            return fixed, 0
+        aux = self.aux[layer_idx]
+        pd = spec["proj_dims"]
+        gated = pd.get("g") is not None
+        n = pd["u"][1]
+        # Streamed path: padded fp32 output, the tail's compressed output, the input copy with
+        # its zero row, and the sorted assignment lists
+        fixed += (rows + 1) * h * 4 + rows * h * 4 + (rows + 1) * hi * 2 + A * 32
+        with torch.cuda.device(device):
+            bufs = self._device_buffers(device)
+            if self._stream_fused_t(spec, aux, h):
+                self._stream_fused_bufs(bufs, spec, device)
+            recon = self._stream_recon_layer(bufs, layer_idx, spec, aux, device)
+        r = min(rows, A)
+        per_expert = r * (hi * 2 + n * 2 * (2 if gated else 1) + h * 4)
+        batched = recon.worst_case_bytes(A, slot_mode = False) if recon is not None else 0
+        return fixed, max(per_expert, batched)
+
     def _submit_prefill_streamed(self, layer_idx, y, selected_experts, routing_weights, spec,
                                  streamed, st, counts_h, flat, shifted, neg):
-        from ..modules.moe_batch_recon import BatchReconLayer, plan_groups
+        from ..modules.moe_batch_recon import plan_groups
         rows = y.shape[0]
         h = y.shape[1]
         E = spec["num_experts"]
@@ -1233,33 +1335,12 @@ class MoeCpuHost:
         # experts too hot for the temp buffers take the per-expert reconstruct path. Same
         # eligibility as support_fused on the GPU side: mul1 (given), silu/gelu gated or relu2
         # gateless, no per-expert biases, no padded dims
-        fused_t = st["fused_t"] if (
-            spec["activation"] in (0, 1, 2) and spec["hi"] == h and spec["ho"] == h
-            and not any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d"))
-        ) else 0
-        # Batched reconstruct tier: same bias-free requirement (per-expert biases would need a
-        # batched add), any activation the act kernels cover; lazily built per (device, layer)
-        recon = None
+        fused_t = self._stream_fused_t(spec, aux, h)
+        recon = self._stream_recon_layer(st, layer_idx, spec, aux, y.device)
         recon_ctx = None
-        if self.batch_recon and not any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d")):
-            recon = st["recon"].get(layer_idx)
-            if recon is None:
-                scales = {p: (aux["suh_" + p], aux["svh_" + p])
-                          for p in (("g", "u", "d") if gated else ("u", "d"))}
-                recon = BatchReconLayer(
-                    pd.get("g"), pd["u"], pd["d"], (False, True), (False, True), (False, True),
-                    spec["activation"], spec["act_limit"], y.device, scales)
-                st["recon"][layer_idx] = recon
         fbufs = None
         if fused_t and any(counts_h[e] <= fused_t for e in streamed):
-            key = (spec["hi"], pd["u"][1])
-            fbufs = st["fused_bufs"].get(key)
-            if fbufs is None:
-                conc = ext.exl3_moe_max_concurrency(torch.device(y.device).index or 0)
-                fbufs = tuple(
-                    torch.empty((conc, st["fused_t"], dim), dtype = torch.half, device = y.device)
-                    for dim in (key[0], key[0], key[1], key[1]))
-                st["fused_bufs"][key] = fbufs
+            fbufs = self._stream_fused_bufs(st, spec, y.device)
 
         for i0 in range(0, len(streamed), per_slot):
             batch = streamed[i0:i0 + per_slot]
@@ -1377,13 +1458,16 @@ class MoeCpuHost:
             # Heavy tier: batched reconstruct (groups of experts, a handful of launches per
             # group; see moe_batch_recon.py) when eligible, else per expert
             heavy = [(bi, e) for bi, e, _, _ in per_e if not (fused_t and counts_h[e] <= fused_t)]
-            if heavy and recon is not None:
+            if recon is not None:
                 # Experts above the batched tier's row cap stay on the per-expert loop (large
                 # slabs pad and stream more than they save in launches)
                 single = [(bi, e) for bi, e in heavy if counts_h[e] > recon.max_rows]
                 heavy = [(bi, e) for bi, e in heavy if counts_h[e] <= recon.max_rows]
             else:
-                single = []
+                # No batched tier (EXL3_MOE_STREAM_BATCH_RECON=0 or biased experts): every
+                # heavy expert runs on the per-expert loop below
+                single = heavy
+                heavy = []
             if heavy:
                 if recon_ctx is None:
                     # Padding sources / sinks: a zero input row, an output sink row (out is a
@@ -1505,6 +1589,7 @@ class MoeCpuHost:
             self.slots = None
             self.wviews = None
             self.sstate = None
+            self._dev_bufs = {}
             self.v_quit = self.v_pass_wake = self.v_abort = self.v_ready = None
             self.v_jobs_tail = self.v_jobs_head = self.v_jobs = None
             self.v_stage_tail = self.v_stage_head = self.v_stage_jobs = None

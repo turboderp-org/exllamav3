@@ -85,6 +85,20 @@ def plan_groups(experts, count_of, batch_max = None):
     return groups
 
 
+def _addr_table(t, device):
+    """[E] int64 device tensor of per-expert row addresses: rows of a stacked [E, dim] tensor
+    or the data pointers of a list of per-expert vectors"""
+    if torch.is_tensor(t):
+        assert t.dim() == 2 and t.is_contiguous()
+        step = t.shape[1] * t.element_size()
+        return t.data_ptr() + torch.arange(t.shape[0], dtype = torch.long, device = device) * step
+    return torch.tensor([x.data_ptr() for x in t], dtype = torch.long, device = device)
+
+
+def _stacked(t):
+    return t.contiguous() if torch.is_tensor(t) else torch.stack(list(t)).contiguous()
+
+
 def batch_cap(dims_g, dims_u, dims_d):
     """Largest group the weight scratch budget allows for these projection shapes (gate and up
     are live together, down reuses the gate scratch)"""
@@ -126,12 +140,39 @@ class BatchReconLayer:
         # fp32 gate / up outputs (models whose intermediates overflow fp16, e.g. gemma4): the
         # activation kernels take fp32 in and write the fp16 activation the down GEMM consumes
         self.interm_fp32 = interm_fp32
-        # Stacked [E, dim] per-expert scale tables: had_r_128_batch reads rows by id in the
-        # unfolded path; the folded path derives per-matrix suh/svh addresses from them
+        # Per-expert sign vectors. Folded (default): [E] int64 address tables pointing into the
+        # caller's own suh/svh tensors, no copy (expert swaps copy_ in place, so the addresses
+        # stay valid; a stacked copy cost ~7.5 MiB per 512-expert layer, 180 MiB per device on
+        # Qwen3.8). Unfolded: stacked [E, dim] tables for had_r_128_batch, shared when the
+        # caller's tables are already stacked
         self.scales = {}
+        self.scale_ptrs = {}
         for p in ("g", "u", "d") if self.gated else ("u", "d"):
             suh, svh = scales[p]
-            self.scales[p] = (torch.stack(list(suh)).contiguous(), torch.stack(list(svh)).contiguous())
+            if self.folded:
+                self.scale_ptrs[p] = (_addr_table(suh, device), _addr_table(svh, device))
+            else:
+                self.scales[p] = (_stacked(suh), _stacked(svh))
+
+    def worst_case_bytes(self, assignments: int, slot_mode: bool) -> int:
+        """Upper bound on one group's per-call temporaries (weight slabs, gathered input,
+        gate / up slabs, activation, and the fp32 down slab unless it lands in the caller's slot
+        scratch) for `assignments` routed rows in total: the autosplit loader's worst-case
+        measure. Group rows are bounded by the batch cap, the row cap and the padding budget"""
+        ku, nu, _ = self.dims_u
+        kd, nd, _ = self.dims_d
+        kg, ng = (self.dims_g[0], self.dims_g[1]) if self.gated else (0, 0)
+        cmax = min(self.max_rows, assignments)
+        rows = min(self.cap * cmax, RECON_ROWS, int(assignments * PAD_MAX) + cmax)
+        total = 2 * self.cap * (max(kg * ng, kd * nd) + ku * nu)        # scratch1 + Wu
+        total += rows * ku * 2                                           # gathered input
+        idt = 4 if self.interm_fp32 else 2
+        total += rows * nu * idt * (2 if self.gated else 1)              # u (+ g)
+        if self.interm_fp32:
+            total += rows * nu * 2                                       # fp16 activation
+        if not slot_mode:
+            total += rows * nd * 4                                       # down slab
+        return total
 
     def _linear(self, x, W, p, ids, out_n, out_dtype = torch.half, out = None):
         """x: [B, cmax, k] input slab, W: [B, k, n] -> [B, cmax, n]. Unfolded: the same
@@ -153,13 +194,10 @@ class BatchReconLayer:
     def _recon(self, W, ptrs, p, ids_d, K, cb):
         ptrs = ptrs.contiguous()
         if self.folded:
-            # Per-matrix suh/svh addresses: row `id` of the stacked tables
-            suh, svh = self.scales[p]
+            # Per-matrix suh/svh addresses, gathered by expert id
+            suh_p, svh_p = self.scale_ptrs[p]
             ext.reconstruct_had_batch(
-                W, ptrs,
-                (suh.data_ptr() + ids_d * (suh.shape[1] * 2)).contiguous(),
-                (svh.data_ptr() + ids_d * (svh.shape[1] * 2)).contiguous(),
-                K, *cb)
+                W, ptrs, suh_p.index_select(0, ids_d), svh_p.index_select(0, ids_d), K, *cb)
         else:
             ext.reconstruct_batch(W, ptrs, K, *cb)
 

@@ -498,6 +498,30 @@ only when the table lives on high-latency storage (e.g. HDD, where per-row seeks
 unusable). Also settable per load via `config.infer_params.ngram_stream_from_disk` or
 `--ngram_ram` in `model_init`-based scripts.
 
+### `EXL3_AUTOSPLIT_WORSTCASE` (default: `1`)
+
+The layer-split autosplit loader measures each module's transient VRAM with one forward of a
+dummy state and keeps that much headroom per device. Some transients don't show in that
+forward: attention/MLA decode statics (QSA/DSA families) and, for block-sparse MoE layers,
+everything that depends on how the real workload routes tokens: the deterministic slot scratch
+(all assignments slotted, `EXL3_MOE_FUSED_DET`), the batched-reconstruct group temporaries,
+and the CPU-offload host's GPU side (per-device weight ring, fused-tier buffers, batched tier
+statics, padded fp32 outputs), which the measuring forward skips entirely. With the switch on,
+these modules allocate and drop an upper bound of those transients inside the measuring window
+(`autosplit_extra_measure`), so the split leaves room for them. `0` restores the plain
+measured forward.
+
+### `EXL3_AUTOSPLIT_MARGIN_MB` (default: `256`)
+
+The layer-split loader closes a device when its remaining headroom no longer covers the largest
+transient measured on it. Besides the `-gs` budget, the check is made against the device
+itself (free VRAM plus the allocator's reserved-but-unallocated pool): a split value at or above
+the card's size otherwise plans against the several hundred MiB the CUDA context, the loaded
+kernels and other processes hold, and the load passes but the first real forward fails. This
+margin is added on top of the measured transient in that physical check, covering what a real
+forward keeps live around a module (recurrent test states, gathered embeddings, allocator
+slack). `0` disables the margin.
+
 ### `EXL3_VISION_PINNED` (default: `0`)
 
 Default for `Config.infer_params.vision_pinned`: store the vision component's linear-layer

@@ -13,6 +13,7 @@ from .mlp import MLP, GatedMLP
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
+from .moe_batch_recon import PAD_MAX
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
@@ -743,6 +744,57 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 mg.ptrs_trellis if mg is not None else None, mu.ptrs_trellis, md.ptrs_trellis)
         return self.batch_recon
 
+    def prefill_worst_case_parts(self, rows: int, assignments: int) -> tuple[int, int]:
+        """Upper bound on the GPU-expert prefill transients of a `rows`-token chunk with
+        `assignments` routed rows landing on GPU-resident experts, as (fixed, variable) bytes:
+        the fp32 accumulator, the output state and the deterministic slot scratch (every
+        assignment slotted, padded) live for the whole call; the larger of one
+        batched-reconstruct group and the per-expert dequant path with every row on one expert
+        is the working set on top. The autosplit measuring forward routes a dummy state, so
+        what it sees of these depends on that routing; the loader takes this bound instead
+        (autosplit_extra_measure)"""
+        if self.cpu_offload or self.multi_up is None:
+            return 0, 0
+        h = self.hidden_size
+        fixed = (rows + 1) * h * 4 + rows * h * 2
+        if FUSED_DET:
+            fixed += (int(assignments * PAD_MAX) + 1) * h * 4
+        r = min(rows, assignments)
+        isz = (self.interm_dtype or torch.float).itemsize
+        per_expert = r * (2 * self.intermediate_size_padded * isz + 2 * h * 2 + h * 4)
+        if self.interm_dtype != torch.half:
+            per_expert += r * self.intermediate_size_padded * 2
+        recon = self._batch_recon_layer(torch.empty((1, h), dtype = torch.half, device = self.device))
+        batched = recon.worst_case_bytes(assignments, slot_mode = FUSED_DET) if recon is not None else 0
+        return fixed, max(per_expert, batched)
+
+    def autosplit_extra_measure(self, params):
+        """Autosplit loader hook: allocate (and drop) the worst-case prefill transient so the
+        device keeps headroom for it. The CPU-offload host's per-device stream state and this
+        layer's tier statics are allocated for real here: the measuring forward skips the CPU
+        path, and they would otherwise appear unaccounted on the first real prefill"""
+        if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
+            return
+        rows = getattr(self, "_measure_rows", 0)
+        if not rows or self.device is None or self.device.type != "cuda":
+            return
+        A = rows * self.num_experts_per_tok
+        host = getattr(self, "cpu_host", None)
+        if host is not None and getattr(self, "cpu_layer_idx", None) is not None:
+            # Split layers: the assignments divide between GPU-resident and CPU-resident
+            # experts. Both sides' whole-call buffers live at once; the CPU side's group
+            # working set is freed before the GPU side allocates its own. Take the worst split
+            total = 0
+            for a in (A * i // 4 for i in range(5)):
+                gf, gv = self.prefill_worst_case_parts(rows, a)
+                cf, cv = host.prefill_worst_case_parts(self.cpu_layer_idx, rows, self.device, A - a)
+                total = max(total, gf + cf + max(gv, cv))
+        else:
+            total = sum(self.prefill_worst_case_parts(rows, A))
+        if total > 0:
+            t = torch.empty((total,), dtype = torch.uint8, device = self.device)
+            del t
+
     def _run_batch_recon(self, recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
                          scratch = None, tables = None):
         """Run the planned groups through the batched reconstruct tier. With a slot scratch each
@@ -814,6 +866,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             y = x.view(-1, self.hidden_size)
         bsz = y.shape[0]
         bc_sh_exp = False
+        if params.get("autosplit_measure"):
+            self._measure_rows = bsz
 
         # Eligibility for the multi-row CUDA-graph path (bsz 1..MAX_BSZN): computed up front so
         # it can override the f_threshold-based routing below (bsz>=f_threshold would otherwise
