@@ -13,6 +13,7 @@ if not (torch.version.hip and torch.cuda.is_available()):
 from exllamav3.modules import block_sparse_mlp as bsm
 from exllamav3.modules import dsv4
 from exllamav3.modules import gated_delta_net as gdn
+from exllamav3.generator import generator as generator_module
 
 DEVICE = "cuda"
 
@@ -35,6 +36,30 @@ def _routing_cfg():
         topk_group = 1,
         tid2eid = torch.tensor([[0, 2], [1, 3], [4, 5]], device = DEVICE),
     )
+
+
+def test_ngram_drafting_fails_during_generator_construction_when_sam_is_unavailable(monkeypatch):
+    model = SimpleNamespace(
+        config = SimpleNamespace(vocab_size = 64),
+        caps = {},
+    )
+    cache = SimpleNamespace(max_num_tokens = 256)
+    monkeypatch.setattr(
+        generator_module,
+        "PageTable",
+        lambda _generator, _cache: SimpleNamespace(max_pages = 1),
+    )
+    monkeypatch.setattr(generator_module.ext, "BC_SAM", lambda: None)
+
+    with pytest.raises(NotImplementedError, match = "N-gram drafting requires BC_SAM"):
+        generator_module.Generator(model, cache, None, ngram_match_min = 1)
+
+    monkeypatch.setattr(generator_module.ext, "BC_SAM", lambda: object())
+    generator = generator_module.Generator(model, cache, None, ngram_match_min = 1)
+    try:
+        assert generator.ngram_match_min == 1
+    finally:
+        generator.filter_pool.shutdown()
 
 
 def test_missing_routing_bindings_use_torch_contracts(monkeypatch):
