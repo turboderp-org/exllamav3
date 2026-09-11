@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
@@ -22,6 +23,9 @@ from .block_sparse_mlp_routing import (
 
 TEMP_ROWS_FUSED = 128
 TEMP_ROWS_GRAPH = 32
+# Batched reconstruct tier for the experts above the fused kernel's row capacity at prefill
+# (moe_batch_recon.py); EXL3_MOE_BATCH_RECON=0 restores the per-expert reconstruct loop
+BATCH_RECON = os.environ.get("EXL3_MOE_BATCH_RECON", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
 @dataclass
@@ -355,6 +359,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.bc = None
         self.bc_sh_exp = False
         self.fused_mode_buffers = None
+        self.batch_recon = None
         self._cpu_init_state()
 
     @override
@@ -701,11 +706,61 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.load_routing(**kwargs)
 
 
+    def _batch_recon_layer(self, y):
+        """Per-module batched reconstruct state (moe_batch_recon.BatchReconLayer), built on
+        first use; None when the module's configuration isn't covered (same conditions as the
+        DQ path plus fp16 intermediates and unpadded hidden dims)"""
+        if self.batch_recon is False:
+            return None
+        if self.batch_recon is None:
+            ok = (
+                BATCH_RECON and self.bc is not None and self.support_quant_paths and
+                self.interm_dtype == torch.half and self.multi_up is not None and
+                self.multi_up.in_features == y.shape[1] and
+                self.multi_down.out_features == y.shape[1] and
+                self.multi_down.in_features == self.multi_up.out_features
+            )
+            if not ok:
+                self.batch_recon = False
+                return None
+            from .moe_batch_recon import BatchReconLayer
+            mg, mu, md = self.multi_gate, self.multi_up, self.multi_down
+            scales = {p: ([l.inner.suh for l in m.linears], [l.inner.svh for l in m.linears])
+                      for p, m in (("g", mg), ("u", mu), ("d", md)) if m is not None}
+            self.batch_recon = BatchReconLayer(
+                (mg.in_features, mg.out_features, mg.K) if mg is not None else None,
+                (mu.in_features, mu.out_features, mu.K),
+                (md.in_features, md.out_features, md.K),
+                mg.q_cb() if mg is not None else None, mu.q_cb(), md.q_cb(),
+                self.activation_fn, self.act_limit, self.device, scales)
+            self.batch_recon.set_static_pointers(
+                mg.ptrs_trellis if mg is not None else None, mu.ptrs_trellis, md.ptrs_trellis)
+        return self.batch_recon
+
+    def _run_batch_recon(self, recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, heavy):
+        """Run the experts in `heavy` (local ids) through the batched reconstruct tier,
+        accumulating into fhs_ext (rows + 1, the last row a padding sink). Returns the set of
+        experts handled."""
+        from .moe_batch_recon import plan_groups
+        rows = y.shape[0]
+        y_ext = torch.cat([y, torch.zeros((1, y.shape[1]), dtype = y.dtype, device = y.device)])
+        tok_ext = torch.cat([token_sorted, torch.full((1,), rows, dtype = token_sorted.dtype, device = y.device)])
+        w_ext = torch.cat([weight_sorted.half(), torch.zeros((1,), dtype = torch.half, device = y.device)])
+        starts = [0]
+        for c in expert_count_list:
+            starts.append(starts[-1] + c)
+        for grp in plan_groups(heavy, lambda e: expert_count_list[e], recon.cap):
+            recon.run_group(
+                y_ext, fhs_ext, tok_ext, w_ext,
+                grp, [starts[e] for e in grp], [expert_count_list[e] for e in grp])
+        return set(heavy)
+
     @override
     def unload(self):
         self.cpu_unload()
         self.bc = None
         self.fused_mode_buffers = None
+        self.batch_recon = None
         if self.multi_gate is not None:
             self.multi_gate.unload()
             self.multi_gate = None
@@ -799,7 +854,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.config.infer_params.no_reconstruct or
             not (self.support_quant_paths or bszn_eligible)
         ):
-            final_hidden_states = torch.zeros_like(y, dtype = torch.float)
+            # One spare row: the batched reconstruct tier's padding sink (never read back)
+            fhs_ext = torch.zeros((y.shape[0] + 1, y.shape[1]), dtype = torch.float, device = y.device)
+            final_hidden_states = fhs_ext[:y.shape[0]]
 
             # if self.routing_device is None or self.num_local_experts == self.num_experts:
             #     expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
@@ -903,11 +960,25 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 max_count = 0
                 start = 0
 
+                # Batched reconstruct tier: the experts above the fused capacity (and the
+                # graph path's) in count-sorted groups, a handful of launches per group; the
+                # per-expert loop below skips them
+                batched = ()
+                if expert_count_list is not None:
+                    recon = self._batch_recon_layer(y)
+                    if recon is not None:
+                        lim = max(min_rows, TEMP_ROWS_GRAPH)
+                        heavy = [e for e in range(num_ex) if lim < expert_count_list[e] <= recon.max_rows]
+                        if heavy:
+                            batched = self._run_batch_recon(
+                                recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list,
+                                heavy)
+
                 # expert_count_list None: everything already handled by the fused kernel above
                 for expert_idx in range(num_ex if expert_count_list is not None else 0):
                     count = expert_count_list[expert_idx]
                     end = start + count
-                    if count <= min_rows:
+                    if count <= min_rows or expert_idx in batched:
                         start = end
                         continue
 
