@@ -21,6 +21,33 @@ _spec.loader.exec_module(_fallback_impl)
 fb = _fallback_impl
 
 
+@pytest.mark.parametrize(
+    "fallback,activation",
+    [
+        (fb.silu_mul, F.silu),
+        (fb.gelu_mul, lambda t: F.gelu(t, approximate = "tanh")),
+        (fb.relu2_mul, lambda t: F.relu(t).square()),
+        (fb.relu_mul, F.relu),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_activation_mul_clamps_activated_gate_and_up_path_before_product(fallback, activation, dtype):
+    x = torch.tensor([[-6.0, -1.0, 0.5, 3.0, 12.0]], dtype = dtype)
+    y = torch.tensor([[-8.0, -2.5, 1.0, 2.5, 8.0]], dtype = dtype)
+    original_x, original_y = x.clone(), y.clone()
+    output = torch.full(x.shape, float("nan"), dtype = torch.float16)
+    limit = 2.0
+
+    assert fallback(x, y, output, limit) is None
+
+    expected = activation(x).clamp(max = limit) * y.clamp(min = -limit, max = limit)
+    if dtype == torch.float32:
+        expected = expected.clamp(min = -65504.0, max = 65504.0)
+    torch.testing.assert_close(output, expected.half(), rtol = 2e-3, atol = 2e-3)
+    assert torch.equal(x, original_x)
+    assert torch.equal(y, original_y)
+
+
 def test_silu_oai_mul_matches_clamped_swiglu_and_allows_output_alias():
     gate = torch.tensor([[-3.0, -0.5, 0.5, 4.0]], dtype = torch.float32)
     up = torch.tensor([[-4.0, -0.25, 0.75, 5.0]], dtype = torch.float32)

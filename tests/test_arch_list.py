@@ -44,3 +44,27 @@ def test_rocm_arch_fallback_prefers_gcn_arch_name_and_recognizes_gfx12(
     arch_list.maybe_set_arch_list_env()
 
     assert arch_list.os.environ["PYTORCH_ROCM_ARCH"] == expected
+
+
+def test_rocm_arch_list_uses_rocminfo_and_preserves_first_seen_dedup_order(monkeypatch):
+    fake_torch = SimpleNamespace(version = SimpleNamespace(hip = "6.4", cuda = None))
+    rocminfo = """\
+Name: gfx1201
+Name: gfx1100
+Name: gfx1201
+Name: amdgcn-amd-amdhsa--gfx11-generic
+Name: gfx1030
+Name: gfx1100
+"""
+    monkeypatch.setattr(arch_list, "torch", fake_torch)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout = rocminfo),
+    )
+    monkeypatch.delenv("TORCH_CUDA_ARCH_LIST", raising = False)
+    monkeypatch.delenv("PYTORCH_ROCM_ARCH", raising = False)
+
+    arch_list.maybe_set_arch_list_env()
+
+    assert arch_list.os.environ["PYTORCH_ROCM_ARCH"] == "gfx1201;gfx1100;gfx1030"
