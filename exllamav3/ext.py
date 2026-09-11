@@ -38,8 +38,8 @@ else:
 
             # Possible locations for MSVC, in order of preference
 
-            program_files_x64 = os.environ.get("ProgramW6432", os.environ.get("ProgramFiles", r"C:\Program Files"))
-            program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+            program_files_x64 = os.environ["ProgramW6432"]
+            program_files_x86 = os.environ["ProgramFiles(x86)"]
 
             msvc_dirs = \
             [
@@ -190,13 +190,30 @@ if torch.version.hip:
 
     for _name in [
         'silu_mul', 'silu_oai_mul', 'gelu_mul', 'relu2_mul', 'relu_mul', 'xielu',
+        'apply_logit_bitmask',
         'mul_sigmoid_', 'mul_sigmoid_broadcast_', 'mul_softplus_broadcast_',
         'add_sigmoid_gate', 'add_sigmoid_gate_proj', 'deinterleave_qg',
         'rms_norm', 'rms_norm_res_in', 'gated_rms_norm',
         'softcap',
+        'quant_cache_cont', 'dequant_cache_cont',
+        'quant_cache_paged', 'dequant_cache_paged', 'dequant_cache_paged_window',
+        'count_inf_nan', 'dsa_topk',
     ]:
         if not hasattr(exllamav3_ext, _name):
             setattr(exllamav3_ext, _name, getattr(_fb, _name))
+
+    # Keep the public API stable while using the fixed-K native QSA kernel only for its
+    # validated gfx12 wave32 shape. Everything else retains the general PyTorch fallback.
+    if hasattr(exllamav3_ext, "dsa_topk_gfx12"):
+        def _dsa_topk_rocm(scores, indices, k, t_ptr = None, t_seq = 0):
+            if (
+                hasattr(exllamav3_ext, "dsa_topk_gfx12") and
+                _fb.dsa_topk_gfx12_supported(scores, indices, k, t_ptr, t_seq)
+            ):
+                return exllamav3_ext.dsa_topk_gfx12(scores, indices)
+            return _fb.dsa_topk(scores, indices, k, t_ptr, t_seq)
+
+        setattr(exllamav3_ext, "dsa_topk", _dsa_topk_rocm)
 
     # Constants and functions guarded by fused_sampler_enable in generator/sampler/custom.py.
     # Disable the fused sampler path on ROCm by setting the flag and providing stub values.
@@ -204,4 +221,4 @@ if torch.version.hip:
         setattr(exllamav3_ext, 'FUSED_SAMPLER_MAX_BLOCKS', 0)
     if not hasattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE'):
         setattr(exllamav3_ext, 'FUSED_SAMPLER_HIST_STRIDE', 0)
-    os.environ.setdefault('EXL3_FUSED_SAMPLER', '0')
+    os.environ['EXL3_FUSED_SAMPLER'] = '0'
