@@ -56,4 +56,7 @@
     const int K_up,                             \
     const int K_down,                           \
                                                 \
-    int* __restrict__ locks
+    int* __restrict__ locks,                    \
+                                                \
+    float* __restrict__ output_scratch,         \
+    const int64_t* __restrict__ fused_base

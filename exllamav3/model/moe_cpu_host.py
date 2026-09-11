@@ -1372,7 +1372,7 @@ class MoeCpuHost:
                     tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
                     tblt[6], tblt[7], tblt[8],
                     False, True, False, True, False, True,
-                    float(spec["act_limit"] or 0.0), n_fused)
+                    float(spec["act_limit"] or 0.0), n_fused, None, None)
 
             # Heavy tier: batched reconstruct (groups of experts, a handful of launches per
             # group; see moe_batch_recon.py) when eligible, else per expert

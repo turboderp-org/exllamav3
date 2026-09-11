@@ -33,26 +33,23 @@ RECON_BATCH = max(1, int(os.environ.get("EXL3_MOE_RECON_BATCH", 16)))
 RECON_ROWS = max(1, int(os.environ.get("EXL3_MOE_RECON_ROWS", 16384)))
 # Dequantized weight scratch budget (two live projections at a time)
 RECON_MB = max(1, int(os.environ.get("EXL3_MOE_RECON_MB", 256)))
-RECON_FOLDED = os.environ.get("EXL3_MOE_RECON_FOLDED", "0") != "0"
+# Folded reconstruct (suh / Hadamard / svh applied to the dequantized weights, the dense
+# Linear prefill formulation) vs Hadamards on the activation slabs. Default on
+RECON_FOLDED = os.environ.get("EXL3_MOE_RECON_FOLDED", "1") != "0"
 # Batching pays while a single expert's GEMM cannot fill the GPU: with 128x128 output tiles an
 # m x n GEMM launches ceil(m/128) * ceil(n/128) blocks, and below roughly the SM count the
-# strided-batched kernel wins by a wide margin (PRO 6000, 188 SMs, k = 2048: n = 768 is 1.45x
-# faster batched at m = 1024 and 2.9x at m = 256; n = 1792 breaks even at m = 1024). Above
-# that the batched cuBLAS kernels are ~10-15% slower than the single-GEMM ones, and the slab
-# padding / gather traffic grows with the rows, so experts whose narrowest projection already
-# spans more than RECON_TILES tiles stay per-expert. EXL3_MOE_RECON_TILES sets the budget
+# strided-batched kernel wins by a wide margin. EXL3_MOE_RECON_TILES sets the budget
 # (0 = batch everything); EXL3_MOE_RECON_MAX_ROWS caps rows directly
 RECON_TILES = int(os.environ.get("EXL3_MOE_RECON_TILES", 64))
 RECON_MAX_ROWS = int(os.environ.get("EXL3_MOE_RECON_MAX_ROWS", 0))
 # Give up on adding a smaller expert to a group once padded rows would exceed this multiple of
-# the real rows: a group of very uneven experts wastes GEMM work on zeros. Measured on
-# Qwen3.8-Flash-Next at 4096 tokens (padding share of the tier's rows / prefill tok/s):
-# batch 16 at 1.5: 32% / 6098; batch 8 at 1.5: 20% / 6162; batch 16 at 1.1: 8% / 6215.
-# The limit beats a smaller batch because it only splits the uneven groups
+# the real rows: a group of very uneven experts wastes GEMM work on zeros.
 PAD_MAX = float(os.environ.get("EXL3_MOE_RECON_PAD", 1.1))
-# Accumulate the group's results one expert at a time (bit-reproducible) instead of one
-# atomic index_add_ over the padded slab; EXL3_MOE_RECON_DET=0 restores the single call
-DETERMINISTIC = os.environ.get("EXL3_MOE_RECON_DET", "1") != "0"
+# Accumulation when the tier is not writing into the layer's slot scratch (the streamed CPU
+# tier, and the GPU path with EXL3_MOE_FUSED_DET=0): one index_add_ per expert (bit-
+# reproducible, up to B launches per group) or a single atomic index_add_ over the padded slab.
+# Follows EXL3_MOE_FUSED_DET unless EXL3_MOE_RECON_DET is set explicitly
+DETERMINISTIC = os.environ.get("EXL3_MOE_RECON_DET", os.environ.get("EXL3_MOE_FUSED_DET", "0")) != "0"
 
 # act(g, u) -> a kernels; gateless relu2 rides relu_mul(u, u, a) = relu2(u)
 _ACT_CALLS_GATED = {
@@ -102,7 +99,7 @@ class BatchReconLayer:
     differ between GPU-resident and streamed experts)."""
 
     def __init__(self, dims_g, dims_u, dims_d, cb_g, cb_u, cb_d, activation, act_limit, device,
-                 scales, folded = None):
+                 scales, folded = None, interm_fp32 = False):
         # dims: (k, n, K); cb: (mcg, mul1); scales: per projection ("g", "u", "d") a pair of
         # lists of per-expert suh (k) and svh (n) half tensors, stacked here into [E, dim]
         # tables
@@ -126,6 +123,9 @@ class BatchReconLayer:
         # a host-built list. Streamed experts (VRAM slot addresses) pass pointers per call.
         self.ptr_tables = None
         self.folded = RECON_FOLDED if folded is None else folded
+        # fp32 gate / up outputs (models whose intermediates overflow fp16, e.g. gemma4): the
+        # activation kernels take fp32 in and write the fp16 activation the down GEMM consumes
+        self.interm_fp32 = interm_fp32
         # Stacked [E, dim] per-expert scale tables: had_r_128_batch reads rows by id in the
         # unfolded path; the folded path derives per-matrix suh/svh addresses from them
         self.scales = {}
@@ -133,7 +133,7 @@ class BatchReconLayer:
             suh, svh = scales[p]
             self.scales[p] = (torch.stack(list(suh)).contiguous(), torch.stack(list(svh)).contiguous())
 
-    def _linear(self, x, W, p, ids, out_n, out_dtype = torch.half):
+    def _linear(self, x, W, p, ids, out_n, out_dtype = torch.half, out = None):
         """x: [B, cmax, k] input slab, W: [B, k, n] -> [B, cmax, n]. Unfolded: the same
         arithmetic as the per-expert path (had_r_128 with fp16 pre-scale in, fp16/fp32 post-
         scale out), with the per-expert scale rows picked from the stacked tables"""
@@ -143,7 +143,7 @@ class BatchReconLayer:
             xh = torch.empty_like(x)
             ext.had_r_128_batch(x.view(B * cmax, k), xh.view(B * cmax, k), suh, None, ids, cmax, 1.0)
             x = xh
-        y = torch.empty((B, cmax, out_n), dtype = out_dtype, device = x.device)
+        y = out if out is not None else torch.empty((B, cmax, out_n), dtype = out_dtype, device = x.device)
         ext.hgemm_batched(x, W, y)
         if not self.folded:
             y2 = y.view(B * cmax, out_n)
@@ -178,6 +178,9 @@ class BatchReconLayer:
         counts: list[int],         # per expert: rows
         ptrs: tuple | None = None, # streamed experts: per projection (g, u, d) lists of B
                                    # trellis addresses; None = gather from set_static_pointers
+        out_slab: torch.Tensor | None = None,  # (B * cmax, ho) fp32 view of the layer's slot
+                                   # scratch: the down projection is written there unweighted and
+                                   # nothing is accumulated here (exl3_moe_gather sums the slots)
     ):
         B = len(counts)
         assert B <= self.cap
@@ -221,37 +224,50 @@ class BatchReconLayer:
         # call (the down projection reuses the gate slab, which is dead after the activation)
         kg, ng = (self.dims_g[0], self.dims_g[1]) if self.gated else (0, 0)
         scratch1 = torch.empty(B * max(kg * ng, kd * nd), dtype = torch.half, device = dev)
+        idt = torch.float if self.interm_fp32 else torch.half
         Wu = torch.empty((B, ku, nu), dtype = torch.half, device = dev)
         self._recon(Wu, ptr_u, "u", ids_d, Ku, self.cb_u)
-        u = self._linear(x, Wu, "u", ids_d, nu)
+        u = self._linear(x, Wu, "u", ids_d, nu, out_dtype = idt)
         del Wu
         if self.gated:
             Kg = self.dims_g[2]
             Wg = scratch1[:B * kg * ng].view(B, kg, ng)
             self._recon(Wg, ptr_g, "g", ids_d, Kg, self.cb_g)
-            g = self._linear(x, Wg, "g", ids_d, ng)
+            g = self._linear(x, Wg, "g", ids_d, ng, out_dtype = idt)
             g2, u2 = g.view(B * cmax, ng), u.view(B * cmax, nu)
-            self.act_call(g2, u2, u2, self.act_limit)      # in place into u
-            del g
         else:
-            u2 = u.view(B * cmax, nu)
-            self.act_call(u2, u2, u2, self.act_limit)
+            g2 = u2 = u.view(B * cmax, nu)
+        if self.interm_fp32:
+            a = torch.empty((B * cmax, nu), dtype = torch.half, device = dev)
+            self.act_call(g2, u2, a, self.act_limit)
+            u = a.view(B, cmax, nu)
+        else:
+            self.act_call(g2, u2, u2, self.act_limit)      # in place into u
+        if self.gated:
+            del g
 
         # Down: fp32 output, as the per-expert DQ path (hgemm into fp32, fp32 output Hadamard)
         Wd = scratch1[:B * kd * nd].view(B, kd, nd)
         self._recon(Wd, ptr_d, "d", ids_d, Kd, self.cb_d)
+        # Slot mode: the down projection lands straight in the layer scratch, unweighted; the
+        # caller's exl3_moe_gather sums each token's slots in k order (deterministic, one launch
+        # per layer, no copy). Otherwise accumulate here
+        if out_slab is not None:
+            assert nd == out_slab.shape[1], "slot scratch width must match the down projection"
+            self._linear(u, Wd, "d", ids_d, nd, out_dtype = torch.float, out = out_slab.view(B, cmax, nd))
+            return
         d = self._linear(u, Wd, "d", ids_d, nd, out_dtype = torch.float)
         d2 = d.view(B * cmax, nd)
         ho = out_ext.shape[1]
-        d2[:, :ho].mul_(w.float().unsqueeze(1))
         if DETERMINISTIC:
-            # One index_add_ per expert: within an expert the token ids are unique, so every
-            # output element receives exactly one add per launch and the result is bit-
-            # reproducible. A single call over the whole slab (a token appears once per expert
-            # it routes to) goes through CUDA atomics in arrival order and was the only source
-            # of run-to-run nondeterminism on Qwen3-30B-A3B (KL ~3e-4 between identical runs)
+            # One index_add_ per expert (unique indices per launch, so bit-reproducible; up to B
+            # launches per group). The GPU path uses slot mode instead
+            d2[:, :ho].mul_(w.float().unsqueeze(1))
             for b, c in enumerate(counts):
                 r0 = b * cmax
                 out_ext.index_add_(0, tok[r0 : r0 + c], d2[r0 : r0 + c, :ho])
         else:
+            # Single atomic index_add_ (a token appears once per expert of the group): fastest,
+            # but the arrival order of the atomics makes it non-reproducible
+            d2[:, :ho].mul_(w.float().unsqueeze(1))
             out_ext.index_add_(0, tok, d2[:, :ho])

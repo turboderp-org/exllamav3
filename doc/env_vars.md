@@ -356,6 +356,28 @@ unchanged to four digits; prefill +5.5% on the 5090, +8% on the 4090, +4-8% on t
 2k-4k tokens. On Qwen3-30B-A3B the on/off KL (3.9e-4) sits inside that model's run-to-run
 floor (3.3e-4). Unchanged on the PRO 6000 (probe says off).
 
+### `EXL3_MOE_FUSED_DET` (default: `1`), `EXL3_MOE_RECON_DET` (default: follows `EXL3_MOE_FUSED_DET`)
+
+Bit-reproducible MoE prefill. By default the fused MoE kernel adds each expert's weighted
+output into the token row with float atomics, in whatever order the expert groups finish, and
+the batched reconstruct tier accumulates its padded slab with one atomic `index_add_`;
+together these are the only sources of run-to-run nondeterminism on the GPU prefill path
+(Qwen3.8-Flash-Next KL ~2e-2 between identical 4k-token runs, lfm2.5 ~1e-3, Qwen3-30B-A3B
+~3e-4). With `EXL3_MOE_FUSED_DET=1` every assignment of the fused and batched tiers gets a
+slot in one per-call fp32 scratch (`assignments x hidden`, ~320 MB per layer call on
+Qwen3.8 at 4k tokens): the fused kernel stores its weighted outputs there, the batched
+tier's down-projection GEMMs write straight into their slots, and one `exl3_moe_gather` per
+layer sums each token's slots in k order with the routing weights. Identical runs are then
+bit-identical (verified on all three models), and since the GEMM outputs are written once
+and read once either way it costs nothing measurable: Qwen3.8 6198/6219 vs 6164/6178 tok/s,
+lfm2.5 25.9k vs 26.2k, Qwen3-30B-A3B 7304 vs ~7100 (atomic). The remaining atomic user is
+the streamed CPU-offload tier's fused-kernel call. `EXL3_MOE_RECON_DET` only matters where
+the batched tier cannot write into the slot scratch (the streamed tier, or the switch off):
+`1` accumulates one expert at a time, `0` with one atomic `index_add_`. The GDN/KDA
+recurrent decode kernels (Qwen3.5, Qwen3.8, GLM-5.3) reduce their per-slice partial dot
+products in a fixed order unconditionally (no switch, no cost), so greedy decode on those
+models is reproducible as well.
+
 ### `EXL3_MOE_PINNED_ARENA` (default: `0`, experimental)
 
 Linux only. Back the CPU worker's expert-weight arena with `memfd` chunks that the parent
@@ -388,11 +410,13 @@ strided-batched GEMM and one Hadamard launch per projection for the whole group,
 to the largest expert of the group) instead of one expert at a time, cutting the per-expert
 launch count that dominates many-expert models at large chunk sizes (Qwen3.8-Flash-Next 512
 experts, 8k tokens: +16% prefill). The arithmetic is the same as the per-expert path (fp16
-rotated-basis weights, fp16 activations, fp32 down-projection output). `EXL3_MOE_BATCH_RECON`
+rotated-basis weights, fp16 activations, fp32 down-projection output; models with fp32
+intermediates such as Gemma 4 keep fp32 gate/up outputs and the activation kernel writes the
+fp16 input of the down projection, as in the per-expert path). `EXL3_MOE_BATCH_RECON`
 covers GPU-resident experts, `EXL3_MOE_STREAM_BATCH_RECON` the streamed CPU experts (the
 `EXL3_MOE_STREAM_FUSED_T` overflow tier). Set to `0` to restore the per-expert loops.
 
-### `EXL3_MOE_RECON_TILES` (default: `64`), `EXL3_MOE_RECON_BATCH` (default: `16`), `EXL3_MOE_RECON_PAD` (default: `1.1`), `EXL3_MOE_RECON_ROWS` (default: `16384`), `EXL3_MOE_RECON_MB` (default: `256`), `EXL3_MOE_RECON_MAX_ROWS` (default: unset), `EXL3_MOE_RECON_FOLDED` (default: `0`)
+### `EXL3_MOE_RECON_TILES` (default: `64`), `EXL3_MOE_RECON_BATCH` (default: `16`), `EXL3_MOE_RECON_PAD` (default: `1.1`), `EXL3_MOE_RECON_ROWS` (default: `16384`), `EXL3_MOE_RECON_MB` (default: `256`), `EXL3_MOE_RECON_MAX_ROWS` (default: unset), `EXL3_MOE_RECON_FOLDED` (default: `1`)
 
 Tuning for the batched reconstruct tier. Batching pays while a single expert's GEMM cannot
 fill the GPU: an `m x n` GEMM launches about `m/128 * n/128` output tiles, and below roughly
@@ -411,11 +435,17 @@ before the planner starts a new one (groups fill largest expert first, so this s
 groups of uneven experts: on Qwen3.8-Flash-Next at 4096 tokens a limit of 1.5 pads 32% of the
 tier's rows, 1.1 pads 8% and is 2% faster overall, beating a batch of 8 at 1.5; lfm2.5 gains
 2-5%); the padded-row budget per group; the dequantized-weight scratch budget, which shrinks
-the group for large expert shapes. `EXL3_MOE_RECON_FOLDED=1` folds both
+the group for large expert shapes. `EXL3_MOE_RECON_FOLDED=1` (default) folds both
 Hadamards and the sign vectors into the dequantized weights (the formulation the dense
-`Linear` prefill path uses above 1024 rows): fewer launches, about 10% faster on the tier, but
-the folded weights round to fp16, roughly doubling the tier's relative error versus the
-per-expert path.
+`Linear` prefill path uses above 1024 rows): fewer launches, about 4% faster prefill on
+Qwen3.8-Flash-Next, at the cost of rounding the folded weights to fp16, which roughly doubles
+the tier's error against an fp32 reference of the same quantized weights (9.6e-4 vs 4.6e-4).
+Against the unquantized model that difference is invisible: lfm2.5 4.10bpw over 10 x 2048
+tokens scores KL 0.0902 to the HF weights folded and 0.0907 unfolded (top-1 85.2% vs 84.9%,
+perplexity 40.50 vs 40.56). Note that the two modes are far apart from each other on
+routing-sensitive models (Qwen3.8 KL 2e-2, lfm2.5 6e-3) while equally far from the
+baseline, so mode-to-mode distance is not a fidelity measure. `0` selects the activation-side
+Hadamards.
 
 ### `EXL3_MOE_CPU_START_TIMEOUT` (default: `60`)
 
