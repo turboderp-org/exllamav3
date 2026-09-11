@@ -421,6 +421,9 @@ class DSV4Attention(Module):
         self.woa_multi_ready = False
         self.x_fan = None
         self.q_fan = None
+        self.qb_multi = None
+        self.wob_multi = None
+        self._one_idx = None
         self.x_fan_ready = False
         self._fan_scratch = {}
         self._bgraph_state = {}
@@ -578,6 +581,9 @@ class DSV4Attention(Module):
         # x-side / q_res-side projection fans (eager cached path), built lazily
         self.x_fan = None
         self.q_fan = None
+        self.qb_multi = None
+        self.wob_multi = None
+        self._one_idx = None
         self.x_fan_ready = False
         self._fan_scratch = {}
         self._bgraph_state = {}
@@ -922,7 +928,12 @@ class DSV4Attention(Module):
         widest). Mirrors the BC_DSV4Attention fan. A second fan pairs q_b with idx_wq_b
         (both consume q_res) for the top-k regime."""
         self.x_fan_ready = True
-        if os.environ.get("EXL3_DSV4_NO_XFAN", "0") != "0":
+        self.x_fan = None
+        self.q_fan = None
+        self.qb_multi = None
+        self.wob_multi = None
+        self._one_idx = None
+        if not hasattr(ext, "exl3_mgemm") or os.environ.get("EXL3_DSV4_NO_XFAN", "0") != "0":
             return
         device = torch.device(self.device)
 
@@ -1001,6 +1012,10 @@ class DSV4Attention(Module):
 
     def _build_woa_multi(self):
         self.woa_multi_ready = True
+        self.wo_a_multi = None
+        self.woa_indices = None
+        if not hasattr(ext, "exl3_mgemm"):
+            return
         try:
             if all(l.quant_type == "exl3" for l in self.wo_a):
                 self.wo_a_multi = MultiLinear(self.device, self.wo_a)
