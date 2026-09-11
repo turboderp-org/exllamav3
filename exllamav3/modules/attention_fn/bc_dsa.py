@@ -305,8 +305,8 @@ class BCDsa:
 
     def run(self, x, rs, rsl, bt_row = None):
         """x (1, seq, hidden) fp16 contiguous, bt_row (1, npr) i32 device block-table row of
-        this job (paged pools). Returns y (1, seq, hidden) fp32 (a static: consume before the
-        next BC call), or None to decline (host-side ring maintenance needed this
+        this job (paged pools). Returns y (1, seq, hidden) fp32 (a static: consume before
+        the next BC call), or None to decline (host-side ring maintenance needed this
         step)."""
         seq = x.shape[1]
         pos = rs.position
@@ -414,7 +414,7 @@ class BCDsaBatch:
                 m.indexer._build_fused()
             fan_lins += [m.indexer.wkv, m.indexer.wgate]
         fan_inner = [l.inner for l in fan_lins]
-        self.fan_ns = [l.out_features for l in fan_inner] if False else [l.out_features for l in fan_lins]
+        self.fan_ns = [l.out_features for l in fan_lins]
         q_lora = m.q_a.out_features
         self.q_lora = q_lora
         if not (
