@@ -2,12 +2,13 @@
 
 // This used to force integer MAD on sm_86 via inline asm, which outperformed the IMUL emitted by older
 // nvcc versions on the RTX 3090. As of CUDA 13.2 the workaround has inverted: the plain multiply is ~4%
-// faster end-to-end at m=1. Kept as a hook in case it regresses again.
+// faster end-to-end at m=1. Kept as a hook (CUDA-only; the inline PTX does not compile under hipcc)
+// in case it regresses again.
 template <uint32_t w>
 __device__ __forceinline__
 uint32_t mul_const_u32(uint32_t x)
 {
-    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860)
+    #if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860)
         uint32_t r;
         asm volatile (
             "{ .reg .u32 z,t;"
@@ -41,11 +42,43 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
     return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
 }
 
+// gfx1201: V_SAD_U8(p, 0, 0x6400) == byte_sum(p) + 0x6400 bit-exactly (gfx1201 lacks
+// V_DOT4; the dp4a byte-sum is emulated with ~5 VALU ops per state, the SAD form is one
+// instruction and the decode chain is instruction-issue-bound). Same contract as
+// decode_mul1_product_2; see the 2026-09-10 campaign (exl3-decode attribution, §13).
+#if defined(__gfx1200__) || defined(__gfx1201__)
+__device__ inline uint32_t exl3_sad_u8_(uint32_t p, uint32_t addend)
+{
+    uint32_t u;
+    asm("v_sad_u8 %0, %1, %2, %3" : "=v"(u) : "v"(p), "n"(0), "n"(addend));
+    return u;
+}
+
+__device__ inline half2 decode_mul1_product_2_sad(uint32_t x0, uint32_t x1)
+{
+    const uint32_t sum1 = exl3_sad_u8_(x1, 0x6400u);
+    const uint32_t sum0 = exl3_sad_u8_(x0, 0x6400u);
+    const uint32_t packed = (sum1 << 16) + sum0;   // u + 1024 <= 2029: no 16-bit carry
+    half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
+    half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
+    half_uint16 h0((uint16_t) packed);
+    half_uint16 h1((uint16_t)(packed >> 16));
+    return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
+}
+#endif
+
+// PTX lop3 LUT 0x6a with operands (a, b, c) implements c ^ (a & b).
+// Keep this expression portable instead of relying on inline PTX.
+__device__ __forceinline__ uint32_t lop3_0x6a(uint32_t a, uint32_t b, uint32_t c)
+{
+    return c ^ (a & b);
+}
+
 // Ditto mcg (cb 1)
 __device__ inline half2 decode_mcg_product_2(uint32_t x0, uint32_t x1)
 {
-    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+    x0 = lop3_0x6a(x0, 0x8fff8fffu, 0x3b603b60u);
+    x1 = lop3_0x6a(x1, 0x8fff8fffu, 0x3b603b60u);
     half2_uint32 xu0(x0);
     half2_uint32 xu1(x1);
     half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
@@ -60,7 +93,7 @@ __device__ inline half decode_3inst(uint32_t x)
     {
         x *= 89226354u;
         x += 64248484u;
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+        x = lop3_0x6a(x, 0x8fff8fffu, 0x3b603b60u);
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
@@ -69,7 +102,7 @@ __device__ inline half decode_3inst(uint32_t x)
         x *= 0xCBAC1FEDu;
         // x = mul_const_u32<0xCBAC1FEDu>(x);
 
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+        x = lop3_0x6a(x, 0x8fff8fffu, 0x3b603b60u);
         half2_uint32 xu(x);
         return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
@@ -98,8 +131,8 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
         x1 *= 89226354u;
         x0 += 64248484u;
         x1 += 64248484u;
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
-        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+        x0 = lop3_0x6a(x0, 0x8fff8fffu, 0x3b603b60u);
+        x1 = lop3_0x6a(x1, 0x8fff8fffu, 0x3b603b60u);
         half2_uint32 xu0(x0);
         half2_uint32 xu1(x1);
         half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
@@ -118,7 +151,11 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
     {
         x0 *= 0x83DCD12Du;
         x1 *= 0x83DCD12Du;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        return decode_mul1_product_2_sad(x0, x1);
+#else
         return decode_mul1_product_2(x0, x1);
+#endif
     }
 }
 

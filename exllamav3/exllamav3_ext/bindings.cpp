@@ -169,8 +169,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pack_signs", &pack_signs, "pack_signs");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
+#if !defined(USE_ROCM)
     m.def("reconstruct_had_batch", &reconstruct_had_batch, "reconstruct_had_batch");
     m.def("reconstruct_batch", &reconstruct_batch, "reconstruct_batch");
+#endif
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
@@ -301,12 +303,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("had_paley2", &had_paley2, "had_paley2");
 
     m.def("hgemm", &hgemm, "hgemm");
+    m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
+    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
+    m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
+    m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("had_r_128", &had_r_128, "had_r_128");
+    m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
     m.def("pack_signs", &pack_signs, "pack_signs");

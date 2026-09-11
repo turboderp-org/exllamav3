@@ -738,6 +738,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.batch_recon is None:
             ok = (
                 BATCH_RECON and self.bc is not None and self.support_quant_paths and
+                hasattr(ext, "reconstruct_batch") and
                 self.interm_dtype in (torch.half, None, torch.float) and self.multi_up is not None and
                 self.multi_up.in_features == y.shape[1] and
                 self.multi_down.out_features == y.shape[1] and

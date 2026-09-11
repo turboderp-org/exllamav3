@@ -10,6 +10,35 @@
 // C[b] = A[b] @ B[b], row-major, A [M, K], B [K, N], C [M, N] (fp16 or fp32 output), optional
 // strided batch. Requires K % 64 == 0, N % 128 == 0, packed rows; M arbitrary.
 
+#ifdef USE_ROCM
+
+// mma.sync/cp.async PTX has no RDNA equivalent; degrade to cuBLAS as on an uncovered shape.
+#include <ATen/Tensor.h>
+#include <ATen/cuda/CUDAContext.h>
+#include "hgemm.cuh"
+
+bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c)
+{
+    return false;
+}
+
+void hgemm_f16acc(at::Tensor a, at::Tensor b, at::Tensor c)
+{
+    TORCH_CHECK(false, "hgemm_f16acc: not supported on this platform");
+}
+
+int hgemm_f16acc_status(int device)
+{
+    return 0;
+}
+
+void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
+{
+    hgemm(a, b, c);
+}
+
+#else
+
 #include <cuda_fp16.h>
 #include "hgemm.cuh"
 #include <c10/cuda/CUDAGuard.h>
@@ -415,3 +444,5 @@ void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
     if (hgemm_f16acc_try(a, b, c)) return;
     hgemm(a, b, c);
 }
+
+#endif // USE_ROCM
