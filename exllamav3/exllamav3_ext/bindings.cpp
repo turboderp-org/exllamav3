@@ -142,6 +142,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pack_signs", &pack_signs, "pack_signs");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
+    m.def("reconstruct_had_batch", &reconstruct_had_batch, "reconstruct_had_batch");
+    m.def("reconstruct_batch", &reconstruct_batch, "reconstruct_batch");
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
