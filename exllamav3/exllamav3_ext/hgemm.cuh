@@ -17,3 +17,9 @@ void hgemm
     at::Tensor b,
     at::Tensor c
 );
+void hgemm_batched
+(
+    at::Tensor a,
+    at::Tensor w,
+    at::Tensor c
+);

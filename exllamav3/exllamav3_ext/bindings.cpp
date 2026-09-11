@@ -175,6 +175,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("num_tokens") = 1, py::arg("size_n_list") = py::none(), py::arg("c_ptrs") = py::none(),
           py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0);
     m.def("hgemm", &hgemm, "hgemm");
+    m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
