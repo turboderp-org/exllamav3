@@ -17,11 +17,7 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
 > **Looking for a server?** [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) is the official and recommended backend server. It provides an OpenAI-compatible API for local or remote inference, HF model downloading, embedding model support, and HF Jinja2 chat templates. Its startup script manages and installs prerequisites to help you get started.
 
 <p align="center">
-  <a href="doc/exl3.md">
-    <img src="doc/qb_kld.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
-  </a>
-  <br>
-  <sub>Quantization benchmark · <a href="doc/exl3.md">EXL3 format details</a></sub>
+  <img src="doc/qb_kld.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
 </p>
 
 ## Installation
@@ -171,7 +167,7 @@ will build/load it at runtime instead.
 ## Examples
 
 A number of example scripts are provided to showcase the features of the backend and generator. 
-For instance, a versatile CLI chatbot that you can start with:
+For instance, a versatile CLI chatbot:
 
 <p align="center">
   <img src="doc/chatpy.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
@@ -195,7 +191,7 @@ python examples/chat.py -h
 | **Command-A**, **Command-R+** etc.               | `Cohere2ForCausalLM` |  |  |
 | **DeciLM**, **Nemotron**                         | `DeciLMForCausalLM` |  |  |
 | **Deepseek V3**                                  | `DeepseekV3ForCausalLM` |  |  |
-| **Deepseek V4**                                  | `DeepseekV4ForCausalLM` |  |  |
+| **Deepseek V4**                                  | `DeepseekV4ForCausalLM` | ✓ |  |
 | **dots.llm1**                                    | `Dots1ForCausalLM` |  | |
 | **ERNIE 4.5**                                    | `Ernie4_5_ForCausalLM`<br>`Ernie4_5_MoeForCausalLM` |  |  |
 | **EXAONE 4.0**                                   | `Exaone4ForCausalLM` |  |  |
@@ -255,8 +251,7 @@ python convert.py -h
 
 The working directory is temporary storage for state checkpoints and for storing quantized tensors 
 until the converted model can be compiled. It should have enough free space to store an entire copy 
-of the output model. Note that while EXL2 conversion by default resumes an interrupted job when 
-pointed to an existing folder, EXL3 needs you to explicitly resume with the `-r`/`--resume` argument.
+of the output model.
 
 See the [conversion guide](doc/convert.md) for more information, or the 
 [self-calibration guide](doc/optimize.md). 
@@ -302,7 +297,7 @@ supporters (🐈❤️!) The following projects in particular deserve a special 
 - [QTIP](https://github.com/Cornell-RelaxML/qtip)
 - [Transformers](https://github.com/huggingface/transformers)
 - [Marlin](https://github.com/IST-DASLab/marlin)
-- [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention)
+- [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) (chunked linear-attention prefill kernels, vendored under `exllamav3/vendor/fla`)
 
 <p align="center">
   <img src="doc/cat.png" width="40" alt="">

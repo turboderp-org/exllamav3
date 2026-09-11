@@ -1273,7 +1273,8 @@ def quantize_exl3(
         Dump extra stats
 
     :param swap_to_device:
-        If input tensor is on CPU, move to this device before quantization
+        Device a CPU-swapped weight came from. Accepted for API compatibility; the work always
+        happens on quant_args["devices"][0] and the weight is moved there
 
     :param save_reg:
         Save regularized tensor as image to the provided path
@@ -1295,10 +1296,9 @@ def quantize_exl3(
             torch.manual_seed(quant_args["seed"])
 
         devices = quant_args["devices"]
-        if weight.device != torch.device(devices[0]):
-            weight = weight.to(devices[0])
-
-        device = weight.device if swap_to_device is None else swap_to_device
+        device = torch.device(devices[0])
+        if weight.device != device:
+            weight = weight.to(device)
         k, n = weight.shape
 
         # Get H, LDL decomp. and input/output sign flips
@@ -1319,8 +1319,6 @@ def quantize_exl3(
         if L is not None:
             L = L.to(device)
 
-        if swap_to_device is not None:
-            weight = weight.to(swap_to_device)
         if verbose:
             weight_copy = weight.cpu()
         weight_r = weight

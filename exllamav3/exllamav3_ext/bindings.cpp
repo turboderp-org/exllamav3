@@ -142,8 +142,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pack_signs", &pack_signs, "pack_signs");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
+    m.def("reconstruct_had_batch", &reconstruct_had_batch, "reconstruct_had_batch");
+    m.def("reconstruct_batch", &reconstruct_batch, "reconstruct_batch");
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("had_r_128", &had_r_128, "had_r_128");
+    m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
@@ -167,8 +170,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx512_bw", &exl3_moe_cpu_has_avx512_bw, "exl3_moe_cpu_has_avx512_bw");
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
-    m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm");
+    m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm",
+          py::arg("A"), py::arg("B"), py::arg("C"), py::arg("suh"), py::arg("A_had"), py::arg("svh"),
+          py::arg("indices"), py::arg("weights"), py::arg("K"), py::arg("force_shape_idx"), py::arg("mcg"),
+          py::arg("mul1"), py::arg("min_index"), py::arg("max_index"), py::arg("force_num_sms"),
+          py::arg("num_tokens") = 1, py::arg("size_n_list") = py::none(), py::arg("c_ptrs") = py::none(),
+          py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0);
     m.def("hgemm", &hgemm, "hgemm");
+    m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");

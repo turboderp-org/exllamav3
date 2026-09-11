@@ -11,10 +11,6 @@ from .gated_delta_net import GDNLayerState
 from .gated_delta_net_fn import causal_conv1d_update
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
 
-try:
-    from fla.ops.simple_gla import chunk_simple_gla
-except ModuleNotFoundError:
-    chunk_simple_gla = None
 
 
 def torch_recurrent_mamba2(
@@ -439,7 +435,7 @@ class Mamba2(Module):
         )
 
         # SSM
-        if seqlen >= self.num_v_heads and chunk_simple_gla is not None and not save_history:
+        if seqlen >= self.num_v_heads and not save_history:
             core_attn_out = self.ssd_chunked(mixed_xbc, dt, g, recurrent_state, save_state, params, bsz, seqlen)
         else:
             core_attn_out = torch.empty(
@@ -487,7 +483,9 @@ class Mamba2(Module):
 
     def ssd_chunked(self, mixed_xbc, dt, g, recurrent_state, save_state, params, bsz, seqlen):
         # Mamba2 (SSD) prefill: chunk_simple_gla computes the same recurrence without the
-        # delta-rule correction. No GQA support, so B/C expand to all heads
+        # delta-rule correction. No GQA support, so B/C expand to all heads. The vendored fla kernels
+        # probe the devices at import, so import on first use
+        from ..vendor.fla import chunk_simple_gla
         x_v, B, C = torch.split(mixed_xbc, [self.v_dim, self.k_dim, self.k_dim], dim = -1)
         x_v = x_v.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
         q = C.view(bsz, seqlen, self.num_k_heads, self.k_head_dim).repeat_interleave(self.num_v_groups, dim = 2)

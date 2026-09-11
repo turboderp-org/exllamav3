@@ -403,7 +403,10 @@ int exl3_mgemm_gr
     Graph* graph,
     int num_tokens,
     const c10::optional<at::Tensor>& size_n_list,
-    const c10::optional<at::Tensor>& c_ptrs
+    const c10::optional<at::Tensor>& c_ptrs,
+    const c10::optional<at::Tensor>& n_stride_list,
+    const c10::optional<at::Tensor>& had_src_list,
+    int num_had_src
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -426,7 +429,7 @@ int exl3_mgemm_gr
     TORCH_CHECK_DIM(C, 3);
 
     TORCH_CHECK_SHAPES(A, 1, C, 1, 1);
-    TORCH_CHECK_SHAPES(B, 0, suh, 0, 1);
+    if (!had_src_list) TORCH_CHECK_SHAPES(B, 0, suh, 0, 1);   // sliced mode: suh is per source
     TORCH_CHECK_SHAPES(B, 0, svh, 0, 1);
 
     int bsz = A.size(1);
@@ -450,9 +453,37 @@ int exl3_mgemm_gr
     }
     int bszm = MAX(bszm_in, bszm_out);
 
-    // The kernel writes one hadamard-transformed input slab PER MATRIX (A_had + j * m * k);
-    // an undersized scratch is silent OOB corruption (found the hard way)
-    TORCH_CHECK(A_had.numel() >= (int64_t) bszm * A.size(1) * A.size(2),
+    // Sliced mode: the entries are equal-width column slices of num_had_src source matrices,
+    // scheduled as independent z-groups so unequal matrices (e.g. Q vs K/V) can't leave groups
+    // idle. B/svh/c_ptrs entries are pre-offset to the slice's first column, size_n_list holds
+    // the slice width, n_stride_list the source's full width (the row stride of B and C), and
+    // had_src_list maps each slice to its source: suh and the A_had slabs are per source
+    const int* n_stride_list_ptr = nullptr;
+    const int* had_src_list_ptr = nullptr;
+    if (had_src_list)
+    {
+        TORCH_CHECK(size_n_list && c_ptrs && n_stride_list,
+                    "exl3_mgemm: sliced mode requires size_n_list, c_ptrs and n_stride_list");
+        TORCH_CHECK(bszm_in == 1 && !indices && !weights && num_tokens == 1 && min_index < 0,
+                    "exl3_mgemm: sliced mode is single-input, unfiltered and single-token");
+        TORCH_CHECK_DTYPE(had_src_list.value(), kInt);
+        TORCH_CHECK_DTYPE(n_stride_list.value(), kInt);
+        TORCH_CHECK(had_src_list.value().size(0) >= bszm_out && n_stride_list.value().size(0) >= bszm_out,
+                    "exl3_mgemm: had_src_list / n_stride_list must have one entry per slice");
+        TORCH_CHECK(num_had_src > 0 && suh.size(0) >= num_had_src,
+                    "exl3_mgemm: sliced mode needs one suh entry per source");
+        n_stride_list_ptr = (const int*) n_stride_list.value().data_ptr();
+        had_src_list_ptr = (const int*) had_src_list.value().data_ptr();
+    }
+    else
+    {
+        TORCH_CHECK(!n_stride_list, "exl3_mgemm: n_stride_list requires had_src_list");
+    }
+
+    // The kernel writes one hadamard-transformed input slab PER MATRIX (A_had + j * m * k), or
+    // per source in sliced mode; an undersized scratch is silent OOB corruption (found the hard way)
+    int64_t had_slabs = had_src_list ? num_had_src : bszm;
+    TORCH_CHECK(A_had.numel() >= had_slabs * A.size(1) * A.size(2),
                 "exl3_mgemm: A_had must hold bszm * m * k elements");
 
     const int64_t* indices_ptr = (const int64_t*) OPTPTR(indices);
@@ -523,7 +554,10 @@ int exl3_mgemm_gr
         (void*)& max_index,
         (void*)& num_tokens,
         (void*)& size_n_list_ptr,
-        (void*)& c_list_ptr
+        (void*)& c_list_ptr,
+        (void*)& n_stride_list_ptr,
+        (void*)& had_src_list_ptr,
+        (void*)& num_had_src
     };
 
     auto add_graph_args = [&](void* kernel_ptr)
@@ -545,6 +579,7 @@ int exl3_mgemm_gr
         (
             size_m, size_k, size_n, K, c_fp32, device, cc, total_sms, cb, bszm_in, bszm_out
         );
+        if (had_src_list) autotune_key ^= 0x9e3779b97f4a7c15ull;   // sliced launches tune separately
 
         CoopAutotuneLaunch tuned;
         if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, SMEM_MAX, stream, &tuned))
@@ -650,7 +685,10 @@ int exl3_mgemm
     int force_num_sms,
     int num_tokens,
     const c10::optional<at::Tensor>& size_n_list,
-    const c10::optional<at::Tensor>& c_ptrs
+    const c10::optional<at::Tensor>& c_ptrs,
+    const c10::optional<at::Tensor>& n_stride_list,
+    const c10::optional<at::Tensor>& had_src_list,
+    int num_had_src
 )
 {
     return exl3_mgemm_gr
@@ -673,6 +711,9 @@ int exl3_mgemm
         nullptr,
         num_tokens,
         size_n_list,
-        c_ptrs
+        c_ptrs,
+        n_stride_list,
+        had_src_list,
+        num_had_src
     );
 }

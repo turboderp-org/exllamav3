@@ -28,7 +28,6 @@ dependencies = [
     "marisa_trie",
     "pydantic",
     "llguidance>=1.7.0",
-    "flash-linear-attention>=0.5.0",
     "triton-windows; platform_system == 'Windows'",
 ]
 

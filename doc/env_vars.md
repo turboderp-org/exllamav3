@@ -339,6 +339,63 @@ madvise` hosts, plus any compaction the kernel needs first), so it must not sit 
 startup path; the worker reads 4K pages until each chunk lands. `EXL3_MOE_ARENA_DEBUG=1`
 prints how long it took. Set to `0` to skip hugepage promotion entirely.
 
+### `EXL3_MOE_PINNED_ARENA` (default: `0`, experimental)
+
+Linux only. Back the CPU worker's expert-weight arena with `memfd` chunks that the parent
+process also maps and page-locks (`cudaHostRegister`), and lay each expert's gate/up/down
+trellis tensors out as one contiguous block. Streamed prefill (`EXL3_MOE_STREAM_T`) then DMAs
+an expert's block straight out of the arena on the copy stream instead of having the worker's
+stager thread memcpy it into the pinned handoff ring first; the stager is the prefill
+bottleneck on fully offloaded models (mistral-small-4 119B, 54 GiB of experts: 4k-token
+prefill 700 -> 1850 tok/s on a gen5 x16 link, decode unchanged within noise). Costs: the
+descriptors are passed over the worker pipe and every chunk is registered with CUDA as it
+appears (~0.2 s per GiB, overlapping the load), the arena pages are shared memory
+(`Shmem` in `/proc/meminfo`, counted in both processes' RSS), and shmem pages only get
+transparent huge pages where `/sys/kernel/mm/transparent_hugepage/shmem_enabled` allows it
+(`advise`, `within_size` or `always`; on the default `never` the CPU kernels run on 4K pages,
+which cost a few percent of decode on some hosts). Not available on Windows.
+
+### `EXL3_MOE_ARENA_HUGE` (default: unset)
+
+With `EXL3_MOE_PINNED_ARENA=1`: `2m` or `1g` backs the memfd chunks with hugetlbfs pages
+(`MFD_HUGETLB`) of that size instead of shmem. Requires reserved huge pages
+(`vm.nr_hugepages`, or `hugepages-1048576kB` for `1g`) covering the whole arena; allocation
+fails with a clear error otherwise.
+
+### `EXL3_MOE_BATCH_RECON` (default: `1`), `EXL3_MOE_STREAM_BATCH_RECON` (default: `1`)
+
+Batched reconstruct tier for prefill (`exllamav3/modules/moe_batch_recon.py`): experts with
+more assigned rows than the fused MoE kernel's capacity (up to the `EXL3_MOE_RECON_TILES`
+budget below) are dequantized and multiplied in count-sorted groups (one pointer-table reconstruct, one
+strided-batched GEMM and one Hadamard launch per projection for the whole group, rows padded
+to the largest expert of the group) instead of one expert at a time, cutting the per-expert
+launch count that dominates many-expert models at large chunk sizes (Qwen3.8-Flash-Next 512
+experts, 8k tokens: +16% prefill). The arithmetic is the same as the per-expert path (fp16
+rotated-basis weights, fp16 activations, fp32 down-projection output). `EXL3_MOE_BATCH_RECON`
+covers GPU-resident experts, `EXL3_MOE_STREAM_BATCH_RECON` the streamed CPU experts (the
+`EXL3_MOE_STREAM_FUSED_T` overflow tier). Set to `0` to restore the per-expert loops.
+
+### `EXL3_MOE_RECON_TILES` (default: `64`), `EXL3_MOE_RECON_BATCH` (default: `16`), `EXL3_MOE_RECON_ROWS` (default: `16384`), `EXL3_MOE_RECON_MB` (default: `256`), `EXL3_MOE_RECON_MAX_ROWS` (default: unset), `EXL3_MOE_RECON_FOLDED` (default: `0`)
+
+Tuning for the batched reconstruct tier. Batching pays while a single expert's GEMM cannot
+fill the GPU: an `m x n` GEMM launches about `m/128 * n/128` output tiles, and below roughly
+the SM count the strided-batched kernel is much faster (PRO 6000, `k = 2048`: `n = 768` runs
+1.45x faster batched at `m = 1024` and 2.9x at `m = 256`, `n = 1792` breaks even at
+`m = 1024`), while above it the batched cuBLAS kernels are 10-15% slower than the single-GEMM
+ones, and the padded slabs cost traffic that grows with the rows. `EXL3_MOE_RECON_TILES` is
+that tile budget: an expert stays on the per-expert path once its narrowest projection
+(`min(intermediate, hidden)`) would span more tiles, i.e. above `TILES * 16384 / n_min` rows
+(1365 rows for `n = 768`, 512 for `n = 2048`). Measured at 8k tokens on a PRO 6000: lfm2.5
+(`n` 1792/2048) loses 15% with everything batched and 4% at a 1024-row cap, parity at 512;
+Qwen3.8-Flash-Next (`n = 768`) is within 2% for any cap. `0` batches
+every expert; `EXL3_MOE_RECON_MAX_ROWS` overrides the derived row cap directly. The other
+knobs: experts per group; the padded-row budget per group; the dequantized-weight scratch
+budget, which shrinks the group for large expert shapes. `EXL3_MOE_RECON_FOLDED=1` folds both
+Hadamards and the sign vectors into the dequantized weights (the formulation the dense
+`Linear` prefill path uses above 1024 rows): fewer launches, about 10% faster on the tier, but
+the folded weights round to fp16, roughly doubling the tier's relative error versus the
+per-expert path.
+
 ### `EXL3_MOE_CPU_START_TIMEOUT` (default: `60`)
 
 Seconds the parent waits for the CPU worker to signal ready after every offloaded layer has

@@ -30,10 +30,15 @@ void exl3_gemm_kernel_inner
     const int size_k,
     const int size_n,
     int* __restrict__ locks,
-    const half* post_scale
+    const half* post_scale,
+    int size_n_stride = 0     // full width of B and C when computing a column slice (0: = size_n)
 )
 {
     const int TILEBLOCKS_M = TILESIZE_M / 16;
+    if (size_n_stride == 0) size_n_stride = size_n;
+    // Column blocks of the full-width B row: slices index B relative to their own column offset,
+    // but a k-tile row still spans the whole matrix
+    const int blocks_n_full = size_n_stride / 16;
     const int TILEBLOCKS_K = TILESIZE_K / 16;
     const int TILEBLOCKS_N = TILESIZE_N / 16;
     // const int FRAGS_M = TILEBLOCKS_M;
@@ -124,7 +129,7 @@ void exl3_gemm_kernel_inner
         pred_a_gl[i] = m < size_m;
     }
 
-    int gl_b_stride_k = blocks_n * TILEBLOCKS_K * 256 / 16 * bits;
+    int gl_b_stride_k = blocks_n_full * TILEBLOCKS_K * 256 / 16 * bits;
     const int gl_b_stride_n = TILEBLOCKS_N * 256 / 16 * bits;
     const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;
     const uint16_t* gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
@@ -137,7 +142,7 @@ void exl3_gemm_kernel_inner
     {
         int n = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_b_stride_n / 8);
         int k = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_b_stride_n / 8);
-        load_b_gl[i] = k * (blocks_n * 256 / 16 * bits / 8) + n;
+        load_b_gl[i] = k * (blocks_n_full * 256 / 16 * bits / 8) + n;
         pred_b_gl[i] = i * EXL3_GEMM_BASE_THREADS + t < sh0_b_stride_k / 8;
     }
 
@@ -195,7 +200,7 @@ void exl3_gemm_kernel_inner
     int slice2_iters = slice0_iters;
 
     int gl_c_stride_n = TILESIZE_N;
-    int gl_c_stride_m = TILESIZE_M * size_n;
+    int gl_c_stride_m = TILESIZE_M * size_n_stride;
 
     half* gl_c_ptr_16 = ((half*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
     float* gl_c_ptr_32 = ((float*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
@@ -468,12 +473,12 @@ void exl3_gemm_kernel_inner
 
             if constexpr (c_fp32)
             {
-                float* had_out = gl_c_ptr_32 + row * size_n + col * 128;
+                float* had_out = gl_c_ptr_32 + row * size_n_stride + col * 128;
                 had_ff_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
             }
             else
             {
-                half* had_out = gl_c_ptr_16 + row * size_n + col * 128;
+                half* had_out = gl_c_ptr_16 + row * size_n_stride + col * 128;
                 had_fh_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
             }
         }
@@ -492,13 +497,13 @@ void exl3_gemm_kernel_inner
             {
                 if constexpr (c_fp32)
                 {
-                    float* c_ptr = gl_c_ptr_32 + r0 * size_n + (n0 + n) * 8 + c;
+                    float* c_ptr = gl_c_ptr_32 + r0 * size_n_stride + (n0 + n) * 8 + c;
                     frag_c[n][0] += *c_ptr++;
                     frag_c[n][1] += *c_ptr++;
                 }
                 else
                 {
-                    half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n + (n0 + n) * 8 + c);
+                    half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
                     float2 interm = __half22float2(*c_ptr);
                     frag_c[n][0] += interm.x;
                     frag_c[n][1] += interm.y;
@@ -508,13 +513,13 @@ void exl3_gemm_kernel_inner
             {
                 if constexpr (c_fp32)
                 {
-                    float* c_ptr = gl_c_ptr_32 + r1 * size_n + (n0 + n) * 8 + c;
+                    float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
                     frag_c[n][2] += *c_ptr++;
                     frag_c[n][3] += *c_ptr++;
                 }
                 else
                 {
-                    half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n + (n0 + n) * 8 + c);
+                    half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n_stride + (n0 + n) * 8 + c);
                     float2 interm = __half22float2(*c_ptr);
                     frag_c[n][2] += interm.x;
                     frag_c[n][3] += interm.y;
@@ -536,13 +541,13 @@ void exl3_gemm_kernel_inner
             {
                 if constexpr (c_fp32)
                 {
-                    float* c_ptr = gl_c_ptr_32 + r0 * size_n + (n0 + n) * 8 + c;
+                    float* c_ptr = gl_c_ptr_32 + r0 * size_n_stride + (n0 + n) * 8 + c;
                     *c_ptr++ = frag_c[n][0];
                     *c_ptr++ = frag_c[n][1];
                 }
                 else
                 {
-                    half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n + (n0 + n) * 8 + c);
+                    half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
                     half2 sum = __floats2half2_rn(frag_c[n][0], frag_c[n][1]);
                     *c_ptr = sum;
                 }
@@ -551,13 +556,13 @@ void exl3_gemm_kernel_inner
             {
                 if constexpr (c_fp32)
                 {
-                    float* c_ptr = gl_c_ptr_32 + r1 * size_n + (n0 + n) * 8 + c;
+                    float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
                     *c_ptr++ = frag_c[n][2];
                     *c_ptr++ = frag_c[n][3];
                 }
                 else
                 {
-                    half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n + (n0 + n) * 8 + c);
+                    half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n_stride + (n0 + n) * 8 + c);
                     half2 sum = __floats2half2_rn(frag_c[n][2], frag_c[n][3]);
                     *c_ptr = sum;
                 }

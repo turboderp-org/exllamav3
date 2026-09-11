@@ -238,12 +238,21 @@ class NGramEmbedding(Module):
                 for h in set(h.filename for h in self.handles):
                     stc.release_file(h)
         else:
-            # loaded shard by shard and KEPT as individual tensors (never concatenated)
             self.mode = "trellis_ram" if quantized else "fp16_ram"
-            self.tables = [
-                stc.get_tensor(k, "cpu", allow_bf16 = not quantized, no_defer = True)
-                for k in keys
-            ]
+            if len(keys) == 1:
+                self.tables = [stc.get_tensor(keys[0], "cpu", allow_bf16 = not quantized, no_defer = True)]
+            else:
+                # Sharded table: one contiguous slab, each shard copied into its slice as it loads
+                slab = None
+                for s_i, k in enumerate(keys):
+                    t = stc.get_tensor(k, "cpu", allow_bf16 = not quantized, no_defer = True)
+                    if slab is None:
+                        slab = torch.empty((self.num_rows, *t.shape[1:]), dtype = t.dtype)
+                    r0 = s_i * self.rows_per_shard
+                    slab[r0 : r0 + t.shape[0]].copy_(t)
+                    del t
+                self.tables = [slab]
+                self.rows_per_shard = self.num_rows
             if not quantized:
                 self._row_dtype = self.tables[0].dtype
 
@@ -446,13 +455,15 @@ class NGramEmbedding(Module):
         """Gather the (sorted) unique rows into the pinned staging buffer, routing shard
         segments (contiguous in the sorted list) to their tensor/handle."""
         stores = self.tables if self.tables is not None else self.handles
+        if len(stores) > 1:
+            # One searchsorted for every shard boundary (a per-shard call costs ~2.5 us each)
+            bounds = torch.arange(1, len(stores), dtype = torch.int64) * self.rows_per_shard
+            cuts = torch.searchsorted(uids, bounds).tolist() + [uids.numel()]
+        else:
+            cuts = [uids.numel()]
         i0 = 0
         for s, store in enumerate(stores):
-            if s + 1 < len(stores):
-                bound = torch.tensor((s + 1) * self.rows_per_shard, dtype = torch.int64)
-                i1 = int(torch.searchsorted(uids, bound).item())
-            else:
-                i1 = uids.numel()
+            i1 = cuts[s]
             if i1 > i0:
                 seg = uids[i0 : i1]
                 base = s * self.rows_per_shard

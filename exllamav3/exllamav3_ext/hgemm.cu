@@ -100,3 +100,64 @@ void hgemm
 {
     hgemm_gr(a, b, c, nullptr);
 }
+
+/*
+Strided-batched row-major matmul, a[b] @ w[b] -> c[b] for b in [0, B), fp16 inputs with fp32
+accumulation (same cuBLAS setup as hgemm). a: [B, m, k], w: [B, k, n], c: [B, m, n], all
+contiguous; c fp16 or fp32. Used by the batched expert reconstruct path (moe_batch_recon.py).
+*/
+void hgemm_batched
+(
+    at::Tensor a,
+    at::Tensor w,
+    at::Tensor c
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(a, kHalf);
+    TORCH_CHECK_DTYPE(w, kHalf);
+    bool output_fp32 = c.dtype() == at::kFloat;
+    TORCH_CHECK(output_fp32 || c.dtype() == at::kHalf, "hgemm_batched: c must be float32 or float16");
+    TORCH_CHECK_DIM(a, 3);
+    TORCH_CHECK_DIM(w, 3);
+    TORCH_CHECK_DIM(c, 3);
+    TORCH_CHECK(a.is_contiguous() && w.is_contiguous() && c.is_contiguous(), "hgemm_batched: tensors must be contiguous");
+    TORCH_CHECK_SHAPES(a, 0, w, 0, 1);
+    TORCH_CHECK_SHAPES(a, 0, c, 0, 1);
+    TORCH_CHECK_SHAPES(a, 2, w, 1, 1);
+    TORCH_CHECK_SHAPES(a, 1, c, 1, 1);
+    TORCH_CHECK_SHAPES(w, 2, c, 2, 1);
+
+    int batch = a.size(0);
+    int size_m = a.size(1);
+    int size_k = a.size(2);
+    int size_n = w.size(2);
+    if (!batch || !size_m || !size_n || !size_k) return;
+
+    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetStream(cublas_handle, stream);
+    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
+    int device;
+    cudaGetDevice(&device);
+    void* ws = DevCtx::instance().get_ws(device);
+    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
+
+    float alpha_ = 1.0f;
+    float beta_ = 0.0f;
+    auto r = cublasGemmStridedBatchedEx
+    (
+        cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        size_n, size_m, size_k,
+        &alpha_, w.data_ptr(), CUDA_R_16F, size_n, (long long) size_k * size_n,
+                 a.data_ptr(), CUDA_R_16F, size_k, (long long) size_m * size_k,
+        &beta_,  c.data_ptr(), output_fp32 ? CUDA_R_32F : CUDA_R_16F, size_n, (long long) size_m * size_n,
+        batch,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+    cublas_check(r);
+    cuda_check(cudaPeekAtLastError());
+}

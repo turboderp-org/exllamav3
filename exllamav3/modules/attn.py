@@ -6,12 +6,16 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
-from .multilinear import MultiLinear
+from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
+
+# Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
+# EXL3_QKV_SLICE=0 falls back to the pairwise K/V and Q/G bundles
+_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
@@ -391,6 +395,11 @@ class Attention(Module):
         self.prealloc_qg_1 = None
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
+        self.multi_qkv = None
+        self.prealloc_qkvh_1 = None
+        self.prealloc_qkv_out_1 = None
+        self.prealloc_qkv_cptrs_1 = None
+        self.prealloc_qkv_carrier = None
 
 
     @override
@@ -466,6 +475,61 @@ class Attention(Module):
             self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.q_proj.in_features), torch.half, "qgh_1")
             self.prealloc_qg_1 = g_tensor_cache.get(device, (2, 1, self.num_q_heads * self.head_dim), torch.half, "qg_1")
 
+        # Sliced Q/K/V(/G) bundle: all attention projections as one launch of equal-width column
+        # slices (SlicedMultiLinear). Takes precedence over the pairwise bundles at decode. A gate
+        # projection must ride along (full, quantized, same K) or there is no bundle
+        self.multi_qkv = None
+        # Gate: none, interleaved in q_proj (the bundle writes the full q+g row, deinterleaved
+        # after), or a full quantized g_proj riding along; a headwise (fp16) gate excludes it
+        gate_ok = self.g_proj is None or (
+            self.full_gate and not self.interleaved_gate and
+            self.g_proj.quant_type == "exl3" and self.g_proj.inner.bias is None
+        )
+        if self.interleaved_gate and not (self.head_dim % 8 == 0 and self.g_proj is None):
+            gate_ok = False
+        if (
+            _qkv_slice_enable and
+            not self.use_k_as_v and
+            device != torch.device("cpu") and
+            gate_ok and
+            self.k_proj is not None and self.v_proj is not None and
+            all(p.quant_type == "exl3" and p.inner.bias is None for p in (self.q_proj, self.k_proj, self.v_proj)) and
+            all(p.inner.K == self.q_proj.inner.K for p in (self.k_proj, self.v_proj)) and
+            all(p.in_features == self.q_proj.in_features for p in (self.k_proj, self.v_proj))
+        ):
+            linears = [self.q_proj, self.k_proj, self.v_proj] + ([self.g_proj] if self.g_proj is not None else [])
+            try:
+                self.multi_qkv = SlicedMultiLinear(self.device, linears)
+            except (ValueError, AssertionError):
+                self.multi_qkv = None
+            # The unfusing policy (int8 GEMV vs batched MGEMM) judges whether a matrix is wide
+            # enough to fill the GPU on its own: for the bundle that is a slice, not the widest
+            # projection, since equal-width slices are what restore utilization
+            if self.multi_qkv is not None and not self.config.infer_params.use_mgemm(
+                self.multi_qkv.K, self.multi_qkv.width, self.multi_qkv.mul1, device,
+            ):
+                self.multi_qkv = None
+        if self.multi_qkv is not None:
+            mq = self.multi_qkv
+            n_q, n_kv = self.num_q_heads * self.head_dim, self.num_kv_heads * self.head_dim
+            self.prealloc_qkvh_1 = g_tensor_cache.get(device, (mq.num_src, 1, self.q_proj.in_features), torch.half, "qkvh_1")
+            # Static m = 1 outputs: q (and g) as a (2, 1, n_q) pair so q can alias qg[0], k/v as the
+            # (2, 1, n_kv) pair the existing K/V bundle uses. Interleaved gate: q_proj emits the
+            # (1, 2 * n_q) q/g row, deinterleaved into q and g afterwards
+            if self.interleaved_gate:
+                qg_1 = g_tensor_cache.get(device, (1, 1, 2 * n_q), torch.half, "qgi_1")
+                q_out = qg_1[0]
+            else:
+                qg_1 = g_tensor_cache.get(device, (2, 1, n_q), torch.half, "qg_1")
+                q_out = qg_1[0]
+            kv_1 = g_tensor_cache.get(device, (2, 1, n_kv), torch.half, "kv_1")
+            outs = [q_out, kv_1[0], kv_1[1]] + ([qg_1[1]] if self.g_proj is not None else [])
+            self.prealloc_qkv_out_1 = (qg_1, kv_1)
+            self.prealloc_qkv_cptrs_1 = mq.c_ptrs(outs)
+            # The mgemm C argument only carries the dtype and slice width in sliced mode: one row,
+            # expanded to the call's row count
+            self.prealloc_qkv_carrier = g_tensor_cache.get(device, (mq.num_slices, 1, mq.width), torch.half, "qkvc_1")
+
         # Head norm
         if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
             if self.q_norm.unweighted:
@@ -519,6 +583,11 @@ class Attention(Module):
         self.prealloc_qg_1 = None
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
+        self.multi_qkv = None
+        self.prealloc_qkvh_1 = None
+        self.prealloc_qkv_out_1 = None
+        self.prealloc_qkv_cptrs_1 = None
+        self.prealloc_qkv_carrier = None
 
 
     @override
@@ -551,6 +620,10 @@ class Attention(Module):
 
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
+
+        if self.multi_qkv is not None and bsz * q_len <= 32:
+            q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
+            return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
         if self.multi_qg is None or bsz * q_len > 32:
             q = self.q_proj.forward(x, params)
@@ -634,6 +707,10 @@ class Attention(Module):
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
 
+        return self.finish_qkv(q, k, v, g, bsz, q_len, params)
+
+
+    def finish_qkv(self, q, k, v, g, bsz: int, q_len: int, params: dict) -> tuple:
         q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
         k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim)
@@ -641,6 +718,62 @@ class Attention(Module):
         if self.v_norm is not None:
             v = self.v_norm.forward(v, params, out_dtype = torch.half)
 
+        return q, k, v, g
+
+
+    def project_qkv_sliced(self, x: torch.Tensor, bsz: int, q_len: int) -> tuple:
+        """All attention projections as one sliced mgemm (see SlicedMultiLinear); m <= 32 rows"""
+        mq = self.multi_qkv
+        m = bsz * q_len
+        n_q, n_kv = self.num_q_heads * self.head_dim, self.num_kv_heads * self.head_dim
+        # The fused path doesn't zero-extend the input for padded in_features
+        if x.shape[-1] < self.q_proj.in_features:
+            x = torch.nn.functional.pad(x, (0, self.q_proj.in_features - x.shape[-1]))
+        x = x.view(1, m, self.q_proj.in_features)
+        if m == 1:
+            qkvh = self.prealloc_qkvh_1
+            qg, kv = self.prealloc_qkv_out_1
+            c_ptrs = self.prealloc_qkv_cptrs_1
+        else:
+            qkvh = torch.empty((mq.num_src, m, self.q_proj.in_features), dtype = torch.half, device = x.device)
+            if self.interleaved_gate:
+                qg = torch.empty((1, m, 2 * n_q), dtype = torch.half, device = x.device)
+            else:
+                qg = torch.empty((2, m, n_q), dtype = torch.half, device = x.device)
+            kv = torch.empty((2, m, n_kv), dtype = torch.half, device = x.device)
+            c_ptrs = mq.c_ptrs([qg[0], kv[0], kv[1]] + ([qg[1]] if self.g_proj is not None else []))
+        ext.exl3_mgemm(
+            x,
+            mq.ptrs_trellis,
+            self.prealloc_qkv_carrier.expand(mq.num_slices, m, mq.width),
+            mq.ptrs_suh,
+            qkvh,
+            mq.ptrs_svh,
+            None,
+            None,
+            mq.K,
+            -1,
+            mq.mcg,
+            mq.mul1,
+            -1,
+            -1,
+            0,
+            1,
+            mq.size_n_list,
+            c_ptrs,
+            mq.n_stride_list,
+            mq.had_src_list,
+            mq.num_src,
+        )
+        if self.interleaved_gate:
+            q = torch.empty((bsz, q_len, self.num_q_heads, self.head_dim), dtype = torch.half, device = x.device)
+            g = torch.empty((bsz, q_len, n_q), dtype = torch.half, device = x.device)
+            ext.deinterleave_qg(qg[0].view(bsz, q_len, 2 * n_q), q, g, self.head_dim)
+        else:
+            q = qg[0].view(bsz, q_len, n_q)
+            g = qg[1].view(bsz, q_len, n_q) if self.g_proj is not None else None
+        k = kv[0].view(bsz, q_len, n_kv)
+        v = kv[1].view(bsz, q_len, n_kv)
         return q, k, v, g
 
 

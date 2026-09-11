@@ -2,50 +2,8 @@ import torch
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import get_for_device, buffered_arange
 
-try:
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-except ModuleNotFoundError:
-    chunk_gated_delta_rule = None
-
-try:
-    from fla.ops.kda import chunk_kda
-except (ModuleNotFoundError, ImportError):
-    chunk_kda = None
-
-# """
-# fla wrapper, reduce overhead by bypassing input_guard and torch custom ops stuff
-# """
-#
-# def fused_recurrent_gated_delta_rule(
-#     q: torch.Tensor,
-#     k: torch.Tensor,
-#     v: torch.Tensor,
-#     g: torch.Tensor,
-#     beta: torch.Tensor,
-#     initial_state: torch.Tensor = None,
-#     output_final_state: bool = False,
-#     use_qk_l2norm_in_kernel: bool = False,
-# ):
-#     from fla.ops.gated_delta_rule.fused_recurrent import fused_recurrent_gated_delta_rule_fwd
-#
-#     scale = k.shape[-1] ** -0.5
-#     with torch.cuda.device(q.device.index):
-#         o, final_state = fused_recurrent_gated_delta_rule_fwd(
-#             q,
-#             k,
-#             v.contiguous(),
-#             g,
-#             None,
-#             None,
-#             beta,
-#             scale,
-#             initial_state.contiguous() if initial_state is not None else None,
-#             output_final_state,
-#             use_qk_l2norm_in_kernel,
-#             None,
-#         )
-#     return o, final_state
-
+# The vendored fla chunk kernels (exllamav3.vendor.fla) query the devices and Triton at import, so
+# they are imported on first use rather than with the library
 
 def torch_recurrent_gated_delta_rule(
     query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
@@ -152,7 +110,8 @@ def gated_delta_rule_fn(
     # KDA (per-k-channel decay, g shaped (b, s, h, dk)): fla chunk kernel for prefill, the
     # channelwise CUDA recurrent kernel (in-kernel q/k l2norm, history-capable) otherwise
     if channelwise_g:
-        if seqlen >= num_v_heads and chunk_kda is not None and not history:
+        if seqlen >= num_v_heads and not history:
+            from ...vendor.fla import chunk_kda
             q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
             q = q.view(bsz, seqlen, -1, k_head_dim)
             k = k.view(bsz, seqlen, -1, k_head_dim)
@@ -204,7 +163,8 @@ def gated_delta_rule_fn(
         return core_attn_out
 
     # Chunked rule
-    if seqlen >= num_v_heads and chunk_gated_delta_rule is not None and not history:
+    if seqlen >= num_v_heads and not history:
+        from ...vendor.fla import chunk_gated_delta_rule
 
         q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
         q = q.view(bsz, seqlen, -1, k_head_dim)

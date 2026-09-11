@@ -206,7 +206,7 @@ def main(args):
             model = model,
             cache = cache,
             tokenizer = tokenizer,
-            max_chunk_size = args.max_chunk_size,
+            max_chunk_size = args.chunk_size,
         )
         result_baseline = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens)
 
@@ -223,7 +223,7 @@ def main(args):
             dynamic_draft_tokens = args.dynamic_draft,
             draft_confidence = args.draft_confidence,
             record_draft_stats = stats_sink is not None,
-            max_chunk_size = args.max_chunk_size,
+            max_chunk_size = args.chunk_size,
         )
         result_ngram = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens, stats_sink)
         if args.temperature:
@@ -243,7 +243,7 @@ def main(args):
             draft_confidence = args.draft_confidence,
             dynamic_draft_tokens = args.dynamic_draft,
             record_draft_stats = stats_sink is not None,
-            max_chunk_size = args.max_chunk_size,
+            max_chunk_size = args.chunk_size,
         )
         result_draft = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens, stats_sink)
         if args.temperature:
