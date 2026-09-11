@@ -39,6 +39,125 @@ def _ext_rope(x, inv_freq, position = 0, position_ids = None):
     )
 
 
+def _dsv4_rope_torch(x, inv_freq, positions):
+    rd = inv_freq.numel() * 2
+    if rd == 0:
+        return x
+    pairs = x[..., -rd:].view(x.shape[0], -1, 2)
+    theta = positions.float().unsqueeze(1) * inv_freq.float().unsqueeze(0)
+    cs, sn = theta.cos(), theta.sin()
+    even, odd = pairs[..., 0], pairs[..., 1]
+    rotated = torch.stack((even * cs - odd * sn, odd * cs + even * sn), dim = -1)
+    return torch.cat((x[..., :-rd], rotated.flatten(-2)), dim = -1)
+
+
+def _dsv4_compress_torch(
+    kv_new, gate_new, ring_kv, ring_gate, ovl, ape, norm_w, rms_norm_eps,
+    inv_freq, dest_a, dest_b, position, position_tensor, m, slot_ids, pool_bt, pool_epp,
+    stage_rel = False,
+):
+    """GPU-local reference for the stateful compressor binding, including paged stores."""
+    W = kv_new.shape[-1]
+    batch = slot_ids.numel() if slot_ids is not None else 1
+    seq = kv_new.numel() // (batch * W)
+    kv_jobs = kv_new.reshape(batch, seq, W)
+    gate_jobs = gate_new.reshape(batch, seq, W)
+
+    for job in range(batch):
+        slot = int(slot_ids[job]) if slot_ids is not None else None
+        pos0 = int(position_tensor[job]) if position_tensor is not None else position
+        rkv = ring_kv[slot] if slot is not None else ring_kv
+        rgate = ring_gate[slot] if slot is not None else ring_gate
+        jovl = ovl[slot] if ovl is not None and slot is not None else ovl
+        ec0 = pos0 // m
+        nw = (pos0 + seq) // m - ec0
+        hd = dest_a.shape[-1] + (dest_b.shape[-1] if dest_b is not None else 0)
+        overlap = W == 2 * hd
+
+        def rows_at(abs_rows, cols):
+            old = rkv.index_select(0, abs_rows.remainder(rkv.shape[0]))[:, cols]
+            new_idx = (abs_rows - pos0).clamp(0, max(seq - 1, 0))
+            new = kv_jobs[job].index_select(0, new_idx)[:, cols]
+            values = torch.where((abs_rows >= pos0).unsqueeze(1), new, old)
+
+            old_g = rgate.index_select(0, abs_rows.remainder(rgate.shape[0]))[:, cols]
+            new_g = gate_jobs[job].index_select(0, new_idx)[:, cols]
+            gates = torch.where((abs_rows >= pos0).unsqueeze(1), new_g, old_g)
+            return values.float(), gates.float()
+
+        if nw:
+            abs_rows = torch.arange(ec0 * m, (ec0 + nw) * m, device = kv_new.device)
+            if overlap:
+                ca, ca_gate = rows_at(abs_rows, slice(0, hd))
+                ca = ca.view(nw, m, hd)
+                ca_gate = ca_gate.view(nw, m, hd) + ape[:, :hd].float()
+                cb, cb_gate = rows_at(abs_rows, slice(hd, W))
+                cb = cb.view(nw, m, hd)
+                cb_gate = cb_gate.view(nw, m, hd) + ape[:, hd:].float()
+                if ec0:
+                    prev_kv = torch.cat((jovl[(ec0 - 1) % jovl.shape[0], 0].unsqueeze(0), ca[:-1]), dim = 0)
+                    prev_gate = torch.cat((jovl[(ec0 - 1) % jovl.shape[0], 1].unsqueeze(0), ca_gate[:-1]), dim = 0)
+                else:
+                    prev_kv = torch.cat((torch.zeros_like(ca[:1]), ca[:-1]), dim = 0)
+                    prev_gate = torch.cat((torch.full_like(ca_gate[:1], -float("inf")), ca_gate[:-1]), dim = 0)
+                window_kv = torch.cat((prev_kv, cb), dim = 1)
+                window_gate = torch.cat((prev_gate, cb_gate), dim = 1)
+                jovl[(ec0 + nw - 1) % jovl.shape[0], 0].copy_(ca[-1])
+                jovl[(ec0 + nw - 1) % jovl.shape[0], 1].copy_(ca_gate[-1])
+            else:
+                window_kv, window_gate = rows_at(abs_rows, slice(0, W))
+                window_kv = window_kv.view(nw, m, hd)
+                window_gate = window_gate.view(nw, m, hd) + ape.float()
+
+            comp = (window_kv * window_gate.softmax(dim = 1)).sum(dim = 1)
+            comp *= torch.rsqrt(comp.square().mean(dim = -1, keepdim = True) + rms_norm_eps)
+            comp *= norm_w.float()
+            logical = torch.arange(ec0, ec0 + nw, device = kv_new.device, dtype = torch.long)
+            comp = _dsv4_rope_torch(comp, inv_freq, logical * m).half()
+            if stage_rel:
+                # dest_a is a per-job staging buffer of this step's windows, row-ordered
+                physical = torch.arange(nw, device = kv_new.device, dtype = torch.long)
+            elif pool_bt is not None:
+                bt = pool_bt[job] if pool_bt.dim() == 2 else pool_bt
+                physical = bt.index_select(0, torch.div(logical, pool_epp, rounding_mode = "floor")) \
+                    .long() * pool_epp + logical.remainder(pool_epp)
+            else:
+                physical = logical
+            if stage_rel:
+                da, db = dest_a[job], dest_b[job] if dest_b is not None else None
+            else:
+                da = dest_a[slot] if slot is not None and pool_bt is None and dest_a.dim() > 2 else dest_a
+                db = dest_b[slot] if slot is not None and pool_bt is None and dest_b.dim() > 2 else dest_b
+            da.index_copy_(0, physical, comp[:, :da.shape[-1]])
+            if db is not None:
+                db.index_copy_(0, physical, comp[:, da.shape[-1]:])
+
+        j0 = max(seq - rkv.shape[0], 0)
+        store_rows = torch.arange(pos0 + j0, pos0 + seq, device = kv_new.device).remainder(rkv.shape[0])
+        rkv.index_copy_(0, store_rows, kv_jobs[job, j0:])
+        rgate.index_copy_(0, store_rows, gate_jobs[job, j0:])
+
+
+def _dsv4_compress(*args):
+    fn = getattr(ext, "dsv4_compress", None)
+    return fn(*args) if fn is not None else _dsv4_compress_torch(*args)
+
+
+def _dsv4_ring_append(kv, ring, pos, ring_beg, slot_ids):
+    fn = getattr(ext, "dsv4_ring_append", None)
+    if fn is not None:
+        return fn(kv, ring, pos, ring_beg, slot_ids)
+    batch = slot_ids.numel() if slot_ids is not None else 1
+    seq = kv.shape[0] // batch
+    rows = kv.reshape(batch, seq, kv.shape[-1])
+    for job in range(batch):
+        dst = ring[int(slot_ids[job])] if slot_ids is not None else ring
+        offset = int(pos[job]) - int(ring_beg[job])
+        lo, hi = max(0, -offset), min(seq, dst.shape[0] - offset)
+        if hi > lo:
+            dst[offset + lo:offset + hi].copy_(rows[job, lo:hi])
+
+
 class DSV4CompressorState:
     """
     Cross-chunk state interface for one compressor (one entry name in HF terms). The
@@ -157,6 +276,8 @@ class DSV4Compressor:
         self.fused_norm_w = self.norm.weight.data
         if self.fused_norm_w.dtype != torch.half:
             self.fused_norm_w = self.fused_norm_w.half().contiguous()
+        if not hasattr(ext, "dsv4_compress") or not hasattr(ext, "BC_DSV4Compressor"):
+            return
         wkv_i, wgate_i = self.wkv.inner, self.wgate.inner
         if (
             self.wkv.out_features != self.wkv.out_features_unpadded or
@@ -238,7 +359,7 @@ class DSV4Compressor:
         else:
             kv = self.wkv.forward(x, params)[0]
             gate = self.wgate.forward(x, params)[0]
-            ext.dsv4_compress(
+            _dsv4_compress(
                 kv, gate, buf_kv, buf_gate, ovl, self.ape, self.fused_norm_w,
                 self.norm.rms_norm_eps, self.fused_inv_freq, dest_a, dest_b, position,
                 None, self.compress_rate, None, pool_bt, pool_epp, stage_rel,
@@ -1374,7 +1495,8 @@ class DSV4Attention(Module):
             comp, idx = self.compressor, self.indexer
             if kl.quant:
                 # Packed pool: per-job staging rows, then quantize + scatter through each
-                # job's block-table row
+                # job's block-table row. CUDA-only: no torch fallback for the fused
+                # scatter path.
                 stage = g_tensor_cache.get(device, (B, S // m + 1, self.head_dim), torch.half, "dsv4_b_stage")
                 ext.dsv4_compress(
                     comp_kv, comp_gate, rsl.comp_buf_kv, rsl.comp_buf_gate,
@@ -1385,13 +1507,13 @@ class DSV4Attention(Module):
                     stage, kl.pool_c_view(), kl.pool_s.view(-1, kl.G), kl.pool_r.view(-1, kl.D_r),
                     bt_st, 0, a_pos, m, S, kl.epp)
             else:
-                ext.dsv4_compress(
+                _dsv4_compress(
                     comp_kv, comp_gate, rsl.comp_buf_kv, rsl.comp_buf_gate,
                     rsl.comp_ovl, comp.ape, comp.fused_norm_w, comp.norm.rms_norm_eps,
                     comp.fused_inv_freq, kl.pool_c.view(-1, kl.D_c), kl.pool_r.view(-1, kl.D_r),
                     0, a_pos, m, a_slots, bt_st, kl.epp, False)
             if self.layer_type == "csa":
-                ext.dsv4_compress(
+                _dsv4_compress(
                     idx_kv, idx_gate, rsl.idx_buf_kv, rsl.idx_buf_gate,
                     rsl.idx_ovl, idx.ape, idx.fused_norm_w, idx.norm.rms_norm_eps,
                     idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None,
@@ -1464,7 +1586,7 @@ class DSV4Attention(Module):
         )
 
         # Ring appends (shift already applied in the prepass): batched, slot-indexed
-        ext.dsv4_ring_append(kv.reshape(R, self.head_dim), rsl.ring, a_pos, a_beg, a_slots)
+        _dsv4_ring_append(kv.reshape(R, self.head_dim), rsl.ring, a_pos, a_beg, a_slots)
         return self._project_o_grouped(out.unsqueeze(1), params, out_dtype,
                                        mgemm_out = True).view(B, S, -1)
 
@@ -1698,14 +1820,14 @@ class DSV4Attention(Module):
                 dest_a, dest_b, dbt, depp, rel = kl.pool_c.view(-1, kl.D_c), pool_r_flat, bt_row, epp, False
             if use_fan:
                 comp = self.compressor
-                ext.dsv4_compress(
+                _dsv4_compress(
                     fouts[2], fouts[3], rsl.comp_buf_kv[slot], rsl.comp_buf_gate[slot],
                     rsl.comp_ovl[slot] if rsl.comp_ovl is not None else None,
                     comp.ape, comp.fused_norm_w, comp.norm.rms_norm_eps, comp.fused_inv_freq,
                     dest_a, dest_b, pos0, None, m, None, dbt, depp, rel)
                 if self.layer_type == "csa":
                     idx = self.indexer
-                    ext.dsv4_compress(
+                    _dsv4_compress(
                         fouts[4], fouts[5], rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
                         rsl.idx_ovl[slot], idx.ape, idx.fused_norm_w, idx.norm.rms_norm_eps,
                         idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None, pos0,
