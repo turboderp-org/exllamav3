@@ -1,15 +1,14 @@
 #pragma once
 #include <math.h>
 
-// Portable clamp: works on both CUDA and CPU
-#ifndef LM_CLAMP_IDX
-#ifdef __CUDA_ARCH__
-#define LM_CLAMP_IDX(idx, lo, hi) max((lo), min((hi), (idx)))
+// Portable clamp: usable from host and device code on both CUDA and HIP
+#if defined(__CUDACC__) || defined(__HIPCC__)
+__host__ __device__ __forceinline__
 #else
-static inline int lm_clamp_(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); }
+static inline
+#endif
+int lm_clamp_(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); }
 #define LM_CLAMP_IDX(idx, lo, hi) lm_clamp_((idx), (lo), (hi))
-#endif
-#endif
 
 // Cubic scheme:  f(t) = a*t + (1-a)*t^3
 
