@@ -24,7 +24,7 @@
 namespace
 {
 
-constexpr uint64_t COOP_AUTOTUNE_VERSION = 3;
+constexpr uint64_t COOP_AUTOTUNE_VERSION = 4;
 constexpr char DISK_CACHE_MAGIC[8] = { 'E', 'X', '3', 'A', 'T', 'U', 'N', 'E' };
 constexpr uint32_t DISK_CACHE_FORMAT = 1;
 

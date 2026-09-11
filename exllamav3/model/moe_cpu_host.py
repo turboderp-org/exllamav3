@@ -7,6 +7,7 @@ import torch
 
 from ..ext import exllamav3_ext as ext
 from ..util.misc import Cleanupper, install_parent_death_signal
+from ..util.shm import check_shm_capacity
 from .model_tp_cuda import (
     cuda_host_register,
     cuda_host_unregister,
@@ -87,8 +88,9 @@ class MoeCpuTuning:
         # region once easily-compactable free memory runs low, which can stall loading badly
         self.arena_hugepage = os.environ.get("EXL3_MOE_ARENA_HUGEPAGE", "1") != "0"
         # Band-contiguous ("swizzled") expert trellis layout: repacked at arena rehome so each
-        # 8-tile output band streams sequentially from DRAM. Only applied when the VBMI kernel
-        # tier is active. EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
+        # 8-tile output band streams sequentially from DRAM. Applied on every AVX-512 kernel
+        # tier (bw, vnni, vbmi); the AVX2 and scalar tiers read the native layout.
+        # EXL3_MOE_CPU_SWIZZLE=0 restores the native layout.
         self.swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
 
         # --- GPU-streaming prefill ---
@@ -150,17 +152,19 @@ class _HugeArena:
         loading gets the same steady-state throughput benefit without blocking incremental
         per-layer progress. Best-effort: silently leaves chunks at 4K pages if collapse fails or
         the kernel doesn't support it."""
-        import mmap, os
+        import mmap, os, time
         if not TUNING.arena_hugepage:
             return
         collapse = getattr(mmap, "MADV_COLLAPSE", 25)
+        t0 = time.perf_counter()
         for c in self.chunks:
             try:
                 c.madvise(collapse)
             except Exception:
                 pass
         if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
-            print(f" -- arena: MADV_COLLAPSE issued on {len(self.chunks)} chunks", flush = True)
+            print(f" -- arena: MADV_COLLAPSE issued on {len(self.chunks)} chunks "
+                  f"in {time.perf_counter() - t0:.1f} s", flush = True)
 
     def rehome(self, tensor, band_swizzle = False):
         """Copy `tensor` into the arena and return a same-dtype/shape view over the copy. The
@@ -235,8 +239,9 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
                 out.append((trellis, suh, svh, bias))
             return out
 
-        # Swizzle the trellis copies band-contiguous when the VBMI kernel tier will consume them
-        swz = TUNING.swizzle and cext.exl3_moe_cpu_has_avx512_vbmi()
+        # Swizzle the trellis copies band-contiguous when an AVX-512 kernel tier will consume
+        # them (has_avx512_bw is true for the bw, vnni and vbmi tiers alike)
+        swz = TUNING.swizzle and cext.exl3_moe_cpu_has_avx512_bw()
 
         def rehome_trellis(t):
             return arena.rehome(t, band_swizzle = swz and t.shape[2] // 16 != 8)
@@ -289,8 +294,6 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
             elif msg[0] == "quit":
                 return
 
-        arena.promote_hugepages()
-
         stc.close()
         shm = shared_memory.SharedMemory(name = shm_name)
         base = np.frombuffer(shm.buf, dtype = np.uint8).ctypes.data
@@ -331,6 +334,13 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads):
             daemon = True,
         )
         worker.start()
+
+        # Hugepage promotion runs off the startup path: MADV_COLLAPSE is synchronous and copies
+        # the whole arena into 2 MiB pages (tens of seconds for a 50+ GiB arena, minutes when
+        # free memory is fragmented and the kernel has to compact first), and the parent's
+        # startup wait must not depend on it. Page migration is transparent to the compute
+        # threads, so the worker serves requests on 4K pages until each chunk lands
+        threading.Thread(target = arena.promote_hugepages, daemon = True).start()
 
         while True:
             try:
@@ -514,6 +524,7 @@ class MoeCpuHost:
         self.layout["wslot_size"] = self.wslot_size
         self.layout["cpu_prof"] = TUNING.cpu_prof
         size = MOE_CTRL_SIZE + self.num_slots * slot_size + self.num_wslots * self.wslot_size
+        check_shm_capacity(size, "The CPU MoE offload handoff segment")
         self.shm = shared_memory.SharedMemory(create = True, size = size)
         buf = np.frombuffer(self.shm.buf, dtype = np.uint8)
         buf[:MOE_CTRL_SIZE] = 0
@@ -584,18 +595,24 @@ class MoeCpuHost:
 
         import time
         t0 = time.time()
+        # Startup is now just the shared-memory attach, layer registration and thread spawn
+        # (hugepage promotion runs in the worker's background); the limit stays generous for
+        # slow hosts and is overridable
+        timeout = float(os.environ.get("EXL3_MOE_CPU_START_TIMEOUT", "60"))
         while not self.v_ready[0]:
             if not self.proc.is_alive():
                 raise RuntimeError("CPU MoE worker process died during startup")
-            if time.time() - t0 > 60:
-                raise RuntimeError("CPU MoE worker startup timeout")
+            if time.time() - t0 > timeout:
+                raise RuntimeError(
+                    f"CPU MoE worker startup timeout ({timeout:.0f} s; EXL3_MOE_CPU_START_TIMEOUT overrides)")
             time.sleep(0.005)
         self.started = True
         self._flags_u32 = u32
         self._start_watchdog()
         kern = "avx512-vbmi" if ext.exl3_moe_cpu_has_avx512_vbmi() else \
                ("avx512-vnni" if ext.exl3_moe_cpu_has_avx512_vnni() else \
-               ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar"))
+               ("avx512-bw" if ext.exl3_moe_cpu_has_avx512_bw() else \
+               ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar")))
         print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
 
     def _start_watchdog(self):
@@ -872,10 +889,10 @@ class MoeCpuHost:
                 for k in ("g", "u", "d"):
                     if pd.get(k):
                         mx = max(mx, pd[k][0] * pd[k][1])
-        # Experts arrive band-swizzled when the VBMI CPU tier owns them (same rule as the child's
+        # Experts arrive band-swizzled when an AVX-512 CPU tier owns them (same rule as the child's
         # arena rehome, K8 excepted per matrix); the GPU restores the native tile order into a
         # parallel ring after each DMA
-        swz = TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_vbmi()
+        swz = TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_bw()
         st = dict(
             copy_stream = torch.cuda.Stream(device = device),
             vram_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)

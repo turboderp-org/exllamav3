@@ -38,6 +38,7 @@ def set_memory_fraction_reserve(
     fraction = (current + free - reserve) / total
     fraction = min(1.0, max(0.01, fraction))
     torch.cuda.set_per_process_memory_fraction(fraction, device = device)
+    return int(fraction * total)
 
 
 # Allow byte amount to be used on device, PER LOAD: the budget is headroom for the load
@@ -55,6 +56,7 @@ def set_memory_fraction_use(
     current = torch.cuda.memory_reserved(device)
     fraction = min((current + use) / total, 1.0)
     torch.cuda.set_per_process_memory_fraction(fraction, device = device)
+    return int(fraction * total)
 
 
 # Un-reserve VRAM

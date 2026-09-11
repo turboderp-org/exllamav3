@@ -1,21 +1,32 @@
 import torch
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
 
-try:
-    import xformers.ops as xops
-    from xformers.ops.fmha import ck, cutlass, flash
-    from xformers.ops.fmha.attn_bias import (
-        BlockDiagonalCausalWithOffsetPaddedKeysMask,
-        BlockDiagonalPaddedKeysMask,
-        LowerTriangularFromBottomRightMask,
-        LowerTriangularMask,
-    )
-    # Monkey-patch xformers for sm_120 support, what could go wrong
-    from xformers.ops.fmha import cutlass as xf_cutlass
-    xf_cutlass.FwOp.CUDA_MAXIMUM_COMPUTE_CAPABILITY = (12, 0)
-    has_xformers = True
-except (ModuleNotFoundError, ImportError):
-    has_xformers = False
+# xformers is a fallback backend (large head dims without Triton) and importing it costs ~0.4 s,
+# so it is imported on first use rather than at library import
+xops = None
+cutlass = None
+LowerTriangularMask = None
+LowerTriangularFromBottomRightMask = None
+has_xformers: bool | None = None
+
+def _load_xformers() -> bool:
+    global xops, cutlass, LowerTriangularMask, LowerTriangularFromBottomRightMask, has_xformers
+    if has_xformers is None:
+        try:
+            import xformers.ops as xops_
+            from xformers.ops.fmha import cutlass as cutlass_
+            from xformers.ops.fmha.attn_bias import (
+                LowerTriangularFromBottomRightMask as ltbr_,
+                LowerTriangularMask as lt_,
+            )
+            # Monkey-patch xformers for sm_120 support, what could go wrong
+            cutlass_.FwOp.CUDA_MAXIMUM_COMPUTE_CAPABILITY = (12, 0)
+            xops, cutlass = xops_, cutlass_
+            LowerTriangularMask, LowerTriangularFromBottomRightMask = lt_, ltbr_
+            has_xformers = True
+        except (ModuleNotFoundError, ImportError):
+            has_xformers = False
+    return has_xformers
 
 
 # Hack required for xformers currently since GQA is broken
@@ -39,14 +50,14 @@ def _stable_xformers_gqa_via_4d(q5, k5, v5, attn_bias = None, scale = None):
 
 def fn_xformers_cutlass_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
     if (
-        not has_xformers or
         args.is_varlen() or
         args.has_kv_cache() or
         args.dim < 512 or
         args.softcap != 0.0 or
         args.sinks is not None or
         args.non_causal_spans or
-        args.is_swa()
+        args.is_swa() or
+        not _load_xformers()
     ):
         return None
 
@@ -76,13 +87,13 @@ def fn_xformers_cutlass_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
 
 def fn_xformers_cutlass_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
     if (
-        not has_xformers or
         args.is_varlen() or
         not args.has_kv_cache() or
         args.dim < 512 or
         args.softcap != 0.0 or
         args.sinks is not None or
-        args.is_swa()
+        args.is_swa() or
+        not _load_xformers()
     ):
         return None
 

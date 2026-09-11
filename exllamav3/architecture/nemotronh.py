@@ -273,12 +273,3 @@ class NemotronHModel(Model):
         p += f"{prompt}<|im_end|>\n"
         p += f"<|im_start|>assistant\n"
         return p
-
-
-    @override
-    def check_compat(self):
-        try:
-            from fla.ops.simple_gla import chunk_simple_gla
-        except ModuleNotFoundError as e:
-            print(" ## NemotronH requires flash-linear-attention (https://github.com/fla-org/flash-linear-attention)")
-            raise e

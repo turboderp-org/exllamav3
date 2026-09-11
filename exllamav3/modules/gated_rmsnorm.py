@@ -73,25 +73,6 @@ class GatedRMSNorm(Module):
             f"{self.key}.weight": self.weight.data
         }
 
-    def forward_fla(
-        self,
-        x: torch.Tensor,
-        params: dict,
-        out_dtype: torch.dtype | None = None,
-        gate: torch.Tensor = None,
-    ) -> torch.Tensor:
-        from fla.modules.fused_norm_gate import rms_norm_gated
-        x = rms_norm_gated(
-            x = x,
-            g = gate,
-            weight = self.weight,
-            bias = None,
-            activation = "silu",
-            eps = self.rms_norm_eps
-        )
-        x = x.to(out_dtype or self.out_dtype)
-        return x
-
     def forward_torch(
         self,
         x: torch.Tensor,

@@ -11,6 +11,12 @@ from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
 from ..cache import Cache
 from ..util.tensor import g_tensor_cache
+from .multilinear import SlicedMultiLinear
+import os
+
+# Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
+# one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
+_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 from ..cache.recurrent import (
@@ -686,6 +692,31 @@ class GatedDeltaNet(Module):
             )
             self.bc_split = True
 
+            # Sliced qkv+z bundle: both projections read x and are cut into equal-width column
+            # slices run as one launch (SlicedMultiLinear); the graph object gets the tables, the
+            # eager path (m <= 32) uses them directly
+            self.multi_qkvz = None
+            if (
+                _qkv_slice_enable and
+                self.qkv_proj.inner.bias is None and self.z_proj.inner.bias is None and
+                self.qkv_proj.inner.K == self.z_proj.inner.K and
+                self.qkv_proj.in_features == self.z_proj.in_features
+            ):
+                try:
+                    self.multi_qkvz = SlicedMultiLinear(self.device, [self.qkv_proj, self.z_proj])
+                except (ValueError, AssertionError):
+                    self.multi_qkvz = None
+                # Unfusing policy judged on the slice width (see attn.py)
+                if self.multi_qkvz is not None and not self.config.infer_params.use_mgemm(
+                    self.multi_qkvz.K, self.multi_qkvz.width, self.multi_qkvz.mul1, device,
+                ):
+                    self.multi_qkvz = None
+            if self.multi_qkvz is not None:
+                mq = self.multi_qkvz
+                self.bc.set_qkvz_bundle(mq.ptrs_trellis, mq.ptrs_suh, mq.ptrs_svh, mq.meta, mq.K, bool(mq.mcg), bool(mq.mul1))
+                # fp32 outputs: the mgemm C argument carries the dtype and slice width only
+                self.prealloc_qkvz_carrier = g_tensor_cache.get(device, (mq.num_slices, 1, mq.width), torch.float, "qkvzc_1")
+
         is_quantized_kda = (
             device != torch.device("cpu") and self.kda and
             self.qkv_proj is not None and self.qkv_proj.quant_type == "exl3" and
@@ -769,6 +800,8 @@ class GatedDeltaNet(Module):
         self.ba_weight_t = None
         self.ba_bias = None
         self.ba_weight_filled = False
+        self.multi_qkvz = None
+        self.prealloc_qkvz_carrier = None
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
@@ -848,6 +881,45 @@ class GatedDeltaNet(Module):
             qkv, z, b_out, fa_out, fb_out, ga_out, beta, g, mixed_qkv, conv_out,
             core_attn_out, core_attn_out_f, qkv_xh, o_xh,
         )
+
+    def project_qkvz_sliced(self, x: torch.Tensor, bsz: int, seqlen: int) -> tuple:
+        """qkv and z projections as one sliced mgemm (fp32 outputs, like the Linears); m <= 32"""
+        mq = self.multi_qkvz
+        m = bsz * seqlen
+        hidden = self.qkv_proj.in_features
+        x = x.half()
+        if x.shape[-1] < hidden:
+            x = torch.nn.functional.pad(x, (0, hidden - x.shape[-1]))
+        x = x.contiguous().view(1, m, hidden)
+        xh = torch.empty((mq.num_src, m, hidden), dtype = torch.half, device = x.device)
+        qkv = torch.empty((bsz, seqlen, self.qkv_proj.out_features), dtype = torch.float, device = x.device)
+        z = torch.empty((bsz, seqlen, self.z_proj.out_features), dtype = torch.float, device = x.device)
+        c_ptrs = mq.c_ptrs([qkv.view(m, -1), z.view(m, -1)])
+        ext.exl3_mgemm(
+            x,
+            mq.ptrs_trellis,
+            self.prealloc_qkvz_carrier.expand(mq.num_slices, m, mq.width),
+            mq.ptrs_suh,
+            xh,
+            mq.ptrs_svh,
+            None,
+            None,
+            mq.K,
+            -1,
+            mq.mcg,
+            mq.mul1,
+            -1,
+            -1,
+            0,
+            1,
+            mq.size_n_list,
+            c_ptrs,
+            mq.n_stride_list,
+            mq.had_src_list,
+            mq.num_src,
+        )
+        return qkv, z
+
 
     def _bc_configure_slot(self, bsz: int, seqlen: int, history: bool):
         """Allocate (or fetch, if already cached at this exact shape) the per-(bsz, seqlen)
@@ -1016,8 +1088,18 @@ class GatedDeltaNet(Module):
             else:
                 g = -decay * torch.where(gf > 20.0, gf, torch.log1p(torch.exp(gf)))
         else:
-            qkv = self.qkv_proj.forward(x, params)
-            z = self.z_proj.forward(x, params).view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
+            # The sliced qkv/z bundle (project_qkvz_sliced) reads trellis storage
+            # directly and never applies a runtime LoRA; take the per-linear
+            # path while one is loaded so the adapter is not silently dropped.
+            if (
+                getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32 and
+                not has_runtime_lora(self.qkv_proj, self.z_proj)
+            ):
+                qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
+            else:
+                qkv = self.qkv_proj.forward(x, params)
+                z = self.z_proj.forward(x, params)
+            z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
             b = self.b_proj.forward(x, params)
             a = self.a_proj.forward(x, params)
 

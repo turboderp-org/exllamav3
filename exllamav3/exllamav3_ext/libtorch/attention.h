@@ -83,6 +83,21 @@ struct BC_Attention
     bool qg_mcg;
     bool qg_mul1;
 
+    // Sliced Q/K/V(/G) bundle: every projection cut into equal-width column slices and run as
+    // ONE exl3_mgemm in sliced mode, so the wide Q matrix can't leave the K/V groups idle.
+    // Meta (CPU int32, 5 x slices): target (0 q, 1 k, 2 v, 3 g), column offset, width, row
+    // stride, source index. The per-slot output pointer table comes from the statics
+    c10::optional<at::Tensor> qkv_ptrs_trellis;
+    c10::optional<at::Tensor> qkv_ptrs_suh;      // per source
+    c10::optional<at::Tensor> qkv_ptrs_svh;
+    c10::optional<at::Tensor> qkv_meta;
+    int qkv_K;
+    bool qkv_mcg;
+    bool qkv_mul1;
+    at::Tensor qkv_size_n, qkv_n_stride, qkv_had_src;   // device int32, per slice
+    at::Tensor qkv_carrier;   // (slices, MAX_R, width) dtype/width carrier for the mgemm C argument
+    int qkv_num_src = 0;
+
     // Head norms, fused into the RoPE kernel
     c10::optional<at::Tensor> q_norm;
     c10::optional<at::Tensor> k_norm;
@@ -149,6 +164,7 @@ struct BC_Attention
         // yp: padded o_proj output, only when hidden_size_padded > hidden_size
         at::Tensor q, kv, o, partial_o, partial_ml, gate_a, gate_b, xp, yp;
         at::Tensor q2, q4, k4, v4, o2, o4, qg2, g2;
+        at::Tensor qkv_c_ptrs;   // sliced bundle: per-slice output pointers into the statics
 
         std::shared_ptr<TritonKernel> k_split;
         std::shared_ptr<TritonKernel> k_combine;   // null when num_splits == 1
@@ -204,6 +220,13 @@ struct BC_Attention
         int qg_K,
         bool qg_mcg,
         bool qg_mul1,
+        c10::optional<at::Tensor> qkv_ptrs_trellis,
+        c10::optional<at::Tensor> qkv_ptrs_suh,
+        c10::optional<at::Tensor> qkv_ptrs_svh,
+        c10::optional<at::Tensor> qkv_meta,
+        int qkv_K,
+        bool qkv_mcg,
+        bool qkv_mul1,
         c10::optional<at::Tensor> q_norm,
         c10::optional<at::Tensor> k_norm,
         float norm_eps,

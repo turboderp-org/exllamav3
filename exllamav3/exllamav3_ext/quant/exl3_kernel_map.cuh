@@ -45,7 +45,10 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     const int max_index, \
     const int num_tokens, \
     const int* __restrict__ size_n_list, \
-    void** __restrict__ C_list
+    void** __restrict__ C_list, \
+    const int* __restrict__ n_stride_list, \
+    const int* __restrict__ had_src_list, \
+    const int num_had_src
 
 typedef void (*fp_exl3_gemm_kernel) (EXL3_GEMM_ARGS);
 typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);

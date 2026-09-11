@@ -99,6 +99,29 @@ def test_bc_attn_graph_dispatch_guarded(fname):
         src), f"{fname}: graph-captured decode dispatch lost its runtime-LoRA guard"
 
 
+@pytest.mark.parametrize("fname", ["attn.py", "sliding_attn.py"])
+def test_sliced_qkv_bundle_dispatch_guarded(fname):
+    # Upstream v1.4.9's sliced Q/K/V(/G) bundle (project_qkv_sliced) is one
+    # mgemm launch with no LoRA epilogue and takes precedence over the pairwise
+    # bundles at decode; the dispatch must skip it while any involved
+    # projection carries a runtime LoRA so the pairwise branches (which add
+    # the delta) run instead
+    src = _src("exllamav3", "modules", fname)
+    assert re.search(
+        r"self\.multi_qkv is not None and bsz \* q_len <= 32 and\s*"
+        r"not has_runtime_lora\(self\.q_proj, self\.k_proj, self\.v_proj, self\.g_proj\)",
+        src), f"{fname}: sliced qkv bundle dispatch lost its runtime-LoRA guard"
+
+
+def test_gdn_sliced_qkvz_bundle_dispatch_guarded():
+    # Same for the GDN qkv/z sliced bundle on the non-graph torch path
+    src = _src("exllamav3", "modules", "gated_delta_net.py")
+    assert re.search(
+        r"getattr\(self, \"multi_qkvz\", None\) is not None and bsz \* seqlen <= 32 and\s*"
+        r"not has_runtime_lora\(self\.qkv_proj, self\.z_proj\)",
+        src), "GDN: sliced qkv/z bundle dispatch lost its runtime-LoRA guard"
+
+
 def test_mla_graph_dispatch_guarded():
     # v1.3.0: MLAttention (DeepseekV3-class) has a graph-captured decode block
     # binding q/q_a/kv_a/o projections' base trellis (inner.bc); the dispatch
@@ -340,6 +363,7 @@ def test_sliding_attention_padded_mgemm_lora(bsz, q_len, fuse_qg, fuse_kv):
     tree = ast.parse(_src("exllamav3", "modules", "sliding_attn.py"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SlidingAttention")
     method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "project_qkv")
+    finish = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "finish_qkv")
     dim, padded, width = 6, 8, 4
     torch.manual_seed(17)
     x = torch.randn(bsz, q_len, dim, dtype=torch.float16)
@@ -365,17 +389,21 @@ def test_sliding_attention_padded_mgemm_lora(bsz, q_len, fuse_qg, fuse_kv):
 
     ns = {"torch": torch, "ext": SimpleNamespace(exl3_mgemm=mgemm),
           "has_runtime_lora": lambda *args: True}
-    exec(compile(ast.Module(body=[method], type_ignores=[]), "sliding_attn.py", "exec"), ns)
+    exec(compile(ast.Module(body=[method, finish], type_ignores=[]), "sliding_attn.py", "exec"), ns)
     multi = SimpleNamespace(ptrs_trellis=None, ptrs_suh=None, ptrs_svh=None, K=4, mcg=False, mul1=False)
     layer = SimpleNamespace(
         q_proj=Projection(), g_proj=Projection(), k_proj=Projection(), v_proj=Projection(),
         multi_qg=multi if fuse_qg else None, multi_kv=multi if fuse_kv else None,
+        # The sliced bundle is present but the stub has no project_qkv_sliced:
+        # with a runtime LoRA loaded the dispatch must not reach it
+        multi_qkv=multi,
         num_q_heads=1, num_kv_heads=1, head_dim=width, v_norm=None,
         prealloc_qgh_1=torch.empty(2, 1, padded, dtype=torch.float16),
         prealloc_kvh_1=torch.empty(2, 1, padded, dtype=torch.float16),
         prealloc_qg_1=torch.empty(2, 1, width, dtype=torch.float16),
         prealloc_kv_1=torch.empty(2, 1, width, dtype=torch.float16),
     )
+    layer.finish_qkv = lambda *args: ns["finish_qkv"](layer, *args)
     actual = ns["project_qkv"](layer, x, {})
     for result, proj in zip(actual, [layer.q_proj, layer.k_proj, layer.v_proj, layer.g_proj]):
         torch.testing.assert_close(result.reshape(bsz, q_len, width), proj.forward(x, {}))

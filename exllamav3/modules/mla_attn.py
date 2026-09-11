@@ -847,6 +847,7 @@ class MLAttention(Module):
                 indices = to_device(indices, x.device)
             return self._attend_sparse(
                 q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, indices, qc,
+                pool_len = max(host_seqlens) + seqlen,
             )
 
         if use_mha:
@@ -896,7 +897,7 @@ class MLAttention(Module):
 
 
     def _attend_sparse(self, q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache,
-                       block_table, indices, qc):
+                       block_table, indices, qc, pool_len = 0):
         """Gathered attention over the top-k selected latent rows (V3.2-on-MLA form of
         dsa_attn: no window, no sinks, V is the latent). The chunk's own rows are already in
         the paged pool (fp16 or packed-quantized; the packed form is dequantized online by the
@@ -921,7 +922,8 @@ class MLAttention(Module):
             indices = indices, k_len = indices.shape[1],
             scale = self.sm_scale, page_size = ckv_cache.shape[1],
             q_pe = q_pe.reshape(R, H, D_r), out_latent = True,
-            qc = qc,   # packed latent pages read online (scales, bits)
+            qc = qc,   # packed latent pages read online (scales, bits), or staged for prefill
+            pool_len = pool_len,   # entries the selection can reference (context, not pool)
         )
         o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
         o = o.reshape(bsz, seqlen, H * self.v_head_dim)

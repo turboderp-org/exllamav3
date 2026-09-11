@@ -1227,6 +1227,7 @@ class Job:
             prefill_end = min(prefill_end, len(seq.sequence_ids) - 1)
 
             atomic_mm_prefill = bool(self.embeddings) and self.generator.model.caps.get("atomic_mm_prefill")
+            mm_exact_chunks = bool(self.embeddings) and self.generator.model.caps.get("mm_exact_chunks")
             # assert not atomic_mm_prefill or not self.recurrent_state, \
             #     "Atomic prefill is not supported for recurrent models"
 
@@ -1256,7 +1257,7 @@ class Job:
             if prefill_end <= prefill_start:
                 continue
 
-            assert prefill_start % PAGE_SIZE == 0
+            assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
@@ -1310,6 +1311,30 @@ class Job:
                     prefill_end = last_page_b
                     recurrent_last_page = True
                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
+
+            # Exact multimodal chunking (DeepSeek-V4 vision): an image span is prefilled as
+            # exactly one chunk (non-causal within itself) and never re-fed, since the
+            # ring / compressor / pool states are streams. Text chunks end at a span start and
+            # a span chunk ends at the span end, page boundaries notwithstanding (pages are
+            # allocated for the whole prompt)
+            if mm_exact_chunks and prefill_end > prefill_start:
+                for s_beg, s_end in self.mm_exact_spans(seq):
+                    if s_beg < prefill_start < s_end:
+                        raise RuntimeError(
+                            "DeepSeek-V4 vision: prefill would start inside an image span "
+                            "(the image is only partially cached); clear the cache or resend the prompt")
+                    if prefill_start == s_beg:
+                        cut = s_end
+                    elif prefill_start < s_beg < prefill_end:
+                        cut = s_beg
+                    else:
+                        continue
+                    if cut != prefill_end:
+                        prefill_end = cut
+                        p1 = (prefill_end + PAGE_SIZE - 1) // PAGE_SIZE
+                        recurrent_last_page = False
+                        prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
+                    break
 
             # Inference
             if prefill_end > prefill_start:
@@ -1426,7 +1451,10 @@ class Job:
                     pf_b = min(local_idx * PAGE_SIZE + PAGE_SIZE, prefill_end)
                     pfp_a = pf_a - local_idx * PAGE_SIZE
                     pfp_b = pf_b - local_idx * PAGE_SIZE
-                    page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
+                    # The loop runs one page past the chunk; with a chunk ending mid-page
+                    # (exact multimodal chunking) that page starts after prefill_end
+                    if pfp_b > pfp_a:
+                        page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
                     page.can_revert = False
 
                 progress += prefill_end - prefill_start
@@ -1550,6 +1578,23 @@ class Job:
         else:
             return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval_pp == 0
 
+
+    def mm_exact_spans(self, seq):
+        """Prompt positions [start, end) of each embedding's non-causal span (its rows from
+        align_lead on, i.e. IMAGE_START .. IMAGE_END for DeepSeek-V4), ascending. Computed once:
+        the prompt never moves."""
+        spans = getattr(self, "_mm_exact_spans", None)
+        if spans is None:
+            ids = seq.sequence_ids.torch()[0]
+            spans = []
+            for e in self.embeddings:
+                lo, hi = e.first_index + getattr(e, "align_lead", 0), e.last_index
+                pos = torch.nonzero((ids >= lo) & (ids < hi)).flatten()
+                if pos.numel():
+                    spans.append((int(pos[0]), int(pos[-1]) + 1))
+            spans.sort()
+            self._mm_exact_spans = spans
+        return spans
 
     def maybe_stash_recurrent(self, cache, interval = None):
         """

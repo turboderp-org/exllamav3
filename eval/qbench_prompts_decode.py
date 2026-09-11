@@ -33,9 +33,25 @@ def fence_for(*texts: str) -> str:
     return "`" * (longest + 1)
 
 
+def load_trace(path: str) -> dict:
+    """The JSON trace written by qbench_prompts.py. Anything else (a calibration .safetensors
+    trace, a stray model shard) fails here with a pointer, not a codec traceback from json."""
+    with open(path, "rb") as f:
+        head = f.read(8)
+    if head.startswith(b"\x93NUMPY") or (len(head) == 8 and int.from_bytes(head, "little") < (1 << 32) and path.endswith(".safetensors")):
+        raise SystemExit(f"{path} is a safetensors file, not a qbench_prompts.py JSON trace")
+    try:
+        with open(path, "r", encoding = "utf8") as f:
+            data = json.load(f)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise SystemExit(f"{path} is not a qbench_prompts.py JSON trace ({e.__class__.__name__}: {e})")
+    if not isinstance(data, dict) or "rows" not in data:
+        raise SystemExit(f"{path} is JSON but has no 'rows' key; expected a qbench_prompts.py trace")
+    return data
+
+
 def main(args):
-    with open(args.trace, "r") as f:
-        data = json.load(f)
+    data = load_trace(args.trace)
 
     model_dir = args.model_dir or data.get("model")
     assert model_dir, "Trace has no model path; specify one with -m"
