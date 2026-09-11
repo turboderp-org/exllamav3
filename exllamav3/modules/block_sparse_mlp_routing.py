@@ -229,9 +229,19 @@ def routing_ds3(bsz, cfg, y, params):
 def routing_dots(bsz, cfg, y, params):
 
     if not hasattr(ext, "routing_ds3_nogroup"):
-        return _routing_nogroup_torch(
-            cfg, y, params, torch.sigmoid(torch.matmul(y, cfg.gate_tensor).float())
-        )
+        scores = torch.sigmoid(torch.matmul(y, cfg.gate_tensor).float())
+        if params.get("activate_all_experts"):
+            routing_weights = scores
+            if cfg.e_score_correction_bias is not None:
+                routing_weights = routing_weights + cfg.e_score_correction_bias.unsqueeze(0).float()
+            factor = cfg.routed_scaling_factor / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
+            routing_weights = (routing_weights * factor).half()
+            selected_experts = (
+                torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
+                .repeat((bsz, 1))
+            )
+            return selected_experts, routing_weights
+        return _routing_nogroup_torch(cfg, y, params, scores)
 
     if bsz == 1:
         if cfg.gate_tensor_t is None:
@@ -287,7 +297,7 @@ def _vl_rows(cfg, params, bsz, device):
     """DeepSeek-V4 vision: mask of image rows (multimodal embedding ids) in the current chunk,
     or None when there are none. Only chunks that carry indexed embeddings (prompt prefill)
     are inspected, computed once per forward per device, so text decode never syncs."""
-    if cfg.e_score_bias_vl is None or not params.get("indexed_embeddings"):
+    if getattr(cfg, "e_score_bias_vl", None) is None or not params.get("indexed_embeddings"):
         return None
     key = ("_vl_rows", str(device))
     if key in params:

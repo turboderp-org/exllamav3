@@ -248,11 +248,12 @@ def rms_norm(
     yn = y.flatten(-2) if span_heads else y
     dim = xn.shape[-1]
     rows = xn.numel() // dim
-    xf = xn.reshape(rows, dim).float()
-    if x.dtype == torch.float16:
-        xf = xf.clamp(min = -65504.0, max = 65504.0)
-    xf = xf * torch.rsqrt(xf.square().mean(dim = -1, keepdim = True) + eps)
-    xf = xf * constant_scale
+    xr = xn.reshape(rows, dim)
+    yr = yn.reshape(rows, dim)
+    # Row chunks bound the fp32 working set: a full-tensor .float() copy would triple the input's
+    # footprint on large rows * dim tensors
+    row_chunk = max(1, _RMS_NORM_ROW_ELEMS // dim)
+    wf = None
     if w is not None:
         wf = w.float()
         if constant_bias != 0.0:
@@ -260,17 +261,28 @@ def rms_norm(
         if w_groups == 1:
             if w.numel() != dim:
                 raise ValueError("rms_norm weight must have dim elements")
-            xf = xf * wf.reshape(1, dim)
+            wf = wf.reshape(1, dim)
         else:
             if w.numel() != w_groups * dim:
                 raise ValueError("rms_norm weight must have w_groups * dim elements")
-            row_groups = torch.arange(rows, device = x.device) % w_groups
-            xf = xf * wf.reshape(w_groups, dim).index_select(0, row_groups)
-    result = xf.reshape_as(yn)
-    if add_residual:
-        yn.copy_((yn.float() + result).to(yn.dtype))
-    else:
-        yn.copy_(result.to(yn.dtype))
+            wf = wf.reshape(w_groups, dim)
+    for r0 in range(0, rows, row_chunk):
+        xf = xr[r0:r0 + row_chunk].float()
+        if x.dtype == torch.float16:
+            xf = xf.clamp(min = -65504.0, max = 65504.0)
+        xf = xf * torch.rsqrt(xf.square().mean(dim = -1, keepdim = True) + eps)
+        xf = xf * constant_scale
+        if wf is not None:
+            if w_groups == 1:
+                xf = xf * wf
+            else:
+                row_groups = torch.arange(r0, r0 + xf.shape[0], device = x.device) % w_groups
+                xf = xf * wf.index_select(0, row_groups)
+        if add_residual:
+            yc = yr[r0:r0 + row_chunk]
+            yc.copy_((yc.float() + xf).to(yc.dtype))
+        else:
+            yr[r0:r0 + row_chunk].copy_(xf.to(yr.dtype))
 
 def rms_norm_res_in(
     x: torch.Tensor,
@@ -369,6 +381,9 @@ def _hadamard32(x: torch.Tensor) -> torch.Tensor:
 _CACHE_GROUP_CHUNK = 4096
 _CACHE_ROW_CHUNK = 8192
 _DSA_TOPK_ROW_CHUNK = 8
+
+
+_RMS_NORM_ROW_ELEMS = 8 * 1024 * 1024
 
 
 def _f32_scalar(value: float, like: torch.Tensor) -> torch.Tensor:
