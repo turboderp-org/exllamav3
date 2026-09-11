@@ -54,7 +54,12 @@ def set_memory_fraction_use(
     touch_device(device)
     total = torch.cuda.get_device_properties(device).total_memory
     current = torch.cuda.memory_reserved(device)
-    fraction = min((current + use) / total, 1.0)
+    # The budget cannot exceed what the device can still give: a split value at or above the
+    # card's size would otherwise plan against memory the CUDA context and other processes
+    # already hold, and the loader's headroom check would pass loads that fail at the first
+    # real forward
+    free, _ = torch.cuda.mem_get_info(device)
+    fraction = min((current + min(use, free)) / total, 1.0)
     torch.cuda.set_per_process_memory_fraction(fraction, device = device)
     return int(fraction * total)
 

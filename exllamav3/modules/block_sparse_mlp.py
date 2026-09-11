@@ -13,6 +13,7 @@ from .mlp import MLP, GatedMLP
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
+from .moe_batch_recon import PAD_MAX
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
@@ -21,11 +22,16 @@ from .block_sparse_mlp_routing import (
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
 )
 
-TEMP_ROWS_FUSED = 128
+# Row capacity of the fused MoE kernel's per-group temp buffers (experts with more assigned
+# rows take the reconstruct paths); EXL3_MOE_FUSED_ROWS overrides for tuning sweeps
+TEMP_ROWS_FUSED = int(os.environ.get("EXL3_MOE_FUSED_ROWS", 128))
 TEMP_ROWS_GRAPH = 32
 # Batched reconstruct tier for the experts above the fused kernel's row capacity at prefill
 # (moe_batch_recon.py); EXL3_MOE_BATCH_RECON=0 restores the per-expert reconstruct loop
 BATCH_RECON = os.environ.get("EXL3_MOE_BATCH_RECON", "1") != "0"
+# Deterministic (slot + gather) accumulation for the fused kernel's outputs; EXL3_MOE_FUSED_DET=0
+# restores the atomic adds
+FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
 @dataclass
@@ -709,13 +715,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
     def _batch_recon_layer(self, y):
         """Per-module batched reconstruct state (moe_batch_recon.BatchReconLayer), built on
         first use; None when the module's configuration isn't covered (same conditions as the
-        DQ path plus fp16 intermediates and unpadded hidden dims)"""
+        DQ path plus unpadded hidden dims; fp32 intermediates as in the DQ path are supported)"""
         if self.batch_recon is False:
             return None
         if self.batch_recon is None:
             ok = (
                 BATCH_RECON and self.bc is not None and self.support_quant_paths and
-                self.interm_dtype == torch.half and self.multi_up is not None and
+                self.interm_dtype in (torch.half, None, torch.float) and self.multi_up is not None and
                 self.multi_up.in_features == y.shape[1] and
                 self.multi_down.out_features == y.shape[1] and
                 self.multi_down.in_features == self.multi_up.out_features
@@ -732,16 +738,69 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 (mu.in_features, mu.out_features, mu.K),
                 (md.in_features, md.out_features, md.K),
                 mg.q_cb() if mg is not None else None, mu.q_cb(), md.q_cb(),
-                self.activation_fn, self.act_limit, self.device, scales)
+                self.activation_fn, self.act_limit, self.device, scales,
+                interm_fp32 = self.interm_dtype != torch.half)
             self.batch_recon.set_static_pointers(
                 mg.ptrs_trellis if mg is not None else None, mu.ptrs_trellis, md.ptrs_trellis)
         return self.batch_recon
 
-    def _run_batch_recon(self, recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, heavy):
-        """Run the experts in `heavy` (local ids) through the batched reconstruct tier,
-        accumulating into fhs_ext (rows + 1, the last row a padding sink). Returns the set of
-        experts handled."""
-        from .moe_batch_recon import plan_groups
+    def prefill_worst_case_parts(self, rows: int, assignments: int) -> tuple[int, int]:
+        """Upper bound on the GPU-expert prefill transients of a `rows`-token chunk with
+        `assignments` routed rows landing on GPU-resident experts, as (fixed, variable) bytes:
+        the fp32 accumulator, the output state and the deterministic slot scratch (every
+        assignment slotted, padded) live for the whole call; the larger of one
+        batched-reconstruct group and the per-expert dequant path with every row on one expert
+        is the working set on top. The autosplit measuring forward routes a dummy state, so
+        what it sees of these depends on that routing; the loader takes this bound instead
+        (autosplit_extra_measure)"""
+        if self.cpu_offload or self.multi_up is None:
+            return 0, 0
+        h = self.hidden_size
+        fixed = (rows + 1) * h * 4 + rows * h * 2
+        if FUSED_DET:
+            fixed += (int(assignments * PAD_MAX) + 1) * h * 4
+        r = min(rows, assignments)
+        isz = (self.interm_dtype or torch.float).itemsize
+        per_expert = r * (2 * self.intermediate_size_padded * isz + 2 * h * 2 + h * 4)
+        if self.interm_dtype != torch.half:
+            per_expert += r * self.intermediate_size_padded * 2
+        recon = self._batch_recon_layer(torch.empty((1, h), dtype = torch.half, device = self.device))
+        batched = recon.worst_case_bytes(assignments, slot_mode = FUSED_DET) if recon is not None else 0
+        return fixed, max(per_expert, batched)
+
+    def autosplit_extra_measure(self, params):
+        """Autosplit loader hook: allocate (and drop) the worst-case prefill transient so the
+        device keeps headroom for it. The CPU-offload host's per-device stream state and this
+        layer's tier statics are allocated for real here: the measuring forward skips the CPU
+        path, and they would otherwise appear unaccounted on the first real prefill"""
+        if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
+            return
+        rows = getattr(self, "_measure_rows", 0)
+        if not rows or self.device is None or self.device.type != "cuda":
+            return
+        A = rows * self.num_experts_per_tok
+        host = getattr(self, "cpu_host", None)
+        if host is not None and getattr(self, "cpu_layer_idx", None) is not None:
+            # Split layers: the assignments divide between GPU-resident and CPU-resident
+            # experts. Both sides' whole-call buffers live at once; the CPU side's group
+            # working set is freed before the GPU side allocates its own. Take the worst split
+            total = 0
+            for a in (A * i // 4 for i in range(5)):
+                gf, gv = self.prefill_worst_case_parts(rows, a)
+                cf, cv = host.prefill_worst_case_parts(self.cpu_layer_idx, rows, self.device, A - a)
+                total = max(total, gf + cf + max(gv, cv))
+        else:
+            total = sum(self.prefill_worst_case_parts(rows, A))
+        if total > 0:
+            t = torch.empty((total,), dtype = torch.uint8, device = self.device)
+            del t
+
+    def _run_batch_recon(self, recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
+                         scratch = None, tables = None):
+        """Run the planned groups through the batched reconstruct tier. With a slot scratch each
+        group's down projection lands in its slots (summed later by exl3_moe_gather); otherwise
+        each group accumulates into fhs_ext (rows + 1, the last row a padding sink). Returns the
+        set of experts handled."""
         rows = y.shape[0]
         y_ext = torch.cat([y, torch.zeros((1, y.shape[1]), dtype = y.dtype, device = y.device)])
         tok_ext = torch.cat([token_sorted, torch.full((1,), rows, dtype = token_sorted.dtype, device = y.device)])
@@ -749,11 +808,24 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         starts = [0]
         for c in expert_count_list:
             starts.append(starts[-1] + c)
-        for grp in plan_groups(heavy, lambda e: expert_count_list[e], recon.cap):
+        handled = set()
+        slot = None
+        if scratch is not None:
+            # groups were laid out after the fused slots, in plan order, len(grp) * cmax each
+            slot = sum(c for c in expert_count_list[:self.num_local_experts or self.num_experts]
+                       if 0 < c <= TEMP_ROWS_FUSED) if self.fused_mode_buffers is not None else 0
+        for grp in groups:
+            out_slab = None
+            if scratch is not None:
+                cmax = max(expert_count_list[e] for e in grp)
+                out_slab = scratch[slot : slot + len(grp) * cmax]
+                slot += len(grp) * cmax
             recon.run_group(
                 y_ext, fhs_ext, tok_ext, w_ext,
-                grp, [starts[e] for e in grp], [expert_count_list[e] for e in grp])
-        return set(heavy)
+                grp, [starts[e] for e in grp], [expert_count_list[e] for e in grp],
+                out_slab = out_slab)
+            handled.update(grp)
+        return handled
 
     @override
     def unload(self):
@@ -794,6 +866,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             y = x.view(-1, self.hidden_size)
         bsz = y.shape[0]
         bc_sh_exp = False
+        if params.get("autosplit_measure"):
+            self._measure_rows = bsz
 
         # Eligibility for the multi-row CUDA-graph path (bsz 1..MAX_BSZN): computed up front so
         # it can override the f_threshold-based routing below (bsz>=f_threshold would otherwise
@@ -894,8 +968,72 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 token_sorted = flat_token[order]
                 weight_sorted = flat_weight[order]
 
-                # Count how many assignments per expert
+                # Count how many assignments per expert. With few enough total assignments no
+                # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
+                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
+                if self.fused_mode_buffers is not None and num_tokens * top_k <= TEMP_ROWS_FUSED:
+                    expert_count_list = None
+                else:
+                    expert_count_list = expert_count.tolist()
+
+                # Tier plan: fused kernel for experts up to TEMP_ROWS_FUSED rows, batched
+                # reconstruct groups above that up to the tile cap, per-expert reconstruct beyond
+                recon = None
+                groups = []
+                min_rows = 0
+                if expert_count_list is None:
+                    fused_total = num_tokens * top_k
+                else:
+                    fused_total = 0
+                    if self.fused_mode_buffers is not None:
+                        min_rows = TEMP_ROWS_FUSED
+                        fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED)
+                    recon = self._batch_recon_layer(y)
+                    if recon is not None:
+                        lim = max(min_rows, TEMP_ROWS_GRAPH)
+                        heavy = [e for e in range(num_ex) if lim < expert_count_list[e] <= recon.max_rows]
+                        if heavy:
+                            from .moe_batch_recon import plan_groups
+                            groups = plan_groups(heavy, lambda e: expert_count_list[e], recon.cap)
+
+                # Deterministic accumulation (FUSED_DET): every assignment of the fused and
+                # batched tiers gets a slot in one fp32 scratch (fused experts: count rows each,
+                # weighted by the kernel; batched experts: their group's padded row count each,
+                # unweighted) and one exl3_moe_gather per layer sums each token's slots in k
+                # order, so identical inputs give identical outputs. The atomic alternative adds
+                # contributions in arrival order. Slot tables come from the host-side counts, the
+                # all-fused fast path builds them on the device. Scratch is prefill-shaped and per
+                # call. Its traffic (written once by the GEMMs, read once by the gather) matches
+                # what the atomic index_add_ path moved
+                scratch = tables = inv_order = None
+                if FUSED_DET and (fused_total or groups):
+                    A = flat_expert_local.shape[0]
+                    inv_order = torch.empty_like(order).scatter_(
+                        0, order, torch.arange(A, device = order.device))
+                    if expert_count_list is None:
+                        expert_start = torch.cumsum(expert_count, 0) - expert_count
+                        tables = torch.stack([expert_start, expert_start, (expert_count > 0).long()])
+                        n_slots = fused_total
+                    else:
+                        import numpy as np
+                        E1 = len(expert_count_list)
+                        base = np.zeros(E1, dtype = np.int64)
+                        kind = np.zeros(E1, dtype = np.int64)
+                        starts_np = np.cumsum([0] + expert_count_list[:-1]).astype(np.int64)
+                        n_slots = 0
+                        if self.fused_mode_buffers is not None:
+                            for e in range(num_ex):
+                                c = expert_count_list[e]
+                                if 0 < c <= TEMP_ROWS_FUSED:
+                                    base[e] = n_slots; kind[e] = 1; n_slots += c
+                        for grp in groups:
+                            cmax = max(expert_count_list[e] for e in grp)
+                            for b, e in enumerate(grp):
+                                base[e] = n_slots + b * cmax; kind[e] = 2
+                            n_slots += len(grp) * cmax
+                        tables = torch.from_numpy(np.stack([base, starts_np, kind])).to(y.device, non_blocking = True)
+                    scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
 
                 def run_fused(num_active):
                     # Gateless: the up module stands in for the gate pointer tables (the kernel
@@ -931,48 +1069,34 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         self.multi_down.mcg,
                         self.multi_down.mul1,
                         self.act_limit,
-                        num_active
+                        num_active,
+                        scratch, tables[0] if tables is not None else None
                     )
 
-                # With few enough total assignments, no expert can exceed the fused kernel's
-                # row capacity: the fused path handles everything, the per-expert count
-                # readback (a CPU sync per layer, ~33% idle at MTP verify shapes) is
-                # unnecessary, and the overflow fallback loop below cannot have work.
-                # num_active -1 = unknown, kernel launches at max concurrency
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= TEMP_ROWS_FUSED:
-                    run_fused(-1)
-                    expert_count_list = None
-                else:
-                    expert_count_list = expert_count.tolist()
-
-                    # Run fused path if possible, skips experts with more than TEMP_ROWS_FUSED
-                    # tokens
-                    if self.fused_mode_buffers is not None:
-                        num_active = sum(1 for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED)
-                        run_fused(num_active)
-                        min_rows = TEMP_ROWS_FUSED
+                # num_active -1 = unknown (all fused), kernel launches at max concurrency
+                if self.fused_mode_buffers is not None:
+                    if expert_count_list is None:
+                        run_fused(-1)
                     else:
-                        min_rows = 0
+                        run_fused(sum(1 for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED))
+
+                # Batched reconstruct tier (into slots when deterministic, else accumulating)
+                batched = ()
+                if groups:
+                    batched = self._run_batch_recon(
+                        recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
+                        scratch, tables)
+
+                # One fixed-order gather over every slot
+                if scratch is not None:
+                    ext.exl3_moe_gather(final_hidden_states, scratch, flat_expert_local, inv_order,
+                                        tables[1], tables[0], tables[2], weight_sorted)
 
                 out_state = None
                 interm = None
                 interm_a = None
                 max_count = 0
                 start = 0
-
-                # Batched reconstruct tier: the experts above the fused capacity (and the
-                # graph path's) in count-sorted groups, a handful of launches per group; the
-                # per-expert loop below skips them
-                batched = ()
-                if expert_count_list is not None:
-                    recon = self._batch_recon_layer(y)
-                    if recon is not None:
-                        lim = max(min_rows, TEMP_ROWS_GRAPH)
-                        heavy = [e for e in range(num_ex) if lim < expert_count_list[e] <= recon.max_rows]
-                        if heavy:
-                            batched = self._run_batch_recon(
-                                recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list,
-                                heavy)
 
                 # expert_count_list None: everything already handled by the fused kernel above
                 for expert_idx in range(num_ex if expert_count_list is not None else 0):

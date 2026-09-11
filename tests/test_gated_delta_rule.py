@@ -281,3 +281,30 @@ def test_chunk_gated_delta_rule_matches_torch(
     torch.testing.assert_close(chunk_state, ref_state[:, 0], rtol = 5e-2, atol = 5e-2)
     torch.testing.assert_close(chunk_out, cuda_out, rtol = 5e-2, atol = 5e-2)
     torch.testing.assert_close(chunk_state, cuda_state[:, 0], rtol = 5e-2, atol = 5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
+@pytest.mark.parametrize(
+    "bsz,seqlen,num_k_heads,num_v_heads,k_head_dim,v_head_dim",
+    [
+        (2, 9, 2, 4, 64, 64),        # generic kernel
+        (2, 9, 4, 8, 128, 128),      # 128 kernel
+        (1, 9, 2, 4, 256, 256),      # generic, wide
+    ],
+)
+@torch.inference_mode()
+def test_cuda_recurrent_gated_delta_rule_is_bit_reproducible(bsz, seqlen, num_k_heads, num_v_heads, k_head_dim, v_head_dim):
+    # The per-k-slice partial dot products used to be combined with shared-memory float atomics
+    # in arrival order; they are now reduced in a fixed order, so identical inputs give identical
+    # outputs and states
+    torch.manual_seed(99)
+    qkv_dim = 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim
+    mixed_qkv = (torch.randn((bsz, seqlen, qkv_dim), dtype = torch.float, device = device) * 0.25).bfloat16()
+    g = torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device) * 0.5 - 1.0
+    beta = torch.sigmoid(torch.randn((bsz, seqlen, num_v_heads), dtype = torch.float, device = device)).bfloat16()
+    recurrent_state = torch.randn((bsz + 1, 1, num_v_heads, k_head_dim, v_head_dim), dtype = torch.float, device = device) * 0.05
+    slots = torch.arange(bsz, dtype = torch.int32, device = device) + 1
+    runs = [_run_cuda_gated_delta_rule(mixed_qkv, g, beta, recurrent_state, slots, False,
+                                       num_k_heads, num_v_heads, k_head_dim, v_head_dim) for _ in range(4)]
+    for out, state in runs[1:]:
+        assert torch.equal(out, runs[0][0]) and torch.equal(state, runs[0][1])

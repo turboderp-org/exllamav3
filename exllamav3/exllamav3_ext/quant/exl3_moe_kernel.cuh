@@ -240,19 +240,40 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             const int total_warps = token_count * warps_per_token;
             const int64_t* top_x = token_sorted + start;
             const half* weights = weight_sorted + start;
+            // Deterministic mode (output_scratch set): every fused assignment owns a compact
+            // slot (fused_base[expert] + row within the expert) and the weighted output is
+            // stored there; exl3_moe_gather then sums each token's top-k slots in a fixed
+            // order. Otherwise the contributions are atomically added into the token row in
+            // arrival order, which is not bit-reproducible run to run
+            const int64_t slot_base = output_scratch ? fused_base[expert_idx] : 0;
             for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
             {
-                int token_idx = top_x[warp_idx / warps_per_token];
-                half weight = weights[warp_idx / warps_per_token];
+                int row = warp_idx / warps_per_token;
+                int token_idx = top_x[row];
+                half weight = weights[row];
                 int token_off = warp_idx % warps_per_token;
-                float* out_ptr = output_state + token_idx * hidden_dim + token_off * 128;
-                had_hf_r_128_d_inner
-                (
-                    temp_state_g + 128 * warp_idx,
-                    out_ptr,
-                    exp_down_svh + 128 * token_off,
-                    0.088388347648f * __half2float(weight)
-                );
+                if (output_scratch)
+                {
+                    float* out_ptr = output_scratch + (slot_base + row) * hidden_dim + token_off * 128;
+                    had_hf_r_128_d_inner<false>
+                    (
+                        temp_state_g + 128 * warp_idx,
+                        out_ptr,
+                        exp_down_svh + 128 * token_off,
+                        0.088388347648f * __half2float(weight)
+                    );
+                }
+                else
+                {
+                    float* out_ptr = output_state + token_idx * hidden_dim + token_off * 128;
+                    had_hf_r_128_d_inner<true>
+                    (
+                        temp_state_g + 128 * warp_idx,
+                        out_ptr,
+                        exp_down_svh + 128 * token_off,
+                        0.088388347648f * __half2float(weight)
+                    );
+                }
             }
         };
 

@@ -42,6 +42,19 @@ void exl3_moe
     const bool down_mul1,
 
     const float act_limit,
-    const int num_active
+    const int num_active,
+    const c10::optional<at::Tensor>& output_scratch,
+    const c10::optional<at::Tensor>& fused_base
 );
 
+void exl3_moe_gather
+(
+    at::Tensor output_state,
+    const at::Tensor& output_scratch,
+    const at::Tensor& flat_expert,
+    const at::Tensor& inv_order,
+    const at::Tensor& expert_start,
+    const at::Tensor& slot_base,
+    const at::Tensor& slot_kind,
+    const at::Tensor& weight_sorted
+);

@@ -178,6 +178,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0);
     m.def("hgemm", &hgemm, "hgemm");
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
+    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
+    m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
+    m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
@@ -250,6 +253,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
+    m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");
     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");
