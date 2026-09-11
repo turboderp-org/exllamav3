@@ -44,9 +44,15 @@ RECON_FOLDED = os.environ.get("EXL3_MOE_RECON_FOLDED", "0") != "0"
 # (0 = batch everything); EXL3_MOE_RECON_MAX_ROWS caps rows directly
 RECON_TILES = int(os.environ.get("EXL3_MOE_RECON_TILES", 64))
 RECON_MAX_ROWS = int(os.environ.get("EXL3_MOE_RECON_MAX_ROWS", 0))
-# Give up on adding a smaller expert to a group once padding would exceed this fraction of the
-# real rows: a group of very uneven experts wastes GEMM work on zeros
-PAD_MAX = 1.5
+# Give up on adding a smaller expert to a group once padded rows would exceed this multiple of
+# the real rows: a group of very uneven experts wastes GEMM work on zeros. Measured on
+# Qwen3.8-Flash-Next at 4096 tokens (padding share of the tier's rows / prefill tok/s):
+# batch 16 at 1.5: 32% / 6098; batch 8 at 1.5: 20% / 6162; batch 16 at 1.1: 8% / 6215.
+# The limit beats a smaller batch because it only splits the uneven groups
+PAD_MAX = float(os.environ.get("EXL3_MOE_RECON_PAD", 1.1))
+# Accumulate the group's results one expert at a time (bit-reproducible) instead of one
+# atomic index_add_ over the padded slab; EXL3_MOE_RECON_DET=0 restores the single call
+DETERMINISTIC = os.environ.get("EXL3_MOE_RECON_DET", "1") != "0"
 
 # act(g, u) -> a kernels; gateless relu2 rides relu_mul(u, u, a) = relu2(u)
 _ACT_CALLS_GATED = {
@@ -237,4 +243,15 @@ class BatchReconLayer:
         d = self._linear(u, Wd, "d", ids_d, nd, out_dtype = torch.float)
         d2 = d.view(B * cmax, nd)
         ho = out_ext.shape[1]
-        out_ext.index_add_(0, tok, d2[:, :ho].mul_(w.float().unsqueeze(1)))
+        d2[:, :ho].mul_(w.float().unsqueeze(1))
+        if DETERMINISTIC:
+            # One index_add_ per expert: within an expert the token ids are unique, so every
+            # output element receives exactly one add per launch and the result is bit-
+            # reproducible. A single call over the whole slab (a token appears once per expert
+            # it routes to) goes through CUDA atomics in arrival order and was the only source
+            # of run-to-run nondeterminism on Qwen3-30B-A3B (KL ~3e-4 between identical runs)
+            for b, c in enumerate(counts):
+                r0 = b * cmax
+                out_ext.index_add_(0, tok[r0 : r0 + c], d2[r0 : r0 + c, :ho])
+        else:
+            out_ext.index_add_(0, tok, d2[:, :ho])

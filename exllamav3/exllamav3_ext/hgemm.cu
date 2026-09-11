@@ -113,6 +113,9 @@ void hgemm_batched
     at::Tensor c
 )
 {
+    // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays (GeForce), else cuBLAS
+    if (hgemm_f16acc_try(a, w, c)) return;
+
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 

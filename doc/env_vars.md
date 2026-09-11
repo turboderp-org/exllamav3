@@ -339,6 +339,23 @@ madvise` hosts, plus any compaction the kernel needs first), so it must not sit 
 startup path; the worker reads 4K pages until each chunk lands. `EXL3_MOE_ARENA_DEBUG=1`
 prints how long it took. Set to `0` to skip hugepage promotion entirely.
 
+### `EXL3_HGEMM_F16ACC` (default: auto)
+
+GeForce parts run the fp32-accumulator tensor-core MMA at half the rate of the fp16-accumulator
+form (measured 2.00x on the 3090, 4090 and 5090; 1.00x on the RTX PRO 6000). The reconstruct
+(prefill) GEMMs, i.e. the dense `Linear` path above the reconstruct threshold, the per-expert
+and batched MoE reconstruct tiers, run through a kernel (`hgemm_f16acc.cu`) that uses the
+fp16-accumulator MMA and flushes the partial sums into fp32 every 32 elements of K, so the
+accumulation across K stays fp32. `auto` runs a one-time per-device rate probe and enables the
+kernel where the fp16-accumulator MMA is at least 1.5x faster; `1` forces it on, `0` forces
+cuBLAS. Shapes the kernel does not cover (K not a multiple of 64, N not a multiple of 128,
+fewer than 384 rows or fewer blocks than SMs) use cuBLAS regardless. End-to-end on Qwen3-8B
+4.0bpw, 2048 tokens (the fp32 path is bit-reproducible run to run on this model): mean KL
+7.8e-6 (5090) / 1.1e-5 (4090) against the cuBLAS path, top-1 99.95% / 99.66%, perplexity
+unchanged to four digits; prefill +5.5% on the 5090, +8% on the 4090, +4-8% on the 3090 at
+2k-4k tokens. On Qwen3-30B-A3B the on/off KL (3.9e-4) sits inside that model's run-to-run
+floor (3.3e-4). Unchanged on the PRO 6000 (probe says off).
+
 ### `EXL3_MOE_PINNED_ARENA` (default: `0`, experimental)
 
 Linux only. Back the CPU worker's expert-weight arena with `memfd` chunks that the parent
@@ -375,7 +392,7 @@ rotated-basis weights, fp16 activations, fp32 down-projection output). `EXL3_MOE
 covers GPU-resident experts, `EXL3_MOE_STREAM_BATCH_RECON` the streamed CPU experts (the
 `EXL3_MOE_STREAM_FUSED_T` overflow tier). Set to `0` to restore the per-expert loops.
 
-### `EXL3_MOE_RECON_TILES` (default: `64`), `EXL3_MOE_RECON_BATCH` (default: `16`), `EXL3_MOE_RECON_ROWS` (default: `16384`), `EXL3_MOE_RECON_MB` (default: `256`), `EXL3_MOE_RECON_MAX_ROWS` (default: unset), `EXL3_MOE_RECON_FOLDED` (default: `0`)
+### `EXL3_MOE_RECON_TILES` (default: `64`), `EXL3_MOE_RECON_BATCH` (default: `16`), `EXL3_MOE_RECON_PAD` (default: `1.1`), `EXL3_MOE_RECON_ROWS` (default: `16384`), `EXL3_MOE_RECON_MB` (default: `256`), `EXL3_MOE_RECON_MAX_ROWS` (default: unset), `EXL3_MOE_RECON_FOLDED` (default: `0`)
 
 Tuning for the batched reconstruct tier. Batching pays while a single expert's GEMM cannot
 fill the GPU: an `m x n` GEMM launches about `m/128 * n/128` output tiles, and below roughly
@@ -389,8 +406,12 @@ that tile budget: an expert stays on the per-expert path once its narrowest proj
 (`n` 1792/2048) loses 15% with everything batched and 4% at a 1024-row cap, parity at 512;
 Qwen3.8-Flash-Next (`n = 768`) is within 2% for any cap. `0` batches
 every expert; `EXL3_MOE_RECON_MAX_ROWS` overrides the derived row cap directly. The other
-knobs: experts per group; the padded-row budget per group; the dequantized-weight scratch
-budget, which shrinks the group for large expert shapes. `EXL3_MOE_RECON_FOLDED=1` folds both
+knobs: experts per group; `EXL3_MOE_RECON_PAD`, the padded-to-real row ratio a group may reach
+before the planner starts a new one (groups fill largest expert first, so this splits only
+groups of uneven experts: on Qwen3.8-Flash-Next at 4096 tokens a limit of 1.5 pads 32% of the
+tier's rows, 1.1 pads 8% and is 2% faster overall, beating a batch of 8 at 1.5; lfm2.5 gains
+2-5%); the padded-row budget per group; the dequantized-weight scratch budget, which shrinks
+the group for large expert shapes. `EXL3_MOE_RECON_FOLDED=1` folds both
 Hadamards and the sign vectors into the dequantized weights (the formulation the dense
 `Linear` prefill path uses above 1024 rows): fewer launches, about 10% faster on the tier, but
 the folded weights round to fp16, roughly doubling the tier's relative error versus the

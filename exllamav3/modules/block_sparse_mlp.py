@@ -21,7 +21,9 @@ from .block_sparse_mlp_routing import (
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
 )
 
-TEMP_ROWS_FUSED = 128
+# Row capacity of the fused MoE kernel's per-group temp buffers (experts with more assigned
+# rows take the reconstruct paths); EXL3_MOE_FUSED_ROWS overrides for tuning sweeps
+TEMP_ROWS_FUSED = int(os.environ.get("EXL3_MOE_FUSED_ROWS", 128))
 TEMP_ROWS_GRAPH = 32
 # Batched reconstruct tier for the experts above the fused kernel's row capacity at prefill
 # (moe_batch_recon.py); EXL3_MOE_BATCH_RECON=0 restores the per-expert reconstruct loop
