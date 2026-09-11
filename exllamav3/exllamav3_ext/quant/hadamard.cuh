@@ -23,3 +23,14 @@ void had_r_128_dual
     const c10::optional<at::Tensor>& post_scale2,
     const float scale
 );
+
+void had_r_128_batch
+(
+    const at::Tensor& input,
+    const at::Tensor& output,
+    const c10::optional<at::Tensor>& pre_table,
+    const c10::optional<at::Tensor>& post_table,
+    const at::Tensor& ids,
+    int rows_per_expert,
+    const float scale
+);

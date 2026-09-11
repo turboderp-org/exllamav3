@@ -80,6 +80,43 @@ void had_ff_r_128_dual_kernel
     had_ff_r_128_inner<pre_scale, post_scale>(input2_ptr, output2_ptr, scale_2, r_scale);
 }
 
+// Batched-expert variant: the rows are B blocks of rows_per_expert rows, and the scale vector
+// of a row comes from a [E, cols] table selected by ids[row / rows_per_expert] (the slab
+// layout of moe_batch_recon.py)
+template <bool pre_scale, bool post_scale>
+__global__ __launch_bounds__(32)
+void had_hf_r_128_batch_kernel
+(
+    const half* __restrict__ input_ptr,
+    half* __restrict__ output_ptr,
+    const half* __restrict__ table,
+    const int64_t* __restrict__ ids,
+    const int rows_per_expert,
+    const float r_scale
+)
+{
+    size_t off = (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    const half* scale = table + (size_t) ids[blockIdx.x / rows_per_expert] * gridDim.y * 128;
+    had_hf_r_128_inner<pre_scale, post_scale>(input_ptr + off, output_ptr + off, scale, r_scale);
+}
+
+template <bool pre_scale, bool post_scale>
+__global__ __launch_bounds__(32)
+void had_ff_r_128_batch_kernel
+(
+    const float* __restrict__ input_ptr,
+    float* __restrict__ output_ptr,
+    const half* __restrict__ table,
+    const int64_t* __restrict__ ids,
+    const int rows_per_expert,
+    const float r_scale
+)
+{
+    size_t off = (size_t) gridDim.y * 128 * blockIdx.x + blockIdx.y * 128;
+    const half* scale = table + (size_t) ids[blockIdx.x / rows_per_expert] * gridDim.y * 128;
+    had_ff_r_128_inner<pre_scale, post_scale>(input_ptr + off, output_ptr + off, scale, r_scale);
+}
+
 /*
 Compute y = (x.view(-1, 128) @ had_128).view(x.shape)
 Works inplace if y == x
@@ -287,4 +324,74 @@ void had_r_128_dual
     }
 
     else TORCH_CHECK(false, "unsupported datatype");
+}
+
+
+/*
+had_r_128 over a [B * rows_per_expert, cols] slab with per-expert pre/post scale vectors: the
+scale of row r is table[ids[r / rows_per_expert]], tables are [E, cols] half. Works in place.
+*/
+void had_r_128_batch
+(
+    const at::Tensor& input,
+    const at::Tensor& output,
+    const c10::optional<at::Tensor>& pre_table,
+    const c10::optional<at::Tensor>& post_table,
+    const at::Tensor& ids,
+    int rows_per_expert,
+    const float scale
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_SHAPES_FULL(input, output);
+    TORCH_CHECK_DIM(input, 2);
+    TORCH_CHECK_DIV(input, 1, 128);
+    TORCH_CHECK_DTYPE(ids, kLong);
+    TORCH_CHECK(ids.is_contiguous(), "ids must be contiguous");
+    TORCH_CHECK(rows_per_expert > 0, "rows_per_expert must be positive");
+    TORCH_CHECK(pre_table.has_value() != post_table.has_value(), "exactly one of pre_table / post_table");
+    int rows = input.size(0);
+    int cols = input.size(1);
+    TORCH_CHECK(rows % rows_per_expert == 0, "rows must be a multiple of rows_per_expert");
+    TORCH_CHECK(ids.numel() >= rows / rows_per_expert, "ids too short for the slab");
+    const at::Tensor& table = pre_table.has_value() ? pre_table.value() : post_table.value();
+    TORCH_CHECK_DTYPE(table, kHalf);
+    TORCH_CHECK_DIM(table, 2);
+    TORCH_CHECK(table.is_contiguous() && table.size(1) == cols, "scale table must be contiguous [E, cols]");
+    if (!rows) return;
+
+    int blocks = cols / 128;
+    float r_scale = scale * 0.088388347648f;
+    dim3 blockDim(32);
+    dim3 gridDim(rows, blocks);
+    bool pre = pre_table.has_value();
+
+    if (input.dtype() == at::kHalf)
+    {
+        TORCH_CHECK_DTYPE(output, kHalf);
+        if (pre)
+            had_hf_r_128_batch_kernel<true, false><<<gridDim, blockDim, 0, stream>>>
+            ((const half*) input.data_ptr(), (half*) output.data_ptr(), (const half*) table.data_ptr(),
+             (const int64_t*) ids.data_ptr(), rows_per_expert, r_scale);
+        else
+            had_hf_r_128_batch_kernel<false, true><<<gridDim, blockDim, 0, stream>>>
+            ((const half*) input.data_ptr(), (half*) output.data_ptr(), (const half*) table.data_ptr(),
+             (const int64_t*) ids.data_ptr(), rows_per_expert, r_scale);
+    }
+    else if (input.dtype() == at::kFloat)
+    {
+        TORCH_CHECK_DTYPE(output, kFloat);
+        if (pre)
+            had_ff_r_128_batch_kernel<true, false><<<gridDim, blockDim, 0, stream>>>
+            ((const float*) input.data_ptr(), (float*) output.data_ptr(), (const half*) table.data_ptr(),
+             (const int64_t*) ids.data_ptr(), rows_per_expert, r_scale);
+        else
+            had_ff_r_128_batch_kernel<false, true><<<gridDim, blockDim, 0, stream>>>
+            ((const float*) input.data_ptr(), (float*) output.data_ptr(), (const half*) table.data_ptr(),
+             (const int64_t*) ids.data_ptr(), rows_per_expert, r_scale);
+    }
+    else TORCH_CHECK(false, "unsupported datatype");
+    cuda_check(cudaPeekAtLastError());
 }
