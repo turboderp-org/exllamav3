@@ -153,7 +153,10 @@ class _HugeArena:
 
     def _new_chunk(self, min_bytes):
         import mmap, os
+        from ..util.memory import check_host_memory
         size = max(self.CHUNK_BYTES, (min_bytes + (2 << 20) - 1) & ~((2 << 20) - 1))
+        check_host_memory(size, f"CPU MoE expert arena chunk {len(self.chunks)} "
+                                f"({(sum(len(c) for c in self.chunks) + size) >> 20} MiB in total)")
         if self.shared:
             flags = 0
             if self.huge == "1g":

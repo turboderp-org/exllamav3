@@ -394,6 +394,16 @@ transparent huge pages where `/sys/kernel/mm/transparent_hugepage/shmem_enabled`
 (`advise`, `within_size` or `always`; on the default `never` the CPU kernels run on 4K pages,
 which cost a few percent of decode on some hosts). Not available on Windows.
 
+### `EXL3_HOST_MEM_RESERVE_MB` (default: `2048`)
+
+Host-memory guard for the large CPU allocations (CPU MoE expert arena chunks, the n-gram table
+held in RAM with `--ngram_ram`): before each one, `MemAvailable` (from `/proc/meminfo`, or
+psutil where that is unavailable) must cover the allocation plus this reserve, or the load
+fails with a message naming the allocation. Linux has no allocation-time failure for anonymous
+or shmem memory: an oversized arena only fails once the machine has swapped itself into a
+minutes-long stall and the OOM killer picks a victim, and pinned pages cannot be reclaimed at
+all. `0` disables the check.
+
 ### `EXL3_MOE_ARENA_HUGE` (default: unset)
 
 With `EXL3_MOE_PINNED_ARENA=1`: `2m` or `1g` backs the memfd chunks with hugetlbfs pages
