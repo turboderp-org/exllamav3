@@ -6,7 +6,11 @@ from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
 from .bc_attn import _compile_kernel
-from .dsa_triton import _dsa_attn_split_kernel, _dsa_attn_combine_kernel, _dsa_indexer_fewq_kernel
+from .dsa_triton import has_triton
+
+# These kernel names are only defined when Triton is available.
+if has_triton:
+    from .dsa_triton import _dsa_attn_split_kernel, _dsa_attn_combine_kernel, _dsa_indexer_fewq_kernel
 
 """
 Whole-attention-step graphs for DeepSeek-V4 DSA decode (BC_DSV4Attention): projections,
@@ -22,7 +26,7 @@ On by default; EXL3_BC_DSA=0 falls back to the eager path. Ineligible configurat
 decline per-layer; build failures raise with EXL3_BC_DSA_DEBUG=1, else decline.
 """
 
-bc_dsa_enable = os.environ.get("EXL3_BC_DSA", "1") != "0"
+bc_dsa_enable = has_triton and os.environ.get("EXL3_BC_DSA", "1") != "0"
 _bc_debug = os.environ.get("EXL3_BC_DSA_DEBUG", "0") != "0"
 
 MAX_QLEN = 16
@@ -301,8 +305,8 @@ class BCDsa:
 
     def run(self, x, rs, rsl, bt_row = None):
         """x (1, seq, hidden) fp16 contiguous, bt_row (1, npr) i32 device block-table row of
-        this job (paged pools). Returns y (1, seq, hidden) fp32 (a static: consume before
-        the next BC call), or None to decline (host-side ring maintenance needed this
+        this job (paged pools). Returns y (1, seq, hidden) fp32 (a static: consume before the
+        next BC call), or None to decline (host-side ring maintenance needed this
         step)."""
         seq = x.shape[1]
         pos = rs.position
@@ -345,6 +349,8 @@ class BCDsa:
 
 
 def build_bc_dsa(module, rs, rsl, kl):
+    if not has_triton:
+        return None
     try:
         return BCDsa(module, rs, rsl, kl)
     except Exception:
@@ -408,7 +414,7 @@ class BCDsaBatch:
                 m.indexer._build_fused()
             fan_lins += [m.indexer.wkv, m.indexer.wgate]
         fan_inner = [l.inner for l in fan_lins]
-        self.fan_ns = [l.out_features for l in fan_lins]
+        self.fan_ns = [l.out_features for l in fan_inner] if False else [l.out_features for l in fan_lins]
         q_lora = m.q_a.out_features
         self.q_lora = q_lora
         if not (
@@ -633,6 +639,8 @@ class BCDsaBatch:
 
 
 def build_bc_dsa_batch(module, rsl, kl):
+    if not has_triton:
+        return None
     try:
         return BCDsaBatch(module, rsl, kl)
     except Exception:
