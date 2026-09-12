@@ -96,7 +96,7 @@ class MoeCpuTuning:
         # --- GPU-streaming prefill ---
         self.stream_t_explicit = "EXL3_MOE_STREAM_T" in os.environ
         self.stream_t = int(os.environ.get("EXL3_MOE_STREAM_T", 8))
-        self.stream_fused_t = int(os.environ.get("EXL3_MOE_STREAM_FUSED_T", 512))
+        self.stream_fused_t = int(os.environ.get("EXL3_MOE_STREAM_FUSED_T", 256))
         self.stream_min_rows = int(os.environ.get("EXL3_MOE_STREAM_MIN_ROWS", 32))
         self.batch_experts = max(1, min(
             int(os.environ.get("EXL3_MOE_STREAM_BATCH_EXPERTS", 24)), MOE_JOB_MAX_EXPERTS))
@@ -120,6 +120,9 @@ class MoeCpuTuning:
         # projection and run through padded bmm. EXL3_MOE_STREAM_BATCH_RECON=0 restores the
         # per-expert loop
         self.stream_batch_recon = os.environ.get("EXL3_MOE_STREAM_BATCH_RECON", "1") != "0"
+        # Fused-tier row tiles (32 / 64-row kernel instances per expert range), as EXL3_MOE_MTILE
+        # on the GPU side
+        self.mtile = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
 
         # --- debug / kill switches ---
         self.stream_debug = bool(os.environ.get("EXL3_MOE_STREAM_DEBUG"))
@@ -1449,14 +1452,25 @@ class MoeCpuHost:
                 wts = torch.cat([wseg for _, _, _, wseg in per_e]).half()
                 Ku, Kd = pd["u"][2], pd["d"][2]
                 Kg = pd["g"][2] if gated else Ku
-                ext.exl3_moe(
-                    y, out, ec, tok, wts,
-                    fbufs[0], fbufs[1], fbufs[2], fbufs[3],
-                    spec["activation"], Kg, Ku, Kd,
-                    tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
-                    tblt[6], tblt[7], tblt[8],
-                    False, True, False, True, False, True,
-                    float(spec["act_limit"] or 0.0), n_fused, None, None)
+                # Row-tile tiers as on the GPU side (block_sparse_mlp): one launch per tile over
+                # its expert range. Streamed experts are mul1 by construction
+                fc = [counts_h[e] for _, e, _, _ in per_e if counts_h[e] <= fused_t]
+                t1 = sum(1 for c in fc if 16 < c <= 32)
+                t2 = sum(1 for c in fc if c > 32)
+                tiers = [(t2, 33, fused_t, 64), (t1, 17, 32, 32), (len(fc) - t1 - t2, 1, 16, 16)] \
+                    if TUNING.mtile and (t1 or t2) else [(n_fused, 1, fused_t, 16)]
+                for n_act, lo, hi, mt in tiers:
+                    if not n_act:
+                        continue
+                    ext.exl3_moe(
+                        y, out, ec, tok, wts,
+                        fbufs[0], fbufs[1], fbufs[2], fbufs[3],
+                        spec["activation"], Kg, Ku, Kd,
+                        tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
+                        tblt[6], tblt[7], tblt[8],
+                        False, True, False, True, False, True,
+                        float(spec["act_limit"] or 0.0), n_act, None, None, lo, hi, mt
+                    )
 
             # Heavy tier: batched reconstruct (groups of experts, a handful of launches per
             # group; see moe_batch_recon.py) when eligible, else per expert

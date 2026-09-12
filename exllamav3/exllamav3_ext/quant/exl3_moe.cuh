@@ -44,7 +44,10 @@ void exl3_moe
     const float act_limit,
     const int num_active,
     const c10::optional<at::Tensor>& output_scratch,
-    const c10::optional<at::Tensor>& fused_base
+    const c10::optional<at::Tensor>& fused_base,
+    const int count_lo,
+    const int count_hi,
+    const int m_tile
 );
 
 void exl3_moe_gather

@@ -29,6 +29,15 @@ TEMP_ROWS_GRAPH = 32
 # Batched reconstruct tier for the experts above the fused kernel's row capacity at prefill
 # (moe_batch_recon.py); EXL3_MOE_BATCH_RECON=0 restores the per-expert reconstruct loop
 BATCH_RECON = os.environ.get("EXL3_MOE_BATCH_RECON", "1") != "0"
+# Row tiles for the fused kernel: experts with more than MTILE_T1 rows run through a 32-row tile
+# instance, more than MTILE_T2 through a 64-row one (32 for the N = 256 shape), each its own
+# launch over its expert range (mul1 codebook only). EXL3_MOE_MTILE=0 keeps the single 16-row
+# launch
+MTILE = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
+MTILE_T1, MTILE_T2 = 16, 32
+# Fused-kernel row capacity per expert when the wide tiles apply: with them the fused kernel
+# beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk: 128 -> 256 rows +3%)
+FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # Deterministic (slot + gather) accumulation for the fused kernel's outputs; EXL3_MOE_FUSED_DET=0
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
@@ -365,6 +374,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.bc = None
         self.bc_sh_exp = False
         self.fused_mode_buffers = None
+        self.mtile_ok = False
+        self.fused_rows = TEMP_ROWS_FUSED
         self.batch_recon = None
         self._cpu_init_state()
 
@@ -615,14 +626,20 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 act_relu2 = self.activation_fn == "relu2",
             )
 
-            # Larger buffers for fused path, if supported
+            # Larger buffers for fused path, if supported. Wide row tiles (32 / 64 rows, separate
+            # N = 128 kernel instances) exist for the mul1 codebook; with them the fused tier's
+            # row capacity rises to FUSED_ROWS_WIDE. Dims that are multiples of 256 keep the
+            # N = 256 instance for the <= 16-row launch only (it is the faster 16-row tiling)
             if self.support_fused:
+                self.mtile_ok = MTILE and bool(self.multi_up.mul1)
+                self.fused_rows = FUSED_ROWS_WIDE if self.mtile_ok else TEMP_ROWS_FUSED
+                R = self.fused_rows
                 C = ext.exl3_moe_max_concurrency(torch.device(device).index)
                 self.fused_mode_buffers = FusedBuffers(
-                    temp_state_g = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, H), torch.half, "moe2_temp_state_g"),
-                    temp_state_u = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, H), torch.half, "moe2_temp_state_u"),
-                    temp_intermediate_g = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, I), torch.half, "moe2_temp_intermediate_g"),
-                    temp_intermediate_u = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, I), torch.half, "moe2_temp_intermediate_u"),
+                    temp_state_g = g_tensor_cache.get(device, (C, R, H), torch.half, "moe2_temp_state_g"),
+                    temp_state_u = g_tensor_cache.get(device, (C, R, H), torch.half, "moe2_temp_state_u"),
+                    temp_intermediate_g = g_tensor_cache.get(device, (C, R, I), torch.half, "moe2_temp_intermediate_g"),
+                    temp_intermediate_u = g_tensor_cache.get(device, (C, R, I), torch.half, "moe2_temp_intermediate_u"),
                 )
                 self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 4)
 
@@ -813,7 +830,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if scratch is not None:
             # groups were laid out after the fused slots, in plan order, len(grp) * cmax each
             slot = sum(c for c in expert_count_list[:self.num_local_experts or self.num_experts]
-                       if 0 < c <= TEMP_ROWS_FUSED) if self.fused_mode_buffers is not None else 0
+                       if 0 < c <= self.fused_rows) if self.fused_mode_buffers is not None else 0
         for grp in groups:
             out_slab = None
             if scratch is not None:
@@ -972,12 +989,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
                 # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= TEMP_ROWS_FUSED:
+                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
                     expert_count_list = None
                 else:
                     expert_count_list = expert_count.tolist()
 
-                # Tier plan: fused kernel for experts up to TEMP_ROWS_FUSED rows, batched
+                # Tier plan: fused kernel for experts up to self.fused_rows rows, batched
                 # reconstruct groups above that up to the tile cap, per-expert reconstruct beyond
                 recon = None
                 groups = []
@@ -987,8 +1004,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 else:
                     fused_total = 0
                     if self.fused_mode_buffers is not None:
-                        min_rows = TEMP_ROWS_FUSED
-                        fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED)
+                        min_rows = self.fused_rows
+                        fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows)
                     recon = self._batch_recon_layer(y)
                     if recon is not None:
                         lim = max(min_rows, TEMP_ROWS_GRAPH)
@@ -1025,7 +1042,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         if self.fused_mode_buffers is not None:
                             for e in range(num_ex):
                                 c = expert_count_list[e]
-                                if 0 < c <= TEMP_ROWS_FUSED:
+                                if 0 < c <= self.fused_rows:
                                     base[e] = n_slots; kind[e] = 1; n_slots += c
                         for grp in groups:
                             cmax = max(expert_count_list[e] for e in grp)
@@ -1035,7 +1052,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         tables = torch.from_numpy(np.stack([base, starts_np, kind])).to(y.device, non_blocking = True)
                     scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
 
-                def run_fused(num_active):
+                def run_fused(num_active, count_lo = 1, count_hi = self.fused_rows, m_tile = 16):
                     # Gateless: the up module stands in for the gate pointer tables (the kernel
                     # skips the gate GEMM when activation_fn_idx is MOE_ACT_RELU2_NOGATE)
                     multi_gate = self.multi_gate if self.gated else self.multi_up
@@ -1070,7 +1087,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         self.multi_down.mul1,
                         self.act_limit,
                         num_active,
-                        scratch, tables[0] if tables is not None else None
+                        scratch, tables[0] if tables is not None else None,
+                        count_lo, count_hi, m_tile
                     )
 
                 # num_active -1 = unknown (all fused), kernel launches at max concurrency
@@ -1078,7 +1096,20 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     if expert_count_list is None:
                         run_fused(-1)
                     else:
-                        run_fused(sum(1 for c in expert_count_list[:num_ex] if 0 < c <= TEMP_ROWS_FUSED))
+                        counts = [c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows]
+                        t1 = sum(1 for c in counts if MTILE_T1 < c <= MTILE_T2)
+                        t2 = sum(1 for c in counts if c > MTILE_T2)
+                        if self.mtile_ok and (t1 or t2):
+                            # One launch per row tile over its expert range, largest first
+                            t0 = len(counts) - t1 - t2
+                            if t2:
+                                run_fused(t2, MTILE_T2 + 1, self.fused_rows, 64)
+                            if t1:
+                                run_fused(t1, MTILE_T1 + 1, MTILE_T2, 32)
+                            if t0:
+                                run_fused(t0, 1, MTILE_T1, 16)
+                        else:
+                            run_fused(len(counts))
 
                 # Batched reconstruct tier (into slots when deterministic, else accumulating)
                 batched = ()

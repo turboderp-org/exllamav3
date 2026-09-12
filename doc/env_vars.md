@@ -411,6 +411,39 @@ With `EXL3_MOE_PINNED_ARENA=1`: `2m` or `1g` backs the memfd chunks with hugetlb
 (`vm.nr_hugepages`, or `hugepages-1048576kB` for `1g`) covering the whole arena; allocation
 fails with a clear error otherwise.
 
+### `EXL3_MOE_MTILE` (default: `1`)
+
+Row tiles for the fused MoE prefill kernel. The kernel dequantizes each expert's weights once
+per 16-row tile, so an expert holding 100 rows re-runs the whole B pipeline seven times. With
+this on, experts with 17-32 rows go through a 32-row-tile instance and experts with more than 32
+rows through a 64-row one, each as its own launch over its expert range (up to three launches
+per layer, largest tile first; a wide instance finishes an expert's remainder with the largest
+smaller tile). The wider tiles are separate kernel instances rather than a runtime switch inside
+one kernel: sharing one 128-register budget between the tiers costs the 16-row path 60-70% on
+Ada / Ampere. Instantiated for the mul1 codebook as N = 128 tile-shape kernels: 30-47% less
+fused-kernel time at 24-128 rows per expert on every GPU generation for Qwen3.8-class shapes,
+and ~20% for dims that are multiples of 256 (gemma4, Qwen3-30B), where they replace the N = 256
+16-row tiling for experts above 16 rows (the N = 256 instance stays for the small-expert
+launch, where it is 10-20% faster). Model level, 4k chunks: Qwen3.8 +10% on the PRO 6000, +3%
+on a 4090 + 3090 split; gemma4-26B +1-4%; Qwen3-30B neutral. Other codebooks and the
+all-fused fast path (no host-side counts) keep the single launch. Outputs are bit-identical to
+the 16-row tiling at equal group geometry (per-launch active counts widen the groups, which
+reorders the fp32 k-slice reduction to rounding level). Set to `0` for the single launch.
+
+### `EXL3_MOE_TILE_N` (default: `0` = automatic)
+
+`128` keeps the N = 128 tile shape for the fused kernel's 16-row launches on dims that are
+multiples of 256 (which otherwise take the N = 256 instances). Measurement knob; the N = 256
+instance is faster for those launches.
+
+### `EXL3_MOE_FUSED_ROWS_WIDE` (default: `256`)
+
+Fused-tier row capacity per expert for layers that use the wide tiles (see `EXL3_MOE_MTILE`);
+`EXL3_MOE_FUSED_ROWS` still applies to every other layer. With the wide tiles the fused kernel
+beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk on the PRO 6000: 6.87k ->
+7.06k tok/s over 128 rows), at 4 x concurrency x rows x (hidden + intermediate) x 2 bytes of
+static buffers per device (Qwen3.8 on a 188-SM card: +38 MB over 128 rows).
+
 ### `EXL3_MOE_BATCH_RECON` (default: `1`), `EXL3_MOE_STREAM_BATCH_RECON` (default: `1`)
 
 Batched reconstruct tier for prefill (`exllamav3/modules/moe_batch_recon.py`): experts with
