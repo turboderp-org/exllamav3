@@ -285,19 +285,14 @@ void exl3_gemv_sm70_kernel(EXL3_GEMM_ARGS)
                     // B fragment: 4 cells (k = 4*qk + vi, col = (lane&3)
                     //   + 4*(lane>=16) + 8*mh)  — the ISA B map's col with
                     //   the mh 8-col group shift.
-                    uint32_t wv[4];
-                    #pragma unroll
-                    for (int vi = 0; vi < 4; ++vi)
-                    {
-                        const int src = 4 * (lane & 3) + 16 * (lane >= 16)
-                            + 2 * (qk & 1) + (vi >> 1);
-                        const int slot = (qk >> 1) + 2 * mh;
-                        const uint32_t pair = __shfl_sync(0xffffffffu,
-                            v[slot], src);
-                        wv[vi] = (vi & 1) ? (pair >> 16) : (pair & 0xffff);
-                    }
-                    const uint32_t b0 = wv[0] | (wv[1] << 16);
-                    const uint32_t b1 = wv[2] | (wv[3] << 16);
+                    // vi {0,1} share one source pair (lo/hi); vi {2,3} share
+                    // another — 2 shuffles per (mh, qk), and the pairs ARE
+                    // the .f16x2 B operands (no extraction/repacking).
+                    const int slot = (qk >> 1) + 2 * mh;
+                    const int src_lo = 4 * (lane & 3) + 16 * (lane >= 16)
+                        + 2 * (qk & 1);
+                    const uint32_t b0 = __shfl_sync(0xffffffffu, v[slot], src_lo);
+                    const uint32_t b1 = __shfl_sync(0xffffffffu, v[slot], src_lo + 1);
                     exl3_gemv_sm70_ns::mma_ab_sm70(a0, a1, b0, b1, acc[t][mh]);
                 }
 
