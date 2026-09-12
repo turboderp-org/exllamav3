@@ -141,7 +141,7 @@ class LinearEXL3:
             # sm80 block-pipelined kernels are arch-guarded no-ops. Route
             # rows > 1 to reconstruct+hgemm.
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
-                if rows > 1 and x.device.index is not None and ext.g_get_cc(x.device.index) < 8:
+                if rows > 2 and x.device.index is not None and ext.g_get_cc(x.device.index) < 8:
                     pass  # fall through to reconstruct_hgemm
                 else:
                     dtype = out_dtype or self.default_out_dtype
