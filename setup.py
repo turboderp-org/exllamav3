@@ -21,6 +21,7 @@ windows = os.name == "nt"
 extra_cflags = []
 extra_cuda_cflags = [
     "-lineinfo", "-O3", "--use_fast_math",
+    "-std=c++20",
     "-Xcudafe", "--diag_suppress=177",
     "-Xcudafe", "--diag_suppress=20012",
 ]
