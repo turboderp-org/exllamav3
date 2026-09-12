@@ -64,722 +64,713 @@ def _dbg_sync(tag, device):
         except Exception as e:
             raise RuntimeError(f"MLA debug sync failed after {tag} on {device}: {e}") from e
 
-try:
-    import triton
-    import triton.language as tl
-    has_triton = True
-except ImportError:
-    has_triton = False
-    triton = None
-    tl = None
+import triton
+import triton.language as tl
+
+from .triton_paged import _qc_load_kt, _qc_load_v, _rot_h32
+
+@triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
+def _mla_kv_quant_scatter_kernel(
+    tmp_q,               # (rows, N_G * BITS) int32, packed by quant_cache_cont
+    tmp_s,               # (rows, N_G) fp16 group scales
+    kpe_new,             # (rows, D_r) fp16
+    qk,                  # (pages, page_size, N_G * BITS) int32
+    sk,                  # (pages, page_size, N_G) fp16
+    kpe_cache,           # (pages, page_size, 1, D_r) fp16
+    block_table,
+    cache_seqlens,
+    num_pages_per_seq,
+    append_len,          # runtime: chunk lengths vary freely without recompiling
+    page_size: tl.constexpr,
+    W_TOT: tl.constexpr,     # N_G * BITS packed words per row
+    W_PAD: tl.constexpr,     # next pow2 (tl.arange needs it; W_TOT = 48/80/96/112 for odd widths)
+    N_G: tl.constexpr,
+    D_r: tl.constexpr,
+):
+    """Scatter contiguously quantized latent rows plus their fp16 rope keys into the paged
+    cache. Quantization itself runs in the CUDA kernel (same packed format as the MHA cache);
+    this only places the rows."""
+    row = tl.program_id(0)
+    batch = row // append_len
+    pos = row - batch * append_len
+
+    abs_pos = tl.load(cache_seqlens + batch) + pos
+    page = abs_pos // page_size
+    page_off = abs_pos - page * page_size
+    phys = tl.load(block_table + batch * num_pages_per_seq + page)
+    tok = phys * page_size + page_off
+
+    w = tl.arange(0, W_PAD)
+    mask_w = w < W_TOT
+    tl.store(qk + tok * W_TOT + w, tl.load(tmp_q + row * W_TOT + w, mask = mask_w), mask = mask_w)
+    g = tl.arange(0, N_G)
+    tl.store(sk + tok * N_G + g, tl.load(tmp_s + row * N_G + g))
+    if D_r > 0:
+        r = tl.arange(0, D_r)
+        tl.store(kpe_cache + tok * D_r + r, tl.load(kpe_new + row * D_r + r))
 
 
-if has_triton:
+@triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
+def _mla_kv_update_kernel(
+    ckv_new,             # (bsz, len, D_c)
+    kpe_new,             # (bsz, len, D_r)
+    ckv_cache,           # (pages, page_size, D_c)
+    kpe_cache,           # (pages, page_size, D_r)
+    block_table,
+    cache_seqlens,
+    num_pages_per_seq,
+    append_len,          # runtime: chunk lengths vary freely without recompiling
+    page_size: tl.constexpr,
+    D_c: tl.constexpr,
+    D_r: tl.constexpr,
+):
+    """Append one chunk of latent + rope rows to the paged cache. Both widths move in one
+    launch; the ext fp16 append kernel requires K and V to be the same shape, which they are
+    not here."""
+    row = tl.program_id(0)
+    batch = row // append_len
+    pos = row - batch * append_len
 
-    from .triton_paged import _qc_load_kt, _qc_load_v, _rot_h32
+    abs_pos = tl.load(cache_seqlens + batch) + pos
+    page = abs_pos // page_size
+    page_off = abs_pos - page * page_size
+    phys = tl.load(block_table + batch * num_pages_per_seq + page)
+    tok = phys * page_size + page_off
 
-    @triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
-    def _mla_kv_quant_scatter_kernel(
-        tmp_q,               # (rows, N_G * BITS) int32, packed by quant_cache_cont
-        tmp_s,               # (rows, N_G) fp16 group scales
-        kpe_new,             # (rows, D_r) fp16
-        qk,                  # (pages, page_size, N_G * BITS) int32
-        sk,                  # (pages, page_size, N_G) fp16
-        kpe_cache,           # (pages, page_size, 1, D_r) fp16
-        block_table,
-        cache_seqlens,
-        num_pages_per_seq,
-        append_len,          # runtime: chunk lengths vary freely without recompiling
-        page_size: tl.constexpr,
-        W_TOT: tl.constexpr,     # N_G * BITS packed words per row
-        W_PAD: tl.constexpr,     # next pow2 (tl.arange needs it; W_TOT = 48/80/96/112 for odd widths)
-        N_G: tl.constexpr,
-        D_r: tl.constexpr,
-    ):
-        """Scatter contiguously quantized latent rows plus their fp16 rope keys into the paged
-        cache. Quantization itself runs in the CUDA kernel (same packed format as the MHA cache);
-        this only places the rows."""
-        row = tl.program_id(0)
-        batch = row // append_len
-        pos = row - batch * append_len
-
-        abs_pos = tl.load(cache_seqlens + batch) + pos
-        page = abs_pos // page_size
-        page_off = abs_pos - page * page_size
-        phys = tl.load(block_table + batch * num_pages_per_seq + page)
-        tok = phys * page_size + page_off
-
-        w = tl.arange(0, W_PAD)
-        mask_w = w < W_TOT
-        tl.store(qk + tok * W_TOT + w, tl.load(tmp_q + row * W_TOT + w, mask = mask_w), mask = mask_w)
-        g = tl.arange(0, N_G)
-        tl.store(sk + tok * N_G + g, tl.load(tmp_s + row * N_G + g))
-        if D_r > 0:
-            r = tl.arange(0, D_r)
-            tl.store(kpe_cache + tok * D_r + r, tl.load(kpe_new + row * D_r + r))
+    offs_c = tl.arange(0, D_c)
+    tl.store(ckv_cache + tok * D_c + offs_c,
+             tl.load(ckv_new + row * D_c + offs_c))
+    if D_r > 0:
+        offs_r = tl.arange(0, D_r)
+        tl.store(kpe_cache + tok * D_r + offs_r,
+                 tl.load(kpe_new + row * D_r + offs_r))
 
 
-    @triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
-    def _mla_kv_update_kernel(
-        ckv_new,             # (bsz, len, D_c)
-        kpe_new,             # (bsz, len, D_r)
-        ckv_cache,           # (pages, page_size, D_c)
-        kpe_cache,           # (pages, page_size, D_r)
-        block_table,
-        cache_seqlens,
-        num_pages_per_seq,
-        append_len,          # runtime: chunk lengths vary freely without recompiling
-        page_size: tl.constexpr,
-        D_c: tl.constexpr,
-        D_r: tl.constexpr,
-    ):
-        """Append one chunk of latent + rope rows to the paged cache. Both widths move in one
-        launch; the ext fp16 append kernel requires K and V to be the same shape, which they are
-        not here."""
-        row = tl.program_id(0)
-        batch = row // append_len
-        pos = row - batch * append_len
+@triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
+def _mla_plane_update_kernel(
+    rows_new,            # (bsz, len, D)
+    plane_cache,         # (pages, page_size, DST_D)
+    block_table,
+    cache_seqlens,
+    num_pages_per_seq,
+    append_len,
+    page_size: tl.constexpr,
+    D: tl.constexpr,
+    DST_D: tl.constexpr = 0,   # plane row width when packing (0 = D); rows land at DST_OFF
+    DST_OFF: tl.constexpr = 0,
+):
+    """Single-plane variant of _mla_kv_update_kernel, for the per-token indexer-key rows
+    of DSA-on-MLA layers (GLM-5.2). The DST_D/DST_OFF variant packs a D-wide source into
+    a slice of a wider plane row (GLM5.3 kpool: [k || gate_scores])."""
+    row = tl.program_id(0)
+    batch = row // append_len
+    pos = row - batch * append_len
 
-        abs_pos = tl.load(cache_seqlens + batch) + pos
-        page = abs_pos // page_size
-        page_off = abs_pos - page * page_size
-        phys = tl.load(block_table + batch * num_pages_per_seq + page)
-        tok = phys * page_size + page_off
+    abs_pos = tl.load(cache_seqlens + batch) + pos
+    page = abs_pos // page_size
+    page_off = abs_pos - page * page_size
+    phys = tl.load(block_table + batch * num_pages_per_seq + page)
+    tok = phys * page_size + page_off
 
-        offs_c = tl.arange(0, D_c)
-        tl.store(ckv_cache + tok * D_c + offs_c,
-                 tl.load(ckv_new + row * D_c + offs_c))
-        if D_r > 0:
-            offs_r = tl.arange(0, D_r)
-            tl.store(kpe_cache + tok * D_r + offs_r,
-                     tl.load(kpe_new + row * D_r + offs_r))
+    offs = tl.arange(0, D)
+    dst_d = DST_D if DST_D > 0 else D
+    tl.store(plane_cache + tok * dst_d + DST_OFF + offs, tl.load(rows_new + row * D + offs))
 
 
-    @triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
-    def _mla_plane_update_kernel(
-        rows_new,            # (bsz, len, D)
-        plane_cache,         # (pages, page_size, DST_D)
-        block_table,
-        cache_seqlens,
-        num_pages_per_seq,
-        append_len,
-        page_size: tl.constexpr,
-        D: tl.constexpr,
-        DST_D: tl.constexpr = 0,   # plane row width when packing (0 = D); rows land at DST_OFF
-        DST_OFF: tl.constexpr = 0,
-    ):
-        """Single-plane variant of _mla_kv_update_kernel, for the per-token indexer-key rows
-        of DSA-on-MLA layers (GLM-5.2). The DST_D/DST_OFF variant packs a D-wide source into
-        a slice of a wider plane row (GLM5.3 kpool: [k || gate_scores])."""
-        row = tl.program_id(0)
-        batch = row // append_len
-        pos = row - batch * append_len
-
-        abs_pos = tl.load(cache_seqlens + batch) + pos
-        page = abs_pos // page_size
-        page_off = abs_pos - page * page_size
-        phys = tl.load(block_table + batch * num_pages_per_seq + page)
-        tok = phys * page_size + page_off
-
-        offs = tl.arange(0, D)
-        dst_d = DST_D if DST_D > 0 else D
-        tl.store(plane_cache + tok * dst_d + DST_OFF + offs, tl.load(rows_new + row * D + offs))
-
-
-    @triton.jit(do_not_specialize = ["R"])
-    def _mla_idx_norm_kernel(
-        k_raw,               # (R, D) fp16
-        w,                   # (D,) fp16
-        b,                   # (D,) fp16
-        k_out,               # (R, D) fp16
-        R,
-        eps: tl.constexpr,
-        D: tl.constexpr,
-    ):
-        """Biased LayerNorm for the DSA indexer keys (GLM-5.2 k_norm), fp32 math. One program
-        per row; D is a power of two (128)."""
-        row = tl.program_id(0)
-        offs = tl.arange(0, D)
-        x = tl.load(k_raw + row * D + offs).to(tl.float32)
-        mean = tl.sum(x, axis = 0) / D
-        xc = x - mean
-        var = tl.sum(xc * xc, axis = 0) / D
-        xn = xc * tl.rsqrt(var + eps)
-        y = xn * tl.load(w + offs).to(tl.float32) + tl.load(b + offs).to(tl.float32)
-        tl.store(k_out + row * D + offs, y.to(tl.float16))
+@triton.jit(do_not_specialize = ["R"])
+def _mla_idx_norm_kernel(
+    k_raw,               # (R, D) fp16
+    w,                   # (D,) fp16
+    b,                   # (D,) fp16
+    k_out,               # (R, D) fp16
+    R,
+    eps: tl.constexpr,
+    D: tl.constexpr,
+):
+    """Biased LayerNorm for the DSA indexer keys (GLM-5.2 k_norm), fp32 math. One program
+    per row; D is a power of two (128)."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, D)
+    x = tl.load(k_raw + row * D + offs).to(tl.float32)
+    mean = tl.sum(x, axis = 0) / D
+    xc = x - mean
+    var = tl.sum(xc * xc, axis = 0) / D
+    xn = xc * tl.rsqrt(var + eps)
+    y = xn * tl.load(w + offs).to(tl.float32) + tl.load(b + offs).to(tl.float32)
+    tl.store(k_out + row * D + offs, y.to(tl.float16))
 
 
 
 
-    @triton.jit(do_not_specialize = ["split_len", "num_pages_per_seq", "num_splits"])
-    def _mla_decode_split_kernel(
-        q_lat,               # (H, bsz * q_len, D_c) absorbed queries, head-major
-        q_pe,                # (H, bsz * q_len, D_r)
-        ckv_cache,           # fp16 latent pages, or packed int32 when QC > 0
-        kpe_cache,           # always fp16
-        ckv_scales,          # fp16 group scales when QC > 0 (dummy otherwise)
-        h32,                 # 32x32 Hadamard/sqrt(32) when QC > 0 (dummy otherwise)
-        block_table,
-        cache_seqlens,
-        out,                 # (H, bsz * q_len, D_c) latent output, head-major
-        partial_o,
-        partial_ml,
-        split_len,           # runtime: derived from the block-table bound, changes as it grows
-        num_pages_per_seq,   # runtime: block-table width can grow without recompiling
-        num_splits,          # runtime: the grid may be launched wider; extra splits idle
-        QC: tl.constexpr,    # latent cache bits (2-8), 0 = fp16
-        QC_TRANS: tl.constexpr,  # 0: expand both orientations; 1: expand V once, trans for K^T
-        Q_PE_TM: tl.constexpr,   # q_pe layout: 0 = head-major (H, R, D_r), 1 = token-major
-                                 # (R, H, D_r) as staged by the BC graph (no permute stage)
-        bsz: tl.constexpr,
-        q_len: tl.constexpr,
-        pre_appended_len: tl.constexpr,
-        n_q_heads: tl.constexpr,
-        page_size: tl.constexpr,
-        D_c: tl.constexpr,
-        D_r: tl.constexpr,
-        scale: tl.constexpr,
-        CAUSAL: tl.constexpr,
-        FINAL: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_H: tl.constexpr,
-        BLOCK_ROWS: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        """Flash-decoding phase 1: one program per (batch, head block, kv split). Query positions
-        and sibling heads share the row axis so the latent tile is read once per program."""
-        pid = tl.program_id(0)
-        split = tl.program_id(1)
+@triton.jit(do_not_specialize = ["split_len", "num_pages_per_seq", "num_splits"])
+def _mla_decode_split_kernel(
+    q_lat,               # (H, bsz * q_len, D_c) absorbed queries, head-major
+    q_pe,                # (H, bsz * q_len, D_r)
+    ckv_cache,           # fp16 latent pages, or packed int32 when QC > 0
+    kpe_cache,           # always fp16
+    ckv_scales,          # fp16 group scales when QC > 0 (dummy otherwise)
+    h32,                 # 32x32 Hadamard/sqrt(32) when QC > 0 (dummy otherwise)
+    block_table,
+    cache_seqlens,
+    out,                 # (H, bsz * q_len, D_c) latent output, head-major
+    partial_o,
+    partial_ml,
+    split_len,           # runtime: derived from the block-table bound, changes as it grows
+    num_pages_per_seq,   # runtime: block-table width can grow without recompiling
+    num_splits,          # runtime: the grid may be launched wider; extra splits idle
+    QC: tl.constexpr,    # latent cache bits (2-8), 0 = fp16
+    QC_TRANS: tl.constexpr,  # 0: expand both orientations; 1: expand V once, trans for K^T
+    Q_PE_TM: tl.constexpr,   # q_pe layout: 0 = head-major (H, R, D_r), 1 = token-major
+                             # (R, H, D_r) as staged by the BC graph (no permute stage)
+    bsz: tl.constexpr,
+    q_len: tl.constexpr,
+    pre_appended_len: tl.constexpr,
+    n_q_heads: tl.constexpr,
+    page_size: tl.constexpr,
+    D_c: tl.constexpr,
+    D_r: tl.constexpr,
+    scale: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    FINAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Flash-decoding phase 1: one program per (batch, head block, kv split). Query positions
+    and sibling heads share the row axis so the latent tile is read once per program."""
+    pid = tl.program_id(0)
+    split = tl.program_id(1)
 
-        h_blocks = tl.cdiv(n_q_heads, BLOCK_H)
-        h_block = pid % h_blocks
-        batch = pid // h_blocks
+    h_blocks = tl.cdiv(n_q_heads, BLOCK_H)
+    h_block = pid % h_blocks
+    batch = pid // h_blocks
 
-        rows = tl.arange(0, BLOCK_ROWS)
-        row_q = rows % BLOCK_M
-        row_h = h_block * BLOCK_H + (rows // BLOCK_M)
-        valid_row = (row_q < q_len) & (row_h < n_q_heads)
+    rows = tl.arange(0, BLOCK_ROWS)
+    row_q = rows % BLOCK_M
+    row_h = h_block * BLOCK_H + (rows // BLOCK_M)
+    valid_row = (row_q < q_len) & (row_h < n_q_heads)
 
-        offs_c = tl.arange(0, D_c)
-        offs_r = tl.arange(0, D_r if D_r > 0 else 1)
+    offs_c = tl.arange(0, D_c)
+    offs_r = tl.arange(0, D_r if D_r > 0 else 1)
 
-        # Head-major: the absorbed queries arrive straight from a batched GEMM over heads, and the
-        # latent output feeds the next one, so neither D_c-wide tensor is ever permuted
-        q_row = row_h * (bsz * q_len) + batch * q_len + row_q
-        q_c = tl.load(q_lat + q_row[:, None] * D_c + offs_c[None, :],
+    # Head-major: the absorbed queries arrive straight from a batched GEMM over heads, and the
+    # latent output feeds the next one, so neither D_c-wide tensor is ever permuted
+    q_row = row_h * (bsz * q_len) + batch * q_len + row_q
+    q_c = tl.load(q_lat + q_row[:, None] * D_c + offs_c[None, :],
+                  mask = valid_row[:, None], other = 0.0)
+    if Q_PE_TM:
+        qpe_row = (batch * q_len + row_q) * n_q_heads + row_h
+    else:
+        qpe_row = q_row
+    if D_r > 0:
+        q_r = tl.load(q_pe + qpe_row[:, None] * D_r + offs_r[None, :],
                       mask = valid_row[:, None], other = 0.0)
-        if Q_PE_TM:
-            qpe_row = (batch * q_len + row_q) * n_q_heads + row_h
-        else:
-            qpe_row = q_row
-        if D_r > 0:
-            q_r = tl.load(q_pe + qpe_row[:, None] * D_r + offs_r[None, :],
-                          mask = valid_row[:, None], other = 0.0)
+    if QC > 0:
+        # Packed values live in the rotated domain; rotating q here keeps the score dot exact
+        # (H32 is orthogonal and block-diagonal per 32, so dot(Hq, Hk) == dot(q, k))
+        q_c = _rot_h32(q_c, h32, BLOCK_ROWS, D_c)
+
+    total_k_len = tl.load(cache_seqlens + batch) + pre_appended_len
+    q_abs = total_k_len - q_len + row_q
+
+    n_start = split * split_len
+    n_end = tl.minimum(n_start + split_len, total_k_len)
+
+    m = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
+    l = tl.full((BLOCK_ROWS,), 0.0, tl.float32)
+    acc = tl.zeros((BLOCK_ROWS, D_c), tl.float32)
+
+    for n0 in range(n_start, n_end, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        in_range = offs_n < n_end
+        page = offs_n // page_size
+        page_off = offs_n - page * page_size
+        phys = tl.load(block_table + batch * num_pages_per_seq + page, mask = in_range, other = 0)
+        tok = phys * page_size + page_off
+
         if QC > 0:
-            # Packed values live in the rotated domain; rotating q here keeps the score dot exact
-            # (H32 is orthogonal and block-diagonal per 32, so dot(Hq, Hk) == dot(q, k))
-            q_c = _rot_h32(q_c, h32, BLOCK_ROWS, D_c)
-
-        total_k_len = tl.load(cache_seqlens + batch) + pre_appended_len
-        q_abs = total_k_len - q_len + row_q
-
-        n_start = split * split_len
-        n_end = tl.minimum(n_start + split_len, total_k_len)
-
-        m = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
-        l = tl.full((BLOCK_ROWS,), 0.0, tl.float32)
-        acc = tl.zeros((BLOCK_ROWS, D_c), tl.float32)
-
-        for n0 in range(n_start, n_end, BLOCK_N):
-            offs_n = n0 + tl.arange(0, BLOCK_N)
-            in_range = offs_n < n_end
-            page = offs_n // page_size
-            page_off = offs_n - page * page_size
-            phys = tl.load(block_table + batch * num_pages_per_seq + page, mask = in_range, other = 0)
-            tok = phys * page_size + page_off
-
-            if QC > 0:
-                # V is K in the packed cache too: both orientations come from the same words.
-                # Either expand twice (QC_TRANS 0) or expand the V orientation once and transpose
-                # the dequantized fp16 tile for the score dot (QC_TRANS 1) -- the transpose is of
-                # a plain fp16 value, not of loader interleave output (the miscompiling shape)
-                if QC_TRANS:
-                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
-                    kt = tl.trans(v_tile)
-                else:
-                    kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
-                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
-            else:
-                # V is K: load the latent tile once, transpose it for the score dot
-                v_tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
-                                 mask = in_range[:, None], other = 0.0)
+            # V is K in the packed cache too: both orientations come from the same words.
+            # Either expand twice (QC_TRANS 0) or expand the V orientation once and transpose
+            # the dequantized fp16 tile for the score dot (QC_TRANS 1) -- the transpose is of
+            # a plain fp16 value, not of loader interleave output (the miscompiling shape)
+            if QC_TRANS:
+                v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
                 kt = tl.trans(v_tile)
-            scores = tl.dot(q_c, kt)
-            if D_r > 0:
-                kt_pe = tl.load(kpe_cache + tok[None, :] * D_r + offs_r[:, None],
-                                mask = in_range[None, :], other = 0.0)
-                scores = tl.dot(q_r, kt_pe, acc = scores)
-            scores = scores * scale
-
-            valid = valid_row[:, None] & in_range[None, :]
-            if CAUSAL:
-                valid = valid & (offs_n[None, :] <= q_abs[:, None])
-            scores = tl.where(valid, scores, -float("inf"))
-
-            m_new = tl.maximum(m, tl.max(scores, axis = 1))
-            m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
-            p = tl.exp(scores - m_exp[:, None])
-            p = tl.where(valid, p, 0.0)
-            alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
-            l = l * alpha + tl.sum(p, axis = 1)
-            acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
-            m = m_new
-
-        if FINAL:
-            out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
-            if QC > 0:
-                # The accumulator is in the rotated domain (rotated V); one inverse rotation at
-                # the end recovers the latent (H32 is symmetric, so the same helper serves)
-                out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, D_c)
-            tl.store(out + q_row[:, None] * D_c + offs_c[None, :], out_tile,
-                     mask = valid_row[:, None])
+            else:
+                kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
+                v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
         else:
-            if split < num_splits:
-                po_base = (pid * num_splits + split) * BLOCK_ROWS * D_c
-                tl.store(partial_o + po_base + rows[:, None] * D_c + offs_c[None, :], acc)
-                ml_base = (pid * num_splits + split) * BLOCK_ROWS * 2
-                tl.store(partial_ml + ml_base + rows * 2, m)
-                tl.store(partial_ml + ml_base + rows * 2 + 1, l)
-
-
-    @triton.jit(do_not_specialize = ["num_splits"])
-    def _mla_decode_combine_kernel(
-        partial_o,
-        partial_ml,
-        out,
-        h32,
-        num_splits,
-        QC: tl.constexpr,
-        bsz: tl.constexpr,
-        q_len: tl.constexpr,
-        n_q_heads: tl.constexpr,
-        D_c: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_H: tl.constexpr,
-        BLOCK_ROWS: tl.constexpr,
-    ):
-        """Flash-decoding phase 2: reduce the per-split partial accumulators."""
-        pid = tl.program_id(0)
-        h_blocks = tl.cdiv(n_q_heads, BLOCK_H)
-        h_block = pid % h_blocks
-        batch = pid // h_blocks
-
-        rows = tl.arange(0, BLOCK_ROWS)
-        row_q = rows % BLOCK_M
-        row_h = h_block * BLOCK_H + (rows // BLOCK_M)
-        valid_row = (row_q < q_len) & (row_h < n_q_heads)
-        offs_c = tl.arange(0, D_c)
-
-        m_max = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
-        for s in range(num_splits):
-            ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
-            m_max = tl.maximum(m_max, tl.load(partial_ml + ml_base + rows * 2))
-
-        m_safe = tl.where(m_max == -float("inf"), 0.0, m_max)
-        l_sum = tl.zeros((BLOCK_ROWS,), tl.float32)
-        acc = tl.zeros((BLOCK_ROWS, D_c), tl.float32)
-        for s in range(num_splits):
-            ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
-            m_s = tl.load(partial_ml + ml_base + rows * 2)
-            l_s = tl.load(partial_ml + ml_base + rows * 2 + 1)
-            w = tl.where(m_s == -float("inf"), 0.0, tl.exp(m_s - m_safe))
-            po_base = (pid * num_splits + s) * BLOCK_ROWS * D_c
-            acc += tl.load(partial_o + po_base + rows[:, None] * D_c + offs_c[None, :]) * w[:, None]
-            l_sum += l_s * w
-
-        out_tile = acc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
-        if QC > 0:
-            # Split partials stay in the rotated domain; the single inverse rotation happens here
-            out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, D_c)
-        q_row = row_h * (bsz * q_len) + batch * q_len + row_q
-        tl.store(out + q_row[:, None] * D_c + offs_c[None, :], out_tile, mask = valid_row[:, None])
-
-
-    @triton.jit(do_not_specialize = ["num_pages_per_seq", "q_len", "n_rows"])
-    def _mla_prefill_kernel(
-        q_lat,
-        q_pe,
-        ckv_cache,
-        kpe_cache,
-        ckv_scales,
-        h32,
-        block_table,
-        cache_seqlens,
-        out,
-        num_pages_per_seq,
-        q_len,
-        n_rows,
-        QC: tl.constexpr,
-        QC_TRANS: tl.constexpr,
-        pre_appended_len: tl.constexpr,
-        n_q_heads: tl.constexpr,
-        page_size: tl.constexpr,
-        D_c: tl.constexpr,
-        D_r: tl.constexpr,
-        scale: tl.constexpr,
-        CAUSAL: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        """Long-query MLA attention, still absorbed. One program per (q block, batch, head); the
-        accumulator is D_c wide rather than a normal head dim, so BLOCK_M has to stay small."""
-        pid_m = tl.program_id(0)
-        bh = tl.program_id(1)
-        batch = bh // n_q_heads
-        head = bh - batch * n_q_heads
-
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        valid_row = offs_m < q_len
-
-        offs_c = tl.arange(0, D_c)
-        offs_r = tl.arange(0, D_r if D_r > 0 else 1)
-
-        q_row = head * n_rows + batch * q_len + offs_m
-        q_c = tl.load(q_lat + q_row[:, None] * D_c + offs_c[None, :],
-                      mask = valid_row[:, None], other = 0.0)
+            # V is K: load the latent tile once, transpose it for the score dot
+            v_tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
+                             mask = in_range[:, None], other = 0.0)
+            kt = tl.trans(v_tile)
+        scores = tl.dot(q_c, kt)
         if D_r > 0:
-            q_r = tl.load(q_pe + q_row[:, None] * D_r + offs_r[None, :],
-                          mask = valid_row[:, None], other = 0.0)
-        if QC > 0:
-            q_c = _rot_h32(q_c, h32, BLOCK_M, D_c)
+            kt_pe = tl.load(kpe_cache + tok[None, :] * D_r + offs_r[:, None],
+                            mask = in_range[None, :], other = 0.0)
+            scores = tl.dot(q_r, kt_pe, acc = scores)
+        scores = scores * scale
 
-        past = tl.load(cache_seqlens + batch) + pre_appended_len - q_len
-        total_k_len = past + q_len
-        q_abs = past + offs_m
-
-        n_end = total_k_len
+        valid = valid_row[:, None] & in_range[None, :]
         if CAUSAL:
-            # No kv tile past the last query row of this block can contribute
-            n_end = tl.minimum(n_end, past + (pid_m + 1) * BLOCK_M)
+            valid = valid & (offs_n[None, :] <= q_abs[:, None])
+        scores = tl.where(valid, scores, -float("inf"))
 
-        m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
-        l = tl.full((BLOCK_M,), 0.0, tl.float32)
-        acc = tl.zeros((BLOCK_M, D_c), tl.float32)
+        m_new = tl.maximum(m, tl.max(scores, axis = 1))
+        m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
+        p = tl.exp(scores - m_exp[:, None])
+        p = tl.where(valid, p, 0.0)
+        alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
+        l = l * alpha + tl.sum(p, axis = 1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
+        m = m_new
 
-        for n0 in range(0, n_end, BLOCK_N):
-            offs_n = n0 + tl.arange(0, BLOCK_N)
-            in_range = offs_n < n_end
-            page = offs_n // page_size
-            page_off = offs_n - page * page_size
-            phys = tl.load(block_table + batch * num_pages_per_seq + page, mask = in_range, other = 0)
-            tok = phys * page_size + page_off
-
-            if QC > 0:
-                if QC_TRANS:
-                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
-                    kt = tl.trans(v_tile)
-                else:
-                    kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
-                    v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
-            else:
-                v_tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
-                                 mask = in_range[:, None], other = 0.0)
-                kt = tl.trans(v_tile)
-            scores = tl.dot(q_c, kt)
-            if D_r > 0:
-                kt_pe = tl.load(kpe_cache + tok[None, :] * D_r + offs_r[:, None],
-                                mask = in_range[None, :], other = 0.0)
-                scores = tl.dot(q_r, kt_pe, acc = scores)
-            scores = scores * scale
-
-            valid = valid_row[:, None] & in_range[None, :]
-            if CAUSAL:
-                valid = valid & (offs_n[None, :] <= q_abs[:, None])
-            scores = tl.where(valid, scores, -float("inf"))
-
-            m_new = tl.maximum(m, tl.max(scores, axis = 1))
-            m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
-            p = tl.exp(scores - m_exp[:, None])
-            p = tl.where(valid, p, 0.0)
-            alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
-            l = l * alpha + tl.sum(p, axis = 1)
-            acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
-            m = m_new
-
+    if FINAL:
         out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
         if QC > 0:
-            out_tile = _rot_h32(out_tile, h32, BLOCK_M, D_c)
-        tl.store(out + q_row[:, None] * D_c + offs_c[None, :], out_tile, mask = valid_row[:, None])
+            # The accumulator is in the rotated domain (rotated V); one inverse rotation at
+            # the end recovers the latent (H32 is symmetric, so the same helper serves)
+            out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, D_c)
+        tl.store(out + q_row[:, None] * D_c + offs_c[None, :], out_tile,
+                 mask = valid_row[:, None])
+    else:
+        if split < num_splits:
+            po_base = (pid * num_splits + split) * BLOCK_ROWS * D_c
+            tl.store(partial_o + po_base + rows[:, None] * D_c + offs_c[None, :], acc)
+            ml_base = (pid * num_splits + split) * BLOCK_ROWS * 2
+            tl.store(partial_ml + ml_base + rows * 2, m)
+            tl.store(partial_ml + ml_base + rows * 2 + 1, l)
 
 
-    @triton.jit(do_not_specialize = ["tile_start", "tile_len", "num_pages_per_seq", "batch"])
-    def _mla_gather_tile_kernel(
-        ckv_cache,           # fp16 latent pages, or packed int32 when QC > 0
-        kpe_cache,           # fp16 rope pages
-        ckv_scales,
-        h32,
-        block_table,
-        out_ckv,             # (tile_len, D_c) fp16, plain latent domain
-        out_kpe,             # (tile_len, D_r) fp16
-        tile_start,          # runtime: absolute kv index of the tile's first row
-        tile_len,            # runtime
-        num_pages_per_seq,   # runtime
-        batch,               # runtime
-        QC: tl.constexpr,
-        page_size: tl.constexpr,
-        D_c: tl.constexpr,
-        D_r: tl.constexpr,
-        BLOCK_R: tl.constexpr,
-    ):
-        """Gather one contiguous tile of past latent + rope rows out of the paged cache, with
-        online dequantization (and the inverse H32 rotation -- the packed values live in the
-        rotated domain) when the cache is quantized. Feeds the up-projection GEMMs of the
-        MHA-form prefill path."""
-        pid = tl.program_id(0)
-        r = pid * BLOCK_R + tl.arange(0, BLOCK_R)
-        in_range = r < tile_len
-        pos = tile_start + r
-        page = pos // page_size
-        off = pos - page * page_size
+@triton.jit(do_not_specialize = ["num_splits"])
+def _mla_decode_combine_kernel(
+    partial_o,
+    partial_ml,
+    out,
+    h32,
+    num_splits,
+    QC: tl.constexpr,
+    bsz: tl.constexpr,
+    q_len: tl.constexpr,
+    n_q_heads: tl.constexpr,
+    D_c: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    """Flash-decoding phase 2: reduce the per-split partial accumulators."""
+    pid = tl.program_id(0)
+    h_blocks = tl.cdiv(n_q_heads, BLOCK_H)
+    h_block = pid % h_blocks
+    batch = pid // h_blocks
+
+    rows = tl.arange(0, BLOCK_ROWS)
+    row_q = rows % BLOCK_M
+    row_h = h_block * BLOCK_H + (rows // BLOCK_M)
+    valid_row = (row_q < q_len) & (row_h < n_q_heads)
+    offs_c = tl.arange(0, D_c)
+
+    m_max = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
+    for s in range(num_splits):
+        ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
+        m_max = tl.maximum(m_max, tl.load(partial_ml + ml_base + rows * 2))
+
+    m_safe = tl.where(m_max == -float("inf"), 0.0, m_max)
+    l_sum = tl.zeros((BLOCK_ROWS,), tl.float32)
+    acc = tl.zeros((BLOCK_ROWS, D_c), tl.float32)
+    for s in range(num_splits):
+        ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
+        m_s = tl.load(partial_ml + ml_base + rows * 2)
+        l_s = tl.load(partial_ml + ml_base + rows * 2 + 1)
+        w = tl.where(m_s == -float("inf"), 0.0, tl.exp(m_s - m_safe))
+        po_base = (pid * num_splits + s) * BLOCK_ROWS * D_c
+        acc += tl.load(partial_o + po_base + rows[:, None] * D_c + offs_c[None, :]) * w[:, None]
+        l_sum += l_s * w
+
+    out_tile = acc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
+    if QC > 0:
+        # Split partials stay in the rotated domain; the single inverse rotation happens here
+        out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, D_c)
+    q_row = row_h * (bsz * q_len) + batch * q_len + row_q
+    tl.store(out + q_row[:, None] * D_c + offs_c[None, :], out_tile, mask = valid_row[:, None])
+
+
+@triton.jit(do_not_specialize = ["num_pages_per_seq", "q_len", "n_rows"])
+def _mla_prefill_kernel(
+    q_lat,
+    q_pe,
+    ckv_cache,
+    kpe_cache,
+    ckv_scales,
+    h32,
+    block_table,
+    cache_seqlens,
+    out,
+    num_pages_per_seq,
+    q_len,
+    n_rows,
+    QC: tl.constexpr,
+    QC_TRANS: tl.constexpr,
+    pre_appended_len: tl.constexpr,
+    n_q_heads: tl.constexpr,
+    page_size: tl.constexpr,
+    D_c: tl.constexpr,
+    D_r: tl.constexpr,
+    scale: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Long-query MLA attention, still absorbed. One program per (q block, batch, head); the
+    accumulator is D_c wide rather than a normal head dim, so BLOCK_M has to stay small."""
+    pid_m = tl.program_id(0)
+    bh = tl.program_id(1)
+    batch = bh // n_q_heads
+    head = bh - batch * n_q_heads
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    valid_row = offs_m < q_len
+
+    offs_c = tl.arange(0, D_c)
+    offs_r = tl.arange(0, D_r if D_r > 0 else 1)
+
+    q_row = head * n_rows + batch * q_len + offs_m
+    q_c = tl.load(q_lat + q_row[:, None] * D_c + offs_c[None, :],
+                  mask = valid_row[:, None], other = 0.0)
+    if D_r > 0:
+        q_r = tl.load(q_pe + q_row[:, None] * D_r + offs_r[None, :],
+                      mask = valid_row[:, None], other = 0.0)
+    if QC > 0:
+        q_c = _rot_h32(q_c, h32, BLOCK_M, D_c)
+
+    past = tl.load(cache_seqlens + batch) + pre_appended_len - q_len
+    total_k_len = past + q_len
+    q_abs = past + offs_m
+
+    n_end = total_k_len
+    if CAUSAL:
+        # No kv tile past the last query row of this block can contribute
+        n_end = tl.minimum(n_end, past + (pid_m + 1) * BLOCK_M)
+
+    m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+    l = tl.full((BLOCK_M,), 0.0, tl.float32)
+    acc = tl.zeros((BLOCK_M, D_c), tl.float32)
+
+    for n0 in range(0, n_end, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        in_range = offs_n < n_end
+        page = offs_n // page_size
+        page_off = offs_n - page * page_size
         phys = tl.load(block_table + batch * num_pages_per_seq + page, mask = in_range, other = 0)
-        tok = phys * page_size + off
+        tok = phys * page_size + page_off
 
-        offs_c = tl.arange(0, D_c)
         if QC > 0:
-            tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
-            # h32 is symmetric orthonormal, so the same multiply that rotates also unrotates
-            tile = _rot_h32(tile, h32, BLOCK_R, D_c)
+            if QC_TRANS:
+                v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
+                kt = tl.trans(v_tile)
+            else:
+                kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
+                v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
         else:
-            tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
-                           mask = in_range[:, None], other = 0.0)
-        tl.store(out_ckv + r[:, None] * D_c + offs_c[None, :], tile, mask = in_range[:, None])
-
+            v_tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
+                             mask = in_range[:, None], other = 0.0)
+            kt = tl.trans(v_tile)
+        scores = tl.dot(q_c, kt)
         if D_r > 0:
-            offs_r2 = tl.arange(0, D_r)
-            kpe = tl.load(kpe_cache + tok[:, None] * D_r + offs_r2[None, :],
-                          mask = in_range[:, None], other = 0.0)
-            tl.store(out_kpe + r[:, None] * D_r + offs_r2[None, :], kpe, mask = in_range[:, None])
+            kt_pe = tl.load(kpe_cache + tok[None, :] * D_r + offs_r[:, None],
+                            mask = in_range[None, :], other = 0.0)
+            scores = tl.dot(q_r, kt_pe, acc = scores)
+        scores = scores * scale
+
+        valid = valid_row[:, None] & in_range[None, :]
+        if CAUSAL:
+            valid = valid & (offs_n[None, :] <= q_abs[:, None])
+        scores = tl.where(valid, scores, -float("inf"))
+
+        m_new = tl.maximum(m, tl.max(scores, axis = 1))
+        m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
+        p = tl.exp(scores - m_exp[:, None])
+        p = tl.where(valid, p, 0.0)
+        alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
+        l = l * alpha + tl.sum(p, axis = 1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
+        m = m_new
+
+    out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
+    if QC > 0:
+        out_tile = _rot_h32(out_tile, h32, BLOCK_M, D_c)
+    tl.store(out + q_row[:, None] * D_c + offs_c[None, :], out_tile, mask = valid_row[:, None])
 
 
-    @triton.jit(do_not_specialize = ["R"])
-    def _mla_absorb_kernel(
-        q,                  # (R, H, QK_DIM) fp16 token-major; nope part read per head
-        w_uk_flat,          # (D_c, H * D_nope) fp16
-        out,                # (H, R, D_c) fp16 head-major (the decode kernels' q layout)
-        R,                  # runtime
-        n_q_heads: tl.constexpr,
-        QK_DIM: tl.constexpr,
-        Q_STRIDE: tl.constexpr,   # row stride of q; > H * QK_DIM when the projection is padded
-        D_nope: tl.constexpr,
-        NOPE_PAD: tl.constexpr,   # next pow2 of D_nope (192 for GLM-style heads)
-        D_c: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        """Per-head absorb q_lat_h = q_nope_h @ W_UK_h, reading W_UK straight out of the flat
-        (D_c, H*D_nope) layout the MHA prefill uses -- one stored form serves both paths, and no
-        cuBLAS batched GEMM (with its contiguity demands and the SM120 nvjet TMA fault) is
-        involved anywhere in the MLA module."""
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
-        head = tl.program_id(2)
+@triton.jit(do_not_specialize = ["tile_start", "tile_len", "num_pages_per_seq", "batch"])
+def _mla_gather_tile_kernel(
+    ckv_cache,           # fp16 latent pages, or packed int32 when QC > 0
+    kpe_cache,           # fp16 rope pages
+    ckv_scales,
+    h32,
+    block_table,
+    out_ckv,             # (tile_len, D_c) fp16, plain latent domain
+    out_kpe,             # (tile_len, D_r) fp16
+    tile_start,          # runtime: absolute kv index of the tile's first row
+    tile_len,            # runtime
+    num_pages_per_seq,   # runtime
+    batch,               # runtime
+    QC: tl.constexpr,
+    page_size: tl.constexpr,
+    D_c: tl.constexpr,
+    D_r: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    """Gather one contiguous tile of past latent + rope rows out of the paged cache, with
+    online dequantization (and the inverse H32 rotation -- the packed values live in the
+    rotated domain) when the cache is quantized. Feeds the up-projection GEMMs of the
+    MHA-form prefill path."""
+    pid = tl.program_id(0)
+    r = pid * BLOCK_R + tl.arange(0, BLOCK_R)
+    in_range = r < tile_len
+    pos = tile_start + r
+    page = pos // page_size
+    off = pos - page * page_size
+    phys = tl.load(block_table + batch * num_pages_per_seq + page, mask = in_range, other = 0)
+    tok = phys * page_size + off
 
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        valid_m = offs_m < R
-        offs_k = tl.arange(0, NOPE_PAD)
-        valid_k = offs_k < D_nope
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_c = tl.arange(0, D_c)
+    if QC > 0:
+        tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
+        # h32 is symmetric orthonormal, so the same multiply that rotates also unrotates
+        tile = _rot_h32(tile, h32, BLOCK_R, D_c)
+    else:
+        tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
+                       mask = in_range[:, None], other = 0.0)
+    tl.store(out_ckv + r[:, None] * D_c + offs_c[None, :], tile, mask = in_range[:, None])
 
-        q_t = tl.load(q + offs_m[:, None] * Q_STRIDE + head * QK_DIM + offs_k[None, :],
-                      mask = valid_m[:, None] & valid_k[None, :], other = 0.0)
-        # W_UK_h^T columns live at flat[:, head*D_nope : (head+1)*D_nope]; the dot wants (K, N)
-        w_t = tl.load(w_uk_flat + offs_n[:, None] * (n_q_heads * D_nope) + head * D_nope + offs_k[None, :],
-                      mask = valid_k[None, :], other = 0.0)
-        acc = tl.dot(q_t, tl.trans(w_t))
-        tl.store(out + (head * R + offs_m[:, None]) * D_c + offs_n[None, :],
-                 acc.to(tl.float16), mask = valid_m[:, None])
+    if D_r > 0:
+        offs_r2 = tl.arange(0, D_r)
+        kpe = tl.load(kpe_cache + tok[:, None] * D_r + offs_r2[None, :],
+                      mask = in_range[:, None], other = 0.0)
+        tl.store(out_kpe + r[:, None] * D_r + offs_r2[None, :], kpe, mask = in_range[:, None])
 
 
-    @triton.jit(do_not_specialize = ["R"])
-    def _mla_unfold_kernel(
-        o_lat,              # (H, R, D_c) fp16 head-major latent attention output
-        w_uv_flat,          # (D_c, H * D_v) fp16
-        out,                # (R, H, D_v) fp16 token-major (direct o_proj input)
-        R,                  # runtime
-        n_q_heads: tl.constexpr,
-        D_c: tl.constexpr,
-        D_v: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-    ):
-        """Per-head unfold o_h = o_lat_h @ W_UV_h from the flat layout, emitting token-major
-        output so o_proj consumes it without a permute."""
-        pid_m = tl.program_id(0)
-        head = tl.program_id(1)
+@triton.jit(do_not_specialize = ["R"])
+def _mla_absorb_kernel(
+    q,                  # (R, H, QK_DIM) fp16 token-major; nope part read per head
+    w_uk_flat,          # (D_c, H * D_nope) fp16
+    out,                # (H, R, D_c) fp16 head-major (the decode kernels' q layout)
+    R,                  # runtime
+    n_q_heads: tl.constexpr,
+    QK_DIM: tl.constexpr,
+    Q_STRIDE: tl.constexpr,   # row stride of q; > H * QK_DIM when the projection is padded
+    D_nope: tl.constexpr,
+    NOPE_PAD: tl.constexpr,   # next pow2 of D_nope (192 for GLM-style heads)
+    D_c: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Per-head absorb q_lat_h = q_nope_h @ W_UK_h, reading W_UK straight out of the flat
+    (D_c, H*D_nope) layout the MHA prefill uses -- one stored form serves both paths, and no
+    cuBLAS batched GEMM (with its contiguity demands and the SM120 nvjet TMA fault) is
+    involved anywhere in the MLA module."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    head = tl.program_id(2)
 
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        valid_m = offs_m < R
-        offs_v = tl.arange(0, D_v)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    valid_m = offs_m < R
+    offs_k = tl.arange(0, NOPE_PAD)
+    valid_k = offs_k < D_nope
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
+    q_t = tl.load(q + offs_m[:, None] * Q_STRIDE + head * QK_DIM + offs_k[None, :],
+                  mask = valid_m[:, None] & valid_k[None, :], other = 0.0)
+    # W_UK_h^T columns live at flat[:, head*D_nope : (head+1)*D_nope]; the dot wants (K, N)
+    w_t = tl.load(w_uk_flat + offs_n[:, None] * (n_q_heads * D_nope) + head * D_nope + offs_k[None, :],
+                  mask = valid_k[None, :], other = 0.0)
+    acc = tl.dot(q_t, tl.trans(w_t))
+    tl.store(out + (head * R + offs_m[:, None]) * D_c + offs_n[None, :],
+             acc.to(tl.float16), mask = valid_m[:, None])
+
+
+@triton.jit(do_not_specialize = ["R"])
+def _mla_unfold_kernel(
+    o_lat,              # (H, R, D_c) fp16 head-major latent attention output
+    w_uv_flat,          # (D_c, H * D_v) fp16
+    out,                # (R, H, D_v) fp16 token-major (direct o_proj input)
+    R,                  # runtime
+    n_q_heads: tl.constexpr,
+    D_c: tl.constexpr,
+    D_v: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Per-head unfold o_h = o_lat_h @ W_UV_h from the flat layout, emitting token-major
+    output so o_proj consumes it without a permute."""
+    pid_m = tl.program_id(0)
+    head = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    valid_m = offs_m < R
+    offs_v = tl.arange(0, D_v)
+
+    acc = tl.zeros((BLOCK_M, D_v), tl.float32)
+    for k0 in range(0, D_c, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        o_t = tl.load(o_lat + (head * R + offs_m[:, None]) * D_c + offs_k[None, :],
+                      mask = valid_m[:, None], other = 0.0)
+        w_t = tl.load(w_uv_flat + offs_k[:, None] * (n_q_heads * D_v) + head * D_v + offs_v[None, :])
+        acc = tl.dot(o_t, w_t, acc = acc)
+    tl.store(out + (offs_m[:, None] * n_q_heads + head) * D_v + offs_v[None, :],
+             acc.to(tl.float16), mask = valid_m[:, None])
+
+
+@triton.jit
+def _mla_stage_kernel(
+    q_full,             # (R, >= H * QK_DIM) fp16 q projection output
+    ckv_kpe,            # (R, >= D_c + D_r) fp16 kv_a projection output
+    kv_norm_w,          # (D_c,) kv_a_layernorm weight
+    q_pe,               # out: (R, H, D_r) fp16 token-major rope queries
+    ckv,                # out: (R, D_c) fp16 normalized latent (append input)
+    kpe,                # out: (R, D_r) fp16 rope key (append input, pre-rope)
+    eps: tl.constexpr,
+    n_q_heads: tl.constexpr,
+    QK_DIM: tl.constexpr,
+    Q_STRIDE: tl.constexpr,    # q_full row stride (the projection's padded width)
+    CKV_STRIDE: tl.constexpr,  # ckv_kpe row stride (576 pads to 640 in EXL3)
+    D_nope: tl.constexpr,
+    D_c: tl.constexpr,     # must be a power of 2 (tl.arange)
+    D_r: tl.constexpr,
+):
+    """Staging between the projections and the rope/attention kernels for the graph-captured
+    decode path: applies kv_a_layernorm to the latent, splits off the rope key and gathers
+    the rope columns of every query head into a dense token-major tensor. One program per
+    row; every operand is a static, so the captured node needs no patching."""
+    row = tl.program_id(0)
+
+    offs_c = tl.arange(0, D_c)
+    x = tl.load(ckv_kpe + row * CKV_STRIDE + offs_c).to(tl.float32)
+    rmf = 1.0 / tl.sqrt(tl.sum(x * x) / D_c + eps)
+    w = tl.load(kv_norm_w + offs_c).to(tl.float32)
+    tl.store(ckv + row * D_c + offs_c, (x * w * rmf).to(tl.float16))
+
+    if D_r > 0:
+        offs_r = tl.arange(0, D_r)
+        tl.store(kpe + row * D_r + offs_r,
+                 tl.load(ckv_kpe + row * CKV_STRIDE + D_c + offs_r))
+
+        for h in range(n_q_heads):
+            v = tl.load(q_full + row * Q_STRIDE + h * QK_DIM + D_nope + offs_r)
+            tl.store(q_pe + (row * n_q_heads + h) * D_r + offs_r, v)
+
+
+@triton.jit(do_not_specialize = [
+    "q_row0", "s_len", "tile_start", "tile_len", "past0",
+    "tile_init", "tile_final", "tile_masked",
+])
+def _mla_prefill_mha_kernel(
+    q,                  # (R, H, QK_DIM) fp16, token-major: [nope | pe] per head
+    k_nope,             # (TS, H * D_nope) fp16, up-projected tile
+    v,                  # (TS, H * D_v) fp16, up-projected tile
+    k_pe,               # (TS, D_r) fp16, shared by all heads
+    state_m,            # (H, S) fp32 running max, carried across tile launches
+    state_l,            # (H, S) fp32 running denominator
+    state_acc,          # (H, S, D_v) fp32 running numerator
+    out,                # (R, H, D_v) fp16, token-major
+    q_row0,             # runtime: first q row of this batch item within R
+    s_len,              # runtime: q rows for this batch item
+    tile_start,         # runtime: absolute kv index of the tile's first row
+    tile_len,           # runtime
+    past0,              # runtime: total_kv - s_len (absolute position of q row 0)
+    tile_init,          # runtime: first tile -- initialize the running state
+    tile_final,         # runtime: last tile -- normalize and emit fp16 output
+    tile_masked,        # runtime: tile crosses the causal boundary
+    n_q_heads: tl.constexpr,
+    QK_DIM: tl.constexpr,
+    D_nope: tl.constexpr,
+    D_nope_pad: tl.constexpr,   # next_power_of_2(D_nope); GLM-5.2 has D_nope 192
+    D_r: tl.constexpr,
+    D_v: tl.constexpr,
+    scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """MHA-form prefill over one up-projected past tile. The compressed cache stays the
+    source of truth; each tile of it is expanded to per-head K/V once per chunk, and this
+    kernel attends over the expansion -- ~2.8x fewer FLOPs per (query, past token) than
+    absorbed-form attention, because the contraction widths are the true head dims rather
+    than the latent width. The softmax state lives in global memory between tile launches
+    (same-stream ordering makes the read-modify-write safe), so no combine pass is needed.
+
+    The tile-position flags are RUNTIME values, deliberately: one compiled kernel serves
+    every tile at every chunk depth, so warming any single-tile prefill warms the whole
+    prefill path (perf.py's warmup, and the generator's first long prompt, rely on kernel
+    specialization being independent of past_len)."""
+    pid_m = tl.program_id(0)
+    head = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    valid_m = offs_m < s_len
+    q_abs = past0 + offs_m
+
+    offs_nope = tl.arange(0, D_nope_pad)
+    nope_ok = offs_nope < D_nope
+    offs_r = tl.arange(0, D_r if D_r > 0 else 1)
+    offs_v = tl.arange(0, D_v)
+
+    qb = q + ((q_row0 + offs_m[:, None]) * n_q_heads + head) * QK_DIM
+    q_n = tl.load(qb + offs_nope[None, :],
+                  mask = valid_m[:, None] & nope_ok[None, :], other = 0.0)
+    if D_r > 0:
+        q_p = tl.load(qb + D_nope + offs_r[None, :], mask = valid_m[:, None], other = 0.0)
+
+    sb = head * s_len + offs_m
+    if tile_init != 0:
+        m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+        l = tl.full((BLOCK_M,), 0.0, tl.float32)
         acc = tl.zeros((BLOCK_M, D_v), tl.float32)
-        for k0 in range(0, D_c, BLOCK_K):
-            offs_k = k0 + tl.arange(0, BLOCK_K)
-            o_t = tl.load(o_lat + (head * R + offs_m[:, None]) * D_c + offs_k[None, :],
-                          mask = valid_m[:, None], other = 0.0)
-            w_t = tl.load(w_uv_flat + offs_k[:, None] * (n_q_heads * D_v) + head * D_v + offs_v[None, :])
-            acc = tl.dot(o_t, w_t, acc = acc)
-        tl.store(out + (offs_m[:, None] * n_q_heads + head) * D_v + offs_v[None, :],
-                 acc.to(tl.float16), mask = valid_m[:, None])
+    else:
+        m = tl.load(state_m + sb, mask = valid_m, other = -float("inf"))
+        l = tl.load(state_l + sb, mask = valid_m, other = 0.0)
+        acc = tl.load(state_acc + sb[:, None] * D_v + offs_v[None, :],
+                      mask = valid_m[:, None], other = 0.0)
 
+    for n0 in range(0, tile_len, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        in_r = offs_n < tile_len
 
-    @triton.jit
-    def _mla_stage_kernel(
-        q_full,             # (R, >= H * QK_DIM) fp16 q projection output
-        ckv_kpe,            # (R, >= D_c + D_r) fp16 kv_a projection output
-        kv_norm_w,          # (D_c,) kv_a_layernorm weight
-        q_pe,               # out: (R, H, D_r) fp16 token-major rope queries
-        ckv,                # out: (R, D_c) fp16 normalized latent (append input)
-        kpe,                # out: (R, D_r) fp16 rope key (append input, pre-rope)
-        eps: tl.constexpr,
-        n_q_heads: tl.constexpr,
-        QK_DIM: tl.constexpr,
-        Q_STRIDE: tl.constexpr,    # q_full row stride (the projection's padded width)
-        CKV_STRIDE: tl.constexpr,  # ckv_kpe row stride (576 pads to 640 in EXL3)
-        D_nope: tl.constexpr,
-        D_c: tl.constexpr,     # must be a power of 2 (tl.arange)
-        D_r: tl.constexpr,
-    ):
-        """Staging between the projections and the rope/attention kernels for the graph-captured
-        decode path: applies kv_a_layernorm to the latent, splits off the rope key and gathers
-        the rope columns of every query head into a dense token-major tensor. One program per
-        row; every operand is a static, so the captured node needs no patching."""
-        row = tl.program_id(0)
-
-        offs_c = tl.arange(0, D_c)
-        x = tl.load(ckv_kpe + row * CKV_STRIDE + offs_c).to(tl.float32)
-        rmf = 1.0 / tl.sqrt(tl.sum(x * x) / D_c + eps)
-        w = tl.load(kv_norm_w + offs_c).to(tl.float32)
-        tl.store(ckv + row * D_c + offs_c, (x * w * rmf).to(tl.float16))
-
+        kt = tl.load(k_nope + offs_n[None, :] * (n_q_heads * D_nope) + head * D_nope + offs_nope[:, None],
+                     mask = in_r[None, :] & nope_ok[:, None], other = 0.0)
+        scores = tl.dot(q_n, kt)
         if D_r > 0:
-            offs_r = tl.arange(0, D_r)
-            tl.store(kpe + row * D_r + offs_r,
-                     tl.load(ckv_kpe + row * CKV_STRIDE + D_c + offs_r))
+            kt_pe = tl.load(k_pe + offs_n[None, :] * D_r + offs_r[:, None],
+                            mask = in_r[None, :], other = 0.0)
+            scores = tl.dot(q_p, kt_pe, acc = scores)
+        scores = scores * scale
 
-            for h in range(n_q_heads):
-                v = tl.load(q_full + row * Q_STRIDE + h * QK_DIM + D_nope + offs_r)
-                tl.store(q_pe + (row * n_q_heads + h) * D_r + offs_r, v)
+        valid = valid_m[:, None] & in_r[None, :]
+        if tile_masked != 0:
+            valid = valid & ((tile_start + offs_n)[None, :] <= q_abs[:, None])
+        scores = tl.where(valid, scores, -float("inf"))
 
+        m_new = tl.maximum(m, tl.max(scores, axis = 1))
+        m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
+        p = tl.exp(scores - m_exp[:, None])
+        p = tl.where(valid, p, 0.0)
+        alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
+        l = l * alpha + tl.sum(p, axis = 1)
 
-    @triton.jit(do_not_specialize = [
-        "q_row0", "s_len", "tile_start", "tile_len", "past0",
-        "tile_init", "tile_final", "tile_masked",
-    ])
-    def _mla_prefill_mha_kernel(
-        q,                  # (R, H, QK_DIM) fp16, token-major: [nope | pe] per head
-        k_nope,             # (TS, H * D_nope) fp16, up-projected tile
-        v,                  # (TS, H * D_v) fp16, up-projected tile
-        k_pe,               # (TS, D_r) fp16, shared by all heads
-        state_m,            # (H, S) fp32 running max, carried across tile launches
-        state_l,            # (H, S) fp32 running denominator
-        state_acc,          # (H, S, D_v) fp32 running numerator
-        out,                # (R, H, D_v) fp16, token-major
-        q_row0,             # runtime: first q row of this batch item within R
-        s_len,              # runtime: q rows for this batch item
-        tile_start,         # runtime: absolute kv index of the tile's first row
-        tile_len,           # runtime
-        past0,              # runtime: total_kv - s_len (absolute position of q row 0)
-        tile_init,          # runtime: first tile -- initialize the running state
-        tile_final,         # runtime: last tile -- normalize and emit fp16 output
-        tile_masked,        # runtime: tile crosses the causal boundary
-        n_q_heads: tl.constexpr,
-        QK_DIM: tl.constexpr,
-        D_nope: tl.constexpr,
-        D_nope_pad: tl.constexpr,   # next_power_of_2(D_nope); GLM-5.2 has D_nope 192
-        D_r: tl.constexpr,
-        D_v: tl.constexpr,
-        scale: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        """MHA-form prefill over one up-projected past tile. The compressed cache stays the
-        source of truth; each tile of it is expanded to per-head K/V once per chunk, and this
-        kernel attends over the expansion -- ~2.8x fewer FLOPs per (query, past token) than
-        absorbed-form attention, because the contraction widths are the true head dims rather
-        than the latent width. The softmax state lives in global memory between tile launches
-        (same-stream ordering makes the read-modify-write safe), so no combine pass is needed.
+        v_t = tl.load(v + offs_n[:, None] * (n_q_heads * D_v) + head * D_v + offs_v[None, :],
+                      mask = in_r[:, None], other = 0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v_t.dtype), v_t)
+        m = m_new
 
-        The tile-position flags are RUNTIME values, deliberately: one compiled kernel serves
-        every tile at every chunk depth, so warming any single-tile prefill warms the whole
-        prefill path (perf.py's warmup, and the generator's first long prompt, rely on kernel
-        specialization being independent of past_len)."""
-        pid_m = tl.program_id(0)
-        head = tl.program_id(1)
-
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        valid_m = offs_m < s_len
-        q_abs = past0 + offs_m
-
-        offs_nope = tl.arange(0, D_nope_pad)
-        nope_ok = offs_nope < D_nope
-        offs_r = tl.arange(0, D_r if D_r > 0 else 1)
-        offs_v = tl.arange(0, D_v)
-
-        qb = q + ((q_row0 + offs_m[:, None]) * n_q_heads + head) * QK_DIM
-        q_n = tl.load(qb + offs_nope[None, :],
-                      mask = valid_m[:, None] & nope_ok[None, :], other = 0.0)
-        if D_r > 0:
-            q_p = tl.load(qb + D_nope + offs_r[None, :], mask = valid_m[:, None], other = 0.0)
-
-        sb = head * s_len + offs_m
-        if tile_init != 0:
-            m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
-            l = tl.full((BLOCK_M,), 0.0, tl.float32)
-            acc = tl.zeros((BLOCK_M, D_v), tl.float32)
-        else:
-            m = tl.load(state_m + sb, mask = valid_m, other = -float("inf"))
-            l = tl.load(state_l + sb, mask = valid_m, other = 0.0)
-            acc = tl.load(state_acc + sb[:, None] * D_v + offs_v[None, :],
-                          mask = valid_m[:, None], other = 0.0)
-
-        for n0 in range(0, tile_len, BLOCK_N):
-            offs_n = n0 + tl.arange(0, BLOCK_N)
-            in_r = offs_n < tile_len
-
-            kt = tl.load(k_nope + offs_n[None, :] * (n_q_heads * D_nope) + head * D_nope + offs_nope[:, None],
-                         mask = in_r[None, :] & nope_ok[:, None], other = 0.0)
-            scores = tl.dot(q_n, kt)
-            if D_r > 0:
-                kt_pe = tl.load(k_pe + offs_n[None, :] * D_r + offs_r[:, None],
-                                mask = in_r[None, :], other = 0.0)
-                scores = tl.dot(q_p, kt_pe, acc = scores)
-            scores = scores * scale
-
-            valid = valid_m[:, None] & in_r[None, :]
-            if tile_masked != 0:
-                valid = valid & ((tile_start + offs_n)[None, :] <= q_abs[:, None])
-            scores = tl.where(valid, scores, -float("inf"))
-
-            m_new = tl.maximum(m, tl.max(scores, axis = 1))
-            m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
-            p = tl.exp(scores - m_exp[:, None])
-            p = tl.where(valid, p, 0.0)
-            alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
-            l = l * alpha + tl.sum(p, axis = 1)
-
-            v_t = tl.load(v + offs_n[:, None] * (n_q_heads * D_v) + head * D_v + offs_v[None, :],
-                          mask = in_r[:, None], other = 0.0)
-            acc = acc * alpha[:, None] + tl.dot(p.to(v_t.dtype), v_t)
-            m = m_new
-
-        if tile_final != 0:
-            out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
-            ob = out + ((q_row0 + offs_m[:, None]) * n_q_heads + head) * D_v
-            tl.store(ob + offs_v[None, :], out_tile, mask = valid_m[:, None])
-        else:
-            tl.store(state_m + sb, m, mask = valid_m)
-            tl.store(state_l + sb, l, mask = valid_m)
-            tl.store(state_acc + sb[:, None] * D_v + offs_v[None, :], acc, mask = valid_m[:, None])
+    if tile_final != 0:
+        out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
+        ob = out + ((q_row0 + offs_m[:, None]) * n_q_heads + head) * D_v
+        tl.store(ob + offs_v[None, :], out_tile, mask = valid_m[:, None])
+    else:
+        tl.store(state_m + sb, m, mask = valid_m)
+        tl.store(state_l + sb, l, mask = valid_m)
+        tl.store(state_acc + sb[:, None] * D_v + offs_v[None, :], acc, mask = valid_m[:, None])
 
 
 _sm_count = {}

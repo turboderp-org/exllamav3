@@ -10,7 +10,6 @@ from exllamav3.cache import CacheLayer_MLA_fp16, CacheLayer_MLA_quant
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.constants import PAGE_SIZE
 from exllamav3.util.rope import RopeSettings, RopeStyle
-from exllamav3.modules.attention_fn.mla_triton import has_triton
 
 from test_mla import FakeConfig, rms_norm
 
@@ -28,7 +27,6 @@ from test_mla import FakeConfig, rms_norm
 #   - the cached path (paged indexer-key plane) against the cache-less path, chunked.
 
 device = "cuda:0"
-pytestmark = pytest.mark.skipif(not has_triton, reason = "requires Triton")
 
 
 def build_dsa(H = 8, hidden = 512, kv_lora = 512, nope = 128, rope_dim = 64, v_head = 128,

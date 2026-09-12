@@ -1,23 +1,8 @@
 import torch
 import torch.nn.functional as F
 
-try:
-    import triton
-    import triton.language as tl
-    has_triton = True
-except ImportError:
-    has_triton = False
-
-    class _DummyTritonLanguage:
-        constexpr = object()
-
-    class _DummyTriton:
-        @staticmethod
-        def jit(fn):
-            return fn
-
-    triton = _DummyTriton()
-    tl = _DummyTritonLanguage()
+import triton
+import triton.language as tl
 
 
 def sqnr(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8):
@@ -91,7 +76,7 @@ def compute_target_log_probs(logits: torch.Tensor, target_ids: torch.Tensor, voc
     The Triton path stores only [tokens, ceil(vocab / block_size)] partial reductions.
     """
 
-    if not has_triton or not logits.is_cuda:
+    if not logits.is_cuda:
         return _target_log_probs_torch(logits, target_ids.to(logits.device), vocab_size)
 
     logits_2d = _flatten_logits(logits)
@@ -234,7 +219,7 @@ def compute_kl_div(
     while avoiding full-vocab FP32 probability/log-prob tensors on CUDA.
     """
 
-    if not has_triton or not input_logits.is_cuda or not target_logits.is_cuda:
+    if not input_logits.is_cuda or not target_logits.is_cuda:
         return _kl_div_torch(input_logits, target_logits, vocab_size)
     if target_logits.device != input_logits.device:
         raise ValueError("input_logits and target_logits must be on the same CUDA device")

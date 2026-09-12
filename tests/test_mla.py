@@ -8,7 +8,6 @@ from exllamav3.modules import MLAttention
 from exllamav3.cache import CacheLayer_MLA_fp16
 from exllamav3.constants import PAGE_SIZE
 from exllamav3.util.rope import RopeSettings, RopeStyle
-from exllamav3.modules.attention_fn.mla_triton import has_triton
 
 # MLAttention runs attention in absorbed form: per-head K and V are never built, only the latent
 # and the shared rope key. These tests check that against a direct transcription of the reference
@@ -18,7 +17,6 @@ from exllamav3.modules.attention_fn.mla_triton import has_triton
 # absorption, cache layout, kernels - and not rope conventions, which test_rope.py covers.
 
 device = "cuda:0"
-pytestmark = pytest.mark.skipif(not has_triton, reason = "requires Triton")
 
 
 class FakeSTC:
