@@ -748,6 +748,8 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
+        hot_vocab = getattr(self.draft_model, "mtp_hot_vocab", 0)
+        draft_ids_gpu = [] if hot_vocab else None
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -755,6 +757,7 @@ class Generator:
                 "block_table": block_index,
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens,
+                "mtp_hot_embedding": bool(hot_vocab and idx > 0),
             }
             if cal is not None:
                 params["export_draft_conf"] = True
@@ -762,8 +765,12 @@ class Generator:
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
-            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-            batch_ids.copy_(new_ids)
+            if hot_vocab:
+                draft_ids_gpu.append(new_ids)
+                batch_ids = new_ids
+            else:
+                self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
+                batch_ids.copy_(new_ids)
             cache_seqlens += 1
             temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
@@ -775,6 +782,9 @@ class Generator:
                 if idx + 1 < window and max(reach) < cal.confidence:
                     window = idx + 1
                     break
+
+        if hot_vocab:
+            self.draft_ids_pinned[:batch_size, :window].copy_(torch.cat(draft_ids_gpu, dim = -1))
 
         if conf_cols and len(conf_cols) == window:
             self._draft_conf_round = {
@@ -1145,6 +1155,9 @@ class Generator:
                 job_logits = batch_logits[a:b, :, :]
                 accepted_length = 1
                 rejected = 0
+
+                if self.record_draft_stats and draft_tokens is not None:
+                    job.draft_token_ids.extend(draft_tokens[j].tolist())
 
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]

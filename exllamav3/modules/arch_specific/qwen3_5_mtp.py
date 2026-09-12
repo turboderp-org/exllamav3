@@ -73,6 +73,8 @@ class Qwen3_5MTPInputLayer(Module):
 
         # Populated by attach_to()
         self.attached_model = None
+        self.hot_embedding = None
+        self.hot_inverse = None
 
         self.caps.update({"x_cpu": True})
 
@@ -100,7 +102,11 @@ class Qwen3_5MTPInputLayer(Module):
         y = self.pre_fc_norm_hidden.forward(y, params)
 
         # Token embedding
-        if not self.attached_model().loaded_tp:
+        if params.get("mtp_hot_embedding") and self.hot_embedding is not None:
+            if self.hot_inverse is not None:
+                x = self.hot_inverse[x]
+            x = F.embedding(x, self.hot_embedding).half()
+        elif not self.attached_model().loaded_tp:
             x = self.attached_model().modules[0].forward(x, params, out_dtype = torch.half)
         else:
             x = self.attached_model().tp_producer.send(x)
