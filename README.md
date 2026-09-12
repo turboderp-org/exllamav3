@@ -214,7 +214,7 @@ python examples/chat.py -h
 | **MiniMax-M2**                                   | `MiniMaxM2ForCausalLM` |  |  |
 | **Mistral**, **Ministral 3**, **Mistral-4** etc. | `MistralForCausalLM`<br>`Mistral3ForConditionalGeneration` | ✓ |  |
 | **Mixtral**                                      | `MixtralForCausalLM` |  |  |
-| **NemotronH, Nemotron-3**                        | `NemotronHForCausalLM` |  |  |
+| **NemotronH, Nemotron-3 Nano/Super**              | `NemotronHForCausalLM` |  |  |
 | **Olmo 3.1**                                     | `Olmo3ForCausalLM` |  |  |
 | **Olmo-Hybrid**                                  | `OlmoHybridForCausalLM` |  |  |
 | **Phi3**, **Phi4**                               | `Phi3ForCausalLM` |  |  |

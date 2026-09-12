@@ -76,6 +76,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         num_experts: int,
         num_experts_per_tok: int,
         num_local_experts: int | None = None,
+        latent_size: int | None = None,
+        key_latent_in: str | None = None,
+        key_latent_out: str | None = None,
+        latent_in: Linear | None = None,
+        latent_out: Linear | None = None,
+        latent_hq_bits: int = 0,
         key_up: str | None = None,
         key_gate: str | None = None,
         key_down: str | None = None,
@@ -138,6 +144,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 4)
         self.num_local_experts = num_local_experts if num_local_experts is not None else num_experts
         self.hidden_size = hidden_size
+        # Latent MoE (Nemotron-3 Super): the routed experts run at latent_size, between a
+        # projection of the block input down to that width and a projection of the routed sum
+        # back up. The router and the shared experts see the full-width block input
+        self.latent_size = latent_size
+        self.expert_size = latent_size or hidden_size
         self.router_type = router_type
         self.act_limit = act_limit
         self.alt_residual_channel = alt_residual_channel
@@ -193,9 +204,43 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.shared_gate = shared_gate
             self.register_submodule(self.shared_gate)
 
-        # Non-gated experts (NemotronH: up/down with relu2). The quantized fast paths all assume
-        # a gate projection, so gateless configurations run the dense per-expert path at every
-        # batch size until the kernels grow a gateless mode
+        if latent_in is None and key_latent_in is None:
+            assert latent_size is None, "latent_size requires the latent projection keys"
+            self.latent_in = None
+            self.latent_out = None
+        else:
+            assert latent_size, "latent projections require latent_size"
+            # The down projection shares the block input (and its Hessian) with the shared
+            # experts; the up projection's input is the routed sum
+            self.latent_in = latent_in if latent_in is not None else Linear(
+                config = config,
+                key = f"{key}.{key_latent_in}",
+                in_features = hidden_size,
+                out_features = latent_size,
+                qmap = qmap + ".input" if qmap else None,
+                out_dtype = torch.half,
+                select_hq_bits = latent_hq_bits,
+                qgroup = key + ".latent",
+                qbits_key = qbits_key,
+            )
+            self.latent_out = latent_out if latent_out is not None else Linear(
+                config = config,
+                key = f"{key}.{key_latent_out}",
+                in_features = latent_size,
+                out_features = hidden_size,
+                qmap = qmap + ".latent_out" if qmap else None,
+                out_dtype = torch.float,
+                select_hq_bits = latent_hq_bits,
+                qgroup = key + ".latent",
+                qbits_key = qbits_key,
+            )
+            self.register_submodule(self.latent_in)
+            self.register_submodule(self.latent_out)
+
+        # Non-gated experts (NemotronH: up/down with relu2). Gateless relu2 rides every quantized
+        # fast path (relu(u) * u = relu2(u): the BC graphs and mgemm loops skip the gate GEMM, the
+        # fused kernel synthesizes the gate lane, the batched reconstruct tier and the CPU worker
+        # take up/down only); other gateless activations run the dense per-expert path
         self.gated = (
             key_gate is not None or key_gate_split is not None or key_gate_up_split is not None or
             (gates is not None and len(gates) > 0)
@@ -214,6 +259,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.ups = []
             self.downs = []
 
+            # The experts' input is the block input, or the latent projection of it (a
+            # different activation, so a different Hessian) in a latent MoE
+            expert_qmap = (qmap + (".latent" if latent_size else ".input")) if qmap else None
             for idx in range(self.num_local_experts):
 
                 fkey_gate, fkey_up, fkey_down = (
@@ -234,9 +282,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     fidx = idx,
                     frange = (0, intermediate_size) if key_gate_up_split else None,
                     finterleaved = gate_up_interleaved,
-                    in_features = hidden_size,
+                    in_features = self.expert_size,
                     out_features = intermediate_size,
-                    qmap = qmap + ".input" if qmap else None,
+                    qmap = expert_qmap,
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
@@ -252,9 +300,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     fidx = idx,
                     frange = (intermediate_size, intermediate_size * 2) if key_gate_up_split else None,
                     finterleaved = gate_up_interleaved,
-                    in_features = hidden_size,
+                    in_features = self.expert_size,
                     out_features = intermediate_size,
-                    qmap = qmap + ".input" if qmap else None,
+                    qmap = expert_qmap,
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
@@ -270,7 +318,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     fkey = fkey_down,
                     fidx = idx,
                     in_features = intermediate_size,
-                    out_features = hidden_size,
+                    out_features = self.expert_size,
                     qmap = qmap + f".{idx}.down" if qmap else None,
                     out_dtype = torch.float,
                     allow_input_padding = True,
@@ -385,6 +433,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         for m in self.gates: g += m.optimizer_targets()
         for m in self.ups: u += m.optimizer_targets()
         for m in self.downs: d += m.optimizer_targets()
+        if self.latent_in is not None:
+            u = self.latent_in.optimizer_targets() + u
+            d = d + self.latent_out.optimizer_targets()
         if self.shared_experts:
             s = self.shared_experts.optimizer_targets()
             return [s, [g + u, d]]
@@ -454,7 +505,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok
-        H = self.hidden_size
+        H = self.expert_size
         # The gate/up input width and the down output width are the (possibly 128-padded)
         # quantized dims; both equal H for aligned models
         Hi = self.ups[0].in_features
@@ -527,10 +578,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 and self.shared_experts.bc is not None
                 and self.shared_experts_post_norm is None   # TODO: embed post_norm in BC
                 and not self.alt_residual_channel  # TODO: allow residual channel switching in BC (Gemma4)
+                and self.latent_in is None  # the graph would merge the shared output at the latent width
             ):
                 self.bc_sh_exp = True
                 sh_exp_bc = self.shared_experts.bc
-                sh_exp_t = torch.empty((1, MAX_BSZN, H), dtype = torch.float, device = self.device)
+                sh_exp_t = torch.empty((1, MAX_BSZN, self.hidden_size), dtype = torch.float, device = self.device)
                 if self.shared_gate:
                     assert self.shared_gate.quant_type == "fp16"
                     sh_gate_bc = self.shared_gate.inner.bc
@@ -772,7 +824,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         (autosplit_extra_measure)"""
         if self.cpu_offload or self.multi_up is None:
             return 0, 0
-        h = self.hidden_size
+        h = self.expert_size
         fixed = (rows + 1) * h * 4 + rows * h * 2
         if FUSED_DET:
             fixed += (int(assignments * PAD_MAX) + 1) * h * 4
@@ -885,6 +937,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         bc_sh_exp = False
         if params.get("autosplit_measure"):
             self._measure_rows = bsz
+        # Shape of the routed sum: the experts' width is the latent width in a latent MoE
+        eshape = x.shape[:-1] + (self.expert_size,)
 
         # Eligibility for the multi-row CUDA-graph path (bsz 1..MAX_BSZN): computed up front so
         # it can override the f_threshold-based routing below (bsz>=f_threshold would otherwise
@@ -919,6 +973,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.routed_pre_norm:
             y = self.routed_pre_norm.forward(y, params, out_dtype = torch.half)
 
+        # Latent MoE: the experts (GPU and CPU-resident alike) see the projected input
+        if self.latent_in is not None:
+            y = self.latent_in.forward(y, params)
+
         # Broadcast routing indices and weights
         if self.routing_device is not None:
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
@@ -933,11 +991,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
 
         if self.cpu_offload:
-            final_hidden_states = self.cpu_offload_forward(x, y, selected_experts, routing_weights, params)
+            final_hidden_states = self.cpu_offload_forward(eshape, y, selected_experts, routing_weights, params)
 
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
-            final_hidden_states = torch.zeros_like(x, dtype = torch.float)
+            final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
 
         # Torch/C++/fused path
         elif (
@@ -1151,7 +1209,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         # DQ path
                         else:
                             if count > max_count:
-                                out_state = torch.empty((count, self.hidden_size), dtype = torch.float, device = self.device)
+                                out_state = torch.empty((count, self.expert_size), dtype = torch.float, device = self.device)
                                 interm = torch.empty((count * 2, self.intermediate_size_padded), dtype = self.interm_dtype, device = self.device)
                                 interm_a = interm[:count] if self.interm_dtype == torch.half else \
                                     torch.empty_like(interm[:count], dtype = torch.half)
@@ -1168,7 +1226,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 interm_ = interm[:count * 2]
                                 interm_a_ = interm_a[:count]
 
-                            yh = torch.empty((count * 2, self.hidden_size), dtype = torch.half, device = self.device)
+                            yh = torch.empty((count * 2, self.expert_size), dtype = torch.half, device = self.device)
                             self.bc.run_single_expert_dq(current_state, expert_idx, yh, interm_, interm_a_, out_state)
                             current_state = out_state_
                     else:
@@ -1192,7 +1250,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     final_hidden_states.index_add_(0, top_x, current_state)
                     start = end
 
-            final_hidden_states = final_hidden_states.reshape(x.shape)
+            final_hidden_states = final_hidden_states.reshape(eshape)
 
         # Multi-row CUDA-graph path (bsz 1..MAX_BSZN): a single cooperative mgemm call per
         # projection across all bsz*top_k assignment slots (no sort/dedup -- overlap between
@@ -1205,9 +1263,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         elif bszn_eligible:
             self.bc.run_bszN(y, selected_experts, routing_weights)
             if self.experts_cfg.out_trim is not None:
-                final_hidden_states = self.experts_cfg.out_trim[:bsz].view(x.shape)
+                final_hidden_states = self.experts_cfg.out_trim[:bsz].view(eshape)
             else:
-                final_hidden_states = self.experts_cfg.out_d[:bsz, ...].view(x.shape)
+                final_hidden_states = self.experts_cfg.out_d[:bsz, ...].view(eshape)
             bc_sh_exp = self.bc_sh_exp
 
         # Per-token mgemm loop: fallback for TP-sharded / shared-experts models at bsz 2..f_threshold-1
@@ -1294,7 +1352,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 t = cfg.out_d[0]
                 final_hidden_states[i:i+1] = t
 
-            final_hidden_states = final_hidden_states.view(x.shape)
+            final_hidden_states = final_hidden_states.view(eshape)
 
         else:
             y = y.unsqueeze(0)
@@ -1363,11 +1421,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 0,
                 1, None, None)
 
-            final_hidden_states = cfg.out_d[:1, ...].view(x.shape)
+            final_hidden_states = cfg.out_d[:1, ...].view(eshape)
 
         # CPU tail partial folds in before the post norms (nonlinear: they must see the
         # complete routed sum)
-        final_hidden_states = self.cpu_split_combine(final_hidden_states, cpu_partial, cpu_pending, x)
+        final_hidden_states = self.cpu_split_combine(final_hidden_states, cpu_partial, cpu_pending, eshape)
+
+        # Latent MoE: project the routed sum back to the residual width (linear, so under TP
+        # each rank's partial sum projects on its own ahead of the reduction)
+        if self.latent_out is not None:
+            final_hidden_states = self.latent_out.forward(final_hidden_states.to(torch.half), params)
 
         # The post norms are nonlinear, so under TP their inputs must be complete sums, not
         # per-rank partials: reduce the routed and shared contributions separately before the
@@ -1437,6 +1500,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         for g in self.gates: storage += g.storage_size()
         for u in self.ups: storage += u.storage_size()
         for d in self.downs: storage += d.storage_size()
+        # The latent projections are replicated on every rank
+        storage_d = 0
+        if self.latent_in is not None:
+            storage_d += self.latent_in.storage_size() + self.latent_out.storage_size()
         # TODO: More precise overhead estimate accounting for gate etc.
         overhead_d = self.hidden_size * torch.float.itemsize
         overhead_s = 4 * self.intermediate_size * (self.interm_dtype or torch.half).itemsize
@@ -1452,7 +1519,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             key = self.key,
             channel_width = 128 if use_tp_split else 1,
             channel_unit = "channels" if use_tp_split else "experts",
-            storage_per_device = 0,
+            storage_per_device = storage_d,
             storage_to_split = storage,
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
@@ -1478,6 +1545,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             "kwargs": {
                 "key": self.key,
                 "hidden_size": self.hidden_size,
+                "latent_size": self.latent_size,
                 "intermediate_size": self.intermediate_size,
                 "activation_fn": self.activation_fn,
                 "num_experts": self.num_experts,
@@ -1497,6 +1565,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             "tid2eid": producer.send(self.tid2eid) if self.tid2eid is not None else None,
             "routing_gate": _export(self.routing_gate),
             "shared_gate": _export(self.shared_gate),
+            "latent_in": _export(self.latent_in),
+            "latent_out": _export(self.latent_out),
             "e_score_correction_bias": producer.send(self.e_score_correction_bias),
             "e_score_bias_vl": producer.send(self.e_score_bias_vl) if self.e_score_bias_vl is not None else None,
             "per_expert_scale": producer.send(self.per_expert_scale),
@@ -1578,6 +1648,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             downs = downs,
             shared_experts = _import_no_reduce("shared_experts"),
             shared_gate = _import("shared_gate"),
+            latent_in = _import("latent_in"),
+            latent_out = _import("latent_out"),
             routing_gate = _import("routing_gate") if device == output_device else None,
             routing_first = routing_first,
             routing_last = routing_last,
