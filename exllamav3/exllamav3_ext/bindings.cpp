@@ -91,6 +91,8 @@
 #include "generator/gumbel.cuh"
 #include "generator/rep_pen.cuh"
 #include "generator/cache.cuh"
+#include "generator/dry.cuh"
+#include "ngram.cuh"
 
 #endif
 
@@ -336,6 +338,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
     m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
     m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
+    m.def("dry_penalty", &dry_penalty, "dry_penalty");
 
     m.def("cache_rotate", &cache_rotate, "cache_rotate");
     m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
