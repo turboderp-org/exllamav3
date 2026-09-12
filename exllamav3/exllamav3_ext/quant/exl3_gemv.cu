@@ -62,6 +62,10 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     // small-to-mid k. Everything else runs the regular block-pipelined kernel.
     // Per-bits envelopes: 2 bpw is decode-bound and won at every measured shape on both archs;
     // 3 bpw wins everywhere on Ada but only in the narrow envelope on Ampere
+    // sm_70: the gemv is the only tensor-core path — the fallback (sm80
+    // block-pipelined kernels) is arch-guarded no-ops, so always take it
+    // when the shape fits the cooperative launch constraints.
+    if (cc < 8) return size_n <= 8192 ? 0 : 1;
     if (K == 2) return size_n <= 8192 ? 0 : 1;
     if (K == 3 && cc == CC_ADA) return size_n <= 8192 ? 0 : 1;
     if (size_n / 32 <= narrow_coresident) return 0;
