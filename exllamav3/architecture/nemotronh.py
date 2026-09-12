@@ -55,12 +55,15 @@ class NemotronHConfig(Config):
         self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
         self.assert_cfg(str, "mlp_hidden_act", "relu2", True)
 
-        # MoE params (30B-A3B): DeepSeek-style sigmoid router with correction bias, non-gated
-        # relu2 experts plus one always-on shared expert
+        # MoE params (30B-A3B, 120B-A12B): DeepSeek-style sigmoid router with correction bias,
+        # non-gated relu2 experts plus one always-on shared expert
         self.num_experts = self.read_cfg(int, "n_routed_experts", 0)
         self.num_experts_per_tok = self.read_cfg(int, "num_experts_per_tok", 0)
         self.moe_intermediate_size = self.read_cfg(int, "moe_intermediate_size", 0)
         self.shared_expert_intermediate_size = self.read_cfg(int, "moe_shared_expert_intermediate_size", 0)
+        # Latent MoE (Nemotron-3 Super): routed experts run at moe_latent_size behind a pair of
+        # projections (fc1_latent_proj / fc2_latent_proj); the shared expert stays full width
+        self.moe_latent_size = self.read_cfg(int, "moe_latent_size", None)
         self.routed_scaling_factor = self.read_cfg(float, "routed_scaling_factor", 2.5)
         if self.num_experts:
             self.assert_cfg(int, "n_group", 1, True)
@@ -186,6 +189,10 @@ class NemotronHModel(Model):
                             intermediate_size = config.moe_intermediate_size,
                             num_experts = config.num_experts,
                             num_experts_per_tok = config.num_experts_per_tok,
+                            latent_size = config.moe_latent_size,
+                            key_latent_in = "fc1_latent_proj" if config.moe_latent_size else None,
+                            key_latent_out = "fc2_latent_proj" if config.moe_latent_size else None,
+                            latent_hq_bits = 2,
                             key_up = "experts.{expert_idx}.up_proj",
                             key_down = "experts.{expert_idx}.down_proj",
                             key_routing_gate = "gate",
