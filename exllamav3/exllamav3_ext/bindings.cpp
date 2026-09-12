@@ -8,6 +8,8 @@
 #include "cuda_host.h"
 #include "hadamard.h"
 
+#if !defined(USE_ROCM)
+
 #include "norm.cuh"
 #include "hgemm.cuh"
 #include "rope.cuh"
@@ -71,6 +73,28 @@
 
 #include "sam.h"
 
+#else
+
+#include "hgemm.cuh"
+#include "rope.cuh"
+#include "gdn.cuh"
+#include "add.cuh"
+
+#include "quant/pack.cuh"
+#include "quant/reconstruct.cuh"
+#include "quant/hadamard.cuh"
+
+#include "generator/strings.h"
+#include "generator/sampling_basic.cuh"
+#include "generator/sampling_extra.cuh"
+#include "generator/gumbel.cuh"
+#include "generator/rep_pen.cuh"
+#include "generator/cache.cuh"
+#include "generator/dry.cuh"
+#include "ngram.cuh"
+
+#endif
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("stloader_read", &stloader_read, "stloader_read");
@@ -87,10 +111,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
     m.def("pinned_cuda_view", &pinned_cuda_view, py::arg("t"), py::arg("device"));
 
+#if !defined(USE_ROCM)
     m.def("rms_norm", &rms_norm, "rms_norm",
         py::arg("x"), py::arg("w"), py::arg("y"), py::arg("epsilon"),
         py::arg("constant_bias"), py::arg("constant_scale"), py::arg("span_heads"),
         py::arg("add_residual"), py::arg("w_groups") = 1);
+#endif
+#if !defined(USE_ROCM)
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
@@ -142,8 +169,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pack_signs", &pack_signs, "pack_signs");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
+#if !defined(USE_ROCM)
     m.def("reconstruct_had_batch", &reconstruct_had_batch, "reconstruct_had_batch");
     m.def("reconstruct_batch", &reconstruct_batch, "reconstruct_batch");
+#endif
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
@@ -269,4 +298,59 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/dsv4_compressor_bc.h"
     #include "libtorch/dsv4_attn_bc.h"
     #include "sam_bc.h"
+#else
+    m.def("had_paley", &had_paley, "had_paley");
+    m.def("had_paley2", &had_paley2, "had_paley2");
+
+    m.def("hgemm", &hgemm, "hgemm");
+    m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
+    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
+    m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
+    m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
+    m.def("rope", &rope, "rope");
+    m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
+    m.def("reconstruct", &reconstruct, "reconstruct");
+    m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
+    m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
+    m.def("had_r_128", &had_r_128, "had_r_128");
+    m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
+    m.def("pack_trellis", &pack_trellis, "pack_trellis");
+    m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
+    m.def("pack_signs", &pack_signs, "pack_signs");
+
+    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
+    m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
+    m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
+    m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
+    m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
+    m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
+    m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
+
+    py::class_<ConvRewindJob>(m, "ConvRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int, int, int>());
+    py::class_<StateRewindJob>(m, "StateRewindJob")
+        .def(py::init<uintptr_t, uintptr_t, int64_t>());
+    m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
+
+    m.def("argmax_sample", &argmax_sample, "argmax_sample");
+    m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
+    m.def("gumbel_noise_f16", &gumbel_noise_f16, "gumbel_noise_f16");
+    m.def("gumbel_noise_f32", &gumbel_noise_f32, "gumbel_noise_f32");
+    m.def("gumbel_noise_log", &gumbel_noise_log, "gumbel_noise_log");
+    m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
+    m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
+    m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
+    m.def("dry_penalty", &dry_penalty, "dry_penalty");
+
+    m.def("cache_rotate", &cache_rotate, "cache_rotate");
+    m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
+
+    m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
+    m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
+    m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
+    m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
+    m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
+#endif
 }

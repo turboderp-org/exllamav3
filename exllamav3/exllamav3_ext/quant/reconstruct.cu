@@ -4,7 +4,9 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "../util.h"
 #include "../util.cuh"
+#if !defined(USE_ROCM)
 #include "../ptx.cuh"
+#endif
 #include "exl3_dq.cuh"
 #include "hadamard_inner.cuh"
 
@@ -96,6 +98,7 @@ void reconstruct_kernel
     reconstruct_tile<K, cb>(g_unpacked, g_packed, packed_blocks_n, packed_n_offset);
 }
 
+#if !defined(USE_ROCM)
 // Batched variant: blockIdx.z selects the matrix from a pointer table, outputs are consecutive
 // [k, n] slabs out_stride halfs apart. Whole matrices only.
 template <int K, int cb>
@@ -103,7 +106,7 @@ __global__ __launch_bounds__(256)
 void reconstruct_batch_kernel
 (
     half* __restrict__ g_unpacked,
-    const uint16_t* const* __restrict__ packed_ptrs,
+    const uint16_t* const* packed_ptrs,
     int packed_blocks_n,
     size_t out_stride
 )
@@ -111,14 +114,17 @@ void reconstruct_batch_kernel
     int b = blockIdx.z;
     reconstruct_tile<K, cb>(g_unpacked + (size_t) b * out_stride, packed_ptrs[b], packed_blocks_n, 0);
 }
+#endif // USE_ROCM
 
 #define __(i, cb) reconstruct_batch_kernel<i, cb>
+#if !defined(USE_ROCM)
 constexpr auto reconstruct_batch_kernel_instances = std::array
 {
     __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
     __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
     __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2)
 };
+#endif // USE_ROCM
 #undef __
 
 #define __(i, cb) reconstruct_kernel<i, cb>
@@ -178,7 +184,8 @@ void reconstruct_slice
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+    auto reconstruct_kernel = reconstruct_kernel_instances[cbi];
+    reconstruct_kernel<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),
@@ -368,6 +375,7 @@ void reconstruct_had_kernel
     reconstruct_had_tile<K, cb>(g_unpacked, g_packed, suh, svh, packed_blocks_n, packed_n_offset);
 }
 
+#if !defined(USE_ROCM)
 // Batched variant: blockIdx.z selects the matrix from per-matrix pointer tables, the outputs
 // are consecutive [k, n] slabs out_stride halfs apart. Whole matrices only (no n slicing).
 template <int K, int cb>
@@ -375,9 +383,9 @@ __global__ __launch_bounds__(RH_THREADS)
 void reconstruct_had_batch_kernel
 (
     half* __restrict__ g_unpacked,
-    const uint16_t* const* __restrict__ packed_ptrs,
-    const half* const* __restrict__ suh_ptrs,
-    const half* const* __restrict__ svh_ptrs,
+    const uint16_t* const* packed_ptrs,
+    const half* const* suh_ptrs,
+    const half* const* svh_ptrs,
     int packed_blocks_n,
     size_t out_stride
 )
@@ -401,6 +409,7 @@ constexpr auto reconstruct_had_batch_kernel_instances = std::array
     __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
     __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2)
 };
+#endif // USE_ROCM
 #undef __
 
 #define __(i, cb) reconstruct_had_kernel<i, cb>
@@ -462,7 +471,8 @@ void reconstruct_had_slice
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_had_kernel_instances[cbi]<<<gridDim, RH_THREADS, 0, stream>>>
+    auto reconstruct_had_kernel = reconstruct_had_kernel_instances[cbi];
+    reconstruct_had_kernel<<<gridDim, RH_THREADS, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr(),
@@ -488,6 +498,7 @@ void reconstruct
 }
 
 
+#if !defined(USE_ROCM)
 /*
 Batched reconstruct_had over B whole matrices of one shape: unpacked is [B, k, n] fp16
 (contiguous), packed_ptrs / suh_ptrs / svh_ptrs are int64 device tensors of B addresses of
@@ -538,7 +549,8 @@ void reconstruct_had_batch
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_batch_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_had_batch_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+    auto kernel = reconstruct_had_batch_kernel_instances[cbi];
+    kernel<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t* const*) packed_ptrs.data_ptr(),
@@ -594,7 +606,8 @@ void reconstruct_batch
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_batch_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    reconstruct_batch_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+    auto kernel = reconstruct_batch_kernel_instances[cbi];
+    kernel<<<gridDim, blockDim, 0, stream>>>
     (
         (half*) unpacked.data_ptr(),
         (const uint16_t* const*) packed_ptrs.data_ptr(),
@@ -603,3 +616,4 @@ void reconstruct_batch
     );
     cuda_check(cudaPeekAtLastError());
 }
+#endif // USE_ROCM

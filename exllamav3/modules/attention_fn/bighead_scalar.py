@@ -6,6 +6,7 @@ KV_CHUNK_SIZE = 128
 
 def fn_bighead_scalar_attn(args: AttnArgs) -> torch.Tensor | None:
     if (
+        not hasattr(ext, "bighead_attn_paged") or
         args.is_varlen() or
         args.is_swa() or
         not args.has_kv_cache() or

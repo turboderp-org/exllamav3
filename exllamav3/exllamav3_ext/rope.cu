@@ -138,7 +138,7 @@ void rope_kernel
             if (t < head_dim / 2)
                 ((half2*) sh_head)[t] = ((half2*)g_head_in_ptr)[t];
             else
-                ((half2*) sh_head)[t] = {};
+                ((half2*) sh_head)[t] = __half2half2(__float2half(0.0f));
             __syncthreads();
         };
         auto store_head = [&] ()
