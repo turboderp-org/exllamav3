@@ -9,13 +9,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 import torch
 from exllamav3.modules.attention_fn.triton_paged import (
-    paged_attn_triton_decode, paged_attn_triton_prefill, has_triton,
+    paged_attn_triton_decode, paged_attn_triton_prefill,
 )
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.constants import PAGE_SIZE
 
 device = "cuda:0"
-pytestmark = pytest.mark.skipif(not has_triton, reason = "requires Triton")
 
 
 def ref_attn(q, k, v, causal, past, window = None):
