@@ -44,6 +44,33 @@ namespace exl3_sm70 {
 constexpr int elem_row(int L, int mh, int r) { return 8 * mh + (L & 3) + 4 * r; }
 constexpr int elem_k(int L, int kh, int r) { return 4 * kh + ((L >> 2) * 2 + (r & 1)); }
 
+
+// ---- Shuffle-exchange pattern (decode → m8n8k4 ownership) ---------------
+// The trellis decode yields, per 16x16 tile, 8 values per lane in sm80
+// m16n8k16 B-fragment order: lane Ls holds codes {8*Ls .. 8*Ls+7}; code c
+// ↔ cell (k = 2*(Ls&3) + (i&1) + 8*(i>>1), col = (Ls>>2) + 8*(j>>2)) with
+// j = c&7, i = j&3 (tiling verified: 256 codes ↔ 256 cells, bijective).
+//
+// The m8n8k4 consumer (lane Lp) needs cells
+//   W[(Lp&3) + 4*mh][4*((Lp>>2)&3) + i]   mh = 0..1, i = 0..3
+//   x[4*((Lp>>2)&3) + i]                  (activation, same k)
+// The owning decode lane and slot are, in closed form (validated over all
+// 256 cells):
+//   Ls   = 16*mh + (i>>1) + 4*(Lp&3) + 2*((Lp>>2)&1)
+//   slot = (i&1) + 2*(((Lp>>2)>>1)&1)
+// → 8 __shfl per lane per tile re-home the decoded values; the same
+// values serve both the A (activation) and B (weight) operands.
+
+// Source decode lane for consumer lane Lp, MMA half mh, k-index i.
+constexpr int shfl_src(int Lp, int mh, int i)
+{
+    return 16 * mh + (i >> 1) + 4 * (Lp & 3) + 2 * ((Lp >> 2) & 1);
+}
+// Source slot (0..7) within the source lane's 8 decoded values.
+constexpr int shfl_slot(int Lp, int i)
+{
+    return (i & 1) + 2 * (((Lp >> 2) >> 1) & 1);
+}
 // C fragment: lane L, reg 0..7 → (row, col) within the 8x8 C tile.
 // (Per MMA computation; the warp's 4 computations each tile the 8x8.)
 constexpr int c_row(int L, int reg)
