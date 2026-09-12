@@ -667,6 +667,7 @@ def test_gumbel(dim: tuple):
 
 @pytest.mark.parametrize("dim", dims)
 @torch.inference_mode()
+@pytest.mark.skipif(not hasattr(ext, "fused_sampler"), reason = "fused sampler absent from this build")
 def test_fused_eager_parity(dim: tuple):
     """
     For temperature/min-P chains the collapsed path draws the same Gumbel noise per token as

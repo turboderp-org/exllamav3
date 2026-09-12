@@ -12,6 +12,13 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.ext import exllamav3_ext as ext
 
+# The routing kernels are excluded from non-CUDA builds; the module-level torch fallbacks in
+# block_sparse_mlp_routing.py carry those builds, so the direct-kernel tests skip there
+pytestmark = pytest.mark.skipif(
+    not all(hasattr(ext, n) for n in ("routing_std", "routing_ds3_nogroup", "routing_sel_norm")),
+    reason = "routing kernels absent from this build",
+)
+
 device = "cuda:0"
 ROWS = 1024
 CONFIGS = [(e, k) for e in (32, 64, 96, 128, 160, 256, 384, 512) for k in (1, 2, 4, 6, 8, 10, 16) if k <= e]
