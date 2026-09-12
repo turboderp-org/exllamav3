@@ -16,6 +16,7 @@ from ..modules import (
 )
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
+from .nemotronh_mtp import NemotronHMTPModel
 
 class NemotronHConfig(Config):
     arch_string = "NemotronHForCausalLM"
@@ -27,7 +28,7 @@ class NemotronHConfig(Config):
     ):
         super().__init__(
             directory,
-            {"text": NemotronHModel},
+            {"text": NemotronHModel, "mtp": NemotronHMTPModel},
             **kwargs
         )
 
@@ -79,6 +80,150 @@ class NemotronHConfig(Config):
             "hybrid_override_pattern length does not match num_hidden_layers"
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
 
+        # MTP head (Nemotron-3 Super): one DeepSeek-style step (enorm/hnorm/eh_proj) followed by the
+        # blocks of mtp_hybrid_override_pattern ("*E": attention + latent MoE) and a final norm, under
+        # the mtp.* namespace. The component only exists when the tensors are present (a quant made
+        # before MTP support gets them from util/convert_mtp.py)
+        self.num_mtp_layers = self.read_cfg(int, "num_nextn_predict_layers", 0)
+        self.mtp_hybrid_override_pattern = self.read_cfg(str, "mtp_hybrid_override_pattern", "")
+        if self.num_mtp_layers == 0 or not any(
+            self.stc.has_tensor(f"mtp.layers.0.eh_proj.{t}") for t in ("weight", "trellis")
+        ):
+            del self.model_classes["mtp"]
+
+
+
+def nemotronh_block(
+    config: NemotronHConfig,
+    key: str,
+    layer_idx: int,
+    block_type: str,
+    qbits_key: str = "bits",
+) -> TransformerBlock:
+    """One block of the hybrid pattern: M = Mamba2, * = attention, - = MLP, E = MoE. Shared by the
+    trunk (backbone.layers.N) and the MTP head (mtp.layers.N, mtp_bits)"""
+    norm = RMSNorm(
+        config = config,
+        key = f"{key}.norm",
+        rms_norm_eps = config.layer_norm_epsilon,
+    )
+    match block_type:
+        case "M":
+            return TransformerBlock(
+                config = config,
+                key = key,
+                layer_idx = layer_idx,
+                attn_norm = norm,
+                attn = Mamba2(
+                    config = config,
+                    key = f"{key}.mixer",
+                    layer_idx = layer_idx,
+                    hidden_size = config.hidden_size,
+                    num_heads = config.mamba_num_heads,
+                    head_dim = config.mamba_head_dim,
+                    num_groups = config.n_groups,
+                    state_size = config.ssm_state_size,
+                    rms_norm_eps = config.layer_norm_epsilon,
+                    conv_kernel_size = config.conv_kernel,
+                    dt_limit = tuple(config.time_step_limit),
+                    qmap = "block.attn",
+                    out_dtype = torch.float,
+                    select_hq_bits = 2,
+                ),
+            )
+        case "*":
+            return TransformerBlock(
+                config = config,
+                key = key,
+                layer_idx = layer_idx,
+                attn_norm = norm,
+                attn = Attention(
+                    config = config,
+                    key = f"{key}.mixer",
+                    layer_idx = layer_idx,
+                    hidden_size = config.hidden_size,
+                    head_dim = config.head_dim,
+                    num_q_heads = config.num_q_heads,
+                    num_kv_heads = config.num_kv_heads,
+                    rope_settings = None,
+                    sm_scale = None,
+                    key_q = "q_proj",
+                    key_k = "k_proj",
+                    key_v = "v_proj",
+                    key_o = "o_proj",
+                    qmap = "block.attn",
+                    out_dtype = torch.float,
+                    select_hq_bits = 2,
+                    qbits_key = qbits_key,
+                ),
+            )
+        case "-":
+            return TransformerBlock(
+                config = config,
+                key = key,
+                layer_idx = layer_idx,
+                mlp_norm = norm,
+                mlp = MLP(
+                    config = config,
+                    key = f"{key}.mixer",
+                    hidden_size = config.hidden_size,
+                    intermediate_size = config.intermediate_size,
+                    key_up = "up_proj",
+                    key_down = "down_proj",
+                    activation_fn = "relu2",
+                    qmap = "block.mlp",
+                    out_dtype = torch.float,
+                    select_hq_bits = 1,
+                    qbits_key = qbits_key,
+                ),
+            )
+        case "E":
+            return TransformerBlock(
+                config = config,
+                key = key,
+                layer_idx = layer_idx,
+                mlp_norm = norm,
+                mlp = BlockSparseMLP(
+                    config = config,
+                    key = f"{key}.mixer",
+                    hidden_size = config.hidden_size,
+                    intermediate_size = config.moe_intermediate_size,
+                    num_experts = config.num_experts,
+                    num_experts_per_tok = config.num_experts_per_tok,
+                    latent_size = config.moe_latent_size,
+                    key_latent_in = "fc1_latent_proj" if config.moe_latent_size else None,
+                    key_latent_out = "fc2_latent_proj" if config.moe_latent_size else None,
+                    latent_hq_bits = 2,
+                    key_up = "experts.{expert_idx}.up_proj",
+                    key_down = "experts.{expert_idx}.down_proj",
+                    key_routing_gate = "gate",
+                    activation_fn = "relu2",
+                    router_type = "dots",
+                    routed_scaling_factor = config.routed_scaling_factor,
+                    n_group = 1,
+                    topk_group = 1,
+                    qmap = "block.mlp",
+                    interm_dtype = torch.half,
+                    out_dtype = torch.float,
+                    qbits_key = qbits_key,
+                    shared_experts = MLP(
+                        config = config,
+                        key = f"{key}.mixer.shared_experts",
+                        hidden_size = config.hidden_size,
+                        intermediate_size = config.shared_expert_intermediate_size,
+                        key_up = "up_proj",
+                        key_down = "down_proj",
+                        activation_fn = "relu2",
+                        qmap = "block.mlp",
+                        out_dtype = torch.float,
+                        select_hq_bits = 2,
+                        qbits_key = qbits_key,
+                    ),
+                ),
+            )
+        case _:
+            raise ValueError(f"Unknown layer type {block_type!r} in hybrid_override_pattern")
+
 
 class NemotronHModel(Model):
     config_class = NemotronHConfig
@@ -102,125 +247,9 @@ class NemotronHModel(Model):
         self.first_block_idx = len(self.modules)
 
         for idx in range(config.num_hidden_layers):
-            block_type = config.hybrid_override_pattern[idx]
-            norm = RMSNorm(
-                config = config,
-                key = f"backbone.layers.{idx}.norm",
-                rms_norm_eps = config.layer_norm_epsilon,
-            )
-            match block_type:
-                case "M":
-                    block = TransformerBlock(
-                        config = config,
-                        key = f"backbone.layers.{idx}",
-                        layer_idx = idx,
-                        attn_norm = norm,
-                        attn = Mamba2(
-                            config = config,
-                            key = f"backbone.layers.{idx}.mixer",
-                            layer_idx = idx,
-                            hidden_size = config.hidden_size,
-                            num_heads = config.mamba_num_heads,
-                            head_dim = config.mamba_head_dim,
-                            num_groups = config.n_groups,
-                            state_size = config.ssm_state_size,
-                            rms_norm_eps = config.layer_norm_epsilon,
-                            conv_kernel_size = config.conv_kernel,
-                            dt_limit = tuple(config.time_step_limit),
-                            qmap = "block.attn",
-                            out_dtype = torch.float,
-                            select_hq_bits = 2,
-                        ),
-                    )
-                case "*":
-                    block = TransformerBlock(
-                        config = config,
-                        key = f"backbone.layers.{idx}",
-                        layer_idx = idx,
-                        attn_norm = norm,
-                        attn = Attention(
-                            config = config,
-                            key = f"backbone.layers.{idx}.mixer",
-                            layer_idx = idx,
-                            hidden_size = config.hidden_size,
-                            head_dim = config.head_dim,
-                            num_q_heads = config.num_q_heads,
-                            num_kv_heads = config.num_kv_heads,
-                            rope_settings = None,
-                            sm_scale = None,
-                            key_q = "q_proj",
-                            key_k = "k_proj",
-                            key_v = "v_proj",
-                            key_o = "o_proj",
-                            qmap = "block.attn",
-                            out_dtype = torch.float,
-                            select_hq_bits = 2,
-                        ),
-                    )
-                case "-":
-                    block = TransformerBlock(
-                        config = config,
-                        key = f"backbone.layers.{idx}",
-                        layer_idx = idx,
-                        mlp_norm = norm,
-                        mlp = MLP(
-                            config = config,
-                            key = f"backbone.layers.{idx}.mixer",
-                            hidden_size = config.hidden_size,
-                            intermediate_size = config.intermediate_size,
-                            key_up = "up_proj",
-                            key_down = "down_proj",
-                            activation_fn = "relu2",
-                            qmap = "block.mlp",
-                            out_dtype = torch.float,
-                            select_hq_bits = 1,
-                        ),
-                    )
-                case "E":
-                    block = TransformerBlock(
-                        config = config,
-                        key = f"backbone.layers.{idx}",
-                        layer_idx = idx,
-                        mlp_norm = norm,
-                        mlp = BlockSparseMLP(
-                            config = config,
-                            key = f"backbone.layers.{idx}.mixer",
-                            hidden_size = config.hidden_size,
-                            intermediate_size = config.moe_intermediate_size,
-                            num_experts = config.num_experts,
-                            num_experts_per_tok = config.num_experts_per_tok,
-                            latent_size = config.moe_latent_size,
-                            key_latent_in = "fc1_latent_proj" if config.moe_latent_size else None,
-                            key_latent_out = "fc2_latent_proj" if config.moe_latent_size else None,
-                            latent_hq_bits = 2,
-                            key_up = "experts.{expert_idx}.up_proj",
-                            key_down = "experts.{expert_idx}.down_proj",
-                            key_routing_gate = "gate",
-                            activation_fn = "relu2",
-                            router_type = "dots",
-                            routed_scaling_factor = config.routed_scaling_factor,
-                            n_group = 1,
-                            topk_group = 1,
-                            qmap = "block.mlp",
-                            interm_dtype = torch.half,
-                            out_dtype = torch.float,
-                            shared_experts = MLP(
-                                config = config,
-                                key = f"backbone.layers.{idx}.mixer.shared_experts",
-                                hidden_size = config.hidden_size,
-                                intermediate_size = config.shared_expert_intermediate_size,
-                                key_up = "up_proj",
-                                key_down = "down_proj",
-                                activation_fn = "relu2",
-                                qmap = "block.mlp",
-                                out_dtype = torch.float,
-                                select_hq_bits = 2,
-                            ),
-                        ),
-                    )
-                case _:
-                    raise ValueError(f"Unknown layer type {block_type!r} in hybrid_override_pattern")
-            self.modules.append(block)
+            self.modules.append(nemotronh_block(
+                config, f"backbone.layers.{idx}", idx, config.hybrid_override_pattern[idx]
+            ))
 
         self.last_kv_module_idx = len(self.modules) - 1
 
