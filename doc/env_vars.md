@@ -354,12 +354,9 @@ fp16-accumulator MMA and flushes the partial sums into fp32 every 32 elements of
 accumulation across K stays fp32. `auto` runs a one-time per-device rate probe and enables the
 kernel where the fp16-accumulator MMA is at least 1.5x faster; `1` forces it on, `0` forces
 cuBLAS. Shapes the kernel does not cover (K not a multiple of 64, N not a multiple of 128,
-fewer than 384 rows or fewer blocks than SMs) use cuBLAS regardless. End-to-end on Qwen3-8B
-4.0bpw, 2048 tokens (the fp32 path is bit-reproducible run to run on this model): mean KL
-7.8e-6 (5090) / 1.1e-5 (4090) against the cuBLAS path, top-1 99.95% / 99.66%, perplexity
-unchanged to four digits; prefill +5.5% on the 5090, +8% on the 4090, +4-8% on the 3090 at
-2k-4k tokens. On Qwen3-30B-A3B the on/off KL (3.9e-4) sits inside that model's run-to-run
-floor (3.3e-4). Unchanged on the PRO 6000 (probe says off).
+unsupported strides/alignment) use cuBLAS regardless. Compute capability 12.x uses swizzled
+128x128 or 128x64 tiles selected by shape, and a native mixed-precision add when folding
+each 32-term FP16 partial into FP32.
 
 ### `EXL3_MOE_FUSED_DET` (default: `1`), `EXL3_MOE_RECON_DET` (default: follows `EXL3_MOE_FUSED_DET`)
 

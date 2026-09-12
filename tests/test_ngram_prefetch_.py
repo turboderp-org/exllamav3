@@ -2,6 +2,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from types import SimpleNamespace
 import torch
+import pytest
 
 """
 NGramEmbedding.prefetch: staging the hash + gather for a coming forward on a worker thread must
@@ -20,7 +21,13 @@ from exllamav3.loader.safetensors import SafetensorsCollection
 from exllamav3.modules import NGramEmbedding
 from exllamav3.modules import ngram_embedding as ne
 
-_IM = torch.inference_mode(); _IM.__enter__()
+@pytest.fixture(scope = "module", autouse = True)
+def _inference_mode():
+    # Entered per module, not at import: an import-time __enter__ leaked inference mode into every
+    # test module collected after this one
+    with torch.inference_mode():
+        yield
+
 torch.manual_seed(0)
 
 def make_module(stream):
