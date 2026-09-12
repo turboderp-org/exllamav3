@@ -6,8 +6,14 @@ and ack the next dispatch twice, letting run() return early. Oversubscribes the 
 alternates a small participant cap with the full pool, the configuration in which the race is reachable.
 """
 import os, sys
+import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3.ext import exllamav3_ext as ext
+
+pytestmark = pytest.mark.skipif(
+    not hasattr(ext, "exl3_moe_cpu_pool_stress"),
+    reason = "CPU MoE pool sources absent from this build",
+)
 
 
 def test_pool_dispatch_exactly_once():
