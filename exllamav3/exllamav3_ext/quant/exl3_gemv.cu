@@ -8,6 +8,7 @@ namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
+#include "exl3_gemv_sm70_kernel.cuh"
 #include "exl3_devctx.cuh"
 #include <map>
 
@@ -47,7 +48,7 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
 {
     if (mode == 0) return -1;
     if (K < 2 || K > 4) return -1;
-    if (K != 4 && cb == 0) return -1;
+    if (K != 4 && cb == 0 && cc >= 8) return -1;  // sm70 kernel supports K=2,3 cb=0
     if (size_m > EXL3_GEMV_MAX_M) return -1;
     if (size_k % 128 || size_n % 128) return -1;
     //if (cc != CC_AMPERE) return -1;  // measured win on Ampere; Ada/Blackwell are memory-bound here
@@ -81,13 +82,29 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
         SEL(bits_, cb_, false, 1, 0, sm_) SEL(bits_, cb_, false, 1, 1, sm_) \
         SEL(bits_, cb_, true,  0, 0, sm_) SEL(bits_, cb_, true,  0, 1, sm_) \
         SEL(bits_, cb_, true,  1, 0, sm_) SEL(bits_, cb_, true,  1, 1, sm_)
+    #undef SEL
+    return nullptr;
+}
+
+// sm_70 variant: same selection signature, different kernel template.
+static void* exl3_gemv_sm70_select_kernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem)
+{
+    #define SEL(bits_, cb_, fp32_, mm_, cfg_, sm_) \
+        if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_ && smem == sm_) \
+            return (void*) exl3_gemv_sm70_kernel<bits_, fp32_, cb_, mm_, cfg_, sm_>;
+    #define SEL_GRID(bits_, cb_, sm_) \
+        SEL(bits_, cb_, false, 0, 0, sm_) SEL(bits_, cb_, false, 0, 1, sm_) \
+        SEL(bits_, cb_, false, 1, 0, sm_) SEL(bits_, cb_, false, 1, 1, sm_) \
+        SEL(bits_, cb_, true,  0, 0, sm_) SEL(bits_, cb_, true,  0, 1, sm_) \
+        SEL(bits_, cb_, true,  1, 0, sm_) SEL(bits_, cb_, true,  1, 1, sm_)
     SEL_GRID(4, 0, false) SEL_GRID(4, 1, false) SEL_GRID(4, 2, false)
-    SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
-    SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
+    SEL_GRID(2, 0, false) SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
+    SEL_GRID(3, 0, false) SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
     #undef SEL_GRID
     #undef SEL
     return nullptr;
 }
+
 
 bool exl3_gemv_try_launch
 (
@@ -96,7 +113,6 @@ bool exl3_gemv_try_launch
     int size_k,
     int size_n,
     int K,
-    bool half_k,
     int cb,
     bool c_fp32,
     bool has_su_sv,
@@ -109,15 +125,8 @@ bool exl3_gemv_try_launch
     // Free integer checks first; the env read (~64 ns) and device queries only run for calls
     // that could actually take this path
     if (!has_su_sv) return false;
-    if (half_k)
-    {
-        if (K < 1 || K > 3 || cb != 2) return false;
-    }
-    else
-    {
-        if (K < 2 || K > 4) return false;
-        if (K != 4 && cb == 0) return false;
-    }
+    if (K < 2 || K > 4) return false;
+    if (K != 4 && cb == 0 && DevCtx::instance().get_cc(device) >= 8) return false;  // sm70 kernel supports K=2,3 cb=0
     if (size_m > EXL3_GEMV_MAX_M) return false;
     if (size_k % 128 || size_n % 128) return false;
 
@@ -145,21 +154,28 @@ bool exl3_gemv_try_launch
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
     bool smem = exl3_gemv_env_smem() == 1;
 
-    auto select = [&] (int cfg_) -> void*
+    // sm_70 and older: the sm80 mma kernels are no-ops (arch-guarded) —
+    // route to the m8n8k4 variant, which shares the launch signature.
+    void* narrow_kernel;
+    if (cc < 8)
     {
-        return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem)
-                      : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem);
-    };
-    void* narrow_kernel = select(0);
+        narrow_kernel = exl3_gemv_sm70_select_kernel(K, cb, c_fp32, mmode, 0, smem);
+    }
+    else
+    {
+        narrow_kernel = exl3_gemv_select_kernel(K, cb, c_fp32, mmode, 0, smem);
+    }
     if (!narrow_kernel) return false;
     int narrow_coresident = occupancy(narrow_kernel, 512) * num_sms;
 
-    // Shape heuristic: a half-integer rate K + 0.5 is handled like the integer rate above it (its tile is
-    // between the two in bytes; unmeasured, so it inherits the K + 1 envelope)
-    int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
+    int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, K, cb, mode, narrow_coresident);
     if (cfg < 0) return false;
 
-    void* kernel = cfg == 0 ? narrow_kernel : select(cfg);
+    void* kernel = nullptr;
+    if (cc < 8)
+        kernel = cfg == 0 ? narrow_kernel : exl3_gemv_sm70_select_kernel(K, cb, c_fp32, mmode, cfg, smem);
+    else
+        kernel = cfg == 0 ? narrow_kernel : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg, smem);
     if (!kernel) return false;
 
     int block_dim = cfg == 0 ? 512 : 256;
@@ -217,10 +233,7 @@ void exl3_gemv
     for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
-    const int tile_u16 = B.size(2);
-    const bool half_k = (tile_u16 % 16) != 0;
-    int K = tile_u16 / 16;
-    TORCH_CHECK(!half_k || (tile_u16 % 16 == 8 && mul1), "exl3_gemv: half-integer bitrates require the mul1 codebook");
+    int K = B.size(2) / 16;
 
     int cb = 0;
     if (mcg) cb = 1;
@@ -250,7 +263,7 @@ void exl3_gemv
 
     bool ok = exl3_gemv_try_launch
     (
-        kernel_args, size_m, size_k, size_n, K, half_k, cb, c_fp32,
+        kernel_args, size_m, size_k, size_n, K, cb, c_fp32,
         true, device, stream, nullptr, true
     );
     TORCH_CHECK(ok, "exl3_gemv: call is not eligible for the GEMV kernel");
