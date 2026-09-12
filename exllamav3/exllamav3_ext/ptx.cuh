@@ -56,6 +56,7 @@ __device__ inline void ptx_mma_m16n8k16
     FragC& frag_c
 )
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     float* c = reinterpret_cast<float*>(&frag_c);
@@ -71,6 +72,7 @@ __device__ inline void ptx_mma_m16n8k16
            "r"(b[0]), "r"(b[1]),
            "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3])
     );
+#endif
 }
 
 // FP16 @ FP16 + FP16 -> FP16
@@ -81,6 +83,7 @@ __device__ inline void ptx_mma_m16n8k16
     FragC_h& frag_c
 )
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
@@ -96,6 +99,7 @@ __device__ inline void ptx_mma_m16n8k16
            "r"(b[0]), "r"(b[1]),
            "r"(d[0]), "r"(d[1])
     );
+#endif
 }
 
 // Global barrier
@@ -145,6 +149,7 @@ __device__ inline void cp_async_pred(void* smem_ptr, const void* glob_ptr, bool 
 {
     const int bytes = 16;
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile(
         "{\n"
         "   .reg .pred p;\n"
@@ -152,19 +157,22 @@ __device__ inline void cp_async_pred(void* smem_ptr, const void* glob_ptr, bool 
         "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
         "}\n" :: "r"((int) pred), "r"(smem), "l"(glob_ptr), "n"(bytes)
     );
+#endif
 }
 
 // Load global to shared memory
 
 __device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
 {
-    const int bytes = 16;
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    const int bytes = 16;
     asm volatile(
         "{\n"
         "   cp.async.cg.shared.global [%0], [%1], %2;\n"
         "}\n" :: "r"(smem), "l"(glob_ptr), "n"(bytes)
     );
+#endif
 }
 
 // Load global to shared memory with cache hint to evict data from L2 ASAP
@@ -172,6 +180,7 @@ __device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
 __device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
 {
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     const int bytes = 16;
     asm volatile
     (
@@ -181,13 +190,16 @@ __device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
         "   cp.async.cg.shared.global.L2::cache_hint [%0], [%1], %2, p;\n"
         "}\n" :: "r"(smem), "l"(glob_ptr), "n"(bytes)
     );
+#endif
 }
 
 // Async copy fence, commit all pending async copies
 
 __device__ inline void cp_async_fence()
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;\n" ::);
+#endif
 }
 
 // Wait until at most n async groups are still pending.
@@ -195,7 +207,9 @@ __device__ inline void cp_async_fence()
 template <int n>
 __device__ inline void cp_async_wait()
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
+#endif
 }
 
 // Load 16x16 matrix fragment from shared memory, directly in tensor core layout
@@ -204,11 +218,13 @@ __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
 {
     uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     asm volatile
     (
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem)
     );
+#endif
 }
 
 __device__ inline uint32_t mul_lo_u32(uint32_t x, uint32_t y)
