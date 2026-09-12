@@ -245,13 +245,18 @@ inversely with the measured pinned→device bandwidth (probed once per device): 
 x4 link needs a much hotter expert to justify the weight DMA than a CPU-direct x16 one. Setting
 this explicitly pins the threshold on every device and disables the bandwidth scaling.
 
-### `EXL3_MOE_STREAM_FUSED_T` (default: `512`)
+### `EXL3_MOE_STREAM_FUSED_T` (default: `256`)
 
 Maximum per-expert assignment count eligible for the fused `exl3_moe` GPU kernel (one launch
-covers a whole batch of experts); above this an expert still streams but runs through the
-per-expert reconstruct path instead. Same eligibility as the GPU-resident fused path otherwise
-(mul1, silu/gelu gated or relu2 gateless, no per-expert biases, no padded dims); ineligible
-layers use the reconstruct path for every streamed expert regardless of count.
+covers a whole batch of experts, up to three with the row tiles of `EXL3_MOE_MTILE`); above
+this an expert still streams but runs through the batched reconstruct tier
+(`EXL3_MOE_STREAM_BATCH_RECON`) or the per-expert reconstruct path instead. Same eligibility as
+the GPU-resident fused path otherwise (mul1, silu/gelu gated or relu2 gateless, no per-expert
+biases, no padded dims); ineligible layers use the reconstruct path for every streamed expert
+regardless of count. The default was 512 while the alternative above it was the per-expert
+loop; with the batched tier there, 128-256 measure best (Qwen3.8 4090 + 3090 split, 4k
+chunks: 512 -> 256 +4%; mistral-small-4 119B full offload on the PRO 6000: +2.8%), and the
+fused temp buffers (concurrency x T x (2 hidden + 2 intermediate) x 2 bytes per device) halve.
 
 ### `EXL3_MOE_STREAM_MIN_ROWS` (default: `32`)
 
@@ -394,12 +399,55 @@ transparent huge pages where `/sys/kernel/mm/transparent_hugepage/shmem_enabled`
 (`advise`, `within_size` or `always`; on the default `never` the CPU kernels run on 4K pages,
 which cost a few percent of decode on some hosts). Not available on Windows.
 
+### `EXL3_HOST_MEM_RESERVE_MB` (default: `2048`)
+
+Host-memory guard for the large CPU allocations (CPU MoE expert arena chunks, the n-gram table
+held in RAM with `--ngram_ram`): before each one, `MemAvailable` (from `/proc/meminfo`, or
+psutil where that is unavailable) must cover the allocation plus this reserve, or the load
+fails with a message naming the allocation. Linux has no allocation-time failure for anonymous
+or shmem memory: an oversized arena only fails once the machine has swapped itself into a
+minutes-long stall and the OOM killer picks a victim, and pinned pages cannot be reclaimed at
+all. `0` disables the check.
+
 ### `EXL3_MOE_ARENA_HUGE` (default: unset)
 
 With `EXL3_MOE_PINNED_ARENA=1`: `2m` or `1g` backs the memfd chunks with hugetlbfs pages
 (`MFD_HUGETLB`) of that size instead of shmem. Requires reserved huge pages
 (`vm.nr_hugepages`, or `hugepages-1048576kB` for `1g`) covering the whole arena; allocation
 fails with a clear error otherwise.
+
+### `EXL3_MOE_MTILE` (default: `1`)
+
+Row tiles for the fused MoE prefill kernel. The kernel dequantizes each expert's weights once
+per 16-row tile, so an expert holding 100 rows re-runs the whole B pipeline seven times. With
+this on, experts with 17-32 rows go through a 32-row-tile instance and experts with more than 32
+rows through a 64-row one, each as its own launch over its expert range (up to three launches
+per layer, largest tile first; a wide instance finishes an expert's remainder with the largest
+smaller tile). The wider tiles are separate kernel instances rather than a runtime switch inside
+one kernel: sharing one 128-register budget between the tiers costs the 16-row path 60-70% on
+Ada / Ampere. Instantiated for the mul1 codebook as N = 128 tile-shape kernels: 30-47% less
+fused-kernel time at 24-128 rows per expert on every GPU generation for Qwen3.8-class shapes,
+and ~20% for dims that are multiples of 256 (gemma4, Qwen3-30B), where they replace the N = 256
+16-row tiling for experts above 16 rows (the N = 256 instance stays for the small-expert
+launch, where it is 10-20% faster). Model level, 4k chunks: Qwen3.8 +10% on the PRO 6000, +3%
+on a 4090 + 3090 split; gemma4-26B +1-4%; Qwen3-30B neutral. Other codebooks and the
+all-fused fast path (no host-side counts) keep the single launch. Outputs are bit-identical to
+the 16-row tiling at equal group geometry (per-launch active counts widen the groups, which
+reorders the fp32 k-slice reduction to rounding level). Set to `0` for the single launch.
+
+### `EXL3_MOE_TILE_N` (default: `0` = automatic)
+
+`128` keeps the N = 128 tile shape for the fused kernel's 16-row launches on dims that are
+multiples of 256 (which otherwise take the N = 256 instances). Measurement knob; the N = 256
+instance is faster for those launches.
+
+### `EXL3_MOE_FUSED_ROWS_WIDE` (default: `256`)
+
+Fused-tier row capacity per expert for layers that use the wide tiles (see `EXL3_MOE_MTILE`);
+`EXL3_MOE_FUSED_ROWS` still applies to every other layer. With the wide tiles the fused kernel
+beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk on the PRO 6000: 6.87k ->
+7.06k tok/s over 128 rows), at 4 x concurrency x rows x (hidden + intermediate) x 2 bytes of
+static buffers per device (Qwen3.8 on a 188-SM card: +38 MB over 128 rows).
 
 ### `EXL3_MOE_BATCH_RECON` (default: `1`), `EXL3_MOE_STREAM_BATCH_RECON` (default: `1`)
 

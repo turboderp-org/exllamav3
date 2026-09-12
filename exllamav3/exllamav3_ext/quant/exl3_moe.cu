@@ -19,6 +19,19 @@ int exl3_moe_max_concurrency(int device)
 
 std::set<void*> moe_kernel_attr_set[MAX_DEVICES] = {};
 
+// EXL3_MOE_TILE_N=128 keeps the N = 128 tile shape for dims that are multiples of 256 (which
+// otherwise take the N = 256 instances); 0 / unset = automatic
+static int moe_tile_n_override()
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char* e = getenv("EXL3_MOE_TILE_N");
+        v = e ? atoi(e) : 0;
+    }
+    return v;
+}
+
 fp_exl3_moe_kernel exl3_moe_kernel_instances[] =
 {
     // [K][cb - 1][N_off]: K = 0 switches Kg/Ku/Kd at runtime, K > 0 = compile-time Kg = Ku = Kd
@@ -31,6 +44,22 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances[] =
     exl3_moe_kernel_k6_n128_cb1(), exl3_moe_kernel_k6_n256_cb1(), exl3_moe_kernel_k6_n128_cb2(), exl3_moe_kernel_k6_n256_cb2(),
     exl3_moe_kernel_k7_n128_cb1(), exl3_moe_kernel_k7_n256_cb1(), exl3_moe_kernel_k7_n128_cb2(), exl3_moe_kernel_k7_n256_cb2(),
     exl3_moe_kernel_k8_n128_cb1(), exl3_moe_kernel_k8_n256_cb1(), exl3_moe_kernel_k8_n128_cb2(), exl3_moe_kernel_k8_n256_cb2()
+};
+
+// 32-row tile instances, [K], N = 128 shape, mul1 codebook only
+fp_exl3_moe_kernel exl3_moe_kernel_instances_m32[] =
+{
+    exl3_moe_kernel_k0_n128_cb2_m32(), exl3_moe_kernel_k1_n128_cb2_m32(), exl3_moe_kernel_k2_n128_cb2_m32(),
+    exl3_moe_kernel_k3_n128_cb2_m32(), exl3_moe_kernel_k4_n128_cb2_m32(), exl3_moe_kernel_k5_n128_cb2_m32(),
+    exl3_moe_kernel_k6_n128_cb2_m32(), exl3_moe_kernel_k7_n128_cb2_m32(), exl3_moe_kernel_k8_n128_cb2_m32()
+};
+
+// 64-row tile instances, [K], N = 128 shape, mul1 codebook only
+fp_exl3_moe_kernel exl3_moe_kernel_instances_m64[] =
+{
+    exl3_moe_kernel_k0_n128_cb2_m64(), exl3_moe_kernel_k1_n128_cb2_m64(), exl3_moe_kernel_k2_n128_cb2_m64(),
+    exl3_moe_kernel_k3_n128_cb2_m64(), exl3_moe_kernel_k4_n128_cb2_m64(), exl3_moe_kernel_k5_n128_cb2_m64(),
+    exl3_moe_kernel_k6_n128_cb2_m64(), exl3_moe_kernel_k7_n128_cb2_m64(), exl3_moe_kernel_k8_n128_cb2_m64()
 };
 
 /*
@@ -90,6 +119,14 @@ inputs:
     down_mul1:
         bool, codebook flags
 
+    count_lo, count_hi:
+        experts with token counts outside [count_lo, count_hi] are skipped (they belong to another
+        launch's row tile); num_active must count the experts inside the range
+
+    m_tile:
+        rows per GEMM tile: 16 (any codebook; N = 128 or 256 tile shape by dims), 32 or 64
+        (mul1 codebook, N = 128 instances). Worth it for experts holding more than 16 / 32 rows
+
     num_active:
         number of experts with 0 < token count <= max_tokens_per_expert, i.e. the number of experts this kernel
         will process. Used to size the launch: fewer, wider expert groups when few experts are active. Pass -1 if
@@ -135,7 +172,10 @@ void exl3_moe
     const float act_limit,
     const int num_active,
     const c10::optional<at::Tensor>& output_scratch,
-    const c10::optional<at::Tensor>& fused_base
+    const c10::optional<at::Tensor>& fused_base,
+    const int count_lo,
+    const int count_hi,
+    const int m_tile
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
@@ -236,8 +276,22 @@ void exl3_moe
     dim3 grid_dim(group_size, 1, num_groups);
 
     int N_off = 0;
-    if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0) N_off = 1;
-    fp_exl3_moe_kernel kernel = exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];
+    if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
+    fp_exl3_moe_kernel kernel;
+    if (m_tile <= 16)
+    {
+        kernel = exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];
+    }
+    else
+    {
+        // The wide row tiles exist as N = 128 instances only and take any dims that are
+        // multiples of 128: for dims that are multiples of 256 they still beat the N = 256
+        // 16-row tiling by ~20% at 24+ rows per expert (the N = 256 instance stays the faster
+        // one for the <= 16-row launch, which the caller issues with m_tile 16)
+        TORCH_CHECK(cb_idx == 1, "exl3_moe: row tiles above 16 are instantiated for the mul1 codebook only");
+        TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
+        kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] : exl3_moe_kernel_instances_m32[K];
+    }
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
     {
@@ -300,7 +354,9 @@ void exl3_moe
         (void*) &K_down,
         (void*) &locks,
         &_output_scratch,
-        &_fused_base
+        &_fused_base,
+        (void*) &count_lo,
+        (void*) &count_hi
     };
 
     cudaLaunchKernel

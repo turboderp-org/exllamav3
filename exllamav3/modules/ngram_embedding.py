@@ -247,6 +247,9 @@ class NGramEmbedding(Module):
                 for s_i, k in enumerate(keys):
                     t = stc.get_tensor(k, "cpu", allow_bf16 = not quantized, no_defer = True)
                     if slab is None:
+                        from ..util.memory import check_host_memory
+                        check_host_memory(self.num_rows * t[0].numel() * t.element_size(),
+                                          f"n-gram table {self.key} held in RAM (--ngram_ram)")
                         slab = torch.empty((self.num_rows, *t.shape[1:]), dtype = t.dtype)
                     r0 = s_i * self.rows_per_shard
                     slab[r0 : r0 + t.shape[0]].copy_(t)

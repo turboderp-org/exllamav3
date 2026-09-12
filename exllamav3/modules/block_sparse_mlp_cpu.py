@@ -137,6 +137,14 @@ class BlockSparseMLP_CPU:
         split_layers = int(os.environ.get("EXL3_MOE_CPU_SPLIT_LAYERS", 0))
         if split_layers and getattr(ip, "moe_cpu_split_assigned", 0) >= split_layers:
             split_k = 0
+        # The split keeps at least one expert on the GPU (the module's GPU slice cannot be
+        # empty); a larger request is capped rather than silently turning the split off
+        if split_k >= self.num_experts > 1:
+            if not getattr(ip, "moe_cpu_split_capped", False):
+                ip.moe_cpu_split_capped = True
+                print(f" !! --moe_cpu_split {split_k} exceeds the {self.num_experts} routed experts per layer, "
+                      f"capped to {self.num_experts - 1} (use --moe_cpu_offload to move whole layers)")
+            split_k = self.num_experts - 1
         if (
             0 < split_k < self.num_experts and
             self.cpu_split_first is None and
