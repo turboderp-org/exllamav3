@@ -245,13 +245,18 @@ inversely with the measured pinned→device bandwidth (probed once per device): 
 x4 link needs a much hotter expert to justify the weight DMA than a CPU-direct x16 one. Setting
 this explicitly pins the threshold on every device and disables the bandwidth scaling.
 
-### `EXL3_MOE_STREAM_FUSED_T` (default: `512`)
+### `EXL3_MOE_STREAM_FUSED_T` (default: `256`)
 
 Maximum per-expert assignment count eligible for the fused `exl3_moe` GPU kernel (one launch
-covers a whole batch of experts); above this an expert still streams but runs through the
-per-expert reconstruct path instead. Same eligibility as the GPU-resident fused path otherwise
-(mul1, silu/gelu gated or relu2 gateless, no per-expert biases, no padded dims); ineligible
-layers use the reconstruct path for every streamed expert regardless of count.
+covers a whole batch of experts, up to three with the row tiles of `EXL3_MOE_MTILE`); above
+this an expert still streams but runs through the batched reconstruct tier
+(`EXL3_MOE_STREAM_BATCH_RECON`) or the per-expert reconstruct path instead. Same eligibility as
+the GPU-resident fused path otherwise (mul1, silu/gelu gated or relu2 gateless, no per-expert
+biases, no padded dims); ineligible layers use the reconstruct path for every streamed expert
+regardless of count. The default was 512 while the alternative above it was the per-expert
+loop; with the batched tier there, 128-256 measure best (Qwen3.8 4090 + 3090 split, 4k
+chunks: 512 -> 256 +4%; mistral-small-4 119B full offload on the PRO 6000: +2.8%), and the
+fused temp buffers (concurrency x T x (2 hidden + 2 intermediate) x 2 bytes per device) halve.
 
 ### `EXL3_MOE_STREAM_MIN_ROWS` (default: `32`)
 
