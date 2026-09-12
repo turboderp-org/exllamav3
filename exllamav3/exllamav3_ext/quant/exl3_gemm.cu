@@ -240,6 +240,48 @@ int exl3_gemm_gr
             cuda_check(cudaPeekAtLastError());
             return 90;
         }
+
+        // sm_70: the block-pipelined kernels are arch-guarded no-ops. Tile
+        // the m dimension into 8-row slices and run the GEMV kernel per
+        // slice — each launch is self-contained (cooperative, per-block
+        // reduction, per-slice Had transforms).
+        if (cc < 8 && (suh_ptr && A_had_ptr && svh_ptr))
+        {
+            const int tile_m = 8;
+            int tiles = CEIL_DIVIDE(size_m, tile_m);
+            bool all_ok = true;
+            for (int tile = 0; tile < tiles && all_ok; ++tile)
+            {
+                int tile_rows = MIN(size_m - tile * tile_m, tile_m);
+                const half* A_tile = A_ptr + tile * tile_m * size_k;
+                void* C_tile = c_fp32
+                    ? (void*) (((float*) C_ptr) + tile * tile_m * size_n)
+                    : (void*) (((half*) C_ptr) + tile * tile_m * size_n);
+                void* tileArgs[] =
+                {
+                    (void*)& A_tile,
+                    (void*)& B_ptr,
+                    (void*)& C_tile,
+                    (void*)& tile_rows,
+                    (void*)& size_k,
+                    (void*)& size_n,
+                    (void*)& locks,
+                    kernelArgs[7], kernelArgs[8], kernelArgs[9]
+                };
+                void* tile_kernel = nullptr;
+                all_ok = exl3_gemv_try_launch
+                (
+                    tileArgs, tile_rows, size_k, size_n, K, cb, c_fp32,
+                    suh_ptr && A_had_ptr && svh_ptr,
+                    device, stream, &tile_kernel, true
+                );
+            }
+            if (all_ok)
+            {
+                cuda_check(cudaPeekAtLastError());
+                return 91;
+            }
+        }
     }
 
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
