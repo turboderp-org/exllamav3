@@ -84,7 +84,8 @@ void pack_trellis
     dim3 blockDim(128);
     dim3 gridDim(rows, cols);
 
-    pack_trellis_kernel_instances[K - 1]<<<gridDim, blockDim, 0, stream>>>
+    auto pack_kernel = pack_trellis_kernel_instances[K - 1];
+    pack_kernel<<<gridDim, blockDim, 0, stream>>>
     (
         (uint16_t*) packed.data_ptr(),
         (const uint16_t*) unpacked.data_ptr()
@@ -165,7 +166,8 @@ void unpack_trellis
     dim3 blockDim(128);
     dim3 gridDim(cols, rows);
 
-    unpack_trellis_kernel_instances[K - 1]<<<gridDim, blockDim, 0, stream>>>
+    auto unpack_kernel = unpack_trellis_kernel_instances[K - 1];
+    unpack_kernel<<<gridDim, blockDim, 0, stream>>>
     (
         (uint16_t*) unpacked.data_ptr(),
         (const uint16_t*) packed.data_ptr()
