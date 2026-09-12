@@ -135,6 +135,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
+    m.def("quantize_tiles_scratch", &quantize_tiles_scratch, "quantize_tiles_scratch");
     m.def("test_distribution", &test_distribution, "test_distribution");
     m.def("decode", &decode, "decode");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");

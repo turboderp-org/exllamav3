@@ -672,3 +672,12 @@ kernel with the kernel name, source line and bad index instead of corrupting mem
 faulting asynchronously downstream. Debug tool for paged-pool issues; significant JIT
 overhead (forces Triton debug mode globally), leave unset in production. AOT/BC graph
 kernels are unaffected (compiled with asserts off).
+
+## Quantization
+
+### `EXL3_QT_OPTIMIZED`
+
+Forces the quantizer's dense trellis specializations (`quantize_tiles_optimized.cuh`) on (`1`) or
+off (`0`) regardless of the per-architecture dispatch (on for every K on sm_120; per K and codebook
+on Ada and Ampere where measured faster; the original kernels elsewhere). For experiments only: the
+choice also sizes the quantizer's scratch buffers.
