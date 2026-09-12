@@ -342,5 +342,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
     m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
+    m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
+    m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
+    m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
 #endif
 }

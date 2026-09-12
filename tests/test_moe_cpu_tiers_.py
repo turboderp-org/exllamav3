@@ -18,6 +18,13 @@ random states miss. Skipped when the ladder is not present.
 import os, sys, subprocess, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
+from exllamav3.ext import exllamav3_ext as _ext
+pytestmark = pytest.mark.skipif(
+    not hasattr(_ext, "exl3_moe_cpu_has_avx2"),
+    reason = "CPU MoE sources absent from this build",
+)
+
 INT8_TOL = 5e-4     # rel. L2 between int8 tiers (observed <= 1e-4 under -Ofast; 0 with strict FP)
 SCALAR_TOL = 0.05   # rel. L2 int8 tiers vs the fp32 scalar reference (observed <= 0.02)
 
