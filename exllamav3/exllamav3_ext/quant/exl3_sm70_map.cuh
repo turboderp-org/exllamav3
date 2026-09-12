@@ -82,4 +82,25 @@ constexpr int c_col(int L, int reg)
     return ((reg >> 2) & 1) * 4 + (L & 2) + (reg & 1);
 }
 
+// ---- mma.m8n8k4 primitive (sm_70 native) --------------------------------
+// D (8 f32) += A (8x4 .f16) @ B (4x8 .f16), .row.col. Native on sm_70.
+// A/B fragments: 2 .f16x2 regs per lane (4 halves); D: 8 f32 regs.
+__device__ __forceinline__ void mma_m8n8k4_rc_f32(
+    const uint32_t a0, const uint32_t a1,   // A fragment (2 .f16x2)
+    const uint32_t b0, const uint32_t b1,   // B fragment (2 .f16x2)
+    float* d)                               // 8 f32 accumulators
+{
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+    asm volatile
+    (
+        "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+        "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
+          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+        : "r"(a0), "r"(a1), "r"(b0), "r"(b1)
+    );
+#endif
+}
+
 }  // namespace exl3_sm70
