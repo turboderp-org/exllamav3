@@ -137,9 +137,15 @@ class LinearEXL3:
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
+            # sm_70: only the GEMV decode kernel (rows == 1) is ported; the
+            # sm80 block-pipelined kernels are arch-guarded no-ops. Route
+            # rows > 1 to reconstruct+hgemm.
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
-                dtype = out_dtype or self.default_out_dtype
-                return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
+                if rows > 1 and x.device.index is not None and ext.g_get_cc(x.device.index) < 8:
+                    pass  # fall through to reconstruct_hgemm
+                else:
+                    dtype = out_dtype or self.default_out_dtype
+                    return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
         return self.reconstruct_hgemm(x, out_dtype)
 
