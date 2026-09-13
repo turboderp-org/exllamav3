@@ -8,6 +8,7 @@ import torch
 from ..ext import exllamav3_ext as ext
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
+from ..util.memory import check_host_memory, windows_memory_status
 from .model_tp_cuda import (
     cuda_host_register,
     cuda_host_unregister,
@@ -111,10 +112,13 @@ class MoeCpuTuning:
         # /sys/kernel/mm/transparent_hugepage/shmem_enabled allows it (advise/always/
         # within_size), so on a default (never) system the CPU kernels run on 4K pages;
         # EXL3_MOE_ARENA_HUGE=2m|1g backs the memfd with hugetlbfs pages instead (requires
-        # vm.nr_hugepages / hugepages-1048576kB reservations). Not available on Windows.
-        self.pinned_arena = os.environ.get("EXL3_MOE_PINNED_ARENA", "0") != "0" and os.name != "nt"
+        # vm.nr_hugepages / hugepages-1048576kB reservations). On Windows the chunks are named
+        # pagefile-backed sections instead (see _HugeArena._new_chunk); no hugepage variant there.
+        self.pinned_arena = os.environ.get("EXL3_MOE_PINNED_ARENA", "0") != "0"
         self.arena_huge = os.environ.get("EXL3_MOE_ARENA_HUGE", "").strip().lower()
         assert self.arena_huge in ("", "2m", "1g"), "EXL3_MOE_ARENA_HUGE must be 2m or 1g"
+        if self.arena_huge and os.name == "nt":
+            raise RuntimeError("EXL3_MOE_ARENA_HUGE is Linux-only (hugetlbfs memfd); unset it on Windows")
         # Batched reconstruct tier for the streamed heavy experts (see moe_batch_recon.py):
         # experts too hot for the fused kernel are dequantized in groups with one launch per
         # projection and run through padded bmm. EXL3_MOE_STREAM_BATCH_RECON=0 restores the
@@ -143,10 +147,11 @@ class _HugeArena:
     CHUNK_BYTES = 1 << 30   # 1 GiB
 
     def __init__(self, shared = False, huge = "", conn = None):
-        """shared: back each chunk with a memfd instead of an anonymous private mapping and
-        publish it over `conn` as ("chunk", index, size) followed by the descriptor itself
-        (SCM_RIGHTS), so the parent can map the same pages and page-lock them for DMA.
-        huge: "2m"/"1g" requests hugetlbfs-backed memfds (MFD_HUGETLB)."""
+        """shared: back each chunk with shared memory instead of an anonymous private mapping
+        and publish it over `conn` as ("chunk", index, size, name): on Linux a memfd whose
+        descriptor follows the message (SCM_RIGHTS, name = None), on Windows a named pagefile
+        section the parent opens by name. Either way the parent maps the same pages and
+        page-locks them for DMA. huge: "2m"/"1g" requests hugetlbfs-backed memfds (Linux)."""
         self.shared = shared
         self.huge = huge
         self.conn = conn
@@ -156,11 +161,32 @@ class _HugeArena:
 
     def _new_chunk(self, min_bytes):
         import mmap, os
-        from ..util.memory import check_host_memory
         size = max(self.CHUNK_BYTES, (min_bytes + (2 << 20) - 1) & ~((2 << 20) - 1))
         check_host_memory(size, f"CPU MoE expert arena chunk {len(self.chunks)} "
                                 f"({(sum(len(c) for c in self.chunks) + size) >> 20} MiB in total)")
-        if self.shared:
+        if self.shared and os.name == "nt":
+            # Named pagefile-backed section, kept as a plain mmap (the object SharedMemory wraps;
+            # a SharedMemory owner's finalizer trips on the layer tensors' exports at worker exit).
+            # It charges commit up front and the parent page-locks every page, so both free
+            # physical RAM and commit headroom must cover the chunk: fail here rather than let
+            # the load thrash the pagefile or die in registration
+            index = len(self.chunks)
+            avail_phys, avail_commit = windows_memory_status()
+            if size > min(avail_phys, avail_commit):
+                raise RuntimeError(
+                    f"CPU MoE pinned arena: chunk {index} needs {size >> 20} MiB, but only "
+                    f"{avail_phys >> 20} MiB of physical RAM and {avail_commit >> 20} MiB of commit "
+                    f"are available. Free RAM, offload fewer experts, or unset EXL3_MOE_PINNED_ARENA.")
+            name = f"exl3_moe_arena_{os.getpid()}_{index}"
+            try:
+                m = mmap.mmap(-1, size, tagname = name)
+            except OSError as e:
+                raise RuntimeError(
+                    f"CPU MoE pinned arena: cannot create the {size >> 20} MiB section for chunk "
+                    f"{index} ({e.strerror}). Free RAM or commit, or unset EXL3_MOE_PINNED_ARENA.") from e
+            if self.conn is not None:
+                self.conn.send(("chunk", index, size, name))
+        elif self.shared:
             flags = 0
             if self.huge == "1g":
                 size = (size + (1 << 30) - 1) & ~((1 << 30) - 1)
@@ -193,7 +219,7 @@ class _HugeArena:
                 # acknowledgement byte, which would stall the worker's loading until the
                 # parent next pumps the pipe
                 import socket
-                self.conn.send(("chunk", len(self.chunks), size))
+                self.conn.send(("chunk", len(self.chunks), size, None))
                 with socket.socket(fileno = os.dup(self.conn.fileno())) as sock:
                     socket.send_fds(sock, [b"F"], [fd])
             os.close(fd)   # the mapping keeps the pages alive
@@ -466,6 +492,28 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             shm.close()
 
 
+def probe_bandwidth(timed_copy, floor_s = 0.5, cap_s = 2.0, asleep_gbs = 5.0):
+    """Sustained pinned->device rate in GB/s; `timed_copy()` performs one probe copy and returns
+    its rate. An idle PCIe link sits in a low power state (the Windows driver drops it to Gen1
+    after a few idle seconds) and retrains only under sustained traffic, 0.2-0.3 s on a gen4 x16
+    link, reading a perfectly stable Gen1 rate until then. So: copy for at least floor_s, then
+    until the last 8 copies sit within 5% of the best seen (steady state, no copy straddling the
+    retrain step), and keep pushing traffic up to cap_s while the rate still looks like a
+    sleeping link. Returns the median of the last 8 so one straddling copy cannot win."""
+    import time
+    t0 = time.perf_counter()
+    best, trace = 0.0, []
+    while True:
+        rate = timed_copy()
+        trace.append(rate)
+        best = max(best, rate)
+        t = time.perf_counter() - t0
+        tail = trace[-8:]
+        steady = len(tail) == 8 and min(tail) >= 0.95 * best
+        if t >= cap_s or (t >= floor_s and steady and best >= asleep_gbs):
+            return sorted(tail)[len(tail) // 2]
+
+
 class MoeCpuHost:
 
     def __init__(self, config):
@@ -542,34 +590,46 @@ class MoeCpuHost:
                 self.layer_blocks.append(msg[1] if len(msg) > 1 else None)
                 self.acked += 1
             elif msg[0] == "chunk":
-                self._attach_chunk(msg[1], msg[2])
+                self._attach_chunk(msg[1], msg[2], msg[3])
             return True
         if not self.proc.is_alive():
             raise RuntimeError("CPU MoE worker process died")
         return False
 
-    def _attach_chunk(self, index, size):
-        """Pinned arena: receive the descriptor of arena chunk `index` (sent right after the
-        ("chunk", ...) message), map it and page-lock the mapping for DMA. Registration is
-        done here, per chunk as it appears during loading, so its cost overlaps the rest of
-        the load instead of stacking up at startup."""
+    def _attach_chunk(self, index, size, name):
+        """Pinned arena: attach arena chunk `index` as published by the worker (Linux: the memfd
+        descriptor follows the ("chunk", ...) message; Windows: `name` is the worker's pagefile
+        section), map it and page-lock the mapping for DMA. Registration is done here, per chunk
+        as it appears during loading, so its cost overlaps the rest of the load instead of
+        stacking up at startup. The mapping is owned by the handler below from the moment it
+        is opened: any failure closes it before the error leaves this frame."""
         import mmap
         import socket
         assert index == len(self.arena_maps), "arena chunk published out of order"
-        with socket.socket(fileno = os.dup(self.conn.fileno())) as sock:
-            _, fds, _, _ = socket.recv_fds(sock, 1, 1)
-        assert len(fds) == 1, "arena chunk descriptor missing"
-        fd = fds[0]
+        if name is not None:
+            # Opening by name fails loudly if the worker already dropped the section
+            m = shared_memory.SharedMemory(name = name)
+        else:
+            with socket.socket(fileno = os.dup(self.conn.fileno())) as sock:
+                _, fds, _, _ = socket.recv_fds(sock, 1, 1)
+            assert len(fds) == 1, "arena chunk descriptor missing"
+            fd = fds[0]
+            try:
+                m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+            finally:
+                os.close(fd)
+        view = None
         try:
-            m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
-        finally:
-            os.close(fd)
-        view = torch.frombuffer(m, dtype = torch.int16)
-        try:
+            # count = size // 2: a section opened by name reports its page-rounded size, and
+            # frombuffer rejects a buffer shorter than the advertised chunk
+            view = torch.frombuffer(m.buf if name is not None else m, dtype = torch.int16,
+                                    count = size // 2)
             cuda_host_register(view.data_ptr(), size, flags = CUDA_HOST_REGISTER_PORTABLE)
         except Exception as e:
+            view = None   # no tensor over an unmapped region may survive in the traceback's frame
+            m.close()
             raise RuntimeError(
-                f"CPU MoE pinned arena: cudaHostRegister failed on a {size >> 20} MiB chunk "
+                f"CPU MoE pinned arena: chunk {index} ({size >> 20} MiB) could not be attached "
                 f"({e}). Unset EXL3_MOE_PINNED_ARENA to use the staged path.") from e
         self.arena_maps.append(m)
         self.arena_views.append(view)
@@ -1089,28 +1149,16 @@ class MoeCpuHost:
         # EXL3_MOE_STREAM_T overrides the scaling.
         probe = min(self.wslot_size, 16 << 20)
         ev0, ev1 = torch.cuda.Event(enable_timing = True), torch.cuda.Event(enable_timing = True)
-        bw = 0.0
+        def timed_copy():
+            ev0.record(st["copy_stream"])
+            st["vram_slots"][0][:probe // 2].copy_(self.wviews[0][:probe // 2], non_blocking = True)
+            ev1.record(st["copy_stream"])
+            ev1.synchronize()
+            return probe / (ev0.elapsed_time(ev1) * 1e-3) / 1e9   # GB/s
         with torch.cuda.stream(st["copy_stream"]):
-            # An idle PCIe link sits in a low power state (the Windows driver drops it to Gen1
-            # after a few idle seconds) and only retrains under sustained traffic, over a few
-            # hundred ms. Two warm-up copies would measure the sleeping link; warm it for a
-            # wall-clock budget, then take the best of several timed copies: streaming keeps
-            # the link awake, so the peak is the rate the break-even estimate should use
-            import time
-            t0 = time.perf_counter()
-            for _ in range(256):
-                st["vram_slots"][0][:probe // 2].copy_(self.wviews[0][:probe // 2],
-                                                       non_blocking = True)
-                st["copy_stream"].synchronize()
-                if time.perf_counter() - t0 > 0.25:
-                    break
-            for _ in range(8):
-                ev0.record(st["copy_stream"])
-                st["vram_slots"][0][:probe // 2].copy_(self.wviews[0][:probe // 2],
-                                                       non_blocking = True)
-                ev1.record(st["copy_stream"])
-                ev1.synchronize()
-                bw = max(bw, probe / (ev0.elapsed_time(ev1) * 1e-3) / 1e9)   # GB/s
+            # Streaming keeps the link awake, so the sustained awake rate is what the break-even
+            # estimate should use (see probe_bandwidth for the sleeping-link handling)
+            bw = probe_bandwidth(timed_copy)
         st["bw"] = bw
         if TUNING.stream_t_explicit:
             st["stream_t"] = self.stream_t
@@ -1614,7 +1662,7 @@ class MoeCpuHost:
             import gc
             gc.collect()
         # Pinned arena mappings: unpin, drop the views, unmap. The pages themselves die with
-        # the worker (memfd, no name to unlink)
+        # the worker (memfd, no name to unlink; a Windows section goes with its last handle)
         for view in self.arena_views:
             try:
                 cuda_host_unregister(view.data_ptr())

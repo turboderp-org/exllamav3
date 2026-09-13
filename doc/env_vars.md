@@ -242,8 +242,10 @@ models with many small experts (see issue trace on Qwen3.6-35B-A3B).
 Minimum per-expert token-assignment count (in a prefill chunk) for an expert's weights to be
 streamed to the GPU instead of computed on the CPU tail. Unset, the effective threshold scales
 inversely with the measured pinned→device bandwidth (probed once per device): a chipset-attached
-x4 link needs a much hotter expert to justify the weight DMA than a CPU-direct x16 one. Setting
-this explicitly pins the threshold on every device and disables the bandwidth scaling.
+x4 link needs a much hotter expert to justify the weight DMA than a CPU-direct x16 one. The probe
+keeps traffic on the link for at least 0.5 s and until the rate is steady, since an idle link sits
+at Gen1 and retrains only after a few hundred ms of sustained traffic. Setting this explicitly
+pins the threshold on every device and disables the bandwidth scaling.
 
 ### `EXL3_MOE_STREAM_FUSED_T` (default: `256`)
 
@@ -385,19 +387,22 @@ models is reproducible as well.
 
 ### `EXL3_MOE_PINNED_ARENA` (default: `0`, experimental)
 
-Linux only. Back the CPU worker's expert-weight arena with `memfd` chunks that the parent
-process also maps and page-locks (`cudaHostRegister`), and lay each expert's gate/up/down
-trellis tensors out as one contiguous block. Streamed prefill (`EXL3_MOE_STREAM_T`) then DMAs
-an expert's block straight out of the arena on the copy stream instead of having the worker's
-stager thread memcpy it into the pinned handoff ring first; the stager is the prefill
-bottleneck on fully offloaded models (mistral-small-4 119B, 54 GiB of experts: 4k-token
-prefill 700 -> 1850 tok/s on a gen5 x16 link, decode unchanged within noise). Costs: the
-descriptors are passed over the worker pipe and every chunk is registered with CUDA as it
-appears (~0.2 s per GiB, overlapping the load), the arena pages are shared memory
-(`Shmem` in `/proc/meminfo`, counted in both processes' RSS), and shmem pages only get
-transparent huge pages where `/sys/kernel/mm/transparent_hugepage/shmem_enabled` allows it
-(`advise`, `within_size` or `always`; on the default `never` the CPU kernels run on 4K pages,
-which cost a few percent of decode on some hosts). Not available on Windows.
+Back the CPU worker's expert-weight arena with shared chunks that the parent process also maps
+and page-locks (`cudaHostRegister`), and lay each expert's gate/up/down trellis tensors out as
+one contiguous block. Streamed prefill (`EXL3_MOE_STREAM_T`) then DMAs an expert's block
+straight out of the arena on the copy stream instead of having the worker's stager thread
+memcpy it into the pinned handoff ring first; the stager is the prefill bottleneck on fully
+offloaded models (mistral-small-4 119B, 54 GiB of experts: 4k-token prefill 700 -> 1850 tok/s
+on a gen5 x16 link, decode unchanged within noise). Costs: every chunk is registered with CUDA
+as it appears (~0.2 s per GiB, overlapping the load) and the arena is shared memory counted in
+both processes' RSS. On Linux the chunks are `memfd`s passed over the worker pipe; shmem pages
+only get transparent huge pages where `/sys/kernel/mm/transparent_hugepage/shmem_enabled`
+allows it (`advise`, `within_size` or `always`; on the default `never` the CPU kernels run on
+4K pages, which cost a few percent of decode on some hosts). On Windows the chunks are named
+pagefile-backed sections opened by name, always on 4K pages; each chunk must fit both the free
+physical RAM and the commit headroom at the time it is created or the load fails with a
+message naming the chunk, since page-locked memory cannot be paged out and a section short of
+commit fails at creation.
 
 ### `EXL3_HOST_MEM_RESERVE_MB` (default: `2048`)
 
@@ -411,10 +416,10 @@ all. `0` disables the check.
 
 ### `EXL3_MOE_ARENA_HUGE` (default: unset)
 
-With `EXL3_MOE_PINNED_ARENA=1`: `2m` or `1g` backs the memfd chunks with hugetlbfs pages
-(`MFD_HUGETLB`) of that size instead of shmem. Requires reserved huge pages
+Linux only. With `EXL3_MOE_PINNED_ARENA=1`: `2m` or `1g` backs the memfd chunks with hugetlbfs
+pages (`MFD_HUGETLB`) of that size instead of shmem. Requires reserved huge pages
 (`vm.nr_hugepages`, or `hugepages-1048576kB` for `1g`) covering the whole arena; allocation
-fails with a clear error otherwise.
+fails with a clear error otherwise. Rejected on Windows.
 
 ### `EXL3_MOE_MTILE` (default: `1`)
 

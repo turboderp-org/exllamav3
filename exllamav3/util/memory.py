@@ -597,3 +597,19 @@ def check_host_memory(nbytes: int, what: str):
             f"in host memory (fewer offloaded experts, no --ngram_ram, ...) or set "
             f"EXL3_HOST_MEM_RESERVE_MB=0 to skip this check."
         )
+
+
+def windows_memory_status() -> tuple[int, int]:
+    """(available physical bytes, available commit bytes) from GlobalMemoryStatusEx"""
+    import ctypes
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                    ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+    status = MEMORYSTATUSEX(dwLength = ctypes.sizeof(MEMORYSTATUSEX))
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+    if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return status.ullAvailPhys, status.ullAvailPageFile
