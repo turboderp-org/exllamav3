@@ -54,7 +54,12 @@ def set_memory_fraction_use(
     touch_device(device)
     total = torch.cuda.get_device_properties(device).total_memory
     current = torch.cuda.memory_reserved(device)
-    fraction = min((current + use) / total, 1.0)
+    # The budget cannot exceed what the device can still give: a split value at or above the
+    # card's size would otherwise plan against memory the CUDA context and other processes
+    # already hold, and the loader's headroom check would pass loads that fail at the first
+    # real forward
+    free, _ = torch.cuda.mem_get_info(device)
+    fraction = min((current + min(use, free)) / total, 1.0)
     torch.cuda.set_per_process_memory_fraction(fraction, device = device)
     return int(fraction * total)
 
@@ -555,3 +560,40 @@ def format_vram_report(reports: list[VRAMDeviceReport], color: bool = True, unit
             row(label, sum(getattr(r, attr) for r in reports), "bold" if label.startswith(("torch", "device")) else None, key = attr)
         lines.append("")
     return "\n".join(lines)
+
+
+# Host (system) memory guard for large CPU allocations. EXL3_HOST_MEM_RESERVE_MB (default 2048) is
+# kept free on top of the request; 0 disables the check.
+def host_memory_available() -> int | None:
+    """Bytes of host memory the kernel considers available, None when unknown"""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def check_host_memory(nbytes: int, what: str):
+    """Raise before allocating `nbytes` of host memory when it would leave the system with less
+    than the configured reserve"""
+    import os
+    reserve_mb = int(os.environ.get("EXL3_HOST_MEM_RESERVE_MB", 2048))
+    if reserve_mb <= 0:
+        return
+    avail = host_memory_available()
+    if avail is None:
+        return
+    if nbytes + (reserve_mb << 20) > avail:
+        raise RuntimeError(
+            f"{what} needs {nbytes >> 20} MiB of host memory, but only {avail >> 20} MiB is available "
+            f"and EXL3_HOST_MEM_RESERVE_MB = {reserve_mb} MiB is kept free. Lower the amount of data held "
+            f"in host memory (fewer offloaded experts, no --ngram_ram, ...) or set "
+            f"EXL3_HOST_MEM_RESERVE_MB=0 to skip this check."
+        )

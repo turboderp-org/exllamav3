@@ -195,7 +195,7 @@ class LinearEXL3:
                 ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
             else:
                 ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
-            ext.hgemm(xh, w, y_)
+            ext.hgemm_recon(xh, w, y_)
         else:
             numel_ = self.in_features * MAX_RECONSTRUCT_SLICE_N
             w_ = torch.empty((numel_,), dtype = torch.half, device = self.trellis.device)
@@ -208,7 +208,7 @@ class LinearEXL3:
                         w, self.trellis, self.suh, self.svh[n_start:], self.K, self.mcg, self.mul1, n_start)
                 else:
                     ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
-                ext.hgemm(xh, w, y_[:, n_start:n_end])
+                ext.hgemm_recon(xh, w, y_[:, n_start:n_end])
 
         if not use_fused:
             ext.had_r_128(y_, y_, None, self.svh, 1.0)

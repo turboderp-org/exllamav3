@@ -30,6 +30,7 @@
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include "quant/exl3_moe.cuh"
+#include "quant/exl3_moe_coop.cuh"
 
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
@@ -135,6 +136,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
+    m.def("quantize_tiles_scratch", &quantize_tiles_scratch, "quantize_tiles_scratch");
     m.def("test_distribution", &test_distribution, "test_distribution");
     m.def("decode", &decode, "decode");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
@@ -142,8 +144,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pack_signs", &pack_signs, "pack_signs");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
+    m.def("reconstruct_had_batch", &reconstruct_had_batch, "reconstruct_had_batch");
+    m.def("reconstruct_batch", &reconstruct_batch, "reconstruct_batch");
     m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("had_r_128", &had_r_128, "had_r_128");
+    m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
@@ -174,6 +179,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("num_tokens") = 1, py::arg("size_n_list") = py::none(), py::arg("c_ptrs") = py::none(),
           py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0);
     m.def("hgemm", &hgemm, "hgemm");
+    m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
+    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
+    m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
+    m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
@@ -246,6 +255,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
+    m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
+    m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");
     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");

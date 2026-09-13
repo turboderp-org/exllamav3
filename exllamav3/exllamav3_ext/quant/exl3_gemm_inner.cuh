@@ -19,6 +19,11 @@
     #define EXL3_GEMM_H_ACC 0
 #endif
 
+// TILESIZE_M == 16 is the dense / decode shape: one m16 row fragment, A fragments double-buffered
+// across the fragment stages (codegen unchanged by the multi-row support below). TILESIZE_M > 16
+// is the fused-MoE prefill shape (32 / 64 rows per tile): TILEBLOCKS_M row fragments share each
+// dequantized B fragment instead of re-running the whole B pipeline per 16 rows, with A
+// single-buffered so the row fragments fit alongside the prefetched B fragments.
 template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
 inline __device__
 void exl3_gemm_kernel_inner
@@ -48,7 +53,7 @@ void exl3_gemm_kernel_inner
     const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;   // in uint16s
     const int sh_c_size = MAX  // in floats
     (
-        4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP,
+        4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP * TILEBLOCKS_M,
         shmem_out_had ? TILESIZE_N * TILESIZE_M : 0
     );
 
@@ -60,7 +65,7 @@ void exl3_gemm_kernel_inner
 
     // Sanity checks
     static_assert(EXL3_GEMM_BASE_THREADS == 256);
-    static_assert(TILESIZE_M == 16, "Invalid kernel params");                     // strictly assume size_m <= 16
+    static_assert(TILESIZE_M >= 16 && TILESIZE_M % 16 == 0, "Invalid kernel params");
     static_assert(TILESIZE_K % 16 == 0, "Invalid kernel params");
     static_assert(TILESIZE_N % 128 == 0, "Invalid kernel params");
     static_assert
@@ -205,11 +210,14 @@ void exl3_gemm_kernel_inner
     half* gl_c_ptr_16 = ((half*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
     float* gl_c_ptr_32 = ((float*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
 
-    register FragA frag_a[FRAG_STAGES];
+    // TILEBLOCKS_M == 1 (dense / decode): A fragments double-buffered across the fragment stages,
+    // as before. TILEBLOCKS_M > 1 (fused MoE prefill tiles): one A fragment per 16-row block,
+    // single-buffered, so the row fragments fit alongside the prefetched B fragments
+    register FragA frag_a[TILEBLOCKS_M == 1 ? FRAG_STAGES : TILEBLOCKS_M];
     register FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
-    register FragC frag_c[FRAGS_N_PER_WARP];
+    register FragC frag_c[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #if EXL3_GEMM_H_ACC
-        register FragC_h frag_c_h[FRAGS_N_PER_WARP];
+        register FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #endif
 
     auto advance2 = [&] ()
@@ -285,7 +293,7 @@ void exl3_gemm_kernel_inner
             {
                 int R = r + m * 16;
                 int c_swizzled = base_c ^ ((R >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
-                ldsm4(frag_a[buf], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
+                ldsm4(frag_a[TILEBLOCKS_M == 1 ? buf : m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
             }
         }
 
@@ -306,14 +314,32 @@ void exl3_gemm_kernel_inner
     // Clear C fragments
     auto clear_frag_c = [&] ()
     {
-        #pragma unroll
-        for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
-            frag_c[n] = {};
-        #if EXL3_GEMM_H_ACC
+        if constexpr (TILEBLOCKS_M == 1)
+        {
             #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
-                frag_c_h[n] = {};
-        #endif
+                frag_c[0][n] = {};
+            #if EXL3_GEMM_H_ACC
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                    frag_c_h[0][n] = {};
+            #endif
+        }
+        else
+        {
+            #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                    frag_c[m][n] = {};
+            #if EXL3_GEMM_H_ACC
+                #pragma unroll
+                for (int m = 0; m < TILEBLOCKS_M; ++m)
+                    #pragma unroll
+                    for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                        frag_c_h[m][n] = {};
+            #endif
+        }
     };
 
     // Threadblock reduction
@@ -323,12 +349,27 @@ void exl3_gemm_kernel_inner
         {
             if (sub_k == i)
             {
-                float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
-                #pragma unroll
-                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                if constexpr (TILEBLOCKS_M == 1)
                 {
+                    float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
                     #pragma unroll
-                    for (int j = 0; j < 4; ++j) *sh_red++ = frag_c[n][j];
+                    for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                    {
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) *sh_red++ = frag_c[0][n][j];
+                    }
+                }
+                else
+                {
+                    float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4 * TILEBLOCKS_M) * t;
+                    #pragma unroll
+                    for (int m = 0; m < TILEBLOCKS_M; ++m)
+                        #pragma unroll
+                        for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                        {
+                            #pragma unroll
+                            for (int j = 0; j < 4; ++j) *sh_red++ = frag_c[m][n][j];
+                        }
                 }
             }
             __syncthreads();
@@ -338,41 +379,99 @@ void exl3_gemm_kernel_inner
         {
             if (sub_k == i)
             {
-                float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
-                #pragma unroll
-                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                if constexpr (TILEBLOCKS_M == 1)
                 {
+                    float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
                     #pragma unroll
-                    for (int j = 0; j < 4; ++j) frag_c[n][j] += *sh_red++;
+                    for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                    {
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) frag_c[0][n][j] += *sh_red++;
+                    }
+                }
+                else
+                {
+                    float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4 * TILEBLOCKS_M) * t;
+                    #pragma unroll
+                    for (int m = 0; m < TILEBLOCKS_M; ++m)
+                        #pragma unroll
+                        for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                        {
+                            #pragma unroll
+                            for (int j = 0; j < 4; ++j) frag_c[m][n][j] += *sh_red++;
+                        }
                 }
             }
         };
 
         auto store_small = [&] (int i)
         {
-            if (sub_k == i && lane_id / 4 < size_m)
+            if constexpr (TILEBLOCKS_M == 1)
             {
-                float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
-                #pragma unroll
-                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                if (sub_k == i && lane_id / 4 < size_m)
                 {
-                    *sh_red++ = frag_c[n][0];
-                    *sh_red++ = frag_c[n][1];
+                    float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
+                    #pragma unroll
+                    for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                    {
+                        *sh_red++ = frag_c[0][n][0];
+                        *sh_red++ = frag_c[0][n][1];
+                    }
                 }
+                __syncthreads();
             }
-            __syncthreads();
+            else
+            {
+                if (sub_k == i)
+                {
+                    float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4 * TILEBLOCKS_M) * t;
+                    #pragma unroll
+                    for (int m = 0; m < TILEBLOCKS_M; ++m)
+                    {
+                        bool row_ok = (m * 16 + lane_id / 4) < size_m;
+                        #pragma unroll
+                        for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                        {
+                            if (row_ok) { *sh_red = frag_c[m][n][0]; *(sh_red + 1) = frag_c[m][n][1]; }
+                            sh_red += 2;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
         };
 
         auto add_small = [&] (int i)
         {
-            if (sub_k == i && lane_id / 4 < size_m)
+            if constexpr (TILEBLOCKS_M == 1)
             {
-                float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
-                #pragma unroll
-                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                if (sub_k == i && lane_id / 4 < size_m)
                 {
-                    frag_c[n][0] += *sh_red++;
-                    frag_c[n][1] += *sh_red++;
+                    float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4) * t;
+                    #pragma unroll
+                    for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                    {
+                        frag_c[0][n][0] += *sh_red++;
+                        frag_c[0][n][1] += *sh_red++;
+                    }
+                }
+            }
+            else
+            {
+                if (sub_k == i)
+                {
+                    float* sh_red = sh_c + (FRAGS_N_PER_WARP * 4 * TILEBLOCKS_M) * t;
+                    #pragma unroll
+                    for (int m = 0; m < TILEBLOCKS_M; ++m)
+                    {
+                        bool row_ok = (m * 16 + lane_id / 4) < size_m;
+                        #pragma unroll
+                        for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                        {
+                            if (row_ok) { frag_c[m][n][0] += *sh_red; frag_c[m][n][1] += *(sh_red + 1); }
+                            sh_red += 2;
+                        }
+                    }
                 }
             }
         };
@@ -431,28 +530,62 @@ void exl3_gemm_kernel_inner
     auto write_sum_tile_sh = [&]()
     {
         const int n0 = warp_id * FRAGS_N_PER_WARP;
-        const int r0 = lane_id / 4;
-        const int r1 = r0 + 8;
-        if (r0 < size_m)
+        if constexpr (TILEBLOCKS_M == 1)
         {
-            const int c = (lane_id % 4) * 2;
-            #pragma unroll
-            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+            const int r0 = lane_id / 4;
+            const int r1 = r0 + 8;
+            if (r0 < size_m)
             {
-                float* c_ptr = ((float*) sh_c) + r0 * TILESIZE_N + (n0 + n) * 8 + c;
-                *c_ptr++ = frag_c[n][0];
-                *c_ptr++ = frag_c[n][1];
+                const int c = (lane_id % 4) * 2;
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                {
+                    float* c_ptr = ((float*) sh_c) + r0 * TILESIZE_N + (n0 + n) * 8 + c;
+                    *c_ptr++ = frag_c[0][n][0];
+                    *c_ptr++ = frag_c[0][n][1];
+                }
+            }
+            if (r1 < size_m)
+            {
+                const int c = (lane_id % 4) * 2;
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                {
+                    float* c_ptr = ((float*) sh_c) + r1 * TILESIZE_N + (n0 + n) * 8 + c;
+                    *c_ptr++ = frag_c[0][n][2];
+                    *c_ptr++ = frag_c[0][n][3];
+                }
             }
         }
-        if (r1 < size_m)
+        else
         {
-            const int c = (lane_id % 4) * 2;
             #pragma unroll
-            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
             {
-                float* c_ptr = ((float*) sh_c) + r1 * TILESIZE_N + (n0 + n) * 8 + c;
-                *c_ptr++ = frag_c[n][2];
-                *c_ptr++ = frag_c[n][3];
+                const int r0 = m * 16 + lane_id / 4;
+                const int r1 = r0 + 8;
+                if (r0 < size_m)
+                {
+                    const int c = (lane_id % 4) * 2;
+                    #pragma unroll
+                    for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                    {
+                        float* c_ptr = ((float*) sh_c) + r0 * TILESIZE_N + (n0 + n) * 8 + c;
+                        *c_ptr++ = frag_c[m][n][0];
+                        *c_ptr++ = frag_c[m][n][1];
+                    }
+                }
+                if (r1 < size_m)
+                {
+                    const int c = (lane_id % 4) * 2;
+                    #pragma unroll
+                    for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                    {
+                        float* c_ptr = ((float*) sh_c) + r1 * TILESIZE_N + (n0 + n) * 8 + c;
+                        *c_ptr++ = frag_c[m][n][2];
+                        *c_ptr++ = frag_c[m][n][3];
+                    }
+                }
             }
         }
     };
@@ -487,86 +620,178 @@ void exl3_gemm_kernel_inner
     auto read_sum_gl = [&]()
     {
         int n0 = warp_id * FRAGS_N_PER_WARP;
-        #pragma unroll
-        for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+        if constexpr (TILEBLOCKS_M == 1)
         {
-            int r0 = lane_id / 4;
-            int r1 = r0 + 8;
-            int c = (lane_id % 4) * 2;
-            if (r0 < size_m)
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             {
-                if constexpr (c_fp32)
+                int r0 = lane_id / 4;
+                int r1 = r0 + 8;
+                int c = (lane_id % 4) * 2;
+                if (r0 < size_m)
                 {
-                    float* c_ptr = gl_c_ptr_32 + r0 * size_n_stride + (n0 + n) * 8 + c;
-                    frag_c[n][0] += *c_ptr++;
-                    frag_c[n][1] += *c_ptr++;
+                    if constexpr (c_fp32)
+                    {
+                        float* c_ptr = gl_c_ptr_32 + r0 * size_n_stride + (n0 + n) * 8 + c;
+                        frag_c[0][n][0] += *c_ptr++;
+                        frag_c[0][n][1] += *c_ptr++;
+                    }
+                    else
+                    {
+                        half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
+                        float2 interm = __half22float2(*c_ptr);
+                        frag_c[0][n][0] += interm.x;
+                        frag_c[0][n][1] += interm.y;
+                    }
                 }
-                else
+                if (r1 < size_m)
                 {
-                    half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
-                    float2 interm = __half22float2(*c_ptr);
-                    frag_c[n][0] += interm.x;
-                    frag_c[n][1] += interm.y;
+                    if constexpr (c_fp32)
+                    {
+                        float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
+                        frag_c[0][n][2] += *c_ptr++;
+                        frag_c[0][n][3] += *c_ptr++;
+                    }
+                    else
+                    {
+                        half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n_stride + (n0 + n) * 8 + c);
+                        float2 interm = __half22float2(*c_ptr);
+                        frag_c[0][n][2] += interm.x;
+                        frag_c[0][n][3] += interm.y;
+                    }
                 }
             }
-            if (r1 < size_m)
-            {
-                if constexpr (c_fp32)
+        }
+        else
+        {
+            #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
-                    float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
-                    frag_c[n][2] += *c_ptr++;
-                    frag_c[n][3] += *c_ptr++;
+                    int r0 = m * 16 + lane_id / 4;
+                    int r1 = r0 + 8;
+                    int c = (lane_id % 4) * 2;
+                    if (r0 < size_m)
+                    {
+                        if constexpr (c_fp32)
+                        {
+                            float* c_ptr = gl_c_ptr_32 + r0 * size_n_stride + (n0 + n) * 8 + c;
+                            frag_c[m][n][0] += *c_ptr++;
+                            frag_c[m][n][1] += *c_ptr++;
+                        }
+                        else
+                        {
+                            half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
+                            float2 interm = __half22float2(*c_ptr);
+                            frag_c[m][n][0] += interm.x;
+                            frag_c[m][n][1] += interm.y;
+                        }
+                    }
+                    if (r1 < size_m)
+                    {
+                        if constexpr (c_fp32)
+                        {
+                            float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
+                            frag_c[m][n][2] += *c_ptr++;
+                            frag_c[m][n][3] += *c_ptr++;
+                        }
+                        else
+                        {
+                            half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n_stride + (n0 + n) * 8 + c);
+                            float2 interm = __half22float2(*c_ptr);
+                            frag_c[m][n][2] += interm.x;
+                            frag_c[m][n][3] += interm.y;
+                        }
+                    }
                 }
-                else
-                {
-                    half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n_stride + (n0 + n) * 8 + c);
-                    float2 interm = __half22float2(*c_ptr);
-                    frag_c[n][2] += interm.x;
-                    frag_c[n][3] += interm.y;
-                }
-            }
         }
     };
 
     auto write_sum_gl = [&]()
     {
         int n0 = warp_id * FRAGS_N_PER_WARP;
-        #pragma unroll
-        for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+        if constexpr (TILEBLOCKS_M == 1)
         {
-            int r0 = lane_id / 4;
-            int r1 = r0 + 8;
-            int c = (lane_id % 4) * 2;
-            if (r0 < size_m)
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
             {
-                if constexpr (c_fp32)
+                int r0 = lane_id / 4;
+                int r1 = r0 + 8;
+                int c = (lane_id % 4) * 2;
+                if (r0 < size_m)
                 {
-                    float* c_ptr = gl_c_ptr_32 + r0 * size_n_stride + (n0 + n) * 8 + c;
-                    *c_ptr++ = frag_c[n][0];
-                    *c_ptr++ = frag_c[n][1];
+                    if constexpr (c_fp32)
+                    {
+                        float* c_ptr = gl_c_ptr_32 + r0 * size_n_stride + (n0 + n) * 8 + c;
+                        *c_ptr++ = frag_c[0][n][0];
+                        *c_ptr++ = frag_c[0][n][1];
+                    }
+                    else
+                    {
+                        half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
+                        half2 sum = __floats2half2_rn(frag_c[0][n][0], frag_c[0][n][1]);
+                        *c_ptr = sum;
+                    }
                 }
-                else
+                if (r1 < size_m)
                 {
-                    half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
-                    half2 sum = __floats2half2_rn(frag_c[n][0], frag_c[n][1]);
-                    *c_ptr = sum;
+                    if constexpr (c_fp32)
+                    {
+                        float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
+                        *c_ptr++ = frag_c[0][n][2];
+                        *c_ptr++ = frag_c[0][n][3];
+                    }
+                    else
+                    {
+                        half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n_stride + (n0 + n) * 8 + c);
+                        half2 sum = __floats2half2_rn(frag_c[0][n][2], frag_c[0][n][3]);
+                        *c_ptr = sum;
+                    }
                 }
             }
-            if (r1 < size_m)
-            {
-                if constexpr (c_fp32)
+        }
+        else
+        {
+            #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
                 {
-                    float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
-                    *c_ptr++ = frag_c[n][2];
-                    *c_ptr++ = frag_c[n][3];
+                    int r0 = m * 16 + lane_id / 4;
+                    int r1 = r0 + 8;
+                    int c = (lane_id % 4) * 2;
+                    if (r0 < size_m)
+                    {
+                        if constexpr (c_fp32)
+                        {
+                            float* c_ptr = gl_c_ptr_32 + r0 * size_n_stride + (n0 + n) * 8 + c;
+                            *c_ptr++ = frag_c[m][n][0];
+                            *c_ptr++ = frag_c[m][n][1];
+                        }
+                        else
+                        {
+                            half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
+                            half2 sum = __floats2half2_rn(frag_c[m][n][0], frag_c[m][n][1]);
+                            *c_ptr = sum;
+                        }
+                    }
+                    if (r1 < size_m)
+                    {
+                        if constexpr (c_fp32)
+                        {
+                            float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
+                            *c_ptr++ = frag_c[m][n][2];
+                            *c_ptr++ = frag_c[m][n][3];
+                        }
+                        else
+                        {
+                            half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n_stride + (n0 + n) * 8 + c);
+                            half2 sum = __floats2half2_rn(frag_c[m][n][2], frag_c[m][n][3]);
+                            *c_ptr = sum;
+                        }
+                    }
                 }
-                else
-                {
-                    half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n_stride + (n0 + n) * 8 + c);
-                    half2 sum = __floats2half2_rn(frag_c[n][2], frag_c[n][3]);
-                    *c_ptr = sum;
-                }
-            }
         }
     };
 
@@ -575,13 +800,29 @@ void exl3_gemm_kernel_inner
     {
         #if EXL3_GEMM_H_ACC
             // Fold the fp16 MMA accumulators into the fp32 accumulators once per k-slice
-            #pragma unroll
-            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+            if constexpr (TILEBLOCKS_M == 1)
             {
-                float2 f0 = __half22float2(frag_c_h[n][0]);
-                float2 f1 = __half22float2(frag_c_h[n][1]);
-                frag_c[n][0] += f0.x; frag_c[n][1] += f0.y;
-                frag_c[n][2] += f1.x; frag_c[n][3] += f1.y;
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                {
+                    float2 f0 = __half22float2(frag_c_h[0][n][0]);
+                    float2 f1 = __half22float2(frag_c_h[0][n][1]);
+                    frag_c[0][n][0] += f0.x; frag_c[0][n][1] += f0.y;
+                    frag_c[0][n][2] += f1.x; frag_c[0][n][3] += f1.y;
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int m = 0; m < TILEBLOCKS_M; ++m)
+                    #pragma unroll
+                    for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                    {
+                        float2 f0 = __half22float2(frag_c_h[m][n][0]);
+                        float2 f1 = __half22float2(frag_c_h[m][n][1]);
+                        frag_c[m][n][0] += f0.x; frag_c[m][n][1] += f0.y;
+                        frag_c[m][n][2] += f1.x; frag_c[m][n][3] += f1.y;
+                    }
             }
         #endif
 
@@ -642,14 +883,31 @@ void exl3_gemm_kernel_inner
     // Perform tensor core matmul on current tile
     auto matmul = [&] (int buf)
     {
-        #pragma unroll
-        for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+        if constexpr (TILEBLOCKS_M == 1)
         {
-            #if EXL3_GEMM_H_ACC
-                ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c_h[n]);
-            #else
-                ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c[n]);
-            #endif
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+            {
+                #if EXL3_GEMM_H_ACC
+                    ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c_h[0][n]);
+                #else
+                    ptx_mma_m16n8k16(frag_a[buf], frag_b[buf][n], frag_c[0][n]);
+                #endif
+            }
+        }
+        else
+        {
+            #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
+                #pragma unroll
+                for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+                {
+                    #if EXL3_GEMM_H_ACC
+                        ptx_mma_m16n8k16(frag_a[m], frag_b[buf][n], frag_c_h[m][n]);
+                    #else
+                        ptx_mma_m16n8k16(frag_a[m], frag_b[buf][n], frag_c[m][n]);
+                    #endif
+                }
         }
     };
 

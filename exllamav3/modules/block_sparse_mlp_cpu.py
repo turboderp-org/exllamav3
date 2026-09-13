@@ -137,6 +137,14 @@ class BlockSparseMLP_CPU:
         split_layers = int(os.environ.get("EXL3_MOE_CPU_SPLIT_LAYERS", 0))
         if split_layers and getattr(ip, "moe_cpu_split_assigned", 0) >= split_layers:
             split_k = 0
+        # The split keeps at least one expert on the GPU (the module's GPU slice cannot be
+        # empty); a larger request is capped rather than silently turning the split off
+        if split_k >= self.num_experts > 1:
+            if not getattr(ip, "moe_cpu_split_capped", False):
+                ip.moe_cpu_split_capped = True
+                print(f" !! --moe_cpu_split {split_k} exceeds the {self.num_experts} routed experts per layer, "
+                      f"capped to {self.num_experts - 1} (use --moe_cpu_offload to move whole layers)")
+            split_k = self.num_experts - 1
         if (
             0 < split_k < self.num_experts and
             self.cpu_split_first is None and
@@ -257,18 +265,18 @@ class BlockSparseMLP_CPU:
             buf[:n], self.cpu_split_first)
         return sel_cpu
 
-    def cpu_offload_forward(self, x, y, selected_experts, routing_weights, params):
-        """Whole-layer offload: the routed sum comes entirely from the worker. The autosplit
-        measuring forward only observes VRAM allocation, which the CPU compute cannot
-        affect, so it skips the (slow, full-chunk) host pass and just allocates the
-        output."""
+    def cpu_offload_forward(self, shape, y, selected_experts, routing_weights, params):
+        """Whole-layer offload: the routed sum (of the given shape) comes entirely from the
+        worker. The autosplit measuring forward only observes VRAM allocation, which the CPU
+        compute cannot affect, so it skips the (slow, full-chunk) host pass and just allocates
+        the output."""
         if params.get("autosplit_measure"):
-            return torch.zeros_like(y, dtype = torch.float).reshape(x.shape)
+            return torch.zeros_like(y, dtype = torch.float).reshape(shape)
         return self.cpu_host.submit_prefill(
             self.cpu_layer_idx, y, selected_experts, routing_weights
-        ).reshape(x.shape)
+        ).reshape(shape)
 
-    def cpu_split_combine(self, final_hidden_states, cpu_partial, cpu_pending, x):
+    def cpu_split_combine(self, final_hidden_states, cpu_partial, cpu_pending, shape):
         """Fold the CPU tail partial into the routed sum (stream-ordered: the collect
         enqueues a flag wait ahead of the readback, so the add consumes the worker's output
         exactly when it is ready). Fused handles add in place straight from the pinned slot
@@ -284,7 +292,7 @@ class BlockSparseMLP_CPU:
                 return final_hidden_states
             cpu_partial = self.cpu_host.submit_collect(cpu_pending)
         if cpu_partial is not None:
-            final_hidden_states = final_hidden_states + cpu_partial.view(x.shape)
+            final_hidden_states = final_hidden_states + cpu_partial.view(shape)
         return final_hidden_states
 
     @override

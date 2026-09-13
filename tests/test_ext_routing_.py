@@ -1,9 +1,10 @@
 """
 Reference tests for the MoE routing kernels (routing.cu): top-K selection and weight normalization for the
 std-softmax and DS3/DSv4 (sigmoid / sqrt-softplus, optional selection bias) routers, both the iterative
-top-K kernels and the radix-sort variants, over the whole (num_experts, K) range. Inputs are tie-free by
-construction so the selected set is unambiguous. Many rows per launch so the multi-warp merge stages run
-concurrently across blocks (the merge stages had shared-memory read/write races without a barrier).
+top-K kernels (K up to 32) and the radix-sort variants (K up to 16), over the whole (num_experts, K)
+range. Inputs are tie-free by construction so the selected set is unambiguous. Many rows per launch so
+the multi-warp merge stages run concurrently across blocks (the merge stages had shared-memory
+read/write races without a barrier).
 """
 import sys, os
 import pytest
@@ -14,7 +15,9 @@ from exllamav3.ext import exllamav3_ext as ext
 
 device = "cuda:0"
 ROWS = 1024
-CONFIGS = [(e, k) for e in (32, 64, 96, 128, 160, 256, 384, 512) for k in (1, 2, 4, 6, 8, 10, 16) if k <= e]
+CONFIGS = [(e, k) for e in (32, 64, 96, 128, 160, 256, 384, 512) for k in (1, 2, 4, 6, 8, 10, 16, 20, 22, 24, 32) if k <= e]
+# The radix-sort variants keep K of every 32 candidates per merge stage, which stops converging past K = 16
+CONFIGS_RADIX = [(e, k) for e, k in CONFIGS if k <= 16]
 
 
 def tie_free_scores(rows, num_experts, gen):
@@ -68,7 +71,7 @@ def ref_ds3(scores, K, bias, scaling, act):
 @pytest.mark.parametrize("scaled", [False, True])
 def test_routing_std(use_topk, scaled):
     gen = torch.Generator().manual_seed(1)
-    for E, K in CONFIGS:
+    for E, K in (CONFIGS if use_topk else CONFIGS_RADIX):
         for it in range(6):
             scores = tie_free_scores(ROWS, E, gen)
             pes = (torch.rand(E, generator = gen) + 0.5).bfloat16().to(device) if scaled else None
@@ -97,7 +100,7 @@ def test_routing_ds3_topk(act, with_bias):
 @pytest.mark.parametrize("act", [0, 1])
 def test_routing_ds3_radix_no_bias(act):
     gen = torch.Generator().manual_seed(3)
-    for E, K in CONFIGS:
+    for E, K in CONFIGS_RADIX:
         scores = tie_free_scores(ROWS, E, gen)
         idx = torch.empty((ROWS, K), dtype = torch.long, device = device)
         w = torch.empty((ROWS, K), dtype = torch.half, device = device)

@@ -19,6 +19,19 @@ int exl3_moe_max_concurrency(int device)
 
 std::set<void*> moe_kernel_attr_set[MAX_DEVICES] = {};
 
+// EXL3_MOE_TILE_N=128 keeps the N = 128 tile shape for dims that are multiples of 256 (which
+// otherwise take the N = 256 instances); 0 / unset = automatic
+static int moe_tile_n_override()
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char* e = getenv("EXL3_MOE_TILE_N");
+        v = e ? atoi(e) : 0;
+    }
+    return v;
+}
+
 fp_exl3_moe_kernel exl3_moe_kernel_instances[] =
 {
     // [K][cb - 1][N_off]: K = 0 switches Kg/Ku/Kd at runtime, K > 0 = compile-time Kg = Ku = Kd
@@ -31,6 +44,22 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances[] =
     exl3_moe_kernel_k6_n128_cb1(), exl3_moe_kernel_k6_n256_cb1(), exl3_moe_kernel_k6_n128_cb2(), exl3_moe_kernel_k6_n256_cb2(),
     exl3_moe_kernel_k7_n128_cb1(), exl3_moe_kernel_k7_n256_cb1(), exl3_moe_kernel_k7_n128_cb2(), exl3_moe_kernel_k7_n256_cb2(),
     exl3_moe_kernel_k8_n128_cb1(), exl3_moe_kernel_k8_n256_cb1(), exl3_moe_kernel_k8_n128_cb2(), exl3_moe_kernel_k8_n256_cb2()
+};
+
+// 32-row tile instances, [K], N = 128 shape, mul1 codebook only
+fp_exl3_moe_kernel exl3_moe_kernel_instances_m32[] =
+{
+    exl3_moe_kernel_k0_n128_cb2_m32(), exl3_moe_kernel_k1_n128_cb2_m32(), exl3_moe_kernel_k2_n128_cb2_m32(),
+    exl3_moe_kernel_k3_n128_cb2_m32(), exl3_moe_kernel_k4_n128_cb2_m32(), exl3_moe_kernel_k5_n128_cb2_m32(),
+    exl3_moe_kernel_k6_n128_cb2_m32(), exl3_moe_kernel_k7_n128_cb2_m32(), exl3_moe_kernel_k8_n128_cb2_m32()
+};
+
+// 64-row tile instances, [K], N = 128 shape, mul1 codebook only
+fp_exl3_moe_kernel exl3_moe_kernel_instances_m64[] =
+{
+    exl3_moe_kernel_k0_n128_cb2_m64(), exl3_moe_kernel_k1_n128_cb2_m64(), exl3_moe_kernel_k2_n128_cb2_m64(),
+    exl3_moe_kernel_k3_n128_cb2_m64(), exl3_moe_kernel_k4_n128_cb2_m64(), exl3_moe_kernel_k5_n128_cb2_m64(),
+    exl3_moe_kernel_k6_n128_cb2_m64(), exl3_moe_kernel_k7_n128_cb2_m64(), exl3_moe_kernel_k8_n128_cb2_m64()
 };
 
 /*
@@ -90,6 +119,14 @@ inputs:
     down_mul1:
         bool, codebook flags
 
+    count_lo, count_hi:
+        experts with token counts outside [count_lo, count_hi] are skipped (they belong to another
+        launch's row tile); num_active must count the experts inside the range
+
+    m_tile:
+        rows per GEMM tile: 16 (any codebook; N = 128 or 256 tile shape by dims), 32 or 64
+        (mul1 codebook, N = 128 instances). Worth it for experts holding more than 16 / 32 rows
+
     num_active:
         number of experts with 0 < token count <= max_tokens_per_expert, i.e. the number of experts this kernel
         will process. Used to size the launch: fewer, wider expert groups when few experts are active. Pass -1 if
@@ -133,7 +170,12 @@ void exl3_moe
     const bool down_mul1,
 
     const float act_limit,
-    const int num_active
+    const int num_active,
+    const c10::optional<at::Tensor>& output_scratch,
+    const c10::optional<at::Tensor>& fused_base,
+    const int count_lo,
+    const int count_hi,
+    const int m_tile
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
@@ -141,6 +183,18 @@ void exl3_moe
 
     // Nothing for the fused kernel to do
     if (num_active == 0) return;
+    void* _output_scratch = nullptr;
+    void* _fused_base = nullptr;
+    if (output_scratch.has_value())
+    {
+        TORCH_CHECK(fused_base.has_value(), "exl3_moe: output_scratch needs fused_base");
+        TORCH_CHECK_DTYPE(output_scratch.value(), kFloat);
+        TORCH_CHECK_DTYPE(fused_base.value(), kLong);
+        TORCH_CHECK(output_scratch.value().is_contiguous() && output_scratch.value().dim() == 2 &&
+                    output_scratch.value().size(1) == hidden_state.size(1), "exl3_moe: output_scratch must be [slots, hidden]");
+        _output_scratch = output_scratch.value().data_ptr();
+        _fused_base = fused_base.value().data_ptr();
+    }
 
     // Validate args
     TORCH_CHECK_DTYPE(hidden_state, kHalf);
@@ -222,8 +276,22 @@ void exl3_moe
     dim3 grid_dim(group_size, 1, num_groups);
 
     int N_off = 0;
-    if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0) N_off = 1;
-    fp_exl3_moe_kernel kernel = exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];
+    if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
+    fp_exl3_moe_kernel kernel;
+    if (m_tile <= 16)
+    {
+        kernel = exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];
+    }
+    else
+    {
+        // The wide row tiles exist as N = 128 instances only and take any dims that are
+        // multiples of 128: for dims that are multiples of 256 they still beat the N = 256
+        // 16-row tiling by ~20% at 24+ rows per expert (the N = 256 instance stays the faster
+        // one for the <= 16-row launch, which the caller issues with m_tile 16)
+        TORCH_CHECK(cb_idx == 1, "exl3_moe: row tiles above 16 are instantiated for the mul1 codebook only");
+        TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
+        kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] : exl3_moe_kernel_instances_m32[K];
+    }
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
     {
@@ -284,7 +352,11 @@ void exl3_moe
         (void*) &K_gate,
         (void*) &K_up,
         (void*) &K_down,
-        (void*) &locks
+        (void*) &locks,
+        &_output_scratch,
+        &_fused_base,
+        (void*) &count_lo,
+        (void*) &count_hi
     };
 
     cudaLaunchKernel
@@ -297,5 +369,130 @@ void exl3_moe
         stream
     );
 
+    cuda_check(cudaPeekAtLastError());
+}
+
+
+// Deterministic reduction of the fused kernel's per-assignment outputs: for every token and
+// column, sum the token's top-k slots in k order and add to the output row. An assignment
+// a = token * topk + k is in the fused tier when its expert has 0 < count <= cap (and is a real
+// expert, not the sentinel bin); its slot is fused_base[e] + (inv_order[a] - expert_start[e])
+#define MOE_GATHER_MAX_TOPK 32
+
+// Deterministic reduction of per-assignment expert outputs: for every token and column, sum the
+// token's top-k slots in k order and add to the output row. slot_kind[e]: 0 = expert e has no
+// slots (handled elsewhere), 1 = slots hold weighted outputs (fused kernel), 2 = slots hold
+// unweighted outputs (batched reconstruct tier), multiplied by the routing weight here. The slot
+// of assignment a = token * topk + k is slot_base[e] + (inv_order[a] - expert_start[e]).
+__global__ void exl3_moe_gather_kernel
+(
+    float* __restrict__ output_state,
+    const float* __restrict__ output_scratch,
+    const int64_t* __restrict__ flat_expert,
+    const int64_t* __restrict__ inv_order,
+    const int64_t* __restrict__ expert_start,
+    const int64_t* __restrict__ slot_base,
+    const int64_t* __restrict__ slot_kind,
+    const half* __restrict__ weight_sorted,
+    const int hidden_dim,
+    const int topk,
+    const int num_experts
+)
+{
+    // One block per token: the slot list is resolved once into shared memory (threads
+    // 0..topk-1), then every column thread streams its column of the listed slots in k order
+    __shared__ int64_t slots[MOE_GATHER_MAX_TOPK];
+    __shared__ float wts[MOE_GATHER_MAX_TOPK];
+    __shared__ int nslots;
+    const int token = blockIdx.x;
+    if (threadIdx.x < topk)
+    {
+        int64_t a = (int64_t) token * topk + threadIdx.x;
+        int64_t e = flat_expert[a];
+        int64_t slot = -1;
+        float wt = 1.0f;
+        if (e >= 0 && e < num_experts)
+        {
+            int64_t kind = slot_kind[e];
+            if (kind)
+            {
+                int64_t pos = inv_order[a];
+                slot = slot_base[e] + (pos - expert_start[e]);
+                if (kind == 2) wt = __half2float(weight_sorted[pos]);
+            }
+        }
+        slots[threadIdx.x] = slot;
+        wts[threadIdx.x] = wt;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        int n = 0;
+        for (int k = 0; k < topk; ++k)
+            if (slots[k] >= 0) { slots[n] = slots[k]; wts[n] = wts[k]; ++n; }
+        nslots = n;
+    }
+    __syncthreads();
+    const int n = nslots;
+    if (n == 0) return;
+    for (int col = threadIdx.x; col < hidden_dim; col += blockDim.x)
+    {
+        float sum = 0.0f;
+        for (int k = 0; k < n; ++k)
+            sum += output_scratch[slots[k] * hidden_dim + col] * wts[k];
+        output_state[(int64_t) token * hidden_dim + col] += sum;
+    }
+}
+
+void exl3_moe_gather
+(
+    at::Tensor output_state,
+    const at::Tensor& output_scratch,
+    const at::Tensor& flat_expert,
+    const at::Tensor& inv_order,
+    const at::Tensor& expert_start,
+    const at::Tensor& slot_base,
+    const at::Tensor& slot_kind,
+    const at::Tensor& weight_sorted
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(output_state.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(output_state, kFloat);
+    TORCH_CHECK_DTYPE(output_scratch, kFloat);
+    TORCH_CHECK_DTYPE(flat_expert, kLong);
+    TORCH_CHECK_DTYPE(inv_order, kLong);
+    TORCH_CHECK_DTYPE(expert_start, kLong);
+    TORCH_CHECK_DTYPE(slot_base, kLong);
+    TORCH_CHECK_DTYPE(slot_kind, kLong);
+    TORCH_CHECK_DTYPE(weight_sorted, kHalf);
+    TORCH_CHECK(output_state.is_contiguous() && output_state.dim() == 2, "exl3_moe_gather: output_state");
+    TORCH_CHECK(output_scratch.is_contiguous() && output_scratch.dim() == 2 && output_scratch.size(1) == output_state.size(1),
+                "exl3_moe_gather: output_scratch must be [slots, hidden]");
+    TORCH_CHECK(flat_expert.is_contiguous() && inv_order.is_contiguous() && expert_start.is_contiguous() &&
+                slot_base.is_contiguous() && slot_kind.is_contiguous() && weight_sorted.is_contiguous(),
+                "exl3_moe_gather: index tensors must be contiguous");
+    int tokens = output_state.size(0);
+    int hidden_dim = output_state.size(1);
+    int num_assign = flat_expert.size(0);
+    TORCH_CHECK(num_assign % tokens == 0, "exl3_moe_gather: assignments / tokens");
+    int topk = num_assign / tokens;
+    int num_experts = slot_kind.size(0);
+    TORCH_CHECK(slot_base.size(0) >= num_experts && expert_start.size(0) >= num_experts, "exl3_moe_gather: table sizes");
+    if (!tokens) return;
+    TORCH_CHECK(topk <= MOE_GATHER_MAX_TOPK, "exl3_moe_gather: top-k too large");
+    int threads = MAX(MIN(hidden_dim, 1024), 32);
+    exl3_moe_gather_kernel<<<tokens, threads, 0, stream>>>
+    (
+        (float*) output_state.data_ptr(),
+        (const float*) output_scratch.data_ptr(),
+        (const int64_t*) flat_expert.data_ptr(),
+        (const int64_t*) inv_order.data_ptr(),
+        (const int64_t*) expert_start.data_ptr(),
+        (const int64_t*) slot_base.data_ptr(),
+        (const int64_t*) slot_kind.data_ptr(),
+        (const half*) weight_sorted.data_ptr(),
+        hidden_dim, topk, num_experts
+    );
     cuda_check(cudaPeekAtLastError());
 }

@@ -14,7 +14,6 @@ from .triton_paged import (
     fn_triton_paged_attn_decode_qc,
     fn_triton_paged_attn_prefill_qc,
     fn_triton_attn_nocache,
-    has_triton,
 )
 
 # Candidate attn functions in order of preference: the Triton decode/prefill/varlen kernels
@@ -118,7 +117,7 @@ def attn_dispatch(
         assert cache_seqlens is not None
         layer = cache if isinstance(cache, CacheLayer) else cache.layers[cache_idx, cache_instance or 0]
         if (
-            _qc_attn and has_triton and
+            _qc_attn and
             isinstance(layer, CacheLayer_quant) and
             layer.compand_a == 0.0 and
             q.dtype == torch.float16 and

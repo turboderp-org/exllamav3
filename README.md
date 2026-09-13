@@ -98,7 +98,7 @@ uv pip install .
 
 **Option 4 — With `pip`:**
 
-On Windows, you should also make sure you have the `triton-windows` package installed. ExLlamaV3 may work without it, but many things will work suboptimally.
+On Windows, you also need the `triton-windows` package (declared as a dependency in `pyproject.toml`); the attention, cache and recurrent kernels are Triton and ExLlamaV3 does not import without it.
 
 ```sh
 # install a CUDA-enabled torch first so it matches your setup, e.g.:
@@ -214,7 +214,7 @@ python examples/chat.py -h
 | **MiniMax-M2**                                   | `MiniMaxM2ForCausalLM` |  |  |
 | **Mistral**, **Ministral 3**, **Mistral-4** etc. | `MistralForCausalLM`<br>`Mistral3ForConditionalGeneration` | ✓ |  |
 | **Mixtral**                                      | `MixtralForCausalLM` |  |  |
-| **NemotronH, Nemotron-3**                        | `NemotronHForCausalLM` |  |  |
+| **NemotronH, Nemotron-3 Nano/Super**              | `NemotronHForCausalLM` |  |  |
 | **Olmo 3.1**                                     | `Olmo3ForCausalLM` |  |  |
 | **Olmo-Hybrid**                                  | `OlmoHybridForCausalLM` |  |  |
 | **Phi3**, **Phi4**                               | `Phi3ForCausalLM` |  |  |
