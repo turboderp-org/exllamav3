@@ -3,24 +3,8 @@ import os
 
 import torch
 
-try:
-    import triton
-    import triton.language as tl
-    has_triton = True
-except ImportError:
-    has_triton = False
-
-    # Triton dummy functions so import doesn't break if Triton is unavailable
-    class _DummyTritonLanguage:
-        constexpr = object()
-
-    class _DummyTriton:
-        @staticmethod
-        def jit(fn):
-            return fn
-
-    triton = _DummyTriton()
-    tl = _DummyTritonLanguage()
+import triton
+import triton.language as tl
 
 from .common import AttnArgs, get_non_causal_span_arglist
 
@@ -361,9 +345,6 @@ def paged_attn_triton(
     q/k/v are [batch, seq, heads, dim], caches are [pages, page_size, kv_heads, dim],
     block_table is [batch, pages_per_seq], and cache_seqlens is the pre-append length.
     """
-    if not has_triton:
-        raise RuntimeError("paged_attn_triton requires Triton, but Triton is not available")
-
     _check_tensor("q", q)
     _check_tensor("k_cache", k_cache)
     _check_tensor("v_cache", v_cache)
@@ -508,9 +489,6 @@ def paged_attn_triton_longq(
     num_stages: int = 1,
 ) -> torch.Tensor:
     """Long-query paged attention path that groups GQA sibling Q heads per program."""
-    if not has_triton:
-        raise RuntimeError("paged_attn_triton_longq requires Triton, but Triton is not available")
-
     _check_tensor("q", q)
     _check_tensor("k_cache", k_cache)
     _check_tensor("v_cache", v_cache)
@@ -641,7 +619,6 @@ def paged_attn_triton_longq(
 
 def fn_triton_paged_attn(args: AttnArgs) -> torch.Tensor | None:
     if (
-        not has_triton or
         args.is_varlen() or
         not args.has_kv_cache() or
         args.q_len > 256 or
@@ -672,7 +649,6 @@ def fn_triton_paged_attn(args: AttnArgs) -> torch.Tensor | None:
 
 def fn_triton_paged_attn_longq(args: AttnArgs) -> torch.Tensor | None:
     if (
-        not has_triton or
         args.is_varlen() or
         not args.has_kv_cache() or
         args.q_len <= 256 or
@@ -1118,9 +1094,6 @@ def paged_attn_triton_decode(
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
     second pass. GQA sibling q heads share K/V tiles within a program."""
-    if not has_triton:
-        raise RuntimeError("paged_attn_triton_decode requires Triton, but Triton is not available")
-
     _check_tensor("q", q)
     _check_tensor("block_table", block_table, None)
     _check_tensor("cache_seqlens", cache_seqlens, None)
@@ -1241,7 +1214,6 @@ def paged_attn_triton_decode(
 
 def fn_triton_paged_attn_decode(args: AttnArgs) -> torch.Tensor | None:
     if (
-        not has_triton or
         args.is_varlen() or
         not args.has_kv_cache() or
         args.q_len > 16 or
@@ -1734,9 +1706,6 @@ def paged_attn_triton_prefill(
     touching the cache -- kv positions at or above cache_seqlens[b] read from them. The direct
     form also works without a cache at all (k_cache = None), covering plain non-cached
     attention."""
-    if not has_triton:
-        raise RuntimeError("paged_attn_triton_prefill requires Triton, but Triton is not available")
-
     _check_tensor("q", q)
 
     bsz, q_len, n_q_heads, head_dim = q.shape
@@ -1965,7 +1934,6 @@ def paged_attn_triton_prefill(
 def fn_triton_attn_nocache(args: AttnArgs) -> torch.Tensor | None:
     """Non-cached attention through the prefill kernel's direct-kv source (NEW_KV=2)."""
     if (
-        not has_triton or
         args.is_varlen() or
         args.has_kv_cache() or
         args.dim > 512 or
@@ -1991,7 +1959,6 @@ def fn_triton_attn_nocache(args: AttnArgs) -> torch.Tensor | None:
 
 def fn_triton_paged_attn_prefill(args: AttnArgs) -> torch.Tensor | None:
     if (
-        not has_triton or
         args.is_varlen() or
         not args.has_kv_cache() or
         args.q_len <= 16 or
@@ -2170,9 +2137,6 @@ def varlen_attn_triton(
 ) -> torch.Tensor:
     """Packed varlen self-attention over (total, heads, head_dim) tensors, segments given by
     cu_seqlens (as flash_attn_varlen_func with cu_seqlens_q == cu_seqlens_k)."""
-    if not has_triton:
-        raise RuntimeError("varlen_attn_triton requires Triton, but Triton is not available")
-
     squeeze = q.ndim == 4
     if squeeze:
         q, k, v = q.squeeze(0), k.squeeze(0), v.squeeze(0)
@@ -2214,7 +2178,6 @@ def varlen_attn_triton(
 
 def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
     if (
-        not has_triton or
         not args.is_varlen() or
         args.bsz > 1 or
         args.has_kv_cache() or
@@ -2241,7 +2204,6 @@ def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
 def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
     if (
         args.q_cache is None or
-        not has_triton or
         args.q_len > 16 or
         args.dim > 512 or
         args.dim % 32 != 0 or
@@ -2270,7 +2232,6 @@ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
 def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
     if (
         args.q_cache is None or
-        not has_triton or
         (args.q_len <= 16 and not args.non_causal_spans) or
         args.dim > 512 or
         args.dim % 32 != 0 or

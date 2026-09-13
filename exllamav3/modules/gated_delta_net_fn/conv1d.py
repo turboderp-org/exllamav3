@@ -9,23 +9,8 @@ from ...ext import exllamav3_ext as ext
 MAX_CUDA_SEQLEN = 32
 MAX_CUDA_K = 16
 
-try:
-    import triton
-    import triton.language as tl
-    has_triton = True
-except ImportError:
-    has_triton = False
-
-    class _DummyTritonLanguage:
-        constexpr = object()
-
-    class _DummyTriton:
-        @staticmethod
-        def jit(fn):
-            return fn
-
-    triton = _DummyTriton()
-    tl = _DummyTritonLanguage()
+import triton
+import triton.language as tl
 
 
 @triton.jit
@@ -419,33 +404,16 @@ def causal_conv1d_update(
         )
         return out
 
-    if has_triton:
-        if dummy_slots:
-            recurrent_slots = buffered_arange(bsz, mixed_qkv.device)
-        mixed_qkv = causal_conv1d_update_slotted_triton(
-            mixed_qkv,
-            conv_state,
-            recurrent_slots,
-            conv1d_weight,
-            conv1d_bias,
-            transpose_output = True,
-            history = history,
-        )
-    else:
-        recurrent_slots_cpu = get_for_device(params, "recurrent_slots", "cpu") \
-            if not dummy_slots else buffered_arange(bsz, "cpu")
-        mixed_qkv_conv = []
-        for i, s in enumerate(recurrent_slots_cpu.tolist()):
-            mixed_qkv_conv.append(
-                causal_conv1d_update_function_torch(
-                    mixed_qkv[i].unsqueeze(0),
-                    conv_state[s].unsqueeze(0),  # Updated inplace
-                    conv1d_weight,
-                    conv1d_bias,
-                    history = history,
-                )
-            )
-        mixed_qkv = torch.cat(mixed_qkv_conv, dim = 0)
-        mixed_qkv = mixed_qkv.transpose(1, 2).contiguous()
+    if dummy_slots:
+        recurrent_slots = buffered_arange(bsz, mixed_qkv.device)
+    mixed_qkv = causal_conv1d_update_slotted_triton(
+        mixed_qkv,
+        conv_state,
+        recurrent_slots,
+        conv1d_weight,
+        conv1d_bias,
+        transpose_output = True,
+        history = history,
+    )
 
     return mixed_qkv

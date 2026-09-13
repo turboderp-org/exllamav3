@@ -14,7 +14,6 @@ from .attention_fn.mla_triton import (
     mla_attn_triton_prefill_mha,
     mla_absorb,
     mla_unfold,
-    has_triton,
 )
 from .attention_fn.bc_attn import MAX_BSZ as _bc_max_bsz
 import os
