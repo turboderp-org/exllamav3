@@ -358,6 +358,19 @@ unsupported strides/alignment) use cuBLAS regardless. Compute capability 12.x us
 128x128 or 128x64 tiles selected by shape, and a native mixed-precision add when folding
 each 32-term FP16 partial into FP32.
 
+### `EXL3_MOE_COOP_KSPLIT` (default: unset)
+
+Split-k factor of the fused decode MoE kernels: `n` runs every column chunk as `n` blocks over
+disjoint k ranges whose partial sums the last-arriving block adds. Measured as neutral to harmful
+on every GPU here, so the default is no split. Testing knob only.
+
+### `EXL3_MOE_COOP_WIDE` (default: unset)
+
+Tile geometry of the fused decode MoE kernels (the bsz <= 8 path of `BlockSparseMLP`): `0` forces
+the narrow tile (32 columns per block, k split 16 ways), `1` the wide one (128 columns per block,
+4 x 4 warps). Unset picks per stage: wide on Ampere/Ada at every shape, on Blackwell only for
+k >= 4096 or k >= 2048 with 32 or more (token, expert) slots. Testing knob only.
+
 ### `EXL3_MOE_FUSED_DET` (default: `1`), `EXL3_MOE_RECON_DET` (default: follows `EXL3_MOE_FUSED_DET`)
 
 Bit-reproducible MoE prefill. By default the fused MoE kernel adds each expert's weighted
