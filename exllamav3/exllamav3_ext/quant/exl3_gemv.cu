@@ -104,6 +104,9 @@ static void* exl3_gemv_sm70_select_kernel(int bits, int cb, bool c_fp32, int mmo
     SEL_GRID(4, 0, false) SEL_GRID(4, 1, false) SEL_GRID(4, 2, false)
     SEL_GRID(2, 0, false) SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 0, false) SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
+    SEL_GRID(4, 0, true) SEL_GRID(4, 1, true) SEL_GRID(4, 2, true)
+    SEL_GRID(2, 0, true) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
+    SEL_GRID(3, 0, true) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
     #undef SEL_GRID
     #undef SEL
     return nullptr;
@@ -186,6 +189,12 @@ bool exl3_gemv_try_launch
     int cols = cfg == 0 ? 32 : 64;
 
     int max_blocks = occupancy(kernel, block_dim) * num_sms;
+    // TEMP: grid-cap sweep for V100 tuning (EXL3_GEMV_GRID_CAP)
+    if (const char* cap_env = std::getenv("EXL3_GEMV_GRID_CAP"))
+    {
+        int cap = atoi(cap_env);
+        if (cap > 0) max_blocks = MIN(max_blocks, cap);
+    }
     int grid = MIN(size_n / cols, max_blocks);
     if (grid < 1) return false;
 
