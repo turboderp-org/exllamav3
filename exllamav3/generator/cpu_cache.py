@@ -1,7 +1,7 @@
 from __future__ import annotations
-import gc
 import heapq
 import threading
+import weakref
 import torch
 from collections import deque
 from ..constants import PAGE_SIZE
@@ -9,6 +9,38 @@ from ..constants import PAGE_SIZE
 
 def _align(n: int, a: int) -> int:
     return (n + a - 1) // a * a
+
+
+def _stop_worker(cond: threading.Condition, stop: threading.Event):
+    stop.set()
+    with cond:
+        cond.notify_all()
+
+
+def _alloc_worker(ref: weakref.ref, cond: threading.Condition, stop: threading.Event):
+    # Pins slabs until the configured budget is reached, then sleeps until a slab is consumed. Holds the tier
+    # only through a weak reference, and only while touching it, so dropping the Generator releases the cache
+    # tensors and the pinned slabs even if nobody calls close(); the tier's finalizer wakes this thread so it
+    # exits instead of waiting forever
+    with torch.inference_mode():
+        while not stop.is_set():
+            with cond:
+                while True:
+                    tier = ref()
+                    if tier is None or stop.is_set():
+                        return
+                    full = len(tier.slot_slabs) + len(tier._spare) >= tier.max_slots
+                    del tier
+                    if not full:
+                        break
+                    cond.wait()
+            tier = ref()
+            if tier is None:
+                return
+            sv = tier._make_slab()  # slow part, outside the lock
+            with cond:
+                tier._spare.append(sv)
+            del tier
 
 
 class CPUPageCache:
@@ -143,11 +175,15 @@ class CPUPageCache:
         self._spare = deque()
         self._spare_cond = threading.Condition()
         self._stop_event = threading.Event()
+        self._alloc_thread = None
         if self.segments:
-            self._alloc_thread = threading.Thread(target = self._alloc_worker, daemon = True)
+            self._alloc_thread = threading.Thread(
+                target = _alloc_worker,
+                args = (weakref.ref(self), self._spare_cond, self._stop_event),
+                daemon = True,
+            )
             self._alloc_thread.start()
-        else:
-            self._alloc_thread = None
+            weakref.finalize(self, _stop_worker, self._spare_cond, self._stop_event)
 
 
     def attach(self, pagetable):
@@ -169,23 +205,6 @@ class CPUPageCache:
             nbytes = t[0].numel() * t.element_size()
             views.append(slab[offset : offset + nbytes].view(dtype).view(page_shape))
         return slab, views
-
-
-    def _alloc_worker(self):
-        with torch.inference_mode():
-            while not self._stop_event.is_set():
-                with self._spare_cond:
-                    while len(self.slot_slabs) + len(self._spare) >= self.max_slots:
-                        self._spare_cond.wait(timeout=0.5)
-                        if self._stop_event.is_set():
-                            return
-                    if self._stop_event.is_set():
-                        return
-                sv = self._make_slab()  # slow part, outside the lock
-                with self._spare_cond:
-                    if self._stop_event.is_set():
-                        return
-                    self._spare.append(sv)
 
 
     def _new_slot(self, protect: set | None):
@@ -340,19 +359,20 @@ class CPUPageCache:
         return e
 
     def close(self):
-        """Stop the background pinning thread and drop all tensor references."""
-        self._stop_event.set()
-        with self._spare_cond:
-            self._spare_cond.notify_all()
+        """
+        Stop the pinning thread and drop the slabs and cache tensor references. Optional: the same happens when
+        the tier is garbage collected, this just makes it deterministic.
+        """
+        _stop_worker(self._spare_cond, self._stop_event)
         if self._alloc_thread is not None:
             self._alloc_thread.join()
+            self._alloc_thread = None
+        with self._spare_cond:
+            self._spare.clear()
         self.segments = []
         self.entries = {}
         self.slot_slabs = []
         self.slot_views = []
-        self._spare.clear()
+        self.free_slots.clear()
+        self.num_slots = 0
         self.pagetable = None
-
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch._C._host_emptyCache()
