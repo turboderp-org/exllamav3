@@ -1629,7 +1629,8 @@ void gated_delta_net_fused_op_3_gr
 
 #define BA_GEMV_WARPS 8
 
-__global__ __launch_bounds__(BA_GEMV_WARPS * 32)
+template<int WARPS>
+__global__ __launch_bounds__(WARPS * 32)
 void gdn_ba_gemv_kernel
 (
     const half* __restrict__ x,                 // [rows, k]
@@ -1642,7 +1643,7 @@ void gdn_ba_gemv_kernel
 {
     int warp = threadIdx.x / 32;
     int lane = threadIdx.x % 32;
-    int row = blockIdx.x * BA_GEMV_WARPS + warp;
+    int row = blockIdx.x * WARPS + warp;
     if (row >= n) return;
     int r = blockIdx.y;
 
@@ -1694,21 +1695,31 @@ void gdn_ba_gemv_gr
     TORCH_CHECK(x.is_contiguous() && w_t.is_contiguous() && y.is_contiguous(), "tensors must be contiguous");
 
     const half* bias_ptr = (const half*) OPTPTR(bias);
-    dim3 blocks(CEIL_DIVIDE(n, BA_GEMV_WARPS), rows);
+    // This decode shape launches only 12 eight-warp blocks. Spread its 96
+    // independent outputs over more SMs; each warp keeps the same arithmetic.
+    bool single_warp = false;
+    #if !defined(USE_ROCM)
+    if (rows == 1 && n == 96 && k == 5120)
+    {
+        const auto* prop = at::cuda::getDeviceProperties(x.get_device());
+        single_warp = prop->major == 12 && prop->minor == 0;
+    }
+    #endif
+    int warps = single_warp ? 1 : BA_GEMV_WARPS;
+    dim3 blocks(CEIL_DIVIDE(n, warps), rows);
 
-    gdn_ba_gemv_kernel<<<blocks, BA_GEMV_WARPS * 32, 0, stream>>>
-    (
-        (const half*) x.data_ptr(),
-        (const half*) w_t.data_ptr(),
-        bias_ptr,
-        (float*) y.data_ptr(),
-        k, n
-    );
+    #define BA_ARGS (const half*) x.data_ptr(), (const half*) w_t.data_ptr(), bias_ptr, (float*) y.data_ptr(), k, n
+    if (single_warp)
+        gdn_ba_gemv_kernel<1><<<blocks, 32, 0, stream>>>(BA_ARGS);
+    else
+        gdn_ba_gemv_kernel<BA_GEMV_WARPS><<<blocks, BA_GEMV_WARPS * 32, 0, stream>>>(BA_ARGS);
+    #undef BA_ARGS
 
     if (graph)
     {
-        graph->record_param((void*) &gdn_ba_gemv_kernel, GP_gdn_ba_x, 0);
-        graph->record_param((void*) &gdn_ba_gemv_kernel, GP_end, 0);
+        void* kernel = single_warp ? (void*) &gdn_ba_gemv_kernel<1> : (void*) &gdn_ba_gemv_kernel<BA_GEMV_WARPS>;
+        graph->record_param(kernel, GP_gdn_ba_x, 0);
+        graph->record_param(kernel, GP_end, 0);
     }
 
     cuda_check(cudaPeekAtLastError());
