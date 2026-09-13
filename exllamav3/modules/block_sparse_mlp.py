@@ -1078,6 +1078,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     inv_order = torch.empty_like(order).scatter_(
                         0, order, torch.arange(A, device = order.device))
                     if expert_count_list is None:
+                        # Row num_ex of expert_count is the sentinel bucket for picks outside this
+                        # module's expert slice (TP shard, CPU split). Its slots are never written,
+                        # so the gather below is restricted to the first num_ex table rows
                         expert_start = torch.cumsum(expert_count, 0) - expert_count
                         tables = torch.stack([expert_start, expert_start, (expert_count > 0).long()])
                         n_slots = fused_total
@@ -1170,7 +1173,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # One fixed-order gather over every slot
                 if scratch is not None:
                     ext.exl3_moe_gather(final_hidden_states, scratch, flat_expert_local, inv_order,
-                                        tables[1], tables[0], tables[2], weight_sorted)
+                                        tables[1, :num_ex], tables[0, :num_ex], tables[2, :num_ex], weight_sorted)
 
                 out_state = None
                 interm = None
