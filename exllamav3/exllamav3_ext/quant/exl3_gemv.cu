@@ -47,7 +47,8 @@ static int exl3_gemv_env_smem()
 static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
 {
     if (mode == 0) return -1;
-    if (K < 2 || K > 4) return -1;
+    if (K < 2 || K > 8) return -1;
+    if (K > 4 && cc >= 8) return -1;              // sm70 kernel covers K=5-8
     if (K != 4 && cb == 0 && cc >= 8) return -1;  // sm70 kernel supports K=2,3 cb=0
     if (size_m > EXL3_GEMV_MAX_M) return -1;
     if (size_k % 128 || size_n % 128) return -1;
@@ -107,6 +108,10 @@ static void* exl3_gemv_sm70_select_kernel(int bits, int cb, bool c_fp32, int mmo
     SEL_GRID(4, 0, true) SEL_GRID(4, 1, true) SEL_GRID(4, 2, true)
     SEL_GRID(2, 0, true) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 0, true) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
+    SEL_GRID(5, 0, true) SEL_GRID(5, 1, true) SEL_GRID(5, 2, true)
+    SEL_GRID(6, 0, true) SEL_GRID(6, 1, true) SEL_GRID(6, 2, true)
+    SEL_GRID(7, 0, true) SEL_GRID(7, 1, true) SEL_GRID(7, 2, true)
+    SEL_GRID(8, 0, true) SEL_GRID(8, 1, true) SEL_GRID(8, 2, true)
     #undef SEL_GRID
     #undef SEL
     return nullptr;
@@ -132,7 +137,8 @@ bool exl3_gemv_try_launch
     // Free integer checks first; the env read (~64 ns) and device queries only run for calls
     // that could actually take this path
     if (!has_su_sv) return false;
-    if (K < 2 || K > 4) return false;
+    if (K < 2 || K > 8) return false;
+    if (K > 4 && DevCtx::instance().get_cc(device) >= 8) return false;  // sm70 kernel covers K=5-8
     if (K != 4 && cb == 0 && DevCtx::instance().get_cc(device) >= 8) return false;  // sm70 kernel supports K=2,3 cb=0
     if (size_m > EXL3_GEMV_MAX_M) return false;
     if (size_k % 128 || size_n % 128) return false;
@@ -160,6 +166,9 @@ bool exl3_gemv_try_launch
 
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
     bool smem = exl3_gemv_env_smem() == 1;
+    // sm_70 with K >= 5: the decode runs on the shared-memory tile
+    // (verbatim dq4), so SMEM_STAGE is required, not optional.
+    if (cc < 8 && K >= 5) smem = true;
 
     // sm_70 and older: the sm80 mma kernels are no-ops (arch-guarded) —
     // route to the m8n8k4 variant, which shares the launch signature.
