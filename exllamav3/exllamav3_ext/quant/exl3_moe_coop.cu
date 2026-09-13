@@ -2,7 +2,7 @@
 // exl3_moe_coop_kernel.cuh, instantiated per (K, codebook) in comp_units/exl3_moe_coop_inst_k*.cu
 
 #include <cuda_fp16.h>
-#include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <map>
