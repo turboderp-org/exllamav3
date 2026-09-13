@@ -251,6 +251,15 @@ int exl3_gemm_gr
         // the m dimension into 8-row slices and run the GEMV kernel per
         // slice — each launch is self-contained (cooperative, per-block
         // reduction, per-slice Had transforms).
+        // This path launches one kernel per 8-row tile. Making it
+        // graph-capturable requires the caller to present one param
+        // set per tile at replay (the replay walk patches sites 1:1
+        // with params; a single param set per call leaves tiles 1+
+        // with capture-time args — silently wrong output). Until the
+        // caller protocol supports per-tile params, refuse capture.
+        if (cc < 8 && graph)
+            TORCH_CHECK(false, "exl3_gemm_gr: tiled sm70 path is not graph-capturable "
+                               "(caller must present per-tile params)");
         if (cc < 8 && (suh_ptr && A_had_ptr && svh_ptr))
         {
             const int tile_m = 8;
