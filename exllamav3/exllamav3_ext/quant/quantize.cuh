@@ -1,6 +1,9 @@
 #pragma once
 
 #include <ATen/Tensor.h>
+#include <tuple>
+
+std::tuple<bool, int64_t> quantize_tiles_scratch(int device, int K, bool mcg, bool mul1, int L);
 
 void quantize_tiles
 (

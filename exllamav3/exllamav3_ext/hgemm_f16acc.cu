@@ -20,6 +20,7 @@
 #include <mutex>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace f16acc
 {
@@ -34,7 +35,35 @@ constexpr int A_STAGE = BM * AS_STRIDE, B_STAGE = BK * BS_STRIDE;
 constexpr size_t SMEM_BYTES = (size_t) STAGES * (A_STAGE + B_STAGE) * sizeof(half);
 constexpr int MIN_ROWS = 384;
 
-static int g_num_sms[MAX_DEVICES];
+// Preserve the existing configuration on pre-Blackwell GPUs. The two tuned layouts
+// share the 32-term partial-sum interval and differ only in scheduling and storage.
+template <int TILE_N, bool TUNED> struct Config
+{
+    static constexpr int BM = 128, BN = TILE_N, BK = 64, PAD = TUNED ? 0 : 8;
+    static constexpr int WARPS_M = 2, WARPS_N = BN / 32;
+    static constexpr int THREADS = WARPS_M * WARPS_N * 32;
+    static constexpr int STAGES = 2, GROUP_M = TUNED ? 16 : 8;
+    static constexpr int WM = BM / WARPS_M, WN = BN / WARPS_N;
+    static constexpr int MT = WM / 16, NT = WN / 8;
+    static constexpr int AS_STRIDE = BK + PAD, BS_STRIDE = BN + PAD;
+    static constexpr int A_STAGE = BM * AS_STRIDE, B_STAGE = BK * BS_STRIDE;
+    static constexpr size_t SMEM_BYTES = (size_t) STAGES * (A_STAGE + B_STAGE) * sizeof(half);
+};
+
+__device__ __forceinline__ void add_half_pair(float& a, float& b, uint32_t h)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    // PTX 8.6+: convert an FP16 partial and add it to the FP32 total in one instruction.
+    asm volatile("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %2; "
+                 "add.rn.f32.f16 %0, lo, %0; add.rn.f32.f16 %1, hi, %1; }"
+                 : "+f"(a), "+f"(b) : "r"(h));
+#else
+    float2 f = __half22float2(*reinterpret_cast<half2*>(&h));
+    a += f.x;
+    b += f.y;
+#endif
+}
+
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p)
 {
@@ -70,8 +99,8 @@ __device__ __forceinline__ void mma_f32(float* c, const uint32_t* a, const uint3
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-template <bool OUT_F32>
-__global__ void __launch_bounds__(THREADS, 1)
+template <bool OUT_F32, int TILE_N = 128, bool TUNED = false>
+__global__ void __launch_bounds__((Config<TILE_N, TUNED>::THREADS), 1)
 gemm_kernel
 (
     const half* __restrict__ A, const half* __restrict__ B, void* __restrict__ C,
@@ -79,6 +108,14 @@ gemm_kernel
     long long strideA, long long strideB, long long strideC
 )
 {
+    using CF = Config<TILE_N, TUNED>;
+    constexpr int BM = CF::BM, BN = CF::BN, BK = CF::BK, THREADS = CF::THREADS;
+    constexpr int STAGES = CF::STAGES, GROUP_M = CF::GROUP_M;
+    constexpr int WARPS_M = CF::WARPS_M, WARPS_N = CF::WARPS_N;
+    constexpr int WM = CF::WM, WN = CF::WN, MT = CF::MT, NT = CF::NT;
+    constexpr int AS_STRIDE = CF::AS_STRIDE, BS_STRIDE = CF::BS_STRIDE;
+    constexpr int A_STAGE = CF::A_STAGE, B_STAGE = CF::B_STAGE;
+
     extern __shared__ __align__(16) half smem[];
     half* As = smem;
     half* Bs = smem + STAGES * A_STAGE;
@@ -116,7 +153,8 @@ gemm_kernel
             int grow = bm + row;
             bool pred = grow < M;
             const half* src = A + (long long) (pred ? grow : 0) * K + k0 + chunk * 8;
-            cp_async16(as + row * AS_STRIDE + chunk * 8, src, pred);
+            if constexpr (TUNED) cp_async16(as + row * AS_STRIDE + (chunk ^ (row % A_CPR)) * 8, src, pred);
+            else cp_async16(as + row * AS_STRIDE + chunk * 8, src, pred);
         }
         #pragma unroll
         for (int i = 0; i < B_ITERS; ++i)
@@ -124,7 +162,8 @@ gemm_kernel
             int c = tid + i * THREADS;
             int row = c / B_CPR, chunk = c % B_CPR;
             const half* src = B + (long long) (k0 + row) * N + bn + chunk * 8;
-            cp_async16(bs + row * BS_STRIDE + chunk * 8, src, true);
+            if constexpr (TUNED) cp_async16(bs + row * BS_STRIDE + (chunk ^ (row % B_CPR)) * 8, src, true);
+            else cp_async16(bs + row * BS_STRIDE + chunk * 8, src, true);
         }
     };
 
@@ -172,12 +211,20 @@ gemm_kernel
     {
         #pragma unroll
         for (int i = 0; i < MT; ++i)
-            ldmatrix_x4(af[buf][i], as + (i * 16 + a_lrow) * AS_STRIDE + kk * 16 + a_lcol);
+            if constexpr (TUNED)
+                ldmatrix_x4(af[buf][i], as + (i * 16 + a_lrow) * AS_STRIDE +
+                            (((kk * 16 + a_lcol) / 8) ^ ((i * 16 + a_lrow) % A_CPR)) * 8);
+            else
+                ldmatrix_x4(af[buf][i], as + (i * 16 + a_lrow) * AS_STRIDE + kk * 16 + a_lcol);
         #pragma unroll
         for (int j = 0; j < NT; j += 2)
         {
             uint32_t r[4];
-            ldmatrix_x4_trans(r, bs + (kk * 16 + b_lrow) * BS_STRIDE + j * 8 + b_lcol);
+            if constexpr (TUNED)
+                ldmatrix_x4_trans(r, bs - wn * WN + (kk * 16 + b_lrow) * BS_STRIDE +
+                                  (((wn * WN + j * 8 + b_lcol) / 8) ^ ((kk * 16 + b_lrow) % B_CPR)) * 8);
+            else
+                ldmatrix_x4_trans(r, bs + (kk * 16 + b_lrow) * BS_STRIDE + j * 8 + b_lcol);
             bf[buf][j][0] = r[0]; bf[buf][j][1] = r[1]; bf[buf][j + 1][0] = r[2]; bf[buf][j + 1][1] = r[3];
         }
     };
@@ -194,18 +241,43 @@ gemm_kernel
         const half* as = As + (kt % STAGES) * A_STAGE + wm * WM * AS_STRIDE;
         const half* bs = Bs + (kt % STAGES) * B_STAGE + wn * WN;
 
-        load_frags(0, as, bs, 0);
-        #pragma unroll
-        for (int kk = 0; kk < KK; ++kk)
+        if constexpr (TUNED)
         {
-            if (kk + 1 < KK) load_frags((kk + 1) & 1, as, bs, kk + 1);
-            const int cur = kk & 1;
+            // Preserve each pair of k16 MMAs and the FP32 addition order, but flush a
+            // fragment immediately so conversions/additions can overlap other MMAs.
             #pragma unroll
-            for (int i = 0; i < MT; ++i)
+            for (int kk = 0; kk < KK; kk += 2)
+            {
+                load_frags(0, as, bs, kk);
+                load_frags(1, as, bs, kk + 1);
                 #pragma unroll
-                for (int j = 0; j < NT; ++j)
-                    mma_f16(hacc[i][j], af[cur][i], bf[cur][j]);
-            if (kk & 1) flush();     // every 32 of K
+                for (int i = 0; i < MT; ++i)
+                    #pragma unroll
+                    for (int j = 0; j < NT; ++j)
+                    {
+                        uint32_t h[2] = {};
+                        mma_f16(h, af[0][i], bf[0][j]);
+                        mma_f16(h, af[1][i], bf[1][j]);
+                        add_half_pair(acc[i][j][0], acc[i][j][1], h[0]);
+                        add_half_pair(acc[i][j][2], acc[i][j][3], h[1]);
+                    }
+            }
+        }
+        else
+        {
+            load_frags(0, as, bs, 0);
+            #pragma unroll
+            for (int kk = 0; kk < KK; ++kk)
+            {
+                if (kk + 1 < KK) load_frags((kk + 1) & 1, as, bs, kk + 1);
+                const int cur = kk & 1;
+                #pragma unroll
+                for (int i = 0; i < MT; ++i)
+                    #pragma unroll
+                    for (int j = 0; j < NT; ++j)
+                        mma_f16(hacc[i][j], af[cur][i], bf[cur][j]);
+                if (kk & 1) flush();     // every 32 of K
+            }
         }
     }
 
@@ -322,61 +394,103 @@ bool enabled(int device)
     return on == 1;
 }
 
-// Hard shape coverage of the kernel (independent of the device decision)
+// Hard shape coverage of the kernel (independent of the device decision).
 static bool covered(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c)
 {
+    if (!a.is_cuda() || a.device() != b.device() || a.device() != c.device()) return false;
     if (a.dtype() != at::kHalf || b.dtype() != at::kHalf) return false;
     if (c.dtype() != at::kHalf && c.dtype() != at::kFloat) return false;
     if (a.dim() != b.dim() || a.dim() != c.dim() || (a.dim() != 2 && a.dim() != 3)) return false;
     int64_t M = a.size(-2), K = a.size(-1), N = b.size(-1);
     if (b.size(-2) != K || c.size(-2) != M || c.size(-1) != N) return false;
-    if (K % BK != 0 || N % BN != 0 || M < 1) return false;
+    if (K < 1 || N < 1 || M < 1 || K % BK != 0 || N % BN != 0) return false;
+    if (M > std::numeric_limits<int>::max() || N > std::numeric_limits<int>::max() ||
+        K > std::numeric_limits<int>::max()) return false;
+    // CUDA grid.y and grid.z are limited to 65535. Keep every narrowing conversion checked.
+    if ((M + BM - 1) / BM > 65535) return false;
     if (a.stride(-1) != 1 || b.stride(-1) != 1 || c.stride(-1) != 1) return false;
     if (a.stride(-2) != K || b.stride(-2) != N) return false;
-    if (c.stride(-2) % 2 != 0) return false;                    // half2 / float2 stores
-    if (a.dim() == 3 && (a.size(0) != b.size(0) || a.size(0) != c.size(0))) return false;
-    if (((uintptr_t) a.data_ptr() & 15) || ((uintptr_t) b.data_ptr() & 15) || ((uintptr_t) c.data_ptr() & 3)) return false;
-    return true;
+    if (c.stride(-2) < N || c.stride(-2) > std::numeric_limits<int>::max() ||
+        c.stride(-2) % 2 != 0) return false;
+    const uintptr_t output_alignment = c.dtype() == at::kFloat ? 8 : 4;
+    if (((uintptr_t) a.data_ptr() & 15) || ((uintptr_t) b.data_ptr() & 15) ||
+        ((uintptr_t) c.data_ptr() & (output_alignment - 1))) return false;
+    if (a.dim() == 3)
+    {
+        if (a.size(0) < 1 || a.size(0) > 65535 || a.size(0) != b.size(0) || a.size(0) != c.size(0)) return false;
+        // Inputs may broadcast across batches; each batch must still start at a copy-aligned address.
+        if (a.stride(0) % 8 || b.stride(0) % 8 || c.stride(0) % 2) return false;
+        if (a.size(0) > 1 && c.stride(0) < (M - 1) * c.stride(-2) + N) return false;
+    }
+    return at::cuda::getDeviceProperties(a.device().index())->major >= 8;
 }
 
-// Heuristic: shapes where the kernel beats cuBLAS (enough rows, at least one block per SM)
+static bool tuned_device(int device)
+{
+    // The layout/shape sweep was measured on GeForce Blackwell. Other Ampere+ parts retain
+    // their existing layout; the rate probe still determines whether FP16 MMA is worthwhile.
+    return at::cuda::getDeviceProperties(device)->major == 12;
+}
+
+static bool narrow_tile(const at::Tensor& a, const at::Tensor& b)
+{
+    const int64_t M = a.size(-2), K = a.size(-1), N = b.size(-1);
+    const int64_t batch = a.dim() == 3 ? a.size(0) : 1;
+    // Narrow grids, short rows and long reductions favor 128x64. Wide expansions and
+    // batched 128+-row experts favor 128x128. Avoid a benchmark/synchronization during capture.
+    if (N <= 1024 || M < 128) return true;
+    if (batch > 1 || N > 4096) return false;
+    return M < 512 || K > N || (M >= 1024 && M < 4096);
+}
+
 static bool worthwhile(const at::Tensor& a, const at::Tensor& b)
 {
-    int64_t M = a.size(-2), N = b.size(-1);
-    if (M < MIN_ROWS) return false;
     int device = a.device().index();
     if (device < 0 || device >= MAX_DEVICES) return false;
-    if (!g_num_sms[device])
-        cudaDeviceGetAttribute(&g_num_sms[device], cudaDevAttrMultiProcessorCount, device);
+    const auto* props = at::cuda::getDeviceProperties(device);
+    int64_t M = a.size(-2), N = b.size(-1), K = a.size(-1);
     int64_t batch = a.dim() == 3 ? a.size(0) : 1;
+    if (tuned_device(device) && M >= 64 && M * batch >= MIN_ROWS && N >= 1024 && K >= 512)
+    {
+        const int tile_n = narrow_tile(a, b) ? 64 : 128;
+        int64_t blocks = ((M + BM - 1) / BM) * (N / tile_n) * batch;
+        // The measured small-M and batched wins include grids below one block per SM.
+        return blocks * 2 >= props->multiProcessorCount;
+    }
+    if (M < MIN_ROWS) return false;
     int64_t blocks = ((M + BM - 1) / BM) * (N / BN) * batch;
-    return blocks >= g_num_sms[device];
+    return blocks >= props->multiProcessorCount;
+}
+
+template <bool OUT_F32, int TILE_N, bool TUNED>
+static void launch_config(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, cudaStream_t stream)
+{
+    using CF = Config<TILE_N, TUNED>;
+    auto kern = gemm_kernel<OUT_F32, TILE_N, TUNED>;
+    static std::once_flag attr_set[MAX_DEVICES];
+    int device = a.device().index();
+    TORCH_CHECK(device >= 0 && device < MAX_DEVICES, "hgemm_f16acc: device index");
+    std::call_once(attr_set[device], [&]()
+    {
+        cuda_check(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) CF::SMEM_BYTES));
+    });
+    bool batched = a.dim() == 3;
+    int batch = batched ? a.size(0) : 1;
+    int M = a.size(-2), K = a.size(-1), N = b.size(-1);
+    dim3 grid(N / CF::BN, (M + CF::BM - 1) / CF::BM, batch);
+    kern<<<grid, CF::THREADS, CF::SMEM_BYTES, stream>>>(
+        (const half*) a.data_ptr(), (const half*) b.data_ptr(), c.data_ptr(),
+        M, N, K, (int) c.stride(-2),
+        batched ? a.stride(0) : 0, batched ? b.stride(0) : 0, batched ? c.stride(0) : 0);
+    cuda_check(cudaPeekAtLastError());
 }
 
 template <bool OUT_F32>
 static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, cudaStream_t stream)
 {
-    auto kern = gemm_kernel<OUT_F32>;
-    // The dynamic-smem opt-in is a per-device function attribute: set it once per device
-    // (a process-wide flag left the second device of a layer split launching without it:
-    // "invalid argument" at the launch)
-    static bool attr_set[MAX_DEVICES] = {};
-    int device = a.device().index();
-    TORCH_CHECK(device >= 0 && device < MAX_DEVICES, "hgemm_f16acc: device index");
-    if (!attr_set[device])
-    {
-        cuda_check(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) SMEM_BYTES));
-        attr_set[device] = true;
-    }
-    bool batched = a.dim() == 3;
-    int batch = batched ? a.size(0) : 1;
-    int M = a.size(-2), K = a.size(-1), N = b.size(-1);
-    dim3 grid(N / BN, (M + BM - 1) / BM, batch);
-    kern<<<grid, THREADS, SMEM_BYTES, stream>>>(
-        (const half*) a.data_ptr(), (const half*) b.data_ptr(), c.data_ptr(),
-        M, N, K, (int) c.stride(-2),
-        batched ? a.stride(0) : 0, batched ? b.stride(0) : 0, batched ? c.stride(0) : 0);
-    cuda_check(cudaPeekAtLastError());
+    if (!tuned_device(a.device().index())) launch_config<OUT_F32, 128, false>(a, b, c, stream);
+    else if (narrow_tile(a, b)) launch_config<OUT_F32, 64, true>(a, b, c, stream);
+    else launch_config<OUT_F32, 128, true>(a, b, c, stream);
 }
 
 } // namespace f16acc
@@ -396,7 +510,7 @@ bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c)
 // Force the kernel (tests / benchmarks): errors if the shape is not covered
 void hgemm_f16acc(at::Tensor a, at::Tensor b, at::Tensor c)
 {
-    TORCH_CHECK(f16acc::covered(a, b, c), "hgemm_f16acc: shape not covered (K % 64, N % 128, packed 16-byte aligned rows)");
+    TORCH_CHECK(f16acc::covered(a, b, c), "hgemm_f16acc: unsupported device, shape, strides or alignment (Ampere+, K % 64, N % 128; 16-byte input and vector-aligned output)");
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     if (c.dtype() == at::kFloat) f16acc::launch<true>(a, b, c, stream);

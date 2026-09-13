@@ -8,6 +8,7 @@ namespace py = pybind11;
 #include "mlp.h"
 #include "linear.h"
 #include "../graph.cuh"
+#include "../quant/exl3_moe_coop.cuh"
 
 #define MAX_EXPERTS 512
 #define TEMP_ROWS_GRAPH 32  // must match TEMP_ROWS_GRAPH in BlockSparseMLP.py
@@ -32,7 +33,8 @@ struct BC_BlockSparseMLP
     at::Tensor out_d;
     at::Tensor out_d2;
     c10::optional<at::Tensor> out_d_sh;
-    c10::optional<at::Tensor> z;
+    at::Tensor coop_ctr;    // int32 completion counters of the fused decode kernels (zeroed at creation)
+    at::Tensor had_u;       // (MAX_BSZN * top_k, Hi) rotated up input of the fused decode kernels (yh holds the gate's)
     at::Tensor dq_temp_up;
     at::Tensor dq_temp_down;
     int min_expert;
@@ -71,21 +73,17 @@ struct BC_BlockSparseMLP
     at::Tensor gu_svh_ptr;
 
     // Per-expert bias pointer tables (int64 device tensors) for models with biased experts
-    // (gpt-oss); the down bias applies before the routing weight, so the weighted mgemm
-    // reduction is corrected with the weighted bias sum
+    // (gpt-oss); the down bias applies before the routing weight
     c10::optional<at::Tensor> gate_bias_ptrs;
     c10::optional<at::Tensor> up_bias_ptrs;
     c10::optional<at::Tensor> down_bias_ptrs;
 
-    // Padded hidden dim (gpt-oss): zero-padded input staging for the gate/up mgemms (the
-    // quantized K) and exact-width output copied out of the padded down result
-    c10::optional<at::Tensor> y_pad;
-    c10::optional<at::Tensor> out_trim;
+    // Output of the fused decode path (run_bszN): the trimmed, reduced row per token
+    at::Tensor out_bszn;    // (MAX_BSZN, H) fp32
 
-    // Static scratch for the num_tokens > 1 gathered input (each of num_tokens*top_k slots holds
-    // a copy of its token's row); sized [MAX_BSZN * top_k, Hi] Python-side. Unused (num_tokens==1
-    // keeps the zero-copy y.unsqueeze(0)/y_pad broadcast path)
-    at::Tensor a_gather;
+    // Validated static parameter block of the fused decode kernels (built in the constructor)
+    MoeCoopParams coop_p;
+    int coop_K_gu, coop_K_d, coop_cb;
 
     int max_experts_per_token;
     int max_tokens_per_expert;
@@ -96,14 +94,7 @@ struct BC_BlockSparseMLP
 
     bool use_mgemm;
 
-    // graph_bszN[bsz - 1] covers bsz 1..MAX_BSZN (bsz==1 keeps the original zero-copy behavior
-    // internally; replaces the old single-instance graph_bsz1)
-    Graph graph_bszN[MAX_BSZN];
     Graph graph_single[TEMP_ROWS_GRAPH];
-    // Lazily-built per num_tokens (index num_tokens - 1); only entries for num_tokens >= 2 are
-    // populated. Depends only on (num_tokens, top_k), never on routing outcome, so built once and
-    // reused for every subsequent call at that bsz
-    std::vector<at::Tensor> flat_token_cache;
 
     BC_BlockSparseMLP
     (
@@ -117,7 +108,8 @@ struct BC_BlockSparseMLP
         at::Tensor _out_d,
         at::Tensor _out_d2,
         c10::optional<at::Tensor> _out_d_sh,
-        c10::optional<at::Tensor> _z,
+        at::Tensor _coop_ctr,
+        at::Tensor _had_u,
         at::Tensor _dq_temp_up,
         at::Tensor _dq_temp_down,
         int _min_expert,
@@ -152,23 +144,11 @@ struct BC_BlockSparseMLP
         at::Tensor _gu_trellis_ptr,
         at::Tensor _gu_suh_ptr,
         at::Tensor _gu_svh_ptr,
-        at::Tensor _a_gather,
+        at::Tensor _out_bszn,
         c10::optional<at::Tensor> _gate_bias_ptrs,
         c10::optional<at::Tensor> _up_bias_ptrs,
         c10::optional<at::Tensor> _down_bias_ptrs,
-        c10::optional<at::Tensor> _y_pad,
-        c10::optional<at::Tensor> _out_trim,
         bool _act_relu2 = false
-    );
-
-    void run_bszN_gr
-    (
-        const at::Tensor& A_in,
-        const at::Tensor& x_dense,
-        at::Tensor& selected_experts,
-        at::Tensor& routing_weights,
-        int num_tokens,
-        Graph* graph
     );
 
     void run_bszN

@@ -30,6 +30,7 @@
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include "quant/exl3_moe.cuh"
+#include "quant/exl3_moe_coop.cuh"
 
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
@@ -135,6 +136,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
+    m.def("quantize_tiles_scratch", &quantize_tiles_scratch, "quantize_tiles_scratch");
     m.def("test_distribution", &test_distribution, "test_distribution");
     m.def("decode", &decode, "decode");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
@@ -254,6 +256,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
+    m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");
     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");
