@@ -651,8 +651,21 @@ class GatedMLP(Module):
 
         # Graphed bsz-1 path: fused gate+up mgemm when available, otherwise two separate GEMV
         # calls (the unfused configuration the int8-activation GEMV mode prefers)
+        # sm_70: the bc path runs exl3_gemm_gr in C++ with graph capture;
+        # K > 4 layers need the reconstruct+hgemm fallback, which is not
+        # graph-capturable. Skip the bc path entirely on cc < 8 with K > 4.
         self.bc = None
-        if self.num_slices == 1 and self.downs[0].inner.bc is not None:
+        cc_ok = True
+        try:
+            from ..ext import exllamav3_ext as _ext
+            dev = self.device
+            dev_str = str(dev)
+            dev_idx = int(dev_str.split(':')[-1]) if ':' in dev_str else 0
+            if _ext.g_get_cc(dev_idx) < 8:
+                cc_ok = all(l.inner.K <= 4 for l in (self.gates[0], self.ups[0], self.downs[0]))
+        except Exception:
+            pass
+        if self.num_slices == 1 and cc_ok and self.downs[0].inner.bc is not None:
             mgu = self.multi_gu[0]
             g0, u0 = self.gates[0], self.ups[0]
             can_separate = (

@@ -6,6 +6,8 @@
 #include "../util.h"
 #include "../hgemm.cuh"
 #include "../quant/exl3_gemm.cuh"
+#include "../quant/reconstruct.cuh"
+#include "../quant/hadamard.cuh"
 #include "../add.cuh"
 
 void BC_LinearFP16::run_gr(const at::Tensor& x, at::Tensor& y, Graph* graph)
@@ -33,6 +35,28 @@ void BC_LinearFP16::run(const at::Tensor& x, at::Tensor& y)
 
 void BC_LinearEXL3::run_gr(const at::Tensor& x, at::Tensor& y, Graph* graph)
 {
+    // K > 4: the sm70 GEMV kernel and the block-pipelined kernels (no-ops
+    // below sm_80) both decline, so exl3_gemm_gr would silently produce
+    // zeros. Reconstruct + cuBLAS hgemm instead — correct on every arch.
+    // The fused fused-reconstruct path is not available here, so this is
+    // the plain reconstruct + hgemm pair.
+    if (K > 4)
+    {
+        TORCH_CHECK(!graph || graph->disabled, "BC_LinearEXL3 K > 4 invoked with graph capture");
+        at::Tensor w = at::empty({trellis.size(0) * 16, trellis.size(1) * 16},
+            at::TensorOptions().dtype(at::kHalf).device(trellis.device()));
+        reconstruct(w, trellis, K, mcg, mul1);
+        at::Tensor x_ = x.reshape({-1, x.size(-1)});
+        at::Tensor xh_ = at::empty_like(x_);
+        had_r_128(x_, xh_, suh, c10::nullopt, 1.0f);
+        at::Tensor y_ = at::empty({x_.size(0), w.size(1)},
+            at::TensorOptions().dtype(at::kHalf).device(y.device()));
+        hgemm(xh_, w, y_);
+        had_r_128(y_, y_, c10::nullopt, svh, 1.0f);
+        y.copy_(y_.view(y.sizes()));
+        return;
+    }
+
     if (x.numel() == x.size(-1))
     {
         exl3_gemm_gr(x, trellis, y, suh, xh, svh, -1, mcg, mul1, 0, graph);

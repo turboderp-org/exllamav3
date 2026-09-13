@@ -7,6 +7,12 @@
 namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
+#include "../hgemm.cuh"
+#include <ATen/ATen.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/empty_like.h>
+#include "reconstruct.cuh"
+#include "hadamard.cuh"
 #include "exl3_gemm_kernel.cuh"
 #include "exl3_kernel_map.cuh"
 #include "bits_k.cuh"
@@ -181,6 +187,28 @@ int exl3_gemm_gr
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
+
+    // sm_70 (cc < 8) with K > 4: neither the GEMV kernel (K <= 4) nor the
+    // block-pipelined kernels (sm_80+) can run this shape. Reconstruct +
+    // cuBLAS hgemm — correct on every arch. Not graph-capturable (the
+    // reconstruct allocates); callers must keep this path eager.
+    if (K > 4 && cc < 8)
+    {
+        TORCH_CHECK(!graph, "exl3_gemm_gr: K > 4 on cc < 8 is not graph-capturable; "
+                            "disable fused/graphed paths for K > 4 layers");
+        at::Tensor w = at::empty({B.size(0) * 16, B.size(1) * 16},
+            A.options().dtype(at::kHalf));
+        reconstruct(w, B, K, mcg, mul1);
+        at::Tensor x2 = A.reshape({-1, A.size(-1)});
+        at::Tensor xh2 = at::empty_like(x2);
+        had_r_128(x2, xh2, suh, c10::nullopt, 1.0f);
+        at::Tensor y2 = at::empty({x2.size(0), w.size(1)},
+            A.options().dtype(c_fp32 ? at::kFloat : at::kHalf));
+        hgemm(xh2, w, y2);
+        had_r_128(y2, y2, c10::nullopt, svh, 1.0f);
+        C.copy_(y2.view(C.sizes()));
+        return 0;
+    }
 
     // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
@@ -581,6 +609,28 @@ int exl3_mgemm_gr
     const int K = bk.bits;
     const bool half_k = bk.half;
     TORCH_CHECK(!half_k || mul1, "exl3_mgemm: half-integer bitrates require the mul1 codebook");
+
+    // sm_70 (cc < 8) with K > 4: neither the GEMV kernel (K <= 4) nor the
+    // block-pipelined kernels (sm_80+) can run this shape. Reconstruct +
+    // cuBLAS hgemm — correct on every arch. Not graph-capturable (the
+    // reconstruct allocates); callers must keep this path eager.
+    if (K > 4 && cc < 8)
+    {
+        TORCH_CHECK(!graph, "exl3_gemm_gr: K > 4 on cc < 8 is not graph-capturable; "
+                            "disable fused/graphed paths for K > 4 layers");
+        at::Tensor w = at::empty({B.size(0) * 16, B.size(1) * 16},
+            A.options().dtype(at::kHalf));
+        reconstruct(w, B, K, mcg, mul1);
+        at::Tensor x2 = A.reshape({-1, A.size(-1)});
+        at::Tensor xh2 = at::empty_like(x2);
+        had_r_128(x2, xh2, suh, c10::nullopt, 1.0f);
+        at::Tensor y2 = at::empty({x2.size(0), w.size(1)},
+            A.options().dtype(c_fp32 ? at::kFloat : at::kHalf));
+        hgemm(xh2, w, y2);
+        had_r_128(y2, y2, c10::nullopt, svh, 1.0f);
+        C.copy_(y2.view(C.sizes()));
+        return 0;
+    }
 
     int shape_idx;
     int block_dim;
