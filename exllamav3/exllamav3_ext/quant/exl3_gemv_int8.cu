@@ -48,7 +48,11 @@ int exl3_gemv_int8_max_k(int device)
     static const int env_max_k = [] { const char* e = getenv("EXL3_INT8_GEMV_MAX_K"); return e ? atoi(e) : 0; }();
     if (env_max_k) return MIN(env_max_k, 8);
     int cc = DevCtx::instance().get_cc(device);
-    return (cc == CC_HOPPER || cc == CC_BLACKWELL) ? 6 : 5;
+    // sm_70 (cc < 8): the K=5 int8 kernel mis-executes here (wrong
+    // output at n >= 256; exact at n = 128 — measured on V100).
+    // Cap at K=4 so K=5 mul1 falls through to the sm70 GEMV, which
+    // is exact for all K 5-8.
+    return (cc == CC_HOPPER || cc == CC_BLACKWELL) ? 6 : (cc < 8 ? 4 : 5);
 }
 
 struct GemvInt8Workspace
