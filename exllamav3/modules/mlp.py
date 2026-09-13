@@ -778,8 +778,20 @@ class GatedMLP(Module):
         # Graphed bsz-1 path: fused gate+up mgemm when available, otherwise two separate GEMV
         # calls (the unfused configuration the int8-activation GEMV mode prefers)
         # (not with interm_div: the graph has no hook for the pre-activation rescale)
+        # sm_70 (pre-Ampere): K > 4 layers need the reconstruct+hgemm fallback, which
+        # is not graph-capturable; skip the bc path for those only. g_get_cc returns
+        # the DevCtx class enum (CC_OLD=1 .. CC_BLACKWELL=5), so "pre-Ampere" == 1.
         self.bc = None
-        if self.num_slices == 1 and self.interm_div == 1.0 and self.downs[0].inner.bc is not None:
+        cc_old = False
+        try:
+            from ..ext import exllamav3_ext as _ext
+            dev_str = str(self.device)
+            dev_idx = int(dev_str.split(':')[-1]) if ':' in dev_str else 0
+            cc_old = _ext.g_get_cc(dev_idx) == 1
+        except Exception:
+            pass
+        if (self.num_slices == 1 and self.interm_div == 1.0 and self.downs[0].inner.bc is not None
+                and (not cc_old or all(l.inner.K <= 4 for l in (self.gates[0], self.ups[0], self.downs[0])))):
             mgu = self.multi_gu[0]
             g0, u0 = self.gates[0], self.ups[0]
             can_separate = (
