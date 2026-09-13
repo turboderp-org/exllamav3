@@ -1,4 +1,5 @@
 from __future__ import annotations
+import gc
 import heapq
 import threading
 import torch
@@ -351,3 +352,7 @@ class CPUPageCache:
         self.slot_views = []
         self._spare.clear()
         self.pagetable = None
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch._C._host_emptyCache()
