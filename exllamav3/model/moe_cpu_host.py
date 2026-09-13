@@ -112,8 +112,8 @@ class MoeCpuTuning:
         # /sys/kernel/mm/transparent_hugepage/shmem_enabled allows it (advise/always/
         # within_size), so on a default (never) system the CPU kernels run on 4K pages;
         # EXL3_MOE_ARENA_HUGE=2m|1g backs the memfd with hugetlbfs pages instead (requires
-        # vm.nr_hugepages / hugepages-1048576kB reservations). On Windows the chunks are named
-        # pagefile-backed sections instead (see _HugeArena._new_chunk); no hugepage variant there.
+        # vm.nr_hugepages / hugepages-1048576kB reservations); Windows uses named sections, no
+        # hugepage variant.
         self.pinned_arena = os.environ.get("EXL3_MOE_PINNED_ARENA", "0") != "0"
         self.arena_huge = os.environ.get("EXL3_MOE_ARENA_HUGE", "").strip().lower()
         assert self.arena_huge in ("", "2m", "1g"), "EXL3_MOE_ARENA_HUGE must be 2m or 1g"
@@ -147,11 +147,10 @@ class _HugeArena:
     CHUNK_BYTES = 1 << 30   # 1 GiB
 
     def __init__(self, shared = False, huge = "", conn = None):
-        """shared: back each chunk with shared memory instead of an anonymous private mapping
-        and publish it over `conn` as ("chunk", index, size, name): on Linux a memfd whose
-        descriptor follows the message (SCM_RIGHTS, name = None), on Windows a named pagefile
-        section the parent opens by name. Either way the parent maps the same pages and
-        page-locks them for DMA. huge: "2m"/"1g" requests hugetlbfs-backed memfds (Linux)."""
+        """shared: back each chunk with shared memory and publish it over `conn` as
+        ("chunk", index, size, name) so the parent can map the same pages and page-lock them
+        for DMA: Linux sends a memfd descriptor after the message (SCM_RIGHTS, name = None),
+        Windows a named pagefile section. huge: "2m"/"1g" requests hugetlbfs memfds (Linux)."""
         self.shared = shared
         self.huge = huge
         self.conn = conn
@@ -165,11 +164,9 @@ class _HugeArena:
         check_host_memory(size, f"CPU MoE expert arena chunk {len(self.chunks)} "
                                 f"({(sum(len(c) for c in self.chunks) + size) >> 20} MiB in total)")
         if self.shared and os.name == "nt":
-            # Named pagefile-backed section, kept as a plain mmap (the object SharedMemory wraps;
-            # a SharedMemory owner's finalizer trips on the layer tensors' exports at worker exit).
-            # It charges commit up front and the parent page-locks every page, so both free
-            # physical RAM and commit headroom must cover the chunk: fail here rather than let
-            # the load thrash the pagefile or die in registration
+            # Named pagefile-backed section as a plain mmap (a SharedMemory owner's finalizer
+            # trips on the layer tensors' exports at worker exit). It charges commit and gets
+            # page-locked by the parent, so both free RAM and commit must cover the chunk
             index = len(self.chunks)
             avail_phys, avail_commit = windows_memory_status()
             if size > min(avail_phys, avail_commit):
@@ -493,13 +490,11 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
 
 
 def probe_bandwidth(timed_copy, floor_s = 0.5, cap_s = 2.0, asleep_gbs = 5.0):
-    """Sustained pinned->device rate in GB/s; `timed_copy()` performs one probe copy and returns
-    its rate. An idle PCIe link sits in a low power state (the Windows driver drops it to Gen1
-    after a few idle seconds) and retrains only under sustained traffic, 0.2-0.3 s on a gen4 x16
-    link, reading a perfectly stable Gen1 rate until then. So: copy for at least floor_s, then
-    until the last 8 copies sit within 5% of the best seen (steady state, no copy straddling the
-    retrain step), and keep pushing traffic up to cap_s while the rate still looks like a
-    sleeping link. Returns the median of the last 8 so one straddling copy cannot win."""
+    """Sustained pinned->device rate in GB/s from repeated `timed_copy()` calls. An idle link
+    sits at Gen1 (the Windows driver drops it after a few idle seconds) and retrains only after
+    0.2-0.3 s of sustained traffic, so: copy for at least floor_s, then until the last 8 copies
+    are within 5% of the best, up to cap_s while the rate still looks asleep. Median of the
+    last 8, so one copy straddling the retrain step cannot win."""
     import time
     t0 = time.perf_counter()
     best, trace = 0.0, []
@@ -597,12 +592,11 @@ class MoeCpuHost:
         return False
 
     def _attach_chunk(self, index, size, name):
-        """Pinned arena: attach arena chunk `index` as published by the worker (Linux: the memfd
-        descriptor follows the ("chunk", ...) message; Windows: `name` is the worker's pagefile
-        section), map it and page-lock the mapping for DMA. Registration is done here, per chunk
-        as it appears during loading, so its cost overlaps the rest of the load instead of
-        stacking up at startup. The mapping is owned by the handler below from the moment it
-        is opened: any failure closes it before the error leaves this frame."""
+        """Pinned arena: map arena chunk `index` (Linux: descriptor sent right after the
+        ("chunk", ...) message; Windows: section `name`) and page-lock it for DMA. Registration
+        is done here, per chunk as it appears during loading, so its cost overlaps the rest of
+        the load instead of stacking up at startup. Any failure closes the mapping before the
+        error leaves this frame."""
         import mmap
         import socket
         assert index == len(self.arena_maps), "arena chunk published out of order"
@@ -1156,8 +1150,7 @@ class MoeCpuHost:
             ev1.synchronize()
             return probe / (ev0.elapsed_time(ev1) * 1e-3) / 1e9   # GB/s
         with torch.cuda.stream(st["copy_stream"]):
-            # Streaming keeps the link awake, so the sustained awake rate is what the break-even
-            # estimate should use (see probe_bandwidth for the sleeping-link handling)
+            # streaming keeps the link awake, so the sustained awake rate is the one to use
             bw = probe_bandwidth(timed_copy)
         st["bw"] = bw
         if TUNING.stream_t_explicit:

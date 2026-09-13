@@ -242,10 +242,10 @@ models with many small experts (see issue trace on Qwen3.6-35B-A3B).
 Minimum per-expert token-assignment count (in a prefill chunk) for an expert's weights to be
 streamed to the GPU instead of computed on the CPU tail. Unset, the effective threshold scales
 inversely with the measured pinned→device bandwidth (probed once per device): a chipset-attached
-x4 link needs a much hotter expert to justify the weight DMA than a CPU-direct x16 one. The probe
-keeps traffic on the link for at least 0.5 s and until the rate is steady, since an idle link sits
-at Gen1 and retrains only after a few hundred ms of sustained traffic. Setting this explicitly
-pins the threshold on every device and disables the bandwidth scaling.
+x4 link needs a much hotter expert to justify the weight DMA than a CPU-direct x16 one. On
+Windows the driver drops an idle link to Gen1, so the probe keeps traffic on it for at least
+0.5 s and until the rate is steady. Setting this explicitly pins the threshold on every device
+and disables the bandwidth scaling.
 
 ### `EXL3_MOE_STREAM_FUSED_T` (default: `256`)
 
@@ -409,10 +409,8 @@ both processes' RSS. On Linux the chunks are `memfd`s passed over the worker pip
 only get transparent huge pages where `/sys/kernel/mm/transparent_hugepage/shmem_enabled`
 allows it (`advise`, `within_size` or `always`; on the default `never` the CPU kernels run on
 4K pages, which cost a few percent of decode on some hosts). On Windows the chunks are named
-pagefile-backed sections opened by name, always on 4K pages; each chunk must fit both the free
-physical RAM and the commit headroom at the time it is created or the load fails with a
-message naming the chunk, since page-locked memory cannot be paged out and a section short of
-commit fails at creation.
+pagefile-backed sections (4K pages); each must fit both free physical RAM and commit headroom
+when it is created, or the load fails naming the chunk.
 
 ### `EXL3_HOST_MEM_RESERVE_MB` (default: `2048`)
 
