@@ -53,11 +53,14 @@ template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE>
 __global__ __launch_bounds__(CFG == 0 ? 512 : 256)
 void exl3_gemv_sm70_kernel(EXL3_GEMM_ARGS)
 {
-    static_assert(bits == 2 || bits == 3 || bits == 4, "exl3_gemv_sm70_kernel supports 2, 3 and 4 bpw");
+    static_assert(bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 7 || bits == 8,
+        "exl3_gemv_sm70_kernel supports 2-8 bpw");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
-    constexpr int LOADS = bits == 2 ? WNT / 2 : WNT;        // warp loads per k-slice
+    // K >= 5: the tile is 8*bits >= 40 words — more than the 32 lanes
+    // hold in one load, so each tile takes 2 loads (64 slots >= 8*bits).
+    constexpr int LOADS = bits >= 5 ? 2 * WNT : (bits == 2 ? WNT / 2 : WNT);  // warp loads per k-slice
     constexpr int COLS = WNT * 16;
 
     constexpr int TWORDS = 8 * bits;                        // uint32 per 16x16 tile
@@ -146,9 +149,16 @@ void exl3_gemv_sm70_kernel(EXL3_GEMM_ARGS)
         const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
 
         // Prefetch ring (indices must be compile-time or pf lands in local memory)
+        // K >= 5: each tile spans 2 loads; load l covers tile (l >> 1),
+        // words (l & 1) * 32 + lane. K <= 4: one load per tile, offset
+        // l * LSTRIDE (== TWORDS).
         auto ld_b = [&] (int i, int l) -> uint32_t
         {
-            if constexpr (bits == 3)
+            // bp = tile 0, word lane. For K >= 5 each tile spans 2 loads:
+            // load l reads tile (l >> 1), word (l & 1) * 32 + lane.
+            if constexpr (bits >= 5)
+                return __ldcs(bp + (size_t) i * slice_stride + (l >> 1) * TWORDS + (l & 1) * 32);
+            else if constexpr (bits == 3)
                 return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
             else
                 return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
@@ -190,8 +200,14 @@ void exl3_gemv_sm70_kernel(EXL3_GEMM_ARGS)
                 __syncwarp();
                 #pragma unroll
                 for (int l = 0; l < LOADS; ++l)
-                    if (bits != 3 || lane < 24)
+                {
+                    // K >= 5: load l holds word (l & 1) * 32 + lane of
+                    // tile (l >> 1). K <= 4: load l = tile l, word lane.
+                    if constexpr (bits >= 5)
+                        sh_stage[warp][(l >> 1) * TWORDS + (l & 1) * 32 + lane] = bw[l];
+                    else
                         sh_stage[warp][l * LSTRIDE + lane] = bw[l];
+                }
                 __syncwarp();
             }
 
@@ -207,7 +223,26 @@ void exl3_gemv_sm70_kernel(EXL3_GEMM_ARGS)
                 if constexpr (SMEM_STAGE)
                 {
                     const uint32_t* tp = &sh_stage[warp][t * TWORDS];
-                    if constexpr (bits == 4)
+                    if constexpr (bits >= 5)
+                    {
+                        // Verbatim upstream decode on the shared-memory
+                        // tile, mirroring dq_dispatch for bits 5-8:
+                        // dq4 pairs for 5/6/8, dq2x2 pairs for 7.
+                        FragB f0, f1;
+                        if constexpr (bits == 7)
+                        {
+                            dq2x2<bits, cb>(tp, lane << 3, f0);
+                            dq2x2<bits, cb>(tp, (lane << 3) + 4, f1);
+                        }
+                        else
+                        {
+                            dq4<bits, cb>(tp, lane << 3, f0);
+                            dq4<bits, cb>(tp, (lane << 3) + 4, f1);
+                        }
+                        v[0] = *reinterpret_cast<const uint32_t*>(&f0[0]); v[1] = *reinterpret_cast<const uint32_t*>(&f0[1]);
+                        v[2] = *reinterpret_cast<const uint32_t*>(&f1[0]); v[3] = *reinterpret_cast<const uint32_t*>(&f1[1]);
+                    }
+                    else if constexpr (bits == 4)
                     {
                         uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
                         FragB f0, f1;
@@ -246,6 +281,15 @@ void exl3_gemv_sm70_kernel(EXL3_GEMM_ARGS)
                     uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
                     FragB f0, f1;
                     exl3_gemv_ns::dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
+                    v[0] = *reinterpret_cast<const uint32_t*>(&f0[0]); v[1] = *reinterpret_cast<const uint32_t*>(&f0[1]);
+                    v[2] = *reinterpret_cast<const uint32_t*>(&f1[0]); v[3] = *reinterpret_cast<const uint32_t*>(&f1[1]);
+                }
+                else if constexpr (bits >= 5)
+                {
+                    // Tile t spans loads 2t (words 0..31) and 2t+1 (words
+                    // 32..63); dq8_regs_gen gathers via shuffles.
+                    FragB f0, f1;
+                    exl3_gemv_ns::dq8_regs_gen<bits, cb>(&bw[2 * t], lane << 3, f0, f1);
                     v[0] = *reinterpret_cast<const uint32_t*>(&f0[0]); v[1] = *reinterpret_cast<const uint32_t*>(&f0[1]);
                     v[2] = *reinterpret_cast<const uint32_t*>(&f1[0]); v[3] = *reinterpret_cast<const uint32_t*>(&f1[1]);
                 }
