@@ -141,9 +141,12 @@ class CPUPageCache:
         # its own shard, so there is nothing to pin here for a cache that is entirely TP.
         self._spare = deque()
         self._spare_cond = threading.Condition()
+        self._stop_event = threading.Event()
         if self.segments:
             self._alloc_thread = threading.Thread(target = self._alloc_worker, daemon = True)
             self._alloc_thread.start()
+        else:
+            self._alloc_thread = None
 
 
     def attach(self, pagetable):
@@ -169,12 +172,18 @@ class CPUPageCache:
 
     def _alloc_worker(self):
         with torch.inference_mode():
-            while True:
+            while not self._stop_event.is_set():
                 with self._spare_cond:
                     while len(self.slot_slabs) + len(self._spare) >= self.max_slots:
-                        self._spare_cond.wait()
+                        self._spare_cond.wait(timeout=0.5)
+                        if self._stop_event.is_set():
+                            return
+                    if self._stop_event.is_set():
+                        return
                 sv = self._make_slab()  # slow part, outside the lock
                 with self._spare_cond:
+                    if self._stop_event.is_set():
+                        return
                     self._spare.append(sv)
 
 
@@ -328,3 +337,17 @@ class CPUPageCache:
             m.tp_cpu_cache_fetch(ids, e["slot"], page_index)
         self.metrics["restores"] += 1
         return e
+
+    def close(self):
+        """Stop the background pinning thread and drop all tensor references."""
+        self._stop_event.set()
+        with self._spare_cond:
+            self._spare_cond.notify_all()
+        if self._alloc_thread is not None:
+            self._alloc_thread.join()
+        self.segments = []
+        self.entries = {}
+        self.slot_slabs = []
+        self.slot_views = []
+        self._spare.clear()
+        self.pagetable = None
