@@ -109,6 +109,10 @@ static void* exl3_gemv_sm70_select_kernel(int bits, int cb, bool c_fp32, int mmo
     SEL_GRID(2, 0, true) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 0, true) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
     SEL_GRID(5, 0, true) SEL_GRID(5, 1, true) SEL_GRID(5, 2, true)
+    SEL_GRID(5, 0, false) SEL_GRID(5, 1, false) SEL_GRID(5, 2, false)
+    SEL_GRID(6, 0, false) SEL_GRID(6, 1, false) SEL_GRID(6, 2, false)
+    SEL_GRID(7, 0, false) SEL_GRID(7, 1, false) SEL_GRID(7, 2, false)
+    SEL_GRID(8, 0, false) SEL_GRID(8, 1, false) SEL_GRID(8, 2, false)
     SEL_GRID(6, 0, true) SEL_GRID(6, 1, true) SEL_GRID(6, 2, true)
     SEL_GRID(7, 0, true) SEL_GRID(7, 1, true) SEL_GRID(7, 2, true)
     SEL_GRID(8, 0, true) SEL_GRID(8, 1, true) SEL_GRID(8, 2, true)
@@ -166,9 +170,10 @@ bool exl3_gemv_try_launch
 
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
     bool smem = exl3_gemv_env_smem() == 1;
-    // sm_70 with K >= 5: the decode runs on the shared-memory tile
-    // (verbatim dq4), so SMEM_STAGE is required, not optional.
-    if (cc < 8 && K >= 5) smem = true;
+    // sm_70 with K >= 5: default to the register-form shuffle gather
+    // (SMEM_STAGE=false) — drops sh_stage (8 KB/block at K>=5), restoring
+    // K=4 occupancy. EXL3_GEMV_SMEM=1 forces the SMEM-staged variant.
+    // if (cc < 8 && K >= 5) smem = true;
 
     // sm_70 and older: the sm80 mma kernels are no-ops (arch-guarded) —
     // route to the m8n8k4 variant, which shares the launch signature.

@@ -44,6 +44,70 @@ __device__ __forceinline__ void mma_ab_sm70(
     exl3_sm70::mma_m8n8k4_rc_f32(a0, a1, b0, b1, d);
 }
 
+// Shuffle-based tile word gather for bits >= 5 (SMEM_STAGE=false):
+// tile t spans loads 2t (words 0-31) and 2t+1 (words 32-63); word i
+// of the tile lives at lane (i & 31) in register bw[2*t + (i >> 5)].
+// The array index must be lane-uniform for the shuffle, so each word
+// read takes two shuffles (lo/hi) with a lane-local selector.
+__device__ __forceinline__ uint32_t shfl_word(
+    const uint32_t* bw, int t, int i)
+{
+    uint32_t lo = __shfl_sync(0xffffffffu, bw[2 * t], i & 31);
+    uint32_t hi = __shfl_sync(0xffffffffu, bw[2 * t + 1], i & 31);
+    return (i >> 5) ? hi : lo;
+}
+
+// dq4 on shuffle-gathered words: same bit math as exl3_dq.cuh's
+// dq4, with ptr[i0 % TWORDS] / ptr[i2 % TWORDS] replaced by
+// shfl_word(bw, t, i0 % TWORDS) etc.
+template <int bits, int cb>
+__device__ __forceinline__ void dq4_shfl(
+    const uint32_t* bw, int t, int t_offset, FragB& frag)
+{
+    constexpr int TWORDS = 8 * bits;
+    int b0 = (t_offset + 257) * bits - 16;
+    int b1 = b0 + 3 * bits;
+    int b2 = b1 + 16;
+    int i0 = b0 / 32;
+    int i2 = (b2 - 1) / 32;
+    int s2 = (i2 + 1) * 32 - b2;
+
+    uint32_t a = shfl_word(bw, t, i0 % TWORDS);
+    uint32_t b = shfl_word(bw, t, i2 % TWORDS);
+    uint32_t w3 = fshift(b, a, s2)            & 0xffff;
+    uint32_t w2 = fshift(b, a, s2 + bits)     & 0xffff;
+    uint32_t w1 = fshift(b, a, s2 + bits * 2) & 0xffff;
+    uint32_t w0 = fshift(b, a, s2 + bits * 3) & 0xffff;
+    half2 d0d1 = decode_3inst_2<cb>(w0, w1);
+    half2 d2d3 = decode_3inst_2<cb>(w2, w3);
+    frag[0] = d0d1;
+    frag[1] = d2d3;
+}
+
+template <int bits, int cb>
+__device__ __forceinline__ void dq2x2_shfl(
+    const uint32_t* bw, int t, int t_offset, FragB& frag)
+{
+    constexpr int TWORDS = 8 * bits;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+    {
+        int b0 = (t_offset + 2 * i + 257) * bits - 16;
+        int b1 = b0 + 1 * bits;
+        int b2 = b1 + 16;
+        int i0 = b0 / 32;
+        int i2 = (b2 - 1) / 32;
+        int s2 = (i2 + 1) * 32 - b2;
+
+        uint32_t a = shfl_word(bw, t, i0 % TWORDS);
+        uint32_t b = shfl_word(bw, t, i2 % TWORDS);
+        uint32_t w1 = fshift(b, a, s2)        & 0xffff;
+        uint32_t w0 = fshift(b, a, s2 + bits) & 0xffff;
+        half2 d0d1 = decode_3inst_2<cb>(w0, w1);
+        frag[i] = d0d1;
+    }
+}
+
 }  // namespace exl3_gemv_sm70_ns
 
 // MMODE: 0 = single row (m == 1), 1 = batched (m <= EXL3_GEMV_SM70_MAX_M)
@@ -265,6 +329,27 @@ void exl3_gemv_sm70_kernel(EXL3_GEMM_ARGS)
                         v[2] = *reinterpret_cast<const uint32_t*>(&f1[0]); v[3] = *reinterpret_cast<const uint32_t*>(&f1[1]);
                     }
                 }
+                else if constexpr (bits >= 5)
+                {
+                    // Register-form gather: the tile's words live across
+                    // the warp's bw registers (load l holds tile word
+                    // (l & 1) * 32 + lane). Same decode math as the SMEM
+                    // path, word reads via warp shuffles — no staging,
+                    // no sh_stage footprint.
+                    FragB f0, f1;
+                    if constexpr (bits == 7)
+                    {
+                        exl3_gemv_sm70_ns::dq2x2_shfl<bits, cb>(bw, t, lane << 3, f0);
+                        exl3_gemv_sm70_ns::dq2x2_shfl<bits, cb>(bw, t, (lane << 3) + 4, f1);
+                    }
+                    else
+                    {
+                        exl3_gemv_sm70_ns::dq4_shfl<bits, cb>(bw, t, lane << 3, f0);
+                        exl3_gemv_sm70_ns::dq4_shfl<bits, cb>(bw, t, (lane << 3) + 4, f1);
+                    }
+                    v[0] = *reinterpret_cast<const uint32_t*>(&f0[0]); v[1] = *reinterpret_cast<const uint32_t*>(&f0[1]);
+                    v[2] = *reinterpret_cast<const uint32_t*>(&f1[0]); v[3] = *reinterpret_cast<const uint32_t*>(&f1[1]);
+                }
                 else if constexpr (bits == 4)
                 {
                     uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
@@ -281,15 +366,6 @@ void exl3_gemv_sm70_kernel(EXL3_GEMM_ARGS)
                     uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
                     FragB f0, f1;
                     exl3_gemv_ns::dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
-                    v[0] = *reinterpret_cast<const uint32_t*>(&f0[0]); v[1] = *reinterpret_cast<const uint32_t*>(&f0[1]);
-                    v[2] = *reinterpret_cast<const uint32_t*>(&f1[0]); v[3] = *reinterpret_cast<const uint32_t*>(&f1[1]);
-                }
-                else if constexpr (bits >= 5)
-                {
-                    // Tile t spans loads 2t (words 0..31) and 2t+1 (words
-                    // 32..63); dq8_regs_gen gathers via shuffles.
-                    FragB f0, f1;
-                    exl3_gemv_ns::dq8_regs_gen<bits, cb>(&bw[2 * t], lane << 3, f0, f1);
                     v[0] = *reinterpret_cast<const uint32_t*>(&f0[0]); v[1] = *reinterpret_cast<const uint32_t*>(&f0[1]);
                     v[2] = *reinterpret_cast<const uint32_t*>(&f1[0]); v[3] = *reinterpret_cast<const uint32_t*>(&f1[1]);
                 }
