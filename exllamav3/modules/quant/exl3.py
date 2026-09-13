@@ -142,13 +142,9 @@ class LinearEXL3:
             # rows > 1 to reconstruct+hgemm.
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
                 cc = ext.g_get_cc(x.device.index) if x.device.index is not None else 99
-                # K > 4: the tiled sm70 fallback (exl3_gemm_gr cc<8 branch)
-                # routes through exl3_gemv_try_launch, which rejects K > 4 —
-                # the call then falls through to the block-pipelined kernel
-                # (a silent no-op on sm70, output zeros). Route to
-                # reconstruct+hgemm instead.
-                if self.K > 4 and cc < 8:
-                    return self.reconstruct_hgemm(x, out_dtype)
+                # K > 4 on sm70: the GEMV kernel now covers K 5-8 (SMEM
+                # decode); exl3_gemm_gr's reconstruct+hgemm fallback catches
+                # whatever the GEMV declines (large M). No special routing.
                 if rows > 2 and cc < 8:
                     pass  # fall through to reconstruct_hgemm
                 else:
