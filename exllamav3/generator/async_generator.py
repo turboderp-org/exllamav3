@@ -112,6 +112,10 @@ class AsyncGenerator:
             async_job.put_result(_CANCELLED_SENTINEL)
         self.jobs.clear()
 
+        cpu_cache = getattr(self.generator, "cpu_page_cache", None)
+        if cpu_cache is not None:
+            cpu_cache.close()
+
     async def cancel(self, job: AsyncJob):
         # Remove the underlying Job from the synchronous generator first so no new tokens are produced, then drop
         # the async mapping so any late results from an in-flight iteration are ignored. Finally wake the job's

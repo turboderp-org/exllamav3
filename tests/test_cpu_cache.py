@@ -93,3 +93,44 @@ def test_a_large_protect_set_does_not_claim_protected_pages():
     assert all(h in cache.entries for h in protect), "evicted a page the allocation in progress claimed"
     assert len(cache.entries) == slots - 1
     assert cache.metrics["evictions"] == 1
+
+
+def _wait_pinned(cache, timeout = 10.0):
+    # The worker pins the whole budget in the background; wait until it has, so the test covers the state the
+    # tier spends its life in (worker parked on the condition)
+    import time
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        with cache._spare_cond:
+            if len(cache._spare) + len(cache.slot_slabs) >= cache.max_slots:
+                return
+        time.sleep(0.01)
+    raise AssertionError("pinning thread did not fill the spare pool")
+
+
+def test_dropped_tier_releases_cache_tensors_and_worker():
+    # The pinning thread used to run a bound method and wait on the condition forever once the budget was pinned,
+    # which kept the tier alive after the Generator was dropped, and with it every GPU cache tensor in the
+    # segment table and the whole pinned budget (one KV cache leaked per model reload with cpu_cache_size set)
+    import gc, weakref
+    cache = build(8)
+    _wait_pinned(cache)
+    thread = cache._alloc_thread
+    tensor = cache.segments[0][0]
+    ref_cache, ref_tensor = weakref.ref(cache), weakref.ref(tensor)
+    del cache, tensor
+    gc.collect()
+    assert ref_cache() is None, "tier kept alive after its last reference was dropped"
+    assert ref_tensor() is None, "GPU cache tensor kept alive by a dropped tier"
+    thread.join(5.0)
+    assert not thread.is_alive(), "pinning thread did not exit when the tier was collected"
+
+
+def test_close_stops_worker_and_releases_slabs():
+    cache = build(8)
+    _wait_pinned(cache)
+    cache.store(page(1, 0), serial = 1)
+    thread = cache._alloc_thread
+    cache.close()
+    assert not thread.is_alive()
+    assert not cache._spare and not cache.slot_slabs and not cache.segments and not cache.entries
