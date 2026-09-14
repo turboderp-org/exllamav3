@@ -31,6 +31,16 @@ N_SPLITS = 16
 BLOCK_H = 16
 
 
+def _block_n_for(dev: torch.device) -> int:
+    """Split-kernel K-tile: 32 stages 2 needs > 96 KB smem per block on
+    D = 512 models; sm70-class devices (96 KB/SM) must drop to 16 or the
+    cubin's MAX_DYNAMIC_SHARED_SIZE_BYTES attribute load fails."""
+    smem = getattr(
+        torch.cuda.get_device_properties(dev),
+        "shared_memory_per_block_optin", 1 << 30)
+    return 16 if smem < 131072 else 32
+
+
 def _exl3_bc(lin):
     if lin is None or lin.quant_type != "exl3":
         return None
@@ -43,6 +53,10 @@ class BCDsa:
         m = module
         self.module = m
         self.device = torch.device(m.device) if isinstance(m.device, int) else torch.device(m.device)
+        # The whole-step graph path runs the mgemm fan kernels, which are sm80+
+        # only (arch-guarded no-ops below) — decline the entire path on cc < 8
+        if ext.g_get_cc_raw(self.device.index or 0) < 8:
+            raise RuntimeError("mgemm fan not supported on cc < 8")
         self.hidden = m.hidden_size
         self.head_dim = m.head_dim
         self.rd = m.rope_head_dim
@@ -263,7 +277,7 @@ class BCDsa:
             D_c_pad = 1 << (D_c - 1).bit_length(), D_r = self.rd, K_pad = kp,
             compress_rate = self.m_rate, scale = self.module.sm_scale,
             HAS_WINDOW = True, DENSE_POOL = regime == 0,
-            BLOCK_H = BLOCK_H, BLOCK_N = 32, BLOCK_W = 16,
+            BLOCK_H = BLOCK_H, BLOCK_N = _block_n_for(dev), BLOCK_W = 16,
             SEQ = 1, MULTIROW = 0, DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
             Q_SPLIT = 0, OUT_LATENT = 0, QC = self.pool_bits,
         )
@@ -573,7 +587,7 @@ class BCDsaBatch:
             D_c_pad = 1 << (D_c - 1).bit_length(), D_r = self.rd, K_pad = self.kp,
             compress_rate = self.m_rate, scale = self.module.sm_scale,
             HAS_WINDOW = True, DENSE_POOL = not self.has_idx,
-            BLOCK_H = BLOCK_H, BLOCK_N = 32, BLOCK_W = 16,
+            BLOCK_H = BLOCK_H, BLOCK_N = _block_n_for(dev), BLOCK_W = 16,
             SEQ = S, MULTIROW = 1, DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
             Q_SPLIT = 0, OUT_LATENT = 0, QC = self.pool_bits,
         )

@@ -635,7 +635,7 @@ def _module_eligible(m):
         import exllamav3_ext as _ext
         _dev = str(m.device)
         _idx = int(_dev.split(':')[-1]) if ':' in _dev else 0
-        if _ext.g_get_cc(_idx) < 8:
+        if _ext.g_get_cc_raw(_idx) < 8:
             for _p in (m.q_proj, m.k_proj, m.v_proj, m.o_proj):
                 if _p is not None and getattr(_p.inner, 'K', 0) > 4:
                     return False

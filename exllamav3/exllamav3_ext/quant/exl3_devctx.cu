@@ -77,6 +77,17 @@ int g_get_cc(int device)
     return DevCtx::instance().get_cc(device);
 }
 
+// Raw compute-capability major version (7 = Volta, 8 = Ampere, ...). Python
+// callers compare against 8; the DevCtx enum (CC_OLD=1..CC_BLACKWELL=5) is
+// for the C++ kernel-map switch and must not be mixed with these thresholds.
+int g_get_cc_raw(int device)
+{
+    int device_i = device;
+    cudaDeviceProp prop;
+    cuda_check(cudaGetDeviceProperties(&prop, device_i));
+    return prop.major;
+}
+
 int g_get_num_sms(int device)
 {
     return DevCtx::instance().get_num_sms(device);

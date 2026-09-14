@@ -267,6 +267,13 @@ void exl3_moe
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);
 
+    // sm_70: the fused MoE kernel's compute stages are arch-guarded no-ops below
+    // sm_80 (cp.async/ldmatrix/mma.m16n8k16) — a launch here silently produces
+    // zeros. Fail loudly instead.
+    if (cc < CC_AMPERE)
+        TORCH_CHECK(false, "exl3_moe: fused MoE kernel is not supported on this "
+                           "architecture (compute capability < 8.0)");
+
     // Launch. All blocks of the grid must be co-resident for the group barriers, so groups * width <= num_sms.
     // With a known number of active experts, launch only as many groups as there are experts and widen them to
     // use the freed SMs, up to MOE_MAX_SMS_PER_EXPERT

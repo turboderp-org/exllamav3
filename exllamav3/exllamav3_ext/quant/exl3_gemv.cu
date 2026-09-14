@@ -48,8 +48,8 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
 {
     if (mode == 0) return -1;
     if (K < 2 || K > 8) return -1;
-    if (K > 4 && cc >= 8) return -1;              // sm70 kernel covers K=5-8
-    if (K != 4 && cb == 0 && cc >= 8) return -1;  // sm70 kernel supports K=2,3 cb=0
+    if (K > 4 && cc >= CC_AMPERE) return -1;              // sm70 kernel covers K=5-8
+    if (K != 4 && cb == 0 && cc >= CC_AMPERE) return -1;  // sm70 kernel supports K=2,3 cb=0
     if (size_m > EXL3_GEMV_MAX_M) return -1;
     if (size_k % 128 || size_n % 128) return -1;
     //if (cc != CC_AMPERE) return -1;  // measured win on Ampere; Ada/Blackwell are memory-bound here
@@ -66,7 +66,7 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     // sm_70: the gemv is the only tensor-core path — the fallback (sm80
     // block-pipelined kernels) is arch-guarded no-ops, so always take it
     // when the shape fits the cooperative launch constraints.
-    if (cc < 8) return size_n <= 8192 ? 0 : 1;
+    if (cc < CC_AMPERE) return size_n <= 8192 ? 0 : 1;
     if (K == 2) return size_n <= 8192 ? 0 : 1;
     if (K == 3 && cc == CC_ADA) return size_n <= 8192 ? 0 : 1;
     if (size_n / 32 <= narrow_coresident) return 0;
@@ -142,8 +142,8 @@ bool exl3_gemv_try_launch
     // that could actually take this path
     if (!has_su_sv) return false;
     if (K < 2 || K > 8) return false;
-    if (K > 4 && DevCtx::instance().get_cc(device) >= 8) return false;  // sm70 kernel covers K=5-8
-    if (K != 4 && cb == 0 && DevCtx::instance().get_cc(device) >= 8) return false;  // sm70 kernel supports K=2,3 cb=0
+    if (K > 4 && DevCtx::instance().get_cc(device) >= CC_AMPERE) return false;  // sm70 kernel covers K=5-8
+    if (K != 4 && cb == 0 && DevCtx::instance().get_cc(device) >= CC_AMPERE) return false;  // sm70 kernel supports K=2,3 cb=0
     if (size_m > EXL3_GEMV_MAX_M) return false;
     if (size_k % 128 || size_n % 128) return false;
 
@@ -178,7 +178,7 @@ bool exl3_gemv_try_launch
     // sm_70 and older: the sm80 mma kernels are no-ops (arch-guarded) —
     // route to the m8n8k4 variant, which shares the launch signature.
     void* narrow_kernel;
-    if (cc < 8)
+    if (cc < CC_AMPERE)
     {
         narrow_kernel = exl3_gemv_sm70_select_kernel(K, cb, c_fp32, mmode, 0, smem);
     }
@@ -193,7 +193,7 @@ bool exl3_gemv_try_launch
     if (cfg < 0) return false;
 
     void* kernel = nullptr;
-    if (cc < 8)
+    if (cc < CC_AMPERE)
         kernel = cfg == 0 ? narrow_kernel : exl3_gemv_sm70_select_kernel(K, cb, c_fp32, mmode, cfg, smem);
     else
         kernel = cfg == 0 ? narrow_kernel : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg, smem);

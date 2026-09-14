@@ -661,7 +661,7 @@ class GatedMLP(Module):
             dev = self.device
             dev_str = str(dev)
             dev_idx = int(dev_str.split(':')[-1]) if ':' in dev_str else 0
-            if _ext.g_get_cc(dev_idx) < 8:
+            if _ext.g_get_cc_raw(dev_idx) < 8:
                 cc_ok = all(l.inner.K <= 4 for l in (self.gates[0], self.ups[0], self.downs[0]))
         except Exception:
             pass

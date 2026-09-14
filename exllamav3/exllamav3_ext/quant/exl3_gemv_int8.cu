@@ -52,7 +52,7 @@ int exl3_gemv_int8_max_k(int device)
     // output at n >= 256; exact at n = 128 — measured on V100).
     // Cap at K=4 so K=5 mul1 falls through to the sm70 GEMV, which
     // is exact for all K 5-8.
-    return (cc == CC_HOPPER || cc == CC_BLACKWELL) ? 6 : (cc < 8 ? 4 : 5);
+    return (cc == CC_HOPPER || cc == CC_BLACKWELL) ? 6 : (cc == CC_OLD ? 4 : 5);
 }
 
 struct GemvInt8Workspace
