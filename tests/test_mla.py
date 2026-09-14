@@ -60,7 +60,9 @@ class FakeSTC:
 
 class FakeConfig:
     def __init__(self, tensors):
+        from exllamav3.model.config import InferParams
         self.stc = FakeSTC(tensors)
+        self.infer_params = InferParams()     # the EXL3 GEMM path reads its reconstruct thresholds
 
 
 def build(H = 8, hidden = 1024, kv_lora = 512, nope = 128, rope_dim = 64, v_head = 128,
@@ -210,6 +212,83 @@ def test_mla_nope():
     ref = ref_forward(module, t, key, x, torch.zeros((bsz,), dtype = torch.int32, device = device))
     out = run_module(module, x, layer, bt)
     assert rel_err(out, ref) < 5e-3, f"rel err {rel_err(out, ref):.3e}"
+
+
+def build_exl3_nope(H = 16, hidden = 1024, kv_lora = 512, nope = 128, rope_dim = 64, v_head = 128,
+                    seed = 0, K = 4):
+    """Kimi Linear shaped MLA with EXL3 (random trellis) q / kv_a / o projections and no rope
+    instance: the decode graph only admits EXL3 projections, so this is the only way to reach it
+    from a unit test. kv_b stays fp16 (the module reads it as the absorbed W_UK / W_UV)."""
+    g = torch.Generator(device = "cpu").manual_seed(seed)
+    key = "model.layers.0.self_attn"
+    dev = torch.device(device)
+
+    def trellis(k, n):
+        return torch.randint(0, 65536, (k // 16, n // 16, 16 * K), dtype = torch.int32, generator = g) \
+            .to(torch.int16).to(dev)
+
+    def scale(n):
+        return ((torch.rand((n,), generator = g) * 0.2 + 0.9) * torch.where(
+            torch.rand((n,), generator = g) < 0.5, -1.0, 1.0)).half().to(dev)
+
+    t = {}
+    for name, k, n in (
+        ("q_proj", hidden, H * (nope + rope_dim)),
+        ("kv_a_proj_with_mqa", hidden, kv_lora + rope_dim),
+        ("o_proj", H * v_head, hidden),
+    ):
+        n_pad = (n + 127) // 128 * 128
+        t[f"{key}.{name}.trellis"] = trellis(k, n_pad)
+        t[f"{key}.{name}.suh"] = scale(k)
+        t[f"{key}.{name}.svh"] = scale(n_pad)
+        t[f"{key}.{name}.mul1"] = torch.tensor([1], dtype = torch.int32)
+    t[f"{key}.kv_a_layernorm.weight"] = (torch.randn(kv_lora, generator = g) * 0.1 + 1).half()
+    t[f"{key}.kv_b_proj.weight"] = (torch.randn(H * (nope + v_head), kv_lora, generator = g) * 0.085).half()
+
+    module = MLAttention(
+        config = FakeConfig(t), key = key, layer_idx = 0, hidden_size = hidden,
+        num_q_heads = H, kv_lora_rank = kv_lora, qk_nope_head_dim = nope,
+        qk_rope_head_dim = rope_dim, v_head_dim = v_head, rope_settings = None,
+        q_lora_rank = None, rms_norm_eps = 1e-6,
+    )
+    module.load(dev)
+    assert module.q_proj.quant_type == "exl3"
+    return module
+
+
+def test_mla_nope_decode_matches_prefill():
+    """Kimi Linear: pe dims present but never rotated. The decode graph used to require a rope
+    instance whenever qk_rope_head_dim > 0 (and its C++ ran the rope stage unconditionally, which
+    raises on a rope-less module), so this configuration silently fell back to the dispatch path.
+    Now the graph must run, agree with the dispatch decode path at fp16 noise, and both must agree
+    with the prefill path."""
+    import exllamav3.modules.attention_fn.bc_mla as bcm
+    module = build_exl3_nope(seed = 13)
+    bsz, S = 2, 300
+    # Random trellis weights decode to O(1) entries, so a small input keeps the scores O(1)
+    x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.03).half()
+    bt = torch.arange(4 * bsz, dtype = torch.int32, device = device).view(bsz, 4)
+
+    whole = run_module(module, x, make_cache(module, 4 * PAGE_SIZE * bsz), bt)
+    assert torch.isfinite(whole).all() and whole.abs().max() > 0
+    step_graph = run_module(module, x, make_cache(module, 4 * PAGE_SIZE * bsz), bt, chunk = 1)
+    if bcm.bc_attn_enable:
+        assert any(bool(v) for v in module.dispatch_cache.values()), \
+            "decode graph declined the rope-less MLA configuration"
+
+    enable = bcm.bc_attn_enable
+    bcm.bc_attn_enable = False
+    module.dispatch_cache.clear()
+    try:
+        step_dispatch = run_module(module, x, make_cache(module, 4 * PAGE_SIZE * bsz), bt, chunk = 1)
+    finally:
+        bcm.bc_attn_enable = enable
+        module.dispatch_cache.clear()
+
+    # Graph vs dispatch decode: same kernels' worth of fp16 rounding, tight. Decode vs prefill
+    # crosses GEMV/GEMM and attention kernels, looser (the fp16-weight variant above sees the same)
+    assert rel_err(step_graph, step_dispatch) < 3e-3, f"graph vs dispatch rel err {rel_err(step_graph, step_dispatch):.3e}"
+    assert rel_err(step_graph, whole) < 2e-2, f"decode vs prefill rel err {rel_err(step_graph, whole):.3e}"
 
 
 @pytest.mark.parametrize("chunk", [PAGE_SIZE, 128, 64])

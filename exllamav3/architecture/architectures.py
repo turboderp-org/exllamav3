@@ -27,6 +27,7 @@ from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
+from .kimi_linear import KimiLinearModel
 from .laguna import LagunaModel
 from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
@@ -91,6 +92,7 @@ ARCHITECTURES = {
         Glm4MoeLiteModel,
         GlmMoeDsaModel,
         Glm5NextModel,
+        KimiLinearModel,
         GptOssModel,
         HCXVisionV2Model,
         HyV3Model,

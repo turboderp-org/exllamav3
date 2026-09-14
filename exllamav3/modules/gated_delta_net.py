@@ -774,6 +774,8 @@ class GatedDeltaNet(Module):
         super().load(device, **kwargs)
         if self.key_a_log is not None:
             self.a_log = self.config.stc.get_tensor(self.key_a_log, self.device, optional = False, allow_bf16 = True)
+            # Kimi Linear stores A_log as (1, 1, H, 1); the kernels take it as (H,)
+            self.a_log = self.a_log.reshape(-1)
             self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True)
         if self.key_conv1d_weight is not None:
             # no_defer: load_local concatenates/flattens (copies) these immediately, which a

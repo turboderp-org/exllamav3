@@ -207,6 +207,7 @@ python examples/chat.py -h
 | **HyperCLOVAX**                                  | `HyperCLOVAXForCausalLM`<br>`HCXVisionV2ForCausalLM` | ✓ |  |
 | **Hy3**                                          | `HYV3ForCausalLM` |  |  |
 | **IQuest-Coder**                                 | `IQuestCoderForCausalLM` |  |  |
+| **Kimi Linear**                                  | `KimiLinearForCausalLM` |  |  |
 | **Laguna 2.1**                                   | `LagunaForCausalLM` |  |  |
 | **LFM 2.5**                                      | `Lfm2ForCausalLM`<br>`Lfm2MoeForCausalLM` |  |  |
 | **Llama 1/2/3**,**3.1-Nemotron** etc.            | `LlamaForCausalLM` |  |  |
