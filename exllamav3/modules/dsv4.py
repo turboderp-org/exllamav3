@@ -1012,8 +1012,23 @@ class DSV4Attention(Module):
 
     def _build_woa_multi(self):
         self.woa_multi_ready = True
-        # mgemm is sm80+ only; on cc < 8 keep the per-slice loop
+        # mgemm is sm80+ only; on cc < 8 use the sm70 multi-matrix
+        # GEMV (pointer tables, one launch for all G slices)
+        self.woa_sm70_multi = None
         if ext.g_get_cc_raw(torch.device(self.device).index or 0) < 8:
+            try:
+                if all(l.quant_type == "exl3" for l in self.wo_a):
+                    inner = [l.inner.bc for l in self.wo_a]
+                    self.woa_sm70_multi = dict(
+                        B_list = torch.tensor([i.trellis.data_ptr() for i in inner], dtype = torch.int64, device = self.device),
+                        suh_list = torch.tensor([i.suh.data_ptr() for i in inner], dtype = torch.int64, device = self.device),
+                        svh_list = torch.tensor([i.svh.data_ptr() for i in inner], dtype = torch.int64, device = self.device),
+                        K = self.wo_a[0].inner.bc.K,
+                        mcg = self.wo_a[0].inner.bc.mcg,
+                        mul1 = self.wo_a[0].inner.bc.mul1,
+                    )
+            except Exception:
+                self.woa_sm70_multi = None
             return
         try:
             if all(l.quant_type == "exl3" for l in self.wo_a):
@@ -1066,6 +1081,32 @@ class DSV4Attention(Module):
                 return self._mgemm1(self.wob_multi, o2.contiguous(),
                                     out_dtype or self.out_dtype,
                                     f"dsv4_wob1_L{self.layer_idx}")
+            return self.wo_b.forward(o2, params, out_dtype = out_dtype or self.out_dtype)
+
+        if self.woa_sm70_multi is not None and bsz == 1 and seq <= 32:
+            # sm70 multi-matrix GEMV: one launch for all G slices.
+            # Each slice g reads its own input o[g] (contiguous rows
+            # of o) and writes a 1024-wide output chunk.
+            G = self.o_groups
+            m = self.woa_sm70_multi
+            slice_rows = o.shape[2]          # seq rows per slice
+            slice_k = o.shape[3]
+            n_out = self.wo_a[0].out_features
+            A_ptrs = torch.tensor(
+                [o[g].contiguous().data_ptr() for g in range(G)],
+                dtype = torch.int64, device = o.device)
+            C = torch.empty(G, seq, n_out, dtype = torch.half, device = o.device)
+            C_ptrs = torch.tensor(
+                [C[g].data_ptr() for g in range(G)],
+                dtype = torch.int64, device = o.device)
+            A_had = torch.empty(G, seq, slice_k, dtype = torch.half, device = o.device)
+            A_had_ptrs = torch.tensor(
+                [A_had[g].data_ptr() for g in range(G)],
+                dtype = torch.int64, device = o.device)
+            ext.exl3_gemv_multi(
+                A_ptrs, m["B_list"], C_ptrs, m["suh_list"], A_had_ptrs,
+                m["svh_list"], G, slice_k, n_out, m["K"], m["mcg"], m["mul1"])
+            o2 = C.permute(1, 0, 2).reshape(seq, G * n_out).unsqueeze(0)
             return self.wo_b.forward(o2, params, out_dtype = out_dtype or self.out_dtype)
 
         o = torch.cat([self.wo_a[g].forward(o[g], params) for g in range(self.o_groups)], dim = -1)
