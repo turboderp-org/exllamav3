@@ -787,7 +787,12 @@ class GatedMLP(Module):
             from ..ext import exllamav3_ext as _ext
             dev_str = str(self.device)
             dev_idx = int(dev_str.split(':')[-1]) if ':' in dev_str else 0
-            cc_old = _ext.g_get_cc(dev_idx) == 1
+<<<<<<< HEAD
+            cc_old = _ext.g_get_cc_raw(dev_idx) < 75  # Volta only; Turing keeps the fused path
+=======
+            if _ext.g_get_cc_raw(dev_idx) < 8:
+                cc_ok = all(l.inner.K <= 4 for l in (self.gates[0], self.ups[0], self.downs[0]))
+>>>>>>> 5a6838c (sm70: gate fused MoE/mgemm/mgemm-fan paths on cc >= 8)
         except Exception:
             pass
         if (self.num_slices == 1 and self.interm_div == 1.0 and self.downs[0].inner.bc is not None

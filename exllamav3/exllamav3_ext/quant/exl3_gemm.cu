@@ -300,10 +300,10 @@ int exl3_gemm_gr
         // with params; a single param set per call leaves tiles 1+
         // with capture-time args — silently wrong output). Until the
         // caller protocol supports per-tile params, refuse capture.
-        if (cc < 8 && graph)
+        if (cc < CC_AMPERE && graph)
             TORCH_CHECK(false, "exl3_gemm_gr: tiled sm70 path is not graph-capturable "
                                "(caller must present per-tile params)");
-        if (cc < 8 && (suh_ptr && A_had_ptr && svh_ptr))
+        if (cc < CC_AMPERE && (suh_ptr && A_had_ptr && svh_ptr))
         {
             const int tile_m = 8;
             int tiles = CEIL_DIVIDE(size_m, tile_m);
@@ -360,7 +360,7 @@ int exl3_gemm_gr
     // this path eager.
     if (K > 4 && cc == CC_OLD)
     {
-        TORCH_CHECK(!graph, "exl3_gemm_gr: K > 4 on cc < 8 is not graph-capturable; "
+        TORCH_CHECK(!graph, "exl3_gemm_gr: K > 4 on cc < CC_AMPERE is not graph-capturable; "
                             "disable fused/graphed paths for K > 4 layers");
         at::Tensor w = at::empty({B.size(0) * 16, B.size(1) * 16},
             A.options().dtype(at::kHalf));
@@ -580,6 +580,16 @@ int exl3_mgemm_gr
     TORCH_CHECK_DIM(svh, 1);
     TORCH_CHECK_DIM(C, 3);
 
+    // sm_70: the block-pipelined mgemm kernel's compute stages are arch-guarded
+    // no-ops below sm_80 (cp.async/ldmatrix/mma.m16n8k16), so a launch here
+    // silently produces zeros. The sm70 GEMV covers m <= 8 single-matrix calls
+    // via exl3_gemm_gr; the multi-matrix fan has no sm70 kernel yet — fail
+    // loudly instead of returning garbage.
+    int mgemm_device = A.device().index();
+    if (DevCtx::instance().get_cc(mgemm_device) < CC_AMPERE)
+        TORCH_CHECK(false, "exl3_mgemm: block-pipelined multi-matrix kernel is not "
+                           "supported on this architecture (compute capability < 8.0); "
+                           "the sm70 port covers single-matrix GEMV/GEMM only");
     TORCH_CHECK_SHAPES(A, 1, C, 1, 1);
     if (!had_src_list) TORCH_CHECK_SHAPES(B, 0, suh, 0, 1);   // sliced mode: suh is per source
     TORCH_CHECK_SHAPES(B, 0, svh, 0, 1);

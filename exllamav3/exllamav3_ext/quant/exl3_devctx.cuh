@@ -62,6 +62,7 @@ private:
 };
 
 int g_get_cc(int device);
+int g_get_cc_raw(int device);
 int g_get_num_sms(int device);
 int g_get_smem_max(int device);
 
