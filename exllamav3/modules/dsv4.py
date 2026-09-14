@@ -1018,14 +1018,14 @@ class DSV4Attention(Module):
         if ext.g_get_cc_raw(torch.device(self.device).index or 0) < 8:
             try:
                 if all(l.quant_type == "exl3" for l in self.wo_a):
-                    inner = [l.inner.bc for l in self.wo_a]
+                    inners = [l.inner for l in self.wo_a]
                     self.woa_sm70_multi = dict(
-                        B_list = torch.tensor([i.trellis.data_ptr() for i in inner], dtype = torch.int64, device = self.device),
-                        suh_list = torch.tensor([i.suh.data_ptr() for i in inner], dtype = torch.int64, device = self.device),
-                        svh_list = torch.tensor([i.svh.data_ptr() for i in inner], dtype = torch.int64, device = self.device),
-                        K = self.wo_a[0].inner.bc.K,
-                        mcg = self.wo_a[0].inner.bc.mcg,
-                        mul1 = self.wo_a[0].inner.bc.mul1,
+                        B_list = torch.tensor([i.trellis.data_ptr() for i in inners], dtype = torch.int64, device = self.device),
+                        suh_list = torch.tensor([i.suh.data_ptr() for i in inners], dtype = torch.int64, device = self.device),
+                        svh_list = torch.tensor([i.svh.data_ptr() for i in inners], dtype = torch.int64, device = self.device),
+                        K = self.wo_a[0].inner.K,
+                        mcg = self.wo_a[0].inner.mcg,
+                        mul1 = self.wo_a[0].inner.mul1,
                     )
             except Exception:
                 self.woa_sm70_multi = None
