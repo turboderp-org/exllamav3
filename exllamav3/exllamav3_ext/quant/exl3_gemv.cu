@@ -157,6 +157,21 @@ static void* exl3_gemv_sm70_select_kernel_dual(int bits, int cb, bool c_fp32, in
     return nullptr;
 }
 
+// sm_70 multi-matrix selector: pointer-table variant, N matrices
+// per launch. Instantiated for the shapes in use (K=3/5, cb=2).
+static void* exl3_gemv_sm70_select_kernel_multi(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem)
+{
+    #define SELM(bits_, cb_, fp32_, mm_, cfg_, sm_) \
+        if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_ && smem == sm_) \
+            return (void*) exl3_gemv_sm70_kernel_multi<bits_, fp32_, cb_, mm_, cfg_, sm_>;
+    SELM(5, 2, false, 0, 0, false) SELM(5, 2, false, 1, 0, false)
+    SELM(5, 2, true,  0, 0, false) SELM(5, 2, true,  1, 0, false)
+    SELM(3, 2, false, 0, 0, false) SELM(3, 2, false, 1, 0, false)
+    SELM(3, 2, true,  0, 0, false) SELM(3, 2, true,  1, 0, false)
+    #undef SELM
+    return nullptr;
+}
+
 
 bool exl3_gemv_try_launch
 (
@@ -467,6 +482,84 @@ void exl3_gemv2
         dim3(grid),
         dim3(block_dim),
         kernel_args,
+        0,
+        stream
+    ));
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+// Multi-matrix entry: N matrices in ONE launch via pointer tables.
+// Tables are device int64 tensors of N pointers each (sm80 mgemm
+// contract): A_list/B_list/C_list/suh_list/A_had_list/svh_list.
+// All matrices share size_k; each matrix's output width is
+// n_list[mi]. See docs/sm70_perf_report.md.
+void exl3_gemv_multi
+(
+    const at::Tensor& A_list,
+    const at::Tensor& B_list,
+    const at::Tensor& C_list,
+    const at::Tensor& suh_list,
+    const at::Tensor& A_had_list,
+    const at::Tensor& svh_list,
+    int64_t n_mat,
+    int64_t size_k,
+    int64_t size_n,
+    int64_t K,
+    bool mcg,
+    bool mul1
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A_list.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    int device;
+    cudaGetDevice(&device);
+    int* locks = DevCtx::instance().get_locks(device);
+    float* ws_ptr = (float*) DevCtx::instance().get_ws(device);
+
+    const half* const* A_ptr = (const half* const*) A_list.data_ptr();
+    const uint16_t* const* B_ptr = (const uint16_t* const*) B_list.data_ptr();
+    void* const* C_ptr = (void* const*) C_list.data_ptr();
+    const half* const* suh_ptr = (const half* const*) suh_list.data_ptr();
+    half* const* A_had_ptr = (half* const*) A_had_list.data_ptr();
+    const half* const* svh_ptr = (const half* const*) svh_list.data_ptr();
+
+    int size_m = 1;
+    int nm = (int) n_mat;
+
+    // Arg order must match EXL3_GEMM_ARGS_MULTI: A, B, C, m, k, n,
+    // locks, suh, A_had, svh, A_list, B_list, C_list, suh_list,
+    // A_had_list, svh_list, n_mat, ws
+    void* kernel_args_multi[] =
+    {
+        (void*)& A_ptr, (void*)& B_ptr, (void*)& C_ptr,
+        (void*)& size_m, (void*)& size_k, (void*)& size_n,
+        (void*)& locks, (void*)& suh_ptr, (void*)& A_had_ptr,
+        (void*)& svh_ptr,
+        (void*)& A_ptr, (void*)& B_ptr, (void*)& C_ptr,
+        (void*)& suh_ptr, (void*)& A_had_ptr, (void*)& svh_ptr,
+        (void*)& nm,
+        (void*)& ws_ptr
+    };
+
+    void* kernel = exl3_gemv_sm70_select_kernel_multi((int) K, mul1 ? 2 : (mcg ? 1 : 0), false, 0, 0, false);
+    TORCH_CHECK(kernel, "exl3_gemv_multi: no multi kernel for this shape");
+
+    int num_sms = DevCtx::instance().get_num_sms(device);
+    int block_dim = 512;
+    int blocks_per_sm;
+    cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
+    int max_blocks = blocks_per_sm * num_sms;
+    int grid = MIN(size_n / 32, max_blocks);
+    TORCH_CHECK(grid >= 1, "exl3_gemv_multi: output too small");
+
+    cuda_check(cudaLaunchCooperativeKernel
+    (
+        kernel,
+        dim3(grid),
+        dim3(block_dim),
+        kernel_args_multi,
         0,
         stream
     ));

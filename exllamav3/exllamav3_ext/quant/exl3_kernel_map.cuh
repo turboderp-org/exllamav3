@@ -78,6 +78,30 @@ typedef void (*fp_exl3_gemm_kernel_ks) (EXL3_GEMM_ARGS_KS);
     EXL3_GEMM_ARGS_DUAL, \
     float* __restrict__ ws
 typedef void (*fp_exl3_gemm_kernel_dual_ks) (EXL3_GEMM_ARGS_DUAL_KS);
+
+// Multi-matrix variant: N matrices via device pointer tables (the
+// sm70 counterpart of the sm80 mgemm pointer-table contract).
+// Tables: device arrays of N pointers each; n_mat = active count.
+#define EXL3_GEMM_ARGS_MULTI \
+    const half* __restrict__ A, \
+    const uint16_t* __restrict__ B, \
+    void* __restrict__ C, \
+    const int size_m, \
+    const int size_k, \
+    const int size_n, \
+    int* __restrict__ locks, \
+    const half* __restrict__ suh, \
+    half* __restrict__ A_had, \
+    const half* __restrict__ svh, \
+    const half* const* __restrict__ A_list, \
+    const uint16_t* const* __restrict__ B_list, \
+    void* const* __restrict__ C_list, \
+    const half* const* __restrict__ suh_list, \
+    half* const* __restrict__ A_had_list, \
+    const half* const* __restrict__ svh_list, \
+    const int n_mat, \
+    float* __restrict__ ws
+typedef void (*fp_exl3_gemm_kernel_multi) (EXL3_GEMM_ARGS_MULTI);
 typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 
 #define EXL3_GEMM_SHAPE_1     16,     16,    128,     6,     5

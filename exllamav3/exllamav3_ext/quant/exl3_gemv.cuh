@@ -61,3 +61,21 @@ void exl3_gemv2
     bool mcg,
     bool mul1
 );
+
+// Multi-matrix entry (pointer tables, sm80 mgemm contract): N
+// matrices in ONE launch. See docs/sm70_perf_report.md.
+void exl3_gemv_multi
+(
+    const at::Tensor& A_list,
+    const at::Tensor& B_list,
+    const at::Tensor& C_list,
+    const at::Tensor& suh_list,
+    const at::Tensor& A_had_list,
+    const at::Tensor& svh_list,
+    int64_t n_mat,
+    int64_t size_k,
+    int64_t size_n,
+    int64_t K,
+    bool mcg,
+    bool mul1
+);
