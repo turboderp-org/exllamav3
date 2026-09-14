@@ -66,7 +66,18 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     // sm_70: the gemv is the only tensor-core path — the fallback (sm80
     // block-pipelined kernels) is arch-guarded no-ops, so always take it
     // when the shape fits the cooperative launch constraints.
-    if (cc < CC_AMPERE) return size_n <= 8192 ? 0 : 1;
+    // Small-n shapes: K-split across blocks (cfg 2) raises occupancy —
+    // n <= 2048 gives <= 64 blocks at cfg 0, well under the 80 SMs.
+    // Requires co-residency for 4x the grid (all KS chunks resident
+    // for the grid.sync); else fall back to cfg 0.
+    if (cc < CC_AMPERE)
+    {
+        if (const char* fc = std::getenv("EXL3_GEMV_FORCE_CFG"))
+            return atoi(fc);
+        // if (size_n <= 2048 && narrow_coresident >= (size_n / 32) * 4)
+        //     return 2;
+        return 0;  // cfg2 disabled: illegal-address debug
+    }
     if (K == 2) return size_n <= 8192 ? 0 : 1;
     if (K == 3 && cc == CC_ADA) return size_n <= 8192 ? 0 : 1;
     if (size_n / 32 <= narrow_coresident) return 0;
@@ -102,6 +113,10 @@ static void* exl3_gemv_sm70_select_kernel(int bits, int cb, bool c_fp32, int mmo
         SEL(bits_, cb_, false, 1, 0, sm_) SEL(bits_, cb_, false, 1, 1, sm_) \
         SEL(bits_, cb_, true,  0, 0, sm_) SEL(bits_, cb_, true,  0, 1, sm_) \
         SEL(bits_, cb_, true,  1, 0, sm_) SEL(bits_, cb_, true,  1, 1, sm_)
+    SEL(5, 2, false, 0, 2, false) SEL(5, 2, false, 1, 2, false)
+    SEL(5, 2, true,  0, 2, false) SEL(5, 2, true,  1, 2, false)
+    SEL(3, 2, false, 0, 2, false) SEL(3, 2, false, 1, 2, false)
+    SEL(3, 2, true,  0, 2, false) SEL(3, 2, true,  1, 2, false)
     SEL_GRID(4, 0, false) SEL_GRID(4, 1, false) SEL_GRID(4, 2, false)
     SEL_GRID(2, 0, false) SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 0, false) SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
@@ -220,8 +235,9 @@ bool exl3_gemv_try_launch
         kernel = cfg == 0 ? narrow_kernel : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg, smem);
     if (!kernel) return false;
 
-    int block_dim = cfg == 0 ? 512 : 256;
-    int cols = cfg == 0 ? 32 : 64;
+    int block_dim = cfg == 1 ? 256 : 512;
+    int cols = cfg == 1 ? 64 : 32;
+    const int ksplit = cfg == 2 ? 4 : 1;   // must match the kernel's KS
 
     int max_blocks = occupancy(kernel, block_dim) * num_sms;
     // TEMP: grid-cap sweep for V100 tuning (EXL3_GEMV_GRID_CAP)
@@ -230,8 +246,24 @@ bool exl3_gemv_try_launch
         int cap = atoi(cap_env);
         if (cap > 0) max_blocks = MIN(max_blocks, cap);
     }
-    int grid = MIN(size_n / cols, max_blocks);
-    if (grid < 1) return false;
+    // K-split: grid must cover all groups (>= n/cols) and be a
+    // multiple of n/cols so every group gets an equal k-chunk count.
+    // Shrink the split factor to fit co-residency; decline if even
+    // one block per group doesn't fit.
+    int grid;
+    if (ksplit > 1)
+    {
+        // The kernel's KS is compile-time (4): all 4 chunks must be
+        // resident. The heuristic guarantees co-residency; double-check.
+        int groups = size_n / cols;
+        if (max_blocks < groups * ksplit) return false;
+        grid = groups * ksplit;
+    }
+    else
+    {
+        grid = MIN(size_n / cols, max_blocks);
+        if (grid < 1) return false;
+    }
 
     cuda_check(cudaLaunchCooperativeKernel
     (
@@ -290,6 +322,7 @@ void exl3_gemv
     int device;
     cudaGetDevice(&device);
     int* locks = DevCtx::instance().get_locks(device);
+    float* ws_ptr = (float*) DevCtx::instance().get_ws(device);
 
     const half* A_ptr = (const half*) A.data_ptr();
     const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
@@ -306,7 +339,8 @@ void exl3_gemv
         (void*)& locks,
         (void*)& suh_ptr,
         (void*)& A_had_ptr,
-        (void*)& svh_ptr
+        (void*)& svh_ptr,
+        (void*)& ws_ptr
     };
 
     bool ok = exl3_gemv_try_launch
@@ -386,6 +420,7 @@ void exl3_gemv2
     int device;
     cudaGetDevice(&device);
     int* locks = DevCtx::instance().get_locks(device);
+    float* ws_ptr = (float*) DevCtx::instance().get_ws(device);
 
     const half* A_ptr = (const half*) A.data_ptr();
     const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
@@ -411,7 +446,8 @@ void exl3_gemv2
         (void*)& C2_ptr,
         (void*)& suh2_ptr,
         (void*)& A_had2_ptr,
-        (void*)& svh2_ptr
+        (void*)& svh2_ptr,
+        (void*)& ws_ptr   // K-split arg; unused by the dual (CFG 0)
     };
 
     void* kernel = exl3_gemv_sm70_select_kernel_dual(K, cb, c_fp32, size_m == 1 ? 0 : 1, 0, false);

@@ -227,6 +227,7 @@ int exl3_gemm_gr
     int shape_idx;
     fp_exl3_gemm_kernel kernel;
 
+    float* ws_ptr = (float*) DevCtx::instance().get_ws(device);
     void* kernelArgs[] =
     {
         (void*)& A_ptr,
@@ -238,7 +239,8 @@ int exl3_gemm_gr
         (void*)& locks,
         (void*)& suh_ptr,
         (void*)& A_had_ptr,
-        (void*)& svh_ptr
+        (void*)& svh_ptr,
+        (void*)& ws_ptr   // read by the sm70 K-split (CFG 2) kernels only
     };
 
     auto add_graph_args = [&](void* kernel_ptr)
@@ -324,7 +326,8 @@ int exl3_gemm_gr
                     (void*)& size_k,
                     (void*)& size_n,
                     (void*)& locks,
-                    kernelArgs[7], kernelArgs[8], kernelArgs[9]
+                    kernelArgs[7], kernelArgs[8], kernelArgs[9],
+                    kernelArgs[10]
                 };
                 void* tile_kernel = nullptr;
                 all_ok = exl3_gemv_try_launch
