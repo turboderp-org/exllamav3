@@ -251,6 +251,18 @@ bool exl3_gemv_int8
 {
     if (!suh.has_value() || !A_had.has_value() || !svh.has_value()) return false;
 
+    // sm_70 (cc < CC_AMPERE): the int8 kernels mis-execute here (wrong
+    // output on mul1 tensors; measured on V100 — K=3 and K=5 both wrong,
+    // exact at every K on sm_86+). The sm70 fp16 GEMV is exact for all
+    // K 1-8 and takes these calls instead.
+    {
+        int device_;
+        cudaGetDevice(&device_);
+        if (DevCtx::instance().get_cc(device_) < CC_AMPERE) return false;
+    }
+
+    int K = B.size(2) / 16;
+
     // 16 * K uint16 per tile, 16 * K + 8 at the half-integer rates (mul1 only, which this path is anyway)
     const int tile_u16 = B.size(2);
     const bool half_k = (tile_u16 % 16) != 0;
