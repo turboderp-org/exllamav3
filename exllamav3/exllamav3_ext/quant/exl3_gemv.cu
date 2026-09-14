@@ -122,6 +122,27 @@ static void* exl3_gemv_sm70_select_kernel(int bits, int cb, bool c_fp32, int mmo
 }
 
 
+// sm_70 dual-matrix selector: same template params as the single-matrix
+// sm70 kernel, but instantiates exl3_gemv_sm70_kernel_dual. Shapes in
+// use first (K=3 cb=2 MoE gate+up pairs); extend the grid as needed.
+static void* exl3_gemv_sm70_select_kernel_dual(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem)
+{
+    #define SEL(bits_, cb_, fp32_, mm_, cfg_, sm_) \
+        if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_ && smem == sm_) \
+            return (void*) exl3_gemv_sm70_kernel_dual<bits_, fp32_, cb_, mm_, cfg_, sm_>;
+    #define SEL_GRID(bits_, cb_, sm_) \
+        SEL(bits_, cb_, false, 0, 0, sm_) SEL(bits_, cb_, false, 0, 1, sm_) \
+        SEL(bits_, cb_, false, 1, 0, sm_) SEL(bits_, cb_, false, 1, 1, sm_) \
+        SEL(bits_, cb_, true,  0, 0, sm_) SEL(bits_, cb_, true,  0, 1, sm_) \
+        SEL(bits_, cb_, true,  1, 0, sm_) SEL(bits_, cb_, true,  1, 1, sm_)
+    SEL_GRID(3, 2, false)
+    SEL_GRID(3, 2, true)
+    #undef SEL_GRID
+    #undef SEL
+    return nullptr;
+}
+
+
 bool exl3_gemv_try_launch
 (
     void** kernel_args,
@@ -294,6 +315,125 @@ void exl3_gemv
         true, device, stream, nullptr, true
     );
     TORCH_CHECK(ok, "exl3_gemv: call is not eligible for the GEMV kernel");
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+// Dual-matrix entry: fuses two back-to-back GEMV calls (e.g. MoE
+// gate+up) into ONE kernel launch. Computes
+//   C  = svh-transform(GEMV(B,  suh-transform(A)))   (slot 0)
+//   C2 = svh2-transform(GEMV(B2, suh2-transform(A))) (slot 1)
+// with the same A on both slots. See docs/sm70_dual_gemv_design.md.
+void exl3_gemv2
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& C,
+    const at::Tensor& B2,
+    at::Tensor& C2,
+    const c10::optional<at::Tensor>& suh,
+    const c10::optional<at::Tensor>& A_had,
+    const c10::optional<at::Tensor>& svh,
+    const c10::optional<at::Tensor>& suh2,
+    const c10::optional<at::Tensor>& A_had2,
+    const c10::optional<at::Tensor>& svh2,
+    bool mcg,
+    bool mul1
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DIM(B, 3);
+    TORCH_CHECK_DIM(B2, 3);
+    TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
+    TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
+    TORCH_CHECK_SHAPES(B2, 0, B, 0, 1);
+    TORCH_CHECK_SHAPES(C2, -1, B2, 1, 16);
+    TORCH_CHECK_DTYPE(A, kHalf);
+    TORCH_CHECK_DTYPE(B, kShort);
+    TORCH_CHECK_DTYPE(B2, kShort);
+    bool c_fp32 = C.dtype() == at::kFloat;
+    TORCH_CHECK(c_fp32 == (C2.dtype() == at::kFloat), "exl3_gemv2: C and C2 must have matching dtypes");
+    if (!c_fp32) TORCH_CHECK_DTYPE(C, kHalf);
+    TORCH_CHECK(C2.dtype() == (c_fp32 ? at::kFloat : at::kHalf), "exl3_gemv2: C2 dtype must match C");
+    TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
+
+    const half* suh_ptr = (const half*) OPTPTR(suh);
+    half* A_had_ptr = (half*) OPTPTR(A_had);
+    const half* svh_ptr = (const half*) OPTPTR(svh);
+    const half* suh2_ptr = (const half*) OPTPTR(suh2);
+    half* A_had2_ptr = (half*) OPTPTR(A_had2);
+    const half* svh2_ptr = (const half*) OPTPTR(svh2);
+    TORCH_CHECK(suh_ptr && A_had_ptr && svh_ptr, "exl3_gemv2 requires suh, A_had and svh");
+    TORCH_CHECK(suh2_ptr && A_had2_ptr && svh2_ptr, "exl3_gemv2 requires suh2, A_had2 and svh2");
+
+    int size_m = 1;
+    int dim = A.dim();
+    for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
+    int size_k = A.size(-1);
+    int size_n = B.size(1) * 16;
+    int size_n2 = B2.size(1) * 16;
+    TORCH_CHECK(size_n == size_n2, "exl3_gemv2: B and B2 must have matching output dims");
+    int K = B.size(2) / 16;
+    int K2 = B2.size(2) / 16;
+    TORCH_CHECK(K == K2, "exl3_gemv2: B and B2 must have matching bitrates");
+
+    int cb = 0;
+    if (mcg) cb = 1;
+    if (mul1) cb = 2;
+
+    int device;
+    cudaGetDevice(&device);
+    int* locks = DevCtx::instance().get_locks(device);
+
+    const half* A_ptr = (const half*) A.data_ptr();
+    const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
+    void* C_ptr = (void*) C.data_ptr();
+    const uint16_t* B2_ptr = (const uint16_t*) B2.data_ptr();
+    void* C2_ptr = (void*) C2.data_ptr();
+
+    // EXL3_GEMM_ARGS_DUAL order: A, B, C, m, k, n, locks, suh, A_had,
+    // svh, B2, C2, suh2, A_had2, svh2
+    void* kernel_args[] =
+    {
+        (void*)& A_ptr,
+        (void*)& B_ptr,
+        (void*)& C_ptr,
+        (void*)& size_m,
+        (void*)& size_k,
+        (void*)& size_n,
+        (void*)& locks,
+        (void*)& suh_ptr,
+        (void*)& A_had_ptr,
+        (void*)& svh_ptr,
+        (void*)& B2_ptr,
+        (void*)& C2_ptr,
+        (void*)& suh2_ptr,
+        (void*)& A_had2_ptr,
+        (void*)& svh2_ptr
+    };
+
+    void* kernel = exl3_gemv_sm70_select_kernel_dual(K, cb, c_fp32, size_m == 1 ? 0 : 1, 0, false);
+    TORCH_CHECK(kernel, "exl3_gemv2: no dual kernel for this shape (K, cb, mmode, cfg, smem)");
+
+    int num_sms = DevCtx::instance().get_num_sms(device);
+    int block_dim = 512;  // cfg 0
+    int blocks_per_sm;
+    cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
+    int max_blocks = blocks_per_sm * num_sms;
+    int grid = MIN(size_n / 32, max_blocks);  // cfg 0: 32 cols
+    TORCH_CHECK(grid >= 1, "exl3_gemv2: output too small for one block");
+
+    cuda_check(cudaLaunchCooperativeKernel
+    (
+        kernel,
+        dim3(grid),
+        dim3(block_dim),
+        kernel_args,
+        0,
+        stream
+    ));
 
     cuda_check(cudaPeekAtLastError());
 }
