@@ -49,7 +49,11 @@ class Exl3Backend:
     def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
         from exllamav3.modules import Linear
         modules = self.model.modules
-        states = list(ids.split(1))
+        # Per-row params, prepared by the architecture as Model.forward does before the module
+        # chain (attention layout, recurrence, DeepSeek-V4's hash-routing ids / image chunks);
+        # they carry state across modules, so each row keeps its own dict
+        params_rows = [{} for _ in range(ids.shape[0])]
+        states = [self.model.prepare_inputs(row, p) for row, p in zip(ids.split(1), params_rows)]
         gen = torch.Generator(device = self.device)
         gen.manual_seed(1)
 
@@ -83,10 +87,14 @@ class Exl3Backend:
 
                 logits_layer = idx == len(modules) - 1
                 for r in range(len(states)):
-                    # Hash-MoE layers (DeepSeek-V4) route by token id; provide the row's ids
-                    params = {"input_ids": ids[r:r + 1]}
+                    params = params_rows[r]
+                    params.setdefault("input_ids", ids[r:r + 1])
                     x = module.prepare_for_device(states[r], params)
                     x = module.forward(x, params)
+                    # Modules may hand back a view of a shared g_tensor_cache workspace (mHC /
+                    # GatedResidual streams); the next row's pass would overwrite it, so own it
+                    if torch.is_tensor(x):
+                        x = x.clone()
                     if noise_eps and idx < len(modules) - 2 and x.is_floating_point():
                         x = apply_mult_noise(x, noise_eps, gen)
                     if logits_layer:
@@ -272,7 +280,13 @@ class TransformersBackend:
                     if not sources or not targets:
                         continue
                     if ops:
-                        self.converters.append((targets[0], sources, ops))
+                        # Merge converters are matched below as literal suffixes with the
+                        # engine's "experts.*.w1.weight" wildcard convention; transformers >= 5
+                        # declares them as regex fragments (r"\.experts.*.w1.weight", target
+                        # r"\.experts.gate_up_proj"), so unescape and drop the leading dot
+                        def plain(pat):
+                            return re.sub(r"\\(.)", r"\1", pat).lstrip(".")
+                        self.converters.append((plain(targets[0]), [plain(sp) for sp in sources], ops))
                     else:
                         renames.append((sources[0], targets[0]))
             except ImportError:
