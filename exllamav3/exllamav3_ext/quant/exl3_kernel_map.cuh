@@ -64,6 +64,20 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     const int num_had_src
 
 typedef void (*fp_exl3_gemm_kernel) (EXL3_GEMM_ARGS);
+
+// K-split variant: EXL3_GEMM_ARGS + fp32 partial-sum workspace.
+// CFG==2 kernels write per-k-chunk partials to the workspace and
+// reduce across chunks after a grid barrier; other variants ignore it.
+#define EXL3_GEMM_ARGS_KS \
+    EXL3_GEMM_ARGS, \
+    float* __restrict__ ws
+typedef void (*fp_exl3_gemm_kernel_ks) (EXL3_GEMM_ARGS_KS);
+
+// Dual K-split: dual args + workspace
+#define EXL3_GEMM_ARGS_DUAL_KS \
+    EXL3_GEMM_ARGS_DUAL, \
+    float* __restrict__ ws
+typedef void (*fp_exl3_gemm_kernel_dual_ks) (EXL3_GEMM_ARGS_DUAL_KS);
 typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 
 #define EXL3_GEMM_SHAPE_1     16,     16,    128,     6,     5
