@@ -69,6 +69,7 @@ struct BC_MLAttention
     // Partial RoPE over the rope halves (q_pe/k_pe), GPTJ or NEOX per rope_style
     at::Tensor inv_freq;
     int rope_style;
+    bool rope_active;       // D_r > 0 and rope_style != NONE; otherwise the pe slices pass unrotated
     float attn_factor;
     int rotate_dims;
 

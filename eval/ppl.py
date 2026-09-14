@@ -212,9 +212,19 @@ def main(args):
             if not args.hf_tight and not args.hf_fp32:
                 hf_kwargs["dtype"] = torch.bfloat16
 
+        # -gs doubles as a per-device GiB budget: an explicit device map from accelerate's planner,
+        # since Transformers' own "auto" planner fills every device to the brim (its conversion
+        # transients, e.g. fusing 256 experts' gate/up projections, then OOM) or refuses outright
+        device_map = "auto" if args.hf_device is None else torch.device(args.hf_device)
+        if args.hf_device is None and args.gpu_split:
+            from exllamav3.util.hf_util import hf_device_map_from_split
+            device_map = hf_device_map_from_split(args.model_dir, args.gpu_split.split(","))
+            # The grouped_mm expert path mixes devices when a model is split (native KimiLinear on
+            # transformers 5.17); the eager expert loop is the reference path anyway
+            hf_kwargs["experts_implementation"] = "eager"
         model = AutoModelForCausalLM.from_pretrained(
             args.model_dir,
-            device_map = "auto" if args.hf_device is None else torch.device(args.hf_device),
+            device_map = device_map,
             dtype = torch.half if args.hf_tight else torch.float if args.hf_fp32 else hf_kwargs.pop("dtype", None),
             **hf_kwargs,
         )
