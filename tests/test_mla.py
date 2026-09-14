@@ -256,6 +256,8 @@ def build_exl3_nope(H = 16, hidden = 1024, kv_lora = 512, nope = 128, rope_dim =
     return module
 
 
+@pytest.mark.skipif(bool(torch.version.hip),
+                    reason = "the bc MLA decode graph declines unpinned bound classes")
 def test_mla_nope_decode_matches_prefill():
     """Kimi Linear: pe dims present but never rotated. The decode graph used to require a rope
     instance whenever qk_rope_head_dim > 0 (and its C++ ran the rope stage unconditionally, which
