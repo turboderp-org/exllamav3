@@ -28,6 +28,17 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     half* __restrict__ A_had, \
     const half* __restrict__ svh
 
+// Dual-matrix GEMV variant: EXL3_GEMM_ARGS + a second matrix slot
+// (B2/C2/suh2/A_had2/svh2). Fuses two back-to-back GEMV calls into
+// one launch — see docs/sm70_dual_gemv_design.md.
+#define EXL3_GEMM_ARGS_DUAL \
+    EXL3_GEMM_ARGS, \
+    const uint16_t* __restrict__ B2, \
+    void* __restrict__ C2, \
+    const half* __restrict__ suh2, \
+    half* __restrict__ A_had2, \
+    const half* __restrict__ svh2
+
 #define EXL3_MGEMM_ARGS \
     const half* __restrict__  A, \
     const uint16_t** __restrict__ B_list, \
