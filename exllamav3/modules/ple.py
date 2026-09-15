@@ -28,6 +28,12 @@ caller). Norms are grouped RMS (rms per 2560-stream, zero-init weight applied as
 """
 
 
+def _ple_gate_torch(gate, value, gate_scale):
+    scaled = gate.float() * gate_scale
+    signed_sqrt = torch.sign(scaled) * torch.sqrt(torch.clamp(scaled.abs(), min = 1e-6))
+    return torch.sigmoid(signed_sqrt).unsqueeze(-1) * value.float().unsqueeze(-2)
+
+
 class PLELayerState:
     """
     Per-slot recurrent state for one PLE layer, following the ShortConvLayerState conventions:
@@ -269,7 +275,8 @@ class PLELayer(Module):
         bsz, seq = streams.shape[:2]
         H, D = self.hc_mult, self.hidden_size
         emb = self.ple_embedding.forward(token_history, params)               # (bsz, seq, ple_dim)
-        if self.key_proj.quant_type == "fp16" and self.value_proj.quant_type == "fp16" \
+        if hasattr(ext, "ple_forward_streams") \
+                and self.key_proj.quant_type == "fp16" and self.value_proj.quant_type == "fp16" \
                 and streams.dtype == torch.float and streams.is_contiguous() \
                 and self.key_proj.inner.bias is None and self.value_proj.inner.bias is None:
             delta = torch.empty_like(streams)
@@ -298,8 +305,12 @@ class PLELayer(Module):
         # per-stream key/query dots as a batched (1, D) x (D, 1) matmul, then the fused gate
         # kernel: gated = sigmoid(signed_sqrt(dot * scale)) * value broadcast over streams
         gate = torch.bmm(query.view(-1, 1, D), key.reshape(-1, D, 1)).view(bsz, seq, H)
-        gated = torch.empty((bsz, seq, H, D), dtype = torch.float, device = value.device)
-        ext.ple_gate(gate, value, gated, self.gate_scale)
+        ple_gate = getattr(ext, "ple_gate", None)
+        if ple_gate is not None:
+            gated = torch.empty((bsz, seq, H, D), dtype = torch.float, device = value.device)
+            ple_gate(gate, value, gated, self.gate_scale)
+        else:
+            gated = _ple_gate_torch(gate, value, self.gate_scale)
         normed = self.norm_conv.forward(gated, params, out_dtype = torch.half).flatten(-2)
         conv_out, conv_stream = self._short_conv(normed, conv_state)
         delta = gated + conv_out.view(bsz, seq, H, D)

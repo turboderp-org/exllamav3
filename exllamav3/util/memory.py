@@ -79,12 +79,28 @@ def free_mem():
 # Host-allocation churn (recurrent checkpoint stashes, per-layer fp32 copies during
 # conversion, ...) leaves freed memory stranded in glibc's arenas: interleaved lifetimes
 # fragment the heap and RSS ratchets up even though nothing is referenced. malloc_trim
-# returns what can be returned
+# returns what can be returned.
+#
+# On ROCm the trim is off unless EXL3_MALLOC_TRIM=1. Host pages that the runtime has
+# registered with KFD are invalidated by malloc_trim's madvise; the driver then evicts the
+# process's GPU queues while svm_range_restore_work / restore_userptr_worker repopulate the
+# range, which stalls every in-flight and newly arriving request for seconds. CUDA keeps the
+# trim unless EXL3_MALLOC_TRIM=0.
 _libc = None
+
+def malloc_trim_enabled() -> bool:
+    import os
+    flag = os.environ.get("EXL3_MALLOC_TRIM")
+    if flag is not None:
+        return flag != "0"
+    return torch.version.hip is None
+
 
 def malloc_trim():
     global _libc
     if _libc is False:
+        return
+    if not malloc_trim_enabled():
         return
     try:
         if _libc is None:

@@ -133,8 +133,9 @@ class LinearEXL3:
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
-                dtype = out_dtype or self.default_out_dtype
-                return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
+                if self.bc is not None:
+                    dtype = out_dtype or self.default_out_dtype
+                    return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
         return self.reconstruct_hgemm(x, out_dtype)
 

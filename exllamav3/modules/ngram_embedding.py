@@ -474,8 +474,12 @@ class NGramEmbedding(Module):
                     torch.index_select(store, 0, seg - base if base else seg,
                                        out = out[i0 : i1])
                 else:
-                    ext.ngram_gather_cpu(store._ensure_open(), store.abs_offset,
-                                         store.row_bytes, seg.contiguous(), base, out[i0 : i1])
+                    gather = getattr(ext, "ngram_gather_cpu", None)
+                    if gather is not None:
+                        gather(store._ensure_open(), store.abs_offset,
+                               store.row_bytes, seg.contiguous(), base, out[i0 : i1])
+                    else:
+                        out[i0 : i1].copy_(store.read_rows(seg - base if base else seg))
             i0 = i1
 
     def prefetch(self, history: torch.Tensor):
@@ -519,12 +523,16 @@ class NGramEmbedding(Module):
         the last seq_len = x.shape[1] - context_len positions, on the module's device.
         """
         out_len = x.shape[1] - self.context_len
+        trellis = self.mode.startswith("trellis")
+        if not hasattr(ext, "ngram_hash_cpu") or \
+                (trellis and not hasattr(ext, "ngram_dequant")):
+            return self.forward_reference(x, params, out_dtype)
+
         ids = x.to("cpu", torch.int64).contiguous()
         bsz = ids.shape[0]
         H = self.num_heads
         n = bsz * out_len * H
         dev = self.device
-        trellis = self.mode.startswith("trellis")
         row_words = words_per_row(self.K) if trellis else ROW_DIM
         row_dtype = torch.int16 if trellis else self._row_dtype
 

@@ -118,7 +118,9 @@ class HyperConnection(Module):
         (both block consumers cast it immediately); the torch fallback keeps fp32."""
         hc = self.hc_mult
         b, s, H, D = streams.shape
-        if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous():
+        if hasattr(ext, "hc_mix_num_chunks") and hasattr(ext, "hc_mix") \
+                and hc == 4 and streams.dtype == torch.float and D % 4 == 0 \
+                and streams.is_contiguous():
             R = b * s
             st = streams.view(R, H, D)
             chunks = ext.hc_mix_num_chunks(R, H * D)
@@ -177,7 +179,8 @@ class HyperConnection(Module):
         path: the capture and advance passes forward the SAME stored input states twice."""
         b, s, H, D = x.shape
         converting = "quant_preserve" in params or "capture" in params
-        if not converting and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
+        if hasattr(ext, "hc_apply") and not converting \
+                and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
                 and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
             R = b * s
@@ -359,6 +362,9 @@ class GatedResidual(Module):
         if not s3.is_contiguous():
             s3 = s3.contiguous()
         dev = s3.device
+        if not hasattr(ext, "gr_mix"):
+            post, mixed = self._mix_ref(s3.view(1, R, H, Dh))
+            return (post.view(R, H) if post is not None else None), mixed.view(R, Dh).half()
 
         if R <= self.FUSED_MAX_R:
             # Decode/MTP-class row counts (the fused path's whole domain) take bucketed
@@ -408,7 +414,7 @@ class GatedResidual(Module):
         """Residual update for one sublayer site, in place: x <- x + post (x) y (comb unused).
         Conversion must NOT run the in-place path: the capture and advance passes forward the
         SAME stored input states twice (mHC apply_ has the same guard)."""
-        if "quant_preserve" in params or "capture" in params:
+        if not hasattr(ext, "hc_apply") or "quant_preserve" in params or "capture" in params:
             return x + post.unsqueeze(-1) * y.float().unsqueeze(-2)
         b, s = x.shape[:2]
         y2 = y.reshape(b * s, self.hidden_size)
@@ -569,7 +575,8 @@ class HyperHead(Module):
         if self.mean:
             return x.mean(dim = 2)
         b, s, H, D = x.shape
-        if H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
+        if hasattr(ext, "hc_mix_num_chunks") and hasattr(ext, "hc_head") \
+                and H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
             R = b * s
             chunks = ext.hc_mix_num_chunks(R, H * D)
             partials = g_tensor_cache.get_bucketed(
