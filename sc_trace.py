@@ -748,7 +748,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
-    model_init.add_args(parser, default_cache_size = 131072, add_draft_model_args = True)
+    model_init.add_args(parser, default_cache_size = 131072, add_draft_model_args = True, default_autosplit_max_batch_size = 32)
     parser.add_argument("-o", "--output", type = str, required = True, help = "Output trace (JSON, qbench-compatible)")
     parser.add_argument("-co", "--cal_out", type = str, default = None, help = "Output packed calibration rows (safetensors), default: derived from --output")
     parser.add_argument("-cr", "--cal_rows", type = int, default = 250, help = "Calibration rows to pack, default: 250")
