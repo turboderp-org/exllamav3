@@ -405,10 +405,14 @@ memcpy it into the pinned handoff ring first; the stager is the prefill bottlene
 offloaded models (mistral-small-4 119B, 54 GiB of experts: 4k-token prefill 700 -> 1850 tok/s
 on a gen5 x16 link, decode unchanged within noise). Costs: every chunk is registered with CUDA
 as it appears (~0.2 s per GiB, overlapping the load) and the arena is shared memory counted in
-both processes' RSS. On Linux the chunks are `memfd`s passed over the worker pipe; shmem pages
+both processes' RSS. On Linux the chunks are `memfd`s passed over the worker pipe (resolved at
+runtime through libc or the raw syscall when the interpreter was built without
+`os.memfd_create`, as conda builds are); shmem pages
 only get transparent huge pages where `/sys/kernel/mm/transparent_hugepage/shmem_enabled`
-allows it (`advise`, `within_size` or `always`; on the default `never` the CPU kernels run on
-4K pages, which cost a few percent of decode on some hosts). On Windows the chunks are named
+allows it at allocation time: `within_size` (or `always`) is what works, since the chunks are
+preallocated with `fallocate` and then page-locked by the parent, so neither the `advise` hint
+nor the later collapse pass can convert them (on the default `never` the CPU kernels run on 4K
+pages, which cost a few percent of decode on some hosts). On Windows the chunks are named
 pagefile-backed sections (4K pages); each must fit both free physical RAM and commit headroom
 when it is created, or the load fails naming the chunk.
 

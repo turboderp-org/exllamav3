@@ -138,6 +138,62 @@ TUNING = MoeCpuTuning()
 ext.exl3_moe_cpu_set_memops(TUNING.memops)
 
 
+# memfd_create only ships in CPython when the interpreter was built against glibc >= 2.27; conda
+# and manylinux-built interpreters lack it (and the os.MFD_* constants) even on kernels that
+# have had the syscall since 4.17 (PR #341 discussion). Resolve it at runtime instead: os first,
+# then libc's symbol, then the raw syscall by architecture. The MFD_* values are kernel ABI
+MFD_CLOEXEC = 0x0001
+MFD_HUGETLB = 0x0004
+MFD_HUGE_2MB = 21 << 26
+MFD_HUGE_1GB = 30 << 26
+_MEMFD_SYSCALL = {"x86_64": 319, "aarch64": 279, "riscv64": 279, "loongarch64": 279,
+                  "ppc64le": 360, "ppc64": 360, "s390x": 350, "i686": 356, "armv7l": 385}
+
+
+def _memfd_via_libc(name: str, flags: int) -> int:
+    """libc's memfd_create symbol (any glibc >= 2.27 / musl >= 1.1.20 at runtime)"""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno = True)
+    fn = libc.memfd_create   # AttributeError when the runtime libc predates it
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    fd = fn(name.encode(), flags)
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return fd
+
+
+def _memfd_via_syscall(name: str, flags: int) -> int:
+    """Raw memfd_create syscall, for a runtime libc without the wrapper"""
+    import ctypes
+    nr = _MEMFD_SYSCALL.get(os.uname().machine)
+    if nr is None:
+        raise RuntimeError(f"no memfd_create syscall number known for {os.uname().machine}")
+    libc = ctypes.CDLL(None, use_errno = True)
+    libc.syscall.restype = ctypes.c_long
+    fd = libc.syscall(ctypes.c_long(nr), ctypes.c_char_p(name.encode()), ctypes.c_uint(flags))
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return int(fd)
+
+
+def _memfd_create(name: str, flags: int = 0) -> int:
+    if hasattr(os, "memfd_create"):
+        return os.memfd_create(name, flags)
+    try:
+        return _memfd_via_libc(name, flags)
+    except AttributeError:
+        pass
+    try:
+        return _memfd_via_syscall(name, flags)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"CPU MoE pinned arena: this Python build has no os.memfd_create and no fallback "
+            f"applies ({e}). Unset EXL3_MOE_PINNED_ARENA to use the staged path.") from e
+
+
 class _HugeArena:
     """
     Growable pool of large (default 1 GiB) anonymous mmap chunks that expert weights are copied
@@ -187,10 +243,10 @@ class _HugeArena:
             flags = 0
             if self.huge == "1g":
                 size = (size + (1 << 30) - 1) & ~((1 << 30) - 1)
-                flags = os.MFD_HUGETLB | os.MFD_HUGE_1GB
+                flags = MFD_HUGETLB | MFD_HUGE_1GB
             elif self.huge == "2m":
-                flags = os.MFD_HUGETLB | os.MFD_HUGE_2MB
-            fd = os.memfd_create(f"exl3_moe_arena_{len(self.chunks)}", flags)
+                flags = MFD_HUGETLB | MFD_HUGE_2MB
+            fd = _memfd_create(f"exl3_moe_arena_{len(self.chunks)}", flags)
             try:
                 # Preallocate: a hugetlb memfd without enough reserved pages fails here with
                 # ENOMEM instead of SIGBUS on first touch
