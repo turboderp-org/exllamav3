@@ -8,6 +8,9 @@
 #define NUM_THREADS 512
 #define NUM_BLOCKS 128
 
+// Copies in units of T. Pages are a multiple of sizeof(T) bytes and the cache is a torch
+// allocation (256-byte aligned), so every page start is aligned to sizeof(T)
+template <typename T>
 __global__ __launch_bounds__(NUM_THREADS)
 void cache_rotate_kernel
 (
@@ -18,10 +21,12 @@ void cache_rotate_kernel
     const size_t rotate_len
 )
 {
-    // Chunk for current CTA. Chunks must stay 16-byte aligned for the uint4 copies:
-    // round the split up to 16 (small pages, e.g. DSA HCA pools at 1792 B, would otherwise
-    // give misaligned per-CTA offsets; trailing CTAs just idle)
-    size_t block_size = CEIL_DIVIDE(CEIL_DIVIDE(page_size, gridDim.x), 16) * 16;
+    constexpr size_t W = sizeof(T);
+
+    // Chunk for current CTA. Chunks must stay W-byte aligned for the vector copies: round the
+    // split up to W (small pages, e.g. DSA HCA pools at 1792 B, would otherwise give misaligned
+    // per-CTA offsets; trailing CTAs just idle)
+    size_t block_size = CEIL_DIVIDE(CEIL_DIVIDE(page_size, gridDim.x), W) * W;
     size_t block_beg = blockIdx.x * block_size;
     size_t block_end = MIN(block_beg + block_size, page_size);
     if (block_end <= block_beg) return;
@@ -34,8 +39,8 @@ void cache_rotate_kernel
         int64_t b = (int64_t) order[2 * i + 1];
         uint8_t* dst = (a >= 0 ? cache + page_size * a : temp) + block_beg;
         uint8_t* src = (b >= 0 ? cache + page_size * b : temp) + block_beg;
-        for (int offset = threadIdx.x * 16; offset < block_size; offset += NUM_THREADS * 16)
-            *((uint4*) (dst + offset)) = *((uint4*) (src + offset));
+        for (size_t offset = threadIdx.x * W; offset < block_size; offset += NUM_THREADS * W)
+            *((T*) (dst + offset)) = *((T*) (src + offset));
         __syncthreads();
     }
 }
@@ -52,6 +57,9 @@ for i in range(n):
     a = order[2*i]
     b = order[2*i+1]
     copy: (page[a] if a >= 0 else temp) <- (page[b] if b >= 0 else temp)
+
+Any page size: 16-byte vector copies when the page allows, narrower units otherwise (DeepSeek-V4
+HCA pools compress 128:1, so their quantized scale plane is 2 x 14 fp16 = 56 bytes per page)
 */
 
 void cache_rotate
@@ -65,6 +73,7 @@ void cache_rotate
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK(cache.dim() >= 2, "cache argument must have dim >= 2")
+    TORCH_CHECK(cache.is_contiguous(), "cache argument must be contiguous")
     TORCH_CHECK(order.dim() == 1, "order argument must have dim == 1")
     TORCH_CHECK_DTYPE(order, kInt);
 
@@ -73,16 +82,17 @@ void cache_rotate
     size_t rotate_len = order.size(0) / 2;
 
     TORCH_CHECK(temp.nbytes() == page_size, "temp tensor incorrect size");
-    TORCH_CHECK(page_size % 16 == 0, "cache_rotate: page size must be a multiple of 16 bytes");
+    if (!page_size || !rotate_len) return;
 
-    cache_rotate_kernel<<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>
-    (
-        (uint8_t*) cache.data_ptr(),
-        (const int32_t*) order.data_ptr(),
-        (uint8_t*) temp.data_ptr(),
-        page_size,
-        rotate_len
-    );
+    uint8_t* c = (uint8_t*) cache.data_ptr();
+    const int32_t* o = (const int32_t*) order.data_ptr();
+    uint8_t* t = (uint8_t*) temp.data_ptr();
+    uintptr_t align = (uintptr_t) c | (uintptr_t) t | page_size;
+    if      (align % 16 == 0) cache_rotate_kernel<uint4>   <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
+    else if (align %  8 == 0) cache_rotate_kernel<uint2>   <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
+    else if (align %  4 == 0) cache_rotate_kernel<uint32_t><<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
+    else if (align %  2 == 0) cache_rotate_kernel<uint16_t><<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
+    else                      cache_rotate_kernel<uint8_t> <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(c, o, t, page_size, rotate_len);
     cuda_check(cudaPeekAtLastError());
 }
 
