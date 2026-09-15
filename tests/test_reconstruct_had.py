@@ -4,12 +4,23 @@
 # sign/order/scale error in the fused kernel shows up directly. Also checks forward-path
 # equivalence: had(x*su) @ W_hat -> had -> *sv (old pipeline) vs x @ W_fused.
 
+import os
+
+import pytest
 import torch
-from exllamav3.ext import exllamav3_ext as ext
 
 torch.manual_seed(0)
-device = "cuda:1"
-torch.cuda.set_device(device)
+device = torch.device(os.environ.get("EXL_TEST_DEVICE", "cuda:0"))
+DEVICE_AVAILABLE = (
+    device.type == "cuda" and torch.cuda.is_available() and
+    (device.index is None or device.index < torch.cuda.device_count())
+)
+pytestmark = pytest.mark.skipif(not DEVICE_AVAILABLE, reason = f"test device unavailable: {device}")
+if DEVICE_AVAILABLE:
+    from exllamav3.ext import exllamav3_ext as ext
+    torch.cuda.set_device(device)
+else:
+    ext = None
 
 
 def sylvester(n):
@@ -19,7 +30,7 @@ def sylvester(n):
     return h
 
 
-H = sylvester(128) / 128 ** 0.5
+H = sylvester(128) / 128 ** 0.5 if DEVICE_AVAILABLE else None
 
 
 def ref_transform(w_hat, suh, svh):
@@ -32,6 +43,8 @@ def ref_transform(w_hat, suh, svh):
 
 
 def main():
+    if not DEVICE_AVAILABLE:
+        pytest.skip(f"test device unavailable: {device}")
     for (k, n, K, mcg, mul1) in [
         (256, 128, 3, False, False),
         (512, 384, 2, False, False),

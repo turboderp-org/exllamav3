@@ -22,8 +22,23 @@ import time
 import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
+from ..ext import exllamav3_ext as ext
 
 class Generator:
+
+    @staticmethod
+    def _validate_ngram_drafting_support() -> None:
+        try:
+            sam = ext.BC_SAM()
+        except AttributeError as exc:
+            raise NotImplementedError(
+                "N-gram drafting requires the BC_SAM extension binding, which is unavailable on this build."
+            ) from exc
+        if sam is None:
+            raise NotImplementedError(
+                "N-gram drafting requires BC_SAM, which is unavailable on this platform/build."
+            )
+
 
     def __init__(
         self,
@@ -166,6 +181,7 @@ class Generator:
             else:
                 self.num_draft_tokens = draft_model.caps.get("default_draft_size", 4)
         elif ngram_match_min:
+            self._validate_ngram_drafting_support()
             self.num_draft_tokens = num_draft_tokens if num_draft_tokens is not None else 4
         else:
             self.num_draft_tokens = 0
