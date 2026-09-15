@@ -152,6 +152,9 @@ static void* exl3_gemv_sm70_select_kernel_dual(int bits, int cb, bool c_fp32, in
         SEL(bits_, cb_, true,  1, 0, sm_) SEL(bits_, cb_, true,  1, 1, sm_)
     SEL_GRID(3, 2, false)
     SEL_GRID(3, 2, true)
+    // cfg 2 (K-split 2-ways, 256 threads): K=3 cb=2 MoE gate+up shapes
+    SEL(3, 2, false, 0, 2, false) SEL(3, 2, false, 1, 2, false)
+    SEL(3, 2, true,  0, 2, false) SEL(3, 2, true,  1, 2, false)
     #undef SEL_GRID
     #undef SEL
     return nullptr;
@@ -465,15 +468,34 @@ void exl3_gemv2
         (void*)& ws_ptr   // K-split arg; unused by the dual (CFG 0)
     };
 
-    void* kernel = exl3_gemv_sm70_select_kernel_dual(K, cb, c_fp32, size_m == 1 ? 0 : 1, 0, false);
+    // cfg 0: 512 threads, 32 cols/block, no K-split. cfg 2 (env-gated):
+    // 256 threads, K-split 2-ways — engages all 80 SMs at n=2048
+    // (grid 128 vs 64) where cfg 0 leaves 16 SMs idle.
+    int cfg = 0;
+    if (const char* env = std::getenv("EXL3_GEMV2_CFG")) cfg = atoi(env);
+
+    void* kernel = exl3_gemv_sm70_select_kernel_dual(K, cb, c_fp32, size_m == 1 ? 0 : 1, cfg, false);
     TORCH_CHECK(kernel, "exl3_gemv2: no dual kernel for this shape (K, cb, mmode, cfg, smem)");
 
     int num_sms = DevCtx::instance().get_num_sms(device);
-    int block_dim = 512;  // cfg 0
+    int block_dim = cfg == 0 ? 512 : 256;
+    int cols = 32;
     int blocks_per_sm;
     cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
     int max_blocks = blocks_per_sm * num_sms;
-    int grid = MIN(size_n / 32, max_blocks);  // cfg 0: 32 cols
+    int grid;
+    if (cfg == 2)
+    {
+        const int ksplit = 2;
+        int groups = size_n / cols;
+        TORCH_CHECK(max_blocks >= groups * ksplit,
+            "exl3_gemv2: cfg 2 grid does not fit co-residency (", max_blocks, " < ", groups * ksplit, ")");
+        grid = groups * ksplit;
+    }
+    else
+    {
+        grid = MIN(size_n / cols, max_blocks);
+    }
     TORCH_CHECK(grid >= 1, "exl3_gemv2: output too small for one block");
 
     cuda_check(cudaLaunchCooperativeKernel

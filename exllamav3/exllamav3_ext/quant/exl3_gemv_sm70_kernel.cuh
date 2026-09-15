@@ -541,9 +541,10 @@ void exl3_gemv_sm70_kernel_dual(EXL3_GEMM_ARGS_DUAL_KS)
 {
     static_assert(bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 7 || bits == 8,
         "exl3_gemv_sm70_kernel supports 2-8 bpw");
-    constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
-    constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
-    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
+    constexpr int WK   = CFG == 0 ? 16 : 8;     // warps per block (CFG 2: 8 = 256 threads)
+    constexpr int WNT  = CFG == 1 ? 4 : 2;      // adjacent n-tiles per warp
+    constexpr int PF   = CFG == 1 ? 2 : 4;      // prefetch ring depth
+    constexpr int KS   = CFG == 2 ? 2 : 1;      // k-split across blocks (CFG 2)
     // K >= 5: the tile is 8*bits >= 40 words — more than the 32 lanes
     // hold in one load, so each tile takes 2 loads (64 slots >= 8*bits).
     constexpr int LOADS = bits >= 5 ? 2 * WNT : (bits == 2 ? WNT / 2 : WNT);  // warp loads per k-slice
@@ -588,10 +589,14 @@ void exl3_gemv_sm70_kernel_dual(EXL3_GEMM_ARGS_DUAL_KS)
     const int ntiles = size_n / 16;
     const int kslices = size_k / 16;
     const int num_groups = size_n / COLS;
-
-    const int chunk = CEIL_DIVIDE(kslices, WK);
-    const int ks0 = warp * chunk;
-    const int myn = max(0, min(chunk, kslices - ks0));
+    const int num_groups_ks = num_groups;
+    const int kblk = KS > 1 ? blockIdx.x / num_groups_ks : 0;
+    const int ks_per_blk = KS > 1 ? CEIL_DIVIDE(kslices, KS) : kslices;
+    const int ks_base = KS > 1 ? kblk * ks_per_blk : 0;
+    const int ks_len = KS > 1 ? max(0, min(ks_per_blk, kslices - ks_base)) : kslices;
+    const int chunk = CEIL_DIVIDE(ks_len, WK);
+    const int ks0 = ks_base + warp * chunk;
+    const int myn = max(0, min(chunk, ks_len - warp * chunk));
 
     const size_t slice_stride = (size_t) ntiles * TWORDS;   // uint32 per k-slice row
     const half2 hzero = __half2half2(__ushort_as_half(0));
@@ -641,7 +646,9 @@ void exl3_gemv_sm70_kernel_dual(EXL3_GEMM_ARGS_DUAL_KS)
         const uint32_t* Bm = (const uint32_t*)(mi ? B2 : B);
         void* Cm = mi ? C2 : C;
         const half2* A2 = (const half2*)(mi ? A_had2 : A_had);
-        for (int group = blockIdx.x; group < num_groups; group += gridDim.x)
+        const int group0 = KS > 1 ? (blockIdx.x % num_groups_ks) : blockIdx.x;
+        const int group_stride = KS > 1 ? num_groups_ks : gridDim.x;
+        for (int group = group0; group < num_groups; group += group_stride)
         {
             const uint32_t* bp = Bm + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
 
@@ -891,14 +898,52 @@ void exl3_gemv_sm70_kernel_dual(EXL3_GEMM_ARGS_DUAL_KS)
                 for (int j = 0; j < WK; ++j)
                     sum += sh_red[j][r][c];
                 const int col = group * COLS + c;
-                if constexpr (c_fp32) ((float*) Cm)[(size_t) r * size_n + col] = sum;
+                if constexpr (KS > 1)
+                {
+                    // K-split: write fp32 partials; slot 0 at ws + kblk*size_n,
+                    // slot 1 at ws + (KS + kblk)*size_n. Reduction after grid.sync.
+                    float* wsm = ws + (mi ? KS : 0) * size_n + (size_t) kblk * size_n;
+                    if (MMODE == 0 ? (r == 0) : (r < rows_out))
+                        wsm[(size_t) r * size_n + col] = sum;
+                }
+                else if constexpr (c_fp32) ((float*) Cm)[(size_t) r * size_n + col] = sum;
                 else                  ((half*)  Cm)[(size_t) r * size_n + col] = __float2half_rn(sum);
             }
             __syncthreads();
         }
 
     }
-    grid.sync();
+    grid.sync();   // publish phase-2 stores (and KS partials) before reduction/phase 3
+    // K-split reduction: sum the KS partials into C (pre-Had). The
+    // grid.sync above publishes all partials; kblk == 0 blocks then
+    // reduce their own group (== blockIdx.x % num_groups_ks).
+    if constexpr (KS > 1)
+    {
+        if (kblk == 0)
+        {
+            const int red_group = blockIdx.x % num_groups_ks;
+            #pragma unroll
+            for (int mi = 0; mi < 2; ++mi)
+            {
+                void* Cm = mi ? C2 : C;
+                const float* wsm = ws + (mi ? KS : 0) * size_n;
+                const int rows_out2 = MMODE == 0 ? 1 : min(size_m, ROWS);
+                for (int idx = threadIdx.x; idx < COLS * rows_out2; idx += THREADS)
+                {
+                    const int r = idx / COLS;
+                    const int c = idx % COLS;
+                    const int col = red_group * COLS + c;
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int kb = 0; kb < KS; ++kb)
+                        sum += wsm[(size_t) kb * size_n + col];
+                    if constexpr (c_fp32) ((float*) Cm)[(size_t) r * size_n + col] = sum;
+                    else                  ((half*)  Cm)[(size_t) r * size_n + col] = __float2half_rn(sum);
+                }
+            }
+        }
+    }
+    if constexpr (KS > 1) grid.sync();   // publish reduced C before phase 3 (KS==1: 916's sync already covers it)
     // Phase 3: output Had per matrix (disjoint C/svh)
     #pragma unroll
     for (int mi = 0; mi < 2; ++mi)
