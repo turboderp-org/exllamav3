@@ -31,6 +31,7 @@ from .kimi_linear import KimiLinearModel
 from .laguna import LagunaModel
 from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
+from .lfm2_vl import Lfm2VlTextModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
 from .minimax_m2 import MiniMaxM2Model
@@ -101,6 +102,7 @@ ARCHITECTURES = {
         LagunaModel,
         Lfm2Model,
         Lfm2MoeModel,
+        Lfm2VlTextModel,
         LlamaModel,
         MiMoModel,
         MiniMaxM2Model,
