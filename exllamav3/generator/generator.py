@@ -192,17 +192,19 @@ class Generator:
         self.sample_pinned = None
         self.staging_buffers = {}
 
-        # Buffers
+        # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
+        # the DFlash2 selector reads its anchor from the same view), the drafted ids come back
+        # into draft_ids_pinned
         if draft_model or ngram_match_min:
             self.draft_input_ids_pinned = torch.empty(
                 (max_batch_size, 1),
                 dtype = torch.long,
-                pin_memory = False
+                pin_memory = True
             )
             self.draft_ids_pinned = torch.empty(
                 (max_batch_size, self.num_draft_tokens),
                 dtype = torch.long,
-                pin_memory = False
+                pin_memory = True
             )
 
         # CPU page cache tier
@@ -614,8 +616,12 @@ class Generator:
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
+        # pageable copies; the draft's own buffers, since the target's are still in flight
+        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
@@ -710,8 +716,12 @@ class Generator:
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
+        # pageable copies; the draft's own buffers, since the target's are still in flight
+        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
@@ -810,8 +820,12 @@ class Generator:
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
+        # pageable copies; the draft's own buffers, since the target's are still in flight
+        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
