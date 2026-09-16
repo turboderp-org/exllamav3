@@ -4,7 +4,7 @@ import torch
 from ..model.config import Config, no_default
 from ..model.model import Model
 from ..util.rope import RopeStyle, RopeSettings
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
+from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, SlidingAttention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 
 class Spark2_5Config(Config):
@@ -133,6 +133,12 @@ class Spark2_5Model(Model):
         self.first_block_idx = len(self.modules)
 
         for idx in range(config.num_hidden_layers):
+            # Sliding-window layers use the recurrent windowed KV ring (SlidingAttention) instead of a
+            # full-width paged cache; full-attention layers keep the standard paged KV (same per-layer
+            # construction as the other hybrid architectures, e.g. gemma4)
+            attn_cls = SlidingAttention if (
+                config.layer_types is not None and config.layer_types[idx] == "sliding_attention"
+            ) else Attention
             self.modules += [
                 TransformerBlock(
                     config = config,
@@ -143,7 +149,7 @@ class Spark2_5Model(Model):
                         key = f"model.layers.{idx}.input_layernorm",
                         rms_norm_eps = config.rms_norm_eps,
                     ),
-                    attn = Attention(
+                    attn = attn_cls(
                         config = config,
                         key = f"model.layers.{idx}.self_attn",
                         layer_idx = idx,
