@@ -135,13 +135,14 @@ class DFlash2Model(Model):
             )
             self.attn_modules.append(attn)
 
-            def dynconv(name: str):
+            def dynconv(name: str, qmap: str):
                 return DFlash2DynConv(
                     config = config,
                     key = f"layers.{idx}.{name}",
                     hidden_size = config.hidden_size,
                     kernel_size = config.conv_kernel_size,
                     group_size = config.conv_group_size,
+                    qmap = qmap,
                 )
 
             self.modules += [
@@ -172,8 +173,8 @@ class DFlash2Model(Model):
                         interm_dtype = torch.half,
                         out_dtype = torch.float,
                     ),
-                    attn_conv = dynconv("attention_conv"),
-                    mlp_conv = dynconv("mlp_conv"),
+                    attn_conv = dynconv("attention_conv", "block.attn"),
+                    mlp_conv = dynconv("mlp_conv", "block.mlp"),
                 )
             ]
 
