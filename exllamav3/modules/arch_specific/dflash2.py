@@ -18,96 +18,7 @@ from ...model.config import Config
 from .. import Module, Linear, RMSNorm, Attention, GatedMLP
 from ...util.tensor import to2
 
-try:
-    import triton
-    import triton.language as tl
-    has_triton = True
-except ImportError:
-    has_triton = False
-
-    class _DummyTritonLanguage:
-        constexpr = object()
-
-    class _DummyTriton:
-        @staticmethod
-        def jit(fn):
-            return fn
-
-    triton = _DummyTriton()
-    tl = _DummyTritonLanguage()
-
-
-@triton.jit
-def _grouped_dynamic_convolve_kernel(
-    hidden,
-    dynamic,
-    base,
-    output,
-    dynamic_stride_b: tl.constexpr,
-    dynamic_stride_l: tl.constexpr,
-    dynamic_stride_k: tl.constexpr,
-    dynamic_stride_g: tl.constexpr,
-    length: tl.constexpr,
-    hidden_size: tl.constexpr,
-    groups: tl.constexpr,
-    kernel_size: tl.constexpr,
-    group_size: tl.constexpr,
-    channel_tiles: tl.constexpr,
-    BLOCK_L: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    batch_idx = tl.program_id(0)
-    group_tile = tl.program_id(1)
-    position_tile = tl.program_id(2)
-    group_idx = group_tile // channel_tiles
-    channel_tile = group_tile - group_idx * channel_tiles
-
-    positions = position_tile * BLOCK_L + tl.arange(0, BLOCK_L)
-    local_channels = channel_tile * BLOCK_C + tl.arange(0, BLOCK_C)
-    channels = group_idx * group_size + local_channels
-    position_mask = positions < length
-    channel_mask = local_channels < group_size
-    acc = tl.zeros((BLOCK_L, BLOCK_C), dtype = tl.float32)
-
-    for offset in range(kernel_size):
-        source_positions = positions - offset
-        source_mask = position_mask & (source_positions >= 0)
-        hidden_offsets = (
-            (batch_idx * length + source_positions[:, None]) * hidden_size +
-            channels[None, :]
-        )
-        values = tl.load(
-            hidden + hidden_offsets,
-            mask = source_mask[:, None] & channel_mask[None, :],
-            other = 0.0,
-        ).to(tl.float32)
-        base_values = tl.load(
-            base + offset * hidden_size + channels,
-            mask = channel_mask,
-            other = 0.0,
-        ).to(tl.float32)
-        dynamic_offsets = (
-            batch_idx * dynamic_stride_b +
-            positions * dynamic_stride_l +
-            offset * dynamic_stride_k +
-            group_idx * dynamic_stride_g
-        )
-        dynamic_values = tl.load(
-            dynamic + dynamic_offsets,
-            mask = position_mask,
-            other = 0.0,
-        ).to(tl.float32)
-        acc += values * (base_values[None, :] + dynamic_values[:, None])
-
-    output_offsets = (
-        (batch_idx * length + positions[:, None]) * hidden_size +
-        channels[None, :]
-    )
-    tl.store(
-        output + output_offsets,
-        acc,
-        mask = position_mask[:, None] & channel_mask[None, :],
-    )
+from ...ext import exllamav3_ext as ext
 
 
 def _grouped_dynamic_convolve_torch(
@@ -115,6 +26,7 @@ def _grouped_dynamic_convolve_torch(
     dynamic: torch.Tensor,
     base: torch.Tensor,
     group_size: int,
+    residual: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch, length, hidden_size = hidden.shape
     groups = hidden_size // group_size
@@ -126,7 +38,11 @@ def _grouped_dynamic_convolve_torch(
         kernel = base[offset].float().view(1, 1, groups, group_size)
         weights = kernel + dynamic[:, offset:, offset]
         output[:, offset:] += weights * values
-    return output.view(batch, length, hidden_size).to(hidden.dtype)
+    output = output.view(batch, length, hidden_size)
+    if residual is not None:
+        residual += output
+        return residual
+    return output.to(hidden.dtype)
 
 
 def _grouped_dynamic_convolve(
@@ -134,48 +50,24 @@ def _grouped_dynamic_convolve(
     dynamic: torch.Tensor,
     base: torch.Tensor,
     group_size: int,
+    residual: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Transcribed from dflash.model._grouped_dynamic_convolve.
 
-    hidden  [b, l, H]; dynamic [b, l, taps, H//group_size]; base [taps, H].
+    hidden  [b, l, H]; dynamic [b, l, taps, H//group_size] (any strides); base [taps, H].
     output[t] = sum_taps  base[tap] * x[t - tap] + dyn[tap][t] * x[t - tap]
-    (causal; tap 0 = current position). Caller controls dtype.
+    (causal; tap 0 = current position). Result has hidden's dtype, or, with residual (fp32
+    [b, l, H]), is added into residual in place and residual is returned (the finish()
+    variant's residual add, fused into the kernel).
     """
-    if not hidden.is_cuda or not has_triton:
-        return _grouped_dynamic_convolve_torch(hidden, dynamic, base, group_size)
-
+    if not hidden.is_cuda:
+        return _grouped_dynamic_convolve_torch(hidden, dynamic, base, group_size, residual)
     hidden = hidden.contiguous()
-    base = base.contiguous()
-    batch, length, hidden_size = hidden.shape
-    kernel_size = base.shape[0]
-    groups = hidden_size // group_size
+    if residual is not None:
+        ext.dflash2_dynconv(hidden, dynamic, base, residual, group_size, True)
+        return residual
     output = torch.empty_like(hidden)
-    block_l = triton.next_power_of_2(min(length, 16))
-    block_c = triton.next_power_of_2(min(group_size, 64))
-    channel_tiles = triton.cdiv(group_size, block_c)
-    num_warps = 2 if block_l * block_c < 256 else 4
-    grid = batch, groups * channel_tiles, triton.cdiv(length, block_l)
-    with torch.cuda.device(hidden.device):
-        _grouped_dynamic_convolve_kernel[grid](
-            hidden,
-            dynamic,
-            base,
-            output,
-            dynamic_stride_b = dynamic.stride(0),
-            dynamic_stride_l = dynamic.stride(1),
-            dynamic_stride_k = dynamic.stride(2),
-            dynamic_stride_g = dynamic.stride(3),
-            length = length,
-            hidden_size = hidden_size,
-            groups = groups,
-            kernel_size = kernel_size,
-            group_size = group_size,
-            channel_tiles = channel_tiles,
-            BLOCK_L = block_l,
-            BLOCK_C = block_c,
-            num_warps = num_warps,
-            num_stages = 1,
-        )
+    ext.dflash2_dynconv(hidden, dynamic, base, output, group_size, False)
     return output
 
 
@@ -186,8 +78,8 @@ class DFlash2DynConv(Module):
       {key}.base_kernel        [2, kernel_size, hidden]   (prepare base, finish base)
       {key}.kernel_projection  Linear(hidden -> 2 * kernel_size * groups)
 
-    prepare() uses fp16 input/output. finish() uses fp32 input/output so the
-    surrounding block keeps its residual stream in fp32.
+    prepare() uses fp16 input/output. finish() adds the fp32 result into the block's
+    fp32 residual stream in place (one kernel, no separate add).
     """
 
     def __init__(
@@ -262,7 +154,12 @@ class DFlash2DynConv(Module):
             x, dyn[..., 0, :, :], self.base_kernel[0], self.group_size)
         return y, dyn[..., 1, :, :]
 
-    def finish(self, x: torch.Tensor, dynamic: torch.Tensor) -> torch.Tensor:
+    def finish(self, x: torch.Tensor, dynamic: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
+        """Sublayer output x [b, l, H] (fp16 or fp32) -> conv result in fp32, or, with residual
+        (fp32 [b, l, H]), residual += conv result in place (returned)"""
+        if residual is not None:
+            return _grouped_dynamic_convolve(
+                x, dynamic, self.base_kernel[1], self.group_size, residual = residual)
         return _grouped_dynamic_convolve(
             x.float(), dynamic, self.base_kernel[1], self.group_size)
 
@@ -280,7 +177,8 @@ class DFlash2Block(Module):
         r = x; x = mlp_norm(x);  x, k = mlp_conv.prepare(x);  x = mlp(x);
         x = mlp_conv.finish(x, k); x = r + x
 
-    Residual stream fp32; normed sub-ops fp16.
+    Residual stream fp32; normed sub-ops fp16. The residual adds are fused into the
+    finish() convolutions.
     """
 
     def __init__(
@@ -312,17 +210,16 @@ class DFlash2Block(Module):
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype = None):
+        x = x.float() if x.dtype != torch.float else x
         y = self.attn_norm.forward(x, params, out_dtype = torch.half)
         y, kernel = self.attn_conv.prepare(y, params)
         y = self.attn.forward(y, params)
-        y = self.attn_conv.finish(y, kernel)
-        x += y
+        x = self.attn_conv.finish(y, kernel, residual = x)
 
         y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
         y, kernel = self.mlp_conv.prepare(y, params)
         y = self.mlp.forward(y, params)
-        y = self.mlp_conv.finish(y, kernel)
-        x += y
+        x = self.mlp_conv.finish(y, kernel, residual = x)
 
         return to2(x, out_dtype, torch.float)
 

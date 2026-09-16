@@ -13,7 +13,6 @@ from exllamav3.modules.arch_specific.dflash2 import (
     DFlash2Selector,
     _grouped_dynamic_convolve,
     _grouped_dynamic_convolve_torch,
-    has_triton,
 )
 
 
@@ -134,8 +133,8 @@ def test_grouped_dynamic_convolve_torch_matches_reference():
     torch.testing.assert_close(actual, expected)
 
 
-def test_grouped_dynamic_convolve_triton_matches_torch():
-    if not torch.cuda.is_available() or not has_triton:
+def test_grouped_dynamic_convolve_cuda_matches_torch():
+    if not torch.cuda.is_available():
         return
 
     torch.manual_seed(1)
@@ -152,8 +151,8 @@ def test_grouped_dynamic_convolve_triton_matches_torch():
     torch.testing.assert_close(actual, expected, rtol = 2e-3, atol = 2e-3)
 
 
-def test_grouped_dynamic_convolve_triton_handles_odd_geometry():
-    if not torch.cuda.is_available() or not has_triton:
+def test_grouped_dynamic_convolve_cuda_handles_odd_geometry():
+    if not torch.cuda.is_available():
         return
 
     torch.manual_seed(2)
@@ -168,8 +167,8 @@ def test_grouped_dynamic_convolve_triton_handles_odd_geometry():
     torch.testing.assert_close(actual, expected, rtol = 1e-5, atol = 1e-5)
 
 
-def test_grouped_dynamic_convolve_triton_preserves_fp32_finish():
-    if not torch.cuda.is_available() or not has_triton:
+def test_grouped_dynamic_convolve_cuda_preserves_fp32_finish():
+    if not torch.cuda.is_available():
         return
 
     hidden = torch.full((1, 8, 96), 1.5e5, dtype = torch.float32, device = "cuda")
@@ -183,6 +182,41 @@ def test_grouped_dynamic_convolve_triton_preserves_fp32_finish():
     assert torch.isfinite(actual).all()
     assert actual.max() > 65504
     torch.testing.assert_close(actual, expected)
+
+
+def test_grouped_dynamic_convolve_cuda_fused_residual():
+    if not torch.cuda.is_available():
+        return
+
+    torch.manual_seed(3)
+    for x_dtype in (torch.float32, torch.float16):
+        hidden = torch.randn(2, 8, 96, dtype = x_dtype, device = "cuda")
+        packed = torch.randn(2, 8, 2, 3, 6, dtype = torch.float16, device = "cuda")
+        dynamic = packed[:, :, 1]
+        base = torch.randn(3, 96, dtype = torch.bfloat16, device = "cuda")
+        residual = torch.randn(2, 8, 96, dtype = torch.float32, device = "cuda")
+
+        expected = residual + _grouped_dynamic_convolve_torch(hidden.float(), dynamic, base, group_size = 16)
+        out = _grouped_dynamic_convolve(hidden, dynamic, base, group_size = 16, residual = residual)
+
+        assert out is residual, "fused finish must accumulate into the residual tensor"
+        torch.testing.assert_close(residual, expected, rtol = 1e-5 if x_dtype == torch.float32 else 2e-3, atol = 1e-5 if x_dtype == torch.float32 else 2e-3)
+
+
+def test_grouped_dynamic_convolve_cuda_rejects_bad_geometry():
+    if not torch.cuda.is_available():
+        return
+    import pytest
+    hidden = torch.randn(1, 4, 96, dtype = torch.float16, device = "cuda")
+    dynamic = torch.randn(1, 4, 2, 6, dtype = torch.float16, device = "cuda")
+    base = torch.randn(2, 96, dtype = torch.bfloat16, device = "cuda")
+    with pytest.raises(RuntimeError):
+        _grouped_dynamic_convolve(hidden, dynamic, base, group_size = 7)          # 96 % 7 != 0
+    with pytest.raises(RuntimeError):
+        _grouped_dynamic_convolve(hidden, dynamic[:, :, :1], base, group_size = 16)   # taps mismatch
+    with pytest.raises(RuntimeError):
+        _grouped_dynamic_convolve(hidden, dynamic, base, group_size = 16,
+                                  residual = torch.zeros(1, 4, 96, dtype = torch.float16, device = "cuda"))   # residual must be fp32
 
 
 class _Norm:
@@ -204,8 +238,11 @@ class _Conv:
         self.prepare_dtypes.append(x.dtype)
         return x, None
 
-    def finish(self, x, dynamic):
+    def finish(self, x, dynamic, residual = None):
         self.finish_dtypes.append(x.dtype)
+        if residual is not None:
+            residual += x.float()
+            return residual
         return x.float()
 
 
@@ -335,9 +372,9 @@ if __name__ == "__main__":
     test_target_taps_are_reordered_at_dflash_projection()
     test_exact_projection_widths_are_preserved()
     test_grouped_dynamic_convolve_torch_matches_reference()
-    test_grouped_dynamic_convolve_triton_matches_torch()
-    test_grouped_dynamic_convolve_triton_handles_odd_geometry()
-    test_grouped_dynamic_convolve_triton_preserves_fp32_finish()
+    test_grouped_dynamic_convolve_cuda_matches_torch()
+    test_grouped_dynamic_convolve_cuda_handles_odd_geometry()
+    test_grouped_dynamic_convolve_cuda_preserves_fp32_finish()
     test_dflash2_block_keeps_fp32_residual_and_fp16_branches()
     test_candidate_logit_scale_and_softcap_are_applied()
     test_sample_exports_selector_confidence_for_dynamic_drafting()
