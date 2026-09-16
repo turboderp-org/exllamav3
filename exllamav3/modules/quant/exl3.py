@@ -81,6 +81,13 @@ class LinearEXL3:
         assert self.frac is None or self.mul1, f"{key}: half-integer bitrate {self.K} requires the mul1 codebook"
 
         self._fused_reconstruct = None
+        # The cached xh doubles as the GEMV's A_had workspace. The sm70
+        # GEMV covers m up to EXL3_GEMV_SM70_MAX_M (8) — its input-Had
+        # phase writes m * in_features halves into this buffer, so an
+        # m==1-sized allocation overflows for every batched call
+        # (observed as an IMA at the tiled m>1 launch). Size it for the
+        # kernel's max M; the m==1 path wastes 7 rows of scratch.
+        self.bsz1_xh_args = (self.trellis.device, (8, self.in_features), self.out_dtype)
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
         # K is the bitrate (int, or float for the half-integer rates); the C++ side decomposes it
         self.bc = ext.BC_LinearEXL3(
