@@ -1089,23 +1089,28 @@ class DSV4Attention(Module):
             # of o) and writes a 1024-wide output chunk.
             G = self.o_groups
             m = self.woa_sm70_multi
-            slice_rows = o.shape[2]          # seq rows per slice
             slice_k = o.shape[3]
             n_out = self.wo_a[0].out_features
-            A_ptrs = torch.tensor(
-                [o[g].contiguous().data_ptr() for g in range(G)],
-                dtype = torch.int64, device = o.device)
+            # exl3_gemv_multi computes ONE row per matrix (size_m is
+            # hardcoded to 1 in the launch): drive it row by row so
+            # every seq row is written. One launch per row still
+            # amortizes the G-matrix fan into a single cooperative
+            # launch.
             C = torch.empty(G, seq, n_out, dtype = torch.half, device = o.device)
-            C_ptrs = torch.tensor(
-                [C[g].data_ptr() for g in range(G)],
-                dtype = torch.int64, device = o.device)
             A_had = torch.empty(G, seq, slice_k, dtype = torch.half, device = o.device)
-            A_had_ptrs = torch.tensor(
-                [A_had[g].data_ptr() for g in range(G)],
-                dtype = torch.int64, device = o.device)
-            ext.exl3_gemv_multi(
-                A_ptrs, m["B_list"], C_ptrs, m["suh_list"], A_had_ptrs,
-                m["svh_list"], G, slice_k, n_out, m["K"], m["mcg"], m["mul1"])
+            for r in range(seq):
+                row_A = torch.tensor(
+                    [o[g][0][r].contiguous().data_ptr() for g in range(G)],
+                    dtype = torch.int64, device = o.device)
+                row_Ah = torch.tensor(
+                    [A_had[g][r].data_ptr() for g in range(G)],
+                    dtype = torch.int64, device = o.device)
+                row_C = torch.tensor(
+                    [C[g][r].data_ptr() for g in range(G)],
+                    dtype = torch.int64, device = o.device)
+                ext.exl3_gemv_multi(
+                    row_A, m["B_list"], row_C, m["suh_list"], row_Ah,
+                    m["svh_list"], G, slice_k, n_out, m["K"], m["mcg"], m["mul1"])
             o2 = C.permute(1, 0, 2).reshape(seq, G * n_out).unsqueeze(0)
             return self.wo_b.forward(o2, params, out_dtype = out_dtype or self.out_dtype)
 
