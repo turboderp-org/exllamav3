@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from exllamav3.ext import exllamav3_ext as ext
 
 from exllamav3.architecture.architectures import ARCHITECTURES
 from exllamav3.architecture.dflash import DFlashModel
@@ -219,6 +220,76 @@ def test_grouped_dynamic_convolve_cuda_rejects_bad_geometry():
                                   residual = torch.zeros(1, 4, 96, dtype = torch.float16, device = "cuda"))   # residual must be fp32
 
 
+def test_selector_walk_cuda_matches_torch():
+    if not torch.cuda.is_available():
+        return
+    from exllamav3.modules.arch_specific.dflash2 import DFlash2Selector
+    torch.manual_seed(5)
+    bsz, rows, vocab, rank, k = 3, 7, 5000, 256, 16
+    for cb_dtype in (torch.bfloat16, torch.float16):
+        selector = object.__new__(DFlash2Selector)
+        selector.top_k = k
+        selector.pred_codebook = (torch.randn(vocab, rank, device = "cuda") * 0.1).to(cb_dtype)
+        selector.succ_codebook = (torch.randn(vocab, rank, device = "cuda") * 0.1).to(cb_dtype)
+        unary = torch.randn(bsz, rows, k, device = "cuda")
+        cands = torch.stack([torch.randperm(vocab, device = "cuda")[:k] for _ in range(bsz * rows)]).view(bsz, rows, k)
+        gate = torch.randn(bsz, rows, rank, device = "cuda").half()
+        anchor = torch.randint(0, vocab, (bsz,), device = "cuda")
+
+        out_ref, conf_ref = selector._walk_torch(unary, cands, gate.float(), anchor, True)
+        out = torch.empty((bsz, rows + 1), dtype = torch.long, device = "cuda")
+        conf = torch.empty((bsz, rows + 1), dtype = torch.float, device = "cuda")
+        ext.dflash2_selector_walk(unary, cands, gate, selector.pred_codebook, selector.succ_codebook, anchor, out, conf)
+
+        assert out[:, 0].tolist() == anchor.tolist()
+        assert (conf[:, 0] == 0).all()
+        # Random scores: the argmax margins are wide, so the paths must agree exactly and the
+        # winning scores to fp32 summation-order noise
+        assert out.tolist() == out_ref.tolist()
+        torch.testing.assert_close(conf, conf_ref, rtol = 1e-4, atol = 1e-4)
+
+        # Without the confidence output
+        out2 = torch.empty_like(out)
+        ext.dflash2_selector_walk(unary, cands, gate, selector.pred_codebook, selector.succ_codebook, anchor, out2, None)
+        assert out2.tolist() == out.tolist()
+
+
+def test_topk_cuda_matches_torch():
+    if not torch.cuda.is_available():
+        return
+    torch.manual_seed(6)
+    for k in (8, 16, 32):
+        for dtype in (torch.float16, torch.float32):
+            # padded head (vocab 5003 of 5120 columns), rows sliced off a block (strided view),
+            # scale + softcap on the fly
+            full = torch.randn(2, 8, 5120, dtype = dtype, device = "cuda") * 4
+            logits = full[:, 1:]
+            vocab, scale, softcap = 5003, 1.7, 30.0
+            values = torch.empty((2, 7, k), dtype = torch.float, device = "cuda")
+            indices = torch.empty((2, 7, k), dtype = torch.long, device = "cuda")
+            ext.dflash2_topk(logits, vocab, scale, softcap, values, indices)
+
+            ref = torch.tanh(logits[..., :vocab].float() * scale / softcap) * softcap
+            ref_v, ref_i = torch.topk(ref, k, dim = -1)
+            for b in range(2):
+                for r in range(7):
+                    assert sorted(indices[b, r].tolist()) == sorted(ref_i[b, r].tolist()), (k, dtype, b, r)
+                    got = values[b, r][indices[b, r].argsort()]
+                    exp = ref_v[b, r][ref_i[b, r].argsort()]
+                    torch.testing.assert_close(got, exp, rtol = 1e-5, atol = 1e-5)
+            # every kept id is inside the valid vocab
+            assert int(indices.max()) < vocab
+
+    # A row where the K largest all sit in one thread's strided slice (stride 1024): the block
+    # merge must drain that thread's private list rather than take one entry per thread
+    logits = torch.zeros(1, 1, 40960, dtype = torch.float32, device = "cuda")
+    logits[0, 0, 7::1024][:16] = torch.arange(16, 0, -1, dtype = torch.float32, device = "cuda")
+    values = torch.empty((1, 1, 16), dtype = torch.float, device = "cuda")
+    indices = torch.empty((1, 1, 16), dtype = torch.long, device = "cuda")
+    ext.dflash2_topk(logits, 40960, 1.0, 0.0, values, indices)
+    assert sorted(indices[0, 0].tolist()) == [7 + 1024 * i for i in range(16)]
+
+
 class _Norm:
     def __init__(self):
         self.input_dtypes = []
@@ -282,9 +353,10 @@ def test_candidate_logit_scale_and_softcap_are_applied():
     class Selector:
         device = torch.device("cpu")
 
-        def walk(self, hidden, logits, anchor, return_confidence = False):
+        def walk_block(self, hidden, logits, anchor, return_confidence = False, **kwargs):
             self.logits = logits
-            return torch.zeros((1, 1), dtype = torch.long)
+            self.kwargs = kwargs
+            return torch.zeros((1, 2), dtype = torch.long), None
 
     target = SimpleNamespace(
         loaded_tp = False,
@@ -302,9 +374,10 @@ def test_candidate_logit_scale_and_softcap_are_applied():
     DFlash2Model.sample_from_state(model, torch.zeros(1, 2, 4), params)
 
     assert "draft_conf" not in params
-    raw = torch.tensor([[3.0, 4.0]]) * 2.0
-    expected = torch.tanh(raw / 3.0) * 3.0
-    torch.testing.assert_close(selector.logits[0], expected)
+    # The head's raw logits go to the selector; the multiplier and softcap are applied inside
+    # its top-k (both monotonic, so selection is unchanged and only the kept values transform)
+    torch.testing.assert_close(selector.logits[0], torch.tensor([[3.0, 4.0]]))
+    assert selector.kwargs == {"vocab_size": 2, "scale": 2.0, "softcap": 3.0}
 
 
 def test_sample_exports_selector_confidence_for_dynamic_drafting():
@@ -318,9 +391,9 @@ def test_sample_exports_selector_confidence_for_dynamic_drafting():
     class Selector:
         device = torch.device("cpu")
 
-        def walk(self, hidden, logits, anchor, return_confidence = False):
+        def walk_block(self, hidden, logits, anchor, return_confidence = False, **kwargs):
             assert return_confidence
-            return torch.tensor([[2, 3]]), torch.tensor([[7.5, 4.25]])
+            return torch.tensor([[1, 2, 3]]), torch.tensor([[0.0, 7.5, 4.25]])
 
     target = SimpleNamespace(
         loaded_tp = False,

@@ -318,25 +318,65 @@ class DFlash2Selector(Module):
         anchor_ids: torch.Tensor,    # [b]
         return_confidence: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Greedily rerank each row's top-k tokens, conditioned on the preceding token."""
-        unary, cands = torch.topk(logits, self.top_k, dim = -1, sorted = False)
-        unary = unary.float()
-        cands = cands.long()
-        gate = self.hidden_proj.forward(hidden.half(), params = {}).float()
+        """Greedily rerank each row's top-k tokens, conditioned on the preceding token.
+        Returns the path [b, rows] (and per-row winning scores [b, rows])."""
+        out, conf = self.walk_block(hidden, logits, anchor_ids, return_confidence)
+        if return_confidence:
+            return out[:, 1:], conf[:, 1:]
+        return out[:, 1:]
 
-        pred = anchor_ids.long()
-        path = []
-        confidence = []
-        for i in range(logits.shape[1]):
+
+    def walk_block(
+        self,
+        hidden: torch.Tensor,
+        logits: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        return_confidence: bool = False,
+        vocab_size: int | None = None,
+        scale: float = 1.0,
+        softcap: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """walk() in the generator's block layout: ids [b, rows + 1] = [anchor, path...] and,
+        when requested, confidence [b, rows + 1] = [0, winning score...]. logits may be wider
+        than vocab_size (padded head) and are scaled / softcapped on the fly. On CUDA the top-k
+        and the whole chain run as two kernels (no per-row host round trip, no torch
+        intermediates)."""
+        vocab_size = vocab_size or logits.shape[-1]
+        gate = self.hidden_proj.forward(hidden.half(), params = {})
+        anchor_ids = anchor_ids.long()
+        bsz, rows = logits.shape[:2]
+        cuda = hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16)
+        if cuda and self.top_k in (8, 16, 32) and logits.stride(-1) == 1:
+            unary = torch.empty((bsz, rows, self.top_k), dtype = torch.float, device = hidden.device)
+            cands = torch.empty((bsz, rows, self.top_k), dtype = torch.long, device = hidden.device)
+            ext.dflash2_topk(logits, vocab_size, scale, softcap, unary, cands)
+        else:
+            logits = logits[..., :vocab_size].float() * scale
+            if softcap > 0.0:
+                logits = torch.tanh(logits / softcap) * softcap
+            unary, cands = torch.topk(logits, self.top_k, dim = -1, sorted = False)
+        if cuda:
+            out = torch.empty((bsz, rows + 1), dtype = torch.long, device = hidden.device)
+            conf = torch.empty((bsz, rows + 1), dtype = torch.float, device = hidden.device) if return_confidence else None
+            ext.dflash2_selector_walk(
+                unary.float().contiguous(), cands.long().contiguous(), gate.contiguous(),
+                self.pred_codebook, self.succ_codebook, anchor_ids.to(hidden.device, non_blocking = anchor_ids.is_pinned()).contiguous(), out, conf,
+            )
+            return out, conf
+        return self._walk_torch(unary.float(), cands.long(), gate.float(), anchor_ids, return_confidence)
+
+
+    def _walk_torch(self, unary, cands, gate, anchor_ids, return_confidence):
+        pred = anchor_ids
+        path = [pred]
+        confidence = [torch.zeros_like(pred, dtype = torch.float)]
+        for i in range(unary.shape[1]):
             a_emb = F.embedding(pred, self.pred_codebook).float()
             b_emb = F.embedding(cands[:, i], self.succ_codebook).float()
             scores = unary[:, i] + torch.einsum("br,bkr->bk", a_emb * gate[:, i], b_emb)
             score, idx = torch.max(scores, dim = -1)
             pred = cands[:, i].gather(-1, idx[:, None])[:, 0]
             path.append(pred)
-            if return_confidence:
-                confidence.append(score)
-        path = torch.stack(path, dim = 1)
-        if return_confidence:
-            return path, torch.stack(confidence, dim = 1)
-        return path
+            confidence.append(score)
+        out = torch.stack(path, dim = 1)
+        return out, (torch.stack(confidence, dim = 1) if return_confidence else None)

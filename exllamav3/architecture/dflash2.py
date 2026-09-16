@@ -11,6 +11,8 @@ from ..modules.arch_specific.dflash import DFlashInputLayer
 from ..modules.arch_specific.dflash2 import DFlash2Block, DFlash2DynConv, DFlash2Selector
 from ..modules.attn import prepare_for_attn
 from .dflash import DFlashConfig, dflash_update_kv_from_target
+from ..util.tensor import get_for_device
+from ..util.device_copy import to_device
 
 # DFlash2 draft model: the DFlash encoder (fc + hidden_norm over the concatenated target taps)
 # and SWA/GQA layers, with grouped dynamic convolutions around every attention/MLP sublayer and
@@ -269,31 +271,25 @@ class DFlash2Model(Model):
         lm = target.modules[target.logit_layer_idx]
         logits = lm.prepare_for_device(state.half(), params)
         logits = lm.forward(logits, params)
-        logits = logits[..., :target.config.vocab_size]
-        if self.config.output_multiplier != 1.0:
-            logits = logits * self.config.output_multiplier
-        if self.config.final_logit_softcapping > 0.0:
-            softcap = self.config.final_logit_softcapping
-            logits = torch.tanh(logits / softcap) * softcap
 
         dev = self.selector.device
-        anchor = params["dflash2_anchor_ids"][:, -1].to(dev)
+        # The generator stages the block ids in pinned memory: upload without a host sync
+        anchor = get_for_device(params, "dflash2_anchor_ids", dev)[:, -1]
         export_conf = params.get("export_draft_conf", False)
-        walk = self.selector.walk(
-            state[:, 1:].to(dev), logits[:, 1:].to(dev).float(), anchor,
+        # [anchor, path...] and [0, score...] straight from the selector, in the block layout
+        # the generator consumes. The head's padded width, the output multiplier and the
+        # softcap (Gemma-class targets) are handled inside the selector's top-k. The state
+        # (draft's last block) and the logits (target's head) may sit on other devices than
+        # the selector: to_device bounces pairs with a broken peer path through the host
+        out, confidence = self.selector.walk_block(
+            to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor,
             return_confidence = export_conf,
+            vocab_size = target.config.vocab_size,
+            scale = self.config.output_multiplier,
+            softcap = self.config.final_logit_softcapping,
         )
         if export_conf:
-            path, confidence = walk
-            params["draft_conf"] = torch.cat(
-                (torch.zeros_like(confidence[:, :1]), confidence), dim = 1)
-        else:
-            path = walk
-        out = torch.empty(
-            (path.shape[0], path.shape[1] + 1),
-            dtype = torch.long, device = dev)
-        out[:, 0] = anchor
-        out[:, 1:] = path
+            params["draft_conf"] = confidence
         return out
 
 
