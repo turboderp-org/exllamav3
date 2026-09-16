@@ -12,6 +12,11 @@ MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
+# sm70 GEMV fast-path kill switch: the batched-decode GEMV carries an
+# in-vivo-only IMA (see 1Cat-vLLM-sm70 docs/sm70_tp4_integration_notes.md,
+# "GEMV IMA full elimination record"). Setting EXL3_SM70_GEMV_DISABLE=1
+# routes every row to reconstruct+hgemm — the verified-green config.
+disable_sm70_gemv = os.environ.get("EXL3_SM70_GEMV_DISABLE", "0") != "0"
 
 class LinearEXL3:
 
@@ -147,7 +152,7 @@ class LinearEXL3:
             # sm_70: only the GEMV decode kernel (rows == 1) is ported; the
             # sm80 block-pipelined kernels are arch-guarded no-ops. Route
             # rows > 1 to reconstruct+hgemm.
-            if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
+            if (rows <= AUTO_RECONSTRUCT_THRESHOLD and not disable_sm70_gemv) or self.config.infer_params.no_reconstruct:
                 cc = ext.g_get_cc(x.device.index) if x.device.index is not None else 99
                 # K > 4 on sm70: the GEMV kernel now covers K 5-8 (SMEM
                 # decode); exl3_gemm_gr's reconstruct+hgemm fallback catches
