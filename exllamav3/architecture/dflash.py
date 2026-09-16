@@ -79,6 +79,80 @@ class DFlashConfig(Config):
         self.vision = None
 
 
+def dflash_update_kv_from_target(
+    model: Model,
+    target_hidden: list,
+    cache: Cache,
+    params: dict,
+    lengths: list[int] = None,
+):
+    """
+    Update a DFlash-style draft's K/V cache with hidden states extracted from the target model.
+    Shared by every drafter built on the DFlash encoder (fc + hidden_norm over concatenated taps)
+    with plain GQA attention layers: model.input_layer, model.attn_modules and
+    model.config.target_layer_ids are what it reads.
+
+    params:
+        "block_table": torch.Tensor
+        "cache_seqlens": torch.Tensor
+    """
+
+    # Target states arrive in layer execution order. Reorder them only when the checkpoint's
+    # projection expects a different target_layer_ids order.
+    target_layer_ids = model.config.target_layer_ids
+    if target_layer_ids != sorted(target_layer_ids):
+        source_idx = {layer_id: idx for idx, layer_id in enumerate(sorted(target_layer_ids))}
+        target_hidden = [target_hidden[source_idx[layer_id]] for layer_id in target_layer_ids]
+
+    # May update a few redundant tokens when batching, but we'd never draft longer than the cache length
+    if lengths is not None:
+        max_length = max(lengths)
+        target_hidden = [t[:, :max_length] for t in target_hidden]
+
+    # Ensure all state snapshots are on the same device
+    device = model.input_layer.device
+    for i in range(len(target_hidden)):
+        target_hidden[i] = to_device(target_hidden[i], device)
+
+    # Projection concatenated states to hidden size, once
+    target_hidden = torch.cat(target_hidden, dim = -1)
+    target_hidden = model.input_layer.proj.forward(target_hidden, {}, out_dtype = torch.half)
+    target_hidden = model.input_layer.norm.forward(target_hidden, {}, out_dtype = torch.half)
+
+    bsz, target_seqlen, dim = target_hidden.shape
+    params["target_hidden_cc"] = target_hidden
+
+    # Update KV layers
+    for layer in model.attn_modules:
+        block_table = get_for_device(params, "block_table", layer.device)
+        cache_seqlens = get_for_device(params, "cache_seqlens", layer.device)
+        target_hidden = get_for_device(params, "target_hidden_cc", layer.device)
+
+        # k/v project
+        k = layer.k_proj.forward(target_hidden, params)
+        v = layer.v_proj.forward(target_hidden, params)
+        k = k.view(bsz, target_seqlen, layer.num_kv_heads, layer.head_dim)
+        v = v.view(bsz, target_seqlen, layer.num_kv_heads, layer.head_dim)
+
+        # Apply rope and norm to k
+        k, _ = layer.rope.apply(
+            k, None,
+            0,
+            cache_seqlens,
+            None,
+            True,
+            layer.k_norm_tensor,
+            None,
+            layer.norm_eps,
+            layer.norm_constant_bias,
+            None,
+        )
+
+        # Write k, v rows to the paged cache; quantized caches quantize them in place rather
+        # than dequantizing/requantizing full layers
+        cache.update_layer_direct(layer.layer_idx, cache_seqlens, block_table, k, v, target_seqlen, 0)
+
+
 class DFlashModel(Model):
     config_class = DFlashConfig
 
@@ -212,68 +286,7 @@ class DFlashModel(Model):
         params: dict,
         lengths: list[int] = None,
     ):
-        """
-        Update K/V cache with hidden states extracted from target model
-
-        params:
-            "block_table": torch.Tensor
-            "cache_seqlens": torch.Tensor
-        """
-
-        # Target states arrive in layer execution order. Reorder them only when the checkpoint's
-        # projection expects a different target_layer_ids order.
-        target_layer_ids = self.config.target_layer_ids
-        if target_layer_ids != sorted(target_layer_ids):
-            source_idx = {layer_id: idx for idx, layer_id in enumerate(sorted(target_layer_ids))}
-            target_hidden = [target_hidden[source_idx[layer_id]] for layer_id in target_layer_ids]
-
-        # May update a few redundant tokens when batching, but we'd never draft longer than the cache length
-        if lengths is not None:
-            max_length = max(lengths)
-            target_hidden = [t[:, :max_length] for t in target_hidden]
-
-        # Ensure all state snapshots are on the same device
-        device = self.input_layer.device
-        for i in range(len(target_hidden)):
-            target_hidden[i] = to_device(target_hidden[i], device)
-
-        # Projection concatenated states to hidden size, once
-        target_hidden = torch.cat(target_hidden, dim = -1)
-        target_hidden = self.input_layer.proj.forward(target_hidden, {}, out_dtype = torch.half)
-        target_hidden = self.input_layer.norm.forward(target_hidden, {}, out_dtype = torch.half)
-
-        bsz, target_seqlen, dim = target_hidden.shape
-        params["target_hidden_cc"] = target_hidden
-
-        # Update KV layers
-        for layer in self.attn_modules:
-            block_table = get_for_device(params, "block_table", layer.device)
-            cache_seqlens = get_for_device(params, "cache_seqlens", layer.device)
-            target_hidden = get_for_device(params, "target_hidden_cc", layer.device)
-
-            # k/v project
-            k = layer.k_proj.forward(target_hidden, params)
-            v = layer.v_proj.forward(target_hidden, params)
-            k = k.view(bsz, target_seqlen, layer.num_kv_heads, layer.head_dim)
-            v = v.view(bsz, target_seqlen, layer.num_kv_heads, layer.head_dim)
-
-            # Apply rope and norm to k
-            k, _ = layer.rope.apply(
-                k, None,
-                0,
-                cache_seqlens,
-                None,
-                True,
-                layer.k_norm_tensor,
-                None,
-                layer.norm_eps,
-                layer.norm_constant_bias,
-                None,
-            )
-
-            # Write k, v rows to the paged cache; quantized caches quantize them in place rather
-            # than dequantizing/requantizing full layers
-            cache.update_layer_direct(layer.layer_idx, cache_seqlens, block_table, k, v, target_seqlen, 0)
+        dflash_update_kv_from_target(self, target_hidden, cache, params, lengths)
 
 
     def sample_from_state(

@@ -22,16 +22,20 @@ def test_architecture_is_registered():
 
 
 def test_prepare_inputs_sets_anchor_and_uses_dflash_attention_setup():
+    import exllamav3.architecture.dflash2 as arch
     model = object.__new__(DFlash2Model)
     input_ids = torch.tensor([[42]])
     params = {}
     prepared = object()
 
-    with patch.object(DFlashModel, "prepare_inputs", return_value = prepared) as prepare:
+    # Same setup as the DFlash v1 drafter: bidirectional block (causal = False) through the
+    # standard attention input preparation, plus the anchor ids for the selector walk
+    with patch.object(arch, "prepare_for_attn", return_value = prepared) as prepare:
         actual = DFlash2Model.prepare_inputs(model, input_ids, params)
 
     assert actual is prepared
     assert params["dflash2_anchor_ids"] is input_ids
+    assert params["causal"] is False
     prepare.assert_called_once_with(input_ids, params)
 
 
