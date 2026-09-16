@@ -226,10 +226,20 @@ void exl3_gemv_sm70_kernel(EXL3_GEMM_ARGS_KS)
         // l * LSTRIDE (== TWORDS).
         auto ld_b = [&] (int i, int l) -> uint32_t
         {
-            // bp = tile 0, word lane. For K >= 5 each tile spans 2 loads:
-            // load l reads tile (l >> 1), word (l & 1) * 32 + lane.
+            // bp = tile 0, word lane (the trailing + lane at the bp
+            // definition is the word within tile 0; the K <= 4 branches
+            // rely on it). For K >= 5 each tile spans 2 loads: load l
+            // reads tile (l >> 1), word (l & 1) * 32 + lane — measured
+            // from the TILE base, i.e. from bp minus the per-lane word
+            // offset. Subtract lane before adding the tile/word terms,
+            // and clamp the word to the tile's last word: the tile
+            // holds 8*bits = 40 words; odd loads cover words 32..63,
+            // of which only 32..39 exist — lanes 8..31 would read past
+            // the tile (past the tensor for the final tile). Those
+            // lanes' values are discarded by the decoder (it consumes
+            // 40 words).
             if constexpr (bits >= 5)
-                return __ldcs(bp + (size_t) i * slice_stride + (l >> 1) * TWORDS + (l & 1) * 32);
+                return __ldcs(bp - lane + (size_t) i * slice_stride + (l >> 1) * TWORDS + min((l & 1) * 32 + lane, (int) TWORDS - 1));
             else if constexpr (bits == 3)
                 return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
             else
@@ -658,10 +668,15 @@ void exl3_gemv_sm70_kernel_dual(EXL3_GEMM_ARGS_DUAL_KS)
             // l * LSTRIDE (== TWORDS).
             auto ld_b = [&] (int i, int l) -> uint32_t
             {
-                // bp = tile 0, word lane. For K >= 5 each tile spans 2 loads:
-                // load l reads tile (l >> 1), word (l & 1) * 32 + lane.
+                // bp = tile 0, word lane (trailing + lane = word within
+                // tile 0). For K >= 5: load l reads tile (l >> 1), word
+                // (l & 1) * 32 + lane — from the TILE base, so subtract
+                // the per-lane offset first. Odd loads cover words
+                // 32..63 of a 40-word tile: clamp lanes 8..31 to the
+                // tile's last word (their values are discarded by the
+                // decoder).
                 if constexpr (bits >= 5)
-                    return __ldcs(bp + (size_t) i * slice_stride + (l >> 1) * TWORDS + (l & 1) * 32);
+                    return __ldcs(bp - lane + (size_t) i * slice_stride + (l >> 1) * TWORDS + min((l & 1) * 32 + lane, (int) TWORDS - 1));
                 else if constexpr (bits == 3)
                     return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
                 else
@@ -1101,10 +1116,15 @@ void exl3_gemv_sm70_kernel_multi(EXL3_GEMM_ARGS_MULTI)
             // l * LSTRIDE (== TWORDS).
             auto ld_b = [&] (int i, int l) -> uint32_t
             {
-                // bp = tile 0, word lane. For K >= 5 each tile spans 2 loads:
-                // load l reads tile (l >> 1), word (l & 1) * 32 + lane.
+                // bp = tile 0, word lane (trailing + lane = word within
+                // tile 0). For K >= 5: load l reads tile (l >> 1), word
+                // (l & 1) * 32 + lane — from the TILE base, so subtract
+                // the per-lane offset first. Odd loads cover words
+                // 32..63 of a 40-word tile: clamp lanes 8..31 to the
+                // tile's last word (their values are discarded by the
+                // decoder).
                 if constexpr (bits >= 5)
-                    return __ldcs(bp + (size_t) i * slice_stride + (l >> 1) * TWORDS + (l & 1) * 32);
+                    return __ldcs(bp - lane + (size_t) i * slice_stride + (l >> 1) * TWORDS + min((l & 1) * 32 + lane, (int) TWORDS - 1));
                 else if constexpr (bits == 3)
                     return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
                 else
