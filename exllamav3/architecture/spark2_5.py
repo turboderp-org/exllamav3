@@ -4,7 +4,7 @@ import torch
 from ..model.config import Config, no_default
 from ..model.model import Model
 from ..util.rope import RopeStyle, RopeSettings
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, SlidingAttention, GatedMLP, Linear
+from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, SlidingAttention, SWAState, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 
 class Spark2_5Config(Config):
@@ -120,6 +120,15 @@ class Spark2_5Model(Model):
         **kwargs
     ):
         super().__init__(config, **kwargs)
+
+        # Sliding-window layers are recurrent (windowed KV ring); the full-attention layers stay paged
+        self.recurrent_state_cls = None
+        if config.layer_types is not None and "sliding_attention" in config.layer_types:
+            self.caps.update({
+                "recurrent_states": True,
+                "default_recurrent_checkpoint_interval": 2048,
+            })
+            self.recurrent_state_cls = SWAState
 
         self.modules += [
             Embedding(
