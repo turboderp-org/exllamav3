@@ -69,6 +69,7 @@ class DFlashInputLayer(Module):
                 self.register_submodule(aux_norm)
 
         self.mask_token_id = mask_token_id
+        self.input_embedding_scale = 1.0
 
         # Populated by attach_to()
         self.attached_model = None
@@ -103,4 +104,6 @@ class DFlashInputLayer(Module):
         else:
             x = self.attached_model().tp_producer.send(x)
             x = self.attached_model().tp_dispatch_master(mp_model_forward_embedding, (x, params))
+        if self.input_embedding_scale != 1.0:
+            x = x * self.input_embedding_scale
         return x

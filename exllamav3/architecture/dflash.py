@@ -68,6 +68,8 @@ class DFlashConfig(Config):
         # "tap_shift" under dflash_config or at the top level
         self.tap_shift = self.read_cfg(int, ["dflash_config->tap_shift", "tap_shift"], self.tap_shift)
         self.target_layer_ids = [i + self.tap_shift for i in self.target_layer_ids]
+        assert len(set(self.target_layer_ids)) == len(self.target_layer_ids), \
+            "DFlash target_layer_ids must be unique"
         self.block_size = self.read_cfg(int, ["block_size", "dflash_config->block_size"], no_default)
 
         # RoPE
@@ -217,6 +219,13 @@ class DFlashModel(Model):
             "block_table": torch.Tensor
             "cache_seqlens": torch.Tensor
         """
+
+        # Target states arrive in layer execution order. Reorder them only when the checkpoint's
+        # projection expects a different target_layer_ids order.
+        target_layer_ids = self.config.target_layer_ids
+        if target_layer_ids != sorted(target_layer_ids):
+            source_idx = {layer_id: idx for idx, layer_id in enumerate(sorted(target_layer_ids))}
+            target_hidden = [target_hidden[source_idx[layer_id]] for layer_id in target_layer_ids]
 
         # May update a few redundant tokens when batching, but we'd never draft longer than the cache length
         if lengths is not None:
