@@ -547,6 +547,8 @@ class HyperHead(Module):
                 "hc_mult": self.hc_mult,
                 "rms_norm_eps": self.rms_eps,
                 "hc_eps": self.hc_eps,
+                # GLM5.3: parameterless mean over the streams (fn/base/scale are None)
+                "mean": self.mean,
             },
             "fn": producer.send(self.fn),
             "base": producer.send(self.base),
