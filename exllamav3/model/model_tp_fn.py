@@ -251,6 +251,13 @@ def mp_model_forward(
 
     x = consumer.recv(shared_input)
 
+    # Modules that stage input-dependent data on a worker thread (PLE n-gram rows) go first, as
+    # in the layer-split forward, so the gather overlaps the leading blocks
+    if x.dtype == torch.long and single_idx is None:
+        for module in modules:
+            if module.caps.get("prefetch_ids"):
+                module.prefetch(x, params)
+
     for idx, module in enumerate(modules):
         logits_layer = module.caps.get("logits_output")
         if logits_layer and (num := params.get("last_tokens_only")):

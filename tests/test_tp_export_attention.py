@@ -73,11 +73,27 @@ class TPExportAttentionTest(unittest.TestCase):
                 Attention.tp_import({"device": DEVICE, "consumer": None}, exported, {m.key: (2, 4, "heads")})
             self.assertEqual(seen["split"], expect, f"g_proj split wrong for full_gate={full_gate}")
 
-    def test_attention_with_qsa_indexer_refuses_export(self):
+    def test_attention_with_qsa_indexer_is_placed_whole(self):
+        # QSA layers run whole on one rank: single-channel allocation with a module-enforced
+        # device cap, the indexer travels with the export, and the owner rank gets it back
+        class FakeIndexer(FakeChild):
+            head_dim = 32; compress_ratio = 4
+            def storage_size(self): return 0
+            def tp_export(self, plan, producer): return {"cls": FakeIndexer, "key": self.key}
+            @staticmethod
+            def tp_import(local_context, exported, plan): return FakeIndexer(exported["key"])
         m = _bare(Attention)
-        m.qsa_indexer = object()
-        with self.assertRaises((AssertionError, NotImplementedError)):
-            m.tp_export(plan = {}, producer = None)
+        m.qsa_indexer = FakeIndexer("idx")
+        exported = m.tp_export(plan = {}, producer = None)
+        self.assertIsNotNone(exported.get("qsa_indexer"))
+        plan = {m.key: (0, KV_HEADS, "heads")}
+        with patch.object(Attention, "load_local", lambda self, device, **kw: None), patch("torch.cuda.synchronize", lambda: None):
+            owner = Attention.tp_import({"device": DEVICE, "consumer": None}, exported, plan)
+            stub = Attention.tp_import({"device": DEVICE, "consumer": None}, exported, {m.key: (KV_HEADS, KV_HEADS, "heads")})
+        self.assertEqual(owner.qsa_indexer.key, "idx")
+        self.assertIsNone(stub.qsa_indexer)
+        with self.assertRaises(AssertionError):
+            Attention.tp_import({"device": DEVICE, "consumer": None}, exported, {m.key: (0, KV_HEADS // 2, "heads")})
 
 
 if __name__ == "__main__":
