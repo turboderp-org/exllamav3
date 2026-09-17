@@ -145,6 +145,8 @@ class LayerNorm(Module):
         module.device = device
         w = consumer.recv(exported["weight"], cuda = True)
         module.weight = nn.Parameter(w)
+        b = consumer.recv(exported.get("bias"), cuda = True)
+        module.bias = nn.Parameter(b) if b is not None else None
         return module
 
     @staticmethod
