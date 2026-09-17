@@ -12,6 +12,11 @@ import pytest
 import torch
 from exllamav3.ext import exllamav3_ext as ext
 
+pytestmark = pytest.mark.skipif(
+    not hasattr(ext, "exl3_moe_coop"),
+    reason = "the two-stage coop MoE kernel is not built for this platform",
+)
+
 DEV = torch.device(os.environ.get("EXL3_TEST_DEVICE", "cuda:0"))
 ACTS = {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}
 
