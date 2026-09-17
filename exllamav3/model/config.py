@@ -59,6 +59,9 @@ class InferParams:
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
+        from ..ext import exllamav3_ext as ext
+        if not hasattr(ext, 'exl3_mgemm'):
+            return False
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
         # requires the mul1 codebook; other tensors always keep the fused MGEMM
         if not mul1:

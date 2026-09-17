@@ -6,8 +6,9 @@ from exllamav3.ext import exllamav3_ext as ext
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
-    reason="requires Ampere or later",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8
+        or not ext.hgemm_f16acc_status(torch.cuda.current_device()),
+    reason="requires Ampere or later with the FP16 MMA dispatch enabled",
 )
 
 

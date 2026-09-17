@@ -16,7 +16,9 @@ import torch.nn.functional as F
 
 # Collapse eligible sampler stacks into the fused kernel path; EXL3_FUSED_SAMPLER=0 keeps the
 # original step-by-step implementation (for testing/validation)
-fused_sampler_enable = os.environ.get("EXL3_FUSED_SAMPLER", "1") != "0"
+fused_sampler_enable = (
+    os.environ.get("EXL3_FUSED_SAMPLER", "1") != "0" and hasattr(ext, "fused_sampler")
+)
 
 class SS(Enum):
     INIT = 0  # only state.in_logits is valid

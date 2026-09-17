@@ -130,7 +130,8 @@ void dsv4_pool_quant_scatter_gr
     if (grid_w <= 0) return;
 
     int threads = CEIL_DIVIDE(G, 4) * 32;
-    dsv4_pool_quant_scatter_kernel_instances[bits - 2]<<<dim3(grid_w, batch), threads, 0, stream>>>
+    auto kernel = dsv4_pool_quant_scatter_kernel_instances[bits - 2];
+    kernel<<<dim3(grid_w, batch), threads, 0, stream>>>
     (
         (const half*) stage.data_ptr(),
         (uint32_t*) pool_q.data_ptr(),
