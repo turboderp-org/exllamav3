@@ -140,7 +140,8 @@ class DFlashModel(Model):
             self.attn_modules.append(attn)
 
             self.modules += [
-                TransformerBlock(
+                # DFlash2 sets block_cls = DFlash2Block. Default TransformerBlock: v1 bit-identical.
+                getattr(type(self), "block_cls", TransformerBlock)(
                     config = config,
                     key = f"layers.{idx}",
                     layer_idx = idx,
