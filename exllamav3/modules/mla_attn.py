@@ -109,8 +109,12 @@ class MLAttention(Module):
         index_kpool_tail: bool = True,
         key_indexer: str = "indexer",
         submodules: dict | None = None,
+        tp_affinity: str | None = None,
     ):
         super().__init__(config, key, None)
+        # Tensor-parallel placement group (see TPAllocation.affinity_key): DSA "shared" layers must
+        # share the device of the "full" layer whose selection they reuse
+        self.tp_affinity = tp_affinity
 
         self.q_priority = 2 + select_hq_bits
         self.layer_idx = layer_idx
@@ -1197,6 +1201,7 @@ class MLAttention(Module):
             channels_to_split = 1,
             limit_key = "attn",
             max_devices = 1,
+            affinity_key = self.tp_affinity,
         )
         return [tpa]
 

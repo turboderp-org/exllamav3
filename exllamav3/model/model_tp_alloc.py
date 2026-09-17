@@ -25,7 +25,8 @@ class TPAllocation:
         recons_temp: int = 0,
         channels_to_split: int = 1,
         limit_key: str = None,
-        max_devices: int = None
+        max_devices: int = None,
+        affinity_key: str = None,
     ):
         self.key = key
         self.channel_width = channel_width
@@ -39,6 +40,10 @@ class TPAllocation:
         self.recons_temp = recons_temp
         self.channels_to_split = channels_to_split
         self.max_devices = max_devices
+        # Components sharing an affinity key are placed on the device the first of them (the
+        # group leader) lands on: DSA "shared" indexer layers read the selection of the nearest
+        # preceding "full" layer out of that layer's process
+        self.affinity_key = affinity_key
 
         self.current_split = []
 
@@ -84,6 +89,7 @@ class TPAllocator:
             raise RuntimeError("Insufficient VRAM in split for model and cache")
         storage_sum = [0] * self.num_devices
         overhead_max = [0] * self.num_devices
+        affinity_dev = {}
 
         for c in self.components:
 
@@ -101,7 +107,12 @@ class TPAllocator:
             dev_limit = self.dev_limits.get(c.limit_key) if c.limit_key else None
             if c.max_devices is not None:
                 dev_limit = c.max_devices if dev_limit is None else min(dev_limit, c.max_devices)
-            if dev_limit is not None:
+            if c.affinity_key is not None and c.affinity_key in affinity_dev:
+                # Pinned to the group leader's device, whatever the memory picture (the estimate
+                # then overshoots there and the load's headroom checks catch a real shortfall)
+                d = affinity_dev[c.affinity_key]
+                rem_mem_s = [max(r, 1) if i == d else 0 for i, r in enumerate(rem_mem_s)]
+            elif dev_limit is not None:
                 dev_limit = min(dev_limit, len(active_devices))
                 top_k_mask_(rem_mem_s, dev_limit)
 
@@ -112,6 +123,10 @@ class TPAllocator:
             channels = c.channels_to_split
             split = ratio_split(channels, rem_mem_s, chunk_size = 1)
             c.current_split = split
+            if c.affinity_key is not None and c.affinity_key not in affinity_dev:
+                owners = [i for i, s in enumerate(split) if s]
+                if len(owners) == 1:
+                    affinity_dev[c.affinity_key] = owners[0]
 
             # Compute storage and overhead given layer and split
             tokens = self.output_num_tokens if c is self.components[-1] else self.num_tokens

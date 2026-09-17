@@ -126,6 +126,16 @@ class GlmMoeDsaModel(Model):
 
         self.first_block_idx = len(self.modules)
 
+        # DSA indexer groups for tensor-parallel placement: a "shared" layer reads the top-k
+        # selection published by the nearest preceding "full" layer (params dict, per process),
+        # so the group must live whole on one device
+        dsa_group = []
+        for idx in range(config.num_hidden_layers):
+            if config.indexer_types[idx] == "full":
+                dsa_group.append(idx)
+            else:
+                dsa_group.append(dsa_group[-1])
+
         self.modules += [
             TransformerBlock(
                 config = config,
@@ -157,6 +167,7 @@ class GlmMoeDsaModel(Model):
                     index_n_heads = config.index_n_heads,
                     index_head_dim = config.index_head_dim,
                     index_topk = config.index_topk,
+                    tp_affinity = f"dsa_indexer_group_{dsa_group[idx]}",
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
@@ -246,8 +257,9 @@ class GlmMoeDsaModel(Model):
         # Activate all experts during H capture pass in quantization
         self.calibration_all_experts = True
 
-        # MLA layers currently do not support TP because the latent cache cannot be split by head
-        self.caps.update({"supports_tp": False})
+        # MLA layers run whole on one device under TP (latent cache is MQA); DSA indexer groups
+        # keep a "full" layer and its "shared" followers together (tp_affinity above)
+        self.caps.update({"supports_tp": True})
 
 
     @override
