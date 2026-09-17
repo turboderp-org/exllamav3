@@ -24,6 +24,7 @@ class DFlashInputLayer(Module):
         qmap: str | None = None,
         key_aux_norms: str | None = None,
         num_aux_norms: int = 0,
+        input_embedding_scale: float = 1.0,
     ):
         super().__init__(config, key, None)
         self.module_name = "DFlashInputLayer"
@@ -69,6 +70,7 @@ class DFlashInputLayer(Module):
                 self.register_submodule(aux_norm)
 
         self.mask_token_id = mask_token_id
+        self.input_embedding_scale = input_embedding_scale
 
         # Populated by attach_to()
         self.attached_model = None
@@ -103,4 +105,6 @@ class DFlashInputLayer(Module):
         else:
             x = self.attached_model().tp_producer.send(x)
             x = self.attached_model().tp_dispatch_master(mp_model_forward_embedding, (x, params))
+        if self.input_embedding_scale != 1.0:
+            x = x * self.input_embedding_scale
         return x

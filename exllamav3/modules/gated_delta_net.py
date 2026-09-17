@@ -250,17 +250,23 @@ class GDNLayerState:
 
     def rewind_conv_job(self, slot: int, last_history: int, num_tokens: int):
         """Job descriptor for the batched conv-state rewind kernel (ext.batched_conv_rewind),
-        computed without performing any copy. Same gating condition as rewind()'s conv branch."""
+        computed without performing any copy. Same gating condition as rewind()'s conv branch.
+        Addresses are integer arithmetic on the base pointer: a rewind touches every GDN layer
+        of the model, and indexing views cost ~10 us per layer in Python (issue: ~0.5 ms per
+        rejected draft on a 48-layer model)."""
         if last_history == 0:
             return None
+        cs = self.conv_state
         cdim = self.module.conv_kernel_size
-        p = self.conv_state.shape[-1] - num_tokens
+        p = cs.shape[-1] - num_tokens
+        es = cs.element_size()
+        base = cs.data_ptr() + slot * cs.stride(0) * es
         return ext.ConvRewindJob(
-            self.conv_state[slot, 0, p - cdim].data_ptr(),
-            self.conv_state[slot, 0, 0].data_ptr(),
-            self.conv_state.shape[1],
+            base + (p - cdim) * cs.stride(2) * es,
+            base,
+            cs.shape[1],
             cdim,
-            self.conv_state.stride(1),
+            cs.stride(1),
         )
 
 
@@ -269,10 +275,13 @@ class GDNLayerState:
         computed without performing any copy. Same gating condition as rewind()'s state branch."""
         if num_tokens == 0:
             return None
+        rs = self.recurrent_state
+        es = rs.element_size()
+        base = rs.data_ptr() + slot * rs.stride(0) * es
         return ext.StateRewindJob(
-            self.recurrent_state[slot, last_history + 1 - num_tokens].data_ptr(),
-            self.recurrent_state[slot, 0].data_ptr(),
-            self.recurrent_state[slot, 0].numel(),
+            base + (last_history + 1 - num_tokens) * rs.stride(1) * es,
+            base,
+            rs.stride(1),
         )
 
 

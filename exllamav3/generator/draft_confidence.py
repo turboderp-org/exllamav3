@@ -4,7 +4,7 @@ import math
 
 class DraftConfidenceCalibrator:
     """
-    Online mapping from a drafter's per-position confidence score (argmax logit) to an observed
+    Online mapping from a drafter's per-position confidence score to an observed
     acceptance probability, used to truncate draft blocks at the first position whose estimated
     acceptance falls below a target confidence.
 
