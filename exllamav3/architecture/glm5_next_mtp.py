@@ -224,15 +224,21 @@ class Glm5NextMTPModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        ll = self.attached_model().logit_layer_idx
-        lm = self.attached_model().modules[ll]
-        logits = lm.prepare_for_device(state, params)
-        logits = lm.forward(logits, params)
-        if params.get("export_draft_conf"):
-            # Per-position confidence for the generator's draft truncation: the argmax logit
-            # value, over the unpadded vocabulary
-            logits = logits[..., :self.attached_model().config.vocab_size]
-            conf, ids = torch.max(logits, dim = -1)
-            params["draft_conf"] = conf
-            return ids
-        return torch.argmax(logits, dim = -1)
+        if not self.attached_model().loaded_tp:
+            ll = self.attached_model().logit_layer_idx
+            lm = self.attached_model().modules[ll]
+            logits = lm.prepare_for_device(state, params)
+            logits = lm.forward(logits, params)
+            if params.get("export_draft_conf"):
+                # Per-position confidence for the generator's draft truncation: the argmax logit
+                # value, over the unpadded vocabulary
+                logits = logits[..., :self.attached_model().config.vocab_size]
+                conf, ids = torch.max(logits, dim = -1)
+                params["draft_conf"] = conf
+                return ids
+            return torch.argmax(logits, dim = -1)
+        else:
+            # The target's lm_head lives in the TP workers (sharded); argmax over the shards,
+            # as for the other MTP heads sharing the target's head
+            state = self.attached_model().tp_producer.send(state)
+            return self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
