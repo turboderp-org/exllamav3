@@ -16,6 +16,8 @@ import os
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
 # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+# EXL3_BC_GDN=0 disables the graph-captured decode paths (torch path only), for A/B testing
+_bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 from ..cache.recurrent import (
@@ -655,7 +657,7 @@ class GatedDeltaNet(Module):
             self.conv1d_weight_flat = self.conv1d_weight.squeeze(1).contiguous()
 
         is_quantized_split = (
-            device != torch.device("cpu") and
+            _bc_gdn_enable and device != torch.device("cpu") and
             self.qkvz_proj is None and self.ba_proj is None and
             self.qkv_proj is not None and self.qkv_proj.quant_type == "exl3" and
             self.z_proj is not None and self.z_proj.quant_type == "exl3" and
@@ -726,7 +728,7 @@ class GatedDeltaNet(Module):
                 self.prealloc_qkvz_carrier = g_tensor_cache.get(device, (mq.num_slices, 1, mq.width), torch.float, "qkvzc_1")
 
         is_quantized_kda = (
-            device != torch.device("cpu") and self.kda and
+            _bc_gdn_enable and device != torch.device("cpu") and self.kda and
             self.qkv_proj is not None and self.qkv_proj.quant_type == "exl3" and
             self.o_proj is not None and self.o_proj.quant_type == "exl3" and
             all(p is not None and p.quant_type == "fp16" for p in

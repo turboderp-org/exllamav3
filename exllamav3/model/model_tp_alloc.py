@@ -95,13 +95,15 @@ class TPAllocator:
                 else:
                     break
 
-            # Mask out devices to satisy max split per component type
-            if c.max_devices is not None or c.limit_key:
-                dev_limit = self.dev_limits.get(c.limit_key, c.max_devices)
-                if dev_limit is not None:
-                    dev_limit = min(dev_limit, len(active_devices))
-                if dev_limit is not None:
-                    top_k_mask_(rem_mem_s, dev_limit)
+            # Mask out devices to satisfy the max split per component type. A module-enforced cap
+            # (max_devices, e.g. 1 for attention variants that only run whole on one device) is a
+            # hard limit on top of whatever the user set for the type
+            dev_limit = self.dev_limits.get(c.limit_key) if c.limit_key else None
+            if c.max_devices is not None:
+                dev_limit = c.max_devices if dev_limit is None else min(dev_limit, c.max_devices)
+            if dev_limit is not None:
+                dev_limit = min(dev_limit, len(active_devices))
+                top_k_mask_(rem_mem_s, dev_limit)
 
             # Active devices on layer
             mask = [m > 0 for m in rem_mem_s]

@@ -45,6 +45,18 @@ rebuild anything. Steps that need a host-side window ring shift or rebase (page-
 decline to the eager path for that step, as do ineligible layer configurations (non-EXL3
 projections, ...) permanently. Set to `0` to force the eager path everywhere.
 
+### `EXL3_BC_MLA` (default: `1`)
+
+MLA counterpart of `EXL3_BC_ATTN`: decode steps (q_len ≤ 16) of an MLA layer run as one
+graph-captured C++ block (projections, absorb, latent attention, unfold, o_proj). Set to `0` to
+force the eager dispatch path, for A/B testing.
+
+### `EXL3_BC_GDN` (default: `1`)
+
+Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL3_BC_ATTN`:
+the decode step of a linear-attention layer runs as one graph-captured C++ call. Set to `0` to
+force the torch path, for A/B testing.
+
 ### `EXL3_BC_DSA_DEBUG` (default: `0`)
 
 Raise errors encountered while building the graphed DSA path instead of silently declining to

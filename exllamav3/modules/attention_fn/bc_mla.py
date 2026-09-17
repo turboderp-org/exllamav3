@@ -617,7 +617,8 @@ def build_bc_mla(module, layer):
                 layer.get_idx() is not None
             ))
         )) and
-        not m.has_split_cache and
+        # A TP rank holds the whole layer and its whole cache layer (MLA is never head-split),
+        # so the graph captures the local cache layer exactly as in single-process mode
         isinstance(layer, (CacheLayer_MLA_fp16, CacheLayer_MLA_quant)) and
         (not isinstance(layer, CacheLayer_MLA_quant) or (
             layer.qk is not None and layer.qk.device == dev

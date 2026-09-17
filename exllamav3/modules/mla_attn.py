@@ -23,6 +23,9 @@ import os
 # restores the single-kernel absorbed prefill for A/B testing
 _prefill_mode = os.environ.get("EXL3_MLA_PREFILL", "mha")
 
+# EXL3_BC_MLA=0 disables the graph-captured decode block (dispatch path only), for A/B testing
+_bc_mla_enable = os.environ.get("EXL3_BC_MLA", "1") != "0"
+
 # Query lengths at or below this use the flash-decoding kernel (kv split across programs);
 # above it, the long-query kernel (q split across programs) wins
 MAX_DECODE_QLEN = 16
@@ -105,6 +108,7 @@ class MLAttention(Module):
         index_kpool: int = 0,
         index_kpool_tail: bool = True,
         key_indexer: str = "indexer",
+        submodules: dict | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -137,60 +141,6 @@ class MLAttention(Module):
         # width is what actually lands in the cache
         self.head_dim = self.qk_head_dim
 
-        qmap_in = qmap + ".input" if qmap is not None else None
-        qmap_o = qmap + ".o" if qmap is not None else None
-
-        # Query path: either a direct projection or a LoRA-style pair with a norm between
-        if q_lora_rank is None:
-            self.q_a_proj = None
-            self.q_a_layernorm = None
-            self.q_b_proj = None
-            self.q_proj = Linear(
-                config, f"{key}.{key_q}", hidden_size, num_q_heads * self.qk_head_dim,
-                qmap = qmap_in, out_dtype = torch.half, trim_padded_out = True,
-                select_hq_bits = select_hq_bits, qbits_key = qbits_key,
-            )
-            self.register_submodule(self.q_proj)
-        else:
-            self.q_a_proj = Linear(
-                config, f"{key}.{key_q_a}", hidden_size, q_lora_rank,
-                qmap = qmap_in, out_dtype = torch.half, trim_padded_out = True,
-                select_hq_bits = select_hq_bits, qbits_key = qbits_key,
-            )
-            self.q_a_layernorm = RMSNorm(
-                config, f"{key}.{key_q_a_norm}", rms_norm_eps, out_dtype = torch.half,
-            )
-            self.q_b_proj = Linear(
-                config, f"{key}.{key_q_b}", q_lora_rank, num_q_heads * self.qk_head_dim,
-                qmap = qmap + ".q_a" if qmap is not None else None,
-                out_dtype = torch.half, trim_padded_out = True,
-                select_hq_bits = select_hq_bits, qbits_key = qbits_key,
-            )
-            self.q_proj = self.q_b_proj
-            self.register_submodule(self.q_a_proj)
-            self.register_submodule(self.q_a_layernorm)
-            self.register_submodule(self.q_b_proj)
-
-        # Latent path. The output of this projection goes straight into the cache, so it is the
-        # one place where quantization error compounds over the whole context
-        self.kv_a_proj_with_mqa = Linear(
-            config, f"{key}.{key_kv_a}", hidden_size, kv_lora_rank + qk_rope_head_dim,
-            qmap = qmap_in, out_dtype = torch.half, trim_padded_out = True,
-            select_hq_bits = select_hq_bits, qbits_key = qbits_key,
-        )
-        self.kv_a_layernorm = RMSNorm(
-            config, f"{key}.{key_kv_a_norm}", rms_norm_eps, out_dtype = torch.half,
-        )
-        self.register_submodule(self.kv_a_proj_with_mqa)
-        self.register_submodule(self.kv_a_layernorm)
-
-        self.o_proj = Linear(
-            config, f"{key}.{key_o}", num_q_heads * v_head_dim, hidden_size,
-            qmap = qmap_o, out_dtype = out_dtype, trim_padded_out = True,
-            select_hq_bits = select_hq_bits, qbits_key = qbits_key,
-        )
-        self.register_submodule(self.o_proj)
-
         # DSA lightning indexer (GLM-5.2 / DeepSeek-V3.2-on-MLA). "full" layers score and select
         # index_topk tokens per query and publish the selection; "shared" layers reuse the
         # nearest preceding full layer's selection. None = plain dense MLA
@@ -199,6 +149,7 @@ class MLAttention(Module):
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
+        self.index_norm_eps = index_norm_eps
         # GLM5.3-style k-pool compression: keys are pooled index_kpool at a time (softmax over
         # cached per-token gate scores + a learned in-pool APE), scoring and selection run over
         # pools, and selections expand back to raw token indices (plus the incomplete tail
@@ -213,44 +164,23 @@ class MLAttention(Module):
             None if indexer_mode != "full" else
             index_head_dim * 2 if index_kpool else index_head_dim
         )
-        if indexer_mode == "full":
-            assert q_lora_rank is not None, "DSA indexer queries project from the q_a latent"
-            self.idx_wq_b = Linear(
-                config, f"{key}.{key_indexer}.wq_b", q_lora_rank, index_n_heads * index_head_dim,
-                qmap = qmap + ".q_a" if qmap is not None else None,
-                out_dtype = torch.half, trim_padded_out = True,
-                select_hq_bits = select_hq_bits, qbits_key = qbits_key,
-            )
-            # Key head and per-head scoring weights are router-like: tiny, and selection noise
-            # is coherent across every layer sharing it, so they stay unquantized
-            self.idx_wk = Linear(
-                config, f"{key}.{key_indexer}.wk", hidden_size, index_head_dim,
-                qmap = None, out_dtype = torch.half, pad_to = 1,
-            )
-            self.idx_k_norm = LayerNorm(
-                config, f"{key}.{key_indexer}.k_norm", index_norm_eps, out_dtype = torch.half,
-            )
-            self.idx_weights = Linear(
-                config, f"{key}.{key_indexer}.weights_proj", hidden_size, index_n_heads,
-                qmap = None, out_dtype = torch.half, pad_to = 1,
-            )
-            self.register_submodule(self.idx_wq_b)
-            self.register_submodule(self.idx_wk)
-            self.register_submodule(self.idx_k_norm)
-            self.register_submodule(self.idx_weights)
-        else:
-            self.idx_wq_b = None
-            self.idx_wk = None
-            self.idx_k_norm = None
-            self.idx_weights = None
 
-        self.caps.update({
-            "kv_cache": True
-        })
+        self.q_a_proj = None
+        self.q_a_layernorm = None
+        self.q_b_proj = None
+        self.q_proj = None
+        self.kv_a_proj_with_mqa = None
+        self.kv_a_layernorm = None
+        self.o_proj = None
+        self.idx_wq_b = None
+        self.idx_wk = None
+        self.idx_k_norm = None
+        self.idx_weights = None
 
         self.cache_layers = []
         self.tp_cache_lookup = {}
         self.has_split_cache = False
+        self.tp_reduce = False
         self.dispatch_cache = {}
 
         # kv_b_proj, stored ONLY in the flattened (kv_lora_rank, H * dim) form: the prefill
@@ -260,6 +190,89 @@ class MLAttention(Module):
         self.w_uk_flat = None   # (kv_lora_rank, H * qk_nope_head_dim)
         self.w_uv_flat = None   # (kv_lora_rank, H * v_head_dim)
         self._scratch = {}
+
+        # Tensor-parallel rank that does not hold this layer (MLA runs whole on one device): a
+        # stub that only takes part in the trailing all-reduce. It deliberately has no kv_cache
+        # cap, so the rank's cache bookkeeping never looks for a cache layer here
+        if num_q_heads == 0:
+            return
+
+        # In a TP worker the submodules arrive prebuilt (imported from the parent process)
+        # instead of being constructed against the tensor collection
+        def _sub(name, factory):
+            m = submodules.get(name) if submodules is not None else factory()
+            self.register_submodule(m)
+            return m
+
+        qmap_in = qmap + ".input" if qmap is not None else None
+        qmap_o = qmap + ".o" if qmap is not None else None
+
+        # Query path: either a direct projection or a LoRA-style pair with a norm between
+        if q_lora_rank is None:
+            self.q_proj = _sub("q_proj", lambda: Linear(
+                config, f"{key}.{key_q}", hidden_size, num_q_heads * self.qk_head_dim,
+                qmap = qmap_in, out_dtype = torch.half, trim_padded_out = True,
+                select_hq_bits = select_hq_bits, qbits_key = qbits_key,
+            ))
+        else:
+            self.q_a_proj = _sub("q_a_proj", lambda: Linear(
+                config, f"{key}.{key_q_a}", hidden_size, q_lora_rank,
+                qmap = qmap_in, out_dtype = torch.half, trim_padded_out = True,
+                select_hq_bits = select_hq_bits, qbits_key = qbits_key,
+            ))
+            self.q_a_layernorm = _sub("q_a_layernorm", lambda: RMSNorm(
+                config, f"{key}.{key_q_a_norm}", rms_norm_eps, out_dtype = torch.half,
+            ))
+            self.q_b_proj = _sub("q_b_proj", lambda: Linear(
+                config, f"{key}.{key_q_b}", q_lora_rank, num_q_heads * self.qk_head_dim,
+                qmap = qmap + ".q_a" if qmap is not None else None,
+                out_dtype = torch.half, trim_padded_out = True,
+                select_hq_bits = select_hq_bits, qbits_key = qbits_key,
+            ))
+            self.q_proj = self.q_b_proj
+
+        # Latent path. The output of this projection goes straight into the cache, so it is the
+        # one place where quantization error compounds over the whole context
+        self.kv_a_proj_with_mqa = _sub("kv_a_proj_with_mqa", lambda: Linear(
+            config, f"{key}.{key_kv_a}", hidden_size, kv_lora_rank + qk_rope_head_dim,
+            qmap = qmap_in, out_dtype = torch.half, trim_padded_out = True,
+            select_hq_bits = select_hq_bits, qbits_key = qbits_key,
+        ))
+        self.kv_a_layernorm = _sub("kv_a_layernorm", lambda: RMSNorm(
+            config, f"{key}.{key_kv_a_norm}", rms_norm_eps, out_dtype = torch.half,
+        ))
+
+        self.o_proj = _sub("o_proj", lambda: Linear(
+            config, f"{key}.{key_o}", num_q_heads * v_head_dim, hidden_size,
+            qmap = qmap_o, out_dtype = out_dtype, trim_padded_out = True,
+            select_hq_bits = select_hq_bits, qbits_key = qbits_key,
+        ))
+
+        if indexer_mode == "full":
+            assert q_lora_rank is not None, "DSA indexer queries project from the q_a latent"
+            self.idx_wq_b = _sub("idx_wq_b", lambda: Linear(
+                config, f"{key}.{key_indexer}.wq_b", q_lora_rank, index_n_heads * index_head_dim,
+                qmap = qmap + ".q_a" if qmap is not None else None,
+                out_dtype = torch.half, trim_padded_out = True,
+                select_hq_bits = select_hq_bits, qbits_key = qbits_key,
+            ))
+            # Key head and per-head scoring weights are router-like: tiny, and selection noise
+            # is coherent across every layer sharing it, so they stay unquantized
+            self.idx_wk = _sub("idx_wk", lambda: Linear(
+                config, f"{key}.{key_indexer}.wk", hidden_size, index_head_dim,
+                qmap = None, out_dtype = torch.half, pad_to = 1,
+            ))
+            self.idx_k_norm = _sub("idx_k_norm", lambda: LayerNorm(
+                config, f"{key}.{key_indexer}.k_norm", index_norm_eps, out_dtype = torch.half,
+            ))
+            self.idx_weights = _sub("idx_weights", lambda: Linear(
+                config, f"{key}.{key_indexer}.weights_proj", hidden_size, index_n_heads,
+                qmap = None, out_dtype = torch.half, pad_to = 1,
+            ))
+
+        self.caps.update({
+            "kv_cache": True
+        })
 
 
     def cache_layer_type(self, default, kwargs: dict):
@@ -289,10 +302,15 @@ class MLAttention(Module):
 
 
     def load_local(self, device, **kwargs):
+        if self.num_q_heads == 0:
+            return
+
         for cl in self.cache_layers:
             cl.alloc(device)
 
-        if self.index_kpool:
+        # A TP worker receives the k-pool parameters and the kv_b flats prebuilt from the parent
+        # process (it has no tensor collection); only a loading module reads them itself
+        if self.index_kpool and self.idx_kpool_ape is None:
             stc = self.config.stc
             self.idx_kpool_ape = stc.get_tensor(
                 f"{self.key}.{self.key_indexer}.index_kpool_compress_ape", device,
@@ -312,6 +330,8 @@ class MLAttention(Module):
 
         # kv_b_proj maps the latent to per-head K-nope and V. Attention never applies it as that
         # GEMM; the halves fold into the query/output (decode) or up-project past tiles (prefill)
+        if self.w_uk_flat is not None:
+            return
         w = self.config.stc.get_tensor(f"{self.key}.{self.key_kv_b}.weight", device, no_defer = True)
         if w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             # fp8 checkpoint: this tensor is read raw rather than through a Linear, so apply the
@@ -388,6 +408,13 @@ class MLAttention(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+        # TP rank without this layer: contribute nothing, stay in step with the collective
+        if self.num_q_heads == 0:
+            x = torch.zeros_like(x, dtype = self.out_dtype)
+            if self.tp_reduce:
+                params["backend"].all_reduce(x, False)
+            return to2(x, out_dtype, self.out_dtype)
+
         bsz, seqlen, _ = x.shape
         attn_mode = params.get("attn_mode", "flash_attn_nc")
         match attn_mode:
@@ -397,6 +424,8 @@ class MLAttention(Module):
                 x = self.decode_flash_attn_nc(x, bsz, seqlen, params)
             case _:
                 raise ValueError(f"Unknown attn_mode: {attn_mode}")
+        if self.tp_reduce:
+            params["backend"].all_reduce(x)
         return to2(x, out_dtype, self.out_dtype)
 
 
@@ -991,7 +1020,7 @@ class MLAttention(Module):
         bcm = self.dispatch_cache.get(key)
         if bcm is None:
             from .attention_fn.bc_mla import build_bc_mla
-            bcm = self.dispatch_cache[key] = (build_bc_mla(self, layer) or False)
+            bcm = self.dispatch_cache[key] = ((build_bc_mla(self, layer) if _bc_mla_enable else None) or False)
         if bcm is False:
             return None
         if self.indexer_mode is not None:
@@ -1120,9 +1149,144 @@ class MLAttention(Module):
             params["_as_dsa_indices"] = p2.get("dsa_topk_indices")
 
 
+    # Tensor-parallel: the layer runs whole on one device. The latent K/V cache is MQA (nothing
+    # to split by head), the absorbed decode kernels read all heads of a query row, and the
+    # DSA/k-pool indexers are headless, so a head split would replicate the whole KV side for
+    # little gain. The allocator places the layer as a single channel (max_devices = 1); the
+    # other ranks get a head-less stub whose forward only joins the trailing all-reduce with
+    # no contribution, so the residual stream stays in step on every rank
+    _tp_submodules = (
+        "q_proj", "q_a_proj", "q_a_layernorm", "q_b_proj", "kv_a_proj_with_mqa",
+        "kv_a_layernorm", "o_proj", "idx_wq_b", "idx_wk", "idx_k_norm", "idx_weights",
+    )
+    _tp_tensors = ("w_uk_flat", "w_uv_flat", "idx_kpool_ape", "idx_kpool_gate")
+
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
-        raise NotImplementedError()
+        stc = self.config.stc
+        linears = [m for m in (getattr(self, n) for n in self._tp_submodules) if isinstance(m, Linear)]
+        storage = sum(m.storage_size() for m in linears)
+        storage += sum(stc.get_tensor_sizes(f"{self.key}.{self.key_kv_b}"))
+        for n in ("q_a_layernorm", "kv_a_layernorm", "idx_k_norm"):
+            if getattr(self, n) is not None:
+                storage += sum(stc.get_tensor_sizes(getattr(self, n).key))
+        if self.index_kpool:
+            for n in ("index_kpool_compress_ape", "index_kpool_compress_gate"):
+                storage += sum(stc.get_tensor_sizes(f"{self.key}.{self.key_indexer}.{n}"))
+        for cl in self.cache_layers:
+            storage += cl.storage_size()
+        overhead_d = self.hidden_size * (self.out_dtype or torch.half).itemsize
+        overhead_s = 0
+        for cl in self.cache_layers:
+            overhead_s += cl.overhead_size()
+        # Per-token transients: q (nope + pe) and its absorbed latent form, the latent attention
+        # output and the unfolded o rows, plus the new latent/rope row itself
+        overhead_s += self.num_q_heads * (self.qk_head_dim + self.kv_lora_rank + self.qk_rope_head_dim) \
+            * torch.half.itemsize
+        overhead_s += self.num_q_heads * (self.kv_lora_rank + self.v_head_dim) * torch.half.itemsize
+        overhead_s += (self.kv_lora_rank + self.qk_rope_head_dim) * torch.half.itemsize
+        recons = max((m.recons_size() for m in linears), default = 0)
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = self.num_q_heads,
+            channel_unit = "heads",
+            storage_per_device = 0,
+            storage_to_split = storage,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = 1,
+            limit_key = "attn",
+            max_devices = 1,
+        )
+        return [tpa]
 
 
     def tp_export(self, plan, producer):
-        raise NotImplementedError("Tensor-parallel inference is not implemented for MLA layers")
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            nonlocal producer
+            return child.tp_export(plan, producer) if child is not None else None
+
+        # q_proj aliases q_b_proj on the LoRA query path; export each module once
+        names = [n for n in self._tp_submodules if not (n == "q_proj" and self.q_lora_rank is not None)]
+
+        return {
+            "cls": MLAttention,
+            "kwargs": {
+                "key": self.key,
+                "layer_idx": self.layer_idx,
+                "hidden_size": self.hidden_size,
+                "kv_lora_rank": self.kv_lora_rank,
+                "qk_nope_head_dim": self.qk_nope_head_dim,
+                "qk_rope_head_dim": self.qk_rope_head_dim,
+                "v_head_dim": self.v_head_dim,
+                "rope_settings": self.rope_settings,
+                "q_lora_rank": self.q_lora_rank,
+                "sm_scale": self.sm_scale,
+                "rms_norm_eps": self.norm_eps,
+                "out_dtype": self.out_dtype,
+                "key_kv_b": self.key_kv_b,
+                "indexer_mode": self.indexer_mode,
+                "index_n_heads": self.index_n_heads,
+                "index_head_dim": self.index_head_dim,
+                "index_topk": self.index_topk,
+                "index_norm_eps": self.index_norm_eps,
+                "index_kpool": self.index_kpool,
+                "index_kpool_tail": self.index_kpool_tail,
+                "key_indexer": self.key_indexer,
+            },
+            "num_q_heads": self.num_q_heads,
+            **{name: _export(getattr(self, name)) for name in names},
+            **{name: (producer.send(t) if (t := getattr(self, name)) is not None else None)
+               for name in self._tp_tensors},
+            "cache_layers": [cl.tp_export(plan) for cl in self.cache_layers],
+            "device": self.device,
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan, **kwargs):
+        kw = exported["kwargs"]
+        key = kw["key"]
+        device = local_context["device"]
+        consumer = local_context["consumer"]
+        first, last, unit = plan[key]
+        assert unit == "heads"
+        num_q_heads = last - first
+        assert num_q_heads in (0, exported["num_q_heads"]), \
+            "MLA layers run whole on one device (allocation max_devices = 1)"
+
+        def _import(name):
+            nonlocal exported, plan
+            e = exported.get(name)
+            return e["cls"].tp_import(local_context, e, plan) if (e and num_q_heads) else None
+
+        # Submodule keys are not in the plan, so every import is the whole (unsplit) module
+        submodules = {name: _import(name) for name in MLAttention._tp_submodules}
+        module = MLAttention(
+            config = None,
+            **kw,
+            num_q_heads = num_q_heads,
+            submodules = submodules,
+        )
+        module.device = device
+
+        if num_q_heads:
+            for name in MLAttention._tp_tensors:
+                e = exported.get(name)
+                setattr(module, name, consumer.recv(e, cuda = True) if e is not None else None)
+            cache_layers = exported["cache_layers"]
+            if len(cache_layers):
+                module.has_split_cache = True
+                for cl in cache_layers:
+                    cli = cl["cls"](None, module, **cl["args"])
+                    module.cache_layers.append(cli)
+                    module.tp_cache_lookup[cl["args"]["cache_id"]] = cli
+
+        if not kwargs.get("skip_reduction"):
+            module.tp_reduce = True
+
+        module.load_local(device)
+        torch.cuda.synchronize()
+        return module
