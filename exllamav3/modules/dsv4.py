@@ -864,6 +864,7 @@ class DSV4Attention(Module):
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            module.tp_owner = module.tp_single_owner(local_context, key)
 
         module.load_local(device)
         torch.cuda.synchronize()
@@ -1064,7 +1065,7 @@ class DSV4Attention(Module):
             # Zero-width TP shard: contribute nothing, keep the collective aligned
             y = torch.zeros_like(x, dtype = out_dtype or self.out_dtype)
             if self.tp_reduce:
-                params["backend"].all_reduce(y, False)
+                self.tp_collect(params["backend"], y, False)
             return y
         mode = params.get("attn_mode", "flash_attn_nc")
         if mode == "flash_attn":
@@ -1073,7 +1074,7 @@ class DSV4Attention(Module):
             assert mode == "flash_attn_nc", f"DSV4Attention: unsupported attn_mode {mode}"
             y = self._forward_nc(x, params, out_dtype)
         if self.tp_reduce:
-            params["backend"].all_reduce(y)
+            self.tp_collect(params["backend"], y)
         return y
 
 

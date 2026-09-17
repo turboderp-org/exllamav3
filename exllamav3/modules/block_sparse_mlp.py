@@ -1285,7 +1285,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             (self.shared_experts is not None and self.shared_experts_post_norm is not None and not bc_sh_exp)
         )
         if pre_norm_reduce:
-            params["backend"].all_reduce(
+            self.tp_collect(
+                params["backend"],
                 final_hidden_states,
                 self.intermediate_size > 0 and self.num_local_experts > 0
             )
@@ -1298,7 +1299,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.shared_experts and not bc_sh_exp:
             y = self.shared_experts.forward(x, params)
             if pre_norm_reduce:
-                params["backend"].all_reduce(y, True)
+                self.tp_collect(params["backend"], y, True)
             if self.shared_experts_post_norm:
                 y = self.shared_experts_post_norm.forward(y, params)
             if self.shared_gate:
@@ -1312,7 +1313,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Output reduction
         if self.tp_reduce and not pre_norm_reduce:
-            params["backend"].all_reduce(
+            self.tp_collect(
+                params["backend"],
                 final_hidden_states,
                 (self.intermediate_size > 0 and self.num_local_experts > 0) or bool(self.shared_experts)
             )
@@ -1517,4 +1519,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             module.load_routing()
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            # Routed and shared experts are allocated separately; only when one rank owns both
+            # is the trailing collective a plain broadcast
+            owner_keys = [key]
+            if exported.get("shared_experts") is not None:
+                owner_keys.append(exported["shared_experts"]["kwargs"]["key"])
+            module.tp_owner = module.tp_single_owner(local_context, *owner_keys)
         return module

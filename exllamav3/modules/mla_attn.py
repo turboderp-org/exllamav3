@@ -412,7 +412,7 @@ class MLAttention(Module):
         if self.num_q_heads == 0:
             x = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                params["backend"].all_reduce(x, False)
+                self.tp_collect(params["backend"], x, False)
             return to2(x, out_dtype, self.out_dtype)
 
         bsz, seqlen, _ = x.shape
@@ -425,7 +425,7 @@ class MLAttention(Module):
             case _:
                 raise ValueError(f"Unknown attn_mode: {attn_mode}")
         if self.tp_reduce:
-            params["backend"].all_reduce(x)
+            self.tp_collect(params["backend"], x)
         return to2(x, out_dtype, self.out_dtype)
 
 
@@ -1286,6 +1286,7 @@ class MLAttention(Module):
 
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            module.tp_owner = module.tp_single_owner(local_context, key)
 
         module.load_local(device)
         torch.cuda.synchronize()
