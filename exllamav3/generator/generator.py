@@ -166,6 +166,39 @@ def _dflash2_sampling_dist(
         probs = torch.zeros_like(logits, dtype = probs.dtype).scatter(-1, indices, probs)
     return probs
 
+def _dflash2_accept_step(token_logits, candidates, q, d, temperature, top_k, top_p):
+    """
+    Pure core of one q-aware DFlash2 rejection position. Returns
+    (accepted, bonus): accepted with no bonus, or rejected with one bonus token
+    sampled from the normalized (p - q)+ residual distribution. p is the target
+    sampling distribution, q the selector's proposal distribution over its
+    candidate list. No generator state; unit-testable on synthetic p/q.
+    """
+    # The walked draft token always comes from the candidate list, so there
+    # is exactly one hit; an all-false row is the impossible event (q_d = 0,
+    # which degenerates to accept, matching the reference). One on-device
+    # reduction, no host sync to find the index.
+    q_d = (q * (candidates == d)).sum()
+    # p(d) alone decides acceptance; the full distribution is materialized
+    # only on reject, for the residual bonus sample.
+    p_d = _dflash2_sampling_dist(token_logits, temperature, top_k, top_p, token = d)
+    u = torch.rand((), device = q.device, dtype = torch.float)
+    if float(u * q_d) < float(p_d):
+        return True, None
+
+    p = _dflash2_sampling_dist(token_logits, temperature, top_k, top_p)
+    residual = p[0, 0].clone()
+    residual.index_add_(0, candidates.long(), -q.to(residual.dtype))
+    residual.clamp_min_(0)
+    total = residual.sum()
+    if float(total) <= 0:
+        bonus_dist = p[0, 0]
+    else:
+        bonus_dist = residual / total
+    bonus = torch.multinomial(bonus_dist, 1)[0]
+    return False, bonus
+
+
 class Generator:
 
     def __init__(
@@ -1102,29 +1135,8 @@ class Generator:
         d = draft_tokens[j, i].item()
         candidates = prop["candidates"][j, i]
         q = prop["q"][j, i]
-        # The walked draft token always comes from the candidate list, so there
-        # is exactly one hit; an all-false row is the impossible event (q_d = 0,
-        # which degenerates to accept, matching the reference). One on-device
-        # reduction, no host sync to find the index.
-        q_d = (q * (candidates == d)).sum()
-        # p(d) alone decides acceptance; the full distribution is materialized
-        # only on reject, for the residual bonus sample.
-        p_d = _dflash2_sampling_dist(token_logits, temperature, top_k, top_p, token = d)
-        u = torch.rand((), device = q.device, dtype = torch.float)
-        if float(u * q_d) < float(p_d):
-            return True, None
-
-        p = _dflash2_sampling_dist(token_logits, temperature, top_k, top_p)
-        residual = p[0, 0].clone()
-        residual.index_add_(0, candidates.long(), -q.to(residual.dtype))
-        residual.clamp_min_(0)
-        total = residual.sum()
-        if float(total) <= 0:
-            bonus_dist = p[0, 0]
-        else:
-            bonus_dist = residual / total
-        bonus = torch.multinomial(bonus_dist, 1)[0]
-        return False, bonus
+        return _dflash2_accept_step(
+            token_logits, candidates, q, d, temperature, top_k, top_p)
 
 
     def iterate_ngram_gen(self, results: list):
