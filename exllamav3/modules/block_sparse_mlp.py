@@ -970,8 +970,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Broadcast routing indices and weights
         if self.routing_device is not None:
-            params["backend"].broadcast(selected_experts, src_device = self.routing_device)
-            params["backend"].broadcast(routing_weights, src_device = self.routing_device)
+            if params.get("tp_warmup"):
+                # Warmup runs without collectives: the ranks without the gate would route on
+                # uninitialized buffers, so every rank takes a random (valid, spread-out)
+                # selection instead, which exercises the expert paths at realistic row counts
+                selected_experts.random_(0, self.num_experts)
+                routing_weights.fill_(1.0 / self.num_experts_per_tok)
+            else:
+                params["backend"].broadcast(selected_experts, src_device = self.routing_device)
+                params["backend"].broadcast(routing_weights, src_device = self.routing_device)
 
         # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
         # share to the worker now so it computes concurrently with the GPU expert paths below

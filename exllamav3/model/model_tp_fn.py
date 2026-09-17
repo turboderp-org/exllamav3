@@ -9,7 +9,7 @@ from collections import deque
 from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
-from .model_tp_backend import TPBackendNCCL, TPBackendNative
+from .model_tp_backend import TPBackendNCCL, TPBackendNative, TPBackendNull
 from ..tokenizer.mm_embedding import recv_embeddings
 from ..util import log_tp, set_t0
 
@@ -218,11 +218,13 @@ def mp_model_forward(
     """
     Forward pass for parallel slice of a model
     """
-    backend = local_context["backend"]
+    # Warmup passes (Model.warmup) run every rank independently with collectives stubbed out
+    warmup = bool(params.get("tp_warmup"))
+    backend = TPBackendNull() if warmup else local_context["backend"]
     # The pass-start barrier aligns all rank streams before the first collective. The collectives
     # are individually ordered by their stage counters, so this is not required for correctness;
     # EXL3_TP_NO_FWD_BARRIER=1 skips it (experimental) to save one spin kernel per rank per pass
-    if not _no_fwd_barrier:
+    if not _no_fwd_barrier and not warmup:
         backend.fwd_barrier()
 
     modules = local_context["modules"] if single_idx is None else [local_context["modules"][single_idx]]

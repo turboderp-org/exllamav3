@@ -35,6 +35,40 @@ class TPBackend:
         raise NotImplementedError()
 
 
+class TPBackendNull:
+    """
+    Collective-free stand-in used by Model.warmup() in TP mode: every rank walks its module list
+    on its own and compiles/tunes its kernels concurrently with the others, never waiting in a
+    collective (a rank cold-compiling Triton kernels can hold a real reduce past its sync deadline).
+    Reductions leave the local partial sums in place and the output gather leaves the output
+    buffer untouched: the values are garbage but finite, which is all a warmup pass needs.
+    """
+
+    def close(self):
+        pass
+
+    def fwd_barrier(self):
+        pass
+
+    def broadcast(self, tensor: torch.Tensor, src_device: int):
+        pass
+
+    def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        pass
+
+    def gather(self, tensor, out_tensor, gather_devices, output_device, ldims):
+        pass
+
+    def gather_small(self, tensor, out_tensor, gather_devices, output_device, ldims):
+        pass
+
+    def run_cpu_reduce_jobs(self):
+        pass
+
+    def end_cpu_reduce_jobs(self):
+        pass
+
+
 class TPBackendNCCL:
 
     def __init__(

@@ -77,6 +77,7 @@ def add_args(
 
     parser.add_argument("-lv", "--load_verbose", action = "store_true", help = "Verbose output while loading")
     parser.add_argument("-asnf", "--autosplit_no_forward", action = "store_true", help = "Skip forward pass in autosplit, for debug purposes.")
+    parser.add_argument("-nw", "--no_warmup", action = "store_true", help = "Skip the post-load warmup (kernel compilation, GEMM autotuning and graph workspaces are then paid on the first requests instead)")
 
     parser.add_argument("-layer_map", "--layer_map", type = str, help = "RYS layer map as a list of ints or (inclusive) ranges, example: 0..15,11..31 (repeats layers 11 through 15 once)", default = None)
 
@@ -369,6 +370,16 @@ def init(
         max_chunk_size = args.chunk_size,
         **kwargs
     )
+
+    # Warmup (before any generator is attached to the cache)
+    if not getattr(args, "no_warmup", False):
+        printp(not quiet, f" -- Warming up...")
+        model.warmup(
+            cache = cache,
+            max_chunk_size = args.chunk_size,
+            progressbar = progress,
+            verbose = args.load_verbose,
+        )
 
     # Load tokenizer
     if load_tokenizer:
