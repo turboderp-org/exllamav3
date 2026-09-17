@@ -1182,9 +1182,12 @@ def main(args, job_state):
                     print(f"     - Cloned {m.key} from {m.alt_key}")
             module.config.stc.close()
 
-            # Skip modules without quant targets
+            # Skip modules without quant targets. Modules flagged retain_raw_fp16
+            # still pass through: they carry no quantizable Linears (nothing is
+            # quantized), but their get_tensors() must be collected so raw fp16
+            # tensors (DFlash2 codebooks, conv base kernels) reach the output.
             qmaps = module.get_qmaps()
-            if len(qmaps) > 0:
+            if len(qmaps) > 0 or module.caps.get("retain_raw_fp16", False):
 
                 # Capture calibration input states during forward pass. For block-sparse models, all expert layers
                 # are activated to ensure all down projections capture at least some calibration data. When the
