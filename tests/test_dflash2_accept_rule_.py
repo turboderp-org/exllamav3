@@ -12,11 +12,16 @@ import math
 import pytest
 import torch
 
-from exllamav3.generator.generator import _dflash2_accept_step, _dflash2_sampling_dist
+from exllamav3.generator.generator import (
+    _dflash2_accept_step,
+    _dflash2_batch_pd,
+    _dflash2_sampling_dist,
+)
 
 V = 257  # small, odd, non-multiple-of-anything vocab
 K = 7    # candidate list length (matches serve window)
-N = 30000
+N = 15000
+REPS = 6
 TEMP, TOP_K, TOP_P = 0.8, 32, 0.9
 
 
@@ -65,20 +70,43 @@ def _chi2_over_df(counts, expected):
 
 @pytest.mark.parametrize("mode", ["matched", "flat", "peaked_low", "near_disjoint"])
 def test_accept_step_output_matches_p(mode):
-    rng = torch.Generator().manual_seed(1234 + len(mode))
-    torch.manual_seed(999)
-    counts = torch.zeros(V, dtype = torch.float64)
-    p_sum = torch.zeros(V, dtype = torch.float64)
-    for _ in range(N):
-        logits, cands, q, d, p = _trial_inputs(rng, mode)
-        acc, bonus = _dflash2_accept_step(
-            logits, cands, q, d, TEMP, TOP_K, TOP_P)
-        counts[bonus.item() if not acc else d] += 1
-        p_sum += p.double()
-    expected = p_sum / p_sum.sum() * N
-    ratio = _chi2_over_df(counts, expected)
-    # E[ratio] == 1, Var == 2/df; df ~ 200 here, so +-0.3 is ~3 sigma
-    assert 0.7 < ratio < 1.3, f"{mode}: chi2/df = {ratio:.3f}"
+    # df is small (top-k truncates p to ~32 live bins + pooled tail), so one
+    # replicate's chi2/df has sigma ~0.25 — assert on the mean over REPS
+    # independent replicates instead (SE ~0.1), plus a wide per-rep sanity.
+    ratios = []
+    for rep in range(REPS):
+        rng = torch.Generator().manual_seed(1000 * (rep + 1) + len(mode))
+        torch.manual_seed(7000 + rep)
+        counts = torch.zeros(V, dtype = torch.float64)
+        p_sum = torch.zeros(V, dtype = torch.float64)
+        for _ in range(N):
+            logits, cands, q, d, p = _trial_inputs(rng, mode)
+            acc, bonus = _dflash2_accept_step(
+                logits, cands, q, d, TEMP, TOP_K, TOP_P)
+            counts[bonus.item() if not acc else d] += 1
+            p_sum += p.double()
+        expected = p_sum / p_sum.sum() * N
+        r = _chi2_over_df(counts, expected)
+        assert 0.2 < r < 2.0, f"{mode} rep {rep}: chi2/df = {r:.3f}"
+        ratios.append(r)
+    mean = sum(ratios) / len(ratios)
+    assert abs(mean - 1.0) < 0.3, f"{mode}: mean chi2/df = {mean:.3f}"
+
+
+def test_batch_pd_matches_scalar_path():
+    # The round precompute must agree with the per-position fast path it
+    # replaces, in all four sampler shapes (top-k/top-p on/off).
+    rng = torch.Generator().manual_seed(51)
+    n = 7
+    logits = (torch.randn(1, n, V, generator = rng) * 2.0)
+    toks = torch.randint(0, V, (n,), generator = rng)
+    for top_k, top_p in ((0, 1.0), (32, 1.0), (0, 0.9), (32, 0.9)):
+        got = _dflash2_batch_pd(logits, TEMP, top_k, top_p, toks)
+        for i in range(n):
+            want = _dflash2_sampling_dist(
+                logits[:, i:i + 1, :], TEMP, top_k, top_p,
+                token = toks[i].item())
+            assert abs(float(got[i]) - float(want)) < 2e-6, (top_k, top_p, i)
 
 
 def test_method_delegates_to_step():

@@ -180,12 +180,54 @@ def _dflash2_accept_step(token_logits, candidates, q, d, temperature, top_k, top
     # reduction, no host sync to find the index.
     q_d = (q * (candidates == d)).sum()
     # p(d) alone decides acceptance; the full distribution is materialized
-    # only on reject, for the residual bonus sample.
+    # only on reject, for the residual bonus sample. Single host sync: the
+    # comparison stays on-device and only the boolean crosses.
     p_d = _dflash2_sampling_dist(token_logits, temperature, top_k, top_p, token = d)
     u = torch.rand((), device = q.device, dtype = torch.float)
-    if float(u * q_d) < float(p_d):
+    if bool((u * q_d < p_d).item()):
         return True, None
 
+    return False, _dflash2_residual_bonus(
+        token_logits, candidates, q, temperature, top_k, top_p)
+
+
+def _dflash2_batch_pd(logits, temperature, top_k, top_p, tokens):
+    """
+    Batched p(token) for one round: logits (1, n, V), tokens (n,) long on the
+    logits device. Same math as the token= fast path of _dflash2_sampling_dist,
+    vectorized so the round pays one topk/sort/cumsum instead of one per
+    position. Agrees with the scalar path to ~1e-6 (top-p summation order).
+    """
+    n = tokens.numel()
+    scores = logits.float() / temperature
+    indices = None
+    vocab_size = scores.shape[-1]
+    if 0 < top_k < vocab_size:
+        scores, indices = torch.topk(scores, top_k, dim = -1)
+    probs = torch.softmax(scores, dim = -1)
+    tok = tokens.view(1, n, 1)
+    if top_p < 1.0:
+        sorted_probs, order = probs.sort(dim = -1, descending = True)
+        keep = sorted_probs.cumsum(dim = -1) - sorted_probs < top_p
+        kept = sorted_probs * keep
+        denom = kept.sum(dim = -1, keepdim = True)
+        if indices is None:
+            hit = (order == tok)
+        else:
+            # kept positions address the top-k index list in sorted order
+            hit = (indices.gather(-1, order) == tok)
+        return ((kept / denom) * hit).sum(dim = (0, 2))
+    if indices is None:
+        return probs[0, torch.arange(n, device = logits.device), tokens]
+    return (probs * (indices == tok)).sum(dim = (0, 2))
+
+
+def _dflash2_residual_bonus(token_logits, candidates, q, temperature, top_k, top_p):
+    """
+    Lazy half of rejection: one bonus token from the normalized (p - q)+
+    residual. Runs at most once per round (first reject); kept out of the
+    precompute so the common all-accept round does zero V-wide work here.
+    """
     p = _dflash2_sampling_dist(token_logits, temperature, top_k, top_p)
     residual = p[0, 0].clone()
     residual.index_add_(0, candidates.long(), -q.to(residual.dtype))
@@ -195,8 +237,12 @@ def _dflash2_accept_step(token_logits, candidates, q, d, temperature, top_k, top
         bonus_dist = p[0, 0]
     else:
         bonus_dist = residual / total
-    bonus = torch.multinomial(bonus_dist, 1)[0]
-    return False, bonus
+    # inverse-CDF over the CDF: two cheap launches replace the heavyweight
+    # generic multinomial (same distribution, different RNG stream).
+    return torch.searchsorted(
+        bonus_dist.cumsum(0),
+        torch.rand((), device = bonus_dist.device),
+    ).clamp(max = bonus_dist.numel() - 1)
 
 
 class Generator:
@@ -1403,6 +1449,34 @@ class Generator:
                 accepted_length = 1
                 rejected = 0
 
+                # DFlash2: the whole round's accept flags are pure functions of
+                # the target logits and the stashed proposal, so precompute
+                # them with one topk/sort/cumsum, one rand launch, one sync.
+                # Only the first-reject bonus stays lazy (it needs the residual
+                # at the reject position). RNG stream changes vs per-position
+                # draws: still exact samples, but fixed-seed text is not
+                # comparable across this change.
+                dflash2_ctx = None
+                if (draft_tokens is not None
+                        and self._dflash2_propose is not None
+                        and self._dflash2_sampling is not None):
+                    prop = self._dflash2_propose
+                    _, temperature, top_k, top_p = self._dflash2_sampling
+                    window = batch_logits.shape[1] - 1
+                    dev = batch_logits.device
+                    qdev = prop["q"].device
+                    d_all = draft_tokens[j, :window].to(dev)
+                    cands = prop["candidates"][j, :window]
+                    q = prop["q"][j, :window]
+                    p_d = _dflash2_batch_pd(
+                        job_logits[:, :window, :], temperature, top_k, top_p, d_all,
+                    ).to(qdev)
+                    d_q = draft_tokens[j, :window].to(qdev)
+                    q_d = (q * (cands == d_q[:, None])).sum(-1)
+                    u = torch.rand(window, device = qdev, dtype = torch.float)
+                    flags = (u * q_d < p_d).tolist()
+                    dflash2_ctx = (flags, cands, q, temperature, top_k, top_p)
+
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]
                     next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
@@ -1415,17 +1489,21 @@ class Generator:
                     # token is the forced one. Lossless w.r.t. the quantized target model, whose
                     # lm_head produces both p (here) and q (draft propose).
                     dflash2_q = (
-                        draft_tokens is not None
+                        dflash2_ctx is not None
                         and i < batch_logits.shape[1] - 1
-                        and self._dflash2_propose is not None
-                        and self._dflash2_sampling is not None
                     )
                     dflash2_reject = False
                     if dflash2_q:
-                        accepted_, bonus = self._dflash2_accept(job, j, i, token_logits, draft_tokens)
-                        if accepted_:
+                        flags, cands_i, q_i, temperature, top_k, top_p = dflash2_ctx
+                        if flags[i]:
+                            accepted_ = True
                             next_token = draft_tokens[j, i].reshape(next_token.shape)
                         else:
+                            bonus = _dflash2_residual_bonus(
+                                token_logits, cands_i[i], q_i[i],
+                                temperature, top_k, top_p,
+                            )
+                            accepted_ = False
                             next_token = bonus.reshape(next_token.shape)
                             dflash2_reject = True
 

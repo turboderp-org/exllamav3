@@ -228,15 +228,27 @@ def selector_select(
     # anchor ids arrive from the generator's job bookkeeping (CPU); the codebooks live on
     # the model device, so the index tensor has to follow
     predecessor = anchor_ids.to(predecessor_codebook.device)
+    # Position-independent gathers, hoisted out of the walk: candidates come
+    # from the single topk above, so their codebook rows and the
+    # hidden-product need one launch each, not one per position. Only the
+    # predecessor embedding stays serial. (~57KB at T=7/k=16/rank=256.)
+    m = F.embedding(candidates, successor_codebook) * hidden[:, :, None, :]
+    bsz, T, _, _ = m.shape
+    # One coalescing copy: a leading-dim slice per step is a view, while
+    # m[:, position] is strided and forces bmm to copy it back (7 copies).
+    m = m.permute(1, 0, 2, 3).reshape(T * bsz, -1, m.shape[-1])
     path, q_rows, conf_rows = [], [], []
-    for position in range(hidden.shape[1]):
-        scores = unary[:, position] + torch.einsum(
-            "br,bkr->bk",
-            F.embedding(predecessor, predecessor_codebook) * hidden[:, position],
-            F.embedding(candidates[:, position], successor_codebook),
-        )
+    for position in range(T):
+        a = F.embedding(predecessor, predecessor_codebook)
+        scores = unary[:, position] + torch.bmm(
+            m[position * bsz : (position + 1) * bsz], a[..., None])[..., 0]
         if temperature > 0:
             q = torch.softmax(scores.float() / temperature, dim = -1)
+            # NOTE: multinomial, not inverse-CDF: the reference implementation
+            # draws this stream, and exact stream parity (same seed -> same
+            # path, since the draw feeds the next predecessor) is worth more
+            # than the ~0.1ms a searchsorted swap would save. The hoist above
+            # carries the launch savings and is bit-exact.
             index = torch.multinomial(q, 1)[:, 0]
             q_rows.append(q)
         else:
