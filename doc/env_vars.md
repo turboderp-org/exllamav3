@@ -638,6 +638,12 @@ two ranks, fp16-level rounding beyond, at the same PCIe traffic as the bf16 wire
 always use the bf16 wire (fp16 lacks the range for residual-stream outliers). Set to `1` to
 force the bf16 wire for fp16 payloads too, e.g. for A/B comparison.
 
+### `EXL3_TP_NCCL_FP32` (default: `0`)
+
+NCCL backend only: reduce fp32 payloads in fp32 instead of over a bf16 wire (which is what the
+native backend always uses for fp32 sublayer outputs). Exact but roughly twice the reduction
+traffic; for A/B testing of the wire rounding.
+
 ### `EXL3_TP_TRACE_WIRE` (default: `0`)
 
 Print a line (once per process) when the fp16 all-reduce wire first activates. Activation check

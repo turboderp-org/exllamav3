@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.distributed as dist
 import time
@@ -17,6 +18,7 @@ from ..util import log_tp
 
 GLOBALS_SIZE = 128*1024
 SHBUF_SIZE = 16 * 1024 ** 2
+_nccl_fp32 = os.environ.get("EXL3_TP_NCCL_FP32", "0") != "0"
 # 17 slots (16 devices + accumulator) x 2MB: 8 ring stages of the 256KB reduce chunk size
 SHBUF_SIZE_R = 17 * 8 * 256 * 1024
 SHBUF_SIZE_S = 16 * 1024
@@ -151,7 +153,9 @@ class TPBackendNCCL:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
-        if tensor.dtype == torch.float32:
+        # fp32 payloads normally go over a bf16 wire like the native backend; EXL3_TP_NCCL_FP32=1
+        # reduces them in fp32 (A/B testing of the wire rounding)
+        if tensor.dtype == torch.float32 and not _nccl_fp32:
             temp = tensor.to(torch.bfloat16)
             dist.all_reduce(temp, async_op = False)
             temp = temp.to(torch.float32)
