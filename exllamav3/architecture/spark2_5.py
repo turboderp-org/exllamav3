@@ -117,13 +117,16 @@ class Spark2_5Model(Model):
     def __init__(
         self,
         config: Spark2_5Config,
+        swa_full: bool = False,
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        self.swa_full = swa_full
 
-        # Sliding-window layers are recurrent (windowed KV ring); the full-attention layers stay paged
+        # Sliding-window layers are recurrent (windowed KV ring); the full-attention layers stay paged.
+        # -swa_full keeps every layer on the full-width paged cache instead (as gemma4/laguna)
         self.recurrent_state_cls = None
-        if config.layer_types is not None and "sliding_attention" in config.layer_types:
+        if not swa_full and config.layer_types is not None and "sliding_attention" in config.layer_types:
             self.caps.update({
                 "recurrent_states": True,
                 "default_recurrent_checkpoint_interval": 2048,
@@ -146,7 +149,7 @@ class Spark2_5Model(Model):
             # full-width paged cache; full-attention layers keep the standard paged KV (same per-layer
             # construction as the other hybrid architectures, e.g. gemma4)
             attn_cls = SlidingAttention if (
-                config.layer_types is not None and config.layer_types[idx] == "sliding_attention"
+                not swa_full and config.layer_types is not None and config.layer_types[idx] == "sliding_attention"
             ) else Attention
             self.modules += [
                 TransformerBlock(
