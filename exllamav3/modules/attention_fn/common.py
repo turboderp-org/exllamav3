@@ -27,6 +27,8 @@ class AttnArgs(NamedTuple):
     max_kv_len: int | None = None   # host-known bound on the past length any row attends to
                                     # (lets cached kernels size windows / staging below the
                                     # block-table span; e.g. QSA's dense regime)
+    k_scales: torch.Tensor | None = None  # NVFP4 cache: E4M3 block scales for k_cache
+    v_scales: torch.Tensor | None = None  # NVFP4 cache: E4M3 block scales for v_cache
 
     def sanity_check(self):
         # Cache must be paged

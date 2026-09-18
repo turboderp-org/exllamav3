@@ -10,3 +10,6 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
+
+# DFlash2 synth fixture weights (built on demand by test session fixture)
+tests/data/dflash2_synth/model.safetensors

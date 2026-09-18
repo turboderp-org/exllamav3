@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from . import Model, Config, Cache, Tokenizer
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
-from .cache import CacheLayer_fp16, CacheLayer_quant
+from .cache import CacheLayer_fp16, CacheLayer_quant, CacheLayer_nvfp4
 from .generator.sampler import ComboSampler
 from argparse import ArgumentParser
 import yaml
@@ -273,7 +273,22 @@ def init(
         4 if (vars(args).get("ngram_match_min") and not vars(args).get("num_draft_tokens")) else 0,
     )
     if "cache_size" in vars(args):
-        if args.cache_quant is not None:
+        if args.cache_quant == "nvfp4":
+            # KV in NVFP4 (E2M1 + E4M3 block-16 scales, 4.5 bits/elem).
+            # Target only; the draft cache stays fp16 (parity-pinned).
+            cache = Cache(
+                model,
+                max_num_tokens = args.cache_size,
+                layer_type = CacheLayer_nvfp4,
+                max_history = max_history,
+                max_batch_size = args.autosplit_max_batch_size,
+            )
+            draft_cache = Cache(
+                draft_model,
+                max_num_tokens = args.cache_size,
+                max_history = max_history,
+            ) if draft_model_dir else None
+        elif args.cache_quant is not None:
             split = [int(bits) for bits in args.cache_quant.split(",")]
             if len(split) == 1:
                 k_bits = v_bits = split[0]

@@ -103,4 +103,11 @@ class DFlashInputLayer(Module):
         else:
             x = self.attached_model().tp_producer.send(x)
             x = self.attached_model().tp_dispatch_master(mp_model_forward_embedding, (x, params))
+        # DFlash2 checkpoints may scale the mask (noise) embeddings; the anchor
+        # column (position 0) is a real token embedding and stays unscaled. v1
+        # configs lack the key and read 1.0, so v1 is a no-op without a clone.
+        scale = getattr(self.config, "input_embedding_scale", 1.0)
+        if scale != 1.0:
+            x = x.clone()
+            x[:, 1:] *= scale   # mask columns only
         return x

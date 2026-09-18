@@ -23,6 +23,228 @@ import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 
+
+def _dflash2_sampler_params(sampler):
+    """
+    Extract (greedy, temperature, top_k, top_p) from a job sampler if it is a plain
+    temperature / top-k / top-p sampler (fused or not) with no penalties, min-p, or
+    adaptive steps. Returns None for anything else — the q-aware DFlash2 verify only
+    runs for samplers whose target distribution we can reproduce exactly.
+
+    DFlash2 lossless verify (#379 / z-lab). Used only when every job shares
+    plain temp/top-k/top-p. Otherwise iterate does v1 token-match.
+    """
+    from .sampler.custom import (
+        SS_Fused,
+        SS_Temperature,
+        SS_TopK,
+        SS_TopP,
+        SS_MinP,
+        SS_Sample,
+        SS_Argmax,
+        SS_NoOp,
+    )
+    steps = getattr(sampler, "steps", None)
+    if steps is None:
+        return None
+    if len(steps) == 1 and isinstance(steps[0], SS_Fused):
+        f = steps[0]
+        if f.mode == SS_Fused.MODE_GREEDY:
+            return (True, 0.0, 0, 1.0)
+        if f.minp_log:
+            return None
+        return (False, 1.0 / f.inv_temp, f.top_k, f.top_p)
+    greedy = False
+    temperature = 1.0
+    top_k = 0
+    top_p = 1.0
+    for s in steps:
+        if isinstance(s, SS_NoOp):
+            continue
+        if isinstance(s, SS_Argmax):
+            greedy = True
+        elif isinstance(s, SS_Temperature):
+            temperature *= s.temperature
+        elif isinstance(s, SS_TopK):
+            top_k = s.top_k
+        elif isinstance(s, SS_TopP):
+            top_p = s.top_p
+        elif isinstance(s, SS_MinP):
+            if s.min_p != 0.0:
+                return None
+        elif isinstance(s, SS_Sample):
+            continue
+        else:
+            return None
+    if greedy:
+        return (True, 0.0, 0, 1.0)
+    return (False, temperature, top_k, top_p)
+
+
+def _dflash2_job_is_cfg(job) -> bool:
+    """
+    True when the job carries classifier-free guidance: multiple sequences
+    (prompt tuple) or a live gen_settings.cfg_scale. cfg_scale exists only as
+    a commented TODO today; the getattr chain keeps this correct if someone
+    turns it on, instead of silently missing CFG-on-one-sequence.
+    """
+    if len(job.sequences) > 1:
+        return True
+    gs = getattr(job, "gen_settings", None)
+    scale = getattr(gs, "cfg_scale", None) if gs is not None else None
+    return scale is not None and scale != 1.0
+
+
+def _dflash2_check_page_budget(draft_cache_tokens: int, pagetable_pages: int, block_size: int):
+    """
+    Fail loudly when the draft cache cannot hold one full block_size-wide
+    draft block: neither in raw tokens nor in pagetable pages. Called at
+    Generator setup; unit-tested directly (a full Generator is too heavy).
+    Raises (never asserts) so -O cannot skip it.
+    """
+    if draft_cache_tokens < block_size:
+        raise ValueError(
+            f"DFlash2 draft cache holds {draft_cache_tokens} tokens but the "
+            f"draft block needs {block_size} rows; use max_num_tokens >= {block_size}."
+        )
+    if pagetable_pages * PAGE_SIZE < block_size:
+        raise ValueError(
+            f"DFlash2 draft pagetable pages={pagetable_pages} cannot hold "
+            f"block_size={block_size} rows; use max_num_tokens >= {block_size}."
+        )
+
+
+def _dflash2_reject_cfg(job):
+    if _dflash2_job_is_cfg(job):
+        raise NotImplementedError(
+            "DFlash2 drafting does not support CFG/multi-sequence jobs"
+        )
+
+
+def _dflash2_sampling_dist(
+    logits: torch.Tensor,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    token: int | None = None,
+) -> torch.Tensor:
+    """
+    Target sampling distribution p over the vocabulary for a plain
+    temperature/top-k/top-p sampler (same transform as the reference DFlash2
+    rejection sampler). logits: (..., vocab) raw target logits. With token
+    given, returns the scalar p(token) without materializing the V-wide
+    distribution (accept-path fast path; agrees with indexing the full
+    distribution to ~1e-6 — summation order in the top-p normalizer can differ
+    by 1 ulp, and the accept comparison is against a continuous uniform, so
+    either outcome is an exact sample).
+    """
+    scores = logits.float() / temperature
+    indices = None
+    vocab_size = scores.shape[-1]
+    if 0 < top_k < vocab_size:
+        scores, indices = torch.topk(scores, top_k, dim = -1)
+    probs = torch.softmax(scores, dim = -1)
+    if top_p < 1.0:
+        sorted_probs, order = probs.sort(dim = -1, descending = True)
+        keep = sorted_probs.cumsum(dim = -1) - sorted_probs < top_p
+        if token is not None:
+            kept = sorted_probs * keep
+            denom = kept.sum(dim = -1, keepdim = True)
+            if indices is None:
+                mask = (order == token)
+            else:
+                # kept positions address the top-k index list in sorted order
+                mask = (indices.gather(-1, order) == token)
+            return ((kept / denom) * mask).sum()
+        probs = torch.zeros_like(probs).scatter(-1, order, sorted_probs * keep)
+        probs = probs / probs.sum(dim = -1, keepdim = True)
+    if token is not None:
+        if indices is None:
+            return probs[..., token].reshape(())
+        return (probs * (indices == token)).sum()
+    if indices is not None:
+        probs = torch.zeros_like(logits, dtype = probs.dtype).scatter(-1, indices, probs)
+    return probs
+
+def _dflash2_accept_step(token_logits, candidates, q, d, temperature, top_k, top_p):
+    """
+    Pure core of one q-aware DFlash2 rejection position. Returns
+    (accepted, bonus): accepted with no bonus, or rejected with one bonus token
+    sampled from the normalized (p - q)+ residual distribution. p is the target
+    sampling distribution, q the selector's proposal distribution over its
+    candidate list. No generator state; unit-testable on synthetic p/q.
+    """
+    # The walked draft token always comes from the candidate list, so there
+    # is exactly one hit; an all-false row is the impossible event (q_d = 0,
+    # which degenerates to accept, matching the reference). One on-device
+    # reduction, no host sync to find the index.
+    q_d = (q * (candidates == d)).sum()
+    # p(d) alone decides acceptance; the full distribution is materialized
+    # only on reject, for the residual bonus sample. Single host sync: the
+    # comparison stays on-device and only the boolean crosses.
+    p_d = _dflash2_sampling_dist(token_logits, temperature, top_k, top_p, token = d)
+    u = torch.rand((), device = q.device, dtype = torch.float)
+    if bool((u * q_d < p_d).item()):
+        return True, None
+
+    return False, _dflash2_residual_bonus(
+        token_logits, candidates, q, temperature, top_k, top_p)
+
+
+def _dflash2_batch_pd(logits, temperature, top_k, top_p, tokens):
+    """
+    Batched p(token) for one round: logits (1, n, V), tokens (n,) long on the
+    logits device. Same math as the token= fast path of _dflash2_sampling_dist,
+    vectorized so the round pays one topk/sort/cumsum instead of one per
+    position. Agrees with the scalar path to ~1e-6 (top-p summation order).
+    """
+    n = tokens.numel()
+    scores = logits.float() / temperature
+    indices = None
+    vocab_size = scores.shape[-1]
+    if 0 < top_k < vocab_size:
+        scores, indices = torch.topk(scores, top_k, dim = -1)
+    probs = torch.softmax(scores, dim = -1)
+    tok = tokens.view(1, n, 1)
+    if top_p < 1.0:
+        sorted_probs, order = probs.sort(dim = -1, descending = True)
+        keep = sorted_probs.cumsum(dim = -1) - sorted_probs < top_p
+        kept = sorted_probs * keep
+        denom = kept.sum(dim = -1, keepdim = True)
+        if indices is None:
+            hit = (order == tok)
+        else:
+            # kept positions address the top-k index list in sorted order
+            hit = (indices.gather(-1, order) == tok)
+        return ((kept / denom) * hit).sum(dim = (0, 2))
+    if indices is None:
+        return probs[0, torch.arange(n, device = logits.device), tokens]
+    return (probs * (indices == tok)).sum(dim = (0, 2))
+
+
+def _dflash2_residual_bonus(token_logits, candidates, q, temperature, top_k, top_p):
+    """
+    Lazy half of rejection: one bonus token from the normalized (p - q)+
+    residual. Runs at most once per round (first reject); kept out of the
+    precompute so the common all-accept round does zero V-wide work here.
+    """
+    p = _dflash2_sampling_dist(token_logits, temperature, top_k, top_p)
+    residual = p[0, 0].clone()
+    residual.index_add_(0, candidates.long(), -q.to(residual.dtype))
+    residual.clamp_min_(0)
+    total = residual.sum()
+    if float(total) <= 0:
+        bonus_dist = p[0, 0]
+    else:
+        bonus_dist = residual / total
+    # inverse-CDF over the CDF: two cheap launches replace the heavyweight
+    # generic multinomial (same distribution, different RNG stream).
+    return torch.searchsorted(
+        bonus_dist.cumsum(0),
+        torch.rand((), device = bonus_dist.device),
+    ).clamp(max = bonus_dist.numel() - 1)
+
+
 class Generator:
 
     def __init__(
@@ -165,6 +387,38 @@ class Generator:
                 self.num_draft_tokens = num_draft_tokens
             else:
                 self.num_draft_tokens = draft_model.caps.get("default_draft_size", 4)
+            # DFlash2 propose() returns positions 1..block_size-1 (block_size
+            # minus the anchor). A wider window overruns the draft_ids buffer
+            # with an opaque shape error deep in the round, so fail loudly at
+            # setup instead (found via a serving crash at window 8/block 8).
+            if draft_model.caps.get("dflash2_draft", False):
+                block = draft_model.config.block_size
+                if self.num_draft_tokens > block - 1:
+                    raise ValueError(
+                        f"DFlash2 draft window is {self.num_draft_tokens} but "
+                        f"propose() yields {block - 1} positions (block_size "
+                        f"{block} minus anchor). Set num_draft_tokens <= "
+                        f"{block - 1}.")
+            # Recurrent (GDN / SWA) targets carry per-slot past states; speculative decoding
+            # replays verified positions through them and needs one history row per draft
+            # token. Without the reservation the first verify pass fails with an opaque
+            # shape error, so fail loudly at setup instead.
+            if getattr(cache, "recurrent_layers", None) and cache.max_history < self.num_draft_tokens:
+                raise ValueError(
+                    f"Draft model attached but the target cache reserves max_history="
+                    f"{cache.max_history} past states; speculative decoding on recurrent models "
+                    f"needs max_history >= {self.num_draft_tokens} (the number of draft tokens). "
+                    f"Create the cache with max_history=<draft tokens>."
+                )
+            # DFlash2 drafts a fixed block_size-wide block every round; the draft
+            # cache must hold at least one full block or the first round blows a
+            # page. Kept DFlash2-only to avoid changing v1 setup behavior.
+            if draft_model.caps.get("dflash2_draft", False):
+                _dflash2_check_page_budget(
+                    draft_cache.max_num_tokens,
+                    self.pagetable.max_pages,
+                    draft_model.config.block_size,
+                )
         elif ngram_match_min:
             self.num_draft_tokens = num_draft_tokens if num_draft_tokens is not None else 4
         else:
@@ -249,6 +503,9 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+        self.dflash2_draft = self.dflash_draft and self.draft_model.caps.get("dflash2_draft", False)
+        self._dflash2_propose = None
+        self._dflash2_sampling = None
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
@@ -840,13 +1097,48 @@ class Generator:
             "cache": self.draft_cache,
             "cache_seqlens": cache_seqlens,
         }
+        self._dflash2_propose = None
+        self._dflash2_sampling = None
         if self.draft_calibrator is not None:
             params["export_draft_conf"] = True
         out_state = self.draft_model.forward(
             input_ids = batch_ids,
             params = params,
         )
-        new_ids = self.draft_model.sample_from_state(out_state, params)
+        if self.dflash2_draft:
+            # Consensus sampling params across active jobs: the selector walk runs sampled only
+            # when every job uses the same plain temperature/top-k/top-p sampler; otherwise it
+            # falls back to the greedy walk (token-match verify, as DFlash v1).
+            sampling = None
+            for job in self.active_jobs:
+                if not job.is_prefill_done(): continue
+                _dflash2_reject_cfg(job)
+                ps = _dflash2_sampler_params(job.sampler)
+                if ps is None:
+                    sampling = None
+                    break
+                if sampling is None:
+                    sampling = ps
+                elif ps != sampling:
+                    sampling = None
+                    break
+            walk_greedy = sampling is None or sampling[0]
+            temperature = 0.0 if walk_greedy else sampling[1]
+            if not walk_greedy:
+                self._dflash2_sampling = sampling
+            path, candidates, q = self.draft_model.propose(
+                out_state,
+                batch_ids[:, 0],
+                params,
+                temperature,
+            )
+            # Stashed unconditionally; q is None on the greedy walk, in which
+            # case the verify below takes the token-match path (dflash2_q
+            # requires _dflash2_sampling, which is only set for sampled walks).
+            self._dflash2_propose = {"candidates": candidates, "q": q}
+            new_ids = path  # positions 1..block_size-1 already cropped by propose()
+        else:
+            new_ids = self.draft_model.sample_from_state(out_state, params)
 
         # Draft models with a confidence head cap the usable draft length per round;
         # 0 means no draft position cleared the threshold, so skip drafting entirely
@@ -856,8 +1148,12 @@ class Generator:
                 return None
             window = min(window, conf_len)
 
-        # Crop out the first token after sampling to keep batch contiguous for lm_head
-        new_ids = new_ids[:, 1:]
+        # v1 drafters sample the full block; the first (anchor-position) sample is redundant, so
+        # crop it to start the window at the first drafted token. DFlash2's propose() returns
+        # positions 1..block_size-1 directly — cropping again would drop a draft token and shift
+        # the selector's per-position candidates/q out of alignment with the verify loop.
+        if not self.dflash2_draft:
+            new_ids = new_ids[:, 1:]
 
         # Confidence-calibrated truncation: cut the batch window at the first position whose
         # drafter confidence falls below the calibrated threshold, taking the longest cut across
@@ -880,6 +1176,25 @@ class Generator:
 
         self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
         return self.draft_ids_pinned[:, :window]
+
+
+    def _dflash2_accept(self, job, j, i, token_logits, draft_tokens):
+        """
+        One position of the q-aware DFlash2 rejection sampler. Returns
+        (accepted, bonus): accepted with no bonus, or rejected with one bonus token
+        sampled from the normalized (p - q)+ residual distribution. p is the target
+        sampling distribution at position i, q the selector's proposal distribution
+        over its candidate list.
+        """
+        prop = self._dflash2_propose
+        _, temperature, top_k, top_p = self._dflash2_sampling
+        # Python int: exact on any device mix, no implicit CPU-scalar promotion
+        # to rely on (draft_tokens lives on the CPU staging buffer).
+        d = draft_tokens[j, i].item()
+        candidates = prop["candidates"][j, i]
+        q = prop["q"][j, i]
+        return _dflash2_accept_step(
+            token_logits, candidates, q, d, temperature, top_k, top_p)
 
 
     def iterate_ngram_gen(self, results: list):
@@ -1146,11 +1461,64 @@ class Generator:
                 accepted_length = 1
                 rejected = 0
 
+                # DFlash2: the whole round's accept flags are pure functions of
+                # the target logits and the stashed proposal, so precompute
+                # them with one topk/sort/cumsum, one rand launch, one sync.
+                # Only the first-reject bonus stays lazy (it needs the residual
+                # at the reject position). RNG stream changes vs per-position
+                # draws: still exact samples, but fixed-seed text is not
+                # comparable across this change.
+                dflash2_ctx = None
+                if (draft_tokens is not None
+                        and self._dflash2_propose is not None
+                        and self._dflash2_sampling is not None):
+                    prop = self._dflash2_propose
+                    _, temperature, top_k, top_p = self._dflash2_sampling
+                    window = batch_logits.shape[1] - 1
+                    dev = batch_logits.device
+                    qdev = prop["q"].device
+                    d_all = draft_tokens[j, :window].to(dev)
+                    cands = prop["candidates"][j, :window]
+                    q = prop["q"][j, :window]
+                    p_d = _dflash2_batch_pd(
+                        job_logits[:, :window, :], temperature, top_k, top_p, d_all,
+                    ).to(qdev)
+                    d_q = draft_tokens[j, :window].to(qdev)
+                    q_d = (q * (cands == d_q[:, None])).sum(-1)
+                    u = torch.rand(window, device = qdev, dtype = torch.float)
+                    flags = (u * q_d < p_d).tolist()
+                    dflash2_ctx = (flags, cands, q, temperature, top_k, top_p)
+
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]
                     next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
                         token_logits,
                     )
+
+                    # DFlash2 q-aware rejection (sampled samplers only): accept draft token d with
+                    # probability p(d)/q(d); on reject, the committed output is one sample from the
+                    # normalized (p - q)+ residual. Decided before receive_sample so the output
+                    # token is the forced one. Lossless w.r.t. the quantized target model, whose
+                    # lm_head produces both p (here) and q (draft propose).
+                    dflash2_q = (
+                        dflash2_ctx is not None
+                        and i < batch_logits.shape[1] - 1
+                    )
+                    dflash2_reject = False
+                    if dflash2_q:
+                        flags, cands_i, q_i, temperature, top_k, top_p = dflash2_ctx
+                        if flags[i]:
+                            accepted_ = True
+                            next_token = draft_tokens[j, i].reshape(next_token.shape)
+                        else:
+                            bonus = _dflash2_residual_bonus(
+                                token_logits, cands_i[i], q_i[i],
+                                temperature, top_k, top_p,
+                            )
+                            accepted_ = False
+                            next_token = bonus.reshape(next_token.shape)
+                            dflash2_reject = True
+
                     eos, sampled_token, rq = job.receive_sample(
                         token_logits,
                         next_token,
@@ -1205,7 +1573,29 @@ class Generator:
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                        if dflash2_q:
+                            if cp_boundary or dflash2_reject:
+                                rejected = reject_remainder(job, j, i, batch_states)
+                                break
+
+                            # Accept draft token
+                            job.accepted_draft_tokens += 1
+                            accepted_length += 1
+
+                            # Advance filters
+                            for f in job.filters:
+                                if not f.is_active: continue
+                                if f.use_background_worker():
+                                    job.filter_futures.append(self.filter_pool.submit(f.get_next_logit_mask))
+                                else:
+                                    job.logit_masks.append(f.get_next_logit_mask())
+                                    job.filter_futures.append(None)
+
+                            # Update masks and past IDs
+                            job.prepare_logit_mask()
+                            job.prepare_sampling_past_ids()
+
+                        elif draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 
@@ -1409,6 +1799,12 @@ class Generator:
                 self.pending_jobs.remove(job)
                 self.active_jobs.append(job)
                 job.activate()
+
+                # DFlash2 drafts one anchor per job; a CFG/multi-sequence job
+                # would fan out to several batch rows the selector cannot align.
+                # Fail here at job start, not on the first draft round.
+                if self.dflash2_draft:
+                    _dflash2_reject_cfg(job)
 
                 # Allocate pages for job
                 try:

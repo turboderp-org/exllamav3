@@ -1,10 +1,11 @@
 import torch
-from ...cache import CacheLayer, Cache, CacheLayer_quant
+from ...cache import CacheLayer, Cache, CacheLayer_quant, CacheLayer_nvfp4
 from .common import AttnArgs, AttnFn
 from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
 from .triton_paged import (
+    has_triton,
     _qc_staging,
     fn_triton_paged_attn,
     fn_triton_paged_attn_longq,
@@ -32,6 +33,13 @@ _fns_triton_fast: list[AttnFn] = [
 _fns_qc: list[AttnFn] = [
     fn_triton_paged_attn_decode_qc,
     fn_triton_paged_attn_prefill_qc,
+]
+
+# NVFP4 calls carry packed pages + scales; only the nvfp4-aware Triton fns may
+# run them (generic backends would read packed uint8 as fp16)
+_fns_nvfp4: list[AttnFn] = [
+    fn_triton_paged_attn,
+    fn_triton_paged_attn_longq,
 ]
 
 # Quantized caches feed the attention kernels directly (online dequant or prefill staging by
@@ -112,6 +120,8 @@ def attn_dispatch(
     # kernels when possible: new K/V are quantized into the cache up front and never
     # materialized as full fp16 cache-sized temporaries
     q_cache = None
+    nvfp4_written = False
+    k_scales, v_scales = None, None
     if cache is not None:
         assert block_table is not None
         assert cache_seqlens is not None
@@ -127,8 +137,24 @@ def attn_dispatch(
             layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
             q_cache = layer.get_qkv()
             k_cache, v_cache = None, None
+            nvfp4_written = False
+        elif isinstance(layer, CacheLayer_nvfp4):
+            if has_triton and q.dtype == torch.float16 and cu_seqlens is None:
+                # Fast path: raw packed pages + scales straight into the Triton
+                # kernels; new K/V are quantized and appended in-kernel.
+                _k4, _ks, _v4, _vs = layer.get_paged()  # (k4, k_scales, v4, v_scales)
+                k_cache, k_scales, v_cache, v_scales = _k4, _ks, _v4, _vs
+                nvfp4_written = True
+            else:
+                # Slow path (no Triton fast path yet): quantize the new K/V into
+                # pages up front, hand fp16 copies to the generic backends, and
+                # skip the post-hook rewrite below (pages already current).
+                layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
+                k_cache, v_cache = layer.dequant_full()
+                nvfp4_written = True
         else:
             k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, window_size if window_size is not None else -1)
+            nvfp4_written = False
     else:
         k_cache, v_cache = None, None
 
@@ -152,12 +178,20 @@ def attn_dispatch(
         q_cache,
         sinks,
         max_kv_len = max_kv_len,
+        k_scales = k_scales,
+        v_scales = v_scales,
     )
-    # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
+    # NVFP4 calls run only on the nvfp4-aware Triton fns (generic backends would
+    # read packed uint8 pages as fp16). Quant-direct calls select among the
+    # qc-aware backends only; a separate hint slot keeps a function that
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache
     # and would accept them as cache-less)
-    candidates = _fns_qc if q_cache is not None else attn_fns
-    hint_key = "fn_qc" if q_cache is not None else "fn"
+    if k_scales is not None:
+        candidates = _fns_nvfp4
+        hint_key = "fn_nvfp4"
+    else:
+        candidates = _fns_qc if q_cache is not None else attn_fns
+        hint_key = "fn_qc" if q_cache is not None else "fn"
 
     # Retry the backend that matched last time for this caller before scanning the full list.
     # Candidate functions return None on incompatible arguments, so a stale hint self-corrects
@@ -176,8 +210,9 @@ def attn_dispatch(
         if dispatch_cache is not None:
             dispatch_cache[hint_key] = fn
 
-    # Update cache (quant-direct mode already wrote the new K/V before the attention call)
-    if cache is not None and q_cache is None:
+    # Update cache (quant-direct mode already wrote the new K/V before the attention call;
+    # NVFP4 slow path likewise wrote up front and skips the rewrite)
+    if cache is not None and q_cache is None and not nvfp4_written:
         if isinstance(cache, CacheLayer):
             cache.update_kv(cache_seqlens, block_table, k_cache, v_cache, q_len)
         elif isinstance(cache, Cache):

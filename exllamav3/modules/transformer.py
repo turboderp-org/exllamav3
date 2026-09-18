@@ -133,6 +133,21 @@ class TransformerBlock(Module):
             (self.mlp_resid_scalar.numel() if self.mlp_resid_scalar is not None else 0)
         )
 
+    def _pre_attn(self, y, params):
+        # Sublayer wrap points for conv-style architectures (DFlash2Block
+        # runs its grouped dynamic convs here). Default no-ops: v1 behavior
+        # is bit-identical.
+        return y, None
+
+    def _post_attn(self, y, ctx, params):
+        return y
+
+    def _pre_mlp(self, y, params):
+        return y, None
+
+    def _post_mlp(self, y, ctx, params):
+        return y
+
     @override
     def forward(
         self,
@@ -145,6 +160,7 @@ class TransformerBlock(Module):
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
+        _attn_dyn, _mlp_dyn = None, None
 
         if self.attn:
             if self.attn_hc:
@@ -156,9 +172,11 @@ class TransformerBlock(Module):
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
+            y, _attn_dyn = self._pre_attn(y, params)
             y = self.attn.forward(y, params)
             if params.get("prefill") and not export_state:
                 return x
+            y = self._post_attn(y, _attn_dyn, params)
             if self.attn_resid_scalar is not None:
                 y *= self.attn_resid_scalar
             if self.attn_hc:
@@ -184,7 +202,9 @@ class TransformerBlock(Module):
                     y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
                 else:
                     y = x.half()
+            y, _mlp_dyn = self._pre_mlp(y, params)
             y = self.mlp.forward(y, params)
+            y = self._post_mlp(y, _mlp_dyn, params)
             if self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
             if self.mlp_hc:
