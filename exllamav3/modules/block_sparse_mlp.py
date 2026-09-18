@@ -67,6 +67,9 @@ class ExpertsCFG:
 
 # Debug: replicate the router on every TP rank and compare local vs broadcast selections
 _routing_check = os.environ.get("EXL3_TP_ROUTING_CHECK", "0") != "0"
+# Shared expert as a one-expert fused decode launch (see BC_BlockSparseMLP::sh_coop); 0 keeps the
+# three-launch BC_GatedMLP graph
+_moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
 
 # Router types whose selection runs entirely on the deterministic ext paths (routing_gemm.cu +
 # fixed-order top-k with FMA-only activations), so under tensor parallelism every rank can route
@@ -712,6 +715,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 up_bias_ptrs,
                 down_bias_ptrs,
                 act_relu2 = self.activation_fn == "relu2",
+                sh_coop = self.shared_coop_ok(),
             )
 
             # Larger buffers for fused path, if supported. Wide row tiles (32 / 64 rows, separate
@@ -1387,6 +1391,31 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         return t
 
 
+    def shared_coop_ok(self) -> bool:
+        """The shared expert can run as a one-expert fused decode launch: an EXL3 GatedMLP with a
+        single slice, 128-aligned widths and an activation the fused kernels implement, merged
+        without a post-norm at the residual width. Under TP such a shared expert is placed whole
+        on one rank (the fused kernels tile the intermediate width in 128s and a split slice
+        would rarely stay aligned), whose launch is the only one contributing it."""
+        se = self.shared_experts
+        if not _moe_shared_coop or se is None or not isinstance(se, GatedMLP):
+            return False
+        if self.shared_experts_post_norm is not None or self.latent_in is not None or self.alt_residual_channel:
+            return False
+        if len(se.gates) != 1 or len(se.ups) != 1 or len(se.downs) != 1:
+            return False
+        if se.activation_fn not in ("silu", "gelu", "relu2"):
+            return False
+        g, u, d = se.gates[0], se.ups[0], se.downs[0]
+        def quantized(l):
+            if l.quant_type is not None:
+                return l.quant_type == "exl3"
+            return self.config is not None and self.config.stc.has_tensor(f"{l.key}.trellis")
+        if not (quantized(g) and quantized(u) and quantized(d)):
+            return False
+        return g.in_features % 128 == 0 and g.out_features % 128 == 0 and d.out_features % 128 == 0 \
+            and self.hidden_size <= d.out_features
+
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         if self.shared_gate:
@@ -1424,7 +1453,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         )
         tpa_list = [tpa]
         if self.shared_experts:
-            tpa_list += self.shared_experts.make_tp_allocation(options)
+            sh = self.shared_experts.make_tp_allocation(options)
+            if self.shared_coop_ok():
+                for t in sh:
+                    t.max_devices = 1
+            tpa_list += sh
         return tpa_list
 
 
@@ -1539,6 +1572,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         else:
             assert False
 
+        # A shared expert placed whole on one rank (allocation max_devices = 1, see
+        # shared_coop_ok) is absent on the others: its contribution enters the reduction from
+        # the owner alone
+        sh_present = True
+        if exported.get("shared_experts") is not None:
+            sh_key = exported["shared_experts"]["kwargs"]["key"]
+            if sh_key in plan:
+                sh_first, sh_last, _ = plan[sh_key]
+                sh_present = sh_last > sh_first
         module = BlockSparseMLP(
             config = None,
             **exported["kwargs"],
@@ -1546,8 +1588,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             gates = gates,
             ups = ups,
             downs = downs,
-            shared_experts = _import_no_reduce("shared_experts"),
-            shared_gate = _import("shared_gate"),
+            shared_experts = _import_no_reduce("shared_experts") if sh_present else None,
+            shared_gate = _import("shared_gate") if sh_present else None,
             latent_in = _import("latent_in"),
             latent_out = _import("latent_out"),
             routing_gate = _import("routing_gate") if (replicate or device == output_device or _routing_check) else None,

@@ -85,6 +85,16 @@ struct BC_BlockSparseMLP
     MoeCoopParams coop_p;
     int coop_K_gu, coop_K_d, coop_cb;
 
+    // Shared expert as its own one-expert fused launch (at its own bit width) instead of the
+    // three latency-bound GEMV launches of the BC_GatedMLP graph; the routed launch merges its
+    // output (through the sigmoid gate when there is one) exactly as before. Built when enabled
+    // and the shared MLP is EXL3 with 128-aligned widths
+    bool sh_coop = false;
+    MoeCoopParams sh_coop_p;
+    int sh_K_gu = 0, sh_K_d = 0, sh_cb = 0;
+    std::vector<at::Tensor> sh_tables;      // int64 pointer tables (one expert) and scratch, kept alive
+    at::Tensor sh_sel, sh_rw;               // (MAX_BSZN, 1): expert 0, weight 1
+
     int max_experts_per_token;
     int max_tokens_per_expert;
     std::vector<at::Tensor> interm_g_single;
@@ -148,7 +158,8 @@ struct BC_BlockSparseMLP
         c10::optional<at::Tensor> _gate_bias_ptrs,
         c10::optional<at::Tensor> _up_bias_ptrs,
         c10::optional<at::Tensor> _down_bias_ptrs,
-        bool _act_relu2 = false
+        bool _act_relu2 = false,
+        bool _sh_coop = false
     );
 
     void run_bszN

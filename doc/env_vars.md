@@ -51,6 +51,15 @@ MLA counterpart of `EXL3_BC_ATTN`: decode steps (q_len ≤ 16) of an MLA layer r
 graph-captured C++ block (projections, absorb, latent attention, unfold, o_proj). Set to `0` to
 force the eager dispatch path, for A/B testing.
 
+### `EXL3_MOE_SHARED_COOP` (default: `1`)
+
+MoE layers with a shared expert run it, at decode batch sizes, as a one-expert launch of the fused
+expert kernels (at the shared expert's own bit width) instead of the three separate GEMV launches
+of its own graph; the routed launch merges the result as before. Applies to EXL3-quantized gated
+shared experts with 128-aligned widths and no post-norm. Under tensor parallelism such a shared
+expert is placed whole on one rank (its contribution enters the all-reduce from that rank only)
+rather than split across ranks. Set to `0` to keep the separate graph and the tensor split.
+
 ### `EXL3_GR_MIX_TILED` (default: `1`)
 
 Prefill-sized mixes of the Qwen3.8-style gated residual (`GatedResidual`, the low-rank

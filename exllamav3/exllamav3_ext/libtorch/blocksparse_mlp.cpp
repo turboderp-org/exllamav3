@@ -85,7 +85,15 @@ void BC_BlockSparseMLP::run_bszN
     // Shared experts run through their own multi-row graph first (same stream); the kernel adds
     // the result into the routed sum, through the sigmoid gate when there is one
     c10::optional<at::Tensor> sh_o;
-    if (shared_experts)
+    if (sh_coop)
+    {
+        // One-expert fused launch at the shared expert's own bit width (expert 0, weight 1);
+        // the sigmoid gate, if any, is applied by the routed launch when it merges the result
+        at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
+        exl3_moe_coop_run(sh_coop_p, sh_K_gu, sh_K_d, sh_cb, y, sh_sel.slice(0, 0, num_tokens), sh_rw.slice(0, 0, num_tokens), c10::nullopt);
+        sh_o = out_d_sh_n;
+    }
+    else if (shared_experts)
     {
         at::Tensor x_dense = y.unsqueeze(0);
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
@@ -147,7 +155,8 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     c10::optional<at::Tensor> _gate_bias_ptrs,
     c10::optional<at::Tensor> _up_bias_ptrs,
     c10::optional<at::Tensor> _down_bias_ptrs,
-    bool _act_relu2
+    bool _act_relu2,
+    bool _sh_coop
 ) :
         yh2                 (std::move(_yh2)),
         yh                  (std::move(_yh)),
@@ -251,6 +260,72 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         coop_p.max_expert = max_expert;
     }
 
+    // Shared expert fused launch. The shared BC_GatedMLP carries its gate and up either as one
+    // merged pointer table (gu_ptrs_*: [gate, up], the multi-GEMM form) or as separate bound
+    // linears; the down projection is always a bound linear
+    if (_sh_coop && shared_experts && out_d_sh && shared_experts->down && (shared_experts->gu_ptrs_trellis || (shared_experts->gate && shared_experts->up)))
+    {
+        auto& se = shared_experts; auto& d = se->down;
+        auto dev = yh.device();
+        auto lopt = at::TensorOptions().dtype(at::kLong);
+        auto table = [&](const at::Tensor& t) { return at::tensor({(int64_t) t.data_ptr()}, lopt).to(dev); };
+        at::Tensor gt, gs, gv, ut, us, uv;
+        int Kgu, Hi_sh, I_sh; bool mcg_gu, mul1_gu;
+        c10::optional<at::Tensor> gb, ub;
+        if (se->gu_ptrs_trellis)
+        {
+            gt = se->gu_ptrs_trellis->slice(0, 0, 1).contiguous(); ut = se->gu_ptrs_trellis->slice(0, 1, 2).contiguous();
+            gs = se->gu_ptrs_suh->slice(0, 0, 1).contiguous();     us = se->gu_ptrs_suh->slice(0, 1, 2).contiguous();
+            gv = se->gu_ptrs_svh->slice(0, 0, 1).contiguous();     uv = se->gu_ptrs_svh->slice(0, 1, 2).contiguous();
+            Kgu = se->gu_K; mcg_gu = se->gu_mcg; mul1_gu = se->gu_mul1;
+            Hi_sh = (int) se->guh.size(-1); I_sh = (int) se->gu.size(-1);
+        }
+        else
+        {
+            auto& g = se->gate; auto& u = se->up;
+            gt = table(g->trellis); gs = table(g->suh); gv = table(g->svh);
+            ut = table(u->trellis); us = table(u->suh); uv = table(u->svh);
+            Kgu = g->K; mcg_gu = u->mcg; mul1_gu = u->mul1;
+            Hi_sh = (int) g->trellis.size(0) * 16; I_sh = (int) g->trellis.size(1) * 16;
+            if (g->K != u->K || g->mcg != u->mcg || g->mul1 != u->mul1) Kgu = -1;
+            if (g->bias) gb = table(g->bias.value());
+            if (u->bias) ub = table(u->bias.value());
+        }
+        const int Ho_sh = (int) d->trellis.size(1) * 16;
+        const bool ok = Kgu >= 1 && Hi_sh % 128 == 0 && I_sh % 128 == 0 && Ho_sh % 128 == 0 &&
+                        (int) d->trellis.size(0) * 16 == I_sh && mcg_gu == d->mcg && mul1_gu == d->mul1 &&
+                        out_d_sh->size(-1) <= Ho_sh && (int) yh.size(-1) == Hi_sh;
+        if (ok)
+        {
+            at::Tensor dt = table(d->trellis), ds = table(d->suh), dv = table(d->svh);
+            c10::optional<at::Tensor> db;
+            if (d->bias) db = table(d->bias.value());
+            auto hopt = at::TensorOptions().dtype(at::kHalf).device(dev);
+            auto gopt = at::TensorOptions().dtype(interm_g.scalar_type()).device(dev);
+            at::Tensor had_g_sh = at::empty({MAX_BSZN, Hi_sh}, hopt), had_u_sh = at::empty({MAX_BSZN, Hi_sh}, hopt);
+            at::Tensor gu_g_sh = at::empty({MAX_BSZN, I_sh}, gopt), gu_u_sh = at::empty({MAX_BSZN, I_sh}, gopt);
+            at::Tensor act_out_sh = at::empty({MAX_BSZN, I_sh}, hopt);
+            at::Tensor d_out_sh = at::empty({MAX_BSZN, Ho_sh}, at::TensorOptions().dtype(at::kFloat).device(dev));
+            at::Tensor ctr_sh = at::zeros({exl3_moe_coop_ctr_len(MAX_BSZN, MAX_BSZN, I_sh, Ho_sh)}, at::TensorOptions().dtype(at::kInt).device(dev));
+            int act_sh = se->act_gelu ? MOE_COOP_ACT_GELU : se->act_relu2 ? MOE_COOP_ACT_RELU2 : MOE_COOP_ACT_SILU;
+            sh_coop_p = exl3_moe_coop_prepare
+            (
+                Hi_sh, gt, gs, gv, ut, us, uv, dt, ds, dv, gb, ub, db,
+                Kgu, Kgu, d->K, mcg_gu, mul1_gu, act_sh, se->act_limit, true,
+                had_g_sh, had_u_sh, gu_g_sh, gu_u_sh, act_out_sh, d_out_sh, ctr_sh, out_d_sh.value(),
+                c10::nullopt, sh_K_gu, sh_K_d, sh_cb
+            );
+            sh_coop_p.min_expert = -1;
+            sh_coop_p.max_expert = -1;
+            sh_tables = { gt, gs, gv, ut, us, uv, dt, ds, dv, had_g_sh, had_u_sh, gu_g_sh, gu_u_sh, act_out_sh, d_out_sh, ctr_sh };
+            if (gb) sh_tables.push_back(gb.value());
+            if (ub) sh_tables.push_back(ub.value());
+            if (db) sh_tables.push_back(db.value());
+            sh_sel = at::zeros({MAX_BSZN, 1}, lopt.device(dev));
+            sh_rw = at::ones({MAX_BSZN, 1}, hopt);
+            sh_coop = true;
+        }
+    }
     for (int i = 0; i < max_tokens_per_expert; ++i)
     {
         interm_g_single.push_back(interm_g.squeeze(1).slice(0, 0, i + 1));
