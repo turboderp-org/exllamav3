@@ -8,6 +8,36 @@ import triton.language as tl
 from .. import Module, Linear
 from ...model.config import Config
 
+import os
+
+_ext = None
+_ext_probed = False
+# Granular kill-switches (isolation A/B without rebuild):
+# EXL3_DFLASH2_EXT=0 kills all; _NO_CONV / _NO_WALK kill one leaf.
+_ext_allow = {
+    "conv": os.environ.get("EXL3_DFLASH2_NO_CONV", "0") != "1",
+    "walk": os.environ.get("EXL3_DFLASH2_NO_WALK", "0") != "1",
+}
+_ext_hits = {"conv": 0, "walk": 0}
+
+def _get_ext():
+    """Native dflash2 kernels, resolved lazily: module-level import can run
+    while exllamav3.ext is still initializing (circular import -> silent None),
+    so resolve on first use instead."""
+    global _ext, _ext_probed
+    if not _ext_probed:
+        _ext_probed = True
+        if os.environ.get("EXL3_DFLASH2_EXT", "1") != "0":
+            try:
+                from ...ext import exllamav3_ext as mod
+                if all(hasattr(mod, s) for s in (
+                    "dflash2_dynconv", "dflash2_selector_walk", "dflash2_topk",
+                )):
+                    _ext = mod
+            except ImportError:
+                pass
+    return _ext
+
 # ---------------------------------------------------------------------------
 # Pure math, ported from the reference implementation (z-lab/dflash,
 # dflash/model.py, MIT license). The walk/conv functions take plain tensors so
@@ -126,11 +156,29 @@ def _grouped_dynamic_convolve(
     group_size: int,
 ) -> torch.Tensor:
     """
-    Serve-path grouped dynamic conv: the Triton kernel on CUDA, the eager
-    grouped_dynamic_convolve elsewhere. hidden: (batch, length, hidden);
-    dynamic: (batch, length, K, groups); base: (K, hidden). Output dtype
-    follows hidden (the kernel accumulates in fp32).
+    Serve-path grouped dynamic conv: native ext kernel on CUDA when built
+    (ext -> Triton -> eager), the eager grouped_dynamic_convolve elsewhere.
+    hidden: (batch, length, hidden); dynamic: (batch, length, K, groups);
+    base: (K, hidden). Output dtype follows hidden (the kernel accumulates
+    in fp32).
     """
+    _ex = _get_ext() if _ext_allow["conv"] else None
+    if hidden.is_cuda and _ex is not None:
+        assert hidden.is_contiguous() and base.is_contiguous(), \
+            "dflash2 ext dynconv needs contiguous hidden/base"
+        assert hidden.dtype in (torch.half, torch.float), \
+            f"dflash2 ext dynconv: hidden {hidden.dtype}"
+        output = torch.empty_like(hidden)
+        _ext_hits["conv"] += 1
+        if _ext_hits["conv"] == 1:
+            print(f"ext dynconv engaged: hidden {tuple(hidden.shape)} {hidden.dtype}", flush=True)
+        # ext kernel demands half dyn; ours may arrive fp32. Cast here (their
+        # pipeline is half-native) and prove it at the cell level: live counts
+        # must reproduce the Triton run bit-exactly.
+        dyn = dynamic.contiguous().half() if dynamic.dtype != torch.half else dynamic.contiguous()
+        _ex.dflash2_dynconv(hidden, dyn, base.contiguous(), output,
+                             group_size, False)
+        return output
     if not hidden.is_cuda:
         return grouped_dynamic_convolve(hidden, dynamic, base, group_size)
 
@@ -468,6 +516,45 @@ class CandidateSelector(Module):
         proj = self.hidden_projection.forward(hidden, {}, out_dtype = torch.half)
         assert self.predecessor_codebook is not None and self.successor_codebook is not None, \
             "CandidateSelector not loaded"
+        # Native ext walk, greedy only: the sampled path keeps the torch
+        # multinomial stream bit-exact (same seed -> same path). Guards are
+        # asserts, not comments: miss one -> Triton/eager, never half-ext.
+        if (
+            _get_ext() is not None and _ext_allow["walk"]
+            and temperature == 0.0
+            and not return_confidence
+            and hidden.is_cuda
+            and hidden.shape[0] == 1
+            and self.top_k in (8, 16, 32)
+            and logits.dtype in (torch.float32, torch.half)
+            and logits.stride(-1) == 1
+        ):
+            bsz, rows = logits.shape[:2]
+            unary = torch.empty((bsz, rows, self.top_k), dtype = torch.float, device = hidden.device)
+            cands = torch.empty((bsz, rows, self.top_k), dtype = torch.long, device = hidden.device)
+            _get_ext().dflash2_topk(logits, logits.shape[-1], 1.0, 0.0, unary, cands)
+            assert unary.is_contiguous() and cands.is_contiguous(), \
+                "dflash2 ext walk needs contiguous unary/cands"
+            out = torch.empty((bsz, rows + 1), dtype = torch.long, device = hidden.device)
+            anchor = anchor_ids.to(hidden.device).contiguous()
+            assert anchor.dtype == torch.long, "dflash2 ext walk needs long anchor"
+            assert self.predecessor_codebook.is_contiguous() and self.successor_codebook.is_contiguous(), \
+                "dflash2 ext walk needs contiguous codebooks"
+            assert (self.predecessor_codebook.dtype == self.successor_codebook.dtype
+                    and self.predecessor_codebook.dtype in (torch.half, torch.bfloat16)), \
+                "dflash2 ext walk needs fp16/bf16 codebooks"
+            _ext_hits["walk"] += 1
+            if _ext_hits["walk"] == 1:
+                print(f"ext walk engaged: rows {logits.shape[1]} top_k {self.top_k} temp {temperature} conf {return_confidence}", flush=True)
+            _get_ext().dflash2_selector_walk(
+                unary, cands, proj.half().contiguous(),
+                self.predecessor_codebook, self.successor_codebook,
+                anchor, out, None,
+            )
+            # ext layout is [anchor, path...]; our pipeline takes path-only
+            # (selector_select stacks from the first drafted token). Returning
+            # out unstripped shifts every draft by one and collapses tau.
+            return out[:, 1:], cands, None, None
         return selector_select(
             proj,
             logits,

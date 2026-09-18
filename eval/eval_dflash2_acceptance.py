@@ -254,6 +254,9 @@ def main(args):
         total_acc, total_rej, total_out, total_wall = 0, 0, 0, 0.0
         rows = []  # per-tally (acc, rej, out-tokens, wall) for the STEADY line
         prompts = PROMPTS[:args.num_prompts]
+        if getattr(args, "prompt_idxs", None):
+            idxs = [int(i) for i in args.prompt_idxs.split(",")]
+            prompts = [PROMPTS[i] for i in idxs]
         if getattr(args, "mtp", False):
             print(f"tag={cell_tag} draft: in-checkpoint MTP")
         else:
@@ -428,5 +431,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-prompts", type = int, default = 4,
                         help = "Use the first N of PROMPTS (default 4 reproduces the published table; "
                              "more prompts + the STEADY line for methodology upgrades)")
+    parser.add_argument("--prompt-idxs", type = str, default = None,
+                        help = "Comma-separated PROMPTS indices overriding --num-prompts "
+                             "(e.g. prose-only subset)")
     _args = parser.parse_args()
     sys.exit(main(_args))

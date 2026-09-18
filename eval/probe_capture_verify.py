@@ -24,11 +24,17 @@ import torch
 
 
 def capture_verify(model, cache, ids, seqlens, block_table, positions, n_check=20):
+    dev = torch.device("cuda")
+    def static(t):
+        # Capture poisons on any CPU->CUDA copy inside the region
+        # (prepare_for_device/to_device). Everything static lives on CUDA;
+        # replay mutates via device-to-device copy_ only.
+        return t.to(dev).contiguous() if torch.is_tensor(t) else t
     static = {
-        "ids": ids.clone(),
-        "seqlens": seqlens.clone(),
-        "bt": block_table.clone(),
-        "pos": positions.clone(),
+        "ids": static(ids),
+        "seqlens": static(seqlens),
+        "bt": static(block_table),
+        "pos": static(positions),
     }
     params = {
         "attn_mode": "flash_attn",
