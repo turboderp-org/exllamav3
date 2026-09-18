@@ -1011,17 +1011,23 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.latent_in is not None:
             y = self.latent_in.forward(y, params)
 
-        # Broadcast routing indices and weights
-        if self.routing_device is not None:
-            if params.get("tp_warmup"):
-                # Warmup runs without collectives: the ranks without the gate would route on
-                # uninitialized buffers, so every rank takes a random (valid, spread-out)
-                # selection instead, which exercises the expert paths at realistic row counts
-                selected_experts.random_(0, self.num_experts)
-                routing_weights.fill_(1.0 / self.num_experts_per_tok)
-            else:
-                params["backend"].broadcast(selected_experts, src_device = self.routing_device)
-                params["backend"].broadcast(routing_weights, src_device = self.routing_device)
+        if params.get("tp_warmup"):
+            # Warmup runs without collectives on garbage-but-finite streams: every rank takes a
+            # random (valid, spread-out) selection instead of routing, which exercises the
+            # expert paths at realistic row counts (and ranks without a gate have no selection)
+            selected_experts.random_(0, self.num_experts)
+            routing_weights.fill_(1.0 / self.num_experts_per_tok)
+        elif self.routing_device is not None:
+            # Selection made on the routing rank and broadcast (router types not yet on the
+            # deterministic paths, or EXL3_TP_ROUTING_CHECK, which keeps the broadcast so this
+            # rank's own selection can be compared against it)
+            check = _routing_check and self.routing_device != self.device and self.routing_gate is not None
+            if check:
+                local_sel, local_w = selected_experts.clone(), routing_weights.clone()
+            params["backend"].broadcast(selected_experts, src_device = self.routing_device)
+            params["backend"].broadcast(routing_weights, src_device = self.routing_device)
+            if check:
+                _routing_check_compare(self.key, local_sel, local_w, selected_experts, routing_weights)
 
         # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
         # share to the worker now so it computes concurrently with the GPU expert paths below
@@ -1383,14 +1389,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
-        storage += self.routing_gate.storage_size()
         if self.shared_gate:
             storage += self.shared_gate.storage_size()
         for g in self.gates: storage += g.storage_size()
         for u in self.ups: storage += u.storage_size()
         for d in self.downs: storage += d.storage_size()
-        # The latent projections are replicated on every rank
-        storage_d = 0
+        # The latent projections are replicated on every rank, and so is the routing gate (with
+        # its transposed and int8 copies, see block_sparse_mlp_routing._gate_t)
+        storage_d = 3 * self.routing_gate.storage_size()
         if self.latent_in is not None:
             storage_d += self.latent_in.storage_size() + self.latent_out.storage_size()
         # TODO: More precise overhead estimate accounting for gate etc.
@@ -1504,6 +1510,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # gates list so the ctor derives gated = False
         gated = exported.get("gates") is not None
 
+        # Replicated routing: every rank holds the gate and routes for itself (no selection
+        # broadcast); the residual stream is rank-identical by construction of the deterministic
+        # paths, so the selections agree. The check tool keeps the broadcast for comparison
+        replicate = exported["kwargs"]["router_type"] in _replicated_router_types and not _routing_check
+
         # Tensor parallel
         if unit == "channels":
             num_local_experts = exported["kwargs"]["num_experts"]
@@ -1539,10 +1550,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             shared_gate = _import("shared_gate"),
             latent_in = _import("latent_in"),
             latent_out = _import("latent_out"),
-            routing_gate = _import("routing_gate") if device == output_device else None,
+            routing_gate = _import("routing_gate") if (replicate or device == output_device or _routing_check) else None,
             routing_first = routing_first,
             routing_last = routing_last,
-            routing_device = output_device,
+            routing_device = None if replicate else output_device,
             shared_experts_post_norm = _import("shared_experts_post_norm"),
             router_pre_norm = _import("router_pre_norm"),
             routed_pre_norm = _import("routed_pre_norm"),
@@ -1554,7 +1565,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if exported.get("e_score_bias_vl") is not None:
             module.e_score_bias_vl = consumer.recv(exported["e_score_bias_vl"], cuda = True)
         module.per_expert_scale = consumer.recv(exported["per_expert_scale"], cuda = True)
-        if exported.get("tid2eid") is not None and device == output_device:
+        if exported.get("tid2eid") is not None and (replicate or device == output_device):
             module.tid2eid = consumer.recv(exported["tid2eid"], cuda = True)
         if unit == "channels" or num_local_experts > 0:
             module.load_local()
