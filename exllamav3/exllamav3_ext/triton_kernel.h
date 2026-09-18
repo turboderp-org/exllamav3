@@ -25,6 +25,7 @@ struct TritonKernel
     std::string name;
     int num_warps;
     int shared_bytes;
+    int grid_y = 1;     // second launch-grid axis chosen at compile time (sub-tiles), read by the graph launch sites
 
     TritonKernel(py::bytes cubin, std::string name, int num_warps, int shared_bytes);
     ~TritonKernel();

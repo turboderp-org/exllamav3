@@ -263,6 +263,7 @@ class BCAttn:
     def _configure(self, bsz: int, q_len: int, causal: bool, regime: int):
         import triton
         from .triton_paged import (
+            combine_subtiles,
             _paged_attn_decode_split_kernel,
             _paged_attn_decode_combine_kernel,
             _paged_kv_update_kernel,
@@ -315,13 +316,16 @@ class BCAttn:
             "num_splits": "i32", "sinks": "*fp32",
         } | {n: "constexpr" for n in (
             "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD",
-            "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")}
+            "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "ROWS_SUB", "D_SUB")}
+        rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
         consts_c = dict(
             QCV = self.v_bits, HAS_SINKS = self.sinks is not None, q_len = q_len,
             n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
+            ROWS_SUB = rows_sub, D_SUB = d_sub,
         )
         k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
+        k_combine.grid_y = (block_rows // rows_sub) * (hd_pad // d_sub)
 
         k_update = None
         if not self.quant:
@@ -403,7 +407,7 @@ class BCAttn:
         programs = rows * self.num_kv_heads * h_blocks
         block_n = 32
         target = 2 * _get_sm_count(self.device)
-        splits = max(1, min(target // programs, -(-k_pad // (4 * block_n)), 128))
+        splits = max(1, min(target // programs, -(-k_pad // (1 * block_n)), 128))
         per_split = -(-k_pad // splits)
         split_len = -(-per_split // block_n) * block_n
         return k_pad, kp_pool, block_h, h_blocks, programs, block_n, splits, split_len
@@ -422,7 +426,7 @@ class BCAttn:
             _qsa_pool_update_kernel,
             _qsa_sparse_split_kernel,
         )
-        from .triton_paged import _paged_attn_decode_combine_kernel
+        from .triton_paged import _paged_attn_decode_combine_kernel, combine_subtiles
 
         dev = self.device
         idx = self.qsa_idx
@@ -518,19 +522,21 @@ class BCAttn:
                      PAGED = 1, QCK = self.k_bits, QCV = self.v_bits),
                 4, 2)
 
+            sp_rows_sub, sp_d_sub = combine_subtiles(block_h, self.head_dim)
             k_sp_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel,
                 {"partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
                  "num_splits": "i32", "sinks": "*fp32"}
                 | {n: "constexpr" for n in (
                     "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD",
-                    "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")},
+                    "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "ROWS_SUB", "D_SUB")},
                 # q_len 1: the sparse gather treats every query row as a batch (programs =
                 # R * kv_heads * h_blocks), so the combine's output row is the batch index
                 # alone -- compiling the true q_len here would scatter row r to row r * q_len
                 dict(QCV = self.v_bits, HAS_SINKS = False, q_len = 1,
                      n_q_heads = self.num_q_heads, n_kv_heads = self.num_kv_heads,
                      head_dim = self.head_dim, HD_PAD = self.head_dim, BLOCK_M = 1, BLOCK_H = block_h,
-                     BLOCK_ROWS = block_h), 4, 1)
+                     BLOCK_ROWS = block_h, ROWS_SUB = sp_rows_sub, D_SUB = sp_d_sub), 4, 1)
+            k_sp_combine.grid_y = (block_h // sp_rows_sub) * (self.head_dim // sp_d_sub)
 
         self.bc.configure_slot_qsa(
             bsz, q_len, regime,

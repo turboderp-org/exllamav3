@@ -1,4 +1,5 @@
-py::class_<TritonKernel, std::shared_ptr<TritonKernel>>(m, "TritonKernel").def
+py::class_<TritonKernel, std::shared_ptr<TritonKernel>>(m, "TritonKernel")
+    .def_readwrite("grid_y", &TritonKernel::grid_y).def
 (
     py::init<py::bytes, std::string, int, int>(),
     py::arg("cubin"),
