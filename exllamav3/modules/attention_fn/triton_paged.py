@@ -509,7 +509,12 @@ def paged_attn_triton(
     if block_m is None:
         block_m = 16
     if block_dv is None:
-        block_dv = 64 if q_len <= 16 else min(128, head_dim)
+        if nvfp4 and q_len <= 16 and block_table.shape[1] > 128:
+            # Swept on sm_120 serve shapes (wide table, decode q): bigger DV
+            # tiles win (~28% kernel). Narrow/small tables keep default 64.
+            block_dv = 128
+        else:
+            block_dv = 64 if q_len <= 16 else min(128, head_dim)
     for name, value in (("block_m", block_m), ("block_n", block_n), ("block_dv", block_dv)):
         if not _is_power_of_2(value):
             raise ValueError(f"{name} must be a power of two")
