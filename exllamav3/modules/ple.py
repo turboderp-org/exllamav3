@@ -139,6 +139,7 @@ class PLELayer(Module):
         out_dtype: torch.dtype | None = None,
         mm_token_id: int | None = None,
         submodules: dict | None = None,
+        stub: bool = False,
     ):
         super().__init__(config = config, key = key, qmap = None)
         self.hidden_size = hidden_size
@@ -155,6 +156,22 @@ class PLELayer(Module):
         self.gate_scale = 1.0 / math.sqrt(hidden_size)
         self.out_dtype = out_dtype
         hc_hidden = hc_mult * hidden_size
+
+        # TP rank that does not own the layer (allocation max_devices = 1): no submodules, no
+        # recurrent state, no prefetch; its forward only receives the owner's output. Like the
+        # head-less attention stubs it must not carry the recurrent_cache cap, or the worker
+        # would register it as a cache module
+        self.stub = stub
+        self.tp_owner = None
+        if stub:
+            self.ple_embedding = self.key_proj = self.value_proj = None
+            self.norm_key = self.norm_query = self.norm_conv = None
+            self.layer_idx = layer_idx
+            self.layer_state_cls = PLELayerState
+            self.recurrent_layers = []
+            self.tp_recurrent_lookup = {}
+            self.conv_w = None
+            return
 
         # In a TP worker the submodules arrive prebuilt (imported from the parent process)
         def _sub(name, factory):
@@ -243,8 +260,12 @@ class PLELayer(Module):
         return self.key_proj.optimizer_targets() + self.value_proj.optimizer_targets()
 
     # Tensor-parallel: the layer adds to the replicated residual stream stack from the token ids
-    # alone, so every rank runs it whole (like the embedding); nothing is split and nothing is
-    # reduced. The n-gram table stays on disk and each rank streams its own rows
+    # alone, so nothing in it splits. It runs whole on ONE rank (allocation max_devices = 1)
+    # which broadcasts its updated stream stack; the other ranks hold stubs that receive it. That
+    # keeps the stack bit-identical across ranks (the layer's fp16 projections are cuBLAS
+    # matmuls whose kernel choice, and so rounding, depends on the device), and the n-gram hash
+    # and disk gather run once instead of once per rank. The recurrent state lives on the
+    # owner only
     _tp_submodules = ("ple_embedding", "key_proj", "value_proj", "norm_key", "norm_query", "norm_conv")
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
@@ -260,8 +281,12 @@ class PLELayer(Module):
                     + self.ple_embed_dim * torch.half.itemsize)
         return [TPAllocation(
             key = self.key,
-            storage_per_device = storage,
-            overhead_per_device = overhead,
+            channel_width = 1,
+            channel_unit = "layer",
+            storage_to_split = storage,
+            overhead_to_split = overhead,
+            channels_to_split = 1,
+            max_devices = 1,
         )]
 
     def tp_export(self, plan, producer):
@@ -292,9 +317,19 @@ class PLELayer(Module):
     def tp_import(local_context, exported, plan):
         consumer = local_context["consumer"]
         device = local_context["device"]
+        key = exported["kwargs"]["key"]
+        first, last, unit = plan[key]
+        assert unit == "layer" and last - first in (0, 1), \
+            "PLE layers run whole on one device (allocation max_devices = 1)"
+        if last == first:
+            module = PLELayer(config = None, **exported["kwargs"], stub = True)
+            module.device = device
+            module.tp_owner = module.tp_single_owner(local_context, key)
+            return module
         subs = {n: exported[n]["cls"].tp_import(local_context, exported[n], plan) for n in PLELayer._tp_submodules}
         module = PLELayer(config = None, **exported["kwargs"], submodules = subs)
         module.device = device
+        module.tp_owner = module.tp_single_owner(local_context, key)
         module.conv_w = consumer.recv(exported["conv_w"], cuda = True).contiguous()
         for rl in exported["recurrent_layers"]:
             rli = rl["cls"](module, **rl["args"])
@@ -432,6 +467,13 @@ class PLELayer(Module):
         conventions as ShortConv: state window in [:, ..., :width], history writes right-aligned
         for rewind).
         """
+        # TP rank without the layer: receive the owner's updated stack into a copy of the input
+        # (a warmup pass runs without collectives and then merely misses this layer's delta)
+        if self.stub:
+            assert self.tp_owner is not None, "PLE stub without an owner"
+            out = x.clone()
+            self.tp_collect(params["backend"], out, False)
+            return out
         bsz, seq = x.shape[:2]
         ids = params.get("input_ids")
         if ids is None:
@@ -459,4 +501,7 @@ class PLELayer(Module):
                     id_state[s, :ctx].copy_(history[i, -ctx:])
         else:
             delta, _ = self.forward_streams(x, history, params)
-        return x + delta
+        out = x + delta
+        if self.tp_owner is not None:
+            self.tp_collect(params["backend"], out)
+        return out
