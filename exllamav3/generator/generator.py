@@ -387,6 +387,18 @@ class Generator:
                 self.num_draft_tokens = num_draft_tokens
             else:
                 self.num_draft_tokens = draft_model.caps.get("default_draft_size", 4)
+            # DFlash2 propose() returns positions 1..block_size-1 (block_size
+            # minus the anchor). A wider window overruns the draft_ids buffer
+            # with an opaque shape error deep in the round, so fail loudly at
+            # setup instead (found via a serving crash at window 8/block 8).
+            if draft_model.caps.get("dflash2_draft", False):
+                block = draft_model.config.block_size
+                if self.num_draft_tokens > block - 1:
+                    raise ValueError(
+                        f"DFlash2 draft window is {self.num_draft_tokens} but "
+                        f"propose() yields {block - 1} positions (block_size "
+                        f"{block} minus anchor). Set num_draft_tokens <= "
+                        f"{block - 1}.")
             # Recurrent (GDN / SWA) targets carry per-slot past states; speculative decoding
             # replays verified positions through them and needs one history row per draft
             # token. Without the reservation the first verify pass fails with an opaque
