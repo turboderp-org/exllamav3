@@ -64,6 +64,20 @@ class TestGrMixTiled(unittest.TestCase):
                 else:
                     self.assertIsNone(post)
 
+    def test_fused_decode_matches_reference(self):
+        # The fused decode pair (R <= FUSED_MAX_R) on the Qwen3.8 shape and a larger one
+        for D, rank in ((2560, 320), (4096, 512), (1024, 320)):
+            m = make_site(D, rank, True)
+            for R in (1, 2, 5, 8):
+                torch.manual_seed(R)
+                x = torch.randn(1, R, 4, D, device = DEVICE) * 3.0
+                ref_post, ref_mixed = m._mix_ref(x)
+                post, mixed = m._mix(x, cached = False)
+                self.assertLess(rel(mixed, ref_mixed.view(R, D)), 3e-3, (D, rank, R))
+                self.assertLess(rel(post, ref_post.view(R, 4)), 1e-3, (D, rank, R))
+                post2, mixed2 = m._mix(x, cached = False)
+                self.assertTrue(torch.equal(mixed, mixed2) and torch.equal(post, post2))
+
     def test_tiled_is_deterministic(self):
         m = make_site(1024, 320, True)
         for R in (100, 2048):

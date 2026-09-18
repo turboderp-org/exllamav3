@@ -248,7 +248,7 @@ class GatedResidual(Module):
     {key}.input_mix_weight_up.weight and, for the site form, {key}.block_inject_weight.weight.
     """
 
-    FUSED_MAX_R = 32
+    FUSED_MAX_R = 8             # the fused decode pair; beyond this the tiled int8 path is cheaper (flat ~37 us on a PRO 6000 vs 53 us fused at 16 rows)
 
     def __init__(
         self,
