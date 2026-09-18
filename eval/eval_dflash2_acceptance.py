@@ -122,7 +122,8 @@ def main(args):
     # window, update_kv closes it), so prefill is excluded.
     phase = {}
     if args.profile:
-        assert draft_model is not None, "--profile needs a draft model"
+        # Draft-gated wrappers (verify/propose/accept) attach only when a draft
+        # is present; prefill/TTFT timing is draft-independent and always valid.
 
         def _wrap_gpu(obj, name, key):
             fn = getattr(obj, name)
@@ -141,62 +142,65 @@ def main(args):
 
             setattr(obj, name, wrapped)
 
-        _wrap_gpu(draft_model, "forward", "draft_us")
+        _wrap_gpu(model, "prefill", "prefill_us")
 
-        propose_fn = draft_model.propose
-        kv_fn = draft_model.update_kv_from_target
-        verify_fn = model.forward
+        if draft_model is not None:
+            _wrap_gpu(draft_model, "forward", "draft_us")
 
-        def wrapped_propose(*a, **k):
-            e0 = torch.cuda.Event(enable_timing = True)
-            e1 = torch.cuda.Event(enable_timing = True)
-            e0.record()
-            try:
-                return propose_fn(*a, **k)
-            finally:
-                e1.record()
-                e1.synchronize()
-                phase["select_us"] = phase.get("select_us", 0.0) + e0.elapsed_time(e1) * 1000.0
-                phase["select_us_n"] = phase.get("select_us_n", 0) + 1
-                phase["_active"] = True
+            propose_fn = draft_model.propose
+            kv_fn = draft_model.update_kv_from_target
+            verify_fn = model.forward
 
-        def wrapped_kv(*a, **k):
-            try:
-                return kv_fn(*a, **k)
-            finally:
-                phase["_active"] = False
+            def wrapped_propose(*a, **k):
+                e0 = torch.cuda.Event(enable_timing = True)
+                e1 = torch.cuda.Event(enable_timing = True)
+                e0.record()
+                try:
+                    return propose_fn(*a, **k)
+                finally:
+                    e1.record()
+                    e1.synchronize()
+                    phase["select_us"] = phase.get("select_us", 0.0) + e0.elapsed_time(e1) * 1000.0
+                    phase["select_us_n"] = phase.get("select_us_n", 0) + 1
+                    phase["_active"] = True
 
-        def wrapped_verify(*a, **k):
-            if not phase.get("_active"):
-                return verify_fn(*a, **k)
-            e0 = torch.cuda.Event(enable_timing = True)
-            e1 = torch.cuda.Event(enable_timing = True)
-            e0.record()
-            try:
-                return verify_fn(*a, **k)
-            finally:
-                e1.record()
-                e1.synchronize()
-                phase["verify_us"] = phase.get("verify_us", 0.0) + e0.elapsed_time(e1) * 1000.0
-                phase["verify_us_n"] = phase.get("verify_us_n", 0) + 1
+            def wrapped_kv(*a, **k):
+                try:
+                    return kv_fn(*a, **k)
+                finally:
+                    phase["_active"] = False
 
-        draft_model.propose = wrapped_propose
-        draft_model.update_kv_from_target = wrapped_kv
-        model.forward = wrapped_verify
+            def wrapped_verify(*a, **k):
+                if not phase.get("_active"):
+                    return verify_fn(*a, **k)
+                e0 = torch.cuda.Event(enable_timing = True)
+                e1 = torch.cuda.Event(enable_timing = True)
+                e0.record()
+                try:
+                    return verify_fn(*a, **k)
+                finally:
+                    e1.record()
+                    e1.synchronize()
+                    phase["verify_us"] = phase.get("verify_us", 0.0) + e0.elapsed_time(e1) * 1000.0
+                    phase["verify_us_n"] = phase.get("verify_us_n", 0) + 1
 
-        accept_fn = generator._dflash2_accept
+            draft_model.propose = wrapped_propose
+            draft_model.update_kv_from_target = wrapped_kv
+            model.forward = wrapped_verify
 
-        def wrapped_accept(*a, **k):
-            t0 = time.perf_counter()
-            try:
-                return accept_fn(*a, **k)
-            finally:
-                # sync-inclusive wall time (the accept path syncs by design)
-                phase["accept_us"] = phase.get("accept_us", 0.0) + (time.perf_counter() - t0) * 1e6
-                phase["accept_us_n"] = phase.get("accept_us_n", 0) + 1
+            accept_fn = generator._dflash2_accept
 
-        # instance attribute shadows the class method for this process only
-        generator._dflash2_accept = wrapped_accept
+            def wrapped_accept(*a, **k):
+                t0 = time.perf_counter()
+                try:
+                    return accept_fn(*a, **k)
+                finally:
+                    # sync-inclusive wall time (the accept path syncs by design)
+                    phase["accept_us"] = phase.get("accept_us", 0.0) + (time.perf_counter() - t0) * 1e6
+                    phase["accept_us_n"] = phase.get("accept_us_n", 0) + 1
+
+            # instance attribute shadows the class method for this process only
+            generator._dflash2_accept = wrapped_accept
 
     sampler = model_init.get_arg_sampler(args)
 
