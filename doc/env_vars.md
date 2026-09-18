@@ -51,6 +51,18 @@ MLA counterpart of `EXL3_BC_ATTN`: decode steps (q_len ≤ 16) of an MLA layer r
 graph-captured C++ block (projections, absorb, latent attention, unfold, o_proj). Set to `0` to
 force the eager dispatch path, for A/B testing.
 
+### `EXL3_GR_MIX_TILED` (default: `1`)
+
+Prefill-sized mixes of the Qwen3.8-style gated residual (`GatedResidual`, the low-rank
+hyper-connection) run a tiled CUDA kernel whose GEMMs use exact int8 tensor-core accumulation with
+a fixed fp32 combination, so the result is bit-identical on every GPU architecture and
+tensor-parallel ranks compute identical streams (a prerequisite for replicating decisions such as
+MoE routing across ranks instead of broadcasting them). Precision matches the fp16 path and it is
+faster than the cuBLAS path it replaces. Set to `0` to fall back to the cuBLAS GEMM path
+(device-dependent kernel choice, not rank-consistent). Decode-sized mixes use the fused `gr_mix`
+kernel either way. The same int8 scheme covers the MoE router projection for batched rows
+(`routing_gemm.cu`), which has no switch.
+
 ### `EXL3_BC_GDN` (default: `1`)
 
 Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL3_BC_ATTN`:
@@ -622,6 +634,23 @@ bounce, no probing. Set to `0`: always copy directly, no probing.
 
 Rendezvous address and port for the tensor-parallel backend. The port defaults to a free port
 picked at startup.
+
+### `EXL3_TP_ROUTING_CHECK` (default: `0`)
+
+Debug for expert-parallel MoE layers. Routing is normally replicated: every rank holds the router
+and selects experts for itself on the rank-identical residual stream (the deterministic int8 GEMM
+and mix kernels make the streams bit-identical across ranks and architectures), which saves two
+broadcasts per MoE layer per token. With this set, the layers fall back to routing on the output
+rank and broadcasting the selection, while every other rank also routes locally and compares its
+top-k selection and weights with the broadcast one; the mismatch counts (split by row class:
+single-row, other decode-sized, prefill) are printed at exit. Any mismatch means the streams or
+the router differ between ranks, so this is the acceptance test for changes to replicated paths.
+
+### `EXL3_TP_STREAM_HASH` (default: `0`)
+
+Debug: set to N to print a digest of the residual stream after every module on every rank for
+the first N real forward passes (warmup passes excluded), to locate where ranks stop agreeing
+bit for bit.
 
 ### `EXL3_TP_NO_FWD_BARRIER` (default: `1`)
 

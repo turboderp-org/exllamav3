@@ -1172,7 +1172,8 @@ def main(args, job_state):
             try:
                 module.load(
                     torch.device("cpu") if module.caps.get("prefer_cpu") else device,
-                    load_slice = current_slice if slicing else None
+                    load_slice = current_slice if slicing else None,
+                    keep_source_weights = True
                 )
             finally:
                 if defer:
@@ -1321,7 +1322,8 @@ def main(args, job_state):
         config.stc.set_new_tensors(q_tensors)
         module.load(
             torch.device("cpu") if module.caps.get("prefer_cpu") else device,
-            source = q_tensors
+            source = q_tensors,
+            keep_source_weights = True
         )
         advance_replicas = None
         if state is not None and parallel_calib and not module.caps.get("prefer_cpu"):
@@ -1442,7 +1444,8 @@ def main(args, job_state):
             if defer:
                 module.config.stc.begin_deferred_load()
             try:
-                module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
+                module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device,
+                            keep_source_weights = True)
             finally:
                 if defer:
                     module.config.stc.end_deferred_load()

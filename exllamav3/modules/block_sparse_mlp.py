@@ -65,6 +65,49 @@ class ExpertsCFG:
     out_bszn: torch.Tensor | None = None   # (MAX_BSZN, H) fp32 routed sum of the bsz<=MAX_BSZN path
 
 
+# Debug: replicate the router on every TP rank and compare local vs broadcast selections
+_routing_check = os.environ.get("EXL3_TP_ROUTING_CHECK", "0") != "0"
+
+# Router types whose selection runs entirely on the deterministic ext paths (routing_gemm.cu +
+# fixed-order top-k with FMA-only activations), so under tensor parallelism every rank can route
+# for itself on the (rank-identical) residual stream instead of receiving the selection by
+# broadcast from the output rank: two collectives per MoE layer per token fewer. Every router in
+# use is on those paths; the grouped DS3 router (n_group > 1, not supported by any loadable
+# architecture) is still torch-composed and would keep the broadcast
+_replicated_router_types = ("std", "std_bias", "dots", "sqrtsp", "sqrtsp_hash")
+_routing_check_stats = {}
+
+def _routing_check_compare(key, local_sel, local_w, sel, w):
+    import atexit
+    # Stats split by row-count class: single-row calls (fixed-order routing GEMV), other
+    # decode-sized calls (<= 32 rows: fused mix path upstream, hgemm routing logits) and
+    # prefill-sized calls (tiled mix path, hgemm routing logits)
+    R = sel.shape[0]
+    key = (key, "bsz1" if R == 1 else "decode" if R <= 32 else "prefill")
+    st = _routing_check_stats.get(key)
+    if st is None:
+        st = _routing_check_stats[key] = {"rows": 0, "sel_mismatch": 0, "w_maxdiff": 0.0, "calls": 0}
+        if len(_routing_check_stats) == 1:
+            def report():
+                for cls in ("bsz1", "decode", "prefill"):
+                    vs = [v for k, v in _routing_check_stats.items() if k[1] == cls]
+                    if not vs: continue
+                    rows = sum(v["rows"] for v in vs); mism = sum(v["sel_mismatch"] for v in vs)
+                    wmax = max(v["w_maxdiff"] for v in vs)
+                    print(f" -- routing-check (pid {os.getpid()}) [{cls}]: {rows} rows over {len(vs)} layers, "
+                          f"selection mismatches {mism} ({mism / max(rows, 1) * 100:.4f}%), max weight diff {wmax:.3e}", flush = True)
+            atexit.register(report)
+    ls = torch.sort(local_sel, dim = 1).values; bs = torch.sort(sel, dim = 1).values
+    same = (ls == bs).all(dim = 1)
+    st["rows"] += sel.shape[0]; st["calls"] += 1
+    st["sel_mismatch"] += int((~same).sum().item())
+    if same.any():
+        # weights compared in the sorted-expert order on agreeing rows
+        lw = torch.gather(local_w, 1, torch.sort(local_sel, dim = 1).indices)[same]
+        bw = torch.gather(w, 1, torch.sort(sel, dim = 1).indices)[same]
+        st["w_maxdiff"] = max(st["w_maxdiff"], float((lw.float() - bw.float()).abs().max().item()))
+
+
 class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     def __init__(

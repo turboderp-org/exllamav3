@@ -14,6 +14,7 @@ from ..tokenizer.mm_embedding import recv_embeddings
 from ..util import log_tp, set_t0
 
 _no_fwd_barrier = os.environ.get("EXL3_TP_NO_FWD_BARRIER", "1") != "0"
+_stream_hash_passes = int(os.environ.get("EXL3_TP_STREAM_HASH", "0") or "0")
 
 
 from ..util.misc import install_parent_death_signal
@@ -258,6 +259,12 @@ def mp_model_forward(
             if module.caps.get("prefetch_ids"):
                 module.prefetch(x, params)
 
+    # EXL3_TP_STREAM_HASH: print a digest of the residual stream after every module on every rank
+    # for the first forward passes, to locate where ranks stop agreeing bit for bit (debug)
+    stream_hash = _stream_hash_passes > 0 and not warmup and local_context.get("_hash_passes", 0) < _stream_hash_passes
+    if stream_hash:
+        local_context["_hash_passes"] = local_context.get("_hash_passes", 0) + 1
+
     for idx, module in enumerate(modules):
         logits_layer = module.caps.get("logits_output")
         if logits_layer and (num := params.get("last_tokens_only")):
@@ -266,6 +273,10 @@ def mp_model_forward(
             params["prefill"] = (idx == last_kv_module_idx)
         x = module.prepare_for_device(x, params)
         x = module.forward(x, params)
+        if stream_hash and x is not None:
+            import hashlib
+            h = hashlib.sha1(x.detach().contiguous().cpu().numpy().tobytes()).hexdigest()[:12]
+            print(f"stream-hash dev={local_context['device']} pass={local_context['_hash_passes']} {idx:3d} {module.key:<44} {h} {tuple(x.shape)} {x.dtype}", flush = True)
         if prefill and idx == last_kv_module_idx:
             backend.end_cpu_reduce_jobs()
             del params["prefill"]
