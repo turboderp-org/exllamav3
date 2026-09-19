@@ -11,8 +11,10 @@
 /*
 
 Deterministic router projection: scores (R, E) half = hidden (R, K) half @ gate^T with the int8
-Ozaki-style scheme of det_gemm.cuh, so every tensor-parallel rank of ANY architecture that
-routes on identical streams produces identical logits and top-k selections. cuBLAS picks
+Ozaki-style scheme of det_gemm.cuh, so every tensor-parallel rank of any sm_80+ architecture
+that routes on identical streams produces identical logits and top-k selections (the int8
+kernels need cp.async and mma.m16n8k32, both sm_80+; pre-Ampere devices take the cuBLAS
+path, which is device-dependent but uniform within a fleet of one arch). cuBLAS picks
 split-K kernels for this skinny shape (E of 64..512, K of thousands) with a device-dependent
 split factor, and fp16 tensor cores accumulate differently per architecture.
 
