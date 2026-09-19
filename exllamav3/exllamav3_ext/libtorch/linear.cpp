@@ -109,7 +109,7 @@ std::pair<at::Tensor, at::Tensor> BC_LinearEXL3::run_alloc_pair
     bool eligible =
         cc < 8 &&
         x.numel() == x.size(-1) &&            // m == 1 (GEMV shape)
-        K == other.K &&
+        K == other.K && K == 3 &&  // dual kernel instantiated for bits=3 only (DSV4 3bpw); other bitrates fall back to two forwards
         mcg == other.mcg && mul1 == other.mul1 &&
         !bias && !other.bias &&
         suh.defined() && svh.defined() && xh.defined() &&
