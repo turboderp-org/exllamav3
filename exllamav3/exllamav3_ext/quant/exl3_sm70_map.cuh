@@ -90,7 +90,7 @@ __device__ __forceinline__ void mma_m8n8k4_rc_f32(
     const uint32_t b0, const uint32_t b1,   // B fragment (2 .f16x2)
     float* d)                               // 8 f32 accumulators
 {
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 800)
     asm volatile
     (
         "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
