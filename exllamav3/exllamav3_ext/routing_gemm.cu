@@ -5,7 +5,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
 #include "util.cuh"
-#include "quant/exl3_devctx.cuh"
 #include "det_gemm.cuh"
 
 /*
@@ -252,7 +251,12 @@ bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, 
     // The deterministic int8 kernels use cp.async and mma.m16n8k32 s8 —
     // sm_80+ instructions — and need 97 KB dynamic smem (over the 96 KB
     // pre-Ampere limit). Ampere+ only; cuBLAS serves the other arches.
-    if (g_get_cc_raw(hidden.get_device()) < 8) return false;
+    // The deterministic int8 kernels need cp.async and mma.m16n8k32 s8 — both
+    // sm_80+ — and 97 KB dynamic smem, over the 96 KB pre-Ampere ceiling
+    int cc_major = 0;
+    cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor,
+                           hidden.get_device());
+    if (cc_major < 8) return false;
     return K % 16 == 0 && gate_i8.dim() == 3 && gate_i8.size(0) == 2 && gate_i8.size(2) == K && gate_sb.numel() == gate_i8.size(1);
 }
 
