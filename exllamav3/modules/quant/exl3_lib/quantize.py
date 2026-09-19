@@ -963,6 +963,18 @@ def pack_signs(signs: torch.Tensor, quant_args: dict) -> torch.Tensor:
     return packed
 
 
+# LDLQ error feedback inflates the tiles the quantizer actually sees relative to the regularized
+# weight (accumulated compensation grows along the recursion). Mean stream RMS over the recursion
+# relative to the first block, measured on Qwen3-8B (q/up/down, layer 10): K=1 1.06-1.10, 1.5
+# 1.03-1.05, 2 1.01-1.02, 2.5 ~1.01, 3 ~1.005, >= 4 ~1.0. The global scale search runs on the
+# pre-feedback weight, so its sample tiles are inflated by the expected drift and the scale it
+# picks lands the recursion's mean input at the codebook's operating point
+LDLQ_DRIFT = {1: 1.08, 1.5: 1.035, 2: 1.018, 2.5: 1.009, 3: 1.004}
+
+def ldlq_drift(K) -> float:
+    return LDLQ_DRIFT.get(float(K), 1.0)
+
+
 def sample_scale_tiles(weight_r: torch.Tensor, width: int = 3) -> torch.Tensor:
     """
     Sample tiles for the global scale search: a wrapped diagonal, guaranteeing every tile row and column is
@@ -1074,6 +1086,7 @@ def g_scale_gss(
     # TODO: Figure out why Torch always initializes cuda:0 when exiting this CM, even when it's not used
     with torch.cuda.stream(main_stream):
         tiles = sample_scale_tiles(weight_r, width)
+        tiles *= ldlq_drift(quant_args["K"])
         if pb:
             pb.update(50)
         best_scale, best_mse = g_scale_search_batch([tiles], quant_args)[0]
