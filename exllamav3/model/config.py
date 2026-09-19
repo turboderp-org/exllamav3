@@ -59,16 +59,18 @@ class InferParams:
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
-        # sm_70: the fused MGEMM has no K > 4 kernel (the block-pipelined
-        # kernels are sm_80+), so the sliced bundle would silently produce
-        # garbage. Unfuse — the separate Linears route to reconstruct+hgemm.
+        # sm_70 and older: the fused MGEMM kernels use cp.async and
+        # mma.m16n8k16 — sm_80+ instructions — so their compute stages are
+        # arch-guarded no-ops below sm_80 and a launch would silently
+        # produce zeros. Refuse every bundle below Ampere; the separate
+        # Linears route to the sm70 GEMV/reconstruct paths instead.
         if device is not None:
             import torch
             device_t = torch.device(device)
             if device_t.type == "cuda":
                 try:
                     from ..ext import exllamav3_ext as ext
-                    if ext.g_get_cc(device_t.index) < 8 and K > 4:
+                    if ext.g_get_cc(device_t.index) < 8:
                         return False
                 except Exception:
                     pass
