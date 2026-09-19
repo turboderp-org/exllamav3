@@ -13,6 +13,11 @@ from exllamav3.util.file import disk_lru_cache
 from exllamav3.util.measures import compute_kl_div
 from exllamav3.util.tensor import g_tensor_cache
 from exllamav3.modules.linear import Linear
+from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
+from exllamav3.modules.mlp import GatedMLP
+from exllamav3.modules.attn import Attention
+from exllamav3.modules.sliding_attn import SlidingAttention
+from exllamav3.modules.gated_delta_net import GatedDeltaNet
 from exllamav3.modules.quant.fp16 import LinearFP16
 from exllamav3.modules.quant.exl3_lib.quantize import finalize_capture_H, get_hadamard_dt, had_k
 from datasets import load_dataset
@@ -56,7 +61,12 @@ The largest module plus Hessian/noise workspace must still fit on the device.
 Not validated on MoE models.
 """
 
-# TODO: Validate on MoE models
+# TODO: Validate the grouped MoE measurement real MoE models
+# TODO: Streaming throughput: pending states go to pageable host memory after every module and
+#       rows run one (1, L) forward at a time; pinned/asynchronous state buffers and batching the
+#       pending rows into one forward per module would remove most of the transfer cost (tens of
+#       TB of round trips on a 70B measurement)
+# TODO: Rethink
 
 
 class ModuleRunner:
@@ -173,6 +183,71 @@ def plan_fanout_passes(measurements_by_idx, state_bytes, budget):
         passes.append(current)
     return passes
 
+class Target:
+    """One measurement target: a single quantizable Linear, or every routed-expert Linear of one
+    MoE layer perturbed together. A layer's experts are measured (and later quantized) as one
+    unit: sc_optimize then assigns them one bitrate, which keeps the fused MoE kernels on a
+    single K instead of the mixed-K fallback, and it keeps the fan-out at a handful of targets
+    per layer instead of hundreds."""
+
+    def __init__(self, key, linears, qbits_key):
+        self.key = key
+        self.linears = linears
+        self.qbits_key = qbits_key
+        self.members = [lin.key for lin in linears]
+
+    @property
+    def grouped(self):
+        return len(self.linears) > 1
+
+    def weights_numel(self):
+        return sum(lin.weights_numel() for lin in self.linears)
+
+
+def collect_targets(mod):
+    """Targets under one top-level module: the routed experts of each BlockSparseMLP as one
+    grouped target (its routing gate and latent projections stay individual); the gate and up
+    projections of each GatedMLP (dense MLPs and MoE shared experts alike) as one grouped target,
+    since the fused gate/up GEMM and the shared-expert path of the MoE kernels need them at one
+    bitrate; the q/k/v (+ full quantized gate) projections of each attention module and the
+    qkv/z projections of each GatedDeltaNet, which the sliced mgemm bundles run as one launch at
+    one K; every other quantizable Linear on its own."""
+    targets = []
+    grouped_ids = set()
+
+    def group(m, name, linears):
+        linears = [lin for lin in linears if lin is not None and lin.qmap is not None and id(lin) not in grouped_ids]
+        if len(linears) > 1:
+            targets.append(Target(f"{m.key}.{name}", linears, linears[0].qbits_key))
+            grouped_ids.update(id(lin) for lin in linears)
+
+    def walk(m):
+        if isinstance(m, (Attention, SlidingAttention)):
+            qkv = [m.q_proj, m.k_proj] + ([] if getattr(m, "use_k_as_v", False) else [m.v_proj])
+            # A full quantized gate rides along in the bundle; an interleaved gate is part of
+            # q_proj already and a headwise gate is fp16
+            if getattr(m, "g_proj", None) is not None and getattr(m, "full_gate", False) \
+                    and not getattr(m, "interleaved_gate", False):
+                qkv.append(m.g_proj)
+            group(m, "qkv", qkv)
+        elif isinstance(m, GatedDeltaNet):
+            group(m, "qkvz", [getattr(m, "qkv_proj", None), getattr(m, "z_proj", None)])
+        if isinstance(m, BlockSparseMLP):
+            experts = [lin for lin in (m.gates + m.ups + m.downs) if lin is not None and lin.qmap is not None]
+            if experts:
+                targets.append(Target(f"{m.key}.experts", experts, experts[0].qbits_key))
+                grouped_ids.update(id(lin) for lin in experts)
+        elif isinstance(m, GatedMLP):
+            group(m, "gate_up", m.gates + m.ups)
+        if isinstance(m, Linear) and m.qmap is not None and id(m) not in grouped_ids:
+            targets.append(Target(m.key, [m], m.qbits_key))
+        for ch in getattr(m, "modules", []):
+            walk(ch)
+
+    walk(mod)
+    return targets
+
+
 @disk_lru_cache("get_dataset_text")
 def get_dataset_text(spec: dict):
     assert spec["dataset"] == "wiki2", "Only wiki2 implemented atm"
@@ -237,16 +312,23 @@ def main(args):
         # Packed self-sampled trace from sc_trace.py: in-distribution for the model,
         # and the same data the quantizer can calibrate on (convert.py --cal_data)
         from safetensors.torch import load_file
-        packed = load_file(args.trace)["input_ids"]
+        data = load_file(args.trace)
+        packed = data["input_ids"]
+        lengths = data.get("lengths")     # per-row lengths (each row one example from position 0)
         assert packed.shape[0] >= total_rows, \
             f"trace has {packed.shape[0]} rows, need {total_rows} (rows + h_rows)"
-        assert packed.shape[1] >= args.length, \
+        assert lengths is not None or packed.shape[1] >= args.length, \
             f"trace rows are {packed.shape[1]} tokens, need {args.length}"
-        ids = packed[:total_rows, :args.length]
+        # Every row starts at its own position 0 (BOS, system prompt, whole turns) and is truncated
+        # to --length; a row shorter than that keeps its own length rather than being padded or
+        # continued into the next example
+        ids = [packed[i : i + 1, : (args.length if lengths is None else min(args.length, int(lengths[i])))]
+               for i in range(total_rows)]
+        assert all(r.shape[1] > 0 for r in ids), "trace contains an empty row"
     else:
-        ids = get_test_tokens(tokenizer, total_rows, args.length)
-    rows = list(ids[:args.rows].split(1))
-    cap_states = list(ids[args.rows:].split(1)) if args.shaped else None
+        ids = list(get_test_tokens(tokenizer, total_rows, args.length).split(1))
+    rows = ids[:args.rows]
+    cap_states = ids[args.rows:] if args.shaped else None
 
     mods = model.modules
     num_mods = len(mods)
@@ -323,26 +405,25 @@ def main(args):
             logits.append(x.half().cpu())
         return boundary, logits
 
-    # Collect perturbation targets: every quantizable Linear, grouped by top-level module
-    def walk(mod, out):
-        out.append(mod)
-        for ch in getattr(mod, "modules", []):
-            walk(ch, out)
-
+    # Collect perturbation targets by top-level module: every quantizable Linear, with each MoE
+    # layer's routed experts as one grouped target
     targets_by_idx = defaultdict(list)
     num_targets = 0
+    num_grouped = 0
     for i in range(num_mods):
-        tree = []
-        walk(mods[i], tree)
-        for t in tree:
-            if isinstance(t, Linear) and t.qmap is not None:
-                if not streaming:
-                    assert isinstance(t.inner, LinearFP16), \
-                        f"{t.key}: expected unquantized (fp16) tensor, got {type(t.inner).__name__}"
-                targets_by_idx[i].append(t)
-                num_targets += 1
+        for t in collect_targets(mods[i]):
+            if not streaming:
+                for lin in t.linears:
+                    assert isinstance(lin.inner, LinearFP16), \
+                        f"{lin.key}: expected unquantized (fp16) tensor, got {type(lin.inner).__name__}"
+            targets_by_idx[i].append(t)
+            num_targets += 1
+            num_grouped += t.grouped
+    if num_grouped:
+        print(f" -- {num_grouped} grouped target(s): MoE routed experts per layer, gate/up of dense MLPs and "
+              f"shared experts, attention q/k/v(/g), GDN qkv/z")
 
-    expected_keys = {lin.key for targets in targets_by_idx.values() for lin in targets}
+    expected_keys = {t.key for targets in targets_by_idx.values() for t in targets}
 
     # Per-target noise levels
     if args.rfn_ref:
@@ -350,14 +431,23 @@ def main(args):
             ref_data = json.load(f)
         ref_rfn = {r["key"]: r["rfn"] for r in ref_data["results"]}
         scales = [float(s) for s in args.rfn_scale.split(",")]
-        missing = [t.key for tl in targets_by_idx.values() for t in tl if t.key not in ref_rfn]
+        missing = [m for tl in targets_by_idx.values() for t in tl for m in t.members if m not in ref_rfn]
         assert not missing, f"keys missing from {args.rfn_ref}: {missing[:5]}..."
-        levels = {key: [ref_rfn[key] * s for s in scales] for key in ref_rfn}
+        # Per-member anchors: each expert of a grouped target keeps its own measured error level
+        member_levels = {key: [ref_rfn[key] * s for s in scales] for key in ref_rfn}
         num_levels = len(scales)
     else:
         rfns = [float(s) for s in args.rfn.split(",")]
-        levels = defaultdict(lambda: rfns)
+        member_levels = defaultdict(lambda: rfns)
         num_levels = len(rfns)
+
+    def target_rfn(target, li):
+        """Nominal level of a target: its members' levels, numel-weighted rms for the record"""
+        per = [member_levels[m][li] for m in target.members]
+        if not target.grouped:
+            return per[0], per
+        w = [lin.weights_numel() for lin in target.linears]
+        return math.sqrt(sum(wi * r * r for wi, r in zip(w, per)) / sum(w)), per
 
     # Resume from partial output
     results = []
@@ -488,6 +578,42 @@ def main(args):
             err_sq += (w[a:b].float() - saved[a:b].float()).square().sum().item()
         return saved, (err_sq / w_sq) ** 0.5, w_sq ** 0.5
 
+    SAVED_ON_HOST_BYTES = 1 << 30      # grouped targets park their saved weights in host RAM past this
+
+    @torch.inference_mode()
+    def perturb_target(target, li, draw, shaping):
+        """Perturb every member of a target at its own level (seeded per member, so single-Linear
+        targets reproduce the ungrouped seeds). Returns (saved list, realized rfn over the whole
+        target, ||W|| over the whole target, all members shaped)."""
+        _, per = target_rfn(target, li)
+        total_bytes = sum(lin.inner.weight.numel() * lin.inner.weight.element_size() for lin in target.linears)
+        to_host = target.grouped and total_bytes > SAVED_ON_HOST_BYTES
+        saved, err_sq, w_sq, shaped_all = [], 0.0, 0.0, True
+        for lin, rfn in zip(target.linears, per):
+            seed = zlib.crc32(f"{lin.key}|{li}|{draw}".encode()) & 0x7fffffff
+            shape_lin = shaping.get(lin.qmap) if args.shaped else None
+            if shape_lin is not None:
+                factors = tuple(t.to(lin.inner.weight.device) for t in shape_lin)
+                sv, rfn_actual, w_norm = perturb_shaped(lin, rfn, seed, *factors)
+                del factors
+            else:
+                shaped_all = False
+                sv, rfn_actual, w_norm = perturb_iid(lin, rfn, seed)
+            if to_host:
+                sv = sv.to("cpu", copy = True)
+            saved.append(sv)
+            err_sq += (rfn_actual * w_norm) ** 2
+            w_sq += w_norm ** 2
+        if not target.grouped:
+            return saved, rfn_actual, w_norm, shaped_all      # bit-identical to the ungrouped record
+        return saved, (err_sq / w_sq) ** 0.5, w_sq ** 0.5, shaped_all
+
+    @torch.inference_mode()
+    def restore_target(target, saved):
+        for lin, sv in zip(target.linears, saved):
+            lin.inner.weight.copy_(sv)
+        saved.clear()
+
     @torch.inference_mode()
     def advance_capture(top_idx, capture):
         """Advance the capture rows through module top_idx, accumulating H per qmap if capture
@@ -526,20 +652,24 @@ def main(args):
             del H, H_diag, L, su, h_data
         return shaping
 
-    def measurement_plan(lin):
-        """(level index, rfn, draw, seed) for every measurement on one tensor"""
-        return [(li, rfn, draw, zlib.crc32(f"{lin.key}|{li}|{draw}".encode()) & 0x7fffffff)
-                for li, rfn in enumerate(levels[lin.key]) for draw in range(args.draws)]
+    def measurement_plan(target):
+        """(level index, nominal rfn, draw) for every measurement on one target"""
+        return [(li, target_rfn(target, li)[0], draw)
+                for li in range(num_levels) for draw in range(args.draws)]
 
-    def new_result(top_idx, lin, shaped):
-        return dict(
+    def new_result(top_idx, target):
+        res = dict(
             idx = top_idx,
-            key = lin.key,
-            qbits_key = lin.qbits_key,
-            numel = lin.weights_numel(),
-            shaped = shaped,
+            key = target.key,
+            qbits_key = target.qbits_key,
+            numel = target.weights_numel(),
+            shaped = None,
             levels = [],
         )
+        if target.grouped:
+            # sc_optimize expands the group's bitrate to every member key in the recipe
+            res["members"] = list(target.members)
+        return res
 
     def injected_rfn(states, top_idx):
         """Injected error at the top-level module output, relative to the clean state"""
@@ -572,11 +702,11 @@ def main(args):
 
     if streaming:
         # Load each module once per pass, advancing pending states and spawning new perturbed states
-        todo_by_idx = {idx: [lin for lin in targets_by_idx[idx] if lin.key not in done]
+        todo_by_idx = {idx: [t for t in targets_by_idx[idx] if t.key not in done]
                        for idx in sorted(targets_by_idx)}
-        todo_by_idx = {idx: lins for idx, lins in todo_by_idx.items() if lins}
-        measurements_by_idx = {idx: 1 + sum(len(measurement_plan(lin)) for lin in lins)
-                              for idx, lins in todo_by_idx.items()}
+        todo_by_idx = {idx: ts for idx, ts in todo_by_idx.items() if ts}
+        measurements_by_idx = {idx: 1 + sum(len(measurement_plan(t)) for t in ts)
+                              for idx, ts in todo_by_idx.items()}
         state_bytes = max((sum(t.numel() * t.element_size() for t in states)
                            for states in boundary[1:]), default = 0)
         budget = sysmem_budget(args.max_sys)
@@ -632,31 +762,25 @@ def main(args):
                         states, kld = run(boundary[idx])
                         pending.append(dict(control = idx, states = states, kld = kld))
 
-                    for lin in spawn:
-                        assert isinstance(lin.inner, LinearFP16), \
-                            f"{lin.key}: expected unquantized (fp16) tensor, got {type(lin.inner).__name__}"
-                        shape_lin = shaping.get(lin.qmap) if args.shaped else None
-                        factors = None if shape_lin is None else \
-                            tuple(t.to(lin.inner.weight.device) for t in shape_lin)
-                        res = new_result(idx, lin, shape_lin is not None)
-                        for li, rfn, draw, seed in measurement_plan(lin):
-                            if factors is not None:
-                                saved, rfn_actual, w_norm = perturb_shaped(lin, rfn, seed, *factors)
-                            else:
-                                saved, rfn_actual, w_norm = perturb_iid(lin, rfn, seed)
+                    for target in spawn:
+                        for lin in target.linears:
+                            assert isinstance(lin.inner, LinearFP16), \
+                                f"{lin.key}: expected unquantized (fp16) tensor, got {type(lin.inner).__name__}"
+                        res = new_result(idx, target)
+                        for li, rfn, draw in measurement_plan(target):
+                            saved, rfn_actual, w_norm, shaped_all = perturb_target(target, li, draw, shaping)
+                            res["shaped"] = shaped_all
                             try:
                                 states, kld = run(boundary[idx])
                             finally:
                                 # Restore before unloading, which discards lin.inner
-                                lin.inner.weight.copy_(saved)
-                                del saved
+                                restore_target(target, saved)
                             pending.append(dict(
                                 res = res, rfn = rfn, rfn_actual = rfn_actual, draw = draw,
                                 w_norm = w_norm, inj_rfn = injected_rfn(states, idx),
                                 states = states, kld = kld,
                             ))
                         pass_results.append(res)
-                        del factors
                     for v in shaping.values():
                         del v
                     shaping.clear()
@@ -677,7 +801,7 @@ def main(args):
         for top_idx in range(num_mods):
             if top_idx > max(targets_by_idx, default=-1):
                 break
-            todo = [lin for lin in targets_by_idx.get(top_idx, []) if lin.key not in done]
+            todo = [t for t in targets_by_idx.get(top_idx, []) if t.key not in done]
 
             # Advance the capture rows through every module; accumulate H only where needed
             shaping = {}
@@ -695,20 +819,16 @@ def main(args):
                 kld, _ = forward_rows(top_idx, boundary[top_idx])
                 check_control(top_idx, kld)
 
-            for lin in todo:
-                shape_lin = shaping.get(lin.qmap) if args.shaped else None
-                res = new_result(top_idx, lin, shape_lin is not None)
-                for li, rfn, draw, seed in measurement_plan(lin):
-                    if shape_lin is not None:
-                        saved, rfn_actual, w_norm = perturb_shaped(lin, rfn, seed, *shape_lin)
-                    else:
-                        saved, rfn_actual, w_norm = perturb_iid(lin, rfn, seed)
+            for target in todo:
+                res = new_result(top_idx, target)
+                for li, rfn, draw in measurement_plan(target):
+                    saved, rfn_actual, w_norm, shaped_all = perturb_target(target, li, draw, shaping)
+                    res["shaped"] = shaped_all
                     try:
                         kld, states = forward_rows(top_idx, boundary[top_idx],
                                                    collect_states = top_idx + 1 < num_mods)
                     finally:
-                        lin.inner.weight.copy_(saved)
-                        del saved
+                        restore_target(target, saved)
                     record(res, rfn, rfn_actual, draw, kld, injected_rfn(states, top_idx), w_norm)
                     del states
 
@@ -718,7 +838,6 @@ def main(args):
             for v in shaping.values():
                 del v
             shaping.clear()
-            shape_lin = None
             torch.cuda.empty_cache()
 
     # Summary
