@@ -1262,6 +1262,75 @@ def regularize(
     return apply_out_scales, weight, g_scale, su, sv
 
 
+def unrotate_H(H_rot: torch.Tensor, su_signs: torch.Tensor) -> torch.Tensor:
+    """Undo finalize_capture_H's input transform on the (damped) Hessian: H_rot = P (S H S) P^T with
+    the blockwise 128-Hadamard P (its own inverse) and the sign flips S"""
+    H = H_rot.float().clone()
+    blockwise_preapply_had_r_(H, had_k)
+    blockwise_preapply_had_l_(H, had_k)
+    s = su_signs.flatten().sign().float().to(H.device)
+    H *= s.unsqueeze(0)
+    H *= s.unsqueeze(1)
+    return H
+
+
+def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, su: torch.Tensor, sv: torch.Tensor,
+                 rounds: int = 2, chunk: int = 16384):
+    """
+    Free post-quantization polish: refit the stored per-channel fp16 scales (suh on the input side, svh on
+    the output side) to the quantized weight in the Hessian metric, holding the trellis fixed. With
+    W, Q (k, n) in the original basis: per output column c_n = (q_n^T H w_n) / (q_n^T H q_n) (closed form);
+    per input row r solves ((Q Q^T) o H) r = rowsum(Q o (H W)); alternated. Returns the rescaled weight_q
+    and the proxy error before / after (trace(E H E^T) / trace(W H W^T)).
+    """
+    dev = weight_q.device
+    H = H.to(dev)
+    W = weight if weight.device == dev else None      # large originals may sit on the CPU; stream columns
+    def cols(x, a, b):
+        return (x[:, a:b] if x.device == dev else x[:, a:b].to(dev)).float()
+    k, n = weight_q.shape
+    Q = weight_q
+    su = su.float().to(dev).view(k, 1)
+    sv = sv.float().to(dev).view(1, n)
+    # H W once (streamed over columns), reused by both steps; den = trace(W H W^T)
+    HW = torch.empty((k, n), dtype = torch.float, device = dev)
+    den = 0.0
+    for a in range(0, n, chunk):
+        b = min(a + chunk, n)
+        wc = cols(weight, a, b)
+        HW[:, a:b] = H @ wc
+        den += (wc * HW[:, a:b]).sum().item()
+    def err(Qx):
+        e = 0.0
+        for a in range(0, n, chunk):
+            b = min(a + chunk, n)
+            E = cols(weight, a, b) - Qx[:, a:b]
+            e += (E * (H @ E)).sum().item()
+        return e / max(den, 1e-30)
+    e_before = err(Q)
+    for _ in range(rounds):
+        # output-side scales
+        num = torch.zeros(n, device = dev); dn = torch.zeros(n, device = dev)
+        for a in range(0, n, chunk):
+            b = min(a + chunk, n)
+            HQ = H @ Q[:, a:b]
+            num[a:b] = (Q[:, a:b] * HW[:, a:b]).sum(0)
+            dn[a:b] = (Q[:, a:b] * HQ).sum(0)
+        c = torch.where(dn > 1e-30, num / dn.clamp(min = 1e-30), torch.ones_like(num))
+        Q = Q * c.view(1, n)
+        sv = sv * c.view(1, n)
+        # input-side scales
+        A = (Q @ Q.T) * H
+        b_ = (Q * HW).sum(1)
+        A.diagonal().add_(1e-6 * A.diagonal().mean())
+        r = torch.linalg.solve(A, b_)
+        r = torch.where(torch.isfinite(r) & (r > 0), r, torch.ones_like(r))
+        Q = Q * r.view(k, 1)
+        su = su * r.view(k, 1)
+    e_after = err(Q)
+    return Q, su, sv, e_before, e_after
+
+
 def quantize_exl3(
     weight: torch.Tensor,
     H_data: dict,
@@ -1344,6 +1413,8 @@ def quantize_exl3(
 
         if verbose:
             weight_copy = weight.cpu()
+        # The post-LDLQ scale refit compares against the original weight (regularize works in place)
+        weight_orig = weight.clone() if weight.numel() <= 5e8 else weight.cpu()
         weight_r = weight
         del weight
 
@@ -1414,17 +1485,27 @@ def quantize_exl3(
 
         # free_mem()
 
-        if return_weight_q or verbose:
-            weight_q = weight_q.to(device)
-            weight_q = preapply_had_l(weight_q, had_k)
-            weight_q *= su
-            weight_q = preapply_had_r(weight_q, had_n)
-            weight_q *= sv
+        weight_q = weight_q.to(device)
+        weight_q = preapply_had_l(weight_q, had_k)
+        weight_q *= su
+        weight_q = preapply_had_r(weight_q, had_n)
+        weight_q *= sv
 
+        # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
+        if not q_fallback and H is not None and not quant_args.get("no_refit"):
+            H_orig = unrotate_H(H, H_data["su"])
+            weight_q, su_f, sv_f, e_before, e_after = refit_scales(weight_orig, weight_q, H_orig, su, sv)
+            del H_orig
+            su = su_f.view(-1, 1).to(su.dtype)
+            sv = sv_f.view(1, -1).to(sv.dtype)
             if verbose:
-                weight = weight_copy.to(device)
-                nmse = block_nmse(weight_q, weight)
-                print(f"     - quant nmse: {nmse:.6f}")
+                print(f"     - scale refit: proxy err {e_before:.6f} -> {e_after:.6f} ({100 * (1 - e_after / max(e_before, 1e-30)):.2f}%)")
+        del weight_orig
+
+        if verbose:
+            weight = weight_copy.to(device)
+            nmse = block_nmse(weight_q, weight)
+            print(f"     - quant nmse: {nmse:.6f}")
 
         # Compile packed tensor
         suh = su.flatten().contiguous().to(dtype = torch.half, copy = True)
@@ -1595,6 +1676,7 @@ def quantize_exl3_batch(
         stager = _WeightStager(device)
         stager.prefetch(batch_idx[0], weights[batch_idx[0]])
         regs = {}
+        origs = {}
         for bi, t in enumerate(batch_idx):
             qa = quant_args_list[t]
             if "seed" in qa:
@@ -1608,12 +1690,14 @@ def quantize_exl3_batch(
             if H_diag is not None and H_diag.is_cuda:
                 H_diag = H_diag.to(device)
             sv = (torch.randn(weight.shape[1], device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
+            # Original kept for the post-LDLQ scale refit (regularize works in place)
+            origs[t] = weight.clone() if weight.numel() <= 5e7 else weight.cpu()
             apply_out_scales, weight_r, _, su, sv = regularize(
                 weight, su, sv, qa, verbose, H_diag, None, skip_g_scale = True)
             regs[t] = [weight_r, su, sv, apply_out_scales]
             weights[t] = None
 
-        samples = [sample_scale_tiles(regs[t][0]) for t in batch_idx]
+        samples = [sample_scale_tiles(regs[t][0]) * ldlq_drift(qa0["K"]) for t in batch_idx]
         scales = g_scale_search_batch(samples, qa0)
         del samples
         g_scales = {}
@@ -1682,6 +1766,22 @@ def quantize_exl3_batch(
                 E = None
                 proxy_err = -1.0
             weight_rs[bi] = None
+
+            # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
+            if not qa.get("no_refit"):
+                wq = weight_qs[bi].to(device)
+                wq = preapply_had_l(wq, had_k)
+                wq *= su
+                wq = preapply_had_r(wq, had_n)
+                wq *= sv
+                H_orig = unrotate_H(Hd, H_datas[t]["su"])
+                _, su_f, sv_f, e_before, e_after = refit_scales(origs[t], wq, H_orig, su, sv)
+                del wq, H_orig
+                su = su_f.view(-1, 1).to(su.dtype)
+                sv = sv_f.view(1, -1).to(sv.dtype)
+                if verbose:
+                    print(f"     - scale refit: proxy err {e_before:.6f} -> {e_after:.6f} ({100 * (1 - e_after / max(e_before, 1e-30)):.2f}%)")
+            origs[t] = None
             weight_qs[bi] = None
 
             suh = su.flatten().contiguous().to(dtype = torch.half, copy = True)
