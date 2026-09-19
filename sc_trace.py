@@ -729,21 +729,26 @@ def main(args):
     print(f" -- {len(rows)} trace rows, {total_in:,} context + {total_out:,} response tokens "
           f"-> {args.output}")
 
-    # Packed calibration rows: each trace row's exact model-visible stream (templated context +
-    # sampled response), row order shuffled for mixing, concatenated and sliced to fixed width
+    # Packed calibration rows: one row per trace row, its exact model-visible stream (templated
+    # context + sampled response) from position 0, truncated to cal_cols and right-padded, with
+    # the true lengths alongside. Rows are never sliced out of a concatenated stream: instruction
+    # models (Gemma4-it) need every row to start with BOS + system prompt + whole turns, and a
+    # window cut mid-conversation makes them wildly unstable. Row order shuffled for mixing
     cal_out = args.cal_out or os.path.splitext(args.output)[0] + ".safetensors"
     order = list(range(len(rows)))
     random.Random(args.seed).shuffle(order)
-    stream = []
-    for i in order:
-        stream += rows[i]["input_ids"] + rows[i]["response_ids"]
-    n_rows = len(stream) // args.cal_cols
-    if args.cal_rows and n_rows > args.cal_rows:
-        n_rows = args.cal_rows
-    packed = torch.tensor(stream[:n_rows * args.cal_cols], dtype = torch.long)
-    packed = packed.view(n_rows, args.cal_cols)
-    save_file({"input_ids": packed}, cal_out)
-    print(f" -- {n_rows} calibration rows x {args.cal_cols} tokens -> {cal_out}")
+    if args.cal_rows and len(order) > args.cal_rows:
+        order = order[:args.cal_rows]
+    n_rows = len(order)
+    packed = torch.zeros((n_rows, args.cal_cols), dtype = torch.long)
+    lengths = torch.zeros((n_rows,), dtype = torch.long)
+    for r, i in enumerate(order):
+        ids = (rows[i]["input_ids"] + rows[i]["response_ids"])[:args.cal_cols]
+        packed[r, :len(ids)] = torch.tensor(ids, dtype = torch.long)
+        lengths[r] = len(ids)
+    save_file({"input_ids": packed, "lengths": lengths}, cal_out)
+    print(f" -- {n_rows} calibration rows x up to {args.cal_cols} tokens (mean {lengths.float().mean():.0f}, "
+          f"{int((lengths == args.cal_cols).sum())} truncated) -> {cal_out}")
 
 
 if __name__ == "__main__":
