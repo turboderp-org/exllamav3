@@ -5,6 +5,7 @@ from ...util.device_copy import to_device
 from ...model.config import Config
 from ...modules import Module, Linear, RMSNorm
 from ...util.tensor import get_for_device, to2
+from ...model.model_tp_fn import mp_model_forward_embedding
 
 """
 MTP input layer for Qwen3.8-Flash-Next.
@@ -150,8 +151,12 @@ class Qwen4ExpMTPInputLayer(Module):
             * self.norm_hidden_w
         h = self.fc_hidden.forward(normed.half().contiguous(), params)         # (b, s, H, D)
 
-        # Token embedding via the attached model
-        emb = self.attached_model().modules[0].forward(x, params, out_dtype = torch.half)
+        # Token embedding via the attached model (in the TP output worker when the target is TP)
+        if not self.attached_model().loaded_tp:
+            emb = self.attached_model().modules[0].forward(x, params, out_dtype = torch.half)
+        else:
+            emb = self.attached_model().tp_producer.send(x)
+            emb = self.attached_model().tp_dispatch_master(mp_model_forward_embedding, (emb, params)).half()
         emb = self.pre_fc_norm_embedding.forward(to_device(emb, self.device), params)
         emb = self.fc_embedding.forward(emb, params)                           # (b, s, D)
 

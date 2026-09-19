@@ -9,11 +9,12 @@ from collections import deque
 from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
-from .model_tp_backend import TPBackendNCCL, TPBackendNative
+from .model_tp_backend import TPBackendNCCL, TPBackendNative, TPBackendNull
 from ..tokenizer.mm_embedding import recv_embeddings
 from ..util import log_tp, set_t0
 
 _no_fwd_barrier = os.environ.get("EXL3_TP_NO_FWD_BARRIER", "1") != "0"
+_stream_hash_passes = int(os.environ.get("EXL3_TP_STREAM_HASH", "0") or "0")
 
 
 from ..util.misc import install_parent_death_signal
@@ -218,11 +219,13 @@ def mp_model_forward(
     """
     Forward pass for parallel slice of a model
     """
-    backend = local_context["backend"]
+    # Warmup passes (Model.warmup) run every rank independently with collectives stubbed out
+    warmup = bool(params.get("tp_warmup"))
+    backend = TPBackendNull() if warmup else local_context["backend"]
     # The pass-start barrier aligns all rank streams before the first collective. The collectives
     # are individually ordered by their stage counters, so this is not required for correctness;
     # EXL3_TP_NO_FWD_BARRIER=1 skips it (experimental) to save one spin kernel per rank per pass
-    if not _no_fwd_barrier:
+    if not _no_fwd_barrier and not warmup:
         backend.fwd_barrier()
 
     modules = local_context["modules"] if single_idx is None else [local_context["modules"][single_idx]]
@@ -249,6 +252,19 @@ def mp_model_forward(
 
     x = consumer.recv(shared_input)
 
+    # Modules that stage input-dependent data on a worker thread (PLE n-gram rows) go first, as
+    # in the layer-split forward, so the gather overlaps the leading blocks
+    if x.dtype == torch.long and single_idx is None:
+        for module in modules:
+            if module.caps.get("prefetch_ids"):
+                module.prefetch(x, params)
+
+    # EXL3_TP_STREAM_HASH: print a digest of the residual stream after every module on every rank
+    # for the first forward passes, to locate where ranks stop agreeing bit for bit (debug)
+    stream_hash = _stream_hash_passes > 0 and not warmup and local_context.get("_hash_passes", 0) < _stream_hash_passes
+    if stream_hash:
+        local_context["_hash_passes"] = local_context.get("_hash_passes", 0) + 1
+
     for idx, module in enumerate(modules):
         logits_layer = module.caps.get("logits_output")
         if logits_layer and (num := params.get("last_tokens_only")):
@@ -257,6 +273,10 @@ def mp_model_forward(
             params["prefill"] = (idx == last_kv_module_idx)
         x = module.prepare_for_device(x, params)
         x = module.forward(x, params)
+        if stream_hash and x is not None:
+            import hashlib
+            h = hashlib.sha1(x.detach().contiguous().cpu().numpy().tobytes()).hexdigest()[:12]
+            print(f"stream-hash dev={local_context['device']} pass={local_context['_hash_passes']} {idx:3d} {module.key:<44} {h} {tuple(x.shape)} {x.dtype}", flush = True)
         if prefill and idx == last_kv_module_idx:
             backend.end_cpu_reduce_jobs()
             del params["prefill"]

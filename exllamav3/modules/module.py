@@ -81,6 +81,38 @@ class Module(ABC):
         for module in self.modules:
             module.unload()
 
+    # Tensor-parallel collectives. tp_reduce (set per module by tp_import) marks a module whose
+    # forward ends with a collective over its per-rank partial outputs. tp_owner is the one rank
+    # that holds the WHOLE module when the allocator placed it that way (max_devices = 1, or a
+    # plan that happened to give every channel to one device): the other ranks then hold stubs
+    # contributing zeros, and the collective is a byte-exact broadcast from the owner instead of
+    # a sum through the reduce wire (which rounds fp32 outputs to bf16 on the native backend)
+    tp_owner: int | None = None
+
+    def tp_collect(self, backend, x: torch.Tensor, contribution: bool = True):
+        if self.tp_owner is not None:
+            backend.broadcast(x, self.tp_owner)
+        else:
+            backend.all_reduce(x, contribution)
+
+    @staticmethod
+    def tp_single_owner(local_context: dict, *keys: str) -> int | None:
+        """
+        The single rank whose plan slice is non-empty for every one of keys, or None when the
+        module is split across ranks (or its parts are owned by different ranks)
+        """
+        plan = local_context.get("plan")
+        devices = local_context.get("active_devices")
+        if plan is None or devices is None:
+            return None
+        owner = None
+        for key in keys:
+            owners = [d for d in devices if key in plan[d] and plan[d][key][1] > plan[d][key][0]]
+            if len(owners) != 1 or (owner is not None and owners[0] != owner):
+                return None
+            owner = owners[0]
+        return owner
+
     def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
         if x.device != self.device:
             # Pinned CPU sources (e.g. the generator's staged input IDs) upload without

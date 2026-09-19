@@ -102,21 +102,29 @@ def get_default_calibration(args, tokenizer):
 def get_file_calibration(args, tokenizer):
     """
     Calibration rows from a packed token file (safetensors with an "input_ids" tensor of shape
-    (rows, cols)), e.g. a self-sampled in-domain trace from sc_trace.py. The file must have been
-    produced with the same tokenizer/model family; rows/cols are cropped to the requested
-    calibration size.
+    (rows, cols) and, from sc_trace.py, a "lengths" tensor: each row is one example from position
+    0, right-padded), e.g. a self-sampled in-domain trace. The file must have been produced with
+    the same tokenizer/model family. Rows are cropped to the requested calibration width; with
+    lengths present a row keeps its own (shorter) length, so a chat example is never cut mid-turn
+    and never continued into the padding. Files without lengths are read as full-width rows.
     """
     from safetensors.torch import load_file
-    packed = load_file(args["cal_data"])["input_ids"]
+    data = load_file(args["cal_data"])
+    packed = data["input_ids"]
+    lengths = data.get("lengths")
     rows, columns = args["cal_rows"], args["cal_cols"]
-    if packed.shape[0] < rows or packed.shape[1] < columns:
-        raise ValueError(
-            f"Calibration file {args['cal_data']} is {packed.shape[0]} rows x {packed.shape[1]} "
-            f"tokens, need {rows} x {columns}"
-        )
+    if packed.shape[0] < rows:
+        print(f" !! Calibration file contains {packed.shape[0]} rows, less than cal_rows ({rows})")
+        rows = args["cal_rows"] = packed.shape[0]
     if packed.max().item() >= tokenizer.actual_vocab_size:
         raise ValueError(
             f"Calibration file {args['cal_data']} contains token ids outside the model's vocab; "
             f"was it produced with a different tokenizer?"
         )
-    return [packed[i : i + 1, :columns].to(torch.long).contiguous() for i in range(rows)]
+    out = []
+    for i in range(rows):
+        n = columns if lengths is None else min(columns, int(lengths[i]))
+        if n < 1:
+            raise ValueError(f"Calibration file {args['cal_data']}: row {i} is empty")
+        out.append(packed[i : i + 1, :n].to(torch.long).contiguous())
+    return out

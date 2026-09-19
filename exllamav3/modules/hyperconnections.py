@@ -7,6 +7,12 @@ from .rmsnorm import RMSNorm
 from ..model.config import Config
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
+import os
+import math
+
+# Prefill-sized GatedResidual mixes run the tiled deterministic kernel (rank-consistent under
+# TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
+_gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
 
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
@@ -227,18 +233,22 @@ class GatedResidual(Module):
     with comb = None. Final-mixer form (use_combine = False, HF hyper_connection_mixer): a
     standalone module whose forward() collapses the stack.
 
-    Two compute paths sharing the hc_mix.cu machinery: small R (decode) runs the fused
-    ext.gr_mix pair (per-stream partial dots on the raw streams + a finalize that derives the
-    low-rank gate inline), large R (prefill) runs half GEMMs + a few elementwise ops where
-    launch count amortizes and tensor cores carry the FLOPs. apply_() is ext.hc_apply without
-    a comb (x[h] += post[h] * y), shared with mHC. _mix_ref() keeps the fp32 torch reference
-    the parity tests compare against.
+    Three compute paths: small R (decode) runs the fused ext.gr_mix pair (per-stream partial
+    dots on the raw streams + a finalize that derives the low-rank gate inline); large R
+    (prefill) runs the tiled ext.gr_mix_tiled kernels (hc_mix_tiled.cu: int8 tensor-core
+    tiles over the row stack with exact integer accumulation and a fixed fp32 combination, so
+    replicated TP ranks of ANY architecture produce identical streams and any replicated
+    decision downstream agrees),
+    or, where the shape does not fit that kernel or EXL3_GR_MIX_TILED=0, half cuBLAS GEMMs +
+    a few elementwise ops. apply_() is ext.hc_apply without a comb (x[h] += post[h] * y),
+    shared with mHC. _mix_ref() keeps the fp32 torch reference the parity tests compare
+    against.
 
     Tensors: {key}.hc_norm.weight, {key}.input_mix_weight_down.weight,
     {key}.input_mix_weight_up.weight and, for the site form, {key}.block_inject_weight.weight.
     """
 
-    FUSED_MAX_R = 32
+    FUSED_MAX_R = 8             # the fused decode pair; beyond this the tiled int8 path is cheaper (flat ~37 us on a PRO 6000 vs 53 us fused at 16 rows)
 
     def __init__(
         self,
@@ -263,12 +273,22 @@ class GatedResidual(Module):
         self.up_h = None            # (hc_mult * hidden, rank) half, checkpoint orientation
         self.upx_h = None           # (hc_mult, hidden / 4, rank, 4) half (fused-kernel layout)
         self.inject_h = None        # (hc_mult, hc_mult * hidden) half (site form)
-        self.proj_h = None          # cat(down, inject) half, unfolded (GEMM path)
+        self.proj_h = None          # cat(down, inject) half, unfolded, zero-padded to a multiple
+                                    # of 64 rows for the tiled path (GEMM paths use [:proj_m])
+        self.proj_m = 0             # rows of proj_h in use: rank (+ hc_mult in the site form)
         self.fn_h = None            # cat(down, inject) * w half, folded (fused path)
         self.rank = 0
+        self.tiled = False          # prefill mixes take the tiled deterministic kernel
+        self.proj_i8 = None         # (2, Mpad, hc_mult * hidden) int8 hi/lo slices (tiled path)
+        self.proj_sb = None         # (Mpad) fp32 row scales
+        self.up_i8 = None           # (2, hc_mult * hidden, rank) int8
+        self.up_sb = None           # (hc_mult * hidden) fp32
 
     @override
-    def load(self, device: torch.device, **kwargs):
+    def load(self, device: torch.device, keep_source_weights: bool = False, **kwargs):
+        """keep_source_weights: keep the fp16 projection tables after the kernel-layout copies
+        are built. Conversion needs them (get_tensors exports the original weights); inference
+        does not, and they are a third copy of 1.3 GB on Qwen3.8-class models."""
         super().load(device, **kwargs)
         stc = self.config.stc
         self.norm_w_raw = stc.get_tensor(f"{self.key}.hc_norm.weight", device, no_defer = True)
@@ -276,9 +296,9 @@ class GatedResidual(Module):
         up = stc.get_tensor(f"{self.key}.input_mix_weight_up.weight", device, no_defer = True)
         inject = stc.get_tensor(f"{self.key}.block_inject_weight.weight", device,
                                 no_defer = True) if self.use_combine else None
-        self._prepare(down, up, inject)
+        self._prepare(down, up, inject, keep_source_weights)
 
-    def _prepare(self, down, up, inject):
+    def _prepare(self, down, up, inject, keep_source_weights: bool = False):
         # Derived buffers are deduplicated (down/inject live as views of proj_h; up is kept in
         # its checkpoint orientation and the GEMM path transposes by view), and the fp32 folding
         # intermediates go through a REUSED scratch: load interleaves these preparations with
@@ -290,32 +310,55 @@ class GatedResidual(Module):
         self.norm_w = (self.norm_w_raw.float() + 1.0).view(H, Dh).contiguous()
         self.w_h = self.norm_w.flatten().half().contiguous()
         self.rank = down.shape[0]
+        M = self.rank + (0 if inject is None else inject.shape[0])
+        Mpad = -(-M // 64) * 64
+        self.proj_m = M
+        self.proj_h = torch.zeros((Mpad, H * Dh), dtype = torch.half, device = dev)
+        self.proj_h[: self.rank].copy_(down)
         if inject is None:
-            self.proj_h = down.half().contiguous()
             self.inject_h = None
         else:
-            self.proj_h = torch.cat((down.half(), inject.half())).contiguous()
-            self.inject_h = self.proj_h[self.rank :]
+            self.proj_h[self.rank : M].copy_(inject)
+            self.inject_h = self.proj_h[self.rank : M]
         self.down_h = self.proj_h[: self.rank]
-        M = self.proj_h.shape[0]
+        # Tiled kernel constraints (hc_mix_tiled.cu): H = 4, D a multiple of 128, rank of 64,
+        # at most 512 padded proj rows. Its int8 tensor-core path takes the projection tables
+        # pre-quantized per row (14-bit fixed point split into two int8 slices, det_quant_weight)
+        # (the TP loader stages modules on the CPU in the parent process; workers rebuild them
+        # on their devices, so the int8 tables are only prepared for CUDA-resident copies)
+        self.tiled = _gr_mix_tiled_enable and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
+            and Mpad <= 512 and not torch.version.hip and dev.type == "cuda"
         tmp = g_tensor_cache.get_bucketed(dev, M * H * Dh, torch.float, "gr_prep_tmp") \
             .view(M, H * Dh)
-        tmp.copy_(self.proj_h)
+        tmp.copy_(self.proj_h[: M])
         tmp *= self.w_h.float()
         self.fn_h = tmp.half().contiguous()
         self.up_h = up.half().contiguous()          # (H * D, rank), checkpoint orientation
+        if self.tiled:
+            self.proj_i8 = torch.empty((2, Mpad, H * Dh), dtype = torch.int8, device = dev)
+            self.proj_sb = torch.empty((Mpad,), dtype = torch.float, device = dev)
+            ext.det_quant_weight(self.proj_h, self.proj_i8, self.proj_sb)
+            self.up_i8 = torch.empty((2, H * Dh, self.rank), dtype = torch.int8, device = dev)
+            self.up_sb = torch.empty((H * Dh,), dtype = torch.float, device = dev)
+            ext.det_quant_weight(self.up_h, self.up_i8, self.up_sb)
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
             .permute(0, 1, 3, 2).contiguous()
+        if self.tiled and not keep_source_weights:
+            # Every inference consumer now reads the int8 tables (tiled path) or the folded and
+            # repacked copies (fused decode path): release the fp16 sources
+            self.proj_h = self.down_h = self.inject_h = self.up_h = None
 
     @override
     def unload(self):
         super().unload()
         self.norm_w_raw = self.norm_w = self.w_h = None
         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = self.fn_h = None
+        self.proj_i8 = self.proj_sb = self.up_i8 = self.up_sb = None
 
     @override
     def get_tensors(self):
+        self._require_source_weights("get_tensors")
         t = {
             f"{self.key}.hc_norm.weight": self.norm_w_raw.contiguous(),
             f"{self.key}.input_mix_weight_down.weight": self.down_h.contiguous(),
@@ -334,9 +377,15 @@ class GatedResidual(Module):
     def optimizer_targets(self):
         return []
 
+    def _require_source_weights(self, what):
+        assert self.down_h is not None, \
+            f"GatedResidual {self.key}: {what} needs the fp16 source weights, released after load " \
+            f"(load with keep_source_weights = True, as conversion does)"
+
     def _mix_ref(self, streams: torch.Tensor):
         """fp32 torch reference of the mix (the parity tests' ground truth): returns
         (post (b, s, H) or None, mixed (b, s, D)), both fp32."""
+        self._require_source_weights("the reference path")
         x = streams.float()
         normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim = True) + self.rms_eps) * self.norm_w
         flat = normed.flatten(-2)
@@ -376,13 +425,31 @@ class GatedResidual(Module):
             post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
             ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
+        elif self.tiled:
+            # Prefill-shaped workspaces are per-call (pow2-rounded so the caching allocator
+            # reuses segments across chunk sizes), never statics
+            def ws(shape, dtype):
+                numel = math.prod(shape)
+                buf = torch.empty((1 << (numel - 1).bit_length(),), dtype = dtype, device = dev)
+                return buf[: numel].view(shape)
+            Mpad = self.proj_i8.shape[1]
+            S = ext.gr_mix_tiled_slices(R, Dh, Mpad)
+            Rpad = -(-R // 64) * 64
+            post = ws((R, H), torch.float) if self.use_combine else None
+            mixed = ws((R, Dh), torch.half)
+            ext.gr_mix_tiled(
+                s3, self.w_h, self.proj_i8, self.proj_sb, self.up_i8, self.up_sb, self.rms_eps, self.proj_m,
+                ws((S, Rpad, Mpad), torch.float), ws((S, Rpad), torch.float), ws((R, H), torch.float),
+                ws((2, R, self.rank), torch.int8), ws((R, self.rank // 64), torch.float), post, mixed
+            )
         else:
+            self._require_source_weights("the cuBLAS path")
             post = torch.empty((R, H), dtype = torch.float, device = dev) \
                 if self.use_combine else None
             normed = torch.empty((R * H, Dh), dtype = torch.half, device = dev)
             ext.rms_norm(s3.view(R * H, Dh), self.w_h, normed,
                          self.rms_eps, 0.0, 1.0, False, False, H)
-            dm = torch.matmul(normed.view(R, H * Dh), self.proj_h.t())     # (R, rank [+ H])
+            dm = torch.matmul(normed.view(R, H * Dh), self.proj_h[: self.proj_m].t())  # (R, rank [+ H])
             t = F.silu(dm[:, : self.rank] / H)
             if self.use_combine:
                 post.copy_(2.0 * torch.sigmoid(dm[:, self.rank :].float() / H))
@@ -442,6 +509,8 @@ class GatedResidual(Module):
 
     def tp_export(self, plan, producer):
         # Streams are replicated across TP workers (like the residual), so plain replication
+        # The parent loads on the CPU (no kernel tables built there), so the sources are present
+        self._require_source_weights("tp_export")
         return {
             "cls": GatedResidual,
             "kwargs": {
@@ -547,6 +616,8 @@ class HyperHead(Module):
                 "hc_mult": self.hc_mult,
                 "rms_norm_eps": self.rms_eps,
                 "hc_eps": self.hc_eps,
+                # GLM5.3: parameterless mean over the streams (fn/base/scale are None)
+                "mean": self.mean,
             },
             "fn": producer.send(self.fn),
             "base": producer.send(self.base),

@@ -65,6 +65,52 @@ class ExpertsCFG:
     out_bszn: torch.Tensor | None = None   # (MAX_BSZN, H) fp32 routed sum of the bsz<=MAX_BSZN path
 
 
+# Debug: replicate the router on every TP rank and compare local vs broadcast selections
+_routing_check = os.environ.get("EXL3_TP_ROUTING_CHECK", "0") != "0"
+# Shared expert as a one-expert fused decode launch (see BC_BlockSparseMLP::sh_coop); 0 keeps the
+# three-launch BC_GatedMLP graph
+_moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
+
+# Router types whose selection runs entirely on the deterministic ext paths (routing_gemm.cu +
+# fixed-order top-k with FMA-only activations), so under tensor parallelism every rank can route
+# for itself on the (rank-identical) residual stream instead of receiving the selection by
+# broadcast from the output rank: two collectives per MoE layer per token fewer. Every router in
+# use is on those paths; the grouped DS3 router (n_group > 1, not supported by any loadable
+# architecture) is still torch-composed and would keep the broadcast
+_replicated_router_types = ("std", "std_bias", "dots", "sqrtsp", "sqrtsp_hash")
+_routing_check_stats = {}
+
+def _routing_check_compare(key, local_sel, local_w, sel, w):
+    import atexit
+    # Stats split by row-count class: single-row calls (fixed-order routing GEMV), other
+    # decode-sized calls (<= 32 rows: fused mix path upstream, hgemm routing logits) and
+    # prefill-sized calls (tiled mix path, hgemm routing logits)
+    R = sel.shape[0]
+    key = (key, "bsz1" if R == 1 else "decode" if R <= 32 else "prefill")
+    st = _routing_check_stats.get(key)
+    if st is None:
+        st = _routing_check_stats[key] = {"rows": 0, "sel_mismatch": 0, "w_maxdiff": 0.0, "calls": 0}
+        if len(_routing_check_stats) == 1:
+            def report():
+                for cls in ("bsz1", "decode", "prefill"):
+                    vs = [v for k, v in _routing_check_stats.items() if k[1] == cls]
+                    if not vs: continue
+                    rows = sum(v["rows"] for v in vs); mism = sum(v["sel_mismatch"] for v in vs)
+                    wmax = max(v["w_maxdiff"] for v in vs)
+                    print(f" -- routing-check (pid {os.getpid()}) [{cls}]: {rows} rows over {len(vs)} layers, "
+                          f"selection mismatches {mism} ({mism / max(rows, 1) * 100:.4f}%), max weight diff {wmax:.3e}", flush = True)
+            atexit.register(report)
+    ls = torch.sort(local_sel, dim = 1).values; bs = torch.sort(sel, dim = 1).values
+    same = (ls == bs).all(dim = 1)
+    st["rows"] += sel.shape[0]; st["calls"] += 1
+    st["sel_mismatch"] += int((~same).sum().item())
+    if same.any():
+        # weights compared in the sorted-expert order on agreeing rows
+        lw = torch.gather(local_w, 1, torch.sort(local_sel, dim = 1).indices)[same]
+        bw = torch.gather(w, 1, torch.sort(sel, dim = 1).indices)[same]
+        st["w_maxdiff"] = max(st["w_maxdiff"], float((lw.float() - bw.float()).abs().max().item()))
+
+
 class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     def __init__(
@@ -669,6 +715,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 up_bias_ptrs,
                 down_bias_ptrs,
                 act_relu2 = self.activation_fn == "relu2",
+                sh_coop = self.shared_coop_ok(),
             )
 
             # Larger buffers for fused path, if supported. Wide row tiles (32 / 64 rows, separate
@@ -968,10 +1015,23 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.latent_in is not None:
             y = self.latent_in.forward(y, params)
 
-        # Broadcast routing indices and weights
-        if self.routing_device is not None:
+        if params.get("tp_warmup"):
+            # Warmup runs without collectives on garbage-but-finite streams: every rank takes a
+            # random (valid, spread-out) selection instead of routing, which exercises the
+            # expert paths at realistic row counts (and ranks without a gate have no selection)
+            selected_experts.random_(0, self.num_experts)
+            routing_weights.fill_(1.0 / self.num_experts_per_tok)
+        elif self.routing_device is not None:
+            # Selection made on the routing rank and broadcast (router types not yet on the
+            # deterministic paths, or EXL3_TP_ROUTING_CHECK, which keeps the broadcast so this
+            # rank's own selection can be compared against it)
+            check = _routing_check and self.routing_device != self.device and self.routing_gate is not None
+            if check:
+                local_sel, local_w = selected_experts.clone(), routing_weights.clone()
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
+            if check:
+                _routing_check_compare(self.key, local_sel, local_w, selected_experts, routing_weights)
 
         # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
         # share to the worker now so it computes concurrently with the GPU expert paths below
@@ -1278,7 +1338,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             (self.shared_experts is not None and self.shared_experts_post_norm is not None and not bc_sh_exp)
         )
         if pre_norm_reduce:
-            params["backend"].all_reduce(
+            self.tp_collect(
+                params["backend"],
                 final_hidden_states,
                 self.intermediate_size > 0 and self.num_local_experts > 0
             )
@@ -1291,7 +1352,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.shared_experts and not bc_sh_exp:
             y = self.shared_experts.forward(x, params)
             if pre_norm_reduce:
-                params["backend"].all_reduce(y, True)
+                self.tp_collect(params["backend"], y, True)
             if self.shared_experts_post_norm:
                 y = self.shared_experts_post_norm.forward(y, params)
             if self.shared_gate:
@@ -1305,7 +1366,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Output reduction
         if self.tp_reduce and not pre_norm_reduce:
-            params["backend"].all_reduce(
+            self.tp_collect(
+                params["backend"],
                 final_hidden_states,
                 (self.intermediate_size > 0 and self.num_local_experts > 0) or bool(self.shared_experts)
             )
@@ -1329,16 +1391,41 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         return t
 
 
+    def shared_coop_ok(self) -> bool:
+        """The shared expert can run as a one-expert fused decode launch: an EXL3 GatedMLP with a
+        single slice, 128-aligned widths and an activation the fused kernels implement, merged
+        without a post-norm at the residual width. Under TP such a shared expert is placed whole
+        on one rank (the fused kernels tile the intermediate width in 128s and a split slice
+        would rarely stay aligned), whose launch is the only one contributing it."""
+        se = self.shared_experts
+        if not _moe_shared_coop or se is None or not isinstance(se, GatedMLP):
+            return False
+        if self.shared_experts_post_norm is not None or self.latent_in is not None or self.alt_residual_channel:
+            return False
+        if len(se.gates) != 1 or len(se.ups) != 1 or len(se.downs) != 1:
+            return False
+        if se.activation_fn not in ("silu", "gelu", "relu2"):
+            return False
+        g, u, d = se.gates[0], se.ups[0], se.downs[0]
+        def quantized(l):
+            if l.quant_type is not None:
+                return l.quant_type == "exl3"
+            return self.config is not None and self.config.stc.has_tensor(f"{l.key}.trellis")
+        if not (quantized(g) and quantized(u) and quantized(d)):
+            return False
+        return g.in_features % 128 == 0 and g.out_features % 128 == 0 and d.out_features % 128 == 0 \
+            and self.hidden_size <= d.out_features
+
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
-        storage += self.routing_gate.storage_size()
         if self.shared_gate:
             storage += self.shared_gate.storage_size()
         for g in self.gates: storage += g.storage_size()
         for u in self.ups: storage += u.storage_size()
         for d in self.downs: storage += d.storage_size()
-        # The latent projections are replicated on every rank
-        storage_d = 0
+        # The latent projections are replicated on every rank, and so is the routing gate (with
+        # its transposed and int8 copies, see block_sparse_mlp_routing._gate_t)
+        storage_d = 3 * self.routing_gate.storage_size()
         if self.latent_in is not None:
             storage_d += self.latent_in.storage_size() + self.latent_out.storage_size()
         # TODO: More precise overhead estimate accounting for gate etc.
@@ -1366,7 +1453,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         )
         tpa_list = [tpa]
         if self.shared_experts:
-            tpa_list += self.shared_experts.make_tp_allocation(options)
+            sh = self.shared_experts.make_tp_allocation(options)
+            if self.shared_coop_ok():
+                for t in sh:
+                    t.max_devices = 1
+            tpa_list += sh
         return tpa_list
 
 
@@ -1452,6 +1543,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # gates list so the ctor derives gated = False
         gated = exported.get("gates") is not None
 
+        # Replicated routing: every rank holds the gate and routes for itself (no selection
+        # broadcast); the residual stream is rank-identical by construction of the deterministic
+        # paths, so the selections agree. The check tool keeps the broadcast for comparison
+        replicate = exported["kwargs"]["router_type"] in _replicated_router_types and not _routing_check
+
         # Tensor parallel
         if unit == "channels":
             num_local_experts = exported["kwargs"]["num_experts"]
@@ -1476,6 +1572,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         else:
             assert False
 
+        # A shared expert placed whole on one rank (allocation max_devices = 1, see
+        # shared_coop_ok) is absent on the others: its contribution enters the reduction from
+        # the owner alone
+        sh_present = True
+        if exported.get("shared_experts") is not None:
+            sh_key = exported["shared_experts"]["kwargs"]["key"]
+            if sh_key in plan:
+                sh_first, sh_last, _ = plan[sh_key]
+                sh_present = sh_last > sh_first
         module = BlockSparseMLP(
             config = None,
             **exported["kwargs"],
@@ -1483,14 +1588,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             gates = gates,
             ups = ups,
             downs = downs,
-            shared_experts = _import_no_reduce("shared_experts"),
-            shared_gate = _import("shared_gate"),
+            shared_experts = _import_no_reduce("shared_experts") if sh_present else None,
+            shared_gate = _import("shared_gate") if sh_present else None,
             latent_in = _import("latent_in"),
             latent_out = _import("latent_out"),
-            routing_gate = _import("routing_gate") if device == output_device else None,
+            routing_gate = _import("routing_gate") if (replicate or device == output_device or _routing_check) else None,
             routing_first = routing_first,
             routing_last = routing_last,
-            routing_device = output_device,
+            routing_device = None if replicate else output_device,
             shared_experts_post_norm = _import("shared_experts_post_norm"),
             router_pre_norm = _import("router_pre_norm"),
             routed_pre_norm = _import("routed_pre_norm"),
@@ -1502,7 +1607,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if exported.get("e_score_bias_vl") is not None:
             module.e_score_bias_vl = consumer.recv(exported["e_score_bias_vl"], cuda = True)
         module.per_expert_scale = consumer.recv(exported["per_expert_scale"], cuda = True)
-        if exported.get("tid2eid") is not None and device == output_device:
+        if exported.get("tid2eid") is not None and (replicate or device == output_device):
             module.tid2eid = consumer.recv(exported["tid2eid"], cuda = True)
         if unit == "channels" or num_local_experts > 0:
             module.load_local()
@@ -1510,4 +1615,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             module.load_routing()
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            # Routed and shared experts are allocated separately; only when one rank owns both
+            # is the trailing collective a plain broadcast
+            owner_keys = [key]
+            if exported.get("shared_experts") is not None:
+                owner_keys.append(exported["shared_experts"]["kwargs"]["key"])
+            module.tp_owner = module.tp_single_owner(local_context, *owner_keys)
         return module

@@ -601,7 +601,7 @@ class Attention(Module):
         if self.num_kv_heads == 0:
             x = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                params["backend"].all_reduce(x, False)
+                self.tp_collect(params["backend"], x, False)
         else:
             bsz, seqlen, _ = x.shape
             attn_mode = params.get("attn_mode", "flash_attn_nc")
@@ -613,7 +613,7 @@ class Attention(Module):
                 case _:
                     raise ValueError(f"Unknown attn_mode: {attn_mode}")
             if self.tp_reduce:
-                params["backend"].all_reduce(x)
+                self.tp_collect(params["backend"], x)
 
         return to2(x, out_dtype, self.out_dtype)
 
@@ -1165,13 +1165,23 @@ class Attention(Module):
         )
         channel_width = 1
         channels_to_split = self.num_kv_heads
-        while channel_width * self.head_dim < 128:
-            assert channels_to_split % 2 == 0, \
+        max_devices = None
+        if self.qsa_indexer is not None:
+            # QSA: the indexer's raw/pooled key planes and block selection are per token, and the
+            # sparse decode path reads all heads of a query row, so the layer runs whole on one
+            # rank (see MLAttention); the other ranks hold head-less stubs
+            storage += self.qsa_indexer.storage_size()
+            channel_width = self.num_kv_heads
+            channels_to_split = 1
+            max_devices = 1
+        else:
+            while channel_width * self.head_dim < 128:
+                assert channels_to_split % 2 == 0, \
+                    "Model's K/V heads cannot divide into 128-channel tensors"
+                channel_width *= 2
+                channels_to_split //= 2
+            assert (channel_width * self.head_dim) % 128 == 0, \
                 "Model's K/V heads cannot divide into 128-channel tensors"
-            channel_width *= 2
-            channels_to_split //= 2
-        assert (channel_width * self.head_dim) % 128 == 0, \
-            "Model's K/V heads cannot divide into 128-channel tensors"
         # TODO: Account for flash-attn temp VRAM usage
         tpa = TPAllocation(
             key = self.key,
@@ -1183,15 +1193,14 @@ class Attention(Module):
             overhead_to_split = overhead_s,
             recons_temp = recons,
             channels_to_split = channels_to_split,
-            limit_key = "attn"
+            limit_key = "attn",
+            max_devices = max_devices,
         )
         return [tpa]
 
 
     def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
-        assert getattr(self, "qsa_indexer", None) is None, \
-            "TP export of Attention with a QSA indexer is not implemented"
 
         def _export(child):
             nonlocal producer
@@ -1235,6 +1244,8 @@ class Attention(Module):
                 "o_proj",
                 "g_proj",
             )},
+            # QSA indexer (Qwen3.8): replicated whole on the owning rank
+            "qsa_indexer": _export(self.qsa_indexer),
             # Learned attention sinks (gpt-oss): one logit per query head, sliced to the local heads on import
             "sinks": producer.send(self.sinks) if self.sinks is not None else None,
             "device": self.device,
@@ -1303,11 +1314,17 @@ class Attention(Module):
             return exported[name]["cls"].tp_import_split(local_context, exported[name], plan, split) \
                 if split and exported.get(name) else None
 
+        qsa_indexer = None
+        if exported.get("qsa_indexer") is not None and num_kv_heads:
+            assert num_kv_heads == exported["num_kv_heads"], "QSA attention layers run whole on one device"
+            qsa_indexer = _import("qsa_indexer")
+
         module = Attention(
             config = None,
             **exported["kwargs"],
             num_q_heads = num_q_heads,
             num_kv_heads = num_kv_heads,
+            qsa_indexer = qsa_indexer,
             q_norm = _import_split("q_norm", norm_q_split) if tp_split_norm else _import("q_norm"),
             k_norm = _import_split("k_norm", norm_k_split) if tp_split_norm else _import("k_norm"),
             # V norm shares the K/V head geometry (gemma4: unweighted, so the split is a no-op there)
@@ -1339,6 +1356,7 @@ class Attention(Module):
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            module.tp_owner = module.tp_single_owner(local_context, key)
 
         # Set up TP-aware span_heads norm if needed
         if exported.get("q_norm_span_heads", False):

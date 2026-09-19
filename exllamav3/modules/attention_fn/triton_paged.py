@@ -1013,9 +1013,17 @@ def _paged_attn_decode_combine_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    ROWS_SUB: tl.constexpr,
+    D_SUB: tl.constexpr,
 ):
-    """Flash-decoding phase 2: reduce the per-split partial accumulators."""
+    """Flash-decoding phase 2: reduce the per-split partial accumulators. Grid axis 1 splits
+    the program's (BLOCK_ROWS, HD_PAD) tile into (ROWS_SUB, D_SUB) sub-tiles so the serial
+    walk over the splits runs on many CTAs (decode launches only a few programs)."""
     pid = tl.program_id(0)
+    sub = tl.program_id(1)
+    D_CHUNKS: tl.constexpr = HD_PAD // D_SUB
+    r_c = sub // D_CHUNKS
+    d_c = sub - r_c * D_CHUNKS
 
     group_size = n_q_heads // n_kv_heads
     h_blocks = tl.cdiv(group_size, BLOCK_H)
@@ -1024,46 +1032,68 @@ def _paged_attn_decode_combine_kernel(
     batch = bh // n_kv_heads
     kv_head = bh - batch * n_kv_heads
 
-    rows = tl.arange(0, BLOCK_ROWS)
+    rows = r_c * ROWS_SUB + tl.arange(0, ROWS_SUB)
     row_q = rows % BLOCK_M
     row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
     q_head = kv_head * group_size + row_h_local
     valid_row = (row_q < q_len) & (row_h_local < group_size)
 
-    offs_d = tl.arange(0, HD_PAD)
+    offs_d = d_c * D_SUB + tl.arange(0, D_SUB)
     d_mask = offs_d < head_dim
 
-    m_max = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
-    for s in range(num_splits):
-        ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
-        m_s = tl.load(partial_ml + ml_base + rows * 2)
-        m_max = tl.maximum(m_max, m_s)
+    # Splits are walked S_BLK at a time as one masked tile load per pass: a scalar loop with a
+    # runtime trip count and no pipelining serializes a full load latency per split (65 splits
+    # at a 2K sparse context cost 20 us), a tile load amortizes it
+    S_BLK: tl.constexpr = 16
+    offs_s = tl.arange(0, S_BLK)
+    m_max = tl.full((ROWS_SUB,), -float("inf"), tl.float32)
+    for s0 in range(0, num_splits, S_BLK):
+        sidx = s0 + offs_s
+        s_mask = sidx < num_splits
+        ml_idx = ((pid * num_splits + sidx)[:, None] * BLOCK_ROWS + rows[None, :]) * 2
+        m_s = tl.load(partial_ml + ml_idx, mask=s_mask[:, None], other=-float("inf"))
+        m_max = tl.maximum(m_max, tl.max(m_s, axis=0))
 
     if HAS_SINKS:
         # Learned per-head sink joins the softmax denominator at the final reduction
         sink = tl.load(sinks + q_head, mask=valid_row, other=0.0).to(tl.float32)
         m_max = tl.maximum(m_max, sink)
 
-    l_sum = tl.zeros((BLOCK_ROWS,), tl.float32)
-    acc = tl.zeros((BLOCK_ROWS, HD_PAD), tl.float32)
+    l_sum = tl.zeros((ROWS_SUB,), tl.float32)
+    acc = tl.zeros((ROWS_SUB, D_SUB), tl.float32)
     m_safe = tl.where(m_max == -float("inf"), 0.0, m_max)
-    for s in range(num_splits):
-        ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
-        m_s = tl.load(partial_ml + ml_base + rows * 2)
-        l_s = tl.load(partial_ml + ml_base + rows * 2 + 1)
-        w = tl.where(m_s == -float("inf"), 0.0, tl.exp(m_s - m_safe))
-        po_base = (pid * num_splits + s) * BLOCK_ROWS * HD_PAD
-        o_s = tl.load(partial_o + po_base + rows[:, None] * HD_PAD + offs_d[None, :])
-        acc += o_s * w[:, None]
-        l_sum += l_s * w
+    for s0 in range(0, num_splits, S_BLK):
+        sidx = s0 + offs_s
+        s_mask = sidx < num_splits
+        ml_idx = ((pid * num_splits + sidx)[:, None] * BLOCK_ROWS + rows[None, :]) * 2
+        m_s = tl.load(partial_ml + ml_idx, mask=s_mask[:, None], other=-float("inf"))
+        l_s = tl.load(partial_ml + ml_idx + 1, mask=s_mask[:, None], other=0.0)
+        w = tl.where(m_s == -float("inf"), 0.0, tl.exp(m_s - m_safe[None, :]))
+        po_idx = (pid * num_splits + sidx)[:, None, None] * (BLOCK_ROWS * HD_PAD) \
+            + rows[None, :, None] * HD_PAD + offs_d[None, None, :]
+        o_s = tl.load(partial_o + po_idx, mask=s_mask[:, None, None], other=0.0)
+        acc += tl.sum(o_s * w[:, :, None], axis=0)
+        l_sum += tl.sum(l_s * w, axis=0)
 
     if HAS_SINKS:
         l_sum += tl.exp(sink - m_safe)
     out_tile = acc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
     if QCV > 0:
-        out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, HD_PAD)
+        out_tile = _rot_h32(out_tile, h32, ROWS_SUB, D_SUB)   # 32-wide groups: D_SUB % 32 == 0
     out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
     tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & d_mask[None, :])
+
+
+def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
+    """(ROWS_SUB, D_SUB) for the combine kernel: the smallest sub-tile whose h32 rotation still
+    forms a >= 16-row tl.dot (ROWS_SUB * D_SUB >= 512), D_SUB a multiple of 32."""
+    d_sub = min(128, hd_pad)
+    rows_sub = min(block_rows, max(1, 512 // d_sub))
+    while rows_sub * d_sub < 512 and d_sub < hd_pad:
+        d_sub *= 2
+    if rows_sub * d_sub < 512:
+        rows_sub, d_sub = block_rows, hd_pad
+    return rows_sub, d_sub
 
 
 _decode_sm_count = {}
@@ -1172,7 +1202,7 @@ def paged_attn_triton_decode(
         if dev not in _decode_sm_count:
             _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
         target = 2 * _decode_sm_count[dev]
-        num_splits = max(1, min(target // programs, triton.cdiv(max_k_len, 4 * block_n), 128))
+        num_splits = max(1, min(target // programs, triton.cdiv(max_k_len, 1 * block_n), 128))
     split_len = triton.cdiv(triton.cdiv(max_k_len, num_splits), block_n) * block_n
 
     if num_splits > 1:
@@ -1203,10 +1233,11 @@ def paged_attn_triton_decode(
         )
 
         if num_splits > 1:
-            _paged_attn_decode_combine_kernel[(programs,)](
+            rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
+            _paged_attn_decode_combine_kernel[(programs, (block_rows // rows_sub) * (hd_pad // d_sub))](
                 partial_o, partial_ml, out, h32,
                 num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad,
-                block_m, block_h, block_rows,
+                block_m, block_h, block_rows, rows_sub, d_sub,
                 num_warps=4, num_stages=1,
             )
     return out

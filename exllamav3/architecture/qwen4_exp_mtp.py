@@ -173,6 +173,10 @@ class Qwen4ExpMTPModel(Model):
         bsz, seq, _ = state.shape
         stack = to_device(state, mixer.device).view(bsz, seq, mixer.hc_mult, mixer.hidden_size)
         state = mixer.forward(stack, params)
+        if self.attached_model().loaded_tp:
+            # The target's lm_head lives in the TP workers (sharded): argmax over the shards
+            state = self.attached_model().tp_producer.send(state)
+            return self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
         ll = self.attached_model().logit_layer_idx
         lm = self.attached_model().modules[ll]
         logits = lm.prepare_for_device(state, params)

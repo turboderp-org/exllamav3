@@ -282,7 +282,7 @@ class MLP(Module):
             d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
             self.bc.run_bsz1(x, d)
             if self.tp_reduce:
-                params["backend"].all_reduce(d)
+                self.tp_collect(params["backend"], d)
             return to2(d, out_dtype, self.out_dtype)
 
         qs = params.get("q_mlp_slice")
@@ -304,7 +304,7 @@ class MLP(Module):
             del d_
 
         if self.tp_reduce:
-            params["backend"].all_reduce(d)
+            self.tp_collect(params["backend"], d)
 
         return to2(d, out_dtype, self.out_dtype)
 
@@ -429,6 +429,7 @@ class MLP(Module):
         module.alpha_n = consumer.recv(exported["alpha_n"], cuda = False)
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            module.tp_owner = module.tp_single_owner(local_context, key)
         if module.num_slices == 1:
             module.load_local(device)
         torch.cuda.synchronize()
@@ -729,7 +730,7 @@ class GatedMLP(Module):
         if self.num_slices == 0:
             d = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                params["backend"].all_reduce(d, False)
+                self.tp_collect(params["backend"], d, False)
         else:
             qs = params.get("q_mlp_slice")
             r = [qs] if qs is not None else range(0, self.num_slices)
@@ -786,7 +787,7 @@ class GatedMLP(Module):
                     del d_
 
             if self.tp_reduce:
-                params["backend"].all_reduce(d)
+                self.tp_collect(params["backend"], d)
 
         return to2(d, out_dtype, self.out_dtype)
 
@@ -904,6 +905,7 @@ class GatedMLP(Module):
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            module.tp_owner = module.tp_single_owner(local_context, key)
         for i in range(module.num_slices):
             module.load_local(device, i)
         torch.cuda.synchronize()

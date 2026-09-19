@@ -298,9 +298,12 @@ class BlockSparseMLP_CPU:
     @override
     def can_defer_load(self):
         # The frequency-permuted expert split reads the router tensors right after load (to
-        # permute them); deferred fills would land after that read and be lost
+        # permute them); deferred fills would land after that read and be lost.
+        # infer_params.moe_cpu_split is the authoritative split source (-mcs sets it; the
+        # EXL3_MOE_CPU_SPLIT env is only its construction-time default), same as
+        # cpu_maybe_split_load. Reading the env here left the guard off on the CLI path.
         if (
-            int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0)) > 0 and
+            int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 and
             os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
         ):
             return False

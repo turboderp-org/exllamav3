@@ -340,7 +340,7 @@ class ParallelDecoderBlock(Module):
             y1 += y2
 
             if self.tp_reduce:
-                params["backend"].all_reduce(y1)
+                self.tp_collect(params["backend"], y1)
 
             x += y1
 
@@ -397,4 +397,6 @@ class ParallelDecoderBlock(Module):
 
         # Use single reduction for sum of mlp and attn
         module.tp_reduce = True
+        module.tp_owner = module.tp_single_owner(
+            local_context, exported["attn"]["kwargs"]["key"], exported["mlp"]["kwargs"]["key"])
         return module

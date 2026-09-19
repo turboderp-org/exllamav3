@@ -223,8 +223,7 @@ class DeepseekV3Model(Model):
         self.calibration_all_experts = True
 
         # MLA layers currently do not support TP because the latent cache cannot be split by head
-        # TODO: Consider replicating cache per rank and splitting query/o_proj heads
-        self.caps.update({"supports_tp": False})
+        self.caps.update({"supports_tp": True})
 
 
     @override
