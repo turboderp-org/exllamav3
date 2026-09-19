@@ -326,8 +326,12 @@ class GatedResidual(Module):
         # pre-quantized per row (14-bit fixed point split into two int8 slices, det_quant_weight)
         # (the TP loader stages modules on the CPU in the parent process; workers rebuild them
         # on their devices, so the int8 tables are only prepared for CUDA-resident copies)
+        # The tiled int8 kernels use cp.async and mma.m16n8k32 s8 — sm_80+
+        # instructions — so the path is Ampere+ only; below that the cuBLAS
+        # fallback serves the projection.
         self.tiled = _gr_mix_tiled_enable and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
-            and Mpad <= 512 and not torch.version.hip and dev.type == "cuda"
+            and Mpad <= 512 and not torch.version.hip and dev.type == "cuda" \
+            and ext.g_get_cc(dev.index or 0) >= 8
         tmp = g_tensor_cache.get_bucketed(dev, M * H * Dh, torch.float, "gr_prep_tmp") \
             .view(M, H * Dh)
         tmp.copy_(self.proj_h[: M])
