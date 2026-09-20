@@ -85,7 +85,10 @@ void unpack_trellis_frac_kernel(uint16_t* __restrict__ g_unpacked, const uint16_
 static int frac_bpb(int KA, int64_t MASK)
 {
     TORCH_CHECK(KA >= 1 && KA <= 7 && MASK >= 0 && MASK <= 0xFFFF, "frac: KA must be 1..7, MASK 16 bits");
-    const int bpb = 16 * KA + __builtin_popcount((unsigned) MASK);
+    // Extra-bit positions among the 16. Counted by hand: __builtin_popcount is GCC/Clang only
+    int extra = 0;
+    for (int64_t m = MASK; m; m &= m - 1) extra++;
+    const int bpb = 16 * KA + extra;
     TORCH_CHECK(bpb % 2 == 0, "frac: bits per 16 weights must be even (whole 32-bit words per tile)");
     return bpb;
 }
