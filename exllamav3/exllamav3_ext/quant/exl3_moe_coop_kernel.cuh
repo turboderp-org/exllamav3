@@ -60,18 +60,19 @@ constexpr bool tile_reg() { return bits == 2 || bits == 3 || bits == 4; }
 #endif
 // Shared-memory layout is sized on the host, which doesn't know the device arch: reserve the
 // staging area for every width some arch stages (unused on the others)
-template <int bits>
-constexpr bool tile_may_stage() { return !(bits == 2 || bits == 4); }
+// HALF: half-integer rate bits + 0.5 (mul1 only), always through the staged generic path
+template <int bits, bool HALF = false>
+constexpr bool tile_may_stage() { return HALF || !(bits == 2 || bits == 4); }
 
 // Dynamic shared memory layout (bytes)
-template <int bits>
-__host__ __device__ constexpr int smem_stage_bytes() { return tile_may_stage<bits>() ? WK * STAGE_WORDS * 4 : 0; }
+template <int bits, bool HALF = false>
+__host__ __device__ constexpr int smem_stage_bytes() { return tile_may_stage<bits, HALF>() ? WK * STAGE_WORDS * 4 : 0; }
 constexpr int smem_red_bytes() { return WK * ROWS * COLS * 4; }   // same for both geometries: wk x ROWS x cols
 constexpr int smem_part_bytes() { return WK * 128 * 4; }
-template <int bits>
-__host__ __device__ constexpr int smem_a_bytes(int Hi) { return Hi * 2 + smem_red_bytes() + smem_stage_bytes<bits>(); }
-template <int bits>
-__host__ __device__ constexpr int smem_b_bytes() { return smem_red_bytes() + smem_stage_bytes<bits>() + smem_part_bytes(); }
+template <int bits, bool HALF = false>
+__host__ __device__ constexpr int smem_a_bytes(int Hi) { return Hi * 2 + smem_red_bytes() + smem_stage_bytes<bits, HALF>(); }
+template <int bits, bool HALF = false>
+__host__ __device__ constexpr int smem_b_bytes() { return smem_red_bytes() + smem_stage_bytes<bits, HALF>() + smem_part_bytes(); }
 
 // ---------------------------------------------------------------------------------------------
 // Elementwise helpers (fp32 forms of activation_kernels.cuh, which can't be included twice)
@@ -336,7 +337,7 @@ __device__ __forceinline__ bool read_run(const MoeCoopParams& p, int run_idx, in
 // 2/3/4 bpw; other widths stage each k-slice's tile words in shared memory and decode with
 // dq_dispatch
 
-template <int bits, int cb, bool WIDE>
+template <int bits, int cb, bool WIDE, bool HALF = false>
 __device__ __forceinline__ void gemv_tile
 (
     const uint32_t* __restrict__ B32,
@@ -355,8 +356,8 @@ __device__ __forceinline__ void gemv_tile
     uint32_t* __restrict__ sh_stage     // [WK][STAGE_WORDS], staged widths only
 )
 {
-    constexpr bool REG = tile_reg<bits>();
-    constexpr int TWORDS = 8 * bits;                                            // uint32 per 16x16 tile
+    constexpr bool REG = HALF ? false : tile_reg<bits>();
+    constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;              // uint32 per 16x16 tile
     constexpr int GWORDS = WNT * TWORDS;                                        // uint32 per warp per k-slice
     constexpr int LOADS = REG ? (bits == 2 ? WNT / 2 : WNT) : CEIL_DIVIDE(GWORDS, 32);
     constexpr int LSTRIDE = (REG && bits == 3) ? 24 : 32;
@@ -468,7 +469,7 @@ __device__ __forceinline__ void gemv_tile
                 FragB f0, f1;
                 if constexpr (!REG)
                 {
-                    dq_dispatch<bits, cb>(stage + t * TWORDS, lane << 3, f0, f1);
+                    dq_dispatch<bits, cb, HALF>(stage + t * TWORDS, lane << 3, f0, f1);
                 }
                 else if constexpr (bits == 4)
                 {
@@ -672,7 +673,7 @@ __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
 // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (rotation,
 // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
 
-template <int bits, int cb, bool WIDE>
+template <int bits, int cb, bool WIDE, bool HALF = false>
 __global__ __launch_bounds__(THREADS)
 void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 {
@@ -747,7 +748,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
         // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
         const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
-        gemv_tile<bits, cb, WIDE>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -808,7 +809,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 // token's slots (rotation * svh, down bias, routing weight) in a fixed order, merges the shared
 // expert and stores the trimmed row
 
-template <int bits, int cb, bool WIDE>
+template <int bits, int cb, bool WIDE, bool HALF = false>
 __global__ __launch_bounds__(THREADS)
 void exl3_moe_coop_b_kernel(const MoeCoopParams p)
 {
@@ -818,7 +819,7 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
     extern __shared__ uint32_t smem_dyn[];
     float* sh_red = (float*) smem_dyn;
     uint32_t* sh_stage = smem_dyn + WK * ROWS * COLS;
-    float* sh_part = (float*) (smem_dyn + WK * ROWS * COLS + (tile_may_stage<bits>() ? WK * STAGE_WORDS : 0));
+    float* sh_part = (float*) (smem_dyn + WK * ROWS * COLS + (tile_may_stage<bits, HALF>() ? WK * STAGE_WORDS : 0));
     __shared__ int sh_flag;
     __shared__ int sh_n_active;
     __shared__ float sh_gate;
@@ -848,7 +849,7 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
     {
         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
-        gemv_tile<bits, cb, WIDE>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
+        gemv_tile<bits, cb, WIDE, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
                                   k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
     }
 

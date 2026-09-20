@@ -78,6 +78,46 @@ def get_temp_buffers(device, K: int, tile_len: int = 256, cb: int = 0):
     return temp_costs, temp_edges
 
 
+def frac_k(K):
+    """(KA, MASK) for a half-integer bitrate K = KA + 0.5: alternating KA- and (KA + 1)-bit trellis
+    steps (MASK 0xAAAA, period 16). None for integer K. Half steps keep every tile a whole number of
+    32-bit words (streamable with int4 loads); the kernels accept any period-16 pattern, but only the
+    alternating one is instantiated."""
+    if isinstance(K, int) or float(K).is_integer():
+        return None
+    ka = int(K)
+    assert abs(ka + 0.5 - K) < 1e-9, f"fractional bitrate {K} must be a half-integer"
+    return ka, 0xAAAA
+
+
+def trellis_words(K) -> int:
+    """uint16 words per 256-weight tile at bitrate K (16 * K, an integer for half-integer K)"""
+    w = 16 * K
+    assert float(w).is_integer(), f"bitrate {K}: tile is not a whole number of uint16 words"
+    return int(w)
+
+
+@lru_cache
+def get_temp_buffers_frac(device, ka: int):
+    edges = 65536 >> ka
+    temp_costs = torch.zeros((128, 2, edges), dtype = torch.half, device = device)
+    temp_edges = torch.zeros((128, 256, edges), dtype = torch.short, device = device)
+    return temp_costs, temp_edges
+
+
+def quantize_tiles_frac(tiles, quant_args: dict):
+    """Half-integer bitrate (KA + 0.5): alternating pattern of KA / KA+1-bit steps. mul1 codebook only"""
+    tiles = tiles.contiguous()
+    assert tiles.shape[1] == 256 and tiles.dtype == torch.float
+    assert quant_args.get("mul1"), "fractional bitrates require the mul1 codebook"
+    ka, mask = frac_k(quant_args["K"])
+    quantized_tiles = torch.zeros_like(tiles)
+    quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
+    temp_costs, temp_edges = get_temp_buffers_frac(tiles.device, ka)
+    ext.quantize_tiles_frac(tiles, quantized_tiles, quantized_idx, temp_costs, temp_edges, ka, mask)
+    return quantized_tiles, quantized_idx
+
+
 def quantize_tiles(tiles, quant_args: dict):
     """
     Quantize a batch of 16x16 tiles on the current device.
@@ -86,6 +126,8 @@ def quantize_tiles(tiles, quant_args: dict):
     reconstructed float tile values and the short encoded indices used later for packing. Length-160 rows
     (n-gram embedding vectors, mul1 codebook only) are accepted too and quantized as single tail-biting rings.
     """
+    if frac_k(quant_args["K"]) is not None:
+        return quantize_tiles_frac(tiles, quant_args)
     tiles = tiles.contiguous()
     assert tiles.shape[1] in (256, 160)
     assert tiles.dtype == torch.float
@@ -192,6 +234,8 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
     each GPU quantizes its slice on a per-device stream. Results are copied back through pinned memory and gathered
     on the first device.
     """
+    if frac_k(quant_args["K"]) is not None:
+        return quantize_tiles_frac(tiles, quant_args)
     devices = quant_args["devices"]
     if len(devices) == 1:
         return quantize_tiles(tiles, quant_args)
@@ -946,9 +990,13 @@ def pack_trellis(encoded: torch.Tensor, quant_args: dict) -> torch.Tensor:
     shape = encoded.shape
     assert len(shape) == 3 and shape[2] == 256
     assert encoded.dtype == torch.int16
-    packed_shape = (shape[0], shape[1], 256 * K // 16)
+    packed_shape = (shape[0], shape[1], trellis_words(K))
     packed = torch.zeros(packed_shape, dtype = torch.int16, device = encoded.device)
-    ext.pack_trellis(packed, encoded.contiguous(), K)
+    fk = frac_k(K)
+    if fk is not None:
+        ext.pack_trellis_frac(packed, encoded.contiguous(), fk[0], fk[1])
+    else:
+        ext.pack_trellis(packed, encoded.contiguous(), K)
     # unpacked = torch.zeros_like(encoded)
     # ext.unpack_trellis(unpacked, packed, K)
     # assert torch.equal(unpacked, encoded)
@@ -1510,7 +1558,7 @@ def quantize_exl3(
         # Compile packed tensor
         suh = su.flatten().contiguous().to(dtype = torch.half, copy = True)
         svh = sv.flatten().contiguous().to(dtype = torch.half, copy = True)
-        trellis = pack_trellis(encoded_q.to(device), quant_args)
+        trellis = pack_trellis(encoded_q.to(device), quant_args) if not quant_args.get("no_pack") else encoded_q
 
         out_tensors = {
             # "scale": weight_scale.to(dtype = torch.float, copy = True),

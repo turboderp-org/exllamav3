@@ -16,7 +16,7 @@ py::class_<BC_LinearEXL3, std::shared_ptr<BC_LinearEXL3>>(m, "BC_LinearEXL3").de
         at::Tensor,
         at::Tensor,
         at::Tensor,
-        int,
+        float,
         c10::optional<at::Tensor>,
         bool,
         bool,

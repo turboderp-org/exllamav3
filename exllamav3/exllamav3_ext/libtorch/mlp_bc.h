@@ -8,7 +8,7 @@ py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
         c10::optional<at::Tensor>,
-        int,
+        float,
         bool,
         bool,
         bool,

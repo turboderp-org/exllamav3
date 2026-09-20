@@ -40,7 +40,8 @@ def create_quantization_config_json(
             mcg_mult = mcg.view(torch.uint32).item() if mcg is not None else 0
 
             module_dict["quant_format"] = "exl3"
-            module_dict["bits_per_weight"] = shape[-1] // 16
+            bpw = shape[-1] / 16
+            module_dict["bits_per_weight"] = int(bpw) if float(bpw).is_integer() else bpw
             if mul1_mult:
                 module_dict["mul1_multiplier"] = mul1_mult
             if mcg_mult:

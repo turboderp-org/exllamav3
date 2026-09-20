@@ -14,7 +14,7 @@ from ..util.tensor import save_tensor_image
 from ..util.measures import cosine_error, sqnr
 from .calibration_data import get_default_calibration, get_file_calibration
 from .compile import compile_model, dsize
-from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy
+from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy, HALF_RATES
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
@@ -73,8 +73,8 @@ parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Outpu
 parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in MB, default: 8192")
 parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
 parser.add_argument("-rcp", "--recipe", type = str, default = None, help = "Per-tensor bitrate recipe (YAML from sc_optimize.py), used in place of the budgeted allocation from --bits / --head_bits.")
-parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bits per weight, output (head) layer, default: 6")
-parser.add_argument("-mb", "--mtp_bits", type = int, default = None, help = "Bits per weight, MTP layers, default: 4")
+parser.add_argument("-hb", "--head_bits", type = float, default = None, help = "Bits per weight, output (head) layer: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 6")
+parser.add_argument("-mb", "--mtp_bits", type = float, default = None, help = "Bits per weight, MTP layers: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 4")
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
 parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
 parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "Bits per weight for hashed n-gram embedding tables, 1-8, default: --bits rounded")
@@ -182,6 +182,8 @@ def prepare(args) -> (dict, dict, bool, str):
         return None, None, False, "--bits must be between 1 and 8"
     if args.head_bits is not None and (args.head_bits > 8 or args.head_bits < 1) and args.head_bits != 16:
         return None, None, False, "--head_bits must be between 1 and 8, or 16"
+    if args.mtp_bits is not None and (args.mtp_bits > 8 or args.mtp_bits < 1) and args.mtp_bits != 16:
+        return None, None, False, "--mtp_bits must be between 1 and 8, or 16"
     if not args.resume and args.bits is None and not args.recipe:
         return None, None, False, "Specify either --bits or --recipe"
 
@@ -200,10 +202,13 @@ def prepare(args) -> (dict, dict, bool, str):
         recipe_tensors = recipe.get("tensors") if isinstance(recipe, dict) else None
         if not isinstance(recipe_tensors, dict) or not recipe_tensors:
             return None, None, False, "Recipe must contain a non-empty 'tensors' mapping"
-        bad = [k for k, v in recipe_tensors.items()
-               if not isinstance(v, int) or not (1 <= v <= 8 or v == 16)]
+        # Integer bitrates 1-8 (or 16 = unquantized), plus the half-integer trellis rates (mul1 codebook)
+        def ok(v):
+            if isinstance(v, bool) or not isinstance(v, (int, float)): return False
+            return (float(v).is_integer() and (1 <= v <= 8 or v == 16)) or float(v) in HALF_RATES
+        bad = [k for k, v in recipe_tensors.items() if not ok(v)]
         if bad:
-            return None, None, False, f"Recipe bitrates must be integers 1-8 or 16, bad keys e.g.: {bad[:5]}"
+            return None, None, False, f"Recipe bitrates must be integers 1-8, 16, or one of {HALF_RATES}; bad keys e.g.: {bad[:5]}"
         recipe_bits = recipe.get("achieved_bpw") or recipe.get("target_bpw")
         if args.bits is None and recipe_bits is None:
             return None, None, False, "Recipe has no target_bpw/achieved_bpw; pass --bits for reporting"
@@ -268,6 +273,17 @@ def prepare(args) -> (dict, dict, bool, str):
         ("codebook", True, "mul1"),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
+
+    # Bitrates outside the main budget must be supported rates; the half-integer ones need the mul1 codebook
+    half_ok = in_args["codebook"] == "mul1"
+    for arg_ in ("head_bits", "mtp_bits"):
+        v = in_args[arg_]
+        if v == 16 or (float(v).is_integer() and 1 <= v <= 8):
+            in_args[arg_] = int(v)
+        elif not (half_ok and v in HALF_RATES):
+            return None, None, False, f"--{arg_} must be an integer 1-8, 16, or one of {HALF_RATES} with the mul1 codebook, got {v}"
+    if recipe_tensors is not None and not half_ok and any(v in HALF_RATES for v in recipe_tensors.values()):
+        return None, None, False, f"Recipe uses half-integer bitrates, which need the mul1 codebook"
 
     # Recipe strategy travels with the job; a stored map from a resumed job wins over the file
     if recipe_tensors is not None and "recipe_strategy" not in in_args:
@@ -1116,6 +1132,7 @@ def main(args, job_state):
         strategy, final_bpw = create_q_strategy(
             model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
             vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
+            half_steps = args["codebook"] == "mul1",   # 1.5 / 2.5 / 3.5 bpw exist for the mul1 codebook only
         )
     args["final_bits"] = round(final_bpw, 2)
     print(" -- Quantization strategy, summary:")

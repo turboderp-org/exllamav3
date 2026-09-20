@@ -25,6 +25,7 @@
 #include "quant/exl3_gemm.cuh"
 #include "quant/exl3_gemv.cuh"
 #include "quant/exl3_gemv_int8.cuh"
+#include "quant/frac.cuh"
 #include "cpu/moe_mul1.h"
 #include "cpu/moe_handoff.h"
 #include "quant/exl3_kernel_map.cuh"
@@ -143,10 +144,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
     m.def("quantize_tiles_scratch", &quantize_tiles_scratch, "quantize_tiles_scratch");
+    m.def("quantize_tiles_frac", &quantize_tiles_frac, "quantize_tiles_frac");
     m.def("test_distribution", &test_distribution, "test_distribution");
     m.def("decode", &decode, "decode");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
+    m.def("pack_trellis_frac", &pack_trellis_frac, "pack_trellis_frac");
+    m.def("unpack_trellis_frac", &unpack_trellis_frac, "unpack_trellis_frac");
     m.def("pack_signs", &pack_signs, "pack_signs");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");

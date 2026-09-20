@@ -1,7 +1,7 @@
 from __future__ import annotations
 import torch
 from ...model.config import Config
-from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n
+from .exl3_lib.quantize import frac_k, preapply_had_l, preapply_had_r, had_k, had_n
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
 import os
@@ -63,7 +63,10 @@ class LinearEXL3:
         self.suh = suh if suh is not None else self.unpack_bf(su)
         self.svh = svh if svh is not None else self.unpack_bf(sv)
         self.trellis = trellis
-        self.K = trellis.shape[-1] // 16
+        # Bitrate from the tile width: 16 * K uint16 per tile, 16 * K + 8 for half-integer K (mul1 only)
+        K = trellis.shape[-1] / 16
+        self.K = int(K) if float(K).is_integer() else K
+        self.frac = frac_k(self.K)
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
@@ -75,9 +78,11 @@ class LinearEXL3:
         self.mul1_tensor = mul1
         self.mcg = self.mcg_tensor is not None
         self.mul1 = self.mul1_tensor is not None
+        assert self.frac is None or self.mul1, f"{key}: half-integer bitrate {self.K} requires the mul1 codebook"
 
         self._fused_reconstruct = None
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
+        # K is the bitrate (int, or float for the half-integer rates); the C++ side decomposes it
         self.bc = ext.BC_LinearEXL3(
             self.trellis,
             self.suh,
@@ -194,7 +199,7 @@ class LinearEXL3:
             if use_fused:
                 ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
             else:
-                ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
+                self._reconstruct_inner(w, 0)
             ext.hgemm_recon(xh, w, y_)
         else:
             numel_ = self.in_features * MAX_RECONSTRUCT_SLICE_N
@@ -207,7 +212,7 @@ class LinearEXL3:
                     ext.reconstruct_had_slice(
                         w, self.trellis, self.suh, self.svh[n_start:], self.K, self.mcg, self.mul1, n_start)
                 else:
-                    ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
+                    self._reconstruct_inner(w, n_start)
                 ext.hgemm_recon(xh, w, y_[:, n_start:n_end])
 
         if not use_fused:
@@ -218,9 +223,16 @@ class LinearEXL3:
         return y
 
 
+    def _reconstruct_inner(self, w: torch.Tensor, n_start: int):
+        """Rotated-basis weight slice (in_features, w.shape[1]) from packed columns n_start.."""
+        if n_start == 0 and w.shape[1] == self.out_features:
+            ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
+        else:
+            ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
+
     def get_inner_weight_tensor(self, n_offset: int = 0, n_features: int | None = None):
         w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
-        ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
+        self._reconstruct_inner(w, 0)
         return w
 
 

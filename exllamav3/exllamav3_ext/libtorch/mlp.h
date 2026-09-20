@@ -26,7 +26,7 @@ struct BC_GatedMLP
     c10::optional<at::Tensor> gu_ptrs_trellis;
     c10::optional<at::Tensor> gu_ptrs_suh;
     c10::optional<at::Tensor> gu_ptrs_svh;
-    int gu_K;
+    float gu_K;
     bool gu_mcg;
     bool gu_mul1;
     bool act_silu;
@@ -59,7 +59,7 @@ struct BC_GatedMLP
         c10::optional<at::Tensor> _gu_ptrs_trellis,
         c10::optional<at::Tensor> _gu_ptrs_suh,
         c10::optional<at::Tensor> _gu_ptrs_svh,
-        int _gu_K,
+        float _gu_K,
         bool _gu_mcg,
         bool _gu_mul1,
         bool _act_silu,

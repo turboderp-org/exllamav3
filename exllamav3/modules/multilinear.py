@@ -93,7 +93,7 @@ class SlicedMultiLinear:
             assert trellis.dim() == 3 and trellis.shape[-1] == 16 * self.K and trellis.dtype == torch.int16
             assert trellis.is_contiguous() and l.inner.svh.is_contiguous()
             for n0 in range(0, l.out_features, self.width):
-                trellis_ptrs.append(trellis.data_ptr() + (n0 // 16) * 16 * self.K * trellis.element_size())
+                trellis_ptrs.append(trellis.data_ptr() + (n0 // 16) * trellis.shape[-1] * trellis.element_size())
                 svh_ptrs.append(l.inner.svh.data_ptr() + n0 * l.inner.svh.element_size())
                 targets.append(i)
                 offsets.append(n0)

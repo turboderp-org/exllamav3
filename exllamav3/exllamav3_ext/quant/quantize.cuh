@@ -35,3 +35,4 @@ void test_distribution
     bool mcg,
     bool mul1
 );
+void quantize_tiles_frac(at::Tensor input_tiles, at::Tensor output_tiles, at::Tensor output_indices, at::Tensor temp_costs, at::Tensor temp_edges, int KA, int64_t MASK);

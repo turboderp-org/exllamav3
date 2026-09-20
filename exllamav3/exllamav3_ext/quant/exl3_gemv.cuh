@@ -17,6 +17,7 @@ bool exl3_gemv_try_launch
     int size_k,
     int size_n,
     int K,
+    bool half_k,
     int cb,
     bool c_fp32,
     bool has_su_sv,
@@ -25,6 +26,9 @@ bool exl3_gemv_try_launch
     void** launched_kernel,
     bool force
 );
+
+// Kernel instances for the half-integer bitrates (comp_units/exl3_gemv_half_inst.cu)
+void* exl3_gemv_select_kernel_half(int bits, bool c_fp32, int mmode, int cfg, bool smem);
 
 // Direct entry point (testing): errors if the call is not hard-eligible
 void exl3_gemv

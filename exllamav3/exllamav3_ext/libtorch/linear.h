@@ -31,7 +31,7 @@ struct BC_LinearEXL3
     at::Tensor trellis;
     at::Tensor suh;
     at::Tensor svh;
-    int K;
+    float K;                      // bitrate, integer or half-integer (see quant/bits_k.cuh)
     c10::optional<at::Tensor> bias;
     bool mcg;
     bool mul1;
@@ -42,7 +42,7 @@ struct BC_LinearEXL3
         at::Tensor _trellis,
         at::Tensor _suh,
         at::Tensor _svh,
-        int _K,
+        float _K,
         c10::optional<at::Tensor> _bias,
         bool _mcg,
         bool _mul1,

@@ -9,6 +9,7 @@ namespace cg = cooperative_groups;
 #include "../util.cuh"
 #include "exl3_gemm_kernel.cuh"
 #include "exl3_kernel_map.cuh"
+#include "bits_k.cuh"
 #include "exl3_devctx.cuh"
 #include "exl3_gemv.cuh"
 #include "exl3_gemv_int8.cuh"
@@ -60,7 +61,8 @@ uint64_t gemm_autotune_hash
     int device,
     int cc,
     int max_num_sms,
-    int cb
+    int cb,
+    bool half_k
 )
 {
     uint64_t h = 1469598103934665603ull;
@@ -69,6 +71,7 @@ uint64_t gemm_autotune_hash
         h ^= v;
         h *= 1099511628211ull;
     };
+    mix((uint64_t) (half_k ? 1 : 0));
     mix((uint64_t) MIN(roundup_pow2(size_m), 16));
     mix((uint64_t) size_k);
     mix((uint64_t) size_n);
@@ -93,10 +96,11 @@ uint64_t mgemm_autotune_hash
     int max_num_sms,
     int cb,
     int bszm_in,
-    int bszm_out
+    int bszm_out,
+    bool half_k
 )
 {
-    uint64_t h = gemm_autotune_hash(size_m, size_k, size_n, K, c_fp32, device, cc, max_num_sms, cb);
+    uint64_t h = gemm_autotune_hash(size_m, size_k, size_n, K, c_fp32, device, cc, max_num_sms, cb, half_k);
     auto mix = [&] (uint64_t v)
     {
         h ^= v;
@@ -157,8 +161,11 @@ int exl3_gemm_gr
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);
 
-    // Dispatch
-    int K = B.size(2) / 16;
+    // Dispatch. 16 * K uint16 per tile for integer K; half-integer bitrates (K + 0.5, mul1 only) carry 16 * K + 8
+    const int tile_u16 = B.size(2);
+    const bool half_k = (tile_u16 % 16) != 0;
+    int K = tile_u16 / 16;
+    TORCH_CHECK(!half_k || (tile_u16 % 16 == 8 && mul1), "exl3_gemm: half-integer bitrates require the mul1 codebook");
     const half* A_ptr = (const half*) A.data_ptr();
     const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
     void* C_ptr = (void*) C.data_ptr();
@@ -224,7 +231,7 @@ int exl3_gemm_gr
         void* gemv_kernel = nullptr;
         if (exl3_gemv_try_launch
         (
-            kernelArgs, size_m, size_k, size_n, K, cb, c_fp32,
+            kernelArgs, size_m, size_k, size_n, K, half_k, cb, c_fp32,
             suh_ptr && A_had_ptr && svh_ptr,
             device, stream, &gemv_kernel, false
         ))
@@ -238,7 +245,7 @@ int exl3_gemm_gr
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
-        uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb);
+        uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
         CoopAutotuneLaunch tuned;
         if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, SMEM_MAX, stream, &tuned))
         {
@@ -251,7 +258,7 @@ int exl3_gemm_gr
         {
             if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K)) continue;
 
-            fp_exl3_gemm_kernel candidate_kernel = get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb);
+            fp_exl3_gemm_kernel candidate_kernel = get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
             if (!candidate_kernel) continue;
 
             int tilesize_k = exl3_gemm_tilesize_k_g[candidate_shape_idx];
@@ -282,7 +289,7 @@ int exl3_gemm_gr
     (
         cc, size_m, size_k, size_n, K, c_fp32,
         force_shape_idx, &block_dim, &shape_idx,
-        &num_sms, cb
+        &num_sms, cb, half_k
     );
     if (!kernel) return 0;
 
@@ -393,7 +400,7 @@ int exl3_mgemm_gr
     const at::Tensor& svh,
     const c10::optional<at::Tensor>& indices,
     const c10::optional<at::Tensor>& weights,
-    int K,
+    float K_,
     int force_shape_idx,
     bool mcg,
     bool mul1,
@@ -523,11 +530,15 @@ int exl3_mgemm_gr
     const uintptr_t* suh_ptr_ptr = (const uintptr_t*) suh.data_ptr();
     const uintptr_t* svh_ptr_ptr = (const uintptr_t*) svh.data_ptr();
 
-    // Select kernel
+    // Select kernel. K_ is the bitrate (integer or half-integer, see bits_k.cuh)
     TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
     int cb = 0;
     if (mcg) cb = 1;
     if (mul1) cb = 2;
+    const BitsK bk = bits_from_K(K_);
+    const int K = bk.bits;
+    const bool half_k = bk.half;
+    TORCH_CHECK(!half_k || mul1, "exl3_mgemm: half-integer bitrates require the mul1 codebook");
 
     int shape_idx;
     int block_dim;
@@ -577,7 +588,7 @@ int exl3_mgemm_gr
     {
         uint64_t autotune_key = mgemm_autotune_hash
         (
-            size_m, size_k, size_n, K, c_fp32, device, cc, total_sms, cb, bszm_in, bszm_out
+            size_m, size_k, size_n, K, c_fp32, device, cc, total_sms, cb, bszm_in, bszm_out, half_k
         );
         if (had_src_list) autotune_key ^= 0x9e3779b97f4a7c15ull;   // sliced launches tune separately
 
@@ -595,7 +606,7 @@ int exl3_mgemm_gr
             {
                 if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K)) continue;
 
-                fp_exl3_mgemm_kernel candidate_kernel = get_mgemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb);
+                fp_exl3_mgemm_kernel candidate_kernel = get_mgemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
                 if (!candidate_kernel) continue;
 
                 int tilesize_k = exl3_gemm_tilesize_k_g[candidate_shape_idx];
@@ -629,7 +640,7 @@ int exl3_mgemm_gr
     (
         cc, size_m, size_k, size_n, K, c_fp32,
         force_shape_idx, &block_dim, &shape_idx,
-        &num_sms, cb, bszm_in, bszm_out
+        &num_sms, cb, bszm_in, bszm_out, half_k
     );
     int tilesize_k = exl3_gemm_tilesize_k_g[shape_idx];
     int tilesize_n = exl3_gemm_tilesize_n_g[shape_idx];
@@ -676,7 +687,7 @@ int exl3_mgemm
     const at::Tensor& svh,
     const c10::optional<at::Tensor>& indices,
     const c10::optional<at::Tensor>& weights,
-    int K,
+    float K_,
     int force_shape_idx,
     uint32_t mcg_mult,
     uint32_t mul1_mult,
@@ -701,7 +712,7 @@ int exl3_mgemm
         svh,
         indices,
         weights,
-        K,
+        K_,
         force_shape_idx,
         mcg_mult,
         mul1_mult,

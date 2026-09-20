@@ -131,7 +131,7 @@ struct BC_GatedDeltaNetSplit
     // 5 x slices): target (0 qkv, 1 z), column offset, width, row stride, source. Outputs are
     // fp32 (the projections' out dtype), so the carrier is fp32
     c10::optional<at::Tensor> qkvz_ptrs_trellis, qkvz_ptrs_suh, qkvz_ptrs_svh, qkvz_meta;
-    int qkvz_K = 0;
+    float qkvz_K = 0;
     bool qkvz_mcg = false;
     bool qkvz_mul1 = false;
     at::Tensor qkvz_size_n, qkvz_n_stride, qkvz_had_src, qkvz_carrier;
@@ -141,7 +141,7 @@ struct BC_GatedDeltaNetSplit
         at::Tensor ptrs_suh,
         at::Tensor ptrs_svh,
         at::Tensor meta,
-        int K,
+        float K,
         bool mcg,
         bool mul1
     );

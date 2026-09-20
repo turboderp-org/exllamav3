@@ -566,6 +566,10 @@ class DSV4Attention(Module):
                 for m in comp.modules():
                     self.register_submodule(m)
 
+        # The DSV4 bundle contexts take integer bitrates; keep these projections off the half-integer rates
+        for m in self.modules:
+            m.q_half_bits = False
+
         self.inv_freq_main = None
         self.inv_freq_compress = None
 
