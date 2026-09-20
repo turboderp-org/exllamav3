@@ -90,6 +90,8 @@ parser.add_argument("-d", "--devices", type = str, default = "0", help = "List o
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
 parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
+parser.add_argument("-hess", "--hessians", type = str, default = None, help = "Directory of precomputed per-tensor Hessians (<key>.safetensors with hin (in, in) and/or hout (out, out), square or packed upper triangle, e.g. YAQA-style Kronecker factors from a separate gradient pass). Skips the calibration forward passes; tensors with hout use two-sided LDLQ")
+parser.add_argument("-hreg", "--hessians_reg", type = float, default = None, help = "Diagonal regularization of the output-side Hessian, relative to its mean diagonal (default: same as input side, 0.025). Larger values blend toward plain one-sided LDLQ")
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Deprecated (no-op): parallel mode is now the default; layers with fewer tensors than devices fall back to tile splitting")
 parser.add_argument("--max_module", type = int, help = "End quantization after this many modules, includes embedding and norm layers (for debug purposes)", default = None)
 
@@ -271,6 +273,8 @@ def prepare(args) -> (dict, dict, bool, str):
         ("devices", True, None),
         ("device_ratios", True, None),
         ("codebook", True, "mul1"),
+        ("hessians", False, ""),
+        ("hessians_reg", False, 0.025),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -411,6 +415,44 @@ def get_state_error(x, ref):
      return err.item(), cos, sq
 
 
+def unpack_sym(t, n):
+    """
+    Symmetric (n, n) matrix from its packed upper triangle (row-major, as written by util/yaqa_hessians.py). Full
+    matrices pass through
+    """
+    if t.dim() == 2:
+        return t.float()
+    assert t.dim() == 1 and t.numel() == n * (n + 1) // 2, "packed Hessian size"
+    out = torch.zeros((n, n), dtype = torch.float)
+    out[torch.ones((n, n), dtype = torch.bool).triu_()] = t.float()
+    out += out.triu(1).T
+    return out
+
+
+def get_H_data(args, linear, capture_H, state):
+    """
+    Hessians for one Linear, as (H_data, H_out). H_data: captured online (calibrated conversion), or built from the
+    hin (in, in) of the tensor's --hessians file, or the uncalibrated placeholder. H_out: the file's hout (out, out)
+    if present, enabling two-sided LDLQ; a --hessians export with hout only keeps the online input-side capture
+    """
+    hin = hout = None
+    path = os.path.join(args["hessians"], linear.key + ".safetensors") if args.get("hessians") else None
+    if path and os.path.exists(path):
+        with safe_open(path, framework = "pt", device = "cpu") as f:
+            hin = unpack_sym(f.get_tensor("hin"), linear.in_features) if "hin" in f.keys() and not state else None
+            hout = unpack_sym(f.get_tensor("hout"), linear.out_features) if "hout" in f.keys() else None
+        assert hin is None or hin.shape == (linear.in_features, linear.in_features), f"{linear.key}: hin shape"
+        assert hout is None or hout.shape == (linear.out_features, linear.out_features), f"{linear.key}: hout shape"
+    if state:
+        return capture_H[linear.qmap], hout
+    hd = linear.init_H_data(False)
+    if hin is not None:
+        hd.update({"H": hin, "H_swap_device": linear.device, "count": 1})
+    elif path:
+        print(f" !! No precomputed Hessian for {linear.key}, quantizing uncalibrated")
+    return hd, hout
+
+
 def make_quant_args(args, idx, K, devices, device_ratios = None):
     quant_args = {
         "seed": idx,
@@ -420,6 +462,8 @@ def make_quant_args(args, idx, K, devices, device_ratios = None):
         "apply_out_scales": args["apply_out_scales"],
         "debug_dir": os.path.join(args["work_dir"], "debug"),
     }
+    if args.get("hessians_reg") is not None:
+        quant_args["sigma_reg_out"] = args["hessians_reg"]
     if args["codebook"] == "mcg":
         quant_args.update({"mcg": True})
     elif args["codebook"] == "mul1":
@@ -516,7 +560,8 @@ def _tile_split_devices(numel, devices, device_ratios):
 
 def quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state):
 
-    allow_grouping = state is not None and not args["image_dump"] and not args["verbose"]
+    # Batched group quantization has no two-sided LDLQ: per-tensor path when precomputed Hessians are in play
+    allow_grouping = state is not None and not args["image_dump"] and not args["verbose"] and not args.get("hessians")
     groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None)
 
     for group in groups:
@@ -561,8 +606,9 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
             with Timer() as t:
                 sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
                     if args["image_dump"] else None
+                H_data_, quant_args["H_out"] = get_H_data(args, linear, capture_H, state)
                 proxy_err = linear.convert_exl3(
-                    capture_H[linear.qmap] if state else linear.init_H_data(False),
+                    H_data_,
                     quant_args = quant_args,
                     progress_str = f" -- <step>: {linear.key}",
                     verbose = args["verbose"],
@@ -577,7 +623,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
     assert not args["image_dump"], "Parallel mode is incompatible with --image_dump"
     global curr_progress, max_progress
 
-    allow_grouping = state is not None and not args["verbose"]
+    allow_grouping = state is not None and not args["verbose"] and not args.get("hessians")
     groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None)
 
     # Split workload by group
@@ -638,8 +684,9 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                 linear = group[0]
                 quant_args_local = make_quant_args(args, idx, strategy[linear.key], [device_idx])
 
+                H_data_, quant_args_local["H_out"] = get_H_data(args, linear, capture_H, state)
                 proxy_err = linear.convert_exl3(
-                    capture_H[linear.qmap] if state else linear.init_H_data(False),
+                    H_data_,
                     quant_args = quant_args_local,
                     verbose = args["verbose"],
                     save_reg = False,
@@ -1076,6 +1123,16 @@ def main(args, job_state):
 
     # Get model
     config, model, mtp_model, vision_model, tokenizer, use_reference_state = get_base_model(args)
+    if args.get("hessians"):
+        # Precomputed Hessians with an input-side factor replace the online capture: no calibration state, no forward
+        # passes. An export with output-side factors only adds two-sided LDLQ to the normal calibrated conversion
+        probe = next((f for f in sorted(os.listdir(args["hessians"])) if f.endswith(".safetensors") and "layers." in f), None)
+        assert probe, f"No per-tensor Hessian files in {args['hessians']}"
+        with safe_open(os.path.join(args["hessians"], probe), framework = "pt", device = "cpu") as f:
+            ext_hin = "hin" in f.keys()
+        print(f" -- Using precomputed Hessians: {args['hessians']}" + ("" if ext_hin else " (output side only, input side captured online)"))
+        if ext_hin:
+            use_reference_state = False
 
     # Models with a hashed n-gram embedding table get it quantized (or copied from --ngram_file)
     # into the output directory up front, so the calibration forward pass runs on the quantized

@@ -665,6 +665,95 @@ def ldlq(
     return weight_q, encoded
 
 
+def ldlq_2hess(
+    weight: torch.Tensor,
+    L_in: torch.Tensor,
+    L_out: torch.Tensor,
+    quant_args: dict,
+    pb: ProgressBar | None = None
+):
+    """
+    LDLQ with error feedback along both axes, for a Kronecker-factored Hessian H ~ H_out (x) H_in (YAQA, Tseng et al.
+    2025). Objective tr(E^T H_in E H_out) with E = W - Q, shape (k, n); L_in (k, k) and L_out (n, n) are the block-16
+    LDL factors (zero diagonal, as for ldlq()). The 16x16 tiles are quantized along anti-diagonals from the far corner,
+    every tile of a diagonal being independent given the earlier ones. With L' = I + L the input of tile (a, c) is
+
+        W[a, c] + (L_in'^T E L_out')[a, c],     E restricted to the tiles already quantized
+
+    kept as a running matrix F that receives one rank-(16 * tiles) update per diagonal:
+    F += L_in'[rows, :]^T . blockdiag(dE) . L_out'[cols, :]
+
+    :return:
+        tuple, as ldlq(): quantized weight (k, n), indices (k // 16, n // 16, 256)
+    """
+    devices = quant_args["devices"]
+    for device in devices:
+        torch.cuda.synchronize(device)
+    main_stream = get_quant_stream(devices[0])
+    with torch.cuda.stream(main_stream):
+        device = L_in.device
+        weight = weight.to(device)
+        size_k, size_n = weight.shape
+        assert size_k % 16 == 0 and size_n % 16 == 0
+        tiles_k, tiles_n = size_k // 16, size_n // 16
+
+        Lk = L_in.clone(); Lk.diagonal().fill_(1.0)      # unit lower triangular
+        Ln = L_out.clone(); Ln.diagonal().fill_(1.0)
+        F = torch.zeros((size_k, size_n), dtype = torch.float, device = device)
+        weight_q = torch.zeros_like(weight)
+        encoded = torch.zeros((tiles_k, tiles_n, 256), dtype = torch.short, device = device)
+        W4 = weight.view(tiles_k, 16, tiles_n, 16)
+        Q4 = weight_q.view(tiles_k, 16, tiles_n, 16)
+        F4 = F.view(tiles_k, 16, tiles_n, 16)
+        perm, perm_i = tensor_core_perm(device), tensor_core_perm_i(device)
+        ar16 = torch.arange(16, device = device)
+
+        steps = tiles_k + tiles_n - 1
+        for step, s in enumerate(range(steps - 1, -1, -1)):
+            a = torch.arange(max(0, s - (tiles_n - 1)), min(tiles_k - 1, s) + 1, device = device)
+            c = s - a
+            tiles = (W4[a, :, c, :] + F4[a, :, c, :]).reshape(-1, 256)             # (T, 16, 16) row major
+            quant_w, quant_i = quantize_tiles_multigpu(tiles[:, perm].contiguous(), quant_args)
+            quant_w = quant_w[:, perm_i].view(-1, 16, 16)
+            Q4[a, :, c, :] = quant_w
+            encoded[a, c] = quant_i
+            if s > 0:
+                dE = W4[a, :, c, :] - quant_w                                           # (T, 16, 16)
+                rows = (a.unsqueeze(1) * 16 + ar16).flatten()                           # (16 T,)
+                cols = (c.unsqueeze(1) * 16 + ar16)                                     # (T, 16)
+                # Only tiles above and to the left can still be pending: restrict the update to that corner
+                k_hi = int(a.max().item()) * 16 + 16
+                n_hi = int(c.max().item()) * 16 + 16
+                right = torch.bmm(dE, Ln[cols][:, :, :n_hi])                            # (T, 16, n_hi)
+                F[:k_hi, :n_hi].addmm_(Lk[rows, :k_hi].T, right.reshape(-1, n_hi))
+            if pb and step % 4 == 0:
+                pb.update(min(tiles_k, step * tiles_k // steps))
+
+        for device in devices:
+            torch.cuda.synchronize(device)
+
+    return weight_q, encoded
+
+
+def prepare_H_out(H_out: torch.Tensor, sv: torch.Tensor, quant_args: dict, verbose: bool, device):
+    """
+    Output-side Hessian factor in the quantizer's rotated basis, with its block LDL factor. The rotated weight relates
+    to the original by E_o = S_u P_k E_r P_n S_v, so tr(E_o^T H_in E_o H_out) = tr(E_r^T [..] E_r [P_n S_v H_out S_v P_n]):
+    the full output scale vector sv (signs and channel scales) goes into the transform.
+    """
+    Ho = H_out.to(device, torch.float).clone()
+    s = sv.flatten().to(device, torch.float)
+    Ho *= s.unsqueeze(0)
+    Ho *= s.unsqueeze(1)
+    blockwise_preapply_had_r_(Ho, had_n)
+    blockwise_preapply_had_l_(Ho, had_n)
+    Ho /= Ho.diagonal().mean().clamp_min(1e-30)
+    Ho.diagonal().add_(quant_args.get("sigma_reg_out", quant_args.get("sigma_reg", 0.025)))
+    L_out, Ho = block_ldl(Ho, 16, quant_args, verbose)
+    L_out.diagonal().fill_(0.0)
+    return L_out.to(device), Ho.to(device)
+
+
 def fallback_quant(
     weight: torch.Tensor,
     q_device: torch.Tensor,
@@ -1498,8 +1587,14 @@ def quantize_exl3(
         if weight_r.numel() > 5e8:
             weight_r = weight_r.cpu()
 
-        # Quantize
-        if not q_fallback:
+        # Quantize. An external output-side Hessian factor (YAQA-style Kronecker approximation, see ldlq_2hess)
+        # switches to error feedback along both axes
+        H_out_r = None
+        if not q_fallback and quant_args.get("H_out") is not None:
+            L_out, H_out_r = prepare_H_out(quant_args["H_out"], sv, quant_args, verbose, device)
+            weight_q, encoded_q = ldlq_2hess(weight_r.to(device), L, L_out, quant_args, pb)
+            del L, L_out
+        elif not q_fallback:
             weight_q, encoded_q = ldlq(weight_r, L, quant_args, pb)  #zxc
             del L
         else:
@@ -1515,12 +1610,22 @@ def quantize_exl3(
                 Hd = H.to(device)
                 weight_r = None
                 E = E.to(device)
-                num = block_trace(E, Hd)
+                if H_out_r is not None:
+                    # Two-sided proxy tr(E^T H_in E H_out) / tr(W^T H_in W H_out)
+                    W = W.to(device)
+                    num = ((Hd @ E) * (E @ H_out_r)).sum().item()
+                    den = ((Hd @ W) * (W @ H_out_r)).sum().item()
+                    if verbose:
+                        print(f"     - one-sided proxy:  {block_trace(E, Hd) / max(block_trace(W, Hd), 1e-8):.6f}")
+                else:
+                    num = block_trace(E, Hd)
+                    E = None
+                    W = W.to(device)
+                    den = block_trace(W, Hd)
                 E = None
-                W = W.to(device)
-                den = block_trace(W, Hd)
                 W = None
                 Hd = None
+                H_out_r = None
                 proxy_err = num / max(den, 1e-8)
             except torch.OutOfMemoryError:
                 weight_r = None
