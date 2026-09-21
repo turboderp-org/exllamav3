@@ -26,6 +26,33 @@ EXL3_MOE_COOP_INST_DECL(8)
 
 #undef EXL3_MOE_COOP_INST_DECL
 
+// Half-integer rates K + 0.5 (exl3_moe_coop_inst_h{K}.cu), mul1 codebook only
+#define EXL3_MOE_COOP_INST_DECL_H(K) \
+    MoeCoopKernel exl3_moe_coop_kernel_a_h##K(int Hi, bool wide); \
+    MoeCoopKernel exl3_moe_coop_kernel_b_h##K(bool wide);
+
+EXL3_MOE_COOP_INST_DECL_H(1)
+EXL3_MOE_COOP_INST_DECL_H(2)
+EXL3_MOE_COOP_INST_DECL_H(3)
+
+#undef EXL3_MOE_COOP_INST_DECL_H
+
+#define EXL3_MOE_COOP_INST_DEF_H(K) \
+    MoeCoopKernel exl3_moe_coop_kernel_a_h##K(int Hi, bool wide) \
+    { \
+        using namespace exl3_moe_coop_ns; \
+        const int smem = smem_a_bytes<K, true>(Hi); \
+        if (wide) return { (void*) exl3_moe_coop_a_kernel<K, 2, true, true>, smem }; \
+        return { (void*) exl3_moe_coop_a_kernel<K, 2, false, true>, smem }; \
+    } \
+    MoeCoopKernel exl3_moe_coop_kernel_b_h##K(bool wide) \
+    { \
+        using namespace exl3_moe_coop_ns; \
+        const int smem = smem_b_bytes<K, true>(); \
+        if (wide) return { (void*) exl3_moe_coop_b_kernel<K, 2, true, true>, smem }; \
+        return { (void*) exl3_moe_coop_b_kernel<K, 2, false, true>, smem }; \
+    }
+
 // Body of an instance file
 #define EXL3_MOE_COOP_INST_DEF(K) \
     MoeCoopKernel exl3_moe_coop_kernel_a_k##K(int cb, int Hi, bool wide) \

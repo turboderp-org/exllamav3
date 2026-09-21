@@ -234,6 +234,70 @@ void quantize_tiles
     }
 }
 
+// Fractional-rate quantizer, mul1 codebook only: KA bits per position plus one extra bit where the 16-position MASK is set.
+// Costs and history live in the caller's scratch: temp_costs (batch, 2, 65536 >> KA) half,
+// temp_edges (batch, 256, 65536 >> KA) short
+void quantize_tiles_frac
+(
+    at::Tensor input_tiles,
+    at::Tensor output_tiles,
+    at::Tensor output_indices,
+    at::Tensor temp_costs,
+    at::Tensor temp_edges,
+    int KA,
+    int64_t MASK
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(input_tiles.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DIM(input_tiles, 2);
+    const int L = input_tiles.size(1);
+    TORCH_CHECK(L == 256, "quantize_tiles_frac: tile length must be 256");
+    TORCH_CHECK_SHAPES_FULL(input_tiles, output_indices);
+    TORCH_CHECK_SHAPES_FULL(input_tiles, output_tiles);
+    TORCH_CHECK_DTYPE(input_tiles, kFloat);
+    TORCH_CHECK_DTYPE(output_tiles, kFloat);
+    TORCH_CHECK_DTYPE(output_indices, kShort);
+    TORCH_CHECK_DTYPE(temp_costs, kHalf);
+    TORCH_CHECK_DTYPE(temp_edges, kShort);
+    const int edges_max = 65536 >> KA;
+    TORCH_CHECK_DIM(temp_costs, 3);
+    TORCH_CHECK_SIZE(temp_costs, 1, 2);
+    TORCH_CHECK_SIZE(temp_costs, 2, edges_max);
+    TORCH_CHECK_DIM(temp_edges, 3);
+    TORCH_CHECK_SIZE(temp_edges, 1, L);
+    TORCH_CHECK_SIZE(temp_edges, 2, edges_max);
+    for (const auto& tensor : {input_tiles, output_tiles, output_indices, temp_costs, temp_edges})
+        TORCH_CHECK(tensor.is_contiguous() && tensor.device() == input_tiles.device(), "quantize_tiles_frac: layout");
+    fp_quantize_tiles_kernel kernel = nullptr;
+    struct { int ka; uint32_t mask; fp_quantize_tiles_kernel (*fn)(); } const table[] = {
+        {1, 0xaaaau, &quantize_tiles_frac_kernel_a1_maaaa},
+        {2, 0xaaaau, &quantize_tiles_frac_kernel_a2_maaaa},
+        {3, 0xaaaau, &quantize_tiles_frac_kernel_a3_maaaa},
+    };
+    for (const auto& e : table) if (e.ka == KA && e.mask == (uint32_t) MASK) kernel = e.fn();
+    TORCH_CHECK(kernel, "quantize_tiles_frac: no instance for (KA, MASK) = (", KA, ", ", MASK, ")");
+    const int num_tiles = input_tiles.size(0);
+    if (!num_tiles) return;
+    const int shmem = L * sizeof(half) + 32 * sizeof(int) + 128;
+    cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    const int max_batch_size = (int) MIN(temp_costs.size(0), temp_edges.size(0));
+    for (int batch_i = 0; batch_i < num_tiles; batch_i += max_batch_size)
+    {
+        const int bsz = MIN(max_batch_size, num_tiles - batch_i);
+        kernel<<<bsz, 512, shmem, stream>>>
+        (
+            ((const float*) input_tiles.data_ptr()) + (int64_t) L * batch_i,
+            ((float*) output_tiles.data_ptr()) + (int64_t) L * batch_i,
+            ((uint16_t*) output_indices.data_ptr()) + (int64_t) L * batch_i,
+            (half*) temp_costs.data_ptr(),
+            (uint16_t*) temp_edges.data_ptr(),
+            nullptr
+        );
+        cuda_check(cudaPeekAtLastError());
+    }
+}
+
 template <typename T>
 __global__ //__launch_bounds__(64)
 void decode_kernel

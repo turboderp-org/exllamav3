@@ -20,9 +20,9 @@ void exl3_moe
 
     const int act_function,
 
-    const int K_gate,
-    const int K_up,
-    const int K_down,
+    const float K_gate,
+    const float K_up,
+    const float K_down,
 
     const at::Tensor& gate_ptrs_trellis,
     const at::Tensor& gate_ptrs_suh,

@@ -7,22 +7,42 @@ import re
 if TYPE_CHECKING:
     from ..model import Model, Config
 
+# Half-integer trellis rates with kernel instances (mul1 codebook only); above 3.5 bpw the steps are whole bits
+HALF_RATES = (1.5, 2.5, 3.5)
+
+
+def _as_rate(r: float):
+    return int(r) if float(r).is_integer() else float(r)
+
+
+def rate_floor(bpw: float, half_steps: bool):
+    """Largest supported bitrate <= bpw: integers 1..8, plus 1.5 / 2.5 / 3.5 when half_steps"""
+    r = math.floor(bpw * 2) / 2 if half_steps and bpw < 4 else math.floor(bpw)
+    return _as_rate(max(1, min(8, r)))
+
+
+def rate_next(bpw: float, half_steps: bool):
+    """The next supported bitrate above bpw (8 stays 8)"""
+    return _as_rate(min(8, bpw + (0.5 if half_steps and bpw < 4 else 1)))
+
+
 @dataclass
 class QTarget:
     numel: int
-    target_bpw: int
-    min_bpw: int
+    target_bpw: float
+    min_bpw: float
     priority: int
+    half_steps: bool = False    # may take the half-integer rates
 
     def total_bits(self):
         return self.numel * self.target_bpw
 
     def delta_1(self):
-        delta = (min(8, self.target_bpw + 1) - self.target_bpw) * self.numel
+        delta = (rate_next(self.target_bpw, self.half_steps) - self.target_bpw) * self.numel
         return delta
 
     def increase_1(self):
-        self.target_bpw = min(8, self.target_bpw + 1)
+        self.target_bpw = rate_next(self.target_bpw, self.half_steps)
 
     def clamp_min(self):
         self.target_bpw = max(self.target_bpw, self.min_bpw)
@@ -33,26 +53,28 @@ def create_q_strategy(
     mtp_model: Model,
     config: Config,
     bpw: float,
-    head_bpw: int,
-    mtp_bpw: int,
+    head_bpw: float,
+    mtp_bpw: float,
     hq: bool,
     vision_model: Model = None,
     vision_bpw: int = None,
+    half_steps: bool = False,
 ) -> (dict, float):
     """
     Build the per-module quantization bitrate strategy for a converted model.
 
     Quantizable modules declare their quantization role in the model architecture, primarily through their qmap,
     qbits_key, qgroup, q_priority and select_hq_bits attributes. This function walks the module tree, aggregates
-    all eligible Linear layers into qgroups, assigns an initial integer bitrate from the requested average bpw and
-    then spends the remaining bit budget one bit at a time according to group priority. Auxiliary targets, such as
-    output heads using head_bits, are collected alongside the main budgeted weights and merged into the returned
-    strategy.
+    all eligible Linear layers into qgroups, assigns an initial bitrate from the requested average bpw (rounded down
+    to a supported rate) and then spends the remaining bit budget one step at a time according to group priority.
+    With half_steps (mul1 codebook) the steps below 4 bpw are half bits (1.5 / 2.5 / 3.5), except for modules that
+    opt out with q_half_bits = False (kernels without half-integer instances). The --hq floor is base + select_hq_bits
+    rounded down to a supported rate (2.5 + 2 -> 4). Auxiliary targets, such as output heads using head_bits, are
+    collected alongside the main budgeted weights and merged into the returned strategy.
     """
     from ..modules.module import Module
     from ..modules.linear import Linear
 
-    base_bpw = int(math.floor(bpw))
     sum_numel = 0
     sum_bits = 0
     targets = {}
@@ -77,13 +99,16 @@ def create_q_strategy(
 
             elif module.qbits_key == "bits":
                 numel = module.weights_numel()
+                hs = half_steps and getattr(module, "q_half_bits", True)
+                base_bpw = rate_floor(bpw, hs)
                 sum_numel += numel
                 sum_bits += numel * base_bpw
                 qt = QTarget(
                     numel = numel,
                     target_bpw = base_bpw,
-                    min_bpw = min(base_bpw + module.select_hq_bits, 8),
-                    priority = priority
+                    min_bpw = rate_floor(base_bpw + module.select_hq_bits, hs),
+                    priority = priority,
+                    half_steps = hs
                 )
                 targets[module.key] = qt
                 if module.qgroup not in target_groups:
@@ -106,7 +131,8 @@ def create_q_strategy(
                     target_bpw = mtp_bpw,
                     # --hq promotes the same select layers (attention, shared experts) inside
                     # the MTP head as in the trunk; 16 = store unquantized, never promoted
-                    min_bpw = min(mtp_bpw + module.select_hq_bits, 8) if mtp_bpw <= 8 else mtp_bpw,
+                    min_bpw = rate_floor(mtp_bpw + module.select_hq_bits, half_steps and getattr(module, "q_half_bits", True))
+                              if mtp_bpw <= 8 else mtp_bpw,
                     priority = priority
                 )
 
@@ -185,15 +211,16 @@ def create_q_strategy_from_recipe(
     mtp_model: Model,
     config: Config,
     recipe_tensors: dict,
-    head_bpw: int,
-    mtp_bpw: int,
+    head_bpw: float,
+    mtp_bpw: float,
     vision_model: Model = None,
     vision_bpw: int = None,
 ) -> (dict, float):
     """
     Build the per-module quantization strategy from an explicit per-tensor recipe (e.g. produced
     by util/sc_optimize.py) instead of the budgeted allocation in create_q_strategy. recipe_tensors
-    maps each budgeted ("bits") Linear's key to an integer bitrate (1-8, or 16 to store unquantized).
+    maps each budgeted ("bits") Linear's key to a bitrate (1-8, 1.5 / 2.5 / 3.5 with the mul1 codebook, or 16 to store
+    unquantized).
     The recipe must cover the budgeted tensors exactly.
     """
     from ..modules.linear import Linear

@@ -78,6 +78,46 @@ def get_temp_buffers(device, K: int, tile_len: int = 256, cb: int = 0):
     return temp_costs, temp_edges
 
 
+def frac_k(K):
+    """(KA, MASK) for a half-integer bitrate K = KA + 0.5: alternating KA- and (KA + 1)-bit trellis
+    steps (MASK 0xAAAA, period 16). None for integer K. Half steps keep every tile a whole number of
+    32-bit words (streamable with int4 loads); the kernels accept any period-16 pattern, but only the
+    alternating one is instantiated."""
+    if isinstance(K, int) or float(K).is_integer():
+        return None
+    ka = int(K)
+    assert abs(ka + 0.5 - K) < 1e-9, f"fractional bitrate {K} must be a half-integer"
+    return ka, 0xAAAA
+
+
+def trellis_words(K) -> int:
+    """uint16 words per 256-weight tile at bitrate K (16 * K, an integer for half-integer K)"""
+    w = 16 * K
+    assert float(w).is_integer(), f"bitrate {K}: tile is not a whole number of uint16 words"
+    return int(w)
+
+
+@lru_cache
+def get_temp_buffers_frac(device, ka: int):
+    edges = 65536 >> ka
+    temp_costs = torch.zeros((128, 2, edges), dtype = torch.half, device = device)
+    temp_edges = torch.zeros((128, 256, edges), dtype = torch.short, device = device)
+    return temp_costs, temp_edges
+
+
+def quantize_tiles_frac(tiles, quant_args: dict):
+    """Half-integer bitrate (KA + 0.5): alternating pattern of KA / KA+1-bit steps. mul1 codebook only"""
+    tiles = tiles.contiguous()
+    assert tiles.shape[1] == 256 and tiles.dtype == torch.float
+    assert quant_args.get("mul1"), "fractional bitrates require the mul1 codebook"
+    ka, mask = frac_k(quant_args["K"])
+    quantized_tiles = torch.zeros_like(tiles)
+    quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
+    temp_costs, temp_edges = get_temp_buffers_frac(tiles.device, ka)
+    ext.quantize_tiles_frac(tiles, quantized_tiles, quantized_idx, temp_costs, temp_edges, ka, mask)
+    return quantized_tiles, quantized_idx
+
+
 def quantize_tiles(tiles, quant_args: dict):
     """
     Quantize a batch of 16x16 tiles on the current device.
@@ -86,6 +126,8 @@ def quantize_tiles(tiles, quant_args: dict):
     reconstructed float tile values and the short encoded indices used later for packing. Length-160 rows
     (n-gram embedding vectors, mul1 codebook only) are accepted too and quantized as single tail-biting rings.
     """
+    if frac_k(quant_args["K"]) is not None:
+        return quantize_tiles_frac(tiles, quant_args)
     tiles = tiles.contiguous()
     assert tiles.shape[1] in (256, 160)
     assert tiles.dtype == torch.float
@@ -192,6 +234,8 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
     each GPU quantizes its slice on a per-device stream. Results are copied back through pinned memory and gathered
     on the first device.
     """
+    if frac_k(quant_args["K"]) is not None:
+        return quantize_tiles_frac(tiles, quant_args)
     devices = quant_args["devices"]
     if len(devices) == 1:
         return quantize_tiles(tiles, quant_args)
@@ -621,6 +665,95 @@ def ldlq(
     return weight_q, encoded
 
 
+def ldlq_2hess(
+    weight: torch.Tensor,
+    L_in: torch.Tensor,
+    L_out: torch.Tensor,
+    quant_args: dict,
+    pb: ProgressBar | None = None
+):
+    """
+    LDLQ with error feedback along both axes, for a Kronecker-factored Hessian H ~ H_out (x) H_in (YAQA, Tseng et al.
+    2025). Objective tr(E^T H_in E H_out) with E = W - Q, shape (k, n); L_in (k, k) and L_out (n, n) are the block-16
+    LDL factors (zero diagonal, as for ldlq()). The 16x16 tiles are quantized along anti-diagonals from the far corner,
+    every tile of a diagonal being independent given the earlier ones. With L' = I + L the input of tile (a, c) is
+
+        W[a, c] + (L_in'^T E L_out')[a, c],     E restricted to the tiles already quantized
+
+    kept as a running matrix F that receives one rank-(16 * tiles) update per diagonal:
+    F += L_in'[rows, :]^T . blockdiag(dE) . L_out'[cols, :]
+
+    :return:
+        tuple, as ldlq(): quantized weight (k, n), indices (k // 16, n // 16, 256)
+    """
+    devices = quant_args["devices"]
+    for device in devices:
+        torch.cuda.synchronize(device)
+    main_stream = get_quant_stream(devices[0])
+    with torch.cuda.stream(main_stream):
+        device = L_in.device
+        weight = weight.to(device)
+        size_k, size_n = weight.shape
+        assert size_k % 16 == 0 and size_n % 16 == 0
+        tiles_k, tiles_n = size_k // 16, size_n // 16
+
+        Lk = L_in.clone(); Lk.diagonal().fill_(1.0)      # unit lower triangular
+        Ln = L_out.clone(); Ln.diagonal().fill_(1.0)
+        F = torch.zeros((size_k, size_n), dtype = torch.float, device = device)
+        weight_q = torch.zeros_like(weight)
+        encoded = torch.zeros((tiles_k, tiles_n, 256), dtype = torch.short, device = device)
+        W4 = weight.view(tiles_k, 16, tiles_n, 16)
+        Q4 = weight_q.view(tiles_k, 16, tiles_n, 16)
+        F4 = F.view(tiles_k, 16, tiles_n, 16)
+        perm, perm_i = tensor_core_perm(device), tensor_core_perm_i(device)
+        ar16 = torch.arange(16, device = device)
+
+        steps = tiles_k + tiles_n - 1
+        for step, s in enumerate(range(steps - 1, -1, -1)):
+            a = torch.arange(max(0, s - (tiles_n - 1)), min(tiles_k - 1, s) + 1, device = device)
+            c = s - a
+            tiles = (W4[a, :, c, :] + F4[a, :, c, :]).reshape(-1, 256)             # (T, 16, 16) row major
+            quant_w, quant_i = quantize_tiles_multigpu(tiles[:, perm].contiguous(), quant_args)
+            quant_w = quant_w[:, perm_i].view(-1, 16, 16)
+            Q4[a, :, c, :] = quant_w
+            encoded[a, c] = quant_i
+            if s > 0:
+                dE = W4[a, :, c, :] - quant_w                                           # (T, 16, 16)
+                rows = (a.unsqueeze(1) * 16 + ar16).flatten()                           # (16 T,)
+                cols = (c.unsqueeze(1) * 16 + ar16)                                     # (T, 16)
+                # Only tiles above and to the left can still be pending: restrict the update to that corner
+                k_hi = int(a.max().item()) * 16 + 16
+                n_hi = int(c.max().item()) * 16 + 16
+                right = torch.bmm(dE, Ln[cols][:, :, :n_hi])                            # (T, 16, n_hi)
+                F[:k_hi, :n_hi].addmm_(Lk[rows, :k_hi].T, right.reshape(-1, n_hi))
+            if pb and step % 4 == 0:
+                pb.update(min(tiles_k, step * tiles_k // steps))
+
+        for device in devices:
+            torch.cuda.synchronize(device)
+
+    return weight_q, encoded
+
+
+def prepare_H_out(H_out: torch.Tensor, sv: torch.Tensor, quant_args: dict, verbose: bool, device):
+    """
+    Output-side Hessian factor in the quantizer's rotated basis, with its block LDL factor. The rotated weight relates
+    to the original by E_o = S_u P_k E_r P_n S_v, so tr(E_o^T H_in E_o H_out) = tr(E_r^T [..] E_r [P_n S_v H_out S_v P_n]):
+    the full output scale vector sv (signs and channel scales) goes into the transform.
+    """
+    Ho = H_out.to(device, torch.float).clone()
+    s = sv.flatten().to(device, torch.float)
+    Ho *= s.unsqueeze(0)
+    Ho *= s.unsqueeze(1)
+    blockwise_preapply_had_r_(Ho, had_n)
+    blockwise_preapply_had_l_(Ho, had_n)
+    Ho /= Ho.diagonal().mean().clamp_min(1e-30)
+    Ho.diagonal().add_(quant_args.get("sigma_reg_out", quant_args.get("sigma_reg", 0.025)))
+    L_out, Ho = block_ldl(Ho, 16, quant_args, verbose)
+    L_out.diagonal().fill_(0.0)
+    return L_out.to(device), Ho.to(device)
+
+
 def fallback_quant(
     weight: torch.Tensor,
     q_device: torch.Tensor,
@@ -946,9 +1079,13 @@ def pack_trellis(encoded: torch.Tensor, quant_args: dict) -> torch.Tensor:
     shape = encoded.shape
     assert len(shape) == 3 and shape[2] == 256
     assert encoded.dtype == torch.int16
-    packed_shape = (shape[0], shape[1], 256 * K // 16)
+    packed_shape = (shape[0], shape[1], trellis_words(K))
     packed = torch.zeros(packed_shape, dtype = torch.int16, device = encoded.device)
-    ext.pack_trellis(packed, encoded.contiguous(), K)
+    fk = frac_k(K)
+    if fk is not None:
+        ext.pack_trellis_frac(packed, encoded.contiguous(), fk[0], fk[1])
+    else:
+        ext.pack_trellis(packed, encoded.contiguous(), K)
     # unpacked = torch.zeros_like(encoded)
     # ext.unpack_trellis(unpacked, packed, K)
     # assert torch.equal(unpacked, encoded)
@@ -961,6 +1098,18 @@ def pack_signs(signs: torch.Tensor, quant_args: dict) -> torch.Tensor:
     packed = torch.zeros(signs.shape[0] // 16, dtype = torch.int16, device = signs.device)
     ext.pack_signs(packed, signs)
     return packed
+
+
+# LDLQ error feedback inflates the tiles the quantizer actually sees relative to the regularized
+# weight (accumulated compensation grows along the recursion). Mean stream RMS over the recursion
+# relative to the first block, measured on Qwen3-8B (q/up/down, layer 10): K=1 1.06-1.10, 1.5
+# 1.03-1.05, 2 1.01-1.02, 2.5 ~1.01, 3 ~1.005, >= 4 ~1.0. The global scale search runs on the
+# pre-feedback weight, so its sample tiles are inflated by the expected drift and the scale it
+# picks lands the recursion's mean input at the codebook's operating point
+LDLQ_DRIFT = {1: 1.08, 1.5: 1.035, 2: 1.018, 2.5: 1.009, 3: 1.004}
+
+def ldlq_drift(K) -> float:
+    return LDLQ_DRIFT.get(float(K), 1.0)
 
 
 def sample_scale_tiles(weight_r: torch.Tensor, width: int = 3) -> torch.Tensor:
@@ -1074,6 +1223,7 @@ def g_scale_gss(
     # TODO: Figure out why Torch always initializes cuda:0 when exiting this CM, even when it's not used
     with torch.cuda.stream(main_stream):
         tiles = sample_scale_tiles(weight_r, width)
+        tiles *= ldlq_drift(quant_args["K"])
         if pb:
             pb.update(50)
         best_scale, best_mse = g_scale_search_batch([tiles], quant_args)[0]
@@ -1249,6 +1399,75 @@ def regularize(
     return apply_out_scales, weight, g_scale, su, sv
 
 
+def unrotate_H(H_rot: torch.Tensor, su_signs: torch.Tensor) -> torch.Tensor:
+    """Undo finalize_capture_H's input transform on the (damped) Hessian: H_rot = P (S H S) P^T with
+    the blockwise 128-Hadamard P (its own inverse) and the sign flips S"""
+    H = H_rot.float().clone()
+    blockwise_preapply_had_r_(H, had_k)
+    blockwise_preapply_had_l_(H, had_k)
+    s = su_signs.flatten().sign().float().to(H.device)
+    H *= s.unsqueeze(0)
+    H *= s.unsqueeze(1)
+    return H
+
+
+def refit_scales(weight: torch.Tensor, weight_q: torch.Tensor, H: torch.Tensor, su: torch.Tensor, sv: torch.Tensor,
+                 rounds: int = 2, chunk: int = 16384):
+    """
+    Free post-quantization polish: refit the stored per-channel fp16 scales (suh on the input side, svh on
+    the output side) to the quantized weight in the Hessian metric, holding the trellis fixed. With
+    W, Q (k, n) in the original basis: per output column c_n = (q_n^T H w_n) / (q_n^T H q_n) (closed form);
+    per input row r solves ((Q Q^T) o H) r = rowsum(Q o (H W)); alternated. Returns the rescaled weight_q
+    and the proxy error before / after (trace(E H E^T) / trace(W H W^T)).
+    """
+    dev = weight_q.device
+    H = H.to(dev)
+    W = weight if weight.device == dev else None      # large originals may sit on the CPU; stream columns
+    def cols(x, a, b):
+        return (x[:, a:b] if x.device == dev else x[:, a:b].to(dev)).float()
+    k, n = weight_q.shape
+    Q = weight_q
+    su = su.float().to(dev).view(k, 1)
+    sv = sv.float().to(dev).view(1, n)
+    # H W once (streamed over columns), reused by both steps; den = trace(W H W^T)
+    HW = torch.empty((k, n), dtype = torch.float, device = dev)
+    den = 0.0
+    for a in range(0, n, chunk):
+        b = min(a + chunk, n)
+        wc = cols(weight, a, b)
+        HW[:, a:b] = H @ wc
+        den += (wc * HW[:, a:b]).sum().item()
+    def err(Qx):
+        e = 0.0
+        for a in range(0, n, chunk):
+            b = min(a + chunk, n)
+            E = cols(weight, a, b) - Qx[:, a:b]
+            e += (E * (H @ E)).sum().item()
+        return e / max(den, 1e-30)
+    e_before = err(Q)
+    for _ in range(rounds):
+        # output-side scales
+        num = torch.zeros(n, device = dev); dn = torch.zeros(n, device = dev)
+        for a in range(0, n, chunk):
+            b = min(a + chunk, n)
+            HQ = H @ Q[:, a:b]
+            num[a:b] = (Q[:, a:b] * HW[:, a:b]).sum(0)
+            dn[a:b] = (Q[:, a:b] * HQ).sum(0)
+        c = torch.where(dn > 1e-30, num / dn.clamp(min = 1e-30), torch.ones_like(num))
+        Q = Q * c.view(1, n)
+        sv = sv * c.view(1, n)
+        # input-side scales
+        A = (Q @ Q.T) * H
+        b_ = (Q * HW).sum(1)
+        A.diagonal().add_(1e-6 * A.diagonal().mean())
+        r = torch.linalg.solve(A, b_)
+        r = torch.where(torch.isfinite(r) & (r > 0), r, torch.ones_like(r))
+        Q = Q * r.view(k, 1)
+        su = su * r.view(k, 1)
+    e_after = err(Q)
+    return Q, su, sv, e_before, e_after
+
+
 def quantize_exl3(
     weight: torch.Tensor,
     H_data: dict,
@@ -1331,6 +1550,8 @@ def quantize_exl3(
 
         if verbose:
             weight_copy = weight.cpu()
+        # The post-LDLQ scale refit compares against the original weight (regularize works in place)
+        weight_orig = weight.clone() if weight.numel() <= 5e8 else weight.cpu()
         weight_r = weight
         del weight
 
@@ -1366,8 +1587,14 @@ def quantize_exl3(
         if weight_r.numel() > 5e8:
             weight_r = weight_r.cpu()
 
-        # Quantize
-        if not q_fallback:
+        # Quantize. An external output-side Hessian factor (YAQA-style Kronecker approximation, see ldlq_2hess)
+        # switches to error feedback along both axes
+        H_out_r = None
+        if not q_fallback and quant_args.get("H_out") is not None:
+            L_out, H_out_r = prepare_H_out(quant_args["H_out"], sv, quant_args, verbose, device)
+            weight_q, encoded_q = ldlq_2hess(weight_r.to(device), L, L_out, quant_args, pb)
+            del L, L_out
+        elif not q_fallback:
             weight_q, encoded_q = ldlq(weight_r, L, quant_args, pb)  #zxc
             del L
         else:
@@ -1383,12 +1610,22 @@ def quantize_exl3(
                 Hd = H.to(device)
                 weight_r = None
                 E = E.to(device)
-                num = block_trace(E, Hd)
+                if H_out_r is not None:
+                    # Two-sided proxy tr(E^T H_in E H_out) / tr(W^T H_in W H_out)
+                    W = W.to(device)
+                    num = ((Hd @ E) * (E @ H_out_r)).sum().item()
+                    den = ((Hd @ W) * (W @ H_out_r)).sum().item()
+                    if verbose:
+                        print(f"     - one-sided proxy:  {block_trace(E, Hd) / max(block_trace(W, Hd), 1e-8):.6f}")
+                else:
+                    num = block_trace(E, Hd)
+                    E = None
+                    W = W.to(device)
+                    den = block_trace(W, Hd)
                 E = None
-                W = W.to(device)
-                den = block_trace(W, Hd)
                 W = None
                 Hd = None
+                H_out_r = None
                 proxy_err = num / max(den, 1e-8)
             except torch.OutOfMemoryError:
                 weight_r = None
@@ -1401,22 +1638,32 @@ def quantize_exl3(
 
         # free_mem()
 
-        if return_weight_q or verbose:
-            weight_q = weight_q.to(device)
-            weight_q = preapply_had_l(weight_q, had_k)
-            weight_q *= su
-            weight_q = preapply_had_r(weight_q, had_n)
-            weight_q *= sv
+        weight_q = weight_q.to(device)
+        weight_q = preapply_had_l(weight_q, had_k)
+        weight_q *= su
+        weight_q = preapply_had_r(weight_q, had_n)
+        weight_q *= sv
 
+        # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
+        if not q_fallback and H is not None and not quant_args.get("no_refit"):
+            H_orig = unrotate_H(H, H_data["su"])
+            weight_q, su_f, sv_f, e_before, e_after = refit_scales(weight_orig, weight_q, H_orig, su, sv)
+            del H_orig
+            su = su_f.view(-1, 1).to(su.dtype)
+            sv = sv_f.view(1, -1).to(sv.dtype)
             if verbose:
-                weight = weight_copy.to(device)
-                nmse = block_nmse(weight_q, weight)
-                print(f"     - quant nmse: {nmse:.6f}")
+                print(f"     - scale refit: proxy err {e_before:.6f} -> {e_after:.6f} ({100 * (1 - e_after / max(e_before, 1e-30)):.2f}%)")
+        del weight_orig
+
+        if verbose:
+            weight = weight_copy.to(device)
+            nmse = block_nmse(weight_q, weight)
+            print(f"     - quant nmse: {nmse:.6f}")
 
         # Compile packed tensor
         suh = su.flatten().contiguous().to(dtype = torch.half, copy = True)
         svh = sv.flatten().contiguous().to(dtype = torch.half, copy = True)
-        trellis = pack_trellis(encoded_q.to(device), quant_args)
+        trellis = pack_trellis(encoded_q.to(device), quant_args) if not quant_args.get("no_pack") else encoded_q
 
         out_tensors = {
             # "scale": weight_scale.to(dtype = torch.float, copy = True),
@@ -1582,6 +1829,7 @@ def quantize_exl3_batch(
         stager = _WeightStager(device)
         stager.prefetch(batch_idx[0], weights[batch_idx[0]])
         regs = {}
+        origs = {}
         for bi, t in enumerate(batch_idx):
             qa = quant_args_list[t]
             if "seed" in qa:
@@ -1595,12 +1843,14 @@ def quantize_exl3_batch(
             if H_diag is not None and H_diag.is_cuda:
                 H_diag = H_diag.to(device)
             sv = (torch.randn(weight.shape[1], device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
+            # Original kept for the post-LDLQ scale refit (regularize works in place)
+            origs[t] = weight.clone() if weight.numel() <= 5e7 else weight.cpu()
             apply_out_scales, weight_r, _, su, sv = regularize(
                 weight, su, sv, qa, verbose, H_diag, None, skip_g_scale = True)
             regs[t] = [weight_r, su, sv, apply_out_scales]
             weights[t] = None
 
-        samples = [sample_scale_tiles(regs[t][0]) for t in batch_idx]
+        samples = [sample_scale_tiles(regs[t][0]) * ldlq_drift(qa0["K"]) for t in batch_idx]
         scales = g_scale_search_batch(samples, qa0)
         del samples
         g_scales = {}
@@ -1669,6 +1919,22 @@ def quantize_exl3_batch(
                 E = None
                 proxy_err = -1.0
             weight_rs[bi] = None
+
+            # Polish: refit the per-channel fp16 scales to the quantized weight (free at inference)
+            if not qa.get("no_refit"):
+                wq = weight_qs[bi].to(device)
+                wq = preapply_had_l(wq, had_k)
+                wq *= su
+                wq = preapply_had_r(wq, had_n)
+                wq *= sv
+                H_orig = unrotate_H(Hd, H_datas[t]["su"])
+                _, su_f, sv_f, e_before, e_after = refit_scales(origs[t], wq, H_orig, su, sv)
+                del wq, H_orig
+                su = su_f.view(-1, 1).to(su.dtype)
+                sv = sv_f.view(1, -1).to(sv.dtype)
+                if verbose:
+                    print(f"     - scale refit: proxy err {e_before:.6f} -> {e_after:.6f} ({100 * (1 - e_after / max(e_before, 1e-30)):.2f}%)")
+            origs[t] = None
             weight_qs[bi] = None
 
             suh = su.flatten().contiguous().to(dtype = torch.half, copy = True)

@@ -96,6 +96,7 @@ bool exl3_gemv_try_launch
     int size_k,
     int size_n,
     int K,
+    bool half_k,
     int cb,
     bool c_fp32,
     bool has_su_sv,
@@ -108,8 +109,15 @@ bool exl3_gemv_try_launch
     // Free integer checks first; the env read (~64 ns) and device queries only run for calls
     // that could actually take this path
     if (!has_su_sv) return false;
-    if (K < 2 || K > 4) return false;
-    if (K != 4 && cb == 0) return false;
+    if (half_k)
+    {
+        if (K < 1 || K > 3 || cb != 2) return false;
+    }
+    else
+    {
+        if (K < 2 || K > 4) return false;
+        if (K != 4 && cb == 0) return false;
+    }
     if (size_m > EXL3_GEMV_MAX_M) return false;
     if (size_k % 128 || size_n % 128) return false;
 
@@ -137,14 +145,21 @@ bool exl3_gemv_try_launch
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
     bool smem = exl3_gemv_env_smem() == 1;
 
-    void* narrow_kernel = exl3_gemv_select_kernel(K, cb, c_fp32, mmode, 0, smem);
+    auto select = [&] (int cfg_) -> void*
+    {
+        return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem)
+                      : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem);
+    };
+    void* narrow_kernel = select(0);
     if (!narrow_kernel) return false;
     int narrow_coresident = occupancy(narrow_kernel, 512) * num_sms;
 
-    int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, K, cb, mode, narrow_coresident);
+    // Shape heuristic: a half-integer rate K + 0.5 is handled like the integer rate above it (its tile is
+    // between the two in bytes; unmeasured, so it inherits the K + 1 envelope)
+    int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
     if (cfg < 0) return false;
 
-    void* kernel = cfg == 0 ? narrow_kernel : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg, smem);
+    void* kernel = cfg == 0 ? narrow_kernel : select(cfg);
     if (!kernel) return false;
 
     int block_dim = cfg == 0 ? 512 : 256;
@@ -202,7 +217,10 @@ void exl3_gemv
     for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
-    int K = B.size(2) / 16;
+    const int tile_u16 = B.size(2);
+    const bool half_k = (tile_u16 % 16) != 0;
+    int K = tile_u16 / 16;
+    TORCH_CHECK(!half_k || (tile_u16 % 16 == 8 && mul1), "exl3_gemv: half-integer bitrates require the mul1 codebook");
 
     int cb = 0;
     if (mcg) cb = 1;
@@ -232,7 +250,7 @@ void exl3_gemv
 
     bool ok = exl3_gemv_try_launch
     (
-        kernel_args, size_m, size_k, size_n, K, cb, c_fp32,
+        kernel_args, size_m, size_k, size_n, K, half_k, cb, c_fp32,
         true, device, stream, nullptr, true
     );
     TORCH_CHECK(ok, "exl3_gemv: call is not eligible for the GEMV kernel");

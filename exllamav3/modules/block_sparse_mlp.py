@@ -954,6 +954,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.routing_cfg = None
         self.experts_cfg = None
         self.e_score_correction_bias = None
+        self.e_score_bias_vl = None
         self.tid2eid = None
         self.per_expert_scale = None
         self.bcast_sel_bsz1 = None

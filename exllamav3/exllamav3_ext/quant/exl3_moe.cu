@@ -8,6 +8,7 @@ namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
 #include "comp_units/exl3_moe_instances.cuh"
+#include "bits_k.cuh"
 #include "exl3_devctx.cuh"
 #include <set>
 
@@ -148,9 +149,9 @@ void exl3_moe
 
     const int act_function,
 
-    const int K_gate,
-    const int K_up,
-    const int K_down,
+    const float K_gate,
+    const float K_up,
+    const float K_down,
 
     const at::Tensor& gate_ptrs_trellis,
     const at::Tensor& gate_ptrs_suh,
@@ -240,8 +241,13 @@ void exl3_moe
 
     // TORCH_CHECK(act_function == MOE_ACT_SILU, "MoE kernel: Only SiLU is currently supported");
 
+    // Bitrates: compile-time instances for uniform integer K, the runtime-switch instance (K = 0) otherwise; the
+    // kernel receives the rates in half-bit units (see bits_k.cuh)
+    const int K2_gate = k2_from_K(K_gate), K2_up = k2_from_K(K_up), K2_down = k2_from_K(K_down);
+    TORCH_CHECK(gate_mul1 || (K2_gate % 2 == 0 && K2_up % 2 == 0 && K2_down % 2 == 0),
+                "exl3_moe: half-integer bitrates require the mul1 codebook");
     int K = 0;
-    if (K_gate == K_up && K_up == K_down) K = K_gate;
+    if (K2_gate == K2_up && K2_up == K2_down && K2_gate % 2 == 0) K = K2_gate / 2;
 
     TORCH_CHECK_DIM(gate_ptrs_trellis, 1);
     TORCH_CHECK(gate_ptrs_trellis.size(0) == num_experts, "Number of gate tensors doesn't match num_experts");
@@ -349,9 +355,9 @@ void exl3_moe
         (void*) &num_groups,
         (void*) &act_limit,
         (void*) &act_function,
-        (void*) &K_gate,
-        (void*) &K_up,
-        (void*) &K_down,
+        (void*) &K2_gate,
+        (void*) &K2_up,
+        (void*) &K2_down,
         (void*) &locks,
         &_output_scratch,
         &_fused_base,

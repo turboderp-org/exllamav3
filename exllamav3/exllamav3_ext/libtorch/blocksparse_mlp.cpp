@@ -124,19 +124,19 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     at::Tensor _gate_ptrs_trellis,
     at::Tensor _gate_ptrs_suh,
     at::Tensor _gate_ptrs_svh,
-    int _gate_K,
+    float _gate_K,
     bool _gate_mcg,
     bool _gate_mul1,
     at::Tensor _up_ptrs_trellis,
     at::Tensor _up_ptrs_suh,
     at::Tensor _up_ptrs_svh,
-    int _up_K,
+    float _up_K,
     bool _up_mcg,
     bool _up_mul1,
     at::Tensor _down_ptrs_trellis,
     at::Tensor _down_ptrs_suh,
     at::Tensor _down_ptrs_svh,
-    int _down_K,
+    float _down_K,
     bool _down_mcg,
     bool _down_mul1,
     bool _act_silu,
@@ -270,7 +270,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         auto lopt = at::TensorOptions().dtype(at::kLong);
         auto table = [&](const at::Tensor& t) { return at::tensor({(int64_t) t.data_ptr()}, lopt).to(dev); };
         at::Tensor gt, gs, gv, ut, us, uv;
-        int Kgu, Hi_sh, I_sh; bool mcg_gu, mul1_gu;
+        float Kgu; int Hi_sh, I_sh; bool mcg_gu, mul1_gu;
         c10::optional<at::Tensor> gb, ub;
         if (se->gu_ptrs_trellis)
         {

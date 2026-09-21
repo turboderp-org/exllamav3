@@ -47,6 +47,7 @@ class Module(ABC):
         self.num_slices = 1
         self.select_hq_bits = 0
         self.q_priority = 0
+        self.q_half_bits = True     # may be quantized at a half-integer bitrate (all decode kernels have instances)
         self.layer_idx = None
 
     def __iter__(self):
