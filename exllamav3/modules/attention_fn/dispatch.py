@@ -1,6 +1,7 @@
 import torch
 from ...cache import CacheLayer, Cache, CacheLayer_quant
 from .common import AttnArgs, AttnFn
+from .sm120_tma import fn_sm120_tma_attn_prefill
 from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
@@ -20,6 +21,7 @@ from .triton_paged import (
 # serve every shape they support (any head_dim <= 512, zero-padded to a power of two), then the
 # older Triton kernels and the torch/xformers fallbacks for the rest
 _fns_triton_fast: list[AttnFn] = [
+    fn_sm120_tma_attn_prefill,
     fn_triton_paged_attn_decode,
     fn_triton_paged_attn_prefill,
     fn_triton_varlen_attn,
@@ -159,10 +161,10 @@ def attn_dispatch(
     candidates = _fns_qc if q_cache is not None else attn_fns
     hint_key = "fn_qc" if q_cache is not None else "fn"
 
-    # Retry the backend that matched last time for this caller before scanning the full list.
-    # Candidate functions return None on incompatible arguments, so a stale hint self-corrects
+    # Only retry a hint ahead of the scan if it is still the highest-priority candidate.
+    # A lower-priority backend can remain compatible when a better backend becomes eligible.
     fn = dispatch_cache.get(hint_key) if dispatch_cache is not None else None
-    o = fn(args) if fn is not None else None
+    o = fn(args) if fn is not None and fn is candidates[0] else None
 
     if o is None:
         args.sanity_check()
