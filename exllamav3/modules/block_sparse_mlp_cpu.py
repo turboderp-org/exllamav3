@@ -366,6 +366,11 @@ class BlockSparseMLP_CPU:
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}", self.device, optional = True, allow_bf16 = True)
+        if self.e_score_bias_vl_key:
+            esb_vl = self.config.stc.get_tensor(
+                f"{self.key}.{self.e_score_bias_vl_key}", self.device, optional = True, allow_bf16 = True,
+                no_defer = True)
+            self.e_score_bias_vl = esb_vl.float() if esb_vl is not None else None
         if self.tid2eid_key:
             self.tid2eid = self.config.stc.get_tensor(
                 f"{self.key}.{self.tid2eid_key}", self.device, no_defer = True)
