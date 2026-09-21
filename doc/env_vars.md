@@ -466,6 +466,58 @@ pages (`MFD_HUGETLB`) of that size instead of shmem. Requires reserved huge page
 (`vm.nr_hugepages`, or `hugepages-1048576kB` for `1g`) covering the whole arena; allocation
 fails with a clear error otherwise. Rejected on Windows.
 
+### `EXL3_MOE_STREAM_DECODE` (default: `0`, experimental)
+
+With the pinned arena (`EXL3_MOE_PINNED_ARENA=1`) and whole-layer offload (`-mcl`): at
+single-row (decode) steps, gather the selected experts' trellis blocks straight out of the
+arena into a VRAM staging buffer (one kernel, zero-copy reads over PCIe, top-k blocks per
+layer) and run the resident fused MoE kernel over them through pointer tables, instead of
+waiting for the CPU worker to compute the whole layer. The link's bandwidth then bounds the
+routed experts' cost instead of the cores' GEMV rate, which on a desktop CPU is the smaller
+number: RTX 3060 + i5-12400F (six cores, AVX2), gen4 x16 (24 GB/s pinned→device),
+Qwen3.8-Flash-Next 3.05 bpw (512 experts, top-10, 48 offloaded layers, 1.8 MB expert blocks):
+11.2 → 14.5 tok/s with every pick streamed, 19.0 tok/s with the worker keeping four of the ten
+(`EXL3_MOE_STREAM_DECODE_CPU` below); lfm2.5-8b-a1b 3.10 bpw (32 experts, top-4, 4 MB blocks):
+30.7 → 43.2 and 55.5 tok/s. Prefill is unchanged: the path takes single-row steps only, and
+only for layers the fused kernel can run (the streamed prefill tier's eligibility, per layer:
+silu/gelu gated or relu2 gateless, no per-expert biases, no padded dims); everything else
+keeps the worker path. On the AVX-512 CPU tiers the arena is band-swizzled
+(`EXL3_MOE_CPU_SWIZZLE`), and the gathered blocks are restored to the native tile order in
+VRAM as the prefill tier does. The staging buffer (top-k × expert block: 17 MiB on
+Qwen3.8-Flash-Next) is allocated with the other persistent device buffers, so autosplit
+accounts for it. The fused kernel keeps fp16 intermediates where the worker accumulates in
+fp32, the same difference the streamed prefill tier has against the CPU tail (max relative
+difference per layer call up to ~5e-2, typically 1e-2, on the models above). Any error on the
+path disables it for the rest of the run, with a traceback, and the worker serves everything.
+Set to `check` to run both paths for every decode layer call, report the differences (per
+layer at first, then summaries) and return the worker's result; slow by design, for validating
+a new model or host. Untested on Windows and with offloaded layers on more than one device.
+
+### `EXL3_MOE_STREAM_DECODE_CPU` (default: `0`)
+
+With `EXL3_MOE_STREAM_DECODE`: how many of each layer's selected experts stay with the CPU
+worker, which computes them while the GPU streams the others, so the PCIe link and the cores
+work at the same time instead of in turn. The worker takes the last k positions of the top-k
+selection (the lowest-weighted picks, on routers that sort their selection; its fp32
+arithmetic is the more precise side anyway) and the GPU the first top-k − k; the worker's job
+is issued before the gather and collected after the fused kernel, stream-ordered like the
+prefill tier's tail. Streaming an expert costs its block over the link's bandwidth, computing
+one costs it over the cores' GEMV rate, and the best k is where the two sides finish
+together: on the six-core AVX2 desktop above, k=4 of 10 on Qwen3.8-Flash-Next (19.0 tok/s
+against 14.5 at k=0, 16.9 at k=3 and 17.3 at k=5) and k=1 of 4 on lfm2.5-8b-a1b (55.5 against
+43.2 at k=0 and 52.3 at k=2). More or faster cores want a larger k, a faster link a smaller
+one. The fused kernel processes `exl3_moe_max_concurrency` streamed experts per round (three
+on a 28-SM card), so streamed counts that are a multiple of it waste no round, part of why 6
+of 10 beats 7. `EXL3_MOE_STREAM_DECODE_PROF` shows which side is waiting. Capped at top-k − 1.
+
+### `EXL3_MOE_STREAM_DECODE_PROF` (default: `0`)
+
+With `EXL3_MOE_STREAM_DECODE=1`: CUDA-event brackets around the gather (with the un-swizzle
+where applicable), the fused kernel and the worker wait+fold of every streamed layer call,
+reported as stream-time medians and p90 every 16 decode steps together with the per-token
+totals over all offloaded layers (Qwen3.8-Flash-Next, k=4: 22.7 + 6.6 + 1.8 ms of a 53 ms
+token). About 2% decode cost while on.
+
 ### `EXL3_MOE_MTILE` (default: `1`)
 
 Row tiles for the fused MoE prefill kernel. The kernel dequantizes each expert's weights once
