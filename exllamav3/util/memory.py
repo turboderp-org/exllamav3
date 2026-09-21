@@ -5,9 +5,18 @@ import gc
 import sys
 from pydantic import PydanticUserError
 
-# @lru_cache
-# def init_pynvml():
-#     pynvml.nvmlInit()
+
+def get_memory_info(device: int | torch.device) -> tuple[int, int]:
+    # WDDM's CUDA free value can hit zero while dedicated VRAM is still available.
+    # Keep the CUDA total as the denominator for PyTorch's allocator fraction.
+    if sys.platform == "win32" and torch.version.hip is None:
+        from .nvml import get_wddm_free_memory
+        properties = torch.cuda.get_device_properties(device)
+        free = get_wddm_free_memory(str(properties.uuid))
+        if free is not None:
+            return min(free, properties.total_memory), properties.total_memory
+    return torch.cuda.mem_get_info(device)
+
 
 # Try to make sure device is live for correct measurement of free VRAM
 def touch_device(device: int):
@@ -29,8 +38,8 @@ def set_memory_fraction_reserve(
     device: int
 ):
     touch_device(device)
-    free, total = torch.cuda.mem_get_info(device)
-    # mem_get_info reports memory free *after* whatever this process has already reserved, but
+    free, total = get_memory_info(device)
+    # Free memory is reported *after* whatever this process has already reserved, but
     # set_per_process_memory_fraction limits the process's *cumulative* reserved bytes. Add the
     # current reservation back, or memory held by an earlier load in the same process (a draft
     # model, a vision tower) is subtracted from the budget twice.
@@ -58,7 +67,7 @@ def set_memory_fraction_use(
     # card's size would otherwise plan against memory the CUDA context and other processes
     # already hold, and the loader's headroom check would pass loads that fail at the first
     # real forward
-    free, _ = torch.cuda.mem_get_info(device)
+    free, _ = get_memory_info(device)
     fraction = min((current + min(use, free)) / total, 1.0)
     torch.cuda.set_per_process_memory_fraction(fraction, device = device)
     return int(fraction * total)
