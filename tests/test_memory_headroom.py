@@ -44,8 +44,16 @@ class FakeNVML:
         return 0
 
 
+def _clear_nvml_cache():
+    module = sys.modules.get("exllamav3.util.nvml")
+    if module is not None:
+        module._init_nvml.cache_clear()
+        module._get_device.cache_clear()
+
+
 @pytest.fixture
 def queries(monkeypatch, tmp_path):
+    _clear_nvml_cache()
     nvml = FakeNVML()
     monkeypatch.setenv("SystemRoot", str(tmp_path / "Windows"))
     monkeypatch.setenv("ProgramW6432", str(tmp_path / "Program Files"))
@@ -59,10 +67,7 @@ def queries(monkeypatch, tmp_path):
     monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", Mock())
     monkeypatch.setattr(memory, "touch_device", Mock())
     yield nvml
-    module = sys.modules.get("exllamav3.util.nvml")
-    if module is not None:
-        module._init_nvml.cache_clear()
-        module._get_device.cache_clear()
+    _clear_nvml_cache()
 
 
 def test_wddm_reserve_includes_current_reservation(queries):
