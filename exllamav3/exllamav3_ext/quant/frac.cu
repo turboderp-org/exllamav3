@@ -5,6 +5,9 @@
 #include "../util.h"
 #include "../util.cuh"
 #include "codebook.cuh"
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 // Fractional-rate trellis tiles. The 256-weight tile is a ring of 16 * K bits: weight i's D(i) new bits,
 // D(i) = KA + bit (i mod 16) of MASK, sit at ring position S(i) - D(i) .. S(i) where S(i) is the prefix sum
@@ -85,7 +88,11 @@ void unpack_trellis_frac_kernel(uint16_t* __restrict__ g_unpacked, const uint16_
 static int frac_bpb(int KA, int64_t MASK)
 {
     TORCH_CHECK(KA >= 1 && KA <= 7 && MASK >= 0 && MASK <= 0xFFFF, "frac: KA must be 1..7, MASK 16 bits");
-    const int bpb = 16 * KA + __builtin_popcount((unsigned) MASK);
+    #ifdef _MSC_VER
+        const int bpb = 16 * KA + (int) __popcnt((unsigned) MASK);
+    #else
+        const int bpb = 16 * KA + __builtin_popcount((unsigned) MASK);
+    #endif
     TORCH_CHECK(bpb % 2 == 0, "frac: bits per 16 weights must be even (whole 32-bit words per tile)");
     return bpb;
 }
