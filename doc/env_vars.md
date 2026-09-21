@@ -620,6 +620,11 @@ margin is added on top of the measured transient in that physical check, coverin
 forward keeps live around a module (recurrent test states, gathered embeddings, allocator
 slack). `0` disables the margin.
 
+On Windows WDDM, layer-split budgets and this check use NVML's free dedicated VRAM, since CUDA's
+free-memory query can reach zero while dedicated memory remains. Linux, HIP, and Windows TCC
+keep the CUDA query. WDDM still controls residency: exceeding its budget can cause paging or
+slowdowns under memory pressure. The reserve, measuring forwards, and margin still apply.
+
 ### `EXL3_VISION_PINNED` (default: `0`)
 
 Default for `Config.infer_params.vision_pinned`: store the vision component's linear-layer
