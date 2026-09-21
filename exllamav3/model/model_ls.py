@@ -121,6 +121,13 @@ class Model_LSMixin(ABC):
         # test states, gathered embeddings, allocator slack), so a device packed to exactly one
         # transient of headroom fails on the first real chunk
         autosplit_margin = int(os.environ.get("EXL3_AUTOSPLIT_MARGIN_MB", 256)) << 20
+        # A measuring forward can leave persistent allocations behind (the CPU-offload host's
+        # per-device stream state from autosplit_extra_measure, lazily built statics). They are
+        # in memory_allocated from then on, so counting them as transient as well would hold
+        # that much headroom twice for every later module on the device. Past this much growth
+        # the module is measured again with them resident
+        remeasure_min = 16 << 20
+        fail_reason = None
 
         with ProgressBar(f"Loading (LS)" if progressbar else None, len(modules)) as progress:
 
@@ -192,6 +199,8 @@ class Model_LSMixin(ABC):
                         if self.caps.get("autosplit_load_fwd", True) and not autosplit_no_forward:
                             measure = load_device.type == "cuda"
                             if measure:
+                                in_shape, in_dtype, in_device = dummy_state.shape, dummy_state.dtype, dummy_state.device
+                                in_bytes = dummy_state.untyped_storage().nbytes() if dummy_state.is_cuda else 0
                                 torch.cuda.reset_peak_memory_stats(load_device)
                                 alloc_before = torch.cuda.memory_allocated(load_device)
                             dummy_state = module.prepare_for_device(dummy_state, params)
@@ -202,6 +211,23 @@ class Model_LSMixin(ABC):
                                 i = load_device.index
                                 transient = max(0, torch.cuda.max_memory_allocated(load_device) - alloc_before)
                                 # print(f"{module.key}: {transient,:}")
+
+                                out_bytes = dummy_state.untyped_storage().nbytes() if dummy_state.is_cuda else 0
+                                persisted = torch.cuda.memory_allocated(load_device) - alloc_before - out_bytes + in_bytes
+                                if persisted > remeasure_min:
+                                    # Same measurement with the persistent allocations resident. A fresh
+                                    # state of the input's shape stands in for the input (the loader
+                                    # restarts from one after a device fail-over too); the first run's
+                                    # output stays the running state
+                                    x = torch.zeros(in_shape, dtype = in_dtype, device = in_device)
+                                    torch.cuda.reset_peak_memory_stats(load_device)
+                                    alloc_before = torch.cuda.memory_allocated(load_device)
+                                    x = module.prepare_for_device(x, params)
+                                    x = module.forward(x, params)
+                                    for sm in module:
+                                        sm.autosplit_extra_measure(params)
+                                    x = None
+                                    transient = max(0, torch.cuda.max_memory_allocated(load_device) - alloc_before)
 
                                 max_transient[i] = max(max_transient.get(i, 0), transient)
                                 # Models with mixed layer type and dramatically different transient memory requirements
@@ -257,6 +283,7 @@ class Model_LSMixin(ABC):
                             "HIP out of memory" in str(e):
                             # Exception object will hold references to tensors so we can't free them here
                             fail = True
+                            fail_reason = str(e)
                         else:
                             raise
 
@@ -271,7 +298,7 @@ class Model_LSMixin(ABC):
                         free_mem()
                         current_device_i += 1
                         if current_device_i >= len(active_devices):
-                            raise RuntimeError("Insufficient VRAM in split for model and cache")
+                            raise RuntimeError(f"Insufficient VRAM in split for model and cache ({fail_reason})")
                         continue
 
                     # On to next module
