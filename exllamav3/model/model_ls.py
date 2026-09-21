@@ -213,14 +213,13 @@ class Model_LSMixin(ABC):
                                 persisted = torch.cuda.memory_allocated(load_device) - alloc_before - out_bytes + in_bytes
                                 if persisted > remeasure_min:
                                     # Measure once more with them resident (the known ones allocate once). Drop the first
-                                    # output before making the fresh input so two states never coexist
+                                    # output before the fresh input, which rides in dummy_state so the failure path frees it
                                     dummy_state = None
-                                    x = torch.zeros(in_shape, dtype = in_dtype, device = in_device)
+                                    dummy_state = torch.zeros(in_shape, dtype = in_dtype, device = in_device)
                                     torch.cuda.reset_peak_memory_stats(load_device)
                                     alloc_before = torch.cuda.memory_allocated(load_device)
-                                    x = module.prepare_for_device(x, params)
-                                    dummy_state = module.forward(x, params)
-                                    x = None
+                                    dummy_state = module.prepare_for_device(dummy_state, params)
+                                    dummy_state = module.forward(dummy_state, params)
                                     for sm in module:
                                         sm.autosplit_extra_measure(params)
                                     transient = max(0, torch.cuda.max_memory_allocated(load_device) - alloc_before)

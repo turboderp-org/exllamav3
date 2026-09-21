@@ -1,10 +1,12 @@
 """_load_autosplit must not count persistent allocations left by a measuring forward as transient
-headroom, must not hold two dummy states while re-measuring, and must report the OOM cause."""
+headroom, must keep the recurring autosplit_extra_measure transient, must not hold two dummy states
+while re-measuring, must free the re-measure input when it OOMs, and must report the OOM cause."""
 import os, sys
 from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 import torch
+from exllamav3.model import model_ls
 from exllamav3.model.model_ls import Model_LSMixin
 
 MiB = 1 << 20
@@ -144,6 +146,37 @@ def test_insufficient_vram_error_names_the_cause():
     modules = [FakeModule("a", 128 * MiB)] + [FakeModule(k, 16 * MiB) for k in "bcd"]
     with pytest.raises(RuntimeError, match = "Insufficient VRAM.*no headroom left"):
         _load(modules, use = 300 * MiB)
+
+
+def test_failed_remeasure_frees_its_input(monkeypatch):
+    # Pass 2 OOMs inside forward. At the failure path's free_mem() the failed device must hold only what
+    # unload() cannot drop; a live pass-2 input would be state-sized residue carried to the next device
+    class OomOnSecondForward(FakeModule):
+        def forward(self, x, params):
+            if self.forwards == 1:
+                self.transient = 1 << 40
+            return super().forward(x, params)
+
+    real_free_mem = model_ls.free_mem
+    seen = []
+    def spy_free_mem():
+        seen.append(torch.cuda.memory_allocated(0))
+        real_free_mem()
+    monkeypatch.setattr(model_ls, "free_mem", spy_free_mem)
+
+    modules = [OomOnSecondForward("a", 0, persist = 256 * MiB)]
+    with pytest.raises(RuntimeError, match = "Insufficient VRAM"):
+        _load(modules, use = 2048 * MiB, state_bytes = 256 * MiB)
+    assert modules[0].forwards == 2
+    assert seen and seen[0] < 16 * MiB
+
+
+def test_remeasure_keeps_extra_measure_transient():
+    # a: 64 MiB forward transient, 256 MiB persistent plus 128 MiB recurring from autosplit_extra_measure.
+    # After b loads, 384 MiB resident + 128 MiB headroom exceeds 480 MiB only if the recurring part was kept
+    modules = [FakeModule("a", 64 * MiB, persist = 256 * MiB, extra_transient = 128 * MiB), FakeModule("b", 16 * MiB)]
+    with pytest.raises(RuntimeError, match = "Insufficient VRAM.*no headroom left"):
+        _load(modules, use = 480 * MiB)
 
 
 if __name__ == "__main__":
