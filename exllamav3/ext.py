@@ -107,7 +107,11 @@ else:
             extra_cuda_cflags += []
     else:
         extra_cflags += ["-Ofast"]
-        extra_cuda_cflags += []
+        # GCC 15 flags the missing 'typename' in torch's List_inl.h with -Wtemplate-body as an
+        # error; harmless diagnostic in third-party headers, suppress it rather than pin the
+        # host compiler (mirrors setup.py).
+        extra_cflags += ["-Wno-template-body"]
+        extra_cuda_cflags += ["-Xcompiler", "-Wno-template-body"]
         if ext_debug:
             extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
             extra_cuda_cflags += []
