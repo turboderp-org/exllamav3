@@ -252,6 +252,7 @@ class SlidingAttention(Module):
         num_q_heads: int,
         num_kv_heads: int,
         rope_settings: RopeSettings | None,
+        v_head_dim: int | None = None,
         sm_scale: float | None = None,
         key_q: str | None = None,
         key_k: str | None = None,
@@ -288,6 +289,12 @@ class SlidingAttention(Module):
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.head_dim = head_dim
+        # Asymmetric V head dim (MiMo-V2: QK 192, V 128), mirroring Attention. The window ring,
+        # the paged-attention kernels and the block tables all carry a single head dim, so V is
+        # stored at head_dim with its top head_dim - v_head_dim lanes zero-filled by the loader
+        # and trimmed back off in project_o, which keeps o_proj sized on v_head_dim.
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+        assert self.v_head_dim <= head_dim, "SlidingAttention: v_head_dim > head_dim is not supported"
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.gqa = (num_q_heads != num_kv_heads)
@@ -410,7 +417,7 @@ class SlidingAttention(Module):
             self.o_proj = Linear(
                 config,
                 f"{key}.{key_o}",
-                num_q_heads * head_dim,
+                num_q_heads * self.v_head_dim,
                 hidden_size,
                 qmap =  qmap + ".o" if qmap is not None else None,
                 out_dtype = out_dtype,
@@ -825,7 +832,12 @@ class SlidingAttention(Module):
 
 
     def project_o(self, o: torch.Tensor, bsz: int, seqlen: int, params: dict) -> torch.Tensor:
-        o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
+        if self.v_head_dim != self.head_dim:
+            # Drop the zero lanes V was padded into so o_proj sees num_q_heads * v_head_dim
+            o = o.view(bsz, seqlen, self.num_q_heads, self.head_dim)[..., : self.v_head_dim]
+            o = o.reshape(bsz, seqlen, self.num_q_heads * self.v_head_dim).contiguous()
+        else:
+            o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         x = self.o_proj.forward(o, params)
         return x
 
@@ -1168,6 +1180,7 @@ class SlidingAttention(Module):
                 "layer_idx": self.layer_idx,
                 "hidden_size": self.hidden_size,
                 "head_dim": self.head_dim,
+                "v_head_dim": self.v_head_dim,
                 "rope_settings": self.rope_settings,
                 "sm_scale": self.sm_scale,
                 "out_dtype": self.out_dtype,

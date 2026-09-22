@@ -4,8 +4,12 @@ import torch
 from ..model.config import Config, no_default
 from ..model.model import Model
 from ..util.rope import RopeStyle
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, BlockSparseMLP, Linear
+from ..modules import (
+    RMSNorm, Embedding, TransformerBlock, Attention, SlidingAttention, SWAState,
+    GatedMLP, BlockSparseMLP, Linear,
+)
 from ..modules.attn import prepare_for_attn
+from ..cache.recurrent_util import prepare_for_recurrence
 
 # MiMo-V2's fused qkv_proj is stored as the concatenation of `ckpt_tp` tensor-parallel shards,
 # each laid out [q_shard; k_shard; v_shard], and its FP8 weight_scale_inv grid is computed per
@@ -185,9 +189,14 @@ class MiMoV2Model(Model):
         self,
         config: MiMoV2Config,
         key_prefix: str = "model",
+        swa_full: bool = False,
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        # swa_full = True keeps every layer on the paged full-length cache (the original port's
+        # behaviour, kept for A/B testing); the default routes the 39 sliding-window layers
+        # through SlidingAttention's per-slot window ring instead
+        self.swa_full = swa_full
 
         self.modules += [
             Embedding(
@@ -205,7 +214,10 @@ class MiMoV2Model(Model):
             num_kv_heads = config.swa_num_kv_heads if swa else config.num_kv_heads
             has_sinks = config.add_swa_attention_sink_bias if swa else config.add_full_attention_sink_bias
 
-            attn = Attention(
+            # Shared between both attention flavours. The kernels' left window keeps
+            # window + 1 keys including the query, the HF mask keeps sliding_window including
+            # the query, so the window passed down is sliding_window - 1
+            attn_kwargs = dict(
                 config = config,
                 key = f"{key_prefix}.layers.{idx}.self_attn",
                 layer_idx = idx,
@@ -221,12 +233,22 @@ class MiMoV2Model(Model):
                 key_o = "o_proj",
                 key_sinks = "attention_sink_bias" if has_sinks else None,
                 qmap = "block.attn",
-                # The kernels' left window keeps window + 1 keys including the query, the
-                # HF mask keeps sliding_window including the query
-                sliding_window = config.sliding_window - 1 if swa else -1,
                 out_dtype = torch.float,
                 select_hq_bits = 2,
             )
+            if swa and not swa_full:
+                # 39 of 48 layers only ever look 128 tokens back. On the paged full cache they
+                # would still cost 8 * 192 * 2 halves per token each (~240 KB/token for the
+                # stack); the window ring makes them a fixed per-slot allocation instead.
+                attn = SlidingAttention(
+                    sliding_window = config.sliding_window - 1,
+                    **attn_kwargs,
+                )
+            else:
+                attn = Attention(
+                    sliding_window = config.sliding_window - 1 if swa else -1,
+                    **attn_kwargs,
+                )
             # The fused qkv tensor is TP-shard-interleaved and its FP8 scale grid is per shard;
             # neither is expressible with the generic fused-tensor paths. One reader shared by
             # the three Linears that slice out of it
@@ -330,9 +352,20 @@ class MiMoV2Model(Model):
             "supports_tp": False,
         })
 
+        # SWA layers keep their KV in a per-slot window ring rather than the paged cache
+        self.recurrent_state_cls = None
+        if not self.swa_full:
+            self.caps.update({
+                "recurrent_states": True,
+                "default_recurrent_checkpoint_interval": 2048,
+            })
+            self.recurrent_state_cls = SWAState
+
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        if not self.swa_full:
+            prepare_for_recurrence(input_ids, params, self)
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 
