@@ -12,6 +12,9 @@ import numpy as np
 
 class CacheLayer_quant(CacheLayer):
 
+    # Unbounded prefill can stage the whole context, so the layer reserves a staging window for it
+    reserves_prefill_staging = True
+
     def __init__(
         self,
         config: Config | None,
@@ -46,6 +49,7 @@ class CacheLayer_quant(CacheLayer):
         self.sk = None
         self.sv = None
         self.device = None
+        self.staging_reserved = False
 
 
     @override
@@ -55,17 +59,19 @@ class CacheLayer_quant(CacheLayer):
         self.qv = torch.zeros(self.qshape_v, dtype = torch.int, device = device) if self.shape else None
         self.sk = torch.zeros(self.qshape_s, dtype = torch.half, device = device) if self.shape else None
         self.sv = torch.zeros(self.qshape_s, dtype = torch.half, device = device) if self.shape else None
-        if self.shape:
+        if self.shape and self.reserves_prefill_staging:
             # Imported here: the attention package imports the cache package
             from ..modules.attention_fn.triton_paged import reserve_qc_prefill_staging
             reserve_qc_prefill_staging(device, self.max_num_tokens, self.token_dim)
+            self.staging_reserved = True
 
 
     @override
     def free(self):
-        if self.shape and self.device is not None:
+        if self.staging_reserved:
             from ..modules.attention_fn.triton_paged import release_qc_prefill_staging
             release_qc_prefill_staging(self.device)
+            self.staging_reserved = False
         self.device = None
         self.qk = None
         self.qv = None

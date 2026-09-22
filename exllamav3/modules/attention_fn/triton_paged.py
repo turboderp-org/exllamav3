@@ -692,34 +692,38 @@ _h32_cache = {}
 #       in-kernel expansion cost (~6-26% on the kernel depending on bitrate)
 #   1 = prefill staging (default): prefill dequantizes the referenced cache window once into a
 #       per-device fp16 window and runs the fp16 kernel over it; decode stays online. The window
-#       is reserved by the quantized cache at alloc, sized to its context, so load pays it once
+#       is reserved by the quantized cache at alloc, sized to its context, so load pays it once;
+#       caches whose prefill is bounded (QSA) stage through a small per-call transient instead
 #   2 = full staging: dispatch-path debug mode; whole layers are dequantized into full-size
 #       fp16 temporaries before attention (get_kv). Only affects decode if EXL3_BC_ATTN=0
 _qc_staging = int(os.environ.get("EXL3_QC_STAGING", "1"))
 
-# Prefill staging windows: device -> [k, v, users]. Quantized cache layers on a device share one
-# fp16 K/V pair sized to the largest context reserved there; the last release frees it
+# Prefill staging windows: device -> [window, users]. Quantized cache layers with unbounded prefill
+# share one fp16 buffer per device, K in its first half and V in its second, sized to the largest
+# context reserved there; the last release frees it
 _qc_staging_windows = {}
 
 def reserve_qc_prefill_staging(device, num_tokens: int, token_dim: int):
     if _qc_staging != 1:
         return
     device = torch.device(device)
-    numel = num_tokens * token_dim
-    entry = _qc_staging_windows.setdefault(device, [None, None, 0])
-    if entry[0] is None or entry[0].numel() < numel:
-        entry[0] = entry[1] = None
+    numel = 2 * num_tokens * token_dim
+    entry = _qc_staging_windows.get(device)
+    if entry is None:
+        _qc_staging_windows[device] = [torch.empty(numel, dtype = torch.half, device = device), 1]
+        return
+    if entry[0].numel() < numel:
+        # Allocated before it replaces the old window, so a failed growth leaves current users intact
         entry[0] = torch.empty(numel, dtype = torch.half, device = device)
-        entry[1] = torch.empty(numel, dtype = torch.half, device = device)
-    entry[2] += 1
+    entry[1] += 1
 
 def release_qc_prefill_staging(device):
     if _qc_staging != 1:
         return
     device = torch.device(device)
     entry = _qc_staging_windows[device]
-    entry[2] -= 1
-    if entry[2] == 0:
+    entry[1] -= 1
+    if entry[1] == 0:
         del _qc_staging_windows[device]
 
 # Query-length threshold for the prefill staging pass at EXL3_QC_STAGING=1: below it the direct
@@ -1840,8 +1844,12 @@ def paged_attn_triton_prefill(
         # short query batches stay on the direct path, which reads less gmem
         # (causal only: VLM span chunks fan out into several wrapper calls over the same window,
         # which would repeat the dequant pass per span -- those keep the direct path.) The
-        # referenced window (the job's pages, narrowed when the caller bounds the past length)
-        # is written into the device's reserved staging window, sized once to the cache context
+        # referenced window (the job's pages) is written into the device's reserved staging
+        # window, sized once to the cache context. When the caller bounds the past length (QSA's
+        # dense regime never sees more than its sparse threshold, so a 512k-token pool needs a
+        # 2k-token scratch there) the window is a per-call transient instead, rounded up to a
+        # power of two in pages so the allocator sees a handful of distinct sizes; those caches
+        # reserve nothing
         if (_qc_staging == 1 and q_len >= _qc_prefill_two_pass_min_q
                 and new_kv_mode == 0 and k is None and causal):
             from ...ext import exllamav3_ext as ext
@@ -1850,21 +1858,28 @@ def paged_attn_triton_prefill(
                 npps_w = min(npps_w, -(-(max_kv_len + kv_append_len) // page_size))
                 block_table = block_table[:, :npps_w].contiguous()
             n_kvh = n_kv_heads_override
-            window = _qc_staging_windows.get(q.device)
-            if window is None:
-                raise RuntimeError(
-                    f"No quantized-cache prefill staging window on {q.device}; the cache must "
-                    f"reserve_qc_prefill_staging when it allocates"
-                )
             pages = bsz * npps_w
-            numel = pages * page_size * n_kvh * head_dim
-            if numel > window[0].numel():
-                raise RuntimeError(
-                    f"Prefill needs {pages} pages of staging but the reserved context holds "
-                    f"{window[0].numel() // (page_size * n_kvh * head_dim)}"
-                )
-            kd = window[0][:numel].view(pages, page_size, n_kvh, head_dim)
-            vd = window[1][:numel].view(pages, page_size, n_kvh, head_dim)
+            if max_kv_len is not None:
+                pages_alloc = max(1, 1 << (pages - 1).bit_length())
+                kd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
+                vd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
+            else:
+                entry = _qc_staging_windows.get(q.device)
+                if entry is None:
+                    raise RuntimeError(
+                        f"No quantized-cache prefill staging window on {q.device}; the cache must "
+                        f"reserve_qc_prefill_staging when it allocates"
+                    )
+                window = entry[0]
+                half = window.numel() // 2
+                numel = pages * page_size * n_kvh * head_dim
+                if numel > half:
+                    raise RuntimeError(
+                        f"Prefill needs {pages} pages of staging but the reserved context holds "
+                        f"{half // (page_size * n_kvh * head_dim)}"
+                    )
+                kd = window[:numel].view(pages, page_size, n_kvh, head_dim)
+                vd = window[half:half + numel].view(pages, page_size, n_kvh, head_dim)
             ext.dequant_cache_paged_window(
                 k_cache, k_scales, kd, v_cache, v_scales, vd,
                 cache_seqlens, block_table, page_size, kv_append_len, 0.0,

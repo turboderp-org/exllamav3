@@ -87,6 +87,10 @@ class CacheLayer_qsa_quant(QSAPlanes, CacheLayer_quant):
     """Quantized KV cache layer (CacheLayer_quant packing, read online by the dense and the
     gathered sparse attention kernels) with the fp16 QSA indexer planes."""
 
+    # Dense prefill never sees more than the sparse threshold and the sparse path reads the cache
+    # directly, so the staging is a small per-call transient
+    reserves_prefill_staging = False
+
     def __init__(
         self,
         config,
