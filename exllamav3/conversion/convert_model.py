@@ -79,6 +79,7 @@ parser.add_argument("-mb", "--mtp_bits", type = float, default = None, help = "B
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
 parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
 parser.add_argument("-mbo", "--module_bits", type = str, default = None, help = "Per-module bitrate overrides applied on top of the computed strategy, as a comma-separated list of glob=bits pairs (e.g. 'model.layers.47.mlp.experts.*=6') or the path to a JSON file mapping the same globs to bitrates. Overrides win over --bits and the --hq floor; they do not change any other module's allocation, so they are safe to add on --resume, where they only affect modules that have not been converted yet. Every glob must match at least one quantizable module.")
+parser.add_argument("-mbr", "--max_bad_rows", type = float, default = None, help = "Maximum fraction of calibration rows that may be excluded as non-finite before the job aborts, default: 0.10. Raise this only when the excluded rows are understood: rows are dropped from all subsequent capture, state-advance and error measurement, so the remaining set must still represent the calibration distribution.")
 parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "Bits per weight for hashed n-gram embedding tables, 1-8, default: --bits rounded")
 parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
@@ -331,6 +332,7 @@ def prepare(args) -> (dict, dict, bool, str):
         # resume is safe; an empty dict reads as "unspecified", so a stored map survives a resume
         # that does not repeat the flag (same rule as --hq)
         ("module_bits", True, {}),
+        ("max_bad_rows", True, 0.10),
         ("ngram_bits", False, 0),  # 0 = auto: --bits rounded
         ("ngram_file", False, ""),
         ("cal_data", False, ""),
@@ -362,6 +364,11 @@ def prepare(args) -> (dict, dict, bool, str):
             f"--module_bits bitrates must be integers 1-8, 16, or one of {HALF_RATES} with the mul1 "
             f"codebook; bad entries: {bad_mb[:5]}"
         )
+
+    mbr = in_args.get("max_bad_rows", 0.10)
+    if not (0.0 < float(mbr) <= 1.0):
+        return None, None, False, f"--max_bad_rows must be a fraction in (0, 1], got {mbr}"
+    in_args["max_bad_rows"] = float(mbr)
 
     # Recipe strategy travels with the job; a stored map from a resumed job wins over the file
     if recipe_tensors is not None and "recipe_strategy" not in in_args:
@@ -398,6 +405,8 @@ def prepare(args) -> (dict, dict, bool, str):
     if in_args.get("module_bits"):
         for pat_, bits_ in in_args["module_bits"].items():
             print(f"    Module bits override: {pat_} -> {bits_} bpw")
+    if abs(in_args["max_bad_rows"] - 0.10) > 1e-9:
+        print(f"    Max non-finite calibration rows: {in_args['max_bad_rows']:.0%}")
     print(f"    Output scales: " + {True: "always", False: "never", None: "auto"}[in_args["apply_out_scales"]])
     print(f"    Codebook: {in_args['codebook']}")
 
@@ -1257,6 +1266,7 @@ def main(args, job_state):
     print(" -- Deciding quantization strategy")
     hq = args["hq"]
     module_bits = args.get("module_bits") or {}
+    max_bad_rows = args.get("max_bad_rows") or 0.10
     if module_bits and args.get("recipe_strategy"):
         print(" !! Warning: --module_bits has no effect with --recipe; put the rate in the recipe instead")
     if args.get("recipe_strategy"):
@@ -1514,6 +1524,13 @@ def main(args, job_state):
         cos_error = 0
         sqnr_ = 0
         if state is not None:
+            if model.calibration_all_experts and any(
+                m.__class__.__name__ == "BlockSparseMLP" for m in module
+            ):
+                # The handoff forward deliberately omits activate_all_experts (unlike the capture
+                # pass above): the next module's input state must come from the routing the model
+                # will actually use at inference
+                print(f" -- State handoff routing: top-k (capture used all experts)")
             if advance_replicas is not None:
                 error, cos_error, sqnr_, num_measured = advance_state_parallel(
                     model,
@@ -1537,7 +1554,7 @@ def main(args, job_state):
                 error /= n
                 cos_error /= n
                 sqnr_ /= n
-                check_bad_rows(bad_rows, len(state))
+                check_bad_rows(bad_rows, len(state), max_bad_rows)
             else:
                 num_measured = 0
                 with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
@@ -1571,7 +1588,7 @@ def main(args, job_state):
                 error /= n
                 cos_error /= n
                 sqnr_ /= n
-                check_bad_rows(bad_rows, len(state))
+                check_bad_rows(bad_rows, len(state), max_bad_rows)
 
         # Feedback after module. Trim first so the reported RSS reflects what the job actually
         # retains, not what the allocator happens to be holding
