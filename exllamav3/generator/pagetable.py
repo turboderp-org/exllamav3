@@ -1011,7 +1011,10 @@ class PageTable:
         # Every cache that shares this page table's block tables must move in lockstep
         caches = [self.cache]
         draft_cache = getattr(self.generator, "draft_cache", None)
-        if draft_cache is not None and not os.environ.get("EXL3_DEBUG_NO_DRAFT_DEFRAG"):
+        if (
+            draft_cache is not None and draft_cache.shares_page_table and
+            not os.environ.get("EXL3_DEBUG_NO_DRAFT_DEFRAG")
+        ):
             caches.append(draft_cache)
         # Dispatch per cache, not per main model: an MTP/DFlash draft model never loads TP, so its
         # cache is not registered with the TP workers even when the main model is TP-loaded

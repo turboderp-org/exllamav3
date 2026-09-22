@@ -7,12 +7,18 @@ from ..model.config import Config, no_default
 from ..model.model import Model
 from ..util.rope import RopeStyle
 from ..modules import RMSNorm, TransformerBlock, Attention, GatedMLP
-from ..modules.arch_specific.dflash import DFlashInputLayer
+from ..modules.arch_specific.dflash import (
+    DFlashInputLayer,
+    DFlashRing,
+    DFlashRingAttention,
+    dflash_ring_slots,
+)
 from ..modules.attn import prepare_for_attn
 from ..util.device_copy import to_device
 import weakref
 
 from ..util.tensor import get_for_device
+import os
 
 # TODO: Support DFlash models trained in Speculators (includes lm_head for speculator with limited vocabulary?)
 
@@ -110,6 +116,17 @@ class DFlashConfig(Config):
         # "mask_embedding" tensor in the draft directory
         self.key_mask_embedding = "mask_embedding" if self.stc.has_tensor("mask_embedding") else None
 
+        # Sliding-window draft layers keep a fixed per-slot ring instead of a paged cache
+        # sized for the whole context. Config key, else EXL3_DFLASH_RING (0 restores the paged
+        # cache for A/B). Only engaged when *every* layer is sliding: the ring rewrites the
+        # block table for the whole forward pass, so a mixed drafter would have to carry two
+        self.draft_ring = self.read_cfg(
+            bool, ["dflash_config->draft_ring", "draft_ring"], None
+        )
+        if self.draft_ring is None:
+            self.draft_ring = os.environ.get("EXL3_DFLASH_RING", "1") != "0"
+        self.draft_ring = self.draft_ring and all(t == "sliding_attention" for t in self.layer_types)
+
         # RoPE
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
@@ -160,9 +177,17 @@ def dflash_update_kv_from_target(
     bsz, target_seqlen, dim = target_hidden.shape
     params["target_hidden_cc"] = target_hidden
 
+    # Ring drafters address their own fixed buffer, not the target's page table. The ring
+    # views are the same for every layer, so build them once; RoPE still uses the absolute
+    # positions in cache_seqlens
+    ring = getattr(model, "dflash_ring", None)
+    if ring is not None:
+        ring_slots = dflash_ring_slots(params, bsz)
+        ring_positions = [int(p) for p in params["cache_seqlens"].flatten().tolist()]
+
     # Update KV layers
     for layer in model.attn_modules:
-        block_table = get_for_device(params, "block_table", layer.device)
+        block_table = get_for_device(params, "block_table", layer.device) if ring is None else None
         cache_seqlens = get_for_device(params, "cache_seqlens", layer.device)
         target_hidden = get_for_device(params, "target_hidden_cc", layer.device)
 
@@ -188,7 +213,17 @@ def dflash_update_kv_from_target(
 
         # Write k, v rows to the paged cache; quantized caches quantize them in place rather
         # than dequantizing/requantizing full layers
-        cache.update_layer_direct(layer.layer_idx, cache_seqlens, block_table, k, v, target_seqlen, 0)
+        if ring is None:
+            cache.update_layer_direct(layer.layer_idx, cache_seqlens, block_table, k, v, target_seqlen, 0)
+        else:
+            for t, c, r_bt, r_sl in ring.write_views(ring_slots, ring_positions, target_seqlen, layer.device):
+                cache.update_layer_direct(
+                    layer.layer_idx, r_sl, r_bt,
+                    k[:, t : t + c].contiguous(), v[:, t : t + c].contiguous(), c, 0
+                )
+
+    if ring is not None:
+        ring.note_write(ring_slots, ring_positions, target_seqlen)
 
 
 class DFlashModel(Model):
@@ -222,10 +257,17 @@ class DFlashModel(Model):
         self.first_block_idx = len(self.modules)
         self.attn_modules = []
 
+        # One ring shared by every sliding-window layer (they share window and block size), so
+        # the block table is computed once per forward in prepare_inputs()
+        self.dflash_ring = DFlashRing(config.sliding_window, config.block_size) \
+            if config.draft_ring else None
+
         for idx in range(config.num_hidden_layers):
             is_swa = config.layer_types[idx] == "sliding_attention"
+            attn_cls = DFlashRingAttention if (is_swa and self.dflash_ring is not None) else Attention
+            attn_extra = {"ring": self.dflash_ring} if attn_cls is DFlashRingAttention else {}
 
-            attn = Attention(
+            attn = attn_cls(
                 config = config,
                 key = f"layers.{idx}.self_attn",
                 layer_idx = idx,
@@ -256,6 +298,7 @@ class DFlashModel(Model):
                     rms_norm_eps = config.rms_norm_eps,
                 ),
                 out_dtype = torch.float,
+                **attn_extra,
             )
             # attention_value_scale multiplies V before the attention output; fold into o_proj
             attn.o_proj.weight_scale = config.attention_value_scale
@@ -309,6 +352,7 @@ class DFlashModel(Model):
             "supports_tp": False,
             "attach_target": True,
             "dflash_draft": True,
+            "dflash_ring": self.dflash_ring is not None,
             "default_draft_size": config.block_size - 1,
             "autosplit_load_fwd": False,
         })
@@ -373,6 +417,20 @@ class DFlashModel(Model):
         # The draft block attends to itself bidirectionally; causality on the sliding-window
         # layers is expressed through their window (left sw, right 0) instead
         params["causal"] = False
+        if self.dflash_ring is not None and params.get("attn_mode") == "flash_attn":
+            # Every layer is a ring layer (the config only enables the ring when they all are),
+            # so rewrite the page addressing for the whole pass: RoPE keeps the absolute
+            # positions, the kernels get the ring's rotated block table and in-ring past length
+            bsz = input_ids.shape[0]
+            cache_seqlens = params["cache_seqlens"]
+            if params.get("positions") is None and params.get("position_ids") is None:
+                params["positions"] = cache_seqlens
+            slots = dflash_ring_slots(params, bsz)
+            positions = [int(p) for p in cache_seqlens.flatten().tolist()]
+            device = self.attn_modules[0].device
+            bt, sl = self.dflash_ring.read_view(slots, positions, self.config.block_size, device)
+            params["block_table"] = bt
+            params["cache_seqlens"] = sl
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 

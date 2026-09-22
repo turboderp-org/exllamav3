@@ -210,7 +210,9 @@ class Generator:
         # CPU page cache tier
         self.cpu_page_cache = None
         if cpu_cache_size:
-            tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
+            tier_caches = [cache] + (
+                [draft_cache] if draft_cache is not None and draft_cache.shares_page_table else []
+            )
             self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
             self.cpu_page_cache.attach(self.pagetable)
             self.pagetable.cpu_tier = self.cpu_page_cache
@@ -251,6 +253,13 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+
+        # DFlash ring drafters store K/V per sequence in a fixed window ring rather than in the
+        # target's pages, so every live sequence needs a slot that stays the same for its whole
+        # life. Slots are handed out on first use and returned when the job's pages are freed
+        self.dflash_ring = getattr(self.draft_model, "dflash_ring", None) if self.dflash_draft else None
+        self.dflash_ring_slots = {}
+        self.dflash_ring_free = list(range(self.dflash_ring.num_slots)) if self.dflash_ring else []
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
@@ -379,6 +388,7 @@ class Generator:
         num_jobs = self.num_remaining_jobs()
         for job in self.active_jobs + self.pending_jobs:
             job.deallocate_pages()
+            self.release_dflash_ring_slots(job)
         self.active_jobs.clear()
         self.pending_jobs.clear()
         if num_jobs and not self.num_remaining_jobs():
@@ -434,6 +444,7 @@ class Generator:
             self.pending_jobs.remove(job)
         elif job in self.active_jobs:
             job.deallocate_pages()
+            self.release_dflash_ring_slots(job)
             self.active_jobs.remove(job)
         if num_jobs and not self.num_remaining_jobs():
             self.on_queue_drained()
@@ -854,6 +865,8 @@ class Generator:
             "cache": self.draft_cache,
             "cache_seqlens": cache_seqlens,
         }
+        if self.dflash_ring is not None:
+            params["dflash_ring_slots"] = self.dflash_ring_slots_for(self.active_jobs)
         if self.draft_calibrator is not None:
             params["export_draft_conf"] = True
         out_state = self.draft_model.forward(
@@ -1286,14 +1299,17 @@ class Generator:
         # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         if self.dflash_draft:
+            dflash_params = {
+                "block_table": block_index,
+                "cache_seqlens": p_cache_seqlens,
+            }
+            if self.dflash_ring is not None:
+                dflash_params["dflash_ring_slots"] = self.dflash_ring_slots_for(self.active_jobs)
             self.draft_model.update_kv_from_target(
                 target_hidden = p_export_states,
                 cache = self.draft_cache,
                 lengths = accepted_lengths,
-                params = {
-                    "block_table": block_index,
-                    "cache_seqlens": p_cache_seqlens,
-                }
+                params = dflash_params,
             )
 
         # Accept new target_hidden if MTP. MTP draft models can update their cache from target-model hidden
@@ -1340,6 +1356,7 @@ class Generator:
             if job in requeuing_jobs and self.recurrent_cache is not None:
                 job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
             job.deallocate_pages()
+            self.release_dflash_ring_slots(job)
             self.active_jobs.remove(job)
 
         # Requeue jobs. Puts replacement jobs at the front so long generations continue promptly after they yield
@@ -1351,6 +1368,45 @@ class Generator:
         # Defrag. Physical page indices can only be compacted when no active block tables are using them.
         if num_jobs and not self.num_remaining_jobs():
             self.on_queue_drained()
+
+
+    def dflash_ring_slot(self, seq) -> int:
+        """Stable DFlash ring slot for one live sequence."""
+        slot = self.dflash_ring_slots.get(id(seq))
+        if slot is None:
+            if self.dflash_ring_free:
+                slot = self.dflash_ring_free.pop()
+                self.dflash_ring.reset_slot(slot)
+            else:
+                # More live sequences than ring slots (a cache built for a smaller batch than
+                # the generator runs). Sharing a slot only costs draft acceptance -- every
+                # drafted token is still verified by the target -- so degrade instead of failing
+                slot = len(self.dflash_ring_slots) % self.dflash_ring.num_slots
+            self.dflash_ring_slots[id(seq)] = slot
+        return slot
+
+
+    def dflash_ring_slots_for(self, jobs, prefill_done_only: bool = True) -> list[int] | None:
+        """Ring slots in compact-batch row order, matching how block tables are built."""
+        if self.dflash_ring is None:
+            return None
+        slots = []
+        for job in jobs:
+            if prefill_done_only and not job.is_prefill_done(): continue
+            for seq in job.sequences:
+                slots.append(self.dflash_ring_slot(seq))
+        return slots
+
+
+    def release_dflash_ring_slots(self, job):
+        # getattr: the failure-containment path is exercised against Generator instances built
+        # without __init__, and cleanup must never be the thing that raises
+        if getattr(self, "dflash_ring", None) is None:
+            return
+        for seq in getattr(job, "sequences", ()):
+            slot = self.dflash_ring_slots.pop(id(seq), None)
+            if slot is not None and slot not in self.dflash_ring_free:
+                self.dflash_ring_free.append(slot)
 
 
     def reap_failed_job(self, job, error, results: list):
@@ -1372,6 +1428,7 @@ class Generator:
                 job,
                 exc_info = True,
             )
+        self.release_dflash_ring_slots(job)
         if job in self.active_jobs:
             self.active_jobs.remove(job)
         results.append({

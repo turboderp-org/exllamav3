@@ -1284,8 +1284,13 @@ class Job:
 
                 if best_match_page and best_match > 1:
                     page = seq.allocated_pages[p0]
-                    for c in [self.generator.cache] if not self.generator.draft_model else \
-                            [self.generator.cache, self.generator.draft_cache]:
+                    # A draft cache that does not share this page table (DFlash ring) has no
+                    # page to copy; its ring refills from the target states of whatever is
+                    # actually prefilled
+                    reuse_caches = [self.generator.cache]
+                    if self.generator.draft_model and self.generator.draft_cache.shares_page_table:
+                        reuse_caches.append(self.generator.draft_cache)
+                    for c in reuse_caches:
                         c.copy_page(
                             c,
                             best_match_page.page_index,
@@ -1399,13 +1404,17 @@ class Job:
                     self.generator.model.prefill(input_ids = prefill_ids, params = params)
 
                 if self.generator.dflash_draft:
+                    dflash_params = {
+                        "block_table": seq.block_index_tensor,
+                        "cache_seqlens": params["cache_seqlens"],
+                    }
+                    if self.generator.dflash_ring is not None:
+                        dflash_params["dflash_ring_slots"] = \
+                            [self.generator.dflash_ring_slot(seq)]
                     self.generator.draft_model.update_kv_from_target(
                         target_hidden = params.get("export_states"),
                         cache = self.generator.draft_cache,
-                        params = {
-                            "block_table": seq.block_index_tensor,
-                            "cache_seqlens": params["cache_seqlens"],
-                        }
+                        params = dflash_params,
                     )
                 elif self.generator.draft_model:
                     if self.generator.mtp_draft:

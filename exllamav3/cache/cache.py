@@ -146,6 +146,11 @@ class Cache:
         cl = self.model.get_cache_layers()
         self.num_layers = len(cl)
         self.layers = {}
+        # True while every cache layer is addressed by the generator's page table, i.e. page
+        # index p means the same thing here as in the model's own cache. Layers that manage a
+        # bounded ring of their own (DFlash sliding draft layers) clear it, which excludes the
+        # cache from defragmentation, page copying and the CPU page-cache tier
+        self.shares_page_table = True
         for attn in cl:
             # Attention variants with a different cache geometry (MLA stores one latent plus one
             # shared rope key instead of per-head K/V) map the requested layer type to their own
@@ -153,9 +158,17 @@ class Cache:
                 attn.cache_layer_type(self.layer_type, kwargs)
                 if hasattr(attn, "cache_layer_type") else (self.layer_type, kwargs)
             )
+            # ...and variants that size their own storage (a fixed window ring rather than the
+            # job page pool) say so here, leaving max_num_tokens as the model-level contract
+            layer_tokens = (
+                attn.cache_layer_num_tokens(self.max_num_tokens, max_batch_size)
+                if hasattr(attn, "cache_layer_num_tokens") else self.max_num_tokens
+            )
+            if layer_tokens != self.max_num_tokens:
+                self.shares_page_table = False
             for instance in self.model.get_layer_instances(attn.layer_idx):
                 self.layers[instance] = \
-                    layer_type(self.config, attn, id(self), self.max_num_tokens, **layer_kwargs)
+                    layer_type(self.config, attn, id(self), layer_tokens, **layer_kwargs)
 
         # Attach recurrent (SWA/linear-attn) layers
         self.num_slots = max_batch_size
