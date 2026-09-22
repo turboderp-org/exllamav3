@@ -55,10 +55,17 @@ class CacheLayer_quant(CacheLayer):
         self.qv = torch.zeros(self.qshape_v, dtype = torch.int, device = device) if self.shape else None
         self.sk = torch.zeros(self.qshape_s, dtype = torch.half, device = device) if self.shape else None
         self.sv = torch.zeros(self.qshape_s, dtype = torch.half, device = device) if self.shape else None
+        if self.shape:
+            # Imported here: the attention package imports the cache package
+            from ..modules.attention_fn.triton_paged import reserve_qc_prefill_staging
+            reserve_qc_prefill_staging(device, self.max_num_tokens, self.token_dim)
 
 
     @override
     def free(self):
+        if self.shape and self.device is not None:
+            from ..modules.attention_fn.triton_paged import release_qc_prefill_staging
+            release_qc_prefill_staging(self.device)
         self.device = None
         self.qk = None
         self.qv = None

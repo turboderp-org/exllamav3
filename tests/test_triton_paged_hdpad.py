@@ -10,6 +10,7 @@ import pytest
 import torch
 from exllamav3.modules.attention_fn.triton_paged import (
     paged_attn_triton_decode, paged_attn_triton_prefill,
+    reserve_qc_prefill_staging, release_qc_prefill_staging,
 )
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.constants import PAGE_SIZE
@@ -121,8 +122,13 @@ def test_qc_hdpad(hd, bits, q_len, past):
             num_warps = 2, num_stages = 3)
     qk, sk, kdeq = _quant_cache(kc, bits); qv, sv, vdeq = _quant_cache(vc, bits)
     fn = paged_attn_triton_decode if q_len <= 16 else paged_attn_triton_prefill
-    out = fn(q, None, None, qk, qv, bt, sl, causal = True, qc = (sk, sv, bits, bits),
-             pre_appended_len = q_len, n_kv_heads_override = kvh)
+    # Prefill stages through the window a quantized cache reserves at alloc
+    reserve_qc_prefill_staging(q.device, B * bt.shape[1] * PAGE_SIZE, kvh * hd)
+    try:
+        out = fn(q, None, None, qk, qv, bt, sl, causal = True, qc = (sk, sv, bits, bits),
+                 pre_appended_len = q_len, n_kv_heads_override = kvh)
+    finally:
+        release_qc_prefill_staging(q.device)
     ref = ref_attn(q, gather(kdeq, bt, T), gather(vdeq, bt, T), True, past)
     err = (out.float() - ref).abs().max().item() / ref.abs().max().item()
     assert err < 1.2e-2, f"rel err {err:.3e}"
