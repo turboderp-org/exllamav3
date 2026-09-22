@@ -7,7 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
+#include <condition_variable>
 #include <string>
 #include <thread>
 #include <vector>
@@ -19,6 +19,9 @@
 #ifdef _MSC_VER
 #include <intrin.h>
 #pragma comment(lib, "Synchronization.lib")
+#else
+#include <pthread.h>
+#include <sys/mman.h>
 #endif
 
 // Same convention as moe_mul1.cpp: per-function target attributes on GCC so the
@@ -196,6 +199,74 @@ bool cpu_has_avx2()
     return ok && !cap_scalar;
 }
 
+// Background-munmap janitor.
+//
+// A fresh >32 MB output costs ~4 ms in page faults on alloc and another ~4 ms
+// on free (glibc mmaps/munmaps above its dynamic threshold; Windows pays the
+// same with demand-zero pages). The janitor moves the free off the caller's
+// path: the output's deleter hands the mapping to one futex-sleeping thread
+// via a single slot. If the slot is occupied (janitor still on the previous
+// block), the deleter frees it inline - the no-janitor cost, paid only when
+// the janitor is behind, and self-limiting (depth-1 slot, never accumulates).
+// Steady-state retention is zero: the in-flight block is the only RAM between
+// calls.
+
+struct Handoff
+{
+    void* raw = nullptr;
+    size_t full = 0;
+};
+
+struct Janitor
+{
+    std::mutex mx;
+    std::condition_variable cv;
+    Handoff slot;
+    std::thread th;
+    bool started = false;
+};
+
+Janitor& janitor()
+{
+    static Janitor* j = new Janitor;   // intentionally leaked: deleters may run after static destructors
+    return *j;
+}
+
+void janitor_start(Janitor& j)
+{
+    if (!j.started)
+    {
+        j.started = true;
+        j.th = std::thread([&j]
+                           {
+#ifdef _WIN32
+                               SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#else
+                               // per-thread SCHED_IDLE: the janitor only runs when the
+                               // kernel's threads and the caller are done (setpriority
+                               // would nice the WHOLE process - never do that here)
+                               struct sched_param sp = {0};
+                               pthread_setschedparam(pthread_self(), SCHED_IDLE, &sp);
+#endif
+                               for (;;)
+                               {
+                                   Handoff h;
+                                   {
+                                       std::unique_lock lk(j.mx);
+                                       j.cv.wait(lk, [&j] { return j.slot.raw != nullptr; });
+                                       h = j.slot;
+                                       j.slot.raw = nullptr;
+                                   }
+#ifdef _WIN32
+                                   VirtualFree(h.raw, 0, MEM_RELEASE);
+#else
+                                   munmap(h.raw, h.full);
+#endif
+                               }
+                           });
+    }
+}
+
 } // namespace
 
 at::Tensor emb8_dequant
@@ -231,7 +302,35 @@ at::Tensor emb8_dequant
     for (int64_t i = 0; i < n; i++)
         TORCH_CHECK(id_ptr[i] >= 0 && id_ptr[i] < vocab, "emb8_dequant: id out of range [0, vocab)");
 
-    at::Tensor out = at::empty({n, hidden}, at::TensorOptions().dtype(dt).device(at::kCPU));
+    const size_t bytes = (size_t) n * hidden * (f32_out ? 4 : 2);
+#ifdef _WIN32
+    void* raw = VirtualAlloc(0, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    TORCH_CHECK(raw != nullptr, "emb8_dequant: VirtualAlloc failed");
+#else
+    void* raw = mmap(0, bytes, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    TORCH_CHECK(raw != MAP_FAILED, "emb8_dequant: mmap failed");
+#endif
+    at::Tensor out = at::from_blob(
+        raw, {n, hidden},
+        [raw, bytes](void*)
+        {
+            Janitor& j = janitor();
+            janitor_start(j);
+            std::lock_guard lk(j.mx);
+            if (j.slot.raw)
+            {
+#ifdef _WIN32
+                VirtualFree(j.slot.raw, 0, MEM_RELEASE);
+#else
+                munmap(j.slot.raw, j.slot.full);
+#endif
+            }
+            j.slot.raw = raw;
+            j.slot.full = bytes;
+            j.cv.notify_one();
+        },
+        at::TensorOptions().dtype(dt).device(at::kCPU));
 
     Job job;
     job.q = q_table.data_ptr<int8_t>();

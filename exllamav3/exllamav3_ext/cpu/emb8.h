@@ -11,12 +11,13 @@
 // opmath_t = float; vcvtps2ph rounds to nearest even like c10::Half). fp32 output
 // is exact vs the reference dequant (no intermediate rounding).
 //
-// The output is a fresh allocation per call. For large prefill chunks that
-// pays a page-fault cost on alloc + free (glibc mmaps/munmaps above its
-// dynamic threshold; Windows demand-zero pages cost the same): measured
-// N=4096, hidden=5120, 80 MiB fp32 out, the 2.9 ms kernel pass grows to a
-// ~9.6 ms alloc-to-free cycle. The cost is bounded by the output size and is
-// not visible at decode sizes (N=1, ~20 KB).
+// The output is a fresh allocation per call; its pages are unmapped by a
+// background janitor thread instead of on the caller's path (a fresh >32 MB
+// output costs ~4 ms in page faults on alloc and ~4 ms on free - glibc
+// mmaps/munmaps above its dynamic threshold, Windows demand-zero pages pay
+// the same). Measured N=4096, hidden=5120, 80 MiB fp32 out: the alloc-to-
+// free cycle drops from ~9.6 ms to ~6.3 ms; steady-state retained RAM is
+// zero. Inconsequential at decode sizes (N=1, ~20 KB).
 //
 // The caller must release the GIL around this call.
 

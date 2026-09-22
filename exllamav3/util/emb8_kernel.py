@@ -2,7 +2,7 @@
 
 The kernel is compiled into the extension at install time
 (exllamav3_ext/cpu/emb8.cpp): fused gather + dequant to fp16/fp32, threaded,
-fresh output allocation per call.
+fresh output allocation per call, freed by a background janitor thread.
 
 Numerics: fp16 output is bit-exact with the torch path (ATen CPU fp16
 elementwise ops use opmath_t = float, and vcvtps2ph rounds to nearest even like
