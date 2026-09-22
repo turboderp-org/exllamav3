@@ -18,6 +18,7 @@ from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
+import fnmatch
 import threading
 from pathlib import Path
 from collections import deque
@@ -77,6 +78,7 @@ parser.add_argument("-hb", "--head_bits", type = float, default = None, help = "
 parser.add_argument("-mb", "--mtp_bits", type = float, default = None, help = "Bits per weight, MTP layers: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 4")
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
 parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
+parser.add_argument("-mbo", "--module_bits", type = str, default = None, help = "Per-module bitrate overrides applied on top of the computed strategy, as a comma-separated list of glob=bits pairs (e.g. 'model.layers.47.mlp.experts.*=6') or the path to a JSON file mapping the same globs to bitrates. Overrides win over --bits and the --hq floor; they do not change any other module's allocation, so they are safe to add on --resume, where they only affect modules that have not been converted yet. Every glob must match at least one quantizable module.")
 parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "Bits per weight for hashed n-gram embedding tables, 1-8, default: --bits rounded")
 parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
@@ -169,6 +171,62 @@ def prepare_env(args):
     os.makedirs(images_dir, exist_ok = True)
 
 
+def supported_qbits(v, half_ok):
+    """True for a bitrate the trellis kernels have an instance for: integers 1-8, 16 (store
+    unquantized), plus 1.5 / 2.5 / 3.5 with the mul1 codebook."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    return (float(v).is_integer() and (1 <= v <= 8 or v == 16)) or (half_ok and float(v) in HALF_RATES)
+
+
+def parse_module_bits(spec: str):
+    """Parse --module_bits: either a path to a JSON file mapping module-key globs to bitrates, or
+    a comma-separated list of glob=bits pairs. Returns (dict, error_string)."""
+    if spec is None:
+        return None, None
+    spec = spec.strip()
+    if not spec:
+        return None, None
+    if spec.endswith(".json") or os.path.isfile(spec):
+        if not os.path.isfile(spec):
+            return None, f"--module_bits file not found: {spec}"
+        try:
+            with open(spec, "r", encoding = "utf8") as f:
+                raw = json.load(f)
+        except Exception as e:  # noqa: BLE001 - surfaced to the caller as a clean error string
+            return None, f"--module_bits file {spec} is not readable JSON: {e}"
+        if not isinstance(raw, dict) or not raw:
+            return None, f"--module_bits file {spec} must contain a non-empty object mapping globs to bitrates"
+    else:
+        raw = {}
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                return None, f"--module_bits entry '{part}' is not of the form <glob>=<bits>"
+            pat, _, val = part.rpartition("=")
+            pat = pat.strip()
+            if not pat:
+                return None, f"--module_bits entry '{part}' has an empty pattern"
+            try:
+                raw[pat] = float(val)
+            except ValueError:
+                return None, f"--module_bits entry '{part}' has a non-numeric bitrate"
+        if not raw:
+            return None, f"--module_bits is empty: {spec}"
+    out = {}
+    for pat, v in raw.items():
+        if not isinstance(pat, str):
+            return None, f"--module_bits keys must be strings, got {pat!r}"
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None, f"--module_bits value for '{pat}' is not a number: {v!r}"
+        out[pat] = int(v) if float(v).is_integer() else v
+    return out, None
+
+
 def prepare(args) -> (dict, dict, bool, str):
     check_system()
 
@@ -220,6 +278,12 @@ def prepare(args) -> (dict, dict, bool, str):
         if args.hq:
             print(" !! Warning: --hq has no effect with --recipe")
 
+    # Per-module bitrate overrides, parsed up front so a bad spec fails before anything is loaded
+    module_bits, mb_err = parse_module_bits(args.module_bits)
+    if mb_err:
+        return None, None, False, mb_err
+    args.module_bits = module_bits
+
     in_args = { "work_dir": args.work_dir }
     if args.resume:
         in_args = load_dict("args.json", in_args)
@@ -263,6 +327,10 @@ def prepare(args) -> (dict, dict, bool, str):
         ("mtp_bits", True, 4),
         ("vision_bits", True, 0),  # 0 = auto: architecture's default_vision_bits cap, or 16
         ("hq", False, False),
+        # Overrides only ever affect modules the job has not converted yet, so changing them on a
+        # resume is safe; an empty dict reads as "unspecified", so a stored map survives a resume
+        # that does not repeat the flag (same rule as --hq)
+        ("module_bits", True, {}),
         ("ngram_bits", False, 0),  # 0 = auto: --bits rounded
         ("ngram_file", False, ""),
         ("cal_data", False, ""),
@@ -288,6 +356,12 @@ def prepare(args) -> (dict, dict, bool, str):
             return None, None, False, f"--{arg_} must be an integer 1-8, 16, or one of {HALF_RATES} with the mul1 codebook, got {v}"
     if recipe_tensors is not None and not half_ok and any(v in HALF_RATES for v in recipe_tensors.values()):
         return None, None, False, f"Recipe uses half-integer bitrates, which need the mul1 codebook"
+    bad_mb = [f"{k}={v}" for k, v in (in_args.get("module_bits") or {}).items() if not supported_qbits(v, half_ok)]
+    if bad_mb:
+        return None, None, False, (
+            f"--module_bits bitrates must be integers 1-8, 16, or one of {HALF_RATES} with the mul1 "
+            f"codebook; bad entries: {bad_mb[:5]}"
+        )
 
     # Recipe strategy travels with the job; a stored map from a resumed job wins over the file
     if recipe_tensors is not None and "recipe_strategy" not in in_args:
@@ -321,6 +395,9 @@ def prepare(args) -> (dict, dict, bool, str):
     print(f"    Target bitrate: {in_args['bits']} (decoder), {in_args['head_bits']} (head)")
     if in_args.get("recipe_strategy"):
         print(f"    Recipe: {in_args.get('recipe')} ({len(in_args['recipe_strategy'])} tensors)")
+    if in_args.get("module_bits"):
+        for pat_, bits_ in in_args["module_bits"].items():
+            print(f"    Module bits override: {pat_} -> {bits_} bpw")
     print(f"    Output scales: " + {True: "always", False: "never", None: "auto"}[in_args["apply_out_scales"]])
     print(f"    Codebook: {in_args['codebook']}")
 
@@ -1179,6 +1256,9 @@ def main(args, job_state):
     # Get quantization strategy for model @bitrate
     print(" -- Deciding quantization strategy")
     hq = args["hq"]
+    module_bits = args.get("module_bits") or {}
+    if module_bits and args.get("recipe_strategy"):
+        print(" !! Warning: --module_bits has no effect with --recipe; put the rate in the recipe instead")
     if args.get("recipe_strategy"):
         print(f"    Applying recipe: {args.get('recipe')}")
         strategy, final_bpw = create_q_strategy_from_recipe(
@@ -1190,7 +1270,30 @@ def main(args, job_state):
             model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
             vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
             half_steps = args["codebook"] == "mul1",   # 1.5 / 2.5 / 3.5 bpw exist for the mul1 codebook only
+            module_bits = module_bits,
         )
+
+    # A glob that matches nothing is always a typo, and on a resume it would silently re-run the
+    # module at the rate that already failed -- which costs real GPU time. Fail before loading.
+    if module_bits and not args.get("recipe_strategy"):
+        converted_keys = {
+            sm.key
+            for i, m in enumerate(model.modules) if i < job_state["next_module_idx"]
+            for sm in m if isinstance(sm, Linear)
+        }
+        for pat_, bits_ in module_bits.items():
+            matched = [k for k in strategy if fnmatch.fnmatchcase(k, pat_)]
+            if not matched:
+                raise ValueError(
+                    f" ## --module_bits pattern '{pat_}' matches no quantizable module in this model"
+                )
+            done = [k for k in matched if k in converted_keys]
+            print(
+                f" -- Module bits override: {pat_} -> {bits_} bpw ({len(matched)} tensor(s)"
+                + (f", {len(done)} already converted and unaffected" if done else "")
+                + ")"
+            )
+
     args["final_bits"] = round(final_bpw, 2)
     print(" -- Quantization strategy, summary:")
     print(print_strategy(strategy))

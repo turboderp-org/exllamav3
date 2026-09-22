@@ -1,6 +1,7 @@
 from __future__ import annotations
 import math
 import bisect
+import fnmatch
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 import re
@@ -59,6 +60,7 @@ def create_q_strategy(
     vision_model: Model = None,
     vision_bpw: int = None,
     half_steps: bool = False,
+    module_bits: dict | None = None,
 ) -> (dict, float):
     """
     Build the per-module quantization bitrate strategy for a converted model.
@@ -71,6 +73,9 @@ def create_q_strategy(
     opt out with q_half_bits = False (kernels without half-integer instances). The --hq floor is base + select_hq_bits
     rounded down to a supported rate (2.5 + 2 -> 4). Auxiliary targets, such as output heads using head_bits, are
     collected alongside the main budgeted weights and merged into the returned strategy.
+
+    module_bits, if given, maps fnmatch-style module-key globs to explicit bitrates and is applied on top of the
+    finished allocation (see below), overriding both the budget and the --hq floor for the matching modules only.
     """
     from ..modules.module import Module
     from ..modules.linear import Linear
@@ -185,17 +190,31 @@ def create_q_strategy(
             break
 
     # Apply constraint from --hq:
-    final_bits = 0
     for t in targets.values():
         if hq:
             t.clamp_min()
-        final_bits += t.total_bits()
 
     # Aux targets sit outside the main budget; the only ones with min_bpw above their target
     # are MTP-head layers with select_hq_bits (head/vision targets clamp as a no-op)
     if hq:
         for t in aux_targets.values():
             t.clamp_min()
+
+    # Explicit per-module overrides (--module_bits) are applied last, so they win over both the
+    # budget and the --hq floor. They are deliberately applied *after* budgeting rather than
+    # folded into it: the promotion loop above must see the un-overridden model so that no other
+    # module's allocation shifts. That is what makes an override safe to introduce on a --resume,
+    # where every module before next_module_idx has already been written to <work>/qtensors at
+    # its original rate and will not be revisited. The bits they add or remove are counted in the
+    # returned average, which is only ever used for reporting (quantization_config.json "bits").
+    if module_bits:
+        for k, t in list(targets.items()) + list(aux_targets.items()):
+            for pat, bits in module_bits.items():
+                if fnmatch.fnmatchcase(k, pat):
+                    t.target_bpw = bits
+                    break
+
+    final_bits = sum(t.total_bits() for t in targets.values())
 
     # Combined with head layer
     targets.update(aux_targets)
