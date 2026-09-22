@@ -45,6 +45,7 @@ class Linear(Module):
         frange_dim: int = 0,
         fidx: int | None = None,
         finterleaved: bool = False,
+        fdequant = None,
         caps: dict = None,
         softcap: float = 0.0,
         pad_to: int = 128,
@@ -83,6 +84,9 @@ class Linear(Module):
         self.frange_dim = frange_dim
         self.fidx = fidx
         self.finterleaved = finterleaved
+        # Optional architecture-supplied reader for the fused checkpoint tensor named by fkey.
+        # Signature: (stc, fkey, device) -> fp16 (out_features, in_features) tensor
+        self.fdequant = fdequant
         self.quant_type = None
         self.softcap = softcap
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
@@ -162,7 +166,10 @@ class Linear(Module):
     # grid. E8M0 scales arrive as uint8 exponent bytes, value 2^(byte - 127). Mirrors the
     # transformers finegrained_fp8 reference dequant.
     def dequant_e8m0_blocks_(self, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        if weight.dtype == torch.int8:
+        # MiMo-V2 stores the same packed-FP4 expert weights as U8 rather than I8; the bytes are
+        # identical (SGLang's loader only bitcasts to match its int8 parameter, then masks as
+        # unsigned again), so both dtypes take the unpack path
+        if weight.dtype in (torch.int8, torch.uint8):
             u8 = weight.contiguous().view(torch.uint8)
             lut = torch.tensor(_MXFP4_LUT, dtype = torch.float, device = weight.device)
             w = torch.stack((lut[(u8 & 0x0F).long()], lut[(u8 >> 4).long()]), dim = -1)
@@ -194,6 +201,14 @@ class Linear(Module):
                 pad1 = (self.out_features,) if not self.is_sliced else None
                 pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
                 scale_q = self.config.stc.get_tensor(key + ".scale", dev, optional = True, no_defer = True)
+                if scale_q is None and self.config.stc.has_tensor(key + ".weight_scale"):
+                    # MiMo-V2 routed experts: same E8M0 block grid, named "weight_scale" and
+                    # stored as U8 exponent bytes. Only 2D uint8 scales route here; float
+                    # "weight_scale" tensors keep the per-row/per-tensor fp8 path below. Fetched
+                    # untransposed because the dequant runs in checkpoint (out, in) orientation
+                    ws_q = self.config.stc.get_tensor(key + ".weight_scale", dev, optional = True, no_defer = True)
+                    if ws_q is not None and ws_q.dim() == 2 and ws_q.dtype == torch.uint8:
+                        scale_q = ws_q
                 if scale_q is not None and scale_q.dim() == 2:
                     # DeepSeek-V4 style: fp8/fp4 blocks + E8M0 scale grid, checkpoint
                     # orientation (out, in); dequant first, then orient/pad like a plain load
@@ -341,24 +356,33 @@ class Linear(Module):
 
         elif self.fkey and self.config.stc.has_tensor_group(self.fkey, ["weight"]) and self.frange is not None:
 
-            weight = self.config.stc.get_tensor(
-                self.fkey + ".weight",
-                self.device,
-                no_defer = True
-            )
-            # Fused checkpoint tensor in FP8/FP4-block form (DeepSeek-V4 wo_a): dequantize the
-            # whole tensor before slicing out this group's rows
-            scale_q = self.config.stc.get_tensor(self.fkey + ".scale", self.device, optional = True, no_defer = True)
-            if scale_q is not None and scale_q.dim() == 2:
-                weight = self.dequant_e8m0_blocks_(weight, scale_q)
+            if self.fdequant is not None:
+                # Architecture-supplied reader for a fused tensor whose checkpoint layout the
+                # generic paths cannot describe (MiMo-V2: TP-shard-interleaved fused QKV with a
+                # per-shard, ceiling-padded FP8 scale grid). Returns the canonical, contiguous
+                # (out_features, in_features) fp16 matrix that frange indexes into
+                weight = self.fdequant(self.config.stc, self.fkey, self.device)
+                bias = None
+            else:
+                weight = self.config.stc.get_tensor(
+                    self.fkey + ".weight",
+                    self.device,
+                    no_defer = True
+                )
+                # Fused checkpoint tensor in FP8/FP4-block form (DeepSeek-V4 wo_a): dequantize the
+                # whole tensor before slicing out this group's rows
+                scale_q = self.config.stc.get_tensor(self.fkey + ".scale", self.device, optional = True, no_defer = True)
+                if scale_q is not None and scale_q.dim() == 2:
+                    weight = self.dequant_e8m0_blocks_(weight, scale_q)
             weight = weight[self.frange[0] : self.frange[1]].contiguous()
             weight = self.pad_out(weight)
-            bias = self.config.stc.get_tensor(
-                self.fkey + ".bias",
-                self.device,
-                optional = True,
-                no_defer = True
-            )
+            if self.fdequant is None:
+                bias = self.config.stc.get_tensor(
+                    self.fkey + ".bias",
+                    self.device,
+                    optional = True,
+                    no_defer = True
+                )
             if bias is not None:
                 bias = bias[self.frange[0] : self.frange[1]].contiguous()
                 bias = self.pad_out(bias)

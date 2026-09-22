@@ -643,6 +643,9 @@ def _module_eligible(m):
             (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None) or
             BCAttn._fp16_gate_weight(m.g_proj) is not None) and
         (m.v_norm is None or (type(m.v_norm).__name__ == "RMSNorm" and not m.v_norm.span_heads)) and
+        # Asymmetric V head dim (MiMo-V2): the captured block feeds the attention output
+        # straight into o_proj, with no place to trim the padded V lanes
+        getattr(m, "v_head_dim", m.head_dim) == m.head_dim and
         # TP shards are eligible: the shard owns its split cache layers directly (the opaque cache
         # handle is resolved before bc_attn_step) and the output all-reduce runs after the captured
         # block returns. Span-heads norms stay declined (cross-rank norm inside the block)
