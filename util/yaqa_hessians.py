@@ -32,18 +32,25 @@ Output is one safetensors file per tensor, named by its key in the model checkpo
 
 Both are symmetric and stored as the packed upper triangle, row-major: a 1-D tensor of n (n + 1) / 2 values (convert.py
 also accepts full square matrices). The output head gets hin only, in "both" mode, since its hout would be vocab x
-vocab. Only nn.Linear modules are covered; fused expert tensors (MoE) are not.
+vocab. Recursive mode also accepts explicit --head with "out". Only nn.Linear modules are covered; fused expert tensors (MoE) are not.
 
 Memory: the factors are accumulated on the GPU, in_features^2 + out_features^2 fp32 values per tensor (half that
 on disk). For large models that is far more than fits alongside the weights, so collect a range of layers at a time
 with -l/--layers; ranges write disjoint files into the same output directory. No gradients are computed below the
-first layer in the range, and the forward-only pass stops after the last, so later ranges run somewhat faster. With several devices
-the model is placed on them in the order given, leaving -rv/--reserve_vram GB free on each, which has to cover the
-activations kept for the backward pass (roughly as much as the weights of the layers on that device, at 2048 tokens),
-the factors (on the devices given by -hd, otherwise with each layer) and ~10 GB for logits on the last device.
+first layer in the range, and the forward-only pass stops after the last. With several devices, sequential placement reserves VRAM for activations and factors. Recursive mode additionally checkpoints decoder blocks and allows explicit -rv/--reserve_vram to enable single-device CPU offload. CPU-offloaded factors require an explicit -hd accelerator.
 --tf32 speeds up the accumulation (about 40% off the whole run on a 2B model, 20% on a 27B); the inputs are BF16 and
 the running sums stay FP32. A separate -hd device lets the accumulation overlap with the backward pass, but without P2P
 the copies cost more than that gains back (measured on a 27B), so it's mainly a way to make room.
+
+With --recursive DIR, decoder ranges split recursively using disk-backed activation and gradient boundaries, following section 5 of BaKron: Efficient Quantization with Kronecker-Factored Hessians (Johann Birnick and Rayan Saab, 2026, arXiv:2608.06291). Only one decoder block owns factors at a time. The same sampled Fisher gradients and factor-update schedule are reused at each leaf; output filenames and packed FP32 format are unchanged.
+
+DIR must have space for logarithmically many boundary datasets plus per-row call metadata. Use a disk-backed scratch directory, not tmpfs: storage scales with calibration tokens, hidden width, target samples and recursion depth. Scratch files are removed on normal completion or a handled exception. Forced termination can leave a yaqa-* directory behind. Extra decoder sweeps trade compute and disk I/O for bounded factor memory. Logs report each split and leaf pass; equivalent-pass counts are normalized by selected decoder blocks and rows, excluding checkpoint recomputation from the forward count and excluding decoder blocks outside the selected range.
+
+Recursive resume requires the same model, calibration rows, sampling seed and factor settings. Complete packed FP32 files in the output directory are skipped. Repeat --resume-from DIR to read additional result directories without modifying them; new files go only to --out_dir. Invalid final files cause an error, never replacement. Results are written under temporary names, synced, then atomically published without overwriting an existing filename; interrupted temporary files are ignored.
+
+Resume validates names, FP32 dtype and packed dimensions; it does not detect same-length payload corruption or mismatched calibration settings.
+
+To restart at decoder layer N, use --layers N:end. Every calibration row still runs through the prefix to recompute layer-N inputs and sampled Fisher targets; no activation checkpoint from an earlier process is needed. Recursive collection also trims completed leading/trailing blocks automatically. A restart repeats boundary preparation, not completed factor collection. Example: --layers 56:64 --sides out --head --resume-from previous-results -o remaining-results --recursive scratch.
 
 Sampling noise: Hout depends on the sampled targets and is dominated by relatively few high-gradient tokens. On
 Qwen3.5-2B two seeds differ by ~20% (Frobenius) at 250 rows, ~40% at 64, falling as 1/sqrt(rows), and the same applies
@@ -52,18 +59,30 @@ seem to care: weighted, unweighted and 4-sample variants all land within run-to-
 
     python util/yaqa_hessians.py -m /models/hf/model -c cal_trace.safetensors -o /scratch/hess
     python util/yaqa_hessians.py -m /models/hf/model -c cal_trace.safetensors -o /scratch/hess -d 0,1,2,3 -hd 0 -rv 73,16,12,14 -l 0:16 --tf32 --unweighted
+    python util/yaqa_hessians.py -m /models/hf/model -c cal_trace.safetensors -o /scratch/hess --recursive /scratch/boundaries -rv 22 -hd 0 --sides out --tf32
 """
 
-import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import json
 import re
 import time
+import tempfile
+from pathlib import Path
+from functools import partial
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
+from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
 
 # Quantized linear layers inside a decoder block, by the last component of the module name. Small projections that
 # EXL3 leaves unquantized (GDN a/b, routers etc.) are not matched
@@ -110,23 +129,39 @@ def load_rows(args):
     return out
 
 
-def load_model(args, devices):
+def checkpoint_layers(model: nn.Module) -> None:
+    """Checkpoint frozen decoder blocks while preserving Accelerate's weight lifecycle.
+
+    Non-reentrant checkpointing supports keyword arguments and autograd.grad. Disabling early-stop recomputation ensures Accelerate's post-forward hooks run and release streamed weight copies after backward replay.
     """
-    Load the unquantized model in BF16. With more than one device the layers are distributed by accelerate, leaving
-    reserve_vram GB per device for activations and the Hessian factors. Devices are filled in the order given.
+    checkpointed = set_checkpoint_early_stop(False)(checkpoint)
+    for name, module in model.named_modules():
+        if re.search(r"(^|\.)layers\.\d+$", name) and not any(s in name for s in skip_names):
+            # Recompute through Accelerate's post-forward hook so streamed weights are released.
+            module.forward = partial(checkpointed, module.forward, use_reentrant = False)
+
+
+def load_model(args: argparse.Namespace, devices: list[int]) -> "PreTrainedModel":
+    """Load frozen BF16 weights; recursive mode also checkpoints decoder blocks.
+
+    Recursive mode allows explicit reserve_vram to enable single-device CPU offload.
     """
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
     kwargs = {"dtype": torch.bfloat16}
-    if len(devices) == 1:
+    if len(devices) == 1 and (not args.recursive or args.reserve_vram is None):
         kwargs["device_map"] = {"": devices[0]}
     else:
         reserve = args.reserve_vram or [8.0]
         reserve += [reserve[-1]] * (len(devices) - len(reserve))
+        from accelerate.utils import get_max_memory
         kwargs["device_map"] = "sequential"  # fill devices in order; "auto" balances and ignores most of a large device
-        kwargs["max_memory"] = {
+        max_memory: dict[int | str, int] = {
             d: max(int(torch.cuda.mem_get_info(d)[0] - r * 1024**3), 0)
             for d, r in zip(devices, reserve)
         }
+        if args.recursive:
+            max_memory["cpu"] = get_max_memory()["cpu"]
+        kwargs["max_memory"] = max_memory
     try:
         model = AutoModelForCausalLM.from_pretrained(args.model_dir, **kwargs)
     except ValueError:
@@ -137,6 +172,8 @@ def load_model(args, devices):
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
+    if args.recursive:
+        checkpoint_layers(model)
     return model
 
 
@@ -212,6 +249,50 @@ def pack_sym(h):
     n = h.shape[0]
     mask = torch.ones((n, n), dtype = torch.bool, device = h.device).triu_()
     return h[mask].contiguous()
+
+
+
+def complete_output(path: Path, key: str, module: nn.Linear, sides: str) -> bool:
+    """Return whether an existing result has the factors required for this target.
+
+    Missing files return False; incompatible keys, non-FP32 tensors or wrong packed dimensions raise ValueError. The head requires Hin even in output-only recursive mode. Validation reads tensor metadata, not factor values: it cannot detect same-length corruption or mismatched calibration settings.
+    """
+    if not path.exists():
+        return False
+    expected = {}
+    if sides == "both" or key == "lm_head":
+        expected["hin"] = module.in_features
+    if key != "lm_head":
+        expected["hout"] = module.out_features
+    with safe_open(str(path), framework="pt", device="cpu") as saved:
+        if set(saved.keys()) != set(expected):
+            raise ValueError(f"Incomplete or incompatible Hessian: {path}; use a fresh output directory")
+        for side, width in expected.items():
+            tensor = saved.get_slice(side)
+            if tensor.get_dtype() != "F32" or tensor.get_shape() != [width * (width + 1) // 2]:
+                raise ValueError(f"Invalid Hessian {side}: {path}; use a fresh output directory")
+    return True
+
+
+def pending_targets(
+    args: argparse.Namespace, targets: dict[str, tuple[str, nn.Linear]]
+) -> dict[str, tuple[str, nn.Linear]]:
+    """Select targets absent from both the output directory and read-only resume directories.
+
+    Every existing candidate is validated, so an invalid duplicate still fails even if another directory contains a complete result. No files are modified here. Callers must keep model, calibration and sampling settings identical when reusing factors.
+    """
+    directories = [Path(args.out_dir), *(Path(p) for p in args.resume_from)]
+    pending = {}
+    for name, (key, module) in targets.items():
+        complete = False
+        for directory in directories:
+            complete |= complete_output(directory / (key + ".safetensors"), key, module, args.sides)
+        if complete:
+            print(f" -- Reusing {key}", flush=True)
+        else:
+            pending[name] = key, module
+    return pending
+
 
 
 class Collector:
@@ -324,8 +405,36 @@ class Collector:
             tensors["hout"] = pack_sym(self.hout).cpu()
         save_file(tensors, os.path.join(out_dir, self.key + ".safetensors"))
 
+    def save_atomic(self, out_dir: str, sides: str) -> None:
+        """Publish packed factors without exposing a partially written final file.
+
+        A same-filesystem temporary file is closed and synced before hard-link publication; an existing destination raises FileExistsError rather than being replaced. Syncing the containing directory makes publication durable. Empty factor sets are rejected, and the head always retains its input factor. Interrupted temporary files are not resume candidates.
+        """
+        tensors = {}
+        if self.hin is not None and (sides == "both" or self.key == "lm_head"):
+            tensors["hin"] = pack_sym(self.hin).cpu()
+        if self.hout is not None:
+            tensors["hout"] = pack_sym(self.hout).cpu()
+        if not tensors:
+            raise ValueError(f"No factors collected for {self.key}; refusing an empty output")
+        destination = Path(out_dir) / (self.key + ".safetensors")
+        with tempfile.TemporaryDirectory(prefix=".yaqa-output-", dir=out_dir) as temporary:
+            staging = Path(temporary) / "result.tmp"
+            save_file(tensors, str(staging))
+            with staging.open("rb") as stream:
+                os.fsync(stream.fileno())
+            # link publishes atomically like rename, but cannot overwrite another result.
+            os.link(staging, destination)
+            directory = os.open(out_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+
 
 def main(args):
+    if args.resume_from and not args.recursive:
+        raise ValueError("--resume-from requires --recursive")
     devices = [int(d) for d in args.device.split(",")]
     hess_devices = [torch.device(f"cuda:{d}") for d in args.hessian_device.split(",")] if args.hessian_device else None
     torch.backends.cuda.matmul.allow_tf32 = args.tf32
@@ -346,15 +455,27 @@ def main(args):
     rows = load_rows(args)
     model = load_model(args, devices)
     targets, first, last, head = find_targets(args, model)
-    if args.sides == "out":
+    if args.sides == "out" and (not args.recursive or args.head is not True):
         targets = {k: v for k, v in targets.items() if v[0] != "lm_head"}
         head = False
+    if args.recursive:
+        targets = pending_targets(args, targets)
+        head = any(key == "lm_head" for key, _ in targets.values())
     if not targets:
         print(" !! Nothing to do")
         return
     if max(r.max().item() for r in rows) >= model.get_input_embeddings().num_embeddings:
         raise ValueError(f"Calibration file {args.cal_data} contains token ids outside the model's vocab")
     in_device = model.get_input_embeddings().weight.device
+
+    if args.recursive and first is not None:
+        from util.yaqa_recursive import collect_recursive
+        collect_recursive(args, model, rows, targets, first, last, schedule, hess_devices)
+        return
+    if args.recursive and first is None:
+        # Head-only collection has Hin but no Hout, regardless of decoder weighting.
+        schedule = ["fwd"]
+        want_in = True
 
     # Factors go with their layers, or on the given devices, largest first onto the least loaded
     collectors = {}
@@ -464,7 +585,10 @@ def main(args):
         return
     os.makedirs(args.out_dir, exist_ok = True)
     for c in collectors.values():
-        c.save(args.out_dir, args.sides)
+        if args.recursive:
+            c.save_atomic(args.out_dir, args.sides)
+        else:
+            c.save(args.out_dir, args.sides)
     print(f" -- Wrote {len(collectors)} tensors to {args.out_dir}")
 
 
@@ -480,11 +604,13 @@ if __name__ == "__main__":
     parser.add_argument("-m", "--model_dir", type = str, required = True, help = "Unquantized (HF) model directory")
     parser.add_argument("-c", "--cal_data", type = str, required = True, help = "Packed calibration rows (safetensors with input_ids and optionally lengths, e.g. from sc_trace.py)")
     parser.add_argument("-o", "--out_dir", type = str, required = True, help = "Output directory, one file per tensor")
+    parser.add_argument("--resume-from", action="append", default=[], metavar="DIR", help="With --recursive: read complete factors from DIR without modifying it; repeat for multiple directories. Keep model, calibration and sampling settings identical.")
     parser.add_argument("-d", "--device", type = str, default = "0", help = "Device index, or comma-separated list to split the model across, default: 0")
     parser.add_argument("-hd", "--hessian_device", type = str, default = None, help = "Device index (or list) to accumulate Hessians on, default: same device as each layer")
-    parser.add_argument("-rv", "--reserve_vram", type = lambda s: [float(x) for x in s.split(",")], default = None, help = "With multiple devices: GB to keep free of weights per device (list, last value repeats), default: 8")
+    parser.add_argument("-rv", "--reserve_vram", type = lambda s: [float(x) for x in s.split(",")], default = None, help = "GB to keep free of weights per device (list, last value repeats), default with multiple devices: 8; with --recursive also enables single-device CPU offload")
+    parser.add_argument("--recursive", type = str, default = None, metavar = "DIR", help = "Collect one decoder block at a time, storing recursive boundaries under DIR (use a disk, not tmpfs)")
     parser.add_argument("-l", "--layers", type = parse_layers, default = None, help = "Range of decoder layers to collect, begin:end (end exclusive), default: all")
-    parser.add_argument("--head", action = argparse.BooleanOptionalAction, default = None, help = "With --sides both: collect the output head (input side only), default: when the range includes the last layer")
+    parser.add_argument("--head", action = argparse.BooleanOptionalAction, default = None, help = "Collect the output head input factor with sides=both; with --recursive also supports explicit --head for sides=out; default: ranges including the last layer")
     parser.add_argument("-r", "--rows", type = int, default = None, help = "Calibration rows to use, default: all rows in file")
     parser.add_argument("--skip_rows", type = int, default = 0, help = "Skip this many rows at the start of the file (e.g. to collect from disjoint halves)")
     parser.add_argument("-cc", "--cols", type = int, default = None, help = "Max tokens per row, default: width of file")
@@ -497,7 +623,7 @@ if __name__ == "__main__":
     parser.add_argument("--tf32", action = "store_true", help = "Allow TF32 in the accumulation matmuls (faster on GeForce, inputs are BF16 anyway)")
     parser.add_argument("--pattern", type = str, default = default_pattern, help = "Regex selecting linear modules within the decoder layers")
     parser.add_argument("--key_prefix", type = str, default = None, help = "Name outputs as prefix + 'layers.N...' instead of matching module names to the checkpoint index")
-    parser.add_argument("--dry_run", action = "store_true", help = "Don't write anything, for timing and memory tests")
+    parser.add_argument("--dry_run", action = "store_true", help = "Skip output factors for timing and memory tests; recursive scratch files are still used")
     parser.add_argument("--log_interval", type = int, default = 25, help = "Rows between progress lines, default: 25")
     _args = parser.parse_args()
     main(_args)
