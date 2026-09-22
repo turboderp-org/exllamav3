@@ -28,6 +28,7 @@
 #include "quant/frac.cuh"
 #include "cpu/moe_mul1.h"
 #include "cpu/moe_handoff.h"
+#include "cpu/emb8.h"
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -182,6 +183,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx512_bw", &exl3_moe_cpu_has_avx512_bw, "exl3_moe_cpu_has_avx512_bw");
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
+    m.def("emb8_dequant", &EXL3::emb8_dequant, "emb8_dequant",
+          py::arg("q_table"), py::arg("scale_table"), py::arg("ids"), py::arg("f32_out"),
+          py::call_guard<py::gil_scoped_release>());
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm",
           py::arg("A"), py::arg("B"), py::arg("C"), py::arg("suh"), py::arg("A_had"), py::arg("svh"),
           py::arg("indices"), py::arg("weights"), py::arg("K"), py::arg("force_shape_idx"), py::arg("mcg"),

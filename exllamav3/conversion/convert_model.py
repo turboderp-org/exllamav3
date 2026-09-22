@@ -3,7 +3,7 @@ import torch
 import time
 import sys
 from .. import Config, Model, Tokenizer
-from ..modules import Linear
+from ..modules import Embedding, Linear
 from ..modules.linear import convert_exl3_group
 from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
 from ..modules.quant import LinearFP16, LinearEXL3
@@ -76,6 +76,7 @@ parser.add_argument("-rcp", "--recipe", type = str, default = None, help = "Per-
 parser.add_argument("-hb", "--head_bits", type = float, default = None, help = "Bits per weight, output (head) layer: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 6")
 parser.add_argument("-mb", "--mtp_bits", type = float, default = None, help = "Bits per weight, MTP layers: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 4")
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
+parser.add_argument("-eb", "--emb_bits", type = int, default = None, help = "Store embed_tokens as int8 per-32 (8-bit) instead of 16-bit. Only 8 is supported; default: 16-bit")
 parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
 parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "Bits per weight for hashed n-gram embedding tables, 1-8, default: --bits rounded")
 parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
@@ -186,6 +187,8 @@ def prepare(args) -> (dict, dict, bool, str):
         return None, None, False, "--head_bits must be between 1 and 8, or 16"
     if args.mtp_bits is not None and (args.mtp_bits > 8 or args.mtp_bits < 1) and args.mtp_bits != 16:
         return None, None, False, "--mtp_bits must be between 1 and 8, or 16"
+    if args.emb_bits is not None and args.emb_bits != 8:
+        return None, None, False, "--emb_bits only supports 8"
     if not args.resume and args.bits is None and not args.recipe:
         return None, None, False, "Specify either --bits or --recipe"
 
@@ -265,6 +268,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("hq", False, False),
         ("ngram_bits", False, 0),  # 0 = auto: --bits rounded
         ("ngram_file", False, ""),
+        ("emb_bits", False, 0),  # 0 = disabled
         ("cal_data", False, ""),
         ("cal_rows", False, 250),
         ("cal_cols", False, 2048),
@@ -1140,6 +1144,12 @@ def main(args, job_state):
     from .ngram import prepare_ngram_table_for_conversion
     prepare_ngram_table_for_conversion(args, config, model)
 
+    # int8 embed storage drops the 16-bit embedding tensor, which tied archs alias lm_head onto.
+    # Read the effective flag through the arch config class so its per-arch default applies.
+    if args.get("emb_bits") and getattr(config, "tie_word_embeddings", False):
+        print(" !! Error: --emb_bits is not supported for tied-embedding models")
+        sys.exit(1)
+
     # Check caps
     can_resume_quant = model.caps.get("can_resume_quant", use_reference_state)
     if not can_resume_quant:
@@ -1256,6 +1266,10 @@ def main(args, job_state):
                 if m.used_alt_key and not slicing:
                     print(f"     - Cloned {m.key} from {m.alt_key}")
             module.config.stc.close()
+
+            if isinstance(module, Embedding) and args.get("emb_bits"):
+                module.convert_int8(block_size = 32)
+                print(f" -- Quantized: {module.key}  int8 per-32  (8.50 bpw)")
 
             # Skip modules without quant targets
             qmaps = module.get_qmaps()

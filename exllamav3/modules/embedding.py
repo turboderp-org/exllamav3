@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from ..model.config import Config
 from ..util.tensor import to2
+from ..util import emb8_kernel
 from . import Module
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..model.model_tp_alloc import TPAllocation
@@ -30,6 +31,7 @@ class Embedding(Module):
         self.hidden_size = hidden_size
         self.out_dtype = out_dtype
         self._pinned_staging = {}
+        self.quant = None
         self._numel = vocab_size * hidden_size
         self.normalize = normalize
         self.multiplier = multiplier
@@ -45,7 +47,20 @@ class Embedding(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
-        weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True, allow_bf16 = True)
+        stc = self.config.stc
+        if stc.has_tensor(self.key + ".weight_i8"):
+            w8 = stc.get_tensor(self.key + ".weight_i8", device)
+            scale = stc.get_tensor(self.key + ".scale", device)
+            assert w8.dtype == torch.int8 and scale.dtype == torch.half
+            assert w8.shape == (self.vocab_size, self.hidden_size)
+            assert scale.shape == (self.vocab_size, self.hidden_size // 32)
+            if getattr(stc, "new_tensors", None) is None and stc.has_tensor(self.key + ".weight"):
+                print(f" !! {self.key}.weight (16-bit) found alongside int8 storage; ignoring (dead data)")
+            self._numel = w8.numel()
+            self.quant = {"weight_i8": w8, "scale": scale}
+            self.embedding = None
+            return
+        weight = stc.get_tensor(self.key + ".weight", self.device, float2half = True, allow_bf16 = True)
         self._numel = weight.numel()
         self.embedding = nn.Embedding(
             self.vocab_size,
@@ -54,13 +69,31 @@ class Embedding(Module):
         )
         self.embedding.weight = nn.Parameter(weight)
 
+    def _gather(self, ids: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Tensor:
+        if self.quant is not None:
+            target = dtype or torch.half
+            if target in (torch.half, torch.float) and emb8_kernel.available():
+                x = emb8_kernel.dequant(self.quant["weight_i8"], self.quant["scale"], ids, target)
+                return x.view(*ids.shape, self.hidden_size)
+            q = self.quant["weight_i8"][ids].to(target)
+            s = self.quant["scale"][ids].to(target)
+            x = q.view(*ids.shape, self.hidden_size // 32, 32) * s.unsqueeze(-1)
+            return x.view(*ids.shape, self.hidden_size)
+        return self.embedding(ids)
+
     @override
     def unload(self):
         self.device = None
         self.embedding = None
+        self.quant = None
 
     @override
     def get_tensors(self):
+        if self.quant is not None:
+            return {
+                f"{self.key}.weight_i8": self.quant["weight_i8"].contiguous(),
+                f"{self.key}.scale": self.quant["scale"].contiguous(),
+            }
         return {
             f"{self.key}.weight": self.embedding.weight.data.contiguous()
         }
@@ -113,7 +146,7 @@ class Embedding(Module):
             if standard_mask.any():
                 for i in range(bsz):
                     standard_ids_row = input_ids[i][standard_mask[i]]
-                    standard_emb_row = self.embedding(standard_ids_row)
+                    standard_emb_row = self._gather(standard_ids_row, out_dtype)
                     combined_emb[i][standard_mask[i]] = standard_emb_row.to(out_dtype)
 
             # Only normalize standard embeddings
@@ -145,7 +178,7 @@ class Embedding(Module):
 
         # No indexed embeddings, or none in current batch
         else:
-            x = self.embedding.forward(x)
+            x = self._gather(x, out_dtype)
             if self.multiplier != 1.0:
                 x *= self.multiplier
             x = to2(x, out_dtype, self.out_dtype)
@@ -172,6 +205,15 @@ class Embedding(Module):
 
     def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
+        if self.quant is not None:
+            exported_weights = {
+                "quant": {
+                    "weight_i8": producer.send(self.quant["weight_i8"]),
+                    "scale": producer.send(self.quant["scale"]),
+                }
+            }
+        else:
+            exported_weights = {"embedding.weight": producer.send(self.embedding.weight)}
         return {
             "cls": Embedding,
             "kwargs": {
@@ -182,7 +224,7 @@ class Embedding(Module):
                 "normalize": self.normalize,
                 "multiplier": self.multiplier,
             },
-            "embedding.weight": producer.send(self.embedding.weight),
+            **exported_weights,
             "device": self.device
         }
 
@@ -194,11 +236,36 @@ class Embedding(Module):
             **exported["kwargs"],
         )
         module.device = exported["device"]
-        module.embedding = nn.Embedding(
-            module.vocab_size,
-            module.hidden_size,
-            device = "meta"
-        )
-        emb = consumer.recv(exported["embedding.weight"], cuda = False)
-        module.embedding.weight = nn.Parameter(emb)
+        if "quant" in exported:
+            module.quant = {
+                "weight_i8": consumer.recv(exported["quant"]["weight_i8"], cuda = False),
+                "scale": consumer.recv(exported["quant"]["scale"], cuda = False),
+            }
+            module.embedding = None
+        else:
+            module.embedding = nn.Embedding(
+                module.vocab_size,
+                module.hidden_size,
+                device = "meta"
+            )
+            emb = consumer.recv(exported["embedding.weight"], cuda = False)
+            module.embedding.weight = nn.Parameter(emb)
         return module
+
+    def convert_int8(self, block_size = 32):
+        assert block_size == 32, "int8 embedding storage is fixed at block_size 32"
+        assert self.embedding is not None, f"Cannot convert {self.key} to int8: embedding not loaded"
+        w = self.embedding.weight.data
+        assert w.dim() == 2 and w.shape[1] % block_size == 0
+        assert w.dtype in (torch.half, torch.bfloat16)
+        w = w.to(torch.half)
+        nb = w.shape[1] // block_size
+        wb = w.view(w.shape[0], nb, block_size)
+        d = wb.abs().amax(dim = 2) / 127.0
+        d = torch.where(d == 0, torch.ones_like(d), d)
+        q = torch.round(wb / d.unsqueeze(2)).clamp(-127, 127).to(torch.int8)
+        self.quant = {
+            "weight_i8": q.view(w.shape).contiguous(),
+            "scale": d.contiguous(),
+        }
+        self.embedding = None

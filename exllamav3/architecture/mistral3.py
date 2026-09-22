@@ -142,7 +142,7 @@ class Mistral3Config(Config):
 
         # New style:  model.language_model.embed_tokens.weight
         # Old style:  language_model.model.embed_tokens.weight
-        self.new_key_style = self.stc.has_tensor("model.language_model.embed_tokens.weight")
+        self.new_key_style = self.stc.has_tensor_group("model.language_model.embed_tokens", [["weight", "weight_i8"]])
 
 class Mistral3Model(Model):
     config_class = Mistral3Config
