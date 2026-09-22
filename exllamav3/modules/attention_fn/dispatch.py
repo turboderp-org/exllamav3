@@ -128,7 +128,9 @@ def attn_dispatch(
             q_cache = layer.get_qkv()
             k_cache, v_cache = None, None
         else:
-            k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, window_size if window_size is not None else -1)
+            # Only the left bound governs how much of the paged cache has to be fetched
+            _wl = window_size[0] if isinstance(window_size, tuple) else window_size
+            k_cache, v_cache = layer.get_kv(cache_seqlens, block_table, _wl if _wl is not None else -1)
     else:
         k_cache, v_cache = None, None
 

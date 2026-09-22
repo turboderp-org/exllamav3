@@ -72,6 +72,44 @@ class DFlashConfig(Config):
             "DFlash target_layer_ids must be unique"
         self.block_size = self.read_cfg(int, ["block_size", "dflash_config->block_size"], no_default)
 
+        # --- variant switches -------------------------------------------------------------
+        # These cover checkpoints whose drafter is not the plain z-lab one. MiMo-V2.6-Flash-RL's
+        # `dflash/` is the first: 5 sliding-window layers with gpt-oss style learned sinks, a
+        # value scale, a learned mask embedding that is NOT in the target's embedding table, and
+        # `is_causal: false`. All four switches default to the previous behaviour, so the
+        # original z-lab checkpoints load and run exactly as before.
+
+        # Learned per-q-head attention sinks (extra logit column dropped after the softmax),
+        # stored as layers.N.self_attn.attention_sink_bias. Declared by the config or simply
+        # detected in the checkpoint
+        self.attention_sink_bias = self.read_cfg(
+            bool,
+            ["dflash_config->attention_sink_bias", "attention_sink_bias", "add_swa_attention_sink_bias"],
+            None,
+        )
+        if self.attention_sink_bias is None:
+            self.attention_sink_bias = self.stc.has_tensor("layers.0.self_attn.attention_sink_bias")
+
+        # V is scaled before the attention output; attention is linear in V (the sink column
+        # carries no value), so this folds exactly into o_proj
+        self.attention_value_scale = self.read_cfg(
+            float, ["dflash_config->attention_value_scale", "attention_value_scale"], None
+        ) or 1.0
+
+        # `is_causal: false` with a sliding window. causal = False alone is not enough: the
+        # kernels read a bare int window as (left, 0), which re-imposes causality inside the
+        # drafted block. The bidirectional block is a window of (sliding_window, block_size - 1)
+        self.bidirectional_block = self.read_cfg(
+            bool, ["dflash_config->bidirectional_block", "bidirectional_block"], None
+        )
+        if self.bidirectional_block is None:
+            self.bidirectional_block = not self.read_cfg(bool, "is_causal", True)
+
+        # Learned mask embedding. The original DFlash release reuses the target's embedding row
+        # for mask_token_id; checkpoints that ship their own vector (MiMo) carry it as a
+        # "mask_embedding" tensor in the draft directory
+        self.key_mask_embedding = "mask_embedding" if self.stc.has_tensor("mask_embedding") else None
+
         # RoPE
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
@@ -176,6 +214,7 @@ class DFlashModel(Model):
             mask_token_id = config.mask_token_id,
             rms_norm_eps = config.rms_norm_eps,
             native_draft_len = config.block_size,
+            key_mask_embedding = config.key_mask_embedding,
             qmap = "target_hidden",
         )
         self.modules += [self.input_layer]
@@ -201,6 +240,11 @@ class DFlashModel(Model):
                 key_o = "o_proj",
                 qmap = "block.attn",
                 sliding_window = config.sliding_window if is_swa else -1,
+                # `is_causal: false`: the drafted block attends to itself in both directions.
+                # With no window that follows from causal = False; with one it has to be an
+                # explicit right bound, or the window's implied (left, 0) re-imposes causality
+                window_right = (config.block_size - 1) if (is_swa and config.bidirectional_block) else 0,
+                key_sinks = "attention_sink_bias" if config.attention_sink_bias else None,
                 q_norm = RMSNorm(
                     config = config,
                     key = f"layers.{idx}.self_attn.q_norm",
@@ -213,6 +257,8 @@ class DFlashModel(Model):
                 ),
                 out_dtype = torch.float,
             )
+            # attention_value_scale multiplies V before the attention output; fold into o_proj
+            attn.o_proj.weight_scale = config.attention_value_scale
             self.attn_modules.append(attn)
 
             self.modules += [
@@ -340,5 +386,7 @@ class DFlashModel(Model):
     @override
     def get_additional_compiled_tensors(cls, config: DFlashConfig) -> dict:
         # The fc norm is stored in DFlashInputLayer but doesn't match the fc module-key prefix
-        norm_weight = config.stc.list_tensors(prefix = cls.key_fc_norm)
-        return norm_weight
+        tensors = dict(config.stc.list_tensors(prefix = cls.key_fc_norm))
+        if config.key_mask_embedding:
+            tensors.update(config.stc.list_tensors(prefix = config.key_mask_embedding))
+        return tensors
