@@ -1,5 +1,6 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # fork package must win over any installed copy
+import platform
 import shutil
 import tempfile
 import types
@@ -13,8 +14,9 @@ import torch
 from exllamav3.modules.quant.exl3_lib import embed_trellis as et
 from exllamav3.modules.quant.exl3_lib.embed_trellis import (
     pack_rows, unpack_rows, dequant_rows, lcg_signs, hadamard_butterfly,
-    dequant_rows_transformed, decode_transform, forward_transform, quantize_rows_grouped, mul1_codebook,
-    GROUP,
+    ls_refit_scales,
+    dequant_rows_transformed, decode_transform, forward_transform, quantize_rows_grouped,
+    mul1_codebook, GROUP,
 )
 from exllamav3.conversion.ngram import StreamingSafetensorsWriter
 
@@ -36,6 +38,19 @@ def _skip_no_cuda():
     not silently green on CPU-only CI); as a script, pass through to the caller's return."""
     if pytest is not None and __name__ != "__main__":
         pytest.skip("CUDA unavailable")
+
+
+def _skip_no_avx2():
+    """Tests that need SOME encoded table via the conversion engine's CPU AVX2 Viterbi
+    encoder (exllamav3.conversion.embed.encode_rows, JIT-compiled with -march=x86-64-v3):
+    real SKIP on non-x86-64 hosts (incl. CUDA-equipped ARM), where the encoder raises
+    instead of skipping. The platform check runs FIRST: skipping unconditionally under
+    pytest would drop these tests on every host, x86-64 included."""
+    if platform.machine() not in {"x86_64", "AMD64"}:
+        if pytest is not None and __name__ != "__main__":
+            pytest.skip("AVX2 x86-64 encoder host required")
+        return True
+    return False
 
 
 def _synth_table(N: int, D: int, K: int, seed: int, scale_rows: bool = True):
@@ -181,6 +196,126 @@ def test_codec_pad_rows_decode_to_zero():
         x = dequant_rows_transformed(packed, cs, K, 0, D, G, row_ids = torch.arange(4))
         assert torch.equal(x, torch.zeros(4, D)), f"pad rows not exactly zero at K = {K}"
 
+
+
+@torch.inference_mode()
+def test_encoder_zero_rows_pack_to_zero():
+    """All-zero source rows (vocab pad slots) must PACK to all-zero words through the
+    encode chain (not just decode to zero when pre-zeroed): the group_prescale
+    empty-group guard would otherwise store a 1.0 scale and emit codebook garbage."""
+    for K in (6, 7, 8):
+        D, G = 512, 2
+        w = torch.zeros(3, D)
+        w[1] = 1.0  # nonzero neighbor stays on the normal encode path
+        packed, scale0 = et.quantize_rows_grouped(
+            w, K, D, lambda wp, k, d: torch.zeros(wp.shape[0], d, dtype = torch.int16))
+        assert torch.equal(packed[0], torch.zeros_like(packed[0])), f"zero row not zero-packed at K = {K}"
+        assert torch.equal(packed[2], torch.zeros_like(packed[2])), f"zero row not zero-packed at K = {K}"
+        assert bool((scale0[[0, 2]] == 0).all()), f"zero row scale words not zero at K = {K}"
+        assert bool((scale0[1] != 0).all()), f"nonzero row scales clobbered at K = {K}"
+        x = dequant_rows_transformed(packed[[0, 2]], torch.ones(D, dtype = torch.float16),
+                                     K, 7, D, G, row_ids = torch.tensor([5, 9999]))
+        assert torch.equal(x, torch.zeros(2, D)), f"zero-packed rows decode nonzero at K = {K}"
+
+@torch.inference_mode()
+def test_ls_refit_guards_degenerate_and_overflow():
+    """ls_refit_scales must never store a non-finite scale word: the fused kernel feeds the
+    word straight into the butterfly, so an inf word turns the row into NaN embeddings. Two
+    reachable routes: q identically zero (column scales at/below the fp16 floor, so the
+    denominator vanishes) and an LS optimum beyond the fp16 range (normal source values in a
+    group whose column scales sit at the fp16 subnormal floor, so s* ~ 1/col_scale)."""
+    D, G, K = 512, 2, 6
+    g = torch.Generator().manual_seed(5)
+    ids = torch.arange(4, dtype = torch.int64)
+    states = torch.randint(0, 1 << K, (4, D), generator = g, dtype = torch.int16)
+    scale0 = torch.full((4, G), 0.5, dtype = torch.float16)
+    w = torch.randn(4, D, generator = g)
+    cs = torch.ones(D, dtype = torch.float16)
+    cs[GROUP:] = 0.0                                            # q == 0 for group 1
+    sc, info = ls_refit_scales(states, w, scale0, cs, 7, ids, K, D, G)
+    assert bool((sc[:, 1] == 0).all()), "degenerate group did not get a zero scale word"
+    assert info["degenerate"] == 4 and info["nonfinite"] == 0
+    assert bool(torch.isfinite(sc.float()).all()), "non-finite word stored on the degenerate path"
+    cs2 = torch.ones(D, dtype = torch.float16)
+    cs2[:GROUP] = 5.960464477539063e-8                          # fp16 floor: s* leaves fp16
+    sc2, info2 = ls_refit_scales(states, w, scale0, cs2, 7, ids, K, D, G)
+    assert info2["nonfinite"] >= 4, "fp16 overflow of the LS optimum went unreported"
+    assert bool((sc2[:, 0] == scale0[:, 0]).all()), "overflow did not fall back to the pre-scale"
+    assert bool(torch.isfinite(sc2.float()).all()), "non-finite word stored on the overflow path"
+    x = dequant_rows_transformed(pack_rows(states.to(torch.int64), sc2, K, D, G), cs2, K, 7, D, G,
+                                 row_ids = ids)
+    assert torch.equal(sc2, ls_refit_scales(states, w, scale0, cs2, 7, ids, K, D, G)[0])
+    assert bool(torch.isfinite(x).all()), "guarded words still decoded non-finite"
+
+
+@torch.inference_mode()
+def test_quantize_rows_grouped_refit_hook():
+    """The refit hook of the codec-level encoder must be a pure scale refinement: identical
+    code words with and without it (that is what makes it safe inside a shipped format),
+    the returned scale words are the ones actually packed, and a caller-supplied refit does
+    not disturb the all-zero-row contract."""
+    for K in (4, 5, 6, 7, 8):
+        D, G = 512, 2
+        g = torch.Generator().manual_seed(K * 3 + 1)
+        w = torch.randn(6, D, generator = g)
+        w[2] = 0.0
+        ids = torch.arange(6, dtype = torch.int64)
+        cs = torch.ones(D, dtype = torch.float16)
+        stub = lambda wp, k, d: torch.zeros(wp.shape[0], d, dtype = torch.int16)
+        p0, s0 = quantize_rows_grouped(w, K, D, stub, group = GROUP)
+        p1, s1 = quantize_rows_grouped(w, K, D, stub, group = GROUP,
+                                       refit = lambda st, sc0: ls_refit_scales(st, w, sc0, cs, 3, ids, K, D, G))
+        assert torch.equal(p0[:, G:], p1[:, G:]), f"refit changed the code words at K = {K}"
+        assert torch.equal(p1[:, :G], s1.view(torch.int16)), f"returned scales != packed words at K = {K}"
+        assert torch.equal(p1[2], torch.zeros_like(p1[2])), f"zero row not zero-packed at K = {K}"
+        assert bool((s1[2] == 0).all()) and bool((s1[3] != 0).all()), f"zero-row guard broken at K = {K}"
+        x = dequant_rows_transformed(p1, cs, K, 3, D, G, row_ids = ids)
+        assert torch.equal(x[2], torch.zeros(D)), f"zero row decodes nonzero at K = {K}"
+
+
+@torch.inference_mode()
+def test_ls_refit_keeps_codes_and_reduces_error():
+    """The contract of the LS scale-word refit, measured through the real encoder: the code
+    words stay bit-identical to the no-refit encode, no group's source-space error regresses
+    by more than fp32 decode rounding, the aggregate error drops, the stored words are
+    reproducible from the packed row (verification tooling depends on that), the analytic
+    diagnostics track the decode-based error (a wrong fit space, unit or sign would show up
+    here as well), and a pre-drawn sign plane decodes bitwise identically."""
+    if _skip_no_avx2():
+        return
+    for K in (4, 8):
+        N, D, seed = 64, 5120, 11
+        G = D // GROUP
+        g = torch.Generator().manual_seed(K)
+        cs = (torch.rand(D, generator = g) * 0.6 + 0.6).half()
+        w = torch.randn(N, D, generator = g) * cs.float()
+        w[0] = 0.0                                              # vocab pad slot
+        ids = torch.arange(N, dtype = torch.int64)
+        y = forward_transform(w, cs.float(), seed, ids)
+        packed0, scale0 = quantize_rows_grouped(y, K, D, _cpu_encode, group = GROUP)
+        packed1, scales1 = quantize_rows_grouped(
+            y, K, D, _cpu_encode, group = GROUP,
+            refit = lambda st, sc0: ls_refit_scales(st, w, sc0, cs, seed, ids, K, D, G))
+        assert torch.equal(packed0[:, G:], packed1[:, G:]), f"refit changed the code words at K = {K}"
+        assert not torch.equal(packed0[:, :G], packed1[:, :G]), f"refit was a no-op at K = {K}"
+        assert torch.equal(packed1[0], torch.zeros_like(packed1[0])), f"pad row not zero at K = {K}"
+        x0 = dequant_rows_transformed(packed0, cs, K, seed, D, G, row_ids = ids)
+        x1 = dequant_rows_transformed(packed1, cs, K, seed, D, G, row_ids = ids)
+        assert torch.equal(x1[0], torch.zeros_like(x1[0])), f"pad row decodes nonzero at K = {K}"
+        e0 = (x0 - w).double().square().view(N, G, GROUP).sum(2)
+        e1 = (x1 - w).double().square().view(N, G, GROUP).sum(2)
+        worse = int((e1 > e0 * (1 + 1e-5)).sum())
+        assert worse == 0, f"refit regressed {worse} groups at K = {K}"
+        assert float(e1.sum()) < float(e0.sum()), f"refit did not reduce the total error at K = {K}"
+        again, info = ls_refit_scales(unpack_rows(packed1, K, D, G)[0], w, scale0, cs, seed, ids, K, D, G)
+        assert torch.equal(again, scales1), f"stored scale words not reproducible at K = {K}"
+        dec0 = float((x0 - w).double().square().sum())
+        dec1 = float((x1 - w).double().square().sum())
+        assert abs(info["err_sq_s0"] - dec0) <= 1e-4 * dec0, f"err_sq_s0 != decode error at K = {K}"
+        assert abs(info["err_sq_refit"] - dec1) <= 1e-4 * dec1, f"err_sq_refit != decode error at K = {K}"
+        assert info["nonfinite"] == 0 and info["degenerate"] == 0, f"guards fired unexpectedly at K = {K}"
+        x1s = dequant_rows_transformed(packed1, cs, K, seed, D, G, row_ids = ids)
+        assert torch.equal(x1, x1s), f"decode not deterministic at K = {K}"
 
 @torch.inference_mode()
 def test_lcg_signs_prefix_consistency():
