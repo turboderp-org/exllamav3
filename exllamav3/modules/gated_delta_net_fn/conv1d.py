@@ -28,6 +28,7 @@ def _causal_conv1d_update_slotted_kernel(
     history: tl.constexpr,
     has_bias: tl.constexpr,
     transpose_output: tl.constexpr,
+    token_major: tl.constexpr,   # x is (bsz, seq, dim) instead of (bsz, dim, seq)
     BLOCK_D: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -59,12 +60,16 @@ def _causal_conv1d_update_slotted_kernel(
                 mask = mask_d[:, None] & mask_s[None, :] & (src_t[None, :] < conv_kernel_size),
                 other = 0.0,
             )
+            if token_major:
+                x_off = (pid_b * seq_len + x_t[None, :]) * dim + offs_d[:, None]
+            else:
+                x_off = (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :]
             x_vals = tl.load(
-                x + (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :],
+                x + x_off,
                 mask = mask_d[:, None] & mask_s[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
                 other = 0.0,
-            )
-            vals = tl.where(from_x[None, :], x_vals, state_vals)
+            ).to(tl.float32)
+            vals = tl.where(from_x[None, :], x_vals, state_vals.to(tl.float32))
             w = tl.load(weight + offs_d * conv_kernel_size + k, mask = mask_d, other = 0.0)
             acc += vals * w[:, None]
 
@@ -100,12 +105,16 @@ def _causal_conv1d_update_slotted_kernel(
         mask = mask_d[:, None] & valid_state[None, :] & (src_t[None, :] >= 0) & (src_t[None, :] < conv_kernel_size),
         other = 0.0,
     )
+    if token_major:
+        x_off = (pid_b * seq_len + x_t[None, :]) * dim + offs_d[:, None]
+    else:
+        x_off = (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :]
     x_vals = tl.load(
-        x + (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :],
+        x + x_off,
         mask = mask_d[:, None] & valid_state[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
         other = 0.0,
-    )
-    new_state = tl.where(from_x[None, :], x_vals, state_vals)
+    ).to(tl.float32)
+    new_state = tl.where(from_x[None, :], x_vals, state_vals.to(tl.float32))
     tl.store(
         conv_state + (slot * dim + offs_d[:, None]) * state_size + offs_state[None, :],
         new_state,
@@ -127,6 +136,7 @@ def _causal_conv1d_update_slotted_output_kernel(
     conv_kernel_size: tl.constexpr,
     has_bias: tl.constexpr,
     transpose_output: tl.constexpr,
+    token_major: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -155,12 +165,16 @@ def _causal_conv1d_update_slotted_output_kernel(
                 mask = mask_d[:, None] & mask_s[None, :] & (src_t[None, :] < conv_kernel_size),
                 other = 0.0,
             )
+            if token_major:
+                x_off = (pid_b * seq_len + x_t[None, :]) * dim + offs_d[:, None]
+            else:
+                x_off = (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :]
             x_vals = tl.load(
-                x + (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :],
+                x + x_off,
                 mask = mask_d[:, None] & mask_s[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
                 other = 0.0,
-            )
-            vals = tl.where(from_x[None, :], x_vals, state_vals)
+            ).to(tl.float32)
+            vals = tl.where(from_x[None, :], x_vals, state_vals.to(tl.float32))
             w = tl.load(weight + offs_d * conv_kernel_size + k, mask = mask_d, other = 0.0)
             acc += vals * w[:, None]
 
@@ -193,6 +207,7 @@ def _causal_conv1d_update_slotted_state_kernel(
     state_size: tl.constexpr,
     conv_kernel_size: tl.constexpr,
     history: tl.constexpr,
+    token_major: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_STATE: tl.constexpr,
 ):
@@ -220,12 +235,16 @@ def _causal_conv1d_update_slotted_state_kernel(
         mask = mask_d[:, None] & valid_state[None, :] & (src_t[None, :] >= 0) & (src_t[None, :] < conv_kernel_size),
         other = 0.0,
     )
+    if token_major:
+        x_off = (pid_b * seq_len + x_t[None, :]) * dim + offs_d[:, None]
+    else:
+        x_off = (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :]
     x_vals = tl.load(
-        x + (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :],
+        x + x_off,
         mask = mask_d[:, None] & valid_state[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
         other = 0.0,
-    )
-    new_state = tl.where(from_x[None, :], x_vals, state_vals)
+    ).to(tl.float32)
+    new_state = tl.where(from_x[None, :], x_vals, state_vals.to(tl.float32))
     tl.store(
         conv_state + (slot * dim + offs_d[:, None]) * state_size + offs_state[None, :],
         new_state,
@@ -241,7 +260,14 @@ def causal_conv1d_update_slotted_triton(
     bias: torch.Tensor | None = None,
     transpose_output: bool = False,
     history: bool = False,
+    token_major: bool = False,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    """
+    token_major: x is (bsz, seq, dim), e.g. a projection output read in place, instead of the
+    (bsz, dim, seq) layout; any float dtype (values are widened to fp32 in the kernel, so an
+    fp16 projection needs no bf16 copy). out_dtype defaults to x's dtype.
+    """
     if not x.is_cuda:
         raise RuntimeError("causal_conv1d_update_slotted_triton requires CUDA tensors")
     if not x.is_contiguous() or not conv_state.is_contiguous() or not weight.is_contiguous():
@@ -255,7 +281,10 @@ def causal_conv1d_update_slotted_triton(
     if bias is not None and bias.device != x.device:
         raise RuntimeError(f"bias is on {bias.device}, expected {x.device}")
 
-    bsz, dim, seq_len = x.shape
+    if token_major:
+        bsz, seq_len, dim = x.shape
+    else:
+        bsz, dim, seq_len = x.shape
     state_size = conv_state.shape[-1]
     conv_kernel_size = weight.shape[-1]
     if slots.shape != (bsz,):
@@ -271,7 +300,7 @@ def causal_conv1d_update_slotted_triton(
     if state_size < conv_kernel_size:
         raise ValueError("conv_state must have at least conv_kernel_size entries")
     out_shape = (bsz, seq_len, dim) if transpose_output else (bsz, dim, seq_len)
-    out = torch.empty(out_shape, dtype = x.dtype, device = x.device)
+    out = torch.empty(out_shape, dtype = out_dtype or x.dtype, device = x.device)
     block_d = 32
     block_k = triton.next_power_of_2(conv_kernel_size)
     block_state = triton.next_power_of_2(state_size)
@@ -294,6 +323,7 @@ def causal_conv1d_update_slotted_triton(
                 history,
                 bias is not None,
                 transpose_output,
+                token_major,
                 BLOCK_D = block_d,
                 BLOCK_S = block_s,
                 BLOCK_K = block_k,
@@ -316,6 +346,7 @@ def causal_conv1d_update_slotted_triton(
                 conv_kernel_size,
                 bias is not None,
                 transpose_output,
+                token_major,
                 BLOCK_D = block_d,
                 BLOCK_S = block_s,
                 BLOCK_K = block_k,
@@ -331,6 +362,7 @@ def causal_conv1d_update_slotted_triton(
                 state_size,
                 conv_kernel_size,
                 history,
+                token_major,
                 BLOCK_D = block_d,
                 BLOCK_STATE = block_state,
                 num_warps = 4,
@@ -368,9 +400,17 @@ def causal_conv1d_update(
     conv1d_weight: torch.Tensor,
     conv1d_bias: torch.Tensor,
     history: bool = False,
-    params: dict = None
+    params: dict = None,
+    token_major: bool = False,
 ):
-    bsz, dim, seqlen = mixed_qkv.shape
+    """
+    token_major: mixed_qkv is the (bsz, seqlen, dim) projection output (fp16/bf16/fp32) read
+    in place by the Triton kernel; output is (bsz, seqlen, dim) bf16 either way
+    """
+    if token_major:
+        bsz, seqlen, dim = mixed_qkv.shape
+    else:
+        bsz, dim, seqlen = mixed_qkv.shape
 
     if params is None:
         params = {}
@@ -383,6 +423,7 @@ def causal_conv1d_update(
         dummy_slots = False
 
     if (
+        not token_major and
         mixed_qkv.is_cuda and
         seqlen <= MAX_CUDA_SEQLEN and
         conv1d_weight.shape[-1] <= MAX_CUDA_K and
@@ -414,6 +455,8 @@ def causal_conv1d_update(
         conv1d_bias,
         transpose_output = True,
         history = history,
+        token_major = token_major,
+        out_dtype = torch.bfloat16,
     )
 
     return mixed_qkv

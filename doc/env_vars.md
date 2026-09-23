@@ -78,6 +78,36 @@ Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL
 the decode step of a linear-attention layer runs as one graph-captured C++ call. Set to `0` to
 force the torch path, for A/B testing.
 
+### `EXL3_GDN_SUB_CHUNK` (default: `2048`)
+
+Prefill of a gated-delta-net / KDA layer runs the fla chunked scan over consecutive sub-ranges
+of this many tokens, carrying the fp32 recurrent state between them. The projections and the
+convolution still run at the full chunk size; only the scan's temporaries (about 112 KB per
+token at 48 value heads of 128) shrink from the chunk to the sub-range, e.g. 1.5 GB to 0.7 GB
+per layer at a 16k chunk. The result is bit-identical to a single pass, and 2048 is also the
+fastest setting measured (1024 costs about 40% more on the scan). Set to `0` to run the whole
+chunk in one pass.
+
+### `EXL3_GDN_PROJ_FP32` (default: `0`)
+
+Prefill of a gated-delta-net / KDA layer takes its q/k/v projection out of the GEMM in fp16
+instead of fp32; the values are converted to bf16 for the recurrence either way, and the
+projections stay below |100| on natural text. Set to `1` for the fp32 projection (about
+0.5-2.5e-3 relative difference in the layer's output, 1.5 GB less transient per 16k rows on
+GLM-5.3).
+
+### `EXL3_GDN_GATE_FP32` (default: `1`)
+
+KDA's forget-gate and beta projections (the inputs to the per-channel decay) stay fp32. Set to
+`0` for fp16: 256 MiB less per 16k rows on GLM-5.3, about 1e-3 relative difference in the
+layer's output.
+
+### `EXL3_GDN_CONV_TOKEN_MAJOR` (default: `1`)
+
+The prefill short convolution reads the projection output in place (token-major, any float
+dtype) instead of a transposed bf16 copy of it. Same kernel arithmetic; a bf16 projection is
+bit-identical to the copy, an fp16 one skips its bf16 rounding. Set to `0` for the copy.
+
 ### `EXL3_BC_DSA_DEBUG` (default: `0`)
 
 Raise errors encountered while building the graphed DSA path instead of silently declining to
