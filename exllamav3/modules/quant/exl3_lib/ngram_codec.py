@@ -21,6 +21,19 @@ import torch
 ROW_DIM = 160
 MUL1 = 0x83DCD12D
 
+# Per-row codebook-scale heuristic, shared by the n-gram and embedding trellis
+# quantizers (a silent divergence between the two would quietly change the encoded
+# scales): cs = clamp(gamma / (absmax/rms), CS_MIN, cs_hi), i.e. scale each row so its
+# largest element lands near the codebook edge (~3.35), capped at cs_hi for clean rows.
+# (gamma, cs_hi) fitted per K on the qwen3.8-flash-next table against a per-row grid
+# oracle; captures the predictable (clipping-driven) part of the per-row optimum in a
+# single encode
+CS_HEURISTIC = {
+    1: (4.0, 1.16), 2: (3.6, 0.98), 3: (3.2, 0.98), 4: (3.0, 0.98),
+    5: (3.0, 0.95), 6: (3.0, 0.92), 7: (3.0, 0.90), 8: (3.0, 0.86),
+}
+CS_MIN = 0.55
+
 
 def words_per_row(K: int) -> int:
     return 1 + ROW_DIM * K // 16

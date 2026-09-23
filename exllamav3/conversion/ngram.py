@@ -29,6 +29,7 @@ import torch
 from ..modules.quant.exl3_lib.quantize import quantize_tiles
 from ..modules.quant.exl3_lib.ngram_codec import (  # noqa: F401  (re-exported)
     ROW_DIM, MUL1, words_per_row, mul1_codebook, pack_rows, unpack_rows, dequant_rows,
+    CS_HEURISTIC, CS_MIN,
 )
 
 NGRAM_FORMAT_VERSION = 1
@@ -38,15 +39,9 @@ NGRAM_FORMAT_VERSION = 1
 # qwen3.8-flash-next table (benchmarks/ngram_quant/quant160.py)
 DEFAULT_CS = {1: 1.16, 2: 0.98, 3: 0.98, 4: 0.92, 5: 0.92, 6: 0.86, 7: 0.86, 8: 0.80}
 
-# Per-row heuristic (the default): cs = clamp(gamma / (absmax/rms), CS_MIN, cs_hi), i.e. scale each
-# row so its largest element lands near the codebook edge (~3.35), capped at cs_hi for clean rows.
-# (gamma, cs_hi) fitted per K on the qwen3.8-flash-next table against a per-row grid oracle;
-# captures the predictable (clipping-driven) part of the per-row optimum in a single encode
-CS_HEURISTIC = {
-    1: (4.0, 1.16), 2: (3.6, 0.98), 3: (3.2, 0.98), 4: (3.0, 0.98),
-    5: (3.0, 0.95), 6: (3.0, 0.92), 7: (3.0, 0.90), 8: (3.0, 0.86),
-}
-CS_MIN = 0.55
+# Per-row heuristic (the default): cs = clamp(gamma / (absmax/rms), CS_MIN, cs_hi); the
+# (gamma, cs_hi) constants live in ngram_codec (shared with the embedding trellis
+# quantizer) and are re-exported above
 CS_SEARCH_STEP = 0.06
 
 

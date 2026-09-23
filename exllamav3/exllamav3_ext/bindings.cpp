@@ -69,6 +69,7 @@
 #include "hc_mix.cuh"
 #include "ple.cuh"
 #include "ngram.cuh"
+#include "trellis_embed.cuh"
 
 #include "attention.cuh"
 
@@ -116,6 +117,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
+    m.def("trellis_embed_register", &trellis_embed_register, py::arg("table"), py::arg("device_index") = -1);
+    m.def("trellis_embed_unregister", &trellis_embed_unregister, py::arg("table"));
+    m.def("trellis_embed_gather", &trellis_embed_gather, py::arg("table_ptr"), py::arg("cb"),
+          py::arg("col_scales"), py::arg("ids"), py::arg("K"), py::arg("seed"), py::arg("n_rows"),
+          py::arg("out"));
     m.def("hc_head", &hc_head, "hc_head");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
