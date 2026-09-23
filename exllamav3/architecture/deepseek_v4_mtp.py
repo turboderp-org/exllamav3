@@ -245,7 +245,9 @@ class DeepseekV4MTPModel(Model):
             vocab_size = cfg.vocab_size,
             hidden_size = cfg.hidden_size,
         )
-        embed.load(torch.device("cpu"))
+        # the gather output is consumed by the FIRST draft module (input_layer, which runs
+        # the embed + stream expand), not the final norm the head uses
+        embed.load(torch.device("cpu"), compute_device = self.modules[0].device)
         head_alt_key = None
         if cfg.tie_word_embeddings and not cfg.stc.has_tensor("head"):
             head_alt_key = "embed"

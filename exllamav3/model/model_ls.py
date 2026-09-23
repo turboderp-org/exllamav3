@@ -45,7 +45,8 @@ class Model_LSMixin(ABC):
                     # Pinned modules leave the arena alone: their slab slices would keep whole
                     # blocks resident after the weights move to host memory
                     config.stc.begin_deferred_load(arena = not pin)
-                module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
+                module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device,
+                            compute_device = device)
                 if defer:
                     config.stc.end_deferred_load()
                 if pin:
@@ -181,7 +182,8 @@ class Model_LSMixin(ABC):
                         if defer:
                             # Pinned modules leave the arena alone (see _load_single)
                             config.stc.begin_deferred_load(arena = not pin)
-                        module.load(load_device, max_chunk_size = max_chunk_size)
+                        module.load(load_device, max_chunk_size = max_chunk_size,
+                                    compute_device = torch.device(active_devices[current_device_i]))
                         if defer:
                             config.stc.end_deferred_load()
                         if pin:
@@ -303,6 +305,22 @@ class Model_LSMixin(ABC):
 
             if callback_sync: callback_sync(len(modules), len(modules))
             if generator: yield len(modules), len(modules)
+
+            # CPU-pinned modules (the trellis embedding) were loaded with a load-time guess
+            # of the consumer's device (the device active when they loaded); if the budget
+            # later placed the consumer block elsewhere, retarget the device-mapped
+            # registration now that the placement is final (one-time load cost; a mismatch
+            # would otherwise pay a per-step D2D of the gathered rows). The consumer is the
+            # NEXT module in the list: if it is not on a CUDA device there is no retarget
+            # target (the gather output is consumed from the load-time guess device), so
+            # the guess stands
+            for idx, module in enumerate(modules):
+                retarget = getattr(module, "retarget_trellis", None)
+                if retarget is None:
+                    continue
+                consumer = modules[idx + 1].device if idx + 1 < len(modules) else None
+                if consumer is not None and consumer.type == "cuda":
+                    retarget(consumer)
 
             dummy_state = None
             unset_memory_fraction(touched_devices)
