@@ -976,7 +976,7 @@ class Attention(Module):
     def autosplit_extra_measure(self, params):
         if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
             return
-        if self.qsa_indexer is None or self.device is None:
+        if self.device is None:
             return
         cache = params.get("cache")
         if cache is None:
@@ -985,9 +985,23 @@ class Attention(Module):
         from ..cache.qsa import QSAPlanes
         layer = cache if isinstance(cache, CacheLayer) else \
             cache.layers[self.layer_idx, params.get("layer_instance") or 0]
-        if not isinstance(layer, QSAPlanes):
-            return
         quant = isinstance(layer, CacheLayer_quant)
+
+        # Quantized cache, unbounded prefill: the two-pass prefill stages the referenced window
+        # as fp16 K/V in a per-call transient, which spans the whole pool for a job at full
+        # context. The (1, chunk)-at-context-0 measuring pass only sees a chunk of it, so
+        # allocate (and drop) the worst case here for the device budget. QSA bounds its dense
+        # prefill and stages a small window; MLA/DSA caches have their own measure
+        if quant and not isinstance(layer, QSAPlanes) and self.qsa_indexer is None:
+            from .attention_fn.triton_paged import _qc_staging
+            if _qc_staging == 1:
+                n = 2 * layer.qk.shape[0] * PAGE_SIZE * layer.token_dim
+                t = torch.empty((n,), dtype = torch.half, device = self.device)
+                del t
+            return
+
+        if self.qsa_indexer is None or not isinstance(layer, QSAPlanes):
+            return
         chunk = params["batch_shape"][1]
 
         # Decode statics: every buffer the (bsz <= MAX_BSZ, q_len <= MAX_QLEN) slot family

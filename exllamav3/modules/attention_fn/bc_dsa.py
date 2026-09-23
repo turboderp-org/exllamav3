@@ -236,8 +236,10 @@ class BCDsa:
             k_fewq = _compile_kernel(dev, _dsa_indexer_fewq_kernel, sig, consts, 8, 2)
 
         hb = -(-H // BLOCK_H)
-        ws_ml = st((seq * hb * N_SPLITS * BLOCK_H * 2,), torch.float, "bcd_wsml")
-        ws_acc = st((seq * hb * N_SPLITS * BLOCK_H * D,), torch.float, "bcd_wsacc")
+        # Split-decode partials: one backing per device sized for the largest slot, viewed to
+        # this slot's rows.
+        ws_ml = st((MAX_QLEN * hb * N_SPLITS * BLOCK_H * 2,), torch.float, "bcd_wsml")[:seq * hb * N_SPLITS * BLOCK_H * 2]
+        ws_acc = st((MAX_QLEN * hb * N_SPLITS * BLOCK_H * D,), torch.float, "bcd_wsacc")[:seq * hb * N_SPLITS * BLOCK_H * D]
         attn_out = st((G, seq, hpg * hd), torch.half, "bcd_aout")
         woa_c = st((G, seq, self.o_lora), torch.half, "bcd_woac")
         woa_t = st((seq, G * self.o_lora), torch.half, "bcd_woat")

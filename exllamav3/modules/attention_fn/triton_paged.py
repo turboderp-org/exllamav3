@@ -1820,9 +1820,11 @@ def paged_attn_triton_prefill(
         # (a job's pages, not the cache pool), narrowed further when the caller bounds the past
         # length (QSA's dense regime never sees more than its sparse threshold, so a 512k-token
         # pool needs a 2k-token scratch there), and rounded up to a power of two in pages so
-        # the allocator sees a handful of distinct sizes. Context-shaped workspaces are not
-        # kept as statics: the old pool-sized static held a full fp16 copy of the cache
-        # (1 GiB per 512k tokens on Qwen3.8) for the life of the process
+        # the allocator sees a handful of distinct sizes, but never past the pool itself: the
+        # rounding alone would double a 513-page window to 1024 pages. Context-shaped workspaces
+        # are not kept as statics: the old pool-sized static held a full fp16 copy of the cache
+        # for the life of the process. The loader's autosplit budgets for the worst case (a window
+        # spanning the pool) through Attention.autosplit_extra_measure
         if (_qc_staging == 1 and q_len >= _qc_prefill_two_pass_min_q
                 and new_kv_mode == 0 and k is None and causal):
             from ...ext import exllamav3_ext as ext
@@ -1831,7 +1833,8 @@ def paged_attn_triton_prefill(
                 npps_w = min(npps_w, -(-(max_kv_len + kv_append_len) // page_size))
                 block_table = block_table[:, :npps_w].contiguous()
             n_kvh = n_kv_heads_override
-            pages_alloc = max(1, 1 << (bsz * npps_w - 1).bit_length())
+            pages = bsz * npps_w
+            pages_alloc = min(max(1, 1 << (pages - 1).bit_length()), max(pages, k_cache.shape[0]))
             kd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
             vd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
             ext.dequant_cache_paged_window(
