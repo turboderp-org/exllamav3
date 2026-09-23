@@ -643,10 +643,14 @@ class HyperHead(Module):
         if H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
             R = b * s
             chunks = ext.hc_mix_num_chunks(R, H * D)
-            partials = g_tensor_cache.get_bucketed(
-                x.device, R * chunks * (H + 1), torch.float, "hc_head_partials").view(R, chunks, H + 1)
-            collapsed = g_tensor_cache.get_bucketed(
-                x.device, R * D, torch.float, "hc_head_coll").view(R, D)
+            # Decode-class row counts take the static workspaces (same rule as _mix); prefill
+            # chunks allocate per call, or the collapsed rows alone would pin 64 MiB per device
+            def ws(numel, tag):
+                if R <= 32:
+                    return g_tensor_cache.get_bucketed(x.device, numel, torch.float, tag)
+                return torch.empty((numel,), dtype = torch.float, device = x.device)
+            partials = ws(R * chunks * (H + 1), "hc_head_partials").view(R, chunks, H + 1)
+            collapsed = ws(R * D, "hc_head_coll").view(R, D)
             if R <= 32:
                 if self.fn_h is None:
                     self.fn_h = self.fn.half()
