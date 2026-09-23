@@ -161,10 +161,17 @@ def attn_dispatch(
     candidates = _fns_qc if q_cache is not None else attn_fns
     hint_key = "fn_qc" if q_cache is not None else "fn"
 
-    # Only retry a hint ahead of the scan if it is still the highest-priority candidate.
-    # A lower-priority backend can remain compatible when a better backend becomes eligible.
-    fn = dispatch_cache.get(hint_key) if dispatch_cache is not None else None
-    o = fn(args) if fn is not None and fn is candidates[0] else None
+    # A lower-priority hint can remain compatible when a better backend becomes eligible, so the
+    # highest-priority candidate always gets the first try (a cheap reject off SM120 or for decode).
+    # The hint only runs after it declines and skips the sanity check and full scan
+    hint = dispatch_cache.get(hint_key) if dispatch_cache is not None else None
+    fn = candidates[0]
+    o = fn(args)
+    if o is None and hint is not None and hint is not fn and hint in candidates:
+        fn = hint
+        o = fn(args)
+    elif o is not None and hint is not fn and dispatch_cache is not None:
+        dispatch_cache[hint_key] = fn
 
     if o is None:
         args.sanity_check()

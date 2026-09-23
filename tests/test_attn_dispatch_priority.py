@@ -64,3 +64,25 @@ def test_removed_backend_hint_is_not_called(monkeypatch):
     hint = {"fn": removed}
     _call(64, hint)
     assert hint["fn"] is preferred
+
+
+def test_lower_priority_hint_skips_scan_when_preferred_declines(monkeypatch):
+    calls = []
+
+    def preferred(args):
+        calls.append("preferred")
+        return None
+
+    def fallback(args):
+        calls.append("fallback")
+        return args.q
+
+    def no_scan(self):
+        raise AssertionError("A compatible hint should skip the sanity check and scan")
+
+    monkeypatch.setattr(dispatch, "attn_fns", [preferred, fallback])
+    monkeypatch.setattr(dispatch.AttnArgs, "sanity_check", no_scan)
+    hint = {"fn": fallback}
+    _call(24, hint)
+    assert calls == ["preferred", "fallback"]
+    assert hint["fn"] is fallback

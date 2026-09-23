@@ -20,6 +20,11 @@ def _supported(device: int) -> bool:
     return ext.sm120_tma_attn_supported(device)
 
 
+@lru_cache(maxsize = None)
+def _sm_count(device: int) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
 def _pick_split(args: AttnArgs, q_group_mode: int) -> int:
     if args.dim == 128:
         return 1
@@ -32,10 +37,15 @@ def _pick_split(args: AttnArgs, q_group_mode: int) -> int:
     q_tiles = math.ceil(args.q_len / ncols1)
     gqa_tiles = math.ceil(ratio / group)
     programs = q_tiles * gqa_tiles * args.num_kv_heads * args.bsz
-    if args.block_table.shape[1] * 256 < 8192 or programs == 0:
+    # Prefer the host-known past length over the block table capacity, which covers the whole job
+    if args.max_kv_len is not None:
+        kv_len = args.max_kv_len + args.q_len
+    else:
+        kv_len = args.block_table.shape[1] * 256
+    if kv_len < 8192 or programs == 0:
         return 1
 
-    sms = torch.cuda.get_device_properties(args.q.device).multi_processor_count
+    sms = _sm_count(args.q.device.index)
     waves = math.ceil(programs / sms)
     waves3 = math.ceil(3 * programs / sms)
     if waves3 / (3.0 * waves) > 0.95:

@@ -43,6 +43,8 @@ template<> struct config<512> {
 };
 
 static constexpr int nwarps       = 4;
+// D512 splits DV across two warps per 16-column group so the FP32 accumulator fits in registers.
+template<int DKQ> struct consumer_warps { static constexpr int value = DKQ == 512 ? 2*nwarps : nwarps; };
 static constexpr int depth        = 2;
 static constexpr int chunk_h2     = 32;
 static constexpr int chunk_ne     = 2*chunk_h2;
@@ -56,6 +58,8 @@ struct alignas(8) circular_barriers {
 struct alignas(8) barrier_storage {
     uint64_t q_ready;
     circular_barriers kv;
+    // Producerless D512 path: per-slot release counts; the last consumer warp refills the slot.
+    int32_t released[depth];
 };
 
 static __device__ __forceinline__ uint32_t smem_addr(const void * ptr) {
@@ -99,8 +103,14 @@ static __device__ __forceinline__ void tma_load_3d(
 #endif
 }
 
+template<int nw = nwarps>
 static __device__ __forceinline__ void consumer_sync() {
-    asm volatile("bar.sync %0, %1;" :: "n"(barrier_id), "n"(nwarps*WARP_SIZE) : "memory");
+    asm volatile("bar.sync %0, %1;" :: "n"(barrier_id), "n"(nw*WARP_SIZE) : "memory");
+}
+
+// Named barrier shared by the two warps of one D512 column group (IDs 1-4).
+static __device__ __forceinline__ void pair_sync(const int group) {
+    asm volatile("bar.sync %0, %1;" :: "r"(group + 1), "n"(2*WARP_SIZE) : "memory");
 }
 
 static __device__ __forceinline__ float softmax_rescale(const float diff) {
@@ -162,6 +172,10 @@ struct reader {
 
     __device__ __forceinline__ void pop(const int slot) {
         barrier_arrive(&barriers->consumed[slot]);
+        advance();
+    }
+
+    __device__ __forceinline__ void advance() {
         phase ^= 1u << ptr;
         ptr = ptr + 1 == depth ? 0 : ptr + 1;
     }
@@ -174,11 +188,17 @@ struct shared_layout {
     static constexpr int q_h2             = ncols*(DKQ/2);
     static constexpr int kv_slot_h2       = nbatch_fa*chunk_h2;
     static constexpr int stream_bytes     = depth*kv_slot_h2*sizeof(half2);
-    static constexpr int pipeline_bytes   = q_h2*sizeof(half2) + stream_bytes;
-    static constexpr int combine_f32      = nwarps*16*(config<DKQ>::nbatch_combine + 4);
+    // D512 exchanges P tiles (int per lane) and per-row max/sum partials between warp pairs.
+    static constexpr int xchg_p_i32       = DKQ == 512 ? nwarps*2*2*4*WARP_SIZE : 0;
+    static constexpr int xchg_m_f32       = DKQ == 512 ? nwarps*2*2*WARP_SIZE : 0;
+    static constexpr int xchg_bytes       = (xchg_p_i32 + xchg_m_f32)*4;
+    static constexpr int pipeline_bytes   = q_h2*sizeof(half2) + stream_bytes + xchg_bytes;
+    static constexpr int combine_f32      = consumer_warps<DKQ>::value*16*(config<DKQ>::nbatch_combine + 4) +
+                                            (DKQ == 512 ? 2*ncols : 0);
     static constexpr int data_bytes       = pipeline_bytes > combine_f32*int(sizeof(float)) ? pipeline_bytes : combine_f32*int(sizeof(float));
     static constexpr int shared_bytes     = data_bytes + sizeof(barrier_storage);
     static_assert(data_bytes % alignof(barrier_storage) == 0, "misaligned SM120 attention barriers");
+    static_assert(shared_bytes <= 101376, "SM120 attention exceeds the 99 KB shared memory opt-in limit");
 
     half2 * data;
     barrier_storage * barriers;
@@ -196,7 +216,65 @@ struct shared_layout {
         return data + q_h2 + slot*kv_slot_h2;
     }
 
+    __device__ __forceinline__ int * xchg_p() const {
+        return reinterpret_cast<int *>(data + q_h2 + depth*kv_slot_h2);
+    }
+
+    __device__ __forceinline__ float * xchg_m() const {
+        return reinterpret_cast<float *>(xchg_p() + xchg_p_i32);
+    }
+
 };
+
+// K/V chunk stream for the producerless D512 path. Chunk n of the CTA's stream is K chunk
+// n % (2*nchunks) of its KV tile, then its V chunks alternating between the two DV halves.
+struct kv_issuer {
+    const CUtensorMap * map_k;
+    const CUtensorMap * map_v;
+    const int32_t * block_table;
+    int page_row;
+    int z_KV;
+    int kb0_start;
+    int total_chunks;
+};
+
+template<int DKQ, int ncols1>
+static __device__ __forceinline__ void issue_chunk(
+        const kv_issuer & is, const shared_layout<DKQ, ncols1> & layout, const int n) {
+    constexpr int nbatch_fa = config<DKQ>::nbatch_fa;
+    constexpr int nchunks   = DKQ/chunk_ne;
+    const int kb0 = n/(2*nchunks);
+    const int idx = n - kb0*2*nchunks;
+    const bool is_v = idx >= nchunks;
+    const int i = is_v ? idx - nchunks : idx;
+    const int chunk = is_v ? (i % 2)*(nchunks/2) + i/2 : i;
+    const int logical_token = (is.kb0_start + kb0)*nbatch_fa;
+    const int physical_page = is.block_table[is.page_row + (logical_token >> 8)];
+    const int physical_token = physical_page*256 + (logical_token & 255);
+    const int slot = n % depth;
+    barrier_arrive_expect_tx(&layout.barriers->kv.produced[slot], nbatch_fa*chunk_ne*sizeof(half));
+    tma_load_3d(layout.kv(slot), is_v ? is.map_v : is.map_k, &layout.barriers->kv.produced[slot],
+        chunk*chunk_ne, is.z_KV, physical_token);
+}
+
+// Called by every consumer warp after its last read of chunk n. The counter only grows, so
+// the warp that completes a multiple of nwc releases is the last reader and refills the slot.
+template<int nwc, int DKQ, int ncols1>
+static __device__ __forceinline__ void release_chunk(
+        const kv_issuer & is, const shared_layout<DKQ, ncols1> & layout, const int n) {
+    __syncwarp();
+    if (threadIdx.x == 0) {
+        const int slot = n % depth;
+        // Order this warp's reads of the slot before the release, as mbarrier.arrive would.
+        __threadfence_block();
+        const int old = atomicAdd(&layout.barriers->released[slot], 1);
+        if (old % nwc == nwc - 1 && n + depth < is.total_chunks) {
+            __threadfence_block();
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            issue_chunk(is, layout, n + depth);
+        }
+    }
+}
 
 template<int DKQ, int ncols1, int ncols2>
 static __device__ __forceinline__ void producer(
@@ -225,7 +303,7 @@ static __device__ __forceinline__ void producer(
         if (jt*ncols1 + j < ne01 && zt_gqa*ncols2 + c < gqa_ratio) {
             value = __hmul2(scale_h2, Q_h2[(jt*ncols1 + j)*stride_Q1 + c*stride_Q2 + k]);
         }
-        const int k_smem = DKQ > 256 ? k ^ ((jc & 7)*4) : k;
+        const int k_smem = DKQ > 128 ? k ^ ((jc & 7)*4) : k;
         tile_q[jc*(DKQ/2) + k_smem] = value;
     }
     __syncwarp();
@@ -296,7 +374,7 @@ static __device__ __forceinline__ void consumer(
     constexpr int cols_per_warp   = T_B_KQ::I;
     constexpr int cols_per_thread = get_cols_per_thread();
     constexpr int np              = nwarps*cols_per_warp/ncols;
-    constexpr bool q_in_reg       = DKQ <= 256;
+    constexpr bool q_in_reg       = DKQ <= 128;
     static_assert(ncols == 64 && cols_per_warp == 16 && np == 1, "bad SM120 attention shape");
 
     T_B_KQ Q_B[q_in_reg ? DKQ/(2*T_B_KQ::J) : 1];
@@ -364,21 +442,29 @@ static __device__ __forceinline__ void consumer(
         float KQ_rowsum_add[cols_per_thread] = {0.0f};
 
         const int kv_tile_start = (kb0_start + kb0)*nbatch_fa;
+        // Interior tiles need no mask: every KV column is in range and causally visible to the
+        // first q row of the tile, and every q row is valid. The condition is uniform across the CTA
+        const bool full_tile =
+            kv_tile_start + nbatch_fa <= total_k &&
+            jt*ncols1 + ncols1 <= ne01 &&
+            (!causal || kv_tile_start + nbatch_fa - 1 <= q_base + jt*ncols1);
+        if (!full_tile) {
 #pragma unroll
-        for (int i00 = 0; i00 < nbatch_fa; i00 += T_C_KQ::J) {
+            for (int i00 = 0; i00 < nbatch_fa; i00 += T_C_KQ::J) {
 #pragma unroll
-            for (int l0 = 0; l0 < T_C_KQ::ne; l0 += 2) {
-                const int j = (threadIdx.y*cols_per_warp + T_C_KQ::get_i(l0))/ncols2;
-                const int q_idx = jt*ncols1 + j;
-                const int kv0 = kv_tile_start + i00 + T_C_KQ::get_j(l0);
-                const int kv1 = kv0 + 1;
-                const int q_abs = q_base + q_idx;
-                const bool q_valid = q_idx < ne01;
-                if (!q_valid || kv0 >= total_k || (causal && kv0 > q_abs)) {
-                    KQ_C[i00/T_C_KQ::J].x[l0 + 0] = -INFINITY;
-                }
-                if (!q_valid || kv1 >= total_k || (causal && kv1 > q_abs)) {
-                    KQ_C[i00/T_C_KQ::J].x[l0 + 1] = -INFINITY;
+                for (int l0 = 0; l0 < T_C_KQ::ne; l0 += 2) {
+                    const int j = (threadIdx.y*cols_per_warp + T_C_KQ::get_i(l0))/ncols2;
+                    const int q_idx = jt*ncols1 + j;
+                    const int kv0 = kv_tile_start + i00 + T_C_KQ::get_j(l0);
+                    const int kv1 = kv0 + 1;
+                    const int q_abs = q_base + q_idx;
+                    const bool q_valid = q_idx < ne01;
+                    if (!q_valid || kv0 >= total_k || (causal && kv0 > q_abs)) {
+                        KQ_C[i00/T_C_KQ::J].x[l0 + 0] = -INFINITY;
+                    }
+                    if (!q_valid || kv1 >= total_k || (causal && kv1 > q_abs)) {
+                        KQ_C[i00/T_C_KQ::J].x[l0 + 1] = -INFINITY;
+                    }
                 }
             }
         }
@@ -639,8 +725,312 @@ static __device__ __forceinline__ void consumer(
 #endif
 }
 
+// D512 consumer: warps w and w + nwarps share the 16 q columns of group w. Each computes KQ for
+// half of the KV tile, the pair exchanges row maxima and P tiles through shared memory, and each
+// accumulates half of DV. This halves the FP32 accumulator per thread (256 -> 128 registers).
 template<int DKQ, int ncols1, int ncols2, bool use_logit_softcap, int split_k>
-__global__ __launch_bounds__((nwarps + 1)*WARP_SIZE, 1) void kernel(
+static __device__ __forceinline__ void consumer_dv_split(
+        half * dstk,
+        float * dst_parts,
+        float2 * dst_meta,
+        const float logit_softcap,
+        const int ne01,
+        const int ne02,
+        const int gqa_ratio,
+        const int jt,
+        const int zt_gqa,
+        const int kb0_start,
+        const int kb0_stop,
+        const int q_base,
+        const int total_k,
+        const bool causal,
+        const kv_issuer & is,
+        shared_layout<DKQ, ncols1> layout) {
+    constexpr int DV             = DKQ;
+    constexpr int DV_half        = DV/2;
+    constexpr int ncols          = ncols1*ncols2;
+    constexpr int nwc            = consumer_warps<DKQ>::value;
+    constexpr int nbatch_fa      = config<DKQ>::nbatch_fa;
+    constexpr int nbatch_half    = nbatch_fa/2;
+    constexpr int nbatch_combine = config<DKQ>::nbatch_combine;
+    constexpr int nchunks        = DKQ/chunk_ne;
+    using T_A_KQ  = typename mma_tile_sizes<DV, ncols>::T_A_KQ;
+    using T_B_KQ  = typename mma_tile_sizes<DV, ncols>::T_B_KQ;
+    using T_C_KQ  = typename mma_tile_sizes<DV, ncols>::T_C_KQ;
+    using T_A_VKQ = typename mma_tile_sizes<DV, ncols>::T_A_VKQ;
+    using T_B_VKQ = typename mma_tile_sizes<DV, ncols>::T_B_VKQ;
+    using T_C_VKQ = typename mma_tile_sizes<DV, ncols>::T_C_VKQ;
+    constexpr int cols_per_warp   = T_B_KQ::I;
+    constexpr int cols_per_thread = get_cols_per_thread();
+    constexpr int ntiles_kq       = nbatch_half/T_C_KQ::J;
+    constexpr int ntiles_b        = nbatch_fa/(2*T_B_VKQ::J);
+    static_assert(ncols == nwarps*cols_per_warp && nwc == 2*nwarps, "bad SM120 D512 attention shape");
+    static_assert(ntiles_b == 2*ntiles_kq && T_B_VKQ::ne == 4, "bad SM120 D512 P tile shape");
+
+    const int lane  = threadIdx.x;
+    const int group = threadIdx.y % nwarps;
+    const int half_ = threadIdx.y / nwarps;
+    const int j0    = group*cols_per_warp;
+
+    // Exchange slots, indexed [group][half][...][lane]; the partner reads the other half.
+    int * xchg_p_own = layout.xchg_p() + ((group*2 + half_)*ntiles_kq*T_B_VKQ::ne)*WARP_SIZE;
+    int * xchg_p_par = layout.xchg_p() + ((group*2 + 1 - half_)*ntiles_kq*T_B_VKQ::ne)*WARP_SIZE;
+    float * xchg_m_own = layout.xchg_m() + ((group*2 + half_)*cols_per_thread)*WARP_SIZE;
+    float * xchg_m_par = layout.xchg_m() + ((group*2 + 1 - half_)*cols_per_thread)*WARP_SIZE;
+
+    T_C_VKQ VKQ_C[DV_half/T_C_VKQ::J];
+    float KQ_rowsum[cols_per_thread] = {0.0f};
+    float KQ_max[cols_per_thread];
+#pragma unroll
+    for (int col = 0; col < cols_per_thread; ++col) {
+        KQ_max[col] = -FLT_MAX/2.0f;
+    }
+
+    const half2 * tile_q = layout.q();
+    reader kvr{&layout.barriers->kv};
+    int n = 0;
+
+    for (int kb0 = 0; kb0 < kb0_stop; ++kb0) {
+        T_C_KQ KQ_C[ntiles_kq];
+
+#pragma unroll
+        for (int chunk = 0; chunk < nchunks; ++chunk) {
+            const int slot = kvr.wait();
+            const half2 * tile_k = layout.kv(slot);
+#pragma unroll
+            for (int k0 = 0; k0 < chunk_h2; k0 += T_A_KQ::J) {
+                T_B_KQ Q_fragment;
+                load_ldmatrix_swizzle_128(Q_fragment, tile_q, j0, chunk*chunk_h2 + k0, DKQ/2);
+#pragma unroll
+                for (int t = 0; t < ntiles_kq; ++t) {
+                    T_A_KQ K_A;
+                    load_ldmatrix_swizzle_128(K_A, tile_k, half_*nbatch_half + t*T_A_KQ::I, k0, chunk_h2);
+                    mma(KQ_C[t], Q_fragment, K_A);
+                }
+            }
+            release_chunk<nwc>(is, layout, n++);
+            kvr.advance();
+        }
+
+        if constexpr (use_logit_softcap) {
+#pragma unroll
+            for (int t = 0; t < ntiles_kq; ++t) {
+#pragma unroll
+                for (int l = 0; l < T_C_KQ::ne; ++l) {
+                    KQ_C[t].x[l] = logit_softcap*tanhf(KQ_C[t].x[l]);
+                }
+            }
+        }
+
+        const int kv_tile_start = (kb0_start + kb0)*nbatch_fa;
+        const bool full_tile =
+            kv_tile_start + nbatch_fa <= total_k &&
+            jt*ncols1 + ncols1 <= ne01 &&
+            (!causal || kv_tile_start + nbatch_fa - 1 <= q_base + jt*ncols1);
+        if (!full_tile) {
+#pragma unroll
+            for (int t = 0; t < ntiles_kq; ++t) {
+#pragma unroll
+                for (int l0 = 0; l0 < T_C_KQ::ne; l0 += 2) {
+                    const int j = (j0 + T_C_KQ::get_i(l0))/ncols2;
+                    const int q_idx = jt*ncols1 + j;
+                    const int kv0 = kv_tile_start + half_*nbatch_half + t*T_C_KQ::J + T_C_KQ::get_j(l0);
+                    const int kv1 = kv0 + 1;
+                    const int q_abs = q_base + q_idx;
+                    const bool q_valid = q_idx < ne01;
+                    if (!q_valid || kv0 >= total_k || (causal && kv0 > q_abs)) {
+                        KQ_C[t].x[l0 + 0] = -INFINITY;
+                    }
+                    if (!q_valid || kv1 >= total_k || (causal && kv1 > q_abs)) {
+                        KQ_C[t].x[l0 + 1] = -INFINITY;
+                    }
+                }
+            }
+        }
+
+        float KQ_max_new[cols_per_thread];
+#pragma unroll
+        for (int col = 0; col < cols_per_thread; ++col) {
+            KQ_max_new[col] = KQ_max[col];
+        }
+#pragma unroll
+        for (int t = 0; t < ntiles_kq; ++t) {
+#pragma unroll
+            for (int l = 0; l < T_C_KQ::ne; ++l) {
+                const int KQ_idx = (l/2) % 2;
+                KQ_max_new[KQ_idx] = fmaxf(KQ_max_new[KQ_idx], KQ_C[t].x[l] + FATTN_KQ_MAX_OFFSET);
+            }
+        }
+#pragma unroll
+        for (int col = 0; col < cols_per_thread; ++col) {
+            KQ_max_new[col] = fmaxf(KQ_max_new[col], __shfl_xor_sync(0xffffffffu, KQ_max_new[col], 2));
+            KQ_max_new[col] = fmaxf(KQ_max_new[col], __shfl_xor_sync(0xffffffffu, KQ_max_new[col], 1));
+            xchg_m_own[col*WARP_SIZE + lane] = KQ_max_new[col];
+        }
+        pair_sync(group);
+#pragma unroll
+        for (int col = 0; col < cols_per_thread; ++col) {
+            KQ_max_new[col] = fmaxf(KQ_max_new[col], xchg_m_par[col*WARP_SIZE + lane]);
+        }
+
+        float KQ_rowsum_add[cols_per_thread] = {0.0f};
+#pragma unroll
+        for (int t = 0; t < ntiles_kq; ++t) {
+#pragma unroll
+            for (int l = 0; l < T_C_KQ::ne; ++l) {
+                const int KQ_idx = (l/2) % 2;
+                KQ_C[t].x[l] = expf(KQ_C[t].x[l] - KQ_max_new[KQ_idx]);
+                KQ_rowsum_add[KQ_idx] += KQ_C[t].x[l];
+            }
+        }
+
+        // Both warps of a pair see the same maxima, so their scale factors agree and the
+        // partial row sums over each half of the tile can be added at the end.
+        float KQ_max_scale[cols_per_thread];
+#pragma unroll
+        for (int col = 0; col < cols_per_thread; ++col) {
+            KQ_max_scale[col] = softmax_rescale(KQ_max[col] - KQ_max_new[col]);
+            KQ_max[col] = KQ_max_new[col];
+            KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + KQ_rowsum_add[col];
+        }
+#pragma unroll
+        for (int i = 0; i < DV_half/T_C_VKQ::J; ++i) {
+#pragma unroll
+            for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                VKQ_C[i].x[l] *= KQ_max_scale[(l/2) % cols_per_thread];
+            }
+        }
+
+        T_B_VKQ B_own[ntiles_kq];
+#pragma unroll
+        for (int t = 0; t < ntiles_kq; ++t) {
+            B_own[t] = get_half2(KQ_C[t]);
+            const int * src = reinterpret_cast<const int *>(B_own[t].x);
+#pragma unroll
+            for (int r = 0; r < T_B_VKQ::ne; ++r) {
+                xchg_p_own[(t*T_B_VKQ::ne + r)*WARP_SIZE + lane] = src[r];
+            }
+        }
+        pair_sync(group);
+        T_B_VKQ B[ntiles_b];
+#pragma unroll
+        for (int t = 0; t < ntiles_kq; ++t) {
+            T_B_VKQ B_par;
+            int * dst = reinterpret_cast<int *>(B_par.x);
+#pragma unroll
+            for (int r = 0; r < T_B_VKQ::ne; ++r) {
+                dst[r] = xchg_p_par[(t*T_B_VKQ::ne + r)*WARP_SIZE + lane];
+            }
+            const int * own = reinterpret_cast<const int *>(B_own[t].x);
+            int * lo = reinterpret_cast<int *>(B[t].x);
+            int * hi = reinterpret_cast<int *>(B[ntiles_kq + t].x);
+#pragma unroll
+            for (int r = 0; r < T_B_VKQ::ne; ++r) {
+                lo[r] = half_ == 0 ? own[r] : dst[r];
+                hi[r] = half_ == 0 ? dst[r] : own[r];
+            }
+        }
+
+        // V chunks arrive alternating between the two DV halves (see issue_chunk).
+#pragma unroll
+        for (int c = 0; c < nchunks/2; ++c) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int slot = kvr.wait();
+                if (h == half_) {
+                    const half2 * tile_v = layout.kv(slot);
+#pragma unroll
+                    for (int i0 = 0; i0 < chunk_ne; i0 += T_A_VKQ::I) {
+#pragma unroll
+                        for (int k00 = 0; k00 < nbatch_fa/2; k00 += T_A_VKQ::J) {
+                            T_A_VKQ A;
+                            load_ldmatrix_trans_swizzle_128(A, tile_v, 2*k00, i0/2, chunk_h2);
+                            mma(VKQ_C[(c*chunk_ne + i0)/T_C_VKQ::J], B[k00/T_A_VKQ::J], A);
+                        }
+                    }
+                }
+                release_chunk<nwc>(is, layout, n++);
+                kvr.advance();
+            }
+        }
+    }
+
+#pragma unroll
+    for (int col = 0; col < cols_per_thread; ++col) {
+        KQ_rowsum[col] += __shfl_xor_sync(0xffffffffu, KQ_rowsum[col], 2);
+        KQ_rowsum[col] += __shfl_xor_sync(0xffffffffu, KQ_rowsum[col], 1);
+        xchg_m_own[col*WARP_SIZE + lane] = KQ_rowsum[col];
+    }
+    pair_sync(group);
+#pragma unroll
+    for (int col = 0; col < cols_per_thread; ++col) {
+        KQ_rowsum[col] += xchg_m_par[col*WARP_SIZE + lane];
+    }
+
+    // Keep the numerator in FP32 through normalization or split-K combination.
+    // tile_out is [half][jc][k] for one nbatch_combine slice of each DV half, followed by meta.
+    float * tile_out = reinterpret_cast<float *>(layout.data);
+    constexpr int tile_stride = nbatch_combine + 4;
+    float2 * meta_s = reinterpret_cast<float2 *>(tile_out + 2*ncols*tile_stride);
+
+    // Finish all pipeline and exchange reads before the shared memory is reused.
+    consumer_sync<nwc>();
+    if (half_ == 0 && lane % 4 == 0) {
+#pragma unroll
+        for (int col = 0; col < cols_per_thread; ++col) {
+            meta_s[j0 + T_C_VKQ::get_i(2*col)] = make_float2(KQ_max[col], KQ_rowsum[col]);
+        }
+    }
+
+    const int tid = threadIdx.y*WARP_SIZE + lane;
+#pragma unroll
+    for (int k00 = 0; k00 < DV_half; k00 += nbatch_combine) {
+#pragma unroll
+        for (int k1 = 0; k1 < nbatch_combine; k1 += T_C_VKQ::J) {
+#pragma unroll
+            for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                const int jc = j0 + T_C_VKQ::get_i(l);
+                const int k = k1 + T_C_VKQ::get_j(l);
+                tile_out[(half_*ncols + jc)*tile_stride + k] = VKQ_C[(k00 + k1)/T_C_VKQ::J].x[l];
+            }
+        }
+        consumer_sync<nwc>();
+
+#pragma unroll 4
+        for (int e0 = 0; e0 < 2*ncols*nbatch_combine; e0 += nwc*WARP_SIZE) {
+            const int e = e0 + tid;
+            const int h = e / (ncols*nbatch_combine);
+            const int jc = (e / nbatch_combine) % ncols;
+            const int k = e % nbatch_combine;
+            const int j = jc/ncols2;
+            const int c = jc - j*ncols2;
+            if (jt*ncols1 + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
+                continue;
+            }
+            const float value = tile_out[(h*ncols + jc)*tile_stride + k];
+            const int d = h*DV_half + k00 + k;
+            if constexpr (split_k == 1) {
+                const float rowsum = meta_s[jc].y;
+                dstk[((jt*ncols1 + j)*ne02 + c)*DV + d] = __float2half_rn(rowsum == 0.0f ? 0.0f : value/rowsum);
+            } else {
+                dst_parts[(j*ne02 + c)*split_k*DV + d] = value;
+                if (d == 0) {
+                    dst_meta[(j*ne02 + c)*split_k] = meta_s[jc];
+                }
+            }
+        }
+        consumer_sync<nwc>();
+    }
+}
+
+// D512 has no producer warp: a 9th warp would cap the 8 consumer warps at 168 registers.
+template<int DKQ> struct has_producer { static constexpr bool value = DKQ != 512; };
+template<int DKQ> struct block_warps {
+    static constexpr int value = consumer_warps<DKQ>::value + (has_producer<DKQ>::value ? 1 : 0);
+};
+
+template<int DKQ, int ncols1, int ncols2, bool use_logit_softcap, int split_k>
+__global__ __launch_bounds__(block_warps<DKQ>::value*WARP_SIZE, 1) void kernel(
         __grid_constant__ const CUtensorMap map_k,
         __grid_constant__ const CUtensorMap map_v,
         const half * q_ptr,
@@ -666,8 +1056,11 @@ __global__ __launch_bounds__((nwarps + 1)*WARP_SIZE, 1) void kernel(
 #pragma unroll
         for (int i = 0; i < depth; ++i) {
             barrier_init(&layout.barriers->kv.produced[i], 1);
-            barrier_init(&layout.barriers->kv.consumed[i], nwarps*WARP_SIZE);
+            barrier_init(&layout.barriers->kv.consumed[i], consumer_warps<DKQ>::value*WARP_SIZE);
+            layout.barriers->released[i] = 0;
         }
+        // Make the barrier initialization visible to the async proxy before any TMA completes on it.
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
     __syncthreads();
 
@@ -700,7 +1093,41 @@ __global__ __launch_bounds__((nwarps + 1)*WARP_SIZE, 1) void kernel(
         dst_meta = dst_meta_ptr + row0*split_k + split;
     }
 
-    if (threadIdx.y == nwarps) {
+    if constexpr (!has_producer<DKQ>::value) {
+        constexpr int nwc = consumer_warps<DKQ>::value;
+        constexpr int nchunks = DKQ/chunk_ne;
+        const kv_issuer is{&map_k, &map_v, block_table, sequence*num_pages_per_seq, z_KV, kb0_start,
+            (kb0_stop - kb0_start)*2*nchunks};
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+#pragma unroll
+            for (int n = 0; n < depth; ++n) {
+                if (n < is.total_chunks) {
+                    issue_chunk(is, layout, n);
+                }
+            }
+        }
+
+        // All consumer warps stage the scaled Q tile, swizzled as in the producer.
+        const half2 scale_h2 = make_half2(scale, scale);
+        half2 * tile_q = layout.q();
+        const int stride_Q1 = n_q_heads*(DKQ/2);
+        for (int i = threadIdx.y*WARP_SIZE + threadIdx.x; i < 64*(DKQ/2); i += nwc*WARP_SIZE) {
+            const int jc = i/(DKQ/2);
+            const int k = i - jc*(DKQ/2);
+            const int j = jc/ncols2;
+            const int c = jc - j*ncols2;
+            half2 value = make_half2(0.0f, 0.0f);
+            if (jt*ncols1 + j < q_len && zt_gqa*ncols2 + c < gqa_ratio) {
+                value = __hmul2(scale_h2, q_h2[(jt*ncols1 + j)*stride_Q1 + c*(DKQ/2) + k]);
+            }
+            tile_q[jc*(DKQ/2) + (k ^ ((jc & 7)*4))] = value;
+        }
+        consumer_sync<nwc>();
+
+        consumer_dv_split<DKQ, ncols1, ncols2, use_logit_softcap, split_k>(dstk, dst_parts, dst_meta,
+            logit_softcap, q_len, n_q_heads, gqa_ratio, jt, zt_gqa, kb0_start,
+            kb0_stop - kb0_start, q_base, total_k, causal, is, layout);
+    } else if (threadIdx.y == consumer_warps<DKQ>::value) {
         producer<DKQ, ncols1, ncols2>(q_h2, scale, n_q_heads*(DKQ/2), DKQ/2,
             jt, zt_gqa, gqa_ratio, q_len, sequence, z_KV, kb0_start, kb0_stop,
             block_table, num_pages_per_seq, &map_k, &map_v, layout);

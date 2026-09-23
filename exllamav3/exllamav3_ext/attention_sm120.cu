@@ -181,7 +181,7 @@ static void launch_shape_impl(
     const int ntiles_x = CEIL_DIVIDE(q_len, NCOLS1);
     const int ntiles_z_gqa = CEIL_DIVIDE(gqa_ratio, NCOLS2);
     const dim3 blocks(ntiles_x, SPLIT * ntiles_z_gqa * n_kv_heads, bsz);
-    const dim3 threads(exl3_sm120::WARP_SIZE, exl3_sm120::nwarps + 1, 1);
+    const dim3 threads(exl3_sm120::WARP_SIZE, exl3_sm120::block_warps<D>::value, 1);
     constexpr int shared_bytes = exl3_sm120::shared_layout<D, NCOLS1>::shared_bytes;
     auto fn = exl3_sm120::kernel<D, NCOLS1, NCOLS2, SOFTCAP, SPLIT>;
     set_dynamic_smem_once(fn, shared_bytes, q.get_device());
