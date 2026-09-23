@@ -324,6 +324,12 @@ class Model(Model_TPMixin, Model_LSMixin):
                             params["recurrent_states"] = states
                         if history:
                             params["recurrent_history"] = True
+                    # Chunk-class steps stop the head at the last row, like prefill does (the
+                    # generator never takes logits for a whole chunk): full-chunk logits are the
+                    # single largest transient of the whole load (1.9 GiB fp16 at 4096 rows on a
+                    # 248k vocab) and would set the process's reserved high-water mark for nothing
+                    if q > 16:
+                        params["last_tokens_only"] = 1
                     step_label = f"{label}, {q} token(s) at {pos}" if cache is not None else label
                     try:
                         self.forward(ids(bsz, q), params)
