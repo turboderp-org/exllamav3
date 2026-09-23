@@ -108,6 +108,13 @@ The prefill short convolution reads the projection output in place (token-major,
 dtype) instead of a transposed bf16 copy of it. Same kernel arithmetic; a bf16 projection is
 bit-identical to the copy, an fp16 one skips its bf16 rounding. Set to `0` for the copy.
 
+### `EXL3_PLE_SUB_CHUNK` (default: `1024`)
+
+Prefill of the PLE (n-gram) layer runs its fused stream pass in row slabs of this many tokens,
+carrying the short-conv state between slabs and adding each slab's result into the stream in
+place. The pass holds several full-width fp32 working tensors of the stream stack so the slab 
+bounds that. 1024 is the fastest slab measured. Set to `0` to run the chunk whole.
+
 ### `EXL3_BC_DSA_DEBUG` (default: `0`)
 
 Raise errors encountered while building the graphed DSA path instead of silently declining to
