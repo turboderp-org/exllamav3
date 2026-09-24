@@ -188,7 +188,9 @@ class DSV4Compressor:
                 return
 
         # Batched wkv+wgate projection: one 2-expert exl3_mgemm when formats match
+        # (mgemm is sm80+ only — skip the mg tables on cc < 8)
         if (
+            ext.g_get_cc_raw(self.ape.device.index or 0) >= 8 and
             isinstance(wkv_i, LinearEXL3) and
             isinstance(wgate_i, LinearEXL3) and
             wkv_i.K == wgate_i.K and
@@ -929,6 +931,10 @@ class DSV4Attention(Module):
         self.x_fan_ready = True
         if os.environ.get("EXL3_DSV4_NO_XFAN", "0") != "0":
             return
+        # The mgemm fan kernels are sm80+ only (arch-guarded no-ops below); on
+        # cc < 8 keep the per-Linear path, which routes through the sm70 GEMV
+        if ext.g_get_cc_raw(torch.device(self.device).index or 0) < 8:
+            return
         device = torch.device(self.device)
 
         def mk_fan(lins):
@@ -1006,6 +1012,24 @@ class DSV4Attention(Module):
 
     def _build_woa_multi(self):
         self.woa_multi_ready = True
+        # mgemm is sm80+ only; on cc < 8 use the sm70 multi-matrix
+        # GEMV (pointer tables, one launch for all G slices)
+        self.woa_sm70_multi = None
+        if ext.g_get_cc_raw(torch.device(self.device).index or 0) < 8:
+            try:
+                if all(l.quant_type == "exl3" for l in self.wo_a):
+                    inners = [l.inner for l in self.wo_a]
+                    self.woa_sm70_multi = dict(
+                        B_list = torch.tensor([i.trellis.data_ptr() for i in inners], dtype = torch.int64, device = self.device),
+                        suh_list = torch.tensor([i.suh.data_ptr() for i in inners], dtype = torch.int64, device = self.device),
+                        svh_list = torch.tensor([i.svh.data_ptr() for i in inners], dtype = torch.int64, device = self.device),
+                        K = self.wo_a[0].inner.K,
+                        mcg = self.wo_a[0].inner.mcg,
+                        mul1 = self.wo_a[0].inner.mul1,
+                    )
+            except Exception:
+                self.woa_sm70_multi = None
+            return
         try:
             if all(l.quant_type == "exl3" for l in self.wo_a):
                 self.wo_a_multi = MultiLinear(self.device, self.wo_a)
@@ -1057,6 +1081,37 @@ class DSV4Attention(Module):
                 return self._mgemm1(self.wob_multi, o2.contiguous(),
                                     out_dtype or self.out_dtype,
                                     f"dsv4_wob1_L{self.layer_idx}")
+            return self.wo_b.forward(o2, params, out_dtype = out_dtype or self.out_dtype)
+
+        if self.woa_sm70_multi is not None and bsz == 1 and seq <= 32:
+            # sm70 multi-matrix GEMV: one launch for all G slices.
+            # Each slice g reads its own input o[g] (contiguous rows
+            # of o) and writes a 1024-wide output chunk.
+            G = self.o_groups
+            m = self.woa_sm70_multi
+            slice_k = o.shape[3]
+            n_out = self.wo_a[0].out_features
+            # exl3_gemv_multi computes ONE row per matrix (size_m is
+            # hardcoded to 1 in the launch): drive it row by row so
+            # every seq row is written. One launch per row still
+            # amortizes the G-matrix fan into a single cooperative
+            # launch.
+            C = torch.empty(G, seq, n_out, dtype = torch.half, device = o.device)
+            A_had = torch.empty(G, seq, slice_k, dtype = torch.half, device = o.device)
+            for r in range(seq):
+                row_A = torch.tensor(
+                    [o[g][0][r].contiguous().data_ptr() for g in range(G)],
+                    dtype = torch.int64, device = o.device)
+                row_Ah = torch.tensor(
+                    [A_had[g][r].data_ptr() for g in range(G)],
+                    dtype = torch.int64, device = o.device)
+                row_C = torch.tensor(
+                    [C[g][r].data_ptr() for g in range(G)],
+                    dtype = torch.int64, device = o.device)
+                ext.exl3_gemv_multi(
+                    row_A, m["B_list"], row_C, m["suh_list"], row_Ah,
+                    m["svh_list"], G, slice_k, n_out, m["K"], m["mcg"], m["mul1"])
+            o2 = C.permute(1, 0, 2).reshape(seq, G * n_out).unsqueeze(0)
             return self.wo_b.forward(o2, params, out_dtype = out_dtype or self.out_dtype)
 
         o = torch.cat([self.wo_a[g].forward(o[g], params) for g in range(self.o_groups)], dim = -1)

@@ -48,7 +48,11 @@ int exl3_gemv_int8_max_k(int device)
     static const int env_max_k = [] { const char* e = getenv("EXL3_INT8_GEMV_MAX_K"); return e ? atoi(e) : 0; }();
     if (env_max_k) return MIN(env_max_k, 8);
     int cc = DevCtx::instance().get_cc(device);
-    return (cc == CC_HOPPER || cc == CC_BLACKWELL) ? 6 : 5;
+    // sm_70 (cc < 8): the K=5 int8 kernel mis-executes here (wrong
+    // output at n >= 256; exact at n = 128 — measured on V100).
+    // Cap at K=4 so K=5 mul1 falls through to the sm70 GEMV, which
+    // is exact for all K 5-8.
+    return (cc == CC_HOPPER || cc == CC_BLACKWELL) ? 6 : (cc == CC_OLD ? 4 : 5);
 }
 
 struct GemvInt8Workspace
@@ -246,6 +250,18 @@ bool exl3_gemv_int8
 )
 {
     if (!suh.has_value() || !A_had.has_value() || !svh.has_value()) return false;
+
+    // sm_70 (cc < CC_AMPERE): the int8 kernels mis-execute here (wrong
+    // output on mul1 tensors; measured on V100 — K=3 and K=5 both wrong,
+    // exact at every K on sm_86+). The sm70 fp16 GEMV is exact for all
+    // K 1-8 and takes these calls instead.
+    {
+        int device_;
+        cudaGetDevice(&device_);
+        if (DevCtx::instance().get_cc(device_) < CC_AMPERE) return false;
+    }
+
+    int K = B.size(2) / 16;
 
     // 16 * K uint16 per tile, 16 * K + 8 at the half-integer rates (mul1 only, which this path is anyway)
     const int tile_u16 = B.size(2);

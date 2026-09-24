@@ -28,6 +28,17 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     half* __restrict__ A_had, \
     const half* __restrict__ svh
 
+// Dual-matrix GEMV variant: EXL3_GEMM_ARGS + a second matrix slot
+// (B2/C2/suh2/A_had2/svh2). Fuses two back-to-back GEMV calls into
+// one launch — see docs/sm70_dual_gemv_design.md.
+#define EXL3_GEMM_ARGS_DUAL \
+    EXL3_GEMM_ARGS, \
+    const uint16_t* __restrict__ B2, \
+    void* __restrict__ C2, \
+    const half* __restrict__ suh2, \
+    half* __restrict__ A_had2, \
+    const half* __restrict__ svh2
+
 #define EXL3_MGEMM_ARGS \
     const half* __restrict__  A, \
     const uint16_t** __restrict__ B_list, \
@@ -53,6 +64,44 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     const int num_had_src
 
 typedef void (*fp_exl3_gemm_kernel) (EXL3_GEMM_ARGS);
+
+// K-split variant: EXL3_GEMM_ARGS + fp32 partial-sum workspace.
+// CFG==2 kernels write per-k-chunk partials to the workspace and
+// reduce across chunks after a grid barrier; other variants ignore it.
+#define EXL3_GEMM_ARGS_KS \
+    EXL3_GEMM_ARGS, \
+    float* __restrict__ ws
+typedef void (*fp_exl3_gemm_kernel_ks) (EXL3_GEMM_ARGS_KS);
+
+// Dual K-split: dual args + workspace
+#define EXL3_GEMM_ARGS_DUAL_KS \
+    EXL3_GEMM_ARGS_DUAL, \
+    float* __restrict__ ws
+typedef void (*fp_exl3_gemm_kernel_dual_ks) (EXL3_GEMM_ARGS_DUAL_KS);
+
+// Multi-matrix variant: N matrices via device pointer tables (the
+// sm70 counterpart of the sm80 mgemm pointer-table contract).
+// Tables: device arrays of N pointers each; n_mat = active count.
+#define EXL3_GEMM_ARGS_MULTI \
+    const half* __restrict__ A, \
+    const uint16_t* __restrict__ B, \
+    void* __restrict__ C, \
+    const int size_m, \
+    const int size_k, \
+    const int size_n, \
+    int* __restrict__ locks, \
+    const half* __restrict__ suh, \
+    half* __restrict__ A_had, \
+    const half* __restrict__ svh, \
+    const half* const* __restrict__ A_list, \
+    const uint16_t* const* __restrict__ B_list, \
+    void* const* __restrict__ C_list, \
+    const half* const* __restrict__ suh_list, \
+    half* const* __restrict__ A_had_list, \
+    const half* const* __restrict__ svh_list, \
+    const int n_mat, \
+    float* __restrict__ ws
+typedef void (*fp_exl3_gemm_kernel_multi) (EXL3_GEMM_ARGS_MULTI);
 typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 
 #define EXL3_GEMM_SHAPE_1     16,     16,    128,     6,     5

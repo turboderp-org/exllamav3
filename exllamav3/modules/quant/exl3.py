@@ -12,6 +12,11 @@ MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
+# sm70 GEMV fast-path kill switch: the batched-decode GEMV carries an
+# in-vivo-only IMA (see 1Cat-vLLM-sm70 docs/sm70_tp4_integration_notes.md,
+# "GEMV IMA full elimination record"). Setting EXL3_SM70_GEMV_DISABLE=1
+# routes every row to reconstruct+hgemm — the verified-green config.
+disable_sm70_gemv = os.environ.get("EXL3_SM70_GEMV_DISABLE", "0") != "0"
 
 class LinearEXL3:
 
@@ -81,6 +86,13 @@ class LinearEXL3:
         assert self.frac is None or self.mul1, f"{key}: half-integer bitrate {self.K} requires the mul1 codebook"
 
         self._fused_reconstruct = None
+        # The cached xh doubles as the GEMV's A_had workspace. The sm70
+        # GEMV covers m up to EXL3_GEMV_SM70_MAX_M (8) — its input-Had
+        # phase writes m * in_features halves into this buffer, so an
+        # m==1-sized allocation overflows for every batched call
+        # (observed as an IMA at the tiled m>1 launch). Size it for the
+        # kernel's max M; the m==1 path wastes 7 rows of scratch.
+        self.bsz1_xh_args = (self.trellis.device, (8, self.in_features), self.out_dtype)
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
         # K is the bitrate (int, or float for the half-integer rates); the C++ side decomposes it
         self.bc = ext.BC_LinearEXL3(
@@ -137,9 +149,19 @@ class LinearEXL3:
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
-            if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
-                dtype = out_dtype or self.default_out_dtype
-                return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
+            # sm_70: only the GEMV decode kernel (rows == 1) is ported; the
+            # sm80 block-pipelined kernels are arch-guarded no-ops. Route
+            # rows > 1 to reconstruct+hgemm.
+            if (rows <= AUTO_RECONSTRUCT_THRESHOLD and not disable_sm70_gemv) or self.config.infer_params.no_reconstruct:
+                cc = ext.g_get_cc(x.device.index) if x.device.index is not None else 99
+                # K > 4 on sm70: the GEMV kernel now covers K 5-8 (SMEM
+                # decode); exl3_gemm_gr's reconstruct+hgemm fallback catches
+                # whatever the GEMV declines (large M). No special routing.
+                if rows > 2 and cc < 8:
+                    pass  # fall through to reconstruct_hgemm
+                else:
+                    dtype = out_dtype or self.default_out_dtype
+                    return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
         return self.reconstruct_hgemm(x, out_dtype)
 

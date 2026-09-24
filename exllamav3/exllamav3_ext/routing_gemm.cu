@@ -5,13 +5,16 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
 #include "util.cuh"
+#include "quant/exl3_devctx.cuh"
 #include "det_gemm.cuh"
 
 /*
 
 Deterministic router projection: scores (R, E) half = hidden (R, K) half @ gate^T with the int8
-Ozaki-style scheme of det_gemm.cuh, so every tensor-parallel rank of ANY architecture that
-routes on identical streams produces identical logits and top-k selections. cuBLAS picks
+Ozaki-style scheme of det_gemm.cuh, so every tensor-parallel rank of any sm_80+ architecture
+that routes on identical streams produces identical logits and top-k selections (the int8
+kernels need cp.async and mma.m16n8k32, both sm_80+; pre-Ampere devices take the cuBLAS
+path, which is device-dependent but uniform within a fleet of one arch). cuBLAS picks
 split-K kernels for this skinny shape (E of 64..512, K of thousands) with a device-dependent
 split factor, and fp16 tensor cores accumulate differently per architecture.
 
@@ -246,6 +249,10 @@ bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, 
     if (hidden.dtype() != at::kHalf || gate_i8.dtype() != at::kChar || gate_sb.dtype() != at::kFloat || scores.dtype() != at::kHalf) return false;
     if (!hidden.is_contiguous() || !gate_i8.is_contiguous() || !gate_sb.is_contiguous() || !scores.is_contiguous()) return false;
     const int K = hidden.size(-1);
+    // The deterministic int8 kernels use cp.async and mma.m16n8k32 s8 —
+    // sm_80+ instructions — and need 97 KB dynamic smem (over the 96 KB
+    // pre-Ampere limit). Ampere+ only; cuBLAS serves the other arches.
+    if (g_get_cc_raw(hidden.get_device()) < 8) return false;
     return K % 16 == 0 && gate_i8.dim() == 3 && gate_i8.size(0) == 2 && gate_i8.size(2) == K && gate_sb.numel() == gate_i8.size(1);
 }
 

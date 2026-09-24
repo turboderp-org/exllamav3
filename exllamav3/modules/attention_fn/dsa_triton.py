@@ -935,6 +935,16 @@ def dsa_attn(
         D_c = D - D_r
     if scale is None:
         scale = D ** -0.5
+    # sm70-class devices (96 KB smem/SM): the default 3-stage 32-head tile
+    # exceeds the per-block shared-memory limit (143 KB required). Cap the
+    # stage count and head tile; sm80+ (>= 128 KB opt-in) keeps defaults.
+    smem_limit = getattr(
+        torch.cuda.get_device_properties(q.device),
+        "shared_memory_per_block_optin", 1 << 30)
+    if smem_limit < 131072:
+        num_stages = min(num_stages, 2)
+        block_h = min(block_h, 16)
+        block_n = min(block_n, 16)
     dense_pool = indices is None
     assert H % groups == 0
     if group_major is None:

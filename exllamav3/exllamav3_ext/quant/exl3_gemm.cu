@@ -7,6 +7,12 @@
 namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
+#include "../hgemm.cuh"
+#include <ATen/ATen.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/empty_like.h>
+#include "reconstruct.cuh"
+#include "hadamard.cuh"
 #include "exl3_gemm_kernel.cuh"
 #include "exl3_kernel_map.cuh"
 #include "bits_k.cuh"
@@ -196,6 +202,7 @@ int exl3_gemm_gr
     int shape_idx;
     fp_exl3_gemm_kernel kernel;
 
+    float* ws_ptr = (float*) DevCtx::instance().get_ws(device);
     void* kernelArgs[] =
     {
         (void*)& A_ptr,
@@ -207,7 +214,8 @@ int exl3_gemm_gr
         (void*)& locks,
         (void*)& suh_ptr,
         (void*)& A_had_ptr,
-        (void*)& svh_ptr
+        (void*)& svh_ptr,
+        (void*)& ws_ptr   // read by the sm70 K-split (CFG 2) kernels only
     };
 
     auto add_graph_args = [&](void* kernel_ptr)
@@ -240,6 +248,81 @@ int exl3_gemm_gr
             cuda_check(cudaPeekAtLastError());
             return 90;
         }
+
+        // sm_70: the block-pipelined kernels are arch-guarded no-ops. Tile
+        // the m dimension into 8-row slices and run the GEMV kernel per
+        // slice — each launch is self-contained (cooperative, per-block
+        // reduction, per-slice Had transforms).
+        // This path launches one kernel per 8-row tile. Making it
+        // graph-capturable requires the caller to present one param
+        // set per tile at replay (the replay walk patches sites 1:1
+        // with params; a single param set per call leaves tiles 1+
+        // with capture-time args — silently wrong output). Until the
+        // caller protocol supports per-tile params, refuse capture.
+        if (cc < CC_AMPERE && graph)
+            TORCH_CHECK(false, "exl3_gemm_gr: tiled sm70 path is not graph-capturable "
+                               "(caller must present per-tile params)");
+        if (cc < CC_AMPERE && (suh_ptr && A_had_ptr && svh_ptr))
+        {
+            const int tile_m = 8;
+            int tiles = CEIL_DIVIDE(size_m, tile_m);
+            bool all_ok = true;
+            for (int tile = 0; tile < tiles && all_ok; ++tile)
+            {
+                int tile_rows = MIN(size_m - tile * tile_m, tile_m);
+                const half* A_tile = A_ptr + tile * tile_m * size_k;
+                void* C_tile = c_fp32
+                    ? (void*) (((float*) C_ptr) + tile * tile_m * size_n)
+                    : (void*) (((half*) C_ptr) + tile * tile_m * size_n);
+                void* tileArgs[] =
+                {
+                    (void*)& A_tile,
+                    (void*)& B_ptr,
+                    (void*)& C_tile,
+                    (void*)& tile_rows,
+                    (void*)& size_k,
+                    (void*)& size_n,
+                    (void*)& locks,
+                    kernelArgs[7], kernelArgs[8], kernelArgs[9],
+                    kernelArgs[10]
+                };
+                void* tile_kernel = nullptr;
+                all_ok = exl3_gemv_try_launch
+                (
+                    tileArgs, tile_rows, size_k, size_n, K, cb, c_fp32,
+                    suh_ptr && A_had_ptr && svh_ptr,
+                    device, stream, &tile_kernel, true
+                );
+            }
+            if (all_ok)
+            {
+                cuda_check(cudaPeekAtLastError());
+                return 91;
+            }
+        }
+    }
+
+    // sm_70 (cc < 8) with K > 4: the GEMV kernel now covers K 5-8; this
+    // fallback catches shapes the GEMV declines (large m, graph capture).
+    // Reconstruct + cuBLAS hgemm — correct on every arch. Not
+    // graph-capturable (the reconstruct allocates); callers must keep
+    // this path eager.
+    if (K > 4 && cc < CC_AMPERE)
+    {
+        TORCH_CHECK(!graph, "exl3_gemm_gr: K > 4 on cc < CC_AMPERE is not graph-capturable; "
+                            "disable fused/graphed paths for K > 4 layers");
+        at::Tensor w = at::empty({B.size(0) * 16, B.size(1) * 16},
+            A.options().dtype(at::kHalf));
+        reconstruct(w, B, K, mcg, mul1);
+        at::Tensor x2 = A.reshape({-1, A.size(-1)});
+        at::Tensor xh2 = at::empty_like(x2);
+        had_r_128(x2, xh2, suh, c10::nullopt, 1.0f);
+        at::Tensor y2 = at::empty({x2.size(0), w.size(1)},
+            A.options().dtype(c_fp32 ? at::kFloat : at::kHalf));
+        hgemm(xh2, w, y2);
+        had_r_128(y2, y2, c10::nullopt, svh, 1.0f);
+        C.copy_(y2.view(C.sizes()));
+        return 0;
     }
 
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
@@ -435,6 +518,16 @@ int exl3_mgemm_gr
     TORCH_CHECK_DIM(svh, 1);
     TORCH_CHECK_DIM(C, 3);
 
+    // sm_70: the block-pipelined mgemm kernel's compute stages are arch-guarded
+    // no-ops below sm_80 (cp.async/ldmatrix/mma.m16n8k16), so a launch here
+    // silently produces zeros. The sm70 GEMV covers m <= 8 single-matrix calls
+    // via exl3_gemm_gr; the multi-matrix fan has no sm70 kernel yet — fail
+    // loudly instead of returning garbage.
+    int mgemm_device = A.device().index();
+    if (DevCtx::instance().get_cc(mgemm_device) < CC_AMPERE)
+        TORCH_CHECK(false, "exl3_mgemm: block-pipelined multi-matrix kernel is not "
+                           "supported on this architecture (compute capability < 8.0); "
+                           "the sm70 port covers single-matrix GEMV/GEMM only");
     TORCH_CHECK_SHAPES(A, 1, C, 1, 1);
     if (!had_src_list) TORCH_CHECK_SHAPES(B, 0, suh, 0, 1);   // sliced mode: suh is per source
     TORCH_CHECK_SHAPES(B, 0, svh, 0, 1);

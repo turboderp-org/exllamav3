@@ -673,8 +673,20 @@ class GatedDeltaNet(Module):
         if self.conv1d_weight_flat is None and self.conv1d_weight is not None:
             self.conv1d_weight_flat = self.conv1d_weight.squeeze(1).contiguous()
 
+        # sm_70: the bc fused path runs exl3_gemm_gr under graph capture;
+        # K > 4 layers need the reconstruct+hgemm fallback, which is not
+        # graph-capturable. Skip the bc path on cc < 8 with K > 4.
+        _cc_ok = True
+        try:
+            if device != torch.device("cpu"):
+                import exllamav3_ext as _ext
+                _dev = str(device)
+                _idx = int(_dev.split(':')[-1]) if ':' in _dev else 0
+                _cc_ok = not (_ext.g_get_cc_raw(_idx) < 8 and self.qkv_proj.inner.K > 4)
+        except Exception:
+            pass
         is_quantized_split = (
-            _bc_gdn_enable and device != torch.device("cpu") and
+_cc_ok and _bc_gdn_enable and device != torch.device("cpu") and
             self.qkvz_proj is None and self.ba_proj is None and
             self.qkv_proj is not None and self.qkv_proj.quant_type == "exl3" and
             self.z_proj is not None and self.z_proj.quant_type == "exl3" and

@@ -628,6 +628,19 @@ def _qsa_module_eligible(m):
 
 def _module_eligible(m):
     """Module-level requirements shared by the global-attention and SWA builders."""
+    # sm_70: the bc fused path runs exl3_gemm_gr under graph capture;
+    # K > 4 layers need the reconstruct+hgemm fallback, which is not
+    # graph-capturable. Decline the bc path on cc < 8 with K > 4.
+    try:
+        import exllamav3_ext as _ext
+        _dev = str(m.device)
+        _idx = int(_dev.split(':')[-1]) if ':' in _dev else 0
+        if _ext.g_get_cc_raw(_idx) < 8:
+            for _p in (m.q_proj, m.k_proj, m.v_proj, m.o_proj):
+                if _p is not None and getattr(_p.inner, 'K', 0) > 4:
+                    return False
+    except Exception:
+        pass
     return (
         bc_attn_enable and
         _qsa_module_eligible(m) and
