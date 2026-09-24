@@ -304,8 +304,10 @@ void quantize_row_avx2(const float* dst, int32_t* splat, int32_t* splat_dup,
     _mm256_store_ps(mx, vmax);
     float amax = 0.0f;
     for (int i = 0; i < 8; ++i) amax = std::max(amax, mx[i]);
-    const float q = amax > 0.0f ? amax / 127.0f : 1.0f;
-    const __m256 rq = _mm256_set1_ps(1.0f / q);
+    // Explicit scale / reciprocal order: the reassociation GCC emits under -Ofast, spelled
+    // out so other builds quantize identically at the rounding boundaries
+    const float q = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
+    const __m256 rq = _mm256_set1_ps(amax > 0.0f ? 127.0f / amax : 1.0f);
     const __m256i lo = _mm256_set1_epi32(-127), hi = _mm256_set1_epi32(127);
     const __m256i rep = _mm256_set1_epi32(0x01010101);
     const __m256i mask8 = _mm256_set1_epi32(0xff);
@@ -982,12 +984,14 @@ inline __m512i shift_mask_row(__m512i g)
             _mm512_srli_epi32(g, s0), _mm512_srli_epi32(g, s1)), _mm512_set1_epi32(0xffff));
 }
 
-template <int bits, int rows, int band, int P>
+// stride: the accumulator array's inner extent (MAX_M for the batched bands, rows for the
+// one-row decode band, which keeps its accumulators in registers)
+template <int bits, int rows, int band, int P, int stride>
 M1_TARGET_VBMI
 inline void vbmi_band_rows
 (
     __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat, int k,
-    __m512i (&acc)[band][MAX_M]
+    __m512i (&acc)[band][stride]
 )
 {
     if constexpr (P < 8)
@@ -1094,6 +1098,83 @@ void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
         }
 }
 
+// One-row decode specialization. Keep the band loop explicitly unrolled here rather
+// than forcing unrolling for batched shapes.
+template <int bits, int rows, int band>
+M1_TARGET_VBMI
+void vbmi_decode_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
+{
+    const int tiles_k = mat.k / 16;
+    const int tiles_n = mat.n / 16;
+    constexpr int packed_size = 16 * bits;
+    constexpr int words32 = bits * 256 / 32;
+    // Same MSVC-safe form as vnni_band (C3493: no constexpr locals read inside the lambda)
+    constexpr auto ld_mask = [](int n) -> __mmask16
+    {
+        return n >= 16 ? 0xffffu : (n <= 0 ? 0x0000u : static_cast<__mmask16>((1u << n) - 1u));
+    };
+    constexpr __mmask16 mask0 = ld_mask(words32 - 0);
+    constexpr __mmask16 mask1 = ld_mask(words32 - 16);
+    constexpr __mmask16 mask2 = ld_mask(words32 - 32);
+    constexpr __mmask16 mask3 = ld_mask(words32 - 48);
+
+    __m512i acc[band][rows];
+    for (int b = 0; b < band; ++b)
+        for (int i = 0; i < rows; ++i)
+            acc[b][i] = _mm512_setzero_si512();
+
+    const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
+    const size_t pf_step = mat.swz ? static_cast<size_t>(8) * packed_size : row_stride;
+    const uint16_t* packed_row = mat.trellis + static_cast<size_t>(n0) * packed_size;
+    for (int tile_k = 0; tile_k < tiles_k; ++tile_k, packed_row += row_stride)
+    {
+        const int32_t* splat = in.splat32 + tile_k * 16;
+#ifdef __GNUC__
+        #pragma GCC unroll 8
+#endif
+        for (int b = 0; b < band; ++b)
+        {
+            const uint16_t* packed = mat.swz
+                ? mat.trellis + (static_cast<size_t>(n0 / 8) * tiles_k * 8
+                                 + static_cast<size_t>(tile_k) * 8 + (n0 % 8) + b) * packed_size
+                : packed_row + b * packed_size;
+            if (mat.swz && band == 8)
+            {
+                // Whole-group band on the swizzled layout: the k-stream is sequential, one line
+                // one step ahead is enough and the HW prefetcher follows the ru
+                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+            }
+            else
+            {
+                // Strided stream: the native layout (K8, or VNNI-only CPUs where nothing is
+                // swizzled) strides row_stride per step, and a partial-group band on the
+                // swizzled layout (rows 3-4 at band 4) reads half a group then skips half; both
+                // outrun the HW prefetcher, so touch every line of the tile row a few steps
+                // ahead, as the AVX2 tier does (PR #331).
+                constexpr int pf_lines = (packed_size * 2 + 63) / 64;
+                constexpr int pf_dist = (bits == 6) ? 2 : 4;
+                const char* pf = reinterpret_cast<const char*>(packed + pf_step * pf_dist);
+                for (int l = 0; l < pf_lines; ++l)
+                    _mm_prefetch(pf + l * 64, _MM_HINT_T0);
+            }
+            const uint32_t* pw = reinterpret_cast<const uint32_t*>(packed);
+            const __m512i p0 = _mm512_maskz_loadu_epi32(mask0, pw);
+            const __m512i p1 = _mm512_maskz_loadu_epi32(mask1, pw + 16);
+            const __m512i p2 = mask2 ? _mm512_maskz_loadu_epi32(mask2, pw + 32) : _mm512_setzero_si512();
+            const __m512i p3 = mask3 ? _mm512_maskz_loadu_epi32(mask3, pw + 48) : _mm512_setzero_si512();
+            vbmi_band_rows<bits, rows, band, 0>(p0, p1, p2, p3, b, splat, mat.k, acc);
+        }
+    }
+    for (int b = 0; b < band; ++b)
+        for (int i = 0; i < rows; ++i)
+        {
+            const float scale = mul1_k_inv() * in.q[i];
+            const __m512 corr = _mm512_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
+            const __m512 out = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[b][i]), _mm512_set1_ps(scale), corr);
+            _mm512_storeu_ps(tout + static_cast<size_t>(i) * mat.n + (n0 + b) * 16, out);
+        }
+}
+
 template <int bits, int rows>
 M1_TARGET_VBMI
 void vbmi_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
@@ -1112,6 +1193,15 @@ void vbmi_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
     while (n0 < tn1)
     {
         const int band = std::min(tn1 - n0, max_band);
+        if constexpr (rows == 1)
+        {
+            if (band == 8)
+            {
+                vbmi_decode_band<bits, rows, 8>(mat, in, tout, n0);
+                n0 += band;
+                continue;
+            }
+        }
         switch (band)
         {
             case 1: vbmi_band<bits, rows, 1>(mat, in, tout, n0); break;
@@ -1790,6 +1880,16 @@ struct Pool
         pin_self(0);   // worker 0 is the calling thread itself, never goes through worker_loop
     }
 
+    // A zero-participant generation wakes parked helpers without a completion barrier or
+    // touching fn/ctx. Helpers may safely skip it if real work is published first.
+    void prime()
+    {
+        dispatch.store((++generation << DISPATCH_NW_BITS), std::memory_order_release);
+#ifndef __linux__
+        WakeByAddressAll(&dispatch);
+#endif
+    }
+
     // Run fn on workers 0..n-1; returns when all are done (implicit barrier). n_req > 0
     // caps the worker count for this run: small jobs (one or two experts) saturate RAM
     // bandwidth on a fraction of the pool, and every surplus worker is another straggler
@@ -2079,6 +2179,34 @@ void forward_phase(void* vctx, int worker, int num_workers)
 
         case 4:
         {
+            // Single-token decode: each worker owns complete 128-column Hadamard blocks
+            // and accumulates them directly. No other worker touches those output columns,
+            // so phase 5 and its barrier are unnecessary. Keep the batched path below.
+            if (c.m_total == 1)
+            {
+                const int b0 = (H / 128) * worker / num_workers;
+                const int b1 = (H / 128) * (worker + 1) / num_workers;
+                for (int j = 0; j < nc; ++j)
+                {
+                    const Chunk& ch = c.chunks[j];
+                    const MoeCpuMatrix& mat = L.downs[ch.expert];
+                    // Normally m == 1 here; retain repeated selections of the same expert
+                    // too, which the raw API groups into a multi-row chunk.
+                    for (int r = 0; r < ch.m; ++r)
+                        for (int block = b0 * 128; block < b1 * 128; block += 128)
+                        {
+                            float* v = c.tout_d + static_cast<size_t>(j) * MAX_M * H + r * H + block;
+                            MoeCpuMatrix part = mat;
+                            part.n = 128;
+                            part.svh += block;
+                            if (part.bias) part.bias += block;
+                            transform_out(part, v, 1);
+                            for (int col = 0; col < 128; ++col)
+                                c.out[block + col] += ch.weight[r] * v[col];
+                        }
+                }
+                break;
+            }
             // Down output transform (per chunk), then weighted accumulate into out, partitioned
             // over hidden columns so overlapping token rows are race-free
             for (int j = worker; j < nc; j += num_workers) {
@@ -2298,6 +2426,16 @@ static const MoeCpuLayer* get_layer(int64_t handle)
     return g_layers[handle];
 }
 
+// Prime from the handoff worker before its GPU payload is ready.
+void exl3_moe_cpu_pool_prime(int threads)
+{
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    threads = std::max(1, threads);
+    if (g_pool.spawned < threads - 1 || g_pool.num_workers != threads)
+        g_pool.ensure(threads);
+    g_pool.prime();
+}
+
 // Exported pool self-test (helpers above live in the anonymous namespace of this TU)
 int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin)
 {
@@ -2312,6 +2450,7 @@ int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin)
         const int n = (n_req > 0 && n_req < threads) ? n_req : threads;
         for (auto& r : runs) r.store(0, std::memory_order_relaxed);
         PoolStressCtx c{runs.data(), &active, spin};
+        g_pool.prime();
         g_pool.run(&pool_stress_fn, &c, n_req);
         if (active.load(std::memory_order_acquire) != 0) ++anomalies;          // returned early
         for (int i = 0; i < threads; ++i)
@@ -2425,7 +2564,8 @@ void exl3_moe_cpu_forward_raw(
     static double phase_us[6] = {};
     static long prof_jobs = 0;
 
-    for (int phase = 0; phase <= 5; ++phase) {
+    const int num_phases = rows == 1 ? 5 : 6;
+    for (int phase = 0; phase < num_phases; ++phase) {
         ctx.phase = phase;
         if (prof)
         {
@@ -2441,7 +2581,7 @@ void exl3_moe_cpu_forward_raw(
     if (prof && ++prof_jobs % 512 == 0)
     {
         printf(" -- moe_cpu prof (%ld jobs, us/job): prep_gu %.1f | gemv_gu %.1f | act+prep_d %.1f"
-               " | gemv_d %.1f | tf_d %.1f | accum %.1f\n",
+               " | gemv_d %.1f | tf_d/finish %.1f | accum %.1f\n",
                prof_jobs, phase_us[0] / prof_jobs, phase_us[1] / prof_jobs, phase_us[2] / prof_jobs,
                phase_us[3] / prof_jobs, phase_us[4] / prof_jobs, phase_us[5] / prof_jobs);
         fflush(stdout);

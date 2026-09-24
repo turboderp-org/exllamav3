@@ -1043,7 +1043,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
 
         if self.cpu_offload:
-            final_hidden_states = self.cpu_offload_forward(eshape, y, selected_experts, routing_weights, params)
+            final_hidden_states, cpu_pending = self.cpu_offload_issue(
+                eshape, y, selected_experts, routing_weights, params)
 
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
@@ -1321,9 +1322,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
             bc_sh_exp = self.bc_sh_exp
 
-        # Independent shared-expert work can cover the CPU tail before collect enqueues
-        # its stream wait. Fused shared experts have already run inside the routed path.
-        # Keep prefill scheduling and the order of post norms / TP collectives unchanged.
+        # Independent shared-expert work can cover the CPU job (split tail or whole layer)
+        # before collect enqueues its stream wait. Fused shared experts have already run
+        # inside the routed path. Keep prefill scheduling and the order of post norms / TP
+        # collectives unchanged.
         shared_hidden_states = None
         if cpu_pending is not None and bsz <= MAX_BSZN and self.shared_experts and not bc_sh_exp:
             shared_hidden_states = self.shared_experts.forward(x, params)

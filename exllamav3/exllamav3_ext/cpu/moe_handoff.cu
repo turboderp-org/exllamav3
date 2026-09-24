@@ -272,6 +272,9 @@ void exl3_moe_cpu_worker_run
     long hp_jobs = 0, hp_empty = 0, hp_assign = 0, hp_rows = 0;
     auto hp_prev_end = std::chrono::steady_clock::now();
 
+    const char* prime_env = getenv("EXL3_MOE_POOL_PRIME");
+    const bool prime_pool = !prime_env || prime_env[0] != '0';
+    if (prime_pool) exl3_moe_cpu_pool_prime((int) threads);
     store_release_u32(ready, 1);
 
     uint32_t head = load_acquire_u32(jobs_head);
@@ -282,7 +285,12 @@ void exl3_moe_cpu_worker_run
         if (load_acquire_u32(quit)) break;
 
         const uint32_t wake = load_acquire_u32(pass_wake);
-        if (wake != last_wake) { last_wake = wake; idle = 0; }
+        if (wake != last_wake)
+        {
+            last_wake = wake;
+            idle = 0;
+            if (prime_pool) exl3_moe_cpu_pool_prime((int) threads);
+        }
 
         if (load_acquire_u32(jobs_tail) == head)
         {
