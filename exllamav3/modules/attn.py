@@ -167,6 +167,7 @@ class Attention(Module):
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
+        window_right: int = 0,
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
@@ -204,6 +205,8 @@ class Attention(Module):
         self.register_submodule(qsa_indexer)
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
+        # Keys ahead of the query a windowed row may attend to; 0 = the usual past-only window
+        self.window_right = window_right
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
         self.use_cu_seqlens = use_cu_seqlens
@@ -913,6 +916,7 @@ class Attention(Module):
                 causal = causal,
                 sm_scale = self.sm_scale,
                 window_size = self.sliding_window,
+                window_right = self.window_right,
                 softcap = self.logit_softcapping,
                 sinks = self.sinks,
                 dispatch_cache = self.dispatch_cache,
@@ -1158,6 +1162,7 @@ class Attention(Module):
                 causal = causal,
                 sm_scale = self.sm_scale,
                 window_size = self.sliding_window,
+                window_right = self.window_right,
                 softcap = self.logit_softcapping,
                 non_causal_spans = non_causal_spans,
                 sinks = self.sinks,
@@ -1257,6 +1262,7 @@ class Attention(Module):
                 "sm_scale": self.sm_scale,
                 "out_dtype": self.out_dtype,
                 "sliding_window": self.sliding_window,
+                "window_right": self.window_right,
                 "logit_softcapping": self.logit_softcapping,
                 "tp_split_norm": self.tp_split_norm,
                 "use_k_as_v": self.use_k_as_v,

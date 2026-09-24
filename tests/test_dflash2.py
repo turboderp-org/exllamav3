@@ -25,18 +25,20 @@ def test_prepare_inputs_sets_anchor_and_uses_dflash_attention_setup():
     import exllamav3.architecture.dflash2 as arch
     model = object.__new__(DFlash2Model)
     input_ids = torch.tensor([[42]])
-    params = {}
     prepared = object()
 
-    # Same setup as the DFlash v1 drafter: bidirectional block (causal = False) through the
-    # standard attention input preparation, plus the anchor ids for the selector walk
-    with patch.object(arch, "prepare_for_attn", return_value = prepared) as prepare:
-        actual = DFlash2Model.prepare_inputs(model, input_ids, params)
-
-    assert actual is prepared
-    assert params["dflash2_anchor_ids"] is input_ids
-    assert params["causal"] is False
-    prepare.assert_called_once_with(input_ids, params)
+    # Same setup as the DFlash v1 drafter: the kernel-level causal flag follows the checkpoint's
+    # is_causal (windowed layers carry their own bounds), through the standard attention input
+    # preparation, plus the anchor ids for the selector walk
+    for is_causal, expected in ((None, False), (False, False), (True, True)):
+        model.config = SimpleNamespace(is_causal = is_causal)
+        params = {}
+        with patch.object(arch, "prepare_for_attn", return_value = prepared) as prepare:
+            actual = DFlash2Model.prepare_inputs(model, input_ids, params)
+        assert actual is prepared
+        assert params["dflash2_anchor_ids"] is input_ids
+        assert params["causal"] is expected
+        prepare.assert_called_once_with(input_ids, params)
 
 
 def test_input_embedding_scale_is_applied():

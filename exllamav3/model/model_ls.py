@@ -279,6 +279,8 @@ class Model_LSMixin(ABC):
                             "HIP out of memory" in str(e):
                             # Exception object will hold references to tensors so we can't free them here
                             fail = True
+                            if verbose:
+                                print(f" -- autosplit: {module.key} does not fit on {load_device}: {str(e).splitlines()[0][:200]}")
                         else:
                             raise
 

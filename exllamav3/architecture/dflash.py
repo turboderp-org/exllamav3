@@ -57,6 +57,9 @@ class DFlashConfig(Config):
         # self.num_target_layers = self.read_cfg(int, "num_target_layers", no_default)
         self.layer_types = self.read_cfg(list, "layer_types", ["full_attention"] * self.num_hidden_layers)
         self.sliding_window = self.read_cfg(int, "sliding_window", 2048)
+        # Block attention direction, as the reference draft reads it: "is_causal" in the checkpoint
+        # config overrides the default of causal on sliding-window layers, bidirectional elsewhere
+        self.is_causal = self.read_cfg(bool, ["is_causal", "dflash_config->is_causal"], None)
 
         # DFlash. Config keys live under dflash_config-> in the original release, at the top
         # level in later ones (MuseGlimmerAssistant)
@@ -77,6 +80,18 @@ class DFlashConfig(Config):
 
         # Vision placeholders
         self.vision = None
+
+
+    def block_window(self, idx: int) -> tuple[int, int]:
+        """
+        (sliding_window, window_right) for draft layer idx. The reference masks q - k < sw,
+        i.e. self plus sw - 1 past keys; a layer that is not causal within the draft block sees
+        the same span ahead of the query
+        """
+        if self.layer_types[idx] != "sliding_attention":
+            return -1, 0
+        causal = True if self.is_causal is None else self.is_causal
+        return self.sliding_window - 1, 0 if causal else self.sliding_window - 1
 
 
 def dflash_update_kv_from_target(
@@ -184,7 +199,7 @@ class DFlashModel(Model):
         self.attn_modules = []
 
         for idx in range(config.num_hidden_layers):
-            is_swa = config.layer_types[idx] == "sliding_attention"
+            window_left, window_right = config.block_window(idx)
 
             attn = Attention(
                 config = config,
@@ -200,7 +215,8 @@ class DFlashModel(Model):
                 key_v = "v_proj",
                 key_o = "o_proj",
                 qmap = "block.attn",
-                sliding_window = config.sliding_window if is_swa else -1,
+                sliding_window = window_left,
+                window_right = window_right,
                 q_norm = RMSNorm(
                     config = config,
                     key = f"layers.{idx}.self_attn.q_norm",
@@ -324,9 +340,9 @@ class DFlashModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
-        # The draft block attends to itself bidirectionally; causality on the sliding-window
-        # layers is expressed through their window (left sw, right 0) instead
-        params["causal"] = False
+        # Block attention direction per the checkpoint (DFlashConfig.block_window): the kernel
+        # flag is only needed when every layer is causal; windowed layers carry their own bounds
+        params["causal"] = self.config.is_causal is True
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 
