@@ -5,8 +5,8 @@ bool is_avx2_supported()
     static bool avx2_check = false;
     static bool avx2_supported = false;
     if (avx2_check) return avx2_supported;
-    #if defined(__linux__) && !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))  // EXL3_AARCH64_STUB
-        (void)0;  // non-x86 Linux: no AVX
+    #if !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+        // no AVX on this architecture
     #elif defined(__linux__)
         avx2_supported = __builtin_cpu_supports("avx2");
     #else
@@ -24,8 +24,8 @@ bool is_f16c_supported()
     static bool f16c_check = false;
     static bool f16c_supported = false;
     if (f16c_check) return f16c_supported;
-    #if defined(__linux__) && !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))  // EXL3_AARCH64_STUB
-        (void)0;  // non-x86 Linux: no AVX
+    #if !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+        // no AVX on this architecture
     #elif defined(__linux__)
         f16c_supported = __builtin_cpu_supports("f16c");
     #else

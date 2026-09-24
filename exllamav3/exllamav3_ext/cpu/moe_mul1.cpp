@@ -2635,6 +2635,7 @@ void exl3_moe_cpu_forward
 #include <torch/extension.h>
 #define NO_MOE_CPU() TORCH_CHECK(false, "CPU MoE offload (moe_mul1) is not available on this CPU architecture (x86 AVX2/AVX-512 only)")
 void exl3_moe_cpu_set_prof(bool) {}
+void exl3_moe_cpu_pool_prime(int) {}
 int64_t exl3_moe_cpu_pool_stress(int, int, int, int) { NO_MOE_CPU(); return 0; }
 void exl3_moe_cpu_stage_experts(int64_t, const uint32_t*, int, uint8_t*, int) { NO_MOE_CPU(); }
 bool exl3_moe_cpu_has_avx2() { return false; }
