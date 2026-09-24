@@ -6,7 +6,9 @@ bool is_avx512_supported()
     static bool avx512_supported = false;
     if (avx512_check) return avx512_supported;
 
-#ifdef __linux__
+#if defined(__linux__) && !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))  // EXL3_AARCH64_STUB
+        (void)0;  // non-x86 Linux: no AVX
+    #elif defined(__linux__)
     // Check for AVX-512F and AVX-512BW support
     avx512_supported = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw");
 #else

@@ -149,7 +149,9 @@ namespace {
 
 inline void cpu_pause_()
 {
-#ifdef __linux__
+#if defined(__aarch64__) || defined(__arm__)  // EXL3_AARCH64_PAUSE
+    asm volatile("yield" ::: "memory");
+#elif defined(__linux__)
     __builtin_ia32_pause();
 #else
     _mm_pause();
