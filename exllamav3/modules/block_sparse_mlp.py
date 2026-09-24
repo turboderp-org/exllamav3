@@ -877,16 +877,31 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         batched = recon.worst_case_bytes(assignments, slot_mode = FUSED_DET) if recon is not None else 0
         return fixed, max(per_expert, batched)
 
+    def autosplit_prepare(self, params):
+        """Autosplit loader hook, before the measuring window: the worst-case computation below
+        creates the CPU-offload host's per-device stream state and this layer's tier tables as
+        a side effect, so running it here makes them resident memory rather than transient"""
+        if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
+            return
+        rows = (params.get("batch_shape") or (1, 0))[1]
+        if rows and self.device is not None and self.device.type == "cuda":
+            self._autosplit_worst_case(rows)
+
     def autosplit_extra_measure(self, params):
         """Autosplit loader hook: allocate (and drop) the worst-case prefill transient so the
-        device keeps headroom for it. The CPU-offload host's per-device stream state and this
-        layer's tier statics are allocated for real here: the measuring forward skips the CPU
-        path, and they would otherwise appear unaccounted on the first real prefill"""
+        device keeps headroom for it (the measuring forward skips the CPU path)"""
         if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
             return
         rows = getattr(self, "_measure_rows", 0)
         if not rows or self.device is None or self.device.type != "cuda":
             return
+        total = self._autosplit_worst_case(rows)
+        if total > 0:
+            t = torch.empty((total,), dtype = torch.uint8, device = self.device)
+            del t
+
+    def _autosplit_worst_case(self, rows: int) -> int:
+        """Upper bound on this layer's prefill transient for a `rows`-token chunk, in bytes"""
         A = rows * self.num_experts_per_tok
         host = getattr(self, "cpu_host", None)
         if host is not None and getattr(self, "cpu_layer_idx", None) is not None:
@@ -900,9 +915,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 total = max(total, gf + cf + max(gv, cv))
         else:
             total = sum(self.prefill_worst_case_parts(rows, A))
-        if total > 0:
-            t = torch.empty((total,), dtype = torch.uint8, device = self.device)
-            del t
+        return total
 
     def _run_batch_recon(self, recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
                          scratch = None, tables = None):

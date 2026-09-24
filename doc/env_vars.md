@@ -646,6 +646,16 @@ these modules allocate and drop an upper bound of those transients inside the me
 (`autosplit_extra_measure`), so the split leaves room for them. `0` restores the plain
 measured forward.
 
+### `EXL3_AUTOSPLIT_PREPARE` (default: `1`)
+
+Before measuring a module's transient memory, the autosplit loader lets the module allocate
+the state it would otherwise create lazily inside the measuring forward and keep for good
+(CPU-offload host buffers, batched-reconstruct tables, decode graph slot statics). Measured
+inside the window, that state would be budgeted twice: as resident memory and again as
+transient headroom. Set to `0` to skip the preparation step, for comparison. With verbose
+loading, the loader prints a notice for any module that still leaves more than a small amount
+resident during its measuring forward.
+
 ### `EXL3_AUTOSPLIT_MARGIN_MB` (default: `256`)
 
 The layer-split loader closes a device when its remaining headroom no longer covers the largest

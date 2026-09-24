@@ -1087,31 +1087,30 @@ class MLAttention(Module):
         )
 
 
-    def autosplit_extra_measure(self, params):
-        """
-        The (1, chunk)-at-context-0 pass this follows is NOT this module's memory worst case:
-        sparse DSA replaces the MHA prefill with a different transient set once the context
-        exceeds index_topk, and the BC decode slots allocate their statics only when a decode
-        shape first occurs.
-
-        Both are exercised here so an OoM lands where the loader advances to the next
-        device, rather than after deployment. Outputs are discarded; only allocation shapes
-        matter. The BC slots are configured but never run, so nothing is graph-captured at
-        load time and the end-of-load tensor-cache drop leaves no baked pointers behind.
-        """
+    def _autosplit_layer(self, params):
+        """The cache layer the autosplit hooks act on, with its quantization flag and the
+        chunk length, or None when the module has nothing to prepare or measure"""
 
         if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
-            return
+            return None
         cache = params.get("cache")
         if cache is None or self.device is None:
-            return
+            return None
         from ..cache import CacheLayer_MLA_quant, CacheLayer_MLA_fp16
         layer = cache if not hasattr(cache, "layers") else \
             cache.layers[self.layer_idx, params.get("layer_instance") or 0]
         quant = isinstance(layer, CacheLayer_MLA_quant)
         if not quant and not isinstance(layer, CacheLayer_MLA_fp16):
+            return None
+        return layer, quant, params["batch_shape"][1]
+
+    def autosplit_prepare(self, params):
+        """Decode slot statics for the whole (bsz, q_len) family, allocated before the loader's
+        measuring window (they stay resident; nothing is graph-captured at load time)"""
+        found = self._autosplit_layer(params)
+        if found is None:
             return
-        chunk = params["batch_shape"][1]
+        layer, quant, chunk = found
 
         # Decode statics: every buffer the (bsz <= MAX_BSZ, q_len <= 16) slot family can
         # request, both regimes. Backings are bucketed and shared across slots and layers,
@@ -1128,6 +1127,15 @@ class MLAttention(Module):
                 for rg in regimes:
                     bcm._configure(b, q, rg)
 
+
+    def autosplit_extra_measure(self, params):
+        """Sparse DSA prefill at maximum context, which the (1, chunk)-at-context-0 measuring
+        forward does not reach: exercised here so an OoM lands where the loader advances to
+        the next device rather than after deployment. Outputs are discarded"""
+        found = self._autosplit_layer(params)
+        if found is None:
+            return
+        layer, quant, chunk = found
         # Sparse prefill at maximum context. Synthetic state: every block-table entry aliases
         # page 0, zeroed so the math stays finite
         if self.indexer_mode is None:
