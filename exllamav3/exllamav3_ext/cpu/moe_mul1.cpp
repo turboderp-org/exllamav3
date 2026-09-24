@@ -797,7 +797,7 @@ void bw_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
             acc[b][i] = _mm512_setzero_si512();
 
     // Layout and prefetch handling as in vnni_band (see the comments there); the host hands
-    // this tier the swizzled layout too (moe_cpu_host gates it on has_avx512_bw)
+    // this tier the swizzled layout too (exl3_moe_cpu_swizzle_group, group 8)
     const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
     const size_t pf_step = mat.swz ? static_cast<size_t>(8) * packed_size : row_stride;
     const uint16_t* packed_row = mat.trellis + static_cast<size_t>(n0) * packed_size;
@@ -1303,8 +1303,9 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
     const int32_t* splat_dup = in.splat_dup;
 
     // The k-major stream strides row_stride (>= 8 KB) per step, beyond what the HW prefetcher
-    // tracks (and the swizzled layout the VNNI path uses is not applied for AVX2). Cold-stack
-    // (offloaded expert) microbench: +20..70% at K>=4, largest at K8, warm-neutral, so always
+    // tracks (this kernel reads the native layout; the swizzled AVX2 matrices go to
+    // avx2_swz_tiles). Cold-stack (offloaded expert) microbench: +20..70% at K>=4, largest
+    // at K8, warm-neutral, so always
     // on. Distance 4 measured best cold (>= 2 everywhere within noise, 4 adds another +10..35%
     // at K5-K8 cold); prefetching past the allocation end is architecturally safe.
     constexpr int pf_lines = (32 * bits + 63) / 64;   // cache lines per tile row
@@ -1347,6 +1348,80 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
             float* out = tout + static_cast<size_t>(i) * mat.n + tile_n * 16;
             _mm256_storeu_ps(out, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][0]), _mm256_set1_ps(scale), corr));
             _mm256_storeu_ps(out + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][1]), _mm256_set1_ps(scale), corr));
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+//   AVX2 group-2 swizzled banded kernel
+// -------------------------------------------------------------------------------------------
+
+// The AVX2 analogue of the AVX-512 band kernels: two adjacent n-tiles per k-step, accumulated
+// in separate acc pairs with the production per-tile body (avx2_rows_accum) reused verbatim,
+// so output is bit-identical to avx2_tiles. On the group-2 swizzle layout (tile (kt, nt) at
+// (nt/2, kt, nt%2), the layout group exl3_moe_cpu_swizzle_group returns for this tier) the
+// pair's k-stream is one sequential run: no software prefetch at all -- the HW stride
+// prefetcher covers a 64-512 B stride trivially, and the run collapses the native layout's
+// row_stride-sized k-step stride (tens of KB, one new page per step) to one page per 8-16
+// steps. Group 2 is the maximum AVX2 can band: 2 tiles x 2 ymm accumulators + the tile
+// registers fit 16 ymm at m=1..4; group 8 (the AVX-512 tiers' layout) cannot (the identical
+// restructure spills -- cf. the word-pairing gate above).
+//
+// Measured (5950X, the AVX2 shipping tier; cold = weights >> L3, k=2944 n=32768, medians of
+// 3 interleaved sweeps, vs production avx2_tiles): 1T cold m1 K1 +29% K2 +204% K5 +14%
+// K6 +6% K8 +26%; MT cold T=16 (aggregate) m1 K2 +95% K8 +34% K5 +12% K6 +9%; warm neutral.
+// K3/K4/K7 stay native: the band-2 body costs 30-64% warm at 1T there (gather temporaries +
+// 4 accumulators over budget -> spills, visible when nothing else bottlenecks; the same
+// restructure on the native layout loses identically, i.e. it is the kernel, not the layout),
+// and K3 gains nothing cold. A prefetch distance of 1 pair-step is within noise either way
+// on Zen 3 and cost ~6% at K2 there; pf0 ships (a Zen 5 laptop preferred pf1 at K2/K6 --
+// revisit only if a machine shows a cold gap attributable to prefetch).
+//
+// tn0/tn1 are always even: assign_gemvs splits in 8-tile groups, which is also 2-tile aligned
+// (the group-2 requirement); tiles_n is a multiple of 8 (n % 128 == 0).
+template <int bits>
+M1_TARGET_AVX2
+void avx2_swz_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+{
+    const int tiles_k = mat.k / 16;
+    constexpr int packed_size = 16 * bits;
+    const __m256i mult = _mm256_set1_epi32(static_cast<int32_t>(MUL1_MULT));
+    const __m256i ones32 = _mm256_set1_epi32(0x01010101);
+    const int32_t* splat_dup = in.splat_dup;
+    const size_t step = static_cast<size_t>(2) * packed_size;
+
+    for (int pair = tn0; pair < tn1; pair += 2)
+    {
+        __m256i accA[MAX_M][2], accB[MAX_M][2];
+        for (int i = 0; i < m; ++i)
+        {
+            accA[i][0] = _mm256_setzero_si256(); accA[i][1] = _mm256_setzero_si256();
+            accB[i][0] = _mm256_setzero_si256(); accB[i][1] = _mm256_setzero_si256();
+        }
+        const uint16_t* pA = mat.trellis
+            + static_cast<size_t>(pair >> 1) * tiles_k * 2 * packed_size;
+        const uint16_t* pB = pA + packed_size;
+        for (int tile_k = 0; tile_k < tiles_k; ++tile_k, pA += step, pB += step)
+        {
+            const int32_t* dup = splat_dup + tile_k * 16;
+            __m256i preg[bits];
+            for (int i = 0; i < bits; ++i)
+                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pA + i * 16));
+            avx2_rows_accum<bits>(preg, dup, mat.k, m, accA, mult, ones32);
+            for (int i = 0; i < bits; ++i)
+                preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pB + i * 16));
+            avx2_rows_accum<bits>(preg, dup, mat.k, m, accB, mult, ones32);
+        }
+        for (int i = 0; i < m; ++i)
+        {
+            const float scale = mul1_k_inv() * in.q[i];
+            const __m256 corr = _mm256_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
+            float* outA = tout + static_cast<size_t>(i) * mat.n + pair * 16;
+            float* outB = outA + 16;
+            _mm256_storeu_ps(outA, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accA[i][0]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outA + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accA[i][1]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outB, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accB[i][0]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(outB + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(accB[i][1]), _mm256_set1_ps(scale), corr));
         }
     }
 }
@@ -1586,6 +1661,20 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
         }
         case Isa::Avx2:
         {
+            // Swizzled matrices (group exl3_moe_cpu_swizzle_group picked for this tier and
+            // bits: {1,2,5,6,8}) run the band-2 kernel; the loader repacks exactly those
+            // tensors, so swz and bits cannot disagree here
+            if (mat.swz)
+            {
+                switch (mat.bits)
+                {
+                    case 1: avx2_swz_tiles<1>(mat, in, tout, m, tn0, tn1); return;
+                    case 2: avx2_swz_tiles<2>(mat, in, tout, m, tn0, tn1); return;
+                    case 5: avx2_swz_tiles<5>(mat, in, tout, m, tn0, tn1); return;
+                    case 6: avx2_swz_tiles<6>(mat, in, tout, m, tn0, tn1); return;
+                    default: avx2_swz_tiles<8>(mat, in, tout, m, tn0, tn1); return;
+                }
+            }
             switch (mat.bits)
             {
                 case 1: avx2_tiles<1>(mat, in, tout, m, tn0, tn1); return;
@@ -1941,7 +2030,8 @@ void transform_out(const MoeCpuMatrix& mat, float* tout, int m)
 // Assign this worker its share of a phase's `total` GEMVs (all of one width, tiles_n tiles),
 // calling gemv(j, t0, t1) per tile range. Few GEMVs (decode, small batches; each expert read
 // once): the GEMVs' tiles form one flat range, split evenly across workers in 8-tile groups so
-// no piece crosses a group of its GEMV (the swizzled band kernels' invariant; n % 128 == 0
+// no piece crosses a group of its GEMV (the swizzled band kernels' invariant -- 8-tile groups
+// are also 2-tile aligned, covering the AVX2 group-2 layout; n % 128 == 0
 // makes every tiles_n a multiple of 8). Whole-GEMV assignment left a 2:1 imbalance whenever
 // 2 * cold experts fell between multiples of the worker count (16 gate/up GEMVs on 20 workers:
 // twelve single-worker GEMVs set the phase time while eight workers idled half of it). Many
@@ -2194,6 +2284,20 @@ bool exl3_moe_cpu_has_avx512_bw() { return g_isa >= Isa::Bw; }
 bool exl3_moe_cpu_has_avx512_vnni() { return g_isa >= Isa::Vnni; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }
 
+// Swizzle layout group for one trellis tensor under the current tier: 0 = native tile order,
+// 8 = band-8 (AVX-512 banded kernels; K8 exempt -- the dword kernel gains nothing), 2 = band-2
+// (AVX2 avx2_swz_tiles; only the bitrates where it measures >= native: {1,2,5,6,8}, see the
+// kernel comment and bench/swz_findings.md). The child loader repacks each tensor with the
+// group this returns and the kernels dispatch on it -- the ONLY place the per-tier/per-bits
+// rule lives, so loader and kernels cannot drift.
+int exl3_moe_cpu_swizzle_group(int64_t bits)
+{
+    if (g_isa >= Isa::Bw) return bits != 8 ? 8 : 0;
+    if (g_isa == Isa::Avx2)
+        return bits == 1 || bits == 2 || bits == 5 || bits == 6 || bits == 8 ? 2 : 0;
+    return 0;
+}
+
 static MoeCpuMatrix make_matrix
 (
     const at::Tensor& trellis,
@@ -2213,10 +2317,10 @@ static MoeCpuMatrix make_matrix
     m.k = static_cast<int>(trellis.size(0)) * 16;
     m.n = static_cast<int>(trellis.size(1)) * 16;
     m.bits = static_cast<int>(trellis.size(2)) / 16;
-    // K8 tensors are exempt from swizzling (routed to the dword kernel, which would gain
-    // nothing) -- the child loader applies the same bits != 8 rule when repacking, so the two
-    // sides agree per tensor
-    m.swz = swizzled && m.bits != 8 ? 1 : 0;
+    // The caller repacks each tensor with the group from exl3_moe_cpu_swizzle_group (band-8
+    // on the AVX-512 tiers minus K8, band-2 on AVX2 for bits {1,2,5,6,8}); apply the same
+    // rule here so the flag matches the bytes per tensor
+    m.swz = swizzled && exl3_moe_cpu_swizzle_group(m.bits) ? 1 : 0;
     TORCH_CHECK(m.bits >= 1 && m.bits <= 8, "CPU MoE requires K in [1, 8]");
     TORCH_CHECK(m.k % 128 == 0 && m.n % 128 == 0, "dims must be divisible by 128");
     TORCH_CHECK(m.k <= 8192, "k too large for i32 accumulation");

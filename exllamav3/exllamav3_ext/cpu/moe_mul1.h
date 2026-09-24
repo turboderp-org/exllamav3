@@ -23,8 +23,10 @@ struct MoeCpuMatrix
     int k;
     int n;
     int bits;
-    // Band-contiguous ("swizzled") trellis layout: tile (kt, nt) stored at group nt/8, then
-    // kt, then member nt%8, so each 8-tile output band reads as one sequential k-stream
+    // Band-contiguous ("swizzled") trellis layout: tile (kt, nt) stored at group nt/g, then
+    // kt, then member nt%g, so each banded kernel's tile group reads as one sequential
+    // k-stream. Group g is tier-specific (8 for the AVX-512 band kernels, 2 for the AVX2
+    // band-2 kernel) and per-matrix gating lives in exl3_moe_cpu_swizzle_group.
     int swz = 0;
 };
 
@@ -59,7 +61,8 @@ int64_t exl3_moe_cpu_make_layer
     const std::vector<at::Tensor>& down_bias,
     int64_t activation,
     double act_limit,
-    int64_t swizzled        // caller repacked trellis tensors band-contiguous (K8 exempt)
+    int64_t swizzled        // caller repacked each trellis tensor with the group from
+                            // exl3_moe_cpu_swizzle_group (matrices it returns 0 for stay native)
 );
 
 void exl3_moe_cpu_free_layer(int64_t handle);
@@ -115,9 +118,14 @@ void exl3_moe_cpu_set_prof(bool enabled);
 int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);   // test hook
 
 // Kernel availability (dispatch happens internally; these are informational, post-env-cap).
-// has_avx512_vbmi and has_avx512_bw additionally gate the swizzled weight layout in the child
-// loader (the VBMI tier's wide swizzle bands need the byte-gather kernels' low temporary count).
 bool exl3_moe_cpu_has_avx2();
 bool exl3_moe_cpu_has_avx512_bw();
 bool exl3_moe_cpu_has_avx512_vnni();
 bool exl3_moe_cpu_has_avx512_vbmi();
+
+// Swizzle layout group for one trellis tensor's bitrate under the runtime ISA tier: 0 = keep
+// native tile order, 8 = band-8 repack (AVX-512 tiers), 2 = band-2 repack (AVX2 tier). The
+// child loader repacks each trellis tensor with the group this returns (and the GPU staging
+// path un-does it with the same value); kernels dispatch on it. Single source of truth for
+// the per-tier/per-bits rule -- query this instead of duplicating the gate.
+int exl3_moe_cpu_swizzle_group(int64_t bits);
