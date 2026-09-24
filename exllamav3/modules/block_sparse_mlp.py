@@ -1321,6 +1321,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
             bc_sh_exp = self.bc_sh_exp
 
+        # Independent shared-expert work can cover the CPU tail before collect enqueues
+        # its stream wait. Fused shared experts have already run inside the routed path.
+        # Keep prefill scheduling and the order of post norms / TP collectives unchanged.
+        shared_hidden_states = None
+        if cpu_pending is not None and bsz <= MAX_BSZN and self.shared_experts and not bc_sh_exp:
+            shared_hidden_states = self.shared_experts.forward(x, params)
+
         # CPU tail partial folds in before the post norms (nonlinear: they must see the
         # complete routed sum)
         final_hidden_states = self.cpu_split_combine(final_hidden_states, cpu_partial, cpu_pending, eshape)
@@ -1351,7 +1358,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Shared experts
         if self.shared_experts and not bc_sh_exp:
-            y = self.shared_experts.forward(x, params)
+            y = shared_hidden_states
+            if y is None:
+                y = self.shared_experts.forward(x, params)
             if pre_norm_reduce:
                 self.tp_collect(params["backend"], y, True)
             if self.shared_experts_post_norm:
