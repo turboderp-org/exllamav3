@@ -10,6 +10,7 @@ from ..util.memory import (
     set_memory_fraction_use,
     unset_memory_fraction,
     free_mem,
+    device_mem_info,
 )
 from ..util.progress import ProgressBar
 from .config import Config
@@ -219,7 +220,7 @@ class Model_LSMixin(ABC):
                                 # real forward. What the largest transient can still draw on is the
                                 # free device memory plus the allocator's reserved-but-unallocated
                                 # pool
-                                free_now, _ = torch.cuda.mem_get_info(load_device)
+                                free_now, _ = device_mem_info(load_device)
                                 reusable = free_now + torch.cuda.memory_reserved(load_device) - \
                                     torch.cuda.memory_allocated(load_device)
                                 if reusable < max_transient[i] + autosplit_margin:

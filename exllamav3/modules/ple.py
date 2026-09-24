@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import math
+import os
 import torch
 import torch.nn.functional as F
 from .module import Module
@@ -117,6 +118,10 @@ class PLELayerState:
                 "max_batch_size": self.max_batch_size,
             }
         }
+
+
+# Prefill row slab for the fused stream pass (see forward_streams); 0 runs the chunk whole
+_ple_sub_range = int(os.environ.get("EXL3_PLE_SUB_CHUNK", "1024"))
 
 
 class PLELayer(Module):
@@ -365,7 +370,8 @@ class PLELayer(Module):
         """
         streams: (bsz, seq, hc_mult, hidden) fp32 residual stack;
         token_history: (bsz, (ngram_size - 1) + seq) token ids (eos-padded at sequence start).
-        Returns (delta (bsz, seq, hc_mult, hidden) fp32 to add to the streams, full conv column
+        Returns (delta (bsz, seq, hc_mult, hidden) fp32 to add to the streams, or None when the
+        fast path has already added it into `streams` in place; full conv column
         stream — see _short_conv). The layer sits at the front of the forward pass and was
         host-bound issued op-by-op from python; the whole sequence runs as one ext call
         (ple_forward_streams), with the op-by-op form kept below as the reference.
@@ -376,19 +382,36 @@ class PLELayer(Module):
         if self.key_proj.quant_type == "fp16" and self.value_proj.quant_type == "fp16" \
                 and streams.dtype == torch.float and streams.is_contiguous() \
                 and self.key_proj.inner.bias is None and self.value_proj.inner.bias is None:
-            delta = torch.empty_like(streams)
-            conv_stream = torch.empty((bsz, H * D, self.conv_state_len + seq),
-                                      dtype = torch.half, device = streams.device)
-            ext.ple_forward_streams(
-                streams, emb.contiguous(),
-                self.key_proj.inner.weight, self.value_proj.inner.weight,
-                self.norm_key.weight.data, self.norm_query.weight.data,
-                self.norm_conv.weight.data, self.conv_w,
-                conv_state.contiguous() if conv_state is not None else None,
-                self.norm_key.rms_norm_eps, self.gate_scale, self.conv_dilation,
-                delta, conv_stream,
-            )
-            return delta, conv_stream
+            emb = emb.contiguous()
+            # Row slabs: the ext call keeps six or so full-width fp32/fp16 working tensors of
+            # the (rows, hc_mult, hidden) stack. Everything but the dilated conv is per row,
+            # and the conv only needs its state columns from the previous slab, so slabs carry
+            # the conv state. Each slab's delta is added into the streams in place (the block
+            # residual adds are in place too; the caller owns the stream and nothing else
+            # refers to it), so neither a full-width delta nor a full-width sum exists. The
+            # returned conv stream is the last slab's: its trailing columns are all the caller
+            # keeps (state and history writes)
+            sub = _ple_sub_range if _ple_sub_range > 0 else seq
+            slabs = [(0, seq)] if bsz > 1 or seq <= sub else [(t0, min(t0 + sub, seq)) for t0 in range(0, seq, sub)]
+            cs = conv_state.contiguous() if conv_state is not None else None
+            delta = None
+            for t0, t1 in slabs:
+                if delta is None or delta.shape[1] != t1 - t0:
+                    delta = torch.empty((bsz, t1 - t0, H, D), dtype = torch.float, device = streams.device)
+                conv_stream = torch.empty((bsz, H * D, self.conv_state_len + (t1 - t0)),
+                                          dtype = torch.half, device = streams.device)
+                ext.ple_forward_streams(
+                    streams[:, t0:t1], emb[:, t0:t1],
+                    self.key_proj.inner.weight, self.value_proj.inner.weight,
+                    self.norm_key.weight.data, self.norm_query.weight.data,
+                    self.norm_conv.weight.data, self.conv_w,
+                    cs,
+                    self.norm_key.rms_norm_eps, self.gate_scale, self.conv_dilation,
+                    delta, conv_stream,
+                )
+                streams[:, t0:t1].add_(delta)
+                cs = conv_stream[:, :, -self.conv_state_len:].contiguous()
+            return None, conv_stream
         return self.forward_streams_reference(streams, emb, params, conv_state)
 
     def forward_streams_reference(self, streams, emb, params, conv_state = None):
@@ -501,7 +524,7 @@ class PLELayer(Module):
                     id_state[s, :ctx].copy_(history[i, -ctx:])
         else:
             delta, _ = self.forward_streams(x, history, params)
-        out = x + delta
+        out = x if delta is None else x + delta
         if self.tp_owner is not None:
             self.tp_collect(params["backend"], out)
         return out

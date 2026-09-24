@@ -876,10 +876,19 @@ class MLAttention(Module):
                 assert indices is not None, \
                     "shared-indexer DSA layer found no top-k selection in params"
                 indices = to_device(indices, x.device)
-            return self._attend_sparse(
+            # q and q_pe_hm are dead here (the sparse kernel reads q_lat and token-major q_pe);
+            # the queries themselves die once the kernel returns, before the (R, H, v) unfold
+            # allocates.
+            del q, q_pe_hm
+            o_lat = self._attend_sparse(
                 q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, indices, qc,
                 pool_len = max(host_seqlens) + seqlen,
             )
+            del q_lat, q_pe
+            o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
+            del o_lat
+            o = o.reshape(bsz, seqlen, H * self.v_head_dim)
+            return self.o_proj.forward(o, params)
 
         if use_mha:
             # MHA-form prefill: everything (past and current chunk) is read back from the cache
@@ -921,15 +930,18 @@ class MLAttention(Module):
                     f"{bad}/{o_lat.numel()} elements, bsz={bsz} seqlen={seqlen} dev={o_lat.device}")
 
         # Unfold W_UV per head from the flat layout; the kernel emits token-major output, so it
-        # feeds o_proj without a permute
+        # feeds o_proj without a permute. The queries are dead by now
+        del q, q_lat, q_pe, q_pe_hm
         o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
+        del o_lat
         o = o.reshape(bsz, seqlen, H * self.v_head_dim)
         return self.o_proj.forward(o, params)
 
 
     def _attend_sparse(self, q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache,
                        block_table, indices, qc, pool_len = 0):
-        """Gathered attention over the top-k selected latent rows (V3.2-on-MLA form of
+        """Gathered attention over the top-k selected latent rows, returning the head-major latent
+        output (H, R, D_c) for the caller's unfold (V3.2-on-MLA form of
         dsa_attn: no window, no sinks, V is the latent). The chunk's own rows are already in
         the paged pool (fp16 or packed-quantized; the packed form is dequantized online by the
         gather kernel) and the indexer's causal bound keeps the selection causal, so the
@@ -956,9 +968,7 @@ class MLAttention(Module):
             qc = qc,   # packed latent pages read online (scales, bits), or staged for prefill
             pool_len = pool_len,   # entries the selection can reference (context, not pool)
         )
-        o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
-        o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-        return self.o_proj.forward(o, params)
+        return o_lat
 
 
     def decode_flash_attn(

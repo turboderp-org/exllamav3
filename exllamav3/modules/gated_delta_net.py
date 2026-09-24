@@ -18,6 +18,14 @@ import os
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
 # EXL3_BC_GDN=0 disables the graph-captured decode paths (torch path only), for A/B testing
 _bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
+# Prefill projections (qkv, z, forget/beta gates) come out of the GEMM in fp16 rather than fp32.
+# EXL3_GDN_PROJ_FP32=1 restores fp32
+_proj_dtype = torch.float if os.environ.get("EXL3_GDN_PROJ_FP32", "0") != "0" else torch.half
+# KDA's per-channel forget gate and beta logits: separate knob, the decay chain they feed is
+# where fp16 rounding compounds (see the A/B in the docs)
+_gate_dtype = torch.float if os.environ.get("EXL3_GDN_GATE_FP32", "1") != "0" else torch.half
+# Prefill conv reads the projection output in place (token-major) instead of a transposed bf16 copy
+_conv_token_major = os.environ.get("EXL3_GDN_CONV_TOKEN_MAJOR", "1") != "0"
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 from ..cache.recurrent import (
@@ -1006,6 +1014,8 @@ class GatedDeltaNet(Module):
         if self.conv1d_weight_flat is None:
             self.conv1d_weight_flat = self.conv1d_weight.squeeze(1).contiguous()
 
+        conv_token_major = False   # set where the conv reads the projection output in place
+
         # Previous state
         rsg = params.get("recurrent_states")
         if rsg:
@@ -1091,38 +1101,54 @@ class GatedDeltaNet(Module):
                 self.v_head_dim,
                 self.beta_scale
             )
+            del qkvz, ba
         elif self.kda:
-            qkv = self.qkv_proj.forward(x, params)
-            mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)
+            if _conv_token_major:
+                mixed_qkv, conv_token_major = qkv, True   # read in place by the conv
+            else:
+                mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            del qkv
 
             # Low-rank sigmoid output gate stands in for z (applied by the gated norm)
-            z = self.g_b_proj.forward(self.g_a_proj.forward(x, params).to(torch.half), params) \
+            # (z stays fp32: the gated norm takes a bf16 or fp32 gate, not fp16)
+            z = self.g_b_proj.forward(self.g_a_proj.forward(x, params, out_dtype = torch.half), params) \
                 .view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
 
-            beta = torch.sigmoid(self.b_proj.forward(x, params).float() * self.beta_scale) \
+            beta = torch.sigmoid(self.b_proj.forward(x, params, out_dtype = _gate_dtype).float() * self.beta_scale) \
                 .to(torch.bfloat16)
 
             # Per-k-channel log decay from the low-rank forget gate: "safe gate" form when a
             # lower bound is configured, else softplus (per the Kimi/GLM5.3 reference)
-            f = self.f_b_proj.forward(self.f_a_proj.forward(x, params).to(torch.half), params)
-            gf = (f.float() + self.dt_bias.float().view(1, 1, -1)) \
-                .view(bsz, seqlen, self.num_v_heads, self.k_head_dim)
+            f = self.f_b_proj.forward(self.f_a_proj.forward(x, params, out_dtype = torch.half), params,
+                                      out_dtype = _gate_dtype)
+            # One fp32 (rows, v_heads, k_head_dim) tensor for the whole chain: F.softplus with the
+            # threshold is the where/log1p/exp expression in one kernel, and the decay scaling is
+            # in place. The op-by-op form held five of these (2.5 GB per 16k rows on GLM-5.3)
+            gf = f.float() if f.dtype != torch.float else f.clone()
+            del f
+            gf = gf.add_(self.dt_bias.float().view(1, 1, -1)).view(bsz, seqlen, self.num_v_heads, self.k_head_dim)
             decay = torch.exp(self.a_log.float()).view(1, 1, self.num_v_heads, 1)
             if self.gate_lower_bound is not None:
-                g = self.gate_lower_bound * torch.sigmoid(decay * gf)
+                g = torch.sigmoid(gf.mul_(decay)).mul_(self.gate_lower_bound)
             else:
-                g = -decay * torch.where(gf > 20.0, gf, torch.log1p(torch.exp(gf)))
+                g = F.softplus(gf, threshold = 20.0).mul_(-decay)
+            del gf
         else:
             if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
             else:
-                qkv = self.qkv_proj.forward(x, params)
-                z = self.z_proj.forward(x, params)
+                qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)
+                z = self.z_proj.forward(x, params)   # fp32: the gated norm takes a bf16 or fp32 gate
             z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
             b = self.b_proj.forward(x, params)
             a = self.a_proj.forward(x, params)
 
-            mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            if _conv_token_major and bsz * seqlen > 32:
+                mixed_qkv, conv_token_major = qkv, True   # the decode kernel wants channel-major bf16
+            else:
+                mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            del qkv
 
             beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
             g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
@@ -1144,6 +1170,7 @@ class GatedDeltaNet(Module):
             conv1d_bias = self.conv1d_bias,
             history = save_history,
             params = params,
+            token_major = conv_token_major,
         )
 
         # Delta rule
@@ -1164,10 +1191,12 @@ class GatedDeltaNet(Module):
             params = params,
             channelwise_g = self.kda,
         )
+        del mixed_qkv, beta, g
 
         # Norm
         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
         core_attn_out = core_attn_out.view(bsz, seqlen, self.num_v_heads * self.v_head_dim)
+        del z
 
         # Output projection
         x = self.o_proj.forward(core_attn_out, params)
