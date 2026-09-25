@@ -87,7 +87,7 @@ def test_codec_pack_unpack_roundtrip():
     consistent ring states, which is what the encoder emits; build them from fresh K-bit
     symbols with the same roll-accumulate the decoder side uses. The ring semantics are
     pinned by an independent oracle that slices the packed bitstream directly."""
-    for K in (6, 7, 8):
+    for K in (4, 5, 6, 7, 8):
         for D in (512, 5120):
             G = D // GROUP
             g = torch.Generator().manual_seed(K * 7 + D)
@@ -106,7 +106,7 @@ def test_codec_pack_unpack_roundtrip():
             # independent ring oracle: extract each position's K-bit code k_i straight
             # from the packed words (stream bits [i*K, (i+1)*K)), then combine with the
             # ring recurrence's closed form - state_i = k_i | k_{i-1} << K |
-            # (k_{i-2} & ((1 << (16 - 2*K)) - 1)) << 2*K (the form the fused kernel uses).
+            # (k_{i-2} & m2) << 2*K | (k_{i-3} & m3) << 3*K (the form the fused kernel uses).
             # Bit shifts/masks on the packed representation only - no roll, no unpack_rows.
             words = packed[:, G:].view(torch.uint16).to(torch.int64)
             W = words.shape[1]
@@ -118,7 +118,9 @@ def test_codec_pack_unpack_roundtrip():
             k = k | ((words[:, (w0 + 1) % W] & ((1 << o2) - 1)) << (16 - o))
             idx = torch.arange(D, dtype = torch.int64)
             m2 = (1 << (16 - 2 * K)) - 1
-            ref = k | (k[:, (idx - 1) % D] << K) | ((k[:, (idx - 2) % D] & m2) << (2 * K))
+            m3 = (1 << (16 - 3 * K)) - 1 if 16 - 3 * K > 0 else 0
+            ref = k | (k[:, (idx - 1) % D] << K) | ((k[:, (idx - 2) % D] & m2) << (2 * K)) \
+                | ((k[:, (idx - 3) % D] & m3) << (3 * K))
             assert torch.equal(ref, states), f"packed stream != ring states at K = {K}, D = {D}"
             back, sc = unpack_rows(packed, K, D, G)
             assert torch.equal(back, states), f"pack/unpack round-trip broken at K = {K}, D = {D}"
@@ -189,7 +191,7 @@ def test_codec_multiblock_partition_invariance():
 def test_codec_pad_rows_decode_to_zero():
     """All-zero state words (pad rows) must decode to exactly 0.0: zero codeword + zero
     ring contribution, no sign or scale leakage."""
-    for K in (6, 7, 8):
+    for K in (4, 5, 6, 7, 8):
         D, G = 512, 2
         packed = torch.zeros(4, et.words_per_row(D, K, G), dtype = torch.int16)
         cs = torch.ones(D, dtype = torch.float16)
@@ -203,7 +205,7 @@ def test_encoder_zero_rows_pack_to_zero():
     """All-zero source rows (vocab pad slots) must PACK to all-zero words through the
     encode chain (not just decode to zero when pre-zeroed): the group_prescale
     empty-group guard would otherwise store a 1.0 scale and emit codebook garbage."""
-    for K in (6, 7, 8):
+    for K in (4, 5, 6, 7, 8):
         D, G = 512, 2
         w = torch.zeros(3, D)
         w[1] = 1.0  # nonzero neighbor stays on the normal encode path
@@ -397,23 +399,26 @@ def test_fused_kernel_bit_exact_vs_codec():
         return
     from exllamav3.ext import exllamav3_ext as ext
     torch.manual_seed(5)
-    N, D = 131, 5120
-    G = D // GROUP
-    for K in (6, 7, 8):
-        for seed in (0, 991):
-            w, packed, cs = _synth_table(N, D, K, seed)
-            ids = torch.cat([torch.arange(8), torch.arange(N - 8, N),
-                             torch.tensor([G, 127, 128, 129, 65535 % N if N > 65535 else N // 2])])
-            ids = ids[ids < N]
-            ref = dequant_rows_transformed(packed[ids], cs, K, seed, D, G, row_ids = ids)
-            table = packed.pin_memory()
-            ptr = ext.trellis_embed_register(table)
-            out = torch.empty(ids.shape[0], D, dtype = torch.float32, device = dev)
-            # load_codes_bits<8> unaligned (A8 = false) fallback: unreachable here since pin_memory() bases are always 8-aligned - only reachable via a misaligned table view.
-            ext.trellis_embed_gather(ptr, mul1_codebook(dev), cs.float().to(dev),
-                                     ids.to(dev), K, seed, N, out)
-            assert torch.equal(out.cpu(), ref), f"fused kernel != codec at K = {K}, seed = {seed}"
-            ext.trellis_embed_unregister(table)
+    N = 131
+    for K in (4, 5, 6, 7, 8):
+        for D in (5120, 512):        # D = 512 -> G = 2 -> 2G % 8 != 0 -> A8 = false for every K
+            G = D // GROUP
+            for seed in (0, 991):
+                w, packed, cs = _synth_table(N, D, K, seed)
+                ids = torch.cat([torch.arange(8), torch.arange(N - 8, N),
+                                 torch.tensor([G, 127, 128, 129, 65535 % N if N > 65535 else N // 2])])
+                ids = ids[ids < N]
+                ref = dequant_rows_transformed(packed[ids], cs, K, seed, D, G, row_ids = ids)
+                table = packed.pin_memory()
+                ptr = ext.trellis_embed_register(table)
+                out = torch.empty(ids.shape[0], D, dtype = torch.float32, device = dev)
+                # A8 (the aligned 8-byte K = 8 load) is gated on the table base AND (2G)/(2W) 8-alignment
+                # (trellis_embed.cu:465), so D = 512 routes every K - incl. load_codes_bits<8> - through the
+                # A8 = false window even though pin_memory() bases are 8-aligned; misaligned views land here too.
+                ext.trellis_embed_gather(ptr, mul1_codebook(dev), cs.float().to(dev),
+                                         ids.to(dev), K, seed, N, out)
+                assert torch.equal(out.cpu(), ref), f"fused kernel != codec at K = {K}, D = {D}, seed = {seed}"
+                ext.trellis_embed_unregister(table)
 
 
 @torch.inference_mode()

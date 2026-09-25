@@ -22,16 +22,18 @@ only device-resident state is the 128 KB mul1 codebook LUT and the D-entry fp32 
 
   warp per (row, 256-column-group); grid = ceil(n * G * 32 / 256), block = 256 (8 warps).
   Ring decode is NOT serial: the 16-bit tail-biting recurrence state_i = ((state_{i-1} << K) |
-  k_i) & 0xFFFF is a finite window for K >= 6 (closed forms per K, bit-exact with
-  embed_trellis.unpack_rows):
-    K=8: state_i = (k_{i-1} << 8) | k_i
+  k_i) & 0xFFFF is a finite window (closed form, bit-exact with embed_trellis.unpack_rows):
+    K=8: ((k_{i-1} & 0xFF) << 8) | k_i
     K=7: ((k_{i-2} & 0x3) << 14) | (k_{i-1} << 7) | k_i
     K=6: ((k_{i-2} & 0xF) << 12) | (k_{i-1} << 6) | k_i
-  K=8 reads its 8 codes + boundary byte as one 8-byte load (codes are bytes; needs every
-  row's code base 8-aligned, checked host-side); K=6/7 read a 16-byte window at 4-byte
-  alignment and extract the 10-code span from a 64-bit word pair (no __int128: MSVC).
-  The ring-wrap head lanes whose 16-byte window would cross the row end fall back to per-byte loads (a few lanes
-  per row, never outside the row's code region).
+    K=5: ((k_{i-3} & 0x1) << 15) | (k_{i-2} << 10) | (k_{i-1} << 5) | k_i
+    K=4: ((k_{i-3} & 0xF) << 12) | (k_{i-2} << 8) | (k_{i-1} << 4) | k_i
+  (k_{i-2}/k_{i-3} terms vanish for K >= 8 / K >= 6 by the masks). K=8 reads its 8 codes +
+  boundary byte as one 8-byte load (codes are bytes; needs every row's code base 8-aligned,
+  checked host-side); K<8 read a 16-byte window at 4-byte alignment and extract the 11-code
+  span from a 64-bit word pair (no __int128: MSVC). The ring-wrap head lanes whose 16-byte
+  window would cross the row end fall back to per-byte loads (a few lanes per row, never
+  outside the row's code region).
   The QTIP inverse (butterfly + LCG signs keyed by the TABLE ROW ID + column scales) runs in
   registers with the exact fp32 operation order of embed_trellis.dequant_rows_transformed and
   of the CPU AVX2 inv_transform reference, so all three paths are bit-identical. The per-lane
@@ -49,11 +51,11 @@ only device-resident state is the 128 KB mul1 codebook LUT and the D-entry fp32 
 
 */
 
-// ^ read the 10-code window ending two codes before pos; K < 8 or unaligned K = 8 fallback
+// ^ read the 11-code window ending three codes before pos; K < 8 or unaligned K = 8 fallback
 template<int K>
 static __device__ inline void load_codes_bits(const uint8_t* kb, uintptr_t kbaddr, int C, int pos, uint32_t* k)
 {
-    const int w0 = (pos - 2) * K;                       // first needed bit (code pos-2)
+    const int w0 = (pos - 3) * K;                       // first needed bit (code pos-3)
     const uint32_t mask = (1u << K) - 1u;
     uintptr_t byteaddr = kbaddr + (w0 >= 0 ? (w0 >> 3) : 0);
     uintptr_t a0 = byteaddr & ~(uintptr_t) 3;
@@ -62,7 +64,7 @@ static __device__ inline void load_codes_bits(const uint8_t* kb, uintptr_t kbadd
 
     if (w0 >= 0 && a0 + 16 <= tend)
     {
-        // aligned 16-byte window, no wrap: extract 10*K <= 80 bits at bit offset s (s <= 31)
+        // aligned 16-byte window, no wrap: extract 11*K <= 88 bits at bit offset s (s <= 31)
         // from a 64-bit word pair (no __int128: MSVC)
         const uint32_t* u = (const uint32_t*) a0;
         const uint64_t v0 = (uint64_t) u[0] | ((uint64_t) u[1] << 32);
@@ -70,7 +72,7 @@ static __device__ inline void load_codes_bits(const uint8_t* kb, uintptr_t kbadd
         const uint64_t lo = (v0 >> s) | (s ? (v1 << (64 - s)) : 0);
         const uint64_t hi = s ? (v1 >> s) : v1;
         #pragma unroll
-        for (int c = 0; c < 10; ++c)
+        for (int c = 0; c < 11; ++c)
         {
             const int b = c * K;
             uint64_t w;
@@ -86,9 +88,9 @@ static __device__ inline void load_codes_bits(const uint8_t* kb, uintptr_t kbadd
         int b0 = w0 >> 3;                               // floor for w0 < 0 handled below
         if (w0 < 0) b0 = -(((-w0) + 7) >> 3);
         s = w0 - 8 * b0;                                // 0..7
-        const int nbytes = (7 + (w0 & 7) + 10 * K) >> 3;  // <= 11
+        const int nbytes = (7 + (w0 & 7) + 11 * K) >> 3;  // <= 12
         uint64_t v = 0;
-        uint32_t extra = 0;                             // bytes 8..10 (bits 64..87)
+        uint32_t extra = 0;                             // bytes 8..11 (bits 64..95)
         #pragma unroll 4
         for (int q = 0; q < nbytes; ++q)
         {
@@ -101,7 +103,7 @@ static __device__ inline void load_codes_bits(const uint8_t* kb, uintptr_t kbadd
         const uint64_t lo = (v >> s) | (s ? ((uint64_t) extra << (64 - s)) : 0);
         const uint64_t hi = s ? (uint64_t) (extra >> s) : (uint64_t) extra;
         #pragma unroll
-        for (int c = 0; c < 10; ++c)
+        for (int c = 0; c < 11; ++c)
         {
             const int b = c * K;
             uint64_t w;
@@ -124,11 +126,14 @@ __global__ void trellis_embed_kernel
     const int N, const int D, const int G, const int64_t n_rows, const uint64_t seed
 )
 {
-    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    // 64-bit: the grid can reach 2**31-1 blocks (checked host-side), so the linear
+    // thread index needs 39 bits and the warp index 34 - int32 arithmetic wraps and
+    // would silently map warps to the wrong (row, group)
+    const int64_t warp = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
-    const int n = warp / G;
+    const int64_t n = warp / G;
     if (n >= N) return;
-    const int g = warp % G;
+    const int g = (int) (warp % G);
     const int64_t rid0 = ids[n];
     // an out-of-range id would be an out-of-bounds read of the device-mapped host table
     // (not a trapped fault: silent garbage at best, a sticky context error at worst):
@@ -138,10 +143,10 @@ __global__ void trellis_embed_kernel
     // before the H2D copy); the sign stream follows the clamped row, so the decode
     // stays context-free
     const int64_t rid = (rid0 < 0 || rid0 >= n_rows) ? (n_rows - 1) : rid0;
-    const int W = G + D * K / 16;
+    const int W = G + (int) ((int64_t) D * K / 16);
     const uint16_t* row = table + (size_t) rid * W;
     const uint8_t* kb = (const uint8_t*) (row + G);
-    const int C = D * K / 8;
+    const int C = (int) ((int64_t) D * K / 8);
     const float s = __half2float(__ushort_as_half(row[g]));    // this group's fp16 scale
 
     const int pos = g * 256 + lane * 8;                        // this lane's first position
@@ -167,13 +172,16 @@ __global__ void trellis_embed_kernel
     }
     else
     {
-        uint32_t k[10];
+        uint32_t k[11];
         load_codes_bits<K>(kb, (uintptr_t) kb, C, pos, k);
-        constexpr uint32_t m2 = (1u << (16 - 2 * K)) - 1u;     // kept width of k_{i-2}
+        constexpr int w2 = 16 - 2 * K;
+        constexpr uint32_t m2 = (w2 > 0 ? (1u << w2) : 1u) - 1u;   // kept width of k_{i-2}
+        constexpr int w3 = 16 - 3 * K;
+        constexpr uint32_t m3 = (w3 > 0 ? (1u << w3) : 1u) - 1u;   // kept width of k_{i-3}
         #pragma unroll
         for (int j = 0; j < 8; ++j)
         {
-            const uint32_t state = ((k[j] & m2) << (2 * K)) | (k[j + 1] << K) | k[j + 2];
+            const uint32_t state = k[j + 3] | (k[j + 2] << K) | ((k[j + 1] & m2) << (2 * K)) | ((k[j] & m3) << (3 * K));
             v[j] = __half2float(__ushort_as_half(cb[state])) * s;
         }
     }
@@ -388,7 +396,7 @@ void trellis_embed_gather
     at::Tensor out
 )
 {
-    TORCH_CHECK(K == 6 || K == 7 || K == 8, "trellis_embed_gather: K must be 6, 7 or 8");
+    TORCH_CHECK(K >= 4 && K <= 8, "trellis_embed_gather: K must be 4..8");
     TORCH_CHECK_DTYPE(cb, kHalf);
     TORCH_CHECK_DTYPE(col_scales, kFloat);
     TORCH_CHECK_DTYPE(ids, kLong);
@@ -397,9 +405,13 @@ void trellis_embed_gather
     TORCH_CHECK(col_scales.is_contiguous() && col_scales.dim() == 1 && col_scales.size(0) % 256 == 0,
                 "trellis_embed_gather: col_scales must be contiguous (D,) float with D % 256 == 0");
     TORCH_CHECK(ids.is_contiguous() && ids.dim() == 1, "trellis_embed_gather: ids must be contiguous 1-D int64");
-    TORCH_CHECK(n_rows >= 0, "trellis_embed_gather: n_rows must be non-negative");
     const int64_t D = col_scales.size(0);
     const int64_t n = ids.size(0);
+    // n_rows must be >= 1 for a non-empty gather: with 0 rows the in-kernel clamp
+    // (rid -> n_rows - 1) would send every id to row -1, an out-of-bounds read of the
+    // mapped region before the table base
+    TORCH_CHECK(n_rows >= (n > 0 ? 1 : 0),
+                "trellis_embed_gather: n_rows must be >= 1 for a non-empty gather (>= 0 otherwise)");
     TORCH_CHECK(n <= INT32_MAX && D <= INT32_MAX, "trellis_embed_gather: n and D must fit in int32");
     TORCH_CHECK(out.is_contiguous() && out.dim() == 2 && out.size(0) >= n && out.size(1) == D,
                 "trellis_embed_gather: out must be contiguous (>=n, D) float");
@@ -432,7 +444,12 @@ void trellis_embed_gather
     // the gather into an out-of-bounds read of the device-mapped host region - silent
     // garbage at best, a sticky context error at worst. Host-side lookup only (no
     // device work, no sync): the ids themselves are clamped in-kernel, and loud
-    // rejection of host-resident ids is the Python caller's job (Embedding._gather)
+    // rejection of host-resident ids is the Python caller's job (Embedding._gather).
+    // The lock is held across the LAUNCH, not just the validation: a concurrent
+    // trellis_embed_unregister in the window between a released lock and the launch
+    // would free the mapped region under the queued kernel (sticky context error).
+    // The launch is a driver call (microseconds); an unregister waiting on the lock
+    // then syncs past the kernel before unmapping, which is exactly the safe order.
     {
         std::lock_guard<std::mutex> lock(reg_mutex());
         auto dit = dev_to_host().find((uintptr_t) table_ptr);
@@ -443,31 +460,39 @@ void trellis_embed_gather
                     "trellis_embed_gather: table_ptr is not a live registration on this device");
         TORCH_CHECK((size_t) n_rows * (size_t) 2 * (size_t) W <= it->second.nbytes,
                     "trellis_embed_gather: n_rows * row bytes exceeds the registered table size");
+
+        // 2W % 8 == 0 <=> W % 4 == 0 (avoids the int32 overflow of 2*W at pathological D)
+        const bool a8 = (table_ptr & 7) == 0 && (W % 4 == 0) && (G % 4 == 0);
+        const int block = 256;
+        // 64-bit: N*G*32 overflows int32 past 2**24 total warps; an int32-wrapped grid
+        // would be silently too small and leave a prefix of rows unwritten (no error)
+        const int64_t grid64 = ((int64_t) N * G * 32 + block - 1) / block;
+        TORCH_CHECK(grid64 <= INT32_MAX,
+                    "trellis_embed_gather: grid of ", grid64, " blocks exceeds the 2**31-1 CUDA limit");
+        const int grid = (int) grid64;
+
+        // A8 (the aligned 8-byte K = 8 load) only exists for K = 8: for K < 8 the flag is
+        // dead, so only kernel<8, true> and kernel<K, false> are instantiated (6 of 10)
+        #define LAUNCH(KK) do { \
+            if (KK == 8 && a8) trellis_embed_kernel<8, true ><<<grid, block, 0, stream>>>( \
+                (const uint16_t*) table_ptr, (const uint16_t*) cb.data_ptr(), \
+                (const float*) col_scales.data_ptr(), (float*) out.data_ptr(), \
+                (const int64_t*) ids.data_ptr(), N, (int) D, G, n_rows, (uint64_t) seed); \
+            else trellis_embed_kernel<KK, false><<<grid, block, 0, stream>>>( \
+                (const uint16_t*) table_ptr, (const uint16_t*) cb.data_ptr(), \
+                (const float*) col_scales.data_ptr(), (float*) out.data_ptr(), \
+                (const int64_t*) ids.data_ptr(), N, (int) D, G, n_rows, (uint64_t) seed); \
+            } while (0)
+
+        switch (K)
+        {
+            case 4: LAUNCH(4); break;
+            case 5: LAUNCH(5); break;
+            case 6: LAUNCH(6); break;
+            case 7: LAUNCH(7); break;
+            default: LAUNCH(8); break;
+        }
+        #undef LAUNCH
     }
-
-    const bool a8 = (table_ptr & 7) == 0 && ((2 * W) % 8 == 0) && ((2 * G) % 8 == 0);
-    const int block = 256;
-    const int grid = (N * G * 32 + block - 1) / block;
-
-    // A8 (the aligned 8-byte K = 8 load) only exists for K = 8: for K < 8 the flag is
-    // dead, so only kernel<8, true> and kernel<K, false> are instantiated (6 of 10)
-    #define LAUNCH(KK) do { \
-        if (KK == 8 && a8) trellis_embed_kernel<8, true ><<<grid, block, 0, stream>>>( \
-            (const uint16_t*) table_ptr, (const uint16_t*) cb.data_ptr(), \
-            (const float*) col_scales.data_ptr(), (float*) out.data_ptr(), \
-            (const int64_t*) ids.data_ptr(), N, (int) D, G, n_rows, (uint64_t) seed); \
-        else trellis_embed_kernel<KK, false><<<grid, block, 0, stream>>>( \
-            (const uint16_t*) table_ptr, (const uint16_t*) cb.data_ptr(), \
-            (const float*) col_scales.data_ptr(), (float*) out.data_ptr(), \
-            (const int64_t*) ids.data_ptr(), N, (int) D, G, n_rows, (uint64_t) seed); \
-        } while (0)
-
-    switch (K)
-    {
-        case 6: LAUNCH(6); break;
-        case 7: LAUNCH(7); break;
-        default: LAUNCH(8); break;
-    }
-    #undef LAUNCH
     cuda_check(cudaPeekAtLastError());
 }

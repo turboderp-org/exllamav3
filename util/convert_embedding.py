@@ -31,7 +31,7 @@ def main():
     parser.add_argument("-i", "--in_dir", type = str, required = True,
                         help = "Input HF model directory (or directory containing the source .safetensors)")
     parser.add_argument("-o", "--out_file", type = str, required = True, help = "Output .safetensors file")
-    parser.add_argument("-K", "--trellis_bits", type = int, required = True, help = "Bits per position (K), 6..8")
+    parser.add_argument("-K", "--trellis_bits", type = int, required = True, help = "Bits per position (K), 4..8")
     parser.add_argument("--seed", type = int, default = 0, help = "LCG sign-stream seed (pinned in metadata)")
     parser.add_argument("-t", "--tensor_key", type = str, default = DEFAULT_TENSOR_KEY,
                         help = f"Source embedding tensor key (default: {DEFAULT_TENSOR_KEY})")
@@ -57,8 +57,8 @@ def main():
                         help = "Print the informational embedding_trellis quantization_config dict")
     args = parser.parse_args()
 
-    if not 6 <= args.trellis_bits <= 8:
-        parser.error("trellis_bits must be in range 6..8 (fused dequant kernel range)")
+    if not 4 <= args.trellis_bits <= 8:
+        parser.error("trellis_bits must be in range 4..8 (fused dequant kernel range)")
     if args.chunk_rows <= 0:
         parser.error("chunk_rows must be > 0")
     if args.limit_rows is not None and args.limit_rows <= 0:

@@ -10,7 +10,6 @@
 // mapping, verified at register time - unavailable under WDDM, platform-dependent
 // elsewhere), and re-registering the same pointer with a different size raises (the
 // original tensor was freed without unregister and the address was reused). The
-// returned pointer does NOT own the memory: the registered tensor must outlive the
 // registration, otherwise the alias dangles (device reads of a freed region). Call
 // trellis_embed_unregister before releasing; it syncs the registered device and only
 // unmaps registrations this module itself created.
@@ -31,7 +30,7 @@ void trellis_embed_unregister
 // col_scales = (D,) fp32, both CUDA-resident; cb/col_scales/ids/out must all live on the
 // SAME CUDA device (the kernel launches on cb.device() and dereferences the other
 // operands' device pointers; a host pointer is kernel-usable only where UVA maps it,
-// verified at register time - unavailable under WDDM). K in {6, 7, 8}.
+// verified at register time - unavailable under WDDM). K in {4, 5, 6, 7, 8}.
 // n_rows = packed table row count: table_ptr must be a live registration on this
 // device and n_rows must fit the registered region (TORCH_CHECK, no sync). ids
 // outside [0, n_rows) are clamped to the last row by the kernel (an OOB id would be

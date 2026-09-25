@@ -109,7 +109,7 @@ class Embedding(Module):
         D = hidden
         assert D % embed_trellis.GROUP == 0 and G == D // embed_trellis.GROUP, \
             f"{key}: metadata G {G} inconsistent with hidden {D}"
-        assert K in (6, 7, 8), f"{key}: unsupported trellis K {K} (fused kernel supports 6/7/8)"
+        assert K in (4, 5, 6, 7, 8), f"{key}: unsupported trellis K {K} (fused kernel supports 4/5/6/7/8)"
 
         # no_defer: the buffer must hold its data before it is copied into the pinned
         # registration (a deferred load would fill the original after this copy)

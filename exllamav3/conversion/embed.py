@@ -20,7 +20,7 @@ imports this and never re-implements the encoder or codec):
         source,                      # str: HF model dir or plain .safetensors dir, OR
                                      # torch.Tensor (V, D) source rows (any float dtype)
         out_path,                    # output .safetensors file
-        K,                           # bits per position, 6..8 (fused kernel range)
+        K,                           # bits per position, 4..8 (fused kernel range)
         seed = 0,                    # LCG sign-stream seed (pinned in metadata)
         key = "model.embed_tokens.weight",   # tensor key when source is a directory
         chunk_rows = 8192,           # rows per work chunk
@@ -413,7 +413,7 @@ tensor). Returns a stats dict with
     measured_rows encoded rows (all of them unless quality_sample limits the measurement);
     the refit_* fields size the LS scale-word refit (analytic, see ls_refit_scales).
     """
-    assert 6 <= K <= 8, "the fused dequant kernel supports K in 6..8"
+    assert 4 <= K <= 8, "the fused dequant kernel supports K in 4..8"
     assert chunk_rows > 0
     assert os.path.isdir(str(source)) if isinstance(source, str) else torch.is_tensor(source), \
         "source must be a directory of .safetensors files or a (V, D) rows tensor"
