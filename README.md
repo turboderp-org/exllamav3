@@ -212,7 +212,7 @@ python examples/chat.py -h
 | **LFM 2.5**                                      | `Lfm2ForCausalLM`<br>`Lfm2MoeForCausalLM` |  |  |
 | **Llama 1/2/3**,**3.1-Nemotron** etc.            | `LlamaForCausalLM` |  |  |
 | **MiMo-RL**                                      | `MiMoForCausalLM` |  |  |
-| **MiMo-V2.6-Flash**                              | `MiMoV2ForCausalLM` |  | text only, no MTP, no TP |
+| **MiMo-V2.6-Flash**                              | `MiMoV2ForCausalLM` |  | text only, no TP |
 | **MiniMax-M2**                                   | `MiniMaxM2ForCausalLM` |  |  |
 | **Mistral**, **Ministral 3**, **Mistral-4** etc. | `MistralForCausalLM`<br>`Mistral3ForConditionalGeneration` | ✓ |  |
 | **Mixtral**                                      | `MixtralForCausalLM` |  |  |

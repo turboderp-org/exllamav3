@@ -324,7 +324,7 @@ def qsa_sparse_attend_rows(
         _paged_attn_decode_combine_kernel[(programs, (BLOCK_H // rows_sub) * (hd // d_sub))](
             partial_o, partial_ml, o, h32, splits, partial_ml,
             QCV = v_bits, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
-            head_dim = hd, HD_PAD = hd, BLOCK_M = 1, BLOCK_H = BLOCK_H, BLOCK_ROWS = BLOCK_H,
+            head_dim = hd, HD_PAD = hd, V_DIM = hd, BLOCK_M = 1, BLOCK_H = BLOCK_H, BLOCK_ROWS = BLOCK_H,
             ROWS_SUB = rows_sub, D_SUB = d_sub,
             num_warps = 4, num_stages = 1,
         )

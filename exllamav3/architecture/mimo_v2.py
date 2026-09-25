@@ -10,6 +10,7 @@ from ..modules import (
 )
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
+from .mimo_v2_mtp import MiMoV2MTPModel
 
 # MiMo-V2's fused qkv_proj is stored as the concatenation of `ckpt_tp` tensor-parallel shards,
 # each laid out [q_shard; k_shard; v_shard], and its FP8 weight_scale_inv grid is computed per
@@ -84,12 +85,16 @@ class MiMoV2Config(Config):
     ):
         super().__init__(
             directory,
-            {"text": MiMoV2Model},
+            {"text": MiMoV2Model, "mtp": MiMoV2MTPModel},
             **kwargs
         )
 
         self.hidden_size = self.read_cfg(int, "hidden_size", no_default)
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
+        # Next-token prediction heads (model.mtp.layers.*), loaded as the "mtp" component
+        self.mtp_num_layers = self.read_cfg(int, "num_nextn_predict_layers", 0)
+        if self.mtp_num_layers == 0:
+            self.model_classes.pop("mtp", None)
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
 
         # Attention geometry. Q/K run at head_dim (192) while V runs at v_head_dim (128) on every
@@ -172,7 +177,14 @@ class MiMoV2Config(Config):
 
 
     def qkv_dequant(self, layer_idx: int):
-        swa = self.hybrid_layer_pattern[layer_idx] == 1
+        return self._qkv_dequant(self.hybrid_layer_pattern[layer_idx] == 1)
+
+
+    def qkv_dequant_swa(self):
+        return self._qkv_dequant(True)
+
+
+    def _qkv_dequant(self, swa: bool):
         return _mimo_v2_qkv_dequant(
             self.qkv_ckpt_tp,
             self.swa_num_q_heads if swa else self.num_q_heads,

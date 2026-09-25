@@ -122,6 +122,7 @@ class BCAttn:
         self.module = module
         self.device = torch.device(module.device)
         self.head_dim = module.head_dim
+        self.v_head_dim = getattr(module, "v_head_dim", module.head_dim)
         self.num_q_heads = module.num_q_heads
         self.num_kv_heads = module.num_kv_heads
         self.hidden_size = module.hidden_size
@@ -180,6 +181,7 @@ class BCAttn:
             num_q_heads = self.num_q_heads,
             num_kv_heads = self.num_kv_heads,
             head_dim = self.head_dim,
+            v_head_dim = self.v_head_dim,
             hidden_size = self.hidden_size,
             hidden_size_padded = self.hidden_padded,
             page_size = PAGE_SIZE,
@@ -315,12 +317,12 @@ class BCAttn:
             "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
             "num_splits": "i32", "sinks": "*fp32",
         } | {n: "constexpr" for n in (
-            "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD",
+            "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "V_DIM",
             "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "ROWS_SUB", "D_SUB")}
         rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
         consts_c = dict(
             QCV = self.v_bits, HAS_SINKS = self.sinks is not None, q_len = q_len,
-            n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad,
+            n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad, V_DIM = self.v_head_dim,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
             ROWS_SUB = rows_sub, D_SUB = d_sub,
         )
@@ -357,7 +359,9 @@ class BCAttn:
                 gate_a = g_tensor_cache.get(dev, (R, 2 * qh * hd), torch.half, "bca_qgi")
                 gate_b = g_tensor_cache.get(dev, (R, qh * hd), torch.half, "bca_g")
         kv = g_tensor_cache.get(dev, (2, R, kvh * hd), torch.half, "bca_kv")
-        o = g_tensor_cache.get(dev, (bsz, q_len, qh, hd), torch.half, "bca_o")
+        # Attention output in o_proj's input layout: v_head_dim lanes per head (the combine
+        # kernel drops the padded V lanes of an asymmetric module)
+        o = g_tensor_cache.get(dev, (bsz, q_len, qh, self.v_head_dim), torch.half, "bca_o")
         # Regime-1 slots never launch the dense split/combine; their partials are sized by the
         # sparse kernels in _configure_qsa (same bucketed tags, so the footprint is the max)
         pn_o = programs * splits_cap * block_rows * hd_pad
@@ -527,14 +531,14 @@ class BCAttn:
                 {"partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
                  "num_splits": "i32", "sinks": "*fp32"}
                 | {n: "constexpr" for n in (
-                    "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD",
+                    "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "V_DIM",
                     "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "ROWS_SUB", "D_SUB")},
                 # q_len 1: the sparse gather treats every query row as a batch (programs =
                 # R * kv_heads * h_blocks), so the combine's output row is the batch index
                 # alone -- compiling the true q_len here would scatter row r to row r * q_len
                 dict(QCV = self.v_bits, HAS_SINKS = False, q_len = 1,
                      n_q_heads = self.num_q_heads, n_kv_heads = self.num_kv_heads,
-                     head_dim = self.head_dim, HD_PAD = self.head_dim, BLOCK_M = 1, BLOCK_H = block_h,
+                     head_dim = self.head_dim, HD_PAD = self.head_dim, V_DIM = self.v_head_dim, BLOCK_M = 1, BLOCK_H = block_h,
                      BLOCK_ROWS = block_h, ROWS_SUB = sp_rows_sub, D_SUB = sp_d_sub), 4, 1)
             k_sp_combine.grid_y = (block_h // sp_rows_sub) * (self.head_dim // sp_d_sub)
 
@@ -643,9 +647,12 @@ def _module_eligible(m):
             (m.g_proj.quant_type == "exl3" and m.g_proj.inner.bc is not None) or
             BCAttn._fp16_gate_weight(m.g_proj) is not None) and
         (m.v_norm is None or (type(m.v_norm).__name__ == "RMSNorm" and not m.v_norm.span_heads)) and
-        # Asymmetric V head dim (MiMo-V2): the captured block feeds the attention output
-        # straight into o_proj, with no place to trim the padded V lanes
-        getattr(m, "v_head_dim", m.head_dim) == m.head_dim and
+        # Asymmetric V head dim (MiMo-V2): the combine kernel writes the trimmed V lanes into
+        # the o_proj input directly; the gate stages and the QSA sparse kernels assume the full
+        # head width, so those combinations stay on the eager path
+        (getattr(m, "v_head_dim", m.head_dim) == m.head_dim or (
+            m.g_proj is None and not getattr(m, "interleaved_gate", False) and
+            getattr(m, "qsa_indexer", None) is None)) and
         # TP shards are eligible: the shard owns its split cache layers directly (the opaque cache
         # handle is resolved before bc_attn_step) and the output all-reduce runs after the captured
         # block returns. Span-heads norms stay declined (cross-rank norm inside the block)

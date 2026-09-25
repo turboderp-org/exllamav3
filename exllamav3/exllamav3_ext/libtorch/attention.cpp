@@ -19,6 +19,7 @@ BC_Attention::BC_Attention
     int _num_q_heads,
     int _num_kv_heads,
     int _head_dim,
+    int _v_head_dim,
     int _hidden_size,
     int _hidden_size_padded,
     int _page_size,
@@ -77,6 +78,7 @@ BC_Attention::BC_Attention
     num_q_heads         (_num_q_heads),
     num_kv_heads        (_num_kv_heads),
     head_dim            (_head_dim),
+    v_head_dim          (_v_head_dim),
     hidden_size         (_hidden_size),
     hidden_size_padded  (_hidden_size_padded),
     page_size           (_page_size),
@@ -257,8 +259,11 @@ void BC_Attention::configure_slot
     s.q4 = s.q.view({bsz, q_len, num_q_heads, head_dim});
     s.k4 = s.kv.select(0, 0).view({bsz, q_len, num_kv_heads, head_dim});
     s.v4 = s.kv.select(0, 1).view({bsz, q_len, num_kv_heads, head_dim});
-    s.o2 = s.o.view({R, num_q_heads * head_dim});
-    s.o4 = s.o.view({bsz, q_len, num_q_heads, head_dim});
+    // The combine kernel writes v_head_dim lanes per head, so o is already the o_proj input
+    // layout (the gate stages assume the full head width and are declined python-side)
+    TORCH_CHECK(v_head_dim == head_dim || gate_mode == 0, "BC_Attention: gates require v_head_dim == head_dim");
+    s.o2 = s.o.view({R, num_q_heads * v_head_dim});
+    s.o4 = s.o.view({bsz, q_len, num_q_heads, v_head_dim});
 
     int n_q = num_q_heads * head_dim;
     if (gate_mode == 1)
@@ -832,7 +837,7 @@ void BC_Attention::run_gr
     at::Tensor c2 = y2;
     if (hs != hidden_size)
         c2 = s.yp.narrow(0, 0, R);
-    at::Tensor xh_o = xh_flat.narrow(0, 0, (int64_t) R * num_q_heads * head_dim).view({R, num_q_heads * head_dim});
+    at::Tensor xh_o = xh_flat.narrow(0, 0, (int64_t) R * num_q_heads * v_head_dim).view({R, num_q_heads * v_head_dim});
     exl3_gemm_gr(s.o2, o_proj->trellis, c2, o_proj->suh, xh_o, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
     if (o_proj->bias)
         add_gr(c2, o_proj->bias.value(), c2, graph);

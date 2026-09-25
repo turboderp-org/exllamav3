@@ -1010,13 +1010,16 @@ def _paged_attn_decode_combine_kernel(
     n_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     HD_PAD: tl.constexpr,
+    V_DIM: tl.constexpr,       # output lanes per head (< head_dim when V rides zero-padded in the cache)
     BLOCK_M: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     ROWS_SUB: tl.constexpr,
     D_SUB: tl.constexpr,
 ):
-    """Flash-decoding phase 2: reduce the per-split partial accumulators. Grid axis 1 splits
+    """Flash-decoding phase 2: reduce the per-split partial accumulators. The output row is
+    written V_DIM wide per head: with an asymmetric V head dim the padded lanes are dropped
+    here, so the result feeds o_proj directly. Grid axis 1 splits
     the program's (BLOCK_ROWS, HD_PAD) tile into (ROWS_SUB, D_SUB) sub-tiles so the serial
     walk over the splits runs on many CTAs (decode launches only a few programs)."""
     pid = tl.program_id(0)
@@ -1080,8 +1083,8 @@ def _paged_attn_decode_combine_kernel(
     out_tile = acc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
     if QCV > 0:
         out_tile = _rot_h32(out_tile, h32, ROWS_SUB, D_SUB)   # 32-wide groups: D_SUB % 32 == 0
-    out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
-    tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & d_mask[None, :])
+    out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * V_DIM
+    tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & (offs_d < V_DIM)[None, :])
 
 
 def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
@@ -1236,7 +1239,7 @@ def paged_attn_triton_decode(
             rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
             _paged_attn_decode_combine_kernel[(programs, (block_rows // rows_sub) * (hd_pad // d_sub))](
                 partial_o, partial_ml, out, h32,
-                num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad,
+                num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
                 block_m, block_h, block_rows, rows_sub, d_sub,
                 num_warps=4, num_stages=1,
             )
@@ -1850,13 +1853,14 @@ def paged_attn_triton_prefill(
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
 
-    # Tile configs by head_dim, sized for ~100 KB of smem with two pipeline stages. Blackwell
-    # prefers narrower kv tiles (measured: 167 vs 153 TFLOPS on RTX 5090 at BN 32 vs 64)
+    # Tile configs by head_dim, sized for ~100 KB of smem. Four warps over a 64-row tile keep
+    # each warp on whole 16-row MMA tiles; eight warps split the rows below that granularity
+    # and stall the dots (issue #384). Blackwell prefers narrower kv tiles and a third stage
     blackwell = torch.cuda.get_device_capability(q.device)[0] >= 10
     if hd_pad <= 128:
-        cfg = (128, 32, 8, 2) if blackwell else (128, 64, 8, 2)
+        cfg = (128, 32, 4, 3) if blackwell else (128, 32, 4, 2)
     elif hd_pad <= 256:
-        cfg = (64, 32, 8, 2)
+        cfg = (64, 32, 4, 2)
     else:
         cfg = (32, 16, 4, 2)
     num_stages_forced = num_stages is not None
