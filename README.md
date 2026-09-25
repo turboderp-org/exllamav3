@@ -7,7 +7,7 @@
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
 
-- **Quantization** - [EXL3](doc/exl3.md), based on QTIP, plus 2–8 bit cache quantization.
+- **Quantization** - [EXL3](#exl3-quantization), based on QTIP, plus 2–8 bit cache quantization.
 - **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.
 - **CPU offloading** - Allows large MoE models to run with limited GPU resources. AVX2 and AVX512 support.  
 - **Generation** - Continuous, dynamic batching, speculative decoding, multimodal support.
