@@ -74,7 +74,8 @@ class Conv(Module):
     @override
     def get_tensors(self):
         t = {}
-        t[f"{self.key}.weight"] = self.weight.contiguous()
+        weight = self.weight.to(torch.half) if self.weight.dtype != torch.half else self.weight
+        t[f"{self.key}.weight"] = weight.contiguous()
         if self.bias is not None:
             t[f"{self.key}.bias"] = self.bias.contiguous()
         return t

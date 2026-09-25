@@ -86,10 +86,13 @@ VgIsa vg_pick_isa()
         if (const char* e = std::getenv("EXL3_VISION_GEMM_ISA"))
         {
             if (std::strcmp(e, "scalar") == 0) return VG_SCALAR;
-            if (std::strcmp(e, "avx2") == 0) return VG_AVX2;
-            if (std::strcmp(e, "avx512") == 0) return VG_AVX512;
+            if (std::strcmp(e, "avx2") == 0)
+                return exl3_moe_cpu_has_avx2() ? VG_AVX2 : VG_SCALAR;
+            if (std::strcmp(e, "avx512") == 0)
+                return exl3_moe_cpu_has_avx512() ? VG_AVX512 : VG_SCALAR;
         }
-        return exl3_moe_cpu_has_avx512() ? VG_AVX512 : VG_AVX2;
+        if (exl3_moe_cpu_has_avx512()) return VG_AVX512;
+        return exl3_moe_cpu_has_avx2() ? VG_AVX2 : VG_SCALAR;
     }();
     return v;
 }

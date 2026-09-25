@@ -143,7 +143,7 @@ def attn_dispatch(
             bsz, q_len, num_q_heads, dim,
             kv_len, num_kv_heads,
             q, k, v,
-            None, None,
+            k_cache, v_cache,
             causal,
             sm_scale,
             cu_seqlens, max_seqlen,

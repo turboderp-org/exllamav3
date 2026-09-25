@@ -42,8 +42,7 @@ def _attn_cpu_native_single(
 
 def _attn_cpu_nocache(args: AttnArgs) -> torch.Tensor | None:
     # Full CPU ceiling: dense + varlen (bsz1 or shared bsz>1) + SWA + softcap + sinks +
-    # non-causal spans (prefix attention per span). Returns None only when the call is
-    # cached (CPU never takes the paged path) or varlen+spans co-occur (never hit).
+    # non-causal spans (prefix attention per span). Cached attention remains unsupported.
     if args.has_kv_cache():
         return None
     if args.is_varlen() and args.non_causal_spans:
