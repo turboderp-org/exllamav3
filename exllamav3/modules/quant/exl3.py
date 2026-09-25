@@ -100,7 +100,7 @@ class LinearEXL3:
 
     def unload(self):
         # g_tensor_cache.drop(*self.bsz1_xh_args)
-        pass
+        self._cpu_w_buf = None
 
 
     def get_tensors(self, key: str):
