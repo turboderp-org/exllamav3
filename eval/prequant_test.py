@@ -293,7 +293,8 @@ def main(args):
         print(f" -- Loading module: {col_green}{module.key}{col_default}")
         print()
         config.stc.begin_deferred_load()
-        module.load(torch.device(args.device) if not module.caps.get("prefer_cpu") else "cpu")
+        module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else torch.device(args.device),
+                    compute_device = torch.device(args.device))
         config.stc.end_deferred_load()
         if (
             (args.from_layer is None or idx >= args.from_layer) and

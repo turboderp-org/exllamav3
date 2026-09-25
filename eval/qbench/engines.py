@@ -61,7 +61,8 @@ class Exl3Backend:
         with ProgressBar("Streaming", len(modules)) as pb:
             for idx, module in enumerate(modules):
                 self.config.stc.begin_deferred_load()
-                module.load(self.device if not module.caps.get("prefer_cpu") else "cpu")
+                module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else self.device,
+                            compute_device = self.device)
                 self.config.stc.end_deferred_load()
 
                 # Storage info while the module is resident. Biases are excluded from the

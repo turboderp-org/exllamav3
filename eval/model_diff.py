@@ -160,18 +160,22 @@ def main(args):
 
         # Load modules
         config_a.stc.begin_deferred_load()
-        module_a.load(device if not module_a.caps.get("prefer_cpu") else "cpu")
+        module_a.load(torch.device("cpu") if module_a.caps.get("prefer_cpu") else device,
+                      compute_device = device)
         config_a.stc.end_deferred_load()
 
         config_b.stc.begin_deferred_load()
-        module_b.load(device if not module_b.caps.get("prefer_cpu") else "cpu")
+        module_b.load(torch.device("cpu") if module_b.caps.get("prefer_cpu") else device,
+                      compute_device = device)
         config_b.stc.end_deferred_load()
 
-        # Error measures
+        # Error measures (means divide by the rows actually measured, not args.rows: a
+        # shorter dataset or a ragged last batch would otherwise scale them silently)
         max_diff = 0
         rfn_error_sum = 0
         cos_error_sum = 0
         sqnr_sum = 0
+        err_rows = 0
 
         # Similarity measures
         topk_max = args.topk_max
@@ -179,8 +183,9 @@ def main(args):
         logprob_count = [0, 0]
         kl_div_sum_ab = 0
         kl_div_sum_ba = 0
-        kl_ab_toks = []      # per-token KLD (A, B), for median/quantile statistics
-        conf_b_toks = []     # reference top-token probability per token, for bucketed KLD
+        kl_rows = 0
+        kl_ab_toks = []      # per-token KL(A || B), for median/quantile statistics
+        conf_a_toks = []     # model A top-token probability per token, for bucketed KLD
         topk_hits_sum = [[0] * topk_max, [0] * topk_max]
         topk_hits_count = [[0] * topk_max, [0] * topk_max]
         topk_agreement_sum = [0] * topk_max
@@ -225,11 +230,22 @@ def main(args):
             # Measure error
             if not logits_layer:
                 rows = state_a.shape[0]
+                err_rows += rows
                 for j in range(rows):
                     # Hyperconnection models carry the residual as (seq, streams, hidden): compare
                     # the streams flattened to rows, the Frobenius norm needs 2D
-                    sa = state_a[j].reshape(-1, state_a.shape[-1]).to(float)
-                    sb = state_b[j].reshape(-1, state_b.shape[-1]).to(float)
+                    # A trellis embedding gathers onto the compute device while a non-trellis
+                    # prefer_cpu embedding stays on CPU; align the operands to the CUDA one
+                    # (the cheaper copy direction: one fp64 H2D upload of the CPU side, not a
+                    # GPU fp64 materialization plus per-row D2H copies in the loop below)
+                    sa = state_a[j].reshape(-1, state_a.shape[-1])
+                    sb = state_b[j].reshape(-1, state_b.shape[-1])
+                    tgt = sa.device if sa.device.type == "cuda" else sb.device
+                    # .clone(): to() is a no-op copy when state_a is already fp32 on tgt (the
+                    # trellis case), and sa -= sb / sa.abs_() below would then write into
+                    # state_a's storage, corrupting states_a[b] for the next module
+                    sa = sa.to(tgt, float).clone()
+                    sb = sb.to(tgt, float)
                     cos_error_sum += cosine_error(sa, sb)
                     sqnr_sum += sqnr(sa, sb)
                     sa -= sb
@@ -242,6 +258,7 @@ def main(args):
             # Perplexity, KL-div
             if logits_layer:
                 rows = state_a.shape[0]
+                kl_rows += rows
                 for j in range(rows):
                     x = (state_a[j], state_b[j])
                     input_ids = eval_ids[j]
@@ -273,24 +290,31 @@ def main(args):
                         topk_agreement_sum[t] += row_hits.sum().item()
                         topk_agreement_count[t] += top_slice_a.shape[0]
 
+                    # compute_kl_div(input, target) = KL(target || input), so the first call
+                    # is KL(A || B) (A-weighted: the direction that treats A as the reference
+                    # when -ma is the reference model) and the second KL(B || A). Positions:
+                    # the last token has no target and is dropped, exactly as in the ppl.
                     kl_vocab_size = min(vocab_size, x[0].shape[-1], x[1].shape[-1])
-                    kl_ab = compute_kl_div(x[0], x[1], kl_vocab_size)
+                    la = x[0][:-1, :]
+                    lb = x[1][:-1, :]
+                    kl_ab = compute_kl_div(lb, la, kl_vocab_size)
                     kl_div_sum_ab += kl_ab.mean().item()
-                    kl_div_sum_ba += compute_kl_div(x[1], x[0], kl_vocab_size).mean().item()
+                    kl_div_sum_ba += compute_kl_div(la, lb, kl_vocab_size).mean().item()
 
-                    # Per-token KLD and reference confidence. The mean KLD is dominated by
-                    # tokens where the reference itself is undecided
+                    # Per-token KLD and model A confidence. The mean KLD is dominated by
+                    # tokens where A itself is undecided
                     kl_ab_toks.append(kl_ab.flatten().float().cpu())
-                    logits_b2 = x[1].view(-1, x[1].shape[-1])
-                    for cf_a in range(0, logits_b2.shape[0], 256):
-                        cf = logits_b2[cf_a:cf_a + 256, :kl_vocab_size].float()
-                        conf_b_toks.append((cf.max(dim = -1).values - cf.logsumexp(dim = -1)).exp().cpu())
+                    logits_a2 = la.reshape(-1, la.shape[-1])
+                    for cf_a in range(0, logits_a2.shape[0], 256):
+                        cf = logits_a2[cf_a:cf_a + 256, :kl_vocab_size].float()
+                        conf_a_toks.append((cf.max(dim = -1).values - cf.logsumexp(dim = -1)).exp().cpu())
 
         # Print error
         if not logits_layer:
-            rfn_error = rfn_error_sum / args.rows
-            cos_error = cos_error_sum / args.rows
-            sqnr_ = sqnr_sum / args.rows
+            n_err = max(err_rows, 1)
+            rfn_error = rfn_error_sum / n_err
+            cos_error = cos_error_sum / n_err
+            sqnr_ = sqnr_sum / n_err
             print(
                 f" -- {module_a.key:40}"
                 f"   rfn_err: {rfn_error:.6f}"
@@ -311,8 +335,8 @@ def main(args):
         # Final ppl, kld
         if logits_layer:
             perplexity = [math.exp(-logprob_sum[i] / logprob_count[i]) for i in (0, 1)]
-            kl_div_ab = kl_div_sum_ab / args.rows
-            kl_div_ba = kl_div_sum_ba / args.rows
+            kl_div_ab = kl_div_sum_ab / max(kl_rows, 1)
+            kl_div_ba = kl_div_sum_ba / max(kl_rows, 1)
 
         # Unload modules
         module_a.unload()
@@ -343,23 +367,24 @@ def main(args):
         topk_agree_ = topk_agreement_sum[t] / topk_agreement_count[t]
         print(f"      K = {t+1}: {topk_agree_:6.4f}")
 
-    # KLD, either way around
-    print(f" -- KL divergence (A, B): {kl_div_ab:11.8f}")
-    print(f" -- KL divergence (B, A): {kl_div_ba:11.8f}")
+    # KLD, either way around. KL(A || B) weights by A, so when -ma is the reference model
+    # it is the reference-weighted direction (the one that answers "how far is B from A")
+    print(f" -- KL divergence (A || B): {kl_div_ab:11.8f}")
+    print(f" -- KL divergence (B || A): {kl_div_ba:11.8f}")
 
-    # Robust per-token statistics
+    # Robust per-token statistics (per token = per predicted position)
     kl_ab_all = torch.cat(kl_ab_toks)
-    conf_b_all = torch.cat(conf_b_toks)
-    print(f" -- KL divergence (A, B), per-token: median {kl_ab_all.median().item():.8f}   p90 {kl_ab_all.quantile(0.9).item():.8f}")
-    print(f" -- KL divergence (A, B), by reference confidence:")
+    conf_a_all = torch.cat(conf_a_toks)
+    print(f" -- KL divergence (A || B), per-token: median {kl_ab_all.median().item():.8f}   p90 {kl_ab_all.quantile(0.9).item():.8f}")
+    print(f" -- KL divergence (A || B), by model A confidence (the reference when -ma is it):")
     for c_lo, c_hi in [(0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 0.95), (0.95, 1.01)]:
-        mask = (conf_b_all >= c_lo) & (conf_b_all < c_hi)
+        mask = (conf_a_all >= c_lo) & (conf_a_all < c_hi)
         n = mask.sum().item()
         if n == 0:
             continue
         kb = kl_ab_all[mask]
         print(
-            f"      B top-prob [{c_lo:4.2f}, {min(c_hi, 1.0):4.2f}): {100 * n / conf_b_all.numel():5.1f}% of tokens"
+            f"      A top-prob [{c_lo:4.2f}, {min(c_hi, 1.0):4.2f}): {100 * n / conf_a_all.numel():5.1f}% of tokens"
             f"   mean {kb.mean().item():.6f}   median {kb.median().item():.6f}"
         )
 
@@ -457,6 +482,9 @@ def cache_quant_sweep_fast(args):
                     logits_a = model_a.forward(ids, {"sim_kvq": sim_kvq})
                     kl_vocab_size = min(vocab_size, logits_a.shape[-1], ref.shape[-1])
                     for j in range(logits_a.shape[0]):
+                        # compute_kl_div(input, target) = KL(target || input): the reference
+                        # model B weights, i.e. the same direction main() prints as
+                        # KL(A || B) when -ma is the reference
                         kl_div_sum += compute_kl_div(logits_a[j], ref[j], kl_vocab_size).mean().item()
                         num_rows += 1
                     del logits_a
