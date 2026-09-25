@@ -60,6 +60,12 @@ def _small_arena(monkeypatch, module, conn = None):
     return module._HugeArena(shared = True, conn = conn)
 
 
+def _small_private_arena(monkeypatch, module):
+    monkeypatch.setenv("EXL3_HOST_MEM_RESERVE_MB", "0")
+    monkeypatch.setattr(module._HugeArena, "CHUNK_BYTES", 4 * MiB)
+    return module._HugeArena()
+
+
 @pytest.mark.skipif(not WIN, reason = "Windows named sections")
 def test_windows_chunk_is_a_named_section_the_parent_can_open(monkeypatch):
     from exllamav3.model import moe_cpu_host as m
@@ -102,6 +108,62 @@ def test_windows_section_creation_failure_names_the_chunk_and_the_switch(monkeyp
     with pytest.raises(RuntimeError, match = "chunk 0.*paging file.*EXL3_MOE_PINNED_ARENA"):
         arena._new_chunk(1)
     assert arena.chunks == [] and arena.conn.messages == []
+
+
+@pytest.mark.skipif(not WIN, reason = "MEM_LARGE_PAGES is Windows-only")
+def test_private_chunk_falls_back_to_mmap_when_large_pages_unavailable(monkeypatch):
+    import mmap
+    from exllamav3.model import moe_cpu_host as m
+    monkeypatch.setattr(m, "_win32_large_page_alloc", lambda size: None)
+    monkeypatch.setattr(m.TUNING, "arena_hugepage", True)
+    arena = _small_private_arena(monkeypatch, m)
+    arena._new_chunk(1)
+    assert isinstance(arena.cur, mmap.mmap) and arena.win32_large_bytes == 0
+    arena.cur.close()
+
+
+@pytest.mark.skipif(not WIN, reason = "MEM_LARGE_PAGES is Windows-only")
+def test_private_chunk_uses_the_large_page_buffer_when_virtualalloc_succeeds(monkeypatch):
+    import ctypes
+    from exllamav3.model import moe_cpu_host as m
+    made = (ctypes.c_uint8 * (4 * MiB))()
+    monkeypatch.setattr(m, "_win32_large_page_alloc", lambda size: made)
+    monkeypatch.setattr(m.TUNING, "arena_hugepage", True)
+    arena = _small_private_arena(monkeypatch, m)
+    arena._new_chunk(1)
+    assert arena.cur is made and arena.win32_large_bytes == len(made)
+    arena.cur[:4] = b"exl3"                    # the buffer-protocol write path rehome() uses
+    assert bytes(memoryview(arena.cur)[:4]) == b"exl3"
+
+
+@pytest.mark.skipif(not WIN, reason = "MEM_LARGE_PAGES is Windows-only")
+def test_shared_chunk_never_takes_the_large_page_path(monkeypatch):
+    # Ordering invariant: a MEM_LARGE_PAGES VirtualAlloc chunk cannot be opened by name by
+    # the parent, so the pinned/shared path must stay on named pagefile sections
+    import mmap
+    from exllamav3.model import moe_cpu_host as m
+    def boom(size):
+        raise AssertionError("_win32_large_page_alloc must not run for shared arenas")
+    monkeypatch.setattr(m, "_win32_large_page_alloc", boom)
+    monkeypatch.setattr(m.TUNING, "arena_hugepage", True)
+    arena = _small_arena(monkeypatch, m, _CapturePipe())
+    arena._new_chunk(1)
+    assert isinstance(arena.cur, mmap.mmap) and arena.win32_large_bytes == 0
+    arena.cur.close()
+
+
+@pytest.mark.skipif(not WIN, reason = "MEM_LARGE_PAGES is Windows-only")
+def test_private_chunk_skips_large_pages_when_the_flag_is_off(monkeypatch):
+    import mmap
+    from exllamav3.model import moe_cpu_host as m
+    def boom(size):
+        raise AssertionError("_win32_large_page_alloc must not run with HUGEPAGE=0")
+    monkeypatch.setattr(m, "_win32_large_page_alloc", boom)
+    monkeypatch.setattr(m.TUNING, "arena_hugepage", False)
+    arena = _small_private_arena(monkeypatch, m)
+    arena._new_chunk(1)
+    assert isinstance(arena.cur, mmap.mmap) and arena.win32_large_bytes == 0
+    arena.cur.close()
 
 
 @pytest.mark.skipif(WIN, reason = "memfd + SCM_RIGHTS transport")
