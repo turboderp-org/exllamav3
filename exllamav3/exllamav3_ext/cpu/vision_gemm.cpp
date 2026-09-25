@@ -566,14 +566,10 @@ void vg_block_dp(const VgCtx& c, int64_t m0, int mr, int64_t n0)
         e0 = _mm512_dpbf16_ps(e0, a, blo); \
         e1 = _mm512_dpbf16_ps(e1, a, bhi); \
     } while (0)
-                VG_DP_ROW(0, e00, e01);
-                VG_DP_ROW(1, e10, e11);
-                VG_DP_ROW(2, e20, e21);
-                VG_DP_ROW(3, e30, e31);
-                VG_DP_ROW(4, e40, e41);
-                VG_DP_ROW(5, e50, e51);
-                VG_DP_ROW(6, e60, e61);
-                VG_DP_ROW(7, e70, e71);
+                VG_DP_ROW(0, e00, e01); VG_DP_ROW(1, e10, e11);
+                VG_DP_ROW(2, e20, e21); VG_DP_ROW(3, e30, e31);
+                VG_DP_ROW(4, e40, e41); VG_DP_ROW(5, e50, e51);
+                VG_DP_ROW(6, e60, e61); VG_DP_ROW(7, e70, e71);
 #undef VG_DP_ROW
             }
         }
