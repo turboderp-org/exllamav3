@@ -1,3 +1,4 @@
+#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #include "all_reduce_cpu_avx512.h"
 #include "all_reduce_cpu_avx2.h"
@@ -418,3 +419,5 @@ void perform_cpu_reduce_avx512
         chunk_idx++;
     }
 }
+
+#endif  // EXL3_AARCH64_STUB

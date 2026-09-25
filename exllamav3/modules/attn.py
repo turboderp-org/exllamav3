@@ -167,6 +167,7 @@ class Attention(Module):
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
+        window_right: int = 0,
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
@@ -204,6 +205,8 @@ class Attention(Module):
         self.register_submodule(qsa_indexer)
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
+        # Keys ahead of the query a windowed row may attend to; 0 = the usual past-only window
+        self.window_right = window_right
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
         self.use_cu_seqlens = use_cu_seqlens
@@ -913,6 +916,7 @@ class Attention(Module):
                 causal = causal,
                 sm_scale = self.sm_scale,
                 window_size = self.sliding_window,
+                window_right = self.window_right,
                 softcap = self.logit_softcapping,
                 sinks = self.sinks,
                 dispatch_cache = self.dispatch_cache,
@@ -973,36 +977,31 @@ class Attention(Module):
         return CacheLayer_qsa, kwargs
 
 
-    def autosplit_extra_measure(self, params):
+    def _autosplit_layer(self, params):
         if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
-            return
+            return None
         if self.device is None:
-            return
+            return None
         cache = params.get("cache")
         if cache is None:
-            return
+            return None
         from ..cache import CacheLayer, CacheLayer_quant
         from ..cache.qsa import QSAPlanes
         layer = cache if isinstance(cache, CacheLayer) else \
             cache.layers[self.layer_idx, params.get("layer_instance") or 0]
         quant = isinstance(layer, CacheLayer_quant)
+        return layer, quant
 
-        # Quantized cache, unbounded prefill: the two-pass prefill stages the referenced window
-        # as fp16 K/V in a per-call transient, which spans the whole pool for a job at full
-        # context. The (1, chunk)-at-context-0 measuring pass only sees a chunk of it, so
-        # allocate (and drop) the worst case here for the device budget. QSA bounds its dense
-        # prefill and stages a small window; MLA/DSA caches have their own measure
-        if quant and not isinstance(layer, QSAPlanes) and self.qsa_indexer is None:
-            from .attention_fn.triton_paged import _qc_staging
-            if _qc_staging == 1:
-                n = 2 * layer.qk.shape[0] * PAGE_SIZE * layer.token_dim
-                t = torch.empty((n,), dtype = torch.half, device = self.device)
-                del t
+    def autosplit_prepare(self, params):
+        """QSA decode slot statics for the whole (bsz, q_len) family, allocated before the
+        loader's measuring window (they stay resident)"""
+        found = self._autosplit_layer(params)
+        if found is None:
             return
-
+        layer, quant = found
+        from ..cache.qsa import QSAPlanes
         if self.qsa_indexer is None or not isinstance(layer, QSAPlanes):
             return
-        chunk = params["batch_shape"][1]
 
         # Decode statics: every buffer the (bsz <= MAX_BSZ, q_len <= MAX_QLEN) slot family
         # can request, both regimes (sparse slots are single-job, and the regime-1 score
@@ -1020,6 +1019,30 @@ class Attention(Module):
                 for q in (1, _bc_max_qlen):
                     bca._configure(1, q, True, 1)
 
+
+    def autosplit_extra_measure(self, params):
+        found = self._autosplit_layer(params)
+        if found is None:
+            return
+        layer, quant = found
+        from ..cache.qsa import QSAPlanes
+
+        # Quantized cache, unbounded prefill: the two-pass prefill stages the referenced window
+        # as fp16 K/V in a per-call transient, which spans the whole pool for a job at full
+        # context. The (1, chunk)-at-context-0 measuring pass only sees a chunk of it, so
+        # allocate (and drop) the worst case here for the device budget. QSA bounds its dense
+        # prefill and stages a small window; MLA/DSA caches have their own measure
+        if quant and not isinstance(layer, QSAPlanes) and self.qsa_indexer is None:
+            from .attention_fn.triton_paged import _qc_staging
+            if _qc_staging == 1:
+                n = 2 * layer.qk.shape[0] * PAGE_SIZE * layer.token_dim
+                t = torch.empty((n,), dtype = torch.half, device = self.device)
+                del t
+            return
+
+        if self.qsa_indexer is None or not isinstance(layer, QSAPlanes):
+            return
+        chunk = params["batch_shape"][1]
         # Sparse prefill at maximum context. Synthetic state: every block-table entry aliases
         # page 0, zeroed so the math stays finite
         num_pages = (layer.qk if quant else layer.k).shape[0]
@@ -1139,6 +1162,7 @@ class Attention(Module):
                 causal = causal,
                 sm_scale = self.sm_scale,
                 window_size = self.sliding_window,
+                window_right = self.window_right,
                 softcap = self.logit_softcapping,
                 non_causal_spans = non_causal_spans,
                 sinks = self.sinks,
@@ -1238,6 +1262,7 @@ class Attention(Module):
                 "sm_scale": self.sm_scale,
                 "out_dtype": self.out_dtype,
                 "sliding_window": self.sliding_window,
+                "window_right": self.window_right,
                 "logit_softcapping": self.logit_softcapping,
                 "tp_split_norm": self.tp_split_norm,
                 "use_k_as_v": self.use_k_as_v,

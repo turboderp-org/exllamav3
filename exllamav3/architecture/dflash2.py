@@ -23,6 +23,9 @@ from ..util.device_copy import to_device
 #     its own position and the selector walks candidates starting from the anchor.
 #   - Taps: reference reads HF hidden_states[target_layer_ids[i] + 1] = output
 #     of target layer id  =>  tap_shift 0 (exl3 export index = layer output).
+#   - Block attention direction: the checkpoint's "is_causal" decides whether block rows
+#     see later rows (reference default: causal only on sliding-window layers); windowed
+#     layers express it through (left, right) window bounds, see DFlashConfig.block_window.
 #   - Draft cache ctx K/V come from the shared DFlash K/V update (fc+hidden_norm
 #     projected tap stream); per-round writes at the new cache position overwrite
 #     the transient noise-block K/V, reproducing the reference's crop semantics.
@@ -106,7 +109,7 @@ class DFlash2Model(Model):
         self.attn_modules = []
 
         for idx in range(config.num_hidden_layers):
-            is_swa = config.layer_types[idx] == "sliding_attention"
+            window_left, window_right = config.block_window(idx)
 
             attn = Attention(
                 config = config,
@@ -122,7 +125,8 @@ class DFlash2Model(Model):
                 key_v = "v_proj",
                 key_o = "o_proj",
                 qmap = "block.attn",
-                sliding_window = config.sliding_window if is_swa else -1,
+                sliding_window = window_left,
+                window_right = window_right,
                 q_norm = RMSNorm(
                     config = config,
                     key = f"layers.{idx}.self_attn.q_norm",
@@ -306,9 +310,9 @@ class DFlash2Model(Model):
         assert input_ids.shape[-1] == 1, \
             "DFlash2 expects one verified anchor token per draft block"
         params["dflash2_anchor_ids"] = input_ids
-        # The draft block attends to itself bidirectionally; causality on the sliding-window
-        # layers is expressed through their window (left sw, right 0) instead
-        params["causal"] = False
+        # Block attention direction per the checkpoint (DFlashConfig.block_window): the kernel
+        # flag is only needed when every layer is causal; windowed layers carry their own bounds
+        params["causal"] = self.config.is_causal is True
         return prepare_for_attn(input_ids, params)
 
 

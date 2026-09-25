@@ -129,36 +129,43 @@ def measure_generate(args, model, cache, warmup = False):
     is_recurrent = model.caps.get("recurrent_states", False)
     progress = 0
     results = {}
+    spread = {}
     seqlens = [1, 2, 3, 4] if args.spec_dec else [1]
     unit = "it" if args.spec_dec else "tokens"
     max_progress = len(lengths)
     with (ProgressBar("Warmup" if warmup else "Generate", max_progress) as pb):
         for length in lengths:
             for seqlen in seqlens:
-                recurrent = [cache.get_test_state(length)] if is_recurrent else None
-                torch.cuda.synchronize()
-                with Timer() as t:
-                    for i in range(100 // seqlen):
-                        params = {
-                            "attn_mode": "flash_attn",
-                            "cache": cache,
-                            "past_len": length + i * seqlen,
-                            "batch_shape": (1, max(length + 256, 256)),
-                            "recurrent_states": recurrent
-                        }
-                        logits = model.forward(workload_ids(ids_offset + length + i, seqlen), params)
-                        sample = torch.argmax(logits)
-                        sample = sample.cpu()  # force sync
-                        del logits
-                if is_recurrent:
-                    recurrent[0].free()
-                results[seqlen, length] = (100 // seqlen) / t.interval
+                rates = []
+                for rep in range(1 if warmup else args.decode_reps):
+                    recurrent = [cache.get_test_state(length)] if is_recurrent else None
+                    torch.cuda.synchronize()
+                    with Timer() as t:
+                        for i in range(100 // seqlen):
+                            params = {
+                                "attn_mode": "flash_attn",
+                                "cache": cache,
+                                "past_len": length + i * seqlen,
+                                "batch_shape": (1, max(length + 256, 256)),
+                                "recurrent_states": recurrent
+                            }
+                            logits = model.forward(workload_ids(ids_offset + length + i, seqlen), params)
+                            sample = torch.argmax(logits)
+                            sample = sample.cpu()  # force sync
+                            del logits
+                    if is_recurrent:
+                        recurrent[0].free()
+                    rates.append((100 // seqlen) / t.interval)
+                results[seqlen, length] = sum(rates) / len(rates)
+                spread[seqlen, length] = (min(rates), max(rates))
 
             if not warmup:
                 print(
                     f"Context {length: 6}: " +
                     ",   ".join([
-                        f"S={col_gray}{seqlen} {col_green}{results[seqlen, length]:10.2f}{col_default} {unit}/s"
+                        f"S={col_gray}{seqlen} {col_green}{results[seqlen, length]:10.2f}{col_default} {unit}/s" +
+                        (f" {col_gray}[{spread[seqlen, length][0]:.2f} - {spread[seqlen, length][1]:.2f}]{col_default}"
+                         if args.decode_reps > 1 else "")
                         for seqlen in seqlens
                     ])
                 )
@@ -216,6 +223,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("-max_length", "--max_length", type = int, help = "Max context length to measure (default: 32768)", default = 32768)
     parser.add_argument("-spf", "--skip_prefill", action = "store_true", help = "Skip measuring prefill speed")
+    parser.add_argument("-dr", "--decode_reps", type = int, default = 1, help = "Repeat each 100-token decode measurement this many times from the same context and report the mean (and min-max), default: 1")
     parser.add_argument("-sg", "--skip_gen", action = "store_true", help = "Skip measuring generaition speed")
     parser.add_argument("-swu", "--skip_warmup", action = "store_true", help = "Skip warmup passes")
     parser.add_argument("-short", "--short_prefill", action = "store_true", help = "Test short-prefill/batch throughput")

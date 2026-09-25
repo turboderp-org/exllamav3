@@ -1,3 +1,4 @@
+#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #include "all_reduce_cpu_avx2.h"
 #include "all_reduce_cpu_avx512.h"
@@ -397,3 +398,15 @@ void perform_cpu_reduce_avx2
         chunk_idx++;
     }
 }
+
+#else  // !x86: EXL3_AARCH64_STUB — CPU all-reduce for native TP backend is AVX-only; stubbed
+#include "all_reduce_cpu_avx2.h"
+#include <torch/extension.h>
+void enable_fast_fp() {}
+void enable_fast_fp_avx2() {}
+void perform_cpu_reduce(PGContext*, size_t, uint32_t, uint32_t, uint8_t*, size_t)
+{ TORCH_CHECK(false, "Native tensor-parallel CPU reduce is not available on this CPU architecture (x86 AVX2 only); use the nccl backend"); }
+void perform_cpu_reduce_avx2(PGContext* c, size_t a, uint32_t b, uint32_t d, uint8_t* e, size_t f) { perform_cpu_reduce(c, a, b, d, e, f); }
+void cpu_reduce_parallel(void (*)(uint16_t*, const uint16_t*, const uint16_t*, size_t), void (*)(uint16_t*, const uint16_t*, size_t),
+                         uint16_t*, const uint16_t*, const uint16_t*, size_t, int) { TORCH_CHECK(false, "cpu_reduce_parallel unavailable on this architecture"); }
+#endif
