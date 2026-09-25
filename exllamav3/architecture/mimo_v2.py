@@ -376,9 +376,8 @@ class MiMoV2Model(Model):
         # Activate all experts during H capture pass in quantization
         self.calibration_all_experts = True
 
-        # TP would have to split the fused qkv reader and the V padding across ranks
         self.caps.update({
-            "supports_tp": False,
+            "supports_tp": True,
         })
 
         # SWA layers keep their KV in a per-slot window ring rather than the paged cache

@@ -1504,8 +1504,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 "num_experts": self.num_experts,
                 "num_experts_per_tok": self.num_experts_per_tok,
                 "interm_dtype": self.interm_dtype,
+                "interm_div": self.interm_div,
                 "router_type": self.router_type,
-                "routed_scaling_factor": self.routed_scaling_factor,
+                # The constructor folds interm_div into the routing scale again on import, so
+                # send the pre-fold value (the expert tensors arrive already rescaled)
+                "routed_scaling_factor": self.routed_scaling_factor / self.interm_div
+                    if (self.interm_div != 1.0 and self.router_type != "std") else self.routed_scaling_factor,
                 "n_group": self.n_group,
                 "topk_group": self.topk_group,
                 "act_limit": self.act_limit,

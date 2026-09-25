@@ -1229,7 +1229,9 @@ class Attention(Module):
             channels_to_split = 1
             max_devices = 1
         else:
-            while channel_width * self.head_dim < 128:
+            # EXL3 tensors split on 128-channel boundaries: widen the unit to as many K/V heads as
+            # it takes for the K/V slice width to be a multiple of 128 (e.g. head_dim 192 -> pairs)
+            while (channel_width * self.head_dim) % 128 != 0:
                 assert channels_to_split % 2 == 0, \
                     "Model's K/V heads cannot divide into 128-channel tensors"
                 channel_width *= 2
@@ -1274,11 +1276,13 @@ class Attention(Module):
                 "layer_idx": self.layer_idx,
                 "hidden_size": self.hidden_size,
                 "head_dim": self.head_dim,
+                "v_head_dim": self.v_head_dim,
                 "rope_settings": self.rope_settings,
                 "sm_scale": self.sm_scale,
                 "out_dtype": self.out_dtype,
                 "sliding_window": self.sliding_window,
                 "window_right": self.window_right,
+                "sink_key0": self.sink_key0,
                 "logit_softcapping": self.logit_softcapping,
                 "tp_split_norm": self.tp_split_norm,
                 "use_k_as_v": self.use_k_as_v,
@@ -1341,7 +1345,10 @@ class Attention(Module):
                 if num_kv_heads else None
         kv_split = (True, first * head_dim, last * head_dim) \
             if num_kv_heads else None
-        o_split = (False, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+        # o_proj consumes v_head_dim lanes per query head (asymmetric V is zero-padded to head_dim
+        # only inside the cache)
+        v_head_dim = exported["kwargs"].get("v_head_dim") or head_dim
+        o_split = (False, first * v_head_dim * n_gqa, last * v_head_dim * n_gqa) \
             if num_kv_heads else None
         # For span_heads norms, we need element indices (head_idx * head_dim)
         # For regular norms, we use head indices
