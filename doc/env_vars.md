@@ -397,6 +397,13 @@ weights (fp16 or EXL3 trellis) in pinned host memory instead of VRAM, computing 
 a zero-copy device alias. Trades vision-tower speed for VRAM. Set before loading the vision
 component.
 
+### CPU vision execution
+
+Load the Qwen 3.5 vision component on the host with `vision_model.load(device = "cpu")`, while
+keeping the text model on its configured device. This trades vision speed for lower VRAM use; the
+vision weights and activations use system RAM. CPU cached attention is not supported. The
+multimodal example exposes the device choice through `vision_device`.
+
 ## Multi-GPU
 
 ### `EXLLAMA_NO_P2P_COPY` (default: unset)

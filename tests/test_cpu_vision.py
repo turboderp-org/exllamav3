@@ -1,18 +1,6 @@
-# Fixture-free primitive coverage for the CPU vision execution path:
-#
-#   - cpu_matmul (half in / float out vs FP32 reference, overflow case)
-#   - Conv flat-3D CPU forward vs CUDA ext.hgemm
-#   - LinearFP16 CPU forward vs CUDA ext.hgemm
-#   - RoPE.apply with external 2D-grid frequencies on CPU vs direct torch reference
-#   - attn_dispatch on CPU tensors vs direct torch SDPA
-#   - reconstruct_had_slice_cpu vs CUDA reconstruct_had_slice for every K and codebook
-#   - LinearEXL3 CPU forwards vs the CUDA reconstructed-HGEMM path
-#
-# CUDA-reference cases run on cuda:0 when available and are skipped otherwise; pure-CPU cases
-# always run.
-
 import os
 import sys
+
 import pytest
 import torch
 
@@ -110,6 +98,25 @@ def test_conv_flat_cpu_vs_cuda():
     assert rel_err(y_cpu, y_cuda.cpu()) < 3e-3
 
 
+def test_conv_cpu_export_keeps_half_weight():
+    conv = Conv(
+        config = NullConfig(),
+        key = "test.conv",
+        in_channels = 3,
+        out_channels = 8,
+        kernel_size = (1, 1, 1),
+        flat = True,
+    )
+    conv.weight = torch.randn(8, 3, 1, 1, 1).half()
+    conv.bias = None
+    conv.device = torch.device("cpu")
+    conv._numel = conv.weight.numel()
+    x = torch.randn(1, 2, 3).half()
+    conv.forward(x, params = {})
+    assert conv.weight.dtype == torch.float
+    assert conv.get_tensors()["test.conv.weight"].dtype == torch.half
+
+
 # ------------------------------------------------------------------------------------------------
 # LinearFP16: CPU forward vs CUDA kernel, both output dtypes
 # ------------------------------------------------------------------------------------------------
@@ -188,8 +195,7 @@ def test_attn_dispatch_cpu_nocache():
 
 
 def test_attn_dispatch_cpu_swa_supported():
-    # G5 ceiling: SWA now runs the fused native kernel (restricted KV range, no N^2
-    # temp) and must match a windowed SDPA reference.
+    # Sliding-window attention uses the native CPU kernel's restricted KV range.
     bsz, heads, seq, dim = 1, 4, 32, 32
     q = torch.randn(bsz, seq, heads, dim).half()
     k = torch.randn_like(q)
@@ -197,9 +203,11 @@ def test_attn_dispatch_cpu_swa_supported():
     o = attn_dispatch(q = q, k = k, v = v, causal = True, window_size = 8)
     qt, kt, vt = q.transpose(1, 2).float(), k.transpose(1, 2).float(), v.transpose(1, 2).float()
     idx = torch.arange(seq)
-    m = (idx[None, :] <= idx[:, None]) & (idx[None, :] >= idx[:, None] - 8)
-    add = torch.zeros(seq, seq).masked_fill(~m, float("-inf"))
-    ref = torch.nn.functional.scaled_dot_product_attention(qt, kt, vt, attn_mask = add, is_causal = False).transpose(1, 2).half()
+    mask = (idx[None, :] <= idx[:, None]) & (idx[None, :] >= idx[:, None] - 8)
+    attn_mask = torch.zeros(seq, seq).masked_fill(~mask, float("-inf"))
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        qt, kt, vt, attn_mask = attn_mask, is_causal = False
+    ).transpose(1, 2).half()
     assert o.shape == ref.shape
     assert rel_err(o, ref) < 3e-3
 
@@ -214,6 +222,21 @@ def test_attn_dispatch_cpu_unsupported_raises():
     with pytest.raises(ValueError):
         attn_dispatch(q = q, k = k, v = v, causal = False, cu_seqlens = cu, max_seqlen = 16,
                       non_causal_spans = [(0, 16, True, 0), (16, 32, False, 0)])
+
+
+def test_attn_dispatch_cpu_cache_unsupported():
+    q = torch.randn(1, 1, 2, 16).half()
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    with pytest.raises(ValueError, match = "Cached attention is not supported on CPU"):
+        attn_dispatch(
+            q = q,
+            k = k,
+            v = v,
+            cache = object(),
+            block_table = torch.zeros((1, 1), dtype = torch.int),
+            cache_seqlens = torch.zeros((1,), dtype = torch.int),
+        )
 
 
 # ------------------------------------------------------------------------------------------------

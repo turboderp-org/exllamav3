@@ -109,6 +109,10 @@ def attn_dispatch(
     bsz, q_len, num_q_heads, dim = q.shape
     _, kv_len, num_kv_heads, _ = k.shape
 
+    # Host attention currently supports cacheless calls only; reject before cache access so
+    # unsupported CPU decode does not materialize or update cache state.
+    if q.is_cpu and cache is not None:
+        raise ValueError("Cached attention is not supported on CPU")
     # Get cache tensors. Quantized layers pass their packed tensors straight to the attention
     # kernels when possible: new K/V are quantized into the cache up front and never
     # materialized as full fp16 cache-sized temporaries

@@ -12,8 +12,8 @@ mode = "gemma4"
 cache_size = 8192
 streaming = True
 
-# Optional explicit device for the vision component, e.g. "cpu" to keep the vision encoder in
-# system RAM (Qwen 3.5). None keeps the default behavior of loading onto the CUDA autosplit.
+# Optional explicit device for the vision component. Set to "cpu" to trade inference speed for
+# lower VRAM use; None keeps the default device loading and autosplit behavior.
 vision_device = None
 
 match mode:
