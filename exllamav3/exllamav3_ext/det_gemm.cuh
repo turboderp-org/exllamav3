@@ -60,14 +60,10 @@ __device__ __forceinline__ void det_quant16(const float* v, float inv, int4& hi4
 
 __device__ __forceinline__ void det_mma_s8(int* c, const unsigned* a, const unsigned* b)
 {
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-#else
-    (void) c; (void) a; (void) b;
-#endif
 }
 
 // One k32 step of the three-pass product for a 16 x 8 tile: hh += A_hi B_hi; x += A_hi B_lo + A_lo B_hi
@@ -92,34 +88,14 @@ __device__ __forceinline__ float det_flush(int hh, int x, float scale, float acc
 __device__ __forceinline__ unsigned det_smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void det_cp_async16(unsigned dst, const void* src, int src_bytes)
 {
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst), "l"(src), "r"(src_bytes));
-#else
-    (void) dst; (void) src; (void) src_bytes;
-#endif
 }
-__device__ __forceinline__ void det_cp_async_commit()
-{
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.commit_group;\n" ::);
-#endif
-}
-template <int N> __device__ __forceinline__ void det_cp_async_wait()
-{
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
-#else
-    (void) N;
-#endif
-}
+__device__ __forceinline__ void det_cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N> __device__ __forceinline__ void det_cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
 __device__ __forceinline__ void det_ldmatrix_x4(unsigned* r, unsigned addr)
 {
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
-#else
-    (void) r; (void) addr;
-#endif
 }
 // Byte offset of 16-byte piece c (0..7) of row r in a dense 128-byte-row int8 tile, XOR-swizzled
 // so that both 16-byte async stores and ldmatrix fragment loads are bank-conflict free

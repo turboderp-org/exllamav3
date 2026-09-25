@@ -253,10 +253,9 @@ void routing_gemv
 {
     // Single rows take the fixed-order FMA GEMV (exact on every architecture, and the fastest);
     // with the int8 gate available every other row count takes the deterministic int8
-    // tensor-core projection (routing_gemm.cu), so tensor-parallel ranks of any sm_80+
-    // architecture routing on identical streams select identical experts (the int8 kernels
-    // need cp.async and mma.m16n8k32, both sm_80+). Pre-Ampere devices fall back to cuBLAS,
-    // which is device-dependent — uniform per-arch fleets still agree with each other
+    // tensor-core projection (routing_gemm.cu), so tensor-parallel ranks of any architecture
+    // routing on identical streams select identical experts. cuBLAS remains the fallback for
+    // shapes neither covers
     int k = hidden.size(-1);
     int E = scores.size(-1);
     bool bsz1 = hidden.numel() == k;
