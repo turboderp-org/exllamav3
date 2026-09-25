@@ -169,6 +169,7 @@ class Attention(Module):
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
         window_right: int = 0,
+        sink_key0: bool = False,
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
@@ -215,6 +216,8 @@ class Attention(Module):
         self.sliding_window = sliding_window
         # Keys ahead of the query a windowed row may attend to; 0 = the usual past-only window
         self.window_right = window_right
+        # Sinks as a bias on the first key of each (varlen) segment rather than an extra logit
+        self.sink_key0 = sink_key0
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
         self.use_cu_seqlens = use_cu_seqlens
@@ -929,6 +932,7 @@ class Attention(Module):
                 sm_scale = self.sm_scale,
                 window_size = self.sliding_window,
                 window_right = self.window_right,
+                sink_key0 = self.sink_key0,
                 softcap = self.logit_softcapping,
                 sinks = self.sinks,
                 dispatch_cache = self.dispatch_cache,

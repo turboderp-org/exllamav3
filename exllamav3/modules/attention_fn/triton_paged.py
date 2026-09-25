@@ -2044,12 +2044,18 @@ def _varlen_attn_kernel(
     WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    SINK_KEY0: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """Packed varlen self-attention (no cache): each segment of the packed sequence attends
     within itself. Grid: (q blocks of the longest segment, segments, q heads); programs beyond
-    a segment's length exit early. head_dim need not be a power of two (padded loads)."""
+    a segment's length exit early. head_dim need not be a power of two (padded loads).
+
+    Sinks come in two forms: HAS_SINKS is the gpt-oss extra logit that joins the softmax
+    denominator without a value; SINK_KEY0 adds the per-head sink to the logit of each
+    segment's first key instead (MiMo-ViT), so the mass lands on that key's value and the
+    window still decides whether the key is visible at all."""
     pid_m = tl.program_id(0)
     seg = tl.program_id(1)
     q_head = tl.program_id(2)
@@ -2070,6 +2076,8 @@ def _varlen_attn_kernel(
     q_ptrs = q + ((q0 + offs_m[:, None]) * n_q_heads + q_head) * head_dim + offs_d[None, :]
     q_tile = tl.load(q_ptrs, mask = valid_row[:, None] & d_mask[None, :], other = 0.0)
     qk_scale_log2e = scale * 1.4426950408889634
+    if SINK_KEY0:
+        sink_l2 = tl.load(sinks + q_head).to(tl.float32) * 1.4426950408889634
 
     m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     l = tl.full((BLOCK_M,), 0.0, tl.float32)
@@ -2104,6 +2112,8 @@ def _varlen_attn_kernel(
             scores = s_nat * 1.4426950408889634
         else:
             scores = scores * qk_scale_log2e
+        if SINK_KEY0:
+            scores = tl.where(offs_n[None, :] == 0, scores + sink_l2, scores)
 
         m_new = tl.maximum(m, tl.max(scores, axis = 1))
         p = tl.exp2(scores - m_new[:, None])
@@ -2126,6 +2136,8 @@ def _varlen_attn_kernel(
             scores = s_nat * 1.4426950408889634
         else:
             scores = scores * qk_scale_log2e
+        if SINK_KEY0:
+            scores = tl.where(offs_n[None, :] == 0, scores + sink_l2, scores)
 
         valid = valid_row[:, None] & (offs_n[None, :] < n_hi)
         if CAUSAL:
@@ -2171,6 +2183,7 @@ def varlen_attn_triton(
     window_size: int | tuple[int, int] | None = None,
     softcap: float = 0.0,
     sinks: torch.Tensor | None = None,
+    sink_key0: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Packed varlen self-attention over (total, heads, head_dim) tensors, segments given by
@@ -2208,7 +2221,7 @@ def varlen_attn_triton(
             q, k, v, cu_seqlens, out, sinks,
             n_q_heads, n_kv_heads, head_dim, hd_p2, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            has_sinks, block_m, block_n,
+            has_sinks and not sink_key0, has_sinks and sink_key0, block_m, block_n,
             num_warps=num_warps, num_stages=num_stages,
         )
     return out.unsqueeze(0) if squeeze else out
@@ -2236,6 +2249,7 @@ def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
         window_size=args.get_window_size(),
         softcap=args.softcap,
         sinks=args.sinks,
+        sink_key0=args.sink_key0,
     )
 
 

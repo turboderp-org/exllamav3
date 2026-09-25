@@ -11,6 +11,9 @@ from ..modules import (
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
 from .mimo_v2_mtp import MiMoV2MTPModel
+from .mimo_v2_vision import MiMoV2VisionModel, read_mimo_v2_vision_config
+from .qwen2_5_vl import read_qwen2_5_vl_pp_config
+import os, json
 
 # MiMo-V2's fused qkv_proj is stored as the concatenation of `ckpt_tp` tensor-parallel shards,
 # each laid out [q_shard; k_shard; v_shard], and its FP8 weight_scale_inv grid is computed per
@@ -85,7 +88,7 @@ class MiMoV2Config(Config):
     ):
         super().__init__(
             directory,
-            {"text": MiMoV2Model, "mtp": MiMoV2MTPModel},
+            {"text": MiMoV2Model, "mtp": MiMoV2MTPModel, "vision": MiMoV2VisionModel},
             **kwargs
         )
 
@@ -95,6 +98,20 @@ class MiMoV2Config(Config):
         self.mtp_num_layers = self.read_cfg(int, "num_nextn_predict_layers", 0)
         if self.mtp_num_layers == 0:
             self.model_classes.pop("mtp", None)
+
+        # Vision tower (visual.*), loaded as the "vision" component. The audio encoder and its
+        # speech embeddings are not supported
+        vision_config = self.read_cfg(dict, "vision_config", None)
+        prep_path = os.path.join(self.directory, "preprocessor_config.json")
+        if vision_config and os.path.exists(prep_path):
+            self.vision = read_mimo_v2_vision_config(vision_config)
+            with open(prep_path, encoding = "utf8") as f:
+                self.vision_pp = read_qwen2_5_vl_pp_config(json.load(f))
+            self.vision_start_token_id = self.read_cfg(int, ["vision_start_token_id", "processor_config->vision_start_token_id"], 151652)
+            self.vision_end_token_id = self.read_cfg(int, ["vision_end_token_id", "processor_config->vision_end_token_id"], 151653)
+        else:
+            self.vision = None
+            self.model_classes.pop("vision", None)
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
 
         # Attention geometry. Q/K run at head_dim (192) while V runs at v_head_dim (128) on every
@@ -384,9 +401,10 @@ class MiMoV2Model(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        # MiMo's template joins turns without a newline after <|im_end|>
         p = ""
         if system_prompt:
-            p += f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-        p += f"<|im_start|>user\n{prompt}<|im_end|>\n"
+            p += f"<|im_start|>system\n{system_prompt}<|im_end|>"
+        p += f"<|im_start|>user\n{prompt}<|im_end|>"
         p += f"<|im_start|>assistant\n"
         return p

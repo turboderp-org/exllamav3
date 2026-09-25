@@ -91,6 +91,7 @@ def attn_dispatch(
     max_seqlen: int | None = None,
     window_size: int | None = None,
     window_right: int = 0,
+    sink_key0: bool = False,
     softcap: float = 0.0,
     block_table: torch.Tensor | None = None,
     cache_seqlens: torch.Tensor | None = None,
@@ -154,6 +155,7 @@ def attn_dispatch(
         sinks,
         max_kv_len = max_kv_len,
         window_right = window_right,
+        sink_key0 = sink_key0,
     )
     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache
