@@ -1159,15 +1159,15 @@ class MoeCpuHost:
         if d is None:
             # Experts arrive band-swizzled when the CPU tier bands them (same per-matrix rule
             # as the child's arena rehome, exl3_moe_cpu_swizzle_group); the GPU restores the
-            # native tile order into a parallel ring after each DMA. The ring is allocated
-            # whenever any matrix could be swizzled (the per-projection group decides at DMA).
-            swz = TUNING.swizzle and ext.exl3_moe_cpu_has_avx2()
+            # native tile order into a parallel ring after each DMA. That ring is only needed
+            # by layers with actually-swizzled projections, so it is allocated lazily on the
+            # first such layer (_native_slots): models whose bitrates all stay native pay no
+            # VRAM and no per-batch copy pass (an eager ring here cost ~4% streamed prefill on
+            # AVX2 hosts where nothing was swizzled).
             d = dict(
                 vram_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
                               for _ in range(self.num_wslots)],
-                native_slots = [torch.empty(self.wslot_size // 2, dtype = torch.int16, device = device)
-                                for _ in range(self.num_wslots)] if swz else None,
-                swz = swz,
+                native_slots = None,
                 w_scratch = None,
                 fused_bufs = {},
                 recon = {},
@@ -1179,6 +1179,17 @@ class MoeCpuHost:
             d["w_scratch"] = torch.empty(mx, dtype = torch.half, device = device)
         return d
 
+    def _native_slots(self, device):
+        """The native-order VRAM ring for swizzled streamed experts, allocated on first use
+        (see _device_buffers); layers with no swizzled projection never touch it"""
+        key = torch.device(device).index or 0
+        bufs = self._dev_bufs[key]
+        if bufs["native_slots"] is None:
+            bufs["native_slots"] = [torch.empty(self.wslot_size // 2, dtype = torch.int16,
+                                                device = device)
+                                    for _ in range(self.num_wslots)]
+        return bufs["native_slots"]
+
     def _ensure_stream_state(self, device):
         key = torch.device(device).index or 0
         st = self.sstate.get(key)
@@ -1189,7 +1200,6 @@ class MoeCpuHost:
             copy_stream = torch.cuda.Stream(device = device),
             vram_slots = bufs["vram_slots"],
             native_slots = bufs["native_slots"],
-            swz = bufs["swz"],
             wready_ev = [torch.cuda.Event() for _ in range(self.num_wslots)],
             wconsumed_ev = [torch.cuda.Event() for _ in range(self.num_wslots)],
             wslot_used = [False] * self.num_wslots,
@@ -1438,6 +1448,18 @@ class MoeCpuHost:
         exp_b = spec["expert_bytes"]
         per_slot = min(self.wslot_size // exp_b, self.batch_experts)
         gated = pd.get("g") is not None
+        # Does this layer's streamed path need the unswizzle detour (swizzled arena bytes ->
+        # native order in VRAM)? Bitrates are fixed per layer, so the answer is cached on the
+        # spec; layers that answer False read vram_slots directly, exactly as before the
+        # swizzle feature existed (no ring, no extra copy pass)
+        swz_layer = spec.get("swz_layer")
+        if swz_layer is None:
+            swz_layer = TUNING.swizzle and any(
+                ext.exl3_moe_cpu_swizzle_group(pd[n][2]) for n in ("g", "u", "d") if pd.get(n))
+            spec["swz_layer"] = swz_layer
+        native = st["native_slots"] if swz_layer else None
+        if swz_layer and native is None:
+            native = st["native_slots"] = self._native_slots(y.device)
         abort = self.gpu_base_ptr + 128
         copy_stream = st["copy_stream"]
         # Pinned arena: per-expert (chunk, offset) of the DMA source; None = staged path
@@ -1505,23 +1527,23 @@ class MoeCpuHost:
                     ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
 
             with torch.cuda.stream(copy_stream):
-                if st["swz"]:
+                if swz_layer:
                     # Restore the native tile order on the copy stream, one launch per projection
-                    # over the whole batch (group 0 projections -- never-swizzled bitrates --
-                    # take the plain-copy path in the same kernel)
+                    # over the whole batch (group 0 projections -- never-swizzled bitrates in an
+                    # otherwise-swizzled layer -- take the plain-copy path in the same kernel)
                     for name, off in (("g", 0), ("u", gb), ("d", gb + ub)):
                         if not pd.get(name):
                             continue
                         k, n, K = pd[name]
                         ext.moe_unswizzle_trellis(
-                            st["vram_slots"][ws], st["native_slots"][ws], len(batch), exp_b, off,
+                            st["vram_slots"][ws], native[ws], len(batch), exp_b, off,
                             k // 16, n // 16, K, ext.exl3_moe_cpu_swizzle_group(K))
                 st["wready_ev"][ws].record(copy_stream)
             st["wslot_used"][ws] = True
 
             # Compute the batch on the current stream once the DMA lands
             torch.cuda.current_stream().wait_event(st["wready_ev"][ws])
-            vslot = st["native_slots"][ws] if st["swz"] else st["vram_slots"][ws]
+            vslot = native[ws] if swz_layer else st["vram_slots"][ws]
             per_e = [(bi, e, token_sorted[offs[e] : offs[e] + counts_h[e]],
                       weight_sorted[offs[e] : offs[e] + counts_h[e]])
                      for bi, e in enumerate(batch)]
