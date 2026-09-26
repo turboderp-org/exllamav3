@@ -71,6 +71,7 @@
 #include "ngram.cuh"
 
 #include "attention.cuh"
+#include "attention_sm120.cuh"
 
 #include "sam.h"
 
@@ -254,6 +255,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cache_rotate", &cache_rotate, "cache_rotate");
     m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
     m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
+    m.def("sm120_tma_attn_paged", &sm120_tma_attn_paged, "sm120_tma_attn_paged");
+    m.def("sm120_tma_attn_supported", &sm120_tma_attn_supported, "sm120_tma_attn_supported");
 
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
     m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
