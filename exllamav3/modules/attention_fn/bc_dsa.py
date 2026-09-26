@@ -5,7 +5,7 @@ import torch
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
-from .bc_attn import _compile_kernel
+from .bc_attn import _compile_kernel, BCKernelTooLarge
 from .dsa_triton import _dsa_attn_split_kernel, _dsa_attn_combine_kernel, _dsa_indexer_fewq_kernel
 
 """
@@ -320,7 +320,10 @@ class BCDsa:
             return None
 
         if self.bc.needs_configure(seq, regime):
-            self._configure(seq, regime)
+            try:
+                self._configure(seq, regime)
+            except BCKernelTooLarge:
+                return None   # eager path sizes its own tiles
 
         # Refresh the block-table static once per job step (any compressor layer may be the
         # one to do it; sliding layers never touch it, so this is tracked separately from
@@ -618,7 +621,10 @@ class BCDsaBatch:
         """x (B, S, hidden) fp16 contiguous, bt (rows, npr) i32 device batch block table.
         Returns y (B, S, hidden) fp32 (a static: consume before the next BC call)."""
         if self.bc.needs_configure(B, S):
-            self._configure(B, S)
+            try:
+                self._configure(B, S)
+            except BCKernelTooLarge:
+                return None
 
         pin = self.pins[self.pin_i]
         self.pin_i = (self.pin_i + 1) % len(self.pins)

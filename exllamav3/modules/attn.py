@@ -156,6 +156,7 @@ class Attention(Module):
         num_q_heads: int,
         num_kv_heads: int,
         rope_settings: RopeSettings | None,
+        v_head_dim: int | None = None,
         sm_scale: float | None = None,
         key_q: str | None = None,
         key_k: str | None = None,
@@ -168,6 +169,7 @@ class Attention(Module):
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
         window_right: int = 0,
+        sink_key0: bool = False,
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
@@ -195,6 +197,13 @@ class Attention(Module):
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.head_dim = head_dim
+        # Asymmetric V head dim (MiMo-V2: QK 192, V 128). The cache, the attention kernels and
+        # AttnArgs all carry a single head dim, so V rides along at head_dim with the top
+        # head_dim - v_head_dim lanes zero-filled by the loader, and the attention output is
+        # trimmed back to v_head_dim before o_proj (which is sized on v_head_dim, so no
+        # quantization waste there -- only the V half of the cache is oversized)
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+        assert self.v_head_dim <= head_dim, "Attn: v_head_dim > head_dim is not supported"
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.gqa = (num_q_heads != num_kv_heads)
@@ -207,6 +216,8 @@ class Attention(Module):
         self.sliding_window = sliding_window
         # Keys ahead of the query a windowed row may attend to; 0 = the usual past-only window
         self.window_right = window_right
+        # Sinks as a bias on the first key of each (varlen) segment rather than an extra logit
+        self.sink_key0 = sink_key0
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
         self.use_cu_seqlens = use_cu_seqlens
@@ -302,7 +313,7 @@ class Attention(Module):
             self.o_proj = Linear(
                 config,
                 f"{key}.{key_o}",
-                num_q_heads * head_dim,
+                num_q_heads * self.v_head_dim,
                 hidden_size,
                 qmap =  qmap + ".o" if qmap is not None else None,
                 out_dtype = out_dtype,
@@ -782,6 +793,10 @@ class Attention(Module):
 
     def project_o(self, o: torch.Tensor, bsz: int, seqlen: int, params: dict) -> torch.Tensor:
         # o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
+        if self.v_head_dim != self.head_dim:
+            # Drop the zero lanes V was padded into so o_proj sees num_q_heads * v_head_dim
+            o = o.view(bsz, seqlen, self.num_q_heads, self.head_dim)[..., : self.v_head_dim]
+            o = o.reshape(bsz, seqlen, self.num_q_heads * self.v_head_dim).contiguous()
         x = self.o_proj.forward(o, params)
         return x
 
@@ -917,6 +932,7 @@ class Attention(Module):
                 sm_scale = self.sm_scale,
                 window_size = self.sliding_window,
                 window_right = self.window_right,
+                sink_key0 = self.sink_key0,
                 softcap = self.logit_softcapping,
                 sinks = self.sinks,
                 dispatch_cache = self.dispatch_cache,
@@ -1213,7 +1229,9 @@ class Attention(Module):
             channels_to_split = 1
             max_devices = 1
         else:
-            while channel_width * self.head_dim < 128:
+            # EXL3 tensors split on 128-channel boundaries: widen the unit to as many K/V heads as
+            # it takes for the K/V slice width to be a multiple of 128 (e.g. head_dim 192 -> pairs)
+            while (channel_width * self.head_dim) % 128 != 0:
                 assert channels_to_split % 2 == 0, \
                     "Model's K/V heads cannot divide into 128-channel tensors"
                 channel_width *= 2
@@ -1258,11 +1276,13 @@ class Attention(Module):
                 "layer_idx": self.layer_idx,
                 "hidden_size": self.hidden_size,
                 "head_dim": self.head_dim,
+                "v_head_dim": self.v_head_dim,
                 "rope_settings": self.rope_settings,
                 "sm_scale": self.sm_scale,
                 "out_dtype": self.out_dtype,
                 "sliding_window": self.sliding_window,
                 "window_right": self.window_right,
+                "sink_key0": self.sink_key0,
                 "logit_softcapping": self.logit_softcapping,
                 "tp_split_norm": self.tp_split_norm,
                 "use_k_as_v": self.use_k_as_v,
@@ -1325,7 +1345,10 @@ class Attention(Module):
                 if num_kv_heads else None
         kv_split = (True, first * head_dim, last * head_dim) \
             if num_kv_heads else None
-        o_split = (False, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+        # o_proj consumes v_head_dim lanes per query head (asymmetric V is zero-padded to head_dim
+        # only inside the cache)
+        v_head_dim = exported["kwargs"].get("v_head_dim") or head_dim
+        o_split = (False, first * v_head_dim * n_gqa, last * v_head_dim * n_gqa) \
             if num_kv_heads else None
         # For span_heads norms, we need element indices (head_idx * head_dim)
         # For regular norms, we use head indices

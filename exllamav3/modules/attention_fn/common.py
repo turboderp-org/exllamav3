@@ -28,6 +28,7 @@ class AttnArgs(NamedTuple):
                                     # (lets cached kernels size windows / staging below the
                                     # block-table span; e.g. QSA's dense regime)
     window_right: int = 0           # keys ahead of the query a windowed row may see (block-diffusion drafts)
+    sink_key0: bool = False         # sinks bias each segment's first key instead of adding a logit (MiMo-ViT)
 
     def sanity_check(self):
         # Cache must be paged

@@ -45,6 +45,7 @@ import os
 import torch
 
 from ...util.tensor import g_tensor_cache
+from .smem import pick_config, shared_bytes, halving_ladder
 
 # Debug aid: synchronize and error-check after every MLA kernel launch, so an async illegal
 # memory access is attributed to the kernel that caused it instead of a later sync point
@@ -926,63 +927,87 @@ def mla_attn_triton_decode(
     if block_n is None:
         # qc: one big expanded tile per iteration, no pipelining (the expansion is ALU work the
         # scheduler overlaps anyway); swept best on Ampere/Ada/Blackwell at 512-wide latents.
-        # fp16: smaller tiles, deeper pipeline
-        block_n = (32 if D_c <= 512 else 16) if qc is None else (_qc_bn_override or 64)
+        # fp16: smaller tiles, deeper pipeline. Small-smem devices step down the ladder (smem.py)
+        bn0 = (32 if D_c <= 512 else 16) if qc is None else (_qc_bn_override or 64)
+    else:
+        bn0 = block_n
     if num_stages is None:
         num_stages = 3 if qc is None else 1
     if num_warps is None:
         num_warps = 4 if qc is None else 8
-    h_blocks = triton.cdiv(n_q_heads, block_h)
+    # kv tile first, then head tile, then pipeline depth (smem.py); the stock config leads
+    if block_n is None:
+        candidates = [(bh, bn, ns) for ns in range(num_stages, 0, -1)
+                      for bh in halving_ladder(block_h, 1) for bn in halving_ladder(bn0)]
+    else:
+        candidates = [(block_h, block_n, num_stages)]
     num_pages_per_seq = block_table.shape[1]
 
     max_k_len = num_pages_per_seq * page_size
     if max_kv_len is not None:
         max_k_len = min(max_k_len, max_kv_len)
 
-    programs = bsz * h_blocks
     # Workspace is sized to the device cap, NOT the live split count: num_splits tracks
     # max_k_len (context), and sizing the buffers to it would keep a new tensor-cache entry
     # for every 4*block_n tokens of context growth (hundreds of MB of dead workspace over a
     # long session). The kernels only touch the first programs * num_splits * block_rows
     # rows of the cap-sized buffers
     target = 2 * _get_sm_count(q_lat.device)
-    splits_cap = max(1, min(target // programs, 128))
-    if num_splits is None:
-        num_splits = max(1, min(splits_cap, triton.cdiv(max_k_len, 4 * block_n)))
-    else:
-        splits_cap = max(splits_cap, num_splits)
-    split_len = triton.cdiv(triton.cdiv(max_k_len, num_splits), block_n) * block_n
 
-    if num_splits > 1:
-        n_o = programs * splits_cap * block_rows * D_c
-        n_ml = programs * splits_cap * block_rows * 2
-        if scratch is not None:
-            buf = scratch.get(n_o)
-            if buf is None:
-                buf = scratch[n_o] = (
-                    torch.empty(n_o, dtype = torch.float32, device = q_lat.device),
-                    torch.empty(n_ml, dtype = torch.float32, device = q_lat.device),
-                )
-            partial_o, partial_ml = buf
+    def prepare(cfg):
+        """Head-block count, split count, workspace and the split kernel's argument list for
+        one (head tile, kv tile, stages) config."""
+        block_h, block_n, _ = cfg
+        block_rows = block_m * block_h
+        h_blocks = triton.cdiv(n_q_heads, block_h)
+        programs = bsz * h_blocks
+        splits_cap = max(1, min(target // programs, 128))
+        splits = num_splits
+        if splits is None:
+            splits = max(1, min(splits_cap, triton.cdiv(max_k_len, 4 * block_n)))
         else:
-            # Shared across layers on the device (sequential use on one stream)
-            partial_o = g_tensor_cache.get(q_lat.device, (n_o,), torch.float, "mla_dec_po")
-            partial_ml = g_tensor_cache.get(q_lat.device, (n_ml,), torch.float, "mla_dec_ml")
-    else:
-        partial_o = partial_ml = q_lat
+            splits_cap = max(splits_cap, splits)
+        split_len = triton.cdiv(triton.cdiv(max_k_len, splits), block_n) * block_n
+        if splits > 1:
+            n_o = programs * splits_cap * block_rows * D_c
+            n_ml = programs * splits_cap * block_rows * 2
+            if scratch is not None:
+                buf = scratch.get(n_o)
+                if buf is None:
+                    buf = scratch[n_o] = (
+                        torch.empty(n_o, dtype = torch.float32, device = q_lat.device),
+                        torch.empty(n_ml, dtype = torch.float32, device = q_lat.device),
+                    )
+                partial_o, partial_ml = buf
+            else:
+                # Shared across layers on the device (sequential use on one stream)
+                partial_o = g_tensor_cache.get(q_lat.device, (n_o,), torch.float, "mla_dec_po")
+                partial_ml = g_tensor_cache.get(q_lat.device, (n_ml,), torch.float, "mla_dec_ml")
+        else:
+            partial_o = partial_ml = q_lat
+        args = (
+            q_lat, q_pe, ckv_cache, kpe_cache, ckv_scales, h32, block_table, cache_seqlens, out,
+            partial_o, partial_ml,
+            split_len, num_pages_per_seq, splits,
+            qc_bits, bool(qc_trans), False, bsz, q_len, pre_appended_len, n_q_heads, page_size, D_c, D_r, float(softmax_scale),
+            bool(causal), splits == 1,
+            block_m, block_h, block_rows, block_n,
+        )
+        return args, splits, split_len, partial_o, partial_ml, programs, block_rows
+
+    with torch.cuda.device(q_lat.device):
+        pick_key = (D_c, D_r, qc_bits, bool(qc_trans), q_len, bool(causal), num_warps, candidates[0])
+        block_h, block_n, num_stages = pick_config(
+            q_lat.device, "mla_attn_decode", pick_key, candidates,
+            lambda cfg: shared_bytes(_mla_decode_split_kernel, prepare(cfg)[0], num_warps = num_warps, num_stages = cfg[2]))
+    args, num_splits, split_len, partial_o, partial_ml, programs, block_rows = prepare((block_h, block_n, num_stages))
 
     if _debug_sync:
         _dbg_sync("upstream-of-decode (not an MLA kernel)", q_lat.device)
         _dbg_snap = (cache_seqlens.cpu().tolist(), block_table.cpu())
     with torch.cuda.device(q_lat.device):
         _mla_decode_split_kernel[(programs, num_splits)](
-            q_lat, q_pe, ckv_cache, kpe_cache, ckv_scales, h32, block_table, cache_seqlens, out,
-            partial_o, partial_ml,
-            split_len, num_pages_per_seq, num_splits,
-            qc_bits, bool(qc_trans), False, bsz, q_len, pre_appended_len, n_q_heads, page_size, D_c, D_r, float(softmax_scale),
-            bool(causal), num_splits == 1,
-            block_m, block_h, block_rows, block_n,
-            num_warps = num_warps, num_stages = num_stages,
+            *args, num_warps = num_warps, num_stages = num_stages,
         )
         try:
             _dbg_sync("mla_decode_split", q_lat.device)
@@ -1195,25 +1220,40 @@ def mla_attn_triton_prefill(
     else:
         ckv_scales, qc_bits, h32 = q_lat, 0, q_lat
 
-    if block_m is None:
-        block_m = 32 if qc is None else 16
     if block_n is None:
         block_n = 32 if qc is None else 64
     if num_stages is None:
         num_stages = 2 if qc is None else 1
+    # q tile, then kv tile, stepped down on small-smem devices (smem.py)
+    if block_m is None:
+        bm0 = 32 if qc is None else 16
+        candidates = [(bm0, block_n, num_stages)] + [
+            (bm, bn, ns) for ns in range(num_stages, 0, -1) for bn in halving_ladder(block_n)
+            for bm in halving_ladder(bm0) if (bm, bn, ns) != (bm0, block_n, num_stages)]
+    else:
+        candidates = [(block_m, block_n, num_stages)]
 
     if out is None:
         out = torch.empty_like(q_lat)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(D_c + D_r)
 
-    with torch.cuda.device(q_lat.device):
-        _mla_prefill_kernel[(triton.cdiv(q_len, block_m), bsz * n_q_heads)](
+    def args_for(cfg):
+        bm, bn, _ = cfg
+        return (
             q_lat, q_pe, ckv_cache, kpe_cache, ckv_scales, h32, block_table, cache_seqlens, out,
             block_table.shape[1], q_len, n_rows,
             qc_bits, bool(qc_trans), pre_appended_len, n_q_heads, page_size, D_c, D_r, float(softmax_scale),
-            bool(causal), block_m, block_n,
-            num_warps = num_warps, num_stages = num_stages,
+            bool(causal), bm, bn,
+        )
+
+    with torch.cuda.device(q_lat.device):
+        pick_key = (D_c, D_r, qc_bits, bool(qc_trans), bool(causal), num_warps, candidates[0])
+        block_m, block_n, num_stages = pick_config(
+            q_lat.device, "mla_attn_prefill", pick_key, candidates,
+            lambda cfg: shared_bytes(_mla_prefill_kernel, args_for(cfg), num_warps = num_warps, num_stages = cfg[2]))
+        _mla_prefill_kernel[(triton.cdiv(q_len, block_m), bsz * n_q_heads)](
+            *args_for((block_m, block_n, num_stages)), num_warps = num_warps, num_stages = num_stages,
         )
     _dbg_sync("mla_prefill", q_lat.device)
     return out
