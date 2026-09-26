@@ -165,6 +165,20 @@ Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, t
 skipping the measurement. Only relevant where the direct path still runs (`EXL3_QC_STAGING=0`,
 or short chunks below the threshold above).
 
+### `EXL3_TRITON_SMEM_LIMIT` (default: unset)
+
+Caps the dynamic shared memory per block that the Triton attention kernels believe the device
+grants. The kernels' tile configs are sized for Ampere-class budgets; each launch site lists a
+ladder of smaller configs and takes the first whose compiled footprint fits the device (Turing:
+64 KB). Setting a limit below the real one walks the ladders on any GPU, which is how the
+stepped-down configs are exercised without the smaller hardware. Note the picks then reflect
+this device's footprints, which differ from the target architecture's. Debugging only.
+
+### `EXL3_TRITON_SMEM_DEBUG` (default: `0`)
+
+Prints every ladder probe (kernel, config, measured footprint, fits or over) and every graph
+kernel that declines to the eager path for lack of shared memory.
+
 ### `EXL3_MLA_PREFILL` (default: `mha`)
 
 Prefill strategy for MLA layers: `mha` up-projects past latent tiles from the compressed cache

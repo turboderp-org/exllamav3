@@ -162,9 +162,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
-    m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
+    m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat",
+          py::arg("shape_idx"), py::arg("size_m"), py::arg("size_k"), py::arg("size_n"), py::arg("bits"), py::arg("half_k") = false);
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
+    m.def("g_get_smem_max", &g_get_smem_max, "g_get_smem_max");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
     m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
     m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");

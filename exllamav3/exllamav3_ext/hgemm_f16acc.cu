@@ -71,32 +71,64 @@ __device__ __forceinline__ uint32_t smem_u32(const void* p)
 }
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool pred)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     int src_size = pred ? 16 : 0;    // 0 -> zero-fill, no global read
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                  :: "r"(smem_u32(smem)), "l"(gmem), "r"(src_size));
+#else
+    (void) smem; (void) gmem; (void) pred;
+#endif
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+__device__ __forceinline__ void cp_async_commit()
+{
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+template <int N> __device__ __forceinline__ void cp_async_wait()
+{
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#else
+    (void) N;
+#endif
+}
 __device__ __forceinline__ void ldmatrix_x4(uint32_t* r, const void* p)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
+#else
+    (void) r; (void) p;
+#endif
 }
 __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t* r, const void* p)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
+#else
+    (void) r; (void) p;
+#endif
 }
 __device__ __forceinline__ void mma_f16(uint32_t* c, const uint32_t* a, const uint32_t* b)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                  : "+r"(c[0]), "+r"(c[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    (void) c; (void) a; (void) b;
+#endif
 }
 __device__ __forceinline__ void mma_f32(float* c, const uint32_t* a, const uint32_t* b)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    (void) c; (void) a; (void) b;
+#endif
 }
 
 template <bool OUT_F32, int TILE_N = 128, bool TUNED = false>

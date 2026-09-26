@@ -1,5 +1,6 @@
 #pragma once
 #include <cuda/atomic>
+#include "arch.cuh"
 
 // Tensor core fragments
 
@@ -49,6 +50,18 @@ __device__ inline void ptx_mma_m8n8k4
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type
 
 // FP16 @ FP16 + FP32 -> FP32
+//
+// Turing has no m16n8k16. The k=16 operation is the sum of two k=8 operations over disjoint
+// halves of the k dimension, and the register-to-element mapping of m16n8k8 is exactly the
+// low half of m16n8k16's: A {a0,a1} covers k=0..7 and {a2,a3} covers k=8..15, B b0 then b1,
+// C identical. Chaining two mmas through the same accumulator computes the same products over
+// the same operands.
+//
+// It is not guaranteed bit-identical: PTX does not specify the internal accumulation order of
+// a k=16 step, and the split forces a rounding of the partial sum at the k=8 boundary that the
+// fused form need not perform. The difference is at most one extra rounding per 16-element dot
+// product, far below the quantization noise EXL3 already carries. tests/test_sm75_gemm.py
+// bounds it against a dequantize-then-matmul reference.
 __device__ inline void ptx_mma_m16n8k16
 (
     const FragA& frag_a,
@@ -61,6 +74,28 @@ __device__ inline void ptx_mma_m16n8k16
     float* c = reinterpret_cast<float*>(&frag_c);
     const float* d = reinterpret_cast<const float*>(&frag_c);
 
+#if EXL3_SM75
+    asm
+    (
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
+
+        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+        :  "r"(a[0]), "r"(a[1]),
+           "r"(b[0]),
+           "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3])
+    );
+    asm
+    (
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
+
+        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+        :  "r"(a[2]), "r"(a[3]),
+           "r"(b[1]),
+           "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3])
+    );
+#else
     asm
     (
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -71,6 +106,7 @@ __device__ inline void ptx_mma_m16n8k16
            "r"(b[0]), "r"(b[1]),
            "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3])
     );
+#endif
 }
 
 // FP16 @ FP16 + FP16 -> FP16
@@ -86,6 +122,28 @@ __device__ inline void ptx_mma_m16n8k16
     uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
     const uint32_t* d = reinterpret_cast<const uint32_t*>(&frag_c);
 
+#if EXL3_SM75
+    asm
+    (
+        "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3}, {%4}, {%5,%6};\n"
+
+        : "=r"(c[0]), "=r"(c[1])
+        :  "r"(a[0]), "r"(a[1]),
+           "r"(b[0]),
+           "r"(d[0]), "r"(d[1])
+    );
+    asm
+    (
+        "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3}, {%4}, {%5,%6};\n"
+
+        : "=r"(c[0]), "=r"(c[1])
+        :  "r"(a[2]), "r"(a[3]),
+           "r"(b[1]),
+           "r"(d[0]), "r"(d[1])
+    );
+#else
     asm
     (
         "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
@@ -96,6 +154,7 @@ __device__ inline void ptx_mma_m16n8k16
            "r"(b[0]), "r"(b[1]),
            "r"(d[0]), "r"(d[1])
     );
+#endif
 }
 
 // Global barrier
@@ -143,6 +202,13 @@ __device__ inline void barrier_release
 
 __device__ inline void cp_async_pred(void* smem_ptr, const void* glob_ptr, bool pred = true)
 {
+#if EXL3_SM75
+    if (pred)
+    {
+        uint4 v = *reinterpret_cast<const uint4*>(glob_ptr);
+        *reinterpret_cast<uint4*>(smem_ptr) = v;
+    }
+#else
     const int bytes = 16;
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile(
@@ -152,12 +218,23 @@ __device__ inline void cp_async_pred(void* smem_ptr, const void* glob_ptr, bool 
         "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
         "}\n" :: "r"((int) pred), "r"(smem), "l"(glob_ptr), "n"(bytes)
     );
+#endif
 }
 
 // Load global to shared memory
+//
+// Turing (sm_75) has no cp.async, so the copy degrades to a synchronous 16 B load/store pair
+// routed through registers. Correctness is unaffected: cp_async_wait() below becomes a no-op,
+// but every consumer of a staged tile already passes a __syncthreads() (see wait_stage() in
+// exl3_gemm_inner.cuh) before reading it, and a synchronous store has completed by then. The
+// cost is the lost global->shared overlap, which is a throughput loss, not a hazard.
 
 __device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
 {
+#if EXL3_SM75
+    uint4 v = *reinterpret_cast<const uint4*>(glob_ptr);
+    *reinterpret_cast<uint4*>(smem_ptr) = v;
+#else
     const int bytes = 16;
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile(
@@ -165,12 +242,18 @@ __device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
         "   cp.async.cg.shared.global [%0], [%1], %2;\n"
         "}\n" :: "r"(smem), "l"(glob_ptr), "n"(bytes)
     );
+#endif
 }
 
 // Load global to shared memory with cache hint to evict data from L2 ASAP
 
 __device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
 {
+#if EXL3_SM75
+    // No cp.async and no createpolicy on Turing; the L2 hint is only an optimization
+    uint4 v = *reinterpret_cast<const uint4*>(glob_ptr);
+    *reinterpret_cast<uint4*>(smem_ptr) = v;
+#else
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     const int bytes = 16;
     asm volatile
@@ -181,13 +264,16 @@ __device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
         "   cp.async.cg.shared.global.L2::cache_hint [%0], [%1], %2, p;\n"
         "}\n" :: "r"(smem), "l"(glob_ptr), "n"(bytes)
     );
+#endif
 }
 
 // Async copy fence, commit all pending async copies
 
 __device__ inline void cp_async_fence()
 {
+#if !EXL3_SM75
     asm volatile("cp.async.commit_group;\n" ::);
+#endif
 }
 
 // Wait until at most n async groups are still pending.
@@ -195,7 +281,9 @@ __device__ inline void cp_async_fence()
 template <int n>
 __device__ inline void cp_async_wait()
 {
+#if !EXL3_SM75
     asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
+#endif
 }
 
 // Load 16x16 matrix fragment from shared memory, directly in tensor core layout

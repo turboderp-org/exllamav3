@@ -16,6 +16,7 @@ from .attention_fn.mla_triton import (
     mla_unfold,
 )
 from .attention_fn.bc_attn import MAX_BSZ as _bc_max_bsz
+from .attention_fn.smem import NoFittingConfig
 import os
 
 # Prefill strategy: "mha" (default) up-projects past tiles from the compressed cache and attends
@@ -278,6 +279,27 @@ class MLAttention(Module):
             "kv_cache": True
         })
 
+
+
+    def _mha_form(self, q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params):
+        """MHA-form attention: everything (past and current chunk) is read back from the cache
+        and attended over per-head up-projections. RoPE produced q_pe as a copy (the strided
+        slice cannot reshape into a view), so fold it back into q's pe columns for the kernel's
+        packed [nope | pe] per-head rows."""
+        H = self.num_q_heads
+        R = bsz * seqlen
+        q = q.view(R, H, self.qk_head_dim)
+        q[:, :, self.qk_nope_head_dim:] = q_pe.reshape(R, H, self.qk_rope_head_dim)
+        o = mla_attn_triton_prefill_mha(
+            q,
+            self.w_uk_flat, self.w_uv_flat,
+            ckv_cache, kpe_cache, block_table, host_seqlens,
+            bsz, seqlen, self.v_head_dim, self.qk_nope_head_dim, self.sm_scale,
+            pre_appended_len = seqlen,
+            qc = qc,
+        )
+        o = o.reshape(bsz, seqlen, H * self.v_head_dim)
+        return self.o_proj.forward(o, params)
 
     def cache_layer_type(self, default, kwargs: dict):
         """MLA stores a latent instead of per-head K/V, so it overrides the cache layer the Cache
@@ -891,33 +913,30 @@ class MLAttention(Module):
             return self.o_proj.forward(o, params)
 
         if use_mha:
-            # MHA-form prefill: everything (past and current chunk) is read back from the cache
-            # and attended over per-head up-projections. RoPE produced q_pe as a copy (the strided
-            # slice cannot reshape into a view), so fold it back into q's pe columns for the
-            # kernel's packed [nope | pe] per-head rows
-            q = q.view(R, H, self.qk_head_dim)
-            q[:, :, self.qk_nope_head_dim:] = q_pe.reshape(R, H, self.qk_rope_head_dim)
-            o = mla_attn_triton_prefill_mha(
-                q,
-                self.w_uk_flat, self.w_uv_flat,
-                ckv_cache, kpe_cache, block_table, host_seqlens,
-                bsz, seqlen, self.v_head_dim, self.qk_nope_head_dim, self.sm_scale,
-                pre_appended_len = seqlen,
-                qc = qc,
-            )
-            o = o.reshape(bsz, seqlen, H * self.v_head_dim)
-            return self.o_proj.forward(o, params)
+            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params)
 
         kernel = mla_attn_triton_decode if seqlen <= MAX_DECODE_QLEN else mla_attn_triton_prefill
         extra = {}
-        o_lat = kernel(
-            q_lat, q_pe_hm, ckv_cache, kpe_cache, block_table, cache_seqlens,
-            bsz = bsz, q_len = seqlen,
-            causal = causal, softmax_scale = self.sm_scale,
-            pre_appended_len = seqlen,
-            qc = qc,
-            **extra,
-        )
+        try:
+            o_lat = kernel(
+                q_lat, q_pe_hm, ckv_cache, kpe_cache, block_table, cache_seqlens,
+                bsz = bsz, q_len = seqlen,
+                causal = causal, softmax_scale = self.sm_scale,
+                pre_appended_len = seqlen,
+                qc = qc,
+                **extra,
+            )
+        except NoFittingConfig:
+            # No latent-form tile fits this device's shared memory at this query length (the
+            # latent width sets the floor; Turing at 512-wide latents). The MHA form attends
+            # over per-head up-projections from the same cache at any query length, and the
+            # un-absorbed q is still live here. Dense causal only, as for use_mha
+            if not (causal and not sparse and self.w_uk_flat is not None):
+                raise
+            if host_seqlens is None:
+                host_seqlens = _host_seqlens(params, cache_seqlens)
+            del q_lat, q_pe_hm
+            return self._mha_form(q, q_pe, ckv_cache, kpe_cache, block_table, host_seqlens, bsz, seqlen, qc, params)
 
         from .attention_fn.mla_triton import _debug_sync
         if _debug_sync:

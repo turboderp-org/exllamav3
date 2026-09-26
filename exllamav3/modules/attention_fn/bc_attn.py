@@ -5,6 +5,7 @@ import torch
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
+from .smem import smem_limit
 
 """
 Graph-captured decode attention (BC_Attention): the whole attention block for a decode step --
@@ -61,6 +62,12 @@ def _is_pow2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 
+class BCKernelTooLarge(RuntimeError):
+    """An AOT-compiled BC kernel needs more shared memory than the device grants. The BC kernels
+    bake their tiles in as constexprs sized for Ampere-class shared memory; the eager Triton path
+    walks a config ladder per device instead, so the builders decline and let it run."""
+
+
 def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                     num_warps: int, num_stages: int):
     key = (device.index, fn.__name__, tuple(sorted(constexprs.items())), num_warps, num_stages,
@@ -84,6 +91,12 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
         with torch.cuda.device(device):
             src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
             ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
+            limit = smem_limit(device)
+            if ck.metadata.shared > limit:
+                if os.environ.get("EXL3_TRITON_SMEM_DEBUG"):
+                    print(f" -- smem: BC {fn.__name__} {ck.metadata.shared} B over {limit} B, declining to eager", flush = True)
+                raise BCKernelTooLarge(
+                    f"{fn.__name__}: {ck.metadata.shared} B of shared memory exceeds the device's {limit} B")
             k = ext.TritonKernel(ck.asm["cubin"], ck.metadata.name, ck.metadata.num_warps, ck.metadata.shared)
         _kernel_cache[key] = k
     return k
@@ -590,7 +603,10 @@ class BCAttn:
         # argument patched into the graph
         skey = (tuple(inv_freq.shape) if inv_freq is not None else None, causal)
         if self.slot_widths.get((bsz, q_len, regime), ...) != skey:
-            self._configure(bsz, q_len, causal, regime)
+            try:
+                self._configure(bsz, q_len, causal, regime)
+            except BCKernelTooLarge:
+                return None   # eager path sizes its own tiles
             self.slot_widths[(bsz, q_len, regime)] = skey
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
