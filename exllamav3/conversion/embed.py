@@ -8,7 +8,10 @@ per-256-column-group fp16 pre-scales followed by the D*K-bit tail-biting ring bi
 kernel). The table is quantized in the QTIP-transformed space: column scales (per-column RMS
 over ALL rows, fp16) -> per-element signs from a seeded LCG keyed by the table row id ->
 256-D Sylvester Hadamard groups, then per-group pre-scale + trellis VQ (the ring spans the
-full row; the fp16 pre-scales ARE the stored scale words).
+full row; the fp16 pre-scales are LS-refit against the source rows after encoding and the
+refit values are the stored scale words: the decode is linear in the scale word, so the fit
+s* = (w.q)/(q.q) minimizes the per-group source-space squared error for the fixed codes
+(measured +0.01..0.02 dB SQNR over K = 4..8 on real tables).
 
 PROGRAMMATIC ENTRY POINT (stable signature; external tooling - e.g. vocab-prune suites -
 imports this and never re-implements the encoder or codec):
@@ -59,7 +62,7 @@ from ..modules.quant.exl3_lib.embed_trellis import (  # noqa: F401  (re-exported
     GROUP, FORMAT, FORMAT_VERSION, CS_HEURISTIC, CS_MIN,
     words_per_row, mul1_codebook, pack_rows, unpack_rows, dequant_rows,
     lcg_signs, hadamard_butterfly, dequant_rows_transformed, forward_transform,
-    quantize_rows_grouped,
+    quantize_rows_grouped, ls_refit_scales,
 )
 from .ngram import StreamingSafetensorsWriter, read_table_tensor
 
@@ -403,10 +406,12 @@ def quantize_trellis_table(
     """
     Quantize a token-embedding table to the exl3_trellis_embed format. See the module
     docstring for the contract of this stable entry point (source = directory or rows
-    tensor). Returns a stats dict with
-    rows/processed_rows/measured_rows/K/seed/encoder/rfn/sqnr_db/elapsed/bytes. The
+tensor). Returns a stats dict with
+    rows/processed_rows/measured_rows/K/seed/encoder/rfn/sqnr_db/refit_moved_frac/
+    refit_mean_rel/refit_gain_db/refit_nonfinite/refit_degenerate/elapsed/bytes. The
     quantization quality (SQNR dB + rfn) is measured against the source rows over
-    measured_rows encoded rows (all of them unless quality_sample limits the measurement).
+    measured_rows encoded rows (all of them unless quality_sample limits the measurement);
+    the refit_* fields size the LS scale-word refit (analytic, see ls_refit_scales).
     """
     assert 6 <= K <= 8, "the fused dequant kernel supports K in 6..8"
     assert chunk_rows > 0
@@ -508,6 +513,10 @@ def quantize_trellis_table(
     qsample_all = quality_sample is None or quality_sample >= total_out
     qgen = torch.Generator().manual_seed(0)
     acc = {"err_sq": 0.0, "src_sq": 0.0}
+    # LS scale-word refit diagnostics (analytic, from the refit pass itself; the shipped
+    # sqnr_db/rfn stay decoder-output measures)
+    racc = {"groups": 0, "moved": 0, "rel_shift": 0.0, "nonfinite": 0, "degenerate": 0,
+            "err_sq_s0": 0.0, "err_sq_refit": 0.0}
     measured_rows = 0
     t0 = time.time()
     enc_rows = 0
@@ -517,9 +526,22 @@ def quantize_trellis_table(
         w = torch.nan_to_num(rows.float(), nan = 0.0, posinf = 0.0, neginf = 0.0)
         out_ids = torch.arange(lo, hi, dtype = torch.int64)   # sign stream keys = OUTPUT rows
         y = forward_transform(w.to(dev), cs_f32_dev, seed, out_ids.to(dev)).cpu()
+        # the LS refit needs the SOURCE rows (the encoder only ever sees the transformed
+        # ones), so it is handed to the codec-level encoder as a callback: it replaces the
+        # heuristic pre-scales as the stored scale words and leaves the code words untouched.
+        # It costs one extra unit-scale decode of the chunk (a few hundred MiB of transients
+        # and a few seconds per chunk, against a ~30 min encode) for that fractional dB
+        chunk_rinfo = []
+        def refit(states, scale0):
+            scales, rinfo = ls_refit_scales(states, w, scale0, col_scales, seed, out_ids, K, D, G)
+            chunk_rinfo.append(rinfo)
+            return scales, rinfo
         packed, _ = quantize_rows_grouped(y, K, D,
                                           lambda wp, KK, DD: encode_rows(wp, KK, DD, threads),
-                                          group = GROUP)
+                                          group = GROUP, refit = refit)
+        for rinfo in chunk_rinfo:
+            for k in racc:
+                racc[k] += rinfo[k]
         writer.write_chunk(packed)
         if quality_sample == 0:
             pass
@@ -561,6 +583,13 @@ def quantize_trellis_table(
     else:
         sqnr = None
     bpw = (D * K + 16 * G) / D
+    # LS scale-word refit report: the refit is a real (provable) error reduction but a small
+    # one, so its size belongs in the run record - without it a +0.01 dB refinement is
+    # indistinguishable from a no-op after the fact
+    refit_groups = int(racc["groups"])
+    refit_gain = (10 * math.log10(racc["err_sq_s0"] / racc["err_sq_refit"])
+                  if refit_groups > 0 and racc["err_sq_s0"] > 0 and racc["err_sq_refit"] > 0 and
+                  math.isfinite(racc["err_sq_s0"]) and math.isfinite(racc["err_sq_refit"]) else None)
     stats = {
         "rows": total_out,
         "processed_rows": enc_rows,
@@ -570,6 +599,11 @@ def quantize_trellis_table(
         "encoder": "cpu_avx2_viterbi",
         "rfn": rfn,
         "sqnr_db": sqnr,
+        "refit_moved_frac": (racc["moved"] / refit_groups) if refit_groups else None,
+        "refit_mean_rel": (racc["rel_shift"] / refit_groups) if refit_groups else None,
+        "refit_gain_db": refit_gain,
+        "refit_nonfinite": racc["nonfinite"],
+        "refit_degenerate": racc["degenerate"],
         "bpw": bpw,
         "elapsed": elapsed,
         "rows_per_s": enc_rows / max(elapsed, 1e-9),
@@ -578,9 +612,17 @@ def quantize_trellis_table(
     if verbose:
         q = f"SQNR {sqnr:.2f} dB, rfn {rfn:.5f}" if measured and sqnr is not None else \
             ("decode produced non-finite values (corrupted table)" if measured else "quality report skipped")
+        rf = "no scale refit"
+        if refit_groups:
+            gain = f", {refit_gain:+.3f} dB" if refit_gain is not None else ""
+            rf = (f"scale words refit for {stats['refit_moved_frac'] * 100:.1f}% of groups "
+                  f"({stats['refit_mean_rel'] * 100:.3f}% mean shift{gain})")
         print(f" -- done: {enc_rows} rows in {elapsed:.0f} s ({stats['rows_per_s']:.0f} rows/s), "
-              f"{q}, {bpw:.3f} bpw, "
+              f"{q}, {rf}, {bpw:.3f} bpw, "
               f"{stats['bytes'] / 2**20:.0f} MiB -> {out_path}")
+    if racc["nonfinite"]:
+        print(f" [warn] {racc['nonfinite']} of {refit_groups} LS-optimal scale words left the fp16 "
+              f"range; those groups kept the heuristic pre-scale (the table stays finite)")
     return stats
 
 

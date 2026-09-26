@@ -20,7 +20,8 @@ trellis_embed.cu): every fp32 operation here is applied in the same order as in 
 (butterfly stage order, (v * 1/16) * sign * col_scale), so the two paths agree bitwise. The
 transform (forward_transform) is the exact inverse of the decode chain in real arithmetic;
 its Viterbi-side companion (per-group pre-scale + encode) lives in exllamav3/conversion/
-embed.py, which stores its fp16 pre-scales as the G scale words.
+embed.py, which stores the least-squares refit of those pre-scales (ls_refit_scales) as the
+G scale words.
 """
 
 from __future__ import annotations
@@ -106,16 +107,34 @@ def pack_rows(states: torch.Tensor, scales_f16: torch.Tensor, K: int, D: int,
     return out.contiguous()
 
 
+def ring_states_from_codes(new: torch.Tensor, K: int) -> torch.Tensor:
+    """(N, D) K-bit code symbols -> the 16-bit ring windows the DECODER uses:
+    state_i = new_i | new_{i-1} << K | (new_{i-2} & m2) << 2K | ... (masked to 16 bits, ring
+    wrap). Single home for the recurrence: unpack_rows derives it from the packed words and
+    ls_refit_scales derives it from the encoder's states, so the refit always fits against the
+    states the decoder will actually see (an encoder whose head-of-row ring window is not
+    tail-biting consistent would otherwise be fitted against states that never decode)."""
+    st = new
+    shift = K
+    lag = 1
+    while shift < 16:
+        width = min(K, 16 - shift)
+        st = st | ((torch.roll(new, shifts = lag, dims = 1) & ((1 << width) - 1)) << shift)
+        shift += K
+        lag += 1
+    return st
+
+
 def unpack_rows(packed: torch.Tensor, K: int, D: int, G: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Inverse of pack_rows: returns (states (N, D) int64, scales (N, G) float16).
 
     state_i is the 16 ring bits ending at stream bit (i+1)*K - 1, i.e.
     state_i = new_i | new_{i-1} << K | new_{i-2} << 2K | ... (masked to 16
-    bits, ring wrap). Built by shifts/or, NOT a (N, D, 16) gather - that
-    intermediate is production-sized and the gather form is also wrong for K
-    that does not divide 16 (torch advanced-index expansion). The word-window
-    planes are row-blocked (PLANE_BUDGET); rows are independent, so the
-    result is identical to the unblocked pass.
+    bits, ring wrap; ring_states_from_codes). Built by shifts/or, NOT a (N, D,
+    16) gather - that intermediate is production-sized and the gather form is
+    also wrong for K that does not divide 16 (torch advanced-index expansion).
+    The word-window planes are row-blocked (PLANE_BUDGET); rows are
+    independent, so the result is identical to the unblocked pass.
     """
     if G is None:
         G = D // GROUP
@@ -132,15 +151,7 @@ def unpack_rows(packed: torch.Tensor, K: int, D: int, G: int | None = None) -> t
         words = packed[lo:hi, G:].view(torch.uint16).to(torch.int64)                   # (blk, W)
         bits = (words.unsqueeze(-1) >> ar16) & 1                                       # (blk, W, 16)
         new = (bits.reshape(hi - lo, D, K) << arK).sum(dim = -1)
-        st = new
-        shift = K
-        lag = 1
-        while shift < 16:
-            width = min(K, 16 - shift)
-            st = st | ((torch.roll(new, shifts = lag, dims = 1) & ((1 << width) - 1)) << shift)
-            shift += K
-            lag += 1
-        states[lo:hi] = st
+        states[lo:hi] = ring_states_from_codes(new, K)
     return states, scales
 
 
@@ -234,11 +245,10 @@ def decode_transform(y: torch.Tensor, col_scales: torch.Tensor, seed: int, D: in
     The exact inverse of forward_transform (the orthonormal H/16 is self-inverse, so the
     butterfly + 1/16 undoes the encode's transform up to fp32 rounding). row_ids are the
     TABLE ROW IDs used as the sign-stream keys (default: arange)."""
-    had = hadamard_butterfly(y, D)
     if row_ids is None:
         row_ids = torch.arange(y.shape[0], dtype = torch.int64)
-    signs = lcg_signs(row_ids, D, seed).to(had.device)
-    return ((had * (1.0 / 16.0)) * signs) * col_scales.float().to(had.device)
+    had = hadamard_butterfly(y, D)
+    return ((had * (1.0 / 16.0)) * lcg_signs(row_ids, D, seed).to(had.device)) * col_scales.float().to(had.device)
 
 
 def dequant_rows_transformed(packed: torch.Tensor, col_scales: torch.Tensor, K: int, seed: int,
@@ -279,8 +289,10 @@ def group_prescale(w: torch.Tensor, K: int, group: int = GROUP) -> tuple[torch.T
         scale0   = clamp(rms / cs_row, 1e-8).to(fp16), where(>0, scale0, 1.0)
         w_pre    = w / scale0
 
-    The fp16 scale0 values ARE the stored G scale words (no LS refit). Returns
-    (w_pre (N, D) fp32 contiguous, scale0 (N, G) fp16).
+    scale0 is the heuristic pre-scale, hence the stored G scale words whenever no LS refit
+    runs (this function works in transformed space and cannot see the source rows a refit
+    would fit against; ls_refit_scales is the refit and conversion/embed.py supplies it).
+    Returns (w_pre (N, D) fp32 contiguous, scale0 (N, G) fp16).
     """
     # group_prescale uses the module-level CS_HEURISTIC/CS_MIN
     N, D = w.shape
@@ -291,22 +303,131 @@ def group_prescale(w: torch.Tensor, K: int, group: int = GROUP) -> tuple[torch.T
     rms = wg.square().mean(dim = 2).sqrt()
     absmax_norm = wg.abs().amax(dim = 2) / rms.clamp(min = 1e-12)
     cs_row = (gamma / absmax_norm.clamp(min = 1e-6)).clamp(min = CS_MIN, max = cs_hi)
-    scale0 = (rms / cs_row).clamp(min = 1e-8).to(torch.float16).float()
+    # the fp16 max cap is a storage bound, not a heuristic one: the scale0 word is stored
+    # verbatim and the fused kernel feeds it straight into the butterfly, so an fp16 overflow
+    # (transformed-group rms > ~3*65504, reachable when a column scale sits at the fp16 floor
+    # while the source values in that group are normal) would turn the row into NaN embeddings
+    scale0 = (rms / cs_row).clamp(min = 1e-8, max = 65504.0).to(torch.float16).float()
     scale0 = torch.where(scale0 > 0, scale0, 1.0)
     w_pre = (wg / scale0.unsqueeze(2)).view(N, D).contiguous()
     return w_pre, scale0.to(torch.float16)
 
 
+def ls_refit_scales(states: torch.Tensor, w: torch.Tensor, scale0: torch.Tensor,
+                    col_scales: torch.Tensor, seed: int, row_ids: torch.Tensor, K: int, D: int,
+                    G: int | None = None, codebook: torch.Tensor | None = None) -> tuple[torch.Tensor, dict]:
+    """
+    Least-squares refit of the stored per-group scale words.
+
+    The decode is linear in the scale word (the Hadamard butterfly is per 256-column group,
+    the LCG signs and the column scales are elementwise), so with q = the SOURCE-space decode
+    of these states at unit scale, the reconstruction of group g is exactly s_g * q_g and
+
+        s*_g = (w_g . q_g) / (q_g . q_g)
+
+    minimizes the per-group source-space squared error over all s. scale0 is itself an fp16
+    value, hence just another candidate: the error is a parabola in s, monotone in |s - s*|,
+    and fp16(s*) is the closest fp16 point to s*, so in exact arithmetic the refit cannot
+    raise the error of any group (in fp32 one group in ~20 000 can end marginally worse from
+    decode rounding; the aggregate always improves). The measured effect is small because the
+    pre-scale heuristic already sits within half an fp16 step of the optimum for most groups:
+    +0.01..0.02 dB SQNR over K = 4..8, with ~80% of the stored words unchanged at K = 8.
+
+    states (N, D) int16/int64 Viterbi states (only the low K bits are the codes: the ring
+    windows are rebuilt with ring_states_from_codes, exactly as the decoder does them),
+    w (N, D) fp32 SOURCE rows, scale0 (N, G) fp16 heuristic pre-scales, col_scales (D,) fp16,
+    row_ids the TABLE ROW IDs used as sign-stream keys. Whole-chunk, no blocking: the
+    transients are the LUT gather (int64), the unit-scale decode and the sign plane, i.e.
+    about 27 bytes per element of the chunk (1.1 GiB measured at chunk_rows = 8192, D = 5120).
+
+    Returns (scales (N, G) fp16 - the words to store, info dict). Guards: a group whose q is
+    identically zero (all-zero source row, or column scales at the fp16 floor with an
+    all-zero group) gets scale word 0, which is also the pad-row contract; an fp16-non-finite
+    s* (only reachable if the LS optimum leaves the fp16 range) falls back to scale0 instead
+    of storing inf into a word the fused kernel feeds straight into the butterfly. info:
+        groups        refitted (row, group) pairs
+        moved         groups whose fp16 word differs from scale0
+        rel_shift     sum |s/scale0 - 1| over the scale0 > 0 groups
+        nonfinite     groups whose fp16(s*) was non-finite (fell back to scale0)
+        degenerate    groups with q == 0 (scale word 0)
+        err_sq_s0     sum |w - scale0 * q|^2, fp64
+        err_sq_refit  sum |w - scales * q|^2 at the STORED words, fp64
+    The two error sums are analytic (same pass, fp64: the fp32 c - b^2/a form cancels away at
+    high SQNR), so they are diagnostics only - conversion/embed.py still reports SQNR/rfn on
+    the decoder output.
+
+    Rows and groups are independent, so any chunking of the caller's is value-identical.
+    """
+    if G is None:
+        G = D // GROUP
+    N = states.shape[0]
+    dev = states.device
+    cb = _codebook(dev) if codebook is None else codebook
+    s0 = scale0.to(dev)
+    ring = ring_states_from_codes(states.to(torch.int64) & ((1 << K) - 1), K)
+    q = cb[ring].float()
+    q = ((hadamard_butterfly(q, D) * (1.0 / 16.0)) *
+         lcg_signs(row_ids, D, seed).to(dev)) * col_scales.float().to(dev)
+    qg = q.view(N, G, GROUP)
+    wg = w.to(dev).view(N, G, GROUP)
+    a = qg.square().sum(2, dtype = torch.float64)                      # (N, G) fp64 moments
+    b = (wg * qg).sum(2, dtype = torch.float64)
+    c = wg.square().sum(2, dtype = torch.float64)
+    # a == 0 (nothing to fit) must give 0, not nan: divide by inf instead of by 0
+    s = (b / torch.where(a > 0, a, torch.full_like(a, float("inf")))).to(torch.float32)
+    sf = s.to(torch.float16)
+    bad = torch.isfinite(sf).logical_not_()
+    if bool(bad.any()):
+        # an LS optimum outside the fp16 range is not representable: fall back to the
+        # heuristic word (capped in group_prescale, hence finite), and to 0 if even that is
+        # not finite - a group that decodes to 0 beats inf fed into the butterfly
+        sf = torch.where(bad, torch.where(torch.isfinite(s0), s0, torch.zeros_like(s0)), sf)
+    sfa = sf.float()
+    live = s0 > 0
+    info = {
+        "groups": N * G,
+        "moved": int((sf != s0).sum()),
+        "rel_shift": float((sfa[live] / s0[live].float() - 1.0).abs().sum()),
+        "nonfinite": int(bad.sum()),
+        "degenerate": int((a == 0).sum()),
+        "err_sq_s0": float((c - 2.0 * s0.double() * b + s0.double().square() * a).sum()),
+        "err_sq_refit": float((c - 2.0 * sfa.double() * b + sfa.double().square() * a).sum()),
+    }
+    return sf, info
+
+
 def quantize_rows_grouped(w: torch.Tensor, K: int, D: int, encode_fn,
-                          group: int = GROUP) -> tuple[torch.Tensor, torch.Tensor]:
+                          group: int = GROUP, refit = None) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Encode-chain companion of forward_transform for one chunk of transformed rows: nan guard,
     per-group pre-scale (group_prescale), Viterbi search through encode_fn(w_pre, K, D) ->
-    states (N, D), and pack_rows with the fp16 pre-scales as the stored scale words.
-    Returns (packed (N, G + D*K/16) int16, scale0 (N, G) fp16).
+    states (N, D), and pack_rows with the stored scale words. Returns (packed
+    (N, G + D*K/16) int16, scales (N, G) fp16 - the words actually stored).
+
+    refit: optional callable refit(states (N, D) int64, scale0 (N, G) fp16) ->
+    ((N, G) fp16, info) that replaces the heuristic pre-scales as the stored scale words
+    (ls_refit_scales is the implementation; conversion/embed.py supplies it with the source
+    rows, which the transformed-space encoder cannot see). The refit only refits per-group
+    magnitudes, so the code words of a table encoded with or without it are bit-identical.
+    Without refit, the fp16 pre-scales ARE the stored scale words.
+
+    All-zero source rows (vocab pad slots) pack to all-zero words deterministically,
+    bypassing the encoder: group_prescale's where(scale0 > 0, scale0, 1.0) guard would
+    otherwise store a 1.0 scale for the empty groups and the Viterbi pass would emit
+    codebook garbage for them (max |dequant| ~55 measured). The contract requires pad
+    rows to dequant to exactly 0.0 (zero scale words -> zero output regardless of
+    codes or sign stream).
     """
     w = torch.nan_to_num(w.float(), nan = 0.0, posinf = 0.0, neginf = 0.0)
     w_pre, scale0 = group_prescale(w, K, group)
     states = encode_fn(w_pre, K, D)
-    packed = pack_rows(states.to(torch.int64), scale0, K, D, D // group)
-    return packed, scale0
+    scales = scale0
+    if refit is not None:
+        scales, _ = refit(states.to(torch.int64), scale0)
+    packed = pack_rows(states.to(torch.int64), scales, K, D, D // group)
+    zero_rows = (w == 0).all(dim = 1)
+    if zero_rows.any():
+        packed[zero_rows] = 0
+        scales = scales.clone()
+        scales[zero_rows] = 0
+    return packed, scales
