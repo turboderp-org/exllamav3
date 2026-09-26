@@ -419,9 +419,11 @@ prints how long it took. Set to `0` to skip hugepage promotion entirely.
 On Windows there is no post-hoc promotion, so the same flag instead makes each arena chunk
 attempt a `MEM_LARGE_PAGES` `VirtualAlloc` at creation (requires `SeLockMemoryPrivilege` on the
 account, enabled on the worker's token at runtime) and falls back to a plain mapping per chunk
-when large pages cannot be supplied. Note that Windows large pages need physically contiguous
-2 MiB regions, which a long-running system often cannot provide -- a fresh boot typically can.
-`EXL3_MOE_ARENA_DEBUG=1` prints the large-page coverage of the arena.
+when large pages cannot be supplied. A failed request is retried at half the size down to
+64 MiB before giving up: Windows large pages need physically contiguous 2 MiB regions, which
+a long-running system can often still supply in smaller runs even when a full 1 GiB chunk
+does not fit -- a fresh boot typically can serve the full size. `EXL3_MOE_ARENA_DEBUG=1`
+prints the large-page coverage of the arena.
 
 ### `EXL3_HGEMM_F16ACC` (default: auto)
 

@@ -88,7 +88,8 @@ class MoeCpuTuning:
         # common default), the kernel does SYNCHRONOUS compaction on first touch of a hinted
         # region once easily-compactable free memory runs low, which can stall loading badly.
         # On Windows the same flag makes each arena chunk attempt MEM_LARGE_PAGES at
-        # VirtualAlloc time (no post-hoc promotion exists there), falling back per chunk
+        # VirtualAlloc time (no post-hoc promotion exists there), negotiating the request
+        # size down per chunk and falling back to a plain mapping per chunk
         self.arena_hugepage = os.environ.get("EXL3_MOE_ARENA_HUGEPAGE", "1") != "0"
         # Band-contiguous ("swizzled") expert trellis layout: repacked at arena rehome so each
         # 8-tile output band streams sequentially from DRAM. Applied on every AVX-512 kernel
@@ -259,12 +260,16 @@ def _win32_enable_lock_memory_privilege() -> bool:
         kernel32.CloseHandle(token)
 
 
-def _win32_large_page_alloc(size: int):
-    """Allocate `size` bytes of MEM_LARGE_PAGES memory. Returns a ctypes byte array bound to
-    the allocation (buffer-protocol compatible, so it drops into the same memoryview /
-    torch.frombuffer consumers as an mmap object), or None when large pages are unavailable.
-    A weakref.finalize on the array issues VirtualFree(MEM_RELEASE) when the last reference
-    dies, giving the chunk the same free-on-GC lifetime semantics as an mmap object."""
+def _win32_large_page_alloc(size: int, min_size: int):
+    """Allocate MEM_LARGE_PAGES memory of up to `size` bytes, halving the request on each
+    failure down to `min_size`, and return the largest buffer obtained (a ctypes byte array
+    bound to the allocation -- buffer-protocol compatible, so it drops into the same
+    memoryview / torch.frombuffer consumers as an mmap object), or None when even `min_size`
+    cannot be supplied. A large request needs that many physically contiguous 2 MiB regions,
+    which a fragmented or busy system often cannot supply even when smaller runs exist, so a
+    shrunken chunk is still a win over falling back to 4K pages outright. A weakref.finalize
+    on the array issues VirtualFree(MEM_RELEASE) when the last reference dies, giving the
+    chunk the same free-on-GC lifetime semantics as an mmap object."""
     import ctypes
     import weakref
 
@@ -283,7 +288,6 @@ def _win32_large_page_alloc(size: int):
         return None
 
     granularity = kernel32.GetLargePageMinimum()
-    alloc_size = (size + granularity - 1) // granularity * granularity
     MEM_RESERVE = 0x2000
     MEM_COMMIT = 0x1000
     MEM_LARGE_PAGES = 0x20000000
@@ -292,12 +296,23 @@ def _win32_large_page_alloc(size: int):
     kernel32.VirtualAlloc.argtypes = [
         ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong]
     kernel32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong]
-    addr = kernel32.VirtualAlloc(
-        None, alloc_size, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE)
+
+    want = (size + granularity - 1) // granularity * granularity
+    floor = (min_size + granularity - 1) // granularity * granularity
+    addr = None
+    while True:
+        addr = kernel32.VirtualAlloc(
+            None, want, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE)
+        if addr or want <= floor:
+            break
+        want = max(want >> 1, floor)
     if not addr:
         return None
-    buf = (ctypes.c_uint8 * alloc_size).from_address(addr)
+    buf = (ctypes.c_uint8 * want).from_address(addr)
     weakref.finalize(buf, kernel32.VirtualFree, ctypes.c_void_p(addr), 0, 0x8000)  # MEM_RELEASE
+    if want < size and os.environ.get("EXL3_MOE_ARENA_DEBUG"):
+        print(f" -- arena: MEM_LARGE_PAGES negotiated down to {want >> 20} MiB "
+              f"(asked {size >> 20} MiB)", flush = True)
     return buf
 
 
@@ -389,9 +404,11 @@ class _HugeArena:
             # writable by default there. Windows has no post-hoc hugepage promotion, so the
             # EXL3_MOE_ARENA_HUGEPAGE knob is honoured here instead: each chunk first tries a
             # MEM_LARGE_PAGES VirtualAlloc (needs SeLockMemoryPrivilege and physically
-            # contiguous 2 MiB regions), falling back to the plain mapping per chunk
+            # contiguous 2 MiB regions), halving the request down to 64 MiB -- and no lower
+            # than what the placement needs -- before falling back to a plain mapping, still
+            # at full chunk size since regular pages have no contiguity constraint
             if TUNING.arena_hugepage:
-                m = _win32_large_page_alloc(size)
+                m = _win32_large_page_alloc(size, max(64 << 20, min_bytes))
                 if m is not None:
                     self.win32_large_bytes += len(m)
                 else:
