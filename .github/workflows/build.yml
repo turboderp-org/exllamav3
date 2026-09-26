@@ -52,7 +52,7 @@ jobs:
           # built against CUDA 13.2 below
           torches = ["2.8.0", "2.9.0", "2.10.0", "2.11.0"]
           torches_cu13 = ["2.12.0", "2.13.0"]
-          cudaarch = "8.0 8.6 8.9 9.0 10.0 12.0+PTX"
+          cudaarch = "7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX"
 
           combos = []
 
