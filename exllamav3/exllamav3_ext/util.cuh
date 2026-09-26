@@ -1,8 +1,14 @@
 #pragma once
 
 #include <cstdio>
+#if defined(USE_ROCM)
+#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
+#include "compat.cuh"
+#else
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#endif
 #include <cublas_v2.h>
 
 typedef struct __align__(8) half4
@@ -110,7 +116,9 @@ inline const char* cublasGetErrorString(cublasStatus_t status) {
         case CUBLAS_STATUS_EXECUTION_FAILED:  return "CUBLAS_STATUS_EXECUTION_FAILED";
         case CUBLAS_STATUS_INTERNAL_ERROR:    return "CUBLAS_STATUS_INTERNAL_ERROR";
         case CUBLAS_STATUS_NOT_SUPPORTED:     return "CUBLAS_STATUS_NOT_SUPPORTED";
+#if !defined(USE_ROCM)
         case CUBLAS_STATUS_LICENSE_ERROR:     return "CUBLAS_STATUS_LICENSE_ERROR";
+#endif
         default:                              return "Unknown cuBLAS status";
     }
 }
