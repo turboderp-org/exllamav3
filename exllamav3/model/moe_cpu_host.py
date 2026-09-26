@@ -16,6 +16,7 @@ from .model_tp_cuda import (
     CUDA_HOST_REGISTER_PORTABLE,
     CUDA_HOST_REGISTER_MAPPED,
 )
+from .moe_stream_decode import MoeStreamDecode, ensure_staging
 
 cleanupper = Cleanupper()
 
@@ -127,6 +128,17 @@ class MoeCpuTuning:
         # Fused-tier row tiles (32 / 64-row kernel instances per expert range), as EXL3_MOE_MTILE
         # on the GPU side
         self.mtile = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
+
+        # --- streamed single-row decode (experimental, opt-in; see moe_stream_decode.py) ---
+        # EXL3_MOE_STREAM_DECODE=1: with the pinned arena, the selected experts of a single-row
+        # (decode) step are gathered out of the arena into VRAM and run through the fused MoE
+        # kernel instead of waiting for the worker; =check runs both paths and reports the
+        # difference. EXL3_MOE_STREAM_DECODE_CPU=k leaves the k lowest-ranked picks of every
+        # layer with the worker, which computes them while the GPU streams the rest
+        sd = os.environ.get("EXL3_MOE_STREAM_DECODE", "0").strip().lower()
+        self.stream_decode = "check" if sd == "check" else ("1" if sd not in ("", "0") else "")
+        self.stream_decode_cpu = int(os.environ.get("EXL3_MOE_STREAM_DECODE_CPU", 0))
+        self.stream_decode_prof = bool(os.environ.get("EXL3_MOE_STREAM_DECODE_PROF"))
 
         # --- debug / kill switches ---
         self.stream_debug = bool(os.environ.get("EXL3_MOE_STREAM_DEBUG"))
@@ -611,6 +623,12 @@ class MoeCpuHost:
         self.arena_views = []
         self.layer_blocks = []
         self.batch_recon = TUNING.stream_batch_recon
+        # Streamed single-row decode (EXL3_MOE_STREAM_DECODE, moe_stream_decode.py): built in
+        # ensure_started once the arena is mapped; None = every step takes the worker path
+        self.stream_decode_mode = TUNING.stream_decode
+        self.stream_decode_cpu = TUNING.stream_decode_cpu
+        self.stream_decode_prof = TUNING.stream_decode_prof
+        self.stream_decode = None
 
     def _spawn(self):
         if self.proc is not None:
@@ -866,6 +884,12 @@ class MoeCpuHost:
                ("avx512-bw" if ext.exl3_moe_cpu_has_avx512_bw() else \
                ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar")))
         print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
+        if self.stream_decode_mode:
+            if self.pinned and self.arena_views:
+                self.stream_decode = MoeStreamDecode(self)
+            else:
+                print(" !! EXL3_MOE_STREAM_DECODE needs the pinned arena (EXL3_MOE_PINNED_ARENA=1); "
+                      "decode steps take the worker path", flush = True)
 
     def _start_watchdog(self):
         """
@@ -1164,6 +1188,10 @@ class MoeCpuHost:
                 recon = {},
             )
             self._dev_bufs[key] = d
+        # Streamed-decode staging (one slot per selected expert), accounted for at load with
+        # the rings above
+        if self.stream_decode_mode and self.pinned:
+            ensure_staging(d, self.specs, device)
         # Reconstruct scratch sized for the largest projection registered so far; grows if a
         # later layer is larger
         if mx and (d["w_scratch"] is None or d["w_scratch"].numel() < mx):
@@ -1279,6 +1307,13 @@ class MoeCpuHost:
         after them, so the CPU works the tail while the GPU streams. Falls back to the plain CPU
         path when nothing qualifies.
         """
+        # Streamed single-row decode (moe_stream_decode.py): the selected experts' blocks are
+        # gathered out of the pinned arena into VRAM and run through the fused kernel; None
+        # means the layer (or the step) takes the worker path below
+        if self.stream_decode is not None and y.shape[0] == 1:
+            out = self.stream_decode.forward(layer_idx, y, selected_experts, routing_weights)
+            if out is not None:
+                return out
         spec = self.specs[layer_idx]
         rows = y.shape[0]
         if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
@@ -1661,6 +1696,9 @@ class MoeCpuHost:
             self.shutdown()
 
     def shutdown(self):
+        # Streamed-decode state first: its device aliases of the arena must not outlive the
+        # mappings released below
+        self.stream_decode = None
         if self.proc is not None:
             try:
                 if self.started and self.shm is not None:
