@@ -1,5 +1,36 @@
 #pragma once
 
+#include <c10/util/Exception.h>
+
+#if defined(USE_ROCM)
+
+#include <hip/hip_runtime_api.h>
+
+struct CudaDrv
+{
+    decltype(&hipModuleLoadData)                module_load_data;
+    decltype(&hipModuleUnload)                  module_unload;
+    decltype(&hipModuleGetFunction)             module_get_function;
+    decltype(&hipFuncSetAttribute)              func_set_attribute;
+    decltype(&hipModuleLaunchKernel)            launch_kernel;
+
+    static const CudaDrv& instance();
+};
+
+#define cuda_check_drv(res) \
+do \
+{ \
+    hipError_t res_ = (res); \
+    if (res_ != hipSuccess) \
+    { \
+        fprintf(stderr, "HIP driver error %d: %s %d\n", static_cast<int>(res_), __FILE__, __LINE__); \
+        TORCH_CHECK(false, "HIP driver error"); \
+    } \
+} \
+while(false)
+
+#else
+
 #include <cuda.h>
 
 // CUDA driver API entry points, resolved at runtime from the driver library so the extension
@@ -31,3 +62,5 @@ do \
     } \
 } \
 while(false)
+
+#endif

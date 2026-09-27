@@ -2,6 +2,26 @@
 #include <c10/util/Exception.h>
 #include "cuda_drv.h"
 
+#if defined(USE_ROCM)
+
+const CudaDrv& CudaDrv::instance()
+{
+    static CudaDrv d = []
+    {
+        CudaDrv d{};
+        d.module_load_data    = hipModuleLoadData;
+        d.module_unload       = hipModuleUnload;
+        d.module_get_function = hipModuleGetFunction;
+        d.func_set_attribute  = hipFuncSetAttribute;
+        d.launch_kernel       = hipModuleLaunchKernel;
+        return d;
+    }
+    ();
+    return d;
+}
+
+#else
+
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -47,3 +67,5 @@ const CudaDrv& CudaDrv::instance()
     ();
     return d;
 }
+
+#endif
