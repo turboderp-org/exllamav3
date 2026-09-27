@@ -785,7 +785,22 @@ present in the environment. Categories are defined at the call sites (see
 ## Build (JIT extension)
 
 These only matter when the C++/CUDA extension is compiled at import time rather than installed
-prebuilt.
+prebuilt. `EXLLAMA_EXT_LINEINFO` and `EXLLAMA_EXT_COMPRESS` apply to wheel builds as well.
+
+### `EXLLAMA_EXT_LINEINFO` (default: unset)
+
+Compiles the CUDA kernels with source line tables (`-lineinfo`), for profilers and debuggers that
+attribute samples or faults to source lines. Off by default because the tables make up most of
+the size of the embedded kernel images and have no effect on the generated code.
+
+### `EXLLAMA_EXT_COMPRESS` (default: auto)
+
+The embedded kernel images are stored compressed (`--compress-mode=size`) when the installed nvcc
+supports it (CUDA 12.8 and later). Compression is applied to the finished images, so the kernels
+themselves are identical either way. `0` disables it, which may be needed to run a locally built
+extension on a driver that predates compressed images. `require` makes the build fail when nvcc
+does not offer the option instead of silently building uncompressed; the release wheels are built
+this way. Not used for ROCm builds.
 
 ### `CUDAHOSTCXX` (default: unset)
 

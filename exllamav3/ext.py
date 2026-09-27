@@ -6,6 +6,7 @@ from torch.utils.cpp_extension import load
 import os
 import sys
 from .util.arch_list import maybe_set_arch_list_env
+from .util.cuda_flags import cuda_cflags
 
 extension_name = "exllamav3_ext"
 verbose = False  # Print wall of text when compiling
@@ -88,11 +89,11 @@ else:
     # compiler flags
 
     extra_cflags = []
-    extra_cuda_cflags = [
-        "-lineinfo", "-O3", "--use_fast_math",
-        "-Xcudafe", "--diag_suppress=177",
-        "-Xcudafe", "--diag_suppress=20012",
-    ]
+    extra_cuda_cflags = cuda_cflags(
+        cuda_home = torch.utils.cpp_extension.CUDA_HOME,
+        debug = ext_debug,
+        hip = bool(torch.version.hip),
+    )
 
     if windows:
         # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break
