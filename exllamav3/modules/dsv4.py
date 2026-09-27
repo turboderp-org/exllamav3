@@ -612,7 +612,7 @@ class DSV4Attention(Module):
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
         stc = self.config.stc
-        self.sinks = stc.get_tensor(f"{self.key}.attn_sink", device, no_defer = True).float().contiguous()
+        self.sinks = stc.get_tensor(f"{self.key}.attn_sink", device, no_defer = True, arena = False).float().contiguous()
 
         self.inv_freq_main = yarn_inv_freq(self.rope_head_dim, self.rope_theta, device)
         self.inv_freq_compress = yarn_inv_freq(
@@ -626,11 +626,11 @@ class DSV4Attention(Module):
         self.q_ones = torch.ones(self.head_dim, dtype = self.kv_norm_w.dtype, device = device)
 
         if self.compressor is not None:
-            self.compressor.ape = stc.get_tensor(f"{self.compressor.key}.ape", device, no_defer = True).float().contiguous()
+            self.compressor.ape = stc.get_tensor(f"{self.compressor.key}.ape", device, no_defer = True, arena = False).float().contiguous()
             self.compressor.make_bc(self.inv_freq_compress)
         if self.indexer is not None:
             self.indexer.make_bc(self.inv_freq_compress)
-            self.indexer.ape = stc.get_tensor(f"{self.indexer.key}.ape", device, no_defer = True).float().contiguous()
+            self.indexer.ape = stc.get_tensor(f"{self.indexer.key}.ape", device, no_defer = True, arena = False).float().contiguous()
         for rl in self.recurrent_layers:
             rl.alloc(device)
         for cl in self.cache_layers:

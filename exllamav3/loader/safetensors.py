@@ -644,9 +644,12 @@ class SafetensorsCollection:
         self.arena = {}
 
 
-    def _arena_alloc(self, shape, dtype: torch.dtype, device: torch.device, zeros: bool):
+    def _arena_alloc(self, shape, dtype: torch.dtype, device: torch.device, zeros: bool, enabled: bool = True):
         """Persistent weight-tensor allocation: carve from the device's slab blocks while a
-        deferred-load bracket is open, falling back to a plain allocation otherwise. First-fit
+        deferred-load bracket is open, falling back to a plain allocation otherwise (or when the
+        caller opts out with enabled = False: a tensor the module only derives other layouts from
+        would otherwise stay resident in its block, kept alive by the weights sharing it, after
+        the module drops it). First-fit
         over the open blocks, oldest first, so a block tail left by a tensor that did not fit
         is packed by later small tensors instead of being abandoned (issue #313: with a single
         bump block, a dense model's 32-64MB projections left GBs of dead tails). The open list
@@ -655,7 +658,7 @@ class SafetensorsCollection:
         weight tensors themselves keep their blocks alive)."""
         device = torch.device(device)
         nbytes = math.prod(shape) * dtype.itemsize
-        if not (self.arena_enable and self.deferred_mode and self.deferred_arena and device.type == "cuda"
+        if not (enabled and self.arena_enable and self.deferred_mode and self.deferred_arena and device.type == "cuda"
                 and 0 < nbytes <= self.ARENA_MAX_TENSOR):
             return (torch.zeros if zeros else torch.empty)(shape, dtype = dtype, device = device)
         blocks = self.arena.setdefault(device.index, [])
@@ -690,7 +693,11 @@ class SafetensorsCollection:
         transpose: bool = False,
         pad_to: tuple = None,
         fidx: int = None,
+        arena: bool = True,
     ) -> torch.Tensor | None:
+        """arena = False: allocate outside the loader's slab blocks. For tensors the module reads
+        once to build its own layouts and then drops; slab-backed, their bytes would stay
+        allocated for the life of the block."""
 
         # Misses first (optional probes for absent tensors are a large share of all calls during
         # a bulk load, so the miss path stays minimal)
@@ -774,7 +781,7 @@ class SafetensorsCollection:
                     final_shape = pad_to if pad_to is not None else load_shape_t
                     final_dtype = dtype if not (bf16_to_fp16 or fp32_to_fp16) else torch.float16
                     tensor = self._arena_alloc(final_shape, final_dtype, device,
-                                               zeros = final_shape != load_shape_t)
+                                               zeros = final_shape != load_shape_t, enabled = arena)
                     if transpose or fp32_to_fp16 or final_shape != load_shape_t:
                         # transient staging: NOT from the arena (freed after the fill; it would
                         # pin its block as dead weight)
@@ -811,7 +818,7 @@ class SafetensorsCollection:
                         and not (dtype == torch.float and float2half) \
                         and not transpose and pad_to is None
                     if final:
-                        tensor = self._arena_alloc(shape, dtype, device, zeros = False)
+                        tensor = self._arena_alloc(shape, dtype, device, zeros = False, enabled = arena)
                     else:
                         tensor = torch.empty(shape, dtype = dtype, device = device)
                     assert tensor.is_contiguous()
