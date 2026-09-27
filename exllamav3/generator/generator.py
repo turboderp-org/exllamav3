@@ -46,6 +46,7 @@ class Generator:
         dynamic_draft_tokens: bool = False,
         draft_confidence: float = 0.4,
         record_draft_stats: bool = False,
+        ngram_corpus: str | None = None,
         **kwargs
     ):
         """
@@ -86,6 +87,9 @@ class Generator:
 
         :param ngram_match_min:
             Minimum number of tokens to match for n-gram draft (0 = disabled).
+
+        :param ngram_corpus:
+            Optional frozen SAM file shared by n-gram jobs; requires ngram_match_min > 0.
 
         :param dynamic_draft_tokens:
             Adapt the per-round draft length to the workload. The draft is cut using a drafter-provided
@@ -175,6 +179,12 @@ class Generator:
         else:
             self.num_draft_tokens = 0
 
+        self.ngram_corpus = None
+        if ngram_corpus is not None:
+            if ngram_match_min <= 0:
+                raise ValueError("ngram_corpus requires ngram_match_min > 0")
+            from .ngram import NgramCorpus
+            self.ngram_corpus = NgramCorpus(ngram_corpus, tokenizer)
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats

@@ -183,6 +183,8 @@ def print_stats(stats_sink):
 
 @torch.inference_mode()
 def main(args):
+    if args.ngram_corpus and args.s_ngram_match_min <= 0:
+        raise ValueError("-ngram_corpus requires -ngram_min > 0")
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(
         args,
         min_draft_len = args.s_ngram_draft_length
@@ -219,6 +221,7 @@ def main(args):
             cache = cache,
             tokenizer = tokenizer,
             ngram_match_min = args.s_ngram_match_min,
+            ngram_corpus = args.ngram_corpus,
             num_draft_tokens = args.s_ngram_draft_length,
             dynamic_draft_tokens = args.dynamic_draft,
             draft_confidence = args.draft_confidence,

@@ -377,6 +377,7 @@ def main(args):
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
         ngram_match_min = args.ngram_match_min,
+        ngram_corpus = args.ngram_corpus,
         dynamic_draft_tokens = args.dynamic_draft,
         draft_confidence = args.draft_confidence,
         max_chunk_size = args.chunk_size,

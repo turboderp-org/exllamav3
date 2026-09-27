@@ -1171,6 +1171,7 @@ class Job:
             self.held_logits = SeqTensor((1, 0, self.generator.padded_vocab_size), dtype = torch.float, seq_dim = 1)
             self.full_completion = ""
             self.sam = None if not generator.ngram_match_min else ext.BC_SAM()
+            self.corpus_cursor = generator.ngram_corpus.cursor() if generator.ngram_corpus else None
 
         self.time_enqueue = time.time()
 
@@ -1642,7 +1643,7 @@ class Job:
 
     def get_ngram_draft(self, draft_length: int):
         """
-        Return speculative draft tokens from the suffix-array n-gram matcher.
+        Return the continuation of the longest live/corpus suffix match.
         """
         assert self.sam
 
@@ -1656,4 +1657,9 @@ class Job:
         else:
             draft = torch.empty((1, 0), dtype = torch.long)
 
+        if self.corpus_cursor is not None:
+            matched, corpus_draft = self.corpus_cursor.draft(seq, self.generator.ngram_match_min, draft_length)
+            # Prefer live context on ties; an exhausted occurrence offers no draft.
+            if corpus_draft.numel() and (not draft.numel() or matched > end - beg):
+                draft = corpus_draft
         return draft

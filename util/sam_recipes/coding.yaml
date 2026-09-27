@@ -1,0 +1,49 @@
+# Targets count rendered UTF-8 bytes, not downloaded bytes. One complete
+# document may overshoot each target. This is a starting mixture to benchmark,
+# not a claim that these proportions maximize draft acceptance.
+version: 1
+target_bytes: 100000000
+max_tokens: 80000000
+max_document_bytes: 512000
+seed: 42
+shuffle_buffer: 32
+chat_template_kwargs: {}
+sources:
+  - name: swe-smith
+    dataset: SWE-bench/SWE-smith-trajectories
+    revision: 08e109b4a59eaeebf80e4675cd125d42e7ac99a4
+    split: tool
+    columns: [messages, resolved]
+    filters: {resolved: true}
+    mode: chat
+    field: messages
+    weight: 40
+    max_rows: 10000
+  - name: magicoder
+    dataset: ise-uiuc/Magicoder-OSS-Instruct-75K
+    revision: 5f839b1f368a76b161028bb9edff055db34022b2
+    split: train
+    mode: text
+    field: solution
+    weight: 30
+    max_rows: 50000
+  - name: opencoder
+    dataset: OpenCoder-LLM/opc-sft-stage2
+    revision: 7d28f40d579edd7c24402d17d0c7639f991e6f8d
+    config: package_instruct
+    split: train
+    columns: [output]
+    mode: text
+    field: output
+    weight: 20
+    max_rows: 50000
+  - name: smoltalk
+    dataset: HuggingFaceTB/smoltalk
+    revision: 5feaf2fd3ffca7c237fc38d1861bc30365d48ffa
+    config: smol-magpie-ultra
+    split: train
+    columns: [messages]
+    mode: assistant_text
+    field: messages
+    weight: 10
+    max_rows: 50000

@@ -1,0 +1,4 @@
+# Optional dependencies for util/build_sam.py (in addition to the base install).
+datasets>=4.0
+transformers>=4.45
+zstandard>=0.23
