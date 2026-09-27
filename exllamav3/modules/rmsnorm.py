@@ -215,7 +215,7 @@ class RMSNorm(Module):
         )
         module.device = device
         w = consumer.recv(exported["weight"], cuda = True)
-        module.weight = nn.Parameter(w) if w is not None else None
+        module.weight = nn.Parameter(w, requires_grad = False) if w is not None else None
         # span_heads is preserved via kwargs
         torch.cuda.synchronize()
         return module
@@ -239,7 +239,7 @@ class RMSNorm(Module):
                 # 1D weight tensor (e.g., span_heads=True norms)
                 # split contains element indices
                 w = w[first : last]
-            module.weight = nn.Parameter(w.to(module.device).contiguous())
+            module.weight = nn.Parameter(w.to(module.device).contiguous(), requires_grad = False)
         # span_heads is preserved via kwargs
 
         return module

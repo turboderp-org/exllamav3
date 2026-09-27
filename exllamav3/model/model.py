@@ -403,6 +403,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         return torch.argmax(logits, dim = -1)
 
 
+    @torch.inference_mode
     def forward(self, input_ids: torch.Tensor, params: dict | None = None):
         """
         Run a normal model forward pass for generation or verification.
