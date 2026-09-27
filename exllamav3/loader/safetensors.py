@@ -918,10 +918,16 @@ class SafetensorsCollection:
         assert not self.deferred_mode
         self.deferred_mode = True
         self.deferred_arena = arena
+        # Open-block state at the start of the bracket, so an aborted load (a module rolled
+        # off a device by an out-of-memory error) can hand back the blocks it opened and the
+        # space it carved from older ones: the module's tensors die with it, but a block
+        # opened for them would otherwise stay resident on the fullest device
+        self.arena_snapshot = {d: [(e[0], e[1]) for e in blocks] for d, blocks in self.arena.items()}
 
 
     def end_deferred_load(self):
         assert self.deferred_mode
+        self.arena_snapshot = None
 
         with (Timer() as timer):
 
@@ -1025,6 +1031,11 @@ class SafetensorsCollection:
     def abort_deferred_load(self):
         self.deferred_mode = False
         self.deferred_loads = []
+        snapshot = getattr(self, "arena_snapshot", None)
+        if snapshot is not None:
+            # Every slab slice handed out since the bracket opened belongs to the aborted module
+            self.arena = {d: [[b, off] for b, off in saved] for d, saved in snapshot.items()}
+            self.arena_snapshot = None
 
 
     def find_stc(self, key):

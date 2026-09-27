@@ -306,6 +306,10 @@ class Model_LSMixin(ABC):
 
             dummy_state = None
             unset_memory_fraction(touched_devices)
+            if verbose:
+                for i in touched_devices:
+                    print(f" -- autosplit: cuda:{i} largest measured transient {max_transient.get(i, 0) >> 20} MiB, "
+                          f"{torch.cuda.mem_get_info(i)[0] >> 20} MiB free after load")
 
         if recurrent_states is not None:
             for rs in recurrent_states:
