@@ -635,6 +635,22 @@ class Model(Model_TPMixin, Model_LSMixin):
                     raise NotImplementedError(f"Tensor-parallel is not currently implemented for {self.config.architecture}")
                 if self.config.layer_map:
                     raise NotImplementedError(f"Tensor-parallel is not currently implemented for relayered models.")
+                # CPU expert offload hooks into a module's load onto a CUDA device. The TP loader
+                # stages modules on the CPU and the workers rebuild them from the export, so a
+                # requested offload would be dropped without notice and every expert would land
+                # in VRAM
+                ip = self.config.infer_params
+                cpu_modes = [name for name, value in (
+                    ("moe_cpu_split", getattr(ip, "moe_cpu_split", 0)),
+                    ("moe_cpu_offload", getattr(ip, "moe_cpu_offload", 0)
+                        if getattr(self, "component", "text") == "text"
+                        else getattr(ip, "draft_moe_cpu_offload", 0)),
+                ) if value]
+                if cpu_modes:
+                    raise NotImplementedError(
+                        f"CPU expert offload ({', '.join(cpu_modes)}) is not currently implemented for "
+                        f"tensor-parallel loads; use layer-split mode or disable the offload."
+                    )
 
                 if tp_output_device is None:
                     tp_output_device = active_devices[0]
