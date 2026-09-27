@@ -224,15 +224,5 @@ class Glm4MoeLiteMTPModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        ll = self.attached_model().logit_layer_idx
-        lm = self.attached_model().modules[ll]
-        logits = lm.prepare_for_device(state, params)
-        logits = lm.forward(logits, params)
-        if params.get("export_draft_conf"):
-            # Per-position confidence for the generator's draft truncation: the argmax logit
-            # value, over the unpadded vocabulary
-            logits = logits[..., :self.attached_model().config.vocab_size]
-            conf, ids = torch.max(logits, dim = -1)
-            params["draft_conf"] = conf
-            return ids
-        return torch.argmax(logits, dim = -1)
+        # The target's head, TP-aware; exports draft confidence when the generator asks
+        return self.attached_model().lm_head_argmax(state, params)
