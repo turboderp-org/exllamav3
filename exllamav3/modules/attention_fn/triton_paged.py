@@ -1878,6 +1878,16 @@ def paged_attn_triton_prefill(
         cfg = (64, 32, 4, 2)
     else:
         cfg = (32, 16, 4, 2)
+    # Pre-Ampere (Turing/Volta, 64 KB per-block smem; the C++ EXL3_SM75 gate is
+    # __CUDA_ARCH__ < 800, the same class): the stock tiles overcommit the device's budget,
+    # and the ladder's first fit starves the mma pipeline -- at hd_pad 256 it is
+    # (32, 32, 2, 2), which fits exactly but runs at 2 warps per block. Measured on a 2080 Ti
+    # (hd 256, GQA 16/4, q_len 1792): (16, 32, 8, 2) is ~6x faster (17.6 vs 118.3 ms): the
+    # narrower q tile doubles the program count and the 8 warps keep the dots fed, the kv tile
+    # stays intact. The other hd_pad ranges halve the q tile only (unmeasured: no pre-Ampere
+    # model at those dims).
+    if torch.cuda.get_device_capability(q.device)[0] < 8:
+        cfg = (16, 32, 8, 2) if hd_pad == 256 else (max(16, cfg[0] // 2), cfg[1], cfg[2], cfg[3])
     forced = (block_m, block_n, num_warps, num_stages)
     if qc is not None and block_n is None:
         # compact plane tiles stage fewer smem bytes than fp16: wider kv tiles pay off. Wide

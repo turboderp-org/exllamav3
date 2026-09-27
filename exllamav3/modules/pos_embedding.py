@@ -42,7 +42,7 @@ class PosEmbedding(Module):
             self.hidden_size,
             device = "meta"
         )
-        self.embedding.weight = nn.Parameter(weight)
+        self.embedding.weight = nn.Parameter(weight, requires_grad = False)
 
     @override
     def unload(self):

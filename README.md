@@ -163,6 +163,7 @@ installations once the venv is active, `python convert.py -i ...`
 compilation. Set this to a reasonable value like 4 in that case.
 - `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch
 will build/load it at runtime instead.
+- `EXLLAMA_EXT_LINEINFO`, `EXLLAMA_EXT_COMPRESS`: see [doc/env_vars.md](doc/env_vars.md).
 
 ## Examples
 

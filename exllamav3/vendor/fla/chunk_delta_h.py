@@ -18,7 +18,7 @@ from .utils import autotune_cache_kwargs
 from .utils import check_shared_mem
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
-GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]
+GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4, 8]
 
 
 @triton.heuristics({
@@ -35,7 +35,11 @@ GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]
         for num_warps in GATED_DELTA_RULE_FWD_H_NUM_WARPS
         for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [2, 1])
         for BV in ([32, 64] if check_shared_mem('ada') else [32])
-    ],
+    ] + ([
+        # sm_75 (Turing): num_warps=8 is ~4x faster than 2/4 for the sequential chunk
+        # recurrence (measured 9.8 ms -> 2.5 ms per GDN layer at T=1792 on a 2080 Ti)
+        triton.Config({'BV': 64}, num_warps=8, num_stages=1),
+    ] if not check_shared_mem('ada') else []),
     key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
