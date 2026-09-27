@@ -71,6 +71,7 @@ class RoutingCFG:
     e_score_bias_vl: torch.Tensor | None = None   # DeepSeek-V4 vision: selection bias for image rows
     gate_i8: torch.Tensor | None = None     # (2, E, K) int8 hi/lo slices, lazy (see _gate_i8)
     gate_sb: torch.Tensor | None = None     # (E) fp32 row scales
+    gate_tensor_f32: torch.Tensor | None = None   # grouped FP32 router, lazy after deferred load
 
 
 def _gate_t(cfg):
@@ -205,6 +206,40 @@ def routing_ds3(bsz, cfg, y, params):
     topk_weights /= denominator
     topk_weights = topk_weights * cfg.routed_scaling_factor
     return topk_indices, topk_weights
+
+
+def routing_ds3_fp32(bsz, cfg, y, params):
+    """Grouped noaux sigmoid routing (Ling): correction affects selection, not mixing.
+
+    Existing ds3/dots arithmetic is unchanged. Materialize the wider matrix only on
+    first forward, after the deferred loader has filled the original destination.
+    This is FP32 routing arithmetic over the engine's native stored weights/input.
+    """
+    if cfg.gate_tensor_f32 is None:
+        cfg.gate_tensor_f32 = cfg.gate_tensor.float()
+    scores = torch.matmul(y.float(), cfg.gate_tensor_f32).sigmoid()
+    if params.get("activate_all_experts"):
+        selected = torch.arange(cfg.num_experts, device = y.device).expand(bsz, -1)
+        weights = scores
+    else:
+        choice = scores
+        if cfg.e_score_correction_bias is not None:
+            choice = choice + cfg.e_score_correction_bias.float().unsqueeze(0)
+        grouped = choice.view(bsz, cfg.n_group, cfg.num_experts // cfg.n_group)
+        group_scores = grouped.topk(2, dim = -1).values.sum(dim = -1)
+        groups = group_scores.topk(cfg.topk_group, dim = -1, sorted = False).indices
+        mask = torch.zeros_like(group_scores, dtype = torch.bool)
+        mask.scatter_(1, groups, True)
+        mask = mask.unsqueeze(-1).expand_as(grouped).reshape_as(choice)
+        # Zero is not exclusion when selection biases make eligible scores negative.
+        selected = choice.masked_fill(~mask, -float("inf")).topk(
+            cfg.num_experts_per_tok, dim = -1, sorted = False
+        ).indices
+        weights = scores.gather(1, selected)
+    if weights.shape[-1] > 1:
+        weights = weights / (weights.sum(dim = -1, keepdim = True) + 1e-20)
+    weights = (weights * cfg.routed_scaling_factor).half()
+    return selected.contiguous(), weights.contiguous()
 
 
 def routing_dots(bsz, cfg, y, params):
