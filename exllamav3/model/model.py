@@ -377,6 +377,32 @@ class Model(Model_TPMixin, Model_LSMixin):
 
 
     @torch.inference_mode
+    def lm_head_argmax(self, state: torch.Tensor, params: dict) -> torch.Tensor:
+        """
+        Greedy token per position from a hidden state through this model's LM head, for drafters
+        that borrow the target's head (MTP, DFlash). Works in both layer-split and tensor-parallel
+        mode. With params["export_draft_conf"], also exports the winning logit per position as
+        params["draft_conf"], which the generator's confidence-calibrated draft sizing consumes.
+        The vocabulary is cropped to the unpadded size in both modes, so a zero-initialized
+        padding column can never win.
+        """
+        export = bool(params.get("export_draft_conf"))
+        if self.loaded_tp:
+            state = self.tp_producer.send(state)
+            ids, conf = self.tp_dispatch_lm_head_argmax((state, {}), return_max = True)
+            if export:
+                params["draft_conf"] = conf
+            return ids
+        lm = self.modules[self.logit_layer_idx]
+        logits = lm.forward(lm.prepare_for_device(state, params), params)
+        logits = logits[..., :self.config.vocab_size]
+        if export:
+            conf, ids = torch.max(logits, dim = -1)
+            params["draft_conf"] = conf
+            return ids
+        return torch.argmax(logits, dim = -1)
+
+
     def forward(self, input_ids: torch.Tensor, params: dict | None = None):
         """
         Run a normal model forward pass for generation or verification.

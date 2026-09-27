@@ -340,10 +340,10 @@ class MLAttention(Module):
             stc = self.config.stc
             self.idx_kpool_ape = stc.get_tensor(
                 f"{self.key}.{self.key_indexer}.index_kpool_compress_ape", device,
-                no_defer = True, allow_bf16 = True).float()
+                no_defer = True, allow_bf16 = True, arena = False).float()
             self.idx_kpool_gate = stc.get_tensor(
                 f"{self.key}.{self.key_indexer}.index_kpool_compress_gate", device,
-                no_defer = True, allow_bf16 = True).to(torch.half)
+                no_defer = True, allow_bf16 = True, arena = False).to(torch.half)
 
         if self.rope_settings:
             self.rope = RoPE(device, self.rope_settings)
@@ -358,12 +358,14 @@ class MLAttention(Module):
         # GEMM; the halves fold into the query/output (decode) or up-project past tiles (prefill)
         if self.w_uk_flat is not None:
             return
-        w = self.config.stc.get_tensor(f"{self.key}.{self.key_kv_b}.weight", device, no_defer = True)
+        # Source only: the halves are copied into w_uk_flat / w_uv_flat below and w is dropped,
+        # so it stays out of the loader's slab blocks
+        w = self.config.stc.get_tensor(f"{self.key}.{self.key_kv_b}.weight", device, no_defer = True, arena = False)
         if w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             # fp8 checkpoint: this tensor is read raw rather than through a Linear, so apply the
             # inverse weight scale here (scalar per-tensor or block grid)
             si = self.config.stc.get_tensor(
-                f"{self.key}.{self.key_kv_b}.weight_scale_inv", device, optional = True, no_defer = True
+                f"{self.key}.{self.key_kv_b}.weight_scale_inv", device, optional = True, no_defer = True, arena = False
             )
             wf = w.float()
             if si is not None:

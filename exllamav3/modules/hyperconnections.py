@@ -88,9 +88,9 @@ class HyperConnection(Module):
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
         stc = self.config.stc
-        self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True).float().contiguous()
-        self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True).float().contiguous()
-        self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True).float().contiguous()
+        self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True, arena = False).float().contiguous()
+        self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True, arena = False).float().contiguous()
+        self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True, arena = False).float().contiguous()
 
     @override
     def unload(self):
@@ -294,10 +294,12 @@ class GatedResidual(Module):
         super().load(device, **kwargs)
         stc = self.config.stc
         self.norm_w_raw = stc.get_tensor(f"{self.key}.hc_norm.weight", device, no_defer = True)
-        down = stc.get_tensor(f"{self.key}.input_mix_weight_down.weight", device, no_defer = True)
-        up = stc.get_tensor(f"{self.key}.input_mix_weight_up.weight", device, no_defer = True)
+        # Sources only: _prepare copies them into the kernel layouts, so keep them out of the
+        # loader's slab blocks or the dead copies stay resident
+        down = stc.get_tensor(f"{self.key}.input_mix_weight_down.weight", device, no_defer = True, arena = False)
+        up = stc.get_tensor(f"{self.key}.input_mix_weight_up.weight", device, no_defer = True, arena = False)
         inject = stc.get_tensor(f"{self.key}.block_inject_weight.weight", device,
-                                no_defer = True) if self.use_combine else None
+                                no_defer = True, arena = False) if self.use_combine else None
         self._prepare(down, up, inject, keep_source_weights)
 
     def _prepare(self, down, up, inject, keep_source_weights: bool = False):
@@ -575,9 +577,9 @@ class HyperHead(Module):
         if self.mean:
             return
         stc = self.config.stc
-        self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True).float().contiguous()
-        self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True).float().contiguous()
-        self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True).float().contiguous()
+        self.fn = stc.get_tensor(f"{self.key}_fn", device, no_defer = True, arena = False).float().contiguous()
+        self.base = stc.get_tensor(f"{self.key}_base", device, no_defer = True, arena = False).float().contiguous()
+        self.scale = stc.get_tensor(f"{self.key}_scale", device, no_defer = True, arena = False).float().contiguous()
 
     @override
     def unload(self):

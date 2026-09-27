@@ -442,7 +442,7 @@ class Attention(Module):
 
         if self.key_sinks:
             self.sinks = self.config.stc.get_tensor(
-                f"{self.key}.{self.key_sinks}", device, no_defer = True
+                f"{self.key}.{self.key_sinks}", device, no_defer = True, arena = False
             ).float().contiguous()
 
         # Test if K and V proj can be fused

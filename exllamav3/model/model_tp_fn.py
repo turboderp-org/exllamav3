@@ -305,6 +305,7 @@ def mp_model_forward_lm_head_argmax(
     offset: int,
     gather_devices: list[int] | None,
     ldims: list[int] | None,
+    vocab_size: int = -1,
 ):
     consumer = local_context["inf_consumer"]
     device = local_context["device"]
@@ -317,8 +318,16 @@ def mp_model_forward_lm_head_argmax(
         module = local_context["logits_module"]
         x = module.prepare_for_device(x, params)
         x = module.forward(x, params)
-        v, i = x.max(dim = -1)
-        i += offset
+        # The head is padded to the tile size; a shard reaching past the vocabulary must not let a
+        # padding column (zero logit) win the local maximum
+        if vocab_size >= 0 and offset + x.shape[-1] > vocab_size:
+            x = x[..., :max(0, vocab_size - offset)]
+        if x.shape[-1] > 0:
+            v, i = x.max(dim = -1)
+            i += offset
+        else:
+            v = torch.full(x.shape[:-1], -float("inf"), dtype = x.dtype, device = x.device)
+            i = torch.zeros(x.shape[:-1], dtype = torch.long, device = x.device)
     else:
         v = torch.empty(*x.shape[:-1], dtype = x.dtype, device = x.device)
         i = torch.empty(*x.shape[:-1], dtype = torch.long, device = x.device)
