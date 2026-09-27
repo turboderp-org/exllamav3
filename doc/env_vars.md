@@ -436,8 +436,19 @@ account, enabled on the worker's token at runtime) and falls back to a plain map
 when large pages cannot be supplied. A failed request is retried at half the size down to
 64 MiB before giving up: Windows large pages need physically contiguous 2 MiB regions, which
 a long-running system can often still supply in smaller runs even when a full 1 GiB chunk
-does not fit -- a fresh boot typically can serve the full size. `EXL3_MOE_ARENA_DEBUG=1`
-prints the large-page coverage of the arena.
+does not fit -- a fresh boot typically can serve the full size. Later chunks start at the
+size the previous one was served at, and no further attempts are made once the smallest size
+has failed, so a fragmented system does not pay for the search on every chunk.
+
+The privilege is the "Lock pages in memory" user right (Local Security Policy > Local Policies
+> User Rights Assignment, or the same entry in Group Policy). It is not granted to any account
+by default, and a newly granted right only takes effect after signing out and back in.
+Without it nothing changes: the arena uses regular pages and prints nothing.
+
+With it, the arena is committed up front and locked in RAM: large pages are never paged out,
+so that memory is unavailable to everything else for as long as the model is loaded. The
+worker prints one line after loading that states how much of the arena is on large pages, or
+that none could be allocated. Set the flag to `0` to keep the arena on regular pages.
 
 ### `EXL3_HGEMM_F16ACC` (default: auto)
 

@@ -202,7 +202,9 @@ def _memfd_create(name: str, flags: int = 0) -> int:
 # (the privilege is granted-but-disabled by default for accounts that have it), and the size
 # must be a multiple of GetLargePageMinimum() (2 MiB on x64). Large pages are committed and
 # non-pageable, so allocation can fail on a fragmented or busy system -- callers fall back to
-# a plain anonymous mapping per chunk.
+# a plain anonymous mapping per chunk. A failed request is expensive to repeat (the kernel
+# searches for contiguous memory each time) and contiguity does not come back during a load,
+# so the arena remembers how far down the size ladder it had to go (see _HugeArena._new_chunk).
 
 _WIN32_LARGE_PAGE_SUPPORT = None
 
@@ -323,6 +325,7 @@ class _HugeArena:
     instead of thousands of separate small (sub-2MB) loader allocations
     """
     CHUNK_BYTES = 1 << 30   # 1 GiB
+    WIN32_LARGE_FLOOR = 64 << 20   # smallest MEM_LARGE_PAGES chunk worth having (Windows)
 
     def __init__(self, shared = False, huge = "", conn = None):
         """shared: back each chunk with shared memory and publish it over `conn` as
@@ -336,6 +339,9 @@ class _HugeArena:
         self.cur = None
         self.cur_off = 0
         self.win32_large_bytes = 0   # bytes of chunks backed by MEM_LARGE_PAGES (Windows)
+        # Largest MEM_LARGE_PAGES request still worth making (Windows), None until the first
+        # attempt: the size the last chunk was served at, or below the smallest size that failed
+        self.win32_large_ceiling = None
 
     def _new_chunk(self, min_bytes):
         import mmap, os
@@ -406,13 +412,18 @@ class _HugeArena:
             # MEM_LARGE_PAGES VirtualAlloc (needs SeLockMemoryPrivilege and physically
             # contiguous 2 MiB regions), halving the request down to 64 MiB -- and no lower
             # than what the placement needs -- before falling back to a plain mapping, still
-            # at full chunk size since regular pages have no contiguity constraint
+            # at full chunk size since regular pages have no contiguity constraint. Later
+            # chunks start at the size the previous one was served at instead of walking the
+            # ladder from the top again, and stop asking once the smallest size has failed
+            m = None
             if TUNING.arena_hugepage:
-                m = _win32_large_page_alloc(size, max(64 << 20, min_bytes))
-                if m is not None:
-                    self.win32_large_bytes += len(m)
-                else:
-                    m = mmap.mmap(-1, size)
+                floor = max(self.WIN32_LARGE_FLOOR, min_bytes)
+                ceiling = self.win32_large_ceiling
+                if ceiling is None or ceiling >= floor:
+                    m = _win32_large_page_alloc(size if ceiling is None else min(size, ceiling), floor)
+                    self.win32_large_ceiling = len(m) if m is not None else floor // 2
+            if m is not None:
+                self.win32_large_bytes += len(m)
             else:
                 m = mmap.mmap(-1, size)
         else:
@@ -422,7 +433,7 @@ class _HugeArena:
         self.cur_off = 0
         if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
             total = sum(len(c) for c in self.chunks)
-            print(f" -- arena: new chunk {size/1e6:.1f} MB, {len(self.chunks)} chunks, "
+            print(f" -- arena: new chunk {len(m)/1e6:.1f} MB, {len(self.chunks)} chunks, "
                   f"{total/1e9:.3f} GB total", flush = True)
 
     def reserve(self, nbytes):
@@ -448,11 +459,18 @@ class _HugeArena:
             return
         if os.name == "nt":
             # MEM_LARGE_PAGES is decided at VirtualAlloc time (see _new_chunk); there is no
-            # promotion step to run here, only coverage to report
-            if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
-                total = sum(len(c) for c in self.chunks)
-                print(f" -- arena: {self.win32_large_bytes/1e9:.3f} GB of {total/1e9:.3f} GB "
-                      f"on large pages", flush = True)
+            # promotion step to run here, only coverage to report. Large pages are locked in
+            # RAM, which the user did not ask for explicitly, so say so whenever they are in
+            # use; an account without the privilege gets regular pages and no message
+            total = sum(len(c) for c in self.chunks)
+            if self.win32_large_bytes:
+                print(f" -- CPU MoE arena: {self.win32_large_bytes/1e9:.2f} GB of {total/1e9:.2f} GB "
+                      f"on large pages (locked in RAM, never paged out; set "
+                      f"EXL3_MOE_ARENA_HUGEPAGE=0 to use regular pages)", flush = True)
+            elif _WIN32_LARGE_PAGE_SUPPORT and total:
+                print(" -- CPU MoE arena: no large pages could be allocated, using regular pages "
+                      "(physical memory is too fragmented; large pages are usually available "
+                      "again after a reboot)", flush = True)
             return
         collapse = getattr(mmap, "MADV_COLLAPSE", 25)
         t0 = time.perf_counter()

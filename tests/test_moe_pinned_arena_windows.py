@@ -284,7 +284,7 @@ class _FakeKernel32:
 
 def _fake_kernel32(monkeypatch, module, max_ok):
     k32 = _FakeKernel32(max_ok)
-    monkeypatch.setattr("ctypes.WinDLL", lambda *a, **k: k32)
+    monkeypatch.setattr("ctypes.WinDLL", lambda *a, **k: k32, raising = False)
     monkeypatch.setattr(module, "_WIN32_LARGE_PAGE_SUPPORT", True)
     return k32
 
@@ -353,4 +353,86 @@ def test_private_chunk_keeps_full_size_when_falling_back_to_mmap(monkeypatch):
     arena = _small_private_arena(monkeypatch, m)
     arena._new_chunk(1)
     assert sizes == [4 * MiB]
+    arena.cur.close()
+
+
+def _windows_private_arena(monkeypatch, module, max_ok):
+    """Private arena on the Windows branch of _new_chunk with a fake kernel32, on any platform:
+    the branch is selected by os.name and only needs an anonymous mmap besides the allocator"""
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(module, "check_host_memory", lambda *a, **k: None)
+    monkeypatch.setattr(module.TUNING, "arena_hugepage", True)
+    return module._HugeArena(), _fake_kernel32(monkeypatch, module, max_ok)
+
+
+def test_large_page_ladder_resumes_at_the_size_the_last_chunk_was_served_at(monkeypatch):
+    from exllamav3.model import moe_cpu_host as m
+    arena, k32 = _windows_private_arena(monkeypatch, m, max_ok = 256 * MiB)
+    arena._new_chunk(1)
+    assert k32.attempts == [1 << 30, 512 * MiB, 256 * MiB]
+    arena._new_chunk(1)
+    arena._new_chunk(1)
+    assert k32.attempts[3:] == [256 * MiB, 256 * MiB]
+    assert [len(c) for c in arena.chunks] == [256 * MiB] * 3
+    assert arena.win32_large_bytes == 3 * 256 * MiB
+
+
+def test_large_page_attempts_stop_once_the_smallest_size_has_failed(monkeypatch):
+    import mmap
+    from exllamav3.model import moe_cpu_host as m
+    arena, k32 = _windows_private_arena(monkeypatch, m, max_ok = 0)
+    arena._new_chunk(1)
+    assert k32.attempts == [1 << 30, 512 * MiB, 256 * MiB, 128 * MiB, 64 * MiB]
+    arena._new_chunk(1)
+    assert len(k32.attempts) == 5
+    # Regular pages have no contiguity constraint, so the fallback keeps the full chunk size
+    assert all(isinstance(c, mmap.mmap) and len(c) == 1 << 30 for c in arena.chunks)
+    assert arena.win32_large_bytes == 0
+    for c in arena.chunks:
+        c.close()
+
+
+def test_large_page_ladder_follows_the_supply_down_and_skips_placements_above_it(monkeypatch):
+    import mmap
+    from exllamav3.model import moe_cpu_host as m
+    arena, k32 = _windows_private_arena(monkeypatch, m, max_ok = 512 * MiB)
+    arena._new_chunk(1)
+    assert k32.attempts == [1 << 30, 512 * MiB]
+    # Supply shrinks mid-load: the next chunk starts at the remembered size and steps down
+    k32.max_ok = 128 * MiB
+    arena._new_chunk(1)
+    assert k32.attempts[2:] == [512 * MiB, 256 * MiB, 128 * MiB]
+    # A placement that needs more than any size that still works goes straight to a plain
+    # mapping, and does not disturb what is remembered for the chunks after it
+    arena._new_chunk(200 * MiB)
+    assert len(k32.attempts) == 5 and isinstance(arena.cur, mmap.mmap)
+    arena._new_chunk(1)
+    assert k32.attempts[5:] == [128 * MiB]
+    arena.chunks[2].close()
+
+
+@pytest.mark.parametrize("max_ok, expected", [
+    (1 << 30, "on large pages (locked in RAM"),
+    (0, "no large pages could be allocated"),
+])
+def test_worker_reports_large_page_use_without_the_debug_flag(monkeypatch, capsys, max_ok, expected):
+    from exllamav3.model import moe_cpu_host as m
+    monkeypatch.delenv("EXL3_MOE_ARENA_DEBUG", raising = False)
+    arena, _ = _windows_private_arena(monkeypatch, m, max_ok)
+    arena._new_chunk(1)
+    arena.promote_hugepages()
+    out = capsys.readouterr().out
+    assert expected in out and out.count("\n") == 1
+    if max_ok == 0:
+        arena.cur.close()
+
+
+def test_worker_stays_silent_when_the_account_lacks_the_privilege(monkeypatch, capsys):
+    from exllamav3.model import moe_cpu_host as m
+    monkeypatch.delenv("EXL3_MOE_ARENA_DEBUG", raising = False)
+    arena, _ = _windows_private_arena(monkeypatch, m, max_ok = 1 << 30)
+    monkeypatch.setattr(m, "_WIN32_LARGE_PAGE_SUPPORT", False)
+    arena._new_chunk(1)
+    arena.promote_hugepages()
+    assert capsys.readouterr().out == "" and arena.win32_large_bytes == 0
     arena.cur.close()
