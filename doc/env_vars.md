@@ -430,6 +430,26 @@ madvise` hosts, plus any compaction the kernel needs first), so it must not sit 
 startup path; the worker reads 4K pages until each chunk lands. `EXL3_MOE_ARENA_DEBUG=1`
 prints how long it took. Set to `0` to skip hugepage promotion entirely.
 
+On Windows there is no post-hoc promotion, so the same flag instead makes each arena chunk
+attempt a `MEM_LARGE_PAGES` `VirtualAlloc` at creation (requires `SeLockMemoryPrivilege` on the
+account, enabled on the worker's token at runtime) and falls back to a plain mapping per chunk
+when large pages cannot be supplied. A failed request is retried at half the size down to
+64 MiB before giving up: Windows large pages need physically contiguous 2 MiB regions, which
+a long-running system can often still supply in smaller runs even when a full 1 GiB chunk
+does not fit -- a fresh boot typically can serve the full size. Later chunks start at the
+size the previous one was served at, and no further attempts are made once the smallest size
+has failed, so a fragmented system does not pay for the search on every chunk.
+
+The privilege is the "Lock pages in memory" user right (Local Security Policy > Local Policies
+> User Rights Assignment, or the same entry in Group Policy). It is not granted to any account
+by default, and a newly granted right only takes effect after signing out and back in.
+Without it nothing changes: the arena uses regular pages and prints nothing.
+
+With it, the arena is committed up front and locked in RAM: large pages are never paged out,
+so that memory is unavailable to everything else for as long as the model is loaded. The
+worker prints one line after loading that states how much of the arena is on large pages, or
+that none could be allocated. Set the flag to `0` to keep the arena on regular pages.
+
 ### `EXL3_HGEMM_F16ACC` (default: auto)
 
 GeForce parts run the fp32-accumulator tensor-core MMA at half the rate of the fp16-accumulator

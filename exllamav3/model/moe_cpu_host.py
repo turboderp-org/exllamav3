@@ -86,7 +86,10 @@ class MoeCpuTuning:
         self.stage_threads = int(os.environ.get("EXL3_MOE_CPU_STAGE_THREADS", 4))
         # madvise(MADV_HUGEPAGE) on the expert-weight arena chunks: with defrag=madvise (the
         # common default), the kernel does SYNCHRONOUS compaction on first touch of a hinted
-        # region once easily-compactable free memory runs low, which can stall loading badly
+        # region once easily-compactable free memory runs low, which can stall loading badly.
+        # On Windows the same flag makes each arena chunk attempt MEM_LARGE_PAGES at
+        # VirtualAlloc time (no post-hoc promotion exists there), negotiating the request
+        # size down per chunk and falling back to a plain mapping per chunk
         self.arena_hugepage = os.environ.get("EXL3_MOE_ARENA_HUGEPAGE", "1") != "0"
         # Band-contiguous ("swizzled") expert trellis layout: repacked at arena rehome so each
         # 8-tile output band streams sequentially from DRAM. Applied on every AVX-512 kernel
@@ -194,6 +197,127 @@ def _memfd_create(name: str, flags: int = 0) -> int:
             f"applies ({e}). Unset EXL3_MOE_PINNED_ARENA to use the staged path.") from e
 
 
+# Windows large pages: there is no madvise/promotion path, so MEM_LARGE_PAGES must be requested
+# at VirtualAlloc time. That requires SeLockMemoryPrivilege enabled on this process's token
+# (the privilege is granted-but-disabled by default for accounts that have it), and the size
+# must be a multiple of GetLargePageMinimum() (2 MiB on x64). Large pages are committed and
+# non-pageable, so allocation can fail on a fragmented or busy system -- callers fall back to
+# a plain anonymous mapping per chunk. A failed request is expensive to repeat (the kernel
+# searches for contiguous memory each time) and contiguity does not come back during a load,
+# so the arena remembers how far down the size ladder it had to go (see _HugeArena._new_chunk).
+
+_WIN32_LARGE_PAGE_SUPPORT = None
+
+
+def _win32_enable_lock_memory_privilege() -> bool:
+    """Best-effort SeLockMemoryPrivilege enable on the current process token. Returns True
+    only when the privilege ends up enabled."""
+    import ctypes
+    from ctypes import wintypes
+
+    TOKEN_ADJUST_PRIVILEGES = 0x0020
+    SE_PRIVILEGE_ENABLED = 0x00000002
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [("PrivilegeCount", wintypes.DWORD),
+                    ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error = True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+    # GetCurrentProcess returns the -1 pseudo-handle; without a pointer-sized restype ctypes
+    # truncates it to 32 bits and OpenProcessToken fails with ERROR_INVALID_HANDLE
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.LookupPrivilegeValueW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+    advapi32.AdjustTokenPrivileges.argtypes = [
+        wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES),
+        wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES,
+            ctypes.byref(token)):
+        return False
+    try:
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, "SeLockMemoryPrivilege", ctypes.byref(luid)):
+            return False
+        tp = TOKEN_PRIVILEGES()
+        tp.PrivilegeCount = 1
+        tp.Privileges[0] = LUID_AND_ATTRIBUTES(luid, SE_PRIVILEGE_ENABLED)
+        advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
+        # AdjustTokenPrivileges returns success even when it silently dropped privileges it
+        # couldn't assign; GetLastError distinguishes full assignment from partial
+        return ctypes.get_last_error() == 0
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _win32_large_page_alloc(size: int, min_size: int):
+    """Allocate MEM_LARGE_PAGES memory of up to `size` bytes, halving the request on each
+    failure down to `min_size`, and return the largest buffer obtained (a ctypes byte array
+    bound to the allocation -- buffer-protocol compatible, so it drops into the same
+    memoryview / torch.frombuffer consumers as an mmap object), or None when even `min_size`
+    cannot be supplied. A large request needs that many physically contiguous 2 MiB regions,
+    which a fragmented or busy system often cannot supply even when smaller runs exist, so a
+    shrunken chunk is still a win over falling back to 4K pages outright. A weakref.finalize
+    on the array issues VirtualFree(MEM_RELEASE) when the last reference dies, giving the
+    chunk the same free-on-GC lifetime semantics as an mmap object."""
+    import ctypes
+    import weakref
+
+    global _WIN32_LARGE_PAGE_SUPPORT
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+    kernel32.GetLargePageMinimum.restype = ctypes.c_size_t
+
+    if _WIN32_LARGE_PAGE_SUPPORT is None:
+        large_page_min = kernel32.GetLargePageMinimum()
+        _WIN32_LARGE_PAGE_SUPPORT = bool(large_page_min) and _win32_enable_lock_memory_privilege()
+        if not _WIN32_LARGE_PAGE_SUPPORT and os.environ.get("EXL3_MOE_ARENA_DEBUG"):
+            print(" -- arena: MEM_LARGE_PAGES unavailable "
+                  f"(GetLargePageMinimum={large_page_min}, SeLockMemoryPrivilege "
+                  "not enabled); arena chunks will use regular pages", flush = True)
+    if not _WIN32_LARGE_PAGE_SUPPORT:
+        return None
+
+    granularity = kernel32.GetLargePageMinimum()
+    MEM_RESERVE = 0x2000
+    MEM_COMMIT = 0x1000
+    MEM_LARGE_PAGES = 0x20000000
+    PAGE_READWRITE = 0x04
+    kernel32.VirtualAlloc.restype = ctypes.c_void_p
+    kernel32.VirtualAlloc.argtypes = [
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong]
+    kernel32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong]
+
+    want = (size + granularity - 1) // granularity * granularity
+    floor = (min_size + granularity - 1) // granularity * granularity
+    addr = None
+    while True:
+        addr = kernel32.VirtualAlloc(
+            None, want, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE)
+        if addr or want <= floor:
+            break
+        want = max(want >> 1, floor)
+    if not addr:
+        return None
+    buf = (ctypes.c_uint8 * want).from_address(addr)
+    weakref.finalize(buf, kernel32.VirtualFree, ctypes.c_void_p(addr), 0, 0x8000)  # MEM_RELEASE
+    if want < size and os.environ.get("EXL3_MOE_ARENA_DEBUG"):
+        print(f" -- arena: MEM_LARGE_PAGES negotiated down to {want >> 20} MiB "
+              f"(asked {size >> 20} MiB)", flush = True)
+    return buf
+
+
 class _HugeArena:
     """
     Growable pool of large (default 1 GiB) anonymous mmap chunks that expert weights are copied
@@ -201,6 +325,7 @@ class _HugeArena:
     instead of thousands of separate small (sub-2MB) loader allocations
     """
     CHUNK_BYTES = 1 << 30   # 1 GiB
+    WIN32_LARGE_FLOOR = 64 << 20   # smallest MEM_LARGE_PAGES chunk worth having (Windows)
 
     def __init__(self, shared = False, huge = "", conn = None):
         """shared: back each chunk with shared memory and publish it over `conn` as
@@ -213,6 +338,10 @@ class _HugeArena:
         self.chunks = []
         self.cur = None
         self.cur_off = 0
+        self.win32_large_bytes = 0   # bytes of chunks backed by MEM_LARGE_PAGES (Windows)
+        # Largest MEM_LARGE_PAGES request still worth making (Windows), None until the first
+        # attempt: the size the last chunk was served at, or below the smallest size that failed
+        self.win32_large_ceiling = None
 
     def _new_chunk(self, min_bytes):
         import mmap, os
@@ -278,9 +407,25 @@ class _HugeArena:
             os.close(fd)   # the mapping keeps the pages alive
         elif os.name == "nt":
             # mmap.MAP_PRIVATE / mmap.PROT_* don't exist on Windows; an anonymous mapping is
-            # writable by default there. Hugepage promotion doesn't apply (promote_hugepages
-            # is already a no-op via its try/except), the arena still serves its pooling role
-            m = mmap.mmap(-1, size)
+            # writable by default there. Windows has no post-hoc hugepage promotion, so the
+            # EXL3_MOE_ARENA_HUGEPAGE knob is honoured here instead: each chunk first tries a
+            # MEM_LARGE_PAGES VirtualAlloc (needs SeLockMemoryPrivilege and physically
+            # contiguous 2 MiB regions), halving the request down to 64 MiB -- and no lower
+            # than what the placement needs -- before falling back to a plain mapping, still
+            # at full chunk size since regular pages have no contiguity constraint. Later
+            # chunks start at the size the previous one was served at instead of walking the
+            # ladder from the top again, and stop asking once the smallest size has failed
+            m = None
+            if TUNING.arena_hugepage:
+                floor = max(self.WIN32_LARGE_FLOOR, min_bytes)
+                ceiling = self.win32_large_ceiling
+                if ceiling is None or ceiling >= floor:
+                    m = _win32_large_page_alloc(size if ceiling is None else min(size, ceiling), floor)
+                    self.win32_large_ceiling = len(m) if m is not None else floor // 2
+            if m is not None:
+                self.win32_large_bytes += len(m)
+            else:
+                m = mmap.mmap(-1, size)
         else:
             m = mmap.mmap(-1, size, mmap.MAP_PRIVATE, mmap.PROT_READ | mmap.PROT_WRITE)
         self.chunks.append(m)
@@ -288,7 +433,7 @@ class _HugeArena:
         self.cur_off = 0
         if os.environ.get("EXL3_MOE_ARENA_DEBUG"):
             total = sum(len(c) for c in self.chunks)
-            print(f" -- arena: new chunk {size/1e6:.1f} MB, {len(self.chunks)} chunks, "
+            print(f" -- arena: new chunk {len(m)/1e6:.1f} MB, {len(self.chunks)} chunks, "
                   f"{total/1e9:.3f} GB total", flush = True)
 
     def reserve(self, nbytes):
@@ -311,6 +456,21 @@ class _HugeArena:
         the kernel doesn't support it."""
         import mmap, os, time
         if not TUNING.arena_hugepage:
+            return
+        if os.name == "nt":
+            # MEM_LARGE_PAGES is decided at VirtualAlloc time (see _new_chunk); there is no
+            # promotion step to run here, only coverage to report. Large pages are locked in
+            # RAM, which the user did not ask for explicitly, so say so whenever they are in
+            # use; an account without the privilege gets regular pages and no message
+            total = sum(len(c) for c in self.chunks)
+            if self.win32_large_bytes:
+                print(f" -- CPU MoE arena: {self.win32_large_bytes/1e9:.2f} GB of {total/1e9:.2f} GB "
+                      f"on large pages (locked in RAM, never paged out; set "
+                      f"EXL3_MOE_ARENA_HUGEPAGE=0 to use regular pages)", flush = True)
+            elif _WIN32_LARGE_PAGE_SUPPORT and total:
+                print(" -- CPU MoE arena: no large pages could be allocated, using regular pages "
+                      "(physical memory is too fragmented; large pages are usually available "
+                      "again after a reboot)", flush = True)
             return
         collapse = getattr(mmap, "MADV_COLLAPSE", 25)
         t0 = time.perf_counter()
