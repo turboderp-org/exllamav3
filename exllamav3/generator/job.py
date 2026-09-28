@@ -630,7 +630,7 @@ class Job:
 
         # Accept token
         self.new_tokens += 1
-        requeue_now = self.new_tokens > self.max_rq_tokens - self.generator.num_draft_tokens
+        requeue_now = self.new_tokens > self.max_rq_tokens - self.rq_margin
 
         for seq in self.sequences:
 
@@ -1116,9 +1116,16 @@ class Job:
                 x = len(self.sequences[0].input_ids)
                 y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
                 self.max_rq_tokens = y - x
+            # A speculative window needs headroom past the requeue point, so drafting requeues early. Early by
+            # a whole page, the requeue lands on a page boundary and stashes the recurrent state there; early by
+            # just the window, it stops a few tokens short of the checkpoint and the next segment re-prefills
+            # everything since the previous one (up to recurrent_checkpoint_interval tokens, every segment)
+            nd = self.generator.num_draft_tokens
+            self.rq_margin = PAGE_SIZE if 0 < nd < PAGE_SIZE < self.max_rq_tokens else nd
         else:
             # Default budget: the whole response plus one speculative window past the limit
             self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.num_draft_tokens
+            self.rq_margin = self.generator.num_draft_tokens
 
         # Compatibility checks
         if self.banned_strings and self.generator.recurrent_cache is not None:
