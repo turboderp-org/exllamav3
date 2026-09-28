@@ -3,6 +3,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
 #include "util.cuh"
+#include "quant/bits_k.cuh"
 
 // Expert weights offloaded to the CPU live in the arena band-swizzled for the VBMI kernels:
 // tile (kt, nt) at (nt / 8) * tiles_k * 8 + kt * 8 + nt % 8 instead of kt * tiles_n + nt. When
@@ -49,7 +50,7 @@ void moe_unswizzle_trellis
     int64_t proj_off_b,
     int64_t tiles_k,
     int64_t tiles_n,
-    int64_t bits,
+    double K,
     bool swizzled
 )
 {
@@ -58,8 +59,8 @@ void moe_unswizzle_trellis
     TORCH_CHECK(src.is_cuda() && dst.is_cuda() && src.device() == dst.device(), "moe_unswizzle: tensors must share a CUDA device");
     TORCH_CHECK(src.is_contiguous() && dst.is_contiguous(), "moe_unswizzle: tensors must be contiguous");
     TORCH_CHECK(tiles_n % 8 == 0, "moe_unswizzle: tiles_n must be a multiple of 8");
-    TORCH_CHECK(bits >= 1 && bits <= 8, "moe_unswizzle: bits out of range");
-    const int tile_b = (int) bits * 32;
+    const BitsK bk = bits_from_K((float) K);
+    const int tile_b = bk.bits * 32 + (bk.half ? 16 : 0);
     const int64_t proj_b = tiles_k * tiles_n * tile_b;
     const int64_t need = (num_experts - 1) * expert_stride_b + proj_off_b + proj_b;
     TORCH_CHECK(num_experts >= 1 && need <= (int64_t) src.numel() * src.element_size()
