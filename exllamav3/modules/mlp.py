@@ -14,6 +14,125 @@ from ..util.tensor import g_tensor_cache
 
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
 
+
+def gated_act_slopes(activation_fn: str, g: torch.Tensor, u: torch.Tensor, act_limit: float):
+    """
+    Slopes of the gated activation a = act(g) * u with respect to u and to g, elementwise in fp32, following
+    the activation kernels including their clamps. Returns (da/du, da/dg), or None for an activation without
+    a closed form here.
+    """
+    g = g.float()
+    u = u.float()
+
+    if activation_fn == "swiglu_oai":
+        free_g = free_u = None
+        if act_limit:
+            free_g, free_u = g < act_limit, u.abs() < act_limit
+            g = g.clamp(max = act_limit)
+            u = u.clamp(-act_limit, act_limit)
+        sg = torch.sigmoid(1.702 * g)
+        du = g * sg
+        dg = sg * (1.0 + 1.702 * g * (1.0 - sg)) * (u + 1.0)
+        if act_limit:
+            du = du * free_u
+            dg = dg * free_g
+        return du, dg
+
+    match activation_fn:
+        case "silu":
+            sg = torch.sigmoid(g)
+            f = g * sg
+            df = sg * (1.0 + g * (1.0 - sg))
+        case "gelu":
+            t = torch.tanh(0.7978845608028654 * (g + 0.044715 * g ** 3))
+            f = 0.5 * g * (1.0 + t)
+            df = 0.5 * (1.0 + t) + 0.5 * g * (1.0 - t * t) * 0.7978845608028654 * (1.0 + 0.134145 * g * g)
+        case "relu2":
+            r = F.relu(g)
+            f = r * r
+            df = 2.0 * r
+        case _:
+            return None
+
+    if act_limit:
+        du = f.clamp(max = act_limit) * (u.abs() < act_limit)
+        dg = df * u.clamp(-act_limit, act_limit) * (f < act_limit)
+    else:
+        du = f
+        dg = df * u
+    return du, dg
+
+
+def capture_out_sensitivity(
+    capture: dict,
+    gate: Linear,
+    up: Linear,
+    down: Linear,
+    g: torch.Tensor,
+    u: torch.Tensor,
+    activation_fn: str,
+    act_limit: float,
+    weights: torch.Tensor | None = None,
+):
+    """
+    Accumulate, per intermediate channel of a gated MLP, how strongly the MLP's output responds to an error in
+    the gate and up projections' outputs: the mean square slope of act(g) * u along each of the two, to be
+    multiplied by the energy of the channel's down projection row (see finalize_out_sensitivity). This is the
+    part of the downstream sensitivity that is local to the MLP; it decides whether the converter applies
+    output channel scales to the two projections (regularize() in quant/exl3_lib/quantize.py).
+
+    :param capture:
+        dict of accumulators, keyed by Linear key (params["capture_sens"] during calibration)
+
+    :param g, u:
+        outputs of the gate and up projections, shape (..., intermediate)
+
+    :param weights:
+        optional weight per row (routing weights of a block-sparse MLP)
+    """
+    n = g.shape[-1]
+    slopes = gated_act_slopes(activation_fn, g.reshape(-1, n), u.reshape(-1, n), act_limit)
+    if slopes is None:
+        return
+    rows = g.numel() // n
+    dn = None
+    for linear, c in zip((up, gate), slopes):
+        if linear is None or linear.qmap is None:
+            continue
+        if weights is not None:
+            c = c * weights.float().view(-1, 1)
+        c = torch.nan_to_num(c, nan = 0.0, posinf = 0.0, neginf = 0.0)
+        acc = capture.get(linear.key)
+        if acc is None:
+            if dn is None:
+                dn = down.inner.get_weight_tensor()[:n].float().square().sum(dim = 1).double()
+            acc = capture[linear.key] = {
+                "sum": torch.zeros(n, dtype = torch.double, device = g.device),
+                "count": 0,
+                "down": dn.to(g.device),
+            }
+        acc["sum"] += c.double().square().sum(dim = 0)
+        acc["count"] += rows
+
+
+def merge_out_sensitivity(capture: dict, other: dict):
+    """Fold the accumulators of another device's calibration shard into capture"""
+    for key, acc in other.items():
+        if key not in capture:
+            capture[key] = acc
+        else:
+            m = capture[key]
+            m["sum"] += acc["sum"].to(m["sum"].device)
+            m["count"] += acc["count"]
+
+
+def finalize_out_sensitivity(capture: dict) -> dict:
+    """Per-channel output sensitivity for every captured Linear, keyed by Linear key, on the CPU"""
+    return {
+        key: (acc["sum"] / max(acc["count"], 1) * acc["down"]).float().cpu()
+        for key, acc in capture.items()
+    }
+
 class MLP(Module):
 
     def __init__(
@@ -753,6 +872,11 @@ class GatedMLP(Module):
                 elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
+                    if "capture_sens" in params:
+                        capture_out_sensitivity(
+                            params["capture_sens"], self.gates[s], self.ups[s], self.downs[s],
+                            g, u, self.activation_fn, self.act_limit
+                        )
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
                     if self.interm_div != 1.0:
                         u *= 1.0 / self.interm_div   # act(g) * u is linear in u

@@ -9,7 +9,7 @@ from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from dataclasses import dataclass
-from .mlp import MLP, GatedMLP
+from .mlp import MLP, GatedMLP, capture_out_sensitivity
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
@@ -1029,6 +1029,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.latent_in is not None:
             y = self.latent_in.forward(y, params)
 
+        # Calibration: the experts' output sensitivity is weighted by the routing the model would
+        # actually do, which is not the selection in use when every expert is activated
+        sens_weights = None
+        if "capture_sens" in params and self.gated and self.routing_gate is not None:
+            sel, w = selected_experts, routing_weights
+            if params.get("activate_all_experts"):
+                sel, w = self.routing_fn(
+                    bsz, self.routing_cfg, z, {k: v for k, v in params.items() if k != "activate_all_experts"})
+            sens_weights = torch.zeros((bsz, self.num_experts), dtype = torch.float, device = y.device)
+            sens_weights.scatter_(1, sel, w.float())
+
         if params.get("tp_warmup"):
             # Warmup runs without collectives on garbage-but-finite streams: every rank takes a
             # random (valid, spread-out) selection instead of routing, which exercises the
@@ -1305,6 +1316,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             u = self.ups[exp_i].forward(xc, params)
                             if self.gated:
                                 g = self.gates[exp_i].forward(xc, params)
+                                if sens_weights is not None:
+                                    exp_g = exp_i if self.num_local_experts == self.num_experts \
+                                        else exp_i + self.routing_first
+                                    sw = sens_weights[top_x, exp_g]
+                                    routed = sw.nonzero().flatten()
+                                    if routed.numel():
+                                        capture_out_sensitivity(
+                                            params["capture_sens"], self.gates[exp_i], self.ups[exp_i],
+                                            self.downs[exp_i], g[routed], u[routed], self.activation_fn,
+                                            self.act_limit, sw[routed]
+                                        )
                                 a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
                                 self.activation_fn_call(g, u, a, self.act_limit)
                             else:

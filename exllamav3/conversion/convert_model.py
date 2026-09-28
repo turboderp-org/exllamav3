@@ -5,6 +5,7 @@ import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear
 from ..modules.linear import convert_exl3_group
+from ..modules.mlp import merge_out_sensitivity, finalize_out_sensitivity
 from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
@@ -96,7 +97,7 @@ parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Dep
 parser.add_argument("--max_module", type = int, help = "End quantization after this many modules, includes embedding and norm layers (for debug purposes)", default = None)
 
 group = parser.add_mutually_exclusive_group()
-group.add_argument("--out_scales", type = str, default = "always", help = "Enable out channel scales (always/never/auto, default: always)")
+group.add_argument("--out_scales", type = str, default = "auto", help = "Output channel scales: always, never, or auto (default): always, except for gate and up projections of gated MLPs whose calibration statistics predict a lower error without")
 
 parser.add_argument("--override_anyway", action = "store_true", help = "Allow resuming even when overriding settings that will break the existing job.")
 
@@ -453,7 +454,7 @@ def get_H_data(args, linear, capture_H, state):
     return hd, hout
 
 
-def make_quant_args(args, idx, K, devices, device_ratios = None):
+def make_quant_args(args, idx, K, devices, device_ratios = None, out_sensitivity = None):
     quant_args = {
         "seed": idx,
         "K": K,
@@ -462,6 +463,8 @@ def make_quant_args(args, idx, K, devices, device_ratios = None):
         "apply_out_scales": args["apply_out_scales"],
         "debug_dir": os.path.join(args["work_dir"], "debug"),
     }
+    if out_sensitivity is not None:
+        quant_args["out_sensitivity"] = out_sensitivity
     if args.get("hessians_reg") is not None:
         quant_args["sigma_reg_out"] = args["hessians_reg"]
     if args["codebook"] == "mcg":
@@ -558,7 +561,9 @@ def _tile_split_devices(numel, devices, device_ratios):
     return devices[:max_dev], None
 
 
-def quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state):
+def quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state,
+                            out_sens = None):
+    out_sens = out_sens or {}
 
     # Batched group quantization has no two-sided LDLQ: per-tensor path when precomputed Hessians are in play
     allow_grouping = state is not None and not args["image_dump"] and not args["verbose"] and not args.get("hessians")
@@ -571,7 +576,8 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                     args,
                     idx,
                     strategy[l.key],
-                    *_tile_split_devices(l.weights_numel(), devices, device_ratios)
+                    *_tile_split_devices(l.weights_numel(), devices, device_ratios),
+                    out_sensitivity = out_sens.get(l.key)
                 ) for l in group]
             with Timer() as t:
                 proxy_errs = convert_exl3_group(
@@ -600,7 +606,8 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                 args,
                 idx,
                 strategy[linear.key],
-                *_tile_split_devices(linear.weights_numel(), devices, device_ratios)
+                *_tile_split_devices(linear.weights_numel(), devices, device_ratios),
+                out_sensitivity = out_sens.get(linear.key)
             )
 
             with Timer() as t:
@@ -619,8 +626,10 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
             print_quantized_linear(config, linear, quant_args, proxy_err, f"  [{t.interval:4.2f} s]")
 
 
-def quantize_linears_parallel(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state):
+def quantize_linears_parallel(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state,
+                              out_sens = None):
     assert not args["image_dump"], "Parallel mode is incompatible with --image_dump"
+    out_sens = out_sens or {}
     global curr_progress, max_progress
 
     allow_grouping = state is not None and not args["verbose"] and not args.get("hessians")
@@ -667,7 +676,10 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
 
             for group in dev_groups:
                 if len(group) > 1:
-                    quant_args_list = [make_quant_args(args, idx, strategy[l.key], [device_idx]) for l in group]
+                    quant_args_list = [
+                        make_quant_args(args, idx, strategy[l.key], [device_idx], out_sensitivity = out_sens.get(l.key))
+                        for l in group
+                    ]
                     proxy_errs = convert_exl3_group(
                         group,
                         [capture_H[l.qmap] for l in group],
@@ -682,7 +694,8 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                     continue
 
                 linear = group[0]
-                quant_args_local = make_quant_args(args, idx, strategy[linear.key], [device_idx])
+                quant_args_local = make_quant_args(
+                    args, idx, strategy[linear.key], [device_idx], out_sensitivity = out_sens.get(linear.key))
 
                 H_data_, quant_args_local["H_out"] = get_H_data(args, linear, capture_H, state)
                 proxy_err = linear.convert_exl3(
@@ -849,10 +862,12 @@ def capture_module_parallel(
     """
     Run the Hessian-capture forward pass with calibration rows split across devices, each device forwarding its
     shard through its own replica of the module. Per-device capture dicts are merged by summing H (the proxy is
-    a plain sum over token batches), counts and inf/nan counters onto the primary device.
+    a plain sum over token batches), counts and inf/nan counters onto the primary device. The output sensitivity
+    accumulators of the gated MLPs merge the same way.
     """
     shards = calibration_row_shards(len(state), devices, device_ratios)
     captures = [{} for _ in modules]
+    captures_sens = [{} for _ in modules]
     ref_map = {}
     lock = threading.Lock()
     progress_count = [0]
@@ -870,6 +885,7 @@ def capture_module_parallel(
                 params = {
                     "attn_mode": "flash_attn_nc",
                     "capture": captures[t_idx],
+                    "capture_sens": captures_sens[t_idx],
                     "activate_all_experts": model.calibration_all_experts,
                     "input_ids": original_input_ids[i],
                 }
@@ -926,9 +942,13 @@ def capture_module_parallel(
                 m["num_total"] += hd["num_total"]
                 m["inf_nan"] += hd["inf_nan"].to(device)
         cap.clear()
+    capture_sens = captures_sens[0]
+    for cap in captures_sens[1:]:
+        merge_out_sensitivity(capture_sens, cap)
+        cap.clear()
 
     # Keyed by row index: rows excluded as non-finite leave gaps, so a list would misalign
-    return capture_H, ref_map
+    return capture_H, capture_sens, ref_map
 
 
 def advance_state_parallel(
@@ -1226,6 +1246,7 @@ def main(args, job_state):
         # Collect output tensors
         q_tensors = {}
         capture_H = None
+        capture_sens = None
         ref_states = {}
 
         # Slice module if necessary
@@ -1270,7 +1291,7 @@ def main(args, job_state):
                         capture_replicas = load_parallel_calib_modules(
                             replica_models, idx, devices, current_slice if slicing else None)
                     if capture_replicas is not None:
-                        capture_H, ref_states = capture_module_parallel(
+                        capture_H, capture_sens, ref_states = capture_module_parallel(
                             model,
                             [module] + capture_replicas,
                             devices,
@@ -1290,6 +1311,7 @@ def main(args, job_state):
                     else:
                         with ProgressBar(f" -- Capturing: {module.key}" + slice_str, len(state)) as progress:
                             capture_H = {}
+                            capture_sens = {}
                             ref_states = {}
                             for i in range(len(state)):
                                 progress.update(i)
@@ -1298,6 +1320,7 @@ def main(args, job_state):
                                 params = {
                                     "attn_mode": "flash_attn_nc",
                                     "capture": capture_H,
+                                    "capture_sens": capture_sens,
                                     "activate_all_experts": model.calibration_all_experts,
                                     "input_ids": original_input_ids[i],
                                 }
@@ -1362,6 +1385,10 @@ def main(args, job_state):
             for linear in linears:
                 linear.inner.swap_cpu()
 
+            # Output sensitivity of the gate and up projections (auto output scales)
+            out_sens = finalize_out_sensitivity(capture_sens) if capture_sens else None
+            capture_sens = None
+
             # Quantize: one linear per device in parallel when the layer has enough
             # tensors to occupy every device, else tile-split each tensor across devices
             # (single large tensors, e.g. lm_head)
@@ -1369,9 +1396,11 @@ def main(args, job_state):
                 len(linears) >= len(devices) and
                 all(strategy[l.key] <= 8 for l in linears)
             ):
-                quantize_linears_parallel(args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), capture_H, state)
+                quantize_linears_parallel(
+                    args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), capture_H, state, out_sens)
             else:
-                quantize_linears_single(args, linears, config, strategy, idx, devices, eff_ratios("quant_tiles"), capture_H, state)
+                quantize_linears_single(
+                    args, linears, config, strategy, idx, devices, eff_ratios("quant_tiles"), capture_H, state, out_sens)
 
             # Collect converted module tensors
             for m in module:
