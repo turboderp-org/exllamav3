@@ -875,7 +875,7 @@ class MoeCpuHost:
             # stage function
             def tb(d):
                 k, n, K = d
-                return (k // 16) * (n // 16) * 16 * K * 2
+                return (k // 16) * (n // 16) * int(16 * K) * 2
             gb = tb(proj_dims["g"]) if proj_dims.get("g") else 0
             ub, db = tb(proj_dims["u"]), tb(proj_dims["d"])
             spec["proj_bytes"] = (gb, ub, db)
@@ -1782,9 +1782,9 @@ class MoeCpuHost:
                 we = wseg.float().unsqueeze(1)
                 def tview(off_b, dims):
                     k, n, K = dims
-                    numel = (k // 16) * (n // 16) * 16 * K
+                    numel = (k // 16) * (n // 16) * int(16 * K)
                     return vslot[boff + off_b // 2 : boff + off_b // 2 + numel] \
-                        .view(k // 16, n // 16, 16 * K)
+                        .view(k // 16, n // 16, int(16 * K))
                 if gated:
                     gy = self._dq_linear(xg, tview(0, pd["g"]), pd["g"],
                                          aux["suh_g"][e], aux["svh_g"][e],

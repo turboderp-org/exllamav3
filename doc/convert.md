@@ -33,7 +33,7 @@ does.
 
 #### Advanced (generally disregard these options)
 
-- **--out_scales *str***: Force enable or disable output channel scales. Options are "always" (default), "never" and "auto". Mostly for debug purposes. 
+- **--out_scales *str***: Output channel scales. Options are "auto" (default), "always" and "never". In auto mode every tensor gets output scales, except gate and up projections of gated MLPs (including MoE experts) where calibration statistics show that the channels the MLP's output is most sensitive to are also the ones with the largest weights. Scaling would concentrate the quantization error in exactly those channels. 
 
 - **-cb / --codebook *str***: Trellis codebook: "mul1" (default), "mcg" or "3inst". The mul1 codebook is required by some optimized inference paths (int8 GEMV, CPU expert offload); there is no reason to pick another codebook except for testing.
 

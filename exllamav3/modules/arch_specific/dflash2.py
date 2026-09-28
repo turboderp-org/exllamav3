@@ -350,7 +350,9 @@ class DFlash2Selector(Module):
         and the whole chain run as two kernels (no per-row host round trip, no torch
         intermediates)."""
         vocab_size = vocab_size or logits.shape[-1]
-        gate = self.hidden_proj.forward(hidden.half(), params = {})
+        # The generator passes state[:, 1:], a strided view for more than one row, and .half() on
+        # an fp16 state returns that view as is
+        gate = self.hidden_proj.forward(hidden.half().contiguous(), params = {})
         anchor_ids = anchor_ids.long()
         bsz, rows = logits.shape[:2]
         cuda = hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16)

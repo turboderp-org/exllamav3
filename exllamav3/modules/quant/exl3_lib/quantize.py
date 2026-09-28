@@ -1289,6 +1289,35 @@ def block_nmse(x: torch.Tensor, y: torch.Tensor, dim: int = 0, blocksize: int = 
     return diff_sq.item() / (sq.item() + 1e-20)
 
 
+def out_scales_ratio(out_channel_scales: torch.Tensor, out_sensitivity: torch.Tensor) -> float | None:
+    """
+    Predicted loss with output channel scales relative to the loss without them.
+
+    Quantization error is uniform in the rotated domain, so the scales don't change how much error there is but
+    where it lands: with scales every output channel gets the same relative error (error energy proportional to
+    the channel's energy), without them the same absolute error. For a per-channel sensitivity s (loss per unit
+    of error energy) and channel energy e, the ratio of the two losses is E[s * e] / (E[s] * E[e]): below one
+    when the sensitive channels are the low-energy ones, above one when they are the high-energy ones.
+
+    Returns None when the sensitivity carries no information (wrong size, non-finite or all zero)
+    """
+    e = out_channel_scales.flatten().double().square()
+    s = out_sensitivity.flatten().to(e.device).double()
+    if s.shape[0] > e.shape[0]:
+        s = s[:e.shape[0]]
+    elif s.shape[0] < e.shape[0]:
+        s = F.pad(s, (0, e.shape[0] - s.shape[0]))
+    den = s.mean() * e.mean()
+    if not torch.isfinite(s).all() or not torch.isfinite(den) or den.item() <= 0.0:
+        return None
+    return ((s * e).mean() / den).item()
+
+
+# In auto mode, output scales are dropped for tensors whose sensitivity predicts a loss above this with them,
+# relative to without
+out_scales_max_ratio = 1.05
+
+
 def regularize(
     weight: torch.Tensor,
     su: torch.Tensor,
@@ -1307,6 +1336,11 @@ def regularize(
     matrix, applies blockwise Hadamard transforms, and optionally searches for a global scale that minimizes sample
     quantization error. It returns the transformed weight plus the scale metadata needed to reconstruct the original
     linear layer behavior after quantization.
+
+    Output-channel scaling is forced on or off by quant_args["apply_out_scales"] (True/False). With None (auto)
+    it is on, except for tensors that come with a per-channel output sensitivity in quant_args["out_sensitivity"]
+    (gate and up projections of gated MLPs, see modules/mlp.py) and whose sensitive channels are the high-energy
+    ones (see out_scales_ratio)
     """
     force_out_scales = quant_args["apply_out_scales"]
 
@@ -1319,28 +1353,7 @@ def regularize(
              F.kl_div((h2 + eps).log(), m, reduction = "sum")
         return js / 2
 
-    # From experiments, it seems the deciding factor in when scaling output channels is beneficial is when
-    # the input to the linear layer is very irregular. After some testing, set the cutoff at 15% of the RMS sum
-    # on 2% of the channels
-    # TODO: More science
-    if not q_fallback and H_diag is not None:
-        diag = H_diag.sqrt()
-        diag, _ = torch.sort(diag, descending = True)
-        cutoff = diag.shape[0] // 50
-        skew_factor = diag[:cutoff].sum() / diag.sum()
-        if verbose:
-            print(f"     - input state skew: {skew_factor.item():.6f}")
-
-        if force_out_scales is None:
-            apply_out_scales = skew_factor.item() < 0.15
-        else:
-            apply_out_scales = force_out_scales
-
-    else:
-        apply_out_scales = True if force_out_scales is None else force_out_scales
-
-    if q_fallback:
-        apply_out_scales = force_out_scales
+    apply_out_scales = True if force_out_scales is None else force_out_scales
 
     # Apply output scales
     out_channel_scales = block_rms(weight, dim = 0, keepdim = True)
@@ -1348,6 +1361,14 @@ def regularize(
     if mean > 1e-30:
         out_channel_scales /= mean
         quant_args["zeros"] = False
+
+        out_sensitivity = quant_args.get("out_sensitivity")
+        if out_sensitivity is not None and not q_fallback:
+            ratio = out_scales_ratio(out_channel_scales, out_sensitivity)
+            if verbose and ratio is not None:
+                print(f"     - out scales loss ratio: {ratio:.6f}")
+            if force_out_scales is None and ratio is not None:
+                apply_out_scales = ratio <= out_scales_max_ratio
     else:
         quant_args["zeros"] = True
         if force_out_scales is not None:
