@@ -2,6 +2,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import deque
 from typing import Type
+from ..constants import PAGE_SIZE
 import torch
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -140,22 +141,11 @@ class Cache:
 
         from .fp16 import CacheLayer_fp16
         self.layer_type = layer_type or CacheLayer_fp16
+        self._layer_kwargs = kwargs
         # self.recurrent_layer_type = recurrent_layer_type or RecurrentLayer_fp16
 
         # Attach transformer cache layers
-        cl = self.model.get_cache_layers()
-        self.num_layers = len(cl)
-        self.layers = {}
-        for attn in cl:
-            # Attention variants with a different cache geometry (MLA stores one latent plus one
-            # shared rope key instead of per-head K/V) map the requested layer type to their own
-            layer_type, layer_kwargs = (
-                attn.cache_layer_type(self.layer_type, kwargs)
-                if hasattr(attn, "cache_layer_type") else (self.layer_type, kwargs)
-            )
-            for instance in self.model.get_layer_instances(attn.layer_idx):
-                self.layers[instance] = \
-                    layer_type(self.config, attn, id(self), self.max_num_tokens, **layer_kwargs)
+        self._build_layers()
 
         # Attach recurrent (SWA/linear-attn) layers
         self.num_slots = max_batch_size
@@ -173,6 +163,71 @@ class Cache:
         # Attach
         self.recurrent_instances = {}
         self.attach_to_model()
+
+
+    def _build_layers(self):
+        """
+        Create one CacheLayer object per cache layer instance of the model, sized by
+        self.max_num_tokens. Split out of __init__ so resize_num_tokens can rebuild the layer
+        objects for a different capacity; no GPU memory is allocated here (that happens in
+        layer.alloc when the owning model loads).
+        """
+        cl = self.model.get_cache_layers()
+        self.num_layers = len(cl)
+        self.layers = {}
+        for attn in cl:
+            # Attention variants with a different cache geometry (MLA stores one latent plus one
+            # shared rope key instead of per-head K/V) map the requested layer type to their own
+            layer_type, layer_kwargs = (
+                attn.cache_layer_type(self.layer_type, self._layer_kwargs)
+                if hasattr(attn, "cache_layer_type") else (self.layer_type, self._layer_kwargs)
+            )
+            for instance in self.model.get_layer_instances(attn.layer_idx):
+                self.layers[instance] = \
+                    layer_type(self.config, attn, id(self), self.max_num_tokens, **layer_kwargs)
+
+
+    def storage_size_total(self) -> int:
+        """Bytes of paged cache storage across all layers, independent of allocation state."""
+        return sum(layer.storage_size() for layer in self.layers.values())
+
+
+    def resize_num_tokens(self, max_num_tokens: int):
+        """
+        Reallocate every paged cache layer for a new token capacity, on the devices the layers are
+        currently resident on (or, if the model has not been loaded yet, simply rebuild the layer
+        objects so the loader allocates the new size). The old tensors are released first, so
+        shrinking returns VRAM to the allocator immediately. The Cache object identity is preserved,
+        so everything that already holds it (params["cache"], the model's weakref table, the
+        caller's variable) stays valid.
+
+        Legal only while nothing else references the layer tensors: no cache state in use, no
+        captured CUDA graph over the cache (build_bc_attn records the tensor pointers), no CPU page
+        cache tier holding segments of them, and no tensor-parallel workers owning them.
+        """
+        assert not self.recurrent_layers, \
+            "Cannot resize a cache that has recurrent state layers"
+        assert not getattr(self.model, "loaded_tp", False), \
+            "Cannot resize a cache whose tensor-parallel workers own the layer tensors"
+        assert max_num_tokens > 0 and max_num_tokens % PAGE_SIZE == 0, \
+            f"max_num_tokens must be a positive multiple of {PAGE_SIZE}"
+        if self.initialized:
+            devices = {instance: layer.device for instance, layer in self.layers.items()}
+            assert all(dev is not None for dev in devices.values()), \
+                "Cannot resize a cache whose layers are not allocated"
+        else:
+            devices = None
+
+        self.detach_from_model()
+        for layer in self.layers.values():
+            layer.free()
+        self.max_num_tokens = max_num_tokens
+        self._build_layers()
+        self.attach_to_model()
+        # Not yet loaded: the model loader allocates the new (smaller) tensors at load time
+        if devices is not None:
+            for instance, layer in self.layers.items():
+                layer.alloc(devices[instance])
 
 
     def attach_to_model(self, model: Model = None):

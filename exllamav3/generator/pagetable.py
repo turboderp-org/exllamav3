@@ -206,6 +206,115 @@ class CachePage:
         self.kv_position = 0
 
 
+@dataclass
+class DraftRing:
+    """
+    Geometry of a windowed draft cache: instead of a second pool-wide cache that mirrors the main
+    page table, each live sequence owns ring_pages pages that it overwrites in place. Logical page
+    p of the sequence is stored at slot * ring_pages + p % ring_pages.
+
+    The map is a fixed modulo, so the block table is a constant of (slot, page_count) that needs no
+    maintenance while the sequence advances, and no allocator: pages are never moved, so defrag,
+    prompt-cache sharing and the CPU page tier simply leave the draft cache alone.
+
+    Correctness requires ring_pages * PAGE_SIZE to cover the largest logical span a draft forward
+    can touch (its window plus the drafted block plus slack). Then no page the draft can read has a
+    newer congruent page, i.e. the slot holding a live page still holds that page's rows even while
+    writes for older logical pages are landing in the same ring.
+    """
+    ring_pages: int
+    num_slots: int
+    window_tokens: int
+    # Widest transient write the drafter lands past the accepted tip in one round (drafted
+    # block rows + the verify row). Rows congruent below it are clobbered, so a rewind that
+    # reaches further back than the span headroom above the window invalidates the window
+    # (see Job.refill_draft_window).
+    spec_rows: int = 0
+
+    @property
+    def span_tokens(self) -> int:
+        return self.ring_pages * PAGE_SIZE
+
+    @property
+    def num_tokens(self) -> int:
+        return self.span_tokens * self.num_slots
+
+    def clip_write(self, start: int, end: int) -> int:
+        """
+        Clip a draft-cache write range [start, end) to the last span_tokens tokens.
+
+        Two writes that are span_tokens apart land on the same physical row. The write kernel
+        maps a whole chunk's positions to rows in one unordered grid-stride launch, so a chunk
+        longer than the span races with itself: the older congruent write can win and leave a
+        row of the live window holding a position from a span ago. Clipping the range to at
+        most the span makes it congruence-free, and the clipped-away head is pure waste anyway:
+        rows below the drafter's window are never read, and cross-chunk writes are stream-
+        ordered, so the newest chunk still wins every aliased row.
+
+        Rows the drafter reads that this sequence never wrote cost acceptance rate, not
+        correctness (the verifier validates every token), and the ring keeps them out of
+        the live window by construction: a fresh prefill projects every window row, and
+        Job.refill_draft_window rebuilds the window after a resume or a deep rewind that
+        clobbers it.
+
+        Ring drafters are DFlash-family only (see draft_cache_ring): they fill these rows by
+        projecting target hidden states, which never reads the draft cache, so the skipped
+        head costs nothing. Drafters that run their own forward over the draft cache (plain
+        AR, MTP) are excluded from the ring and never reach this clip.
+        """
+        return max(start, end - self.span_tokens)
+
+    def table(self, slot: int, page_count: int) -> torch.Tensor:
+        """Block table for one sequence: logical page -> physical page inside the draft pool."""
+        pages = torch.arange(page_count, dtype = torch.int32)
+        return (pages % self.ring_pages + slot * self.ring_pages).view(1, page_count)
+
+
+def draft_cache_ring(
+    draft_model,
+    num_draft_tokens: int,
+    num_slots: int
+) -> DraftRing | None:
+    """
+    Ring geometry for a draft model, or None when the draft model must keep a pool-wide cache.
+
+    The ring is DFlash-family-only (caps dflash_draft), enforced by capability rather than
+    by configuration. DFlash-family drafters fill the ring by projecting target hidden
+    states, which never reads the draft cache, so a window holding another sequence's
+    rows costs only acceptance rate, and refill_draft_window keeps the live window the
+    sequence's own (see clip_write). A plain AR drafter instead runs its own
+    forward over the draft cache: each row's values derive from the cached left window, so
+    ring reuse would corrupt them, and an MTP head reads the target's global context. Such
+    drafters keep the pool-wide draft cache as before.
+
+    A ring is also only sound when every draft attention layer is sliding-window: a layer
+    with global attention (DFlash checkpoints with full_attention layers, -swa_full style
+    overrides) reads draft K/V from position 0, which is exactly what the ring throws away.
+    The window is taken from the constructed modules rather than the config, so any
+    architecture that widens or removes the window self-excludes.
+
+    Only the left window costs ring space: rows ahead of a query exist only up to the current
+    position (a bidirectional draft's right window is served by the block rows just written), so
+    window_right adds no rows to keep.
+    """
+    if os.environ.get("EXL3_DRAFT_RING", "1") == "0":
+        return None
+    if draft_model is None or getattr(draft_model, "loaded_tp", False):
+        return None
+    if not getattr(draft_model, "caps", {}).get("dflash_draft", False):
+        return None
+    windows = [module.sliding_window for module in draft_model.get_cache_layers()]
+    if not windows or any(w is None or w < 0 for w in windows):
+        return None
+    block_size = int(getattr(draft_model.config, "block_size", 0) or 0)
+    spec_rows = max(num_draft_tokens, block_size) + 1
+    keep = max(windows) + spec_rows + PAGE_SIZE
+    ring_pages = (keep + PAGE_SIZE - 1) // PAGE_SIZE
+    return DraftRing(ring_pages = ring_pages, num_slots = num_slots, window_tokens = max(windows),
+                     spec_rows = spec_rows)
+
+
+
 class Sequence:
 
     def __init__(self, ids: torch.Tensor, seq_ids: torch.Tensor):
@@ -217,8 +326,23 @@ class Sequence:
         self.new_unique_pages = 0
         self.allocated_pages = None
         self.block_index_tensor = None
+        # Draft cache ring backing (set by allocate_pages when the generator runs a windowed draft
+        # cache); the draft table is positional, so it is rebuilt with the main table on page swaps
+        self.draft_ring = None
+        self.draft_slot = None
+        self.draft_block_index_tensor = None
         self.live = True
         self.prefill_complete = False
+        # A cached resume reuses pages this job's forwards never ran over, so the ring rows
+        # below the resume point were never projected; armed at allocation, prefill rebuilds
+        # the drafter's window once, at completion
+        self.draft_refill_pending = False
+        # Ceiling of the possibly-FOREIGN rows in the draft ring: rows below it were
+        # resumed/skipped/copied from another sequence's pages and were never
+        # projected by this job (0: nothing known foreign). The completion refill
+        # skips the rebuild when it sits at or below the window start, i.e. this
+        # job's own forwards have projected every window row
+        self.draft_foreign_ceiling = 0
 
         # Multimodal token spans
         self.multimodal_mask = ids[0] >= FIRST_MM_EMBEDDING_INDEX
@@ -227,6 +351,22 @@ class Sequence:
         # the prev_hidden shift in update_kv_from_target. None until first prefill chunk runs.
         self.mtp_carry_hidden = None
 
+    def raise_draft_floor(self, pos: int):
+        # A cached resume (at allocation) or a partial-page copy leaves another sequence's rows
+        # below pos; the ceiling only ever rises (generation, replay, and rebuilds
+        # only project more of the ring as the frontier advances)
+        if pos > self.draft_foreign_ceiling:
+            self.draft_foreign_ceiling = pos
+
+    def credit_draft_window(self, pos: int):
+        # Mark every row at or above pos as own-projected after a rebuild. The credit
+        # must not dip below pos: pos is all the rebuild proved, and the ceiling's one
+        # consumer (the resume-only ceiling exit) treats everything above it as clean.
+        # A rewind rebuild at a fresh prompt therefore RAISES the marker off 0; that
+        # raise decides nothing - rewinds skip the ceiling exit, the completion refill
+        # after a rewind finds ceiling == window_start and skips, and the next cached
+        # resume re-initializes the marker at allocation.
+        self.draft_foreign_ceiling = pos
 
     def prepare(self, has_prefix_token: bool, max_new_tokens: int):
         self.page_hashes = []
@@ -254,6 +394,12 @@ class Sequence:
             [[page.page_index for page in self.allocated_pages]],
             dtype = torch.int32,
         )
+        if self.draft_ring is not None and self.draft_slot is not None:
+            self.draft_block_index_tensor = self.draft_ring.table(
+                self.draft_slot, len(self.allocated_pages))
+        else:
+            self.draft_block_index_tensor = self.block_index_tensor
+
 
     def allocate_pages(
         self,
@@ -280,9 +426,29 @@ class Sequence:
             # rewrites those pages anyway
             restore_limit = (max(recurrent_pages) + 1) if recurrent_pages else 0
 
+        # Claim this sequence's draft ring slot. Pages (and hence the slot) are claimed when the job
+        # is admitted, which the generator bounds by max_batch_size, so the pool has one slot per
+        # live sequence. The ring's content is sequence-private and rebuilt by prefill, so a requeued
+        # sequence may take a different slot
+        self.draft_ring = pagetable.draft_ring
+        if self.draft_ring is not None and self.draft_slot is None:
+            assert pagetable.draft_slots, \
+                "No draft cache ring slot free; raise max_batch_size or set EXL3_DRAFT_RING=0"
+            self.draft_slot = pagetable.draft_slots.popleft()
+
         # Allocate pages in KV cache, limit prefix caching to available recurrent states
         self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
             pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes, restore_limit)
+
+        # A cached resume reuses pages this job's forwards never ran over, so the ring
+        # rows below the resume point were never projected. Arm the completion refill
+        # here where the resume is known: on a recurrent target the prefill skip loop
+        # never runs (the restored state sits at the resume point), so the prefill-side
+        # arming sites can't fire. The ceiling marks the resume point foreign; the
+        # refill itself stays cheap when the window already sits above it
+        if cached_pages > 0:
+            self.draft_refill_pending = True
+            self.raise_draft_floor(self.kv_position)
 
         # Prepare block index
         self.build_block_index_tensor()
@@ -335,6 +501,11 @@ class PageTable:
         # are pushed there on eviction and restored from there on allocation
         self.cpu_tier = None
 
+        # Windowed draft cache ring (DraftRing), set by the Generator together with the slot pool.
+        # Sequences claim a slot as they claim their pages, i.e. when the job is admitted, which
+        # the generator bounds by max_batch_size, so one slot per live sequence is enough
+        self.draft_ring = None
+        self.draft_slots = deque()
         # Cheap always-on counters for cache efficiency analysis
         self.metrics = {
             "evictions": 0,               # unreferenced pages repurposed for new sequences
@@ -633,6 +804,7 @@ class PageTable:
             self.metrics["alloc_kv_only_pages"] += cached_pages - max_recur
             cached_pages = max_recur
 
+
         self.metrics["alloc_pages"] += len(allocated_pages)
         self.metrics["alloc_cached_pages"] += cached_pages
 
@@ -650,6 +822,14 @@ class PageTable:
     def deallocate_pages(self, allocated_pages: list):
         for page in allocated_pages:
             page.sub_ref()
+
+
+    def release_draft_slot(self, seq: Sequence):
+        """Return a sequence's draft ring slot; its rows are dead once the pages are gone."""
+        if seq.draft_slot is not None:
+            self.draft_slots.append(seq.draft_slot)
+            seq.draft_slot = None
+            seq.draft_block_index_tensor = None
 
 
     def num_unreferenced_pages(self):
@@ -1008,10 +1188,12 @@ class PageTable:
         def get_buffer(shape, device, dtype):
             return torch.empty(shape, device = device, dtype = dtype)
 
-        # Every cache that shares this page table's block tables must move in lockstep
+        # Every cache that shares this page table's block tables must move in lockstep. A ring-backed
+        # draft cache has private pages that the rotation never covers, so it stays out
         caches = [self.cache]
         draft_cache = getattr(self.generator, "draft_cache", None)
-        if draft_cache is not None and not os.environ.get("EXL3_DEBUG_NO_DRAFT_DEFRAG"):
+        if (draft_cache is not None and self.draft_ring is None and
+                not os.environ.get("EXL3_DEBUG_NO_DRAFT_DEFRAG")):
             caches.append(draft_cache)
         # Dispatch per cache, not per main model: an MTP/DFlash draft model never loads TP, so its
         # cache is not registered with the TP workers even when the main model is TP-loaded

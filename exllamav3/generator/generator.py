@@ -9,8 +9,9 @@ from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
 
 logger = logging.getLogger(__name__)
-from ..util.memory import malloc_trim
-from .pagetable import PageTable, is_content_hash
+from ..util.memory import malloc_trim, free_mem
+from .pagetable import PageTable, is_content_hash, draft_cache_ring
+from collections import deque
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
@@ -22,6 +23,29 @@ import time
 import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
+
+
+def draft_row_map(jobs, draft_active):
+    """
+    Map each prefill-done job to its draft row: one row per drafting job, in the draft pass'
+    active-set order (draft_active is a subsequence of the prefill-done jobs). A prefill-done
+    job absent from draft_active maps to None and verifies a single token, so its row is
+    padded to the batch width for the forward and never consumed.
+    """
+    rows = {}
+    draft_row = 0
+    for job in jobs:
+        if not job.is_prefill_done():
+            continue
+        if draft_row < len(draft_active) and job is draft_active[draft_row]:
+            rows[id(job)] = draft_row
+            draft_row += 1
+        else:
+            rows[id(job)] = None
+    assert draft_row == len(draft_active), \
+        "draft_active must be a subsequence of the prefill-done jobs, in active_jobs order"
+    return rows
+
 
 class Generator:
 
@@ -79,7 +103,9 @@ class Generator:
             draft_cache. Note that speculative decoding with many parallel jobs is likely not advantageous.
 
         :param draft_cache:
-            Cache allocated for draft model. Must be same size as main cache.
+            Cache allocated for draft model, sized like the main cache. The generator resizes it:
+            to a per-sequence ring covering the drafter's window when the ring applies (see
+            DraftRing), otherwise to the same size as the main cache.
 
         :param num_draft_tokens:
             Number of future tokens to draft. Default is 4 unless the draft model has a preference (e.g.
@@ -161,8 +187,6 @@ class Generator:
                 "Cannot use both draft model and n-gram draft."
             assert draft_cache is not None, \
                 "Must supply cache for draft model"
-            assert draft_cache.max_num_tokens == cache.max_num_tokens, \
-                "Cache and draft cache must be same size"
             assert not draft_model.caps.get("recurrent_states"), \
                 "Speculative decoding with recurrent draft model not supported."
             if num_draft_tokens:
@@ -193,6 +217,17 @@ class Generator:
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
         self.max_chunk_size = max_chunk_size
+
+        # Windowed draft cache. A draft model that only ever reads rows within its own sliding
+        # window of the current position does not need a second pool-wide cache: each live sequence
+        # gets a ring of window-sized pages that it overwrites in place, addressed by a positional
+        # block table. The pages are sequence-private, so defrag, the CPU page tier and partial-page
+        # reuse all leave the draft cache alone. Rows the ring overwrites are not re-prefilled:
+        # Job.refill_draft_window rebuilds a resumed or deeply-rewound sequence's window from the
+        # target's hidden states; the verifier validates every token meanwhile.
+        self.draft_ring = None
+        if draft_model is not None:
+            self._setup_draft_ring(draft_model, draft_cache, cache, max_batch_size)
 
         # Job queues
         self.job_serial = 0
@@ -225,7 +260,12 @@ class Generator:
         # CPU page cache tier
         self.cpu_page_cache = None
         if cpu_cache_size:
-            tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
+            # A ring-backed draft cache has its own pages, so its rows are not part of a main page's
+            # image and must not be copied/restored with it (its tensor is also far too small to be
+            # indexed by a main page index)
+            tier_caches = [cache]
+            if draft_cache is not None and self.draft_ring is None:
+                tier_caches.append(draft_cache)
             self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
             self.cpu_page_cache.attach(self.pagetable)
             self.pagetable.cpu_tier = self.cpu_page_cache
@@ -551,15 +591,18 @@ class Generator:
 
         # Generation with draft model
         if self.draft_model:
+            # The draft pass and the verify pass must agree on which jobs draft this round; compute
+            # the active set once so both passes share one list and never shift each other's rows
+            draft_active = self._draft_active_jobs()
             if self.dflash_draft:
-                draft_tokens = self.iterate_draftmodel_dflash_gen(results)
-                self.iterate_gen(results, draft_tokens)
+                draft_tokens = self.iterate_draftmodel_dflash_gen(results, draft_active)
+                self.iterate_gen(results, draft_tokens, draft_active)
             elif self.mtp_draft:
-                draft_tokens = self.iterate_draftmodel_mtp_gen(results)
-                self.iterate_gen(results, draft_tokens)
+                draft_tokens = self.iterate_draftmodel_mtp_gen(results, draft_active)
+                self.iterate_gen(results, draft_tokens, draft_active)
             else:
-                draft_tokens = self.iterate_draftmodel_gen(results)
-                self.iterate_gen(results, draft_tokens)
+                draft_tokens = self.iterate_draftmodel_gen(results, draft_active)
+                self.iterate_gen(results, draft_tokens, draft_active)
 
         # Generation with n-gram draft
         elif self.ngram_match_min:
@@ -620,17 +663,94 @@ class Generator:
         self.visualizer.update(chains, usage)
 
 
-    def iterate_draftmodel_gen(self, results: list):
+    def _setup_draft_ring(self, draft_model, draft_cache: Cache, cache: Cache, max_batch_size: int):
+        """
+        Decide the draft cache backing and install it (Generator.__init__). A draft model that
+        only ever reads rows within its own sliding window of the current position does not need
+        a second pool-wide cache: each live sequence gets a ring of window-sized pages that it
+        overwrites in place, addressed by a positional block table. The pages are sequence-
+        private, so defrag, the CPU page tier and partial-page reuse all leave the draft cache
+        alone. Rows the ring overwrites are not re-prefilled: Job.refill_draft_window rebuilds
+        a resumed or deeply-rewound sequence's window from the target's hidden states, and the
+        verifier validates every token in the meantime.
+        """
+        ring = draft_cache_ring(draft_model, self.num_draft_tokens, max_batch_size)
+        if ring is not None:
+            assert all(not getattr(m, "bc_attn", None) for m in draft_model.get_cache_layers()), \
+                "Draft cache ring must be set up before any captured attention graph exists"
+            # The caller sizes the draft cache like the main one (model_init, tabbyAPI and
+            # the examples all pass a pool-wide cache); the ring only needs one span per
+            # live sequence, so resize the pool here and hand the rest back. Shrinking
+            # first and growing later would strand the pool-wide allocation below the
+            # ring in the caching allocator, so the freed blocks are explicitly returned
+            # with free_mem(). If the pool holds less than one ring span the Generator
+            # recomputed a larger span than the load-time draft settings implied (or the
+            # cache is simply tiny): refuse instead of silently drafting one sequence.
+            pool_slots = draft_cache.max_num_tokens // ring.span_tokens
+            if pool_slots < 1:
+                raise RuntimeError(
+                    f"Draft cache ({draft_cache.max_num_tokens} tokens) is smaller than one "
+                    f"draft ring ({ring.span_tokens} tokens); use a larger cache_size or set "
+                    f"EXL3_DRAFT_RING=0")
+            if pool_slots < ring.num_slots:
+                logger.warning(
+                    f"Draft ring clamped from {ring.num_slots} to {pool_slots} slots: the "
+                    f"draft cache holds fewer spans than this Generator's max_batch_size; "
+                    f"drafting is capped to {pool_slots} concurrent sequences")
+                ring.num_slots = pool_slots
+            if draft_cache.max_num_tokens != ring.num_tokens:
+                before = draft_cache.storage_size_total()
+                draft_cache.resize_num_tokens(ring.num_tokens)
+                # The freed blocks must leave the caching allocator, or the driver still sees
+                # the old footprint even though nothing references them
+                free_mem()
+                after = draft_cache.storage_size_total()
+                logger.info(
+                    f"Draft cache: windowed ring, {before / 2 ** 20:.0f} MiB -> "
+                    f"{after / 2 ** 20:.0f} MiB ({ring.ring_pages} pages x {ring.num_slots} "
+                    f"sequences, {ring.num_tokens} tokens); the drafter's window is rebuilt "
+                    f"from the target on resume and deep rewind")
+            else:
+                logger.info(
+                    f"Draft cache: windowed ring, {draft_cache.storage_size_total() / 2 ** 20:.0f} "
+                    f"MiB ({ring.ring_pages} pages x {ring.num_slots} sequences, "
+                    f"{ring.num_tokens} tokens); the drafter's window is rebuilt "
+                    f"from the target on resume and deep rewind")
+            self.draft_ring = ring
+            self.pagetable.draft_ring = ring
+            self.pagetable.draft_slots = deque(range(ring.num_slots))
+        else:
+            # Without a ring the draft cache must span the pool like the main one. The
+            # caller may have pre-sized it for a ring that this Generator declined (the
+            # ring depends on runtime state the caller cannot see, e.g. the draft model
+            # arriving tensor-parallel), so resize to match instead of faulting on the
+            # mismatch.
+            if draft_cache.max_num_tokens != cache.max_num_tokens:
+                draft_cache.resize_num_tokens(cache.max_num_tokens)
+                free_mem()
+            assert draft_cache.max_num_tokens == cache.max_num_tokens, \
+                "Cache and draft cache must be same size"
+
+
+    def _draft_active_jobs(self):
+        """
+        Active jobs that may draft this round: the prefill-done jobs, in their active-set
+        order (the draft pass and the verify pass must agree on this set, so it is computed
+        once per iterate and passed to both).
+        """
+        return [job for job in self.active_jobs if job.is_prefill_done()]
+
+    def iterate_draftmodel_gen(self, results: list, active: list):
 
         self._draft_conf_round = None
 
-        # Get shape of active batch
-        batch_size = 0
+        # Active batch: the prefill-done jobs (computed once in iterate)
+        batch_size = len(active)
+        assert all(len(job.sequences) == 1 for job in active), \
+            "Drafting does not currently support CFG/multi-sequence jobs"
         max_seq_len = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
+        for job in active:
             max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
-            batch_size += 1
         if batch_size == 0:
             return None
 
@@ -643,10 +763,9 @@ class Generator:
         block_index.zero_()
         cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
+        for job in active:
             for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
+                seq_block_index = seq.draft_block_index_tensor[:, :max_pages_batch]
                 block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
                 cache_seqlens[batch] = seq.kv_position
                 batch += 1
@@ -659,8 +778,7 @@ class Generator:
 
         # Collect input IDs
         input_ids_list = []
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
+        for job in active:
             if job.time_first_token is None:
                 cuda_sync_active()
                 job.time_first_token = time.time()
@@ -720,17 +838,15 @@ class Generator:
         return self.draft_ids_pinned[:, :window]
 
 
-    def iterate_draftmodel_mtp_gen(self, results: list):
+    def iterate_draftmodel_mtp_gen(self, results: list, active: list):
 
         self._draft_conf_round = None
 
-        # Get shape of active batch
-        batch_size = 0
+        # Active batch: the prefill-done jobs (computed once in iterate)
+        batch_size = len(active)
         max_seq_len = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
+        for job in active:
             max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
-            batch_size += 1
         if batch_size == 0:
             return None
 
@@ -743,10 +859,9 @@ class Generator:
         block_index.zero_()
         cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
+        for job in active:
             for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
+                seq_block_index = seq.draft_block_index_tensor[:, :max_pages_batch]
                 block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
                 cache_seqlens[batch] = seq.kv_position
                 batch += 1
@@ -754,8 +869,7 @@ class Generator:
         # Collect input IDs
         input_ids_list = []
         mtp_hidden_list = []
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
+        for job in active:
             assert len(job.sequences) == 1, "Qwen3.5 MTP drafting does not currently support CFG/multi-sequence jobs"
             if job.mtp_last_hidden is None:
                 # A one-token prompt has no token to prefill before the generation input.
@@ -818,21 +932,21 @@ class Generator:
 
 
     # TODO: Refactor, share code with other draft fns
-    def iterate_draftmodel_dflash_gen(self, results: list):
+    def iterate_draftmodel_dflash_gen(self, results: list, active: list):
 
         self._draft_conf_round = None
 
-        # Get shape of active batch
-        batch_size = 0
+        # Active batch: the prefill-done jobs (computed once in iterate)
+        batch_size = len(active)
+        assert all(len(job.sequences) == 1 for job in active), \
+            "Drafting does not currently support CFG/multi-sequence jobs"
         max_seq_len = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
+        for job in active:
             max_seq_len = max(
                 max_seq_len,
                 job.get_max_seq_len() + self.num_draft_tokens + 1,
                 job.get_max_seq_len() + self.draft_model.config.block_size + 1
             )
-            batch_size += 1
         if batch_size == 0:
             return None
 
@@ -848,18 +962,16 @@ class Generator:
         block_index.zero_()
         cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
+        for job in active:
             for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
+                seq_block_index = seq.draft_block_index_tensor[:, :max_pages_batch]
                 block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
                 cache_seqlens[batch] = seq.kv_position
                 batch += 1
 
         # Collect input IDs
         input_ids_list = []
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
+        for job in active:
             if job.time_first_token is None:
                 cuda_sync_active()
                 job.time_first_token = time.time()
@@ -961,7 +1073,7 @@ class Generator:
         return buf[:rows]
 
 
-    def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
+    def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None, draft_active: list | None = None):
 
         # Get shape of active batch
         # Only jobs that have finished prefill can participate in token generation. The maximum sequence length
@@ -988,6 +1100,14 @@ class Generator:
         block_index = self._staging("block_index", batch_size, max_pages_batch)
         block_index.zero_()
         cache_seqlens = self._staging("cache_seqlens", batch_size)
+        # The DFlash cache refill after verification writes the accepted rows into the draft
+        # cache, which for a ring-backed draft lives in its own page space rather than the main
+        # one. Only the DFlash-family refills read this table (the ring is gated to
+        # dflash_draft-capable drafters), so it is built only when a ring exists
+        draft_block_index = None
+        if self.draft_ring is not None:
+            draft_block_index = self._staging("verify_draft_block_index", batch_size, max_pages_batch)
+            draft_block_index.zero_()
         batch = 0
         use_offsets = "mrope" in self.model.caps
         positions = self._staging("positions", batch_size) if use_offsets else None
@@ -996,6 +1116,9 @@ class Generator:
             for seq in job.sequences:
                 seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
                 block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
+                if draft_block_index is not None:
+                    seq_draft_index = seq.draft_block_index_tensor[:, :max_pages_batch]
+                    draft_block_index[batch:batch+1, :seq_draft_index.shape[-1]].copy_(seq_draft_index)
                 cache_seqlens[batch] = seq.kv_position
                 if use_offsets:
                     positions[batch] = seq.kv_position + job.alt_rope_offset
@@ -1008,23 +1131,53 @@ class Generator:
         active_embeddings = []
         logit_mapping = []
         batch_jobs = []
+        # Per-job count of real input positions. Drafting jobs verify 1 + drafted window; a
+        # prefill-done job without a draft row verifies a single token, so its row is padded
+        # to the batch width for the forward and the extra positions are never consumed (nor
+        # re-read: their K/V lands past the valid cache length and is overwritten as generation
+        # advances)
+        job_widths = []
+        # Draft rows are laid out one per drafting job, in the draft pass' active-set order; a
+        # prefill-done job without a draft row verifies one token
+        draft_rows = draft_row_map(self.active_jobs, draft_active) \
+            if draft_active is not None else None
         for job in self.active_jobs:
             logit_mapping.append(len(input_ids_list))
             if not job.is_prefill_done(): continue
             if job.time_first_token is None:
                 cuda_sync_active()
                 job.time_first_token = time.time()
-            job_ids = job.get_input_ids_list(draft_tokens, len(input_ids_list), add_to_cache = True)
+            if draft_tokens is not None:
+                row = draft_rows[id(job)] if draft_rows is not None else len(input_ids_list)
+                if row is not None:
+                    job_ids = job.get_input_ids_list(draft_tokens, row, add_to_cache = True)
+                else:
+                    job_ids = job.get_input_ids_list(None, 0, add_to_cache = True)
+            else:
+                job_ids = job.get_input_ids_list(None, 0, add_to_cache = True)
             input_ids_list += job_ids
             batch_jobs.append(job)
             active_embeddings += job.embeddings
+            job_widths.append(job_ids[0].shape[-1])
         logit_mapping.append(len(input_ids_list))
-        ids_width = input_ids_list[0].shape[-1]
+        # The forward is rectangular, so the batch runs at the widest row: a job without a
+        # draft row verifies one token while drafting jobs verify 1 + window, and the narrow
+        # rows are zero-padded on the right. The padded positions land past the row's valid
+        # cache length, are never consumed, and are overwritten as generation advances. Both
+        # cases stage through the same pinned buffer, so the upload stays non-blocking; only
+        # the short rows (one per such job, rare and short-lived) cost an allocation.
+        ids_width = max(ids.shape[-1] for ids in input_ids_list)
         if all(ids.shape[-1] == ids_width for ids in input_ids_list):
-            ids_staging = self._staging("batch_ids", len(input_ids_list), ids_width, torch.long)
-            batch_ids = torch.cat(input_ids_list, dim = 0, out = ids_staging)
+            rows = input_ids_list
         else:
-            batch_ids = torch.cat(input_ids_list, dim = 0)
+            rows = []
+            for ids in input_ids_list:
+                width = ids.shape[-1]
+                if width < ids_width:
+                    ids = torch.cat((ids, ids.new_zeros((ids.shape[0], ids_width - width))), dim = -1)
+                rows.append(ids)
+        ids_staging = self._staging("batch_ids", len(input_ids_list), ids_width, torch.long)
+        batch_ids = torch.cat(rows, dim = 0, out = ids_staging)
 
         # Collect recurrent states for batch
         # Recurrent models carry mutable state beside the K/V cache; pass one state object per compact batch job so
@@ -1099,15 +1252,19 @@ class Generator:
 
         # Reject the trailing draft positions after the last accepted token at index i: count them, roll back the
         # job's recurrent state and return cache pages to the accepted position
-        def reject_remainder(job_, j_, i_, batch_states_):
-            num_rejected = batch_logits.shape[1] - 1 - i_
-            if num_rejected == 0:
+        def reject_remainder(job_, j_, i_, batch_states_, width):
+            num_rejected = width - 1 - i_
+            # The verify forward advanced every recurrent state by the padded row width, not the
+            # job's real width, so the state rewind must count the padded positions too; the cache
+            # only moved by the job's real tokens, so its rewind stays job-width based
+            state_rejected = ids_width - 1 - i_
+            if num_rejected == 0 and state_rejected == 0:
                 return 0
             job_.rejected_draft_tokens += num_rejected
 
             # Rewind recurrent states
             if batch_states_ is not None:
-                batch_states_[j_].rewind(num_rejected)
+                batch_states_[j_].rewind(state_rejected)
 
             # Rewind cache position (draft model cache layout is always the same as target)
             for seq_ in job_.sequences:
@@ -1118,7 +1275,7 @@ class Generator:
                     rp = min(page.kv_position, r)
                     page.kv_position -= rp
                     r -= rp
-            return num_rejected
+            return state_rejected
 
         # Without a draft, each job samples exactly one independent token, so all sampler chains
         # are launched first and the results collected in a second pass: the first collect
@@ -1180,10 +1337,12 @@ class Generator:
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
+                job_width = job_widths[j]
+                drow = draft_rows[id(job)] if draft_rows is not None else j
                 accepted_length = 1
                 rejected = 0
 
-                for i in range(batch_logits.shape[1]):
+                for i in range(job_width):
                     token_logits = job_logits[:, i:i + 1, :]
                     next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
                         token_logits,
@@ -1203,7 +1362,7 @@ class Generator:
                     # before the requeue stash.
                     if len(job.sequences) == 1 and rq:
                         if draft_tokens is not None:
-                            rejected = reject_remainder(job, j, i, batch_states)
+                            rejected = reject_remainder(job, j, i, batch_states, job_width)
                         requeuing_jobs.append(job)
                         break
 
@@ -1213,7 +1372,7 @@ class Generator:
                     # the number of drafted positions (no cache/state rollback needed, the pages are released).
                     # The EOS stream event was already built inside receive_sample, so patch its counter too
                     if eos:
-                        num_unresolved = batch_logits.shape[1] - 1 - i if draft_tokens is not None else 0
+                        num_unresolved = job_width - 1 - i if draft_tokens is not None else 0
                         if num_unresolved:
                             job.rejected_draft_tokens += num_unresolved
                             for r_ in reversed(results):
@@ -1232,7 +1391,7 @@ class Generator:
                         job.checkpoint_rewound = False
                         rewound_jobs.add(id(job))
                         if draft_tokens is not None:
-                            job.rejected_draft_tokens += batch_logits.shape[1] - 1 - i
+                            job.rejected_draft_tokens += job_width - 1 - i
                             rejected = -1
                         break
 
@@ -1240,10 +1399,10 @@ class Generator:
                     # checkpoint mark. For speculative decoding, consume additional logits only while the
                     # sampled target token matches the draft token. A recurrent checkpoint boundary also stops
                     # draft acceptance so state can be stashed at an exact page boundary.
-                    if draft_tokens is not None and i < batch_logits.shape[1] - 1:
+                    if draft_tokens is not None and i < job_width - 1:
                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
-                            rejected = reject_remainder(job, j, i, batch_states)
+                        if draft_tokens[drow, i].item() != sampled_token.item() or cp_boundary:
+                            rejected = reject_remainder(job, j, i, batch_states, job_width)
                             break
 
                         # Accept draft token
@@ -1267,13 +1426,18 @@ class Generator:
                             job.prepare_logit_mask()
                             job.prepare_sampling_past_ids()
 
-                # Make sure outgoing state is valid if entire draft was accepted
+                # Make sure the outgoing state matches the accepted prefix: the forward advanced
+                # every state by the padded row width, so a job that consumed fewer positions than
+                # the batch width (a rowless 1-token verify, or an early break) rewinds the padded and unresolved
+                # steps; a job that accepted its entire draft lands on the width and rewinds nothing
                 if batch_states and draft_tokens is not None and rejected == 0:
-                    batch_states[j].rewind(0)
+                    batch_states[j].rewind(ids_width - accepted_length)
 
-                # Record per-round draft stats. Skip abandoned windows (banned-string rewind);
-                # checkpoint-boundary truncations are rare enough to count as ordinary rejections.
-                if draft_tokens is not None and rejected != -1:
+                # Record per-round draft stats. Skip abandoned windows (banned-string rewind) and
+                # jobs that never got a draft row (a rowless job's 1-token verify is not a draft
+                # round); checkpoint-boundary truncations are rare enough to count as rejections.
+                if draft_tokens is not None and rejected != -1 and \
+                        (draft_rows is None or draft_rows[id(job)] is not None):
                     if self.record_draft_stats:
                         job.draft_stats.append((
                             job.new_tokens,
@@ -1296,9 +1460,14 @@ class Generator:
             row = 0
             for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
                 if a_idx == b_idx: continue
+                # Only drafting jobs have a conf row; a rowless job verified a single token
+                drow = draft_rows[id(job)] if draft_rows is not None else row
+                if drow is None:
+                    row += 1
+                    continue
                 accepted_length = accepted_lengths[row]
-                conf = st["conf"][row]
-                ids_full = st["ids"][row]
+                conf = st["conf"][drow]
+                ids_full = st["ids"][drow]
                 row += 1
                 if id(job) in rewound_jobs:
                     continue
@@ -1320,7 +1489,7 @@ class Generator:
                 cache = self.draft_cache,
                 lengths = accepted_lengths,
                 params = {
-                    "block_table": block_index,
+                    "block_table": draft_block_index if draft_block_index is not None else block_index,
                     "cache_seqlens": p_cache_seqlens,
                 }
             )
@@ -1349,7 +1518,7 @@ class Generator:
                         batch_ids[a_idx:b_idx, 1:accepted_length],
                         {
                             "attn_mode": "flash_attn",
-                            "block_table": block_index[a_idx:b_idx],
+                            "block_table": (draft_block_index if draft_block_index is not None else block_index)[a_idx:b_idx],
                             "cache": self.draft_cache,
                             "cache_seqlens": p_cache_seqlens[a_idx:b_idx] + 1,
                             "target_hidden": target_hidden[a_idx:b_idx, :accepted_length - 1, :],
@@ -1416,8 +1585,9 @@ class Generator:
         """
         Move pending jobs into the active set when batch and cache capacity allow.
 
-        Jobs are considered in queue order, but a job can be skipped temporarily if it would exceed max_batch_size
-        or needs more fresh pages than are currently unreferenced. Later jobs may start if they fit, which improves
+        Jobs are considered in queue order, but a job can be skipped temporarily if it would exceed the batch limit
+        (max_batch_size, capped to the draft ring's slot count when a ring-backed draft cache is loaded) or needs
+        more fresh pages than are currently unreferenced. Later jobs may start if they fit, which improves
         utilization, but each skipped job accumulates a skip count; once any skipped job reaches max_skips, startup
         stops for this iteration to preserve approximate queue fairness. Started jobs allocate their cache pages
         immediately and emit a "started" event.
@@ -1428,15 +1598,23 @@ class Generator:
         for job in self.active_jobs:
             current_max_batch += len(job.sequences)
 
+        # A ring-backed draft cache gives every live sequence a private slot: once the pool's
+        # slots are all held, admission must wait even if max_batch_size would allow more
+        # sequences (the ring is clamped to the pool at construction, so this is the cap that
+        # keeps Sequence.allocate_pages' slot claim from failing)
+        batch_limit = self.max_batch_size
+        if self.draft_ring is not None:
+            batch_limit = min(batch_limit, self.draft_ring.num_slots)
+
         # Start new jobs if possible
         if (self.pagetable.num_unreferenced_pages() and
             len(self.pending_jobs) and
-            current_max_batch < self.max_batch_size):
+            current_max_batch < batch_limit):
 
             skipped_jobs = []
             for job in self.pending_jobs.copy():
 
-                if (len(job.sequences) + current_max_batch > self.max_batch_size or
+                if (len(job.sequences) + current_max_batch > batch_limit or
                         job.current_new_pages_required() > self.pagetable.num_unreferenced_pages()):
                     skipped_jobs.append(job)
                     continue

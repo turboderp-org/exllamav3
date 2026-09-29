@@ -161,6 +161,42 @@ Query-length threshold for the prefill staging pass at `EXL3_QC_STAGING=1`. Chun
 this keep the direct path, which reads less global memory (relevant for short trailing chunks
 over long contexts at low cache bitrates). Tuning/testing knob.
 
+### `EXL3_DRAFT_RING` (default: `1`)
+
+Enables the windowed draft cache ring for draft models with the `dflash_draft` capability
+(DFlash, DFlash 2 and its variants, DeepSeek-V4 MTP -- which fill the draft cache by projecting
+target hidden states). Instead of a second pool-wide draft cache, each live sequence gets a
+private ring of window + drafted block + slack, mapped by
+`slot * ring_pages + page % ring_pages`. The draft reads only its window, so the ring's size is
+fixed by the drafter's window, independent of context length: at a fixed batch size it is a small
+fraction of the pool-wide cache that shrinks as the context grows.
+
+The Generator resizes the draft cache to the ring (`ring span x max_batch_size` tokens) when it
+is constructed and returns the freed memory to the allocator, so callers size the draft cache
+like the main cache. A draft cache holding less than `max_batch_size` ring spans does not fail:
+the ring is clamped to the spans the cache holds and drafting is capped to that many concurrent
+sequences, which queue meanwhile. The one case that does not degrade is a draft cache holding
+less than one ring span, which raises a `RuntimeError`: the Generator recomputes the ring span
+from its own `num_draft_tokens`, so a Generator whose `num_draft_tokens` far exceeds the
+load-time draft settings can need more tokens per sequence than the whole draft cache holds.
+Mitigate with a larger `cache_size` or `EXL3_DRAFT_RING=0`.
+
+The ring is declined - the draft model keeps a pool-wide cache as before - when the draft model
+is not a DFlash-family drafter (plain AR and MTP drafters run their own forward over the draft
+cache, so reused rows would carry another sequence's context), when it is loaded with tensor
+parallelism, or when any draft attention layer lacks a sliding window (DFlash checkpoints with
+`full_attention` layers; `-swa_full` or any override that widens or removes the window has the
+same effect); the Generator then resizes the draft cache back to the main cache's size. Set `0`
+to force the pool-wide cache.
+
+After a prompt-cache resume or a rewind deeper than the ring's headroom (`span - spec_rows -
+window`), the Generator rebuilds the drafter's window with one target forward over the window
+instead of letting the drafter run over rows left by another sequence or branch; shallow
+rewinds need no rebuild because the pre-rewind tip never passed the ring's wrap floor. The
+rebuild is skipped - the drafter speculates through the stale rows until the window slides
+past them - when no spare recurrent state slot exists, the nearest checkpoint is too far
+below the window, or the re-run would cover an image span.
+
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
 Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, the best of
