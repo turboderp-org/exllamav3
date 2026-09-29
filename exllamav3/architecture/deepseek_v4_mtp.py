@@ -178,6 +178,7 @@ class DeepseekV4MTPModel(Model):
             key = f"{last}.markov_head.markov_w1",
             vocab_size = config.vocab_size,
             hidden_size = config.dspark_markov_rank,
+            allow_table = False,
         )
         # Device-resident (~63 MB): the sampling loop stays on-stream with no host syncs
         self.markov_w1.caps["prefer_cpu"] = False

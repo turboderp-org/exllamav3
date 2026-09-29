@@ -1142,6 +1142,8 @@ class Generator:
                 launched.append((job, token_logits, sampled))
             if launched:
                 torch.cuda.synchronize(batch_logits.device)
+                # The sampled tokens are the next forward's inputs
+                self.model.prefetch_tokens([t for _, _, s in launched for t in s[0].view(-1).tolist()])
 
             for job, token_logits, (next_token, next_k_tokens, next_k_probs, next_prob) in launched:
                 eos, sampled_token, rq = job.receive_sample(
@@ -1270,6 +1272,9 @@ class Generator:
                             draft_tokens.shape[-1],
                             accepted_length - 1,
                         ))
+
+                # The last sampled token leads the next forward
+                self.model.prefetch_tokens([sampled_token.item()])
 
                 accepted_lengths.append(accepted_length)
                 j += 1

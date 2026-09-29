@@ -31,7 +31,7 @@ def child():
         sums.append(float(out.cpu().double().sum()))    # exact fingerprint of the staged rows
         return out
     ng.forward = logged
-    ng.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}     # load-time forwards don't count
+    ng.table.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}     # load-time forwards don't count
 
     text = open(os.path.join(os.path.dirname(__file__), "..", "README.md")).read()
     ids = tok.encode(text * 3, add_bos = True)[:, :3000 + 137]     # several chunks + a partial one
@@ -42,7 +42,7 @@ def child():
         for r in gen.iterate():
             if r.get("token_ids") is not None:
                 out += r["token_ids"].flatten().tolist()
-    from exllamav3.modules.ngram_embedding import PREFETCH_MIN_TOKENS
+    from exllamav3.modules.row_table import PREFETCH_MIN_TOKENS
     print("RESULT " + json.dumps({
         "tokens": out,
         "stats": ng.prefetch_stats,

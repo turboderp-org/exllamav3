@@ -57,6 +57,10 @@ class InferParams:
         # per-forward row gathers instead of loading the whole table into system RAM (tens of
         # GB). Set before loading the model
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
+        # Stream the token embedding table from disk with per-forward row gathers instead of
+        # holding it in system RAM. Works for quantized and unquantized tables. Set before
+        # loading the model
+        self.embed_stream_from_disk = os.environ.get("EXL3_EMBED_STREAM", "0") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which

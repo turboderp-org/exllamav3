@@ -4,9 +4,66 @@ import torch
 from torch import nn
 from ..model.config import Config
 from ..util.tensor import to2
+from ..ext import exllamav3_ext as ext
 from . import Module
+from .row_table import RowTable
+from .quant.exl3_lib.ngram_codec import GROUP_DIM, mul1_codebook, dequant_rows
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..model.model_tp_alloc import TPAllocation
+
+"""
+Token embedding table. Three storage forms, all behind the same lookup:
+
+    <key>.weight                   -> resident nn.Embedding (the default)
+    <key>.weight, streamed         -> rows gathered from disk per forward (RowTable)
+    <key>.trellis + <key>.signs    -> quantized table (see ngram_codec), held in RAM or streamed,
+                                      decoded on the device
+"""
+
+DEDUP_MIN_TOKENS = 16
+
+class TableEmbedding:
+    """Stands in for nn.Embedding when the table is a RowTable"""
+
+    def __init__(self, table: RowTable, hidden_size: int, device: torch.device, signs: torch.Tensor | None):
+        self.table = table
+        self.hidden_size = hidden_size
+        self.device = device = torch.device(device)     # (TP ranks name their device by index)
+        self.signs = signs
+        if signs is not None:
+            self.groups = signs.shape[0]
+            self.K = (table.row_words // self.groups - 1) // 16
+            assert table.row_words == self.groups * (1 + 16 * self.K) and self.groups * GROUP_DIM >= hidden_size
+            self.codebook = mul1_codebook(device) if device.type != "cuda" else None
+
+    def resolve(self, ids: torch.Tensor, pin) -> tuple:
+        # Decode-sized lookups gather their rows as they come; chunks gather each row once
+        if ids.numel() <= DEDUP_MIN_TOKENS and len(self.table.stores) == 1:
+            return ids.view(-1), True
+        uids, inverse = torch.unique(ids, return_inverse = True)
+        pin.inverse[:ids.numel()] = inverse.view(-1)
+        return uids, False
+
+    def decode(self, rows: torch.Tensor, pin, U: int) -> torch.Tensor:
+        if self.signs is None:
+            return rows if rows.dtype == torch.bfloat16 else rows.half()
+        rings = rows.view(U * self.groups, -1)
+        if rows.is_cuda:
+            out = torch.empty((U * self.groups, GROUP_DIM), dtype = torch.half, device = rows.device)
+            ext.ngram_dequant(rings, self.K, None, self.signs, out, True)
+        else:
+            out = dequant_rows(rings, self.K, self.codebook, signs = self.signs.repeat(U, 1)).half()
+        out = out.view(U, -1)
+        return out if out.shape[1] == self.hidden_size else out[:, :self.hidden_size]
+
+    def forward(self, ids: torch.Tensor, synced: bool = False) -> torch.Tensor:
+        shape = ids.shape
+        ids = ids.to("cpu", torch.int64).contiguous()
+        out = self.table.lookup(ids, ids.numel(), self.resolve, self.decode, self.device, synced)
+        return out.view(*shape, self.hidden_size)
+
+    __call__ = forward
+
 
 class Embedding(Module):
 
@@ -19,7 +76,8 @@ class Embedding(Module):
         out_dtype: torch.dtype | None = torch.float,
         qmap: str | None = None,
         normalize: bool = False,
-        multiplier: float = 1.0
+        multiplier: float = 1.0,
+        allow_table: bool = True,
     ):
         super().__init__(config, key, None)
         assert qmap is None, "No quant scheme for Embedding"
@@ -33,9 +91,15 @@ class Embedding(Module):
         self._numel = vocab_size * hidden_size
         self.normalize = normalize
         self.multiplier = multiplier
+        # False for tables whose weight is read directly (always a resident nn.Embedding)
+        self.allow_table = allow_table
+        self.compiled = None
 
+        # A quantized table is decoded on the device, from ids that stay on the CPU
+        quantized = allow_table and config is not None and config.stc.has_tensor(key + ".trellis")
         self.caps.update({
-            "prefer_cpu": True,
+            "prefer_cpu": not quantized,
+            "x_cpu": quantized,
         })
 
     @override
@@ -45,7 +109,21 @@ class Embedding(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
-        weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True, allow_bf16 = True)
+        stc = self.config.stc
+        table = RowTable.find(stc, self.key, "trellis") if self.allow_table else None
+        infer_params = getattr(self.config, "infer_params", None)
+        stream_from_disk = self.allow_table and infer_params is not None and infer_params.embed_stream_from_disk
+        if table is not None:
+            signs = stc.get_tensor(self.key + ".signs", device, no_defer = True)
+            table.open(stc, stream_from_disk)
+        elif stream_from_disk and stc.get_tensor_handle(self.key + ".weight", optional = True) is not None:
+            signs = None
+            table = RowTable.find(stc, self.key, "weight")
+            table.open(stc, True)
+        if table is not None:
+            self.embedding = TableEmbedding(table, self.hidden_size, device, signs)
+            return
+        weight = stc.get_tensor(self.key + ".weight", self.device, float2half = True, allow_bf16 = True)
         self._numel = weight.numel()
         self.embedding = nn.Embedding(
             self.vocab_size,
@@ -56,14 +134,42 @@ class Embedding(Module):
 
     @override
     def unload(self):
+        if isinstance(self.embedding, TableEmbedding):
+            self.embedding.table.close()
         self.device = None
         self.embedding = None
 
     @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        return x if isinstance(self.embedding, TableEmbedding) else super().prepare_for_device(x, params)
+
+    @override
     def get_tensors(self):
+        if isinstance(self.embedding, TableEmbedding):
+            table = self.embedding.table
+            assert not table.on_disk and self.embedding.signs is not None
+            return {
+                f"{self.key}.trellis": table.stores[0],
+                f"{self.key}.signs": self.embedding.signs,
+            }
         return {
             f"{self.key}.weight": self.embedding.weight.data.contiguous()
         }
+
+    @override
+    def get_compile_sizes(self, stc):
+        if self.compiled is not None:
+            return [v.numel() * v.element_size() for v in self.compiled.values()]
+        return super().get_compile_sizes(stc)
+
+    @override
+    def get_compile_tensors(self, stc):
+        return self.compiled if self.compiled is not None else super().get_compile_tensors(stc)
+
+    def prefetch_tokens(self, ids: list[int]):
+        """Tokens of a coming forward, known ahead of it: start reading their rows"""
+        if isinstance(self.embedding, TableEmbedding):
+            self.embedding.table.advise(ids)
 
     @override
     def weights_numel(self):
@@ -130,12 +236,12 @@ class Embedding(Module):
                     continue
                 for i in range(bsz):
                     indexed_ids_row = input_ids[i][im[i]] - ie.first_index
-                    combined_emb[i][im[i]] = ie.embeddings[indexed_ids_row].to(out_dtype)
+                    combined_emb[i][im[i]] = ie.embeddings[indexed_ids_row].to(combined_emb.device, out_dtype)
 
                     # Prepare deepstack embeddings
                     if ie.deepstack_embeddings is not None:
                         for layer, de in enumerate(ie.deepstack_embeddings):
-                            deepstack_emb[layer][i][im[i]] = de[indexed_ids_row].to(out_dtype)
+                            deepstack_emb[layer][i][im[i]] = de[indexed_ids_row].to(combined_emb.device, out_dtype)
 
             # Save deepstack embeddings to params
             if deepstack_emb is not None:
@@ -145,7 +251,10 @@ class Embedding(Module):
 
         # No indexed embeddings, or none in current batch
         else:
-            x = self.embedding.forward(x)
+            if isinstance(self.embedding, TableEmbedding):
+                x = self.embedding.forward(x, bool(params.get("pinned_staging")))
+            else:
+                x = self.embedding.forward(x)
             if self.multiplier != 1.0:
                 x *= self.multiplier
             x = to2(x, out_dtype, self.out_dtype)
@@ -172,7 +281,7 @@ class Embedding(Module):
 
     def tp_export(self, plan, producer):
         assert self.device is not None, "Cannot export module for TP before loading."
-        return {
+        exported = {
             "cls": Embedding,
             "kwargs": {
                 "key": self.key,
@@ -181,10 +290,18 @@ class Embedding(Module):
                 "out_dtype": self.out_dtype,
                 "normalize": self.normalize,
                 "multiplier": self.multiplier,
+                "allow_table": self.allow_table,
             },
-            "embedding.weight": producer.send(self.embedding.weight),
             "device": self.device
         }
+        if isinstance(self.embedding, TableEmbedding):
+            # Every rank streams the table's rows from disk through its own handles
+            signs = self.embedding.signs
+            exported["table"] = self.embedding.table.export(self.config.stc)
+            exported["signs"] = producer.send(signs) if signs is not None else None
+        else:
+            exported["embedding.weight"] = producer.send(self.embedding.weight)
+        return exported
 
     @staticmethod
     def tp_import(local_context, exported, plan):
@@ -193,6 +310,13 @@ class Embedding(Module):
             config = None,
             **exported["kwargs"],
         )
+        if "table" in exported:
+            signs = exported["signs"]
+            module.device = local_context["device"] if signs is not None else exported["device"]
+            module.embedding = TableEmbedding(
+                RowTable.from_export(exported["table"]), module.hidden_size, module.device,
+                consumer.recv(signs, cuda = True) if signs is not None else None)
+            return module
         module.device = exported["device"]
         module.embedding = nn.Embedding(
             module.vocab_size,

@@ -79,6 +79,18 @@ class Model(Model_TPMixin, Model_LSMixin):
         return [m for m in self if m.caps.get("prefetch_ids")]
 
 
+    def prefetch_tokens(self, ids: list[int]):
+        """
+        Tokens the next forward pass will embed, known ahead of it (the generator has just
+        sampled them). An embedding table streamed from disk starts reading their rows, so the
+        read overlaps the host work before that forward instead of stalling it.
+        """
+        if not self.loaded_tp and self.modules:
+            prefetch = getattr(self.modules[0], "prefetch_tokens", None)
+            if prefetch is not None:
+                prefetch(ids)
+
+
     def get_layer_instances(self, layer_idx):
         if not self.config.layer_map:
             return [(layer_idx, 0)]

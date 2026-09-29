@@ -23,6 +23,8 @@ does.
 
 - **-ngb / --ngram_bits *int***: Bits per weight for hashed n-gram embedding tables (PLE models, e.g. Qwen3.8-Flash-Next). Must be an integer from 1 to 8, default is `--bits` rounded to the nearest integer. The table is quantized (without calibration) before the layer-by-layer conversion and written as a standalone `ngram_embedding.safetensors` in the output directory; calibration forwards then run against the quantized table. Table quantization is resumable together with the rest of the job.
 
+- **-eb / --embed_bits *int***: Bits per weight for the token embedding table. Must be an integer from 1 to 8, or 16 (the default) to store the table unquantized. Each embedding is split into 256-wide groups that are rotated and trellis-coded without calibration, and the following layers are calibrated against the quantized table. A quantized table is decoded on the GPU at inference, and can be held in system RAM or streamed from disk (`--embed_disk` in `model_init`-based scripts). The table of an existing EXL3 model can be quantized with `util/recompile.py --embed_bits`.
+
 - **-ngf / --ngram_file *file***: Pre-quantized n-gram table (from `util/convert_ngram.py`) to copy into the output model instead of quantizing the table as part of the job. Overrides `--ngram_bits`.
 
 - **-hq / --hq**: Increase the bitrate of select layers, such as attention and shared-expert layers. Final model bitrate may be somewhat higher than requested by `--bits`, but for MoE models this is typically a very small increase in size (0.05 - 0.10 bpw) for a disproportionately large increase in model fidelity. 

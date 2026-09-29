@@ -19,10 +19,10 @@ namespace py = pybind11;
 
 /*
 
-Hashed n-gram embedding fast path (Qwen3.8-Flash-Next PLE table): the hot loop stays on the CPU
-where the token ids already live (no device round trips), the scattered table rows are gathered
-with threaded preads into a pinned staging buffer, and the trellis rows are decoded by a
-memory-bound GPU kernel after one non-blocking H2D copy.
+Embedding table fast path (Qwen3.8-Flash-Next PLE table, quantized token embeddings): the hot
+loop stays on the CPU where the token ids already live (no device round trips), the scattered
+table rows are gathered with threaded preads into a pinned staging buffer, and the trellis rows
+are decoded by a memory-bound GPU kernel after one non-blocking H2D copy.
 
   ngram_hash_cpu:   eos-segmented n-gram hashing + global dedup: emits sorted unique table row
                     ids, the inverse map for the output gather, and each unique row's hash head.
@@ -31,13 +31,15 @@ memory-bound GPU kernel after one non-blocking H2D copy.
   ngram_gather_cpu: threaded pread of the unique rows (run-coalesced: unique ids are sorted, so
                     adjacent rows merge into single reads) into a caller buffer. This file holds
                     the Linux version; ngram_gather_win.cpp has the overlapped-ReadFile port.
-  ngram_dequant:    one block per row: unpack the tail-biting ring bitstream, decode the mul1
-                    codebook value per element, apply the fp16 row scale and the per-head bias.
-                    Matches dequant_rows() in ngram_codec.py (fp16 codebook rounding included).
+  ngram_dequant:    one block per ring (an n-gram row, or one group of a token embedding row):
+                    unpack the tail-biting ring bitstream, decode the mul1 codebook value per
+                    element and apply the fp16 scale, then either add the per-head bias or
+                    rotate the ring back and apply its sign vector. Matches dequant_rows() in
+                    ngram_codec.py (fp16 codebook rounding included).
 
 */
 
-#define ROW_DIM 160
+#define MAX_RING_DIM 256
 #define MUL1 0x83DCD12Du
 
 int64_t ngram_hash_cpu
@@ -305,33 +307,37 @@ void ngram_gather_cpu
 
 #endif  // ^ Linux (pread); the Windows version (overlapped ReadFile) is in ngram_gather_win.cpp
 
-__global__ __launch_bounds__(ROW_DIM)
+__global__ __launch_bounds__(MAX_RING_DIM)
 void ngram_dequant_kernel
 (
-    const int16_t* __restrict__ packed,   // (U, 1 + ROW_DIM * K / 16)
-    const int32_t* __restrict__ heads,    // (U)
-    const half* __restrict__ bias,        // (num_heads, ROW_DIM)
-    half* __restrict__ out,               // (U, ROW_DIM)
+    const int16_t* __restrict__ packed,   // (U, 1 + dim * K / 16)
+    const int32_t* __restrict__ heads,    // (U) row of aux per ring, or null for ring index mod num_heads
+    const half* __restrict__ aux,         // (num_heads, dim) bias, or signs when rotating; may be null
+    half* __restrict__ out,               // (U, dim)
     const int K,
-    const int words                       // 1 + ROW_DIM * K / 16
+    const int words,                      // 1 + dim * K / 16
+    const int num_heads,
+    const bool rotate
 )
 {
     const int r = blockIdx.x;
     const int i = threadIdx.x;
+    const int dim = blockDim.x;
 
-    extern __shared__ uint16_t sw[];
+    extern __shared__ float sf[];
+    uint16_t* sw = (uint16_t*) (sf + dim);
     if (i < words) sw[i] = (uint16_t) packed[(size_t) r * words + i];
     __syncthreads();
 
     float scale = __half2float(__ushort_as_half(sw[0]));
 
-    // stream bit m of element i lives at ring position ((i - m / K) mod ROW_DIM) * K + m % K
+    // stream bit m of element i lives at ring position ((i - m / K) mod dim) * K + m % K
     uint32_t state = 0;
     #pragma unroll 4
     for (int m = 0; m < 16; ++m)
     {
         int pos = i - m / K;
-        if (pos < 0) pos += ROW_DIM;
+        if (pos < 0) pos += dim;
         int sb = pos * K + m % K;
         uint32_t bit = (sw[1 + (sb >> 4)] >> (sb & 15)) & 1;
         state |= bit << m;
@@ -343,46 +349,81 @@ void ngram_dequant_kernel
                                  ((prod >> 16) & 0xff) + ((prod >> 24) & 0xff));
     float k_inv = __half2float(__ushort_as_half(0x1eee));
     float k_bias = __half2float(__ushort_as_half(0xc931));
-    float cb = __half2float(__float2half_rn(h * k_inv + k_bias));
+    float v = __half2float(__float2half_rn(h * k_inv + k_bias)) * scale;
 
-    float b = __half2float(bias[(size_t) heads[r] * ROW_DIM + i]);
-    out[(size_t) r * ROW_DIM + i] = __float2half_rn(cb * scale + b);
+    float a = 0.0f;
+    if (aux)
+    {
+        int head = heads ? heads[r] : r % num_heads;
+        a = __half2float(aux[(size_t) head * dim + i]);
+    }
+
+    if (rotate)
+    {
+        // Walsh-Hadamard transform across the block, one butterfly stage per bit of the index
+        sf[i] = v;
+        __syncthreads();
+        for (int s = 1; s < dim; s <<= 1)
+        {
+            float lo = sf[i & ~s];
+            float hi = sf[i | s];
+            __syncthreads();
+            sf[i] = (i & s) ? lo - hi : lo + hi;
+            __syncthreads();
+        }
+        v = sf[i] * (1.0f / sqrtf((float) dim));
+        if (aux) v *= a;
+    }
+    else v += a;
+
+    out[(size_t) r * dim + i] = __float2half_rn(v);
 }
 
 void ngram_dequant
 (
-    const at::Tensor& packed,        // (U, 1 + ROW_DIM * K / 16) int16 CUDA
+    const at::Tensor& packed,                   // (U, 1 + dim * K / 16) int16 CUDA
     int64_t K,
-    const at::Tensor& heads,         // (U) int32 CUDA
-    const at::Tensor& bias,          // (num_heads, ROW_DIM) half CUDA
-    at::Tensor out                   // (U, ROW_DIM) half CUDA
+    const c10::optional<at::Tensor>& heads,     // (U) int32 CUDA
+    const c10::optional<at::Tensor>& aux,       // (num_heads, dim) half CUDA
+    at::Tensor out,                             // (U, dim) half CUDA
+    bool rotate
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(packed.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(packed, kShort);
-    TORCH_CHECK_DTYPE(heads, kInt);
-    TORCH_CHECK_DTYPE(bias, kHalf);
     TORCH_CHECK_DTYPE(out, kHalf);
-    TORCH_CHECK(packed.is_contiguous() && heads.is_contiguous() && bias.is_contiguous() &&
-                out.is_contiguous(), "ngram_dequant: contiguous inputs required");
+    TORCH_CHECK(packed.is_contiguous() && out.is_contiguous(), "ngram_dequant: contiguous inputs required");
     int64_t U = packed.size(0);
     int words = (int) packed.size(1);
-    TORCH_CHECK(1 <= K && K <= 8 && words == 1 + ROW_DIM * (int) K / 16, "ngram_dequant: bad K/words");
-    TORCH_CHECK(out.size(0) >= U && out.size(1) == ROW_DIM && heads.numel() >= U,
-                "ngram_dequant: shapes");
-    TORCH_CHECK(bias.size(1) == ROW_DIM, "ngram_dequant: bias shape");
+    int dim = (int) out.size(1);
+    TORCH_CHECK(1 <= K && K <= 8 && words == 1 + dim * (int) K / 16, "ngram_dequant: bad K/words");
+    TORCH_CHECK(dim <= MAX_RING_DIM && dim % 16 == 0 && out.size(0) >= U, "ngram_dequant: shapes");
+    TORCH_CHECK(!rotate || (dim & (dim - 1)) == 0, "ngram_dequant: rotation needs a power of two");
+    if (heads)
+    {
+        TORCH_CHECK_DTYPE((*heads), kInt);
+        TORCH_CHECK(aux && heads->is_contiguous() && heads->numel() >= U, "ngram_dequant: heads");
+    }
+    if (aux)
+    {
+        TORCH_CHECK_DTYPE((*aux), kHalf);
+        TORCH_CHECK(aux->is_contiguous() && aux->dim() == 2 && aux->size(1) == dim, "ngram_dequant: aux shape");
+    }
     if (!U) return;
 
-    ngram_dequant_kernel<<<(unsigned int) U, ROW_DIM, words * sizeof(uint16_t), stream>>>
+    size_t smem = dim * sizeof(float) + ((words + 1) & ~1) * sizeof(uint16_t);
+    ngram_dequant_kernel<<<(unsigned int) U, dim, smem, stream>>>
     (
         (const int16_t*) packed.data_ptr(),
-        (const int32_t*) heads.data_ptr(),
-        (const half*) bias.data_ptr(),
+        heads ? (const int32_t*) heads->data_ptr() : nullptr,
+        aux ? (const half*) aux->data_ptr() : nullptr,
         (half*) out.data_ptr(),
         (int) K,
-        words
+        words,
+        aux ? (int) aux->size(0) : 1,
+        rotate
     );
     cuda_check(cudaPeekAtLastError());
 }

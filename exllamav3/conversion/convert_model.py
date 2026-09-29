@@ -3,7 +3,7 @@ import torch
 import time
 import sys
 from .. import Config, Model, Tokenizer
-from ..modules import Linear
+from ..modules import Linear, Embedding
 from ..modules.linear import convert_exl3_group
 from ..modules.mlp import merge_out_sensitivity, finalize_out_sensitivity
 from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
@@ -15,6 +15,7 @@ from ..util.tensor import save_tensor_image
 from ..util.measures import cosine_error, sqnr
 from .calibration_data import get_default_calibration, get_file_calibration
 from .compile import compile_model, dsize
+from .ngram import quantize_embedding
 from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy, HALF_RATES
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
@@ -79,6 +80,7 @@ parser.add_argument("-mb", "--mtp_bits", type = float, default = None, help = "B
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
 parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
 parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "Bits per weight for hashed n-gram embedding tables, 1-8, default: --bits rounded")
+parser.add_argument("-eb", "--embed_bits", type = int, default = None, help = "Bits per weight, token embedding table: 1-8, or 16 to store unquantized, default: 16")
 parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
 parser.add_argument("-cd", "--cal_data", type = str, default = None, help = "Calibration data file (safetensors with packed token rows, e.g. from sc_trace.py) used instead of the bundled corpus mix")
@@ -267,6 +269,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("hq", False, False),
         ("ngram_bits", False, 0),  # 0 = auto: --bits rounded
         ("ngram_file", False, ""),
+        ("embed_bits", False, 16),
         ("cal_data", False, ""),
         ("cal_rows", False, 250),
         ("cal_cols", False, 2048),
@@ -289,6 +292,8 @@ def prepare(args) -> (dict, dict, bool, str):
             in_args[arg_] = int(v)
         elif not (half_ok and v in HALF_RATES):
             return None, None, False, f"--{arg_} must be an integer 1-8, 16, or one of {HALF_RATES} with the mul1 codebook, got {v}"
+    if in_args["embed_bits"] != 16 and not 1 <= in_args["embed_bits"] <= 8:
+        return None, None, False, f"--embed_bits must be an integer 1-8, or 16, got {in_args['embed_bits']}"
     if recipe_tensors is not None and not half_ok and any(v in HALF_RATES for v in recipe_tensors.values()):
         return None, None, False, f"Recipe uses half-integer bitrates, which need the mul1 codebook"
 
@@ -1458,7 +1463,12 @@ def main(args, job_state):
 
             # Collect converted module tensors
             for m in module:
-                q_tensors.update(m.get_tensors())
+                if m is module and isinstance(m, Embedding) and m.allow_table and args["embed_bits"] < 16:
+                    tensors, rfn = quantize_embedding(m.key, m.embedding.weight.data, args["embed_bits"], device)
+                    print(f" -- Quantized: {m.key}  bpw: {args['embed_bits']}  rfn: {rfn:.6f}")
+                    q_tensors.update(tensors)
+                else:
+                    q_tensors.update(m.get_tensors())
 
             # Unload module
             if not module.caps.get("retain_during_quant"):

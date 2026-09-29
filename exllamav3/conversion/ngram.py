@@ -28,7 +28,8 @@ import torch
 
 from ..modules.quant.exl3_lib.quantize import quantize_tiles
 from ..modules.quant.exl3_lib.ngram_codec import (  # noqa: F401  (re-exported)
-    ROW_DIM, MUL1, words_per_row, mul1_codebook, pack_rows, unpack_rows, dequant_rows,
+    ROW_DIM, GROUP_DIM, MUL1, words_per_row, mul1_codebook, pack_rows, unpack_rows, dequant_rows,
+    hadamard_rotate,
 )
 
 NGRAM_FORMAT_VERSION = 1
@@ -52,23 +53,25 @@ CS_SEARCH_STEP = 0.06
 
 def quantize_rows(
     rows: torch.Tensor,
-    bias: torch.Tensor,
+    bias: torch.Tensor | None,
     K: int,
     cs: float | None = None,
     cs_search: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    rows: (N, 160) source rows (any float dtype) on a CUDA device
-    bias: (N, 160) per-row bias to subtract (gathered per head), fp16 values
+    rows: (N, 160) source rows, or (N, 256) rotated groups (any float dtype) on a CUDA device
+    bias: (N, 160) per-row bias to subtract (gathered per head), fp16 values, or None
     cs: fixed codebook-scale multiplier, or None for the per-row heuristic (default)
     cs_search: number of encodes per row; > 1 sweeps cs in steps of CS_SEARCH_STEP centered on the
         heuristic/fixed value and keeps the lowest-error encode per row (decode-invisible)
-    Returns (packed (N, 1 + 10*K) int16, deq (N, 160) float reconstruction incl. bias).
+    Returns (packed (N, words) int16, deq float reconstruction incl. bias).
     """
     # Guard against corrupt source values: a single inf/NaN element would make every Viterbi cost
     # non-finite for its row (degenerate garbage output; before the kernel-side argmin clamp it
     # was an out-of-bounds access)
-    w = torch.nan_to_num(rows.float(), nan = 0.0, posinf = 0.0, neginf = 0.0) - bias.float()
+    w = torch.nan_to_num(rows.float(), nan = 0.0, posinf = 0.0, neginf = 0.0)
+    if bias is not None:
+        w = w - bias.float()
     rms = w.square().mean(dim = 1, keepdim = True).sqrt()
     if cs is None:
         gamma, cs_hi = CS_HEURISTIC[K]
@@ -103,8 +106,50 @@ def quantize_rows(
             best_scale = torch.where(better, scale, best_scale)
 
     packed = pack_rows(best_states, best_scale, K)
-    deq = best_q * best_scale.float().unsqueeze(1) + bias.float()
+    deq = best_q * best_scale.float().unsqueeze(1)
+    if bias is not None:
+        deq = deq + bias.float()
     return packed, deq
+
+
+def quantize_embedding(
+    key: str,
+    weight: torch.Tensor,
+    K: int,
+    device,
+    chunk_rows: int = 8192,
+    verbose: bool = True,
+) -> tuple[dict, float]:
+    """
+    Trellis quantization of a token embedding table: rows are zero-padded to a multiple of 256,
+    split into 256-wide groups and rotated (random signs + Hadamard), and each group is encoded
+    like an n-gram row. Returns the module's tensors and the relative error of the table:
+
+        <key>.trellis   (rows, groups * (1 + 16 * K)) int16, the groups' rings back to back
+        <key>.signs     (groups, 256) fp16 sign vectors
+    """
+    assert 1 <= K <= 8
+    rows, dim = weight.shape
+    groups = (dim + GROUP_DIM - 1) // GROUP_DIM
+    gen = torch.Generator().manual_seed(dim)
+    signs = (torch.randint(0, 2, (groups, GROUP_DIM), generator = gen) * 2 - 1).to(torch.float16)
+    signs_d = signs.to(device).float().view(1, -1)
+    trellis = torch.empty((rows, groups * words_per_row(K, GROUP_DIM)), dtype = torch.int16)
+    err_sq = src_sq = 0.0
+    from ..util.progress import ProgressBar
+    with ProgressBar(f" -- Quantizing: {key}" if verbose else None, rows) as pb:
+        for a in range(0, rows, chunk_rows):
+            w = weight[a : a + chunk_rows].to(device).float()
+            padded = torch.nn.functional.pad(w, (0, groups * GROUP_DIM - dim))
+            rotated = hadamard_rotate((padded * signs_d).view(-1, GROUP_DIM))
+            packed, deq = quantize_rows(rotated, None, K)
+            trellis[a : a + chunk_rows] = packed.view(w.shape[0], -1).cpu()
+            deq = (hadamard_rotate(deq).view(w.shape[0], -1) * signs_d)[:, :dim]
+            err_sq += (deq - w).square().sum().double().item()
+            src_sq += w.square().sum().double().item()
+            pb.update(a + w.shape[0])
+    rfn = math.sqrt(err_sq / src_sq) if src_sq > 0 else 0.0
+    return {f"{key}.trellis": trellis, f"{key}.signs": signs}, rfn
 
 
 class StreamingSafetensorsWriter:
