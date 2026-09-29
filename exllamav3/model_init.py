@@ -74,7 +74,7 @@ def add_args(
     parser.add_argument("-tp_moe_ts", "--tp_moe_tensor_split", action = "store_true", help = "(TP) Use tensor split for MoE layers rather than expert parallelism")
 
     parser.add_argument("-swa_full", "--swa_full", action = "store_true", help = f"Use full cache for SWA layers. Default is recurrent mode with snapshots")
-    parser.add_argument("-ambs", "--autosplit_max_batch_size", type = int, help = f"Max batch size to account for when loading in autosplit mode (default: {default_autosplit_max_batch_size})", default = default_autosplit_max_batch_size)
+    parser.add_argument("-ambs", "--autosplit_max_batch_size", type = int, help = f"Max batch size to account for when loading in autosplit mode (default: {default_autosplit_max_batch_size}). With EXL3_DRAFT_RING the Generator also bounds the windowed draft cache ring to this many sequences when max_batch_size is not raised above it", default = default_autosplit_max_batch_size)
     parser.add_argument("-chunk_size", "--chunk_size", type = int, help = f"Max chunk size (default: {default_chunk_size})", default = default_chunk_size)
 
     parser.add_argument("-lv", "--load_verbose", action = "store_true", help = "Verbose output while loading")

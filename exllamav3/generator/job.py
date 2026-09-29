@@ -1048,6 +1048,7 @@ class Job:
             for seq in self.sequences:
                 p_page = seq.kv_position // PAGE_SIZE
                 seq.kv_position -= offset
+                tip = seq.kv_position
                 seq.sequence_ids.truncate(len(seq.sequence_ids) - offset)
                 self.pinned_ids_valid = min(self.pinned_ids_valid, len(seq.sequence_ids))
                 n_page = seq.kv_position // PAGE_SIZE
@@ -1070,6 +1071,11 @@ class Job:
                 if replay_from is not None:
                     seq.kv_position = replay_from
                     seq.prefill_complete = False
+                # A deep rewind leaves the drafter's window holding rows the replay prefill
+                # does not rewrite and the ring's wrap floor clobbered; rebuild it (skipped
+                # for shallow rewinds and when the replay prefill covers the window itself)
+                self.refill_draft_window(seq, tip = tip, replay_from = replay_from,
+                                         rewind_depth = offset)
 
             # An MTP draft carry refers to the pre-rewind context; drop it so drafting pauses until the next
             # target forward (or replay prefill) provides a fresh one. Signal the generator that any in-flight
@@ -1260,12 +1266,16 @@ class Job:
                 y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
                 self.max_rq_tokens = y - x
             # The requeue lands exactly on the aligned boundary, so a recurrent checkpoint stashed there
-            # resumes the next segment with nothing to replay. A speculative window writes K/V past that
-            # point, so drafting jobs reserve the window beyond the budget rather than requeueing early
-            # (early by the window misses the boundary and replays up to a checkpoint interval; early by
-            # a page shortens every segment by a page and requeues up to twice as often)
+            # resumes the next segment with nothing to replay. The verify row is one pending token plus
+            # the drafted window, and it writes K/V past that point, so drafting jobs reserve one plus
+            # the window beyond the budget rather than requeueing early (early by the window misses the
+            # boundary and replays up to a checkpoint interval; early by a page shortens every segment
+            # by a page and requeues up to twice as often). The budget is page-aligned, so for a
+            # window shorter than a page the +1 is free: W and W + 1 headroom tokens occupy the
+            # same extra page. A window that is a whole number of pages is the case the +1 pays
+            # for - it is exactly the page the verify row's last K/V entry lands in
             self.rq_margin = 0
-            self.rq_headroom = self.generator.num_draft_tokens
+            self.rq_headroom = self.generator.num_draft_tokens + 1
         else:
             # Default budget: the whole response plus one speculative window past the limit
             self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.num_draft_tokens
@@ -1342,6 +1352,128 @@ class Job:
         return new_pages
 
 
+    def refill_draft_window(self, seq, tip: int | None = None, replay_from: int | None = None,
+                            rewind_depth: int | None = None):
+        """
+        Rebuild the drafter's window after a prefix resume or a deep rewind, restoring the
+        pre-ring behavior where the drafter's window is prefilled rather than left holding the
+        slot's previous rows.
+
+        Runs the target over the window's tokens (an idempotent rewrite of the main K/V) and
+        projects the exported hidden states into the draft ring. For a recurrent target the
+        forward starts from the latest checkpoint at or below the window start in a throwaway
+        state, so the job's own recurrent state is untouched.
+
+        The rebuild is skipped when the window is provably fine:
+        - shallow rewind (rewind_depth given): as generation advances, the ring loses the row
+          for position p once the tip passes p + span_tokens (+ the spec_rows transient
+          write past the tip), so a rewind that doesn't reach back to that wrap floor leaves
+          every window row holding its own last write, which generation will rewrite anyway;
+        - replay covers the window (replay_from <= window_start): the replay prefill runs
+          from the stash over the whole window and projects it itself;
+        - own forwards cover the window (resume: called with neither rewind_depth nor
+          replay_from): every row at or above seq.draft_foreign_ceiling was projected by
+          this job (the ceiling marks the rows left by a cached resume or partial-page
+          copy, i.e. another sequence's), so when it sits at or below the window start the
+          refill would just re-run the target over rows prefill already projected. A
+          rewind never takes this exit: the ceiling's interval model says nothing about
+          the rows the pre-rewind tip clobbered at the wrap floor.
+        """
+        gen = self.generator
+        ring = seq.draft_ring
+        if not getattr(gen, "dflash_draft", False) or ring is None:
+            return
+        tip = seq.kv_position if tip is None else tip
+        window_start = tip - min(ring.window_tokens, tip)
+        headroom = ring.span_tokens - ring.spec_rows - min(ring.window_tokens, tip)
+        if rewind_depth is not None and rewind_depth <= headroom:
+            return  # shallow: the rewind target (window_start - depth) stays at or above
+                    # the pre-rewind wrap floor (tip + depth + spec_rows - span_tokens),
+                    # so no window row was clobbered
+        if replay_from is not None:
+            if replay_from <= window_start:
+                return  # the replay prefill covers the window and projects it itself
+        elif rewind_depth is None and seq.draft_foreign_ceiling <= window_start:
+            return  # resume only: this job's own forwards already projected the whole window (see docstring)
+
+        run_start = window_start
+        temp_state = None
+        if self.recurrent_state is not None:
+            if not gen.cache.free_list:
+                return  # no spare state slot (a full batch holds every slot): keep the
+                        # window's current rows rather than tripping the pool assertion in
+                        # get_new_state/new_from_stashed; the rows slide out as generation
+                        # advances
+            stashed = self.find_recurrent_stash(window_start)
+            if stashed is not None:
+                run_start = stashed["position"]
+            else:
+                run_start = 0
+            # A stash far below the window costs far more than the window is worth: cap the
+            # re-run (window + span slack covers a normal checkpoint interval below the
+            # window start) and keep the window's current rows beyond it
+            if tip - run_start > ring.window_tokens + ring.span_tokens:
+                return
+            temp_state = (gen.cache.new_from_stashed(stashed, run_start) if stashed is not None
+                          else gen.cache.get_new_state())
+
+        # A re-run that covers an image span would compute the span's K/V causally (the
+        # refill passes no mm_span_prefix), diverging from the original prefill's non-causal
+        # span attention and corrupting the main cache. Skip the rebuild: the window keeps
+        # its current rows, which slide out as generation advances.
+        if self.embeddings and run_start < len(seq.multimodal_mask) \
+                and seq.multimodal_mask[run_start:min(tip, len(seq.multimodal_mask))].any():
+            if temp_state is not None:
+                temp_state.free()
+            return
+
+        # Rewind prefill can exceed the prompt-length table, which the RoPE kernel reads unchecked
+        if self.alt_rope_freqs is not None and tip > self.alt_rope_freqs.shape[-2]:
+            ids = seq.sequence_ids.torch()
+            self.alt_rope_freqs, _ = self.generator.model.g_rope.get_mrope_freqs(
+                ids, self.embeddings, ids.shape[-1]
+            )
+
+        params = {
+            "attn_mode": "flash_attn",
+            "block_table": seq.block_index_tensor,
+            "cache": gen.cache,
+            "cache_seqlens": torch.tensor([run_start], dtype = torch.int32),
+            "recurrent_states": [temp_state] if temp_state is not None else None,
+            "indexed_embeddings": self.embeddings,
+            "inv_freq": self.alt_rope_freqs,
+        }
+        params.update(gen.draft_model.draft_verifier_params)
+        gen.model.prefill(
+            input_ids = seq.sequence_ids.torch_slice(run_start, tip),
+            params = params,
+        )
+        if temp_state is not None:
+            temp_state.free()
+
+        export_states = params.get("export_states")
+        if export_states is not None:
+            # Same span clip as the prefill path: the ring holds only the last span rows
+            clip_start = ring.clip_write(run_start, tip)
+            if clip_start > run_start:
+                export_states = [t[:, clip_start - run_start:] for t in export_states]
+                draft_cache_seqlens = torch.tensor([clip_start], dtype = torch.int32)
+            else:
+                draft_cache_seqlens = torch.tensor([run_start], dtype = torch.int32)
+            gen.draft_model.update_kv_from_target(
+                target_hidden = export_states,
+                cache = gen.draft_cache,
+                params = {
+                    "block_table": seq.draft_block_index_tensor,
+                    "cache_seqlens": draft_cache_seqlens,
+                },
+            )
+            # The window is now this sequence's own projection (rows below it were
+            # already valid - that is what got the rebuild here): lower the ceiling so
+            # a later armed completion refill recognizes the window as covered
+            seq.credit_draft_window(window_start)
+
+
     def prefill(self, results: list):
         """
         Run prompt prefill chunks for already allocated cache pages.
@@ -1384,6 +1516,10 @@ class Job:
                     seq.kv_position = prefill_start
                     self.cached_pages += 1
                     page.can_revert = False
+                    # No refill arming here: a cached resume is armed at allocation
+                    # (Sequence.allocate_pages), and this loop only ever skips the
+                    # self-written frontier page of a multi-chunk prefill - its rows
+                    # are this job's own projection
                 else:
                     break
 
@@ -1397,14 +1533,26 @@ class Job:
                     break
 
             if prefill_end <= prefill_start:
+                # A fully-cached resume never reaches the post-forward refill below, so the
+                # window would keep the slot's previous rows; rebuild it once, now that the
+                # skip has reached the prompt end (this branch re-enters on every later
+                # prefill round, since the sequence never completes without a forward)
+                if seq.draft_refill_pending and seq.kv_position >= len(seq.sequence_ids) - 1:
+                    self.refill_draft_window(seq)
+                    seq.draft_refill_pending = False
                 continue
 
             assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
-            # partially matches, then copy keys/values from there. Skip this step for recurrent models
-            # since the recurrent checkpoint will always be on a page boundary
+            # partially matches, then copy keys/values from there. Skipped for recurrent models
+            # (the recurrent checkpoint is always on a page boundary). For a ring-backed draft cache
+            # only the main cache is copied: the matched page's draft rows live in another sequence's
+            # ring and can't be copied, so the draft cache keeps a hole of up to a page that the
+            # drafter's window can reach; refill_draft_window below rebuilds the window over it.
+            # Reprefilling at most one page of the target model is cheaper than losing the
+            # main-cache copy on every resume that lands on a partial last page.
             p0 = prefill_start // PAGE_SIZE
             p1 = prefill_end // PAGE_SIZE
             if prefill_start == p0 * PAGE_SIZE and self.generator.recurrent_cache is None:
@@ -1426,8 +1574,10 @@ class Job:
 
                 if best_match_page and best_match > 1:
                     page = seq.allocated_pages[p0]
-                    for c in [self.generator.cache] if not self.generator.draft_model else \
-                            [self.generator.cache, self.generator.draft_cache]:
+                    caches = [self.generator.cache]
+                    if self.generator.draft_model is not None and self.generator.draft_ring is None:
+                        caches.append(self.generator.draft_cache)
+                    for c in caches:
                         c.copy_page(
                             c,
                             best_match_page.page_index,
@@ -1442,6 +1592,10 @@ class Job:
                     page.kv_position = best_match
                     page.can_revert = False
                     self.cached_tokens += best_match
+                    seq.draft_refill_pending = True
+                    # The copied rows are the other sequence's draft rows: this job's
+                    # ring coverage starts above the hole
+                    seq.raise_draft_floor(prefill_start)
                     progress += best_match
 
             # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
@@ -1477,6 +1631,8 @@ class Job:
                         recurrent_last_page = False
                         prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
                     break
+
+
 
             # Inference
             if prefill_end > prefill_start:
@@ -1541,12 +1697,27 @@ class Job:
                     self.generator.model.prefill(input_ids = prefill_ids, params = params)
 
                 if self.generator.dflash_draft:
+                    export_states = params.get("export_states")
+                    draft_cache_seqlens = params["cache_seqlens"]
+                    # The ring only ever holds the last span rows: rows below the drafter's
+                    # window are never read, and a chunk longer than the span would map two
+                    # congruent positions onto one physical row inside the same unordered
+                    # kernel launch (the older write could win and corrupt the live window).
+                    # Clipping the write range to the span makes it congruence-free and skips
+                    # the projection of rows nobody reads; cross-chunk aliases stay safe
+                    # because chunks are stream-ordered oldest to newest
+                    if self.generator.draft_ring is not None and export_states is not None:
+                        clip_start = self.generator.draft_ring.clip_write(
+                            prefill_start, prefill_start + export_states[0].shape[1])
+                        if clip_start > prefill_start:
+                            export_states = [t[:, clip_start - prefill_start:] for t in export_states]
+                            draft_cache_seqlens = torch.tensor([clip_start], dtype = torch.int32)
                     self.generator.draft_model.update_kv_from_target(
-                        target_hidden = params.get("export_states"),
+                        target_hidden = export_states,
                         cache = self.generator.draft_cache,
                         params = {
-                            "block_table": seq.block_index_tensor,
-                            "cache_seqlens": params["cache_seqlens"],
+                            "block_table": seq.draft_block_index_tensor,
+                            "cache_seqlens": draft_cache_seqlens,
                         }
                     )
                 elif self.generator.draft_model:
@@ -1560,12 +1731,15 @@ class Job:
                         self.mtp_last_hidden = seq.mtp_carry_hidden
                     else:
                         shifted_hidden = None
+                    # No ring clip here: the ring is DFlash-family-only (draft_cache_ring
+                    # gates on caps dflash_draft), so an AR/MTP drafter always keeps the
+                    # pool-wide draft cache and prefills every chunk in full
                     self.generator.draft_model.prefill(
                         input_ids = prefill_ids,
                         params = {
                             "target_hidden": shifted_hidden,
                             "attn_mode": "flash_attn",
-                            "block_table": seq.block_index_tensor,
+                            "block_table": seq.draft_block_index_tensor,
                             "cache": self.generator.draft_cache,
                             "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
                             "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
@@ -1612,6 +1786,12 @@ class Job:
                 progress += prefill_end - prefill_start
                 if self.sequences[0].kv_position >= len(seq.sequence_ids) - 1:
                     seq.prefill_complete = True
+                    # A resume skips cached pages and a partial-page copy reuses another
+                    # sequence's K/V: neither projected draft rows for those tokens, so the
+                    # window keeps the slot's previous rows until rebuilt at the final tip
+                    if seq.draft_refill_pending:
+                        self.refill_draft_window(seq)
+                        seq.draft_refill_pending = False
 
                 if recurrent_last_page:
                     self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
@@ -1678,6 +1858,7 @@ class Job:
             if seq.allocated_pages is not None:
                 self.pagetable.deallocate_pages(seq.allocated_pages)
                 seq.allocated_pages = []
+            self.pagetable.release_draft_slot(seq)
 
 
     def prepare_sampling_past_ids(self):
