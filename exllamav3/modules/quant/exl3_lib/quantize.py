@@ -1317,6 +1317,39 @@ def out_scales_ratio(out_channel_scales: torch.Tensor, out_sensitivity: torch.Te
 # relative to without
 out_scales_max_ratio = 1.05
 
+# Added to the mean-normalized sensitivity when scales are derived from it, so channels the estimate saw
+# nothing of don't take scales without bound
+out_sensitivity_floor = 0.02
+
+
+def sensitivity_out_scales(out_channel_scales: torch.Tensor, out_sensitivity: torch.Tensor) -> torch.Tensor | None:
+    """
+    Output channel scales that minimize the predicted loss for a per-channel sensitivity.
+
+    With scale t on a channel its error energy is proportional to t^2, and the total error in the rotated domain
+    to sum(sigma^2 / t^2) for channel RMS sigma. For sensitivity s (loss per unit of error energy) the loss
+    (sum s t^2) (sum sigma^2 / t^2) is minimal at t ~ (sigma^2 / s)^(1/4). Plain output scales, t = sigma, are
+    that optimum for s ~ 1 / sigma^2.
+
+    out_channel_scales: the plain scales (channel RMS), (1, n). Returns the scales in the same shape, mean one over
+    the nonzero channels, or None when the sensitivity carries no information (wrong size, non-finite or all zero)
+    """
+    sigma = out_channel_scales.flatten().double()
+    s = out_sensitivity.flatten().to(sigma.device).double()
+    if s.shape[0] > sigma.shape[0] or not torch.isfinite(s).all():
+        return None
+    s = s.clamp(min = 0.0)
+    mean = s.mean().item()
+    if mean <= 0.0:
+        return None
+    # Channels past the sensitivity's length are padding
+    s = F.pad(s / mean, (0, sigma.shape[0] - s.shape[0]), value = 1.0) + out_sensitivity_floor
+    t = (sigma.square() / s).pow(0.25)
+    live = t > 0
+    if not live.any():
+        return None
+    return (t / t[live].mean()).to(out_channel_scales.dtype).view_as(out_channel_scales)
+
 
 def regularize(
     weight: torch.Tensor,
@@ -1340,9 +1373,13 @@ def regularize(
     Output-channel scaling is forced on or off by quant_args["apply_out_scales"] (True/False). With None (auto)
     it is on, except for tensors that come with a per-channel output sensitivity in quant_args["out_sensitivity"]
     (gate and up projections of gated MLPs, see modules/mlp.py) and whose sensitive channels are the high-energy
-    ones (see out_scales_ratio)
+    ones (see out_scales_ratio).
+
+    A tensor that comes with the diagonal of its output-side Hessian in quant_args["out_hessian_diag"] takes its
+    scales from that instead (see sensitivity_out_scales), and quant_args["out_scales_hessian"] reports it
     """
     force_out_scales = quant_args["apply_out_scales"]
+    quant_args["out_scales_hessian"] = False
 
     # dist_ref = torch.empty((512,), dtype = torch.float, device = weight.device)
     # dist_r = torch.empty_like(dist_ref)
@@ -1362,8 +1399,18 @@ def regularize(
         out_channel_scales /= mean
         quant_args["zeros"] = False
 
+        out_hessian_diag = quant_args.get("out_hessian_diag")
         out_sensitivity = quant_args.get("out_sensitivity")
-        if out_sensitivity is not None and not q_fallback:
+        hessian_scales = None
+        if out_hessian_diag is not None and force_out_scales is None and not q_fallback:
+            hessian_scales = sensitivity_out_scales(out_channel_scales, out_hessian_diag)
+        if hessian_scales is not None:
+            ratio = out_scales_ratio(out_channel_scales, out_hessian_diag)
+            if verbose and ratio is not None:
+                print(f"     - out scales loss ratio: {ratio:.6f} (output Hessian)")
+            out_channel_scales = hessian_scales
+            quant_args["out_scales_hessian"] = True
+        elif out_sensitivity is not None and not q_fallback:
             ratio = out_scales_ratio(out_channel_scales, out_sensitivity)
             if verbose and ratio is not None:
                 print(f"     - out scales loss ratio: {ratio:.6f}")

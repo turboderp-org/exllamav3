@@ -1,12 +1,10 @@
 from __future__ import annotations
 from typing_extensions import override
-import os
-from concurrent.futures import ThreadPoolExecutor
 import torch
 from ..model.config import Config
-from ..loader.safetensors import DiskTensorHandle
 from ..ext import exllamav3_ext as ext
 from . import Module
+from .row_table import RowTable, PREFETCH_MIN_TOKENS
 from .quant.exl3_lib.ngram_codec import ROW_DIM, mul1_codebook, dequant_rows, words_per_row
 
 """
@@ -14,8 +12,8 @@ Hashed n-gram embedding table (Qwen3.8-Flash-Next ple_embedding and kin): maps e
 to (ngram_size - 1) * heads_per_ngram hash-table rows and concatenates them into one feature vector.
 
 The table is enormous (tens of billions of parameters), so streaming is a first-class mode: by
-default the table's tensors are never loaded — the module keeps DiskTensorHandles from the loader
-and gathers only the rows a forward pass actually touches. The module is quantization-agnostic:
+default the table's tensors are never loaded, and the module gathers only the rows a forward
+pass actually touches (see RowTable). The module is quantization-agnostic:
 
     <key>.trellis                  -> exl3_ngram_trellis format (util/convert_ngram.py)
     <key>.weight / .shard_N.weight -> unquantized source table
@@ -39,33 +37,6 @@ def _find_nth_prime_after(start: int, count: int) -> int:
         while not is_prime(p):
             p += 1
     return p
-
-
-PREFETCH_ENABLED = os.environ.get("EXL3_NGRAM_PREFETCH", "1") != "0"   # debug/A-B switch
-PREFETCH_MIN_TOKENS = 256   # positions (bsz * seq) below which prefetch() declines (decode-sized)
-MAX_PIN_SETS = 2            # staging sets: one with the last forward's uploads in flight, one being staged
-
-
-class _PinSet:
-    """Pinned staging buffers for one hash + gather: unique row ids, the inverse map, the per-row
-    head index and the packed rows. `held` while a queued prefetch or a running forward owns it;
-    `event` marks the last forward's uploads from it."""
-
-    def __init__(self):
-        self.uids = None
-        self.inverse = None
-        self.heads = None
-        self.packed = None
-        self.event = None
-        self.held = False
-
-    def grow(self, n: int, row_words: int, row_dtype: torch.dtype):
-        if self.uids is None or self.uids.numel() < n or self.packed.shape[1] != row_words \
-                or self.packed.dtype != row_dtype:
-            self.uids = torch.empty(n, dtype = torch.int64, pin_memory = True)
-            self.inverse = torch.empty(n, dtype = torch.int64, pin_memory = True)
-            self.heads = torch.empty(n, dtype = torch.int32, pin_memory = True)
-            self.packed = torch.empty((n, row_words), dtype = row_dtype, pin_memory = True)
 
 
 class NGramEmbedding(Module):
@@ -98,29 +69,27 @@ class NGramEmbedding(Module):
         self.stream_from_disk = stream_from_disk
         self.out_dtype = out_dtype
 
-        self.mode = None            # "trellis_disk" | "trellis_ram" | "fp16_disk" | "fp16_ram"
-        self.K = None
-        # The table is always kept as its individual shard tensors: RAM modes hold a list of CPU
-        # tensors ((rows, 160) bf16/fp16 or (rows, words) int16), disk modes a list of
-        # DiskTensorHandle. Never concatenated (a cat would transiently double the tens-of-GB
-        # footprint); lookups route rows to shards instead. All shards but the last hold
-        # rows_per_shard rows
-        self.tables = None
-        self.handles = None
-        self.rows_per_shard = None
+        self.table = None
+        self.K = None               # None for an unquantized table
         self.num_rows = 0
         self.head_bias = None
         self.head_offsets = None
         self.head_vocab_sizes = None
         self.layer_multipliers = None
         self.codebook = None
-        self._pins = []             # pinned staging sets for the fast path (see _PinSet)
-        self._pending = []          # queued prefetches, oldest first: {"history", "pin", "future"}
-        self._executor = None
-        self.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
-        self._row_dtype = None      # stored row dtype of the unquantized table
 
         self.caps.update({"prefer_cpu": True})
+
+    @property
+    def mode(self):
+        """"trellis_disk" | "trellis_ram" | "fp16_disk" | "fp16_ram", None when not loaded"""
+        if self.table is None:
+            return None
+        return ("trellis" if self.K else "fp16") + ("_disk" if self.table.on_disk else "_ram")
+
+    @property
+    def prefetch_stats(self):
+        return self.table.prefetch_stats
 
     @override
     def optimizer_targets(self):
@@ -155,34 +124,9 @@ class NGramEmbedding(Module):
         stc = self.config.stc
         parent = self.key.rsplit(".", 1)[0]
 
-        def enumerate_shards(suffix):
-            keys = []
-            while stc.has_tensor(f"{self.key}.shard_{len(keys)}.{suffix}"):
-                keys.append(f"{self.key}.shard_{len(keys)}.{suffix}")
-            return keys
-
-        def shard_shapes(keys):
-            # all shards but the last must hold the same row count (row -> shard routing is a
-            # plain division); the last may be short
-            shapes = [stc.get_tensor_meta(k)[k]["shape"] for k in keys]
-            assert all(s[0] == shapes[0][0] for s in shapes[:-1]), \
-                "n-gram table shards must have equal row counts (last may be short)"
-            assert shapes[-1][0] <= shapes[0][0]
-            self.rows_per_shard = shapes[0][0]
-            self.num_rows = sum(s[0] for s in shapes)
-            return shapes
-
-        trellis_keys = enumerate_shards("trellis")
-        if not trellis_keys and stc.has_tensor(f"{self.key}.trellis"):
-            trellis_keys = [f"{self.key}.trellis"]    # single-tensor layout of older files
-
-        if trellis_keys:
-            # quantized table
-            shapes = shard_shapes(trellis_keys)
-            words = shapes[0][1]
-            self.K = (words - 1) * 16 // ROW_DIM
-            assert words == words_per_row(self.K)
-            assert all(s[1] == words for s in shapes)
+        table = RowTable.find(stc, self.key, "trellis")
+        quantized = table is not None
+        if quantized:
             self._load_aux({
                 "offsets": f"{self.key}.head_offsets",
                 "sizes": f"{self.key}.head_vocab_sizes",
@@ -190,85 +134,38 @@ class NGramEmbedding(Module):
                 "bias": f"{self.key}.head_bias",
             })
             self.codebook = mul1_codebook(device)
-            keys = trellis_keys
-
         else:
-            # unquantized source table: single tensor or shard_N split
-            if stc.has_tensor(f"{self.key}.weight"):
-                keys = [f"{self.key}.weight"]
-            else:
-                keys = enumerate_shards("weight")
-                if not keys:
-                    raise ValueError(f"No .trellis, .weight or .shard_N.weight tensors found for {self.key}")
+            # unquantized source table
+            table = RowTable.find(stc, self.key, "weight")
+            if table is None:
+                raise ValueError(f"No .trellis, .weight or .shard_N.weight tensors found for {self.key}")
             self._load_aux({
                 "offsets": f"{parent}.ngram_heads_offsets",
                 "sizes": f"{parent}.ngram_heads_vocab_sizes",
                 "multipliers": f"{parent}.layer_multipliers",
             })
-            shapes = shard_shapes(keys)
-            assert all(s[1] == ROW_DIM for s in shapes)
 
-        quantized = trellis_keys != []
-        self._table_keys = keys      # for tp_export: workers stream the table by their own handles
         stream_from_disk = self.stream_from_disk
         if stream_from_disk is None:
             infer_params = getattr(self.config, "infer_params", None)
             stream_from_disk = infer_params.ngram_stream_from_disk if infer_params is not None else True
-        if stream_from_disk:
-            self.mode = "trellis_disk" if quantized else "fp16_disk"
-            self.handles = [stc.get_tensor_handle(k) for k in keys]
-            if not quantized:
-                self._row_dtype = self.handles[0].dtype
-            # Shards that sit back-to-back in one file (the layout convert_ngram.py writes)
-            # collapse into a single handle spanning the whole table: _gather_rows issues one
-            # synchronous gather call per handle segment
-            h0 = self.handles[0]
-            if len(self.handles) > 1 and all(
-                h.filename == h0.filename and h.row_bytes == h0.row_bytes and
-                h.abs_offset == h0.abs_offset + s * self.rows_per_shard * h0.row_bytes
-                for s, h in enumerate(self.handles)
-            ):
-                merged = DiskTensorHandle(
-                    key = self.key, filename = h0.filename, abs_offset = h0.abs_offset,
-                    shape = [self.num_rows, *h0.row_shape], dtype = h0.dtype)
-                stc.find_stc(keys[0]).disk_handles.append(merged)   # closed with the collection
-                self.handles = [merged]
-                self.rows_per_shard = self.num_rows
-            if os.name == "nt":
-                # Release the loader's handles to the table files now
-                for h in set(h.filename for h in self.handles):
-                    stc.release_file(h)
-        else:
-            self.mode = "trellis_ram" if quantized else "fp16_ram"
-            if len(keys) == 1:
-                self.tables = [stc.get_tensor(keys[0], "cpu", allow_bf16 = not quantized, no_defer = True)]
-            else:
-                # Sharded table: one contiguous slab, each shard copied into its slice as it loads
-                slab = None
-                for s_i, k in enumerate(keys):
-                    t = stc.get_tensor(k, "cpu", allow_bf16 = not quantized, no_defer = True)
-                    if slab is None:
-                        from ..util.memory import check_host_memory
-                        check_host_memory(self.num_rows * t[0].numel() * t.element_size(),
-                                          f"n-gram table {self.key} held in RAM (--ngram_ram)")
-                        slab = torch.empty((self.num_rows, *t.shape[1:]), dtype = t.dtype)
-                    r0 = s_i * self.rows_per_shard
-                    slab[r0 : r0 + t.shape[0]].copy_(t)
-                    del t
-                self.tables = [slab]
-                self.rows_per_shard = self.num_rows
-            if not quantized:
-                self._row_dtype = self.tables[0].dtype
+        table.open(stc, stream_from_disk, allow_bf16 = not quantized,
+                   what = f"n-gram table {self.key} held in RAM (--ngram_ram)")
+        self._set_table(table, quantized)
+
+    def _set_table(self, table: RowTable, quantized: bool):
+        self.table = table
+        self.num_rows = table.num_rows
+        self.K = (table.row_words - 1) * 16 // ROW_DIM if quantized else None
+        assert table.row_words == (words_per_row(self.K) if quantized else ROW_DIM)
 
     @override
     def unload(self):
-        self._drain_prefetch()      # queued workers still read the table; first
+        if self.table is not None:
+            self.table.close()
+        self.table = None
         self.device = None
-        self.mode = None
-        self.tables = None
-        self.handles = None
-        self._pins = []
-        self._row_dtype = None
+        self.K = None
         self.head_bias = None
         self.head_offsets = None
         self.head_vocab_sizes = None
@@ -287,15 +184,12 @@ class NGramEmbedding(Module):
 
     def tp_export(self, plan, producer):
         """
-        Tensor-parallel: the table itself never travels. Every rank streams rows from disk through
-        its own handles (a per-rank RAM copy of a table this size is not an option, and the gather
-        is a few hundred rows per forward), so the export carries the shard locations plus the
-        small hashing/dequant parameters. A table held in RAM here (--ngram_ram) is still streamed
-        from disk by the workers.
+        Tensor-parallel: every rank streams rows from disk through its own handles (a per-rank
+        RAM copy of a table this size is not an option, and the gather is a few hundred rows per
+        forward), so the export carries the table's location plus the small hashing/dequant
+        parameters.
         """
-        assert self.mode is not None, "Cannot export module for TP before loading."
-        stc = self.config.stc
-        handles = [stc.get_tensor_handle(k) for k in self._table_keys]
+        assert self.table is not None, "Cannot export module for TP before loading."
         return {
             "cls": NGramEmbedding,
             "kwargs": {
@@ -306,12 +200,8 @@ class NGramEmbedding(Module):
                 "eos_token_id": self.eos_token_id,
                 "out_dtype": self.out_dtype,
             },
-            "mode": "trellis_disk" if self.mode.startswith("trellis") else "fp16_disk",
-            "K": self.K,
-            "num_rows": self.num_rows,
-            "rows_per_shard": handles[0].shape[0],
-            "handles": [(h.key, h.filename, h.abs_offset, list(h.shape), str(h.dtype)) for h in handles],
-            "row_dtype": str(self._row_dtype) if self._row_dtype is not None else None,
+            "table": self.table.export(self.config.stc),
+            "quantized": self.K is not None,
             "head_offsets": producer.send(self.head_offsets),
             "head_vocab_sizes": producer.send(self.head_vocab_sizes),
             "layer_multipliers": producer.send(self.layer_multipliers),
@@ -323,55 +213,22 @@ class NGramEmbedding(Module):
     def tp_import(local_context, exported, plan):
         consumer = local_context["consumer"]
         device = local_context["device"]
-        def dt(s):
-            return getattr(torch, s.split(".")[1]) if s is not None else None
         module = NGramEmbedding(config = None, **exported["kwargs"], stream_from_disk = True)
         module.device = device
-        module.mode = exported["mode"]
-        module.K = exported["K"]
-        module.num_rows = exported["num_rows"]
-        module.rows_per_shard = exported["rows_per_shard"]
-        module.handles = [
-            DiskTensorHandle(key = k, filename = fn, abs_offset = off, shape = shape, dtype = dt(d))
-            for k, fn, off, shape, d in exported["handles"]
-        ]
-        module._row_dtype = dt(exported["row_dtype"])
+        module._set_table(RowTable.from_export(exported["table"]), exported["quantized"])
         module.head_offsets = consumer.recv(exported["head_offsets"], cuda = False).long().contiguous()
         module.head_vocab_sizes = consumer.recv(exported["head_vocab_sizes"], cuda = False).long().contiguous()
         module.layer_multipliers = consumer.recv(exported["layer_multipliers"], cuda = False).long().contiguous()
         module.head_bias = consumer.recv(exported["head_bias"], cuda = True) if exported.get("head_bias") is not None else None
-        if module.mode.startswith("trellis"):
+        if module.K:
             module.codebook = mul1_codebook(device)
         return module
-
-    def _fetch_packed(self, uids_cpu: torch.Tensor) -> torch.Tensor:
-        """Gather rows of the backing store (packed int16 or raw fp16/bf16) to CPU, routing
-        global row indices to the individual shard tensors/handles."""
-        ram = self.tables is not None
-        store = self.tables if ram else self.handles
-
-        def gather(s, local):
-            return store[s].index_select(0, local) if ram else store[s].read_rows(local)
-
-        if len(store) == 1:
-            return gather(0, uids_cpu)
-        shard = uids_cpu // self.rows_per_shard
-        local = uids_cpu - shard * self.rows_per_shard
-        out = None
-        for s in shard.unique().tolist():
-            m = shard == s
-            rows = gather(s, local[m])
-            if out is None:
-                out = torch.empty((uids_cpu.numel(), *rows.shape[1:]), dtype = rows.dtype)
-            out[m] = rows
-        return out
 
     def fetch_rows(self, uids: torch.Tensor, out_dtype: torch.dtype = torch.half) -> torch.Tensor:
         """Unique row indices (any device) -> decoded (N, 160) rows on the module's device.
         Reference form of the row pipeline (torch codec); forward() runs the fast path."""
-        uids_cpu = uids.to("cpu", torch.int64)
-        raw = self._fetch_packed(uids_cpu).to(self.device)
-        if self.mode.startswith("trellis"):
+        raw = self.table.fetch(uids.to("cpu", torch.int64)).to(self.device)
+        if self.K:
             heads = (torch.searchsorted(self.head_offsets.to(self.device),
                                         uids.to(self.device, torch.int64),
                                         right = True) - 1).clamp(0, self.num_heads - 1)
@@ -437,135 +294,38 @@ class NGramEmbedding(Module):
 
     # ---- fast path -----------------------------------------------------------------------------
     #
-    # Hashing, eos segmentation and dedup run in one C++ call on the CPU, where the token ids
-    # already live (pinned in the generator, so nothing round-trips through the device); the
-    # unique rows are gathered with threaded preads (disk modes) or index_select (RAM modes)
-    # into a pinned staging set; one non-blocking H2D then feeds the GPU trellis dequant kernel
-    # (or a plain upcast for unquantized tables) and the inverse gather.
-    #
-    # The staging step depends only on the token ids, so it can run ahead of the forward on a
-    # worker thread (prefetch()): the model stages the chunk before its first layers are issued,
-    # and the cold gather (~90 ms per 4096-token chunk, vs ~5 ms page-cache-warm) overlaps block
-    # 0 instead of stalling at this layer. Each queued prefetch owns one staging set; forward()
-    # takes the set whose staged history equals the one it was given and stages inline
-    # otherwise, so a prefetch for the wrong ids can only cost time. A set's CUDA event marks
-    # the last forward's uploads from it; the next writer waits on it before reusing the buffers.
-    # Decode-sized inputs stay inline: their 16-row gathers are already parallel preads, and the
-    # thread hop per token measured as a net loss.
+    # Hashing, eos segmentation and dedup run in one C++ call on the CPU; the table stages the
+    # unique rows and the GPU trellis dequant kernel (or a plain upcast for unquantized tables)
+    # decodes them. The model stages each chunk before its first layers are issued (prefetch()),
+    # so a cold gather overlaps block 0 instead of stalling at this layer. Decode-sized inputs
+    # stay inline: their 16-row gathers are already parallel preads.
 
-    def _drain_prefetch(self):
-        for e in list(self._pending):
-            self._retire(e)
-        if self._executor is not None:
-            self._executor.shutdown(wait = True)
-            self._executor = None
-
-    def _forget(self, entry: dict):
-        # by identity: list.remove would compare the entries' history tensors
-        self._pending = [e for e in self._pending if e is not entry]
-
-    def _retire(self, entry: dict):
-        # Drop a queued prefetch that no forward will take. Its worker may still be writing the
-        # staging set, so wait it out (a cold gather, at most) unless it hasn't started
-        self._forget(entry)
-        self.prefetch_stats["retired"] += 1
-        f = entry["future"]
-        if not f.cancel():
-            f.result()
-        entry["pin"].held = False
-
-    def _acquire_pin(self, n: int, row_words: int, row_dtype: torch.dtype) -> _PinSet:
-        """A staging set not held by a queued prefetch, grown to n ids."""
-        free = [p for p in self._pins if not p.held]
-        if not free and len(self._pins) < MAX_PIN_SETS:
-            free = [_PinSet()]
-            self._pins += free
-        if not free:
-            # every set is held by a queued prefetch: retire one, preferably one whose staging
-            # already finished (a stale guess), else the oldest
-            done = [e for e in self._pending if e["future"].done()]
-            self._retire(done[0] if done else self._pending[0])
-            free = [p for p in self._pins if not p.held]
-        pin = free[0]
-        pin.grow(n, row_words, row_dtype)
-        pin.held = True
-        return pin
-
-    @torch.inference_mode()
-    def _stage(self, history: torch.Tensor, pin: _PinSet) -> int:
-        """Hash + gather for a (bsz, context + seq) id history into pin; returns the unique row
-        count. Runs on the prefetch worker or inline (inference mode is thread-local, and the
-        staging buffers are inference tensors)."""
-        out_len = history.shape[1] - self.context_len
-        if pin.event is not None:
-            # the previous forward's non_blocking uploads read this set; the generator issues
-            # chunk forwards back to back with no host sync, so wait before rewriting it
-            pin.event.synchronize()
+    def _resolve(self, history: torch.Tensor, pin) -> tuple:
         U = ext.ngram_hash_cpu(
-            history, out_len, self.layer_multipliers, self.head_offsets, self.head_vocab_sizes,
+            history, history.shape[1] - self.context_len,
+            self.layer_multipliers, self.head_offsets, self.head_vocab_sizes,
             self.heads_per_ngram, self.eos_token_id,
             pin.uids, pin.inverse, pin.heads)
-        self._gather_rows(pin.uids[:U], pin.packed[:U])
-        return U
+        return pin.uids[:U], False
 
-    def _match(self, history: torch.Tensor) -> dict | None:
-        for e in self._pending:
-            if e["history"].shape == history.shape and torch.equal(e["history"], history):
-                return e
-        return None
-
-    def _gather_rows(self, uids: torch.Tensor, out: torch.Tensor):
-        """Gather the (sorted) unique rows into the pinned staging buffer, routing shard
-        segments (contiguous in the sorted list) to their tensor/handle."""
-        stores = self.tables if self.tables is not None else self.handles
-        if len(stores) > 1:
-            # One searchsorted for every shard boundary (a per-shard call costs ~2.5 us each)
-            bounds = torch.arange(1, len(stores), dtype = torch.int64) * self.rows_per_shard
-            cuts = torch.searchsorted(uids, bounds).tolist() + [uids.numel()]
-        else:
-            cuts = [uids.numel()]
-        i0 = 0
-        for s, store in enumerate(stores):
-            i1 = cuts[s]
-            if i1 > i0:
-                seg = uids[i0 : i1]
-                base = s * self.rows_per_shard
-                if self.tables is not None:
-                    torch.index_select(store, 0, seg - base if base else seg,
-                                       out = out[i0 : i1])
-                else:
-                    ext.ngram_gather_cpu(store._ensure_open(), store.abs_offset,
-                                         store.row_bytes, seg.contiguous(), base, out[i0 : i1])
-            i0 = i1
+    def _decode(self, packed: torch.Tensor, pin, U: int) -> torch.Tensor:
+        if not self.K:
+            return packed.float()
+        heads = pin.heads[:U].to(packed.device, non_blocking = True)
+        rows = torch.empty((U, ROW_DIM), dtype = torch.half, device = packed.device)
+        ext.ngram_dequant(packed, self.K, heads, self.head_bias, rows, False)
+        return rows
 
     def prefetch(self, history: torch.Tensor):
         """
         Stage the rows for a coming forward over `history`, the exact (bsz, context + seq) id
-        history that forward() will receive, on a worker thread. Decode-sized inputs stage inline
-        faster than the thread hop, so those are ignored; a history already queued is ignored too.
+        history that forward() will receive, on a worker thread. Decode-sized inputs are ignored.
         """
-        if not PREFETCH_ENABLED or self.mode is None or history.dim() != 2:
+        if self.table is None or history.dim() != 2:
             return
-        bsz, out_len = history.shape[0], history.shape[1] - self.context_len
-        if out_len <= 0 or bsz * out_len < PREFETCH_MIN_TOKENS:
-            return
-        history = history.to("cpu", torch.int64).contiguous().clone()
-        if self._match(history) is not None:
-            return
-        trellis = self.mode.startswith("trellis")
-        pin = self._acquire_pin(
-            bsz * out_len * self.num_heads,
-            words_per_row(self.K) if trellis else ROW_DIM,
-            torch.int16 if trellis else self._row_dtype)
-        for h in self.handles or []:
-            h._ensure_open()        # lazy open isn't thread-safe; do it here, not on the worker
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "ngram_prefetch")
-        self._pending.append({
-            "history": history,
-            "pin": pin,
-            "future": self._executor.submit(self._stage, history, pin),
-        })
+        n = history.shape[0] * (history.shape[1] - self.context_len)
+        if n >= PREFETCH_MIN_TOKENS:
+            self.table.prefetch(history, n * self.num_heads, self._resolve)
 
     @override
     def forward(
@@ -582,35 +342,5 @@ class NGramEmbedding(Module):
         ids = x.to("cpu", torch.int64).contiguous()
         bsz = ids.shape[0]
         H = self.num_heads
-        n = bsz * out_len * H
-        dev = self.device
-        trellis = self.mode.startswith("trellis")
-        row_words = words_per_row(self.K) if trellis else ROW_DIM
-        row_dtype = torch.int16 if trellis else self._row_dtype
-
-        entry = self._match(ids)
-        if entry is not None:
-            self._forget(entry)
-            self.prefetch_stats["hit"] += 1
-            pin = entry["pin"]
-            U = entry["future"].result()
-        else:
-            self.prefetch_stats["miss"] += 1
-            pin = self._acquire_pin(n, row_words, row_dtype)
-            U = self._stage(ids, pin)
-
-        packed_d = pin.packed[:U].to(dev, non_blocking = True)
-        inv_d = pin.inverse[:n].to(dev, non_blocking = True)
-        if trellis:
-            heads_d = pin.heads[:U].to(dev, non_blocking = True)
-            rows = torch.empty((U, ROW_DIM), dtype = torch.half, device = dev)
-            ext.ngram_dequant(packed_d, self.K, heads_d, self.head_bias, rows)
-        else:
-            rows = packed_d.float()
-        if rows.is_cuda:
-            pin.event = torch.cuda.Event()
-            pin.event.record(torch.cuda.current_stream(rows.device))
-        pin.held = False
-        out = rows.index_select(0, inv_d).view(bsz, out_len, H * ROW_DIM)
-        dt = out_dtype or self.out_dtype or torch.half
-        return out.to(dt)
+        out = self.table.lookup(ids, bsz * out_len * H, self._resolve, self._decode, self.device)
+        return out.view(bsz, out_len, H * ROW_DIM).to(out_dtype or self.out_dtype or torch.half)

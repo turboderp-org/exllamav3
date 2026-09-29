@@ -28,11 +28,16 @@ pass; Hout is a noisy estimate (see below) and an extra sample costs about a thi
 
 Output is one safetensors file per tensor, named by its key in the model checkpoint:
 
-    {out_dir}/{key}.safetensors:  "hin": in x in,  "hout": out x out,  fp32
+    {out_dir}/{key}.safetensors:  "hin": in x in,  "hout": out x out,  "hout_diag": out,  fp32
 
-Both are symmetric and stored as the packed upper triangle, row-major: a 1-D tensor of n (n + 1) / 2 values (convert.py
-also accepts full square matrices). The output head gets hin only, in "both" mode, since its hout would be vocab x
-vocab. Only nn.Linear modules are covered; fused expert tensors (MoE) are not.
+Both matrices are symmetric and stored as the packed upper triangle, row-major: a 1-D tensor of n (n + 1) / 2 values
+(convert.py also accepts full square matrices). The output head gets hin only, in "both" mode, since its hout would be
+vocab x vocab. Only nn.Linear modules are covered; fused expert tensors (MoE) are not.
+
+hout_diag is the diagonal of Hout, the sum of squared output gradients per channel, which is all that
+convert.py --out_scales yaqa reads. With --diag nothing else of Hout is collected: one value per output channel in
+place of a matrix, in memory and on disk, so a model that needs layer ranges for the full factors fits in one run.
+Such files can't drive two-sided LDLQ.
 
 Memory: the factors are accumulated on the GPU, in_features^2 + out_features^2 fp32 values per tensor (half that
 on disk). For large models that is far more than fits alongside the weights, so collect a range of layers at a time
@@ -228,7 +233,7 @@ class Collector:
     its own weighted "in" update, which gets its own storage. Hin is allocated when first needed for that reason.
     """
 
-    def __init__(self, name, key, module, device, want_in, want_out):
+    def __init__(self, name, key, module, device, want_in, want_out, diag = False):
         self.name = name
         self.key = key
         self.device = device or module.weight.device
@@ -236,7 +241,9 @@ class Collector:
         self.hin = None
         self.hin_shared = False
         self.leader = None
-        self.hout = torch.zeros(module.out_features, module.out_features, device = self.device) if want_out else None
+        # With diag, Hout is its diagonal only
+        shape = (module.out_features,) if diag else (module.out_features, module.out_features)
+        self.hout = torch.zeros(shape, device = self.device) if want_out else None
         self.weigh_by = None
         self.weigh_scale = 1.0
         self.count = 0
@@ -306,11 +313,14 @@ class Collector:
         d = d.detach().reshape(-1, d.shape[-1]).to(self.device, non_blocking = True).float()
         x = self.x.float() if self.x is not None else None
         if kind == "out":
+            dw = d
             if self.weigh_by is not None:
                 w = ((x @ self.weigh_by) * x).sum(-1, keepdim = True) * self.weigh_scale  # x_t^T Hin x_t / |Hin|^2
-                self.hout.addmm_(d.T, d * w.to(self.device, non_blocking = True))
+                dw = d * w.to(self.device, non_blocking = True)
+            if self.hout.dim() == 1:
+                self.hout.add_((d * dw).sum(0))
             else:
-                self.hout.addmm_(d.T, d)
+                self.hout.addmm_(d.T, dw)
         else:
             w = ((d @ self.weigh_by) * d).sum(-1, keepdim = True) * self.weigh_scale  # d_t^T Hout d_t / |Hout|^2
             self.hin.addmm_(x.T, x * w)
@@ -320,8 +330,11 @@ class Collector:
         tensors = {}
         if self.hin is not None and (sides == "both"):
             tensors["hin"] = pack_sym(self.hin).cpu()
-        if self.hout is not None:
+        if self.hout is not None and self.hout.dim() == 1:
+            tensors["hout_diag"] = self.hout.cpu()
+        elif self.hout is not None:
             tensors["hout"] = pack_sym(self.hout).cpu()
+            tensors["hout_diag"] = self.hout.diagonal().contiguous().cpu()
         save_file(tensors, os.path.join(out_dir, self.key + ".safetensors"))
 
 
@@ -331,6 +344,8 @@ def main(args):
     torch.backends.cuda.matmul.allow_tf32 = args.tf32
 
     # Pass schedule
+    assert not (args.diag and args.sides == "both"), "--diag only applies to --sides out"
+    assert not args.diag or args.unweighted or (args.passes or 2) == 2, "--diag can't weight a later Hin pass"
     if args.sides == "both":
         assert not args.unweighted, "--unweighted only applies to --sides out"
         num_passes = args.passes or 6
@@ -361,10 +376,10 @@ def main(args):
     load = {d: 0 for d in hess_devices or []}
     for name, (key, mod) in sorted(targets.items(), key = lambda t: -(t[1][1].in_features ** 2 + t[1][1].out_features ** 2)):
         dev = min(load, key = load.get) if load else None
-        c = Collector(name, key, mod, dev, want_in, key != "lm_head")
+        c = Collector(name, key, mod, dev, want_in, key != "lm_head", args.diag)
         collectors[name] = c
         if load:
-            load[dev] += mod.in_features ** 2 * want_in + mod.out_features ** 2
+            load[dev] += mod.in_features ** 2 * want_in + mod.out_features ** (1 if args.diag else 2)
     print(f" -- Passes: {', '.join(schedule)}" + (f", {args.samples} targets per row" if args.samples > 1 else ""))
 
     # Hooks: inputs on the way forward, output gradients on the way back (a tensor hook on the output, which is
@@ -491,6 +506,7 @@ if __name__ == "__main__":
     parser.add_argument("-s", "--sides", choices = ["out", "both"], default = "out", help = "Factors to collect: out (Hout only, conversion keeps its own calibrated Hin) or both, default: out")
     parser.add_argument("-p", "--passes", type = int, default = None, help = "Passes over the data, the first forward-only, then alternating Hout/Hin updates, default: 2 for out, 6 for both")
     parser.add_argument("--unweighted", action = "store_true", help = "With --sides out: plain sum of gradient outer products, a single backward pass and no Hin")
+    parser.add_argument("--diag", action = "store_true", help = "With --sides out: collect the diagonal of Hout only (hout_diag), enough for convert.py --out_scales yaqa")
     parser.add_argument("-n", "--samples", type = int, default = 1, help = "Sampled targets (backward passes) per row, default: 1")
     parser.add_argument("-t", "--temperature", type = float, default = 1.0, help = "Temperature of the output distribution the Fisher is taken at. Above 1 gives weight to tokens the model is confident about, default: 1")
     parser.add_argument("--seed", type = int, default = 0, help = "Base RNG seed for target sampling")

@@ -667,6 +667,15 @@ only when the table lives on high-latency storage (e.g. HDD, where per-row seeks
 unusable). Also settable per load via `config.infer_params.ngram_stream_from_disk` or
 `--ngram_ram` in `model_init`-based scripts.
 
+### `EXL3_EMBED_STREAM` (default: `0`)
+
+Default for `Config.infer_params.embed_stream_from_disk`: stream the token embedding table from
+disk, gathering only the rows each forward pass touches, instead of holding the table in system
+RAM. Applies to quantized and unquantized tables alike. The generator announces each sampled
+token as soon as it is known, so the row is read while the host finishes the step (Linux; on
+Windows the row is read when the next forward pass asks for it). Also settable per load via
+`config.infer_params.embed_stream_from_disk` or `--embed_disk` in `model_init`-based scripts.
+
 ### `EXL3_AUTOSPLIT_WORSTCASE` (default: `1`)
 
 The layer-split autosplit loader measures each module's transient VRAM with one forward of a
