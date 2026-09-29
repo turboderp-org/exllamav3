@@ -33,7 +33,13 @@ does.
 
 #### Advanced (generally disregard these options)
 
-- **--out_scales *str***: Output channel scales. Options are "auto" (default), "always" and "never". In auto mode every tensor gets output scales, except gate and up projections of gated MLPs (including MoE experts) where calibration statistics show that the channels the MLP's output is most sensitive to are also the ones with the largest weights. Scaling would concentrate the quantization error in exactly those channels. 
+- **--out_scales *str***: Output channel scales. Options are "auto" (default), "always", "never" and "yaqa". In auto mode every tensor gets output scales, except gate and up projections of gated MLPs (including MoE experts) where calibration statistics show that the channels the MLP's output is most sensitive to are also the ones with the largest weights. Scaling would concentrate the quantization error in exactly those channels. In yaqa mode the scales of each tensor follow how much the model's output depends on each of its output channels, taken from the diagonal of the tensor's output-side Hessian in `--hessians`, so the quantization error lands in the channels where it costs the least. Tensors without a Hessian file are treated as in auto mode. See `science/yaqa.md`.
+
+- **-hess / --hessians *directory***: Precomputed per-tensor Hessians from `util/yaqa_hessians.py`, one file per tensor. Files with an output-side factor (`hout`) switch the rounding of that tensor to two-sided LDLQ, files with an input-side factor (`hin`) replace the calibration passes, and `hout` or its diagonal (`hout_diag`) feeds `--out_scales yaqa`. An export made with `--diag` holds the diagonal only, which is enough for the output scales and leaves the rounding alone.
+
+- **-h1 / --hessians_one_sided**: Keep the regular one-sided LDLQ for tensors that have `hout`, so that `--hessians` only serves `--out_scales yaqa`.
+
+- **-hreg / --hessians_reg *float***: Diagonal regularization of the output-side Hessian in two-sided LDLQ, relative to its mean diagonal. Larger values blend toward one-sided LDLQ. Default is 0.025.
 
 - **-cb / --codebook *str***: Trellis codebook: "mul1" (default), "mcg" or "3inst". The mul1 codebook is required by some optimized inference paths (int8 GEMV, CPU expert offload); there is no reason to pick another codebook except for testing.
 
