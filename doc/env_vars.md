@@ -256,6 +256,30 @@ pipeline everywhere, for A/B testing.
 Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
 selection results, persisted across runs).
 
+## Speculative decoding
+
+### `EXL3_DFLASH_SPEC` (default: `1`)
+
+Speculative (rejection) sampling for DFlash2 drafts, as in the DFlash reference and the Leviathan / Chen et al.
+algorithm: when the single active job samples at temperature > 0 through a stateless sampler (temperature, top-k,
+top-p, min-p; no penalties, DRY, XTC, logit bias, filters, forced tokens or returned probabilities), the drafter's
+candidate selector samples its path from q = softmax(score / T_draft) instead of taking the greedy path, and the
+verifier accepts draft token x with probability min(1, p(x) / q(x)), resampling the first rejected position from
+normalize(max(p - q, 0)). p is the job sampler's exact distribution. The output distribution is unchanged (tested by
+Monte Carlo); acceptance rises wherever several continuations are plausible. Greedy jobs and other samplers keep
+match-the-sample verification. `0` disables it. Read at import.
+
+Qwen3.8-27B 4.0 bpw + DFlash2 4.0 bpw, temperature 1.0 / top-p 0.95 / top-k 20, xhigh reasoning, 16 prompts x 1024
+tokens per task (acceptance length = tokens per verification step): GSM8K 5.25 -> 5.27, MATH-500 4.73 -> 5.08,
+HumanEval 3.53 -> 4.08, MBPP 3.97 -> 4.38, MT-Bench 3.44 -> 3.73 (mean +8%; the drafter card reports 5.46 / 5.28 /
+4.39 / 4.79 / 4.10 on a BF16 target).
+
+### `EXL3_DFLASH_SPEC_TSCALE` (default: `0.5`)
+
+Draft proposal temperature relative to the job's (T_draft = scale x T). Any proposal distribution keeps the output
+exact; a sharper one than the target's accepts more when the drafter is usually right, since a flat q lowers
+sum(min(p, q)). Mean acceptance over the five tasks above: 4.40 at 1.0, 4.46 at 0.7, 4.51 at 0.5, 4.40 at 0.3.
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)

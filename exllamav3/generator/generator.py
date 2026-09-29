@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import logging
 import torch
 from ..model.model import Model
@@ -22,6 +23,36 @@ import time
 import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
+
+# Speculative (rejection) sampling for DFlash2 drafts with stochastic samplers; EXL3_DFLASH_SPEC=0 keeps the
+# match-the-sample verification
+_dflash_spec_enabled = os.environ.get("EXL3_DFLASH_SPEC", "1") != "0"
+# Draft proposal temperature relative to the job's: any proposal distribution keeps the output exact, and a sharper
+# one than the target's accepts more when the drafter is usually right (a flat q lowers sum(min(p, q)))
+_dflash_spec_temp_scale = float(os.environ.get("EXL3_DFLASH_SPEC_TSCALE", "0.5"))
+
+
+def _spec_sampling_ok(job) -> bool:
+    return (
+        getattr(job.sampler, "spec_ok", False) and job.new_tokens >= 0 and job.forced_ids is None and
+        not job.return_probs and not job.return_top_tokens and
+        not any(f.is_active for f in job.filters)
+    )
+
+
+def _spec_generator(job, draft_model, device = None):
+    """Per-job torch generator for the draft and verify draws, seeded from the job's RNG."""
+    if device is None:
+        device = draft_model.selector.device
+    gens = job.__dict__.setdefault("_spec_generators", {})
+    key = str(device)
+    g = gens.get(key)
+    if g is None:
+        g = torch.Generator(device = device)
+        g.manual_seed(job.rng.randint(0, (1 << 62) - 1))
+        gens[key] = g
+    return g
+
 
 class Generator:
 
@@ -872,6 +903,20 @@ class Generator:
         }
         if self.draft_calibrator is not None:
             params["export_draft_conf"] = True
+        # Speculative sampling (DFlash2): a single job whose sampler draws from a stateless distribution
+        # (temperature / top-k / top-p / min-p) gets a sampled draft path, verified in iterate_gen by rejection
+        # sampling instead of match-the-sample. Same output distribution, higher acceptance at temperature > 0
+        self._spec = None
+        spec_job = None
+        # DFlash2 only: the sampled walk runs on its candidate selector (DFlash v1 drafters keep match-the-sample)
+        if batch_size == 1 and _dflash_spec_enabled and getattr(self.draft_model, "selector", None) is not None:
+            spec_job = next((j_ for j_ in self.active_jobs if j_.is_prefill_done()), None)
+            if spec_job is not None and _spec_sampling_ok(spec_job):
+                params["dflash2_temperature"] = float(spec_job.sampler.spec_temperature) * _dflash_spec_temp_scale
+                params["dflash2_generator"] = _spec_generator(spec_job, self.draft_model)
+            else:
+                spec_job = None
+
         out_state = self.draft_model.forward(
             input_ids = batch_ids,
             params = params,
@@ -909,7 +954,46 @@ class Generator:
             window = w_used
 
         self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
+        if spec_job is not None and "dflash2_q" in params:
+            self._spec = {
+                "job": spec_job,
+                "ids": new_ids[:1, :window],
+                "q": params["dflash2_q"][:1, :window],
+                "cands": params["dflash2_cands"][:1, :window],
+            }
         return self.draft_ids_pinned[:, :window]
+
+
+    def _spec_verify(self, job, job_logits: torch.Tensor, spec: dict) -> torch.Tensor:
+        """
+        Rejection sampling over one verified block (Leviathan et al. / Chen et al.): accept draft token x_i with
+        probability min(1, p_i(x_i) / q_i(x_i)); at the first rejection draw from normalize(max(p_i - q_i, 0)),
+        after a fully accepted block draw the bonus token from p_L. Returns the resolved tokens [L + 1] on the CPU:
+        the accepted draft prefix, then the drawn token, then padding (never read).
+        """
+        x = spec["ids"][0].long()
+        L = x.shape[-1]
+        dev = job_logits.device
+        x = x.to(dev)
+        q = spec["q"][0].to(dev).float()
+        c = spec["cands"][0].to(dev).long()
+        P = job.sampler.probs(job_logits[0, :L + 1], self.tokenizer)
+        ar = torch.arange(L, device = dev)
+        p_x = P[ar, x]
+        q_x = (q * (c == x[:, None])).sum(-1)
+        g = _spec_generator(job, None, dev)
+        u = torch.rand((L,), device = dev, generator = g)
+        a = (u * q_x < p_x).int().cumprod(0).sum()
+        q_dense = torch.zeros((L, P.shape[-1]), dtype = P.dtype, device = dev).scatter_(-1, c, q)
+        r = (P[:L] - q_dense).clamp_min_(0.0)
+        tot = r.sum(-1, keepdim = True)
+        r = torch.where(tot > 0, r / tot.clamp_min(1e-30), P[:L])
+        d = torch.cat([r, P[L:L + 1]], dim = 0)
+        gum = -torch.log(-torch.log(torch.rand(d.shape, device = dev, generator = g).clamp_min(1e-20)))
+        fix = torch.argmax(torch.log(d) + gum, dim = -1)
+        seq = torch.cat([x, x[:1]])
+        seq[a] = fix[a]
+        return seq.cpu()
 
 
     def iterate_ngram_gen(self, results: list):
@@ -1178,11 +1262,25 @@ class Generator:
                 accepted_length = 1
                 rejected = 0
 
+                # Speculative sampling: tokens resolved for the whole block by rejection sampling
+                spec_tokens = None
+                spec = getattr(self, "_spec", None)
+                if draft_tokens is not None and spec is not None and spec["job"] is job:
+                    spec_tokens = self._spec_verify(job, job_logits, spec)
+                    self._spec = None
+
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]
-                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
-                        token_logits,
-                    )
+                    # A forced injection (constrain_output_now, e.g. a reasoning budget running out) that arrived
+                    # after the block was resolved takes over from here: receive_logits emits the forced tokens
+                    if spec_tokens is not None and job.forced_ids is not None:
+                        spec_tokens = None
+                    if spec_tokens is not None:
+                        next_token, next_k_tokens, next_k_probs, next_prob = spec_tokens[i:i + 1].view(1, 1), None, None, None
+                    else:
+                        next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+                            token_logits,
+                        )
                     eos, sampled_token, rq = job.receive_sample(
                         token_logits,
                         next_token,
@@ -1237,7 +1335,11 @@ class Generator:
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                        # The speculative block was resolved without filter masks, which is only valid while
+                        # every filter is inactive: once a trigger token (e.g. </think> ahead of a JSON grammar)
+                        # activates one, the rest of the block is dropped and resampled under the mask
+                        spec_cut = spec_tokens is not None and any(f.is_active for f in job.filters)
+                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary or spec_cut:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 
