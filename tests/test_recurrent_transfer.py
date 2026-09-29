@@ -97,7 +97,10 @@ class CPUChecks(unittest.TestCase):
 class CUDAChecks(unittest.TestCase):
     def test_mixed_state_is_exact_independent_and_pageable(self):
         state, layers = fixture("cuda:0")
-        reference = state.stash()
+        # Do not let an inherited opt-in flag turn the native oracle into the candidate.
+        with patch("exllamav3.modules.gated_delta_net._coalesced_checkpoints_enable", False):
+            reference = state.stash()
+        self.assertNotIn("_coalesced_slab", reference)
         with patch("exllamav3.modules.gated_delta_net._coalesced_checkpoints_enable", True):
             saved = state.stash()
         self.assertEqual(saved["_coalesced_slab"].numel(), state.checkpoint_size)

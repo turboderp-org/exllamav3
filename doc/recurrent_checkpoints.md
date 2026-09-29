@@ -22,3 +22,9 @@ alone, since that can alias the live CPU history.
 Run `python tests/test_recurrent_transfer.py -v` for ownership/fallback tests
 and CUDA-conditional byte-equality, arena-reuse and constructor-restore tests.
 No model weights are needed. CPU-only hosts skip the CUDA-specific cases.
+
+The CUDA byte-equality test explicitly disables the opt-in for its native
+reference, regardless of the caller's environment. This is a unit comparison
+against this branch's native copy path, not a benchmark against an unmodified
+upstream checkout. No upstream-base-versus-PR performance result is available
+yet; local combined-kernel prototype results do not establish this patch's gain.
