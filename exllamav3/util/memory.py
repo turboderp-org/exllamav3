@@ -5,9 +5,6 @@ import gc
 import sys
 from pydantic import PydanticUserError
 
-# @lru_cache
-# def init_pynvml():
-#     pynvml.nvmlInit()
 
 # Try to make sure device is live for correct measurement of free VRAM
 def touch_device(device: int):
@@ -29,14 +26,21 @@ def is_integrated_device(device) -> bool:
 
 
 def device_mem_info(device) -> tuple[int, int]:
-    """(free, total) bytes for device. On an integrated GPU, CUDA's free figure is the host's
-    MemFree, which leaves out reclaimable page cache, so use MemAvailable instead"""
-    free, total = torch.cuda.mem_get_info(device)
+    """Return device headroom, using host MemAvailable for integrated GPUs and
+    dedicated NVML memory for Windows CUDA devices under WDDM."""
     if is_integrated_device(device):
+        free, total = torch.cuda.mem_get_info(device)
         available = host_memory_available()
         if available is not None:
             free = min(max(free, available), total)
-    return free, total
+        return free, total
+    if sys.platform == "win32" and torch.version.hip is None:
+        from .nvml import get_wddm_free_memory
+        properties = torch.cuda.get_device_properties(device)
+        free = get_wddm_free_memory(str(properties.uuid))
+        if free is not None:
+            return min(free, properties.total_memory), properties.total_memory
+    return torch.cuda.mem_get_info(device)
 
 
 # Reserve byte amount on device
@@ -46,7 +50,7 @@ def set_memory_fraction_reserve(
 ):
     touch_device(device)
     free, total = device_mem_info(device)
-    # mem_get_info reports memory free *after* whatever this process has already reserved, but
+    # Free memory is reported *after* whatever this process has already reserved, but
     # set_per_process_memory_fraction limits the process's *cumulative* reserved bytes. Add the
     # current reservation back, or memory held by an earlier load in the same process (a draft
     # model, a vision tower) is subtracted from the budget twice.
