@@ -13,6 +13,9 @@ from ..util.tensor import g_tensor_cache
 from .multilinear import SlicedMultiLinear
 import os
 
+# Opt-in bounded host staging; unsupported and multi-device states stay native.
+_coalesced_checkpoints_enable = os.environ.get("EXL3_COALESCED_CHECKPOINTS", "0") == "1"
+
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
 # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
@@ -138,6 +141,13 @@ class GDNState:
 
 
     def stash(self):
+        if _coalesced_checkpoints_enable and not self.cache.model.loaded_tp:
+            groups = self._checkpoint_tensors()
+            if groups is not None:
+                from ..cache.recurrent_transfer import try_stash
+                result = try_stash(groups, self.position, self.checkpoint_size)
+                if result is not None:
+                    return result
         stashed = {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size
@@ -154,12 +164,28 @@ class GDNState:
 
     def unstash(self, stashed: dict):
         assert self.position == stashed["position"]
+        if not self.cache.model.loaded_tp and "_coalesced_slab" in stashed:
+            from ..cache.recurrent_transfer import restore
+            groups = self._checkpoint_tensors()
+            if groups is None:
+                raise ValueError("Unsupported coalesced recurrent checkpoint layer")
+            # __init__ restores before assigning self.checkpoint_size.
+            size = sum(l.get_checkpoint_size() for l in self.cache.get_all_recurrent_layers().values())
+            restore(groups, self.position, size, stashed)
+            return
         if not self.cache.model.loaded_tp:
             for k, l in self.cache.get_all_recurrent_layers().items():
                 l.unstash(self.slot, stashed[k])
         else:
             cp_handle = stashed["tp_handle"]
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot))
+
+
+    def _checkpoint_tensors(self):
+        layers = self.cache.get_all_recurrent_layers()
+        if not all(hasattr(layer, "checkpoint_tensors") for layer in layers.values()):
+            return None
+        return {key: layer.checkpoint_tensors(self.slot) for key, layer in layers.items()}
 
 
     def post_advance(self):
@@ -296,10 +322,14 @@ class GDNLayerState:
 
 
     def stash(self, slot, position: int = 0):
+        return tuple(t.to("cpu", copy = True) for t in self.checkpoint_tensors(slot))
+
+
+    def checkpoint_tensors(self, slot):
         cdim = self.module.conv_kernel_size
         return (
-            self.recurrent_state[slot, :1].cpu(),
-            self.conv_state[slot, :, :cdim].cpu()
+            self.recurrent_state[slot, :1],
+            self.conv_state[slot, :, :cdim]
         )
 
 

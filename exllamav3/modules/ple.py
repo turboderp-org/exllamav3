@@ -103,7 +103,11 @@ class PLELayerState:
             self.id_state[slot, :self.ctx].copy_(temp)
 
     def stash(self, slot, position: int = 0):
-        return (self.conv_state[slot, :, :self.win].cpu(), self.id_state[slot, :self.ctx].cpu())
+        # id_state is already on the CPU: .cpu() would alias the live token history.
+        return tuple(t.to("cpu", copy = True) for t in self.checkpoint_tensors(slot))
+
+    def checkpoint_tensors(self, slot):
+        return self.conv_state[slot, :, :self.win], self.id_state[slot, :self.ctx]
 
     def unstash(self, slot, stashed, position: int = 0):
         self.conv_state[slot, :, :self.win].copy_(stashed[0])
