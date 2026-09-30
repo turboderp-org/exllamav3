@@ -95,6 +95,7 @@ parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save 
 parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
 parser.add_argument("-hess", "--hessians", type = str, default = None, help = "Directory of precomputed per-tensor Hessians (<key>.safetensors with hin (in, in) and/or hout (out, out), square or packed upper triangle, and/or hout_diag, e.g. YAQA-style Kronecker factors from a separate gradient pass, see util/yaqa_hessians.py). Tensors with hin skip the calibration forward passes; tensors with hout use two-sided LDLQ")
 parser.add_argument("-h1", "--hessians_one_sided", action = "store_true", help = "With --hessians: keep the regular one-sided LDLQ for tensors that have hout, leaving the output side to --out_scales yaqa")
+parser.add_argument("-sh", "--scaled_hessian", action = "store_true", help = "Factor the calibration Hessian per tensor with the tensor's input channel scales folded in, so LDLQ's error feedback weights each row by what its error costs at the output (one more Cholesky per tensor; experimental)")
 parser.add_argument("-hreg", "--hessians_reg", type = float, default = None, help = "Diagonal regularization of the output-side Hessian, relative to its mean diagonal (default: same as input side, 0.025). Larger values blend toward plain one-sided LDLQ")
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Deprecated (no-op): parallel mode is now the default; layers with fewer tensors than devices fall back to tile splitting")
 parser.add_argument("--max_module", type = int, help = "End quantization after this many modules, includes embedding and norm layers (for debug purposes)", default = None)
@@ -281,6 +282,7 @@ def prepare(args) -> (dict, dict, bool, str):
         ("hessians", False, ""),
         ("hessians_reg", False, 0.025),
         ("hessians_one_sided", False, False),
+        ("scaled_hessian", False, False),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -513,6 +515,8 @@ def make_quant_args(args, idx, K, devices, device_ratios = None, out_sensitivity
         quant_args["out_hessian_diag"] = out_hessian_diag
     if args.get("hessians_reg") is not None:
         quant_args["sigma_reg_out"] = args["hessians_reg"]
+    if args.get("scaled_hessian"):
+        quant_args["scaled_hessian"] = True
     if args["codebook"] == "mcg":
         quant_args.update({"mcg": True})
     elif args["codebook"] == "mul1":
