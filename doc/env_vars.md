@@ -372,6 +372,19 @@ Read once per process (parent and worker independently), so it must be set befor
 started. Note that capping below `bw` also disables the swizzled weight layout (see
 `EXL3_MOE_CPU_SWIZZLE`).
 
+### `EXL3_MOE_CPU_WIDE` (default: `1`)
+
+The CPU expert kernels take int8 activations, scaled per row to the row's largest element. A row
+that is a few large elements over many small ones loses the small ones at that scale. Models
+whose early layers feed every expert a large component shared by all tokens, confined to a few
+dimensions, produce such rows: what distinguishes one token from the next is in the small
+elements, and the experts' gates, held deep in saturation by the shared component, turn the
+rounding error of their pre-activation into its exponential. A row of which more than one
+activation in sixteen would round to zero is therefore carried as two int8 rows, the high and
+low part of a 15-bit value, at the cost of a second row in the GEMVs that read it. Rows that
+int8 holds well are computed exactly as before. `0` keeps plain int8 rows throughout, for
+testing. Read once per process (parent and worker independently).
+
 ### `EXL3_MOE_CPU_SWIZZLE` (default: `1`)
 
 Repack the CPU worker's expert trellis copies into a band-contiguous ("swizzled") layout at
