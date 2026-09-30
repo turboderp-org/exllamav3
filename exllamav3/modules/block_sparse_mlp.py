@@ -13,7 +13,7 @@ from .mlp import MLP, GatedMLP, capture_out_sensitivity
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
-from .moe_batch_recon import PAD_MAX
+from .moe_batch_recon import PAD_MAX, worst_case_bytes
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
@@ -109,6 +109,20 @@ def _routing_check_compare(key, local_sel, local_w, sel, w):
         lw = torch.gather(local_w, 1, torch.sort(local_sel, dim = 1).indices)[same]
         bw = torch.gather(w, 1, torch.sort(sel, dim = 1).indices)[same]
         st["w_maxdiff"] = max(st["w_maxdiff"], float((lw.float() - bw.float()).abs().max().item()))
+
+
+class MoETPAllocation(TPAllocation):
+    """MoE prefill scratch scales with the routed rows a rank receives, not linearly with its share
+    of experts (see BlockSparseMLP.tp_prefill_bound)"""
+
+    def __init__(self, module: BlockSparseMLP, tensor_split: bool, **kwargs):
+        super().__init__(**kwargs)
+        self.module = module
+        self.tensor_split = tensor_split
+
+    def overhead(self, tokens: int, s: int, channels: int) -> int:
+        return super().overhead(tokens, s, channels) + \
+            self.module.tp_prefill_bound(tokens, s, channels, self.tensor_split)
 
 
 class BlockSparseMLP(BlockSparseMLP_CPU, Module):
@@ -865,16 +879,24 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.cpu_offload or self.multi_up is None:
             return 0, 0
         h = self.expert_size
+        recon = self._batch_recon_layer(torch.empty((1, h), dtype = torch.half, device = self.device))
+        recon_dims = (recon.dims_g, recon.dims_u, recon.dims_d, recon.interm_fp32) if recon is not None else None
+        return self._prefill_bound(rows, assignments, self.intermediate_size_padded, recon_dims)
+
+    def _prefill_bound(self, rows: int, assignments: int, interm: int, recon_dims: tuple | None) -> tuple[int, int]:
+        """Shape-only core of prefill_worst_case_parts: `interm` is the (padded) intermediate width
+        of the local experts and recon_dims the batched tier's (dims_g, dims_u, dims_d, interm_fp32),
+        or None if the layer has no batched tier"""
+        h = self.expert_size
         fixed = (rows + 1) * h * 4 + rows * h * 2
         if FUSED_DET:
             fixed += (int(assignments * PAD_MAX) + 1) * h * 4
         r = min(rows, assignments)
         isz = (self.interm_dtype or torch.float).itemsize
-        per_expert = r * (2 * self.intermediate_size_padded * isz + 2 * h * 2 + h * 4)
+        per_expert = r * (2 * interm * isz + 2 * h * 2 + h * 4)
         if self.interm_dtype != torch.half:
-            per_expert += r * self.intermediate_size_padded * 2
-        recon = self._batch_recon_layer(torch.empty((1, h), dtype = torch.half, device = self.device))
-        batched = recon.worst_case_bytes(assignments, slot_mode = FUSED_DET) if recon is not None else 0
+            per_expert += r * interm * 2
+        batched = worst_case_bytes(*recon_dims, assignments, slot_mode = FUSED_DET) if recon_dims is not None else 0
         return fixed, max(per_expert, batched)
 
     def autosplit_prepare(self, params):
@@ -1463,6 +1485,29 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         return g.in_features % 128 == 0 and g.out_features % 128 == 0 and d.out_features % 128 == 0 \
             and self.hidden_size <= d.out_features
 
+    def tp_prefill_bound(self, tokens: int, s: int, channels: int, tensor_split: bool) -> int:
+        """Prefill transients on a TP rank holding s of channels, the same bound the layer-split
+        loader reserves (prefill_worst_case_parts) but taken from config shapes, since the TP split
+        is planned before load. Expert split: this rank's share of the assignments on full-width
+        experts (a hot expert beyond that share is covered only by the reserve). Tensor split: every
+        assignment, on experts holding this rank's intermediate slice"""
+        h = self.expert_size
+        if s == 0:
+            return tokens * h * torch.float.itemsize  # empty slice: zeroed accumulator only
+        top_k = self.num_experts_per_tok
+        if tensor_split:
+            a, interm = tokens * top_k, s * 128
+        else:
+            a, interm = -(-tokens * top_k * s // channels), self.intermediate_size_padded
+        # Whether the batched reconstruct tier will be available is assumed from the tensors
+        # being EXL3 rather than checked (_batch_recon_layer needs the loaded layer)
+        batched = BATCH_RECON and self.config.stc.has_tensor(f"{self.ups[0].key}.trellis")
+        recon_dims = (
+            (h, interm) if self.gated else None, (h, interm), (interm, h),
+            self.interm_dtype == torch.float
+        ) if batched else None
+        return sum(self._prefill_bound(tokens, a, interm, recon_dims))
+
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         if self.shared_gate:
@@ -1475,25 +1520,23 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         storage_d = 3 * self.routing_gate.storage_size()
         if self.latent_in is not None:
             storage_d += self.latent_in.storage_size() + self.latent_out.storage_size()
-        # TODO: More precise overhead estimate accounting for gate etc.
-        overhead_d = self.hidden_size * torch.float.itemsize
-        overhead_s = 4 * self.intermediate_size * (self.interm_dtype or torch.half).itemsize
-        if self.interm_dtype != torch.half:
-            overhead_s += self.intermediate_size * torch.half.itemsize
+        # Routing selection plus the argsort / sorted token, weight / inverse order index tensors
+        overhead_d = self.num_experts_per_tok * 48
         recons = max(
             self.gates[0].recons_size() if self.gated else 0,
             self.ups[0].recons_size(),
             self.downs[0].recons_size()
         )
         use_tp_split = options.get("moe_tensor_split", False)
-        tpa = TPAllocation(
+        tpa = MoETPAllocation(
+            module = self,
+            tensor_split = use_tp_split,
             key = self.key,
             channel_width = 128 if use_tp_split else 1,
             channel_unit = "channels" if use_tp_split else "experts",
             storage_per_device = storage_d,
             storage_to_split = storage,
             overhead_per_device = overhead_d,
-            overhead_to_split = overhead_s,
             recons_temp = recons,
             channels_to_split = self.ups[0].out_features // 128 if use_tp_split else self.num_experts,
             limit_key = "moe"

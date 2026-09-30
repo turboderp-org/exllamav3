@@ -48,6 +48,18 @@ class TPAllocation:
         self.current_split = []
 
 
+    def overhead(self, tokens: int, s: int, channels: int) -> int:
+        """
+        Transient bytes on a device holding s of channels_to_split channels, for a forward pass of the given
+        number of tokens. Subclasses override this for buffers that don't scale linearly with the share.
+        """
+        return (
+            tokens * self.overhead_per_device
+            + tokens * self.overhead_to_split * s // channels
+            + self.recons_temp * s // channels
+        )
+
+
 class TPAllocator:
 
     def __init__(
@@ -135,12 +147,7 @@ class TPAllocator:
                 + c.storage_to_split * s // channels
                 for s, m in zip(split, mask)
             ]
-            overhead = [
-                (tokens * c.overhead_per_device if m else 0)
-                + tokens * c.overhead_to_split * s // channels
-                + c.recons_temp * s // channels
-                for s, m in zip(split, mask)
-            ]
+            overhead = [c.overhead(tokens, s, channels) if m else 0 for s, m in zip(split, mask)]
 
             # Compute overall usage
             storage_sum = [ss + s for ss, s in zip(storage_sum, storage)]
