@@ -192,6 +192,10 @@ class MiMoV2Config(Config):
             theta_key = ["swa_rope_theta", "rope_theta", "rope_parameters->rope_theta"],
         )
 
+        # Attn and MLP skips
+        self.skip_attention = set(self.read_cfg(list, "skip_attention", {}))
+        self.skip_mlp = set(self.read_cfg(list, "skip_mlp", {}))
+
 
     def qkv_dequant(self, layer_idx: int):
         return self._qkv_dequant(self.hybrid_layer_pattern[layer_idx] == 1)
@@ -265,7 +269,9 @@ class MiMoV2Model(Model):
                 out_dtype = torch.float,
                 select_hq_bits = 2,
             )
-            if swa and not swa_full:
+            if idx in config.skip_attention:
+                attn = None
+            elif swa and not swa_full:
                 # 39 of 48 layers only ever look 128 tokens back. On the paged full cache they
                 # would still cost 8 * 192 * 2 halves per token each (~240 KB/token for the
                 # stack); the window ring makes them a fixed per-slot allocation instead.
@@ -278,16 +284,19 @@ class MiMoV2Model(Model):
                     sliding_window = config.sliding_window - 1 if swa else -1,
                     **attn_kwargs,
                 )
-            # The fused qkv tensor is TP-shard-interleaved and its FP8 scale grid is per shard;
-            # neither is expressible with the generic fused-tensor paths. One reader shared by
-            # the three Linears that slice out of it
-            qkv_reader = config.qkv_dequant(idx)
-            for proj in (attn.q_proj, attn.k_proj, attn.v_proj):
-                proj.fdequant = qkv_reader
-            # attention_value_scale multiplies V before the cache write; fold it into o_proj
-            attn.o_proj.weight_scale = config.attention_value_scale
+            if attn:
+                # The fused qkv tensor is TP-shard-interleaved and its FP8 scale grid is per shard;
+                # neither is expressible with the generic fused-tensor paths. One reader shared by
+                # the three Linears that slice out of it
+                qkv_reader = config.qkv_dequant(idx)
+                for proj in (attn.q_proj, attn.k_proj, attn.v_proj):
+                    proj.fdequant = qkv_reader
+                # attention_value_scale multiplies V before the cache write; fold it into o_proj
+                attn.o_proj.weight_scale = config.attention_value_scale
 
-            if config.moe_layer_freq[idx]:
+            if idx in config.skip_mlp:
+                mlp = None
+            elif config.moe_layer_freq[idx]:
                 mlp = BlockSparseMLP(
                     config = config,
                     key = f"{key_prefix}.layers.{idx}.mlp",
@@ -335,13 +344,13 @@ class MiMoV2Model(Model):
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.input_layernorm",
                         rms_norm_eps = config.rms_norm_eps,
-                    ),
+                    ) if attn else None,
                     attn = attn,
                     mlp_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.post_attention_layernorm",
                         rms_norm_eps = config.rms_norm_eps,
-                    ),
+                    ) if mlp else None,
                     mlp = mlp,
                 )
             ]
