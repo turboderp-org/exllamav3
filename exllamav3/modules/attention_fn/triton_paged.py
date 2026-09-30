@@ -1747,6 +1747,7 @@ def paged_attn_triton_prefill(
     n_kv_heads_override: int | None = None,
     k_new: torch.Tensor | None = None,
     v_new: torch.Tensor | None = None,
+    qc_staging: bool | None = None,
 ) -> torch.Tensor:
     """Prefill (large q_len) attention over the paged cache.
 
@@ -1843,7 +1844,8 @@ def paged_attn_triton_prefill(
         # are not kept as statics: the old pool-sized static held a full fp16 copy of the cache
         # for the life of the process. The loader's autosplit budgets for the worst case (a window
         # spanning the pool) through Attention.autosplit_extra_measure
-        if (_qc_staging == 1 and q_len >= _qc_prefill_two_pass_min_q
+        staging_enabled = _qc_staging == 1 if qc_staging is None else qc_staging
+        if (staging_enabled and q_len >= _qc_prefill_two_pass_min_q
                 and new_kv_mode == 0 and k is None and causal):
             from ...ext import exllamav3_ext as ext
             npps_w = block_table.shape[1]
