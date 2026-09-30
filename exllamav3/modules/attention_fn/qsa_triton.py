@@ -29,6 +29,7 @@ paged/BC form runs decode rows (q_len == 1), the flat form any (B * S) row set. 
 runtime arguments or derived on device, so the kernels are CUDA-graph-safe.
 """
 
+import os
 import torch
 
 import triton
@@ -251,6 +252,7 @@ def _qsa_sparse_split_kernel(
 
 
 _sm_counts = {}
+_qsa_prefill_enabled = os.environ.get("EXL3_QSA_PREFILL", "0") == "1"
 
 def _get_sms(dev):
     if dev.index not in _sm_counts:
@@ -258,7 +260,19 @@ def _get_sms(dev):
     return _sm_counts[dev.index]
 
 
-def qsa_sparse_attend_rows(
+def qsa_sparse_attend_rows(q, k, v, indices, sm_scale, block_table=None, page_size=0,
+                           qc=None, n_kv_heads=None, *, prefill_context=None):
+    if _qsa_prefill_enabled and prefill_context is not None:
+        from .qsa_prefill import try_attend
+        result = try_attend(q, k, v, indices, sm_scale, block_table, page_size,
+                            qc, n_kv_heads, context=prefill_context)
+        if result is not None:
+            return result
+    return _qsa_sparse_attend_rows_native(
+        q, k, v, indices, sm_scale, block_table, page_size, qc, n_kv_heads)
+
+
+def _qsa_sparse_attend_rows_native(
     q: torch.Tensor,               # (R, n_q_heads, head_dim) fp16, normed + roped
     k: torch.Tensor,               # (rows, n_kv_heads, head_dim) fp16 (paged: flat cache view)
     v: torch.Tensor,

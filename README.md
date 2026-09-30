@@ -272,6 +272,12 @@ For more information, see the [**QTIP**](https://arxiv.org/abs/2406.11235) and [
 [excellent writeup](https://www.together.ai/blog/even-better-even-faster-quantized-llms-with-qtip) on **QTIP** from together.ai.
 
 
+## QSA prefill
+
+An independent `EXL3_QSA_PREFILL=1` opt-in enables bounded Q8 QSA prefill for
+the currently supported Flash-Next/SM121 layout. It preserves native decode
+and oversized autosplit probes. See [QSA prefill scope and validation status](doc/qsa_prefill.md).
+
 ## Recurrent checkpoint staging
 
 An opt-in bounded pinned-host staging path is available for single-device
@@ -310,4 +316,3 @@ supporters (🐈❤️!) The following projects in particular deserve a special 
 <p align="center">
   <img src="doc/cat.png" width="40" alt="">
 </p>
-

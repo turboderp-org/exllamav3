@@ -689,7 +689,7 @@ class QSAIndexer(Module):
         q: (bsz, seq, num_q_heads, head_dim) roped; q_idx: roped indexer queries from
         update_planes. Returns (bsz, seq, num_q_heads, head_dim) fp16.
         """
-        from .attention_fn.qsa_triton import qsa_sparse_attend_rows
+        from .attention_fn.qsa_triton import qsa_sparse_attend_rows, _qsa_prefill_enabled
         from ..cache.quant import CacheLayer_quant
         bsz, seq = q.shape[:2]
         indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
@@ -703,10 +703,15 @@ class QSAIndexer(Module):
             k_arg = layer.k.view(-1, attn.num_kv_heads, attn.head_dim)
             v_arg = layer.v.view(-1, attn.num_kv_heads, attn.head_dim)
             qc, page_size = None, layer.k.shape[1]
+        prefill_context = None
+        if _qsa_prefill_enabled and bsz == 1 and seq >= 256 and qc is not None:
+            prefill_context = {"block_table": block_table[0],
+                               "length": int(cache_seqlens_cpu[0]) + seq}
         o = qsa_sparse_attend_rows(
             q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous(),
             k_arg, v_arg, indices, attn.sm_scale,
             block_table = bt_rows, page_size = page_size,
             qc = qc, n_kv_heads = attn.num_kv_heads,
+            prefill_context = prefill_context,
         )
         return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
